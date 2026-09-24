@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,13 +20,20 @@ type fakeCleanupWire struct {
 	acks              chan agentws.ImageCleanupStateAckCmd
 	inventoryRequests chan agentws.ImageInventoryReconcileCmd
 	journalRequests   chan agentws.ImageCleanupJournalRequestCmd
+	snapshotHook      func()
 }
 
 func (f *fakeCleanupWire) ImageCleanupSnapshot(hostID string) (agentws.ImageCleanupSnapshot, bool) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	hook := f.snapshotHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	f.mu.Lock()
 	s, ok := f.snapshots[hostID]
 	s.Versions = append([]agentws.ImageVersionEntry(nil), s.Versions...)
+	f.mu.Unlock()
 	return s, ok
 }
 func (f *fakeCleanupWire) SendImageCleanup(_ context.Context, _ string, c agentws.ImageCleanupCmd) (agentws.AckResult, error) {
@@ -301,7 +309,7 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	seedCatalog(t, env.pool)
 	install(t, env.pool, false)
 	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
-	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 1)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
 	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 1)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:lost-dispatch", State: "present"}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
@@ -321,6 +329,14 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	case <-time.After(5 * time.Second):
 		t.Fatal("initial dispatch missing")
 	}
+	var firstReconcile agentws.ImageInventoryReconcileCmd
+	select {
+	case firstReconcile = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial post-dispatch reconcile missing")
+	}
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
+		ReconciledRevision: 2, ReconciledRequestID: firstReconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})
 	// Catalog/adoption may disappear while the attempt remains durable. The
 	// duplicate still needs to reconcile that exact managed identity.
 	if _, err := env.pool.Exec(context.Background(), `DELETE FROM installed_images`); err != nil {
@@ -349,8 +365,10 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	if duplicate.AttemptID != first.AttemptID || duplicate.Generation != first.Generation {
 		t.Fatalf("duplicate created a new attempt: first=%+v duplicate=%+v", first, duplicate)
 	}
+	var duplicateReconcile agentws.ImageInventoryReconcileCmd
 	select {
 	case inventory := <-env.cleanupWire.inventoryRequests:
+		duplicateReconcile = inventory
 		found := false
 		for _, identity := range inventory.Identities {
 			if identity.ImageID == imgID && identity.Version == imgVer2 && identity.ImageRef == imgDigest2 {
@@ -380,7 +398,7 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	}
 	entry.State = "absent"
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
-		ReconciledRevision: 2, Versions: []agentws.ImageVersionEntry{entry}})
+		ReconciledRevision: 3, ReconciledRequestID: duplicateReconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})
 	env.cleanup.ImageVersionsChanged(context.Background(), host)
 	select {
 	case journal := <-env.cleanupWire.journalRequests:
@@ -402,6 +420,165 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	select {
 	case second := <-env.cleanupWire.cleanup:
 		t.Fatalf("duplicate dispatched second delete: %+v", second)
+	default:
+	}
+}
+
+func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-second-attempt-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
+	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 2)
+	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:retry-same-connection", State: "present"}
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true, Versions: []agentws.ImageVersionEntry{entry}}
+	env.cleanupWire.set(host, snapshot)
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := func(generation string) string {
+		return `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:retry-same-connection","expected_generation":"` + generation + `"}`
+	}
+	code, body := env.do(t, http.MethodPost, path, request("0"))
+	if code != 202 {
+		t.Fatalf("first attempt = %d %s", code, body)
+	}
+	var first CleanupAttempt
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-env.cleanupWire.cleanup:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first dispatch missing")
+	}
+	var firstReconcile agentws.ImageInventoryReconcileCmd
+	select {
+	case firstReconcile = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first post-dispatch reconcile missing")
+	}
+	// The first scan is complete, then its attempt receives a definite refusal.
+	snapshot.ReconciledRevision = 1
+	snapshot.ReconciledRequestID = firstReconcile.ID
+	env.cleanupWire.set(host, snapshot)
+	reason := "operation_busy"
+	env.cleanup.ImageCleanupState(context.Background(), host, agentws.ImageCleanupStateMsg{
+		AttemptID: first.AttemptID, ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+		RuntimeImageID: entry.RuntimeImageID, Generation: first.Generation, State: "failed", Reason: &reason,
+	})
+	code, body = env.do(t, http.MethodPost, path, request("1"))
+	if code != 202 {
+		t.Fatalf("second attempt = %d %s", code, body)
+	}
+	var second CleanupAttempt
+	if err := json.Unmarshal(body, &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.AttemptID == first.AttemptID || second.Generation != "2" {
+		t.Fatalf("second attempt identity = %+v", second)
+	}
+	// A late state from the prior reconcile may advance the revision after the
+	// second attempt commits. Its request ID still cannot authorize retirement.
+	snapshot.ReconciledRevision = 2
+	snapshot.ReconciledRequestID = firstReconcile.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	// A retained complete snapshot from the first scan cannot authorize a
+	// retired-ID settlement of the second attempt.
+	env.cleanup.requestCleanupJournal(context.Background(), host)
+	select {
+	case stale := <-env.cleanupWire.journalRequests:
+		t.Fatalf("second attempt used first scan for journal: %+v", stale)
+	default:
+	}
+	select {
+	case <-env.cleanupWire.cleanup:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second dispatch missing")
+	}
+	var secondReconcile agentws.ImageInventoryReconcileCmd
+	select {
+	case secondReconcile = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second post-dispatch reconcile missing")
+	}
+	select {
+	case stale := <-env.cleanupWire.journalRequests:
+		t.Fatalf("second attempt requested journal before second scan: %+v", stale)
+	default:
+	}
+	snapshot.ReconciledRevision = 3
+	snapshot.ReconciledRequestID = secondReconcile.ID
+	snapshot.Versions[0].State = "absent"
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	select {
+	case journal := <-env.cleanupWire.journalRequests:
+		env.cleanup.ImageCleanupJournal(context.Background(), host, agentws.ImageCleanupJournalMsg{
+			RequestID: journal.ID, RetiredAttemptIDs: []string{second.AttemptID},
+		})
+	case <-time.After(5 * time.Second):
+		t.Fatal("second scan did not request journal")
+	}
+	var state string
+	if err := env.pool.QueryRow(context.Background(), `SELECT state FROM host_image_cleanup_attempts WHERE id=$1::uuid`, second.AttemptID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "removed" {
+		t.Fatalf("second attempt after own fresh scan = %s", state)
+	}
+}
+
+func TestCleanupOlderRegistrationCannotReplaceNewAttemptReconcile(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-stale-registration-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+			RuntimeImageID: "sha256:registration-race", State: "present"}}}
+	env.cleanupWire.set(host, snapshot)
+	started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var paused atomic.Bool
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.snapshotHook = func() {
+		if paused.CompareAndSwap(false, true) {
+			close(started)
+			<-release
+		}
+	}
+	env.cleanupWire.mu.Unlock()
+	go func() {
+		env.cleanup.ImageCleanupRegistered(context.Background(), host)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("older registration did not pause")
+	}
+	// A new durable attempt invalidates the old authority while the first
+	// registration is still reading its managed identities.
+	env.cleanup.mu.Lock()
+	env.cleanup.invalidateReconcileLocked(host, snapshot, "")
+	env.cleanup.mu.Unlock()
+	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	select {
+	case <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("new reconcile not sent")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("older registration did not finish")
+	}
+	select {
+	case older := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("older registration replaced newer scan: %+v", older)
 	default:
 	}
 }
@@ -464,6 +641,7 @@ func TestCleanupJournalLostRepliesKeepOneCurrentRequest(t *testing.T) {
 	host := hosts[0]
 	seedCatalog(t, env.pool)
 	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 1)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:journal", State: "present"}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "connection-a", Capable: true, Complete: true, Versions: []agentws.ImageVersionEntry{entry}})
 	path := "/v1/admin/hosts/" + host + "/images/cleanup"
@@ -471,6 +649,14 @@ func TestCleanupJournalLostRepliesKeepOneCurrentRequest(t *testing.T) {
 	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
 		t.Fatalf("cleanup request = %d %s", code, body)
 	}
+	var reconcile agentws.ImageInventoryReconcileCmd
+	select {
+	case reconcile = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("post-dispatch reconcile missing")
+	}
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "connection-a", Capable: true, Complete: true,
+		ReconciledRevision: 1, ReconciledRequestID: reconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})
 	for range 5 {
 		env.cleanup.requestCleanupJournal(context.Background(), host)
 	}
@@ -571,6 +757,7 @@ func TestCleanupMissingJournalRequiresCurrentConnectionRetirement(t *testing.T) 
 	host := hosts[0]
 	seedCatalog(t, env.pool)
 	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:retired", State: "present"}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "old", Capable: true, Complete: true, Versions: []agentws.ImageVersionEntry{entry}})
 	path := "/v1/admin/hosts/" + host + "/images/cleanup"
@@ -583,6 +770,14 @@ func TestCleanupMissingJournalRequiresCurrentConnectionRetirement(t *testing.T) 
 	if err := json.Unmarshal(body, &attempt); err != nil {
 		t.Fatal(err)
 	}
+	var oldReconcile agentws.ImageInventoryReconcileCmd
+	select {
+	case oldReconcile = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial reconcile missing")
+	}
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "old", Capable: true, Complete: true,
+		ReconciledRevision: 1, ReconciledRequestID: oldReconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})
 	env.cleanup.requestCleanupJournal(context.Background(), host)
 	env.cleanup.mu.Lock()
 	var oldRequest string
@@ -604,8 +799,14 @@ func TestCleanupMissingJournalRequiresCurrentConnectionRetirement(t *testing.T) 
 		t.Fatalf("old-connection journal resolved attempt as %s", state)
 	}
 	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	var newReconcile agentws.ImageInventoryReconcileCmd
+	select {
+	case newReconcile = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("new-connection reconcile missing")
+	}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "new", Capable: true, Complete: true,
-		ReconciledRevision: 1, Versions: []agentws.ImageVersionEntry{entry}})
+		ReconciledRevision: 1, ReconciledRequestID: newReconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})
 	env.cleanup.ImageVersionsChanged(context.Background(), host)
 	env.cleanup.mu.Lock()
 	var newRequest string

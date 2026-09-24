@@ -102,7 +102,7 @@ func TestImageReconcileAckMarksOnlyFollowingCurrentRevision(t *testing.T) {
 	update("4") // a pre-ack snapshot cannot prove the scan completed
 	r.resolveAckFromConn(c, "accepted", AckResult{OK: true})
 	update("5")
-	if got, _ := r.ImageCleanupSnapshot("host"); got.ReconciledRevision != 5 {
+	if got, _ := r.ImageCleanupSnapshot("host"); got.ReconciledRevision != 5 || got.ReconciledRequestID != "accepted" {
 		t.Fatalf("ack-following revision was not marked reconciled: %+v", got)
 	}
 	fresh := newConn("host", nil)

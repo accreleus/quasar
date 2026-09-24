@@ -40,11 +40,14 @@ type CleanupService struct {
 	journalRequests    map[string]pendingCleanupJournal
 	inventorySnapshots map[string]trackedCleanupInventory
 	freshReconcile     map[string]cleanupReconcileGate
+	reconcileEpoch     map[string]uint64
 }
 
 type cleanupReconcileGate struct {
 	connectionID string
 	baseline     uint64
+	epoch        uint64
+	requestID    string
 }
 
 type trackedCleanupInventory struct {
@@ -59,11 +62,13 @@ type pendingCleanupJournal struct {
 	requested     map[string]bool
 	createdAt     time.Time
 	freshRevision uint64
+	gateEpoch     uint64
 }
 
 func NewCleanupService(pool *pgxpool.Pool, wire CleanupTransport) *CleanupService {
 	return &CleanupService{pool: pool, wire: wire, journalRequests: make(map[string]pendingCleanupJournal),
-		inventorySnapshots: make(map[string]trackedCleanupInventory), freshReconcile: make(map[string]cleanupReconcileGate)}
+		inventorySnapshots: make(map[string]trackedCleanupInventory), freshReconcile: make(map[string]cleanupReconcileGate),
+		reconcileEpoch: make(map[string]uint64)}
 }
 
 func (s *CleanupService) SetEnsurer(e interface {
@@ -456,9 +461,16 @@ func (s *CleanupService) Request(ctx context.Context, hostID string, req Cleanup
 		attemptID, hostID, req.ImageID, req.Version, req.ImageRef, req.RuntimeImageID, newGeneration); err != nil {
 		return zero, 0, nil, err
 	}
+	// Retire journal proofs from earlier attempts before this attempt becomes
+	// visible. Keep the service mutex through commit so a concurrent journal
+	// request cannot capture the new row under the old reconcile gate.
+	s.mu.Lock()
+	s.invalidateReconcileLocked(hostID, snap, "")
 	if err := tx.Commit(ctx); err != nil {
+		s.mu.Unlock()
 		return zero, 0, nil, err
 	}
+	s.mu.Unlock()
 	attempt := CleanupAttempt{AttemptID: attemptID, ImageID: req.ImageID, Version: req.Version,
 		ImageRef: req.ImageRef, RuntimeImageID: req.RuntimeImageID, Generation: strconv.FormatInt(newGeneration, 10), State: "removing"}
 	// A lost dispatch is recovered from this durable attempt after reconnect.
@@ -477,6 +489,13 @@ func sameImageVersion(versions []agentws.ImageVersionEntry, expected agentws.Ima
 }
 
 func (s *CleanupService) dispatch(a CleanupAttempt, hostID string) {
+	defer func() {
+		// An accepted command may be lost before the agent journals it. A new
+		// post-dispatch scan gives this attempt its own causal inventory proof.
+		reconcileCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s.ImageCleanupRegistered(reconcileCtx, hostID)
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	id, err := newCmdID()
@@ -497,7 +516,6 @@ func (s *CleanupService) dispatch(a CleanupAttempt, hostID string) {
 	if !result.OK && result.Error == "retired_attempt" {
 		// This only describes the duplicate receipt. The original physical
 		// outcome still needs journal retirement plus fresh inventory proof.
-		s.ImageCleanupRegistered(ctx, hostID)
 		return
 	}
 	if !result.OK && result.Error != "retired_attempt" {
@@ -552,6 +570,21 @@ func (s *CleanupService) changedInventoryIDs(hostID string) []string {
 	return ids
 }
 
+// Call with s.mu held. The epoch distinguishes two attempts whose scans have
+// the same connection and revision when the second POST commits.
+func (s *CleanupService) invalidateReconcileLocked(hostID string, snap agentws.ImageCleanupSnapshot, requestID string) cleanupReconcileGate {
+	for id, pending := range s.journalRequests {
+		if pending.hostID == hostID {
+			delete(s.journalRequests, id)
+		}
+	}
+	s.reconcileEpoch[hostID]++
+	gate := cleanupReconcileGate{connectionID: snap.ConnectionID, baseline: snap.ReconciledRevision,
+		epoch: s.reconcileEpoch[hostID], requestID: requestID}
+	s.freshReconcile[hostID] = gate
+	return gate
+}
+
 func (s *CleanupService) bumpInventoryFences(ctx context.Context, hostID string) {
 	ids := s.changedInventoryIDs(hostID)
 	if len(ids) == 0 {
@@ -566,6 +599,9 @@ func (s *CleanupService) bumpInventoryFences(ctx context.Context, hostID string)
 }
 
 func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID string) {
+	s.mu.Lock()
+	startedEpoch := s.reconcileEpoch[hostID]
+	s.mu.Unlock()
 	s.bumpInventoryFences(ctx, hostID)
 	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
 	if !connected || !snap.Capable {
@@ -601,19 +637,19 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 		return
 	}
 	s.mu.Lock()
+	if s.reconcileEpoch[hostID] != startedEpoch {
+		// A newer attempt or reconcile began while the managed-identity SQL
+		// was in flight. Its scan must not be replaced by this older request.
+		s.mu.Unlock()
+		return
+	}
 	// A newer reconcile supersedes any journal snapshot requested against an
 	// older daemon scan on this same connection.
-	for oldID, old := range s.journalRequests {
-		if old.hostID == hostID {
-			delete(s.journalRequests, oldID)
-		}
-	}
-	s.freshReconcile[hostID] = cleanupReconcileGate{connectionID: snap.ConnectionID, baseline: snap.ReconciledRevision}
+	s.invalidateReconcileLocked(hostID, snap, id)
 	s.mu.Unlock()
 	if s.wire.SendImageInventoryReconcile(hostID, agentws.ImageInventoryReconcileCmd{ID: id, Identities: identities}) != nil {
-		s.mu.Lock()
-		delete(s.freshReconcile, hostID)
-		s.mu.Unlock()
+		// Keep the gate fail closed until a later successful reconcile. An
+		// earlier complete snapshot must not become usable after send failure.
 		return
 	}
 	s.requestCleanupJournal(ctx, hostID)
@@ -629,7 +665,8 @@ func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID strin
 	s.mu.Lock()
 	gate, hasGate := s.freshReconcile[hostID]
 	s.mu.Unlock()
-	if hasGate && (gate.connectionID != snap.ConnectionID || snap.ReconciledRevision <= gate.baseline) {
+	if hasGate && (gate.connectionID != snap.ConnectionID || gate.requestID == "" ||
+		snap.ReconciledRequestID != gate.requestID || snap.ReconciledRevision <= gate.baseline) {
 		// A journal can race ahead of the daemon scan. Do not ask for a
 		// retirement proof until the reconcile ack's later inventory revision.
 		return
@@ -669,7 +706,7 @@ func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID strin
 				freshRevision = snap.ReconciledRevision
 			}
 			s.journalRequests[id] = pendingCleanupJournal{hostID: hostID, connectionID: snap.ConnectionID,
-				requested: requested, createdAt: time.Now(), freshRevision: freshRevision}
+				requested: requested, createdAt: time.Now(), freshRevision: freshRevision, gateEpoch: currentGate.epoch}
 			s.mu.Unlock()
 			if s.wire.SendImageCleanupJournalRequest(hostID, agentws.ImageCleanupJournalRequestCmd{ID: id, AttemptIDs: ids}) != nil {
 				s.mu.Lock()
@@ -850,7 +887,8 @@ func (s *CleanupService) ImageCleanupJournal(ctx context.Context, hostID string,
 		}
 		s.mu.Lock()
 		gate, stillCurrent := s.freshReconcile[hostID]
-		fresh := stillCurrent && gate.connectionID == pending.connectionID && gate.baseline < pending.freshRevision
+		fresh := stillCurrent && gate.connectionID == pending.connectionID && gate.epoch == pending.gateEpoch &&
+			gate.requestID == snap.ReconciledRequestID && gate.baseline < pending.freshRevision
 		s.mu.Unlock()
 		if !fresh {
 			continue // a later reconcile superseded this journal proof

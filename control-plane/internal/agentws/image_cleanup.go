@@ -103,7 +103,9 @@ type ImageCleanupSnapshot struct {
 	// ReconciledRevision is the first accepted inventory revision after the
 	// latest acknowledged image_inventory_reconcile on this connection.
 	ReconciledRevision uint64
-	Versions           []ImageVersionEntry
+	// ReconciledRequestID binds that revision to the exact reconcile command.
+	ReconciledRequestID string
+	Versions            []ImageVersionEntry
 }
 
 func validImageVersions(versions []ImageVersionEntry, complete bool) bool {
@@ -138,8 +140,8 @@ func (r *Registry) ImageCleanupSnapshot(hostID string) (ImageCleanupSnapshot, bo
 	c.mu.Lock()
 	s := ImageCleanupSnapshot{ConnectionID: c.connectionIncarnation, Capable: c.imageCleanupV1,
 		Complete: c.imageVersionsComplete, ObservedAt: c.imageVersionsObservedAt,
-		ReconciledRevision: c.imageReconciledRevision,
-		Versions:           append([]ImageVersionEntry(nil), c.imageVersions...)}
+		ReconciledRevision: c.imageReconciledRevision, ReconciledRequestID: c.imageReconciledRequestID,
+		Versions: append([]ImageVersionEntry(nil), c.imageVersions...)}
 	c.mu.Unlock()
 	r.mu.Unlock()
 	return s, true
@@ -166,7 +168,9 @@ func (r *Registry) updateImageVersions(c *conn, m ImageVersionsStateMsg) bool {
 	c.imageVersionsObservedAt = time.Now().UTC()
 	if c.imageReconcileAwaiting {
 		c.imageReconciledRevision = revision
+		c.imageReconciledRequestID = c.imageReconcileAwaitingID
 		c.imageReconcileAwaiting = false
+		c.imageReconcileAwaitingID = ""
 	}
 	return true
 }
@@ -185,6 +189,7 @@ func (r *Registry) SendImageInventoryReconcile(hostID string, cmd ImageInventory
 	c.mu.Lock()
 	c.imageReconcilePending = map[string]bool{cmd.ID: true}
 	c.imageReconcileAwaiting = false
+	c.imageReconcileAwaitingID = ""
 	c.mu.Unlock()
 	if err := c.enqueue(cmd); err != nil {
 		c.mu.Lock()
