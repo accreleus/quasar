@@ -47,8 +47,10 @@ struct CleanupState {
     connection_epoch: AtomicU64,
     reconcile_lock: Mutex<()>,
     reconcile_request_sequence: AtomicU64,
+    reconcile_overflow_sequence: AtomicU64,
     applied_reconcile_sequence: AtomicU64,
     reply_lane: Mutex<Arc<ReplyLane>>,
+    reconcile_slot: Mutex<ReconcileSlot>,
     scanner: Arc<InventoryScanner>,
     #[cfg(test)]
     reply_hook: Option<Arc<dyn Fn(u64) + Send + Sync>>,
@@ -59,6 +61,25 @@ struct ReplyLane {
     serial: Mutex<()>,
     ordinary_snapshot_pending: AtomicBool,
     ordinary_snapshot_requested: AtomicU64,
+}
+
+const MAX_PENDING_RECONCILE_IDS: usize = 32;
+const MAX_RECONCILE_IDENTITIES: usize = 4096;
+
+#[derive(Default)]
+struct ReconcileSlot {
+    running: bool,
+    active_ids: usize,
+    pending: Option<ReconcileBatch>,
+}
+
+struct ReconcileBatch {
+    ids: Vec<String>,
+    identities: Vec<ImageIdentity>,
+    epoch: u64,
+    sender: Option<mpsc::Sender<AgentMsg>>,
+    reply_lane: Arc<ReplyLane>,
+    sequence: u64,
 }
 
 type InventoryScanner =
@@ -428,8 +449,10 @@ impl ImageManager {
                     connection_epoch: AtomicU64::new(0),
                     reconcile_lock: Mutex::new(()),
                     reconcile_request_sequence: AtomicU64::new(0),
+                    reconcile_overflow_sequence: AtomicU64::new(0),
                     applied_reconcile_sequence: AtomicU64::new(0),
                     reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
+                    reconcile_slot: Mutex::new(ReconcileSlot::default()),
                     scanner: Arc::new(scan_inventory),
                     #[cfg(test)]
                     reply_hook: None,
@@ -589,6 +612,9 @@ impl ImageManager {
             cleanup.connection_epoch.fetch_add(1, Ordering::SeqCst);
             cleanup.inventory.begin_connection();
             *cleanup.reply_lane.lock().unwrap() = Arc::new(ReplyLane::default());
+            let mut slot = cleanup.reconcile_slot.lock().unwrap();
+            slot.pending = None;
+            slot.active_ids = 0;
         }
     }
 
@@ -1187,83 +1213,241 @@ impl ImageManager {
         let Some(cleanup) = &self.cleanup else {
             return Some(ack(id, false, Some("unsupported".into())));
         };
-        // Issuing and applying requests share this short critical section. A
-        // completed older scan cannot apply after a newer request is issued.
-        let (epoch, request_sequence, reply_lane) = {
-            let _guard = cleanup.reconcile_lock.lock().unwrap();
-            (
-                cleanup.connection_epoch.load(Ordering::SeqCst),
+        let mut first = None;
+        let refused = {
+            let _reconcile_guard = cleanup.reconcile_lock.lock().unwrap();
+            let sequence = cleanup
+                .reconcile_request_sequence
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            let epoch = cleanup.connection_epoch.load(Ordering::SeqCst);
+            let mut slot = cleanup.reconcile_slot.lock().unwrap();
+            let pending_ids = slot.pending.as_ref().map_or(0, |batch| batch.ids.len());
+            let oversized = id.len() > MAX_IMAGE_ID_LEN
+                || identities.len() > MAX_RECONCILE_IDENTITIES
+                || identities.iter().any(|identity| {
+                    identity.image_id.len() > MAX_IMAGE_ID_LEN
+                        || identity.version.len() > MAX_VERSION_LEN
+                        || identity.image_ref.len() > MAX_REGISTRY_REF_LEN
+                });
+            if oversized || slot.active_ids + pending_ids >= MAX_PENDING_RECONCILE_IDS {
                 cleanup
-                    .reconcile_request_sequence
-                    .fetch_add(1, Ordering::SeqCst)
-                    + 1,
-                cleanup.reply_lane.lock().unwrap().clone(),
-            )
-        };
-        // Pin the reply to the socket that received this command. A scan which
-        // outlives reconnect cannot publish a stale snapshot into the new epoch.
-        let sender = self.upstream.read().unwrap().clone();
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            let Some(cleanup) = &manager.cleanup else {
-                return;
-            };
-            let scanned = (cleanup.scanner)();
-            // Serialize revision allocation with the entire wire pair. The
-            // lock belongs to this connection epoch, so an old full socket
-            // cannot hold up replies on the new connection.
-            let _reply_guard = reply_lane.serial.lock().unwrap();
-            let (ok, image_versions_complete, image_versions, revision) = {
-                let _reconcile_guard = cleanup.reconcile_lock.lock().unwrap();
-                if cleanup.connection_epoch.load(Ordering::SeqCst) != epoch {
-                    return;
+                    .reconcile_overflow_sequence
+                    .store(sequence, Ordering::SeqCst);
+                cleanup.inventory.revoke();
+                true
+            } else {
+                let batch = ReconcileBatch {
+                    ids: vec![id.clone()],
+                    identities,
+                    epoch,
+                    sender: self.upstream.read().unwrap().clone(),
+                    reply_lane: cleanup.reply_lane.lock().unwrap().clone(),
+                    sequence,
+                };
+                if slot.running {
+                    match &mut slot.pending {
+                        Some(pending) if pending.epoch == epoch => {
+                            pending.ids.push(id.clone());
+                            pending.identities = batch.identities;
+                            pending.sender = batch.sender;
+                            pending.reply_lane = batch.reply_lane;
+                            pending.sequence = sequence;
+                        }
+                        _ => slot.pending = Some(batch),
+                    }
+                } else {
+                    slot.running = true;
+                    slot.active_ids = 1;
+                    first = Some(batch);
                 }
-                let latest = cleanup.reconcile_request_sequence.load(Ordering::SeqCst);
-                let current = latest == request_sequence;
-                if current {
+                false
+            }
+        };
+        if refused {
+            // A capacity refusal did not perform a daemon scan. It must leave
+            // inventory unknown until a later accepted reconcile completes.
+            // The WebSocket inbound branch sends this returned ack before its
+            // select can service the queued image snapshot.
+            self.emit_version_snapshot();
+            return Some(ack(id, false, Some("operation_busy".into())));
+        }
+        if let Some(batch) = first {
+            let manager = self.clone();
+            std::thread::spawn(move || manager.run_reconcile_worker(batch));
+        }
+        None
+    }
+
+    fn next_reconcile_batch(
+        slot: &mut ReconcileSlot,
+        mut active: ReconcileBatch,
+        current_epoch: u64,
+        merge_active: bool,
+    ) -> Option<ReconcileBatch> {
+        if let Some(mut pending) = slot.pending.take() {
+            if merge_active && active.epoch == current_epoch && pending.epoch == current_epoch {
+                active.ids.append(&mut pending.ids);
+                active.identities = pending.identities;
+                active.sender = pending.sender;
+                active.reply_lane = pending.reply_lane;
+                active.sequence = pending.sequence;
+                slot.active_ids = active.ids.len();
+                Some(active)
+            } else {
+                slot.active_ids = pending.ids.len();
+                Some(pending)
+            }
+        } else {
+            slot.running = false;
+            slot.active_ids = 0;
+            None
+        }
+    }
+
+    fn run_reconcile_worker(self: Arc<Self>, mut batch: ReconcileBatch) {
+        let Some(cleanup) = &self.cleanup else {
+            return;
+        };
+        const RETRY_WAIT: Duration = Duration::from_millis(10);
+        loop {
+            let scanned = (cleanup.scanner)();
+            // A reply lane can be held by a full old socket. Never let that
+            // prevent the sole worker from moving to a newer connection epoch.
+            let reply_guard = loop {
+                if cleanup.connection_epoch.load(Ordering::SeqCst) != batch.epoch {
+                    break None;
+                }
+                if let Ok(guard) = batch.reply_lane.serial.try_lock() {
+                    break Some(guard);
+                }
+                std::thread::sleep(RETRY_WAIT);
+            };
+            let mut needs_followup = false;
+            let mut report = None;
+            {
+                let _reconcile_guard = cleanup.reconcile_lock.lock().unwrap();
+                let epoch = cleanup.connection_epoch.load(Ordering::SeqCst);
+                let slot = cleanup.reconcile_slot.lock().unwrap();
+                if epoch != batch.epoch || slot.pending.is_some() {
+                    needs_followup = true;
+                } else {
                     cleanup.inventory.mark_authority_received();
                     let result = scanned.and_then(|(daemon, containers)| {
                         cleanup
                             .inventory
-                            .reconcile(&identities, &daemon, &containers)
-                            .map_err(|e| e.to_string())
+                            .reconcile(&batch.identities, &daemon, &containers)
+                            .map_err(|error| error.to_string())
                     });
                     if let Err(error) = result {
                         warn!(token = "image-inventory-reconcile-failed", "{error}");
                         cleanup.inventory.revoke();
                     }
+                    if batch.sequence < cleanup.reconcile_overflow_sequence.load(Ordering::SeqCst) {
+                        cleanup.inventory.revoke();
+                    }
                     cleanup
                         .applied_reconcile_sequence
-                        .store(request_sequence, Ordering::SeqCst);
-                } else if cleanup.applied_reconcile_sequence.load(Ordering::SeqCst) != latest {
-                    // The newest scan is still pending. A reply from this
-                    // superseded command must remain fail-closed until it lands.
-                    cleanup.inventory.revoke();
+                        .store(batch.sequence, Ordering::SeqCst);
+                    report = Some(cleanup.inventory.snapshot());
                 }
-                let _snapshot_guard = cleanup.snapshot_lock.lock().unwrap();
-                let (complete, versions) = cleanup.inventory.snapshot();
-                let revision = cleanup.revision.fetch_add(1, Ordering::SeqCst) + 1;
-                (current, complete, versions, revision)
+            }
+            if needs_followup {
+                drop(reply_guard);
+                let followup = {
+                    let _reconcile_guard = cleanup.reconcile_lock.lock().unwrap();
+                    let epoch = cleanup.connection_epoch.load(Ordering::SeqCst);
+                    let mut slot = cleanup.reconcile_slot.lock().unwrap();
+                    Self::next_reconcile_batch(&mut slot, batch, epoch, true)
+                };
+                let Some(followup) = followup else {
+                    return;
+                };
+                batch = followup;
+                continue;
+            }
+            let Some((complete, versions)) = report else {
+                drop(reply_guard);
+                return;
             };
             #[cfg(test)]
             if let Some(hook) = &cleanup.reply_hook {
-                hook(revision);
+                hook(cleanup.revision.load(Ordering::SeqCst) + 1);
             }
-            // A full or stalled old socket must not block begin_connection.
-            if let Some(sender) = sender {
-                if sender
-                    .blocking_send(ack(id, ok, (!ok).then(|| "superseded".into())))
-                    .is_ok()
-                {
-                    let _ = sender.blocking_send(AgentMsg::ImageVersionsState {
-                        inventory_revision: revision.to_string(),
-                        image_versions_complete,
-                        image_versions,
-                    });
+            for id in &batch.ids {
+                if !Self::send_reconcile_pair(cleanup, &batch, id, complete, &versions) {
+                    break;
                 }
             }
+            drop(reply_guard);
+            let followup = {
+                let _reconcile_guard = cleanup.reconcile_lock.lock().unwrap();
+                let epoch = cleanup.connection_epoch.load(Ordering::SeqCst);
+                let mut slot = cleanup.reconcile_slot.lock().unwrap();
+                Self::next_reconcile_batch(&mut slot, batch, epoch, false)
+            };
+            let Some(next_batch) = followup else {
+                return;
+            };
+            batch = next_batch;
+        }
+    }
+
+    fn send_reconcile_pair(
+        cleanup: &CleanupState,
+        batch: &ReconcileBatch,
+        id: &str,
+        complete: bool,
+        versions: &[ImageVersionEntry],
+    ) -> bool {
+        let Some(sender) = &batch.sender else {
+            return false;
+        };
+        let Some(ack_permit) = Self::reserve_reconcile_reply(cleanup, batch, sender) else {
+            return false;
+        };
+        ack_permit.send(ack(id.to_string(), true, None));
+        let Some(snapshot_permit) = Self::reserve_reconcile_reply(cleanup, batch, sender) else {
+            return false;
+        };
+        let _reconcile_guard = cleanup.reconcile_lock.lock().unwrap();
+        if cleanup.connection_epoch.load(Ordering::SeqCst) != batch.epoch {
+            return false;
+        }
+        let _snapshot_guard = cleanup.snapshot_lock.lock().unwrap();
+        let revision = cleanup.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let overflowed =
+            batch.sequence < cleanup.reconcile_overflow_sequence.load(Ordering::SeqCst);
+        let mut image_versions = versions.to_vec();
+        if overflowed {
+            for version in &mut image_versions {
+                version.state = "unknown".into();
+            }
+        }
+        snapshot_permit.send(AgentMsg::ImageVersionsState {
+            inventory_revision: revision.to_string(),
+            image_versions_complete: complete && !overflowed,
+            image_versions,
         });
-        None
+        true
+    }
+
+    fn reserve_reconcile_reply<'a>(
+        cleanup: &CleanupState,
+        batch: &ReconcileBatch,
+        sender: &'a mpsc::Sender<AgentMsg>,
+    ) -> Option<mpsc::Permit<'a, AgentMsg>> {
+        const RETRY_WAIT: Duration = Duration::from_millis(10);
+        loop {
+            if cleanup.connection_epoch.load(Ordering::SeqCst) != batch.epoch {
+                return None;
+            }
+            match sender.try_reserve() {
+                Ok(permit) => return Some(permit),
+                Err(mpsc::error::TrySendError::Closed(_)) => return None,
+                Err(mpsc::error::TrySendError::Full(_)) => std::thread::sleep(RETRY_WAIT),
+            }
+        }
     }
 
     pub fn handle_cleanup(self: &Arc<Self>, id: String, attempt: Attempt) -> Option<AgentMsg> {
@@ -1460,6 +1644,11 @@ impl ImageManager {
             });
         if let Err(error) = result {
             warn!(token = "image-inventory-refresh-failed", "{error}");
+            cleanup.inventory.revoke();
+        }
+        if cleanup.applied_reconcile_sequence.load(Ordering::SeqCst)
+            < cleanup.reconcile_overflow_sequence.load(Ordering::SeqCst)
+        {
             cleanup.inventory.revoke();
         }
         self.emit_version_snapshot();
@@ -2071,6 +2260,30 @@ mod tests {
         m
     }
 
+    fn cleanup_mgr(
+        dir: &Path,
+        scanner: Arc<InventoryScanner>,
+        reply_hook: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    ) -> Arc<ImageManager> {
+        let mut manager = mgr();
+        Arc::get_mut(&mut manager).unwrap().cleanup = Some(Arc::new(CleanupState {
+            journal: CleanupJournal::open(dir.join("cleanup.json")).unwrap(),
+            inventory: VersionInventory::open(dir.join("versions.json")).unwrap(),
+            revision: AtomicU64::new(0),
+            snapshot_lock: Mutex::new(()),
+            connection_epoch: AtomicU64::new(0),
+            reconcile_lock: Mutex::new(()),
+            reconcile_request_sequence: AtomicU64::new(0),
+            reconcile_overflow_sequence: AtomicU64::new(0),
+            applied_reconcile_sequence: AtomicU64::new(0),
+            reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
+            reconcile_slot: Mutex::new(ReconcileSlot::default()),
+            scanner,
+            reply_hook,
+        }));
+        manager
+    }
+
     #[test]
     fn stalled_inventory_scan_does_not_block_other_connection_commands() {
         let dir = tempfile::tempdir().unwrap();
@@ -2082,20 +2295,7 @@ mod tests {
             release_rx.lock().unwrap().recv().unwrap();
             Ok((Vec::new(), Vec::new()))
         };
-        let mut manager = mgr();
-        Arc::get_mut(&mut manager).unwrap().cleanup = Some(Arc::new(CleanupState {
-            journal: CleanupJournal::open(dir.path().join("cleanup.json")).unwrap(),
-            inventory: VersionInventory::open(dir.path().join("versions.json")).unwrap(),
-            revision: AtomicU64::new(0),
-            snapshot_lock: Mutex::new(()),
-            connection_epoch: AtomicU64::new(0),
-            reconcile_lock: Mutex::new(()),
-            reconcile_request_sequence: AtomicU64::new(0),
-            applied_reconcile_sequence: AtomicU64::new(0),
-            reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
-            scanner: Arc::new(scanner),
-            reply_hook: None,
-        }));
+        let manager = cleanup_mgr(dir.path(), Arc::new(scanner), None);
         let (tx, mut rx) = mpsc::channel(8);
         let _guard = manager.attach_upstream(tx);
         assert_eq!(
@@ -2172,8 +2372,10 @@ mod tests {
             connection_epoch: AtomicU64::new(0),
             reconcile_lock: Mutex::new(()),
             reconcile_request_sequence: AtomicU64::new(0),
+            reconcile_overflow_sequence: AtomicU64::new(0),
             applied_reconcile_sequence: AtomicU64::new(0),
             reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
+            reconcile_slot: Mutex::new(ReconcileSlot::default()),
             scanner: Arc::new(|| Ok((Vec::new(), Vec::new()))),
             reply_hook: None,
         }));
@@ -2195,31 +2397,19 @@ mod tests {
     #[test]
     fn reconnect_is_not_held_by_a_full_old_inventory_reply_channel() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manager = mgr();
-        Arc::get_mut(&mut manager).unwrap().cleanup = Some(Arc::new(CleanupState {
-            journal: CleanupJournal::open(dir.path().join("cleanup.json")).unwrap(),
-            inventory: VersionInventory::open(dir.path().join("versions.json")).unwrap(),
-            revision: AtomicU64::new(0),
-            snapshot_lock: Mutex::new(()),
-            connection_epoch: AtomicU64::new(0),
-            reconcile_lock: Mutex::new(()),
-            reconcile_request_sequence: AtomicU64::new(0),
-            applied_reconcile_sequence: AtomicU64::new(0),
-            reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
-            scanner: Arc::new(|| Ok((Vec::new(), Vec::new()))),
-            reply_hook: None,
-        }));
+        let manager = cleanup_mgr(dir.path(), Arc::new(|| Ok((Vec::new(), Vec::new()))), None);
         let (tx, rx) = mpsc::channel(1);
         let _guard = manager.attach_upstream(tx); // initial snapshot fills channel
         assert!(manager
             .handle_inventory_reconcile("scan".into(), Vec::new())
             .is_none());
         let cleanup = manager.cleanup.as_ref().unwrap();
+        let old_lane = cleanup.reply_lane.lock().unwrap().clone();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while cleanup.revision.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        while old_lane.serial.try_lock().is_ok() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(cleanup.revision.load(Ordering::SeqCst), 2);
+        assert!(old_lane.serial.try_lock().is_err());
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let reconnect_manager = manager.clone();
         let reconnect = std::thread::spawn(move || {
@@ -2248,20 +2438,7 @@ mod tests {
     #[test]
     fn ordinary_inventory_snapshot_retries_a_full_channel_without_blocking_dispatch() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manager = mgr();
-        Arc::get_mut(&mut manager).unwrap().cleanup = Some(Arc::new(CleanupState {
-            journal: CleanupJournal::open(dir.path().join("cleanup.json")).unwrap(),
-            inventory: VersionInventory::open(dir.path().join("versions.json")).unwrap(),
-            revision: AtomicU64::new(0),
-            snapshot_lock: Mutex::new(()),
-            connection_epoch: AtomicU64::new(0),
-            reconcile_lock: Mutex::new(()),
-            reconcile_request_sequence: AtomicU64::new(0),
-            applied_reconcile_sequence: AtomicU64::new(0),
-            reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
-            scanner: Arc::new(|| Ok((Vec::new(), Vec::new()))),
-            reply_hook: None,
-        }));
+        let manager = cleanup_mgr(dir.path(), Arc::new(|| Ok((Vec::new(), Vec::new()))), None);
         let (tx, mut rx) = mpsc::channel(1);
         let _guard = manager.attach_upstream(tx); // initial snapshot fills queue
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -2309,8 +2486,268 @@ mod tests {
     }
 
     #[test]
-    fn repeated_reconnects_cancel_old_full_socket_snapshot_waiters() {
+    fn stalled_reconcile_coalesces_many_commands_into_one_latest_followup_scan() {
         let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scanner = {
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let calls = calls.clone();
+            move || {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let result = if call == 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                    (Vec::new(), Vec::new())
+                } else {
+                    (
+                        vec![crate::runtime::DaemonImage {
+                            id: "sha256:latest".into(),
+                            refs: vec!["ghcr.io/x/steam:sha-0000020".into()],
+                        }],
+                        Vec::new(),
+                    )
+                };
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(result)
+            }
+        };
+        let manager = cleanup_mgr(dir.path(), Arc::new(scanner), None);
+        let (tx, mut rx) = mpsc::channel(64);
+        let _guard = manager.attach_upstream(tx);
+        let _initial = rx.try_recv().unwrap();
+        let started = Instant::now();
+        for i in 0..=20 {
+            let identity = ImageIdentity {
+                image_id: "steam".into(),
+                version: format!("v{i}"),
+                image_ref: format!("ghcr.io/x/steam:sha-{i:07}"),
+            };
+            assert!(manager
+                .handle_inventory_reconcile(format!("request-{i}"), vec![identity])
+                .is_none());
+            if i == 0 {
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+        }
+        let responsive = started.elapsed() < Duration::from_millis(100);
+        let scans_while_stalled = calls.load(Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert!(responsive, "reconcile handler blocked on daemon scan");
+        assert_eq!(scans_while_stalled, 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut replies = Vec::new();
+        while replies.len() < 42 && Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                replies.push(serde_json::to_value(msg).unwrap());
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(replies.len(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        for i in 0..=20 {
+            assert_eq!(replies[2 * i]["type"], "ack");
+            assert_eq!(replies[2 * i]["id"], format!("request-{i}"));
+            assert_eq!(replies[2 * i]["ok"], true);
+            assert_eq!(replies[2 * i + 1]["type"], "image_versions_state");
+            assert_eq!(replies[2 * i + 1]["image_versions"][0]["version"], "v20");
+            assert_eq!(replies[2 * i + 1]["image_versions"][0]["state"], "present");
+        }
+    }
+
+    #[test]
+    fn reconcile_pending_id_cap_refuses_excess_then_recovers_after_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scanner = {
+            let calls = calls.clone();
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                    Ok((Vec::new(), Vec::new()))
+                } else {
+                    Ok((
+                        vec![crate::runtime::DaemonImage {
+                            id: "sha256:managed".into(),
+                            refs: vec!["ghcr.io/x/steam:sha-1234567".into()],
+                        }],
+                        Vec::new(),
+                    ))
+                }
+            }
+        };
+        let manager = cleanup_mgr(dir.path(), Arc::new(scanner), None);
+        let (tx, mut rx) = mpsc::channel(128);
+        let _guard = manager.attach_upstream(tx);
+        let _initial = rx.try_recv().unwrap();
+        let identity = ImageIdentity {
+            image_id: "steam".into(),
+            version: "v1".into(),
+            image_ref: "ghcr.io/x/steam:sha-1234567".into(),
+        };
+        assert!(manager
+            .handle_inventory_reconcile("first".into(), vec![identity.clone()])
+            .is_none());
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for i in 1..MAX_PENDING_RECONCILE_IDS {
+            assert!(manager
+                .handle_inventory_reconcile(format!("queued-{i}"), vec![identity.clone()])
+                .is_none());
+        }
+        let refusal = manager
+            .handle_inventory_reconcile("overflow".into(), vec![identity.clone()])
+            .unwrap();
+        let refusal = serde_json::to_value(refusal).unwrap();
+        assert_eq!(refusal["type"], "ack");
+        assert_eq!(refusal["id"], "overflow");
+        assert_eq!(refusal["ok"], false);
+        assert_eq!(refusal["error"], "operation_busy");
+        let incomplete = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
+        assert_eq!(incomplete["type"], "image_versions_state");
+        assert_eq!(incomplete["image_versions_complete"], false);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut replies = Vec::new();
+        while replies.len() < 2 * MAX_PENDING_RECONCILE_IDS && Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                replies.push(serde_json::to_value(msg).unwrap());
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(replies.len(), 2 * MAX_PENDING_RECONCILE_IDS);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(replies
+            .iter()
+            .filter(|msg| msg["type"] == "ack")
+            .all(|ack| ack["ok"] == true));
+        assert!(replies
+            .iter()
+            .filter(|msg| msg["type"] == "image_versions_state")
+            .all(|snapshot| snapshot["image_versions_complete"] == false));
+        assert!(manager
+            .handle_inventory_reconcile("recovery".into(), vec![identity])
+            .is_none());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut recovery = Vec::new();
+        while recovery.len() < 2 && Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                recovery.push(serde_json::to_value(msg).unwrap());
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(recovery.len(), 2);
+        assert_eq!(recovery[0]["id"], "recovery");
+        assert_eq!(recovery[1]["image_versions_complete"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn reconnect_churn_drops_old_pending_batches_without_starting_extra_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scanner = {
+            let calls = calls.clone();
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Ok((Vec::new(), Vec::new()))
+            }
+        };
+        let manager = cleanup_mgr(dir.path(), Arc::new(scanner), None);
+        let (tx, mut old_rx) = mpsc::channel(8);
+        let old_guard = manager.attach_upstream(tx);
+        let _initial = old_rx.try_recv().unwrap();
+        assert!(manager
+            .handle_inventory_reconcile("old-active".into(), Vec::new())
+            .is_none());
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(manager
+            .handle_inventory_reconcile("old-pending".into(), Vec::new())
+            .is_none());
+        let mut guards = vec![old_guard];
+        let mut old_receivers = vec![old_rx];
+        let mut current_rx = None;
+        for epoch in 0..4 {
+            manager.begin_connection();
+            let (tx, mut rx) = mpsc::channel(8);
+            let guard = manager.attach_upstream(tx);
+            let _initial = rx.try_recv().unwrap();
+            assert!(manager
+                .handle_inventory_reconcile(format!("current-{epoch}"), Vec::new())
+                .is_none());
+            guards.push(guard);
+            if let Some(old) = current_rx.replace(rx) {
+                old_receivers.push(old);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        let mut current_rx = current_rx.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut replies = Vec::new();
+        while replies.len() < 2 && Instant::now() < deadline {
+            if let Ok(msg) = current_rx.try_recv() {
+                replies.push(serde_json::to_value(msg).unwrap());
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["id"], "current-3");
+        assert_eq!(replies[1]["type"], "image_versions_state");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for receiver in &mut old_receivers {
+            assert!(receiver.try_recv().is_err(), "old epoch received a reply");
+        }
+        drop(guards);
+    }
+
+    #[test]
+    fn overflow_during_completed_scan_cannot_publish_complete_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (scan_entered_tx, scan_entered_rx) = std::sync::mpsc::channel();
+        let (release_scan_tx, release_scan_rx) = std::sync::mpsc::channel();
+        let release_scan_rx = Mutex::new(release_scan_rx);
+        let (reply_entered_tx, reply_entered_rx) = std::sync::mpsc::channel();
+        let (release_reply_tx, release_reply_rx) = std::sync::mpsc::channel();
+        let release_reply_rx = Mutex::new(release_reply_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let scanner = move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                scan_entered_tx.send(()).unwrap();
+                release_scan_rx.lock().unwrap().recv().unwrap();
+                Ok((Vec::new(), Vec::new()))
+            } else {
+                Ok((
+                    vec![crate::runtime::DaemonImage {
+                        id: "sha256:managed".into(),
+                        refs: vec!["ghcr.io/x/steam:sha-1234567".into()],
+                    }],
+                    Vec::new(),
+                ))
+            }
+        };
         let mut manager = mgr();
         Arc::get_mut(&mut manager).unwrap().cleanup = Some(Arc::new(CleanupState {
             journal: CleanupJournal::open(dir.path().join("cleanup.json")).unwrap(),
@@ -2320,11 +2757,67 @@ mod tests {
             connection_epoch: AtomicU64::new(0),
             reconcile_lock: Mutex::new(()),
             reconcile_request_sequence: AtomicU64::new(0),
+            reconcile_overflow_sequence: AtomicU64::new(0),
             applied_reconcile_sequence: AtomicU64::new(0),
             reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
-            scanner: Arc::new(|| Ok((Vec::new(), Vec::new()))),
-            reply_hook: None,
+            reconcile_slot: Mutex::new(ReconcileSlot::default()),
+            scanner: Arc::new(scanner),
+            reply_hook: Some(Arc::new(move |_| {
+                reply_entered_tx.send(()).unwrap();
+                release_reply_rx.lock().unwrap().recv().unwrap();
+            })),
         }));
+        let (tx, mut rx) = mpsc::channel(128);
+        let _guard = manager.attach_upstream(tx);
+        let _initial = rx.try_recv().unwrap();
+        let identity = ImageIdentity {
+            image_id: "steam".into(),
+            version: "v1".into(),
+            image_ref: "ghcr.io/x/steam:sha-1234567".into(),
+        };
+        assert!(manager
+            .handle_inventory_reconcile("first".into(), vec![identity.clone()])
+            .is_none());
+        scan_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        for i in 1..MAX_PENDING_RECONCILE_IDS {
+            assert!(manager
+                .handle_inventory_reconcile(format!("queued-{i}"), vec![identity.clone()])
+                .is_none());
+        }
+        release_scan_tx.send(()).unwrap();
+        reply_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let refusal = manager
+            .handle_inventory_reconcile("overflow".into(), vec![identity])
+            .unwrap();
+        assert_eq!(serde_json::to_value(refusal).unwrap()["ok"], false);
+        release_reply_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut snapshots = Vec::new();
+        while snapshots.len() < MAX_PENDING_RECONCILE_IDS && Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let value = serde_json::to_value(msg).unwrap();
+                if value["type"] == "image_versions_state" {
+                    snapshots.push(value);
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(snapshots.len(), MAX_PENDING_RECONCILE_IDS);
+        assert!(snapshots.iter().all(|snapshot| {
+            snapshot["image_versions_complete"] == false
+                && snapshot["image_versions"][0]["state"] == "unknown"
+        }));
+    }
+
+    #[test]
+    fn repeated_reconnects_cancel_old_full_socket_snapshot_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = cleanup_mgr(dir.path(), Arc::new(|| Ok((Vec::new(), Vec::new()))), None);
         let mut receivers = Vec::new();
         let mut guards = Vec::new();
         let mut cancelled = Vec::new();
@@ -2336,12 +2829,12 @@ mod tests {
                 .handle_inventory_reconcile(format!("scan-{round}"), Vec::new())
                 .is_none());
             let cleanup = manager.cleanup.as_ref().unwrap();
+            let old_lane = cleanup.reply_lane.lock().unwrap().clone();
             let deadline = Instant::now() + Duration::from_secs(1);
-            while cleanup.revision.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            while old_lane.serial.try_lock().is_ok() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(2));
             }
-            assert_eq!(cleanup.revision.load(Ordering::SeqCst), 2);
-            let old_lane = cleanup.reply_lane.lock().unwrap().clone();
+            assert!(old_lane.serial.try_lock().is_err());
             manager.emit_version_snapshot();
             manager.begin_connection();
             let deadline = Instant::now() + Duration::from_millis(100);
@@ -2374,8 +2867,10 @@ mod tests {
             connection_epoch: AtomicU64::new(0),
             reconcile_lock: Mutex::new(()),
             reconcile_request_sequence: AtomicU64::new(0),
+            reconcile_overflow_sequence: AtomicU64::new(0),
             applied_reconcile_sequence: AtomicU64::new(0),
             reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
+            reconcile_slot: Mutex::new(ReconcileSlot::default()),
             scanner: Arc::new(move || {
                 observed_scans.fetch_add(1, Ordering::SeqCst);
                 Ok((Vec::new(), Vec::new()))
@@ -2399,10 +2894,7 @@ mod tests {
         assert!(manager
             .handle_inventory_reconcile("second".into(), Vec::new())
             .is_none());
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while scans.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
         let (emit_done_tx, emit_done_rx) = std::sync::mpsc::channel();
         let emit_manager = manager.clone();
         let emit = std::thread::spawn(move || {
@@ -2420,7 +2912,6 @@ mod tests {
             }
         }
         release_reply_tx.send(()).unwrap();
-        assert_eq!(scans.load(Ordering::SeqCst), 2);
         assert!(
             emit_returned.is_ok(),
             "ordinary emit blocked connection dispatch"
@@ -2440,6 +2931,7 @@ mod tests {
             }
         }
         assert_eq!(messages.len(), 5);
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
         assert_eq!(messages[0]["id"], "first");
         assert_eq!(messages[1]["inventory_revision"], "2");
         let revisions: Vec<_> = messages
@@ -2483,20 +2975,7 @@ mod tests {
                 ))
             }
         };
-        let mut manager = mgr();
-        Arc::get_mut(&mut manager).unwrap().cleanup = Some(Arc::new(CleanupState {
-            journal: CleanupJournal::open(dir.path().join("cleanup.json")).unwrap(),
-            inventory: VersionInventory::open(dir.path().join("versions.json")).unwrap(),
-            revision: AtomicU64::new(0),
-            snapshot_lock: Mutex::new(()),
-            connection_epoch: AtomicU64::new(0),
-            reconcile_lock: Mutex::new(()),
-            reconcile_request_sequence: AtomicU64::new(0),
-            applied_reconcile_sequence: AtomicU64::new(0),
-            reply_lane: Mutex::new(Arc::new(ReplyLane::default())),
-            scanner: Arc::new(scanner),
-            reply_hook: None,
-        }));
+        let manager = cleanup_mgr(dir.path(), Arc::new(scanner), None);
         let (tx, mut rx) = mpsc::channel(8);
         let _guard = manager.attach_upstream(tx);
         let _initial = rx.try_recv().unwrap();
@@ -2509,64 +2988,28 @@ mod tests {
         assert!(manager
             .handle_inventory_reconcile("second".into(), vec![identity])
             .is_none());
+        release_first_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut messages = Vec::new();
-        while messages.len() < 2 && Instant::now() < deadline {
+        while messages.len() < 4 && Instant::now() < deadline {
             if let Ok(msg) = rx.try_recv() {
                 messages.push(serde_json::to_value(msg).unwrap());
             } else {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
-        release_first_tx.send(()).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["type"], "ack");
-        assert_eq!(messages[0]["id"], "second");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["id"], "first");
         assert_eq!(messages[0]["ok"], true);
-        assert_eq!(messages[1]["type"], "image_versions_state");
-        assert_eq!(messages[1]["inventory_revision"], "2");
-        assert_eq!(messages[1]["image_versions_complete"], true);
         assert_eq!(messages[1]["image_versions"][0]["state"], "present");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let old_ack = loop {
-            if let Ok(msg) = rx.try_recv() {
-                break serde_json::to_value(msg).unwrap();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "superseded command must be acked"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        };
-        assert_eq!(old_ack["type"], "ack");
-        assert_eq!(old_ack["id"], "first");
-        assert_eq!(old_ack["ok"], false);
-        let old_snapshot = loop {
-            if let Ok(msg) = rx.try_recv() {
-                break serde_json::to_value(msg).unwrap();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "superseded snapshot must follow ack"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        };
-        assert_eq!(old_snapshot["type"], "image_versions_state");
-        assert_eq!(old_snapshot["inventory_revision"], "3");
-        assert_eq!(old_snapshot["image_versions_complete"], true);
-        assert_eq!(old_snapshot["image_versions"][0]["state"], "present");
+        assert_eq!(messages[2]["id"], "second");
+        assert_eq!(messages[2]["ok"], true);
+        assert_eq!(messages[3]["image_versions"][0]["state"], "present");
+        assert_eq!(messages[1]["inventory_revision"], "2");
+        assert_eq!(messages[3]["inventory_revision"], "3");
         let (complete, entries) = manager.version_snapshot();
         assert!(complete);
         assert_eq!(entries[0].state, "present");
-        assert_eq!(
-            manager
-                .cleanup
-                .as_ref()
-                .unwrap()
-                .revision
-                .load(Ordering::SeqCst),
-            3
-        );
     }
 
     fn ensure(version: &str, registry_ref: &str) -> ImageOp {
