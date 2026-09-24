@@ -173,10 +173,6 @@ impl VersionInventory {
                     && !by_ref.contains_key(&record.image_ref)
                     && container_image_ids.contains(&record.runtime_image_id)
             });
-        let complete = !unclassified
-            && !binding_changed
-            && !orphaned_container
-            && *self.authority_received.lock().unwrap();
         for versions in next.records.values_mut() {
             for record in versions.values_mut() {
                 if let Some(id) = by_ref.get(&record.image_ref) {
@@ -186,6 +182,16 @@ impl VersionInventory {
                 }
             }
         }
+        let unbound = next
+            .records
+            .values()
+            .flat_map(|versions| versions.values())
+            .any(|record| record.runtime_image_id.is_empty());
+        let complete = !unclassified
+            && !binding_changed
+            && !orphaned_container
+            && !unbound
+            && *self.authority_received.lock().unwrap();
         self.save(&next)?;
         *guard = next;
         *self.complete.lock().unwrap() = complete;
@@ -359,5 +365,18 @@ mod tests {
         let (complete, entries) = inventory.reconcile(&[old], &[unknown], &[]).unwrap();
         assert!(!complete);
         assert_eq!(entries[0].state, "unknown");
+    }
+
+    #[test]
+    fn an_unseen_identity_without_a_runtime_id_is_unknown_even_after_full_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = VersionInventory::open(dir.path().join("versions.json")).unwrap();
+        inventory.mark_authority_received();
+        let (complete, entries) = inventory
+            .reconcile(&[identity("v1", "1111111")], &[], &[])
+            .unwrap();
+        assert!(!complete);
+        assert_eq!(entries[0].state, "unknown");
+        assert!(entries[0].runtime_image_id.is_empty());
     }
 }

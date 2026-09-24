@@ -43,6 +43,7 @@ struct CleanupState {
     journal: CleanupJournal,
     inventory: VersionInventory,
     revision: AtomicU64,
+    snapshot_lock: Mutex<()>,
 }
 
 pub fn cleanup_attempt(
@@ -394,6 +395,7 @@ impl ImageManager {
                     journal,
                     inventory,
                     revision: AtomicU64::new(0),
+                    snapshot_lock: Mutex::new(()),
                 })),
                 (journal, inventory) => {
                     tracing::error!(
@@ -526,8 +528,9 @@ impl ImageManager {
     pub fn attach_upstream(self: &Arc<Self>, tx: mpsc::Sender<AgentMsg>) -> UpstreamGuard {
         *self.upstream.write().unwrap() = Some(tx);
         if let Some(cleanup) = &self.cleanup {
+            let _snapshot_guard = cleanup.snapshot_lock.lock().unwrap();
             cleanup.revision.store(0, Ordering::SeqCst);
-            self.emit_version_snapshot();
+            self.emit_version_snapshot_locked(cleanup);
             for attempt in cleanup.journal.terminal() {
                 self.send_upstream(attempt.report());
             }
@@ -557,6 +560,11 @@ impl ImageManager {
         let Some(cleanup) = &self.cleanup else {
             return;
         };
+        let _snapshot_guard = cleanup.snapshot_lock.lock().unwrap();
+        self.emit_version_snapshot_locked(cleanup);
+    }
+
+    fn emit_version_snapshot_locked(&self, cleanup: &CleanupState) {
         let (image_versions_complete, image_versions) = cleanup.inventory.snapshot();
         let revision = cleanup.revision.fetch_add(1, Ordering::SeqCst) + 1;
         self.send_upstream(AgentMsg::ImageVersionsState {
