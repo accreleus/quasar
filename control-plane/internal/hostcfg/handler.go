@@ -102,7 +102,8 @@ func (h *Handler) policyViewForConnection(ctx context.Context, hostID string, vi
 	if hasIdentity {
 		_, connection, current := identity.PolicyIdentity(hostID)
 		if current {
-			if baseline, err := h.store.DeploymentSettingsForConnection(ctx, hostID, connection); err == nil && baseline != nil {
+			baseline, baselineErr := h.store.DeploymentSettingsForConnection(ctx, hostID, connection)
+			if baselineErr == nil && baseline != nil {
 				for key, choice := range view.Choices {
 					if choice.Source != "deployment" {
 						continue
@@ -115,6 +116,19 @@ func (h *Handler) policyViewForConnection(ctx context.Context, hostID string, vi
 			for key, group := range view.Groups {
 				group.Fresh = group.Status == "applied" && group.EvidenceConnection != nil && *group.EvidenceConnection == connection
 				view.Groups[key] = group
+			}
+			if hardware := view.Groups["hardware"]; hardware.Fresh && baselineErr == nil && baseline != nil {
+				if effective, err := h.store.GetEffective(ctx, hostID); err == nil {
+					resolved, verified := verifiedHardwareValues(hardware, view.Choices, baseline, effective)
+					if verified {
+						for _, key := range []string{"encoder", "render_node"} {
+							if view.Choices[key].Source != "automatic" {
+								continue
+							}
+							view.Resolved[key] = map[string]any{"value": resolved[key], "source": "automatic", "observed_at": hardware.ObservedAt, "evidence_id": connection}
+						}
+					}
+				}
 			}
 		}
 	}

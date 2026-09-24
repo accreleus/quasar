@@ -146,6 +146,51 @@ func policyGroup(key string) (string, string) {
 	return key, "next_session"
 }
 
+// An Automatic hardware value is shown as applied only when the observed
+// value reconstructs the exact full group digest verified by this connection's
+// agent journal. A retained legacy effective map alone proves nothing.
+func verifiedHardwareValues(group PolicyGroup, choices map[string]PolicyChoice, baseline map[string]any, effective map[string]string) (map[string]any, bool) {
+	if group.AppliedDigest == nil || group.AppliedRevision == nil || *group.AppliedRevision != group.DesiredRevision {
+		return nil, false
+	}
+	settings := map[string]PolicyChoice{}
+	resolved := map[string]any{}
+	for _, key := range PolicyGroupKeys("hardware") {
+		choice, ok := choices[key]
+		if !ok {
+			return nil, false
+		}
+		settings[key] = choice
+		switch choice.Source {
+		case "explicit":
+			if choice.Value == nil {
+				return nil, false
+			}
+			resolved[key] = choice.Value
+		case "deployment":
+			value, ok := baseline[key]
+			if !ok || value == nil {
+				return nil, false
+			}
+			resolved[key] = value
+		case "automatic":
+			value := effective[key]
+			if value == "" {
+				return nil, false
+			}
+			resolved[key] = value
+		default:
+			return nil, false
+		}
+	}
+	digest, err := digestJSON(map[string]any{"group": "hardware", "scope": "restart", "revision": group.DesiredRevision,
+		"settings": settings, "resolved_settings": resolved})
+	if err != nil || digest != *group.AppliedDigest {
+		return nil, false
+	}
+	return resolved, true
+}
+
 func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error) {
 	view := PolicyView{Choices: map[string]PolicyChoice{}, Resolved: map[string]any{}, Groups: map[string]PolicyGroup{}, ImagePreparation: PolicyEvidenceView{Status: "unknown"}, Readiness: PolicyEvidenceView{Status: "unknown"}}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -295,8 +340,7 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 			value = choice.Value
 		} else {
 			group, _ := policyGroup(knob.Key)
-			hardwareVerified := view.Groups["hardware"].Status == "applied" && view.Groups["hardware"].Fresh
-			if group != "hardware" || hardwareVerified {
+			if group != "hardware" {
 				value = effective[knob.Key]
 			}
 		}
