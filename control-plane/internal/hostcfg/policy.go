@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -313,6 +314,13 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 			remedy := "Idle approval awaits complete current host inventory, a resolved configuration candidate, and any open disruptive operation."
 			if key == "hardware" && (view.Choices["encoder"].Source == "automatic" || view.Choices["render_node"].Source == "automatic") {
 				remedy = "Automatic hardware choice awaits one accessible GPU and a passing current media host probe. Check host readiness and device access; the proposed encoder is tested during approved startup before it is marked applied."
+				missing, err := missingDeploymentHardwareBaseline(ctx, s.pool, hostID, view.Choices)
+				if err != nil {
+					return view, err
+				}
+				if len(missing) > 0 {
+					remedy = "baseline_unavailable: the current agent connection has not reported " + strings.Join(missing, ", ") + ". Request a fresh capacity report or reconnect before reviewing this hardware choice."
+				}
 			}
 			group.Remedy = &remedy
 		}
@@ -328,6 +336,44 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		view.Groups[key] = group
 	}
 	return view, nil
+}
+
+// A hardware offer always covers all dependent settings. Missing persisted
+// choices are deployment-source, and their values must come from this socket's
+// baseline before an Automatic candidate can be reviewed.
+func missingDeploymentHardwareBaseline(ctx context.Context, db idleQueryDB, hostID string, choices map[string]PolicyChoice) ([]string, error) {
+	keys := []string{}
+	for _, key := range PolicyGroupKeys("hardware") {
+		if choices[key].Source == "deployment" {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	var connection *string
+	err := db.QueryRow(ctx, `SELECT connection_incarnation::text FROM host_journal_reconciliation
+		WHERE host_id=$1::uuid AND state='complete'`, hostID).Scan(&connection)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if connection == nil {
+		return nil, nil
+	}
+	baseline, err := deploymentSettingsForConnection(ctx, db, hostID, *connection)
+	if err != nil {
+		return nil, err
+	}
+	missing := []string{}
+	for _, key := range keys {
+		if baseline[key] == nil {
+			missing = append(missing, key)
+		}
+	}
+	return missing, nil
 }
 
 // SavePolicy serializes intent under the host row and policy revision. The

@@ -3,6 +3,7 @@ package hostcfg
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 
@@ -118,6 +119,24 @@ func TestPolicyReadSeparatesObservedValueFromAutomaticHardwarePreview(t *testing
 	if err := store.ObserveHardwareReport(ctx, hostID, "00000000-0000-4000-8000-000000000338",
 		json.RawMessage(`[{"index":0,"vendor":"AMD","render_node":"/dev/dri/renderD129","driver_identity":"amdgpu:test","encode_slots_total":1}]`),
 		json.RawMessage(`[{"id":"media_probe_gpu0","status":"pass","source":"host_probe","observed_at":"2026-09-23T16:00:00Z"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`{"encoder":"va","render_node":"/dev/dri/renderD129"}`)); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noCandidate, _ := missing.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
+	if noCandidate != nil || missing.Groups["hardware"].Remedy == nil ||
+		!strings.Contains(*missing.Groups["hardware"].Remedy, "baseline_unavailable") ||
+		!strings.Contains(*missing.Groups["hardware"].Remedy, "cuda_device") {
+		t.Fatalf("missing current hardware baseline did not explain next action: %+v", missing.Groups["hardware"])
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`{"encoder":"va","render_node":"/dev/dri/renderD129","cuda_device":0}`)); err != nil {
 		t.Fatal(err)
 	}
 	view, err := store.GetPolicy(ctx, hostID)
