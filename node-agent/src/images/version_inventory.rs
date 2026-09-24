@@ -5,6 +5,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -28,9 +30,15 @@ pub struct VersionInventory {
     disk: Mutex<Disk>,
     /// Never persisted as a validity claim; each process and each failed scan
     /// must re-prove completeness from the daemon and control-plane identities.
-    complete: Mutex<bool>,
+    published: Mutex<PublishedSnapshot>,
     authority_received: Mutex<bool>,
-    last: Mutex<Vec<ImageVersionEntry>>,
+    #[cfg(test)]
+    before_publish: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+struct PublishedSnapshot {
+    complete: bool,
+    entries: Vec<ImageVersionEntry>,
 }
 
 impl VersionInventory {
@@ -60,9 +68,13 @@ impl VersionInventory {
         Ok(Self {
             path,
             disk: Mutex::new(disk),
-            complete: Mutex::new(false),
+            published: Mutex::new(PublishedSnapshot {
+                complete: false,
+                entries: last,
+            }),
             authority_received: Mutex::new(false),
-            last: Mutex::new(last),
+            #[cfg(test)]
+            before_publish: Mutex::new(None),
         })
     }
 
@@ -112,7 +124,13 @@ impl VersionInventory {
             );
         self.save(&next)?;
         *guard = next;
-        self.last.lock().unwrap().push(ImageVersionEntry {
+        let mut published = self.published.lock().unwrap();
+        published.complete = false;
+        for entry in &mut published.entries {
+            entry.state = "unknown".into();
+            entry.container_referenced = None;
+        }
+        published.entries.push(ImageVersionEntry {
             image_id: identity.image_id.clone(),
             version: identity.version.clone(),
             image_ref: identity.image_ref.clone(),
@@ -120,7 +138,6 @@ impl VersionInventory {
             state: "unknown".into(),
             container_referenced: None,
         });
-        self.revoke();
         Ok(())
     }
 
@@ -196,7 +213,6 @@ impl VersionInventory {
             && *self.authority_received.lock().unwrap();
         self.save(&next)?;
         *guard = next;
-        *self.complete.lock().unwrap() = complete;
         let mut found = entries(&guard, &by_ref, container_image_ids);
         if !complete {
             for entry in &mut found {
@@ -204,7 +220,14 @@ impl VersionInventory {
                 entry.container_referenced = None;
             }
         }
-        *self.last.lock().unwrap() = found.clone();
+        #[cfg(test)]
+        if let Some(hook) = self.before_publish.lock().unwrap().clone() {
+            hook();
+        }
+        *self.published.lock().unwrap() = PublishedSnapshot {
+            complete,
+            entries: found.clone(),
+        };
         Ok((complete, found))
     }
 
@@ -213,8 +236,9 @@ impl VersionInventory {
     }
 
     pub fn revoke(&self) {
-        *self.complete.lock().unwrap() = false;
-        for entry in self.last.lock().unwrap().iter_mut() {
+        let mut published = self.published.lock().unwrap();
+        published.complete = false;
+        for entry in &mut published.entries {
             entry.state = "unknown".to_string();
             entry.container_referenced = None;
         }
@@ -232,11 +256,12 @@ impl VersionInventory {
     }
 
     pub fn snapshot(&self) -> (bool, Vec<ImageVersionEntry>) {
-        (self.is_complete(), self.last.lock().unwrap().clone())
+        let published = self.published.lock().unwrap();
+        (published.complete, published.entries.clone())
     }
 
     pub fn is_complete(&self) -> bool {
-        *self.complete.lock().unwrap()
+        self.published.lock().unwrap().complete
     }
 
     pub fn matches(&self, identity: &ImageIdentity, runtime_id: &str) -> bool {
@@ -300,6 +325,42 @@ fn entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_never_pairs_new_completeness_with_stale_reference_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = Arc::new(VersionInventory::open(dir.path().join("versions.json")).unwrap());
+        let identity = identity("v1", "1111111");
+        inventory.remember(&identity).unwrap();
+        inventory.mark_authority_received();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume_rx = Mutex::new(resume_rx);
+        *inventory.before_publish.lock().unwrap() = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        }));
+        let scanning = inventory.clone();
+        let daemon = daemon("sha256:managed", &identity.image_ref);
+        let worker = std::thread::spawn(move || {
+            scanning
+                .reconcile(&[], &[daemon], &["sha256:managed".into()])
+                .unwrap()
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let observed = inventory.snapshot();
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(!observed.0);
+        assert_eq!(observed.1[0].state, "unknown");
+        assert_eq!(observed.1[0].container_referenced, None);
+        let current = inventory.snapshot();
+        assert!(current.0);
+        assert_eq!(current.1[0].state, "present");
+        assert_eq!(current.1[0].container_referenced, Some(true));
+    }
 
     fn identity(version: &str, tag: &str) -> ImageIdentity {
         ImageIdentity {
