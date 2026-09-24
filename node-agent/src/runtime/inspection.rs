@@ -50,6 +50,12 @@ pub struct ImageMetadata {
     pub working_dir: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonImage {
+    pub id: String,
+    pub refs: Vec<String>,
+}
+
 /// Translate a path across the agent/daemon namespace boundary. A result is
 /// returned only when the longest component-prefix bind mapping round-trips;
 /// overlapping mounts therefore cannot make a hidden daemon path look safe.

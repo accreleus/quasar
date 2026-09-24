@@ -1048,10 +1048,15 @@ pub(crate) async fn start(
     let docker = open(config).await?;
     let journal = ApplicationJournal::acquire(config, &request.operation).await?;
     let recovered = journal.read()?;
+    let mut launch_guard = None;
     let mut intent = match recovered.as_ref() {
         Some(intent) if owns(intent, config, &owner) && intent.request == request => intent.clone(),
         Some(_) => return Err(ErrorKind::UnknownOutcome.into()),
         None => {
+            // Exact cleanup holds this same daemon-scoped lock through its
+            // final ref/container checks and rmi. A fresh launch holds it from
+            // image resolution until its container exists.
+            launch_guard = Some(super::image_launch_lock(config).lock_owned().await);
             let image = match docker.inspect_image(&request.image).await {
                 Ok(image) => image,
                 Err(Error::DockerResponseServerError {
@@ -1156,6 +1161,7 @@ pub(crate) async fn start(
             }
         }
     }
+    drop(launch_guard);
     let id = identity(&intent)?;
     let (state, learned_volumes) = inspect_owned(&docker, &intent).await?;
     if intent.image_volume_identities.is_none() && intent.image_volumes.is_some() {
