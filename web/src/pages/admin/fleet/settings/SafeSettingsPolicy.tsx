@@ -172,6 +172,12 @@ export function SafeSettingsPolicy({
       // host's current deployment behaviour, not pending work. Restart groups
       // keep their status and remedy: a projected hardware group still needs
       // review and approval. An absent field means saved.
+      // Name the deployment value in the picker when it is the value in
+      // effect. Under another source the host reports that source's value, so
+      // the deployment default is unknown here and is not guessed.
+      const deploymentValue = resolved?.source === "deployment"
+        ? ((resolved.value ?? undefined) === undefined ? "not set" : valueLabel(resolved.value as SettingValue))
+        : null;
       const unsaved = group.saved === false && group.status === "pending" && group.scope === "next_session"
         && resolved?.source === "deployment";
       return <div key={knob.key} className="cset" role="group" aria-label={label}>
@@ -206,7 +212,7 @@ export function SafeSettingsPolicy({
             value={draft.source}
             onChange={(e) => edit(knob, { source: e.target.value as Draft["source"] })}
           >
-            <option value="deployment">Deployment setting</option>
+            <option value="deployment">{deploymentValue === null ? "Deployment setting" : `Deployment setting (${deploymentValue})`}</option>
             {(knob.key === "encoder" || knob.key === "render_node") && <option value="automatic">Automatic choice</option>}
             <option value="explicit">Explicit value</option>
           </select>

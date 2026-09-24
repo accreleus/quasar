@@ -57,6 +57,13 @@ describe("safe next-session settings", () => {
     expect(within(mode).getByText(/Deployment setting smooth · In effect · not saved as a host policy/)).toBeTruthy();
     expect(within(mode).getByText(/No policy revision saved · next session/)).toBeTruthy();
     expect(within(mode).queryByText(/No RH05 policy change has been saved/)).toBeNull();
+    // The picker names the deployment value in effect; a null value reads "not set".
+    expect(within(mode).getByRole("option", { name: "Deployment setting (smooth)" })).toBeTruthy();
+    const zeroCopyPicker = screen.getByRole("group", { name: "Zero-copy path" });
+    expect(within(zeroCopyPicker).getByRole("option", { name: "Deployment setting (Off)" })).toBeTruthy();
+    // An explicit choice hides the deployment default rather than guessing it.
+    const gop = screen.getByRole("group", { name: "GOP length" });
+    expect(within(gop).getByRole("option", { name: "Deployment setting" })).toBeTruthy();
     // A saved group awaiting verification is still genuinely pending.
     const zerocopy = screen.getByRole("group", { name: /zero-copy/i });
     expect(within(zerocopy).getByText("pending")).toBeTruthy();
