@@ -23,11 +23,12 @@ pub use helpers::{
 };
 pub(crate) use helpers::{HelperIntent, HelperJournal, NvidiaGpuRun};
 mod images;
+pub use docker::ExactRemoval;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
 mod inspection;
 pub use inspection::{
     agent_path_for_daemon_path, daemon_path_for_agent_path, ContainerInspection, DaemonHostPath,
-    EngineStorage, ImageMetadata, Mount, MountKind,
+    DaemonImage, EngineStorage, ImageMetadata, Mount, MountKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +541,21 @@ impl RuntimeClient {
         let config = self.config.clone();
         let image = image.into();
         self.submit(async move { docker::inspect_image_metadata(&config, &image).await })
+    }
+
+    pub fn daemon_images(&self) -> Operation<Vec<DaemonImage>> {
+        let config = self.config.clone();
+        self.submit(async move { docker::daemon_images(&config).await })
+    }
+
+    pub fn image_inventory_snapshot(&self) -> Operation<(Vec<DaemonImage>, Vec<String>)> {
+        let config = self.config.clone();
+        self.submit(async move { docker::image_inventory_snapshot(&config).await })
+    }
+
+    pub fn all_container_image_ids(&self) -> Operation<Vec<String>> {
+        let config = self.config.clone();
+        self.submit(async move { docker::all_container_image_ids(&config).await })
     }
 
     /// Create and start one session application under a durable, owned

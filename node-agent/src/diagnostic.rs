@@ -809,7 +809,11 @@ where
         | ControlMsg::SessionSwapApp { id, .. }
         | ControlMsg::SessionDisplayUpdate { id, .. }
         | ControlMsg::SessionCapture { id, .. }
-        | ControlMsg::ReleaseApply { id, .. } => {
+        | ControlMsg::ReleaseApply { id, .. }
+        | ControlMsg::ImageInventoryReconcile { id, .. }
+        | ControlMsg::ImageCleanup { id, .. }
+        | ControlMsg::ImageCleanupJournalRequest { id, .. }
+        | ControlMsg::ImageCleanupStateAck { id, .. } => {
             warn!(
                 token = "control-command-refused-diagnostic",
                 "refusing command {id}: {}",

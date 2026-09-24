@@ -2,16 +2,90 @@
 use super::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 use futures_util::StreamExt;
+use std::sync::OnceLock;
 pub(super) mod application;
 mod build;
 mod credentials;
 mod inspection;
 pub(super) use inspection::{
-    engine_storage, inspect_container, inspect_image_metadata, live_containers,
+    all_container_image_ids, daemon_images, engine_storage, inspect_container,
+    inspect_image_metadata, live_containers,
 };
 pub(super) mod helpers;
 pub(super) mod legacy;
 pub(super) use build::build as build_image;
+
+pub(super) fn image_launch_lock(config: &RuntimeConfig) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    > = OnceLock::new();
+    LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(config.socket.clone())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+pub(super) async fn image_inventory_snapshot(
+    config: &RuntimeConfig,
+) -> Result<(Vec<super::DaemonImage>, Vec<String>), RuntimeError> {
+    let lock = image_launch_lock(config);
+    let _guard = lock.lock().await;
+    let images = daemon_images(config).await?;
+    let containers = all_container_image_ids(config).await?;
+    Ok((images, containers))
+}
+
+/// Holds the same launch exclusion as container creation through the final
+/// daemon checks and non-forced removal. A changed tag binding is a refusal.
+pub(super) async fn remove_exact_image(
+    config: &RuntimeConfig,
+    image_ref: &str,
+    expected_id: &str,
+) -> Result<ExactRemoval, RuntimeError> {
+    let lock = image_launch_lock(config);
+    let _guard = lock.lock().await;
+    let images = daemon_images(config).await?;
+    let containers = all_container_image_ids(config).await?;
+    if containers.iter().any(|id| id == expected_id) {
+        return Ok(ExactRemoval::Referenced);
+    }
+    let current = images
+        .iter()
+        .find(|image| image.refs.iter().any(|reference| reference == image_ref));
+    let Some(current) = current else {
+        return Ok(ExactRemoval::Absent);
+    };
+    if current.id != expected_id {
+        return Ok(ExactRemoval::IdentityMismatch);
+    }
+    let result = remove_image(config, image_ref).await;
+    let after = daemon_images(config).await?;
+    let refs = all_container_image_ids(config).await?;
+    if after
+        .iter()
+        .any(|image| image.refs.iter().any(|reference| reference == image_ref))
+    {
+        Ok(ExactRemoval::StillPresent)
+    } else if !refs.iter().any(|id| id == expected_id) {
+        Ok(ExactRemoval::Removed)
+    } else {
+        Err(result.err().unwrap_or(ErrorKind::UnknownOutcome.into()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactRemoval {
+    Removed,
+    Absent,
+    Referenced,
+    IdentityMismatch,
+    StillPresent,
+}
 
 fn classify(error: Error) -> RuntimeError {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);

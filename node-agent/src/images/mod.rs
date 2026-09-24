@@ -11,29 +11,59 @@
 //! re-checks it in [`ImageManager::commit`].
 
 pub(crate) mod build;
+mod cleanup_journal;
 pub(crate) mod disk;
 mod errors;
 mod progress;
 mod semaphore;
 mod state;
+mod version_inventory;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::messages::{AgentMsg, RegisterImageEntry};
+use crate::messages::{AgentMsg, ImageIdentity, ImageVersionEntry, RegisterImageEntry};
 use crate::session::container::ContainerRuntime;
 
 pub use state::ImageState;
 
+use cleanup_journal::{Attempt, Begin, CleanupJournal};
 use progress::ProgressThrottle;
 use semaphore::CountingSemaphore;
 use state::{ImageRecord, StagedTarget};
+use version_inventory::VersionInventory;
+
+struct CleanupState {
+    journal: CleanupJournal,
+    inventory: VersionInventory,
+    revision: AtomicU64,
+}
+
+pub fn cleanup_attempt(
+    attempt_id: String,
+    image_id: String,
+    version: String,
+    image_ref: String,
+    runtime_image_id: String,
+    generation: String,
+) -> Attempt {
+    Attempt {
+        attempt_id,
+        image_id,
+        version,
+        image_ref,
+        runtime_image_id,
+        generation,
+        state: "removing".into(),
+        reason: None,
+    }
+}
 
 /// Cap on simultaneous pulls, so an ensure storm never starves a live session's IO
 /// (agent-api.md).
@@ -321,6 +351,13 @@ pub struct ImageManager {
     /// The golden-home warm-up scheduler, attached per connection alongside
     /// `upstream`; `None` on a host with the feature off.
     lifecycle: RwLock<Option<Arc<dyn ImageLifecycleObserver>>>,
+    cleanup: Option<Arc<CleanupState>>,
+    image_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Orders new local image intent against exact cleanup across image IDs.
+    admission: RwLock<()>,
+    inventory_refresh_busy: AtomicBool,
+    inventory_last_refresh: Mutex<Instant>,
+    warmup_controls: Mutex<Vec<Weak<crate::session::warmup::WarmupControl>>>,
 }
 
 /// Detaches the upstream sender on every connection-end path, `?` included, so pull
@@ -346,6 +383,29 @@ impl ImageManager {
     /// (agent-api.md). Blocking, N docker round-trips: call it ONCE at process start,
     /// off the async connect path, so a reconnect storm never pays it repeatedly.
     pub fn new(runtime: ContainerRuntime, state_path: String) -> Arc<Self> {
+        let cleanup = if state_path.is_empty() {
+            None
+        } else {
+            let journal = CleanupJournal::open(PathBuf::from(format!("{state_path}.cleanup.json")));
+            let inventory =
+                VersionInventory::open(PathBuf::from(format!("{state_path}.versions.json")));
+            match (journal, inventory) {
+                (Ok(journal), Ok(inventory)) => Some(Arc::new(CleanupState {
+                    journal,
+                    inventory,
+                    revision: AtomicU64::new(0),
+                })),
+                (journal, inventory) => {
+                    tracing::error!(
+                        token = "image-cleanup-state-unavailable",
+                        "cleanup state unavailable: journal={:?} inventory={:?}",
+                        journal.err(),
+                        inventory.err()
+                    );
+                    None
+                }
+            }
+        };
         let mut loaded = state::load(&state_path);
         for (image_id, rec) in loaded.iter_mut() {
             // A staged (in-flight) ensure did not survive the restart.
@@ -374,7 +434,7 @@ impl ImageManager {
             }
         }
         state::save(&state_path, &loaded);
-        Arc::new(ImageManager {
+        let manager = Arc::new(ImageManager {
             runtime,
             state_path,
             records: Mutex::new(loaded),
@@ -384,13 +444,65 @@ impl ImageManager {
             upstream: RwLock::new(None),
             terminal_pending: Mutex::new(HashSet::new()),
             lifecycle: RwLock::new(None),
-        })
+            cleanup,
+            image_locks: Mutex::new(HashMap::new()),
+            admission: RwLock::new(()),
+            inventory_refresh_busy: AtomicBool::new(false),
+            inventory_last_refresh: Mutex::new(Instant::now()),
+            warmup_controls: Mutex::new(Vec::new()),
+        });
+        manager.recover_cleanup();
+        manager
+    }
+
+    fn recover_cleanup(&self) {
+        let Some(cleanup) = &self.cleanup else {
+            return;
+        };
+        let pending = cleanup.journal.unfinished();
+        if pending.is_empty() {
+            return;
+        }
+        let Ok(runtime) = crate::runtime::configured() else {
+            return;
+        };
+        let scanned = runtime.image_inventory_snapshot().wait();
+        for attempt in pending {
+            let state = match &scanned {
+                Ok((images, ids))
+                    if !images
+                        .iter()
+                        .any(|image| image.refs.contains(&attempt.image_ref))
+                        && !ids.contains(&attempt.runtime_image_id) =>
+                {
+                    "removed"
+                }
+                _ => "unknown",
+            };
+            if let Err(error) = cleanup.journal.finish(&attempt.attempt_id, state, None) {
+                warn!(token = "image-cleanup-recovery-write-failed", "{error}");
+            }
+        }
     }
 
     /// Attach the warm-up scheduler, replacing any previous one so reconnects
     /// re-point rather than accumulate observers.
     pub fn set_lifecycle_observer(&self, observer: Option<Arc<dyn ImageLifecycleObserver>>) {
         *self.lifecycle.write().unwrap() = observer;
+    }
+
+    pub fn track_warmup_control(&self, control: &Arc<crate::session::warmup::WarmupControl>) {
+        let mut controls = self.warmup_controls.lock().unwrap();
+        controls.retain(|control| control.strong_count() > 0);
+        controls.push(Arc::downgrade(control));
+    }
+
+    fn warmup_active(&self) -> bool {
+        self.warmup_controls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|control| control.upgrade().is_some_and(|control| control.active()))
     }
 
     /// The lock is released before the callback: a slow observer must never wedge a
@@ -413,8 +525,54 @@ impl ImageManager {
     /// onto it. The returned guard detaches on drop.
     pub fn attach_upstream(self: &Arc<Self>, tx: mpsc::Sender<AgentMsg>) -> UpstreamGuard {
         *self.upstream.write().unwrap() = Some(tx);
+        if let Some(cleanup) = &self.cleanup {
+            cleanup.revision.store(0, Ordering::SeqCst);
+            self.emit_version_snapshot();
+            for attempt in cleanup.journal.terminal() {
+                self.send_upstream(attempt.report());
+            }
+        }
         self.flush_op_free_states();
         UpstreamGuard { mgr: self.clone() }
+    }
+
+    pub fn cleanup_capable(&self) -> bool {
+        self.cleanup.is_some()
+    }
+
+    pub fn begin_connection(&self) {
+        if let Some(cleanup) = &self.cleanup {
+            cleanup.inventory.begin_connection();
+        }
+    }
+
+    pub fn version_snapshot(&self) -> (bool, Vec<ImageVersionEntry>) {
+        self.cleanup
+            .as_ref()
+            .map(|c| c.inventory.snapshot())
+            .unwrap_or((false, Vec::new()))
+    }
+
+    fn emit_version_snapshot(&self) {
+        let Some(cleanup) = &self.cleanup else {
+            return;
+        };
+        let (image_versions_complete, image_versions) = cleanup.inventory.snapshot();
+        let revision = cleanup.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        self.send_upstream(AgentMsg::ImageVersionsState {
+            inventory_revision: revision.to_string(),
+            image_versions_complete,
+            image_versions,
+        });
+    }
+
+    fn image_lock(&self, image_id: &str) -> Arc<Mutex<()>> {
+        self.image_locks
+            .lock()
+            .unwrap()
+            .entry(image_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// The delivery half of the terminal-state guarantee, and a resync for a
@@ -572,6 +730,13 @@ impl ImageManager {
         true
     }
 
+    fn send_worker(&self, msg: AgentMsg) {
+        let upstream = self.upstream.read().unwrap().clone();
+        if let Some(tx) = upstream {
+            let _ = tx.blocking_send(msg);
+        }
+    }
+
     /// The lossy emit path: progress ticks and recoverable re-emits. A worker's
     /// terminal state uses [`Self::emit_terminal`] instead.
     fn emit(&self, image_id: &str) -> bool {
@@ -622,6 +787,7 @@ impl ImageManager {
         registry_ref: String,
         version: String,
     ) -> AgentMsg {
+        let _admission = self.admission.read().unwrap();
         if image_id.trim().is_empty()
             || image_id.len() > MAX_IMAGE_ID_LEN
             || version.len() > MAX_VERSION_LEN
@@ -638,6 +804,21 @@ impl ImageManager {
             warn!(
                 token = "image-ensure-refused-busy","image_ensure for {image_id} refused: {MAX_CONCURRENT_OPS} image operations already in flight");
             return ack(id, false, Some("image operation queue full".to_string()));
+        }
+        if let Some(cleanup) = &self.cleanup {
+            let identity = ImageIdentity {
+                image_id: image_id.clone(),
+                version: version.clone(),
+                image_ref: registry_ref.clone(),
+            };
+            if cleanup.inventory.remember(&identity).is_err() {
+                return ack(
+                    id,
+                    false,
+                    Some("image inventory persistence unavailable".into()),
+                );
+            }
+            self.emit_version_snapshot();
         }
         if self.plan_ensure(&image_id, &registry_ref, &version) {
             self.spawn_worker(image_id);
@@ -708,6 +889,7 @@ impl ImageManager {
         local_tag: String,
         version: String,
     ) -> AgentMsg {
+        let _admission = self.admission.read().unwrap();
         // SSRF/allowlist guard must come first, before any state is touched.
         let allowed = build::allowed_source_hosts();
         if let Err(reason) = build::validate_context_url(&context_url, &allowed) {
@@ -745,6 +927,21 @@ impl ImageManager {
             dockerfile,
             build_args,
         };
+        if let Some(cleanup) = &self.cleanup {
+            let identity = ImageIdentity {
+                image_id: image_id.clone(),
+                version: version.clone(),
+                image_ref: local_tag.clone(),
+            };
+            if cleanup.inventory.remember(&identity).is_err() {
+                return ack(
+                    id,
+                    false,
+                    Some("image inventory persistence unavailable".into()),
+                );
+            }
+            self.emit_version_snapshot();
+        }
         if self.plan_build(&image_id, want, &local_tag, &version) {
             self.spawn_worker(image_id);
         }
@@ -805,6 +1002,7 @@ impl ImageManager {
     /// its own thread, serialized behind any in-flight op for the same image. An
     /// unrecorded `image_id` acks `ok:true` + `absent`, with no docker call.
     pub fn handle_remove(self: &Arc<Self>, id: String, image_id: String) -> AgentMsg {
+        let _admission = self.admission.read().unwrap();
         if image_id.trim().is_empty() || image_id.len() > MAX_IMAGE_ID_LEN {
             return ack(
                 id,
@@ -821,6 +1019,261 @@ impl ImageManager {
             self.spawn_worker(image_id);
         }
         ack(id, true, None)
+    }
+
+    pub fn handle_inventory_reconcile(
+        &self,
+        id: String,
+        identities: Vec<ImageIdentity>,
+    ) -> AgentMsg {
+        let Some(cleanup) = &self.cleanup else {
+            return ack(id, false, Some("unsupported".into()));
+        };
+        cleanup.inventory.mark_authority_received();
+        let result = crate::runtime::configured()
+            .map_err(|e| e.to_string())
+            .and_then(|runtime| {
+                runtime
+                    .image_inventory_snapshot()
+                    .wait()
+                    .map_err(|e| e.to_string())
+            })
+            .and_then(|(daemon, containers)| {
+                cleanup
+                    .inventory
+                    .reconcile(&identities, &daemon, &containers)
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(error) = result {
+            warn!(token = "image-inventory-reconcile-failed", "{error}");
+            cleanup.inventory.revoke();
+        }
+        self.emit_version_snapshot();
+        ack(id, true, None)
+    }
+
+    pub fn handle_cleanup(self: &Arc<Self>, id: String, attempt: Attempt) -> Option<AgentMsg> {
+        let Some(cleanup) = &self.cleanup else {
+            return Some(ack(id, false, Some("unsupported".into())));
+        };
+        let begun = match cleanup.journal.begin(attempt.clone()) {
+            Ok(begun) => begun,
+            Err(error) => {
+                warn!(token = "image-cleanup-accept-write-failed", "{error}");
+                return None; // no definite refusal when acceptance durability is unknown
+            }
+        };
+        match begun {
+            Begin::Retired => Some(ack(id, false, Some("retired_attempt".into()))),
+            Begin::Mismatch => Some(ack(id, false, Some("identity_mismatch".into()))),
+            Begin::Duplicate(existing) => {
+                if existing.state != "removing" {
+                    self.send_upstream(existing.report());
+                }
+                let refusal = existing.reason.as_deref().filter(|reason| {
+                    matches!(
+                        *reason,
+                        "identity_mismatch"
+                            | "inventory_unknown"
+                            | "reference_in_use"
+                            | "operation_busy"
+                            | "unsupported"
+                    )
+                });
+                Some(ack(id, refusal.is_none(), refusal.map(str::to_string)))
+            }
+            Begin::Fresh => {
+                let mgr = self.clone();
+                std::thread::spawn(move || mgr.run_cleanup(id, attempt));
+                None
+            }
+        }
+    }
+
+    fn run_cleanup(&self, id: String, attempt: Attempt) {
+        let Some(cleanup) = &self.cleanup else {
+            return;
+        };
+        let _admission = self.admission.write().unwrap();
+        let lock = self.image_lock(&attempt.image_id);
+        let _guard = lock.lock().unwrap();
+        let identity = ImageIdentity {
+            image_id: attempt.image_id.clone(),
+            version: attempt.version.clone(),
+            image_ref: attempt.image_ref.clone(),
+        };
+        let refusal = if attempt.image_id.is_empty()
+            || attempt.version.is_empty()
+            || attempt.image_ref.is_empty()
+            || attempt.runtime_image_id.is_empty()
+            || attempt.generation.parse::<u64>().is_err()
+        {
+            Some("unsupported")
+        } else if !self.ops.lock().unwrap().is_empty()
+            || crate::session::container::has_pending_application_operations().unwrap_or(true)
+            || self.warmup_active()
+        {
+            Some("operation_busy")
+        } else if !cleanup.inventory.is_complete() {
+            Some("inventory_unknown")
+        } else if !cleanup
+            .inventory
+            .matches(&identity, &attempt.runtime_image_id)
+        {
+            Some("identity_mismatch")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            self.finish_refusal(&id, &attempt, reason);
+            return;
+        }
+        let runtime = match crate::runtime::configured() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                self.finish_refusal(&id, &attempt, "inventory_unknown");
+                return;
+            }
+        };
+        use crate::runtime::ExactRemoval;
+        let result = runtime
+            .remove_exact_image(
+                &attempt.image_ref,
+                &attempt.runtime_image_id,
+                Duration::from_secs(60),
+            )
+            .wait();
+        match result {
+            Ok(ExactRemoval::Referenced) => self.finish_refusal(&id, &attempt, "reference_in_use"),
+            Ok(ExactRemoval::IdentityMismatch) => {
+                self.finish_refusal(&id, &attempt, "identity_mismatch")
+            }
+            Ok(ExactRemoval::Removed | ExactRemoval::Absent) => {
+                if let Ok(Some(done)) = cleanup.journal.finish(&attempt.attempt_id, "removed", None)
+                {
+                    self.send_worker(ack(id, true, None));
+                    self.send_worker(done.report());
+                    self.refresh_version_inventory();
+                }
+            }
+            Ok(ExactRemoval::StillPresent) => {
+                if let Ok(Some(done)) =
+                    cleanup
+                        .journal
+                        .finish(&attempt.attempt_id, "failed", Some("image_ref_remains"))
+                {
+                    self.send_worker(ack(id, true, None));
+                    self.send_worker(done.report());
+                }
+            }
+            Err(error) => {
+                warn!(token = "image-cleanup-runtime-unknown", "{error}");
+                if let Ok(Some(done)) = cleanup.journal.finish(
+                    &attempt.attempt_id,
+                    "unknown",
+                    Some("runtime_unavailable"),
+                ) {
+                    self.send_worker(ack(id, true, None));
+                    self.send_worker(done.report());
+                }
+            }
+        }
+    }
+
+    fn finish_refusal(&self, id: &str, attempt: &Attempt, reason: &str) {
+        let Some(cleanup) = &self.cleanup else {
+            return;
+        };
+        if let Ok(Some(done)) = cleanup
+            .journal
+            .finish(&attempt.attempt_id, "failed", Some(reason))
+        {
+            self.send_worker(ack(id.to_string(), false, Some(reason.to_string())));
+            self.send_worker(done.report());
+        }
+    }
+
+    pub fn handle_cleanup_journal_request(&self, id: String, ids: Vec<String>) -> AgentMsg {
+        let Some(cleanup) = &self.cleanup else {
+            return ack(id, false, Some("unsupported".into()));
+        };
+        match cleanup.journal.snapshot(id.clone(), &ids) {
+            Ok(snapshot) => {
+                self.send_upstream(snapshot);
+                ack(id, true, None)
+            }
+            Err(error) => {
+                warn!(token = "image-cleanup-snapshot-write-failed", "{error}");
+                ack(id, false, Some("operation_busy".into()))
+            }
+        }
+    }
+
+    pub fn handle_cleanup_state_ack(
+        &self,
+        id: String,
+        attempt_id: String,
+        generation: String,
+    ) -> AgentMsg {
+        let Some(cleanup) = &self.cleanup else {
+            return ack(id, false, Some("unsupported".into()));
+        };
+        match cleanup.journal.retire_terminal(&attempt_id, &generation) {
+            Ok(true) => ack(id, true, None),
+            Ok(false) => ack(id, false, Some("identity_mismatch".into())),
+            Err(error) => {
+                warn!(token = "image-cleanup-retire-write-failed", "{error}");
+                ack(id, false, Some("operation_busy".into()))
+            }
+        }
+    }
+
+    fn refresh_version_inventory(&self) {
+        let Some(cleanup) = &self.cleanup else {
+            return;
+        };
+        let result = crate::runtime::configured()
+            .map_err(|e| e.to_string())
+            .and_then(|runtime| {
+                runtime
+                    .image_inventory_snapshot()
+                    .wait()
+                    .map_err(|e| e.to_string())
+            })
+            .and_then(|(daemon, containers)| {
+                cleanup
+                    .inventory
+                    .reconcile(&[], &daemon, &containers)
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(error) = result {
+            warn!(token = "image-inventory-refresh-failed", "{error}");
+            cleanup.inventory.revoke();
+        }
+        self.emit_version_snapshot();
+    }
+
+    /// Observe daemon changes without delaying a heartbeat or running parallel
+    /// full scans when the engine is slow.
+    pub fn maybe_refresh_version_inventory(self: &Arc<Self>) {
+        if self.cleanup.is_none() {
+            return;
+        }
+        let mut last = self.inventory_last_refresh.lock().unwrap();
+        if last.elapsed() < Duration::from_secs(30)
+            || self.inventory_refresh_busy.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        *last = Instant::now();
+        drop(last);
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            manager.refresh_version_inventory();
+            manager
+                .inventory_refresh_busy
+                .store(false, Ordering::Release);
+        });
     }
 
     /// Decision + bookkeeping half of [`Self::handle_remove`].
@@ -903,6 +1356,8 @@ impl ImageManager {
             let Some((op, generation)) = current else {
                 return;
             };
+            let image_lock = self.image_lock(&image_id);
+            let _image_guard = image_lock.lock().unwrap();
             match &op {
                 ImageOp::Ensure {
                     version,
@@ -945,6 +1400,7 @@ impl ImageManager {
                 }
                 ImageOp::Remove => self.run_remove(&image_id, generation),
             }
+            self.refresh_version_inventory();
 
             let promoted = {
                 let mut ops = self.ops.lock().unwrap();
@@ -1388,6 +1844,12 @@ mod tests {
             upstream: RwLock::new(None),
             terminal_pending: Mutex::new(HashSet::new()),
             lifecycle: RwLock::new(None),
+            cleanup: None,
+            image_locks: Mutex::new(HashMap::new()),
+            admission: RwLock::new(()),
+            inventory_refresh_busy: AtomicBool::new(false),
+            inventory_last_refresh: Mutex::new(Instant::now()),
+            warmup_controls: Mutex::new(Vec::new()),
         })
     }
 
@@ -1723,6 +2185,9 @@ mod tests {
                 enrollment_token: "tok".to_string(),
             },
             images: m.register_images(),
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: None,
             built_at: None,
             install_mode: None,

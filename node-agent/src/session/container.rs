@@ -80,6 +80,13 @@ fn pending_application_operations() -> &'static Mutex<HashMap<String, PendingApp
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(crate) fn has_pending_application_operations() -> Result<bool> {
+    pending_application_operations()
+        .lock()
+        .map(|pending| !pending.is_empty())
+        .map_err(|_| anyhow!("application pending-operation lock poisoned"))
+}
+
 fn lexical_mount_source(source: &str) -> Option<String> {
     let path = Path::new(source);
     if !path.is_absolute()

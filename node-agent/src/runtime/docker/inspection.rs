@@ -162,6 +162,60 @@ pub(crate) async fn live_containers(
     Ok(inspected)
 }
 
+/// A complete daemon inventory. Ref enumeration is required before the agent can
+/// claim that old managed versions are classified; the legacy current record is
+/// insufficient evidence.
+pub(crate) async fn daemon_images(
+    config: &RuntimeConfig,
+) -> Result<Vec<crate::runtime::DaemonImage>, RuntimeError> {
+    let (docker, _) = discover(config).await?;
+    let images = docker
+        .list_images(Some(bollard::query_parameters::ListImagesOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .map_err(classify)?;
+    images
+        .into_iter()
+        .map(|image| {
+            if image.id.is_empty() {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let refs = image
+                .repo_tags
+                .into_iter()
+                .chain(image.repo_digests)
+                .filter(|r| r != "<none>:<none>")
+                .collect();
+            Ok(crate::runtime::DaemonImage { id: image.id, refs })
+        })
+        .collect()
+}
+
+/// Includes running and stopped containers, regardless of Quasar ownership.
+pub(crate) async fn all_container_image_ids(
+    config: &RuntimeConfig,
+) -> Result<Vec<String>, RuntimeError> {
+    let (docker, _) = discover(config).await?;
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .map_err(classify)?;
+    containers
+        .into_iter()
+        .map(|container| {
+            container
+                .image_id
+                .filter(|id| !id.is_empty())
+                .ok_or(ErrorKind::Protocol.into())
+        })
+        .collect()
+}
+
 pub(crate) async fn engine_storage(
     config: &RuntimeConfig,
 ) -> Result<crate::runtime::EngineStorage, RuntimeError> {

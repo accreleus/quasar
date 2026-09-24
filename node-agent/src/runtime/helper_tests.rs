@@ -22,6 +22,11 @@ struct LogGate {
 }
 #[derive(Default)]
 struct State {
+    managed_ref: Option<String>,
+    managed_id: String,
+    managed_present: bool,
+    managed_container: bool,
+    managed_remove_calls: usize,
     body: Option<Value>,
     name: String,
     running: bool,
@@ -131,6 +136,88 @@ struct Engine {
     /// re-raise the thread's panic.
     expect_death: AtomicBool,
     _dir: tempfile::TempDir,
+}
+
+#[test]
+fn exact_cleanup_proves_ref_id_and_all_container_safety_before_nonforced_rmi() {
+    let engine = Engine::new();
+    let reference = "ghcr.io/x/steam:sha-1234567";
+    let image_id = "sha256:managed";
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.managed_ref = Some(reference.into());
+        state.managed_id = image_id.into();
+        state.managed_present = true;
+        state.managed_container = true; // stopped containers count too
+    }
+    let runtime = engine.client();
+    assert_eq!(
+        runtime
+            .remove_exact_image(reference, image_id, Duration::from_secs(2))
+            .wait()
+            .unwrap(),
+        ExactRemoval::Referenced
+    );
+    assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 0);
+    engine.state.lock().unwrap().managed_container = false;
+    assert_eq!(
+        runtime
+            .remove_exact_image(reference, "sha256:wrong", Duration::from_secs(2))
+            .wait()
+            .unwrap(),
+        ExactRemoval::IdentityMismatch
+    );
+    assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 0);
+    assert_eq!(
+        runtime
+            .remove_exact_image(reference, image_id, Duration::from_secs(2))
+            .wait()
+            .unwrap(),
+        ExactRemoval::Removed
+    );
+    assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 1);
+    assert_eq!(
+        runtime
+            .remove_exact_image(reference, image_id, Duration::from_secs(2))
+            .wait()
+            .unwrap(),
+        ExactRemoval::Absent
+    );
+    assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 1);
+}
+
+#[test]
+fn exact_cleanup_waits_until_a_starting_launch_has_created_its_container() {
+    let engine = Engine::new();
+    let reference = "ghcr.io/x/steam:sha-1234567";
+    let image_id = "sha256:managed";
+    let gate = Arc::new(LogGate::default());
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.managed_ref = Some(reference.into());
+        state.managed_id = image_id.into();
+        state.managed_present = true;
+        state.pause_mutation_reply = Some(("POST /containers/create".into(), gate.clone()));
+    }
+    let runtime = engine.client();
+    let launch = runtime.start_application(ApplicationRequest {
+        operation: "cleanup-race-launch".into(),
+        name: "quasar-sess-cleanup-race".into(),
+        image: reference.into(),
+        ..Default::default()
+    });
+    wait_for_mutation_reply(&gate);
+    let cleanup = runtime.remove_exact_image(reference, image_id, Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        engine.requests("GET /images/json"),
+        0,
+        "cleanup must wait behind container creation"
+    );
+    gate.released.store(true, Ordering::SeqCst);
+    assert_eq!(launch.wait().unwrap().as_str(), ID);
+    assert_eq!(cleanup.wait().unwrap(), ExactRemoval::Referenced);
+    assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 0);
 }
 impl Engine {
     fn new() -> Self {
@@ -314,8 +401,16 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
         // `inspect_engine`, which the runtime readiness checks call. Every field it
         // folds is optional, so an empty object is a complete answer.
         response = json!({});
+    } else if method == "GET" && route.starts_with("/images/json") {
+        response = Value::Array(if s.managed_present {
+            vec![
+                json!({"Id":s.managed_id,"ParentId":"","RepoTags":[s.managed_ref],"RepoDigests":[],"Size":1,"SharedSize":0,"Containers":0,"Created":0,"Labels":{}}),
+            ]
+        } else {
+            Vec::new()
+        });
     } else if method == "GET" && route.starts_with("/images/") && route.contains("/json") {
-        if s.image_missing {
+        if s.image_missing || s.managed_ref.is_some() && !s.managed_present {
             code = 404;
             response = json!({"message":"missing"});
         } else {
@@ -327,7 +422,20 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
                         .collect(),
                 )
             });
-            response = json!({"Id":"sha256:fixture-image","Config":{"Env":[],"Entrypoint":["/image-entry"],"Cmd":["image-command"],"User":null,"Volumes":volumes}});
+            response = json!({"Id":if s.managed_ref.is_some() { s.managed_id.as_str() } else { "sha256:fixture-image" },"Config":{"Env":[],"Entrypoint":["/image-entry"],"Cmd":["image-command"],"User":null,"Volumes":volumes}});
+        }
+    } else if method == "DELETE" && route.starts_with("/images/") {
+        assert!(
+            route.contains("force=false") && route.contains("noprune=true"),
+            "exact cleanup must use non-forced, no-prune rmi: {route}"
+        );
+        s.managed_remove_calls += 1;
+        if s.managed_container {
+            code = 409;
+            response = json!({"message":"in use"});
+        } else {
+            s.managed_present = false;
+            response = json!([]);
         }
     } else if method == "POST" && route.starts_with("/containers/create?") {
         if s.refuse_create {
@@ -402,9 +510,12 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
                     .filter(|container| !container.gone)
                     .map(|container| json!({"Id":container.id,"Names":[container.name.clone()]}))
                     .chain(
+                        s.managed_container.then(|| json!({"Id":"managed-container","Names":["/managed"],"ImageID":s.managed_id}))
+                    )
+                    .chain(
                         s.body
                             .is_some()
-                            .then(|| json!({"Id":ID,"Names":[format!("/{}", s.name)]})),
+                            .then(|| json!({"Id":ID,"Names":[format!("/{}", s.name)],"ImageID":if s.managed_ref.is_some() { s.managed_id.as_str() } else { "sha256:fixture-image" }})),
                     )
                     .collect(),
             );
@@ -530,7 +641,7 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
                 let env = config["Env"].as_array_mut().unwrap();
                 env.extend(s.inherited_env.iter().cloned().map(Value::String));
             }
-            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Image":"sha256:fixture-image","Name":format!("/{}",s.name),"Config":config,"HostConfig":host_config,"Mounts":realized_mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit,"OOMKilled":s.oom_killed}});
+            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Image":if s.managed_ref.is_some() { s.managed_id.as_str() } else { "sha256:fixture-image" },"Name":format!("/{}",s.name),"Config":config,"HostConfig":host_config,"Mounts":realized_mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit,"OOMKilled":s.oom_killed}});
             if let Some(inspect_code) = s.inspect_code.or_else(|| {
                 (s.running || s.exited)
                     .then_some(s.inspect_after_start_code)

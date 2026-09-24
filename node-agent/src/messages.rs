@@ -72,6 +72,9 @@ pub enum AgentMsg {
         /// the state file must still report `[]`, or the host reads falsely
         /// `ready` forever (agent-api.md `register`).
         images: Vec<RegisterImageEntry>,
+        image_cleanup_v1: bool,
+        image_versions_complete: bool,
+        image_versions: Vec<ImageVersionEntry>,
         /// Platform-release identity (amendment 1, agent-api.md `register`):
         /// four OPTIONAL flat fields. Omitted when unknown — the control plane
         /// stores absent as NULL, and a wrong stamp is worse than none, since
@@ -352,6 +355,26 @@ pub enum AgentMsg {
         /// cause, never a raw docker error blob (`images::errors`).
         error: String,
     },
+    ImageVersionsState {
+        inventory_revision: String,
+        image_versions_complete: bool,
+        image_versions: Vec<ImageVersionEntry>,
+    },
+    ImageCleanupState {
+        attempt_id: String,
+        image_id: String,
+        version: String,
+        image_ref: String,
+        runtime_image_id: String,
+        generation: String,
+        state: String,
+        reason: Option<String>,
+    },
+    ImageCleanupJournal {
+        request_id: String,
+        retired_attempt_ids: Vec<String>,
+        attempts: Vec<ImageCleanupJournalEntry>,
+    },
     /// Progress and outcome of one platform-release apply on this host
     /// (agent-api.md `release_state`). Fire-and-forget like `image_state`.
     ///
@@ -439,6 +462,33 @@ pub struct RegisterImageEntry {
     pub version: String,
     /// `"absent" | "pulling" | "ready" | "failed"`.
     pub state: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ImageVersionEntry {
+    pub image_id: String,
+    pub version: String,
+    pub image_ref: String,
+    pub runtime_image_id: String,
+    pub state: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ImageCleanupJournalEntry {
+    pub attempt_id: String,
+    pub image_id: String,
+    pub version: String,
+    pub image_ref: String,
+    pub runtime_image_id: String,
+    pub generation: String,
+    pub state: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ImageIdentity {
+    pub image_id: String,
+    pub version: String,
+    pub image_ref: String,
 }
 
 /// One codec's entry in `capacity.codec_throughput` (#506): sustained encode
@@ -1120,6 +1170,28 @@ pub enum ControlMsg {
         id: String,
         image_id: String,
     },
+    ImageInventoryReconcile {
+        id: String,
+        identities: Vec<ImageIdentity>,
+    },
+    ImageCleanup {
+        id: String,
+        attempt_id: String,
+        image_id: String,
+        version: String,
+        image_ref: String,
+        runtime_image_id: String,
+        expected_generation: String,
+    },
+    ImageCleanupJournalRequest {
+        id: String,
+        attempt_ids: Vec<String>,
+    },
+    ImageCleanupStateAck {
+        id: String,
+        attempt_id: String,
+        generation: String,
+    },
     /// Build a `kind:"template"` catalog image locally on this host — the
     /// template analogue of `image_ensure`: ack immediately, fetch the build
     /// context tarball (`context_url`, commit-sha-pinned GitHub codeload),
@@ -1772,6 +1844,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cleanup_wire_examples_use_exact_frozen_fields() {
+        let command = serde_json::json!({"type":"image_cleanup","id":"cmd","attempt_id":"attempt","image_id":"steam","version":"v1","image_ref":"ghcr.io/x/steam:sha-1234567","runtime_image_id":"sha256:one","expected_generation":"7"});
+        assert!(
+            matches!(serde_json::from_value::<ControlMsg>(command).unwrap(), ControlMsg::ImageCleanup { expected_generation, .. } if expected_generation == "7")
+        );
+        let report = AgentMsg::ImageCleanupState {
+            attempt_id: "attempt".into(),
+            image_id: "steam".into(),
+            version: "v1".into(),
+            image_ref: "ghcr.io/x/steam:sha-1234567".into(),
+            runtime_image_id: "sha256:one".into(),
+            generation: "7".into(),
+            state: "removed".into(),
+            reason: None,
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["type"], "image_cleanup_state");
+        assert_eq!(json["generation"], "7");
+        assert!(json.get("expected_generation").is_none());
+        assert!(json["reason"].is_null());
+        let journal_request = serde_json::json!({"type":"image_cleanup_journal_request","id":"j","attempt_ids":["attempt"]});
+        assert!(
+            matches!(serde_json::from_value::<ControlMsg>(journal_request).unwrap(), ControlMsg::ImageCleanupJournalRequest { attempt_ids, .. } if attempt_ids == ["attempt"])
+        );
+    }
+
     // A future control plane sending an unknown type must degrade to Unknown,
     // not fail the whole connection.
     #[test]
@@ -1879,6 +1978,9 @@ mod tests {
                 enrollment_token: "tok".to_string(),
             },
             images: Vec::new(),
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: None,
             built_at: None,
             install_mode: None,
@@ -1904,6 +2006,9 @@ mod tests {
                 node_secret: "secret".to_string(),
             },
             images: Vec::new(),
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: None,
             built_at: None,
             install_mode: None,
@@ -1933,6 +2038,9 @@ mod tests {
                 node_secret: "secret".to_string(),
             },
             images: Vec::new(),
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: Some("1f0c1e0e0c5a9d1b7a2f3e4d5c6b7a8901234567".to_string()),
             built_at: Some("2026-09-04T12:00:00Z".to_string()),
             install_mode: Some("registry".to_string()),
@@ -1966,6 +2074,9 @@ mod tests {
                 version: "2026.08.07".to_string(),
                 state: "ready".to_string(),
             }],
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: None,
             built_at: None,
             install_mode: None,
