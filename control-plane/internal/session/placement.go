@@ -161,10 +161,12 @@ func imageReadySQL(refIdx int) string {
 // launch prepares exactly the adopted content, so a prior ready report is not
 // required. Two shapes qualify:
 //   - a prebuilt whose registry_ref is an immutable digest equal to the launch
-//     ref: the agent's on-assignment ensure re-pulls exactly those bits;
+//     ref: the coordinator pulls exactly those bits through the managed
+//     image_ensure and waits for a current authenticated ready report before
+//     assignment (images.Ensurer.PrepareLazyImage);
 //   - a buildable template whose local_tag is the launch ref: the coordinator
 //     builds its frozen context and waits for a current authenticated ready
-//     report before assignment (images.Ensurer.PrepareLazyTemplate).
+//     report before assignment (images.Ensurer.PrepareLazyImage).
 //
 // A lazy tag ref is excluded because a tag can move.
 //
@@ -193,7 +195,7 @@ func lazyOnDemandAdmissionSQL(hostExpr, refExpr string) string {
 // ref proves it was prepared again. The report must be newer than the
 // terminal attempt; a ready row retained from before deletion is no proof.
 // A current lazy on-demand adoption of the ref is the exception: it cannot
-// report ready before its first assignment, and that assignment re-pulls it.
+// report ready before its first launch, and that launch prepares it again.
 func removedManagedImageUnreadySQL(hostExpr, refExpr string) string {
 	return fmt.Sprintf(`EXISTS (
 		SELECT 1 FROM host_image_cleanup_attempts a

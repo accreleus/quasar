@@ -325,7 +325,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 }
 
 func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {
-	if c.lazyTemplates == nil && imageRef != "" {
+	if c.lazyImages == nil && imageRef != "" {
 		// Placement admits a lazy template before any host built it. Without a
 		// preparer nothing would build it, so fail closed rather than assign an
 		// unbuilt local tag.
@@ -337,7 +337,7 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 			return
 		}
 	}
-	if c.lazyTemplates != nil && sess.HostID != nil {
+	if c.lazyImages != nil && sess.HostID != nil {
 		// A template build may take minutes. It is owned by the coordinator's
 		// lifecycle, not the HTTP request which has already returned 201.
 		ctx, cancel := context.WithCancel(c.ctx)
@@ -360,7 +360,7 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 				}
 			}
 		}()
-		err := c.lazyTemplates.PrepareLazyTemplate(ctx, *sess.HostID, imageRef)
+		err := c.lazyImages.PrepareLazyImage(ctx, *sess.HostID, imageRef)
 		close(finished)
 		cancel()
 		if err != nil {

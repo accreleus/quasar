@@ -20,7 +20,7 @@ func TestLazyTemplateFirstLaunchBuildsAndWaitsForReady(t *testing.T) {
 	e := NewEnsurer(pool, fleet, testLog(), WithLazyBuildTimeout(3*time.Second))
 	defer e.Close()
 	result := make(chan error, 1)
-	go func() { result <- e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)) }()
+	go func() { result <- e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)) }()
 	build := fleet.waitBuild(t)
 	if build.ImageID != tplID || build.LocalTag != tplLocalTag(tplVer) || build.Version != tplVer ||
 		build.ContextURL != "https://codeload.github.com/accreleus/quasar-images/tar.gz/"+tplContextSHA ||
@@ -59,7 +59,7 @@ func TestConcurrentLazyTemplateLaunchesShareOneBuild(t *testing.T) {
 	defer e.Close()
 	results := make(chan error, 2)
 	for range 2 {
-		go func() { results <- e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)) }()
+		go func() { results <- e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)) }()
 	}
 	_ = fleet.waitBuild(t)
 	e.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: tplID, Version: tplVer, State: "ready"})
@@ -92,7 +92,7 @@ func TestLazyTemplateReadyFromCurrentRegisterSkipsBuild(t *testing.T) {
 	e.AgentImagesRegistered(context.Background(), host,
 		[]agentws.RegisterImage{{ImageID: tplID, Version: tplVer, State: "ready"}}, true)
 	e.Wait()
-	if err := e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)); err != nil {
+	if err := e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)); err != nil {
 		t.Fatal(err)
 	}
 	fleet.mu.Lock()
@@ -114,7 +114,7 @@ func TestLazyTemplateReconnectAndFailureDoNotAssign(t *testing.T) {
 			e := NewEnsurer(pool, fleet, testLog(), WithLazyBuildTimeout(500*time.Millisecond))
 			defer e.Close()
 			result := make(chan error, 1)
-			go func() { result <- e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)) }()
+			go func() { result <- e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)) }()
 			_ = fleet.waitBuild(t)
 			switch mode {
 			case "reconnect":
@@ -152,7 +152,7 @@ func TestLazyTemplateKindDriftFailsClosed(t *testing.T) {
 	if _, err := pool.Exec(context.Background(), `UPDATE image_catalog SET kind='prebuilt' WHERE id=$1`, tplID); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)); err == nil {
+	if err := e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)); err == nil {
 		t.Fatal("drifted lazy adoption prepared without error")
 	}
 	fleet.mu.Lock()
@@ -173,7 +173,7 @@ func TestLazyTemplatePreparationIgnoresEagerAndUnmanagedRefs(t *testing.T) {
 	e := NewEnsurer(pool, fleet, testLog())
 	defer e.Close()
 	for _, ref := range []string{tplLocalTag(tplVer), "quasar-local/unmanaged:1", "ghcr.io/example/app:1"} {
-		if err := e.PrepareLazyTemplate(context.Background(), host, ref); err != nil {
+		if err := e.PrepareLazyImage(context.Background(), host, ref); err != nil {
 			t.Fatalf("%s: %v", ref, err)
 		}
 	}
@@ -192,7 +192,7 @@ func TestLazyTemplateAdoptionChangeAndCancellationDoNotAssign(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			result := make(chan error, 1)
-			go func() { result <- e.PrepareLazyTemplate(ctx, host, tplLocalTag(tplVer)) }()
+			go func() { result <- e.PrepareLazyImage(ctx, host, tplLocalTag(tplVer)) }()
 			_ = fleet.waitBuild(t)
 			switch mode {
 			case "version":
@@ -232,14 +232,14 @@ func TestLazyTemplateRetryAfterFailureWaitsForNewBuild(t *testing.T) {
 	e := NewEnsurer(pool, fleet, testLog(), WithLazyBuildTimeout(3*time.Second))
 	defer e.Close()
 	first := make(chan error, 1)
-	go func() { first <- e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)) }()
+	go func() { first <- e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)) }()
 	_ = fleet.waitBuild(t)
 	e.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: tplID, Version: tplVer, State: "failed", Error: "context fetch"})
 	if err := <-first; err == nil {
 		t.Fatal("failed build succeeded")
 	}
 	second := make(chan error, 1)
-	go func() { second <- e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)) }()
+	go func() { second <- e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)) }()
 	_ = fleet.waitBuild(t)
 	select {
 	case err := <-second:
@@ -268,7 +268,7 @@ func TestLazyTemplateSnapshotDoesNotEraseLiveReady(t *testing.T) {
 	defer e.Close()
 	e.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: tplID, Version: tplVer, State: "ready"})
 	e.observeSnapshotStates(host, []agentws.RegisterImage{{ImageID: tplID, Version: tplVer, State: "absent"}}, []string{tplID}, "")
-	if err := e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)); err != nil {
+	if err := e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)); err != nil {
 		t.Fatal(err)
 	}
 	fleet.mu.Lock()
@@ -289,10 +289,84 @@ func TestLazyTemplateUnsupportedHostFailsWithoutWaiting(t *testing.T) {
 	defer e.Close()
 	e.markUnsupported(host)
 	start := time.Now()
-	if err := e.PrepareLazyTemplate(context.Background(), host, tplLocalTag(tplVer)); err == nil {
+	if err := e.PrepareLazyImage(context.Background(), host, tplLocalTag(tplVer)); err == nil {
 		t.Fatal("unsupported host prepared a template")
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("unsupported host waited for a build")
+	}
+}
+
+const lazyPrebuiltDigest = "ghcr.io/accreleus/quasar-steam@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+// A lazy prebuilt pinned to a digest is pulled through the managed
+// image_ensure before assignment. That managed record is what lets the agent
+// name the image for Steam home seeding and report it ready for template
+// preparation; an ack alone is still not readiness.
+func TestLazyDigestFirstLaunchEnsuresAndWaitsForReady(t *testing.T) {
+	pool := ensureDB(t)
+	seedCatalog(t, pool)
+	installAt(t, pool, true, imgVer, lazyPrebuiltDigest)
+	host := seedHost(t, pool, "lazy-digest")
+	fleet := newFleet(host)
+	e := NewEnsurer(pool, fleet, testLog(), WithLazyBuildTimeout(3*time.Second))
+	defer e.Close()
+	result := make(chan error, 1)
+	go func() { result <- e.PrepareLazyImage(context.Background(), host, lazyPrebuiltDigest) }()
+	call := fleet.waitEnsure(t)
+	if call.ImageID != imgID || call.RegistryRef != lazyPrebuiltDigest || call.Version != imgVer {
+		t.Fatalf("ensure did not use the frozen adoption: %+v", call)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("ack treated as ready: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	e.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("matching ready did not complete")
+	}
+	// A later launch on the same connection reuses the verified image.
+	if err := e.PrepareLazyImage(context.Background(), host, lazyPrebuiltDigest); err != nil {
+		t.Fatal(err)
+	}
+	fleet.mu.Lock()
+	count := len(fleet.calls)
+	fleet.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("verified lazy digest dispatched %d ensures, want 1", count)
+	}
+}
+
+// A lazy tag ref is admitted only after a ready report, so it is not this
+// seam's concern; a digest adoption whose catalog says template is drift.
+func TestLazyPrebuiltTagIsNoOpAndKindDriftFailsClosed(t *testing.T) {
+	pool := ensureDB(t)
+	seedCatalog(t, pool)
+	install(t, pool, true)
+	host := seedHost(t, pool, "lazy-tag")
+	fleet := newFleet(host)
+	e := NewEnsurer(pool, fleet, testLog())
+	defer e.Close()
+	if err := e.PrepareLazyImage(context.Background(), host, imgRef); err != nil {
+		t.Fatalf("lazy tag ref: %v", err)
+	}
+	installAt(t, pool, true, imgVer, lazyPrebuiltDigest)
+	if _, err := pool.Exec(context.Background(), `UPDATE image_catalog SET kind='template' WHERE id=$1`, imgID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.PrepareLazyImage(context.Background(), host, lazyPrebuiltDigest); err == nil {
+		t.Fatal("drifted lazy digest prepared without error")
+	}
+	fleet.mu.Lock()
+	count := len(fleet.calls)
+	fleet.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("tag or drifted adoption dispatched %d ensures", count)
 	}
 }

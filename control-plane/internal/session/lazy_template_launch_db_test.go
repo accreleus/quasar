@@ -16,7 +16,7 @@ type heldTemplatePreparation struct {
 	release chan struct{}
 }
 
-func (p *heldTemplatePreparation) PrepareLazyTemplate(ctx context.Context, hostID, imageRef string) error {
+func (p *heldTemplatePreparation) PrepareLazyImage(ctx context.Context, hostID, imageRef string) error {
 	select {
 	case p.called <- struct{}{}:
 	default:
@@ -59,7 +59,7 @@ func startLazyTemplateLaunch(t *testing.T) lazyTemplateLaunch {
 	prep := &heldTemplatePreparation{called: make(chan struct{}, 1), release: make(chan struct{})}
 	disp := newFakeDispatcher(true)
 	store := NewStore(pool)
-	coord := newTestCoordinator(t, store, disp, testLogger(), WithLazyTemplatePreparer(prep))
+	coord := newTestCoordinator(t, store, disp, testLogger(), WithLazyImagePreparer(prep))
 	mux := http.NewServeMux()
 	ah := auth.NewHandler(authSvc)
 	NewHandler(coord, store).Register(mux, ah.RequireAuth, ah.RequireAdmin)

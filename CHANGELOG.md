@@ -299,12 +299,14 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 - **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
-  before any host reports it ready. A lazy prebuilt pinned to an image digest
-  is pulled by the agent on assignment, including after a confirmed cleanup of
-  that digest. A lazy template is built on the selected host after the launch
-  is accepted: the control plane sends the adopted, frozen build and assigns
-  the session only after that host's current connection reports the exact
-  version ready. A build failure, timeout, host reconnect or adoption change
+  before any host reports it ready. After the launch is accepted, the control
+  plane prepares the image on the selected host with the adopted, frozen
+  inputs — a pull for a lazy prebuilt pinned to an image digest (including
+  after a confirmed cleanup of that digest), a build for a lazy template — and
+  assigns the session only after that host's current connection reports the
+  exact version ready. A lazy Steam image is therefore a managed image on the
+  host: its first home reports its seed outcome, and Steam template
+  preparation can proceed instead of waiting for an image report forever. A build failure, timeout, host reconnect or adoption change
   fails only that session. A stop during the build ends it without a launch.
   Eager images, tag references and templates without a resolved build context
   still require prior readiness. A host whose earlier on-demand preparation

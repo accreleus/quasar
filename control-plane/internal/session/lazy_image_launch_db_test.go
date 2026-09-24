@@ -51,7 +51,7 @@ func TestOperatorLaunchKeepsEagerManagedImageReadyGate(t *testing.T) {
 
 // A buildable lazy template is admitted without a prior ready report. The
 // coordinator's lazy-template preparation builds it before assignment
-// (images.Ensurer.PrepareLazyTemplate; lazy_template_launch_db_test.go).
+// (images.Ensurer.PrepareLazyImage; lazy_template_launch_db_test.go).
 func TestOperatorLaunchAdmitsBuildableLazyTemplate(t *testing.T) {
 	pool := testDB(t)
 	f := newEntLaunchFixture(t, pool)
