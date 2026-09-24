@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
 import type { HostImageCleanupAttempt, HostImageCleanupCandidate, HostImageCleanupView } from "../../../api/types";
@@ -52,10 +52,19 @@ export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }:
     fetch: (ctx) => requested
       ? adminApi.getHostImageCleanupAttempt(ctx.token, hostID, requested.attempt_id, ctx.signal)
       : Promise.resolve(null),
-    pollMs: (attempt) => attempt && (attempt.state === "removing" || attempt.state === "unknown") ? 3000 : null,
+    // A numeric cadence retries even when the first status read fails before
+    // the resource has data. Terminal outcomes pause it below.
+    pollMs: 3000,
   }, [hostID, requested?.attempt_id]);
   const attempt = attemptStatus.errorMessage ? null : attemptStatus.data ?? requested;
   const attemptUnavailable = attemptStatus.error instanceof ApiError && attemptStatus.error.status === 404;
+  useEffect(() => {
+    if (!requested || attemptUnavailable || attempt?.state === "removed" || attempt?.state === "failed") {
+      attemptStatus.pause();
+    } else {
+      attemptStatus.resume();
+    }
+  }, [requested, attemptUnavailable, attempt?.state, attemptStatus.pause, attemptStatus.resume]);
   const pendingState = attempt ?? requested;
   const attemptPending = !!pendingState && (pendingState.state === "removing" || pendingState.state === "unknown");
 

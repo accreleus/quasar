@@ -45,6 +45,19 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ImageCleanupModal", () => {
+  it("recovers automatically after a transient status read failure", async () => {
+    vi.mocked(adminApi.getHostImageCleanupAttempt)
+      .mockRejectedValueOnce(new ApiError(503, "unavailable", "temporarily unavailable"))
+      .mockResolvedValue({ ...attempt, state: "removed" } as never);
+    renderModal();
+    await requestRemoval();
+
+    expect(await screen.findByText(/Could not check the cleanup outcome/)).toBeTruthy();
+    expect(screen.queryByText(/Removal confirmed/i)).toBeNull();
+    expect(await screen.findByText(/Removal confirmed/i, {}, { timeout: 5000 })).toBeTruthy();
+    expect(adminApi.getHostImageCleanupAttempt).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps an uncertain attempt pending until a durable status read confirms removal", async () => {
     vi.mocked(adminApi.getHostImageCleanupAttempt)
       .mockResolvedValueOnce({ ...attempt, state: "unknown" } as never)
