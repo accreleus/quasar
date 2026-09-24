@@ -94,9 +94,19 @@ type conn struct {
 	out                       chan []byte
 	done                      chan struct{}
 
-	mu     sync.Mutex
-	closed bool
-	acks   map[string]chan AckResult
+	mu                       sync.Mutex
+	closed                   bool
+	acks                     map[string]chan AckResult
+	imageCleanupV1           bool
+	imageVersionsComplete    bool
+	imageVersionsRevision    uint64
+	imageVersionsObservedAt  time.Time
+	imageVersions            []ImageVersionEntry
+	imageReconcilePending    map[string]bool
+	imageReconcileAwaiting   bool
+	imageReconcileAwaitingID string
+	imageReconciledRevision  uint64
+	imageReconciledRequestID string
 }
 
 // SupportsTypedSettings describes the current authenticated connection only.
@@ -425,6 +435,15 @@ func (r *Registry) resolveAckFromConn(c *conn, id string, res AckResult) {
 		return
 	}
 	c.mu.Lock()
+	if c.imageReconcilePending[id] {
+		delete(c.imageReconcilePending, id)
+		if res.OK {
+			// The agent updates its scanned inventory before sending this ack.
+			// Its following image_versions_state is ordered on this connection.
+			c.imageReconcileAwaiting = true
+			c.imageReconcileAwaitingID = id
+		}
+	}
 	ch := c.acks[id]
 	c.mu.Unlock()
 	if ch != nil {

@@ -575,11 +575,26 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	var id string
 	query := fmt.Sprintf(`INSERT INTO apps (%s) VALUES (%s) RETURNING id::text`,
 		strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-	if err := s.pool.QueryRow(ctx, query, args...).Scan(&id); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return App{}, fmt.Errorf("begin app create: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := tx.QueryRow(ctx, query, args...).Scan(&id); err != nil {
 		if translated := appConstraintError(err); translated != nil {
 			return App{}, translated
 		}
 		return App{}, fmt.Errorf("insert app: %w", err)
+	}
+	newRef, err := imageRefForApp(ctx, tx, id)
+	if err != nil {
+		return App{}, fmt.Errorf("read created app image: %w", err)
+	}
+	if err := fenceImageRequirementWrite(ctx, tx, newRef); err != nil {
+		return App{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return App{}, fmt.Errorf("commit app create: %w", err)
 	}
 	return s.getAppFull(ctx, callerID, id)
 }
@@ -829,7 +844,19 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 
 	args = append(args, id)
 	var a App
-	err := s.pool.QueryRow(ctx, query, args...).
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return App{}, fmt.Errorf("begin app update: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	oldRef := ""
+	if enabled != nil || len(runtimeSpec) > 0 || runtimePresetID != nil || parentAppID != nil {
+		oldRef, err = imageRefForApp(ctx, tx, id)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return App{}, fmt.Errorf("read old app image: %w", err)
+		}
+	}
+	err = tx.QueryRow(ctx, query, args...).
 		Scan(&a.ID, &a.Name, &a.Description, &a.CoverURL, &a.HeroURL, &a.Kind,
 			&a.ExternalSource, &a.ExternalID,
 			&a.ParentAppID, &a.Origin, &a.LibraryProvider,
@@ -845,6 +872,18 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 			return App{}, translated
 		}
 		return App{}, fmt.Errorf("update app: %w", err)
+	}
+	if enabled != nil || len(runtimeSpec) > 0 || runtimePresetID != nil || parentAppID != nil {
+		newRef, err := imageRefForApp(ctx, tx, id)
+		if err != nil {
+			return App{}, fmt.Errorf("read new app image: %w", err)
+		}
+		if err := fenceImageRequirementWrite(ctx, tx, oldRef, newRef); err != nil {
+			return App{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return App{}, fmt.Errorf("commit app update: %w", err)
 	}
 	return s.getAppFull(ctx, callerID, a.ID)
 }

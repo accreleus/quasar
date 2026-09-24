@@ -281,18 +281,6 @@ func (f *fakeFleet) SendImageRemove(_ context.Context, hostID, _, imageID string
 	return agentws.AckResult{OK: true}, nil
 }
 
-// waitRemove returns the next dispatched image_remove, or fails the test.
-func (f *fakeFleet) waitRemove(t *testing.T) removeCall {
-	t.Helper()
-	select {
-	case c := <-f.rmCh:
-		return c
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for an image_remove dispatch")
-		return removeCall{}
-	}
-}
-
 // noMoreRemoves asserts nothing further is dispatched within a short window.
 func (f *fakeFleet) noMoreRemoves(t *testing.T, within time.Duration) {
 	t.Helper()
@@ -696,53 +684,6 @@ func TestEnsureRejectionRecordedNotRetried(t *testing.T) {
 		t.Fatalf("rejection not recorded: %+v (found=%v)", hs, ok)
 	}
 	fleet.noMoreEnsures(t, 100*time.Millisecond)
-}
-
-// --- ensure/remove ordering (review round) ------------------------------------
-
-// TestRemoveOrdersAfterInflightEnsure is the review-round acceptance for the
-// ensure/remove ordering bug: a remove for a (host, image) must not overtake an
-// in-flight ensure for the SAME target. Before the fix the two used different
-// inflight keys and ran concurrently, so a remove could complete first and leave
-// the image present after uninstall. Here the ensure is held mid-flight, a remove
-// is enqueued for the same target, and the remove must be dispatched only AFTER
-// the ensure completes — proving they share one serialized worker.
-func TestRemoveOrdersAfterInflightEnsure(t *testing.T) {
-	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, false)
-	h := seedHost(t, pool, "host-a")
-	fleet := newFleet(h)
-	fleet.gate = make(chan struct{})
-	e := NewEnsurer(pool, fleet, testLog())
-	// Release the gate no matter how the test exits, so a mid-test t.Fatal cannot
-	// leave the worker blocked and hang e.Close()'s wg.Wait(). Idempotent.
-	var once sync.Once
-	releaseGate := func() { once.Do(func() { close(fleet.gate) }) }
-	defer e.Close()
-	defer releaseGate()
-	ctx := context.Background()
-
-	// Kick the ensure; it blocks inside the fake agent holding the target worker.
-	if err := e.EnsureAll(ctx); err != nil {
-		t.Fatalf("ensure all: %v", err)
-	}
-	if c := fleet.waitEnsure(t); c.HostID != h {
-		t.Fatalf("ensure went to %s, want %s", c.HostID, h)
-	}
-	// While the ensure is in flight, enqueue a remove for the same target. It must
-	// NOT be dispatched yet — the worker is busy with the ensure.
-	// No image_state has arrived, so uninstall's host_images snapshot is empty.
-	// The in-flight command still needs a matching remove behind it.
-	e.RemoveImage(ctx, imgID, nil)
-	fleet.noMoreRemoves(t, 100*time.Millisecond)
-
-	// Release the ensure; the queued remove now runs behind it.
-	releaseGate()
-	rc := fleet.waitRemove(t)
-	if rc.HostID != h || rc.ImageID != imgID {
-		t.Fatalf("remove after ensure: %+v", rc)
-	}
 }
 
 // --- register reconciliation ---------------------------------------------------

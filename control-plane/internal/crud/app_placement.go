@@ -297,6 +297,15 @@ func (h *Handler) handlePatchAppPlacement(w http.ResponseWriter, r *http.Request
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not save placement")
 		return
 	}
+	selectedRef, err := imageRefForApp(ctx, tx, canonical)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read placement image")
+		return
+	}
+	if err := fenceImageRequirementWrite(ctx, tx, selectedRef); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not serialize image requirement")
+		return
+	}
 	if err := tx.Commit(ctx); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not commit placement")
 		return

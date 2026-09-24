@@ -27,6 +27,7 @@ type Handler struct {
 	retry   interface {
 		RetryHostImage(context.Context, string, string) error
 	}
+	cleanup *CleanupService
 }
 
 // NewHandler builds the images HTTP handler.
@@ -46,6 +47,8 @@ func (h *Handler) SetRetryEnsurer(e interface {
 	h.retry = e
 }
 
+func (h *Handler) SetCleanupService(s *CleanupService) { h.cleanup = s }
+
 // actor is the acting admin's id for an audit row.
 func actor(r *http.Request) string {
 	u, _ := auth.UserFromContext(r.Context())
@@ -63,6 +66,97 @@ func (h *Handler) Register(mux httpx.Router, admin func(http.Handler) http.Handl
 	mux.Handle("DELETE /v1/admin/images/{id}/pin", admin(http.HandlerFunc(h.handleUnpin)))
 	mux.Handle("POST /v1/admin/images/{id}/update", admin(http.HandlerFunc(h.handleUpdate)))
 	mux.Handle("POST /v1/admin/hosts/{id}/images/{image_id}/retry", admin(http.HandlerFunc(h.handleRetry)))
+	mux.Handle("GET /v1/admin/hosts/{id}/images/cleanup", admin(http.HandlerFunc(h.handleCleanupPreview)))
+	mux.Handle("POST /v1/admin/hosts/{id}/images/cleanup", admin(http.HandlerFunc(h.handleCleanupRequest)))
+	mux.Handle("GET /v1/admin/hosts/{id}/images/cleanup/attempts/{attempt_id}", admin(http.HandlerFunc(h.handleCleanupAttempt)))
+}
+
+func (h *Handler) handleCleanupAttempt(w http.ResponseWriter, r *http.Request) {
+	hostID, attemptID := r.PathValue("id"), r.PathValue("attempt_id")
+	if !hostUUID.MatchString(hostID) || !hostUUID.MatchString(attemptID) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid host or attempt ID")
+		return
+	}
+	if h.cleanup == nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "image cleanup unavailable")
+		return
+	}
+	attempt, err := h.cleanup.Attempt(r.Context(), hostID, attemptID)
+	switch {
+	case errors.Is(err, errCleanupNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "cleanup attempt not found")
+	case err != nil:
+		slog.Error("read image cleanup attempt", "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read image cleanup attempt")
+	default:
+		httpx.WriteJSON(w, http.StatusOK, attempt)
+	}
+}
+
+func (h *Handler) handleCleanupPreview(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("id")
+	if !hostUUID.MatchString(hostID) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid host ID")
+		return
+	}
+	if h.cleanup == nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "image cleanup unavailable")
+		return
+	}
+	view, err := h.cleanup.Preview(r.Context(), hostID)
+	if errors.Is(err, errCleanupNotFound) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
+	} else if err != nil {
+		slog.Error("preview image cleanup", "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not preview image cleanup")
+	} else {
+		httpx.WriteJSON(w, http.StatusOK, view)
+	}
+}
+
+func (h *Handler) handleCleanupRequest(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("id")
+	if !hostUUID.MatchString(hostID) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid host ID")
+		return
+	}
+	if h.cleanup == nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "image cleanup unavailable")
+		return
+	}
+	var req CleanupRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid cleanup request")
+		return
+	}
+	attempt, status, conflict, err := h.cleanup.Request(r.Context(), hostID, req)
+	switch {
+	case errors.Is(err, errCleanupValidation):
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid cleanup request")
+	case errors.Is(err, errCleanupNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host or managed image not found")
+	case err != nil:
+		slog.Error("request image cleanup", "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not request image cleanup")
+	case conflict != nil:
+		httpx.WriteJSON(w, http.StatusConflict, struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+			Current *CleanupCandidate `json:"current"`
+			Remedy  string            `json:"remedy"`
+		}{Error: struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}{conflict.Code, conflict.Message}, Current: conflict.Current, Remedy: conflict.Remedy})
+	default:
+		audit.TryRecord(r.Context(), h.auditor, actor(r), "image.cleanup.requested", "image", req.ImageID,
+			map[string]any{"host_id": hostID, "attempt_id": attempt.AttemptID, "version": req.Version})
+		httpx.WriteJSON(w, status, attempt)
+	}
 }
 
 func (h *Handler) handleRetry(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +187,8 @@ func (h *Handler) handleRetry(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Lazy image downloads at first launch")
 	case errors.Is(err, ErrRetryNotFailed):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Image is not failed for the adopted version")
+	case errors.Is(err, ErrRetryRemoving):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Image cleanup is in progress; retry after it finishes")
 	default:
 		slog.Error("retry image", "host_id", hostID, "image_id", imageID, "err", err)
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not schedule image retry")

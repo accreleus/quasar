@@ -366,6 +366,13 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	if err != nil {
 		return Session{}, false, fmt.Errorf("lock app placement: %w", err)
 	}
+	imageAvailable, err := lockRequiredImageFence(ctx, tx, hostID, p.AppImage)
+	if err != nil {
+		return Session{}, false, err
+	}
+	if !imageAvailable {
+		return Session{}, true, nil
+	}
 	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
 		return Session{}, false, err
 	}

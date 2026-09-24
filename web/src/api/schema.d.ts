@@ -3805,6 +3805,146 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/images/cleanup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /** Preview exact managed-image versions eligible for explicit cleanup (RH05). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current preview. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupView"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        /** Request exact-version image cleanup after current generation and reference recheck (RH05). */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostImageCleanupRequest"];
+                };
+            };
+            responses: {
+                /** @description Exact version already confirmed removed. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupAttempt"];
+                    };
+                };
+                /** @description Cleanup accepted or identical attempt in flight. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Current cleanup blocker and remedy. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupConflict"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/images/cleanup/attempts/{attempt_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one durable exact-version cleanup attempt (RH05).
+         * @description Reads persisted state only; it does not infer removal from a preview, contact an agent, or retry dispatch. An attempt on another host or a pruned attempt is 404. The reason is a safe operator code, never a raw runtime error.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current persisted attempt. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/images/{image_id}/retry": {
         parameters: {
             query?: never;
@@ -8734,31 +8874,52 @@ export interface components {
         HostImageCleanupView: {
             /** Format: uuid */
             host_id: string;
-            /** Format: date-time */
-            observed_at: string;
+            /** @enum {string} */
+            inventory_status: "current" | "unknown" | "offline";
+            /**
+             * Format: date-time
+             * @description Null when no current complete observation exists.
+             */
+            observed_at: string | null;
+            /** @description Safe next action when inventory is not current. */
+            remedy: string | null;
             images: components["schemas"]["HostImageCleanupCandidate"][];
         };
         HostImageCleanupCandidate: {
             image_id: string;
             version: string;
+            /** @description Exact frozen adopted reference */
+            image_ref: string;
+            /** @description Daemon image ID verified for that reference. */
+            runtime_image_id: string;
             eligible: boolean;
-            /** @description Current blockers */
-            reasons: string[];
+            reasons: ("required" | "container_reference" | "pending_launch" | "pending_image_operation" | "pending_template_work" | "retained_previous_success" | "unknown_inventory" | "offline" | "removing")[];
+            /** @description Safe next action for an ineligible candidate. */
+            remedy?: string | null;
             generation: components["schemas"]["RH05Revision"];
         };
         HostImageCleanupRequest: {
             image_id: string;
             version: string;
+            image_ref: string;
+            runtime_image_id: string;
             expected_generation: components["schemas"]["RH05Revision"];
+        };
+        HostImageCleanupConflict: {
+            error: components["schemas"]["Error"];
+            current: components["schemas"]["HostImageCleanupCandidate"] | null;
+            remedy: string;
         };
         HostImageCleanupAttempt: {
             /** Format: uuid */
             attempt_id: string;
             image_id: string;
             version: string;
+            image_ref: string;
+            runtime_image_id: string;
             generation: components["schemas"]["RH05Revision"];
             /** @enum {string} */
-            state: "pending" | "removing" | "removed" | "failed" | "cancelled";
+            state: "removing" | "removed" | "failed" | "unknown";
             reason?: string | null;
         };
         /**

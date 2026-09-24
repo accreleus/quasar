@@ -77,7 +77,8 @@ type Handler struct {
 	vram                *vramQueue
 	// Image-management P2 callback surface (images.go). Never nil — NewHandler
 	// installs a no-op — so dispatch needs no guard.
-	imageEvents ImageEvents
+	imageEvents   ImageEvents
+	cleanupEvents ImageCleanupEvents
 	// Platform-release apply callback surface (release.go, amendment 2). Never
 	// nil — NewHandler installs a no-op — so dispatch needs no guard.
 	releaseEvents ReleaseEvents
@@ -633,6 +634,10 @@ func (h *Handler) SetImageEvents(ev ImageEvents) {
 	h.imageEvents = ev
 }
 
+func (h *Handler) SetImageCleanupEvents(ev ImageCleanupEvents) {
+	h.cleanupEvents = ev
+}
+
 // SetReleaseEvents wires the platform-apply callback surface (release_state
 // relay + the register success-evidence hook, #116). A setter for the same
 // reason SetImageEvents is one: the apply runner is constructed after this
@@ -703,7 +708,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
-	hostID, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, err := h.handleRegister(registerCtx, conn, clientIP)
+	hostID, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
 	cancelRegister()
 	h.failures.Release(clientIP)
 	if err != nil {
@@ -739,6 +744,12 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
 	ac.bootIncarnation = h.bootIncarnation
 	ac.connectionIncarnation = connectionID
+	ac.imageCleanupV1 = cleanupRegister.Capable
+	ac.imageVersionsComplete = cleanupRegister.Complete
+	ac.imageVersions = cleanupRegister.Versions
+	if cleanupRegister.Capable {
+		ac.imageVersionsObservedAt = time.Now().UTC()
+	}
 	h.registry.add(ac)
 	go ac.runWriter(h.log)
 	// Every path after add, including a rejected reconciliation start, must
@@ -822,6 +833,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// (one DB op per entry).
 	sanitizedImages, imagesReported := sanitizeRegisterImages(regImages, h.log, hostID)
 	h.imageEvents.AgentImagesRegistered(bg, hostID, sanitizedImages, imagesReported)
+	if ac.imageCleanupV1 && h.cleanupEvents != nil {
+		h.cleanupEvents.ImageCleanupRegistered(bg, hostID)
+	}
 
 	// Step 3 — capacity (protocol requires it next). Its console auto-start
 	// runs only after config_update is queued and stale sessions reconciled.
@@ -1218,6 +1232,33 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			imgCtx, imgCancel := context.WithTimeout(bg, agentDBCallTimeout)
 			h.imageEvents.AgentImageState(imgCtx, hostID, m)
 			imgCancel()
+		case "image_versions_state":
+			var m ImageVersionsStateMsg
+			var changed bool
+			if json.Unmarshal(raw, &m) == nil {
+				changed = h.registry.updateImageVersions(ac, m)
+			} else {
+				// Decode the revision independently: a non-Boolean reference field
+				// rejects the typed payload, but must revoke any newer complete scan.
+				var header struct {
+					InventoryRevision string `json:"inventory_revision"`
+				}
+				_ = json.Unmarshal(raw, &header)
+				changed = h.registry.invalidateImageVersions(ac, header.InventoryRevision)
+			}
+			if changed && h.cleanupEvents != nil {
+				h.cleanupEvents.ImageVersionsChanged(bg, hostID)
+			}
+		case "image_cleanup_state":
+			var m ImageCleanupStateMsg
+			if ac.imageCleanupV1 && h.cleanupEvents != nil && json.Unmarshal(raw, &m) == nil {
+				h.registry.withCurrent(ac, func() { h.cleanupEvents.ImageCleanupState(bg, hostID, m) })
+			}
+		case "image_cleanup_journal":
+			var m ImageCleanupJournalMsg
+			if ac.imageCleanupV1 && h.cleanupEvents != nil && json.Unmarshal(raw, &m) == nil {
+				h.registry.withCurrent(ac, func() { h.cleanupEvents.ImageCleanupJournal(bg, hostID, m) })
+			}
 		case "release_state":
 			// Fire-and-forget apply progress. No token bucket: the contract
 			// throttles it to one message per 2 s and the database allows at
@@ -1258,10 +1299,10 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 // The third return value is the identity commit the agent reported (nil when it
 // reported none or one this build refused), which the caller hands to the
 // platform-apply success-evidence hook.
-func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, bool, bool, []string, string, error) {
-	fail := func(err error) (string, []RegisterImage, *string, bool, bool, []string, string, error) {
+func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
+	fail := func(err error) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
 		h.failures.Failure(clientIP)
-		return "", nil, nil, false, false, nil, "", err
+		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
 	}
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
@@ -1389,9 +1430,17 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	if err := conn.WriteJSON(resp); err != nil {
-		return "", nil, nil, false, false, nil, "", fmt.Errorf("write registered: %w", err)
+		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
 	}
-	return result.HostID, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, nil
+	cleanupRegister := ImageCleanupRegister{Capable: reg.ImageCleanupV1}
+	if reg.ImageCleanupV1 {
+		var versions []ImageVersionEntry
+		if json.Unmarshal(reg.ImageVersions, &versions) == nil && validImageVersions(versions, reg.ImageVersionsComplete) {
+			cleanupRegister.Complete = reg.ImageVersionsComplete
+			cleanupRegister.Versions = versions
+		}
+	}
+	return result.HostID, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
 
 func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *conn) error {

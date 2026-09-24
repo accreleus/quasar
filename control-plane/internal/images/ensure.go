@@ -48,7 +48,6 @@ const (
 type Dispatcher interface {
 	ConnectedHosts() []string
 	SendImageEnsure(ctx context.Context, hostID, id, imageID, registryRef, version string) (agentws.AckResult, error)
-	SendImageRemove(ctx context.Context, hostID, id, imageID string) (agentws.AckResult, error)
 	// SendImageBuild is the template analogue of image_ensure (P4).
 	SendImageBuild(ctx context.Context, hostID, id, imageID, contextURL, contextSubdir, dockerfile string, buildArgs map[string]string, localTag, version string) (agentws.AckResult, error)
 }
@@ -105,9 +104,10 @@ type dbPool interface {
 
 // Ensurer implements agentws.ImageEvents and owns the ensure lifecycle.
 type Ensurer struct {
-	pool dbPool
-	disp Dispatcher
-	log  *slog.Logger
+	pool    dbPool
+	disp    Dispatcher
+	log     *slog.Logger
+	cleanup *CleanupService
 
 	ackTimeout  time.Duration
 	maxAttempts int
@@ -137,10 +137,9 @@ type Ensurer struct {
 	// Epoch invalidates old automatic backoff timers when an operator retries,
 	// the image succeeds, or a newer failure starts another timer.
 	retryEpoch map[string]uint64
-	// pending/active serialize ensure and remove for one (host|image) target
+	// pending/active serialize ensures for one (host|image) target
 	// through a single worker (`pending` = latest desired op, `active` = a
-	// worker is draining it) — otherwise a remove could overtake an in-flight
-	// ensure and leave the image present post-uninstall.
+	// worker is draining it) so retries cannot overtake an in-flight ensure.
 	pending map[string]*pendingOp
 	active  map[string]bool
 	// unsupported marks a host whose agent let an image_ensure ack time out.
@@ -194,6 +193,9 @@ func (e *Ensurer) addWork() bool {
 func NewEnsurer(pool *pgxpool.Pool, disp Dispatcher, log *slog.Logger, opts ...EnsureOption) *Ensurer {
 	return newEnsurer(pool, disp, log, opts...)
 }
+
+// SetCleanupService wires post-commit success-history reconciliation.
+func (e *Ensurer) SetCleanupService(c *CleanupService) { e.cleanup = c }
 
 // newEnsurer is the real constructor, built against dbPool so tests can pass a
 // wrapper (e.g. one that fails mid-transaction, to prove the reconcile
@@ -356,60 +358,15 @@ func (e *Ensurer) EnsureImage(_ context.Context, imageID string) {
 	}
 }
 
-// RemoveImage dispatches a best-effort image_remove to each connected host in
-// hostIDs (P3 uninstall — `DELETE /v1/admin/images/{id}/install`). Best effort
-// by contract: the agent never force-removes an image backing a live
-// container, and an offline host just keeps it until reaped later.
-func (e *Ensurer) RemoveImage(_ context.Context, imageID string, hostIDs []string) {
-	if e.disp == nil || imageID == "" {
-		return
-	}
-	// A just-accepted ensure may not have emitted image_state yet, so the DB
-	// inventory snapshot alone misses it. Serialize a remove behind every
-	// active/queued ensure for this image as well as every known cached host.
-	targets := make(map[string]bool, len(hostIDs))
-	for _, hostID := range hostIDs {
-		targets[hostID] = true
-	}
-	e.mu.Lock()
-	for key := range e.active {
-		if strings.HasSuffix(key, "|"+imageID) {
-			targets[strings.TrimSuffix(key, "|"+imageID)] = true
-		}
-	}
-	e.mu.Unlock()
-	connected := make(map[string]bool)
-	for _, h := range e.disp.ConnectedHosts() {
-		connected[h] = true
-	}
-	for hostID := range targets {
-		if !connected[hostID] {
-			continue
-		}
-		e.clearFailures(hostID + "|" + imageID) // image no longer adopted; drop its retry budget
-		e.dispatchRemove(hostID, imageID)
-	}
-}
-
 // pendingOp is the latest desired action for one (host|image) target.
-// remove=false is an ensure carrying the adopted image; remove=true is an
-// uninstall's image_remove.
 type pendingOp struct {
-	remove bool
-	force  bool           // explicit or bounded retry may resume a current failed row
-	img    installedImage // valid when !remove
-}
-
-// dispatchRemove enqueues an image_remove, serialized behind any in-flight
-// ensure for the same target so a remove can never overtake it.
-func (e *Ensurer) dispatchRemove(hostID, imageID string) {
-	e.enqueue(hostID, imageID, pendingOp{remove: true})
+	force bool // explicit or bounded retry may resume a current failed row
+	img   installedImage
 }
 
 // enqueue records op as the latest desired action for (host|image) and starts a
-// worker if one isn't already running. Latest-write-wins lets an uninstall
-// supersede a queued ensure; the worker re-reads `pending` after each op, so a
-// remove enqueued mid-ensure still runs right after.
+// worker if one isn't already running. Latest-write-wins lets a retry
+// supersede queued ordinary work; the worker re-reads `pending` after each op.
 func (e *Ensurer) enqueue(hostID, imageID string, op pendingOp) {
 	key := hostID + "|" + imageID
 	e.mu.Lock()
@@ -451,11 +408,7 @@ func (e *Ensurer) drainTarget(hostID, imageID, key string) {
 		delete(e.pending, key)
 		e.mu.Unlock()
 
-		if op.remove {
-			e.runRemove(hostID, imageID)
-		} else {
-			e.runEnsure(hostID, imageID, op.img, op.force)
-		}
+		e.runEnsure(hostID, imageID, op.img, op.force)
 	}
 }
 
@@ -499,46 +452,30 @@ func (e *Ensurer) runEnsure(hostID, imageID string, _ installedImage, force bool
 		e.closeRetry(hostID + "|" + imageID)
 		return
 	}
-	e.sendEnsure(hostID, cur)
-	// Coalesce requests through dispatch acceptance, then permit another
-	// explicit Retry if an accepted agent never reports image_state.
-	e.closeRetry(hostID + "|" + imageID)
+	// A queued ensure may have waited behind another image operation. The
+	// durable fence, rather than the queue's old snapshot, decides whether it
+	// may be sent now. A failed lookup also defers the command.
+	removing, fenceErr := imageRemoving(checkCtx, e.pool, hostID, imageID)
+	if fenceErr != nil || removing {
+		if fenceErr != nil {
+			e.log.Warn("ensure: image fence lookup failed; deferring dispatch", "host_id", hostID, "image_id", imageID, "err", fenceErr)
+		}
+		e.closeRetry(hostID + "|" + imageID)
+		return
+	}
+	if !e.sendEnsure(hostID, cur) {
+		// A definite rejection or undeliverable command did not start work.
+		// The operator may retry once that failed dispatch has drained.
+		e.closeRetry(hostID + "|" + imageID)
+	}
+	// Acceptance starts one physical attempt. The failed DB row is still
+	// current until the agent reports image_state, so keep Retry coalesced.
 }
 
 func (e *Ensurer) closeRetry(key string) {
 	e.mu.Lock()
 	delete(e.retryOpen, key)
 	e.mu.Unlock()
-}
-
-// runRemove sends one image_remove. Best effort by contract (agent-api.md):
-// undeliverable or unacked is logged, never retried — an offline host's stale
-// image is a disk-space nuisance, not a correctness bug.
-func (e *Ensurer) runRemove(hostID, imageID string) {
-	if e.disp == nil {
-		return
-	}
-	cmdID, err := newCmdID()
-	if err != nil {
-		e.log.Error("remove: command id generation failed; skipping dispatch",
-			"host_id", hostID, "image_id", imageID, "err", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(e.ctx, e.ackTimeout)
-	defer cancel()
-	res, err := e.disp.SendImageRemove(ctx, hostID, cmdID, imageID)
-	if err != nil {
-		e.log.Warn("remove: dispatch failed", "host_id", hostID, "image_id", imageID, "err", err)
-		if errors.Is(err, context.DeadlineExceeded) {
-			e.markUnsupported(hostID)
-		}
-		return
-	}
-	if !res.OK {
-		e.log.Warn("remove: agent rejected", "host_id", hostID, "image_id", imageID, "err", res.Error)
-		return
-	}
-	e.log.Info("remove: accepted", "host_id", hostID, "image_id", imageID)
 }
 
 // EnsureHost is EnsureAll narrowed to one host — the reconnect path, and the
@@ -756,7 +693,13 @@ func (e *Ensurer) AgentImageState(ctx context.Context, hostID string, m agentws.
 		e.log.Warn("image_state: unknown image_id dropped", "host_id", hostID, "image_id", m.ImageID)
 		return
 	}
+	historyChanged := false
 	if m.State == "ready" {
+		historyChanged, err = successfulVersionWouldChange(ctx, tx, hostID, m.ImageID, m.Version)
+		if err != nil {
+			e.log.Error("image_state: read history failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
+			return
+		}
 		if err := recordSuccessfulVersion(ctx, tx, hostID, m.ImageID, m.Version); err != nil {
 			e.log.Error("image_state: history failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
 			return
@@ -765,6 +708,9 @@ func (e *Ensurer) AgentImageState(ctx context.Context, hostID string, m agentws.
 	if err := tx.Commit(ctx); err != nil {
 		e.log.Error("image_state: commit failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
 		return
+	}
+	if historyChanged && e.cleanup != nil {
+		e.cleanup.ManagedIdentityChanged(hostID)
 	}
 	e.observeImage(hostID, m.ImageID)
 
@@ -822,8 +768,29 @@ func (e *Ensurer) RetryHostImage(ctx context.Context, hostID, imageID string) er
 	if !required {
 		return ErrRetryNotRequired
 	}
+	// Serialize Retry with a cleanup attempt's fence transition. An unlocked
+	// read could accept a retry while another transaction has already changed
+	// the fence to removing but has not committed yet. Dispatch rechecks again
+	// after this short transaction, so no DB lock crosses the agent call.
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `INSERT INTO host_image_operation_fences(host_id,image_id,state)
+		VALUES($1::uuid,$2,'idle') ON CONFLICT DO NOTHING`, hostID, imageID); err != nil {
+		return err
+	}
+	var fenceState string
+	if err := tx.QueryRow(ctx, `SELECT state FROM host_image_operation_fences
+		WHERE host_id=$1::uuid AND image_id=$2 FOR SHARE`, hostID, imageID).Scan(&fenceState); err != nil {
+		return err
+	}
+	if fenceState == "removing" {
+		return ErrRetryRemoving
+	}
 	var state, version string
-	err = e.pool.QueryRow(ctx, `SELECT state,version FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&state, &version)
+	err = tx.QueryRow(ctx, `SELECT state,version FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&state, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrRetryNotFailed
 	}
@@ -832,6 +799,9 @@ func (e *Ensurer) RetryHostImage(ctx context.Context, hostID, imageID string) er
 	}
 	if state != "failed" || (version != "" && version != img.Version) {
 		return ErrRetryNotFailed
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 	key := hostID + "|" + imageID
 	e.mu.Lock()
@@ -863,6 +833,7 @@ var (
 	ErrRetryNotRequired = errors.New("image retry: not required")
 	ErrRetryLazy        = errors.New("image retry: lazy")
 	ErrRetryNotFailed   = errors.New("image retry: not failed at adopted version")
+	ErrRetryRemoving    = errors.New("image retry: cleanup in progress")
 )
 
 // WarmupParamsForHost resolves `template.warmup` params for a MANUAL run on
@@ -1101,6 +1072,7 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 	}()
 
 	seen := make([]string, 0, len(imgs))
+	historyChanged := false
 	// clearKeys: (host,image) retry counters to drop once committed (reported
 	// ready/absent). Deferred past commit so a rolled-back reconcile never
 	// clears a counter for state that was never applied.
@@ -1134,7 +1106,19 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 			}
 			continue
 		}
+		imageHistoryChanged := false
 		if img.State == "ready" {
+			imageHistoryChanged, err = successfulVersionWouldChange(ctx, tx, hostID, img.ImageID, img.Version)
+			if err != nil {
+				if _, rollbackErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT image_report`); rollbackErr != nil {
+					return fmt.Errorf("rollback failed history read image=%s: %w", img.ImageID, rollbackErr)
+				}
+				if _, releaseErr := tx.Exec(ctx, `RELEASE SAVEPOINT image_report`); releaseErr != nil {
+					return fmt.Errorf("release failed history read image=%s: %w", img.ImageID, releaseErr)
+				}
+				e.log.Error("register images: history read failed; retaining other image reports", "host_id", hostID, "image_id", img.ImageID, "err", err)
+				continue
+			}
 			if err := recordSuccessfulVersion(ctx, tx, hostID, img.ImageID, img.Version); err != nil {
 				if _, rollbackErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT image_report`); rollbackErr != nil {
 					return fmt.Errorf("rollback failed history image=%s: %w", img.ImageID, rollbackErr)
@@ -1149,6 +1133,7 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 		if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT image_report`); err != nil {
 			return fmt.Errorf("release registered image=%s: %w", img.ImageID, err)
 		}
+		historyChanged = historyChanged || imageHistoryChanged
 		seen = append(seen, img.ImageID)
 		if img.State == "ready" || img.State == "absent" {
 			clearKeys = append(clearKeys, hostID+"|"+img.ImageID)
@@ -1167,6 +1152,9 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 		return fmt.Errorf("commit reconciliation: %w", err)
 	}
 	committed = true
+	if historyChanged && e.cleanup != nil {
+		e.cleanup.ManagedIdentityChanged(hostID)
+	}
 	e.observeSnapshot(hostID, seen)
 	for _, key := range clearKeys {
 		e.clearFailures(key)

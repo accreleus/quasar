@@ -539,6 +539,11 @@ export type ImageInstallRequest = Schemas["ImageInstallRequest"];
 /** `applied:false` (still 200) means a no-op, not an error. */
 export type ImageUpdateResult = Schemas["ImageUpdateResult"];
 
+export type HostImageCleanupView = Schemas["HostImageCleanupView"];
+export type HostImageCleanupCandidate = Schemas["HostImageCleanupCandidate"];
+export type HostImageCleanupRequest = Schemas["HostImageCleanupRequest"];
+export type HostImageCleanupAttempt = Schemas["HostImageCleanupAttempt"];
+
 /** `render_node` is a local addition, null until the agent reports it. The #383
  *  live-VRAM fields are generated and nullable — null means UNKNOWN, never zero. */
 export type GPUAvailability = Schemas["GPUAvailability"] & {

@@ -1537,7 +1537,11 @@ fn register_message(
     install: &crate::buildinfo::InstallFacts,
     home_cleanup_capable: bool,
     policy_available: bool,
+    image_mgr: Option<&ImageManager>,
 ) -> anyhow::Result<AgentMsg> {
+    let (image_versions_complete, image_versions) = image_mgr
+        .map(ImageManager::version_snapshot)
+        .unwrap_or((false, Vec::new()));
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1, "template_publish_permit": 1})),
         config_policy_versions: policy_available.then(||
@@ -1549,6 +1553,9 @@ fn register_message(
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
         images,
+        image_cleanup_v1: image_mgr.is_some_and(ImageManager::cleanup_capable),
+        image_versions_complete,
+        image_versions,
         source_commit: crate::buildinfo::source_commit().map(str::to_string),
         built_at: crate::buildinfo::built_at().map(str::to_string),
         install_mode: install.install_mode.map(|m| m.as_str().to_string()),
@@ -1750,6 +1757,7 @@ async fn diagnostic_connection(
                 &install,
                 false,
                 station.phase().policy_available(),
+                None,
             )?,
         )
         .await?;
@@ -1842,6 +1850,7 @@ async fn connect_and_run(
     // agent wrote `register` into a dead connection, and every reconnect repeated
     // the same probes into the same wall.
     let prep_started = Instant::now();
+    image_mgr.begin_connection();
 
     // agent-api.md: recorded images are verified against the docker daemon on startup
     // AND reconnect — an image `docker rmi`'d out from under a long-lived agent must
@@ -1905,6 +1914,7 @@ async fn connect_and_run(
                 &install,
                 sessions.mgr.home_cleanup.is_some(),
                 true,
+                Some(image_mgr),
             )?,
         )
         .await?;
@@ -2137,6 +2147,7 @@ async fn connect_and_run(
     let warmup_store = crate::session::warmup::resolve_store(&mgr.runtime_settings.home_root);
     let warmup_activity = Arc::new(crate::session::warmup::HostActivity::new());
     let warmup_control = Arc::new(crate::session::warmup::WarmupControl::new());
+    image_mgr.track_warmup_control(&warmup_control);
     if let Some(handle) = mgr.probe_handle.clone() {
         // A probe's own release fires this too; the scheduler ignores it when
         // nothing waits on the gate.
@@ -2307,6 +2318,7 @@ async fn connect_and_run(
 
             _ = hb_timer.tick() => {
                 image_mgr.flush_terminal_states();
+                image_mgr.maybe_refresh_version_inventory();
                 let ts_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4306,6 +4318,40 @@ impl SessionManager {
             ControlMsg::ImageRemove { id, image_id } => {
                 Some(self.image_mgr.handle_remove(id, image_id))
             }
+            ControlMsg::ImageInventoryReconcile { id, identities } => {
+                self.image_mgr.handle_inventory_reconcile(id, identities)
+            }
+            ControlMsg::ImageCleanup {
+                id,
+                attempt_id,
+                image_id,
+                version,
+                image_ref,
+                runtime_image_id,
+                expected_generation,
+            } => self.image_mgr.handle_cleanup(
+                id,
+                crate::images::cleanup_attempt(
+                    attempt_id,
+                    image_id,
+                    version,
+                    image_ref,
+                    runtime_image_id,
+                    expected_generation,
+                ),
+            ),
+            ControlMsg::ImageCleanupJournalRequest { id, attempt_ids } => Some(
+                self.image_mgr
+                    .handle_cleanup_journal_request(id, attempt_ids),
+            ),
+            ControlMsg::ImageCleanupStateAck {
+                id,
+                attempt_id,
+                generation,
+            } => Some(
+                self.image_mgr
+                    .handle_cleanup_state_ack(id, attempt_id, generation),
+            ),
             // Same shape as ImageEnsure: acks immediately, then downloads the context
             // and runs `docker build` on its own thread.
             ControlMsg::ImageBuild {
@@ -5701,6 +5747,7 @@ mod tests {
             &crate::buildinfo::InstallFacts::default(),
             true,
             true,
+            None,
         )
         .unwrap();
         let normal = serde_json::to_value(normal).unwrap();
@@ -5715,6 +5762,7 @@ mod tests {
                 &crate::buildinfo::InstallFacts::default(),
                 false,
                 station.phase().policy_available(),
+                None,
             )
             .unwrap();
             let diagnostic = serde_json::to_value(diagnostic).unwrap();

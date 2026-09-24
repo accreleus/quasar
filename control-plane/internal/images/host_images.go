@@ -87,6 +87,27 @@ func upsertHostImage(ctx context.Context, db dbExecutor, hostID, imageID, versio
 	return tag.RowsAffected() > 0, nil
 }
 
+// successfulVersionWouldChange reports whether a ready current adoption would
+// advance this host's retained version set. Call it in the same transaction as
+// recordSuccessfulVersion, then publish the identity change after commit.
+func successfulVersionWouldChange(ctx context.Context, db dbExecutor, hostID, imageID, version string) (bool, error) {
+	var currentVersion string
+	err := db.QueryRow(ctx, `SELECT current_version FROM host_image_success_history
+		WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&currentVersion)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if err == nil && currentVersion == version {
+		return false, nil
+	}
+	var matchingAdoption bool
+	if err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
+		WHERE image_id=$1 AND version=$2)`, imageID, version).Scan(&matchingAdoption); err != nil {
+		return false, err
+	}
+	return matchingAdoption, nil
+}
+
 // recordSuccessfulVersion advances retention history only for a current,
 // adopted immutable version the authenticated agent reports ready. The
 // identity includes frozen registry or template build inputs. A same-version
@@ -183,6 +204,19 @@ func hostHasImage(ctx context.Context, db dbExecutor, hostID, imageID, version s
 		return false, fmt.Errorf("read host_images host=%s image=%s: %w", hostID, imageID, err)
 	}
 	return ok, nil
+}
+
+// imageRemoving is the durable gate shared by operator Retry and delayed
+// preparation dispatch. Missing rows are idle until a cleanup attempt creates
+// its fence; a database error fails closed.
+func imageRemoving(ctx context.Context, db dbExecutor, hostID, imageID string) (bool, error) {
+	var removing bool
+	err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_image_operation_fences
+		WHERE host_id=$1::uuid AND image_id=$2 AND state='removing')`, hostID, imageID).Scan(&removing)
+	if err != nil {
+		return false, fmt.Errorf("read image operation fence host=%s image=%s: %w", hostID, imageID, err)
+	}
+	return removing, nil
 }
 
 // A normal reconciliation never restarts a failed current-version pull. Its
