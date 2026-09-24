@@ -104,9 +104,10 @@ type dbPool interface {
 
 // Ensurer implements agentws.ImageEvents and owns the ensure lifecycle.
 type Ensurer struct {
-	pool dbPool
-	disp Dispatcher
-	log  *slog.Logger
+	pool    dbPool
+	disp    Dispatcher
+	log     *slog.Logger
+	cleanup *CleanupService
 
 	ackTimeout  time.Duration
 	maxAttempts int
@@ -192,6 +193,9 @@ func (e *Ensurer) addWork() bool {
 func NewEnsurer(pool *pgxpool.Pool, disp Dispatcher, log *slog.Logger, opts ...EnsureOption) *Ensurer {
 	return newEnsurer(pool, disp, log, opts...)
 }
+
+// SetCleanupService wires post-commit success-history reconciliation.
+func (e *Ensurer) SetCleanupService(c *CleanupService) { e.cleanup = c }
 
 // newEnsurer is the real constructor, built against dbPool so tests can pass a
 // wrapper (e.g. one that fails mid-transaction, to prove the reconcile
@@ -689,7 +693,22 @@ func (e *Ensurer) AgentImageState(ctx context.Context, hostID string, m agentws.
 		e.log.Warn("image_state: unknown image_id dropped", "host_id", hostID, "image_id", m.ImageID)
 		return
 	}
+	historyChanged := false
 	if m.State == "ready" {
+		var previousVersion string
+		historyErr := tx.QueryRow(ctx, `SELECT current_version FROM host_image_success_history
+			WHERE host_id=$1::uuid AND image_id=$2`, hostID, m.ImageID).Scan(&previousVersion)
+		if historyErr != nil && !errors.Is(historyErr, pgx.ErrNoRows) {
+			e.log.Error("image_state: read history failed", "host_id", hostID, "image_id", m.ImageID, "err", historyErr)
+			return
+		}
+		var matchingAdoption bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
+			WHERE image_id=$1 AND version=$2)`, m.ImageID, m.Version).Scan(&matchingAdoption); err != nil {
+			e.log.Error("image_state: read adoption failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
+			return
+		}
+		historyChanged = matchingAdoption && (errors.Is(historyErr, pgx.ErrNoRows) || previousVersion != m.Version)
 		if err := recordSuccessfulVersion(ctx, tx, hostID, m.ImageID, m.Version); err != nil {
 			e.log.Error("image_state: history failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
 			return
@@ -698,6 +717,9 @@ func (e *Ensurer) AgentImageState(ctx context.Context, hostID string, m agentws.
 	if err := tx.Commit(ctx); err != nil {
 		e.log.Error("image_state: commit failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
 		return
+	}
+	if historyChanged && e.cleanup != nil {
+		e.cleanup.ManagedIdentityChanged(hostID)
 	}
 	e.observeImage(hostID, m.ImageID)
 

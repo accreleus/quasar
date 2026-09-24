@@ -122,7 +122,8 @@ type Store struct {
 	// ensure is the seam onto the ensure orchestrator, used by install/update
 	// and the auto update policy. nil is legitimate (no agent registry wired):
 	// dispatch no-ops and adoption rows are still written, same as a lazy install.
-	ensure Ensure
+	ensure  Ensure
+	cleanup *CleanupService
 
 	// imageSourceHosts is the image-source host allowlist
 	// (QUASAR_IMAGE_REGISTRY_HOSTS, allowedHostsFromEnv in digest.go), held here
@@ -210,6 +211,9 @@ func (s *Store) SetLogger(l *slog.Logger) {
 // SetEnsurer wires the ensure orchestrator, from main after both are built
 // (the Ensurer needs the agent registry, the Store does not).
 func (s *Store) SetEnsurer(e Ensure) { s.ensure = e }
+
+// SetCleanupService wires post-commit managed-identity reconciliation.
+func (s *Store) SetCleanupService(c *CleanupService) { s.cleanup = c }
 
 // SetOnSyncSuccess wires the post-sync provider reconciler hook (see the
 // onSyncSuccess field). nil is fine — Sync simply skips it.

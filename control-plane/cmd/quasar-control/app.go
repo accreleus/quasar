@@ -792,6 +792,8 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesCleanup := images.NewCleanupService(pool, agentRegistry)
 	imagesCleanup.SetEnsurer(imagesEnsurer)
 	imagesCleanup.SetAuditor(auditStore)
+	imagesStore.SetCleanupService(imagesCleanup)
+	imagesEnsurer.SetCleanupService(imagesCleanup)
 	go imagesCleanup.RunRetention(janitorCtx)
 	imagesHandler.SetCleanupService(imagesCleanup)
 	crudHandler.SetImageReconciler(imagesEnsurer.EnsureAll)

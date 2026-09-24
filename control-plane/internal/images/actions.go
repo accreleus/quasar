@@ -174,6 +174,9 @@ func (s *Store) Install(ctx context.Context, id string, lazy bool) (CatalogImage
 	if err := tx.Commit(ctx); err != nil {
 		return CatalogImage{}, fmt.Errorf("commit install id=%q: %w", id, err)
 	}
+	if s.cleanup != nil {
+		s.cleanup.ManagedIdentitiesChanged()
+	}
 
 	// Dispatch only after commit: an ensure for a row that then failed to commit
 	// would put images on hosts this instance has no record of wanting.
@@ -240,6 +243,9 @@ func (s *Store) Uninstall(ctx context.Context, id string) error {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit uninstall id=%q: %w", id, err)
+	}
+	if s.cleanup != nil {
+		s.cleanup.ManagedIdentitiesChanged()
 	}
 
 	return nil
@@ -367,6 +373,9 @@ func (s *Store) Update(ctx context.Context, id string) (applied bool, img Catalo
 
 	if err := tx.Commit(ctx); err != nil {
 		return false, CatalogImage{}, fmt.Errorf("commit update id=%q: %w", id, err)
+	}
+	if s.cleanup != nil {
+		s.cleanup.ManagedIdentitiesChanged()
 	}
 
 	// A lazy adoption re-ensures to nothing: EnsureImage reads the non-lazy set,

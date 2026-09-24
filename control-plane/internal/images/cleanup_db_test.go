@@ -758,6 +758,291 @@ func TestCleanupRepeatedDuplicatePOSTsBoundStalledReconcile(t *testing.T) {
 	}
 }
 
+func TestCleanupHistoryIdentityChangeDuringAndAfterFlightGetsFreshScan(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-history-change-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+			RuntimeImageID: "sha256:history-current", State: "present"}}}
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	var first agentws.ImageInventoryReconcileCmd
+	select {
+	case first = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first scan missing")
+	}
+	oldRef := "sha256:history-old"
+	if _, err := env.pool.Exec(context.Background(), `INSERT INTO host_image_success_history
+		(host_id,image_id,current_version,current_identity,previous_version,previous_identity,verified_at)
+		VALUES($1::uuid,$2,$3,jsonb_build_object('registry_ref',$4::text),$5,jsonb_build_object('registry_ref',$6::text),now())`,
+		host, imgID, imgVer2, imgDigest2, imgVer, oldRef); err != nil {
+		t.Fatal(err)
+	}
+	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("changed history started concurrent scan: %+v", extra)
+	default:
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 1, first.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	var second agentws.ImageInventoryReconcileCmd
+	select {
+	case second = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("changed history was dropped during flight")
+	}
+	contains := func(cmd agentws.ImageInventoryReconcileCmd, version, ref string) bool {
+		for _, identity := range cmd.Identities {
+			if identity.ImageID == imgID && identity.Version == version && identity.ImageRef == ref {
+				return true
+			}
+		}
+		return false
+	}
+	if !contains(second, imgVer, oldRef) {
+		t.Fatalf("follow-up omitted previous success: %+v", second.Identities)
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 2, second.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	newOldRef := "sha256:history-older"
+	if _, err := env.pool.Exec(context.Background(), `UPDATE host_image_success_history
+		SET previous_version='v0',previous_identity=jsonb_build_object('registry_ref',$3::text)
+		WHERE host_id=$1::uuid AND image_id=$2`, host, imgID, newOldRef); err != nil {
+		t.Fatal(err)
+	}
+	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	select {
+	case third := <-env.cleanupWire.inventoryRequests:
+		if !contains(third, "v0", newOldRef) {
+			t.Fatalf("post-completion scan omitted changed history: %+v", third.Identities)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("post-completion history change did not scan")
+	}
+}
+
+func TestCleanupAdoptionWritersReconcileManagedIdentitySet(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-adoption-hook-host")
+	host := hosts[0]
+	seedCatalogDigest(t, env.pool, imgVer, imgRef)
+	env.store.SetCleanupService(env.cleanup)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{}}
+	env.cleanupWire.set(host, snapshot)
+	if _, err := env.store.Install(context.Background(), imgID, true); err != nil {
+		t.Fatal(err)
+	}
+	var installed agentws.ImageInventoryReconcileCmd
+	select {
+	case installed = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("install did not reconcile")
+	}
+	found := false
+	for _, identity := range installed.Identities {
+		if identity.ImageID == imgID && identity.Version == imgVer && identity.ImageRef == imgRef {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("install identity missing: %+v", installed.Identities)
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 1, installed.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	if _, err := env.pool.Exec(context.Background(), `UPDATE image_catalog SET version=$2,registry_digest=$3 WHERE id=$1`,
+		imgID, imgVer2, imgDigest2); err != nil {
+		t.Fatal(err)
+	}
+	if applied, _, err := env.store.Update(context.Background(), imgID); err != nil || !applied {
+		t.Fatalf("update adoption: applied=%t err=%v", applied, err)
+	}
+	var updated agentws.ImageInventoryReconcileCmd
+	select {
+	case updated = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("update did not reconcile")
+	}
+	found = false
+	for _, identity := range updated.Identities {
+		if identity.ImageID == imgID && identity.Version == imgVer2 && identity.ImageRef == imgDigest2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("updated adoption identity missing: %+v", updated.Identities)
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 2, updated.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	if err := env.store.Uninstall(context.Background(), imgID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case uninstalled := <-env.cleanupWire.inventoryRequests:
+		for _, identity := range uninstalled.Identities {
+			if identity.ImageID == imgID {
+				t.Fatalf("uninstall retained adoption identity: %+v", uninstalled.Identities)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("uninstall did not reconcile")
+	}
+}
+
+func TestCleanupReadyHistoryWriterQueuesFollowupDuringScan(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-ready-history-hook-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.ens.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+	env.ens.SetCleanupService(env.cleanup)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{{ImageID: imgID, Version: imgVer, ImageRef: imgRef,
+			RuntimeImageID: "sha256:ready-old", State: "present"}}}
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	var first agentws.ImageInventoryReconcileCmd
+	select {
+	case first = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first scan missing")
+	}
+	if _, err := env.pool.Exec(context.Background(), `UPDATE installed_images SET version=$2,registry_ref=$3 WHERE image_id=$1`,
+		imgID, imgVer2, imgDigest2); err != nil {
+		t.Fatal(err)
+	}
+	env.ens.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer2, State: "ready"})
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("ready report started concurrent scan: %+v", extra)
+	default:
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 1, first.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	var second agentws.ImageInventoryReconcileCmd
+	select {
+	case second = <-env.cleanupWire.inventoryRequests:
+		old, current := false, false
+		for _, identity := range second.Identities {
+			if identity.ImageID == imgID && identity.Version == imgVer && identity.ImageRef == imgRef {
+				old = true
+			}
+			if identity.ImageID == imgID && identity.Version == imgVer2 && identity.ImageRef == imgDigest2 {
+				current = true
+			}
+		}
+		if !old || !current {
+			t.Fatalf("history follow-up missing old/current identities: %+v", second.Identities)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ready history change did not trigger follow-up")
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 2, second.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	env.ens.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer2, State: "ready"})
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("unchanged ready replay triggered new scan: %+v", extra)
+	default:
+	}
+}
+
+func TestCleanupIncompleteRepliesKeepBoundedSameAttemptFlight(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-incomplete-flight-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+			RuntimeImageID: "sha256:incomplete", State: "present"}}}
+	env.cleanupWire.set(host, snapshot)
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:incomplete","expected_generation":"0"}`
+	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+		t.Fatalf("initial POST = %d %s", code, body)
+	}
+	var first agentws.ImageInventoryReconcileCmd
+	select {
+	case first = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first scan missing")
+	}
+	snapshot.Complete, snapshot.ReconciledRevision, snapshot.ReconciledRequestID = false, 1, first.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	for range 50 {
+		if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+			t.Fatalf("incomplete duplicate POST = %d %s", code, body)
+		}
+	}
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("incomplete reply multiplied scan: %+v", extra)
+	default:
+	}
+	env.cleanup.mu.Lock()
+	flight := env.cleanup.reconcileFlights[host]
+	flight.startedAt = time.Now().Add(-31 * time.Second)
+	env.cleanup.reconcileFlights[host] = flight
+	env.cleanup.mu.Unlock()
+	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+		t.Fatalf("bounded retry = %d %s", code, body)
+	}
+	var second agentws.ImageInventoryReconcileCmd
+	select {
+	case second = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bounded retry missing")
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 2, second.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	env.cleanup.mu.Lock()
+	flight = env.cleanup.reconcileFlights[host]
+	flight.startedAt = time.Now().Add(-31 * time.Second)
+	env.cleanup.reconcileFlights[host] = flight
+	env.cleanup.mu.Unlock()
+	for range 50 {
+		if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+			t.Fatalf("exhausted incomplete POST = %d %s", code, body)
+		}
+	}
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("incomplete replies escaped retry bound: %+v", extra)
+	default:
+	}
+}
+
+func TestCleanupUnadoptedReadyReportDoesNotStartManagedScan(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-unadopted-ready-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	env.ens.SetCleanupService(env.cleanup)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 1)
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{}})
+	env.ens.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+	select {
+	case scan := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("unadopted ready report started managed scan: %+v", scan)
+	default:
+	}
+}
+
 func TestCleanupReconcileSendFailureKeepsProofClosedUntilRetry(t *testing.T) {
 	env, hosts := newActionsEnv(t, "cleanup-send-failure-host")
 	host := hosts[0]

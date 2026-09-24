@@ -3,6 +3,7 @@ package images
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -42,11 +43,16 @@ type CleanupService struct {
 	freshReconcile     map[string]cleanupReconcileGate
 	reconcileEpoch     map[string]uint64
 	reconcileFlights   map[string]cleanupReconcileFlight
+	hostTriggerRunning map[string]bool
+	hostTriggerDirty   map[string]bool
+	sweepRunning       bool
+	sweepDirty         bool
 }
 
 type cleanupReconcileFlight struct {
 	connectionID string
 	requestID    string
+	identities   string
 	startedAt    time.Time
 	retries      int
 	followup     bool
@@ -77,7 +83,8 @@ type pendingCleanupJournal struct {
 func NewCleanupService(pool *pgxpool.Pool, wire CleanupTransport) *CleanupService {
 	return &CleanupService{pool: pool, wire: wire, journalRequests: make(map[string]pendingCleanupJournal),
 		inventorySnapshots: make(map[string]trackedCleanupInventory), freshReconcile: make(map[string]cleanupReconcileGate),
-		reconcileEpoch: make(map[string]uint64), reconcileFlights: make(map[string]cleanupReconcileFlight)}
+		reconcileEpoch: make(map[string]uint64), reconcileFlights: make(map[string]cleanupReconcileFlight),
+		hostTriggerRunning: make(map[string]bool), hostTriggerDirty: make(map[string]bool)}
 }
 
 func (s *CleanupService) SetEnsurer(e interface {
@@ -607,6 +614,77 @@ func (s *CleanupService) bumpInventoryFences(ctx context.Context, hostID string)
 	}
 }
 
+// ManagedIdentitiesChanged schedules one bounded fleet sweep after an adoption
+// commits. Repeated actions coalesce; offline hosts refresh on registration.
+func (s *CleanupService) ManagedIdentitiesChanged() {
+	s.mu.Lock()
+	if s.sweepRunning {
+		s.sweepDirty = true
+		s.mu.Unlock()
+		return
+	}
+	s.sweepRunning = true
+	s.mu.Unlock()
+	go func() {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			rows, err := s.pool.Query(ctx, `SELECT id::text FROM hosts`)
+			if err == nil {
+				var hosts []string
+				for rows.Next() {
+					var id string
+					if rows.Scan(&id) == nil {
+						hosts = append(hosts, id)
+					}
+				}
+				rows.Close()
+				for _, hostID := range hosts {
+					s.ManagedIdentityChanged(hostID)
+				}
+			}
+			cancel()
+			s.mu.Lock()
+			if !s.sweepDirty {
+				s.sweepRunning = false
+				s.mu.Unlock()
+				return
+			}
+			s.sweepDirty = false
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// ManagedIdentityChanged schedules a host-specific history refresh without
+// blocking the agent WebSocket reader. At most one worker runs per host.
+func (s *CleanupService) ManagedIdentityChanged(hostID string) {
+	s.mu.Lock()
+	if s.hostTriggerRunning[hostID] {
+		s.hostTriggerDirty[hostID] = true
+		s.mu.Unlock()
+		return
+	}
+	s.hostTriggerRunning[hostID] = true
+	s.mu.Unlock()
+	go func() {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if snap, connected := s.wire.ImageCleanupSnapshot(hostID); connected && snap.Capable {
+				s.ImageCleanupRegistered(ctx, hostID)
+			}
+			cancel()
+			s.mu.Lock()
+			if !s.hostTriggerDirty[hostID] {
+				delete(s.hostTriggerRunning, hostID)
+				s.mu.Unlock()
+				return
+			}
+			delete(s.hostTriggerDirty, hostID)
+			s.mu.Unlock()
+		}
+	}()
+}
+
 func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID string) {
 	s.mu.Lock()
 	startedEpoch := s.reconcileEpoch[hostID]
@@ -641,6 +719,20 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 	if rowsErr != nil {
 		return
 	}
+	sort.Slice(identities, func(i, j int) bool {
+		if identities[i].ImageID != identities[j].ImageID {
+			return identities[i].ImageID < identities[j].ImageID
+		}
+		if identities[i].Version != identities[j].Version {
+			return identities[i].Version < identities[j].Version
+		}
+		return identities[i].ImageRef < identities[j].ImageRef
+	})
+	identityJSON, err := json.Marshal(identities)
+	if err != nil {
+		return
+	}
+	identitySet := string(identityJSON)
 	id, err := newCmdID()
 	if err != nil {
 		return
@@ -654,12 +746,12 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 	}
 	retries := 0
 	if flight, inFlight := s.reconcileFlights[hostID]; inFlight && flight.connectionID == snap.ConnectionID &&
-		snap.ReconciledRequestID != flight.requestID {
+		(!snap.Complete || snap.ReconciledRequestID != flight.requestID) {
 		if time.Since(flight.startedAt) < 30*time.Second || flight.retries >= 1 {
 			// The scan is already running on this connection. A new attempt
 			// needs a follow-up scan after it completes, but repeated HTTP
 			// retries must not spawn unbounded daemon scans.
-			if s.freshReconcile[hostID].requestID != flight.requestID {
+			if s.freshReconcile[hostID].requestID != flight.requestID || identitySet != flight.identities {
 				flight.followup = true
 				s.reconcileFlights[hostID] = flight
 			}
@@ -682,7 +774,7 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 	// older daemon scan on this same connection.
 	s.invalidateReconcileLocked(hostID, snap, id)
 	s.reconcileFlights[hostID] = cleanupReconcileFlight{connectionID: snap.ConnectionID,
-		requestID: id, startedAt: time.Now(), retries: retries}
+		requestID: id, identities: identitySet, startedAt: time.Now(), retries: retries}
 	// Lock order invariant: Registry enqueue must remain nonblocking and must
 	// never call back into CleanupService while s.mu is held. Keep gate and
 	// enqueue in one critical section so an older query cannot send last.
@@ -766,7 +858,7 @@ func (s *CleanupService) ImageVersionsChanged(ctx context.Context, hostID string
 	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
 	followup := false
 	s.mu.Lock()
-	if flight, ok := s.reconcileFlights[hostID]; ok && connected &&
+	if flight, ok := s.reconcileFlights[hostID]; ok && connected && snap.Complete &&
 		flight.connectionID == snap.ConnectionID && flight.requestID == snap.ReconciledRequestID {
 		delete(s.reconcileFlights, hostID)
 		followup = flight.followup || s.freshReconcile[hostID].requestID == ""
