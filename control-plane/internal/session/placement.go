@@ -145,7 +145,25 @@ func imageReadySQL(refIdx int) string {
 		                     AND f.state = 'removing'
 		              )
 		       )
-		)`, refIdx)
+		) %s`, refIdx, imageCleanupIdentityFenceSQL(refIdx))
+}
+
+// Active cleanup of a catalog-pruned/uninstalled managed version is still an
+// image availability gate. Its exact ref survives in the durable attempt or
+// successful-version history, even after installed_images disappears. This is
+// rendered in every candidacy query, including the totals probe that decides
+// no_host_available versus capacity_exhausted.
+func imageCleanupIdentityFenceSQL(refIdx int) string {
+	return fmt.Sprintf(`AND NOT EXISTS (
+		SELECT 1 FROM host_image_operation_fences f
+		WHERE f.host_id=g.host_id AND f.state='removing'
+		AND (EXISTS(SELECT 1 FROM host_image_cleanup_attempts a
+			WHERE a.host_id=f.host_id AND a.image_id=f.image_id AND a.image_ref=$%[1]d)
+		OR EXISTS(SELECT 1 FROM host_image_success_history h
+			WHERE h.host_id=f.host_id AND h.image_id=f.image_id
+			AND (COALESCE(NULLIF(h.current_identity->>'registry_ref',''),NULLIF(h.current_identity->>'local_tag',''))=$%[1]d
+				OR COALESCE(NULLIF(h.previous_identity->>'registry_ref',''),NULLIF(h.previous_identity->>'local_tag',''))=$%[1]d)))
+	)`, refIdx)
 }
 
 // StoreOption configures a Store at construction.

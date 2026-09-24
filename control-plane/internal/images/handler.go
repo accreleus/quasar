@@ -68,6 +68,29 @@ func (h *Handler) Register(mux httpx.Router, admin func(http.Handler) http.Handl
 	mux.Handle("POST /v1/admin/hosts/{id}/images/{image_id}/retry", admin(http.HandlerFunc(h.handleRetry)))
 	mux.Handle("GET /v1/admin/hosts/{id}/images/cleanup", admin(http.HandlerFunc(h.handleCleanupPreview)))
 	mux.Handle("POST /v1/admin/hosts/{id}/images/cleanup", admin(http.HandlerFunc(h.handleCleanupRequest)))
+	mux.Handle("GET /v1/admin/hosts/{id}/images/cleanup/attempts/{attempt_id}", admin(http.HandlerFunc(h.handleCleanupAttempt)))
+}
+
+func (h *Handler) handleCleanupAttempt(w http.ResponseWriter, r *http.Request) {
+	hostID, attemptID := r.PathValue("id"), r.PathValue("attempt_id")
+	if !hostUUID.MatchString(hostID) || !hostUUID.MatchString(attemptID) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid host or attempt ID")
+		return
+	}
+	if h.cleanup == nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "image cleanup unavailable")
+		return
+	}
+	attempt, err := h.cleanup.Attempt(r.Context(), hostID, attemptID)
+	switch {
+	case errors.Is(err, errCleanupNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "cleanup attempt not found")
+	case err != nil:
+		slog.Error("read image cleanup attempt", "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read image cleanup attempt")
+	default:
+		httpx.WriteJSON(w, http.StatusOK, attempt)
+	}
 }
 
 func (h *Handler) handleCleanupPreview(w http.ResponseWriter, r *http.Request) {

@@ -16,8 +16,25 @@ func lockRequiredImageFence(ctx context.Context, tx pgx.Tx, hostID, imageRef str
 	if imageRef == "" {
 		return true, nil
 	}
-	rows, err := tx.Query(ctx, `SELECT image_id FROM installed_images
-		WHERE registry_ref=$1 OR local_tag=$1 ORDER BY image_id`, imageRef)
+	// Serialize a launch with a cleanup POST even when the catalog/adoption
+	// rows were pruned. POST and requirement writers take this same ref lock
+	// before the image fence row, so no new removing fence can appear after a
+	// launch has concluded that there is no managed mapping.
+	// Shared mode lets independent launches of the same app proceed together;
+	// cleanup and requirement writers take exclusive mode.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(4,hashtext($1::text))`, imageRef); err != nil {
+		return false, fmt.Errorf("lock managed image ref: %w", err)
+	}
+	rows, err := tx.Query(ctx, `SELECT DISTINCT image_id FROM (
+		SELECT image_id FROM installed_images WHERE registry_ref=$1 OR local_tag=$1
+		UNION ALL SELECT image_id FROM host_image_cleanup_attempts
+		WHERE host_id=$2::uuid AND image_ref=$1
+		UNION ALL SELECT image_id FROM host_image_success_history
+		WHERE host_id=$2::uuid AND (
+			COALESCE(NULLIF(current_identity->>'registry_ref',''),NULLIF(current_identity->>'local_tag',''))=$1
+			OR COALESCE(NULLIF(previous_identity->>'registry_ref',''),NULLIF(previous_identity->>'local_tag',''))=$1
+		)
+	) managed ORDER BY image_id`, imageRef, hostID)
 	if err != nil {
 		return false, fmt.Errorf("resolve managed image fence: %w", err)
 	}
@@ -49,5 +66,16 @@ func lockRequiredImageFence(ctx context.Context, tx pgx.Tx, hostID, imageRef str
 			return false, nil
 		}
 	}
-	return true, nil
+	// The scheduler's first readiness read can precede a terminal cleanup
+	// transaction. Re-read after acquiring the fence: that transaction may
+	// have released the fence and demoted the exact ready row while we waited.
+	var ready bool
+	if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(
+		SELECT 1 FROM installed_images ii WHERE (ii.registry_ref=$1 OR ii.local_tag=$1)
+		AND NOT EXISTS(SELECT 1 FROM host_images hi WHERE hi.host_id=$2::uuid AND hi.image_id=ii.image_id
+			AND hi.state='ready' AND (hi.version='' OR hi.version=ii.version))
+	)`, imageRef, hostID).Scan(&ready); err != nil {
+		return false, fmt.Errorf("recheck managed image readiness: %w", err)
+	}
+	return ready, nil
 }

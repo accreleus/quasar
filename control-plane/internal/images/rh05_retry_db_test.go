@@ -40,6 +40,12 @@ func TestRH05OperatorRetryCoalescesAndRequiresCurrentFailure(t *testing.T) {
 	if got := env.fleet.waitEnsure(t); got.HostID != host || got.ImageID != imgID {
 		t.Fatalf("retry dispatched %+v", got)
 	}
+	// The agent accepted the command, but has not reported image_state yet.
+	// A later operator request must still join this same physical attempt.
+	if code, _ := env.do(t, http.MethodPost, route, ""); code != http.StatusAccepted {
+		t.Fatalf("retry before image_state: %d", code)
+	}
+	env.ens.Wait()
 	env.fleet.noMoreEnsures(t, 30*time.Millisecond)
 	if code, body := env.do(t, http.MethodPost, "/v1/admin/hosts/"+hosts[1]+"/images/"+imgID+"/retry", ""); code != http.StatusConflict || !strings.Contains(string(body), "Image is not required on this host") {
 		t.Fatalf("unselected retry: %d %s", code, body)

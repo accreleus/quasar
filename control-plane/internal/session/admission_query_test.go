@@ -26,6 +26,9 @@ func withoutRH05Restriction(s string) string {
 	// historical SQL capture predates that gate; its exact predicate is checked
 	// separately below before removing it for the legacy comparison.
 	s = strings.ReplaceAll(s, normSQL(imageCleanupFencePredicate), "")
+	for idx := 1; idx <= 32; idx++ {
+		s = strings.ReplaceAll(s, normSQL(imageCleanupIdentityFenceSQL(idx)), "")
+	}
 	return normSQL(placementAnchorGate.ReplaceAllString(s, ""))
 }
 
@@ -187,6 +190,9 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 		for _, s := range sqls {
 			if strings.Contains(s, "host_images hi") && !strings.Contains(s, normSQL(imageCleanupFencePredicate)) {
 				t.Fatalf("%s managed-image query omitted the cleanup fence", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "FROM host_image_cleanup_attempts a") {
+				t.Fatalf("%s managed-image query omitted durable exact-ref cleanup fence", shape)
 			}
 			if !strings.Contains(s, normSQL(unrestrictedHostSQL)) {
 				t.Fatalf("%s query omitted the RH05 owner restriction", shape)

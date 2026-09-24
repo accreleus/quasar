@@ -219,6 +219,115 @@ func TestLaunchWaitsForConcurrentImageCleanupFence(t *testing.T) {
 	}
 }
 
+// A cleanup attempt survives adoption and catalog pruning. An app can still
+// launch that exact ref, so its reservation must wait for the durable fence.
+func TestLaunchWaitsForPrunedImageCleanupFence(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 2)
+	setQuota(t, pool, s.userID, 20)
+	installCatalogImage(t, pool, false)
+	setAppImage(t, pool, s.appID, testImageRef)
+	setHostImage(t, pool, s.hostID, "ready", testImageVer)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `DELETE FROM installed_images; DELETE FROM image_catalog`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_image_operation_fences(host_id,image_id,state,generation)
+		VALUES($1::uuid,$2,'idle',1)`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_image_cleanup_attempts
+		(id,host_id,image_id,version,image_ref,runtime_image_id,generation,state,created_at,updated_at)
+		VALUES('22222222-2222-4222-8222-222222222222',$1::uuid,$2,$3,$4,'sha256:daemon',1,'removing',now(),now())`,
+		s.hostID, testImageID, testImageVer, testImageRef); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE host_image_operation_fences SET state='removing'
+		WHERE host_id=$1::uuid AND image_id=$2`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef))
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("pruned-image launch escaped uncommitted cleanup fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNoHostAvailable) {
+			t.Fatalf("pruned-image launch after cleanup committed = %v, want no host available", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pruned-image launch did not finish after cleanup committed")
+	}
+}
+
+func TestLaunchRechecksReadinessAfterCleanupReleasesFence(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 2)
+	setQuota(t, pool, s.userID, 20)
+	installCatalogImage(t, pool, false)
+	setAppImage(t, pool, s.appID, testImageRef)
+	setHostImage(t, pool, s.hostID, "ready", testImageVer)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO host_image_operation_fences(host_id,image_id,state)
+		VALUES($1::uuid,$2,'idle')`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE host_image_operation_fences SET state='removing'
+		WHERE host_id=$1::uuid AND image_id=$2`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE host_images SET state='failed' WHERE host_id=$1::uuid AND image_id=$2`,
+		s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE host_image_operation_fences SET state='idle'
+		WHERE host_id=$1::uuid AND image_id=$2`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef))
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("launch escaped uncommitted cleanup outcome: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNoHostAvailable) {
+			t.Fatalf("launch used stale ready row after cleanup failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("launch did not finish after cleanup outcome committed")
+	}
+}
+
 func TestLaunchLocksEveryManagedImageIDSharingAReference(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)

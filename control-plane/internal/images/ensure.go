@@ -459,10 +459,13 @@ func (e *Ensurer) runEnsure(hostID, imageID string, _ installedImage, force bool
 		e.closeRetry(hostID + "|" + imageID)
 		return
 	}
-	e.sendEnsure(hostID, cur)
-	// Coalesce requests through dispatch acceptance, then permit another
-	// explicit Retry if an accepted agent never reports image_state.
-	e.closeRetry(hostID + "|" + imageID)
+	if !e.sendEnsure(hostID, cur) {
+		// A definite rejection or undeliverable command did not start work.
+		// The operator may retry once that failed dispatch has drained.
+		e.closeRetry(hostID + "|" + imageID)
+	}
+	// Acceptance starts one physical attempt. The failed DB row is still
+	// current until the agent reports image_state, so keep Retry coalesced.
 }
 
 func (e *Ensurer) closeRetry(key string) {

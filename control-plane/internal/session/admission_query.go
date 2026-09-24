@@ -96,8 +96,8 @@ func (c candidacy) codecGate(a *argset, lead string) string {
 }
 
 // imageGate excludes hosts that do not have the app's MANAGED image ready.
-// Empty for an app with no image reference; inert for any image that is not an
-// installed catalog entry — see imageReadySQL.
+// Empty for an app with no image reference; an uninstalled ref is inert unless
+// a durable exact-identity cleanup fence is removing it — see imageReadySQL.
 func (c candidacy) imageGate(a *argset, lead string) string {
 	if c.p.AppImage == "" {
 		return ""

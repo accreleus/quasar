@@ -36,7 +36,7 @@ type CleanupService struct {
 	}
 	auditor            audit.Recorder
 	mu                 sync.Mutex
-	journalRequests    map[string]map[string]bool
+	journalRequests    map[string]pendingCleanupJournal
 	inventorySnapshots map[string]trackedCleanupInventory
 }
 
@@ -46,8 +46,15 @@ type trackedCleanupInventory struct {
 	versions     map[string]string
 }
 
+type pendingCleanupJournal struct {
+	hostID       string
+	connectionID string
+	requested    map[string]bool
+	createdAt    time.Time
+}
+
 func NewCleanupService(pool *pgxpool.Pool, wire CleanupTransport) *CleanupService {
-	return &CleanupService{pool: pool, wire: wire, journalRequests: make(map[string]map[string]bool),
+	return &CleanupService{pool: pool, wire: wire, journalRequests: make(map[string]pendingCleanupJournal),
 		inventorySnapshots: make(map[string]trackedCleanupInventory)}
 }
 
@@ -154,6 +161,37 @@ func (s *CleanupService) Preview(ctx context.Context, hostID string) (CleanupVie
 	return view, nil
 }
 
+// Attempt reads only the durable control-plane record. It never infers a
+// physical outcome from preview inventory or contacts the agent.
+func (s *CleanupService) Attempt(ctx context.Context, hostID, attemptID string) (CleanupAttempt, error) {
+	var a CleanupAttempt
+	var generation int64
+	err := s.pool.QueryRow(ctx, `SELECT id::text,image_id,version,image_ref,runtime_image_id,generation,state,reason
+		FROM host_image_cleanup_attempts WHERE id=$1::uuid AND host_id=$2::uuid`, attemptID, hostID).Scan(
+		&a.AttemptID, &a.ImageID, &a.Version, &a.ImageRef, &a.RuntimeImageID, &generation, &a.State, &a.Reason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return a, errCleanupNotFound
+	}
+	if err != nil {
+		return a, err
+	}
+	a.Generation = strconv.FormatInt(generation, 10)
+	a.Reason = safeStoredCleanupReason(a.Reason)
+	return a, nil
+}
+
+func safeStoredCleanupReason(reason *string) *string {
+	if reason == nil {
+		return nil
+	}
+	switch *reason {
+	case "identity_mismatch", "inventory_unknown", "reference_in_use", "operation_busy", "unsupported", "image_still_present":
+		return reason
+	default:
+		return nil
+	}
+}
+
 // candidate is intentionally the same blocker computation for GET and POST.
 // POST calls it with a transaction holding the target fence FOR UPDATE.
 func (s *CleanupService) candidate(ctx context.Context, db dbExecutor, hostID string, v agentws.ImageVersionEntry) (CleanupCandidate, error) {
@@ -204,10 +242,9 @@ func (s *CleanupService) candidate(ctx context.Context, db dbExecutor, hostID st
 		SELECT 1 FROM job_runs jr WHERE jr.host_id=$1::uuid AND jr.state IN ('pending','running')
 		AND jr.job_id LIKE 'template.%' AND (jr.params->>'image_id'=$3 OR jr.params->>'image_id' IS NULL)
 	), EXISTS(
-		SELECT 1 FROM host_image_success_history h WHERE h.host_id=$1::uuid AND h.image_id=$3
-		AND h.previous_version=$4 AND
+		SELECT 1 FROM host_image_success_history h WHERE h.host_id=$1::uuid AND
 		COALESCE(NULLIF(h.previous_identity->>'registry_ref',''),NULLIF(h.previous_identity->>'local_tag',''))=$2
-	)`, hostID, v.ImageRef, v.ImageID, v.Version).Scan(&required, &containerSession, &pendingLaunch, &pendingImage, &pendingTemplate, &previous)
+	)`, hostID, v.ImageRef, v.ImageID).Scan(&required, &containerSession, &pendingLaunch, &pendingImage, &pendingTemplate, &previous)
 	if err != nil {
 		return c, err
 	}
@@ -334,6 +371,7 @@ func (s *CleanupService) Request(ctx context.Context, hostID string, req Cleanup
 	if err == nil {
 		zero.ImageID, zero.Version, zero.ImageRef, zero.RuntimeImageID = req.ImageID, req.Version, req.ImageRef, req.RuntimeImageID
 		zero.Generation = strconv.FormatInt(oldGen, 10)
+		zero.Reason = safeStoredCleanupReason(zero.Reason)
 		status := 202
 		if zero.State == "removed" {
 			status = 200
@@ -537,6 +575,10 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 // Every unresolved attempt must be reconciled from the complete durable
 // journal, including missing-ID retirement proof before an absent result.
 func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID string) {
+	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
+	if !connected || !snap.Capable {
+		return
+	}
 	rows, err := s.pool.Query(ctx, `SELECT id::text FROM host_image_cleanup_attempts
 		WHERE host_id=$1::uuid AND state IN ('removing','unknown')`, hostID)
 	if err != nil {
@@ -557,7 +599,13 @@ func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID strin
 				requested[attemptID] = true
 			}
 			s.mu.Lock()
-			s.journalRequests[id] = requested
+			for oldID, old := range s.journalRequests {
+				if old.hostID == hostID || time.Since(old.createdAt) > 10*time.Minute {
+					delete(s.journalRequests, oldID)
+				}
+			}
+			s.journalRequests[id] = pendingCleanupJournal{hostID: hostID, connectionID: snap.ConnectionID,
+				requested: requested, createdAt: time.Now()}
 			s.mu.Unlock()
 			if s.wire.SendImageCleanupJournalRequest(hostID, agentws.ImageCleanupJournalRequestCmd{ID: id, AttemptIDs: ids}) != nil {
 				s.mu.Lock()
@@ -637,17 +685,23 @@ func (s *CleanupService) ImageCleanupState(ctx context.Context, hostID string, s
 		return
 	}
 	newState := "unknown"
+	firstRefusal := state.Reason != nil && safeCleanupRefusal(*state.Reason)
+	present := false
 	if state.State == "removed" && s.currentVersionState(hostID, a, "absent") {
 		newState = "removed"
 	} else if state.State == "failed" {
-		firstRefusal := state.Reason != nil && safeCleanupRefusal(*state.Reason)
-		if firstRefusal || s.currentVersionState(hostID, a, "present") {
+		present = s.currentVersionState(hostID, a, "present")
+		if firstRefusal || present {
 			newState = "failed"
 		}
 	}
 	var reason *string
-	if state.Reason != nil && len(*state.Reason) <= 128 {
-		reason = state.Reason
+	if newState == "failed" {
+		if firstRefusal {
+			reason = state.Reason
+		} else {
+			reason = strptr("image_still_present")
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE host_image_cleanup_attempts SET state=$2,reason=$3,updated_at=now()
 		WHERE id=$1::uuid AND state IN ('removing','unknown')`, state.AttemptID, newState, reason); err != nil {
@@ -658,11 +712,22 @@ func (s *CleanupService) ImageCleanupState(ctx context.Context, hostID string, s
 			WHERE host_id=$1::uuid AND image_id=$2 AND attempt_id=$3::uuid AND state='removing'`, hostID, a.ImageID, state.AttemptID); err != nil {
 			return
 		}
-		if newState == "removed" {
-			if _, err := tx.Exec(ctx, `UPDATE host_images SET state='absent',updated_at=now()
-				WHERE host_id=$1::uuid AND image_id=$2 AND state='ready'`, hostID, a.ImageID); err != nil {
-				return
-			}
+		// host_images has a version but no ref column. Demote only a ready
+		// version whose frozen current adoption/history proves this exact ref;
+		// an older cached version must never erase a different ready version.
+		hostState, hostError := "absent", ""
+		if newState == "failed" {
+			hostState, hostError = "failed", "Image cleanup failed; re-ensure required"
+		}
+		if _, err := tx.Exec(ctx, `UPDATE host_images hi SET state=$5,error=$6,updated_at=now()
+			WHERE hi.host_id=$1::uuid AND hi.image_id=$2 AND hi.version IN ('',$3) AND hi.state='ready'
+			AND (EXISTS(SELECT 1 FROM installed_images ii WHERE ii.image_id=$2 AND ii.version=$3
+				AND COALESCE(NULLIF(ii.registry_ref,''),NULLIF(ii.local_tag,''))=$4)
+			OR EXISTS(SELECT 1 FROM host_image_success_history h WHERE h.host_id=$1::uuid AND h.image_id=$2
+				AND h.current_version=$3
+				AND COALESCE(NULLIF(h.current_identity->>'registry_ref',''),NULLIF(h.current_identity->>'local_tag',''))=$4))`,
+			hostID, a.ImageID, a.Version, a.ImageRef, hostState, hostError); err != nil {
+			return
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -682,13 +747,19 @@ func (s *CleanupService) ImageCleanupState(ctx context.Context, hostID string, s
 }
 
 func (s *CleanupService) ImageCleanupJournal(ctx context.Context, hostID string, journal agentws.ImageCleanupJournalMsg) {
+	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
 	s.mu.Lock()
-	requested := s.journalRequests[journal.RequestID]
-	delete(s.journalRequests, journal.RequestID)
+	pending, found := s.journalRequests[journal.RequestID]
+	if found && pending.hostID == hostID && connected && snap.ConnectionID == pending.connectionID {
+		delete(s.journalRequests, journal.RequestID)
+	} else {
+		found = false
+	}
 	s.mu.Unlock()
-	if requested == nil {
+	if !found {
 		return
 	}
+	requested := pending.requested
 	seen := map[string]bool{}
 	for _, entry := range journal.Attempts {
 		if !requested[entry.AttemptID] {
@@ -720,10 +791,10 @@ func (s *CleanupService) ImageCleanupJournal(ctx context.Context, hostID string,
 		}
 		a.AttemptID = id
 		state := ""
-		if s.currentVersionState(hostID, a, "absent") {
+		if s.currentVersionStateOnConnection(hostID, pending.connectionID, a, "absent") {
 			state = "removed"
 		}
-		if s.currentVersionState(hostID, a, "present") {
+		if s.currentVersionStateOnConnection(hostID, pending.connectionID, a, "present") {
 			state = "failed"
 		}
 		if state == "" {
@@ -745,8 +816,12 @@ func (s *CleanupService) ImageCleanupJournal(ctx context.Context, hostID string,
 }
 
 func (s *CleanupService) currentVersionState(hostID string, a CleanupAttempt, want string) bool {
+	return s.currentVersionStateOnConnection(hostID, "", a, want)
+}
+
+func (s *CleanupService) currentVersionStateOnConnection(hostID, connectionID string, a CleanupAttempt, want string) bool {
 	snap, online := s.wire.ImageCleanupSnapshot(hostID)
-	if !online || !snap.Capable || !snap.Complete {
+	if !online || !snap.Capable || !snap.Complete || connectionID != "" && snap.ConnectionID != connectionID {
 		return false
 	}
 	for _, v := range snap.Versions {
