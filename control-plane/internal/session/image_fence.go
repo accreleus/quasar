@@ -77,5 +77,9 @@ func lockRequiredImageFence(ctx context.Context, tx pgx.Tx, hostID, imageRef str
 	)`, imageRef, hostID).Scan(&ready); err != nil {
 		return false, fmt.Errorf("recheck managed image readiness: %w", err)
 	}
-	return ready, nil
+	var removedUnready bool
+	if err := tx.QueryRow(ctx, `SELECT `+removedManagedImageUnreadySQL("$2::uuid", "$1"), imageRef, hostID).Scan(&removedUnready); err != nil {
+		return false, fmt.Errorf("recheck removed managed image: %w", err)
+	}
+	return ready && !removedUnready, nil
 }

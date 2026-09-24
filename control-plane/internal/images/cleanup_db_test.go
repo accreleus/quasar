@@ -13,17 +13,12 @@ import (
 )
 
 type fakeCleanupWire struct {
-	mu        sync.Mutex
-	snapshots map[string]agentws.ImageCleanupSnapshot
-	cleanup   chan agentws.ImageCleanupCmd
-	acks      chan agentws.ImageCleanupStateAckCmd
-}
-
-type cleanupEnsureRecorder struct{ calls chan string }
-
-func (r cleanupEnsureRecorder) EnsureHost(_ context.Context, hostID string) error {
-	r.calls <- hostID
-	return nil
+	mu                sync.Mutex
+	snapshots         map[string]agentws.ImageCleanupSnapshot
+	cleanup           chan agentws.ImageCleanupCmd
+	acks              chan agentws.ImageCleanupStateAckCmd
+	inventoryRequests chan agentws.ImageInventoryReconcileCmd
+	journalRequests   chan agentws.ImageCleanupJournalRequestCmd
 }
 
 func (f *fakeCleanupWire) ImageCleanupSnapshot(hostID string) (agentws.ImageCleanupSnapshot, bool) {
@@ -39,10 +34,16 @@ func (f *fakeCleanupWire) SendImageCleanup(_ context.Context, _ string, c agentw
 	}
 	return agentws.AckResult{OK: true}, nil
 }
-func (f *fakeCleanupWire) SendImageInventoryReconcile(string, agentws.ImageInventoryReconcileCmd) error {
+func (f *fakeCleanupWire) SendImageInventoryReconcile(_ string, c agentws.ImageInventoryReconcileCmd) error {
+	if f.inventoryRequests != nil {
+		f.inventoryRequests <- c
+	}
 	return nil
 }
-func (f *fakeCleanupWire) SendImageCleanupJournalRequest(string, agentws.ImageCleanupJournalRequestCmd) error {
+func (f *fakeCleanupWire) SendImageCleanupJournalRequest(_ string, c agentws.ImageCleanupJournalRequestCmd) error {
+	if f.journalRequests != nil {
+		f.journalRequests <- c
+	}
 	return nil
 }
 func (f *fakeCleanupWire) SendImageCleanupStateAck(_ string, ack agentws.ImageCleanupStateAckCmd) error {
@@ -257,8 +258,21 @@ func TestCleanupFailedPresentDemotesReadyAndReEnsures(t *testing.T) {
 		WHERE image_id=$1`, imgID, imgVer2, imgDigest2); err != nil {
 		t.Fatal(err)
 	}
-	reensure := cleanupEnsureRecorder{calls: make(chan string, 1)}
-	env.cleanup.SetEnsurer(reensure)
+	if _, err := env.pool.Exec(context.Background(), `INSERT INTO apps(name,runtime_spec)
+		VALUES('cleanup selected fixture',jsonb_build_object('image',$1::text))`, imgDigest2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.pool.Exec(context.Background(), `UPDATE app_placement SET mode='fixed'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.pool.Exec(context.Background(), `INSERT INTO app_placement_hosts(app_id,host_id)
+		SELECT id,$1::uuid FROM apps`, host); err != nil {
+		t.Fatal(err)
+	}
+	if adopted, required, err := requiredAdoptionForHost(context.Background(), env.pool, host, imgID); err != nil || !required {
+		t.Fatalf("test fixture missing current requirement: adoption=%+v required=%t err=%v", adopted, required, err)
+	}
+	env.cleanup.SetEnsurer(env.ens)
 	reason := "reference_present"
 	env.cleanup.ImageCleanupState(context.Background(), host, agentws.ImageCleanupStateMsg{
 		AttemptID: attempt.AttemptID, ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
@@ -274,13 +288,121 @@ func TestCleanupFailedPresentDemotesReadyAndReEnsures(t *testing.T) {
 	if imageState != "failed" || attemptState != "failed" || fenceState != "idle" {
 		t.Fatalf("failed-present transition: host_image=%s attempt=%s fence=%s", imageState, attemptState, fenceState)
 	}
+	if got := env.fleet.waitEnsure(t); got.HostID != host || got.ImageID != imgID || got.Version != imgVer2 {
+		t.Fatalf("failed cleanup did not dispatch current requirement: %+v", got)
+	}
+	env.ens.Wait()
+	env.fleet.noMoreEnsures(t, 0)
+}
+
+func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-duplicate-recovery-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 1)
+	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 1)
+	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:lost-dispatch", State: "present"}
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
+		ReconciledRevision: 1, Versions: []agentws.ImageVersionEntry{entry}})
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:lost-dispatch","expected_generation":"0"}`
+	code, body := env.do(t, http.MethodPost, path, request)
+	if code != 202 {
+		t.Fatalf("initial cleanup = %d %s", code, body)
+	}
+	var first CleanupAttempt
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatal(err)
+	}
 	select {
-	case called := <-reensure.calls:
-		if called != host {
-			t.Fatalf("re-ensure host %s, want %s", called, host)
+	case <-env.cleanupWire.cleanup:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial dispatch missing")
+	}
+	// Catalog/adoption may disappear while the attempt remains durable. The
+	// duplicate still needs to reconcile that exact managed identity.
+	if _, err := env.pool.Exec(context.Background(), `DELETE FROM installed_images`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.pool.Exec(context.Background(), `DELETE FROM image_catalog`); err != nil {
+		t.Fatal(err)
+	}
+	// An older journal response may still be in flight when the duplicate
+	// begins a new daemon scan. It cannot settle against the old inventory.
+	env.cleanup.requestCleanupJournal(context.Background(), host)
+	var oldJournal agentws.ImageCleanupJournalRequestCmd
+	select {
+	case oldJournal = <-env.cleanupWire.journalRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old journal request missing")
+	}
+	code, body = env.do(t, http.MethodPost, path, request)
+	if code != 202 {
+		t.Fatalf("duplicate cleanup = %d %s", code, body)
+	}
+	var duplicate CleanupAttempt
+	if err := json.Unmarshal(body, &duplicate); err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.AttemptID != first.AttemptID || duplicate.Generation != first.Generation {
+		t.Fatalf("duplicate created a new attempt: first=%+v duplicate=%+v", first, duplicate)
+	}
+	select {
+	case inventory := <-env.cleanupWire.inventoryRequests:
+		found := false
+		for _, identity := range inventory.Identities {
+			if identity.ImageID == imgID && identity.Version == imgVer2 && identity.ImageRef == imgDigest2 {
+				found = true
+			}
 		}
+		if !found {
+			t.Fatalf("pruned unresolved identity omitted from reconciliation: %+v", inventory.Identities)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("duplicate did not request fresh inventory")
+	}
+	env.cleanup.ImageCleanupJournal(context.Background(), host, agentws.ImageCleanupJournalMsg{
+		RequestID: oldJournal.ID, RetiredAttemptIDs: []string{first.AttemptID},
+	})
+	var state string
+	if err := env.pool.QueryRow(context.Background(), `SELECT state FROM host_image_cleanup_attempts WHERE id=$1::uuid`, first.AttemptID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "removing" {
+		t.Fatalf("old journal settled attempt before fresh scan: %s", state)
+	}
+	select {
+	case journal := <-env.cleanupWire.journalRequests:
+		t.Fatalf("journal requested before fresh reconcile revision: %+v", journal)
 	default:
-		t.Fatal("failed cleanup did not re-ensure current requirements")
+	}
+	entry.State = "absent"
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
+		ReconciledRevision: 2, Versions: []agentws.ImageVersionEntry{entry}})
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	select {
+	case journal := <-env.cleanupWire.journalRequests:
+		if len(journal.AttemptIDs) != 1 || journal.AttemptIDs[0] != first.AttemptID {
+			t.Fatalf("duplicate requested wrong journal: %+v", journal)
+		}
+		env.cleanup.ImageCleanupJournal(context.Background(), host, agentws.ImageCleanupJournalMsg{
+			RequestID: journal.ID, RetiredAttemptIDs: []string{first.AttemptID},
+		})
+	case <-time.After(5 * time.Second):
+		t.Fatal("duplicate did not request attempt journal")
+	}
+	if err := env.pool.QueryRow(context.Background(), `SELECT state FROM host_image_cleanup_attempts WHERE id=$1::uuid`, first.AttemptID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "removed" {
+		t.Fatalf("fresh retirement plus absent scan left attempt %s", state)
+	}
+	select {
+	case second := <-env.cleanupWire.cleanup:
+		t.Fatalf("duplicate dispatched second delete: %+v", second)
+	default:
 	}
 }
 
@@ -481,7 +603,10 @@ func TestCleanupMissingJournalRequiresCurrentConnectionRetirement(t *testing.T) 
 	if state != "removing" {
 		t.Fatalf("old-connection journal resolved attempt as %s", state)
 	}
-	env.cleanup.requestCleanupJournal(context.Background(), host)
+	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "new", Capable: true, Complete: true,
+		ReconciledRevision: 1, Versions: []agentws.ImageVersionEntry{entry}})
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
 	env.cleanup.mu.Lock()
 	var newRequest string
 	for id := range env.cleanup.journalRequests {

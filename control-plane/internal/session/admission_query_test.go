@@ -5,6 +5,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -28,6 +29,7 @@ func withoutRH05Restriction(s string) string {
 	s = strings.ReplaceAll(s, normSQL(imageCleanupFencePredicate), "")
 	for idx := 1; idx <= 32; idx++ {
 		s = strings.ReplaceAll(s, normSQL(imageCleanupIdentityFenceSQL(idx)), "")
+		s = strings.ReplaceAll(s, normSQL("AND NOT "+removedManagedImageUnreadySQL("g.host_id", "$"+strconv.Itoa(idx))), "")
 	}
 	return normSQL(placementAnchorGate.ReplaceAllString(s, ""))
 }
@@ -193,6 +195,9 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 			}
 			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "FROM host_image_cleanup_attempts a") {
 				t.Fatalf("%s managed-image query omitted durable exact-ref cleanup fence", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "hi.updated_at>a.updated_at") {
+				t.Fatalf("%s managed-image query omitted verified re-ensure after terminal removal", shape)
 			}
 			if !strings.Contains(s, normSQL(unrestrictedHostSQL)) {
 				t.Fatalf("%s query omitted the RH05 owner restriction", shape)

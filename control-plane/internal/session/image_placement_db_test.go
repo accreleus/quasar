@@ -273,6 +273,29 @@ func TestLaunchWaitsForPrunedImageCleanupFence(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("pruned-image launch did not finish after cleanup committed")
 	}
+	// A new app requirement can arrive while removal is active. Releasing the
+	// fence after confirmed deletion must not turn its now-pruned ref into an
+	// unmanaged, immediately launchable image.
+	setAppImage(t, pool, s.appID, "ghcr.io/example/other:unmanaged")
+	setAppImage(t, pool, s.appID, testImageRef)
+	if _, err := pool.Exec(ctx, `UPDATE host_image_cleanup_attempts SET state='removed',updated_at=now()-interval '1 second'
+		WHERE host_id=$1::uuid AND image_id=$2`,
+		s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE host_image_operation_fences SET state='idle' WHERE host_id=$1::uuid AND image_id=$2`,
+		s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef)); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("pruned ref launched after confirmed removal without re-ensure: %v", err)
+	}
+	// A fresh adoption plus a verified later ready report restores launch.
+	installCatalogImage(t, pool, false)
+	setHostImage(t, pool, s.hostID, "ready", testImageVer)
+	if _, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef)); err != nil {
+		t.Fatalf("re-adopted, verified ref remains blocked: %v", err)
+	}
 }
 
 func TestLaunchRechecksReadinessAfterCleanupReleasesFence(t *testing.T) {

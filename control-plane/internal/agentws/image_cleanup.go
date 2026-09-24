@@ -100,7 +100,10 @@ type ImageCleanupSnapshot struct {
 	Capable      bool
 	Complete     bool
 	ObservedAt   time.Time
-	Versions     []ImageVersionEntry
+	// ReconciledRevision is the first accepted inventory revision after the
+	// latest acknowledged image_inventory_reconcile on this connection.
+	ReconciledRevision uint64
+	Versions           []ImageVersionEntry
 }
 
 func validImageVersions(versions []ImageVersionEntry, complete bool) bool {
@@ -135,7 +138,8 @@ func (r *Registry) ImageCleanupSnapshot(hostID string) (ImageCleanupSnapshot, bo
 	c.mu.Lock()
 	s := ImageCleanupSnapshot{ConnectionID: c.connectionIncarnation, Capable: c.imageCleanupV1,
 		Complete: c.imageVersionsComplete, ObservedAt: c.imageVersionsObservedAt,
-		Versions: append([]ImageVersionEntry(nil), c.imageVersions...)}
+		ReconciledRevision: c.imageReconciledRevision,
+		Versions:           append([]ImageVersionEntry(nil), c.imageVersions...)}
 	c.mu.Unlock()
 	r.mu.Unlock()
 	return s, true
@@ -160,6 +164,10 @@ func (r *Registry) updateImageVersions(c *conn, m ImageVersionsStateMsg) bool {
 	c.imageVersionsComplete = m.ImageVersionsComplete
 	c.imageVersions = append([]ImageVersionEntry(nil), m.ImageVersions...)
 	c.imageVersionsObservedAt = time.Now().UTC()
+	if c.imageReconcileAwaiting {
+		c.imageReconciledRevision = revision
+		c.imageReconcileAwaiting = false
+	}
 	return true
 }
 
@@ -170,7 +178,21 @@ func (r *Registry) SendImageCleanup(ctx context.Context, hostID string, cmd Imag
 
 func (r *Registry) SendImageInventoryReconcile(hostID string, cmd ImageInventoryReconcileCmd) error {
 	cmd.Type = "image_inventory_reconcile"
-	return r.Send(hostID, cmd)
+	c, ok := r.get(hostID)
+	if !ok {
+		return ErrAgentNotConnected
+	}
+	c.mu.Lock()
+	c.imageReconcilePending = map[string]bool{cmd.ID: true}
+	c.imageReconcileAwaiting = false
+	c.mu.Unlock()
+	if err := c.enqueue(cmd); err != nil {
+		c.mu.Lock()
+		delete(c.imageReconcilePending, cmd.ID)
+		c.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) SendImageCleanupJournalRequest(hostID string, cmd ImageCleanupJournalRequestCmd) error {

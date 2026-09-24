@@ -102,6 +102,9 @@ type conn struct {
 	imageVersionsRevision   uint64
 	imageVersionsObservedAt time.Time
 	imageVersions           []ImageVersionEntry
+	imageReconcilePending   map[string]bool
+	imageReconcileAwaiting  bool
+	imageReconciledRevision uint64
 }
 
 // SupportsTypedSettings describes the current authenticated connection only.
@@ -430,6 +433,14 @@ func (r *Registry) resolveAckFromConn(c *conn, id string, res AckResult) {
 		return
 	}
 	c.mu.Lock()
+	if c.imageReconcilePending[id] {
+		delete(c.imageReconcilePending, id)
+		if res.OK {
+			// The agent updates its scanned inventory before sending this ack.
+			// Its following image_versions_state is ordered on this connection.
+			c.imageReconcileAwaiting = true
+		}
+	}
 	ch := c.acks[id]
 	c.mu.Unlock()
 	if ch != nil {

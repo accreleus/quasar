@@ -59,3 +59,57 @@ func TestImageCleanupRejectsMalformedCompleteInventory(t *testing.T) {
 		t.Fatal("missing runtime daemon ID declared complete")
 	}
 }
+
+func TestImageReconcileAckMarksOnlyFollowingCurrentRevision(t *testing.T) {
+	r := NewRegistry(nil)
+	c := newConn("host", nil)
+	c.connectionIncarnation = "current"
+	c.imageCleanupV1 = true
+	r.add(c)
+	entry := ImageVersionEntry{ImageID: "steam", Version: "v1", ImageRef: "ref", RuntimeImageID: "sha256:one", State: "present"}
+	update := func(rev string) {
+		t.Helper()
+		if !r.updateImageVersions(c, ImageVersionsStateMsg{InventoryRevision: rev, ImageVersionsComplete: true, ImageVersions: []ImageVersionEntry{entry}}) {
+			t.Fatalf("revision %s rejected", rev)
+		}
+	}
+	update("1")
+	if err := r.SendImageInventoryReconcile("host", ImageInventoryReconcileCmd{ID: "lost-ack"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SendImageInventoryReconcile("host", ImageInventoryReconcileCmd{ID: "current-request"}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	pending := len(c.imageReconcilePending)
+	c.mu.Unlock()
+	if pending != 1 {
+		t.Fatalf("repeated lost acks retained %d reconcile IDs, want one", pending)
+	}
+	r.resolveAckFromConn(c, "lost-ack", AckResult{OK: true})
+	update("2")
+	if got, _ := r.ImageCleanupSnapshot("host"); got.ReconciledRevision != 0 {
+		t.Fatalf("superseded ack marked stale snapshot fresh: %+v", got)
+	}
+	r.resolveAckFromConn(c, "current-request", AckResult{OK: false})
+	update("3")
+	if got, _ := r.ImageCleanupSnapshot("host"); got.ReconciledRevision != 0 {
+		t.Fatalf("refused reconcile marked snapshot fresh: %+v", got)
+	}
+	if err := r.SendImageInventoryReconcile("host", ImageInventoryReconcileCmd{ID: "accepted"}); err != nil {
+		t.Fatal(err)
+	}
+	update("4") // a pre-ack snapshot cannot prove the scan completed
+	r.resolveAckFromConn(c, "accepted", AckResult{OK: true})
+	update("5")
+	if got, _ := r.ImageCleanupSnapshot("host"); got.ReconciledRevision != 5 {
+		t.Fatalf("ack-following revision was not marked reconciled: %+v", got)
+	}
+	fresh := newConn("host", nil)
+	fresh.connectionIncarnation = "new"
+	fresh.imageCleanupV1 = true
+	r.add(fresh)
+	if got, _ := r.ImageCleanupSnapshot("host"); got.ReconciledRevision != 0 {
+		t.Fatalf("reconnect inherited reconciliation marker: %+v", got)
+	}
+}

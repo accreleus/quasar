@@ -33,11 +33,18 @@ type CleanupService struct {
 	wire    CleanupTransport
 	ensurer interface {
 		EnsureHost(context.Context, string) error
+		RetryHostImage(context.Context, string, string) error
 	}
 	auditor            audit.Recorder
 	mu                 sync.Mutex
 	journalRequests    map[string]pendingCleanupJournal
 	inventorySnapshots map[string]trackedCleanupInventory
+	freshReconcile     map[string]cleanupReconcileGate
+}
+
+type cleanupReconcileGate struct {
+	connectionID string
+	baseline     uint64
 }
 
 type trackedCleanupInventory struct {
@@ -47,19 +54,21 @@ type trackedCleanupInventory struct {
 }
 
 type pendingCleanupJournal struct {
-	hostID       string
-	connectionID string
-	requested    map[string]bool
-	createdAt    time.Time
+	hostID        string
+	connectionID  string
+	requested     map[string]bool
+	createdAt     time.Time
+	freshRevision uint64
 }
 
 func NewCleanupService(pool *pgxpool.Pool, wire CleanupTransport) *CleanupService {
 	return &CleanupService{pool: pool, wire: wire, journalRequests: make(map[string]pendingCleanupJournal),
-		inventorySnapshots: make(map[string]trackedCleanupInventory)}
+		inventorySnapshots: make(map[string]trackedCleanupInventory), freshReconcile: make(map[string]cleanupReconcileGate)}
 }
 
 func (s *CleanupService) SetEnsurer(e interface {
 	EnsureHost(context.Context, string) error
+	RetryHostImage(context.Context, string, string) error
 }) {
 	s.ensurer = e
 }
@@ -375,6 +384,15 @@ func (s *CleanupService) Request(ctx context.Context, hostID string, req Cleanup
 		status := 202
 		if zero.State == "removed" {
 			status = 200
+		} else {
+			// This may be a lost dispatch or lost acknowledgement on the same
+			// connection. Release the fence row before asking the agent for its
+			// durable journal and fresh inventory; never create a new attempt or
+			// send a second physical deletion from this HTTP retry.
+			if err := tx.Rollback(ctx); err != nil {
+				return CleanupAttempt{}, 0, nil, err
+			}
+			s.ImageCleanupRegistered(ctx, hostID)
 		}
 		return zero, status, nil, nil
 	}
@@ -479,7 +497,7 @@ func (s *CleanupService) dispatch(a CleanupAttempt, hostID string) {
 	if !result.OK && result.Error == "retired_attempt" {
 		// This only describes the duplicate receipt. The original physical
 		// outcome still needs journal retirement plus fresh inventory proof.
-		s.requestCleanupJournal(ctx, hostID)
+		s.ImageCleanupRegistered(ctx, hostID)
 		return
 	}
 	if !result.OK && result.Error != "retired_attempt" {
@@ -549,25 +567,54 @@ func (s *CleanupService) bumpInventoryFences(ctx context.Context, hostID string)
 
 func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID string) {
 	s.bumpInventoryFences(ctx, hostID)
-	// Reconcile frozen adoption identities before trusting upgraded inventory.
+	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
+	if !connected || !snap.Capable {
+		return
+	}
+	// Reconcile frozen managed identities, including unresolved attempts that
+	// survived catalog pruning, before trusting upgraded inventory.
 	rows, err := s.pool.Query(ctx, `SELECT ii.image_id,ii.version,COALESCE(NULLIF(ii.registry_ref,''),NULLIF(ii.local_tag,''))
 		FROM installed_images ii WHERE ii.registry_ref IS NOT NULL OR ii.local_tag IS NOT NULL
 		UNION SELECT h.image_id,h.current_version,COALESCE(NULLIF(h.current_identity->>'registry_ref',''),NULLIF(h.current_identity->>'local_tag',''))
 		FROM host_image_success_history h WHERE h.host_id=$1::uuid
 		UNION SELECT h.image_id,h.previous_version,COALESCE(NULLIF(h.previous_identity->>'registry_ref',''),NULLIF(h.previous_identity->>'local_tag',''))
-		FROM host_image_success_history h WHERE h.host_id=$1::uuid AND h.previous_version IS NOT NULL`, hostID)
-	if err == nil {
-		var identities []agentws.ImageInventoryIdentity
-		for rows.Next() {
-			var identity agentws.ImageInventoryIdentity
-			if rows.Scan(&identity.ImageID, &identity.Version, &identity.ImageRef) == nil && identity.ImageRef != "" {
-				identities = append(identities, identity)
-			}
+		FROM host_image_success_history h WHERE h.host_id=$1::uuid AND h.previous_version IS NOT NULL
+		UNION SELECT a.image_id,a.version,a.image_ref FROM host_image_cleanup_attempts a
+		WHERE a.host_id=$1::uuid AND a.state IN ('removing','unknown')`, hostID)
+	if err != nil {
+		return
+	}
+	var identities []agentws.ImageInventoryIdentity
+	for rows.Next() {
+		var identity agentws.ImageInventoryIdentity
+		if rows.Scan(&identity.ImageID, &identity.Version, &identity.ImageRef) == nil && identity.ImageRef != "" {
+			identities = append(identities, identity)
 		}
-		rows.Close()
-		if id, err := newCmdID(); err == nil {
-			_ = s.wire.SendImageInventoryReconcile(hostID, agentws.ImageInventoryReconcileCmd{ID: id, Identities: identities})
+	}
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return
+	}
+	id, err := newCmdID()
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	// A newer reconcile supersedes any journal snapshot requested against an
+	// older daemon scan on this same connection.
+	for oldID, old := range s.journalRequests {
+		if old.hostID == hostID {
+			delete(s.journalRequests, oldID)
 		}
+	}
+	s.freshReconcile[hostID] = cleanupReconcileGate{connectionID: snap.ConnectionID, baseline: snap.ReconciledRevision}
+	s.mu.Unlock()
+	if s.wire.SendImageInventoryReconcile(hostID, agentws.ImageInventoryReconcileCmd{ID: id, Identities: identities}) != nil {
+		s.mu.Lock()
+		delete(s.freshReconcile, hostID)
+		s.mu.Unlock()
+		return
 	}
 	s.requestCleanupJournal(ctx, hostID)
 }
@@ -577,6 +624,14 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID string) {
 	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
 	if !connected || !snap.Capable {
+		return
+	}
+	s.mu.Lock()
+	gate, hasGate := s.freshReconcile[hostID]
+	s.mu.Unlock()
+	if hasGate && (gate.connectionID != snap.ConnectionID || snap.ReconciledRevision <= gate.baseline) {
+		// A journal can race ahead of the daemon scan. Do not ask for a
+		// retirement proof until the reconcile ack's later inventory revision.
 		return
 	}
 	rows, err := s.pool.Query(ctx, `SELECT id::text FROM host_image_cleanup_attempts
@@ -599,13 +654,22 @@ func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID strin
 				requested[attemptID] = true
 			}
 			s.mu.Lock()
+			currentGate, stillHasGate := s.freshReconcile[hostID]
+			if stillHasGate != hasGate || hasGate && currentGate != gate {
+				s.mu.Unlock()
+				return // a newer daemon scan superseded this journal request
+			}
 			for oldID, old := range s.journalRequests {
 				if old.hostID == hostID || time.Since(old.createdAt) > 10*time.Minute {
 					delete(s.journalRequests, oldID)
 				}
 			}
+			freshRevision := uint64(0)
+			if hasGate {
+				freshRevision = snap.ReconciledRevision
+			}
 			s.journalRequests[id] = pendingCleanupJournal{hostID: hostID, connectionID: snap.ConnectionID,
-				requested: requested, createdAt: time.Now()}
+				requested: requested, createdAt: time.Now(), freshRevision: freshRevision}
 			s.mu.Unlock()
 			if s.wire.SendImageCleanupJournalRequest(hostID, agentws.ImageCleanupJournalRequestCmd{ID: id, AttemptIDs: ids}) != nil {
 				s.mu.Lock()
@@ -743,6 +807,12 @@ func (s *CleanupService) ImageCleanupState(ctx context.Context, hostID string, s
 	_ = s.ackTerminal(hostID, state.AttemptID, state.Generation)
 	if s.ensurer != nil {
 		_ = s.ensurer.EnsureHost(ctx, hostID)
+		if newState == "failed" {
+			// EnsureHost intentionally suppresses an already failed current
+			// version. A definite cleanup failure demoted ready to failed, so
+			// explicitly re-arm that one current required adoption.
+			_ = s.ensurer.RetryHostImage(ctx, hostID, a.ImageID)
+		}
 	}
 }
 
@@ -775,8 +845,15 @@ func (s *CleanupService) ImageCleanupJournal(ctx context.Context, hostID string,
 		retired[id] = true
 	}
 	for id := range requested {
-		if !retired[id] || seen[id] {
+		if !retired[id] || seen[id] || pending.freshRevision == 0 || snap.ReconciledRevision < pending.freshRevision {
 			continue
+		}
+		s.mu.Lock()
+		gate, stillCurrent := s.freshReconcile[hostID]
+		fresh := stillCurrent && gate.connectionID == pending.connectionID && gate.baseline < pending.freshRevision
+		s.mu.Unlock()
+		if !fresh {
+			continue // a later reconcile superseded this journal proof
 		}
 		// The agent's durable tombstone closes every old handler epoch. A
 		// complete current inventory can now reconcile a lost command. The
