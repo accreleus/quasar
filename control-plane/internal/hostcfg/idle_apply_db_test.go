@@ -31,9 +31,7 @@ func TestIdlePreviewUsesWholeGroupAfterPartialHardwareEdit(t *testing.T) {
 	confirmPolicyGroups(t, pool, hostID, "hardware")
 	ctx := context.Background()
 	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{
-		"encoder":     {Source: "explicit", Value: "vulkan"},
-		"render_node": {Source: "explicit", Value: "/dev/dri/renderD129"},
-		"cuda_device": {Source: "explicit", Value: float64(0)},
+		"encoder": {Source: "explicit", Value: "vulkan"},
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -41,14 +39,32 @@ func TestIdlePreviewUsesWholeGroupAfterPartialHardwareEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 	completeEmptyHostJournal(t, store, hostID)
-	if _, err := store.SavePolicy(ctx, hostID, "1", map[string]PolicyChoice{
-		"render_node": {Source: "explicit", Value: "/dev/dri/renderD999"},
-	}, nil); err != nil {
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338", json.RawMessage(`{"encoder":"va","render_node":"/dev/dri/renderD129","cuda_device":0}`)); err != nil {
 		t.Fatal(err)
 	}
 	preview, err := store.PreviewIdleApply(ctx, hostID, "hardware")
-	if err != nil || preview == nil || !preview.Available || preview.Revision != "2" {
+	if err != nil || preview == nil || !preview.Available || preview.Revision != "1" ||
+		preview.Resolved["encoder"] != "vulkan" || preview.Resolved["render_node"] != "/dev/dri/renderD129" || preview.Resolved["cuda_device"] != float64(0) {
 		t.Fatalf("partial group edit lost the reviewable candidate: %+v %v", preview, err)
+	}
+	wantDigest, err := digestJSON(map[string]any{
+		"group": "hardware", "scope": "restart", "revision": "1",
+		"settings": map[string]PolicyChoice{
+			"encoder":     {Source: "explicit", Value: "vulkan"},
+			"render_node": {Source: "deployment"},
+			"cuda_device": {Source: "deployment"},
+		},
+		"resolved_settings": preview.Resolved,
+	})
+	if err != nil || preview.ContentSHA256 != wantDigest {
+		t.Fatalf("partial edit digest did not bind full hardware group: %s want %s: %v", preview.ContentSHA256, wantDigest, err)
+	}
+	if _, err := store.ApproveIdleApply(ctx, hostID, "hardware", reviewedIdleApply(preview)); err != nil {
+		t.Fatalf("full candidate approval failed: %v", err)
+	}
+	var desiredDigest *string
+	if err := pool.QueryRow(ctx, `SELECT desired_digest FROM host_setting_groups WHERE host_id=$1::uuid AND group_key='hardware'`, hostID).Scan(&desiredDigest); err != nil || desiredDigest == nil || *desiredDigest != wantDigest {
+		t.Fatalf("approval did not bind full reviewed digest: %v %v", desiredDigest, err)
 	}
 }
 
@@ -67,7 +83,7 @@ func TestIdleApprovalUsesOneConnectionForLockedReview(t *testing.T) {
 		t.Fatal(err)
 	}
 	completeEmptyHostJournal(t, store, hostID)
-	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338", json.RawMessage(`{"encoder":"va"}`)); err != nil {
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338", json.RawMessage(`{"encoder":"va","render_node":"","cuda_device":0}`)); err != nil {
 		t.Fatal(err)
 	}
 	config := pool.Config()
@@ -105,12 +121,15 @@ func TestIdleApplyDeploymentUsesCurrentTypedBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	completeEmptyHostJournal(t, store, hostID)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET deployment_settings=NULL,deployment_settings_connection=NULL,deployment_settings_reported_at=NULL WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
 	preview, err := store.PreviewIdleApply(ctx, hostID, "hardware")
 	if err != nil || preview != nil {
 		t.Fatalf("missing baseline permitted approval: %+v %v", preview, err)
 	}
 	connection := "00000000-0000-4000-8000-000000000338"
-	if err := store.ObserveDeploymentSettings(ctx, hostID, connection, json.RawMessage(`{"encoder":"va"}`)); err != nil {
+	if err := store.ObserveDeploymentSettings(ctx, hostID, connection, json.RawMessage(`{"encoder":"va","render_node":"","cuda_device":0}`)); err != nil {
 		t.Fatal(err)
 	}
 	preview, err = store.PreviewIdleApply(ctx, hostID, "hardware")
@@ -154,8 +173,32 @@ func TestIdleApplyAutomaticUsesFencedAccessibleProbeEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection := "00000000-0000-4000-8000-000000000338"
+	if err := store.ObserveDeploymentSettings(ctx, hostID, connection, json.RawMessage(`{"encoder":"va","render_node":"","cuda_device":0}`)); err != nil {
+		t.Fatal(err)
+	}
 	gpus := json.RawMessage(`[{"index":0,"vendor":"AMD","render_node":"/dev/dri/by-path/pci-0000:04:00.0-render","driver_identity":"vk:radv:test","encode_slots_total":1}]`)
 	passing := json.RawMessage(`[{"id":"media_probe_gpu0","status":"pass","source":"host_probe","observed_at":"2026-09-23T16:00:00Z"}]`)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings='{"encoder":"va"}'::jsonb WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveHardwareReport(ctx, hostID, connection, gpus, passing); err != nil {
+		t.Fatal(err)
+	}
+	if candidate, err := store.PreviewIdleApply(ctx, hostID, "hardware"); err != nil || candidate == nil || candidate.Resolved["encoder"] != "vulkan" {
+		t.Fatalf("current VA media proof did not permit reviewed Vulkan transition: %+v %v", candidate, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings='{"encoder":"vulkan"}'::jsonb WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	// A changed setting retires the old media verdict on the agent. Until its
+	// fresh host probe arrives, an old pass must not authorize the candidate.
+	if err := store.ObserveHardwareReport(ctx, hostID, connection, gpus,
+		json.RawMessage(`[{"id":"media_probe_gpu0","status":"indeterminate","source":"host_probe","observed_at":"2026-09-23T16:00:30Z"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if unsuitable, err := store.PreviewIdleApply(ctx, hostID, "hardware"); err != nil || unsuitable != nil {
+		t.Fatalf("retired probe proved a candidate: %+v %v", unsuitable, err)
+	}
 	if err := store.ObserveHardwareReport(ctx, hostID, connection, gpus, passing); err != nil {
 		t.Fatal(err)
 	}
@@ -544,6 +587,10 @@ func completeEmptyHostJournal(t *testing.T, store *Store, hostID string) {
 		map[string]PolicySnapshot{"hardware": {Kind: "seeded", Digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.ObserveDeploymentSettings(context.Background(), hostID, connection,
+		json.RawMessage(`{"encoder":"openh264","render_node":"","cuda_device":0}`)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestIdleApplyWaitingReportsCurrentSessionAndPreparationBlockers(t *testing.T) {
@@ -913,8 +960,18 @@ func TestAcceptedThenRecoveredCannotReplayOldReview(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := view.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
-	if fresh.ApprovalReviewID == old.ApprovalReviewID || len(fresh.Prerequisites) != 2 ||
-		fresh.Prerequisites[0].Kind != "accepted_attempts" || fresh.Prerequisites[0].ID == old.Prerequisites[0].ID {
+	oldAccepted, freshAccepted := "", ""
+	for _, fact := range old.Prerequisites {
+		if fact.Kind == "accepted_attempts" {
+			oldAccepted = fact.ID
+		}
+	}
+	for _, fact := range fresh.Prerequisites {
+		if fact.Kind == "accepted_attempts" {
+			freshAccepted = fact.ID
+		}
+	}
+	if fresh.ApprovalReviewID == old.ApprovalReviewID || oldAccepted == "" || freshAccepted == "" || freshAccepted == oldAccepted {
 		t.Fatalf("recovery not bound into new review: %+v", fresh)
 	}
 }

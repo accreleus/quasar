@@ -49,6 +49,10 @@ func TestIdleOfferAfterCompletedCurrentJournal(t *testing.T) {
 		map[string]hostcfg.PolicySnapshot{"hardware": {Kind: "seeded", Digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, connection,
+		json.RawMessage(`{"encoder":"openh264","render_node":"","cuda_device":0}`)); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.ObserveIdleHeartbeat(ctx, hostID, connection, []string{}); err != nil {
 		t.Fatal(err)
 	}

@@ -48,6 +48,11 @@ own; the two do not move together, and that is deliberate.
   their unprotected-dispatch status visible to operators.
 
 - RH05 #339: reviewed idle approvals now dispatch one hardware group after final idle checks, verify the restarted device and media path before registration, journal startup and one recovery attempt, reconcile lost reports after restart, and show execution and recovery status in the console. An unreadable policy journal reports an agent-enforced diagnostic remedy while independent image work remains available.
+- **RH05 Automatic hardware choice (#340).** New hosts select Automatic encoder
+  and render node after typed capability confirmation. Fleet shows the reviewed
+  accessible-device candidate and its evidence; an approved idle restart
+  verifies the selected media path before reporting it applied. Existing hosts
+  retain deployment intent until an operator changes it.
 - RH05 #338: reviewed idle-apply approvals now wait under an owner-scoped admission hold, expose current session and preparation blockers, and support safe cancellation.
 - **RH05 agent policy hooks (#336).** Added agent-side prepare and apply policy
   handling with durable execution acceptance, bounded retry and explicit

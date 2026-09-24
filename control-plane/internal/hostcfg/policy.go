@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -145,6 +146,51 @@ func policyGroup(key string) (string, string) {
 	return key, "next_session"
 }
 
+// An Automatic hardware value is shown as applied only when the observed
+// value reconstructs the exact full group digest verified by this connection's
+// agent journal. A retained legacy effective map alone proves nothing.
+func verifiedHardwareValues(group PolicyGroup, choices map[string]PolicyChoice, baseline map[string]any, effective map[string]string) (map[string]any, bool) {
+	if group.AppliedDigest == nil || group.AppliedRevision == nil || *group.AppliedRevision != group.DesiredRevision {
+		return nil, false
+	}
+	settings := map[string]PolicyChoice{}
+	resolved := map[string]any{}
+	for _, key := range PolicyGroupKeys("hardware") {
+		choice, ok := choices[key]
+		if !ok {
+			return nil, false
+		}
+		settings[key] = choice
+		switch choice.Source {
+		case "explicit":
+			if choice.Value == nil {
+				return nil, false
+			}
+			resolved[key] = choice.Value
+		case "deployment":
+			value, ok := baseline[key]
+			if !ok || value == nil {
+				return nil, false
+			}
+			resolved[key] = value
+		case "automatic":
+			value := effective[key]
+			if value == "" {
+				return nil, false
+			}
+			resolved[key] = value
+		default:
+			return nil, false
+		}
+	}
+	digest, err := digestJSON(map[string]any{"group": "hardware", "scope": "restart", "revision": group.DesiredRevision,
+		"settings": settings, "resolved_settings": resolved})
+	if err != nil || digest != *group.AppliedDigest {
+		return nil, false
+	}
+	return resolved, true
+}
+
 func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error) {
 	view := PolicyView{Choices: map[string]PolicyChoice{}, Resolved: map[string]any{}, Groups: map[string]PolicyGroup{}, ImagePreparation: PolicyEvidenceView{Status: "unknown"}, Readiness: PolicyEvidenceView{Status: "unknown"}}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -235,19 +281,21 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		return view, err
 	}
 	rows.Close()
-	// A group's first typed edit has no persisted row yet. Project each
-	// next-session group's current writer and pending status so the UI can use
-	// the revisioned policy PATCH from revision zero, without exposing the
-	// legacy editor on an owned group.
+	// A group's first typed edit has no persisted row yet. Project the
+	// negotiated hardware group as well, so an existing host can deliberately
+	// choose Automatic through the revisioned writer. A legacy agent retains
+	// its existing editor until it confirms ownership.
 	persisted := map[string]bool{}
 	for key := range view.Groups {
 		persisted[key] = true
 	}
-	for _, key := range NextSessionPolicyGroups() {
+	projectedGroups := append(NextSessionPolicyGroups(), "hardware")
+	for _, key := range projectedGroups {
 		if persisted[key] {
 			continue
 		}
-		group := PolicyGroup{DesiredRevision: view.Revision, Scope: "next_session", Status: "upgrade_required"}
+		scope, _ := PolicyGroupScope(key)
+		group := PolicyGroup{DesiredRevision: view.Revision, Scope: scope, Status: "upgrade_required"}
 		if confirmed[key] {
 			group.Status = "pending"
 			remedy := "No RH05 policy change has been saved for this group. Current host behavior has not been verified through this policy."
@@ -290,9 +338,10 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		var value any
 		if choice.Source == "explicit" {
 			value = choice.Value
-		} else if choice.Source != "deployment" {
-			if raw, ok := effective[knob.Key]; ok {
-				value = raw
+		} else {
+			group, _ := policyGroup(knob.Key)
+			if group != "hardware" {
+				value = effective[knob.Key]
 			}
 		}
 		view.Resolved[knob.Key] = map[string]any{"value": value, "source": choice.Source, "observed_at": nil, "evidence_id": nil}
@@ -307,6 +356,19 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		}
 		if preview == nil && group.Status == "pending" {
 			remedy := "Idle approval awaits complete current host inventory, a resolved configuration candidate, and any open disruptive operation."
+			if key == "hardware" && (view.Choices["encoder"].Source == "automatic" || view.Choices["render_node"].Source == "automatic") {
+				remedy = "Automatic hardware choice awaits one accessible GPU and a passing current media host probe. Check host readiness and device access; the proposed encoder is tested during approved startup before it is marked applied."
+				missing, err := missingDeploymentHardwareBaseline(ctx, s.pool, hostID, view.Choices)
+				if err != nil {
+					return view, err
+				}
+				if len(missing) > 0 {
+					remedy = "baseline_unavailable: the current agent connection has not reported " + strings.Join(missing, ", ") + ". Request a fresh capacity report or reconnect before reviewing this hardware choice."
+				}
+			}
+			group.Remedy = &remedy
+		} else if key == "hardware" && preview != nil && preview.Available && group.Status == "pending" {
+			remedy := "Review the resolved hardware candidate and its evidence, then approve an idle restart. The agent verifies the selected media path before reporting it applied."
 			group.Remedy = &remedy
 		}
 		group.ApprovalPreview = preview
@@ -321,6 +383,44 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		view.Groups[key] = group
 	}
 	return view, nil
+}
+
+// A hardware offer always covers all dependent settings. Missing persisted
+// choices are deployment-source, and their values must come from this socket's
+// baseline before an Automatic candidate can be reviewed.
+func missingDeploymentHardwareBaseline(ctx context.Context, db idleQueryDB, hostID string, choices map[string]PolicyChoice) ([]string, error) {
+	keys := []string{}
+	for _, key := range PolicyGroupKeys("hardware") {
+		if choices[key].Source == "deployment" {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	var connection *string
+	err := db.QueryRow(ctx, `SELECT connection_incarnation::text FROM host_journal_reconciliation
+		WHERE host_id=$1::uuid AND state='complete'`, hostID).Scan(&connection)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if connection == nil {
+		return nil, nil
+	}
+	baseline, err := deploymentSettingsForConnection(ctx, db, hostID, *connection)
+	if err != nil {
+		return nil, err
+	}
+	missing := []string{}
+	for _, key := range keys {
+		if baseline[key] == nil {
+			missing = append(missing, key)
+		}
+	}
+	return missing, nil
 }
 
 // SavePolicy serializes intent under the host row and policy revision. The
@@ -470,7 +570,11 @@ func (s *Store) savePolicy(ctx context.Context, hostID, expected string, changes
 			}
 		}
 		var digest *string
-		if len(settings) == len(resolvedSettings) {
+		// A partial hardware edit implicitly includes deployment choices for
+		// its omitted dependent keys. Preview resolves those against the live
+		// connection; a digest over only the persisted subset would falsely
+		// mismatch the full reviewed candidate.
+		if len(settings) == len(resolvedSettings) && (group != "hardware" || len(settings) == len(PolicyGroupKeys(group))) {
 			payload := map[string]any{"group": group, "scope": scope, "revision": strconv.FormatInt(next, 10), "settings": settings, "resolved_settings": resolvedSettings}
 			value, e := digestJSON(payload)
 			if e != nil {

@@ -3,6 +3,7 @@ package hostcfg
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 
@@ -59,6 +60,108 @@ func TestPolicySaveIdleTimeoutCASAndDurableObligation(t *testing.T) {
 	}
 	if reloaded.Revision != "1" || reloaded.Choices["idle_timeout_secs"].Value != float64(900) {
 		t.Fatalf("reload = %+v", reloaded)
+	}
+}
+
+func TestExistingHostCanChooseAutomaticOnlyAfterTypedHardwareOwnership(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	before, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Choices["encoder"].Source != "deployment" || before.Groups["hardware"].Status != "upgrade_required" {
+		t.Fatalf("legacy hardware policy = %+v", before)
+	}
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	owned, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned.Groups["hardware"].Scope != "restart" || owned.Groups["hardware"].Status != "pending" {
+		t.Fatalf("typed hardware group missing before first edit: %+v", owned.Groups["hardware"])
+	}
+	saved, err := store.SavePolicy(ctx, hostID, owned.Revision, map[string]PolicyChoice{
+		"encoder": {Source: "automatic"}, "render_node": {Source: "automatic"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Choices["encoder"].Source != "automatic" || saved.Choices["render_node"].Source != "automatic" || saved.Groups["hardware"].Status != "pending" {
+		t.Fatalf("automatic hardware edit = %+v", saved)
+	}
+	if resolved := saved.Resolved["encoder"].(map[string]any); resolved["value"] != nil {
+		t.Fatalf("unobserved automatic candidate was presented as resolved: %+v", resolved)
+	}
+}
+
+func TestPolicyReadSeparatesObservedValueFromAutomaticHardwarePreview(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware", "gop")
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+		VALUES($1::uuid,'hardware',0,'restart','pending')`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,revision)
+		VALUES($1::uuid,'encoder','automatic',0),($1::uuid,'render_node','automatic',0)`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_approval_review_tokens(host_id,group_key,review_id)
+		VALUES($1::uuid,'hardware',gen_random_uuid())`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings='{"encoder":"va","gop":"90"}'::jsonb,
+		last_registered_at=now()-interval '1 minute' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveHardwareReport(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`[{"index":0,"vendor":"AMD","render_node":"/dev/dri/renderD129","driver_identity":"amdgpu:test","encode_slots_total":1}]`),
+		json.RawMessage(`[{"id":"media_probe_gpu0","status":"pass","source":"host_probe","observed_at":"2026-09-23T16:00:00Z"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`{"encoder":"va","render_node":"/dev/dri/renderD129"}`)); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noCandidate, _ := missing.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
+	if noCandidate != nil || missing.Groups["hardware"].Remedy == nil ||
+		!strings.Contains(*missing.Groups["hardware"].Remedy, "baseline_unavailable") ||
+		!strings.Contains(*missing.Groups["hardware"].Remedy, "cuda_device") {
+		t.Fatalf("missing current hardware baseline did not explain next action: %+v", missing.Groups["hardware"])
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`{"encoder":"va","render_node":"/dev/dri/renderD129","cuda_device":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed := view.Resolved["gop"].(map[string]any)["value"]; observed != "90" {
+		t.Fatalf("deployment-sourced setting lost observed value: %v", observed)
+	}
+	if current := view.Resolved["encoder"].(map[string]any)["value"]; current != nil {
+		t.Fatalf("unapproved Automatic candidate appeared effective: %v", current)
+	}
+	preview, ok := view.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
+	if !ok || !preview.Available || view.Revision != "0" || preview.Revision != "0" || preview.Resolved["encoder"] != "vulkan" {
+		t.Fatalf("Automatic candidate absent from review preview: %+v", view.Groups["hardware"].ApprovalPreview)
+	}
+	if view.Groups["hardware"].Remedy == nil || !strings.Contains(*view.Groups["hardware"].Remedy, "approve an idle restart") || strings.Contains(*view.Groups["hardware"].Remedy, "next-session") {
+		t.Fatalf("ready Automatic preview gave the wrong next action: %+v", view.Groups["hardware"])
 	}
 }
 

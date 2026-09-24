@@ -1040,7 +1040,8 @@ impl PolicyAgent {
         if facts != offer.prerequisites || facts_digest(&facts)? != offer.prerequisites_sha256 {
             return Err("prerequisite_mismatch".into());
         }
-        if revision == high_water
+        if self.journal.high_water.contains_key(&offer.group)
+            && revision == high_water
             && !self.journal.records.values().any(|record| {
                 record.group == offer.group
                     && record.revision == offer.revision
@@ -1732,64 +1733,74 @@ mod tests {
 
     #[test]
     fn hardware_offer_is_durable_before_restart_and_never_claims_prestart_application() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.json");
-        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
-        let baseline = runtime.clone();
-        let mut agent = open_at(&path, &mut runtime);
-        agent
-            .apply_legacy_overlay(&baseline, &mut runtime, &json!({}), Some("delivery"))
-            .unwrap();
-        assert!(agent.journal.active_groups.contains_key("hardware"));
-        let advertised: Vec<String> = agent.journal.groups().into_iter().collect();
-        agent
-            .confirm_groups(&advertised, &["hardware".into()])
-            .unwrap();
-        let active = agent.journal.active_groups["hardware"].clone();
-        let live = runtime.deployment_map();
-        let resolved = json!({"encoder":live["encoder"],"render_node":live["render_node"],"cuda_device":live["cuda_device"]});
-        let settings = json!({
-            "encoder":{"source":"explicit","value":resolved["encoder"]},
-            "render_node":{"source":"explicit","value":resolved["render_node"]},
-            "cuda_device":{"source":"explicit","value":resolved["cuda_device"]}
-        });
-        let prerequisites = vec![
-            json!({"kind":"accepted_attempts","id":hex_digest(&[])}),
-            json!({"kind":"seeded_group_digest","id":active.digest}),
-        ];
-        let offer = Offer {
-            attempt_id: "00000000-0000-4000-8000-000000000101".into(),
-            host_id: "host".into(),
-            boot_incarnation: "boot".into(),
-            connection_incarnation: "conn".into(),
-            group: "hardware".into(),
-            revision: "1".into(),
-            content_sha256: policy_catalog::digest(&json!({
-                "group":"hardware","scope":"restart","revision":"1",
-                "settings":settings,"resolved_settings":resolved
-            })),
-            scope: "restart".into(),
-            expires_at: "2099-01-01T00:00:00Z".into(),
-            prerequisites_sha256: facts_digest(&prerequisites).unwrap(),
-            prerequisites,
-            settings,
-            resolved_settings: resolved,
-        };
-        let before = runtime.deployment_map();
-        let state = agent.accept_restart(offer.clone(), &runtime, true, None);
-        assert_eq!(phase_of(&state).0, "awaiting_startup");
-        assert_eq!(runtime.deployment_map(), before);
-        let disk = fs::read(&path).unwrap();
-        let journal = Journal::load(&disk).unwrap();
-        assert_eq!(journal.records[&offer.attempt_id].phase, "awaiting_startup");
-        assert_eq!(
-            journal.records[&offer.attempt_id].resolved_settings,
-            offer.resolved_settings
-        );
-        assert_eq!(
-            phase_of(&agent.accept_restart(offer, &runtime, true, None)).0,
-            "awaiting_startup"
-        );
+        for revision in ["0", "1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("policy.json");
+            let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+            let baseline = runtime.clone();
+            let mut agent = open_at(&path, &mut runtime);
+            agent
+                .apply_legacy_overlay(&baseline, &mut runtime, &json!({}), Some("delivery"))
+                .unwrap();
+            assert!(agent.journal.active_groups.contains_key("hardware"));
+            let advertised: Vec<String> = agent.journal.groups().into_iter().collect();
+            agent
+                .confirm_groups(&advertised, &["hardware".into()])
+                .unwrap();
+            let active = agent.journal.active_groups["hardware"].clone();
+            let live = runtime.deployment_map();
+            let resolved = json!({"encoder":live["encoder"],"render_node":live["render_node"],"cuda_device":live["cuda_device"]});
+            let settings = json!({
+                "encoder":{"source":"explicit","value":resolved["encoder"]},
+                "render_node":{"source":"explicit","value":resolved["render_node"]},
+                "cuda_device":{"source":"explicit","value":resolved["cuda_device"]}
+            });
+            let prerequisites = vec![
+                json!({"kind":"accepted_attempts","id":hex_digest(&[])}),
+                json!({"kind":"seeded_group_digest","id":active.digest}),
+            ];
+            let offer = Offer {
+                attempt_id: "00000000-0000-4000-8000-000000000101".into(),
+                host_id: "host".into(),
+                boot_incarnation: "boot".into(),
+                connection_incarnation: "conn".into(),
+                group: "hardware".into(),
+                revision: revision.into(),
+                content_sha256: policy_catalog::digest(&json!({
+                    "group":"hardware","scope":"restart","revision":revision,
+                    "settings":settings,"resolved_settings":resolved
+                })),
+                scope: "restart".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                prerequisites_sha256: facts_digest(&prerequisites).unwrap(),
+                prerequisites,
+                settings,
+                resolved_settings: resolved,
+            };
+            if revision == "0" {
+                agent.journal.high_water.insert("hardware".into(), 0);
+                assert_eq!(
+                    phase_of(&agent.accept_restart(offer.clone(), &runtime, true, None)),
+                    ("failed", Some("revision_conflict"))
+                );
+                agent.journal.high_water.remove("hardware");
+            }
+            let before = runtime.deployment_map();
+            let state = agent.accept_restart(offer.clone(), &runtime, true, None);
+            assert_eq!(phase_of(&state).0, "awaiting_startup");
+            assert_eq!(runtime.deployment_map(), before);
+            let disk = fs::read(&path).unwrap();
+            let journal = Journal::load(&disk).unwrap();
+            assert_eq!(journal.records[&offer.attempt_id].phase, "awaiting_startup");
+            assert_eq!(
+                journal.records[&offer.attempt_id].resolved_settings,
+                offer.resolved_settings
+            );
+            assert_eq!(
+                phase_of(&agent.accept_restart(offer, &runtime, true, None)).0,
+                "awaiting_startup"
+            );
+        }
     }
 
     #[test]

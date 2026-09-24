@@ -281,9 +281,13 @@ func TestTypedAgentEveryNextSessionGroupReportsIndependently(t *testing.T) {
 	}
 	// zerocopy changed from the value the codec claims were probed under.
 	var hostCodecs, gpuCodecs string
-	if err := pool.QueryRow(ctx, `SELECT h.codecs::text,g.codecs::text FROM hosts h JOIN gpus g ON g.host_id=h.id WHERE h.id=$1::uuid`, agent.hostID).Scan(&hostCodecs, &gpuCodecs); err != nil {
-		t.Fatal(err)
-	}
+	// The applied group and codec withdrawal commit in separate transactions.
+	waitUntil(t, "stale probe codec withdrawal", func() bool {
+		if err := pool.QueryRow(ctx, `SELECT h.codecs::text,g.codecs::text FROM hosts h JOIN gpus g ON g.host_id=h.id WHERE h.id=$1::uuid`, agent.hostID).Scan(&hostCodecs, &gpuCodecs); err != nil {
+			t.Fatal(err)
+		}
+		return hostCodecs == `["h264"]` && gpuCodecs == `["h264"]`
+	})
 	if hostCodecs != `["h264"]` || gpuCodecs != `["h264"]` {
 		t.Fatalf("stale probe codecs kept after zerocopy apply: host=%s gpu=%s", hostCodecs, gpuCodecs)
 	}

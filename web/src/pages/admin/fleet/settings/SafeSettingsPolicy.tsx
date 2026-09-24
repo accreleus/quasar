@@ -10,13 +10,15 @@ import { KnobPanel } from "./KnobPanel";
 import { knobHelp, knobLabel, valueLabel, type SettingValue } from "./knobs";
 
 type Group = adminApi.HostPolicyView["groups"][string];
-type Draft = { source: "deployment" | "explicit"; value?: SettingValue };
+type Draft = { source: "automatic" | "deployment" | "explicit"; value?: SettingValue };
+const hardwareKeys = new Set(["encoder", "render_node", "cuda_device"]);
+const groupKey = (key: string) => hardwareKeys.has(key) ? "hardware" : key;
 
 const STATUS_CHIP: Record<string, ChipVariant> = { applied: "success", pending: "info", failed: "danger", uncertain: "warning" };
 
-/** A group the typed writer owns on this host: next-session scope and negotiated. */
+/** A group the typed writer owns on this host after negotiation. */
 function typedOwned(group: Group | undefined): boolean {
-  return Boolean(group && group.scope === "next_session" && group.status !== "upgrade_required");
+  return Boolean(group && (group.scope === "next_session" || group.scope === "restart") && group.status !== "upgrade_required");
 }
 
 /** Retry is offered only once the server says the transient budget is spent. */
@@ -30,12 +32,11 @@ function remedyText(remedy: string): string {
 }
 
 function sameChoice(a: Draft, b: Draft): boolean {
-  return a.source === b.source && (a.source === "deployment" || a.value === b.value);
+  return a.source === b.source && (a.source !== "explicit" || a.value === b.value);
 }
 
-/** RH05 next-session settings through the typed policy API: one revisioned
- *  edit, then each group reports its own provenance, freshness and outcome.
- *  Restart-scope groups stay on the existing editor. */
+/** RH05 typed settings through one revisioned edit. Restart hardware uses the
+ *  same writer and is then applied only through a reviewed idle approval. */
 export function SafeSettingsPolicy({
   hostId,
   knobs,
@@ -50,7 +51,7 @@ export function SafeSettingsPolicy({
 }) {
   const policy = useResource<adminApi.HostPolicyView | null>(
     {
-      label: "next-session settings",
+      label: "host policy settings",
       pollMs: 5000,
       fetch: async (ctx) => {
         try {
@@ -72,13 +73,13 @@ export function SafeSettingsPolicy({
   const [message, setMessage] = useState<string | null>(null);
 
   const owned = useMemo(
-    () => (view ? knobs.filter((k) => typedOwned(view.groups[k.key])) : []),
+    () => (view ? knobs.filter((k) => typedOwned(view.groups[groupKey(k.key)])) : []),
     [view, knobs],
   );
   // Saved typed intent the agent cannot run yet: the legacy editor keeps the key,
   // and this panel shows only the remedy.
   const awaitingUpgrade = view
-    ? knobs.filter((k) => view.groups[k.key]?.scope === "next_session" && view.groups[k.key]?.status === "upgrade_required")
+    ? knobs.filter((k) => (view.groups[groupKey(k.key)]?.scope === "next_session" || view.groups[groupKey(k.key)]?.scope === "restart") && view.groups[groupKey(k.key)]?.status === "upgrade_required")
     : [];
   const loaded = policy.data !== undefined;
   const ownedKey = owned.map((k) => k.key).join(",");
@@ -94,6 +95,7 @@ export function SafeSettingsPolicy({
     const choice = view.choices[key];
     return choice?.source === "explicit"
       ? { source: "explicit", value: choice.value as SettingValue }
+      : choice?.source === "automatic" ? { source: "automatic" }
       : { source: "deployment" };
   };
   const draftFor = (key: string) => drafts[key] ?? saved(key);
@@ -123,7 +125,7 @@ export function SafeSettingsPolicy({
     try {
       await policy.mutate((ctx) => adminApi.updateHostPolicy(ctx.token, hostId, view.revision, changes), (_old, result) => result);
       setDrafts({});
-      setMessage("Saved. Each setting reports its own application below; new sessions pick it up once the host confirms it.");
+      setMessage("Saved. Each setting reports its own application below; restart settings wait for reviewed idle approval.");
     } catch (e) {
       if (e instanceof ApiError && e.code === "stale_revision") {
         setError("These settings changed elsewhere. Review the current values and save again.");
@@ -144,9 +146,9 @@ export function SafeSettingsPolicy({
   };
 
   return <KnobPanel
-    title="Next-session settings"
-    hint="Saved as one edit. Each setting applies to new sessions once the host confirms it; running sessions keep their launch values."
-    actions={owned.length > 0 && <Button variant="primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? "Saving…" : "Save next-session settings"}</Button>}
+    title={owned.some((k) => view.groups[groupKey(k.key)]?.scope === "restart") ? "Host policy settings" : "Next-session settings"}
+    hint="Saved as one edit. Next-session settings apply after verification; hardware changes wait for a reviewed idle approval."
+    actions={owned.length > 0 && <Button variant="primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? "Saving…" : owned.some((k) => view.groups[groupKey(k.key)]?.scope === "restart") ? "Save policy settings" : "Save next-session settings"}</Button>}
   >
     {message && <p role="status" className="hint">{message}</p>}
     {error && <p role="alert" className="form-error">{error}</p>}
@@ -156,13 +158,13 @@ export function SafeSettingsPolicy({
           {knobLabel(knob)}
           <Chip variant="warning" className="chip-sm">upgrade required</Chip>
         </h3>
-        {view.groups[knob.key].remedy && <p className="hint">{remedyText(view.groups[knob.key].remedy ?? "")}</p>}
+        {view.groups[groupKey(knob.key)].remedy && <p className="hint">{remedyText(view.groups[groupKey(knob.key)].remedy ?? "")}</p>}
       </div>
       <div><p className="hint">Edit this setting in the panels below until the agent is upgraded.</p></div>
     </div>)}
     {owned.map((knob) => {
       const label = knobLabel(knob);
-      const group = view.groups[knob.key];
+      const group = view.groups[groupKey(knob.key)];
       const resolved = view.resolved[knob.key];
       const draft = draftFor(knob.key);
       const verified = group.status === "applied" && group.fresh;
@@ -174,7 +176,7 @@ export function SafeSettingsPolicy({
           </h3>
           <p className="hint">{knobHelp(knob)}</p>
           <p className="hint" style={{ marginTop: 4 }}>
-            {`${resolved?.source === "explicit" ? "Explicit value" : "Deployment setting"} ${valueLabel((resolved?.value ?? undefined) as SettingValue | undefined)} · `}
+            {`${resolved?.source === "explicit" ? "Explicit value" : resolved?.source === "automatic" ? "Automatic choice" : "Deployment setting"} ${valueLabel((resolved?.value ?? undefined) as SettingValue | undefined)} · `}
             {verified
               ? `Verified on the current connection${group.observed_at ? ` at ${new Date(group.observed_at).toLocaleString()}` : ""}`
               : "Not yet verified"}
@@ -182,6 +184,7 @@ export function SafeSettingsPolicy({
           <p className="hint">
             Desired revision {group.desired_revision} · applied revision {group.applied_revision ?? "none"} · {group.scope.replaceAll("_", " ")}
           </p>
+          {group.scope === "restart" && group.approval_preview?.available && <p className="hint">Current hardware evidence supports {Object.entries(group.approval_preview.resolved).map(([key, value]) => `${key}: ${valueLabel(value as SettingValue)}`).join(", ")}. Review the evidence below before idle approval.</p>}
           {group.remedy && <p className="hint" style={{ marginTop: 4 }}>{remedyText(group.remedy)}</p>}
           {group.next_retry_at && <p className="hint">Next retry {new Date(group.next_retry_at).toLocaleTimeString()}</p>}
         </div>
@@ -194,6 +197,7 @@ export function SafeSettingsPolicy({
             onChange={(e) => edit(knob, { source: e.target.value as Draft["source"] })}
           >
             <option value="deployment">Deployment setting</option>
+            {(knob.key === "encoder" || knob.key === "render_node") && <option value="automatic">Automatic choice</option>}
             <option value="explicit">Explicit value</option>
           </select>
           {draft.source === "explicit" && <div style={{ marginTop: 6 }}>

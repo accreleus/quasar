@@ -200,6 +200,82 @@ func TestPolicyReadbackFreshnessRequiresCurrentConnection(t *testing.T) {
 	}
 }
 
+func TestVerifiedAutomaticHardwareReadShowsCurrentObservedValue(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	connection := "00000000-0000-4000-8000-000000000181"
+	settings := map[string]PolicyChoice{"encoder": {Source: "automatic"}, "render_node": {Source: "automatic"}, "cuda_device": {Source: "deployment"}}
+	hardwareDigest := func(encoder, node string) string {
+		digest, err := digestJSON(map[string]any{"group": "hardware", "scope": "restart", "revision": "0", "settings": settings,
+			"resolved_settings": map[string]any{"encoder": encoder, "render_node": node, "cuda_device": float64(0)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return digest
+	}
+	digest := hardwareDigest("vulkan", "/dev/dri/renderD128")
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,revision)
+		VALUES($1::uuid,'encoder','automatic',0),($1::uuid,'render_node','automatic',0)`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,applied_revision,desired_digest,applied_digest,scope,status,evidence_at,evidence_connection)
+		VALUES($1::uuid,'hardware',0,0,$3,$3,'restart','applied',now(),$2::uuid)`, hostID, connection, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings='{"encoder":"vulkan","render_node":"/dev/dri/renderD128","cuda_device":"0","gop":"60"}'::jsonb,
+		deployment_settings='{"encoder":"vulkan","render_node":"/dev/dri/renderD128","cuda_device":0}'::jsonb,
+		deployment_settings_connection=$2::uuid,deployment_settings_reported_at=now() WHERE id=$1::uuid`, hostID, connection); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := &policyIdentityDispatcher{connection: "00000000-0000-4000-8000-000000000182"}
+	h := NewHandler(store, dispatcher, nil)
+	read := func() PolicyView {
+		r := httptest.NewRequest(http.MethodGet, "/v1/admin/hosts/"+hostID+"/policy", nil)
+		r.SetPathValue("id", hostID)
+		w := httptest.NewRecorder()
+		h.handleGetPolicy(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		var result PolicyView
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	stale := read()
+	if stale.Groups["hardware"].Fresh || stale.Resolved["encoder"].(map[string]any)["value"] != nil {
+		t.Fatalf("stale connection exposed Automatic value: %+v", stale)
+	}
+	dispatcher.connection = connection
+	fresh := read()
+	encoder := fresh.Resolved["encoder"].(map[string]any)
+	renderNode := fresh.Resolved["render_node"].(map[string]any)
+	if !fresh.Groups["hardware"].Fresh || encoder["value"] != "vulkan" || renderNode["value"] != "/dev/dri/renderD128" || encoder["source"] != "automatic" || encoder["evidence_id"] != connection {
+		t.Fatalf("verified current Automatic value absent from operator read: %+v", fresh)
+	}
+	newConnection := "00000000-0000-4000-8000-000000000183"
+	if _, err := store.BeginPolicyConnection(ctx, hostID, newConnection, map[string]int{"typed_settings": 2, "deployment_baseline": 1}, []string{"hardware"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, newConnection, mustJSON(t, deploymentBaseline())); err != nil {
+		t.Fatal(err)
+	}
+	// This connection reported a baseline and a verified journal snapshot but
+	// omitted effective_settings. The retained old value cannot prove Automatic.
+	newDigest := hardwareDigest("va", "/dev/dri/renderD129")
+	if _, err := pool.Exec(ctx, `UPDATE host_setting_groups SET evidence_connection=$2::uuid,evidence_at=now(),desired_digest=$3,applied_digest=$3 WHERE host_id=$1::uuid AND group_key='hardware'`, hostID, newConnection, newDigest); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher.connection = newConnection
+	omitted := read()
+	if !omitted.Groups["hardware"].Fresh || omitted.Resolved["encoder"].(map[string]any)["value"] != nil || omitted.Resolved["render_node"].(map[string]any)["value"] != nil || omitted.Resolved["gop"].(map[string]any)["value"] != float64(60) {
+		t.Fatalf("stale retained hardware effective value appeared current or unrelated value disappeared: %+v", omitted)
+	}
+}
+
 func TestPolicyOperatorSaveRejectsUnauthorizedInvalidAndStale(t *testing.T) {
 	pool := testPool(t)
 	hostID := seedHost(t, pool)
