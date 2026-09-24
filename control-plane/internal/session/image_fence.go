@@ -69,13 +69,12 @@ func lockRequiredImageFence(ctx context.Context, tx pgx.Tx, hostID, imageRef str
 	// The scheduler's first readiness read can precede a terminal cleanup
 	// transaction. Re-read after acquiring the fence: that transaction may
 	// have released the fence and demoted the exact ready row while we waited.
-	// Lazy adoptions prepare on assignment and cannot have a ready row before
-	// their first launch. Removal fences and the exact-ref terminal check below
-	// still apply to them.
+	// A lazy on-demand digest cannot have a ready row before its first
+	// launch; this renders the same exception as placement's imageReadySQL.
 	var ready bool
 	if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(
 		SELECT 1 FROM installed_images ii WHERE (ii.registry_ref=$1 OR ii.local_tag=$1)
-		AND ii.lazy = false
+		`+lazyOnDemandAdmissionSQL("$2::uuid", "$1")+`
 		AND NOT EXISTS(SELECT 1 FROM host_images hi WHERE hi.host_id=$2::uuid AND hi.image_id=ii.image_id
 			AND hi.state='ready' AND (hi.version='' OR hi.version=ii.version))
 	)`, imageRef, hostID).Scan(&ready); err != nil {

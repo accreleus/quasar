@@ -27,11 +27,11 @@ func withoutRH05Restriction(s string) string {
 	// historical SQL capture predates that gate; its exact predicate is checked
 	// separately below before removing it for the legacy comparison.
 	s = strings.ReplaceAll(s, normSQL(imageCleanupFencePredicate), "")
-	// #346 lets lazy adoptions reach the agent's on-demand preparation path.
-	// The historical capture predates that intentional extra filter; the
-	// operator launch DB tests assert its behavior for eager and lazy images.
-	s = strings.ReplaceAll(s, normSQL("AND ii.lazy = false"), "")
 	for idx := 1; idx <= 32; idx++ {
+		// #346 lets a lazy pinned digest reach the agent's on-demand pull. The
+		// historical capture predates that filter; the operator launch DB
+		// tests assert its behavior for eager, lazy digest and lazy template.
+		s = strings.ReplaceAll(s, normSQL(lazyOnDemandAdmissionSQL("g.host_id", "$"+strconv.Itoa(idx))), "")
 		s = strings.ReplaceAll(s, normSQL(imageCleanupIdentityFenceSQL(idx)), "")
 		s = strings.ReplaceAll(s, normSQL("AND NOT "+removedManagedImageUnreadySQL("g.host_id", "$"+strconv.Itoa(idx))), "")
 	}
@@ -199,6 +199,9 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 			}
 			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "FROM host_image_cleanup_attempts a") {
 				t.Fatalf("%s managed-image query omitted durable exact-ref cleanup fence", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "lf.state = 'removing'") {
+				t.Fatalf("%s managed-image query omitted the lazy on-demand digest gate", shape)
 			}
 			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "hi.updated_at>a.updated_at") {
 				t.Fatalf("%s managed-image query omitted verified re-ensure after terminal removal", shape)
