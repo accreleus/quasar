@@ -4319,7 +4319,7 @@ impl SessionManager {
                 Some(self.image_mgr.handle_remove(id, image_id))
             }
             ControlMsg::ImageInventoryReconcile { id, identities } => {
-                Some(self.image_mgr.handle_inventory_reconcile(id, identities))
+                self.image_mgr.handle_inventory_reconcile(id, identities)
             }
             ControlMsg::ImageCleanup {
                 id,

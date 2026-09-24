@@ -63,7 +63,21 @@ pub(super) async fn remove_exact_image(
     if current.id != expected_id {
         return Ok(ExactRemoval::IdentityMismatch);
     }
-    let result = remove_image(config, image_ref).await;
+    // The ref can be rebound by an external Docker client after our check.
+    // Address the daemon object we proved safe, never the mutable ref.
+    let (docker, _) = discover(config).await?;
+    let result = docker
+        .remove_image(
+            expected_id,
+            Some(bollard::query_parameters::RemoveImageOptions {
+                force: false,
+                noprune: true,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .map_err(classify);
     let after = daemon_images(config).await?;
     let refs = all_container_image_ids(config).await?;
     if after

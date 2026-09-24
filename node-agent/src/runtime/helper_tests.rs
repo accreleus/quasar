@@ -27,6 +27,7 @@ struct State {
     managed_present: bool,
     managed_container: bool,
     managed_remove_calls: usize,
+    retag_before_remove: Option<String>,
     body: Option<Value>,
     name: String,
     running: bool,
@@ -184,6 +185,37 @@ fn exact_cleanup_proves_ref_id_and_all_container_safety_before_nonforced_rmi() {
         ExactRemoval::Absent
     );
     assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 1);
+}
+
+#[test]
+fn exact_cleanup_cannot_delete_a_new_ref_binding_after_external_retag() {
+    let engine = Engine::new();
+    let reference = "ghcr.io/x/steam:sha-1234567";
+    let old_id = "sha256:managed";
+    let new_id = "sha256:replacement";
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.managed_ref = Some(reference.into());
+        state.managed_id = old_id.into();
+        state.managed_present = true;
+        state.retag_before_remove = Some(new_id.into());
+    }
+    assert_eq!(
+        engine
+            .client()
+            .remove_exact_image(reference, old_id, Duration::from_secs(2))
+            .wait()
+            .unwrap(),
+        ExactRemoval::StillPresent
+    );
+    let state = engine.state.lock().unwrap();
+    assert_eq!(state.managed_remove_calls, 1);
+    assert_eq!(state.managed_id, new_id);
+    assert!(state.managed_present, "new ref binding must survive");
+    assert!(state
+        .requests
+        .iter()
+        .any(|request| { request.starts_with("DELETE /images/") && request.contains("managed") }));
 }
 
 #[test]
@@ -430,7 +462,16 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
             "exact cleanup must use non-forced, no-prune rmi: {route}"
         );
         s.managed_remove_calls += 1;
-        if s.managed_container {
+        if let Some(new_id) = s.retag_before_remove.take() {
+            s.managed_id = new_id;
+            if !route.contains("managed") {
+                s.managed_present = false;
+                response = json!([]);
+            } else {
+                code = 404;
+                response = json!({"message":"old image no longer exists"});
+            }
+        } else if s.managed_container {
             code = 409;
             response = json!({"message":"in use"});
         } else {
