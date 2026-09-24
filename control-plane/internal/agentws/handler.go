@@ -1433,9 +1433,12 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
 	}
 	cleanupRegister := ImageCleanupRegister{Capable: reg.ImageCleanupV1}
-	if reg.ImageCleanupV1 && validImageVersions(reg.ImageVersions, reg.ImageVersionsComplete) {
-		cleanupRegister.Complete = reg.ImageVersionsComplete
-		cleanupRegister.Versions = append([]ImageVersionEntry(nil), reg.ImageVersions...)
+	if reg.ImageCleanupV1 {
+		var versions []ImageVersionEntry
+		if json.Unmarshal(reg.ImageVersions, &versions) == nil && validImageVersions(versions, reg.ImageVersionsComplete) {
+			cleanupRegister.Complete = reg.ImageVersionsComplete
+			cleanupRegister.Versions = versions
+		}
 	}
 	return result.HostID, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }

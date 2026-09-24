@@ -34,10 +34,12 @@ type RegisterMsg struct {
 	// Images (image-management P2) is a wholesale snapshot of the agent's managed
 	// images. Keep-if-absent: nil ⇒ key absent, stored host_images rows untouched;
 	// an explicit [] is a real "I have none" and flips ready rows to absent.
-	Images                []RegisterImage     `json:"images"`
-	ImageCleanupV1        bool                `json:"image_cleanup_v1"`
-	ImageVersionsComplete bool                `json:"image_versions_complete"`
-	ImageVersions         []ImageVersionEntry `json:"image_versions"`
+	Images                []RegisterImage `json:"images"`
+	ImageCleanupV1        bool            `json:"image_cleanup_v1"`
+	ImageVersionsComplete bool            `json:"image_versions_complete"`
+	// Decode cleanup inventory after registration authentication. Malformed
+	// optional inventory must not reject an otherwise healthy host reconnect.
+	ImageVersions json.RawMessage `json:"image_versions"`
 
 	// Platform-release identity (amendment 1, agent-api.md §register): four
 	// OPTIONAL flat fields describing the build the agent IS. Pointers, so

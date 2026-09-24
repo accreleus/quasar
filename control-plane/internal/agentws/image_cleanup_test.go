@@ -137,12 +137,43 @@ func TestImageVersionEntryRejectsNullContainerReference(t *testing.T) {
 	}
 }
 
+func TestRegisterKeepsAuthenticationWhenCleanupInventoryIsMalformed(t *testing.T) {
+	var reg RegisterMsg
+	err := json.Unmarshal([]byte(`{"type":"register","node_name":"host","agent_version":"test","auth":{"enrollment_token":"test-token"},"image_cleanup_v1":true,"image_versions_complete":true,"image_versions":[{"image_id":"steam","version":"v1","image_ref":"ref","runtime_image_id":"sha256:one","state":"present","container_referenced":null}]}`), &reg)
+	if err != nil {
+		t.Fatalf("malformed cleanup inventory rejected the whole registration: %v", err)
+	}
+	if reg.Type != "register" || reg.NodeName != "host" || len(reg.Auth) == 0 || !reg.ImageCleanupV1 {
+		t.Fatalf("registration fields were lost: %+v", reg)
+	}
+}
+
 func TestImageCleanupMalformedReferenceWireRevokesInventory(t *testing.T) {
 	pool := testPool(t)
 	h := NewHandler(pool, "test-token", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
+	badConn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := badConn.WriteJSON(map[string]any{"type": "register", "node_name": "cleanup-bad-auth",
+		"agent_version": "test", "auth": map[string]string{"enrollment_token": "wrong-token"},
+		"image_cleanup_v1": true, "image_versions_complete": true,
+		"image_versions": []map[string]any{{"image_id": "steam", "version": "v1", "image_ref": "ref",
+			"runtime_image_id": "sha256:one", "state": "present", "container_referenced": nil}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var refused ErrorMsg
+	if err := badConn.ReadJSON(&refused); err != nil {
+		t.Fatal(err)
+	}
+	_ = badConn.Close()
+	if refused.Code != "auth_failed" {
+		t.Fatalf("malformed cleanup inventory bypassed authentication: %+v", refused)
+	}
 	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +183,7 @@ func TestImageCleanupMalformedReferenceWireRevokesInventory(t *testing.T) {
 		"agent_version": "test", "auth": map[string]string{"enrollment_token": "test-token"},
 		"image_cleanup_v1": true, "image_versions_complete": true,
 		"image_versions": []map[string]any{{"image_id": "steam", "version": "v1", "image_ref": "ref",
-			"runtime_image_id": "sha256:one", "state": "present", "container_referenced": false}},
+			"runtime_image_id": "sha256:one", "state": "present", "container_referenced": nil}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -175,19 +206,26 @@ func TestImageCleanupMalformedReferenceWireRevokesInventory(t *testing.T) {
 		got, _ := h.registry.ImageCleanupSnapshot(registered.HostID)
 		t.Fatalf("inventory complete=%v, want %v", got.Complete, want)
 	}
-	waitComplete(true)
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"image_versions_state","inventory_revision":"1","image_versions_complete":true,"image_versions":[{"image_id":"steam","version":"v1","image_ref":"ref","runtime_image_id":"sha256:one","state":"present","container_referenced":"false"}]}`)); err != nil {
-		t.Fatal(err)
-	}
 	waitComplete(false)
-	if err := conn.WriteJSON(map[string]any{"type": "image_versions_state", "inventory_revision": "2", "image_versions_complete": true,
+	if err := conn.WriteJSON(map[string]any{"type": "image_versions_state", "inventory_revision": "1", "image_versions_complete": true,
 		"image_versions": []map[string]any{{"image_id": "steam", "version": "v1", "image_ref": "ref",
 			"runtime_image_id": "sha256:one", "state": "present", "container_referenced": false}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	waitComplete(true)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"image_versions_state","inventory_revision":"2","image_versions_complete":true,"image_versions":[{"image_id":"steam","version":"v1","image_ref":"ref","runtime_image_id":"sha256:one","state":"present","container_referenced":"false"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	waitComplete(false)
 	if err := conn.WriteJSON(map[string]any{"type": "image_versions_state", "inventory_revision": "3", "image_versions_complete": true,
+		"image_versions": []map[string]any{{"image_id": "steam", "version": "v1", "image_ref": "ref",
+			"runtime_image_id": "sha256:one", "state": "present", "container_referenced": false}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitComplete(true)
+	if err := conn.WriteJSON(map[string]any{"type": "image_versions_state", "inventory_revision": "4", "image_versions_complete": true,
 		"image_versions": []map[string]any{{"image_id": "steam", "version": "v1", "image_ref": "ref",
 			"runtime_image_id": "sha256:one", "state": "absent", "container_referenced": true}},
 	}); err != nil {
