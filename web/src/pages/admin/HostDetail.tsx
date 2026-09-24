@@ -23,6 +23,7 @@ import { bytesFromMb } from "../../lib/format/bytes";
 import { elapsedWords, relativeTime } from "../../lib/format/relativeTime";
 import { useAdminAction } from "../../lib/resource/action";
 import { useResource } from "../../lib/resource/react";
+import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
 import { AdmissionReasons, admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./fleet/AdmissionReasons";
@@ -133,6 +134,7 @@ export function HostDetail() {
 
   // Awaiting confirmation in the Modal below; null when no "Launch anyway" is pending.
   const [confirmOverrideCheckId, setConfirmOverrideCheckId] = useState<string | null>(null);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
 
   const crumbs = (
     <Breadcrumbs
@@ -173,6 +175,9 @@ export function HostDetail() {
               onClick={() => navigate(`/admin/fleet/hosts/${host.id}/console`)}
             >
               Local console
+            </Button>
+            <Button variant="ghost" onClick={() => setCleanupOpen(true)}>
+              Manage cached images
             </Button>
             <Button
               variant="ghost"
@@ -272,6 +277,10 @@ export function HostDetail() {
             check is failing. The check stays visible, and the override ends when it next passes.
           </p>
         </Modal>
+      )}
+      {cleanupOpen && token && (
+        <ImageCleanupModal token={token} hostID={host.id} hostName={host.node_name}
+          onClose={() => setCleanupOpen(false)} />
       )}
     </section>
   );

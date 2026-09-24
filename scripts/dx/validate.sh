@@ -93,7 +93,9 @@ PG="qval-pg-${QUASAR_INSTANCE}"
 CP="qval-cp-${QUASAR_INSTANCE}"
 GO_IMAGE="golang:1.26"
 ADMIN_EMAIL="admin@quasar.local"
-ADMIN_PASS="adminpassword123"
+# Bootstrap policy rejects passwords containing the username; mint a fresh
+# throwaway credential for this isolated run instead of using a fixed literal.
+ADMIN_PASS="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
 # Set the instant the network exists — every resource created after this point
 # (postgres, the control-plane container) must be torn down on any exit path,
 # INCLUDING one that fails mid-boot before that resource itself is confirmed
@@ -450,7 +452,9 @@ if [ "$LEVEL" = ui ] || [ "$LEVEL" = session ] || [ "$LEVEL" = all ]; then
     IS_LOCAL=1
     boot_local_stack
     BASE_URL="http://127.0.0.1:${CP_PORT}"
-    KEY="$(tr -d '\r\n' < "$RUN_STATE_DIR/dev-agent-key")"
+    # The container creates its key mode 0600 as root; read it inside that
+    # container rather than weakening file permissions on the host.
+    KEY="$(docker exec "$CP" cat /run/quasar/dev-agent-key | tr -d '\r\n')"
   else
     BASE_URL="${TARGET%/}"
     KEY="${QUASAR_DEV_AGENT_KEY:-}"

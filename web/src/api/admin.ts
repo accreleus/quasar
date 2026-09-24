@@ -552,6 +552,14 @@ export function requestHostImageCleanup(token: string, hostID: string, req: Host
   });
 }
 
+/** Reads the persisted outcome of one exact-version cleanup request. */
+export function getHostImageCleanupAttempt(token: string, hostID: string, attemptID: string, signal?: AbortSignal): Promise<HostImageCleanupAttempt> {
+  return apiFetch<HostImageCleanupAttempt>(
+    `/admin/hosts/${encodeURIComponent(hostID)}/images/cleanup/attempts/${encodeURIComponent(attemptID)}`,
+    { token, signal },
+  );
+}
+
 export function pinImage(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/admin/images/${encodeURIComponent(id)}/pin`, {
     method: "POST",

@@ -3896,6 +3896,55 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/images/cleanup/attempts/{attempt_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one durable exact-version cleanup attempt (RH05).
+         * @description Reads persisted state only; it does not infer removal from a preview, contact an agent, or retry dispatch. An attempt on another host or a pruned attempt is 404. The reason is a safe operator code, never a raw runtime error.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current persisted attempt. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/images/{image_id}/retry": {
         parameters: {
             query?: never;
