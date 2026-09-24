@@ -959,6 +959,114 @@ func TestCleanupReadyHistoryWriterQueuesFollowupDuringScan(t *testing.T) {
 	}
 }
 
+func TestCleanupRegistrationHistoryWriterQueuesFollowupDuringScan(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-register-history-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	ctx := context.Background()
+	if err := env.ens.reconcile(ctx, host, []agentws.RegisterImage{{ImageID: imgID, Version: imgVer, State: "ready"}}); err != nil {
+		t.Fatal(err)
+	}
+	env.ens.SetCleanupService(env.cleanup)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true}
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageCleanupRegistered(ctx, host)
+	var first agentws.ImageInventoryReconcileCmd
+	select {
+	case first = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial registration scan was not sent")
+	}
+	if _, err := env.pool.Exec(ctx, `UPDATE installed_images SET version=$2,registry_ref=$3 WHERE image_id=$1`, imgID, imgVer2, imgDigest2); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.ens.reconcile(ctx, host, []agentws.RegisterImage{{ImageID: imgID, Version: imgVer2, State: "ready"}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 1, first.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(ctx, host)
+	select {
+	case second := <-env.cleanupWire.inventoryRequests:
+		found := false
+		for _, identity := range second.Identities {
+			if identity.ImageID == imgID && identity.Version == imgVer && identity.ImageRef == imgRef {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("registration follow-up omitted retained identity: %+v", second.Identities)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("registration history change did not schedule a follow-up scan")
+	}
+}
+
+func TestCleanupManagedIdentityTriggerRetriesFailedSend(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-trigger-retry-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 1)
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true})
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.inventorySendErr = errors.New("temporary send failure")
+	env.cleanupWire.mu.Unlock()
+	failed := make(chan struct{}, 1)
+	env.cleanupWire.inventorySendHook = func() {
+		select {
+		case failed <- struct{}{}:
+		default:
+		}
+	}
+	env.cleanup.ManagedIdentityChanged(host)
+	select {
+	case <-failed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial send did not run")
+	}
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.inventorySendErr = nil
+	env.cleanupWire.mu.Unlock()
+	select {
+	case <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transient send failure discarded identity trigger")
+	}
+}
+
+func TestCleanupFleetIdentityTriggerRetriesFailedHostQuery(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-fleet-query-retry-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 1)
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true})
+	ctx := context.Background()
+	lock, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Rollback(ctx) }()
+	if _, err := lock.Exec(ctx, `LOCK TABLE hosts IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	env.cleanup.ManagedIdentitiesChanged()
+	// The worker's first host query has a ten-second deadline. Once it fails,
+	// releasing the lock must let the same trigger reach the connected host.
+	time.Sleep(11 * time.Second)
+	if err := lock.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transient fleet query failure discarded identity trigger")
+	}
+}
+
 func TestCleanupIncompleteRepliesKeepBoundedSameAttemptFlight(t *testing.T) {
 	env, hosts := newActionsEnv(t, "cleanup-incomplete-flight-host")
 	host := hosts[0]

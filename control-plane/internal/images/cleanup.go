@@ -601,17 +601,21 @@ func (s *CleanupService) invalidateReconcileLocked(hostID string, snap agentws.I
 	return gate
 }
 
-func (s *CleanupService) bumpInventoryFences(ctx context.Context, hostID string) {
+func (s *CleanupService) bumpInventoryFences(ctx context.Context, hostID string) bool {
 	ids := s.changedInventoryIDs(hostID)
 	if len(ids) == 0 {
-		return
+		return true
 	}
 	if _, err := s.pool.Exec(ctx, `UPDATE host_image_operation_fences SET generation=generation+1
 		WHERE host_id=$1::uuid AND image_id=ANY($2::text[]) AND state='idle'`, hostID, ids); err != nil {
+		snap, _ := s.wire.ImageCleanupSnapshot(hostID)
 		s.mu.Lock()
 		delete(s.inventorySnapshots, hostID)
+		s.invalidateReconcileLocked(hostID, snap, "")
 		s.mu.Unlock()
+		return false
 	}
+	return true
 }
 
 // ManagedIdentitiesChanged schedules one bounded fleet sweep after an adoption
@@ -626,23 +630,37 @@ func (s *CleanupService) ManagedIdentitiesChanged() {
 	s.sweepRunning = true
 	s.mu.Unlock()
 	go func() {
+		retryDelay := 100 * time.Millisecond
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			rows, err := s.pool.Query(ctx, `SELECT id::text FROM hosts`)
+			queryOK := err == nil
 			if err == nil {
 				var hosts []string
 				for rows.Next() {
 					var id string
-					if rows.Scan(&id) == nil {
-						hosts = append(hosts, id)
+					if err := rows.Scan(&id); err != nil {
+						queryOK = false
+						break
 					}
+					hosts = append(hosts, id)
+				}
+				if rows.Err() != nil {
+					queryOK = false
 				}
 				rows.Close()
-				for _, hostID := range hosts {
-					s.ManagedIdentityChanged(hostID)
+				if queryOK {
+					for _, hostID := range hosts {
+						s.ManagedIdentityChanged(hostID)
+					}
 				}
 			}
 			cancel()
+			if !queryOK {
+				waitCleanupTriggerRetry(&retryDelay)
+				continue
+			}
+			retryDelay = 100 * time.Millisecond
 			s.mu.Lock()
 			if !s.sweepDirty {
 				s.sweepRunning = false
@@ -658,7 +676,11 @@ func (s *CleanupService) ManagedIdentitiesChanged() {
 // ManagedIdentityChanged schedules a host-specific history refresh without
 // blocking the agent WebSocket reader. At most one worker runs per host.
 func (s *CleanupService) ManagedIdentityChanged(hostID string) {
+	snap, _ := s.wire.ImageCleanupSnapshot(hostID)
 	s.mu.Lock()
+	// An adoption or success-history commit makes the previous scan's managed
+	// identity set stale immediately, before the asynchronous query can run.
+	s.invalidateReconcileLocked(hostID, snap, "")
 	if s.hostTriggerRunning[hostID] {
 		s.hostTriggerDirty[hostID] = true
 		s.mu.Unlock()
@@ -667,12 +689,19 @@ func (s *CleanupService) ManagedIdentityChanged(hostID string) {
 	s.hostTriggerRunning[hostID] = true
 	s.mu.Unlock()
 	go func() {
+		retryDelay := 100 * time.Millisecond
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			sent := true
 			if snap, connected := s.wire.ImageCleanupSnapshot(hostID); connected && snap.Capable {
-				s.ImageCleanupRegistered(ctx, hostID)
+				sent = s.sendImageInventoryReconcile(ctx, hostID)
 			}
 			cancel()
+			if !sent {
+				waitCleanupTriggerRetry(&retryDelay)
+				continue
+			}
+			retryDelay = 100 * time.Millisecond
 			s.mu.Lock()
 			if !s.hostTriggerDirty[hostID] {
 				delete(s.hostTriggerRunning, hostID)
@@ -685,14 +714,36 @@ func (s *CleanupService) ManagedIdentityChanged(hostID string) {
 	}()
 }
 
+// Retry only failed DB work or command enqueue. Once queued, the reconcile
+// flight still limits each cleanup attempt to one timed scan retry.
+func waitCleanupTriggerRetry(delay *time.Duration) {
+	time.Sleep(*delay)
+	if *delay < 30*time.Second {
+		*delay *= 2
+		if *delay > 30*time.Second {
+			*delay = 30 * time.Second
+		}
+	}
+}
+
 func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID string) {
+	if !s.sendImageInventoryReconcile(ctx, hostID) {
+		s.ManagedIdentityChanged(hostID)
+	}
+}
+
+// sendImageInventoryReconcile returns false only when the trigger could not
+// query or enqueue. The managed-identity worker keeps that trigger pending.
+func (s *CleanupService) sendImageInventoryReconcile(ctx context.Context, hostID string) bool {
 	s.mu.Lock()
 	startedEpoch := s.reconcileEpoch[hostID]
 	s.mu.Unlock()
-	s.bumpInventoryFences(ctx, hostID)
+	if !s.bumpInventoryFences(ctx, hostID) {
+		return false
+	}
 	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
 	if !connected || !snap.Capable {
-		return
+		return true // a later capable registration refreshes an offline host
 	}
 	// Reconcile frozen managed identities, including unresolved attempts that
 	// survived catalog pruning, before trusting upgraded inventory.
@@ -705,19 +756,24 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 		UNION SELECT a.image_id,a.version,a.image_ref FROM host_image_cleanup_attempts a
 		WHERE a.host_id=$1::uuid AND a.state IN ('removing','unknown')`, hostID)
 	if err != nil {
-		return
+		return false
 	}
 	var identities []agentws.ImageInventoryIdentity
+	var scanErr error
 	for rows.Next() {
 		var identity agentws.ImageInventoryIdentity
-		if rows.Scan(&identity.ImageID, &identity.Version, &identity.ImageRef) == nil && identity.ImageRef != "" {
+		if err := rows.Scan(&identity.ImageID, &identity.Version, &identity.ImageRef); err != nil {
+			scanErr = err
+			break
+		}
+		if identity.ImageRef != "" {
 			identities = append(identities, identity)
 		}
 	}
 	rowsErr := rows.Err()
 	rows.Close()
-	if rowsErr != nil {
-		return
+	if scanErr != nil || rowsErr != nil {
+		return false
 	}
 	sort.Slice(identities, func(i, j int) bool {
 		if identities[i].ImageID != identities[j].ImageID {
@@ -730,19 +786,21 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 	})
 	identityJSON, err := json.Marshal(identities)
 	if err != nil {
-		return
+		return false
 	}
 	identitySet := string(identityJSON)
 	id, err := newCmdID()
 	if err != nil {
-		return
+		return false
 	}
 	s.mu.Lock()
 	if s.reconcileEpoch[hostID] != startedEpoch {
 		// A newer attempt or reconcile began while the managed-identity SQL
-		// was in flight. Its scan must not be replaced by this older request.
+		// was in flight. Do not replace that scan, but a managed-identity
+		// trigger must retry: the other query may have read identities before
+		// this trigger's transaction committed.
 		s.mu.Unlock()
-		return
+		return false
 	}
 	retries := 0
 	if flight, inFlight := s.reconcileFlights[hostID]; inFlight && flight.connectionID == snap.ConnectionID &&
@@ -764,7 +822,7 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 					SET state='unknown',reason='inventory_unknown',updated_at=now()
 					WHERE host_id=$1::uuid AND state='removing'`, hostID)
 			}
-			return
+			return true // the active flight or its one retry owns this trigger
 		}
 		// One bounded retry can recover a lost reconcile command or ack.
 		// A second stalled scan waits for a new connection incarnation.
@@ -780,13 +838,15 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 	// enqueue in one critical section so an older query cannot send last.
 	if s.wire.SendImageInventoryReconcile(hostID, agentws.ImageInventoryReconcileCmd{ID: id, Identities: identities}) != nil {
 		delete(s.reconcileFlights, hostID)
+		s.invalidateReconcileLocked(hostID, snap, "")
 		s.mu.Unlock()
 		// Keep the gate fail closed until a later successful reconcile. An
 		// earlier complete snapshot must not become usable after send failure.
-		return
+		return false
 	}
 	s.mu.Unlock()
 	s.requestCleanupJournal(ctx, hostID)
+	return true
 }
 
 // Every unresolved attempt must be reconciled from the complete durable
@@ -854,7 +914,10 @@ func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID strin
 func (s *CleanupService) ImageVersionsChanged(ctx context.Context, hostID string) {
 	// The changed exact identity invalidates its preview; an unrelated image
 	// keeps its generation. The agent still rechecks its daemon binding at rmi.
-	s.bumpInventoryFences(ctx, hostID)
+	if !s.bumpInventoryFences(ctx, hostID) {
+		s.ManagedIdentityChanged(hostID)
+		return
+	}
 	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
 	followup := false
 	s.mu.Lock()

@@ -695,20 +695,11 @@ func (e *Ensurer) AgentImageState(ctx context.Context, hostID string, m agentws.
 	}
 	historyChanged := false
 	if m.State == "ready" {
-		var previousVersion string
-		historyErr := tx.QueryRow(ctx, `SELECT current_version FROM host_image_success_history
-			WHERE host_id=$1::uuid AND image_id=$2`, hostID, m.ImageID).Scan(&previousVersion)
-		if historyErr != nil && !errors.Is(historyErr, pgx.ErrNoRows) {
-			e.log.Error("image_state: read history failed", "host_id", hostID, "image_id", m.ImageID, "err", historyErr)
+		historyChanged, err = successfulVersionWouldChange(ctx, tx, hostID, m.ImageID, m.Version)
+		if err != nil {
+			e.log.Error("image_state: read history failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
 			return
 		}
-		var matchingAdoption bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
-			WHERE image_id=$1 AND version=$2)`, m.ImageID, m.Version).Scan(&matchingAdoption); err != nil {
-			e.log.Error("image_state: read adoption failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
-			return
-		}
-		historyChanged = matchingAdoption && (errors.Is(historyErr, pgx.ErrNoRows) || previousVersion != m.Version)
 		if err := recordSuccessfulVersion(ctx, tx, hostID, m.ImageID, m.Version); err != nil {
 			e.log.Error("image_state: history failed", "host_id", hostID, "image_id", m.ImageID, "err", err)
 			return
@@ -1081,6 +1072,7 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 	}()
 
 	seen := make([]string, 0, len(imgs))
+	historyChanged := false
 	// clearKeys: (host,image) retry counters to drop once committed (reported
 	// ready/absent). Deferred past commit so a rolled-back reconcile never
 	// clears a counter for state that was never applied.
@@ -1114,7 +1106,19 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 			}
 			continue
 		}
+		imageHistoryChanged := false
 		if img.State == "ready" {
+			imageHistoryChanged, err = successfulVersionWouldChange(ctx, tx, hostID, img.ImageID, img.Version)
+			if err != nil {
+				if _, rollbackErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT image_report`); rollbackErr != nil {
+					return fmt.Errorf("rollback failed history read image=%s: %w", img.ImageID, rollbackErr)
+				}
+				if _, releaseErr := tx.Exec(ctx, `RELEASE SAVEPOINT image_report`); releaseErr != nil {
+					return fmt.Errorf("release failed history read image=%s: %w", img.ImageID, releaseErr)
+				}
+				e.log.Error("register images: history read failed; retaining other image reports", "host_id", hostID, "image_id", img.ImageID, "err", err)
+				continue
+			}
 			if err := recordSuccessfulVersion(ctx, tx, hostID, img.ImageID, img.Version); err != nil {
 				if _, rollbackErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT image_report`); rollbackErr != nil {
 					return fmt.Errorf("rollback failed history image=%s: %w", img.ImageID, rollbackErr)
@@ -1129,6 +1133,7 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 		if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT image_report`); err != nil {
 			return fmt.Errorf("release registered image=%s: %w", img.ImageID, err)
 		}
+		historyChanged = historyChanged || imageHistoryChanged
 		seen = append(seen, img.ImageID)
 		if img.State == "ready" || img.State == "absent" {
 			clearKeys = append(clearKeys, hostID+"|"+img.ImageID)
@@ -1147,6 +1152,9 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 		return fmt.Errorf("commit reconciliation: %w", err)
 	}
 	committed = true
+	if historyChanged && e.cleanup != nil {
+		e.cleanup.ManagedIdentityChanged(hostID)
+	}
 	e.observeSnapshot(hostID, seen)
 	for _, key := range clearKeys {
 		e.clearFailures(key)
