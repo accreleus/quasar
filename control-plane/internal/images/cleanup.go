@@ -41,6 +41,15 @@ type CleanupService struct {
 	inventorySnapshots map[string]trackedCleanupInventory
 	freshReconcile     map[string]cleanupReconcileGate
 	reconcileEpoch     map[string]uint64
+	reconcileFlights   map[string]cleanupReconcileFlight
+}
+
+type cleanupReconcileFlight struct {
+	connectionID string
+	requestID    string
+	startedAt    time.Time
+	retries      int
+	followup     bool
 }
 
 type cleanupReconcileGate struct {
@@ -68,7 +77,7 @@ type pendingCleanupJournal struct {
 func NewCleanupService(pool *pgxpool.Pool, wire CleanupTransport) *CleanupService {
 	return &CleanupService{pool: pool, wire: wire, journalRequests: make(map[string]pendingCleanupJournal),
 		inventorySnapshots: make(map[string]trackedCleanupInventory), freshReconcile: make(map[string]cleanupReconcileGate),
-		reconcileEpoch: make(map[string]uint64)}
+		reconcileEpoch: make(map[string]uint64), reconcileFlights: make(map[string]cleanupReconcileFlight)}
 }
 
 func (s *CleanupService) SetEnsurer(e interface {
@@ -643,15 +652,48 @@ func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID stri
 		s.mu.Unlock()
 		return
 	}
+	retries := 0
+	if flight, inFlight := s.reconcileFlights[hostID]; inFlight && flight.connectionID == snap.ConnectionID &&
+		snap.ReconciledRequestID != flight.requestID {
+		if time.Since(flight.startedAt) < 30*time.Second || flight.retries >= 1 {
+			// The scan is already running on this connection. A new attempt
+			// needs a follow-up scan after it completes, but repeated HTTP
+			// retries must not spawn unbounded daemon scans.
+			if s.freshReconcile[hostID].requestID != flight.requestID {
+				flight.followup = true
+				s.reconcileFlights[hostID] = flight
+			}
+			exhausted := flight.retries >= 1 && time.Since(flight.startedAt) >= 30*time.Second
+			s.mu.Unlock()
+			if exhausted {
+				// Keep the fence, but make the uncertainty and reconnect remedy
+				// visible through the persisted attempt status.
+				_, _ = s.pool.Exec(ctx, `UPDATE host_image_cleanup_attempts
+					SET state='unknown',reason='inventory_unknown',updated_at=now()
+					WHERE host_id=$1::uuid AND state='removing'`, hostID)
+			}
+			return
+		}
+		// One bounded retry can recover a lost reconcile command or ack.
+		// A second stalled scan waits for a new connection incarnation.
+		retries = flight.retries + 1
+	}
 	// A newer reconcile supersedes any journal snapshot requested against an
 	// older daemon scan on this same connection.
 	s.invalidateReconcileLocked(hostID, snap, id)
-	s.mu.Unlock()
+	s.reconcileFlights[hostID] = cleanupReconcileFlight{connectionID: snap.ConnectionID,
+		requestID: id, startedAt: time.Now(), retries: retries}
+	// Lock order invariant: Registry enqueue must remain nonblocking and must
+	// never call back into CleanupService while s.mu is held. Keep gate and
+	// enqueue in one critical section so an older query cannot send last.
 	if s.wire.SendImageInventoryReconcile(hostID, agentws.ImageInventoryReconcileCmd{ID: id, Identities: identities}) != nil {
+		delete(s.reconcileFlights, hostID)
+		s.mu.Unlock()
 		// Keep the gate fail closed until a later successful reconcile. An
 		// earlier complete snapshot must not become usable after send failure.
 		return
 	}
+	s.mu.Unlock()
 	s.requestCleanupJournal(ctx, hostID)
 }
 
@@ -721,6 +763,19 @@ func (s *CleanupService) ImageVersionsChanged(ctx context.Context, hostID string
 	// The changed exact identity invalidates its preview; an unrelated image
 	// keeps its generation. The agent still rechecks its daemon binding at rmi.
 	s.bumpInventoryFences(ctx, hostID)
+	snap, connected := s.wire.ImageCleanupSnapshot(hostID)
+	followup := false
+	s.mu.Lock()
+	if flight, ok := s.reconcileFlights[hostID]; ok && connected &&
+		flight.connectionID == snap.ConnectionID && flight.requestID == snap.ReconciledRequestID {
+		delete(s.reconcileFlights, hostID)
+		followup = flight.followup || s.freshReconcile[hostID].requestID == ""
+	}
+	s.mu.Unlock()
+	if followup {
+		s.ImageCleanupRegistered(ctx, hostID)
+		return
+	}
 	s.requestCleanupJournal(ctx, hostID)
 }
 

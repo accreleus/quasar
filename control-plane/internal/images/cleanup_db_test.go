@@ -3,6 +3,7 @@ package images
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -21,6 +22,8 @@ type fakeCleanupWire struct {
 	inventoryRequests chan agentws.ImageInventoryReconcileCmd
 	journalRequests   chan agentws.ImageCleanupJournalRequestCmd
 	snapshotHook      func()
+	inventorySendHook func()
+	inventorySendErr  error
 }
 
 func (f *fakeCleanupWire) ImageCleanupSnapshot(hostID string) (agentws.ImageCleanupSnapshot, bool) {
@@ -43,6 +46,16 @@ func (f *fakeCleanupWire) SendImageCleanup(_ context.Context, _ string, c agentw
 	return agentws.AckResult{OK: true}, nil
 }
 func (f *fakeCleanupWire) SendImageInventoryReconcile(_ string, c agentws.ImageInventoryReconcileCmd) error {
+	f.mu.Lock()
+	hook := f.inventorySendHook
+	sendErr := f.inventorySendErr
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if sendErr != nil {
+		return sendErr
+	}
 	if f.inventoryRequests != nil {
 		f.inventoryRequests <- c
 	}
@@ -580,6 +593,214 @@ func TestCleanupOlderRegistrationCannotReplaceNewAttemptReconcile(t *testing.T) 
 	case older := <-env.cleanupWire.inventoryRequests:
 		t.Fatalf("older registration replaced newer scan: %+v", older)
 	default:
+	}
+}
+
+func TestCleanupGateAndReconcileSendStayOrderedAcrossNewAttempt(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-send-order-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 1)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
+	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+		RuntimeImageID: "sha256:send-order", State: "present"}
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{entry}}
+	env.cleanupWire.set(host, snapshot)
+	entered, release, registered := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var paused atomic.Bool
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.inventorySendHook = func() {
+		if paused.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	env.cleanupWire.mu.Unlock()
+	go func() { env.cleanup.ImageCleanupRegistered(context.Background(), host); close(registered) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first reconcile did not reach send")
+	}
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:send-order","expected_generation":"0"}`
+	type answer struct {
+		code int
+		body []byte
+	}
+	result := make(chan answer, 1)
+	go func() { code, body := env.do(t, http.MethodPost, path, request); result <- answer{code, body} }()
+	select {
+	case got := <-result:
+		t.Fatalf("new attempt overtook paused gate/send: %d %s", got.code, got.body)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	var first agentws.ImageInventoryReconcileCmd
+	select {
+	case first = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first reconcile not sent")
+	}
+	select {
+	case <-registered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first registration did not finish")
+	}
+	select {
+	case got := <-result:
+		if got.code != 202 {
+			t.Fatalf("new attempt = %d %s", got.code, got.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("new attempt did not commit")
+	}
+	select {
+	case <-env.cleanupWire.cleanup:
+	case <-time.After(5 * time.Second):
+		t.Fatal("new cleanup did not dispatch")
+	}
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("started second scan before first completed: %+v", extra)
+	default:
+	}
+	snapshot.ReconciledRevision = 1
+	snapshot.ReconciledRequestID = first.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	select {
+	case second := <-env.cleanupWire.inventoryRequests:
+		if second.ID == first.ID {
+			t.Fatal("follow-up reused first reconcile ID")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("new attempt's follow-up scan missing")
+	}
+}
+
+func TestCleanupRepeatedDuplicatePOSTsBoundStalledReconcile(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-stalled-reconcile-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 1)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
+	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+		RuntimeImageID: "sha256:stalled", State: "present"}
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{entry}})
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:stalled","expected_generation":"0"}`
+	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+		t.Fatalf("initial POST = %d %s", code, body)
+	}
+	select {
+	case <-env.cleanupWire.cleanup:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup not dispatched")
+	}
+	select {
+	case <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first scan missing")
+	}
+	for range 50 {
+		if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+			t.Fatalf("duplicate POST = %d %s", code, body)
+		}
+	}
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("stalled scan multiplied: %+v", extra)
+	default:
+	}
+	// One timed retry is allowed. A second stalled request cannot create an
+	// unbounded sequence of agent scan workers on this connection.
+	env.cleanup.mu.Lock()
+	flight := env.cleanup.reconcileFlights[host]
+	flight.startedAt = time.Now().Add(-31 * time.Second)
+	env.cleanup.reconcileFlights[host] = flight
+	env.cleanup.mu.Unlock()
+	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+		t.Fatalf("timed retry POST = %d %s", code, body)
+	}
+	select {
+	case <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("one bounded retry missing")
+	}
+	env.cleanup.mu.Lock()
+	flight = env.cleanup.reconcileFlights[host]
+	flight.startedAt = time.Now().Add(-31 * time.Second)
+	env.cleanup.reconcileFlights[host] = flight
+	env.cleanup.mu.Unlock()
+	for range 50 {
+		if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+			t.Fatalf("exhausted duplicate POST = %d %s", code, body)
+		}
+	}
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("unbounded retry sent: %+v", extra)
+	default:
+	}
+	var state string
+	var reason *string
+	if err := env.pool.QueryRow(context.Background(), `SELECT state,reason FROM host_image_cleanup_attempts
+		WHERE host_id=$1::uuid`, host).Scan(&state, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if state != "unknown" || reason == nil || *reason != "inventory_unknown" {
+		t.Fatalf("exhausted scan should surface uncertain recovery remedy: state=%s reason=%v", state, reason)
+	}
+}
+
+func TestCleanupReconcileSendFailureKeepsProofClosedUntilRetry(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-send-failure-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 1)
+	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 1)
+	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+		RuntimeImageID: "sha256:send-failure", State: "present"}
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{entry}})
+	failedSend := make(chan struct{})
+	var once sync.Once
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.inventorySendErr = errors.New("queue unavailable")
+	env.cleanupWire.inventorySendHook = func() { once.Do(func() { close(failedSend) }) }
+	env.cleanupWire.mu.Unlock()
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:send-failure","expected_generation":"0"}`
+	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+		t.Fatalf("initial POST = %d %s", code, body)
+	}
+	select {
+	case <-failedSend:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial send did not fail")
+	}
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.inventorySendErr = nil
+	env.cleanupWire.mu.Unlock()
+	env.cleanup.requestCleanupJournal(context.Background(), host)
+	select {
+	case journal := <-env.cleanupWire.journalRequests:
+		t.Fatalf("failed send admitted stale journal: %+v", journal)
+	default:
+	}
+	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+		t.Fatalf("retry POST = %d %s", code, body)
+	}
+	select {
+	case <-env.cleanupWire.inventoryRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry did not resend reconcile")
 	}
 }
 
