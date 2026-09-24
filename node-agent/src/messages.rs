@@ -471,6 +471,10 @@ pub struct ImageVersionEntry {
     pub image_ref: String,
     pub runtime_image_id: String,
     pub state: String,
+    /// Point-in-time result of the same complete all-container scan as absence.
+    /// Only present entries may carry this field; no container identity crosses the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_referenced: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

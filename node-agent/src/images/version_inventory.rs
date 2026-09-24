@@ -53,6 +53,7 @@ impl VersionInventory {
                         image_ref: record.image_ref.clone(),
                         runtime_image_id: record.runtime_image_id.clone(),
                         state: "unknown".into(),
+                        container_referenced: None,
                     })
             })
             .collect();
@@ -117,6 +118,7 @@ impl VersionInventory {
             image_ref: identity.image_ref.clone(),
             runtime_image_id: String::new(),
             state: "unknown".into(),
+            container_referenced: None,
         });
         self.revoke();
         Ok(())
@@ -139,7 +141,7 @@ impl VersionInventory {
         for image in daemon {
             for reference in &image.refs {
                 if by_ref.insert(reference.clone(), image.id.clone()).is_some() {
-                    *self.complete.lock().unwrap() = false;
+                    self.revoke();
                     return Err(std::io::Error::other("duplicate daemon image ref"));
                 }
             }
@@ -199,6 +201,7 @@ impl VersionInventory {
         if !complete {
             for entry in &mut found {
                 entry.state = "unknown".to_string();
+                entry.container_referenced = None;
             }
         }
         *self.last.lock().unwrap() = found.clone();
@@ -213,6 +216,7 @@ impl VersionInventory {
         *self.complete.lock().unwrap() = false;
         for entry in self.last.lock().unwrap().iter_mut() {
             entry.state = "unknown".to_string();
+            entry.container_referenced = None;
         }
     }
 
@@ -285,6 +289,8 @@ fn entries(
                     image_ref: rec.image_ref.clone(),
                     runtime_image_id: rec.runtime_image_id.clone(),
                     state: state.to_string(),
+                    container_referenced: (state == "present")
+                        .then(|| container_image_ids.contains(&rec.runtime_image_id)),
                 }
             })
         })
@@ -343,6 +349,12 @@ mod tests {
             entries.iter().find(|e| e.version == "v1").unwrap().state,
             "absent"
         );
+        assert!(entries
+            .iter()
+            .find(|e| e.version == "v1")
+            .unwrap()
+            .container_referenced
+            .is_none());
     }
 
     #[test]

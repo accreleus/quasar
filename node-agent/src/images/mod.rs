@@ -1456,6 +1456,7 @@ impl ImageManager {
         if overflowed {
             for version in &mut image_versions {
                 version.state = "unknown".into();
+                version.container_referenced = None;
             }
         }
         snapshot_permit.send(AgentMsg::ImageVersionsState {
@@ -2336,6 +2337,87 @@ mod tests {
             reply_hook,
         }));
         manager
+    }
+
+    #[test]
+    fn inventory_reports_exact_container_references_and_revokes_failed_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_ref = "ghcr.io/x/steam:sha-1234567";
+        let image_id = "sha256:managed";
+        let scans = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Ok((
+                vec![crate::runtime::DaemonImage {
+                    id: image_id.into(),
+                    refs: vec![image_ref.into()],
+                }],
+                vec!["sha256:unrelated".into(), image_id.into()],
+            )),
+            Ok((
+                vec![crate::runtime::DaemonImage {
+                    id: image_id.into(),
+                    refs: vec![image_ref.into()],
+                }],
+                vec!["sha256:unrelated".into()],
+            )),
+            Err("container scan incomplete".into()),
+        ])));
+        let manager = cleanup_mgr(
+            dir.path(),
+            Arc::new(move || scans.lock().unwrap().pop_front().unwrap()),
+            None,
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        let _guard = manager.attach_upstream(tx);
+        rx.try_recv().unwrap();
+        let identity = ImageIdentity {
+            image_id: "steam".into(),
+            version: "v1".into(),
+            image_ref: image_ref.into(),
+        };
+        manager.handle_inventory_reconcile("scan".into(), vec![identity]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut first = None;
+        while first.is_none() && Instant::now() < deadline {
+            if let Ok(message) = rx.try_recv() {
+                let value = serde_json::to_value(message).unwrap();
+                if value["type"] == "image_versions_state" {
+                    first = Some(value);
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let first = first.expect("complete inventory snapshot");
+        assert_eq!(first["image_versions_complete"], true);
+        assert_eq!(first["image_versions"][0]["container_referenced"], true);
+        assert!(!first.to_string().contains("sha256:unrelated"));
+
+        *manager.inventory_last_refresh.lock().unwrap() = Instant::now() - Duration::from_secs(31);
+        manager.maybe_refresh_version_inventory();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let second = loop {
+            if let Ok(message) = rx.try_recv() {
+                break serde_json::to_value(message).unwrap();
+            }
+            assert!(Instant::now() < deadline, "bounded inventory refresh");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(second["image_versions_complete"], true);
+        assert_eq!(second["image_versions"][0]["container_referenced"], false);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.inventory_refresh_busy.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "inventory refresh finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        manager.refresh_version_inventory();
+        let third = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
+        assert_eq!(third["image_versions_complete"], false);
+        assert_eq!(third["image_versions"][0]["state"], "unknown");
+        assert!(third["image_versions"][0]
+            .get("container_referenced")
+            .is_none());
     }
 
     #[test]
