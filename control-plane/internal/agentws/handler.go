@@ -1234,7 +1234,19 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			imgCancel()
 		case "image_versions_state":
 			var m ImageVersionsStateMsg
-			if json.Unmarshal(raw, &m) == nil && h.registry.updateImageVersions(ac, m) && h.cleanupEvents != nil {
+			var changed bool
+			if json.Unmarshal(raw, &m) == nil {
+				changed = h.registry.updateImageVersions(ac, m)
+			} else {
+				// Decode the revision independently: a non-Boolean reference field
+				// rejects the typed payload, but must revoke any newer complete scan.
+				var header struct {
+					InventoryRevision string `json:"inventory_revision"`
+				}
+				_ = json.Unmarshal(raw, &header)
+				changed = h.registry.invalidateImageVersions(ac, header.InventoryRevision)
+			}
+			if changed && h.cleanupEvents != nil {
 				h.cleanupEvents.ImageVersionsChanged(bg, hostID)
 			}
 		case "image_cleanup_state":

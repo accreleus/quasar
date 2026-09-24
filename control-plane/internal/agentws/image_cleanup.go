@@ -1,7 +1,10 @@
 package agentws
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"strconv"
 	"time"
 )
@@ -15,6 +18,27 @@ type ImageVersionEntry struct {
 	ImageRef       string `json:"image_ref"`
 	RuntimeImageID string `json:"runtime_image_id"`
 	State          string `json:"state"`
+	// Nil means an older agent did not supply all-container reference evidence.
+	ContainerReferenced *bool `json:"container_referenced,omitempty"`
+}
+
+func (v *ImageVersionEntry) UnmarshalJSON(data []byte) error {
+	type plain ImageVersionEntry
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var field struct {
+		ContainerReferenced json.RawMessage `json:"container_referenced"`
+	}
+	if err := json.Unmarshal(data, &field); err != nil {
+		return err
+	}
+	if bytes.Equal(bytes.TrimSpace(field.ContainerReferenced), []byte("null")) {
+		return errors.New("container_referenced must be Boolean when present")
+	}
+	*v = ImageVersionEntry(decoded)
+	return nil
 }
 
 type ImageVersionsStateMsg struct {
@@ -116,7 +140,8 @@ func validImageVersions(versions []ImageVersionEntry, complete bool) bool {
 	for _, v := range versions {
 		if v.ImageID == "" || len(v.ImageID) > 128 || v.Version == "" || len(v.Version) > 128 ||
 			v.ImageRef == "" || len(v.ImageRef) > 1024 || v.RuntimeImageID == "" || len(v.RuntimeImageID) > 256 ||
-			v.State != "present" && v.State != "absent" && v.State != "unknown" {
+			v.State != "present" && v.State != "absent" && v.State != "unknown" ||
+			v.State != "present" && v.ContainerReferenced != nil {
 			return false
 		}
 		key := v.ImageID + "\x00" + v.Version + "\x00" + v.ImageRef + "\x00" + v.RuntimeImageID
@@ -150,7 +175,7 @@ func (r *Registry) ImageCleanupSnapshot(hostID string) (ImageCleanupSnapshot, bo
 func (r *Registry) updateImageVersions(c *conn, m ImageVersionsStateMsg) bool {
 	revision, err := strconv.ParseUint(m.InventoryRevision, 10, 64)
 	if err != nil || revision == 0 || !validImageVersions(m.ImageVersions, m.ImageVersionsComplete) {
-		return false
+		return r.invalidateImageVersions(c, m.InventoryRevision)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -172,6 +197,29 @@ func (r *Registry) updateImageVersions(c *conn, m ImageVersionsStateMsg) bool {
 		c.imageReconcileAwaiting = false
 		c.imageReconcileAwaitingID = ""
 	}
+	return true
+}
+
+// A malformed newer report cannot leave a prior complete scan authoritative.
+// Older out-of-order reports do not replace a newer current snapshot.
+func (r *Registry) invalidateImageVersions(c *conn, revisionText string) bool {
+	revision, err := strconv.ParseUint(revisionText, 10, 64)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conns[c.hostID] != c || !c.imageCleanupV1 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil && revision != 0 && revision <= c.imageVersionsRevision {
+		return false
+	}
+	if err == nil && revision != 0 {
+		c.imageVersionsRevision = revision
+	}
+	c.imageVersionsComplete = false
+	c.imageVersions = nil
+	c.imageVersionsObservedAt = time.Now().UTC()
 	return true
 }
 
