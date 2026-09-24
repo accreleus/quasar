@@ -138,6 +138,12 @@ func imageReadySQL(refIdx int) string {
 		              AND hi.image_id = ii.image_id
 		              AND hi.state = 'ready'
 		              AND (hi.version = '' OR hi.version = ii.version)
+		              AND NOT EXISTS (
+		                  SELECT 1 FROM host_image_operation_fences f
+		                   WHERE f.host_id = hi.host_id
+		                     AND f.image_id = hi.image_id
+		                     AND f.state = 'removing'
+		              )
 		       )
 		)`, refIdx)
 }

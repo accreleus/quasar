@@ -833,15 +833,29 @@ func (e *Ensurer) RetryHostImage(ctx context.Context, hostID, imageID string) er
 	if !required {
 		return ErrRetryNotRequired
 	}
-	removing, err := imageRemoving(ctx, e.pool, hostID, imageID)
+	// Serialize Retry with a cleanup attempt's fence transition. An unlocked
+	// read could accept a retry while another transaction has already changed
+	// the fence to removing but has not committed yet. Dispatch rechecks again
+	// after this short transaction, so no DB lock crosses the agent call.
+	tx, err := e.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if removing {
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `INSERT INTO host_image_operation_fences(host_id,image_id,state)
+		VALUES($1::uuid,$2,'idle') ON CONFLICT DO NOTHING`, hostID, imageID); err != nil {
+		return err
+	}
+	var fenceState string
+	if err := tx.QueryRow(ctx, `SELECT state FROM host_image_operation_fences
+		WHERE host_id=$1::uuid AND image_id=$2 FOR SHARE`, hostID, imageID).Scan(&fenceState); err != nil {
+		return err
+	}
+	if fenceState == "removing" {
 		return ErrRetryRemoving
 	}
 	var state, version string
-	err = e.pool.QueryRow(ctx, `SELECT state,version FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&state, &version)
+	err = tx.QueryRow(ctx, `SELECT state,version FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&state, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrRetryNotFailed
 	}
@@ -850,6 +864,9 @@ func (e *Ensurer) RetryHostImage(ctx context.Context, hostID, imageID string) er
 	}
 	if state != "failed" || (version != "" && version != img.Version) {
 		return ErrRetryNotFailed
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 	key := hostID + "|" + imageID
 	e.mu.Lock()

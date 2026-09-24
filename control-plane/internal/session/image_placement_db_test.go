@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -141,6 +142,137 @@ func TestPlacementSkipsHostWithoutReadyImage(t *testing.T) {
 	setHostImage(t, pool, host2, "ready", "")
 	if _, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef)); err != nil {
 		t.Fatalf("version-less ready host must still be a candidate: %v", err)
+	}
+}
+
+func TestPlacementRejectsReadyImageWhileCleanupFenceRemovesIt(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 2)
+	setQuota(t, pool, s.userID, 20)
+	installCatalogImage(t, pool, false)
+	setAppImage(t, pool, s.appID, testImageRef)
+	setHostImage(t, pool, s.hostID, "ready", testImageVer)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO host_image_operation_fences(host_id,image_id,state)
+		VALUES($1::uuid,$2,'removing')`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	before := countSessions(t, pool)
+	if _, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef)); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("launch during image cleanup = %v, want no host available", err)
+	}
+	if after := countSessions(t, pool); after != before {
+		t.Fatalf("cleanup-refused launch persisted a session: %d → %d", before, after)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE host_image_operation_fences SET state='idle'
+		WHERE host_id=$1::uuid AND image_id=$2`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef)); err != nil {
+		t.Fatalf("launch after fence releases with matching ready image: %v", err)
+	}
+}
+
+func TestLaunchWaitsForConcurrentImageCleanupFence(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 2)
+	setQuota(t, pool, s.userID, 20)
+	installCatalogImage(t, pool, false)
+	setAppImage(t, pool, s.appID, testImageRef)
+	setHostImage(t, pool, s.hostID, "ready", testImageVer)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO host_image_operation_fences(host_id,image_id,state)
+		VALUES($1::uuid,$2,'idle')`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE host_image_operation_fences SET state='removing'
+		WHERE host_id=$1::uuid AND image_id=$2`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef))
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("launch escaped uncommitted cleanup fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNoHostAvailable) {
+			t.Fatalf("launch after cleanup fence commits = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("launch did not finish after cleanup fence committed")
+	}
+}
+
+func TestLaunchLocksEveryManagedImageIDSharingAReference(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 2)
+	setQuota(t, pool, s.userID, 20)
+	installCatalogImage(t, pool, false)
+	setAppImage(t, pool, s.appID, testImageRef)
+	setHostImage(t, pool, s.hostID, "ready", testImageVer)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO image_catalog(id,manifest_version,display_name,kind,version,registry_ref,raw)
+		VALUES('steam-alt',1,'Shared Steam','prebuilt',$1,$2,'{}'::jsonb)`, testImageVer, testImageRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO installed_images(image_id,version,registry_ref)
+		VALUES('steam-alt',$1,$2)`, testImageVer, testImageRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_images(host_id,image_id,version,state)
+		VALUES($1::uuid,'steam-alt',$2,'ready')`, s.hostID, testImageVer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_image_operation_fences(host_id,image_id,state)
+		VALUES($1::uuid,$2,'idle'),($1::uuid,'steam-alt','idle')`, s.hostID, testImageID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE host_image_operation_fences SET state='removing'
+		WHERE host_id=$1::uuid AND image_id='steam-alt'`, s.hostID); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := store.ScheduleAndCreate(ctx, imageLaunch(s, testImageRef))
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("shared-ref launch escaped uncommitted second fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNoHostAvailable) {
+			t.Fatalf("shared-ref launch after second cleanup commits = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shared-ref launch did not finish after second fence committed")
 	}
 }
 
