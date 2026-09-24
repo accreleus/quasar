@@ -231,6 +231,9 @@ func safeStoredCleanupReason(reason *string) *string {
 func (s *CleanupService) candidate(ctx context.Context, db dbExecutor, hostID string, v agentws.ImageVersionEntry) (CleanupCandidate, error) {
 	c := CleanupCandidate{ImageID: v.ImageID, Version: v.Version, ImageRef: v.ImageRef,
 		RuntimeImageID: v.RuntimeImageID, Reasons: []string{}, Generation: "0"}
+	if v.ContainerReferenced == nil {
+		c.Reasons = append(c.Reasons, "unknown_inventory")
+	}
 	var generation int64
 	var fenceState string
 	err := db.QueryRow(ctx, `SELECT generation,state FROM host_image_operation_fences
@@ -282,11 +285,11 @@ func (s *CleanupService) candidate(ctx context.Context, db dbExecutor, hostID st
 	if err != nil {
 		return c, err
 	}
+	if containerSession || (v.ContainerReferenced != nil && *v.ContainerReferenced) {
+		c.Reasons = append(c.Reasons, "container_reference")
+	}
 	if required {
 		c.Reasons = append(c.Reasons, "required")
-	}
-	if containerSession {
-		c.Reasons = append(c.Reasons, "container_reference")
 	}
 	if pendingLaunch {
 		c.Reasons = append(c.Reasons, "pending_launch")
@@ -302,7 +305,11 @@ func (s *CleanupService) candidate(ctx context.Context, db dbExecutor, hostID st
 	}
 	c.Eligible = len(c.Reasons) == 0
 	if !c.Eligible {
-		c.Remedy = strptr(cleanupReasonRemedy(c.Reasons[0]))
+		if c.Reasons[0] == "unknown_inventory" {
+			c.Remedy = strptr("Upgrade the node agent to report container references, then refresh image inventory")
+		} else {
+			c.Remedy = strptr(cleanupReasonRemedy(c.Reasons[0]))
+		}
 	}
 	return c, nil
 }
@@ -353,8 +360,12 @@ func staleCleanupConflict(current *CleanupCandidate) *CleanupConflict {
 }
 
 func reasonCleanupConflict(reason string, current *CleanupCandidate) *CleanupConflict {
-	return &CleanupConflict{Code: reason, Message: cleanupReasonMessage(reason),
+	conflict := &CleanupConflict{Code: reason, Message: cleanupReasonMessage(reason),
 		Remedy: cleanupReasonRemedy(reason), Current: current}
+	if current != nil && current.Remedy != nil && len(current.Reasons) > 0 && current.Reasons[0] == reason {
+		conflict.Remedy = *current.Remedy
+	}
+	return conflict
 }
 
 func (s *CleanupService) Request(ctx context.Context, hostID string, req CleanupRequest) (CleanupAttempt, int, *CleanupConflict, error) {
@@ -453,7 +464,17 @@ func (s *CleanupService) Request(ctx context.Context, hostID string, req Cleanup
 		}
 		return zero, 0, staleCleanupConflict(nil), nil
 	}
-	candidate, err := s.candidate(ctx, tx, hostID, *entry)
+	// Read the current authenticated epoch again under the fence lock. Reference
+	// evidence is point-in-time and can change without a generation change.
+	latest, online := s.wire.ImageCleanupSnapshot(hostID)
+	if !online || latest.ConnectionID != snap.ConnectionID || !latest.Complete {
+		return zero, 0, staleCleanupConflict(nil), nil
+	}
+	current := exactPresentImageVersion(latest.Versions, *entry)
+	if current == nil {
+		return zero, 0, staleCleanupConflict(nil), nil
+	}
+	candidate, err := s.candidate(ctx, tx, hostID, *current)
 	if err != nil {
 		return zero, 0, nil, err
 	}
@@ -463,8 +484,20 @@ func (s *CleanupService) Request(ctx context.Context, hostID string, req Cleanup
 	if !candidate.Eligible {
 		return zero, 0, reasonCleanupConflict(candidate.Reasons[0], &candidate), nil
 	}
-	if latest, online := s.wire.ImageCleanupSnapshot(hostID); !online || latest.ConnectionID != snap.ConnectionID || !latest.Complete || !sameImageVersion(latest.Versions, *entry) {
+	final, online := s.wire.ImageCleanupSnapshot(hostID)
+	if !online || final.ConnectionID != snap.ConnectionID || !final.Complete {
 		return zero, 0, staleCleanupConflict(&candidate), nil
+	}
+	finalEntry := exactPresentImageVersion(final.Versions, *current)
+	if finalEntry == nil {
+		return zero, 0, staleCleanupConflict(&candidate), nil
+	}
+	if finalEntry.ContainerReferenced == nil || *finalEntry.ContainerReferenced {
+		candidate, err = s.candidate(ctx, tx, hostID, *finalEntry)
+		if err != nil {
+			return zero, 0, nil, err
+		}
+		return zero, 0, reasonCleanupConflict(candidate.Reasons[0], &candidate), nil
 	}
 	attemptID, err := newCleanupAttemptID()
 	if err != nil {
@@ -499,13 +532,15 @@ func (s *CleanupService) Request(ctx context.Context, hostID string, req Cleanup
 	return attempt, 202, nil, nil
 }
 
-func sameImageVersion(versions []agentws.ImageVersionEntry, expected agentws.ImageVersionEntry) bool {
-	for _, v := range versions {
-		if v == expected {
-			return true
+func exactPresentImageVersion(versions []agentws.ImageVersionEntry, expected agentws.ImageVersionEntry) *agentws.ImageVersionEntry {
+	for i := range versions {
+		v := &versions[i]
+		if v.ImageID == expected.ImageID && v.Version == expected.Version && v.ImageRef == expected.ImageRef &&
+			v.RuntimeImageID == expected.RuntimeImageID && v.State == "present" {
+			return v
 		}
 	}
-	return false
+	return nil
 }
 
 func (s *CleanupService) dispatch(a CleanupAttempt, hostID string) {

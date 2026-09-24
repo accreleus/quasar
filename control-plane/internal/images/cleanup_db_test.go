@@ -75,6 +75,20 @@ func (f *fakeCleanupWire) SendImageCleanupStateAck(_ string, ack agentws.ImageCl
 }
 
 func (f *fakeCleanupWire) set(host string, s agentws.ImageCleanupSnapshot) {
+	// Existing cleanup fixtures model a current agent whose complete scan found
+	// no external container reference. Tests of older/malformed wire evidence
+	// use setRaw so omission remains an explicit scenario.
+	s.Versions = append([]agentws.ImageVersionEntry(nil), s.Versions...)
+	for i := range s.Versions {
+		if s.Versions[i].State == "present" && s.Versions[i].ContainerReferenced == nil {
+			noReference := false
+			s.Versions[i].ContainerReferenced = &noReference
+		}
+	}
+	f.setRaw(host, s)
+}
+
+func (f *fakeCleanupWire) setRaw(host string, s agentws.ImageCleanupSnapshot) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.snapshots[host] = s
@@ -196,6 +210,89 @@ func TestCleanupHTTPPreviewAndExactAttemptAreCurrentConnectionBound(t *testing.T
 	select {
 	case <-env.cleanupWire.cleanup:
 		t.Fatal("confirmed duplicate dispatched again")
+	default:
+	}
+}
+
+func TestCleanupHTTPUsesCurrentContainerReferenceEvidence(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-container-reference-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:external","expected_generation":"0"}`
+	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+		RuntimeImageID: "sha256:external", State: "present"}
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{entry}}
+	env.cleanupWire.setRaw(host, snapshot)
+	code, body := env.do(t, http.MethodGet, path, "")
+	if code != 200 || !strings.Contains(string(body), `"unknown_inventory"`) ||
+		!strings.Contains(string(body), "Upgrade the node agent to report container references") {
+		t.Fatalf("older-agent preview = %d %s", code, body)
+	}
+	if code, body := env.do(t, http.MethodPost, path, request); code != 409 ||
+		!strings.Contains(string(body), `"code":"unknown_inventory"`) ||
+		!strings.Contains(string(body), "Upgrade the node agent to report container references") {
+		t.Fatalf("older-agent request = %d %s", code, body)
+	}
+	noReference := false
+	entry.ContainerReferenced = &noReference
+	snapshot.Versions = []agentws.ImageVersionEntry{entry}
+	env.cleanupWire.set(host, snapshot)
+	code, body = env.do(t, http.MethodGet, path, "")
+	if code != 200 || !strings.Contains(string(body), `"eligible":true`) {
+		t.Fatalf("complete unreferenced preview = %d %s", code, body)
+	}
+	// A stopped external container can appear after preview without advancing
+	// the cleanup fence generation. POST must use the newest agent evidence.
+	referenced := true
+	entry.ContainerReferenced = &referenced
+	snapshot.Versions = []agentws.ImageVersionEntry{entry}
+	env.cleanupWire.set(host, snapshot)
+	if code, body := env.do(t, http.MethodPost, path, request); code != 409 ||
+		!strings.Contains(string(body), `"code":"container_reference"`) {
+		t.Fatalf("new container reference = %d %s", code, body)
+	}
+	code, body = env.do(t, http.MethodGet, path, "")
+	if code != 200 || !strings.Contains(string(body), `"container_reference"`) ||
+		strings.Contains(string(body), `"eligible":true`) {
+		t.Fatalf("referenced preview = %d %s", code, body)
+	}
+	select {
+	case sent := <-env.cleanupWire.cleanup:
+		t.Fatalf("blocked removal dispatched: %+v", sent)
+	default:
+	}
+	// Replay is identified by its persisted attempt before evaluating new
+	// blockers. A lost 202 must never create a second physical deletion.
+	entry.ContainerReferenced = &noReference
+	snapshot.Versions = []agentws.ImageVersionEntry{entry}
+	env.cleanupWire.set(host, snapshot)
+	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
+	code, body = env.do(t, http.MethodPost, path, request)
+	if code != 202 {
+		t.Fatalf("first accepted removal = %d %s", code, body)
+	}
+	var accepted CleanupAttempt
+	if err := json.Unmarshal(body, &accepted); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-env.cleanupWire.cleanup:
+	case <-time.After(time.Second):
+		t.Fatal("accepted removal did not dispatch")
+	}
+	entry.ContainerReferenced = &referenced
+	snapshot.Versions = []agentws.ImageVersionEntry{entry}
+	env.cleanupWire.set(host, snapshot)
+	code, body = env.do(t, http.MethodPost, path, request)
+	if code != 202 || !strings.Contains(string(body), accepted.AttemptID) {
+		t.Fatalf("lost-response replay with new container = %d %s", code, body)
+	}
+	select {
+	case sent := <-env.cleanupWire.cleanup:
+		t.Fatalf("replay dispatched another deletion: %+v", sent)
 	default:
 	}
 }
