@@ -33,6 +33,14 @@ func (i HostIdentity) Known() bool {
 	return i.SourceCommit != nil && i.BuiltAt != nil && i.InstallMode != nil && i.UpdaterPresent != nil
 }
 
+// Install modes (schema.md hosts.install_mode), the one Go definition:
+// internal/platform aliases these, since platform imports agentws.
+const (
+	InstallRegistry = "registry"
+	InstallSource   = "source"
+	InstallOwned    = "owned"
+)
+
 // 7-40 lowercase hex. A short commit is a real identity, only a less specific
 // one, so it is accepted and stored EXACTLY as sent rather than rejected or
 // padded.
@@ -69,7 +77,7 @@ func identityFromRegister(reg RegisterMsg) (HostIdentity, []string) {
 
 	if reg.InstallMode != nil {
 		switch *reg.InstallMode {
-		case "registry", "source", "owned":
+		case InstallRegistry, InstallSource, InstallOwned:
 			m := *reg.InstallMode
 			id.InstallMode = &m
 		default:
@@ -84,44 +92,28 @@ func identityFromRegister(reg RegisterMsg) (HostIdentity, []string) {
 	// three are meaningful. A non-bool would have failed the message decode.
 	id.UpdaterPresent = reg.UpdaterPresent
 
-	// Read only beside install_mode "owned"; ignored beside any other mode
+	// Read only beside install_mode owned; ignored beside any other mode
 	// (protocol/agent-api.md §register "Owned installs").
-	owned := []struct {
-		name string
-		sent *string
+	owned := id.InstallMode != nil && *id.InstallMode == InstallOwned
+	for _, f := range []struct {
+		name  string
+		sent  *string
+		valid func(string) bool
+		dst   **string
 	}{
-		{"recovery_actor_version", reg.RecoveryActorVersion},
-		{"recovery_actor_source_commit", reg.RecoveryActorSourceCommit},
-		{"seed_version", reg.SeedVersion},
-	}
-	if id.InstallMode == nil || *id.InstallMode != "owned" {
-		for _, f := range owned {
-			if f.sent != nil {
-				dropped = append(dropped, f.name)
-			}
+		{"recovery_actor_version", reg.RecoveryActorVersion, actorVersionOrderable, &id.RecoveryActorVersion},
+		{"recovery_actor_source_commit", reg.RecoveryActorSourceCommit, agentCommit.MatchString, &id.RecoveryActorSourceCommit},
+		{"seed_version", reg.SeedVersion, func(string) bool { return true }, &id.SeedVersion},
+	} {
+		if f.sent == nil {
+			continue
 		}
-		return id, dropped
-	}
-
-	if reg.RecoveryActorVersion != nil {
-		if actorVersionOrderable(*reg.RecoveryActorVersion) {
-			v := *reg.RecoveryActorVersion
-			id.RecoveryActorVersion = &v
-		} else {
-			dropped = append(dropped, "recovery_actor_version")
+		if !owned || !f.valid(*f.sent) {
+			dropped = append(dropped, f.name)
+			continue
 		}
-	}
-	if reg.RecoveryActorSourceCommit != nil {
-		if agentCommit.MatchString(*reg.RecoveryActorSourceCommit) {
-			c := *reg.RecoveryActorSourceCommit
-			id.RecoveryActorSourceCommit = &c
-		} else {
-			dropped = append(dropped, "recovery_actor_source_commit")
-		}
-	}
-	if reg.SeedVersion != nil {
-		seed := *reg.SeedVersion
-		id.SeedVersion = &seed
+		v := *f.sent
+		*f.dst = &v
 	}
 
 	return id, dropped

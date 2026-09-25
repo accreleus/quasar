@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 )
 
@@ -115,13 +116,13 @@ const (
 	HostOffline = "offline"
 )
 
-// Install modes (schema.md hosts.install_mode).
+// Install modes (schema.md hosts.install_mode), defined once in agentws.
 const (
-	InstallRegistry = "registry"
-	InstallSource   = "source"
+	InstallRegistry = agentws.InstallRegistry
+	InstallSource   = agentws.InstallSource
 	// InstallOwned is eligible exactly as InstallRegistry (control-api.md
 	// §"Owned hosts on the host body and the release view").
-	InstallOwned = "owned"
+	InstallOwned = agentws.InstallOwned
 )
 
 // Target kinds.
