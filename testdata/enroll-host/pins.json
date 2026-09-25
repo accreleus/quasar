@@ -1,0 +1,8 @@
+{
+  "seed_image": "registry.example.invalid/quasar/quasar-recovery@sha256:4c1d00000000000000000000000000000000000000000000000000000000e90a",
+  "agent_image": "registry.example.invalid/quasar/quasar-node-agent@sha256:bb22000000000000000000000000000000000000000000000000000000000000",
+  "lines": [
+    "PINNED_SEED_IMAGE='registry.example.invalid/quasar/quasar-recovery@sha256:4c1d00000000000000000000000000000000000000000000000000000000e90a'",
+    "PINNED_AGENT_IMAGE='registry.example.invalid/quasar/quasar-node-agent@sha256:bb22000000000000000000000000000000000000000000000000000000000000'"
+  ]
+}
