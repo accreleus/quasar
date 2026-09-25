@@ -41,10 +41,21 @@ const INPUT_TRACE =
 
 /** `index` is the W3C Gamepad.index (sparse slots). `id` is the raw vendor
  *  string, kept verbatim — the vendor/product ids are what dead-pad debugging
- *  needs; callers shorten for display. */
+ *  needs; callers shorten for display. `mapping` is the browser's
+ *  Gamepad.mapping: only `"standard"` means the indices follow the W3C layout
+ *  the wire format assumes (see `isStandardMapping`). */
 export interface GamepadIdentity {
   index: number;
   id: string;
+  mapping: string;
+}
+
+/** True when the browser recognised the pad and exposes it in the W3C
+ *  Standard Gamepad layout. Anything else (`""` for an unrecognised pad) is the
+ *  device's own HID order: buttons land on the wrong W3C indices and the d-pad
+ *  is usually a hat on an axis (quasar#348). */
+export function isStandardMapping(pad: { mapping: string }): boolean {
+  return pad.mapping === "standard";
 }
 
 /** AS10-13: snapshot of input-pipeline health, sampled each telemetry poll. */
@@ -118,6 +129,12 @@ export interface CaptureOptions {
   /** Ctrl+Alt+Shift+Q while captured: capture.ts releases the lock first, then
    *  calls this. The completing 'Q' keydown is never forwarded to the host. */
   onSummonOverlay?: () => void;
+  /** A pad the browser doesn't recognise (`mapping !== "standard"`) was
+   *  forwarded for the first time. Fired once per pad `id` per capture
+   *  instance. The pad is still forwarded as-is — often A/B and the sticks do
+   *  line up, and cutting it off entirely would be worse — so the page must
+   *  tell the user their buttons may be mixed up (quasar#348). */
+  onNonStandardGamepad?: (pad: GamepadIdentity) => void;
 }
 
 /** bufferedAmount above which we flag backpressure (16 KiB). */
@@ -195,6 +212,7 @@ export function setupCapture({
   isFullscreen,
   onKeyboardLockRefused,
   onSummonOverlay,
+  onNonStandardGamepad,
 }: CaptureOptions): {
   cleanup: () => void;
   getMetrics: () => CaptureMetrics;
@@ -236,6 +254,8 @@ export function setupCapture({
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
+  // Pad ids already reported through onNonStandardGamepad (one notice each).
+  const nonStandardReported = new Set<string>();
   let rafId: number;
 
   // Held keys already forwarded (evdev codes), flushed as key-ups on release —
@@ -773,6 +793,10 @@ export function setupCapture({
           buttons.some((v, i) => v !== prev.buttons[i]) ||
           axes.some((v, i) => v !== prev.axes[i]);
         if (changed) {
+          if (!isStandardMapping(pad) && !nonStandardReported.has(pad.id)) {
+            nonStandardReported.add(pad.id);
+            onNonStandardGamepad?.({ index: pad.index, id: pad.id, mapping: pad.mapping });
+          }
           send({ t: "gp", i: pad.index, buttons, axes });
           gpSendCount++;
           gpPrev[pad.index] = { buttons, axes };
@@ -803,7 +827,7 @@ export function setupCapture({
     for (const p of rawPads) {
       if (!p) continue;
       gamepadCount++;
-      padIdentities.push({ index: p.index, id: p.id });
+      padIdentities.push({ index: p.index, id: p.id, mapping: p.mapping });
     }
 
     const snapshot: CaptureMetrics = {
