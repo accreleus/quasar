@@ -128,9 +128,9 @@ describe("AddHostModal", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Dockge or Arcane" }));
     expect(screen.getByText("Using Dockge or Arcane? Paste this stack instead.")).toBeTruthy();
     const stack = screen.getByTestId("addhost-stack").textContent!;
-    expect(stack).toContain(`image: ${SEED}`);
-    expect(stack).toContain(`QUASAR_AGENT_IMAGE: ${AGENT}`);
-    expect(stack).toContain(`QUASAR_ENROLLMENT: qenr1.${FP}.`);
+    expect(stack).toContain(`image: "${SEED}"`);
+    expect(stack).toContain(`QUASAR_AGENT_IMAGE: "${AGENT}"`);
+    expect(stack).toContain(`QUASAR_ENROLLMENT: "qenr1.${FP}.`);
     expect(stack).toContain("name: quasar-machine");
     expect(screen.getByText(/Preparing the host is then your job/)).toBeTruthy();
     expect(mocked.mintHostEnrollment).toHaveBeenCalledTimes(1);
@@ -140,7 +140,7 @@ describe("AddHostModal", () => {
     renderModal();
     fireEvent.click(screen.getByRole("tab", { name: "Dockge or Arcane" }));
     await create("Create stack");
-    await waitFor(() => expect(screen.getByTestId("addhost-stack").textContent).toContain(`image: ${SEED}`));
+    await waitFor(() => expect(screen.getByTestId("addhost-stack").textContent).toContain(`image: "${SEED}"`));
   });
 
   it("refuses a node name whose agent is connected now, before a token is spent", async () => {

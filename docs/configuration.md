@@ -1290,16 +1290,16 @@ default it differently.
 ```yaml
 services:
   quasar-seed:
-    image: <registry>/quasar-recovery@sha256:<digest>
+    image: "<registry>/quasar-recovery@sha256:<digest>"
     command: seed
     restart: unless-stopped
     security_opt: [label=disable]
     environment:
-      QUASAR_ROLE: gpu
-      QUASAR_ENROLLMENT: qenr1.…
-      QUASAR_HOME_ROOT: /var/lib/quasar/homes
-      QUASAR_TEMPLATE_ROOT: /var/lib/quasar/templates
-      QUASAR_AGENT_IMAGE: <registry>/quasar-node-agent@sha256:<digest>
+      QUASAR_ROLE: "gpu"
+      QUASAR_ENROLLMENT: "qenr1.…"
+      QUASAR_HOME_ROOT: "/var/lib/quasar/homes"
+      QUASAR_TEMPLATE_ROOT: "/var/lib/quasar/templates"
+      QUASAR_AGENT_IMAGE: "<registry>/quasar-node-agent@sha256:<digest>"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - quasar-machine:/var/lib/quasar-machine:ro

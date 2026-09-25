@@ -83,18 +83,20 @@ export type SeedStackInputs = {
  *  `quasar-machine` rather than `<project>_quasar-machine`, which the seed refuses. */
 export function composeSeedStack(i: SeedStackInputs): string {
   const home = i.homeRoot ?? DEFAULT_HOME_ROOT;
+  // Double-quoted (JSON is valid YAML): a node name like 1.10 or 007 stays a string.
+  const q = (v: string) => JSON.stringify(v);
   const env = [
-    "QUASAR_ROLE: gpu",
-    `QUASAR_ENROLLMENT: ${i.enrollment}`,
-    ...(i.nodeName ? [`QUASAR_NODE_NAME: ${i.nodeName}`] : []),
-    `QUASAR_HOME_ROOT: ${home}`,
-    `QUASAR_TEMPLATE_ROOT: ${templateRootFor(home)}`,
-    `QUASAR_AGENT_IMAGE: ${i.agentImage}`,
+    `QUASAR_ROLE: ${q("gpu")}`,
+    `QUASAR_ENROLLMENT: ${q(i.enrollment)}`,
+    ...(i.nodeName ? [`QUASAR_NODE_NAME: ${q(i.nodeName)}`] : []),
+    `QUASAR_HOME_ROOT: ${q(home)}`,
+    `QUASAR_TEMPLATE_ROOT: ${q(templateRootFor(home))}`,
+    `QUASAR_AGENT_IMAGE: ${q(i.agentImage)}`,
   ];
   return [
     "services:",
     "  quasar-seed:",
-    `    image: ${i.seedImage}`,
+    `    image: ${q(i.seedImage)}`,
     "    command: seed",
     "    restart: unless-stopped",
     "    security_opt: [label=disable]",

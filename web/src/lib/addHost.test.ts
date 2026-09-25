@@ -38,8 +38,8 @@ describe("the served script and the stack name one seed (testdata/enroll-host/pi
   it("writes exactly those images into the stack", () => {
     const images = readServedImages(served)!;
     const stack = composeSeedStack({ ...images, enrollment: "qenr1..abc.tok" });
-    expect(stack).toContain(`    image: ${pins.seed_image}\n`);
-    expect(stack).toContain(`      QUASAR_AGENT_IMAGE: ${pins.agent_image}\n`);
+    expect(stack).toContain(`    image: "${pins.seed_image}"\n`);
+    expect(stack).toContain(`      QUASAR_AGENT_IMAGE: "${pins.agent_image}"\n`);
   });
 
   it("finds nothing to install in the repository copy or in a tag", () => {
@@ -69,12 +69,23 @@ describe("the seed-only stack", () => {
     expect(stack).toContain("      - quasar-machine:/var/lib/quasar-machine:ro");
   });
 
+  it("quotes every value, so a node name that looks like a number stays a string", () => {
+    const stack = composeSeedStack({ seedImage: "s@x", agentImage: "a@x", enrollment: "qenr1..u.t", nodeName: "1.10" });
+    expect(stack).toContain(`      QUASAR_NODE_NAME: "1.10"\n`);
+    expect(composeSeedStack({ seedImage: "s@x", agentImage: "a@x", enrollment: "qenr1..u.t", nodeName: "007" })).toContain(
+      `      QUASAR_NODE_NAME: "007"\n`,
+    );
+    for (const line of stack.split("\n").filter((l) => /^ {6}QUASAR_|^ {4}image:/.test(l))) {
+      expect(line).toMatch(/: "[^"]*"$/);
+    }
+  });
+
   it("names the node only when the token is bound to one, and always sets the template root", () => {
     const base = { seedImage: "s@x", agentImage: "a@x", enrollment: "qenr1..u.t" };
     expect(composeSeedStack(base)).not.toContain("QUASAR_NODE_NAME");
-    expect(composeSeedStack({ ...base, nodeName: "gpu-host-6" })).toContain("      QUASAR_NODE_NAME: gpu-host-6\n");
+    expect(composeSeedStack({ ...base, nodeName: "gpu-host-6" })).toContain(`      QUASAR_NODE_NAME: "gpu-host-6"\n`);
     expect(composeSeedStack({ ...base, homeRoot: "/srv/quasar/homes" })).toContain(
-      "      QUASAR_TEMPLATE_ROOT: /srv/quasar/templates\n",
+      `      QUASAR_TEMPLATE_ROOT: "/srv/quasar/templates"\n`,
     );
   });
 });

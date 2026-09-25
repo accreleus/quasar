@@ -128,13 +128,20 @@ case "$cmd" in
     sub="$1"
     case "$sub" in
       inspect) [ -d "$S/v/$last" ]; exit ;;
-      ls) for d in "$S"/v/*; do [ -d "$d" ] && grep -q '^io.quasar.installation=' "$d/labels" && echo "${d##*/}"; done; exit 0 ;;
+      ls)
+        want=""
+        for a in "$@"; do case "$a" in label=*) want="${a#label=}" ;; esac; done
+        for d in "$S"/v/*; do [ -d "$d" ] && { [ -z "$want" ] || has_label "$d" "$want"; } && echo "${d##*/}"; done
+        exit 0 ;;
       rm) [ "${MOCK_VOLUME_RM_OK:-1}" = 1 ] || { echo "mock: volume is in use" >&2; exit 1; }; rm -rf "${S:?}/v/$last"; exit 0 ;;
     esac
     exit 0 ;;
   rm) rm -rf "${S:?}/c/$last"; exit 0 ;;
   start) [ -d "$S/c/$last" ] && echo running >"$S/c/$last/state"; exit 0 ;;
-  logs) [ -d "$S/c/$last" ] && cat "$S/c/$last/logs"; exit 0 ;;
+  logs)
+    # The waiting starts after the seed's docker run; its env file must be gone by then.
+    if [ -f "$S/seed.env.path" ] && [ -e "$(cat "$S/seed.env.path")" ]; then echo alive >> "$S/seed.env.alive"; fi
+    [ -d "$S/c/$last" ] && cat "$S/c/$last/logs"; exit 0 ;;
   exec) printf '%s\n' "${MOCK_SEED_STATUS:-}"; exit 0 ;;
   run)
     envf=""; name=""; args=("$@"); i=0
@@ -363,8 +370,9 @@ if [ "$RC" -eq 0 ] \
 else
   fail "happy path" "rc=$RC run=[$runline] env=[$(cat "$envf" 2>/dev/null)] out=$(tail -5 <<<"$OUT")"
 fi
-if ! grep -qF "$TOKEN" <<<"$DOCKER_LOG" && ! grep -qF "$TOKEN" <<<"$OUT" && [ ! -e "$(cat "$state/seed.env.path")" ]; then
-  pass "the token reaches only the seed's 0600 env file, which does not outlive the run: no docker argv, no output line"
+if ! grep -qF "$TOKEN" <<<"$DOCKER_LOG" && ! grep -qF "$TOKEN" <<<"$OUT" && [ ! -e "$(cat "$state/seed.env.path")" ] \
+   && [ ! -e "$state/seed.env.alive" ]; then
+  pass "the token reaches only the seed's 0600 env file, deleted right after docker run: no docker argv, no output line"
 else
   fail "token containment" "leaked into docker argv or output"
 fi
@@ -487,6 +495,33 @@ if [ "$RC" -eq 1 ] && grep -q 'control plane' <<<"$OUT" && nothing_started; then
   pass "reset on a machine that runs the control plane: refused, nothing removed"
 else
   fail "reset combined" "rc=$RC docker=[$(grep -E '^(rm|volume)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+installed_machine "$ENROLLED_LOG"
+volume quasar-postgres-data io.quasar.installation=inst-0 io.quasar.platform-service=postgres
+run_installer reset-db-volume "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
+if [ "$RC" -eq 1 ] && grep -q 'Quasar postgres' <<<"$OUT" && nothing_started && [ -d "$state/v/quasar-postgres-data" ]; then
+  pass "reset where Quasar's Postgres data lives (its volume alone): refused, nothing removed"
+else
+  fail "reset db volume" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
+container dockge-quasar-seed-1 running "/usr/local/bin/quasar-recovery seed"
+run_installer reset-manager-seed "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
+if [ "$RC" -eq 1 ] && grep -q "dockge-quasar-seed-1" <<<"$OUT" && nothing_started && [ -d "$state/c/quasar-recovery" ]; then
+  pass "reset with a stack-manager seed on the machine: refused before anything is removed (that seed would re-create the actor)"
+else
+  fail "reset manager seed" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+
+# Any trace of an installation already here: a refused string must not remove it.
+reset_engine
+volume quasar-agent-data io.quasar.installation=inst-0 io.quasar.platform-service=node-agent
+run_installer not-fresh "${OK_ENV[@]}" MOCK_AGENT_LOG='ERROR control plane rejected register: auth_failed: authentication failed'
+if [ "$RC" -eq 1 ] && grep -q 'QUASAR_RESET_IDENTITY=1' <<<"$OUT" && ! grep -q 'Nothing was left' <<<"$OUT" \
+   && ! grep -qE '^(rm|volume rm) ' <<<"$DOCKER_LOG" && [ -d "$state/v/quasar-agent-data" ]; then
+  pass "a labelled volume from before the run: the run is not the installer, and a refused string removes nothing"
+else
+  fail "not fresh" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
 fi
 
 reset_engine

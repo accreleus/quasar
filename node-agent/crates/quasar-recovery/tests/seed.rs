@@ -16,6 +16,17 @@ use quasar_recovery::seed::{
 };
 use support::*;
 
+/// Every test here steps seeds, and some count the seed's log lines. tracing caches
+/// each callsite's interest process-wide, so a seed stepped with no subscriber on one
+/// thread can leave a callsite disabled for a capturing subscriber on another: the
+/// tests run one at a time.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn new_machine(env: BTreeMap<String, String>) -> (Arc<FakeEngine>, tempfile::TempDir) {
     (
         Arc::new(FakeEngine::new(seeded_host(env))),
@@ -65,6 +76,7 @@ fn seed_file(dir: &tempfile::TempDir) -> SeedFile {
 
 #[test]
 fn a_first_start_creates_exactly_one_recovery_actor_from_the_seeds_own_image_and_profile() {
+    let _serial = serial();
     let (engine, dir) = new_machine(seed_env());
     let outcome = seed(&engine, dir.path(), SEED_ID).step();
     assert_eq!(
@@ -99,6 +111,7 @@ fn a_first_start_creates_exactly_one_recovery_actor_from_the_seeds_own_image_and
 
 #[test]
 fn a_restarted_or_redeployed_seed_with_an_actor_present_does_nothing() {
+    let _serial = serial();
     let (engine, dir) = installed();
     let before = engine.state();
     let files = contents(dir.path());
@@ -139,6 +152,7 @@ fn a_restarted_or_redeployed_seed_with_an_actor_present_does_nothing() {
 
 #[test]
 fn the_actor_a_seed_creates_installs_from_the_seeds_inputs_and_records_the_seed_file() {
+    let _serial = serial();
     let (engine, dir) = installed();
     let state = engine.state();
 
@@ -171,6 +185,7 @@ fn the_actor_a_seed_creates_installs_from_the_seeds_inputs_and_records_the_seed_
 
 #[test]
 fn the_actor_reports_the_seeds_version_and_digest_and_no_seed_once_it_is_gone() {
+    let _serial = serial();
     let (engine, dir) = installed();
     let id = actor_id(&engine.state());
     let actor = seeded_actor(&engine, dir.path(), &id);
@@ -208,6 +223,7 @@ fn the_actor_reports_the_seeds_version_and_digest_and_no_seed_once_it_is_gone() 
 
 #[test]
 fn a_deleted_actor_is_re_created_from_the_verified_digest_and_nothing_else_moves() {
+    let _serial = serial();
     let (engine, dir) = installed();
     let agent_before = engine
         .state()
@@ -265,6 +281,7 @@ fn a_deleted_actor_is_re_created_from_the_verified_digest_and_nothing_else_moves
 
 #[test]
 fn the_seed_never_replaces_restarts_or_starts_an_actor_it_did_not_just_create() {
+    let _serial = serial();
     let (engine, dir) = installed();
     let id = actor_id(&engine.state());
 
@@ -343,6 +360,7 @@ fn the_seed_never_replaces_restarts_or_starts_an_actor_it_did_not_just_create() 
 /// stamped.
 #[test]
 fn a_seed_finishes_its_own_create_after_a_crash_between_create_and_start() {
+    let _serial = serial();
     let (engine, dir) = new_machine(seed_env());
     let calls = {
         let (reference, rdir) = new_machine(seed_env());
@@ -407,6 +425,7 @@ fn a_seed_finishes_its_own_create_after_a_crash_between_create_and_start() {
 
 #[test]
 fn an_agent_image_the_actor_would_refuse_is_refused_by_the_seed_before_anything_exists() {
+    let _serial = serial();
     let unlabelled = "registry.example.invalid/quasar/quasar-node-agent@sha256:ee55000000000000000000000000000000000000000000000000000000000000";
     let future = "registry.example.invalid/quasar/quasar-node-agent@sha256:ff66000000000000000000000000000000000000000000000000000000000000";
     let mut env = seed_env();
@@ -474,6 +493,7 @@ fn an_agent_image_the_actor_would_refuse_is_refused_by_the_seed_before_anything_
 
 #[test]
 fn an_actor_whose_seed_was_redeployed_before_the_first_install_reads_the_new_seed() {
+    let _serial = serial();
     let (engine, dir) = new_machine(seed_env());
     seed(&engine, dir.path(), SEED_ID).step();
     let id = actor_id(&engine.state());
@@ -515,6 +535,7 @@ fn an_actor_whose_seed_was_redeployed_before_the_first_install_reads_the_new_see
 
 #[test]
 fn a_stopped_seed_is_reported_as_no_seed_and_an_unreadable_version_as_unknown() {
+    let _serial = serial();
     let (engine, dir) = installed();
     let id = actor_id(&engine.state());
     let actor = seeded_actor(&engine, dir.path(), &id);
@@ -554,6 +575,7 @@ fn a_stopped_seed_is_reported_as_no_seed_and_an_unreadable_version_as_unknown() 
 
 #[test]
 fn a_stack_named_machine_volume_is_refused_with_the_compose_fix() {
+    let _serial = serial();
     let (engine, dir) = new_machine(seed_env());
     engine.with_state(|s| {
         for b in &mut s.containers.get_mut(SEED_ID).unwrap().spec.binds {
@@ -573,6 +595,7 @@ fn a_stack_named_machine_volume_is_refused_with_the_compose_fix() {
 
 #[test]
 fn a_container_holding_the_actor_name_without_the_labels_is_left_alone() {
+    let _serial = serial();
     let (engine, dir) = new_machine(seed_env());
     engine.with_state(|s| {
         let mut stranger = seed_container(ACTOR_ID, ACTOR_IMAGE, BTreeMap::new());
@@ -618,6 +641,8 @@ fn logged(engine: &Arc<FakeEngine>, dir: &std::path::Path, looks: usize) -> (Vec
         .with_ansi(false)
         .finish();
     let outcomes = tracing::subscriber::with_default(subscriber, || {
+        // Interest cached before this subscriber existed would hide its lines.
+        tracing::callsite::rebuild_interest_cache();
         let mut seed = seed(engine, dir, SEED_ID);
         (0..looks).map(|_| seed.step()).collect()
     });
@@ -627,6 +652,7 @@ fn logged(engine: &Arc<FakeEngine>, dir: &std::path::Path, looks: usize) -> (Vec
 
 #[test]
 fn invalid_bootstrap_inputs_log_one_clear_line_and_leave_an_idle_seed_and_nothing_installed() {
+    let _serial = serial();
     let cases: [(&str, &str, Option<&str>); 6] = [
         ("QUASAR_ENROLLMENT", "QUASAR_ENROLLMENT", None),
         (
@@ -676,6 +702,7 @@ fn invalid_bootstrap_inputs_log_one_clear_line_and_leave_an_idle_seed_and_nothin
 
 #[test]
 fn inputs_are_not_needed_to_re_create_an_installed_machines_actor() {
+    let _serial = serial();
     let (engine, dir) = installed();
     engine.with_state(|s| {
         let id = s.container_named(names::RECOVERY_ACTOR).unwrap().id.clone();
@@ -689,6 +716,7 @@ fn inputs_are_not_needed_to_re_create_an_installed_machines_actor() {
 
 #[test]
 fn an_uninstalled_marker_keeps_the_seed_idle() {
+    let _serial = serial();
     let (engine, dir) = installed();
     let mut file = seed_file(&dir);
     file.state = SeedState::Uninstalled;
@@ -721,6 +749,7 @@ fn an_uninstalled_marker_keeps_the_seed_idle() {
 
 #[test]
 fn a_seed_file_it_cannot_read_keeps_the_seed_idle_and_is_never_guessed_at() {
+    let _serial = serial();
     for (bytes, token) in [
         (&br#"{"format_version":2,"anything":"new"}"#[..], "seed-file-unknown-format"),
         (&br#"{"installation_id":"x"}"#[..], "seed-file-unknown-format"),
@@ -749,6 +778,7 @@ fn a_seed_file_it_cannot_read_keeps_the_seed_idle_and_is_never_guessed_at() {
 
 #[test]
 fn a_seed_that_cannot_create_a_correct_actor_says_why_and_creates_nothing() {
+    let _serial = serial();
     let without_machine = |s: &mut FakeState| {
         s.containers
             .get_mut(SEED_ID)
@@ -799,6 +829,7 @@ fn a_seed_that_cannot_create_a_correct_actor_says_why_and_creates_nothing() {
 
 #[test]
 fn a_seed_started_by_tag_pins_the_actor_to_its_registry_digest() {
+    let _serial = serial();
     let (engine, dir) = new_machine(seed_env());
     engine.with_state(|s| {
         let image = s.images[ACTOR_IMAGE].clone();
@@ -820,6 +851,7 @@ fn a_seed_started_by_tag_pins_the_actor_to_its_registry_digest() {
 /// takes effect: the looks that follow always end with exactly one running actor.
 #[test]
 fn a_failed_engine_call_during_a_first_look_converges_to_exactly_one_running_actor() {
+    let _serial = serial();
     let (reference, _dir) = new_machine(seed_env());
     seed(&reference, _dir.path(), SEED_ID).step();
     let calls = reference.calls();
@@ -860,6 +892,7 @@ fn a_failed_engine_call_during_a_first_look_converges_to_exactly_one_running_act
 
 #[test]
 fn an_agent_image_that_cannot_be_pulled_is_said_once_however_many_looks() {
+    let _serial = serial();
     let missing = "registry.example.invalid/quasar/quasar-node-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000";
     let mut env = seed_env();
     env.insert("QUASAR_AGENT_IMAGE".into(), missing.into());
@@ -907,6 +940,7 @@ fn health_after_looks(engine: &Arc<FakeEngine>, dir: &std::path::Path) -> (Strin
 
 #[test]
 fn the_seeds_health_check_fails_while_it_is_idle_on_something_only_the_operator_can_fix() {
+    let _serial = serial();
     let mut env = seed_env();
     env.remove("QUASAR_ENROLLMENT");
     let (engine, dir) = new_machine(env);
@@ -932,6 +966,7 @@ fn the_seeds_health_check_fails_while_it_is_idle_on_something_only_the_operator_
 
 #[test]
 fn a_seed_that_stopped_looking_is_unhealthy_and_an_older_status_file_reads_healthy() {
+    let _serial = serial();
     let present = Outcome::Present {
         container: names::RECOVERY_ACTOR.into(),
     };
