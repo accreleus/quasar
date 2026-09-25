@@ -24,6 +24,15 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **Steam no longer swaps the X and Y gamepad buttons (#348).** The session's virtual
+  gamepad now presents as a wired Xbox 360 controller (045e:028e, USB) with exactly the
+  buttons, triggers and hat d-pad the kernel `xpad` driver exposes, so SDL, Steam and games
+  that read the controller directly apply their known Xbox layout instead of guessing one.
+  The device name no longer carries the session id (it moved to `phys`), so a layout saved
+  in Steam survives into the next session. In console mode a forwarded physical pad's d-pad
+  now reaches the game whether the pad reports it as a hat or as buttons.
+
 ## 0.3.0 — 2026-09-13
 
 ### Added
@@ -480,7 +489,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.5 — 2026-09-07
 
 ### Fixed
-
 - `deploy/redeploy.sh`'s header no longer claims that running sessions survive a
   control-plane-only deploy. They do not, and have not: recreating the control
   plane ends every session on the host (#128). Drain first if the sessions
@@ -541,7 +549,6 @@ own; the two do not move together, and that is deliberate.
   preparation off preserves existing homes, templates and running sessions (#145).
 
 ### Fixed
-
 - Release publication waits for the updater image to be validated and promoted,
   so its installation instructions cannot advertise a missing updater tag.
 - Agent startup cleanup only removes its own session and audio containers;
@@ -574,7 +581,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.3 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update no longer re-cordons each host moments after it finishes (#140,
   second half).** The per-host apply inside a fleet run found the host already draining
   — the run's own cordon — took it for an admin's, and restored it a few milliseconds
@@ -584,7 +590,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.2 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update from v0.2.0 no longer leaves every host `draining` when it
   finishes (#140).** The v0.2.0 control plane cordoned the fleet with nothing to record
   it in; when the new control plane picked the run up it found every host draining, took
@@ -599,7 +604,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.1 — 2026-09-05
 
 ### Fixed
-
 - **A fleet update no longer fails on the first host right after the control plane
   updates itself (#117).** When the new control plane came back and picked the run up,
   it moved to the first host before the agents had reconnected, recorded the miss as
@@ -782,7 +786,6 @@ own; the two do not move together, and that is deliberate.
   The release view also gains an additive `source_repo` field.
 
 ### Fixed
-
 - **Installing a release no longer requires building it.** The documented quick start
   told self-hosters to run `deploy/redeploy.sh <profile> vX.Y.Z`, which compiles the web
   client and both runtime images from source — roughly 25 minutes and 25 GB of Docker
