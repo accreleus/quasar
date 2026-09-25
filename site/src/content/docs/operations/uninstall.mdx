@@ -114,7 +114,15 @@ sudo rm /etc/modules-load.d/uinput.conf
 
 Any TLS certificate you added to your machines' trust stores.
 
-{/* TODO(#359): the app-container AppArmor profile the one-line command installs, and how to remove it. */}
+On a GPU host added with the one-line command, the app-container AppArmor
+profile it loaded. It stays loaded until the next boot, and until you remove the
+file if you asked the command to persist it:
+
+```bash
+sudo rm /etc/apparmor.d/quasar-app
+```
+
+{/* TODO(#366): whether `uninstall` unloads the quasar-app profile; confirm the unload command (apparmor_parser -R) against the script before documenting it. */}
 
 ## Removing one host from a fleet
 

@@ -7,7 +7,6 @@ import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
 {/* TODO(#361): the combined and control-only install is a draft. Fill in the inputs #361 fixes (public host, how the control-plane and Postgres images are chosen, ports, TLS names, external-database names), confirm QUASAR_AGENT_IMAGE on a combined machine, and confirm the health check below. */}
 {/* TODO(#365): where the operator gets the seed and agent digests (the format-2 release manifest), and the published repository name of the recovery image. Until then `<registry>/quasar-recovery` and `<digest>` are placeholders. */}
-{/* TODO(#359): the one-line command is the default way to add a GPU host; link its final form here once #359 lands. */}
 
 Read [Requirements](/quasar/start/requirements/) first, particularly the sysctl
 and, on NVIDIA, the container toolkit. Nothing here compiles Quasar. It pulls
@@ -163,13 +162,15 @@ current backup of your own. The console shows the database mode as `external`.
 
 ## Add a GPU host
 
-The usual way is from the console: [Add a second GPU
-host](/quasar/install/second-host/) mints a single-use enrollment string and gives
-you a command that also prepares the host. Starting the seed yourself is the same
+The usual way is from the console: **Add host**, in Admin, Fleet, Hosts, creates a
+one-line command that prepares the host and starts the seed, or on its **Dockge
+or Arcane** tab the stack below with everything filled in. See [Add a second GPU
+host](/quasar/install/second-host/). Starting the seed yourself is the same
 install without the host preparation.
 
-Mint the string first, from Admin, Fleet, Enroll host. It is single use and
-expires in an hour.
+For a `docker run` line, take the enrollment string from the same dialog, under
+**Show the enrollment string**. It is single use, and expires after an hour
+unless you chose longer.
 
 <Tabs>
 <TabItem label="docker run">
@@ -193,19 +194,19 @@ docker run -d --name quasar-seed --restart unless-stopped \
 ```yaml
 services:
   quasar-seed:
-    image: <registry>/quasar-recovery@sha256:<digest>
+    image: "<registry>/quasar-recovery@sha256:<digest>"
     command: seed
     restart: unless-stopped
     security_opt: [label=disable]
+    environment:
+      QUASAR_ROLE: "gpu"
+      QUASAR_ENROLLMENT: "qenr1.…"        # single use; may be deleted once enrolled
+      QUASAR_HOME_ROOT: "/var/lib/quasar/homes"
+      QUASAR_TEMPLATE_ROOT: "/var/lib/quasar/templates"
+      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - quasar-machine:/var/lib/quasar-machine:ro
-    environment:
-      QUASAR_ROLE: gpu
-      QUASAR_ENROLLMENT: qenr1.…          # single use, one hour; may be deleted once enrolled
-      QUASAR_HOME_ROOT: /var/lib/quasar/homes
-      QUASAR_TEMPLATE_ROOT: /var/lib/quasar/templates
-      QUASAR_AGENT_IMAGE: ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>
 volumes:
   quasar-machine:
     name: quasar-machine                  # required: not <project>_quasar-machine

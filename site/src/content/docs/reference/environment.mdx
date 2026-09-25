@@ -36,7 +36,7 @@ Quasar](/quasar/install/install/).
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_ROLE` | `gpu` | The machine's role: `gpu`, `combined` or `control-only`. |
-| `QUASAR_ENROLLMENT` | required on a GPU host | The single-use `qenr1.…` string from Admin, Fleet, Enroll host. Stored as a secret file and handed to the agent as a file, never as an environment variable. |
+| `QUASAR_ENROLLMENT` | required on a GPU host | The single-use `qenr1.…` string from Admin, Fleet, Hosts, Add host. Stored as a secret file and handed to the agent as a file, never as an environment variable. |
 | `QUASAR_HOME_ROOT` | required | Host path of the home root, bound into the agent at the same path. |
 | `QUASAR_TEMPLATE_ROOT` | `/var/lib/quasar/templates` | Host path of the template root. Set it explicitly, as the home root's sibling. |
 | `QUASAR_NODE_NAME` | the machine's host name | The agent's node name. A node name bound into the enrollment string must match. |
@@ -72,7 +72,7 @@ existing ones.
 `ENROLLMENT_TOKEN` is **optional**. It is the older static, deployment-wide
 enrollment secret, and if you set it, it must match on the control plane and
 every agent that uses it. The console path does not need it: mint a
-single-use `QUASAR_ENROLLMENT` string from Admin, Fleet, Enroll host and set only
+single-use `QUASAR_ENROLLMENT` string from Admin, Fleet, Hosts, Add host and set only
 that on the new host. The string carries the control-plane address too. See
 below.
 
@@ -86,7 +86,7 @@ below.
 | `REGISTRATION_MODE` | `closed` | Seeds the registration mode on first boot of a fresh database only. The admin UI is authoritative afterwards. |
 | `PUBLIC_BASE_URL` | unset | Canonical public URL for invite links and proxied signaling. Set it when a proxy rewrites `Host`; otherwise the public host can be derived from forwarded or request headers. |
 | `NODE_NAME` | hostname | Agent side. A stable identity for this host. |
-| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Enroll host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use hour-long token, together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it. |
+| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Hosts, Add host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use hour-long token, together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it. |
 
 ## Secrets
 

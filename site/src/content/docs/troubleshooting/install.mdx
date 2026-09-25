@@ -127,7 +127,7 @@ curl http://127.0.0.1:9091/health
 - Is the control plane's HTTP port reachable? Enrollment uses plain HTTP on 8080
   and is exempt from the HTTPS redirect for that reason.
 - Did you paste the one-value `QUASAR_ENROLLMENT` string from Admin, Fleet,
-  Enroll host instead of setting the two above by hand? It supplies a `wss://`
+  Hosts, Add host instead of setting the two above by hand? It supplies a `wss://`
   address that the agent pins to the certificate fingerprint inside it. A
   `ws://` address to any host but localhost is refused unless
   `QUASAR_ALLOW_PLAINTEXT_AGENT=1`.

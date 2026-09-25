@@ -107,12 +107,17 @@ sudo sysctl --system
 ```
 
 The quick-start script applies and persists this setting for your selected
-platform. When you start the seed yourself, or from Dockge or Arcane, host
-preparation is yours: set it on the host, and the host's readiness card lists
-anything still missing. On Unraid, use the generated Unraid script, which
-persists the setting in `/boot/config/go` because `/etc` is recreated at boot.
+platform. On Unraid, use the generated Unraid script, which persists the setting
+in `/boot/config/go` because `/etc` is recreated at boot. On a GPU host added with
+the one-line command, set it yourself: that command checks and fixes the render
+node, `uinput` (loading it and persisting the module), user namespaces and the
+app-container AppArmor profile, but not this sysctl. When you start the seed
+yourself, or from Dockge or Arcane, all host preparation is yours, and the host's
+readiness card lists what is still missing.
 
-{/* TODO(#359): the one-line command for a GPU host also prints or applies this, the uinput persistence and the app-container AppArmor profile; say so once built. */} The media path sends
+{/* TODO(open, raise on #359): the one-line command does not set or check net.core.wmem_default, which every streaming machine needs. */}
+
+The media path sends
 through libnice, which never calls `setsockopt(SO_SNDBUF)`, so its UDP sockets
 inherit the kernel default of 208 KB. A keyframe burst at 8 Mbps overflows that,
 the kernel drops the overflow silently, and the bitrate estimator reads the loss
