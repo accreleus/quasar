@@ -98,6 +98,8 @@ without them).
 | `QUASAR_PLATFORM_RELEASE_REPO` | `accreleus/quasar` | **Platform-release detection (#104/#110).** The `owner/name` repository whose GitHub Releases the `platform.release_detect` job reads. Point it at a fork to follow that fork's releases. Set it to **`off`** (or `none` / `disabled`) to turn detection off entirely: the job still exists in the Jobs page but every run is `skipped` with a reason, no outbound request is made, and the admin Releases page simply reports nothing available. **Empty means the default, not off** — compose forwards every knob as `${VAR:-}`, so a stock install hands the process an empty string and reading that as "off" would disable self-update everywhere. |
 | `QUASAR_PLATFORM_RELEASE_API` | `https://api.github.com` | API base for the same job, for a GitHub Enterprise host or a test double. Its host is added to the release client's egress allowlist automatically, so pointing at a different API needs no second knob. Must be `https` — the shared outbound client refuses anything else. |
 | `QUASAR_PLATFORM_RELEASE_ASSET_HOSTS` | `github.com,objects.githubusercontent.com,release-assets.githubusercontent.com` | Comma-separated egress allowlist for **release asset downloads**, and the only hosts the download's single redirect may point at. The asset URL and its `Location` are both remote-supplied, so a host outside this list is refused **by name** — the job summary names it and this variable, which is the whole remedy. Separate from the API host because GitHub serves assets from a CDN, and **that CDN moves**: the 302 target was `objects.githubusercontent.com` and is now `release-assets.githubusercontent.com`. Both stay listed; an entry GitHub has stopped using costs nothing, while a missing one stops detection dead (seen live on `v0.2.0-rc.1`). If a future move breaks detection again, the fix is to add the host the summary names. |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | **Developer apply (#360).** Read by the control plane too: `POST /v1/admin/platform/developer-apply` refuses an image outside these namespaces (`409 namespace_rejected`) before any registry is contacted, with the updater's matching rules. Each machine's own recovery actor still enforces its own list. The namespaces' registry hosts are added to the developer apply's registry egress automatically. |
+| `QUASAR_PLATFORM_INSECURE_REGISTRIES` | — (off) | **Developer apply only (#360), for a test or private registry.** Comma-separated `host[:port]` the control plane reads a developer apply's image labels (`org.quasar.source.commit`) from over **plain HTTP, private addresses allowed**. Only the named hosts; every other registry keeps the hardened client (HTTPS, public addresses only). The images must also be under `QUASAR_UPDATER_ALLOWED_NAMESPACES`. **Digest-bound:** the manifest must hash to the requested digest, an index's chosen child manifest to its descriptor's digest, and the config blob to the manifest's config digest; any mismatch refuses the apply `409 image_unresolvable`, so neither the registry nor the unencrypted link can substitute labels. Plain HTTP still exposes what is read to the network. Leave unset in production. |
 | `QUASAR_PLATFORM_REGISTRY` | `ghcr.io` | **Edge channel (#111).** The registry the platform's two component images (`<registry>/<QUASAR_PLATFORM_RELEASE_REPO>/quasar-control-plane` and `.../quasar-node-agent`) are published to. Used only while `release_channel` is `edge`, where detection resolves the branch tag to a digest and reads the build's identity from the image labels — the stable channel reads a release manifest instead and never touches a registry. This host is added to the `QUASAR_IMAGE_REGISTRY_HOSTS` egress allowlist **automatically**, so repointing the platform images at another registry is one knob, not two. A registry that needs credentials is not supported here: resolution is anonymous-pull only. |
 | `QUASAR_PLATFORM_RELEASE_TOKEN` | unset | Optional bearer token for the releases listing and asset download. A public repository needs none; set it for a private fork or to lift GitHub's unauthenticated rate limit. Never logged. |
 | `QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL` | unset; job default `168h` (7 days) | Standard job `EnvOverride` for `platform.release_detect`, which by default runs weekly inside a one-hour window opening 02:00 Monday UTC. A Go duration that is authoritative over the admin Jobs page while set; `0` stops the job being scheduled at all. "Check now" (`POST /v1/admin/jobs/platform.release_detect/run`) bypasses the window as it does for every job. |
@@ -1379,6 +1381,8 @@ registers as `seed_version`.
 | `QUASAR_DOCKER_SOCKET_HOST_PATH` | `/var/run/docker.sock` | Only when the actor cannot inspect its own container: the daemon-host path of the engine socket it binds into the agent. Normally learned from the actor's own mount. |
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from, with exactly the updater's rules (see "Updater" below). Read on every start, unlike the machine inputs. A developer apply from a test registry needs that registry's namespace here. |
+| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | as the updater's | ADR 0003 release signatures, verified by the actor exactly as the updater does. A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value stops the start (`token="actor-trust-config-invalid"`). |
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
 **NVIDIA detection.** When the device probe finds an NVIDIA render node, the actor asks
@@ -1399,6 +1403,27 @@ or only the container toolkit's hook).
 - A container this actor did not create that holds a helper's name (`quasar-gpu-probe`,
   `quasar-secrets-writer`) is left untouched, stops the start
   (`token="actor-helper-name-taken"`) and is listed in status `conflicts`.
+
+**Replacing the node agent (#360).** The agent relays a `release_apply` to its actor over
+the agent socket (`POST /v1/submit`), which may name only `node-agent` and
+`recovery-actor` (replacing the actor itself arrives with RH06-10). The actor journals
+every phase to `journal/<request-id>.json` in machine state before acting on it, pulls,
+stops the old agent, disables its restart policy and renames it
+`quasar-node-agent.kept`, creates and starts the new one, and waits up to 300 s (or the
+request's `wait_timeout_s`) for it to run and report healthy. A new agent that does not
+is removed and the kept one put back (`restored: true`, ADR 0004); a verified one
+replaces it and the kept one is removed. One attempt at a time; a re-post of the same
+request id is answered from the journal. If the actor, the engine or the machine
+restarts part-way, the next start settles the attempt before anything else: interrupted
+before the old agent was touched, it ends `failed`/`interrupted` with nothing changed;
+after, it continues to verification. Nothing is retried on its own. A request id is
+admitted once per machine, ever (`journal/used-ids` outlives pruned journals). A journal
+file that cannot be read (corrupt, or written by a newer actor) stops everything: submits
+answer `busy`, status reports it in flight, and a start settles nothing
+(`token="actor-journal-unreadable"`) until an operator deals with the file. Tokens:
+`actor-attempt-failed`, `actor-verification-failed`, `actor-submit-refused`,
+`actor-journal-write-failed`. `docker exec quasar-recovery quasar-recovery status`
+shows the last attempt's result.
 
 **One socket, one name.** The actor always listens at `/run/quasar-recovery/agent.sock`, inside the `quasar-recovery-agent` volume it mounts read-write; that path is fixed, not an actor input. The agent it creates mounts the same volume read-only at the same path and is told where through `QUASAR_RECOVERY_SOCKET` (see "Node agent — connection & identity"), which the actor's recipe sets. Both names come from one constant module (`quasar_runtime::owned_install`), so the two sides cannot drift.
 

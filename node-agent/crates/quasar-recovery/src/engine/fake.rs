@@ -41,6 +41,18 @@ pub struct FakeContainer {
     pub health: Option<String>,
 }
 
+/// How a started container of one image behaves. An image with none runs, with no
+/// healthcheck.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Behaviour {
+    /// The health the engine reports once the container runs: `None` is no healthcheck.
+    pub health: Option<String>,
+    /// The engine refuses the start with this message; the container stays `created`.
+    pub refuse_start: Option<String>,
+    /// What the container has printed, for `logs_tail`.
+    pub logs: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FakeVolume {
     pub labels: BTreeMap<String, String>,
@@ -70,6 +82,8 @@ pub struct FakeState {
     pub gpus_refusal_message: String,
     /// Failures the next creates of a GPU-requesting container return, in order.
     pub gpus_create_failures: Vec<EngineError>,
+    /// How a started container behaves, by its image reference.
+    pub behaviour: BTreeMap<String, Behaviour>,
     pub unreachable: bool,
     pub next_id: u64,
 }
@@ -134,6 +148,24 @@ impl FakeEngine {
 
     pub fn clear_faults(&self) {
         self.inner.lock().unwrap().faults.clear();
+    }
+
+    /// What a daemon restart does to containers: every running one stops, and the ones
+    /// whose restart policy is `unless-stopped` come back. A stopped or created container,
+    /// and one whose policy is `no`, stays as it is. Not an engine call.
+    pub fn restart_daemon(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        for c in inner.state.containers.values_mut() {
+            if c.status != "running" {
+                continue;
+            }
+            if c.restart == RestartPolicy::UnlessStopped {
+                c.starts += 1;
+            } else {
+                c.status = "exited".into();
+                c.exit_code = Some(0);
+            }
+        }
     }
 
     /// Runs one call: counts it, applies a `Before` fault, the operation, then an
@@ -330,12 +362,20 @@ impl PlatformEngine for FakeEngine {
             } else {
                 s.gpus_refusal_message.clone()
             };
+            let behaviour = s
+                .containers
+                .get(&id)
+                .and_then(|c| s.behaviour.get(&c.spec.image))
+                .cloned();
             let c = s.containers.get_mut(&id).unwrap();
             if c.status == "running" {
                 return Ok(());
             }
             if !c.spec.gpus.is_empty() && !gpus_supported {
                 return Err(refused(500, &gpus_refusal));
+            }
+            if let Some(message) = behaviour.as_ref().and_then(|b| b.refuse_start.clone()) {
+                return Err(refused(500, &message));
             }
             c.starts += 1;
             // A helper runs to completion at once; only the GPU probe prints anything.
@@ -347,6 +387,10 @@ impl PlatformEngine for FakeEngine {
                 }
             } else {
                 c.status = "running".into();
+                if let Some(b) = behaviour {
+                    c.health = b.health;
+                    c.logs = b.logs;
+                }
             }
             Ok(())
         })

@@ -11,7 +11,7 @@
  * targets card's "Per-host detail" disclosure.
  *
  * The per-host apply half is #116 (ApplyControls.tsx); fleet apply and revert
- * are #117/#118.
+ * are #117/#118; developer apply is #360 (DeveloperApply.tsx).
  */
 
 import { useState, type ReactNode } from "react";
@@ -53,6 +53,7 @@ import {
   attemptForTarget,
   useHostSessionCounts,
 } from "./ApplyControls";
+import { DeveloperApplyCard } from "./DeveloperApply";
 import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel, LastRunPanel } from "./FleetApply";
 import { blockingChecks, holdoutText, unknownChecks } from "./preflight";
 import {
@@ -260,6 +261,13 @@ export function ReleasesTab() {
                 <ApplyHistory refreshKey={applied} />
               </RailCard>
               <FaultsCard view={view} />
+              <DeveloperApplyCard
+                view={view}
+                onApplied={() => {
+                  setApplied((n) => n + 1);
+                  void res.refresh();
+                }}
+              />
             </div>
           </div>
         </>

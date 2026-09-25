@@ -40,6 +40,7 @@ import type {
   PlatformApplyAttemptEnvelope,
   PlatformApplyAttemptsResponse,
   PlatformApplyRequest,
+  PlatformDeveloperApplyRequest,
   PlatformApplyRunEnvelope,
   PlatformApplyRunsResponse,
   PlatformIdentity,
@@ -1080,6 +1081,19 @@ export function applyPlatformReleaseToHost(
   req: { release_id: string; force?: boolean },
 ): Promise<PlatformApplyAttemptEnvelope> {
   return apiFetch<PlatformApplyAttemptEnvelope>(`/admin/platform/hosts/${hostId}/apply`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Apply an arbitrary digest set to one owned target. 202 with a
+ *  `developer_apply` attempt, watched through active_apply like any other. */
+export function developerApply(
+  token: string,
+  req: PlatformDeveloperApplyRequest,
+): Promise<PlatformApplyAttemptEnvelope> {
+  return apiFetch<PlatformApplyAttemptEnvelope>("/admin/platform/developer-apply", {
     method: "POST",
     body: req,
     token,

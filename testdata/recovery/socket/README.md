@@ -20,6 +20,10 @@ Rules the fixtures pin:
 
 - `request.wait_timeout_s` and `rejection.request_id` are omitted when zero/empty;
   every other field is always present, with `null` where a value is absent.
+- `status.result` is the attempt `GET /v1/status?request_id=<id>` names (`null` when the
+  machine has no journal for it), or the most recent attempt when no id is given; the
+  agent's relay reads the second on connect to replay or adopt it. `POST /v1/submit`
+  answers `202` with an `accepted`, `409` with a `busy` `rejection`, `400` with any other.
 - `result` keeps the Go updater's result-file spellings (`internal/updater/result.go`,
   without `commands`, which named Compose invocations), so the agent's
   `release_state` relay stays a re-frame. `reason` is set exactly when `state` is

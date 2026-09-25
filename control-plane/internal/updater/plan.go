@@ -189,6 +189,14 @@ func namespaceAllowed(image string, allowed []string) bool {
 	return false
 }
 
+// NamespaceAllowed and ImageHasTagOrDigest are the two image rules the control
+// plane's developer apply checks up front, with the updater's exact semantics
+// (control-api.md §"Developer apply"); the actor's allowlist stays the
+// enforcement.
+func NamespaceAllowed(image string, allowed []string) bool { return namespaceAllowed(image, allowed) }
+
+func ImageHasTagOrDigest(image string) bool { return imageHasTagOrDigest(image) }
+
 // imageHasTagOrDigest reports whether a repository reference carries either.
 // A tag is a `:` AFTER the last `/` (so `registry:5000/repo` is a port, not a
 // tag); a digest is any `@`.

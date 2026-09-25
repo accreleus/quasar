@@ -25,6 +25,18 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Owned GPU hosts take agent updates through their recovery actor, and admins can apply a
+  developer build (#360).** On an owned install the agent relays `release_apply` to its
+  recovery actor, which journals every phase before acting, keeps the old agent stopped and
+  disabled until the new one runs healthy, restores it automatically when the new one does not
+  (recorded with its `auto_revert` row), and after any restart of the actor, the engine or the
+  machine ends an interrupted attempt in a stated outcome (`interrupted` when nothing had
+  changed) without retrying it. Per-host apply and revert work on owned hosts as on registry
+  hosts. `POST /v1/admin/platform/developer-apply` (admin only) applies a digest set from an
+  allowed namespace to one owned host as a `developer_apply` attempt (migration 0096), with a
+  Developer apply card and drawer on Fleet ▸ Releases; the control-plane target answers
+  `target_not_owned` until the control plane's own machine is owned. New knob
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES` for a contributor's plain-HTTP test registry.
 - **The seed: one container that keeps a machine's recovery actor in existence (#358).**
   `quasar-recovery seed` (the same image, started by digest with the GPU host's bootstrap
   inputs, `docs/configuration.md` "Seed") checks those inputs, the agent image included

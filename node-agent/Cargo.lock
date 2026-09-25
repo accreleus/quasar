@@ -1586,6 +1586,7 @@ dependencies = [
  "input-linux",
  "libc",
  "pkg-config",
+ "quasar-recovery",
  "quasar-runtime",
  "regex",
  "rustls",

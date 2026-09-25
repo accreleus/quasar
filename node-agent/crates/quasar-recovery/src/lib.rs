@@ -1,7 +1,9 @@
 //! The recovery actor's library (RH-06, `docs/rh06/2026-09-24-architecture.md` §5.1).
 //!
 //! - [`actor`] is the deep module: [`actor::Actor::resume`] installs and completes this
-//!   machine's services, [`actor::Actor::status`] reports its inventory.
+//!   machine's services and settles an interrupted attempt, [`actor::Actor::status`]
+//!   reports its inventory, [`actor::Actor::submit`] admits a replacement. The attempt
+//!   machinery is [`submit`], [`journal`], [`settle`] (the D8 table) and [`replace`].
 //! - [`recipe`] is the pure recipe book (ADR 0008): each role's container shape by
 //!   revision. [`probe`] detects the GPU through a disposable container.
 //! - [`engine`] is the engine port: the real Docker adapter and an in-memory fake.
@@ -21,11 +23,15 @@ pub mod actor;
 pub mod bootstrap;
 pub mod engine;
 pub mod identity;
+pub mod journal;
 pub mod machine;
 pub mod probe;
 pub mod recipe;
+pub mod replace;
 pub mod seed;
 pub mod server;
+pub mod settle;
 pub mod shutdown;
 pub mod socket;
+pub mod submit;
 pub mod trust;

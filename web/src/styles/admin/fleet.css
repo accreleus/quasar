@@ -488,6 +488,17 @@
   display: none;
 }
 
+/* Developer apply (#360): design_handoff_v3/screens/rh06 devapply*.png, the rail
+   card `rhDevCard` and the drawer `rhDevApply` in assets/pages-rh06.js. */
+.devapply-card-hint { margin-top: var(--s2); line-height: 1.5; }
+.devapply-ns-note {
+  margin: 0;
+  font-size: var(--t-sm);
+  line-height: 1.55;
+  color: var(--text-2);
+}
+.devapply-detail { margin: var(--s2) 0 0; white-space: pre-wrap; }
+
 /* Keep the scoped Releases rail from overriding the shared split breakpoint. */
 .rel-split > * { min-width: 0; }
 @media (max-width: 1240px) {

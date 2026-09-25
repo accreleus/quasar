@@ -11,6 +11,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
+	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
 // The two apply endpoints. Every refusal is evaluated against the same view the
@@ -50,6 +51,10 @@ type ApplyHandler struct {
 	fleet *FleetRunner
 	// Drops the preflight caches before an apply decision; nil is a no-op.
 	refreshPreflight func()
+	// The developer apply's image-identity reader and namespace allowlist
+	// (developer_apply.go); a nil reader refuses image_unresolvable.
+	dev               DeveloperImages
+	allowedNamespaces []string
 }
 
 // logger is the sliver of *slog.Logger this file uses.
@@ -62,7 +67,8 @@ type logger interface {
 // NewApplyHandler builds the apply endpoints. view is the same release view the
 // page reads, so eligibility is evaluated once and in one place.
 func NewApplyHandler(store *Store, runner *Runner, view func(ctx context.Context) (View, error), auditor audit.Recorder, log logger) *ApplyHandler {
-	return &ApplyHandler{store: store, runner: runner, view: view, auditor: auditor, log: log}
+	return &ApplyHandler{store: store, runner: runner, view: view, auditor: auditor, log: log,
+		allowedNamespaces: updater.DefaultAllowedNamespaces}
 }
 
 // WithEdgeResolver wires registry resolution for manifest-less releases.
@@ -97,6 +103,7 @@ func (h *ApplyHandler) Register(mux httpx.Router, admin func(http.Handler) http.
 	mux.Handle("GET /v1/admin/platform/apply/runs", admin(http.HandlerFunc(h.handleRuns)))
 	mux.Handle("GET /v1/admin/platform/apply/runs/{id}", admin(http.HandlerFunc(h.handleRun)))
 	mux.Handle("POST /v1/admin/platform/apply/runs/{id}/cancel", admin(http.HandlerFunc(h.handleRunCancel)))
+	mux.Handle("POST /v1/admin/platform/developer-apply", admin(http.HandlerFunc(h.handleDeveloperApply)))
 }
 
 // notEligible is the `409 host_not_eligible` body: the envelope plus `reason`

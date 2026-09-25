@@ -247,6 +247,9 @@ impl Actor {
   request; components are replaced in request order and a failure stops the sequence; at most
   one running container per role; the actor never stops, renames or removes a container it did
   not create; a control plane is never started against a newer schema.
+- *Implementation note (#360):* the binary takes the lease, opens its socket, then runs
+  `resume`; every submit is refused `busy` from the lease until `resume` returns, and while any
+  journal is unreadable. `status` with no request id returns the latest attempt's result.
 - Terminal outcomes: `succeeded`, `failed` (with `restored: true|false`), `interrupted`
   (nothing changed). Reasons: today's closed set plus `recipe_unsupported`, `owner_conflict`,
   `backup_failed`, `backup_unconfirmed`, `interrupted`. On the wire `interrupted` is `state: failed` + `reason: interrupted` (`release_state` has no such state).

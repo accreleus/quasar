@@ -22,6 +22,7 @@ const REASON_TEXT: Record<string, string> = {
   preflight_blocked: "A preflight check failed on this target; the check below names the fix.",
   attempt_in_flight: "An update is already in flight on this target.",
   run_active: "A fleet update is already running.",
+  below_floor: "Must update before it can be managed: its node agent or recovery actor is below this control plane's floor.",
 };
 
 /** The closed preflight check vocabulary (amendment 9), as short labels. An
@@ -58,6 +59,7 @@ const ATTEMPT_KIND_TEXT: Record<string, string> = {
   apply: "Apply",
   revert: "Revert",
   auto_revert: "Reverted automatically",
+  developer_apply: "Developer apply",
 };
 
 export function attemptKindText(kind: string): string {
@@ -126,6 +128,15 @@ const FAILURE_TEXT: Record<string, string> = {
   unsupported: "This host's agent predates the update feature; update it another way.",
   signature_missing: "This host requires a signed release and this one is not signed.",
   signature_invalid: "The release's signature did not verify against this host's trusted keys.",
+  recipe_unsupported:
+    "This machine's recovery actor does not know how to install this image; nothing changed. Update the recovery actor first.",
+  owner_conflict: "Another owner's container is in the way on this machine; nothing was replaced.",
+  backup_failed:
+    "Quasar could not dump its database, so the control plane was not replaced and the database was not touched.",
+  backup_unconfirmed:
+    "This update changes the database and no backup of your own database was confirmed, so the control plane was not replaced.",
+  interrupted:
+    "The recovery actor restarted before it had touched the running service; nothing changed and nothing was retried.",
 };
 
 export function failureText(reason: string | null | undefined): string {
@@ -258,4 +269,44 @@ export function commitsMatch(a: string | null | undefined, b: string | null | un
   if (!a || !b) return false;
   const [x, y] = a.length <= b.length ? [a, b] : [b, a];
   return y.toLowerCase().startsWith(x.toLowerCase());
+}
+
+/** A developer apply refused before anything started (control-api.md
+ *  §"Developer apply", Errors). */
+const DEVELOPER_REFUSAL_TEXT: Record<string, string> = {
+  namespace_rejected: "An image is not under a namespace this machine allows.",
+  image_unresolvable:
+    "A digest did not resolve at the registry as the control plane sees it, carries no build identity, or the images were built from different commits.",
+  target_not_owned: "This machine is not a Quasar-owned install, so it cannot take a developer apply.",
+  attempt_in_flight: "An update is already in flight on this machine.",
+  run_active: "A fleet update is running. Try again once it has finished.",
+  apply_unsupported: "This machine's agent does not accept updates from the console.",
+  release_below_schema_version:
+    "This control-plane image carries an older database schema than the installed one, and the control plane never moves below its database.",
+  preflight_blocked: "A preflight check failed on the control plane.",
+  not_found: "This host is no longer registered.",
+};
+
+/** `release_above_control_plane` means something else on this route: the
+ *  images' commit is not one the control plane can place at or below itself. */
+const DEVELOPER_NOT_ELIGIBLE_TEXT: Record<string, string> = {
+  release_above_control_plane:
+    "These images were built from a commit the control plane cannot show is at or below its own. Use images built from the installed control plane's commit or an earlier release.",
+};
+
+/** The sentence for a refused developer apply. `showMessage` is true where the
+ *  server's own message adds what the sentence cannot (which image). An
+ *  unmapped code shows the server's message. */
+export function developerRefusalText(
+  code: string,
+  reason: string | undefined,
+  message: string,
+): { text: string; showMessage: boolean } {
+  if (code === "host_not_eligible") {
+    const why = reason ? (DEVELOPER_NOT_ELIGIBLE_TEXT[reason] ?? eligibilityText(reason)) : "";
+    return { text: `This host cannot take a developer apply right now. ${why}`.trim(), showMessage: false };
+  }
+  const text = code === "validation_failed" ? undefined : DEVELOPER_REFUSAL_TEXT[code];
+  if (!text) return { text: message, showMessage: false };
+  return { text, showMessage: code === "namespace_rejected" };
 }

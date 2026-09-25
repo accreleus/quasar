@@ -95,6 +95,11 @@ type ApplyDeps struct {
 	// Connected reports whether this host's agent is on the wire right now.
 	// Nil reads as connected, which sends and lets the send's own error decide.
 	Connected func(hostID string) bool
+	// DeveloperCommit reads the commit a developer apply's images carry, for an
+	// attempt this process did not create (a restart re-adopted it). A
+	// developer_apply row has no release to name its commit, and its digests
+	// name it immutably. Nil fails such an attempt before the send.
+	DeveloperCommit func(ctx context.Context, components []ComponentDigest) (string, error)
 }
 
 // Runner drives every in-flight attempt. Its state is the goroutine set and the
@@ -118,6 +123,9 @@ type Runner struct {
 	// Cleared ONLY by a register: a register is the only evidence the build
 	// changed (agent-api.md).
 	unsupported map[string]bool
+	// attempt id → the commit a developer apply's images carry: its success
+	// evidence and its release_apply provenance.
+	developerCommits map[string]developerEvidence
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -131,17 +139,18 @@ func NewRunner(store applyStore, deps ApplyDeps, log *slog.Logger) *Runner {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
-		store:        store,
-		deps:         deps,
-		log:          log,
-		AckTimeout:   DefaultAckTimeout,
-		Deadline:     DefaultApplyDeadline,
-		PollInterval: DefaultApplyPoll,
-		ConnectWait:  DefaultConnectWait,
-		running:      make(map[string]context.CancelFunc),
-		unsupported:  make(map[string]bool),
-		baseCtx:      ctx,
-		stop:         cancel,
+		store:            store,
+		deps:             deps,
+		log:              log,
+		AckTimeout:       DefaultAckTimeout,
+		Deadline:         DefaultApplyDeadline,
+		PollInterval:     DefaultApplyPoll,
+		ConnectWait:      DefaultConnectWait,
+		running:          make(map[string]context.CancelFunc),
+		unsupported:      make(map[string]bool),
+		developerCommits: make(map[string]developerEvidence),
+		baseCtx:          ctx,
+		stop:             cancel,
 	}
 }
 
@@ -207,6 +216,13 @@ func (r *Runner) Start(a Attempt) {
 			cancel()
 		}()
 		r.drive(ctx, a)
+		if a.Kind == KindDeveloperApply {
+			rctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+			if cur, err := r.store.Attempt(rctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+				r.forgetDeveloperCommit(a.ID)
+			}
+			done()
+		}
 	}()
 }
 
@@ -230,6 +246,55 @@ func (r *Runner) Supported(hostID string) bool {
 func (r *Runner) markUnsupported(hostID string) {
 	r.mu.Lock()
 	r.unsupported[hostID] = true
+	r.mu.Unlock()
+}
+
+// developerEvidence is what a developer_apply attempt's success rule needs.
+type developerEvidence struct {
+	commit string
+	// A register on `commit` proves nothing when the host already ran it: the old
+	// agent a failed attempt restored registers the same commit, possibly before its
+	// relayed failure (agent-api.md §release_state, "A successful node-agent apply
+	// is usually never reported…"). Then only the relayed outcome decides.
+	registerIsEvidence bool
+}
+
+// RememberDeveloperCommit records the commit the developer apply endpoint read
+// off the attempt's images and the commit the host ran before it, so neither the
+// send nor the register hook reads the registry again.
+func (r *Runner) RememberDeveloperCommit(attemptID, commit string, hostCommitBefore *string) {
+	r.mu.Lock()
+	r.developerCommits[attemptID] = developerEvidence{
+		commit:             commit,
+		registerIsEvidence: hostCommitBefore != nil && !commitsMatch(*hostCommitBefore, commit),
+	}
+	r.mu.Unlock()
+}
+
+// developerCommit is the commit a developer_apply attempt carries, and whether a
+// register on it is success evidence. An attempt re-adopted after a restart does
+// not know the host's earlier commit, so for it only the relayed outcome decides.
+func (r *Runner) developerCommit(ctx context.Context, a Attempt) (developerEvidence, error) {
+	r.mu.Lock()
+	ev, ok := r.developerCommits[a.ID]
+	r.mu.Unlock()
+	if ok {
+		return ev, nil
+	}
+	if r.deps.DeveloperCommit == nil {
+		return developerEvidence{}, errors.New("no registry reader is wired to read the images' commit")
+	}
+	commit, err := r.deps.DeveloperCommit(ctx, a.RequestedDigests)
+	if err != nil {
+		return developerEvidence{}, err
+	}
+	r.RememberDeveloperCommit(a.ID, commit, nil)
+	return developerEvidence{commit: commit}, nil
+}
+
+func (r *Runner) forgetDeveloperCommit(attemptID string) {
+	r.mu.Lock()
+	delete(r.developerCommits, attemptID)
 	r.mu.Unlock()
 }
 
@@ -373,6 +438,17 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	}
 
 	release := ReleaseRef{SourceCommit: ""}
+	if a.Kind == KindDeveloperApply {
+		// No release: `id` "", `version` null, and the images' own commit
+		// (agent-api.md §release_apply, amendment 14).
+		ev, err := r.developerCommit(ctx, a)
+		if err != nil {
+			r.log.Error("apply: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			r.fail(a.ID, ReasonInvalid, "the images' build identity could not be read: "+err.Error())
+			return false
+		}
+		release = ReleaseRef{SourceCommit: ev.commit}
+	}
 	if a.ReleaseID != nil {
 		rel, err := r.store.Release(ctx, *a.ReleaseID)
 		if err != nil {
@@ -611,7 +687,7 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 // (ADR 0004). Only after the apply is terminal, so the open-target index is
 // free; only for an apply, never for a revert that failed.
 func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep ReleaseStateReport) {
-	if failed.Kind != KindApply {
+	if failed.Kind != KindApply && failed.Kind != KindDeveloperApply {
 		return
 	}
 	requested := restoredDigests(failed.RequestedDigests, rep.Previous)
@@ -671,6 +747,20 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 	}
 	if sourceCommit == nil || *sourceCommit == "" {
 		return
+	}
+	if wantCommit == "" && a.Kind == KindDeveloperApply {
+		ev, err := r.developerCommit(ctx, a)
+		if err != nil {
+			// The actor's relayed outcome or the deadline decides.
+			r.log.Warn("register: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			return
+		}
+		if !ev.registerIsEvidence {
+			r.log.Info("register during a developer apply of the commit the host already ran; the relayed outcome decides",
+				"host_id", hostID, "attempt_id", a.ID)
+			return
+		}
+		wantCommit = ev.commit
 	}
 	if wantCommit == "" {
 		// A revert to a build this instance can no longer name has no commit

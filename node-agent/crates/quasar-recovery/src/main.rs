@@ -7,11 +7,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quasar_recovery::actor::{Actor, ActorConfig, ResumeError};
+use quasar_recovery::actor::{Actor, ActorConfig, TrustConfig};
 use quasar_recovery::bootstrap::Bootstrap;
 use quasar_recovery::engine::DockerEngine;
 use quasar_recovery::recipe::paths;
 use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
+use quasar_recovery::socket::Request;
+use quasar_recovery::trust::{self, SignatureEvidence};
 use quasar_recovery::{identity, server, shutdown};
 use tracing::{error, info};
 
@@ -208,24 +210,34 @@ fn actor() -> ExitCode {
         }
     };
     info!(engine = %engine.endpoint(), "engine");
+    match trust_from_env() {
+        Ok((trust, evidence)) => {
+            config.trust = trust;
+            config.evidence = evidence;
+        }
+        Err(why) => {
+            error!(token = "actor-trust-config-invalid", "{why}");
+            return ExitCode::from(2);
+        }
+    }
     let actor =
         Arc::new(Actor::new(Arc::new(engine), config).with_status_engine(Arc::new(status_engine)));
 
-    match actor.resume() {
-        Ok(()) => info!("this machine's services are installed and running"),
-        Err(e @ (ResumeError::LeaseHeld | ResumeError::State(_))) if !actor.holds_lease() => {
-            error!(token = "actor-lease-unavailable", "{e}");
-            return ExitCode::FAILURE;
-        }
-        Err(e) => error!(
-            token = "actor-resume-failed",
-            "{e}; the install is retried on the next start, and status keeps being served"
-        ),
+    // The lease first, then the socket, then `resume`: settling an interrupted attempt can
+    // take a whole verification, and the agent must be able to read its status meanwhile.
+    if let Err(e) = actor.acquire_lease() {
+        error!(token = "actor-lease-unavailable", "{e}");
+        return ExitCode::FAILURE;
     }
-
     let socket = agent_socket();
-    let listener = match server::bind(&socket) {
-        Ok(listener) => listener,
+    let server = match server::bind(&socket) {
+        Ok(listener) => {
+            info!(socket = %socket.display(), "serving the agent socket");
+            let serving = actor.clone();
+            Some(std::thread::spawn(move || server::serve(listener, serving)))
+        }
+        // `resume` still runs: an interrupted attempt settles and an install completes
+        // whether or not anyone can ask about it.
         Err(e) => {
             error!(
                 token = "actor-socket-bind-failed",
@@ -234,14 +246,69 @@ fn actor() -> ExitCode {
                 quasar_recovery::recipe::names::AGENT_SOCKET_VOLUME,
                 paths::AGENT_SOCKET_DIR
             );
-            return ExitCode::FAILURE;
+            None
         }
     };
-    info!(socket = %socket.display(), "serving the agent socket");
-    let e = server::serve(listener, actor);
+
+    // The lease is already held, so `resume` cannot answer `LeaseHeld`.
+    match actor.resume() {
+        Ok(()) => info!("this machine's services are installed and running"),
+        Err(e) => error!(
+            token = "actor-resume-failed",
+            "{e}; the install is retried on the next start, and status keeps being served"
+        ),
+    }
+
+    let Some(server) = server else {
+        return ExitCode::FAILURE;
+    };
+    let e = server
+        .join()
+        .unwrap_or_else(|_| std::io::Error::other("the socket thread panicked"));
     error!(
         token = "actor-socket-failed",
         "the agent socket stopped: {e}"
     );
     ExitCode::FAILURE
+}
+
+type Evidence = Box<dyn Fn(&Request) -> SignatureEvidence + Send + Sync>;
+
+/// The updater's trust knobs, read the way the Go updater reads them
+/// (`docs/configuration.md` "Recovery actor").
+fn trust_from_env() -> Result<(TrustConfig, Evidence), String> {
+    let raw = |k: &str| std::env::var(k).unwrap_or_default();
+    let allowed_namespaces =
+        trust::parse_allowed_namespaces(&raw("QUASAR_UPDATER_ALLOWED_NAMESPACES"));
+    let mode = trust::parse_signature_mode(&raw("QUASAR_UPDATER_SIGNATURE_MODE"))
+        .map_err(|e| format!("QUASAR_UPDATER_SIGNATURE_MODE: {e}"))?;
+    let keys = trust::parse_trusted_keys(&raw("QUASAR_UPDATER_TRUSTED_KEYS"))
+        .map_err(|e| format!("QUASAR_UPDATER_TRUSTED_KEYS: {e}"))?;
+    let base = trust::parse_manifest_base_url(&raw("QUASAR_UPDATER_MANIFEST_BASE_URL"))
+        .map_err(|e| format!("QUASAR_UPDATER_MANIFEST_BASE_URL: {e}"))?;
+    let timeout = trust::parse_manifest_timeout(&raw("QUASAR_UPDATER_MANIFEST_TIMEOUT_S"));
+    info!(namespaces = ?allowed_namespaces, signature_mode = mode.as_str(), "release trust");
+    let policy = trust::SignaturePolicy { mode, keys };
+    let fetcher = Arc::new(trust::HttpsFetcher::from_env());
+    let evidence: Evidence = Box::new(move |req: &Request| {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                return SignatureEvidence::FetchError {
+                    error: format!("no runtime to fetch the release assets on: {e}"),
+                }
+            }
+        };
+        runtime.block_on(fetcher.evidence(&base, req.release.version.as_deref(), timeout))
+    });
+    Ok((
+        TrustConfig {
+            allowed_namespaces,
+            signature: policy,
+        },
+        evidence,
+    ))
 }
