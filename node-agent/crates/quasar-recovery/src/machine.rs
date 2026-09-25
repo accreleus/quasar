@@ -7,10 +7,11 @@
 //! secrets/                0700
 //!   <name>.json           0600, one secret each
 //! services/<role>.json    the last specification the actor applied for that role
+//! seed.json               ADR 0007 format 1, read by the seed (`crate::seed::file`)
 //! ```
 //!
-//! `seed.json` (ADR 0007) and the attempt journal are written by later slices. Every file
-//! is committed through [`DurableFile`], so a crash leaves each whole or absent.
+//! The attempt journal is written by a later slice. Every file is committed through
+//! [`DurableFile`], so a crash leaves each whole or absent.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -21,6 +22,7 @@ use quasar_runtime::{DurableFile, LeaseError, StateLease};
 use serde::{Deserialize, Serialize};
 
 use crate::recipe::{ContainerSpec, ImageRef, Inputs, Role};
+use crate::seed::{self, file::SeedFile};
 use crate::socket::MachineRole;
 
 pub const FORMAT: u32 = 1;
@@ -83,6 +85,19 @@ impl MachineDir {
             }
         }
         Ok(machine)
+    }
+
+    fn seed_file(&self) -> DurableFile<SeedFile> {
+        DurableFile::new(self.root.join(seed::file::FILE_NAME), "json.tmp")
+    }
+
+    /// `Ok(None)`: no actor has recorded one yet.
+    pub fn load_seed_file(&self) -> io::Result<Option<SeedFile>> {
+        self.seed_file().load()
+    }
+
+    pub fn store_seed_file(&self, file: &SeedFile) -> io::Result<()> {
+        self.seed_file().store(file)
     }
 
     fn ensure_dir(&self, name: &str, mode: u32) -> io::Result<PathBuf> {

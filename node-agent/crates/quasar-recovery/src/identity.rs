@@ -7,7 +7,8 @@ pub fn version() -> &'static str {
     normalized_version(option_env!("QUASAR_VERSION").unwrap_or(""))
 }
 
-fn normalized_version(raw: &str) -> &str {
+/// `v0.5.0` and `0.5.0` read `0.5.0`; empty or `unknown` reads `dev`.
+pub fn normalized_version(raw: &str) -> &str {
     let value = raw.trim();
     let value = value.strip_prefix('v').unwrap_or(value);
     if value.is_empty() || value == "unknown" {

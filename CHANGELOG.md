@@ -25,6 +25,22 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The seed: one container that keeps a machine's recovery actor in existence (#358).**
+  `quasar-recovery seed` (the same image, started by digest with the GPU host's bootstrap
+  inputs, `docs/configuration.md` "Seed") checks those inputs, the agent image included
+  (pulled, and of a recipe revision the actor carries), then creates exactly one recovery
+  actor from its own image, and finishes its own create if it was stopped between create and
+  start. Afterwards it re-creates one only if none exists, from the last verified actor digest
+  in `seed.json`, and otherwise does nothing. It never replaces an actor, writes no machine
+  state, and idles with one log line on invalid inputs, an unknown `seed.json` format or an
+  uninstalled marker. `seed.json` format 1, the two labels and the compiled actor profile
+  follow ADR 0007 (with a clarification on finishing its own create) and are pinned by a
+  contract test over fixtures per released actor (`testdata/recovery/seed/`, first set added).
+  The actor reads a first install's inputs from the seed's container, writes nothing durable
+  until they and the agent image pass, records `seed.json`, and reports the running seed's
+  version (new `org.quasar.version` image label, `unknown` when unreadable), which the host's
+  services card shows, or "not found". The actor and the seed now stop on SIGTERM/SIGINT with
+  exit 0 instead of being killed after Docker's timeout.
 - **The recovery actor installs a GPU host's agent (#357).** `quasar-recovery actor`, a static
   Rust binary in the new slim `quasar-recovery` image (`deploy/build-images.sh recovery`, its
   own image-contract role), is started by hand on a GPU host with an enrollment string, a home

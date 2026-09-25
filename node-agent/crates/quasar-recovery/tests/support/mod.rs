@@ -12,6 +12,7 @@ use quasar_recovery::engine::{
     RestartPolicy,
 };
 use quasar_recovery::recipe::{names, paths, Bind};
+use quasar_recovery::seed::{Seed, SeedConfig};
 use quasar_recovery::socket::MachineRole;
 
 pub const AGENT_IMAGE: &str = "registry.example.invalid/quasar/quasar-node-agent@sha256:bb22000000000000000000000000000000000000000000000000000000000000";
@@ -194,6 +195,98 @@ pub fn tree(dir: &Path) -> BTreeMap<String, (Vec<u8>, u32, std::time::SystemTime
         }
     }
     out
+}
+
+pub const SEED_ID: &str = "5eed000000000000000000000000000000000000000000000000000000000000";
+pub const SEED_NAME: &str = "quasar-seed";
+pub const SEED_VERSION: &str = "0.6.0";
+/// A later recovery image a manager may update the seed to.
+pub const NEWER_IMAGE: &str = "registry.example.invalid/quasar/quasar-recovery@sha256:dd44000000000000000000000000000000000000000000000000000000000000";
+
+/// The bootstrap inputs of a GPU host's seed, as its `docker run -e …` gives them.
+pub fn seed_env() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("QUASAR_ROLE".to_string(), "gpu".to_string()),
+        ("QUASAR_ENROLLMENT".to_string(), ENROLLMENT.to_string()),
+        ("QUASAR_HOME_ROOT".to_string(), HOME.to_string()),
+        ("QUASAR_AGENT_IMAGE".to_string(), AGENT_IMAGE.to_string()),
+    ])
+}
+
+/// A running seed container as the documented `docker run` makes it.
+pub fn seed_container(id: &str, image: &str, env: BTreeMap<String, String>) -> FakeContainer {
+    FakeContainer {
+        id: id.into(),
+        spec: ContainerSpec {
+            name: SEED_NAME.into(),
+            image: image.into(),
+            entrypoint: Some(vec!["/usr/local/bin/quasar-recovery".into()]),
+            cmd: Some(vec!["seed".into()]),
+            env,
+            labels: BTreeMap::new(),
+            network_mode: None,
+            binds: vec![
+                Bind {
+                    source: SOCKET_HOST_PATH.into(),
+                    target: paths::ENGINE_SOCKET.into(),
+                    read_only: false,
+                },
+                Bind {
+                    source: names::MACHINE_VOLUME.into(),
+                    target: paths::MACHINE_DIR.into(),
+                    read_only: true,
+                },
+            ],
+            devices: Vec::new(),
+            device_cgroup_rules: Vec::new(),
+            gpus: Vec::new(),
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            init: false,
+            restart: RestartPolicy::UnlessStopped,
+        },
+        status: "running".into(),
+        starts: 1,
+        restart: RestartPolicy::UnlessStopped,
+        exit_code: None,
+        logs: String::new(),
+        health: None,
+    }
+}
+
+/// A clean AMD GPU host on which only the seed has been started: no recovery actor yet.
+/// The recovery image carries its release version label.
+pub fn seeded_host(env: BTreeMap<String, String>) -> FakeState {
+    let mut state = amd_host();
+    state.containers.remove(ACTOR_ID);
+    state
+        .images
+        .get_mut(ACTOR_IMAGE)
+        .unwrap()
+        .labels
+        .insert("org.quasar.version".into(), SEED_VERSION.into());
+    state
+        .containers
+        .insert(SEED_ID.into(), seed_container(SEED_ID, ACTOR_IMAGE, env));
+    state
+}
+
+pub fn seed(engine: &Arc<FakeEngine>, dir: &Path, self_id: &str) -> Seed {
+    let mut config = SeedConfig::new(dir);
+    config.self_container = Some(self_id.into());
+    config.new_installation_id = Box::new(|| INSTALLATION.to_string());
+    Seed::new(engine.clone(), config)
+}
+
+/// The recovery actor a seed created, running as that container: no inputs of its own.
+pub fn seeded_actor(engine: &Arc<FakeEngine>, dir: &Path, actor_id: &str) -> Actor {
+    let mut config = ActorConfig::new(dir, MachineRole::Gpu, OperatorInputs::default());
+    config.self_container = Some(actor_id.into());
+    config.seed_container = Some(SEED_ID.into());
+    config.new_installation_id = Box::new(|| "an-id-the-actor-must-not-use".to_string());
+    config.now = Box::new(|| NOW.to_string());
+    config.gpus_probe_backoff = std::time::Duration::ZERO;
+    Actor::new(engine.clone(), config)
 }
 
 /// The tree without modification times, for comparing two machines that reached the same

@@ -123,6 +123,8 @@ function StateCell({ state }: { state: ServiceState }) {
       return <Chip title={state.at}>as of {reportClock(state.at)}</Chip>;
     case "absent":
       return <span className="hint">{state.text}</span>;
+    case "not_found":
+      return <Chip variant="warning">not found</Chip>;
     default:
       return <Chip>unknown</Chip>;
   }

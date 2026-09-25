@@ -120,6 +120,9 @@ fn containers_volumes_and_archives_round_trip_through_a_real_engine() {
     assert_eq!(c.status, "created");
     assert_eq!(c.restart, Some(RestartPolicy::No));
     assert_eq!(c.labels["io.quasar.test"], writer);
+    // What the seed is recognised by, and where a seed-created actor reads its inputs.
+    assert_eq!(c.command, ["/bin/sh", "-c", "true"]);
+    assert!(c.env.iter().any(|kv| kv == "QUASAR_TEST=1"), "{:?}", c.env);
     let mut tar = tar::Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
     header.set_size(6);

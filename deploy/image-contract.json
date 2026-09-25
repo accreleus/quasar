@@ -271,9 +271,10 @@
           "org.quasar.image.role=recovery",
           "org.quasar.source.commit",
           "org.quasar.built.at",
-          "org.quasar.recipe"
+          "org.quasar.recipe",
+          "org.quasar.version"
         ],
-        "_notes": "No org.quasar.pins.base: not built on the quasar-base family. org.quasar.recipe is the revision of the actor's own container shape (node-agent/crates/quasar-recovery/src/recipe/revision.rs), which the seed and a hand-over render (ADR 0007/0008)."
+        "_notes": "No org.quasar.pins.base: not built on the quasar-base family. org.quasar.recipe is the revision of the actor's own container shape (node-agent/crates/quasar-recovery/src/recipe/revision.rs), which the seed and a hand-over render (ADR 0007/0008). org.quasar.version is the release version (dev on a branch build): a recovery actor reads it off the seed's image to report the seed's version (agent-api.md amendment 14 seed_version)."
       },
 
       "image_config": {

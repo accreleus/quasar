@@ -183,6 +183,17 @@ fn find<'a>(state: &'a FakeState, name_or_id: &str) -> Option<&'a FakeContainer>
         .containers
         .get(name_or_id)
         .or_else(|| state.container_named(name_or_id))
+        // The engine resolves a unique id prefix of at least 12 characters, as $HOSTNAME is.
+        .or_else(|| {
+            let mut matching = state
+                .containers
+                .values()
+                .filter(|c| name_or_id.len() >= 12 && c.id.starts_with(name_or_id));
+            match (matching.next(), matching.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        })
 }
 
 fn find_id(state: &FakeState, name_or_id: &str) -> Result<String, EngineError> {
@@ -191,12 +202,16 @@ fn find_id(state: &FakeState, name_or_id: &str) -> Result<String, EngineError> {
         .ok_or(engine(ErrorKind::Missing))
 }
 
-fn view(c: &FakeContainer) -> Container {
+fn view(s: &FakeState, c: &FakeContainer) -> Container {
     Container {
         id: c.id.clone(),
         name: c.spec.name.clone(),
         image: c.spec.image.clone(),
-        image_id: format!("sha256:image-of-{}", c.spec.image),
+        image_id: s
+            .images
+            .get(&c.spec.image)
+            .map(|i| i.id.clone())
+            .unwrap_or_else(|| format!("sha256:image-of-{}", c.spec.image)),
         labels: c.spec.labels.clone(),
         status: c.status.clone(),
         running: c.status == "running",
@@ -208,6 +223,15 @@ fn view(c: &FakeContainer) -> Container {
             .iter()
             .map(|b| (b.source.clone(), b.target.clone(), b.read_only))
             .collect(),
+        command: c
+            .spec
+            .entrypoint
+            .iter()
+            .flatten()
+            .chain(c.spec.cmd.iter().flatten())
+            .cloned()
+            .collect(),
+        env: c.spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
     }
 }
 
@@ -238,12 +262,12 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn inspect_container(&self, name_or_id: &str) -> Result<Option<Container>, EngineError> {
-        self.call(|s| Ok(find(s, name_or_id).map(view)))
+        self.call(|s| Ok(find(s, name_or_id).map(|c| view(s, c))))
     }
 
     fn list_containers(&self) -> Result<Vec<Container>, EngineError> {
         self.call(|s| {
-            let mut all: Vec<Container> = s.containers.values().map(view).collect();
+            let mut all: Vec<Container> = s.containers.values().map(|c| view(s, c)).collect();
             all.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(all)
         })

@@ -1241,16 +1241,132 @@ code directly. Set in `deploy/.env`.
 
 ---
 
+## Seed (`quasar-recovery seed`, RH-06)
+
+The one container an operator or an external manager starts for Quasar on a machine
+(`CONTEXT.md` "Seed", ADR 0007). It makes sure the machine's recovery actor exists and does
+nothing else: on a first install it creates the actor from its own image; afterwards it
+re-creates one only if none exists, from the last verified recovery-actor image recorded in
+`seed.json`; otherwise it does nothing. It never stops, replaces or removes anything, never
+writes machine state and never talks to the control plane, so restarting, redeploying,
+updating or removing it never restarts or removes Quasar. In this build it installs a
+**GPU host** only. It is the `quasar-recovery` image run with the `seed` command; start it
+**by digest** (a tag is resolved to its registry digest, and an image with none is refused):
+
+```
+docker run -d --name quasar-seed --restart unless-stopped \
+  --security-opt label=disable \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine:ro \
+  -e QUASAR_ENROLLMENT='qenr1.…' \
+  -e QUASAR_HOME_ROOT=/srv/quasar/homes \
+  -e QUASAR_AGENT_IMAGE=<registry>/quasar-node-agent@sha256:<digest> \
+  <registry>/quasar-recovery@sha256:<digest> seed
+```
+
+The same seed as a Compose stack (Dockge, Arcane). The top-level `name:` matters: without it
+a stack names the volume `<project>_quasar-machine`, which is not the machine's state volume,
+and the seed refuses to start the install (`token="seed-self-invalid"`, naming what it found).
+
+```yaml
+services:
+  quasar-seed:
+    image: <registry>/quasar-recovery@sha256:<digest>
+    command: seed
+    restart: unless-stopped
+    security_opt: [label=disable]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - quasar-machine:/var/lib/quasar-machine:ro
+    environment:
+      QUASAR_ENROLLMENT: qenr1.…
+      QUASAR_HOME_ROOT: /srv/quasar/homes
+      QUASAR_AGENT_IMAGE: <registry>/quasar-node-agent@sha256:<digest>
+volumes:
+  quasar-machine:
+    name: quasar-machine
+```
+
+The two mounts are required: the engine socket (its daemon-host path is what the actor is
+given) and the `quasar-machine` volume at `/var/lib/quasar-machine`, read-only, where it reads
+`seed.json`. Its bootstrap inputs are the first-install variables of the table below
+(`QUASAR_ROLE`, `QUASAR_ENROLLMENT`, `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`,
+`QUASAR_NODE_NAME`, `QUASAR_AGENT_IMAGE`). The seed checks them before it creates anything,
+including that the agent image can be pulled and declares a recipe revision the actor
+carries (it pulls it). The actor reads them from the seed's container once, on the clean
+machine (a redeployed seed with a new container id is found by what it runs, a running seed first), so the
+enrollment string never enters the actor's environment. Once the machine is installed they
+are not needed again, and the enrollment string can be removed from the stack.
+
+**Correcting an install that did not complete.** An install writes nothing durable until its
+inputs and agent image have passed, so a refused install is fixed by correcting the stack
+and redeploying the seed. If the actor had already been created and its install failed
+(for instance the agent image was removed from the registry in between), correct the stack,
+then `docker restart quasar-recovery`: the actor installs once per start, from the seed's
+current inputs.
+
+Every 30 s (and at start) it looks once and logs only a change, so each condition is one line:
+
+| Log | Meaning |
+|---|---|
+| `token="seed-actor-created"` | It created and started `quasar-recovery`. |
+| (INFO) `a recovery actor exists; nothing to do` | Any container labelled `io.quasar.platform-service=recovery-actor` for this installation exists, running or stopped, under any name. |
+| `token="seed-inputs-invalid"` (ERROR) | A first install's inputs are missing or invalid, or the agent image declares no recipe revision the actor carries; the line names the variable. Nothing is created and the seed stays idle until it is started again with corrected inputs. |
+| `token="seed-agent-image-unavailable"` | The agent image a first install names cannot be pulled. Nothing is created; tried again at the next look. |
+| `token="seed-self-invalid"` (ERROR) | A mount above is missing or is another volume, or its image has no registry digest. Nothing is created. |
+| `token="seed-uninstalled"` | `seed.json` says this machine was uninstalled; the seed stays idle. |
+| `token="seed-file-unknown-format"` / `seed-file-unreadable` | `seed.json` is of a format other than 1, or invalid; the seed stays idle rather than guess. |
+| `token="seed-name-taken"` | A container named `quasar-recovery` exists without this installation's labels (for instance an actor started by hand, below): it is left alone. Remove it and the seed creates the actor. |
+| `seed-engine-unreachable`, `seed-pull-failed`, `seed-create-failed`, `seed-start-failed` | Retried at the next look. |
+
+**Its own unfinished create.** If the seed stops between creating the actor and starting it
+(a crash, an engine restart, a create whose answer it never received), the next look of the
+same seed container starts that actor: a container named `quasar-recovery`, never started,
+with only the two seed labels and this seed's own container id in `QUASAR_SEED_CONTAINER`
+(ADR 0007, "Finishing its own create"). It starts nothing else. A seed redeployed with a new
+container id in that window does not recognise the unstarted actor as its own and leaves it,
+logging `token="seed-actor-unstarted"`; `docker start quasar-recovery` finishes it.
+
+`docker exec quasar-seed quasar-recovery status` prints what the last look came to; the
+image's health check uses it. The console shows the seed's version on the host's "Services
+on this machine" card, `unknown` for a running seed whose version the actor could not read,
+and "not found" when the recovery actor finds no running seed (a stopped seed re-creates
+nothing, so it reads as none: start it again). `SIGTERM` and `SIGINT` stop the seed (and the
+actor) with exit 0, the seed holding the stop until an in-progress create and start finish
+(at most 8 s).
+
+**The files it reads.** `seed.json` (format 1, `testdata/recovery/seed/README.md`) is
+written by the recovery actor the first time it runs: installation id, the actor's own image
+by digest, `state: active`. The actor the seed creates has exactly the compiled profile of
+`testdata/recovery/seed/profile-1.json`: name `quasar-recovery`, restart `unless-stopped`,
+the engine socket, `quasar-machine` and `quasar-recovery-agent` volumes, command `actor`,
+the labels `io.quasar.installation` and `io.quasar.platform-service=recovery-actor`, and
+`QUASAR_SEED_CONTAINER` naming the seed's container.
+
 ## Recovery actor (`quasar-recovery`, RH-06)
 
 The Quasar-owned container that creates this machine's platform services through the
 Engine API (`CONTEXT.md` "Recovery actor"; `docs/rh06/2026-09-24-architecture.md`). In
-this build it installs a **GPU host** only, and is started by hand; the seed that starts
-it (ADR 0007) arrives in RH06-06. Image: `quasar-recovery` (`deploy/Dockerfile.recovery`,
+this build it installs a **GPU host** only. The seed creates it (above); it can still be
+started by hand, as below. Image: `quasar-recovery` (`deploy/Dockerfile.recovery`,
 built by `deploy/build-images.sh recovery`). Inputs are environment variables, so a
-manager's stack can carry them; they are read **only on a clean machine**. Once machine
-state exists (`machine.json` in the `quasar-machine` volume) it wins, and a later start's
-inputs are ignored (a differing home root is logged `token="actor-input-ignored"`).
+manager's stack can carry them; they are read **only on a clean machine**, from the seed's
+container when the seed created the actor (`QUASAR_SEED_CONTAINER`, set by the seed), else
+from its own environment. Once machine state exists (`machine.json` in the `quasar-machine`
+volume) it wins, and a later start's inputs are ignored (a differing home root is logged
+`token="actor-input-ignored"`). A seed-created actor takes the installation id from its
+own container's label, so the seed, machine state and `seed.json` name one installation.
+A machine installed before `seed.json` existed (an actor started by hand, then replaced by a
+seed) is labelled with a new installation while machine state keeps the old one; the actor
+logs `token="actor-installation-label-differs"` and the seed `seed-name-taken`. Remove the
+actor once more (`docker rm -f quasar-recovery`) and the seed re-creates it with the
+installation `seed.json` now names.
+On its first start it writes `seed.json` if there is none (`token="actor-seed-file-unwritten"`
+when it cannot tell its own image digest). It reports the seed it finds, by the container
+named in `QUASAR_SEED_CONTAINER` or else by any running
+`quasar-recovery seed` container, as `seed.version` in its status (the image's `org.quasar.version` label, or `unknown`
+when it cannot be read), which the agent
+registers as `seed_version`.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -1295,7 +1411,9 @@ nothing; an interrupted install is completed by the next start. A failed install
 unreachable engine, an owner conflict) logs `token="actor-resume-failed"`, keeps serving
 status (`stale: true` while the engine does not answer) and is retried only on the next
 start. `docker exec quasar-recovery quasar-recovery status` prints the machine inventory.
-A GPU host started by hand:
+A GPU host started by hand (the seed then logs `token="seed-name-taken"` and leaves this
+unlabelled actor alone; remove it with `docker rm -f quasar-recovery` and the seed creates
+the labelled one on the same machine state):
 
 ```
 docker run -d --name quasar-recovery --restart unless-stopped \
