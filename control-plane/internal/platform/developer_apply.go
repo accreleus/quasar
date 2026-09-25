@@ -45,7 +45,27 @@ type DeveloperImages interface {
 	Commit(ctx context.Context, components []ComponentDigest) (string, error)
 }
 
-var devDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var (
+	devDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	// The distribution reference grammar's path component: no empty, `.` or `..`
+	// segment, so a prefix match on the allowlist cannot be walked out of.
+	pathComponentRe = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$`)
+	registryHostRe  = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]+)?$`)
+)
+
+// RepositoryWellFormed: a registry host, then one or more path components.
+func RepositoryWellFormed(image string) bool {
+	parts := strings.Split(image, "/")
+	if len(parts) < 2 || !registryHostRe.MatchString(parts[0]) {
+		return false
+	}
+	for _, p := range parts[1:] {
+		if !pathComponentRe.MatchString(p) {
+			return false
+		}
+	}
+	return true
+}
 
 // componentRank orders an apply's components: the recovery actor first
 // (ADR 0008), whatever order the request used.
@@ -92,6 +112,9 @@ func ValidateDeveloperApply(req DeveloperApplyRequest) ([]ComponentDigest, error
 		seen[c.Name] = true
 		if c.Image == "" || strings.ContainsAny(c.Image, " \t\n") || updater.ImageHasTagOrDigest(c.Image) {
 			return nil, fmt.Errorf("component %q: image %q must be a repository reference with no tag and no digest", c.Name, c.Image)
+		}
+		if !RepositoryWellFormed(c.Image) {
+			return nil, fmt.Errorf("component %q: image %q is not a registry host followed by lowercase path components", c.Name, c.Image)
 		}
 		if !devDigestRe.MatchString(c.Digest) {
 			return nil, fmt.Errorf("component %q: digest %q is not sha256: + 64 lowercase hex", c.Name, c.Digest)
@@ -288,7 +311,7 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 		h.internal(w, "create attempt", err)
 		return
 	}
-	h.runner.RememberDeveloperCommit(attempt.ID, commit)
+	h.runner.RememberDeveloperCommit(attempt.ID, commit, host.SourceCommit)
 	if n, err := h.store.NonTerminalSessions(ctx, hostID); err == nil {
 		if err := h.store.SetWaitingSessions(ctx, attempt.ID, n); err == nil {
 			attempt.State = AttemptWaitingSessions
@@ -370,6 +393,11 @@ func (d *RegistryDeveloperImages) Commit(ctx context.Context, components []Compo
 		cfg, err := d.inspect.InspectConfig(ctx, ref)
 		if err != nil {
 			return "", fmt.Errorf("%s does not resolve at the registry as the control plane sees it: %w", ref, err)
+		}
+		// Digest-bound: the labels are those of the document that hashes to the
+		// requested digest (the inspector verifies the manifest chain and blob).
+		if cfg.ManifestDigest != c.Digest {
+			return "", fmt.Errorf("%s: the registry answered a manifest whose digest is %q, not the requested one", ref, cfg.ManifestDigest)
 		}
 		got := strings.ToLower(cfg.Label(LabelSourceCommit))
 		if !fullCommitRe.MatchString(got) {

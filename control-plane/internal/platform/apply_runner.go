@@ -125,7 +125,7 @@ type Runner struct {
 	unsupported map[string]bool
 	// attempt id → the commit a developer apply's images carry: its success
 	// evidence and its release_apply provenance.
-	developerCommits map[string]string
+	developerCommits map[string]developerEvidence
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -148,7 +148,7 @@ func NewRunner(store applyStore, deps ApplyDeps, log *slog.Logger) *Runner {
 		ConnectWait:      DefaultConnectWait,
 		running:          make(map[string]context.CancelFunc),
 		unsupported:      make(map[string]bool),
-		developerCommits: make(map[string]string),
+		developerCommits: make(map[string]developerEvidence),
 		baseCtx:          ctx,
 		stop:             cancel,
 	}
@@ -216,6 +216,13 @@ func (r *Runner) Start(a Attempt) {
 			cancel()
 		}()
 		r.drive(ctx, a)
+		if a.Kind == KindDeveloperApply {
+			rctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+			if cur, err := r.store.Attempt(rctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+				r.forgetDeveloperCommit(a.ID)
+			}
+			done()
+		}
 	}()
 }
 
@@ -242,32 +249,53 @@ func (r *Runner) markUnsupported(hostID string) {
 	r.mu.Unlock()
 }
 
+// developerEvidence is what a developer_apply attempt's success rule needs.
+type developerEvidence struct {
+	commit string
+	// A register on `commit` proves nothing when the host already ran it: the old
+	// agent a failed attempt restored registers the same commit, possibly before its
+	// relayed failure (agent-api.md §release_state, "A successful node-agent apply
+	// is usually never reported…"). Then only the relayed outcome decides.
+	registerIsEvidence bool
+}
+
 // RememberDeveloperCommit records the commit the developer apply endpoint read
-// off the attempt's images, so neither the send nor the register hook reads
-// the registry again.
-func (r *Runner) RememberDeveloperCommit(attemptID, commit string) {
+// off the attempt's images and the commit the host ran before it, so neither the
+// send nor the register hook reads the registry again.
+func (r *Runner) RememberDeveloperCommit(attemptID, commit string, hostCommitBefore *string) {
 	r.mu.Lock()
-	r.developerCommits[attemptID] = commit
+	r.developerCommits[attemptID] = developerEvidence{
+		commit:             commit,
+		registerIsEvidence: hostCommitBefore != nil && !commitsMatch(*hostCommitBefore, commit),
+	}
 	r.mu.Unlock()
 }
 
-// developerCommit is the commit a developer_apply attempt must register on.
-func (r *Runner) developerCommit(ctx context.Context, a Attempt) (string, error) {
+// developerCommit is the commit a developer_apply attempt carries, and whether a
+// register on it is success evidence. An attempt re-adopted after a restart does
+// not know the host's earlier commit, so for it only the relayed outcome decides.
+func (r *Runner) developerCommit(ctx context.Context, a Attempt) (developerEvidence, error) {
 	r.mu.Lock()
-	commit, ok := r.developerCommits[a.ID]
+	ev, ok := r.developerCommits[a.ID]
 	r.mu.Unlock()
 	if ok {
-		return commit, nil
+		return ev, nil
 	}
 	if r.deps.DeveloperCommit == nil {
-		return "", errors.New("no registry reader is wired to read the images' commit")
+		return developerEvidence{}, errors.New("no registry reader is wired to read the images' commit")
 	}
 	commit, err := r.deps.DeveloperCommit(ctx, a.RequestedDigests)
 	if err != nil {
-		return "", err
+		return developerEvidence{}, err
 	}
-	r.RememberDeveloperCommit(a.ID, commit)
-	return commit, nil
+	r.RememberDeveloperCommit(a.ID, commit, nil)
+	return developerEvidence{commit: commit}, nil
+}
+
+func (r *Runner) forgetDeveloperCommit(attemptID string) {
+	r.mu.Lock()
+	delete(r.developerCommits, attemptID)
+	r.mu.Unlock()
 }
 
 // drive is one attempt, start to terminal.
@@ -413,13 +441,13 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	if a.Kind == KindDeveloperApply {
 		// No release: `id` "", `version` null, and the images' own commit
 		// (agent-api.md §release_apply, amendment 14).
-		commit, err := r.developerCommit(ctx, a)
+		ev, err := r.developerCommit(ctx, a)
 		if err != nil {
 			r.log.Error("apply: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
 			r.fail(a.ID, ReasonInvalid, "the images' build identity could not be read: "+err.Error())
 			return false
 		}
-		release = ReleaseRef{SourceCommit: commit}
+		release = ReleaseRef{SourceCommit: ev.commit}
 	}
 	if a.ReleaseID != nil {
 		rel, err := r.store.Release(ctx, *a.ReleaseID)
@@ -721,13 +749,18 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 		return
 	}
 	if wantCommit == "" && a.Kind == KindDeveloperApply {
-		commit, err := r.developerCommit(ctx, a)
+		ev, err := r.developerCommit(ctx, a)
 		if err != nil {
 			// The actor's relayed outcome or the deadline decides.
 			r.log.Warn("register: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
 			return
 		}
-		wantCommit = commit
+		if !ev.registerIsEvidence {
+			r.log.Info("register during a developer apply of the commit the host already ran; the relayed outcome decides",
+				"host_id", hostID, "attempt_id", a.ID)
+			return
+		}
+		wantCommit = ev.commit
 	}
 	if wantCommit == "" {
 		// A revert to a build this instance can no longer name has no commit

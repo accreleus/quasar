@@ -22,7 +22,39 @@ func (l labelled) InspectConfig(_ context.Context, ref string) (images.ImageConf
 	if !ok {
 		return images.ImageConfig{}, errors.New("manifest unknown")
 	}
-	return images.ImageConfig{Labels: lab}, nil
+	_, digest, _ := strings.Cut(ref, "@")
+	return images.ImageConfig{ManifestDigest: digest, Labels: lab}, nil
+}
+
+// A reader that answers some other manifest for the digest is not believed.
+type wrongDigest struct{}
+
+func (wrongDigest) InspectConfig(context.Context, string) (images.ImageConfig, error) {
+	return images.ImageConfig{ManifestDigest: "sha256:" + strings.Repeat("0", 64),
+		Labels: map[string]string{LabelSourceCommit: commitB}}, nil
+}
+
+func TestARepositoryCannotWalkOutOfItsNamespace(t *testing.T) {
+	for _, bad := range []string{
+		"ghcr.io/accreleus/quasar/../evil/x", "ghcr.io/accreleus/quasar/./x", "ghcr.io//x",
+		"ghcr.io/Upper/x", "ghcr.io", "ghcr.io/x/", "/x/y",
+	} {
+		if RepositoryWellFormed(bad) {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	for _, good := range []string{"ghcr.io/accreleus/quasar/quasar-node-agent", "registry.lan:5000/dev/a_b", "localhost:5000/x"} {
+		if !RepositoryWellFormed(good) {
+			t.Errorf("%q refused", good)
+		}
+	}
+}
+
+func TestTheIdentityReadIsBoundToTheRequestedDigest(t *testing.T) {
+	_, err := NewRegistryDeveloperImages(wrongDigest{}).Commit(context.Background(), []ComponentDigest{agentComponent()})
+	if err == nil {
+		t.Fatal("labels of a manifest with another digest were accepted")
+	}
 }
 
 func TestTheIdentityReadRoutesOnlyTheNamedPlainRegistriesOverPlainHTTP(t *testing.T) {

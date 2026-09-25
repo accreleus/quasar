@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -201,5 +202,36 @@ func TestPlainHTTPResolverReadsOnlyItsNamedRegistries(t *testing.T) {
 	}
 	if _, err := r.InspectConfig(context.Background(), "ghcr.io/acme/app@"+digestOf(reg.index)); err == nil {
 		t.Fatal("a registry the operator did not name was read")
+	}
+}
+
+// Plain HTTP cannot forge the labels a digest carries: every document is checked
+// against the digest that named it.
+func TestAForgedRegistryAnswerIsRefusedOverPlainHTTP(t *testing.T) {
+	commit := `{"org.quasar.source.commit":"` + strings.Repeat("a", 40) + `"}`
+	forged := `{"architecture":"amd64","os":"linux","config":{"Labels":{"org.quasar.source.commit":"` + strings.Repeat("f", 40) + `"}}}`
+	for name, forge := range map[string]func(*configRegistry) string{
+		"config blob": func(reg *configRegistry) string {
+			ref := digestOf(reg.index)
+			reg.configBody = forged
+			return ref
+		},
+		"child manifest": func(reg *configRegistry) string {
+			ref := digestOf(reg.index)
+			reg.manifestBody = strings.Replace(reg.manifestBody, `"layers":[]`, `"layers":[],"x":1`, 1)
+			return ref
+		},
+		"top-level manifest": func(reg *configRegistry) string {
+			return "sha256:" + strings.Repeat("0", 64)
+		},
+	} {
+		reg := newConfigRegistry(t, commit)
+		host := strings.TrimPrefix(reg.srv.URL, "http://")
+		ref := host + "/dev/quasar-node-agent@" + forge(reg)
+		r := NewPlainHTTPRegistryResolver(map[string]struct{}{host: {}}, inspectTimeout)
+		_, err := r.InspectConfig(context.Background(), ref)
+		if !errors.Is(err, ErrDigestMismatch) {
+			t.Errorf("%s: err = %v, want ErrDigestMismatch", name, err)
+		}
 	}
 }

@@ -185,12 +185,59 @@ func TestAReAdoptedDeveloperApplyReadsItsCommitAgain(t *testing.T) {
 	if got := h.agent.sent[0].Release.SourceCommit; got != commitB {
 		t.Fatalf("provenance commit = %q, want the images' %q", got, commitB)
 	}
+	// This process never saw the host's earlier commit, so a register is not
+	// evidence; the relayed outcome is.
 	want := commitB
 	fresh.HandleRegister(ctx, h.hostID, &want)
+	if a, _ := h.store.Attempt(ctx, attempt.ID); TerminalAttemptState(a.State) {
+		t.Fatalf("a register resolved a re-adopted developer apply: %+v", a)
+	}
+	fresh.HandleReleaseState(ctx, h.hostID, ReleaseStateReport{RequestID: h.agent.sent[0].RequestID, State: AttemptSucceeded})
 	waitFor(t, "success", func() bool {
 		a, _ := h.store.Attempt(ctx, attempt.ID)
 		return a.State == AttemptSucceeded
 	})
+}
+
+// The host already runs the images' commit (a rebuild at the same commit): the
+// restored old agent's register must not turn a failed, restored attempt into a
+// success. control-api.md §"Developer apply" (the success rule is the per-host
+// apply's); agent-api.md §release_state, "A successful node-agent apply…".
+func TestADeveloperApplyOfTheRunningCommitIsDecidedByTheRelayedOutcome(t *testing.T) {
+	h := newDevHarness(t)
+	ctx := context.Background()
+	mustExec(t, h.pool, `UPDATE hosts SET source_commit = $2 WHERE id = $1::uuid`, h.hostID, commitB)
+	code, body := h.post(t, devURL, h.adminToken, h.body(agentComponent()))
+	if code != http.StatusAccepted {
+		t.Fatalf("developer apply = %d (%s)", code, body)
+	}
+	var env AttemptEnvelope
+	_ = json.Unmarshal(body, &env)
+	waitFor(t, "release_apply", func() bool { return h.agent.sentCount() == 1 })
+
+	// The restored old agent reconnects on the same commit before its replay drains.
+	same := commitB
+	h.runner.HandleRegister(ctx, h.hostID, &same)
+	if a, _ := h.store.Attempt(ctx, env.Attempt.ID); TerminalAttemptState(a.State) {
+		t.Fatalf("a register on the running commit resolved the attempt: %+v", a)
+	}
+	prev := "sha256:" + strings.Repeat("a", 64)
+	reason := ReasonUnhealthy
+	h.runner.HandleReleaseState(ctx, h.hostID, ReleaseStateReport{
+		RequestID: h.agent.sent[0].RequestID, State: AttemptFailed, Reason: &reason, Restored: true,
+		Previous: []PreviousDigest{{Name: ComponentNodeAgent, Digest: &prev}},
+	})
+	attempts, err := h.store.ListAttempts(ctx, h.hostID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]string{}
+	for _, a := range attempts {
+		kinds[a.Kind] = a.State
+	}
+	if kinds[KindDeveloperApply] != AttemptFailed || kinds[KindAutoRevert] != AttemptSucceeded {
+		t.Fatalf("history = %v, want the failed developer apply and its auto_revert", kinds)
+	}
 }
 
 func TestARestoredDeveloperApplyIsRecordedWithItsAutoRevertAndIsARevertSourceWhenItSucceeds(t *testing.T) {
