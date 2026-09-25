@@ -3,6 +3,7 @@
 
 import { useMemo } from "react";
 import type { CSSProperties, ReactElement } from "react";
+import { yTicks } from "./chartTicks";
 
 // Reduce-based min/max helpers — avoid Math.min/max spread which stack-overflows
 // on large arrays (up to 1000 samples).
@@ -67,20 +68,17 @@ function scalePoints(
     });
 }
 
-function yTicks(series: LineSeries[], count = 4): number[] {
+function seriesTicks(series: LineSeries[]): number[] {
   const allY = series.flatMap((s) => s.points.map((p) => p.y));
   if (allY.length === 0) return [];
-  const max = arrMax(allY) * 1.1 || 1;
-  return Array.from({ length: count + 1 }, (_, i) =>
-    Math.round((max / count) * i),
-  );
+  return yTicks(arrMax(allY) * 1.1 || 1);
 }
 
 export function LineChart({ series, unit = "", height = 120 }: LineChartProps): ReactElement {
   const width = 340; // viewBox width; SVG scales with CSS width:100%
 
   const paths = useMemo(() => scalePoints(series, width, height), [series, width, height]);
-  const ticks = useMemo(() => yTicks(series), [series]);
+  const ticks = useMemo(() => seriesTicks(series), [series]);
   const innerH = height - PAD.top - PAD.bottom;
 
   const yMin = 0;

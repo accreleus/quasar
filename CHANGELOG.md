@@ -183,6 +183,11 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Design-lint batch A: shared components and utilities (#372).** Every inline style in
+  `web/src/components/` has moved to token-backed classes, and `components.css` gains the
+  `.t-xs` `.t-sm` `.t-lg` `.t-h3` `.text-1` `.text-2` `.mb1` utilities (the block's top
+  comment lists every utility and its token). Off-scale spacing snapped to the 4px scale;
+  nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API
@@ -308,6 +313,10 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Session charts with a small range drew duplicate y-axis ticks (#372).** A metric like
+  `ladder_res_rung` (0–1) got ticks `0, 0, 1, 1, 1`: overlapping gridlines and a React
+  duplicate-key warning. Ticks now take the fewest decimals that keep them distinct
+  (`0, 0.3, 0.6, 0.8, 1.1`); a normal range keeps its integer ticks.
 - **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
   before any host reports it ready. After the launch is accepted, the control
   plane prepares the image on the selected host with the adopted, frozen

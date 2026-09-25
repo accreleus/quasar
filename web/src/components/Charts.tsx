@@ -13,6 +13,7 @@
 import { useMemo } from "react";
 import type { CSSProperties, ReactElement } from "react";
 import { useContainerWidth } from "../lib/useContainerWidth";
+import { yTicks } from "./chartTicks";
 
 // ── helpers ────────────────────────────────────────────────
 
@@ -144,10 +145,7 @@ export function LineChart2({ series, unit = "", height = 120 }: LineChart2Props)
     const toSvgY = (y: number) =>
       PAD2.top + innerH - (y / yMax) * innerH;
 
-    const tickCount = 4;
-    const ticks = Array.from({ length: tickCount + 1 }, (_, i) =>
-      Math.round((yMax / tickCount) * i),
-    );
+    const ticks = yTicks(yMax);
 
     const paths = series
       .filter((s) => s.points.length > 0)
