@@ -87,25 +87,32 @@ no `.env.prev` and no pull. The decision above is extended, and nothing in it is
   runs against exactly the database the failed one saw, so restarting it loses nothing, and the
   case it rescues — a broken image leaving a household install with no console — is the one
   that left an install dead before. **A migrating control plane is never restored automatically**,
-  however early it failed: its migration may have run. That attempt ends `failed`, names the
-  pre-update dump the recovery actor took, and prints one `restore` command that loads the dump
-  into a stopped database and starts the control plane the dump belongs to. ADR 0002 holds: an
-  older control plane never runs against a newer schema.
+  however early it failed: its migration may have run. On a Quasar-owned database that attempt
+  ends `failed`, names the pre-update dump the recovery actor took, and prints one `restore`
+  command that loads the dump into a stopped database and starts the control plane the dump
+  belongs to. On an operator-supplied (external) database there is no dump: the attempt names
+  none, Quasar never restores that database, and the way back is the operator's own backup,
+  confirmed before the update. ADR 0002 holds: an older control plane never runs against a newer
+  schema.
 - **"Passed a health check" is defined per recipe**: the container's own healthcheck reported
   healthy at least once (for the control plane, its `/health`, which also reaches the database),
   and for the node agent additionally its `register` carrying the expected commit.
 - **One service per failure.** When one attempt replaces several components in order (the recovery
   actor first, ADR 0008), a failure restores the component that failed; components already
   verified stay on their new digests, and the `auto_revert` row names only the restored component.
-- **Interrupted is not failed.** An attempt interrupted before the old container was taken out of
-  service settles as *interrupted, nothing changed*; one interrupted after that continues to
-  verification on the next start and is restored under the rules above if verification fails.
-  Nothing is ever retried on its own.
+- **An interrupted attempt is `failed` with reason `interrupted`: nothing changed, and it is not
+  restored.** That applies to an attempt interrupted before the old container was taken out of
+  service; one interrupted after that continues to verification on the next start and is restored
+  under the rules above if verification fails. Nothing is ever retried on its own.
 - A `registry` machine keeps the updater's behaviour described above until the Go updater retires
   with RH06-15 (#367).
 
 Considered and rejected for the control plane: restoring automatically after a migration (a
 schema moved forward cannot be undone by restarting an older binary, and D7's automatic
-database restore was cut by the owner's R1 review), and never restoring it automatically at all
-(the pre-RH06 gap this amendment closes). The wire and storage consequences are
-`protocol/agent-api.md` and `protocol/control-api.md` amendment 14.
+database restore was cut by the owner's R1 review, both in `docs/rh06/2026-09-24-decisions.md`),
+and never restoring it automatically at all (the pre-RH06 gap this amendment closes). The wire and
+storage consequences are `protocol/agent-api.md` and `protocol/control-api.md` amendment 14.
+
+This amendment was approved through the #353 contract amendment: an Opus contract review
+returned APPROVED on round 4, and the owner's standing approval on #352, widened on #353, is the
+sign-off.
