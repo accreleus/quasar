@@ -186,8 +186,6 @@ mod tests {
         assert_eq!(file.load().unwrap(), Some(vec!["new".to_string()]));
     }
 
-    /// A second holder of a held lease is refused, whether it is this process opening
-    /// the file again or another process; the lease is free again once released.
     /// A secret committed with a mode carries exactly those bits, even when a leftover
     /// temp from an earlier store had wider ones.
     #[test]
@@ -204,6 +202,8 @@ mod tests {
         assert_eq!(file.load().unwrap().as_deref(), Some("s3cret"));
     }
 
+    /// A second holder of a held lease is refused, whether it is this process opening
+    /// the file again or another process; the lease is free again once released.
     #[test]
     fn a_held_lease_refuses_every_other_holder_until_released() {
         let dir = tempfile::tempdir().unwrap();

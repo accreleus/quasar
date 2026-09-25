@@ -107,7 +107,7 @@ pub struct InstallFacts {
 
 /// Set by the recovery actor's recipe: the agent socket, whose presence in the
 /// environment is what makes this an owned install. Unset, discovery is the Compose one.
-pub const RECOVERY_SOCKET_ENV: &str = "QUASAR_RECOVERY_SOCKET";
+pub use quasar_runtime::owned_install::AGENT_SOCKET_ENV as RECOVERY_SOCKET_ENV;
 
 /// Well inside the actor's own status deadline plus one engine round trip.
 const ACTOR_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);

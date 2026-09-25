@@ -15,10 +15,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::engine::{ContainerSpec, EngineError, EngineHost, PlatformEngine, RestartPolicy};
-use crate::recipe::{labels, names, Bind, GpuFacts, GpuVendor, HostDevices, ImageRef};
+use crate::engine::{ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
+use crate::recipe::{labels, names, Bind, GpuFacts, GpuRequest, GpuVendor, HostDevices, ImageRef};
 
 pub const PROBE_HELPER: &str = "gpu-probe";
+pub const GPUS_PROBE_HELPER: &str = "gpus-probe";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
@@ -104,19 +105,21 @@ fn render_number(node: &str) -> Option<u32> {
     node.strip_prefix("/dev/dri/renderD")?.parse().ok()
 }
 
-/// Whether the engine can satisfy `--gpus all`.
-pub fn nvidia_runtime(host: &EngineHost) -> bool {
-    host.runtimes.iter().any(|r| r == "nvidia")
-        || host
-            .cdi_devices
-            .iter()
-            .any(|d| d.starts_with("nvidia.com/gpu"))
+impl ProbeReport {
+    /// An NVIDIA device node, the only case worth asking the engine for `--gpus`.
+    pub fn has_nvidia(&self) -> bool {
+        self.nvidia_nodes
+            || self
+                .nodes
+                .iter()
+                .any(|(_, id)| id.as_deref().and_then(vendor_of) == Some(GpuVendor::Nvidia))
+    }
 }
 
 /// The machine's GPU facts from one report: an NVIDIA node the engine can serve wins (the
 /// discrete card of a mixed host, the Compose NVIDIA overlay's case); otherwise the lowest
 /// recognised render node.
-pub fn select(report: &ProbeReport, nvidia_runtime: bool) -> (GpuFacts, HostDevices) {
+pub fn select(report: &ProbeReport, gpus_served: bool) -> (GpuFacts, HostDevices) {
     let mut renders: Vec<(u32, &str, GpuVendor)> = report
         .nodes
         .iter()
@@ -131,12 +134,12 @@ pub fn select(report: &ProbeReport, nvidia_runtime: bool) -> (GpuFacts, HostDevi
     renders.sort_by_key(|(n, node, _)| (*n, *node));
     let nvidia = renders
         .iter()
-        .find(|(_, _, v)| *v == GpuVendor::Nvidia && nvidia_runtime);
+        .find(|(_, _, v)| *v == GpuVendor::Nvidia && gpus_served);
     let chosen = nvidia.or_else(|| renders.first());
     let gpu = GpuFacts {
         vendor: chosen.map(|(_, _, v)| *v),
         render_node: chosen.map(|(_, n, _)| (*n).to_owned()),
-        nvidia_runtime,
+        gpus_served,
     };
     let devices = HostDevices {
         dri: !report.nodes.is_empty(),
@@ -167,6 +170,62 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
         security_opt: Vec::new(),
         init: false,
         restart: RestartPolicy::No,
+    }
+}
+
+/// The `--gpus all` probe: a container requesting every GPU, running `true`. The engine
+/// serves `--gpus` through an `nvidia` runtime, CDI, or the container toolkit's hook, and
+/// only the last is invisible in `/info`, so the evidence is whether this starts and exits
+/// 0. Removed on every path that created it.
+pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
+    ContainerSpec {
+        name: names::GPU_PROBE.into(),
+        image: image.reference(),
+        entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
+        cmd: Some(vec!["true".into()]),
+        env: BTreeMap::new(),
+        labels: BTreeMap::from([(labels::HELPER.to_string(), GPUS_PROBE_HELPER.to_string())]),
+        network_mode: Some("none".into()),
+        binds: Vec::new(),
+        devices: Vec::new(),
+        device_cgroup_rules: Vec::new(),
+        gpus: vec![GpuRequest {
+            driver: None,
+            count: -1,
+            capabilities: vec![vec!["gpu".into()]],
+        }],
+        cap_add: Vec::new(),
+        security_opt: Vec::new(),
+        init: false,
+        restart: RestartPolicy::No,
+    }
+}
+
+/// Whether the engine serves `--gpus all`, and why not when it does not. Only a crash is
+/// an error: a refused create or a failed start is the answer "no".
+pub fn serves_gpus(
+    engine: &dyn PlatformEngine,
+    image: &ImageRef,
+) -> Result<Result<(), String>, EngineError> {
+    let id = match engine.create_container(&gpus_spec(image)) {
+        Ok(id) => id,
+        Err(EngineError::Crashed) => return Err(EngineError::Crashed),
+        Err(e) => return Ok(Err(format!("the engine refused to create it ({e})"))),
+    };
+    let outcome = match engine.start_container(&id) {
+        Err(EngineError::Crashed) => Err(EngineError::Crashed),
+        Err(e) => Ok(Err(format!("it would not start ({e})"))),
+        Ok(()) => match engine.wait_container(&id, PROBE_TIMEOUT) {
+            Err(EngineError::Crashed) => Err(EngineError::Crashed),
+            Err(e) => Ok(Err(format!("it did not finish ({e})"))),
+            Ok(0) => Ok(Ok(())),
+            Ok(code) => Ok(Err(format!("it exited {code}"))),
+        },
+    };
+    match engine.remove_container(&id) {
+        Err(EngineError::Crashed) => Err(EngineError::Crashed),
+        Err(e) if outcome.is_ok() => Err(e),
+        _ => outcome,
     }
 }
 

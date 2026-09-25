@@ -62,6 +62,8 @@ pub struct FakeState {
     pub host_devices: BTreeSet<String>,
     /// What a started GPU probe prints.
     pub probe_output: String,
+    /// Whether the engine can create a container that requests GPUs (`--gpus all`).
+    pub gpus_supported: bool,
     pub unreachable: bool,
     pub next_id: u64,
 }
@@ -249,6 +251,9 @@ impl PlatformEngine for FakeEngine {
             {
                 return Err(engine(ErrorKind::Engine));
             }
+            if !spec.gpus.is_empty() && !s.gpus_supported {
+                return Err(engine(ErrorKind::Engine));
+            }
             // The engine creates a named volume a bind names but nobody created.
             for bind in spec.binds.iter().filter(|b| b.is_volume()) {
                 s.volumes.entry(bind.source.clone()).or_default();
@@ -281,10 +286,13 @@ impl PlatformEngine for FakeEngine {
                 return Ok(());
             }
             c.starts += 1;
-            if c.spec.labels.get(HELPER_LABEL).map(String::as_str) == Some(PROBE_HELPER) {
+            // A helper runs to completion at once; only the GPU probe prints anything.
+            if let Some(helper) = c.spec.labels.get(HELPER_LABEL) {
                 c.status = "exited".into();
                 c.exit_code = Some(0);
-                c.logs = output;
+                if helper == PROBE_HELPER {
+                    c.logs = output;
+                }
             } else {
                 c.status = "running".into();
             }

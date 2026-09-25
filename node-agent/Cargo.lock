@@ -1615,6 +1615,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "quasar-recovery",
  "quasar-runtime",
  "regex",
  "ring",

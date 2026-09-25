@@ -18,7 +18,7 @@ fn golden_dir() -> PathBuf {
 }
 
 pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
-    let (render_node, nvidia_runtime) = match vendor {
+    let (render_node, gpus_served) = match vendor {
         Some(GpuVendor::Nvidia) => (Some("/dev/dri/renderD128"), true),
         Some(GpuVendor::Amd) => (Some("/dev/dri/renderD129"), false),
         Some(GpuVendor::Intel) => (Some("/dev/dri/renderD128"), false),
@@ -33,7 +33,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         gpu: GpuFacts {
             vendor,
             render_node: render_node.map(str::to_owned),
-            nvidia_runtime,
+            gpus_served,
         },
         devices: HostDevices {
             dri: vendor.is_some(),

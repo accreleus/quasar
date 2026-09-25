@@ -145,8 +145,8 @@ pub struct Actor {
 const PLATFORM_NAMES: &[&str] = &[
     names::NODE_AGENT,
     names::RECOVERY_ACTOR,
-    "quasar-control-plane",
-    "quasar-postgres",
+    names::CONTROL_PLANE,
+    names::POSTGRES,
 ];
 const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 const SECRETS_HELPER: &str = "secrets-writer";
@@ -189,7 +189,7 @@ impl Actor {
         match machine.role {
             MachineRole::Gpu => self.ensure_node_agent(&machine),
             other => Err(ResumeError::Unsupported(format!(
-                "machine role {other:?}; only `gpu` installs in this build"
+                "machine role {other:?}; only `gpu` installs in this build (combined and control-only arrive with #361)"
             ))),
         }
     }
@@ -288,7 +288,7 @@ impl Actor {
     fn first_install(&self) -> Result<Machine, ResumeError> {
         if self.config.role != MachineRole::Gpu {
             return Err(ResumeError::Unsupported(format!(
-                "machine role {:?}; only `gpu` installs in this build",
+                "machine role {:?}; only `gpu` installs in this build (combined and control-only arrive with #361)",
                 self.config.role
             )));
         }
@@ -350,7 +350,23 @@ impl Actor {
                 probe::ProbeReport::default()
             }
         };
-        let (gpu, devices) = probe::select(&report, probe::nvidia_runtime(&host));
+        let gpus_served = report.has_nvidia()
+            && {
+                match probe::serves_gpus(self.engine.as_ref(), &image)? {
+                    Ok(()) => {
+                        info!(token = "actor-gpus-served", "NVIDIA: the engine started a --gpus all probe; installing the NVIDIA shape");
+                        true
+                    }
+                    Err(why) => {
+                        warn!(
+                        token = "actor-gpus-refused",
+                        "NVIDIA device found, but a --gpus all probe failed: {why}; installing without the NVIDIA shape (is the NVIDIA Container Toolkit installed for this engine?)"
+                    );
+                        false
+                    }
+                }
+            };
+        let (gpu, devices) = probe::select(&report, gpus_served);
         match &gpu.vendor {
             Some(vendor) => info!(
                 vendor = ?vendor,

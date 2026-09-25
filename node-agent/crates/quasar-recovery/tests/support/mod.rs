@@ -40,7 +40,13 @@ pub fn agent_image(recipe_label: Option<&str>) -> Image {
 
 /// A GPU host with the hand-started actor on it: the actor's own container (engine socket
 /// bound from a non-default host path), its image, and the agent image in the registry.
-pub fn host(probe_output: &str, runtimes: &[&str], devices: &[&str]) -> FakeState {
+/// `gpus_served`: whether the engine starts a container that requests `--gpus all`.
+pub fn host(
+    probe_output: &str,
+    runtimes: &[&str],
+    gpus_served: bool,
+    devices: &[&str],
+) -> FakeState {
     let mut state = FakeState {
         host: EngineHost {
             name: Some("gpu-host-01".into()),
@@ -52,6 +58,7 @@ pub fn host(probe_output: &str, runtimes: &[&str], devices: &[&str]) -> FakeStat
             .map(|d| d.to_string())
             .collect::<BTreeSet<_>>(),
         probe_output: probe_output.into(),
+        gpus_supported: gpus_served,
         ..Default::default()
     };
     state
@@ -121,6 +128,16 @@ pub fn amd_host() -> FakeState {
     host(
         PROBE_AMD,
         &["runc"],
+        false,
+        &["/dev/dri", "/dev/uinput", "/dev/kmsg"],
+    )
+}
+
+pub fn nvidia_host(runtimes: &[&str], gpus_served: bool) -> FakeState {
+    host(
+        PROBE_NVIDIA,
+        runtimes,
+        gpus_served,
         &["/dev/dri", "/dev/uinput", "/dev/kmsg"],
     )
 }

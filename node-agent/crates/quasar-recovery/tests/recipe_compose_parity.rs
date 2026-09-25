@@ -258,7 +258,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         gpu: GpuFacts {
             vendor,
             render_node: render_node.map(str::to_owned),
-            nvidia_runtime: vendor == Some(GpuVendor::Nvidia),
+            gpus_served: vendor == Some(GpuVendor::Nvidia),
         },
         devices: HostDevices {
             dri: vendor.is_some(),

@@ -1,17 +1,20 @@
 //! The engine port (architecture §5.1): every container-engine call the recovery actor
 //! makes, behind one trait with two adapters, [`DockerEngine`] over `quasar-runtime`'s
-//! facade and [`FakeEngine`] in memory with fault and crash injection.
+//! facade and `FakeEngine` in memory with fault and crash injection (feature
+//! `test-support`, which only this crate's tests enable: the binary never carries it).
 //!
 //! Blocking by design: the actor is a single-purpose process, and each real call bridges
 //! the runtime client's bounded executor.
 
 mod docker;
+#[cfg(any(test, feature = "test-support"))]
 mod fake;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use docker::DockerEngine;
+#[cfg(any(test, feature = "test-support"))]
 pub use fake::{FakeContainer, FakeEngine, FakeState, FakeVolume, Fault, When};
 pub use quasar_runtime::platform::{
     ContainerSpec, EngineHost, PlatformContainer as Container, PlatformImage as Image,

@@ -2,8 +2,8 @@
 //! to create, start, stop, rename and remove Quasar's own long-running containers, pull
 //! their images by digest, and manage the named volumes they mount.
 //!
-//! These are deliberately NOT the agent's application/helper lifecycles: those are bound
-//! to the agent's own journals and ownership label. A platform service's owner is the
+//! They are not the agent's application/helper lifecycles, which are bound to the agent's
+//! own journals and ownership label. A platform service's owner is the
 //! recovery actor, whose journal lives in its machine state; everything here is a
 //! single, bounded engine call and nothing more. Every call runs on the
 //! [`RuntimeClient`]'s executor under its admission and a deadline; a mutation is

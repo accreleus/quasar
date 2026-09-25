@@ -62,10 +62,10 @@ fn main() -> ExitCode {
     }
 }
 
+/// Fixed, not configurable: the agent's recipe names the same path (`QUASAR_RECOVERY_SOCKET`
+/// in the agent), and an actor listening anywhere else would never be reached.
 fn agent_socket() -> PathBuf {
-    env("QUASAR_RECOVERY_AGENT_SOCKET")
-        .unwrap_or_else(|| paths::AGENT_SOCKET.into())
-        .into()
+    paths::AGENT_SOCKET.into()
 }
 
 fn status() -> ExitCode {
@@ -81,12 +81,14 @@ fn status() -> ExitCode {
     }
 }
 
-fn parse_role(raw: &str) -> Option<MachineRole> {
+/// Only `gpu` installs in this build; the combined and control-only roles arrive with #361.
+fn parse_role(raw: &str) -> Result<MachineRole, String> {
     match raw {
-        "gpu" => Some(MachineRole::Gpu),
-        "combined" => Some(MachineRole::Combined),
-        "control-only" | "control_only" => Some(MachineRole::ControlOnly),
-        _ => None,
+        "gpu" => Ok(MachineRole::Gpu),
+        "combined" | "control-only" => Err(format!(
+            "QUASAR_ROLE={raw} is not installed by this build (combined and control-only machines arrive with RH06-09, #361); use gpu"
+        )),
+        other => Err(format!("QUASAR_ROLE={other:?} is not a role; this build installs gpu")),
     }
 }
 
@@ -104,12 +106,12 @@ fn actor() -> ExitCode {
         "recovery actor starting"
     );
 
-    let Some(role) = parse_role(&env("QUASAR_ROLE").unwrap_or_else(|| "gpu".into())) else {
-        error!(
-            token = "actor-role-invalid",
-            "QUASAR_ROLE must be gpu, combined or control-only"
-        );
-        return ExitCode::from(2);
+    let role = match parse_role(&env("QUASAR_ROLE").unwrap_or_else(|| "gpu".into())) {
+        Ok(role) => role,
+        Err(why) => {
+            error!(token = "actor-role-invalid", "{why}");
+            return ExitCode::from(2);
+        }
     };
     let operator = OperatorInputs {
         enrollment: env("QUASAR_ENROLLMENT"),

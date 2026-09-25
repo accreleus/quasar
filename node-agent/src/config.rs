@@ -1,6 +1,7 @@
 use std::env;
 
 use crate::enrollment::{self, TransportPolicy};
+use quasar_runtime::owned_install::ENROLLMENT_FILE_ENV;
 
 pub struct Config {
     /// WebSocket base URL of the control plane; `/agent/ws` is appended automatically.
@@ -44,7 +45,7 @@ impl Config {
         // that an empty-but-set ENROLLMENT_TOKEN folds to None is preserved by trimming.
         let blob = enrollment_blob(
             env::var("QUASAR_ENROLLMENT").ok(),
-            env::var("QUASAR_ENROLLMENT_FILE").ok(),
+            env::var(ENROLLMENT_FILE_ENV).ok(),
             |path| std::fs::read_to_string(path),
         )?;
         let url = env::var("CONTROL_PLANE_URL").ok();
@@ -112,12 +113,11 @@ fn enrollment_blob(
         return Ok(value);
     };
     if value.as_deref().is_some_and(|v| !v.trim().is_empty()) {
-        return Err(
-            "set QUASAR_ENROLLMENT or QUASAR_ENROLLMENT_FILE, not both: they name the same input"
-                .into(),
-        );
+        return Err(format!(
+            "set QUASAR_ENROLLMENT or {ENROLLMENT_FILE_ENV}, not both: they name the same input"
+        ));
     }
-    let contents = read(&path).map_err(|e| format!("QUASAR_ENROLLMENT_FILE={path}: {e}"))?;
+    let contents = read(&path).map_err(|e| format!("{ENROLLMENT_FILE_ENV}={path}: {e}"))?;
     let contents = contents.trim().to_string();
     Ok((!contents.is_empty()).then_some(contents))
 }

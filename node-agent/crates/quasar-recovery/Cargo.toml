@@ -47,7 +47,13 @@ flate2 = "1"
 # The binary's log output (a verify-mode WARN from `trust::admit` must be visible).
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+[features]
+# The in-memory engine adapter, for tests. Never enabled by the binary.
+test-support = []
+
 [dev-dependencies]
+# The crate's own tests use the in-memory engine.
+quasar-recovery = { path = ".", features = ["test-support"] }
 tempfile = "3"
 # The recipe parity test parses deploy/docker-compose.yml. Test-only: never in the binary.
 serde_yaml = "0.9"

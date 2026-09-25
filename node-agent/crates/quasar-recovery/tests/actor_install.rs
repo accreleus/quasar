@@ -144,60 +144,51 @@ fn nothing_is_left_behind_but_the_services_and_their_volumes() {
 
 /// Crash the actor at every engine call of a clean install, before and after the call
 /// takes effect; the next start completes the install to exactly the uninterrupted state.
+/// Swept on an AMD host and on an NVIDIA host, whose install adds the `--gpus` probe.
 #[test]
 fn an_install_interrupted_at_any_call_is_completed_by_the_next_resume() {
-    let (reference_engine, reference_dir) = installed(amd_host());
-    let reference = reference_engine.state();
-    let reference_files = contents(reference_dir.path());
-    let calls = {
-        let engine = Arc::new(FakeEngine::new(amd_host()));
-        let dir = tempfile::tempdir().unwrap();
-        actor(&engine, dir.path(), operator()).resume().unwrap();
-        engine.calls()
-    };
-    assert!(calls > 10, "the sweep must not be vacuous ({calls} calls)");
+    for (host_name, host) in [
+        ("amd", amd_host as fn() -> FakeState),
+        ("nvidia", || nvidia_host(&[], true)),
+    ] {
+        let (reference_engine, reference_dir) = installed(host());
+        let reference = reference_engine.state();
+        let reference_files = contents(reference_dir.path());
+        let calls = reference_engine.calls();
+        assert!(
+            calls > 10,
+            "{host_name}: the sweep must not be vacuous ({calls} calls)"
+        );
 
-    for call in 0..calls {
-        for when in [When::Before, When::After] {
-            let engine = Arc::new(FakeEngine::new(amd_host()));
-            let dir = tempfile::tempdir().unwrap();
-            engine.inject(Fault {
-                call,
-                when,
-                error: EngineError::Crashed,
-            });
-            let crashed = actor(&engine, dir.path(), operator()).resume();
-            assert!(
-                crashed.is_err(),
-                "call {call} {when:?}: the crash was swallowed"
-            );
-            engine.clear_faults();
+        for call in 0..calls {
+            for when in [When::Before, When::After] {
+                let at = format!("{host_name} call {call} {when:?}");
+                let engine = Arc::new(FakeEngine::new(host()));
+                let dir = tempfile::tempdir().unwrap();
+                engine.inject(Fault {
+                    call,
+                    when,
+                    error: EngineError::Crashed,
+                });
+                let crashed = actor(&engine, dir.path(), operator()).resume();
+                assert!(crashed.is_err(), "{at}: the crash was swallowed");
+                engine.clear_faults();
 
-            actor(&engine, dir.path(), operator())
-                .resume()
-                .unwrap_or_else(|e| panic!("call {call} {when:?}: the next resume failed: {e}"));
-            let state = engine.state();
-            assert_eq!(
-                state.by_name(),
-                reference.by_name(),
-                "call {call} {when:?}: containers"
-            );
-            assert_eq!(
-                state.volumes, reference.volumes,
-                "call {call} {when:?}: volumes"
-            );
-            assert_eq!(
-                contents(dir.path()),
-                reference_files,
-                "call {call} {when:?}: machine state"
-            );
+                actor(&engine, dir.path(), operator())
+                    .resume()
+                    .unwrap_or_else(|e| panic!("{at}: the next resume failed: {e}"));
+                let state = engine.state();
+                assert_eq!(state.by_name(), reference.by_name(), "{at}: containers");
+                assert_eq!(state.volumes, reference.volumes, "{at}: volumes");
+                assert_eq!(contents(dir.path()), reference_files, "{at}: machine state");
+            }
         }
     }
 }
 
 #[test]
 fn a_host_with_no_usable_gpu_still_gets_its_agent_without_gpu_devices() {
-    let (engine, _dir) = installed(host(PROBE_NONE, &["runc"], &[]));
+    let (engine, _dir) = installed(host(PROBE_NONE, &["runc"], false, &[]));
     let state = engine.state();
     let agent = state.container_named(names::NODE_AGENT).unwrap();
     assert_eq!(agent.status, "running");
@@ -208,11 +199,7 @@ fn a_host_with_no_usable_gpu_still_gets_its_agent_without_gpu_devices() {
 
 #[test]
 fn an_nvidia_host_gets_the_gpu_request_and_the_driver_volume() {
-    let (engine, _dir) = installed(host(
-        PROBE_NVIDIA,
-        &["nvidia", "runc"],
-        &["/dev/dri", "/dev/uinput", "/dev/kmsg"],
-    ));
+    let (engine, _dir) = installed(nvidia_host(&["nvidia", "runc"], true));
     let state = engine.state();
     let agent = state.container_named(names::NODE_AGENT).unwrap();
     assert_eq!(agent.spec.gpus.len(), 1);
@@ -228,13 +215,22 @@ fn an_nvidia_host_gets_the_gpu_request_and_the_driver_volume() {
     );
 }
 
+/// The container toolkit's hook serves `--gpus` with no `nvidia` runtime and no CDI
+/// device in `/info`; the started probe is what tells.
+#[test]
+fn a_toolkit_hook_only_nvidia_host_still_gets_the_nvidia_shape() {
+    let (engine, _dir) = installed(nvidia_host(&["runc"], true));
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert_eq!(agent.spec.gpus.len(), 1);
+    assert_eq!(agent.spec.env["QUASAR_GPU_NVIDIA"], "1");
+    assert!(state.container_named(names::GPU_PROBE).is_none());
+}
+
 #[test]
 fn an_nvidia_card_the_engine_cannot_serve_is_installed_without_the_nvidia_shape() {
-    let (engine, _dir) = installed(host(
-        PROBE_NVIDIA,
-        &["runc"],
-        &["/dev/dri", "/dev/uinput", "/dev/kmsg"],
-    ));
+    // An `nvidia` runtime entry is not evidence: only a started `--gpus all` probe is.
+    let (engine, _dir) = installed(nvidia_host(&["nvidia", "runc"], false));
     let state = engine.state();
     let agent = state.container_named(names::NODE_AGENT).unwrap();
     assert!(agent.spec.gpus.is_empty());

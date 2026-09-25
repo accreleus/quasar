@@ -23,6 +23,8 @@ pub use quasar_runtime::platform::{Bind, ContainerSpec, Device, GpuRequest, Rest
 pub mod names {
     pub const NODE_AGENT: &str = "quasar-node-agent";
     pub const RECOVERY_ACTOR: &str = "quasar-recovery";
+    pub const CONTROL_PLANE: &str = "quasar-control-plane";
+    pub const POSTGRES: &str = "quasar-postgres";
     /// The actor's machine state, mounted only into actors.
     pub const MACHINE_VOLUME: &str = "quasar-machine";
     /// Holds the agent socket; the actor mounts it read-write, the agent read-only.
@@ -55,11 +57,7 @@ pub mod labels {
 pub mod paths {
     /// The machine-state volume inside an actor.
     pub const MACHINE_DIR: &str = "/var/lib/quasar-machine";
-    /// Where the agent-socket volume is mounted, in the actor and in the agent.
-    pub const AGENT_SOCKET_DIR: &str = "/run/quasar-recovery";
-    pub const AGENT_SOCKET: &str = "/run/quasar-recovery/agent.sock";
-    /// Where a per-service secrets volume is mounted, read-only.
-    pub const SECRETS_DIR: &str = "/run/quasar-secrets";
+    pub use quasar_runtime::owned_install::{AGENT_SOCKET, AGENT_SOCKET_DIR, SECRETS_DIR};
     /// The engine socket inside every container that is given one.
     pub const ENGINE_SOCKET: &str = "/var/run/docker.sock";
     /// The fixed runtime directory the agent shares, same path, with its sessions.
@@ -106,9 +104,9 @@ impl Role {
     /// The container name the actor gives this role.
     pub fn container_name(self) -> &'static str {
         match self {
-            Role::ControlPlane => "quasar-control-plane",
+            Role::ControlPlane => names::CONTROL_PLANE,
             Role::NodeAgent => names::NODE_AGENT,
-            Role::Postgres => "quasar-postgres",
+            Role::Postgres => names::POSTGRES,
             Role::RecoveryActor => names::RECOVERY_ACTOR,
         }
     }
@@ -132,14 +130,16 @@ pub struct GpuFacts {
     pub vendor: Option<GpuVendor>,
     /// The render node of `vendor`, from the node's own device evidence.
     pub render_node: Option<String>,
-    /// The engine can satisfy `--gpus all` (an `nvidia` runtime or NVIDIA CDI devices).
-    pub nvidia_runtime: bool,
+    /// The engine started a probe container that requested `--gpus all`: the evidence
+    /// that holds whether it serves GPUs through an `nvidia` runtime, CDI, or the
+    /// container toolkit's hook with no runtime entry.
+    pub gpus_served: bool,
 }
 
 impl GpuFacts {
     /// Whether the NVIDIA shape (the Compose NVIDIA overlay) applies.
     pub fn nvidia_shape(&self) -> bool {
-        self.vendor == Some(GpuVendor::Nvidia) && self.nvidia_runtime
+        self.vendor == Some(GpuVendor::Nvidia) && self.gpus_served
     }
 }
 
@@ -164,6 +164,10 @@ impl Default for HostDevices {
 }
 
 /// The machine inputs a recipe is rendered with. Only ever grows, each with a default.
+///
+/// No control URL: on a GPU host the agent takes the control plane's URL and pin from the
+/// enrollment string, so there is nothing to override. The combined install (#361) adds it
+/// for the local agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Inputs {
@@ -471,10 +475,7 @@ const NVIDIA_ENV: &[(&str, &str)] = &[
     ("LIBVA_MESSAGING_LEVEL", "0"),
 ];
 
-/// Tells the agent it is an owned install and where its recovery actor answers.
-pub const AGENT_SOCKET_ENV: &str = "QUASAR_RECOVERY_SOCKET";
-/// The file twin of `QUASAR_ENROLLMENT`.
-pub const ENROLLMENT_FILE_ENV: &str = "QUASAR_ENROLLMENT_FILE";
+pub use quasar_runtime::owned_install::{AGENT_SOCKET_ENV, ENROLLMENT_FILE_ENV};
 
 fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> ContainerSpec {
     let reference = image.reference();
