@@ -119,6 +119,9 @@ const (
 const (
 	InstallRegistry = "registry"
 	InstallSource   = "source"
+	// InstallOwned is eligible exactly as InstallRegistry (control-api.md
+	// §"Owned hosts on the host body and the release view").
+	InstallOwned = "owned"
 )
 
 // Target kinds.

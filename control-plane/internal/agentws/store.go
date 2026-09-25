@@ -443,8 +443,8 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 	return tx.Commit(ctx)
 }
 
-// replaceHostIdentity writes the four platform-release identity columns
-// (schema.md `hosts`, migration 0074) from one `register` message.
+// replaceHostIdentity writes the platform-release identity columns (schema.md
+// `hosts`, migrations 0074 and 0095) from one `register` message.
 //
 // WHOLESALE REPLACE, not keep-if-absent, and that is the point: every column is
 // written from this message and an absent field becomes NULL. The columns
@@ -459,12 +459,16 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id HostIdentity) error {
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE hosts SET
-			source_commit   = $2,
-			built_at        = $3,
-			install_mode    = $4,
-			updater_present = $5
+			source_commit                = $2,
+			built_at                     = $3,
+			install_mode                 = $4,
+			updater_present              = $5,
+			recovery_actor_version       = $6,
+			recovery_actor_source_commit = $7,
+			seed_version                 = $8
 		WHERE id = $1
-	`, hostID, id.SourceCommit, id.BuiltAt, id.InstallMode, id.UpdaterPresent); err != nil {
+	`, hostID, id.SourceCommit, id.BuiltAt, id.InstallMode, id.UpdaterPresent,
+		id.RecoveryActorVersion, id.RecoveryActorSourceCommit, id.SeedVersion); err != nil {
 		return fmt.Errorf("update host identity: %w", err)
 	}
 	return nil

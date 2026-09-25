@@ -235,6 +235,10 @@ type hostResp struct {
 	BuiltAt        *string `json:"built_at"`
 	InstallMode    *string `json:"install_mode"`
 	UpdaterPresent *bool   `json:"updater_present"`
+	// Amendment 14: always serialized, null on every host that is not owned.
+	RecoveryActorVersion      *string `json:"recovery_actor_version"`
+	RecoveryActorSourceCommit *string `json:"recovery_actor_source_commit"`
+	SeedVersion               *string `json:"seed_version"`
 	// Capacity: always serialized, null when the host has no reported GPUs to sum.
 	Capacity *HostCapacity `json:"capacity"`
 }
@@ -402,6 +406,10 @@ func hostToResp(h Host) hostResp {
 		BuiltAt:               builtAt,
 		InstallMode:           h.InstallMode,
 		UpdaterPresent:        h.UpdaterPresent,
+
+		RecoveryActorVersion:      h.RecoveryActorVersion,
+		RecoveryActorSourceCommit: h.RecoveryActorSourceCommit,
+		SeedVersion:               h.SeedVersion,
 	}
 }
 

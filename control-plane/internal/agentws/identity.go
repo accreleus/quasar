@@ -3,6 +3,8 @@ package agentws
 import (
 	"regexp"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/semver"
 )
 
 // HostIdentity is the validated form of the four optional identity fields on
@@ -15,6 +17,12 @@ type HostIdentity struct {
 	BuiltAt        *time.Time
 	InstallMode    *string
 	UpdaterPresent *bool
+
+	// Owned-install identity (amendment 14). Not part of Known(): a host that
+	// reports none of them keeps the eligibility it had.
+	RecoveryActorVersion      *string
+	RecoveryActorSourceCommit *string
+	SeedVersion               *string
 }
 
 // Known reports whether all four fields are present, which is the
@@ -30,7 +38,7 @@ func (i HostIdentity) Known() bool {
 // padded.
 var agentCommit = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 
-// identityFromRegister validates the four fields off a register message.
+// identityFromRegister validates the identity fields off a register message.
 // Nothing here can fail the registration: an unparseable or out-of-vocabulary
 // value is treated as ABSENT (stored NULL), because the control plane never
 // refuses a registration over these fields (agent-api.md). The second return
@@ -61,13 +69,13 @@ func identityFromRegister(reg RegisterMsg) (HostIdentity, []string) {
 
 	if reg.InstallMode != nil {
 		switch *reg.InstallMode {
-		case "registry", "source":
+		case "registry", "source", "owned":
 			m := *reg.InstallMode
 			id.InstallMode = &m
 		default:
-			// Any other value is treated as absent, per the contract — an
-			// agent from the future naming a third mode must not write a value
-			// this schema's CHECK would refuse.
+			// Any other value is treated as absent, per the contract: an
+			// agent naming a newer mode must not write a value the CHECK
+			// would refuse.
 			dropped = append(dropped, "install_mode")
 		}
 	}
@@ -76,5 +84,62 @@ func identityFromRegister(reg RegisterMsg) (HostIdentity, []string) {
 	// three are meaningful. A non-bool would have failed the message decode.
 	id.UpdaterPresent = reg.UpdaterPresent
 
+	// Read only beside install_mode "owned"; ignored beside any other mode
+	// (protocol/agent-api.md §register "Owned installs").
+	owned := []struct {
+		name string
+		sent *string
+	}{
+		{"recovery_actor_version", reg.RecoveryActorVersion},
+		{"recovery_actor_source_commit", reg.RecoveryActorSourceCommit},
+		{"seed_version", reg.SeedVersion},
+	}
+	if id.InstallMode == nil || *id.InstallMode != "owned" {
+		for _, f := range owned {
+			if f.sent != nil {
+				dropped = append(dropped, f.name)
+			}
+		}
+		return id, dropped
+	}
+
+	if reg.RecoveryActorVersion != nil {
+		if actorVersionOrderable(*reg.RecoveryActorVersion) {
+			v := *reg.RecoveryActorVersion
+			id.RecoveryActorVersion = &v
+		} else {
+			dropped = append(dropped, "recovery_actor_version")
+		}
+	}
+	if reg.RecoveryActorSourceCommit != nil {
+		if agentCommit.MatchString(*reg.RecoveryActorSourceCommit) {
+			c := *reg.RecoveryActorSourceCommit
+			id.RecoveryActorSourceCommit = &c
+		} else {
+			dropped = append(dropped, "recovery_actor_source_commit")
+		}
+	}
+	if reg.SeedVersion != nil {
+		seed := *reg.SeedVersion
+		id.SeedVersion = &seed
+	}
+
 	return id, dropped
+}
+
+// The contract's MAJOR.MINOR.PATCH[-prerelease]: no leading v, no build
+// metadata, no leading zeros. semver.ParseFull alone is looser (it trims and
+// tolerates all three), so here it only adds the component-overflow check.
+var actorVersion = regexp.MustCompile(
+	`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
+		`(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$`)
+
+// actorVersionOrderable: unlike agent_version (stored as sent), a
+// recovery_actor_version that cannot be ordered is stored NULL.
+func actorVersionOrderable(v string) bool {
+	if !actorVersion.MatchString(v) {
+		return false
+	}
+	_, ok := semver.ParseFull(v)
+	return ok
 }

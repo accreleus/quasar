@@ -178,6 +178,7 @@ func host(id, name, commit string, opts ...func(*HostIdentity)) HostIdentity {
 }
 
 func sourceInstall(h *HostIdentity) { h.InstallMode = str(InstallSource) }
+func ownedInstall(h *HostIdentity)  { h.InstallMode = str(InstallOwned) }
 func noUpdater(h *HostIdentity)     { h.UpdaterPresent = boolp(false) }
 func offline(h *HostIdentity)       { h.Status = HostOffline }
 func draining(h *HostIdentity)      { h.Status = "draining" }
@@ -252,6 +253,32 @@ func TestTargetEligibilityReasons(t *testing.T) {
 			host:       host("h1", "gpu-01", commitA, sourceInstall),
 			wantCPRsn:  ReasonUpToDate,
 			wantHostRs: ReasonInstallModeSource,
+		},
+		{
+			name:       "an owned host behind the release is eligible exactly like a registry one",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, ownedInstall),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: "",
+		},
+		{
+			// A format-1 release names no recovery-actor component, so only the
+			// agent's commit is compared.
+			name:       "an owned host on the release is up_to_date",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitC, ownedInstall),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonUpToDate,
+		},
+		{
+			name:       "an owned host whose recovery actor did not answer is updater_absent",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, ownedInstall, noUpdater),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonUpdaterAbsent,
 		},
 		{
 			name:       "durable outranks transient: an offline source host still reports install_mode_source",
