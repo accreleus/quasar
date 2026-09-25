@@ -67,8 +67,27 @@ case "$cmd" in
   quick|web|control|agent)
     "${COMPOSE[@]}" run --rm --no-deps ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash "scripts/verify/$cmd.sh"
     ;;
+  uinput)
+    # The node-agent's real-kernel uinput tests (#[ignore]d in `make test-rust`).
+    # `compose run` cannot pass a device or a cgroup rule, so the binary is built
+    # through compose and run with plain `docker run`, as root: /dev/uinput, the
+    # fake-udev mknod and /run/udev/data all need it.
+    if [ ! -c /dev/uinput ]; then
+      echo "FAIL — /dev/uinput is absent on this host: sudo modprobe uinput, or run on a host that has it" >&2
+      exit 1
+    fi
+    bin="$("${COMPOSE[@]}" run --rm --no-deps -T ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash scripts/verify/uinput.sh | tail -n1)"
+    case "$bin" in
+      /cache/cargo-target/*) ;;
+      *) echo "FAIL — could not build the node-agent test binary (got '$bin')" >&2; exit 1 ;;
+    esac
+    docker run --rm --ulimit core=0 --user 0:0 \
+      --device /dev/uinput --device-cgroup-rule 'c 13:* rmw' \
+      -e QUASAR_REQUIRE_UINPUT=1 -v quasar-cargo-target:/cache/cargo-target:ro \
+      quasar-devtools:local "$bin" uinput_ --ignored --test-threads=1
+    ;;
   *)
-    echo "usage: $0 [quick|web|control|agent|db|full|versions|build|reset-db]" >&2
+    echo "usage: $0 [quick|web|control|agent|uinput|db|full|versions|build|reset-db]" >&2
     exit 2
     ;;
 esac

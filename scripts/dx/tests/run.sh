@@ -2563,7 +2563,7 @@ printf '\n== makefile ==\n'
 # ── every target must resolve to a script that exists ────────────────────────
 if command -v make >/dev/null 2>&1; then
   mk_missing=""
-  for t in help init doctor config-check verify test test-go test-rust test-web \
+  for t in help init doctor config-check verify test test-go test-rust test-uinput test-web \
            test-db preflight up down restart rebuild redeploy-cp status health logs \
            logs-follow dev-web dev-cp diagnose diagnose-bundle clean reset; do
     if ! make -C "$ROOT" -n "$t" >/dev/null 2>&1; then

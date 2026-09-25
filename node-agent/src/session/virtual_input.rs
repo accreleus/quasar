@@ -1285,6 +1285,10 @@ fn key_from_code(code: u16) -> Option<Key> {
     <Key as input_linux::enum_iterator::IterableEnum>::iter().find(|k| *k as u16 == code)
 }
 
+/// Real-kernel uinput tests, `#[ignore]`d (`make test-uinput`).
+#[cfg(test)]
+mod uinput_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,6 +1305,17 @@ mod tests {
         // The gamepad carries its tag in `phys` instead of the name.
         assert!(gamepad_phys(a).contains(a));
         assert_ne!(gamepad_phys(a), gamepad_phys(b));
+    }
+
+    /// uinput rejects a name of `UINPUT_MAX_NAME_SIZE` (80, NUL included) or
+    /// more, and the tag is a session UUID.
+    #[test]
+    fn session_tagged_device_names_fit_uinput() {
+        let tag = "00000000-0000-0000-0000-000000000000";
+        for kind in ["Keyboard", "Mouse"] {
+            assert!(device_name(kind, tag).len() < 80);
+        }
+        assert!(GAMEPAD_NAME.len() < 80);
     }
 
     /// The request number must be the kernel's `UI_SET_PHYS`

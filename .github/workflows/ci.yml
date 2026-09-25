@@ -176,3 +176,12 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: Test
         run: cargo test
+      # The virtual input devices against the runner's real kernel uinput: an
+      # ioctl the kernel rejects (the #348 UI_SET_PHYS request number) passes
+      # every unit test and fails every session launch. Root is needed for
+      # /dev/uinput, the fake-udev mknod and /run/udev/data;
+      # QUASAR_REQUIRE_UINPUT turns a missing module into a failure, not a skip.
+      - name: Load uinput
+        run: sudo modprobe uinput && ls -l /dev/uinput
+      - name: Test against the real uinput
+        run: sudo -E env "PATH=$PATH" QUASAR_REQUIRE_UINPUT=1 cargo test --lib uinput_ -- --ignored --test-threads=1
