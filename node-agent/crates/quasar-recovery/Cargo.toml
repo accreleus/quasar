@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "The Quasar recovery actor's library: the ported release trust gates and the control socket's wire shapes"
+description = "The Quasar recovery actor: its library (actor, recipes, engine port, trust gates, socket shapes) and the quasar-recovery binary"
+
+[[bin]]
+name = "quasar-recovery"
+path = "src/main.rs"
 
 # Like quasar-runtime, this crate must never depend on gstreamer*, glib or anything
 # CUDA: the recovery actor is a small static binary in a slim image
@@ -14,6 +18,10 @@ description = "The Quasar recovery actor's library: the ported release trust gat
 # already enables it, so the single workspace Cargo.lock resolves them to the versions
 # and features it already carries and adds no package.
 [dependencies]
+# The engine facade, the platform-service lifecycles and the durable-state primitives.
+quasar-runtime = { path = "../quasar-runtime" }
+# The secrets archive and the fake engine's reading of it.
+tar = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
@@ -36,5 +44,10 @@ bytes = "1"
 # Go's transport requests and transparently decodes gzip.
 flate2 = "1"
 
-[dev-dependencies]
+# The binary's log output (a verify-mode WARN from `trust::admit` must be visible).
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
+# The recipe parity test parses deploy/docker-compose.yml. Test-only: never in the binary.
+serde_yaml = "0.9"

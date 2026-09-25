@@ -47,6 +47,7 @@ mod owned_entry;
 pub mod policy;
 pub mod policy_catalog;
 pub mod readiness;
+pub mod recipe;
 pub mod release;
 pub mod session;
 pub mod vram;

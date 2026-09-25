@@ -26,8 +26,8 @@
 //! [`docker::image_error`] take Bollard errors, so adapters layered on the crate share one
 //! SDK version with it. The mutating typed lifecycles (image pull/ensure, exact removal, and
 //! container create/start/stop/remove for applications, helpers and the legacy sweep) stay in
-//! the agent because they are bound to the agent's journals; the recovery-actor slice extends
-//! this crate with its own mutating adapter.
+//! the agent because they are bound to the agent's journals. [`platform`] is the recovery
+//! actor's own mutating adapter (#357): single bounded calls on Quasar's platform services.
 
 mod client;
 mod config;
@@ -37,6 +37,7 @@ mod engine;
 mod error;
 mod inspection;
 pub mod ownership;
+pub mod platform;
 pub mod self_inspection;
 
 pub use client::{Operation, RuntimeClient, ENGINE_INSPECTION_BUDGET};

@@ -13,6 +13,7 @@ use std::{
 pub struct DurableFile<T> {
     path: PathBuf,
     temp: PathBuf,
+    mode: Option<u32>,
     _value: PhantomData<fn(&T) -> T>,
 }
 impl<T> DurableFile<T> {
@@ -23,8 +24,19 @@ impl<T> DurableFile<T> {
         Self {
             path,
             temp,
+            mode: None,
             _value: PhantomData,
         }
+    }
+    /// Commit with these permission bits (e.g. `0o600` for a secret), whatever the
+    /// process umask. Without it the temp is created under the umask, as before.
+    pub fn with_mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+    /// The committed file's path.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
     #[cfg(test)]
     fn temp_path(&self) -> &Path {
@@ -39,11 +51,17 @@ impl<T: Serialize> DurableFile<T> {
     /// is never read and the next store overwrites it.
     pub fn store(&self, value: &T) -> io::Result<()> {
         let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.temp)?;
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        if let Some(mode) = self.mode {
+            options.mode(mode);
+        }
+        let mut f = options.open(&self.temp)?;
+        if let Some(mode) = self.mode {
+            // A leftover temp keeps its old bits through `truncate`; set them explicitly.
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         f.write_all(&bytes)?;
         f.sync_all()?;
         fs::rename(&self.temp, &self.path)?;
@@ -170,6 +188,22 @@ mod tests {
 
     /// A second holder of a held lease is refused, whether it is this process opening
     /// the file again or another process; the lease is free again once released.
+    /// A secret committed with a mode carries exactly those bits, even when a leftover
+    /// temp from an earlier store had wider ones.
+    #[test]
+    fn a_mode_is_applied_to_the_committed_file_whatever_the_leftover_temp_had() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file: DurableFile<String> =
+            DurableFile::new(dir.path().join("secret.json"), "secret.tmp").with_mode(0o600);
+        std::fs::write(file.temp_path(), b"old").unwrap();
+        std::fs::set_permissions(file.temp_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        file.store(&"s3cret".to_string()).unwrap();
+        let mode = std::fs::metadata(file.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(file.load().unwrap().as_deref(), Some("s3cret"));
+    }
+
     #[test]
     fn a_held_lease_refuses_every_other_holder_until_released() {
         let dir = tempfile::tempdir().unwrap();
