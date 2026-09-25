@@ -24,6 +24,10 @@ fn engine() -> Arc<DockerEngine> {
     Arc::new(DockerEngine::new(quasar_runtime::RuntimeConfig::unix(socket)).unwrap())
 }
 
+/// Both probes use the one deterministic name `quasar-gpu-probe`, as the actor does under
+/// its lease; the test harness runs tests in parallel, so they take turns.
+static PROBE_NAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn image() -> String {
     std::env::var("QUASAR_TEST_RECOVERY_IMAGE").expect("QUASAR_TEST_RECOVERY_IMAGE")
 }
@@ -179,6 +183,7 @@ fn containers_volumes_and_archives_round_trip_through_a_real_engine() {
 #[test]
 #[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET and QUASAR_TEST_RECOVERY_IMAGE; creates and removes one uniquely named probe"]
 fn the_gpu_probe_runs_on_a_real_engine_and_is_removed() {
+    let _turn = PROBE_NAME.lock().unwrap_or_else(|e| e.into_inner());
     let engine = engine();
     let image = image();
     // A tag resolves to the digest reference the engine already knows it by.
@@ -200,6 +205,7 @@ fn the_gpu_probe_runs_on_a_real_engine_and_is_removed() {
 #[test]
 #[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET and QUASAR_TEST_RECOVERY_IMAGE; creates and removes one uniquely named probe"]
 fn the_gpus_probe_gets_a_definite_answer_from_a_real_engine() {
+    let _turn = PROBE_NAME.lock().unwrap_or_else(|e| e.into_inner());
     let engine = engine();
     let image = image();
     let pinned = match ImageRef::parse(&image) {
