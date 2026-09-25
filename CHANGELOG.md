@@ -200,6 +200,10 @@ own; the two do not move together, and that is deliberate.
 - **Design-lint batch C2: admin library, people, app editor and top-level admin pages (#375).**
   Their inline styles have moved to utilities and token-backed classes in `admin.css` and
   `admin/editor.css`. Off-scale spacing snapped to the 4px scale; nothing else looks different.
+- **Design-lint batch D: setup wizard, styleguide, user-side leftovers (#376).** The setup
+  wizard steps, the /admin resume banner, /styleguide, the auth card, the home detail band and
+  the stream HUD carry no inline styling beyond runtime sizes and custom properties. The 6px
+  gaps under the wizard's headings snapped to 8px; nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API

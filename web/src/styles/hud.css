@@ -40,6 +40,9 @@
   position: fixed;
   z-index: 20;
   display: flex;
+  /* Per dock, from `dockLayout` via the inline custom properties. */
+  flex-direction: var(--hud-dir, row);
+  border-radius: var(--hud-radius, 0);
   overflow: hidden;
   background: var(--hud-glass);
   -webkit-backdrop-filter: blur(22px) saturate(150%);
@@ -63,7 +66,8 @@
 }
 
 /* Docked at every size: flush against its edge. Width/height/radius/direction
-   come from `dockLayout` as inline styles — this is only the anchoring. */
+   come from `dockLayout` (inline, the last two as custom properties) — this is
+   only the anchoring. */
 .hud-root[data-axis="h"] .hud {
   left: 50%;
   transform: translateX(-50%);

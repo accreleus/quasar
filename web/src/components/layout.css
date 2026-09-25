@@ -53,11 +53,38 @@
   border-color: var(--warning-line);
 }
 
-/* StepHosts: one bordered block per registered host. */
+/* One bordered block per host (StepHosts) or library provider (StepLibraries). */
 .setup-host {
   border: 1px solid var(--line-2);
   border-radius: var(--r-sm);
   padding: var(--s4);
+}
+
+/* StepLibraries: a submitted provider's install-status row. */
+.setup-install-row {
+  padding: var(--s3) var(--s4);
+}
+
+/* Name + description beside the switch; the switch stays top-aligned. */
+.setup-provider-head {
+  align-items: flex-start;
+}
+
+.setup-subhead {
+  margin: 0 0 var(--s2);
+}
+
+.setup-claim-lede {
+  text-align: center;
+}
+
+.setup-steps {
+  justify-content: center;
+}
+
+/* The /admin resume banner: the buttons keep their width, the message wraps. */
+.setup-resume-actions {
+  flex-shrink: 0;
 }
 
 .setup-gpu-list {
