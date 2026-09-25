@@ -275,12 +275,12 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
 
   return (
     <div
-      className="card login-card"
-      style={{ width: "100%", maxWidth: 640, display: "flex", flexDirection: "column", gap: "var(--s5)" }}
+      className="card login-card col gap5"
+      style={{ width: "100%", maxWidth: 640 }}
     >
       <div>
-        <h2 style={{ margin: 0 }}>Libraries</h2>
-        <p className="sub" style={{ marginTop: 6 }}>
+        <h2 className="m0">Libraries</h2>
+        <p className="sub mt2">
           Optional: automatically discover games your users already own from a
           library provider and publish them as launchable tiles. Everything
           here stays fully configurable later from{" "}
@@ -315,28 +315,18 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
       )}
 
       {providers.length > 0 && phase === "select" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
+        <div className="col gap4">
           {providers.map((p) => (
-            <div
-              key={p.kind}
-              style={{
-                border: "1px solid var(--line-2)",
-                borderRadius: "var(--r-sm)",
-                padding: "var(--s4)",
-                display: "flex",
-                flexDirection: "column",
-                gap: "var(--s3)",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "var(--s4)" }}>
+            <div key={p.kind} className="setup-host col gap3">
+              <div className="setup-provider-head row between gap4">
                 <div>
                   <strong>{p.displayName}</strong>
                   {p.description && (
-                    <p className="field-hint" style={{ margin: "4px 0 0" }}>
+                    <p className="field-hint m0 mt1">
                       {p.description}
                     </p>
                   )}
-                  <p className="field-hint" style={{ margin: "4px 0 0" }}>
+                  <p className="field-hint m0 mt1">
                     The provider's image is a real download (roughly 2+ GB) —
                     enabling it starts a background install on every host.
                   </p>
@@ -353,7 +343,7 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
                   the choice is submitted on Continue, never on segment focus —
                   SegmentedControl's rule that activation must not drive a fetch. */}
               {selected[p.kind] && (
-                <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)" }}>
+                <div className="col gap2">
                   <SegmentedControl
                     aria-label={`Who can see ${p.displayName}`}
                     value={entitlementMode[p.kind] ?? "all"}
@@ -361,7 +351,7 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
                     options={ENTITLEMENT_MODE_OPTIONS}
                     activation="manual"
                   />
-                  <p className="field-hint" style={{ margin: 0 }}>
+                  <p className="field-hint m0">
                     {ENTITLEMENT_MODE_HINT[entitlementMode[p.kind] ?? "all"]}
                   </p>
                 </div>
@@ -372,8 +362,8 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
       )}
 
       {phase !== "select" && submittedKinds.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
-          <p className="field-hint" style={{ margin: 0 }}>
+        <div className="col gap4">
+          <p className="field-hint m0">
             The download can take a while depending on your connection — it's
             safe to leave this page. Installs continue in the background, and
             you can always check progress later from{" "}
@@ -383,31 +373,20 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
             const provider = providers.find((p) => p.kind === kind);
             const status = images ? providerStatus(images, kind) : null;
             return (
-              <div
-                key={kind}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "var(--s3)",
-                  border: "1px solid var(--line-2)",
-                  borderRadius: "var(--r-sm)",
-                  padding: "var(--s3) var(--s4)",
-                }}
-              >
+              <div key={kind} className="setup-host setup-install-row row between gap3">
                 <span>{provider?.displayName ?? kind}</span>
                 <StatusChip status={providerStatusKey(status)} config={PROVIDER_STATUS_CHIP_CONFIG} />
               </div>
             );
           })}
           {Object.entries(submitErrors).map(([kind, msg]) => (
-            <p key={kind} className="form-error" style={{ margin: 0 }}>
+            <p key={kind} className="form-error m0">
               Could not enable {providers.find((p) => p.kind === kind)?.displayName ?? kind}: {msg}
             </p>
           ))}
           {/* An enabled provider stuck on "all" must say so honestly. */}
           {Object.entries(modeErrors).map(([kind, msg]) => (
-            <p key={kind} className="form-error" style={{ margin: 0 }}>
+            <p key={kind} className="form-error m0">
               {providers.find((p) => p.kind === kind)?.displayName ?? kind} is enabled and
               visible to all users for now — could not switch it to{" "}
               {ENTITLEMENT_MODE_OPTIONS.find((o) => o.value === entitlementMode[kind])?.label.toLowerCase()}{" "}

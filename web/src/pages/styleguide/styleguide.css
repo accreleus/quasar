@@ -61,6 +61,10 @@
   font-weight: 700;
   margin-right: var(--s2);
 }
+/* Separates the second control group from the first. */
+.sg-controls-split {
+  margin-left: var(--s4);
+}
 
 /* ── Block (top-level section) ──────────────────────────── */
 .sg-block {
@@ -97,6 +101,19 @@
   background: var(--surf-chrome);
   padding: var(--s6);
 }
+/* Full-bleed contents (a table, a tab strip) own their padding. */
+.sg-specimen.sg-flush {
+  padding: 0;
+}
+.sg-clip {
+  overflow: hidden;
+}
+.sg-tab-body {
+  padding: var(--s5);
+}
+.sg-eyebrow-gap {
+  margin-bottom: var(--s2);
+}
 
 /* ── Specimen row ────────────────────────────────────────── */
 .sg-specimen-row {
@@ -104,6 +121,9 @@
   flex-wrap: wrap;
   gap: var(--s4);
   align-items: center;
+}
+.sg-specimen-row.sg-align-end {
+  align-items: flex-end;
 }
 
 /* ── Color/token swatches ────────────────────────────────── */
@@ -115,6 +135,8 @@
 }
 .sg-sw .sg-chip-color {
   height: 74px;
+  /* The token this swatch labels, set inline per swatch. */
+  background: var(--sg-swatch, transparent);
 }
 .sg-sw .sg-meta {
   padding: var(--s3) var(--s3);
@@ -155,6 +177,20 @@
   width: 130px;
   flex: none;
 }
+/* A sample at the size token it labels (`--sg-size`, set inline). */
+.sg-type-sample {
+  font-family: var(--font-display);
+  font-size: var(--sg-size, var(--t-base));
+  font-weight: 400;
+}
+.sg-type-sample.is-heading {
+  font-weight: 600;
+  letter-spacing: -.01em;
+}
+/* Two classes: shell.css's `.wordmark` size may load after this sheet. */
+.wordmark.sg-wordmark-sample {
+  font-size: 1.1rem;
+}
 
 /* ── Spacing scale ───────────────────────────────────────── */
 .sg-scale-cell {
@@ -167,6 +203,12 @@
   background: var(--accent-soft);
   border: 1px solid var(--accent-soft-2);
   border-radius: var(--r-control);
+}
+/* A radius specimen at the token it labels (`--sg-radius`, set inline). */
+.sg-radius-box {
+  background: var(--surf-raised);
+  border: 1px solid var(--line-2);
+  border-radius: var(--sg-radius, 0);
 }
 
 /* ── Misc small label ────────────────────────────────────── */

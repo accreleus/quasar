@@ -341,3 +341,10 @@
 .auth-scene .step-indicator {
   margin-bottom: var(--s5);
 }
+
+/* StepBasics is a <form>: `.auth-scene form` above would make it a grid. */
+.auth-scene form.setup-basics-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s5);
+}

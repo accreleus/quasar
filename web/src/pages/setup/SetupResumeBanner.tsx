@@ -32,23 +32,10 @@ export function SetupResumeBanner() {
   }
 
   return (
-    <div
-      className="login-error"
-      role="status"
-      style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: "var(--s4)",
-        color: "var(--info-text)",
-        background: "var(--info-bg)",
-        borderColor: "var(--info-line)",
-        margin: "0 0 var(--s5)",
-      }}
-    >
+    <div className="login-error is-info row between gap4 m0 mb5" role="status">
       <span>First-run setup isn&rsquo;t finished — instance basics and a host check are still pending.</span>
-      <span style={{ display: "flex", gap: "var(--s2)", alignItems: "center", flexShrink: 0 }}>
-        <Link to="/setup" className="btn btn-primary btn-sm" style={{ textDecoration: "none" }}>
+      <span className="setup-resume-actions row gap2">
+        <Link to="/setup" className="btn btn-primary btn-sm">
           Resume setup
         </Link>
         <Button type="button" variant="ghost" size="sm" disabled={skipping} onClick={() => void skip()}>

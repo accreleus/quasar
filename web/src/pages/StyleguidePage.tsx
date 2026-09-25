@@ -31,7 +31,7 @@ export function StyleguidePage() {
           value={theme}
           onChange={(v) => setTheme(v as Theme)}
         />
-        <span className="sg-controls-label" style={{ marginLeft: "var(--s4)" }}>
+        <span className="sg-controls-label sg-controls-split">
           Density
         </span>
         <SegmentedControl
