@@ -183,6 +183,17 @@ fn find<'a>(state: &'a FakeState, name_or_id: &str) -> Option<&'a FakeContainer>
         .containers
         .get(name_or_id)
         .or_else(|| state.container_named(name_or_id))
+        // The engine resolves a unique id prefix of at least 12 characters, as $HOSTNAME is.
+        .or_else(|| {
+            let mut matching = state
+                .containers
+                .values()
+                .filter(|c| name_or_id.len() >= 12 && c.id.starts_with(name_or_id));
+            match (matching.next(), matching.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        })
 }
 
 fn find_id(state: &FakeState, name_or_id: &str) -> Result<String, EngineError> {

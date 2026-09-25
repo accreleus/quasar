@@ -44,6 +44,28 @@ container with both labels exists, do nothing; otherwise create the actor from t
 `seed.json`'s verified image or, on first install when there is no `seed.json`, from the seed's
 own image. It never stops, replaces or removes anything, and never talks to the control plane.
 
+## Clarification: finishing its own create
+
+*(Proposed with #358; the Opus contract review under the standing RH06-01 process rules on
+it.)* Creating a container and starting it are two Engine API calls, so a seed can stop
+between them: a crash, an engine restart, a create whose outcome it never saw. Left alone,
+the container it created counts as "a recovery actor exists" and is never started. We clarify
+that **starting a container the seed itself created and never started finishes that create;
+it is not a replacement**, and the seed does it. The rule is exact and is part of seed
+interface 1:
+
+- the container is named as the profile names it and is in the engine's `created` state;
+- its labels in the `io.quasar.` namespace are exactly the two above and no others;
+- its environment names this seed's own full container id in `QUASAR_SEED_CONTAINER`;
+- it is the only container carrying both labels for this installation.
+
+Anything else is an existing actor, and the seed does nothing. The converse obligation on
+every recovery actor: each actor container it creates, a hand-over's successor included,
+carries at least one more label in the `io.quasar.` namespace (its recipe revision and
+specification digest do), so no actor-created container matches even if it copied
+`QUASAR_SEED_CONTAINER`. A seed redeployed under a new container id does not start its
+predecessor's unstarted create; `docker start` of that container does.
+
 ## The contract-test obligation
 
 A contract test runs the **current** seed code against machine-state fixtures written by **every

@@ -6,13 +6,14 @@
 //! Every [`INTERVAL`] it decides with [`decide`], which is pure and is what the contract
 //! test (`tests/seed_contract.rs`) runs against the fixtures every released actor wrote:
 //! - `seed.json` says `uninstalled`, has another format, or does not parse: idle;
-//! - a container carrying both labels exists, in any state and under any name (a
+//! - the only actor is one this seed created and never started: start it, finishing its
+//!   own create (ADR 0007, "Finishing its own create");
+//! - otherwise a container carrying both labels exists, in any state and under any name (a
 //!   hand-over's kept and successor containers included): nothing;
 //! - otherwise create the actor from the profile, from `seed.json`'s verified image or, on
 //!   a first install (no `seed.json`), from the seed's own image with a new installation.
 //!
-//! It never stops, replaces or removes an actor and never talks to the control plane. The
-//! one container it removes is one it has just created and could not start.
+//! It never stops, replaces or removes anything and never talks to the control plane.
 
 pub mod file;
 pub mod profile;
@@ -25,8 +26,9 @@ use serde::Serialize;
 use tracing::{error, info, warn};
 
 use crate::actor::repository_of;
-use crate::bootstrap::Bootstrap;
+use crate::bootstrap::{self, Bootstrap};
 use crate::engine::{Container, PlatformEngine};
+use crate::recipe::ImageRef;
 use crate::shutdown;
 use file::{ActorImage, SeedRead, SeedState};
 
@@ -48,6 +50,10 @@ pub enum Decision {
     },
     Unreadable {
         why: String,
+    },
+    /// The only recovery actor is this seed's own create, never started: start it.
+    StartOwn {
+        container: String,
     },
     /// A recovery actor of this installation exists.
     ActorPresent {
@@ -76,7 +82,27 @@ fn is_actor(c: &Container, installation: Option<&str>) -> bool {
         && labelled.is_some_and(|id| installation.is_none_or(|want| id == want))
 }
 
-pub fn decide(read: &SeedRead, containers: &[Container]) -> Decision {
+/// A container this seed created and never started. The profile stamps exactly the two
+/// frozen labels in the `io.quasar.` namespace and this seed's full container id; every
+/// actor container a recovery actor renders also carries its recipe and specification
+/// labels, so a hand-over successor never matches, whatever it inherited.
+fn is_own_unstarted(c: &Container, me: Option<&str>) -> bool {
+    let Some(me) = me else { return false };
+    let quasar_labels: Vec<&str> = c
+        .labels
+        .keys()
+        .map(String::as_str)
+        .filter(|k| k.starts_with("io.quasar."))
+        .collect();
+    c.name == profile::NAME
+        && c.status == "created"
+        && quasar_labels == [INSTALLATION_LABEL, PLATFORM_SERVICE_LABEL]
+        && c.env
+            .contains(&format!("{}={me}", profile::SEED_CONTAINER_ENV))
+}
+
+/// `me` is the seed's own full container id, when known.
+pub fn decide(read: &SeedRead, containers: &[Container], me: Option<&str>) -> Decision {
     let (installation, image) = match read {
         SeedRead::UnknownFormat(v) => {
             return Decision::UnknownFormat {
@@ -95,10 +121,22 @@ pub fn decide(read: &SeedRead, containers: &[Container]) -> Decision {
         ),
         SeedRead::Missing => (None, None),
     };
-    if let Some(actor) = containers.iter().find(|c| is_actor(c, installation)) {
-        return Decision::ActorPresent {
-            container: actor.name.clone(),
-        };
+    let actors: Vec<&Container> = containers
+        .iter()
+        .filter(|c| is_actor(c, installation))
+        .collect();
+    match actors.as_slice() {
+        [only] if is_own_unstarted(only, me) => {
+            return Decision::StartOwn {
+                container: only.name.clone(),
+            }
+        }
+        [first, ..] => {
+            return Decision::ActorPresent {
+                container: first.name.clone(),
+            }
+        }
+        [] => {}
     }
     if let Some(taken) = containers.iter().find(|c| c.name == profile::NAME) {
         return Decision::NameTaken {
@@ -117,14 +155,23 @@ pub fn is_seed(c: &Container) -> bool {
     program == Some("quasar-recovery") && c.command.get(1).map(String::as_str) == Some("seed")
 }
 
-/// The machine's seed, for the actor to report: the container that created the actor
-/// (`hint`, from `QUASAR_SEED_CONTAINER`), else any seed, a running one first. A manager
-/// redeploy gives the seed a new id, which is why the hint alone is not enough.
+/// The machine's seed, running or not: the container that created the actor (`hint`, from
+/// `QUASAR_SEED_CONTAINER`), else any seed, a running one first. A manager redeploy gives
+/// the seed a new id, which is why the hint alone is not enough.
 pub fn find<'a>(containers: &'a [Container], hint: Option<&str>) -> Option<&'a Container> {
     let seeds = || containers.iter().filter(|c| is_seed(c));
     hint.and_then(|h| seeds().find(|c| c.id == h || c.name == h))
         .or_else(|| seeds().find(|c| c.running))
         .or_else(|| seeds().next())
+}
+
+/// The running seed, as the actor reports it. A stopped seed re-creates nothing, so it is
+/// reported as no seed: the console's "not found" and its advice (start the seed again)
+/// are then both true.
+pub fn find_running<'a>(containers: &'a [Container], hint: Option<&str>) -> Option<&'a Container> {
+    let running = || containers.iter().filter(|c| is_seed(c) && c.running);
+    hint.and_then(|h| running().find(|c| c.id == h || c.name == h))
+        .or_else(|| running().next())
 }
 
 /// What one look at the machine came to.
@@ -178,6 +225,9 @@ impl Outcome {
                 "seed-name-taken" => warn!(token = "seed-name-taken", "{why}"),
                 "seed-engine-unreachable" => warn!(token = "seed-engine-unreachable", "{why}"),
                 "seed-pull-failed" => warn!(token = "seed-pull-failed", "{why}"),
+                "seed-agent-image-unavailable" => {
+                    warn!(token = "seed-agent-image-unavailable", "{why}")
+                }
                 "seed-create-failed" => warn!(token = "seed-create-failed", "{why}"),
                 "seed-start-failed" => warn!(token = "seed-start-failed", "{why}"),
                 other => warn!(token = "seed-look-failed", "{other}: {why}"),
@@ -235,6 +285,13 @@ fn invalid_self(why: String) -> Outcome {
     Outcome::Idle {
         token: "seed-self-invalid",
         why,
+    }
+}
+
+fn inputs_invalid(why: String) -> Outcome {
+    Outcome::Idle {
+        token: "seed-inputs-invalid",
+        why: format!("{why}; nothing was installed, and this seed stays idle until it is started again with corrected inputs"),
     }
 }
 
@@ -296,7 +353,15 @@ impl Seed {
         } else {
             Vec::new()
         };
-        match decide(&read, &containers) {
+        // The profile carries the inspected full id, so the comparison must use it too:
+        // $HOSTNAME, the fallback identity, is only its first 12 characters.
+        let me = self.config.self_container.as_deref().and_then(|hint| {
+            containers
+                .iter()
+                .find(|c| c.id == hint || (hint.len() >= 12 && c.id.starts_with(hint)))
+                .map(|c| c.id.as_str())
+        });
+        match decide(&read, &containers, me) {
             Decision::Uninstalled { installation_id } => Outcome::Idle {
                 token: "seed-uninstalled",
                 why: format!(
@@ -313,12 +378,14 @@ impl Seed {
                 token: "seed-file-unreadable",
                 why: format!("{why}; this seed does nothing until it is fixed"),
             },
-            Decision::ActorPresent { container } => {
-                match containers.iter().find(|c| c.name == container) {
-                    Some(c) if self.is_own_unstarted(c) => self.start_own(c.id.clone(), c.image.clone(), c.labels.get(INSTALLATION_LABEL).cloned().unwrap_or_default()),
-                    _ => Outcome::Present { container },
-                }
+            Decision::StartOwn { container } => {
+                let Some(c) = containers.iter().find(|c| c.name == container) else {
+                    return Outcome::Present { container };
+                };
+                let installation = c.labels.get(INSTALLATION_LABEL).cloned();
+                self.start_own(c.id.clone(), c.image.clone(), installation.unwrap_or_default())
             }
+            Decision::ActorPresent { container } => Outcome::Present { container },
             Decision::NameTaken { container } => Outcome::Idle {
                 token: "seed-name-taken",
                 why: format!(
@@ -355,13 +422,16 @@ impl Seed {
                     Ok(host) => host,
                     Err(e) => return unreachable(e),
                 };
-                let checked = Bootstrap::from_env(&me.env)
-                    .and_then(|boot| boot.check(host.name.as_deref()).map(|_| ()));
-                if let Err(why) = checked {
-                    return Outcome::Idle {
-                        token: "seed-inputs-invalid",
-                        why: format!("{why}; nothing was installed, and this seed stays idle until it is started again with corrected inputs"),
-                    };
+                let checked =
+                    Bootstrap::from_env(&me.env).and_then(|boot| boot.check(host.name.as_deref()));
+                let checked = match checked {
+                    Ok(checked) => checked,
+                    Err(why) => return inputs_invalid(why),
+                };
+                // The actor would refuse this image only after it had written machine state,
+                // which then wins over corrected inputs: refuse it here, before anything exists.
+                if let Err(outcome) = self.check_agent_image(&checked.agent_image) {
+                    return outcome;
                 }
                 ((self.config.new_installation_id)(), me.image.clone())
             }
@@ -389,15 +459,37 @@ impl Seed {
         self.start_own(id, image.reference(), installation_id)
     }
 
-    /// The actor this seed created and has not yet started: named as the profile names it,
-    /// never started, and carrying this seed's own container id. Starting it finishes this
-    /// seed's own create; any other existing actor is left as it is.
-    fn is_own_unstarted(&self, c: &Container) -> bool {
-        let Some(me) = &self.config.self_container else {
-            return false;
+    /// The agent image a first install names: on the engine (pulled if need be) and of a
+    /// recipe revision this build's actor carries.
+    fn check_agent_image(&self, image: &ImageRef) -> Result<(), Outcome> {
+        let reference = image.reference();
+        let unavailable = |e: String| {
+            Outcome::Retry {
+            token: "seed-agent-image-unavailable",
+            why: format!(
+                "{} {reference} cannot be pulled ({e}); nothing was installed, and it is tried again at the next look",
+                bootstrap::AGENT_IMAGE
+            ),
+        }
         };
-        let mine = format!("{}={me}", profile::SEED_CONTAINER_ENV);
-        c.name == profile::NAME && c.status == "created" && c.env.contains(&mine)
+        let found = match self.engine.inspect_image(&reference) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                info!(image = %reference, "pulling the agent image the install names");
+                if let Err(e) = self.engine.pull(&reference) {
+                    return Err(unavailable(e.to_string()));
+                }
+                match self.engine.inspect_image(&reference) {
+                    Ok(Some(found)) => found,
+                    Ok(None) => return Err(unavailable("not on the engine after the pull".into())),
+                    Err(e) => return Err(unreachable(e)),
+                }
+            }
+            Err(e) => return Err(unreachable(e)),
+        };
+        crate::actor::node_agent_revision(&found, image)
+            .map(|_| ())
+            .map_err(|e| inputs_invalid(format!("{}: {e}", bootstrap::AGENT_IMAGE)))
     }
 
     fn start_own(&self, id: String, image: String, installation_id: String) -> Outcome {
@@ -456,16 +548,20 @@ impl Seed {
                     profile::ENGINE_SOCKET
                 ))
             })?;
-        let machine = c.mounts.iter().any(|(source, target, _)| {
-            target == profile::MACHINE_DIR && source == profile::MACHINE_VOLUME
-        });
-        if !machine {
+        let machine = c
+            .mounts
+            .iter()
+            .find(|(_, target, _)| target == profile::MACHINE_DIR)
+            .map(|(source, _, _)| source.as_str());
+        if machine != Some(profile::MACHINE_VOLUME) {
+            let found = match machine {
+                Some(other) => format!("{other} is mounted there"),
+                None => "nothing is mounted there".into(),
+            };
             return Err(invalid_self(format!(
-                "the {} volume is not mounted at {} (add -v {}:{}:ro)",
-                profile::MACHINE_VOLUME,
-                profile::MACHINE_DIR,
-                profile::MACHINE_VOLUME,
-                profile::MACHINE_DIR
+                "the {vol} volume must be mounted at {dir}, and {found}: with docker run add -v {vol}:{dir}:ro; in a Compose stack (Dockge, Arcane) declare the volume at the top level with `name: {vol}`, since a stack otherwise names it <project>_{vol}",
+                vol = profile::MACHINE_VOLUME,
+                dir = profile::MACHINE_DIR,
             )));
         }
         let image = match ActorImage::parse(&c.image) {

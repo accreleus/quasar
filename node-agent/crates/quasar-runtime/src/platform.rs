@@ -106,8 +106,9 @@ pub struct Refused {
     pub message: String,
 }
 
-/// One container as the engine reports it now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One container as the engine reports it now. Its `Debug` shows only the environment's
+/// keys: the values may be secrets.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlatformContainer {
     pub id: String,
     /// Without the engine's leading `/`.
@@ -128,6 +129,54 @@ pub struct PlatformContainer {
     pub command: Vec<String>,
     /// `Config.Env` as `KEY=value`. May hold secrets: never log it.
     pub env: Vec<String>,
+}
+
+impl std::fmt::Debug for PlatformContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_keys: Vec<&str> = self
+            .env
+            .iter()
+            .map(|kv| kv.split_once('=').map_or(kv.as_str(), |(k, _)| k))
+            .collect();
+        f.debug_struct("PlatformContainer")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("image", &self.image)
+            .field("image_id", &self.image_id)
+            .field("labels", &self.labels)
+            .field("status", &self.status)
+            .field("running", &self.running)
+            .field("health", &self.health)
+            .field("restart", &self.restart)
+            .field("mounts", &self.mounts)
+            .field("command", &self.command)
+            .field("env_keys", &env_keys)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    #[test]
+    fn a_containers_debug_never_shows_an_environment_value() {
+        let c = super::PlatformContainer {
+            id: "id".into(),
+            name: "quasar-seed".into(),
+            image: String::new(),
+            image_id: String::new(),
+            labels: Default::default(),
+            status: "running".into(),
+            running: true,
+            health: None,
+            restart: None,
+            mounts: Vec::new(),
+            command: Vec::new(),
+            env: vec!["QUASAR_ENROLLMENT=qenr1.secret-token".into()],
+        };
+        let shown = format!("{c:?}");
+        assert!(shown.contains("QUASAR_ENROLLMENT"), "{shown}");
+        assert!(!shown.contains("secret-token"), "{shown}");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

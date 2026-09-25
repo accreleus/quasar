@@ -198,6 +198,7 @@ impl Actor {
         let machine = match self.dir.load_machine()? {
             Some(machine) => {
                 self.note_ignored_inputs(&machine);
+                self.note_label_mismatch(&machine)?;
                 machine
             }
             None => self.first_install()?,
@@ -336,6 +337,24 @@ impl Actor {
         Ok(())
     }
 
+    /// A seed that found no `seed.json` on an installed machine labelled this actor with a
+    /// new installation. Machine state wins; the seed then sees no actor of the installation
+    /// `seed.json` names and says `seed-name-taken`, until this container is re-created.
+    fn note_label_mismatch(&self, machine: &Machine) -> Result<(), ResumeError> {
+        let label = self
+            .own_container()?
+            .and_then(|me| me.labels.get(labels::INSTALLATION).cloned());
+        if let Some(label) = label.filter(|l| *l != machine.installation_id) {
+            warn!(
+                token = "actor-installation-label-differs",
+                "this container is labelled installation {label}, machine state is installation {}; machine state wins. Remove this container (docker rm -f {}) and the seed re-creates it with the right label",
+                machine.installation_id,
+                names::RECOVERY_ACTOR
+            );
+        }
+        Ok(())
+    }
+
     fn note_ignored_inputs(&self, machine: &Machine) {
         let op = &self.config.operator;
         if op.enrollment.is_some() {
@@ -364,9 +383,12 @@ impl Actor {
                 operator: self.config.operator.clone(),
             });
         };
-        let container = self.engine.inspect_container(seed)?.ok_or_else(|| {
+        // A seed redeployed since it created this actor has a new id: any seed will do.
+        let containers = self.engine.list_containers()?;
+        let container = seed::find(&containers, Some(seed)).ok_or_else(|| {
             ResumeError::Inputs(format!(
-                "the seed container {seed} that created this actor is gone, so its install inputs cannot be read; start the seed again"
+                "no seed container is on this machine (the one that created this actor, {seed}, is gone), so a first install has no inputs; start the seed with its inputs, then restart this actor (docker restart {})",
+                names::RECOVERY_ACTOR
             ))
         })?;
         Bootstrap::from_env(&container.env).map_err(ResumeError::Inputs)
@@ -404,8 +426,11 @@ impl Actor {
         };
         recipe::validate(&inputs)?;
 
+        // Refused here, before anything durable: once machine state exists it wins over
+        // corrected inputs.
+        let found = self.ensure_image(&image)?;
+        node_agent_revision(&found, &image)?;
         self.dir.store_secret(secrets::ENROLLMENT, enrollment)?;
-        self.ensure_image(&image)?;
         let report = match probe::run(self.engine.as_ref(), &image) {
             Ok(report) => report,
             Err(probe::ProbeError::Engine(e)) => return Err(e.into()),
@@ -741,7 +766,7 @@ impl Actor {
             }
         }
         services.sort_by_key(|s| (s.role != Role::RecoveryActor.as_str(), s.role.clone()));
-        let seed = seed::find(&containers, self.config.seed_container.as_deref())
+        let seed = seed::find_running(&containers, self.config.seed_container.as_deref())
             .map(|c| self.seed_identity(c));
         Ok(Inventory {
             services,
@@ -751,15 +776,18 @@ impl Actor {
     }
 
     /// The seed's version is its image's `org.quasar.version` label; an image without one
-    /// is this actor's own when the ids match, and otherwise reported with no version.
+    /// is this actor's own when the ids match. A seed whose version cannot be read is still
+    /// a seed: it is reported as [`SEED_VERSION_UNKNOWN`], never as absent, since absent
+    /// reads "not found" on the console.
     fn seed_identity(&self, seed: &Container) -> SeedIdentity {
         if let Some(known) = self.seed_images.lock().unwrap().get(&seed.image_id) {
             return known.clone();
         }
+        let digest_of_ref = seed.image.split_once('@').map(|(_, d)| d.to_owned());
         let Ok(image) = self.status_engine.inspect_image(&seed.image_id) else {
             return SeedIdentity {
-                version: String::new(),
-                digest: None,
+                version: SEED_VERSION_UNKNOWN.into(),
+                digest: digest_of_ref,
             };
         };
         let version = image
@@ -771,12 +799,10 @@ impl Actor {
                 let me = self.status_engine.inspect_container(own).ok()??;
                 (me.image_id == seed.image_id).then(|| crate::identity::version().to_owned())
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| SEED_VERSION_UNKNOWN.into());
         let repository = repository_of(&seed.image);
-        let digest = match seed.image.split_once('@') {
-            Some((_, digest)) => Some(digest.to_owned()),
-            None => image.as_ref().and_then(|i| digest_for(i, &repository)),
-        };
+        let digest =
+            digest_of_ref.or_else(|| image.as_ref().and_then(|i| digest_for(i, &repository)));
         let identity = SeedIdentity { version, digest };
         if image.is_some() {
             self.seed_images
@@ -819,12 +845,32 @@ fn service(c: &Container, role: &str) -> Service {
 }
 
 /// `registry/repo:tag@sha256:…` → `registry/repo`.
+/// The reported version of a seed that exists but whose version could not be read.
+/// `seed_version` is opaque (agent-api.md amendment 14), so this is a value, not an absence.
+pub const SEED_VERSION_UNKNOWN: &str = "unknown";
+
 pub(crate) fn repository_of(reference: &str) -> String {
     let without_digest = reference.split('@').next().unwrap_or(reference);
     match without_digest.rsplit_once(':') {
         Some((repo, tag)) if !tag.contains('/') => repo.to_owned(),
         _ => without_digest.to_owned(),
     }
+}
+
+/// The node-agent recipe revision `image` declares, refused unless this actor carries it.
+pub(crate) fn node_agent_revision(
+    image: &crate::engine::Image,
+    reference: &ImageRef,
+) -> Result<u32, ResumeError> {
+    let revision = image_revision(image, reference)?;
+    if !recipe::Book::supports(Role::NodeAgent, revision) {
+        return Err(RenderError::Unsupported {
+            role: Role::NodeAgent,
+            revision,
+        }
+        .into());
+    }
+    Ok(revision)
 }
 
 fn image_revision(image: &crate::engine::Image, reference: &ImageRef) -> Result<u32, ResumeError> {

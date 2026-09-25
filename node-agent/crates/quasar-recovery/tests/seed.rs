@@ -262,7 +262,7 @@ fn a_deleted_actor_is_re_created_from_the_verified_digest_and_nothing_else_moves
 }
 
 #[test]
-fn the_seed_never_replaces_or_starts_an_existing_actor() {
+fn the_seed_never_replaces_restarts_or_starts_an_actor_it_did_not_just_create() {
     let (engine, dir) = installed();
     let id = actor_id(&engine.state());
 
@@ -296,6 +296,267 @@ fn the_seed_never_replaces_or_starts_an_existing_actor() {
         before,
         "a hand-over's containers were touched"
     );
+
+    // A never-started successor already renamed quasar-recovery, carrying this seed's id
+    // copied from its predecessor: a recovery actor rendered it, so it is not the seed's.
+    engine.with_state(|s| {
+        s.containers
+            .retain(|_, c| !c.spec.name.starts_with("quasar-recovery"));
+        let successor = quasar_recovery::recipe::render(
+            quasar_recovery::recipe::Role::RecoveryActor,
+            1,
+            &serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(dir.path().join("machine.json")).unwrap(),
+            )
+            .map(|m| serde_json::from_value(m["inputs"].clone()).unwrap())
+            .unwrap(),
+            &quasar_recovery::recipe::ImageRef::parse(ACTOR_IMAGE).unwrap(),
+            &Default::default(),
+        )
+        .unwrap();
+        let mut spec = successor;
+        spec.env
+            .insert(profile::SEED_CONTAINER_ENV.into(), SEED_ID.into());
+        let mut c = seed_container(
+            "ac20000000000000000000000000000000000000000000000000000000000000",
+            ACTOR_IMAGE,
+            BTreeMap::new(),
+        );
+        c.spec = spec;
+        c.status = "created".into();
+        c.starts = 0;
+        s.containers.insert(c.id.clone(), c);
+    });
+    let before = engine.state();
+    assert!(matches!(
+        seed(&engine, dir.path(), SEED_ID).step(),
+        Outcome::Present { .. }
+    ));
+    assert_eq!(engine.state(), before, "a hand-over successor was started");
+}
+
+/// The seed was stopped between creating the actor and starting it (a crash, an engine
+/// restart); the same seed container, started again, finishes its own create. It knows
+/// itself only by its 12-character `$HOSTNAME` there, and still recognises the full id it
+/// stamped.
+#[test]
+fn a_seed_finishes_its_own_create_after_a_crash_between_create_and_start() {
+    let (engine, dir) = new_machine(seed_env());
+    let calls = {
+        let (reference, rdir) = new_machine(seed_env());
+        seed(&reference, rdir.path(), SEED_ID).step();
+        reference.calls()
+    };
+    // The start is the last call of a first look.
+    engine.inject(Fault {
+        call: calls - 1,
+        when: When::Before,
+        error: EngineError::Crashed,
+    });
+    seed(&engine, dir.path(), SEED_ID).step();
+    engine.clear_faults();
+    assert_eq!(
+        actors(&engine.state()),
+        [(
+            names::RECOVERY_ACTOR.to_string(),
+            ACTOR_IMAGE.to_string(),
+            "created".to_string()
+        )]
+    );
+
+    let outcome = seed(&engine, dir.path(), &SEED_ID[..12]).step();
+    assert!(matches!(outcome, Outcome::Created { .. }), "{outcome:?}");
+    assert_eq!(
+        actors(&engine.state()),
+        [(
+            names::RECOVERY_ACTOR.to_string(),
+            ACTOR_IMAGE.to_string(),
+            "running".to_string()
+        )]
+    );
+
+    // A redeployed seed (another container id) does not start an unstarted actor that the
+    // previous one created: that is the documented `docker start quasar-recovery` case.
+    let (engine, dir) = new_machine(seed_env());
+    engine.inject(Fault {
+        call: calls - 1,
+        when: When::Before,
+        error: EngineError::Crashed,
+    });
+    seed(&engine, dir.path(), SEED_ID).step();
+    engine.clear_faults();
+    let redeployed = "5eed300000000000000000000000000000000000000000000000000000000000";
+    engine.with_state(|s| {
+        s.containers.remove(SEED_ID);
+        s.containers.insert(
+            redeployed.into(),
+            seed_container(redeployed, ACTOR_IMAGE, seed_env()),
+        );
+    });
+    let before = engine.state();
+    let outcome = seed(&engine, dir.path(), redeployed).step();
+    assert!(matches!(outcome, Outcome::Present { .. }), "{outcome:?}");
+    assert_eq!(engine.state(), before);
+}
+
+#[test]
+fn an_agent_image_the_actor_would_refuse_is_refused_by_the_seed_before_anything_exists() {
+    let unlabelled = "registry.example.invalid/quasar/quasar-node-agent@sha256:ee55000000000000000000000000000000000000000000000000000000000000";
+    let future = "registry.example.invalid/quasar/quasar-node-agent@sha256:ff66000000000000000000000000000000000000000000000000000000000000";
+    let mut env = seed_env();
+    env.insert("QUASAR_AGENT_IMAGE".into(), unlabelled.into());
+    let (engine, dir) = new_machine(env);
+    engine.with_state(|s| {
+        let mut plain = agent_image(None);
+        plain.repo_digests = vec![unlabelled.into()];
+        s.registry.insert(unlabelled.into(), plain);
+        let mut ahead = agent_image(Some("99"));
+        ahead.repo_digests = vec![future.into()];
+        s.registry.insert(future.into(), ahead);
+    });
+
+    for (image, token, says) in [
+        (unlabelled, "seed-inputs-invalid", "org.quasar.recipe"),
+        (future, "seed-inputs-invalid", "revision 99"),
+        (
+            "registry.example.invalid/quasar/quasar-node-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "seed-agent-image-unavailable",
+            "cannot be pulled",
+        ),
+    ] {
+        engine.with_state(|s| {
+            s.containers
+                .get_mut(SEED_ID)
+                .unwrap()
+                .spec
+                .env
+                .insert("QUASAR_AGENT_IMAGE".into(), image.into());
+        });
+        let outcome = seed(&engine, dir.path(), SEED_ID).step();
+        assert!(
+            matches!(&outcome, Outcome::Idle { token: t, why } | Outcome::Retry { token: t, why }
+                if *t == token && why.contains(says)),
+            "{image}: {outcome:?}"
+        );
+        assert!(actors(&engine.state()).is_empty(), "{image}: an actor was created");
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    // Corrected in the stack and redeployed: the install goes ahead.
+    engine.with_state(|s| {
+        s.containers
+            .get_mut(SEED_ID)
+            .unwrap()
+            .spec
+            .env
+            .insert("QUASAR_AGENT_IMAGE".into(), AGENT_IMAGE.into());
+    });
+    let outcome = seed(&engine, dir.path(), SEED_ID).step();
+    assert!(matches!(outcome, Outcome::Created { .. }), "{outcome:?}");
+    let id = actor_id(&engine.state());
+    seeded_actor(&engine, dir.path(), &id).resume().unwrap();
+    assert_eq!(
+        engine
+            .state()
+            .container_named(names::NODE_AGENT)
+            .unwrap()
+            .spec
+            .image,
+        AGENT_IMAGE
+    );
+}
+
+#[test]
+fn an_actor_whose_seed_was_redeployed_before_the_first_install_reads_the_new_seed() {
+    let (engine, dir) = new_machine(seed_env());
+    seed(&engine, dir.path(), SEED_ID).step();
+    let id = actor_id(&engine.state());
+    let redeployed = "5eed400000000000000000000000000000000000000000000000000000000000";
+    engine.with_state(|s| {
+        s.containers.remove(SEED_ID);
+        let mut env = seed_env();
+        env.insert("QUASAR_NODE_NAME".into(), "renamed-host".into());
+        s.containers.insert(
+            redeployed.into(),
+            seed_container(redeployed, ACTOR_IMAGE, env),
+        );
+    });
+    seeded_actor(&engine, dir.path(), &id).resume().unwrap();
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert_eq!(agent.spec.env["NODE_NAME"], "renamed-host");
+
+    // No seed at all: the message says what to do.
+    let (engine, dir) = new_machine(seed_env());
+    seed(&engine, dir.path(), SEED_ID).step();
+    let id = actor_id(&engine.state());
+    engine.with_state(|s| {
+        s.containers.remove(SEED_ID);
+    });
+    let err = seeded_actor(&engine, dir.path(), &id).resume().unwrap_err();
+    let why = err.to_string();
+    assert!(
+        why.contains("no seed container") && why.contains("docker restart quasar-recovery"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_stopped_seed_is_reported_as_no_seed_and_an_unreadable_version_as_unknown() {
+    let (engine, dir) = installed();
+    let id = actor_id(&engine.state());
+    let actor = seeded_actor(&engine, dir.path(), &id);
+
+    engine.with_state(|s| s.containers.get_mut(SEED_ID).unwrap().status = "exited".into());
+    assert_eq!(
+        actor.status().seed,
+        None,
+        "a stopped seed re-creates nothing"
+    );
+
+    // Running again, from an image with no version label that is not the actor's own.
+    let unlabelled = "5eed500000000000000000000000000000000000000000000000000000000000";
+    engine.with_state(|s| {
+        s.containers.remove(SEED_ID);
+        s.images.insert(
+            NEWER_IMAGE.into(),
+            Image {
+                id: "sha256:dd4a000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                repo_digests: vec![NEWER_IMAGE.into()],
+                labels: BTreeMap::new(),
+            },
+        );
+        s.containers.insert(
+            unlabelled.into(),
+            seed_container(unlabelled, NEWER_IMAGE, seed_env()),
+        );
+    });
+    let seed = actor.status().seed.expect("a running seed is found");
+    assert_eq!(seed.version, quasar_recovery::actor::SEED_VERSION_UNKNOWN);
+    assert_eq!(
+        seed.digest.as_deref(),
+        Some("sha256:dd44000000000000000000000000000000000000000000000000000000000000")
+    );
+}
+
+#[test]
+fn a_stack_named_machine_volume_is_refused_with_the_compose_fix() {
+    let (engine, dir) = new_machine(seed_env());
+    engine.with_state(|s| {
+        for b in &mut s.containers.get_mut(SEED_ID).unwrap().spec.binds {
+            if b.source == names::MACHINE_VOLUME {
+                b.source = "quasar_quasar-machine".into();
+            }
+        }
+    });
+    let outcome = seed(&engine, dir.path(), SEED_ID).step();
+    assert!(
+        matches!(&outcome, Outcome::Idle { token: "seed-self-invalid", why }
+            if why.contains("quasar_quasar-machine is mounted there") && why.contains("name: quasar-machine")),
+        "{outcome:?}"
+    );
+    assert!(actors(&engine.state()).is_empty());
 }
 
 #[test]
