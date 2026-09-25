@@ -33,7 +33,7 @@ export interface ManualUpdateInputs {
   reason: EligibilityReason | string | null;
   kind: "control_plane" | "host";
   /** `Host.install_mode`, when the caller knows it. */
-  installMode?: "registry" | "source" | null;
+  installMode?: "registry" | "source" | "owned" | null;
   /** The host's GPU vendor, lowercased or not, when the caller knows it. The
    *  Releases page does not; host detail does. */
   gpuVendor?: string | null;
