@@ -19,7 +19,9 @@ export type ServiceState =
   /** The last report, from before the host went offline. */
   | { kind: "as_of"; at: string }
   /** The service does not run on this machine at all. */
-  | { kind: "absent"; text: string };
+  | { kind: "absent"; text: string }
+  /** The recovery actor answered and found no such container. */
+  | { kind: "not_found" };
 
 export interface ServiceRow {
   key: ServiceKey;
@@ -97,6 +99,7 @@ export function hostServices(host: Host, opts: { agentOlder: boolean }): HostSer
   const liveOrLast = (): ServiceState => (offline ? lastReport() : { kind: "running" });
 
   const actorVersion = versionLabel(host.recovery_actor_version);
+  const seedVersion = versionLabel(host.seed_version);
   const actorCommit = host.recovery_actor_source_commit
     ? ` · commit ${shortCommit(host.recovery_actor_source_commit)}`
     : "";
@@ -106,10 +109,13 @@ export function hostServices(host: Host, opts: { agentOlder: boolean }): HostSer
       key: "seed",
       name: "Seed",
       description: "Makes sure the recovery actor exists. Never updated by Quasar.",
-      version: versionLabel(host.seed_version),
+      // `seed_version` is what the recovery actor saw; absent while it answers means it
+      // found no seed. Nothing on the wire says how the seed was started, so one owner
+      // label covers a manager's stack and a `docker run` (mock open question 4).
+      version: answered ? seedVersion : null,
       versionNote: null,
-      owner: null,
-      state: { kind: "unknown" },
+      owner: answered && seedVersion ? "External manager" : null,
+      state: !answered ? { kind: "unknown" } : seedVersion ? liveOrLast() : { kind: "not_found" },
     },
     {
       key: "recovery_actor",

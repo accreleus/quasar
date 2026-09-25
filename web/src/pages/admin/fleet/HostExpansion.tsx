@@ -96,9 +96,14 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
                 label={row.name}
                 value={
                   row.version ? (
-                    <span className="num">{row.version}</span>
+                    <>
+                      <span className="num">{row.version}</span>
+                      {row.key === "seed" && row.owner ? ` · ${row.owner.toLowerCase()}` : ""}
+                    </>
                   ) : row.state.kind === "absent" ? (
                     row.state.text
+                  ) : row.state.kind === "not_found" ? (
+                    "not found"
                   ) : (
                     "not reported"
                   )
