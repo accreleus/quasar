@@ -39,6 +39,15 @@ own; the two do not move together, and that is deliberate.
   exactly as before. Platform images now carry the `org.quasar.recipe` label, stamped by
   `deploy/build-images.sh` and the Images workflow from one helper
   (`deploy/lib/recipe-revision.sh`) and asserted by the image contract.
+- **The control plane stores and serves an owned host's recovery-actor identity (#357).**
+  Migration 0095 widens `hosts.install_mode` to admit `owned` and adds the nullable
+  `recovery_actor_version`, `recovery_actor_source_commit` and `seed_version` columns
+  (amendment 14). An agent registering `install_mode: "owned"` has them stored wholesale on
+  every `register`, absent as null, and an actor version that is not
+  `MAJOR.MINOR.PATCH[-prerelease]` is stored null. They are ignored beside any other mode.
+  The host body (`GET /v1/hosts`, `GET /v1/hosts/{id}`) always serializes all three. An owned
+  host is eligible for platform releases exactly like a `registry` host; agents that send
+  none of the fields register as before.
 - **RH06 release trust ported to Rust, held to shared golden vectors (#356).** The new
   GStreamer-free crate `node-agent/crates/quasar-recovery` holds the recovery actor's
   `trust` module (the Go updater's namespace allowlist, digest-only images, closed

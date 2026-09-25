@@ -183,6 +183,11 @@ type Host struct {
 	BuiltAt        *time.Time `json:"built_at"`
 	InstallMode    *string    `json:"install_mode"`
 	UpdaterPresent *bool      `json:"updater_present"`
+	// Owned-install identity (amendment 14, migration 0095): NULL unless the
+	// host is owned and reported it; same wholesale-replace rule.
+	RecoveryActorVersion      *string `json:"recovery_actor_version"`
+	RecoveryActorSourceCommit *string `json:"recovery_actor_source_commit"`
+	SeedVersion               *string `json:"seed_version"`
 	// Capacity: the GPU roll-up, filled by hostCapacities after the row read.
 	// Nil = nothing to sum (no reported GPUs), which is not the same fact as zero.
 	Capacity *HostCapacity `json:"capacity"`
@@ -1218,7 +1223,8 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 		       readiness, readiness_reported_at, now(),
 		       capacity_detection, capacity_reason, created_at,
 		       agent_process_started_at, agent_restart_count, agent_last_restart_at,
-		       source_commit, built_at, install_mode, updater_present
+		       source_commit, built_at, install_mode, updater_present,
+		       recovery_actor_version, recovery_actor_source_commit, seed_version
 		FROM hosts
 		ORDER BY created_at DESC
 		LIMIT $1 OFFSET $2
@@ -1238,7 +1244,8 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 			&rawReadiness, &h.ReadinessReportedAt, &dbNow,
 			&h.CapacityDetection, &h.CapacityReason, &h.CreatedAt,
 			&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt,
-			&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent); err != nil {
+			&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent,
+			&h.RecoveryActorVersion, &h.RecoveryActorSourceCommit, &h.SeedVersion); err != nil {
 			return nil, "", fmt.Errorf("scan host: %w", err)
 		}
 		h.Storage = json.RawMessage(rawStorage) // nil scans to a JSON "null" (json.RawMessage.MarshalJSON)
@@ -1278,14 +1285,16 @@ func (s *store) getHost(ctx context.Context, id string) (Host, error) {
 		       readiness, readiness_reported_at, now(),
 		       capacity_detection, capacity_reason, created_at,
 		       agent_process_started_at, agent_restart_count, agent_last_restart_at,
-		       source_commit, built_at, install_mode, updater_present
+		       source_commit, built_at, install_mode, updater_present,
+		       recovery_actor_version, recovery_actor_source_commit, seed_version
 		FROM hosts WHERE id::text = $1
 	`, id).Scan(&h.ID, &h.NodeName, &h.Status, &h.AgentVersion,
 		&h.CPUCores, &h.MemMB, &h.LastRegistered, &h.LastHeartbeat, &rawStorage, &h.CPUModel,
 		&rawReadiness, &h.ReadinessReportedAt, &dbNow,
 		&h.CapacityDetection, &h.CapacityReason, &h.CreatedAt,
 		&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt,
-		&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent)
+		&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent,
+		&h.RecoveryActorVersion, &h.RecoveryActorSourceCommit, &h.SeedVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Host{}, ErrNotFound
 	}
