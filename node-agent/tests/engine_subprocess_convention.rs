@@ -13,6 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "support/source_roots.rs"]
+mod source_roots;
+use source_roots::source_roots;
+
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
@@ -41,18 +45,19 @@ struct Source {
 }
 
 fn sources() -> Vec<Source> {
-    let root = src_root();
     let mut files = Vec::new();
-    rs_files(&root, &mut files);
+    for (root, prefix) in source_roots() {
+        let mut found = Vec::new();
+        rs_files(&root, &mut found);
+        files.extend(found.into_iter().map(|path| {
+            let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
+            (format!("{prefix}{rel}"), path)
+        }));
+    }
     files
         .into_iter()
-        .map(|path| {
+        .map(|(rel, path)| {
             let text = std::fs::read_to_string(&path).expect("read source file");
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
             let production = if rel.ends_with("_tests.rs") {
                 String::new()
             } else {
@@ -98,15 +103,17 @@ fn no_call_site_execs_docker_or_podman() {
     );
 }
 
-/// The launch path and the whole runtime module spawn no child process at all.
-/// `runtime/docker/credentials.rs` is the documented exception: Docker-ecosystem
-/// credential helpers are registry tooling, not the engine.
+/// The launch path, the whole runtime module and the shared runtime crate spawn no
+/// child process at all. `quasar-runtime/docker/credentials.rs` is the documented
+/// exception: Docker-ecosystem credential helpers are registry tooling, not the engine.
 #[test]
 fn the_launch_path_and_runtime_module_spawn_no_child_process() {
     let mut bad = Vec::new();
     for source in sources() {
-        let scoped = source.rel == "session/container.rs" || source.rel.starts_with("runtime/");
-        if !scoped || source.rel == "runtime/docker/credentials.rs" {
+        let scoped = source.rel == "session/container.rs"
+            || source.rel.starts_with("runtime/")
+            || source.rel.starts_with("quasar-runtime/");
+        if !scoped || source.rel == "quasar-runtime/docker/credentials.rs" {
             continue;
         }
         for needle in ["Command::new", "process::Command"] {

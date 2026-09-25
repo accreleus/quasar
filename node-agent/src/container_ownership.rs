@@ -1,13 +1,14 @@
 //! Persistent ownership of session/audio siblings on a shared Docker daemon.
 //! The lease file is never renamed or unlinked: its inode is the process lock.
-use std::fs::{File, OpenOptions};
+//! The label, the owned-container proof and the lease itself are the shared
+//! `quasar-runtime` crate's; the identity file and its recovery wording are ours.
+use quasar_runtime::{LeaseError, StateLease};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::OnceLock;
 
-pub(crate) const LABEL: &str = "io.quasar.agent-owner";
+pub(crate) use quasar_runtime::ownership::{owned_id, LABEL};
 /// Name prefix of every host-probe container (#258). Alongside the session
 /// (`quasar-sess-`) and audio (`quasar-pulse-`) prefixes, it is one of the
 /// three owned prefixes: the runtime refuses a probe request outside it, and
@@ -18,7 +19,7 @@ static OWNER: OnceLock<Result<Owner, String>> = OnceLock::new();
 
 struct Owner {
     token: String,
-    _lease: File,
+    _lease: StateLease,
 }
 
 pub(crate) fn initialize(secret_path: &str) -> Result<(), String> {
@@ -61,33 +62,12 @@ fn acquire(path: &Path) -> Result<Owner, String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| error(e.to_string()))?;
     }
-    let (mut lease, created) = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(file) => (file, true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-                .map_err(|e| error(e.to_string()))?,
-            false,
-        ),
-        Err(e) => return Err(error(e.to_string())),
-    };
-    // SAFETY: lease owns this live fd throughout the call and until Owner drops.
-    if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(error(format!(
-            "another agent holds the state lease ({})",
-            std::io::Error::last_os_error()
-        )));
-    }
+    let lease = StateLease::acquire(path).map_err(|e| match e {
+        LeaseError::Open(e) => error(e.to_string()),
+        LeaseError::Held(e) => error(format!("another agent holds the state lease ({e})")),
+    })?;
+    let created = lease.created();
+    let mut file = lease.file();
     let token = if created {
         let mut random = [0u8; 32];
         File::open("/dev/urandom")
@@ -97,19 +77,18 @@ fn acquire(path: &Path) -> Result<Owner, String> {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        writeln!(lease, "{token}")
-            .and_then(|_| lease.sync_all())
+        writeln!(file, "{token}")
+            .and_then(|_| file.sync_all())
             .map_err(|e| error(e.to_string()))?;
         token
     } else {
-        if lease.metadata().map_err(|e| error(e.to_string()))?.len() > 65 {
+        if file.metadata().map_err(|e| error(e.to_string()))?.len() > 65 {
             return Err(error(
                 "existing owner identity is oversized or malformed".into(),
             ));
         }
         let mut raw = String::new();
-        (&mut lease)
-            .take(256)
+        file.take(256)
             .read_to_string(&mut raw)
             .map_err(|e| error(e.to_string()))?;
         let token = raw.trim();
@@ -124,30 +103,9 @@ fn acquire(path: &Path) -> Result<Owner, String> {
     })
 }
 
-/// Inspect data is verified independently of Docker's listing filters. A label
-/// alone never authorizes deletion of an unrelated prefix; a prefix alone never
-/// authorizes deletion of another agent's or legacy unlabelled containers.
-pub(crate) fn owned_id(
-    value: &serde_json::Value,
-    owner: &str,
-    prefixes: &[&str],
-) -> Option<String> {
-    let id = value["Id"].as_str()?;
-    let name = value["Name"].as_str()?.strip_prefix('/')?;
-    if id.len() != 64
-        || !id.bytes().all(|b| b.is_ascii_hexdigit())
-        || !prefixes.iter().any(|prefix| name.starts_with(prefix))
-        || value["Labels"][LABEL].as_str() != Some(owner)
-    {
-        return None;
-    }
-    Some(id.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn ownership_survives_restart_and_distinct_agents_are_isolated() {
@@ -192,24 +150,5 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(acquire(&link).is_err());
-    }
-
-    #[test]
-    fn cleanup_requires_both_exact_prefix_and_matching_owner_for_all_states() {
-        let prefixes = ["quasar-sess-", "quasar-pulse-"];
-        for running in [true, false] {
-            for name in ["/quasar-sess-sid", "/quasar-pulse-sid"] {
-                let mut value = json!({"Id": "a".repeat(64), "Name": name,
-                    "Labels": {LABEL: "one"}, "State": {"Running": running}});
-                assert!(owned_id(&value, "one", &prefixes).is_some());
-                assert!(owned_id(&value, "two", &prefixes).is_none());
-                value["Labels"] = json!({});
-                assert!(owned_id(&value, "one", &prefixes).is_none());
-            }
-        }
-        for name in ["/other-quasar-sess-sid", "/database", "/quasar-session"] {
-            let value = json!({"Id": "b".repeat(64), "Name": name, "Labels": {LABEL: "one"}});
-            assert!(owned_id(&value, "one", &prefixes).is_none());
-        }
     }
 }

@@ -1,5 +1,6 @@
 //! Image operations exposed through Quasar types and bounded progress snapshots.
 use super::*;
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInfo {
@@ -35,11 +36,7 @@ impl<T> ImageOperation<T> {
             }
             let sample = *self.progress.borrow_and_update();
             progress(sample);
-            match self
-                .operation
-                .result
-                .recv_timeout(Duration::from_millis(100))
-            {
+            match self.operation.recv_timeout(Duration::from_millis(100)) {
                 Ok(result) => {
                     let sample = *self.progress.borrow_and_update();
                     progress(sample);
@@ -66,7 +63,7 @@ impl RuntimeClient {
     ) -> Operation<super::ExactRemoval> {
         let image_ref = image_ref.into();
         let expected_id = expected_id.into();
-        let config = self.config.clone();
+        let config = self.config().clone();
         self.submit_owned(
             async move { docker::remove_exact_image(&config, &image_ref, &expected_id).await },
             deadline,
@@ -78,7 +75,7 @@ impl RuntimeClient {
         request: BuildRequest,
         budget: Duration,
     ) -> ImageOperation<ImageInfo> {
-        let config = self.config.clone();
+        let config = self.config().clone();
         let (send, progress) = watch::channel(ImageProgress::default());
         ImageOperation {
             operation: self.submit_owned(
@@ -93,7 +90,7 @@ impl RuntimeClient {
     /// Remove a managed reference without forcing deletion of an in-use image.
     pub fn remove_image(&self, image: impl Into<String>, deadline: Duration) -> Operation<()> {
         let image = image.into();
-        let config = self.config.clone();
+        let config = self.config().clone();
         self.submit_owned(
             async move { docker::remove_image(&config, &image).await },
             deadline,
@@ -107,7 +104,7 @@ impl RuntimeClient {
         deadline: Duration,
     ) -> ImageOperation<ImageInfo> {
         let image = image.into();
-        let config = self.config.clone();
+        let config = self.config().clone();
         let (send, progress) = watch::channel(ImageProgress::default());
         ImageOperation {
             operation: self.submit_owned(

@@ -13,6 +13,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[path = "support/source_roots.rs"]
+mod source_roots;
+use source_roots::source_roots;
+
 /// Tokens that legitimately appear at more than one call site because the sites
 /// mean the *same* condition (the same failure reachable from two arms, or the
 /// same fact discovered by the session runner and by the standalone session
@@ -50,10 +54,6 @@ struct Site {
     file: String,
     line: usize,
     token: Option<String>,
-}
-
-fn src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -98,17 +98,18 @@ fn is_code(line: &str, start: usize) -> bool {
 /// the first argument. `gst::loggable_error!` and friends are not tracing macros
 /// and are skipped — the `!` must be preceded by exactly `warn` or `error`.
 fn collect_sites() -> Vec<Site> {
-    let root = src_root();
     let mut files = Vec::new();
-    rs_files(&root, &mut files);
+    for (root, prefix) in source_roots() {
+        let mut found = Vec::new();
+        rs_files(&root, &mut found);
+        files.extend(found.into_iter().map(|path| {
+            let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
+            (format!("{prefix}{rel}"), path)
+        }));
+    }
     let mut sites = Vec::new();
-    for path in files {
+    for (rel, path) in files {
         let text = std::fs::read_to_string(&path).expect("read source file");
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
         for (idx, line) in text.lines().enumerate() {
             for name in ["warn", "error"] {
                 let pat = format!("{name}!(");

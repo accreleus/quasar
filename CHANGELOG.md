@@ -186,6 +186,16 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The node agent's container-runtime layer is its own GStreamer-free crate (#355).**
+  `node-agent/crates/quasar-runtime` now holds the engine facade (socket discovery and
+  its refusals, the bounded client, error classification, registry credentials,
+  read-only container/image/engine inspection), the ownership label and owned-container
+  proof, container self-inspection, and two durable-state primitives: `DurableFile`
+  (write-temp, fsync, rename, fsync parent; the host-policy journal commits through it)
+  and `StateLease` (the non-blocking `flock` behind the ownership lease). It builds and
+  tests without GStreamer, glib or CUDA, so the RH-06 recovery actor can link it. Pure
+  refactor: agent behaviour, log tokens and wire messages are unchanged. `node-agent/` is
+  now a Cargo workspace; the Rust gates run with `--workspace`.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API

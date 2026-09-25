@@ -1586,6 +1586,7 @@ dependencies = [
  "input-linux",
  "libc",
  "pkg-config",
+ "quasar-runtime",
  "regex",
  "rustls",
  "rustls-pki-types",
@@ -1601,6 +1602,19 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "quasar-runtime"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bollard",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
