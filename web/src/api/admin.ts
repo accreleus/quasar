@@ -286,8 +286,8 @@ export function revokeHostEnrollment(token: string, id: string): Promise<void> {
 /** This request's reachability. The enroll-host flow reads the certificate
  *  fingerprint from here, so the value it pins is the one THIS browser session
  *  was served — and tells the operator to compare it against the startup log. */
-export function accessCheck(token: string): Promise<AccessCheck> {
-  return apiFetch<AccessCheck>("/admin/access-check", { token });
+export function accessCheck(token: string, signal?: AbortSignal): Promise<AccessCheck> {
+  return apiFetch<AccessCheck>("/admin/access-check", { token, signal });
 }
 
 // ── App catalog (P2-08) ───────────────────────────────────────────────────────

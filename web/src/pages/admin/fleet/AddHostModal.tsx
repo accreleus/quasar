@@ -12,14 +12,14 @@
  * so nothing is minted.
  */
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useAuth } from "../../../auth/context";
+import { useState, type ReactNode } from "react";
 import { Button } from "../../../components/Button";
 import { Modal } from "../../../components/Modal";
 import { IconCopy } from "../../../components/icons";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
 import type { AccessCheck } from "../../../api/types";
+import { useResource } from "../../../lib/resource/react";
 import {
   composeEnrollmentString,
   composeInstallCommand,
@@ -63,11 +63,17 @@ function certStateOf(check: AccessCheck): CertState {
   return { kind: "public_ca" };
 }
 
-type ImagesState = { kind: "loading" } | { kind: "ok"; images: ServedImages } | { kind: "missing" } | { kind: "error"; message: string };
+type ImagesState = { kind: "ok"; images: ServedImages } | { kind: "missing" } | { kind: "error"; message: string };
+
+/** What the dialog reads before it can create anything. Each half fails on its own,
+ *  so a certificate that cannot be read still shows why the images are missing. */
+type Setup = { cert: CertState; images: ImagesState };
 
 type Created = { enrollment: string; command: string | null; stack: string; expiresAt: string | null; nodeName: string | null };
 
 type Tab = "command" | "stack";
+
+type FetchScript = (origin: string, signal?: AbortSignal) => Promise<string>;
 
 /** `7A:3F:…:C2:19`: enough to compare by eye against the startup log's line. */
 function shortFingerprint(fp: string): string {
@@ -75,94 +81,83 @@ function shortFingerprint(fp: string): string {
   return parts.length > 4 ? `${parts.slice(0, 2).join(":")}:…:${parts.slice(-2).join(":")}` : fp;
 }
 
-async function fetchServedScript(origin: string): Promise<string> {
+async function fetchServedScript(origin: string, signal?: AbortSignal): Promise<string> {
   const url = installerScriptUrl(origin);
   if (!url) throw new Error("not https");
-  const res = await fetch(url, { cache: "no-store" });
+  const res = await fetch(url, { cache: "no-store", signal });
   if (!res.ok) throw new Error(`${url} answered ${res.status}`);
   return res.text();
 }
 
-export function AddHostModal({
-  open,
-  onClose,
-  connectedNodeNames = [],
-  origin = typeof window === "undefined" ? "" : window.location.origin,
-  fetchScript = fetchServedScript,
-}: {
-  open: boolean;
+type AddHostProps = {
   onClose: () => void;
   /** Node names whose agent is connected now: a command bound to one would be refused. */
   connectedNodeNames?: readonly string[];
   /** Overridable for tests; the page's origin otherwise. */
   origin?: string;
   /** Reads the served /enroll-host.sh; overridable for tests. */
-  fetchScript?: (origin: string) => Promise<string>;
-}) {
-  const { token } = useAuth();
+  fetchScript?: FetchScript;
+};
+
+/** Mounted per opening, so a previous host's token never survives a close. */
+export function AddHostModal({ open, ...props }: AddHostProps & { open: boolean }) {
+  return open ? <AddHostDialog {...props} /> : null;
+}
+
+function AddHostDialog({
+  onClose,
+  connectedNodeNames = [],
+  origin = typeof window === "undefined" ? "" : window.location.origin,
+  fetchScript = fetchServedScript,
+}: AddHostProps) {
   const wssUrl = agentWssUrl(origin);
-  // Read through a ref: a caller's inline function must not re-run the load.
-  const fetchScriptRef = useRef(fetchScript);
-  fetchScriptRef.current = fetchScript;
   const [tab, setTab] = useState<Tab>("command");
   const [nodeName, setNodeName] = useState("");
   const [expiry, setExpiry] = useState(0);
-  const [cert, setCert] = useState<CertState>({ kind: "loading" });
-  const [images, setImages] = useState<ImagesState>({ kind: "loading" });
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<ReactNode | null>(null);
   const [created, setCreated] = useState<Created | null>(null);
 
-  // HostsTab mounts this once and toggles `open`: a previous host's token must
-  // not survive a close/reopen.
-  useEffect(() => {
-    if (!open) return;
-    setCreated(null);
-    setError(null);
-    setCreating(false);
-    setNodeName("");
-    setExpiry(0);
-    setTab("command");
-  }, [open]);
-
-  useEffect(() => {
-    if (!open || !token || !wssUrl) return;
-    let cancelled = false;
-    setCert({ kind: "loading" });
-    setImages({ kind: "loading" });
-    adminApi
-      .accessCheck(token)
-      .then((check) => {
-        if (!cancelled) setCert(certStateOf(check));
-      })
-      .catch((e: unknown) => {
-        if (!cancelled)
-          setCert({ kind: "error", message: e instanceof ApiError ? e.message : "Could not read the served certificate." });
-      });
-    fetchScriptRef.current(origin)
-      .then((text) => {
-        if (cancelled) return;
-        const served = readServedImages(text);
-        setImages(served ? { kind: "ok", images: served } : { kind: "missing" });
-      })
-      .catch((e: unknown) => {
-        if (!cancelled)
-          setImages({ kind: "error", message: e instanceof Error ? e.message : "Could not read /enroll-host.sh." });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, token, wssUrl, origin]);
-
-  if (!open) return null;
+  const setup = useResource<Setup>(
+    {
+      label: "what Add host needs",
+      fetch: async ({ token, signal }) => {
+        // From a plain-http page nothing is composed, so nothing is read.
+        if (!wssUrl) return { cert: { kind: "public_ca" }, images: { kind: "missing" } };
+        const [cert, images] = await Promise.all([
+          adminApi.accessCheck(token, signal).then(
+            (check): CertState => certStateOf(check),
+            (e: unknown): CertState => ({
+              kind: "error",
+              message: e instanceof ApiError ? e.message : "Could not read the served certificate.",
+            }),
+          ),
+          fetchScript(origin, signal).then(
+            (text): ImagesState => {
+              const served = readServedImages(text);
+              return served ? { kind: "ok", images: served } : { kind: "missing" };
+            },
+            (e: unknown): ImagesState => ({
+              kind: "error",
+              message: e instanceof Error ? e.message : "Could not read /enroll-host.sh.",
+            }),
+          ),
+        ]);
+        return { cert, images };
+      },
+    },
+    [origin, wssUrl],
+  );
+  const cert: CertState = setup.data?.cert ?? { kind: "loading" };
+  const images = setup.data?.images;
 
   const fingerprint = cert.kind === "self_signed" ? cert.fingerprint : null;
   const spkiPin = cert.kind === "self_signed" ? cert.spkiPin : null;
   const certReady = cert.kind === "self_signed" || cert.kind === "public_ca" || cert.kind === "proxied";
-  const canCreate = !!token && !!wssUrl && certReady && images.kind === "ok" && !creating;
+  const canCreate = !!wssUrl && certReady && images?.kind === "ok" && !creating;
 
   async function create() {
-    if (!token || images.kind !== "ok") return;
+    if (images?.kind !== "ok") return;
     // Re-checked at the moment of spending: never burn the single-use token
     // when the command cannot be composed or would be refused.
     if (!canMintFrom(origin)) {
@@ -186,11 +181,14 @@ export function AddHostModal({
     setCreating(true);
     setError(null);
     try {
-      const { enrollment } = await adminApi.mintHostEnrollment(token, {
-        max_uses: 1,
-        expires_at: new Date(Date.now() + EXPIRY_OPTIONS[expiry].ms).toISOString(),
-        ...(name ? { node_name: name } : {}),
-      });
+      // mutate, not useAdminAction: a failure is shown inline in the dialog, never as a toast.
+      const { enrollment } = await setup.mutate(({ token }) =>
+        adminApi.mintHostEnrollment(token, {
+          max_uses: 1,
+          expires_at: new Date(Date.now() + EXPIRY_OPTIONS[expiry].ms).toISOString(),
+          ...(name ? { node_name: name } : {}),
+        }),
+      );
       const composed = composeEnrollmentString({ origin, fingerprint, token: enrollment.token });
       if (!composed.ok) {
         setError(composed.reason);
@@ -300,7 +298,7 @@ export function AddHostModal({
           {cert.message}
         </div>
       )}
-      {images.kind === "missing" && (
+      {images?.kind === "missing" && (
         <div className="note warn addhost-note" role="alert" data-testid="addhost-no-images">
           <strong>Could not create the command.</strong> This control plane names no seed and node-agent image to
           install. Set <span className="mono">QUASAR_ENROLL_SEED_IMAGE</span> and{" "}
@@ -308,7 +306,7 @@ export function AddHostModal({
           host&quot;).
         </div>
       )}
-      {images.kind === "error" && (
+      {images?.kind === "error" && (
         <div className="note warn addhost-note" role="alert">
           <strong>Could not create the command.</strong> The installer this control plane serves could not be read (
           {images.message}).
