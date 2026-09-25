@@ -211,6 +211,9 @@ struct Lab {
     /// Images whose process is given an agent socket it cannot bind.
     no_socket: Mutex<Vec<&'static str>>,
     orphan_check: Mutex<Duration>,
+    /// The test removed every actor container on purpose: until the seed has looked, a
+    /// seed that would create one is right, not racing.
+    operator_removed: AtomicBool,
     me: Weak<Lab>,
     stop: AtomicBool,
 }
@@ -289,6 +292,7 @@ impl Lab {
             inert: Mutex::new(Vec::new()),
             no_socket: Mutex::new(Vec::new()),
             orphan_check: Mutex::new(Duration::from_secs(3600)),
+            operator_removed: AtomicBool::new(false),
             me: me.clone(),
             stop: AtomicBool::new(false),
         });
@@ -321,6 +325,21 @@ impl Lab {
 
     fn seed(&self) -> seed::Seed {
         seed(&self.engine, self.dir.path(), SEED_ID)
+    }
+
+    /// The operator removes every recovery-actor container.
+    fn remove_every_actor(&self) {
+        self.operator_removed.store(true, Ordering::SeqCst);
+        for c in self.actors() {
+            self.engine.remove_container(&c.id).unwrap();
+        }
+    }
+
+    /// One look by the seed; it ends an operator's removal.
+    fn seed_step(&self) -> seed::Outcome {
+        let outcome = self.seed().step();
+        self.operator_removed.store(false, Ordering::SeqCst);
+        outcome
     }
 
     fn socket(&self) -> std::path::PathBuf {
@@ -483,6 +502,9 @@ impl Lab {
 
     /// The seed, looking at the machine right now, must never act beside a hand-over.
     fn check_seed(&self, at: &str) {
+        if self.operator_removed.load(Ordering::SeqCst) {
+            return;
+        }
         let state = self.engine.state();
         let containers: Vec<Container> = state.containers.values().map(view).collect();
         let decided = seed::decide(&file::read(self.dir.path()), &containers, Some(SEED_ID));
@@ -1026,11 +1048,9 @@ fn a_successor_that_cannot_start_after_the_old_actor_stopped_needs_one_command()
                 assert_restored(&lab, &result, &old, fix);
             }
             _ => {
-                for c in lab.actors() {
-                    lab.engine.remove_container(&c.id).unwrap();
-                }
+                lab.remove_every_actor();
                 assert!(
-                    matches!(lab.seed().step(), seed::Outcome::Created { .. }),
+                    matches!(lab.seed_step(), seed::Outcome::Created { .. }),
                     "{fix}"
                 );
                 let result = lab.outcome(fix);
@@ -1055,9 +1075,7 @@ fn with_every_actor_container_removed_the_seed_recreates_the_verified_actor() {
         let at = format!("every actor removed after {who:?} {phase:?}");
         let lab = Lab::new();
         at_phase(&lab, who, phase, |lab| {
-            for c in lab.actors() {
-                lab.engine.remove_container(&c.id).unwrap();
-            }
+            lab.remove_every_actor();
             true
         });
         hand_over(&lab);
@@ -1066,7 +1084,7 @@ fn with_every_actor_container_removed_the_seed_recreates_the_verified_actor() {
         });
         let verified = lab.seed_file().recovery_actor_image.reference();
         assert!(
-            matches!(lab.seed().step(), seed::Outcome::Created { .. }),
+            matches!(lab.seed_step(), seed::Outcome::Created { .. }),
             "{at}"
         );
         let result = lab.outcome(&at);
