@@ -254,6 +254,36 @@ fn gamepad_input_id() -> InputId {
     }
 }
 
+/// `UI_SET_PHYS` as the kernel defines it: `_IOW('U', 108, char *)`, so the
+/// size field is a POINTER's size. `input_linux`'s `set_phys` declares the
+/// argument as `c_char` (size 1), producing a request number the kernel does
+/// not recognise (EINVAL), which failed every session launch on the first
+/// #348 edge build. Direction/size/type/nr use the generic `_IOC` layout
+/// (x86-64, arm64).
+const UI_SET_PHYS: u64 = (1 << 30)
+    | ((std::mem::size_of::<*const libc::c_char>() as u64) << 16)
+    | ((b'U' as u64) << 8)
+    | 108;
+
+/// Set a uinput device's `phys` string (before `create`).
+fn set_phys(h: &UInputHandle<File>, phys: &str) -> Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let phys = std::ffi::CString::new(phys).context("phys contains a NUL byte")?;
+    // SAFETY: valid open uinput fd; the kernel copies the NUL-terminated
+    // string (strndup_user) before returning, so `phys` outlives the call.
+    let rc = unsafe {
+        libc::ioctl(
+            h.as_fd().as_raw_fd(),
+            UI_SET_PHYS as libc::Ioctl,
+            phys.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("UI_SET_PHYS");
+    }
+    Ok(())
+}
+
 /// Stable-ish synthetic IDs so the devices are recognizable in logs / udev.
 fn input_id(product: u16) -> InputId {
     InputId {
@@ -802,9 +832,14 @@ impl VirtualDevices {
         for s in &abs {
             h.set_absbit(s.axis)?;
         }
-        let phys = std::ffi::CString::new(gamepad_phys(tag))
-            .context("gamepad phys contains a NUL byte")?;
-        h.set_phys(&phys)?;
+        // Best-effort: `phys` is only a label, and must never cost the session
+        // its input devices (`VirtualDevices::create` failing ends the launch).
+        if let Err(e) = set_phys(&h, &gamepad_phys(tag)) {
+            tracing::warn!(
+                token = "vinput-set-phys-failed",
+                "gamepad phys not set (device still created): {e:#}"
+            );
+        }
         h.create(&gamepad_input_id(), GAMEPAD_NAME.as_bytes(), 0, &abs)?;
         Ok(h)
     }
@@ -1266,6 +1301,16 @@ mod tests {
         // The gamepad carries its tag in `phys` instead of the name.
         assert!(gamepad_phys(a).contains(a));
         assert_ne!(gamepad_phys(a), gamepad_phys(b));
+    }
+
+    /// The request number must be the kernel's `UI_SET_PHYS`
+    /// (`_IOW('U', 108, char *)`), not input_linux's 1-byte variant.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn ui_set_phys_matches_the_kernel_request_number() {
+        assert_eq!(UI_SET_PHYS, 0x4008_556c);
+        // input_linux's `ui_set_phys` sizes the argument as one byte.
+        assert_ne!(UI_SET_PHYS, 0x4001_556c);
     }
 
     /// The gamepad name is stable across sessions (SDL folds it into the
