@@ -94,7 +94,7 @@
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--s2);
   min-width: 0;
   color: var(--text);
   text-decoration: none;
@@ -140,8 +140,8 @@
   height: var(--control-h);
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 0 14px;
+  gap: var(--s2);
+  padding: 0 var(--s4);
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
   background: color-mix(in oklch, var(--surf-inset) 76%, transparent);
@@ -170,7 +170,7 @@
   font-size: 10px;
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
-  padding: 1px 5px;
+  padding: 1px var(--s1);
   color: var(--text-3);
 }
 
@@ -184,9 +184,9 @@
 .user-btn {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
   height: var(--control-h);
-  padding: 0 8px 0 6px;
+  padding: 0 var(--s2) 0 var(--s2);
   border: 1px solid transparent;
   background: none;
   border-radius: var(--r-control);
@@ -248,7 +248,7 @@
   right: 0;
   z-index: 80;
   width: 248px;
-  padding: 6px;
+  padding: var(--s2);
   background: color-mix(in oklch, var(--surf-raised) 90%, transparent);
   backdrop-filter: blur(28px);
   -webkit-backdrop-filter: blur(28px);
@@ -273,10 +273,10 @@
 .up-head {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 10px 10px 12px;
+  gap: var(--s3);
+  padding: var(--s3) var(--s3) var(--s3);
   border-bottom: 1px solid var(--line);
-  margin-bottom: 6px;
+  margin-bottom: var(--s2);
 }
 
 .up-head .u-ava {
@@ -300,9 +300,9 @@
 .up-item {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--s3);
   width: 100%;
-  padding: 9px 10px;
+  padding: var(--s2) var(--s3);
   border: 0;
   border-radius: var(--r-control);
   background: none;
@@ -350,7 +350,7 @@
 .up-div {
   height: 1px;
   background: var(--line);
-  margin: 6px 4px;
+  margin: var(--s2) var(--s1);
 }
 
 .up-val {
@@ -377,8 +377,8 @@
   -webkit-backdrop-filter: blur(26px) saturate(112%);
   display: flex;
   flex-direction: column;
-  padding: var(--s3) 10px;
-  gap: 2px;
+  padding: var(--s3) var(--s2);
+  gap: var(--s1);
   overflow: hidden auto;
 }
 
@@ -386,9 +386,9 @@
   position: relative;
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--s3);
   height: 36px;
-  padding: 0 10px;
+  padding: 0 var(--s2);
   border: 0;
   border-radius: var(--r-control);
   background: none;
@@ -457,7 +457,7 @@
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 500;
-  padding: 1px 6px;
+  padding: 1px var(--s1);
   border-radius: var(--r-pill);
   flex: none;
 }
@@ -473,7 +473,7 @@
   text-transform: uppercase;
   color: var(--text-4);
   font-weight: 700;
-  padding: var(--s4) 10px var(--s2);
+  padding: var(--s4) var(--s2) var(--s2);
 }
 
 .rail-foot {
@@ -516,7 +516,7 @@
 .nav {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--s1);
   flex-wrap: nowrap;
   min-width: 0;
 }
@@ -528,7 +528,7 @@
   color: var(--text-3);
   font-size: var(--t-sm);
   font-weight: 600;
-  padding: 8px 13px;
+  padding: var(--s2) var(--s3);
   border-radius: var(--r-control);
   text-decoration: none;
   transition: background 0.15s ease, color 0.15s ease;
@@ -653,7 +653,7 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 3px;
+    gap: var(--s1);
     position: relative;
     color: var(--text-3);
     font-size: var(--t-xs);
@@ -721,8 +721,8 @@
   }
 
   .user-btn {
-    gap: 7px;
-    padding-inline: 6px;
+    gap: var(--s2);
+    padding-inline: var(--s2);
   }
 
   .user-btn .u-nm {

@@ -44,6 +44,7 @@ import {
   NO_USER_KEY,
   type StorageUserGroup,
 } from "./storageGroups";
+import "../../../styles/admin/fleet.css";
 
 const HOME_GC_JOB_ID = "home.gc";
 
@@ -213,7 +214,7 @@ export function StorageTab() {
       render: (h) => (
         <div className="qtable-stack">
           {isHostOrphaned(h) ? (
-            <span className="sub" style={{ color: "var(--warning-text)" }}>Host deleted</span>
+            <span className="sub tone-warning">Host deleted</span>
           ) : (
             <span>{h.host_name}</span>
           )}
@@ -243,9 +244,10 @@ export function StorageTab() {
     },
     {
       key: "size",
-      header: <span style={{ display: "block", textAlign: "right" }}>Size</span>,
+      header: "Size",
       mobileLabel: "Size",
-      render: (h) => <span style={{ display: "block", textAlign: "right" }}>{bytes(h.bytes_used)}</span>,
+      align: "right",
+      render: (h) => bytes(h.bytes_used),
     },
     {
       key: "state",
@@ -311,9 +313,10 @@ export function StorageTab() {
     },
     {
       key: "size",
-      header: <span style={{ display: "block", textAlign: "right" }}>Size</span>,
+      header: "Size",
       mobileLabel: "Size",
-      render: (g) => <span style={{ display: "block", textAlign: "right" }}>{bytes(g.totalBytes)}</span>,
+      align: "right",
+      render: (g) => bytes(g.totalBytes),
     },
     {
       key: "state",
@@ -384,27 +387,27 @@ export function StorageTab() {
 
       {!res.loading && (
         <>
-          <div className="grid g4" style={{ marginBottom: "var(--s5)" }}>
+          <div className="grid g4 mb5">
             <div className="card card-pad">
               <div className="eyebrow">Managed homes</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{homes.length}</div>
+              <div className="kpi-val mt2">{homes.length}</div>
               <div className="kpi-meta">across {hostsWithHomes} host{hostsWithHomes === 1 ? "" : "s"}</div>
             </div>
             <div className="card card-pad">
               <div className="eyebrow">Total size</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{bytes(totalBytes)}</div>
+              <div className="kpi-val mt2">{bytes(totalBytes)}</div>
               {allocatedMb > 0 && (
                 <div className="kpi-meta">of {bytesFromMb(allocatedMb)} allocated</div>
               )}
             </div>
             <div className="card card-pad">
               <div className="eyebrow">Active</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{activeCount}</div>
+              <div className="kpi-val mt2">{activeCount}</div>
               <div className="kpi-meta">attached to a user</div>
             </div>
             <div className="card card-pad">
               <div className="eyebrow">Pending cleanup</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{pendingHomes.length}</div>
+              <div className="kpi-val mt2">{pendingHomes.length}</div>
               {pendingHomes.length > 0 && (
                 <div className="kpi-meta">{bytes(pendingBytes)} reclaimable</div>
               )}
@@ -453,20 +456,20 @@ export function StorageTab() {
             isExpanded={(g) => expandedKeys.has(g.key)}
             onToggleExpand={(g) => toggleExpand(g.key)}
           />
-          <div className="card" style={{ marginTop: "var(--s5)" }}>
+          <div className="card mt5">
             <div className="panel-head">
               <span className="panel-title">Home ownership</span>
               <span className="hint">Claims can remain after a failed launch. Recorded hosts are bookkeeping, not proof of files.</span>
             </div>
             {claims?.unsupported ? (
-              <p className="hint" style={{ padding: "var(--s4)" }}>Ownership diagnosis is unavailable on this control plane.</p>
+              <p className="hint storage-pad">Ownership diagnosis is unavailable on this control plane.</p>
             ) : (
               <>
                 <ResourceStates loading={claimsRes.loading} error={claimsRes.errorMessage} />
                 {!claimsRes.loading && <Table columns={claimColumns} rows={claims?.items ?? []}
                   rowKey={(c) => `${c.user_id}:${c.canonical_app_id}`}
                   empty="No home ownership claims on this page." />}
-                <div className="row gap3" style={{ padding: "var(--s4)" }}>
+                <div className="row gap3 storage-pad">
                   <Button variant="ghost" disabled={claimCursors.length === 1}
                     onClick={() => setClaimCursors((current) => current.slice(0, -1))}>Previous</Button>
                   <span className="hint">Page {claimCursors.length}</span>
@@ -503,43 +506,40 @@ export function StorageTab() {
         }
       >
         {tombstoning && (
-          <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
-            <p style={{ color: "var(--text-2)" }}>
+          <div className="col gap4">
+            <p className="sec">
               Mark this home for deletion. The GC janitor will reap the backing store.
             </p>
-            <div
-              className="panel"
-              style={{ padding: "var(--s4)", display: "flex", flexDirection: "column", gap: "var(--s2)" }}
-            >
+            <div className="panel col gap2 storage-pad storage-facts">
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>User</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)" }} title={tombstoning.user_id ?? undefined}>
+                <span className="muted" style={{ minWidth: 64 }}>User</span>
+                <span className="mono" title={tombstoning.user_id ?? undefined}>
                   {tombstoning.username ?? "No linked user"}
                 </span>
               </div>
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>App</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)" }} title={tombstoning.app_id ?? undefined}>
+                <span className="muted" style={{ minWidth: 64 }}>App</span>
+                <span className="mono" title={tombstoning.app_id ?? undefined}>
                   {tombstoning.app_name ?? "App deleted"}
                 </span>
               </div>
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>Size</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)" }}>
+                <span className="muted" style={{ minWidth: 64 }}>Size</span>
+                <span className="mono">
                   {bytes(tombstoning.bytes_used)}
                 </span>
               </div>
               {/* Full home id: names are neither unique nor rename-stable, so
                   the operator sees the exact row being destroyed. */}
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>Home</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)", overflowWrap: "anywhere" }}>
+                <span className="muted" style={{ minWidth: 64 }}>Home</span>
+                <span className="mono storage-id">
                   {tombstoning.id}
                 </span>
               </div>
             </div>
             {tombstoneError && (
-              <p style={{ color: "var(--danger-text)", fontSize: "var(--t-sm)" }}>
+              <p className="form-error">
                 {tombstoneError}
               </p>
             )}
@@ -562,7 +562,7 @@ export function StorageTab() {
           </>
         }
       >
-        <p style={{ color: "var(--text-2)" }}>
+        <p className="sec">
           Runs the cleanup job now on {pendingHostIds.length} host{pendingHostIds.length === 1 ? "" : "s"}.
           Homes tombstoned less than 24 hours ago stay until their grace period ends.
         </p>

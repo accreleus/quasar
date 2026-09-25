@@ -18,7 +18,8 @@
 
 /* The mock indents the id under the status dot rather than under the cell. */
 .hosts-page .host-row-id {
-  margin-top: 2px;
+  margin-top: var(--s1);
+  /* design-lint-allow spacing-scale: indents the id under the name, past the status dot */
   padding-left: 17px;
 }
 
@@ -27,7 +28,7 @@
    but its table never groups. Shared by both tabs, so it is not page-scoped. */
 .qtable tbody tr.group-row > td {
   background: color-mix(in oklch, var(--surf-inset) 60%, transparent);
-  padding: 7px var(--s5);
+  padding: var(--s2) var(--s5);
   height: auto;
   display: table-cell;
 }
@@ -42,15 +43,16 @@
 .exp-row .note,
 .exp-row .form-error,
 .exp-row .exp-note {
+  /* design-lint-allow spacing-scale: aligns with .exp-in's 44px text column */
   margin: var(--s4) var(--s5) var(--s4) 44px;
 }
 
 .exp-actions {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--s2);
   align-items: flex-start;
-  margin-top: 2px;
+  margin-top: var(--s1);
 }
 
 /* `.qtable tbody td` is nowrap so a collapsed row stays on one line, and
@@ -60,6 +62,7 @@
    the container: one declaration covers the card, and a descendant that wants
    nowrap back still says so itself. */
 .hosts-page .exp-readiness {
+  /* design-lint-allow spacing-scale: aligns with .exp-in's 44px text column */
   padding: 0 var(--s5) var(--s5) 44px;
   white-space: normal;
 }
@@ -91,7 +94,7 @@
 
 /* The drawer's storage bars sit above the facts and need the same rhythm. */
 .hosts-page .exp-in .bar-row {
-  padding: 5px 0;
+  padding: var(--s1) 0;
 }
 
 /* ── Jobs ─────────────────────────────────────────────────────────── */
@@ -152,7 +155,7 @@
   flex-direction: row;
   flex-wrap: wrap;
   align-items: center;
-  margin-top: 9px;
+  margin-top: var(--s2);
 }
 
 /* A failed run's message, on its own full-width row under the run. `.exp-row`
@@ -160,7 +163,7 @@
    so it aligns with the cells rather than with a chevron. */
 .jobs-page .exp-row .run-error {
   margin: 0;
-  padding: var(--s3) 14px;
+  padding: var(--s3) var(--s4);
 }
 
 /* ── Host detail ──────────────────────────────────────────────────── */
@@ -183,7 +186,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--s2);
 }
 
 .host-detail-page .cap-name {
@@ -219,7 +222,7 @@
 .enroll-fact {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--s1);
   font-size: var(--t-sm);
   color: var(--text-2);
 }
@@ -233,7 +236,7 @@
   background: var(--surf-inset);
   border: 1px solid var(--line);
   border-radius: var(--r-control);
-  padding: 9px 11px;
+  padding: var(--s2) var(--s3);
 }
 
 .enroll-snippet pre {
@@ -354,9 +357,9 @@
 }
 .rel-e > summary {
   display: flex;
-  gap: 11px;
+  gap: var(--s3);
   align-items: baseline;
-  padding: 9px var(--card-pad);
+  padding: var(--s2) var(--card-pad);
   cursor: pointer;
   list-style: none;
 }
@@ -399,7 +402,8 @@
   transform: rotate(180deg);
 }
 .rel-b {
-  padding: 2px var(--card-pad) 13px calc(var(--card-pad) + 47px);
+  /* design-lint-allow spacing-scale: aligns under the summary text, past chevron and version */
+  padding: var(--s1) var(--card-pad) var(--s3) calc(var(--card-pad) + 47px);
   font-size: var(--t-sm);
   color: var(--text-3);
   line-height: 1.6;
@@ -421,7 +425,7 @@
   font-size: 0.85em;
   color: var(--text-2);
   background: var(--ink-5);
-  padding: 1px 4px;
+  padding: 1px var(--s1);
   border-radius: 3px;
 }
 
@@ -431,7 +435,7 @@
   justify-content: space-between;
   align-items: center;
   gap: var(--s3);
-  padding: 7px 0;
+  padding: var(--s2) 0;
   border-top: 1px solid var(--line);
   font-size: var(--t-sm);
 }
@@ -444,13 +448,13 @@
 .rel-fact.stack {
   flex-direction: column;
   align-items: stretch;
-  gap: 3px;
+  gap: var(--s1);
 }
 .rel-holdout {
   display: flex;
   justify-content: space-between;
   gap: var(--s2);
-  padding: 4px 0;
+  padding: var(--s1) 0;
   font-size: var(--t-xs);
 }
 /* The per-host detail: today's targets table, its manual recipes and its
@@ -470,4 +474,17 @@
 .rel-split > * { min-width: 0; }
 @media (max-width: 1240px) {
   .rel-split { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Storage tab: the ownership card's inner rows and the delete modal's facts. */
+.storage-pad {
+  padding: var(--s4);
+}
+
+.storage-facts {
+  font-size: var(--t-sm);
+}
+
+.storage-id {
+  overflow-wrap: anywhere;
 }

@@ -25,6 +25,11 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Design lint for the web client (#370).** `npm run lint:design` checks every
+  stylesheet and component for off-scale spacing, raw colours and inline styles, and
+  each failure names the token or utility class to use instead. A per-file baseline
+  records the existing debt and only ratchets down. CSS spacing now snaps to the 4px
+  token scale, so gaps and padding shift by a few pixels across the UI.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds

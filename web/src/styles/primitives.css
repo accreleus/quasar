@@ -59,7 +59,7 @@
 .page-head .sub {
   color: var(--text-3);
   font-size: var(--t-sm);
-  margin: 5px 0 0;
+  margin: var(--s1) 0 0;
   max-width: 70ch;
   text-wrap: pretty;
 }
@@ -79,10 +79,10 @@
 .crumbs {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--s2);
   font-size: var(--t-sm);
   color: var(--text-3);
-  margin-bottom: 10px;
+  margin-bottom: var(--s3);
   flex-wrap: wrap;
 }
 
@@ -202,7 +202,7 @@
   align-items: baseline;
   justify-content: space-between;
   gap: var(--s4);
-  padding: 7px 0;
+  padding: var(--s2) 0;
   border-top: 1px solid var(--line);
   font-size: var(--t-sm);
 }
@@ -229,8 +229,8 @@
 .stat-cards {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  padding: 8px 18px 14px;
+  gap: var(--s3);
+  padding: var(--s2) var(--s5) var(--s4);
 }
 
 @media (max-width: 900px) {
@@ -239,8 +239,8 @@
 
 [data-axis="v"] .stat-cards {
   grid-template-columns: 1fr;
-  gap: 10px;
-  padding: 9px 14px 14px;
+  gap: var(--s3);
+  padding: var(--s2) var(--s4) var(--s4);
   overflow-y: auto;
 }
 
@@ -266,7 +266,7 @@
    ------------------------------------------------------------------ */
 .tabs {
   display: flex;
-  gap: 2px;
+  gap: var(--s1);
   border-bottom: 1px solid var(--line-2);
   margin-bottom: var(--s5);
   overflow-x: auto;
@@ -278,7 +278,7 @@
   align-items: center;
   white-space: nowrap;
   height: 36px;
-  padding: 0 14px;
+  padding: 0 var(--s4);
   border: 0;
   background: none;
   color: var(--text-3);
@@ -306,7 +306,7 @@
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-4);
-  margin-left: 6px;
+  margin-left: var(--s2);
 }
 
 /* ------------------------------------------------------------------
@@ -338,7 +338,7 @@
 .empty h3 {
   font-size: var(--t-h3);
   color: var(--text);
-  margin-bottom: 6px;
+  margin-bottom: var(--s2);
 }
 
 .empty p {
@@ -357,9 +357,9 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
+  gap: var(--s2);
   height: var(--control-h);
-  padding: 0 13px;
+  padding: 0 var(--s3);
   border-radius: var(--r-control);
   border: 1px solid var(--line-3);
   background: color-mix(in oklch, var(--surf-control) 70%, transparent);
@@ -458,7 +458,7 @@
 
 .btn-sm {
   height: 28px;
-  padding: 0 12px;
+  padding: 0 var(--s3);
   font-size: var(--t-xs);
   letter-spacing: .01em;
 }
@@ -472,7 +472,7 @@
 /* .btn-lg survives from the login/setup card, which needs a 46px CTA. */
 .btn-lg {
   height: 46px;
-  padding: 0 24px;
+  padding: 0 var(--s6);
   font-size: var(--t-base);
 }
 
@@ -556,7 +556,7 @@
 .gbar {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--s1);
   justify-content: flex-end;
 }
 
@@ -684,7 +684,7 @@
 .sec-head .desc {
   color: var(--text-3);
   font-size: var(--t-sm);
-  margin-top: 5px;
+  margin-top: var(--s1);
   max-width: 68ch;
 }
 
@@ -702,9 +702,9 @@
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--s1);
   height: 21px;
-  padding: 0 8px;
+  padding: 0 var(--s2);
   border-radius: var(--r-pill);
   font-family: var(--font-mono);
   font-size: 10px;
@@ -735,7 +735,7 @@
 /* Denser variant used inside table rows and readiness lists. */
 .chip-sm {
   height: 18px;
-  padding: 0 6px;
+  padding: 0 var(--s1);
   font-size: 9px;
 }
 
@@ -757,7 +757,7 @@
 .sdot.off  { color: var(--text-4); }
 
 .shdr-title {
-  gap: 11px;
+  gap: var(--s3);
 }
 
 .shdr-title .sdot {
@@ -773,9 +773,9 @@
 .tier {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--s2);
   height: 26px;
-  padding: 0 11px;
+  padding: 0 var(--s3);
   border-radius: var(--r-control);
   font-family: var(--font-mono);
   font-weight: 600;
@@ -823,14 +823,14 @@
 .caps {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--s2);
 }
 
 .cap {
   font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: .04em;
-  padding: 3px 7px;
+  padding: var(--s1) var(--s2);
   border: 1px solid var(--line-2);
   border-radius: var(--r-control);
   color: var(--text-3);
@@ -855,7 +855,7 @@
 .field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--s2);
 }
 
 .label {
@@ -874,7 +874,7 @@
 .textarea,
 .select {
   height: var(--control-h);
-  padding: 0 13px;
+  padding: 0 var(--s3);
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
   background-color: color-mix(in oklch, var(--surf-inset) 76%, transparent);
@@ -923,7 +923,7 @@
 textarea.input {
   height: auto;
   min-height: 84px;
-  padding: 9px 13px;
+  padding: var(--s2) var(--s3);
   line-height: 1.6;
   resize: vertical;
 }
@@ -940,7 +940,7 @@ textarea.input {
    an ::after because Chrome does not paint pseudo-elements on a bare
    <select>, and SelectField renders exactly that. */
 .select {
-  padding-right: 32px;
+  padding-right: var(--s7);
   appearance: none;
   cursor: pointer;
   background-image:
@@ -963,9 +963,9 @@ textarea.input {
 .search {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
   height: var(--control-h);
-  padding: 0 14px;
+  padding: 0 var(--s4);
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
   background-color: color-mix(in oklch, var(--surf-inset) 76%, transparent);
@@ -1114,7 +1114,7 @@ textarea.input {
 .check {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--s2);
   font-size: var(--t-sm);
   color: var(--text-2);
   min-height: 2.75rem;
@@ -1158,8 +1158,8 @@ textarea.input {
 /* Segmented control: an 8px inset trough holding 4px segments. */
 .segmented {
   display: inline-flex;
-  padding: 3px;
-  gap: 2px;
+  padding: var(--s1);
+  gap: var(--s1);
   background: color-mix(in oklch, var(--surf-inset) 72%, transparent);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
@@ -1169,7 +1169,7 @@ textarea.input {
 
 .segmented button {
   height: calc(var(--control-h) - 10px);
-  padding: 0 12px;
+  padding: 0 var(--s3);
   border: 1px solid transparent;
   background: none;
   border-radius: var(--r-control);
@@ -1180,7 +1180,7 @@ textarea.input {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: var(--s1);
   white-space: nowrap;
   transition: background .16s ease, color .16s ease;
 }
@@ -1211,13 +1211,13 @@ textarea.input {
 .kv {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--s2);
   align-items: flex-start;
 }
 
 .kv-row {
   display: flex;
-  gap: 8px;
+  gap: var(--s2);
   align-items: center;
   width: 100%;
 }
@@ -1271,14 +1271,14 @@ table.qtable {
   letter-spacing: .08em;
   text-transform: uppercase;
   color: var(--text-2);
-  padding: 0 14px;
+  padding: 0 var(--s3);
   height: 34px;
   border-bottom: 1px solid oklch(0.9618 0.0086 247.91/.13);
   white-space: nowrap;
 }
 
 .qtable tbody td {
-  padding: 10px 14px;
+  padding: var(--s3) var(--s3);
   line-height: 1.4;
   height: var(--row-h);
   border-bottom: 1px solid oklch(0.9618 0.0086 247.91/.07);
@@ -1288,7 +1288,7 @@ table.qtable {
 }
 
 [data-density="dense"] .qtable tbody td {
-  padding: 5px 14px;
+  padding: var(--s1) var(--s3);
 }
 
 .qtable tbody tr:last-child td {
@@ -1357,7 +1357,7 @@ td.cell-actions > * + * {
   font-size: var(--t-xs);
   color: var(--text-3);
   background: var(--surf-control);
-  padding: 2px 6px;
+  padding: var(--s1) var(--s1);
   border-radius: var(--r-control);
 }
 
@@ -1371,14 +1371,14 @@ td.cell-actions > * + * {
 .rowflex {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--s2);
 }
 
 /* Sortable column header (Table.tsx). */
 .th-sort-btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--s1);
   border: 0;
   background: none;
   padding: 0;
@@ -1462,6 +1462,7 @@ td.cell-actions > * + * {
   display: flex;
   flex-wrap: wrap;
   gap: var(--s5) var(--s6);
+  /* design-lint-allow spacing-scale: the expansion's 44px text column */
   padding: var(--s5) var(--s5) var(--s5) 44px;
   border-top: 0;
 }
@@ -1478,7 +1479,7 @@ td.cell-actions > * + * {
 }
 
 .exp-in .eyebrow {
-  margin-bottom: 7px;
+  margin-bottom: var(--s2);
 }
 
 .exp-fact {
@@ -1487,7 +1488,7 @@ td.cell-actions > * + * {
   justify-content: space-between;
   gap: 1px var(--s3);
   font-size: var(--t-sm);
-  padding: 5px 0;
+  padding: var(--s1) 0;
   border-bottom: 1px solid var(--line);
 }
 
@@ -1554,7 +1555,7 @@ td.cell-actions > * + * {
 .bar-row {
   display: grid;
   grid-template-columns: 62px 1fr auto;
-  gap: 10px;
+  gap: var(--s3);
   align-items: center;
   font-size: var(--t-xs);
   color: var(--text-3);
@@ -1643,6 +1644,7 @@ td.cell-actions > * + * {
 .signal {
   display: inline-flex;
   align-items: flex-end;
+  /* design-lint-allow spacing-scale: signal glyph geometry, 3.5px bars in 16px */
   gap: 2.5px;
   height: 16px;
 }
@@ -1668,10 +1670,10 @@ td.cell-actions > * + * {
 .u2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 5px 12px;
+  gap: var(--s1) var(--s3);
 }
 
-.u2 .bar-row { gap: 5px; }
+.u2 .bar-row { gap: var(--s1); }
 .u2 .bar { min-width: 20px; }
 .u2 .bar-row > span:first-child { font-size: 9px; }
 
@@ -1685,7 +1687,7 @@ td.cell-actions > * + * {
   border: 1px solid var(--glass-border);
   border-left: 2px solid var(--accent);
   border-radius: var(--r-control);
-  padding: 11px 13px;
+  padding: var(--s3) var(--s3);
   font-size: var(--t-sm);
   color: var(--text-2);
   line-height: 1.45;
@@ -1706,7 +1708,7 @@ td.cell-actions > * + * {
   color: var(--accent-text);
   flex: none;
   vertical-align: -3px;
-  margin-right: 7px;
+  margin-right: var(--s2);
 }
 
 .note.warn svg {
@@ -1733,7 +1735,7 @@ td.cell-actions > * + * {
   border-radius: var(--r-panel);
   box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
   min-width: 186px;
-  padding: 5px;
+  padding: var(--s1);
 }
 
 .menu {
@@ -1757,12 +1759,12 @@ td.cell-actions > * + * {
 .row-menu-item {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--s2);
   width: 100%;
   border: 0;
   background: none;
   text-align: left;
-  padding: 7px 10px;
+  padding: var(--s2) var(--s3);
   border-radius: var(--r-control);
   cursor: pointer;
   font-family: var(--font-ui);
@@ -1807,7 +1809,7 @@ td.cell-actions > * + * {
 .row-menu-pop hr {
   border: 0;
   border-top: 1px solid var(--line);
-  margin: 5px 0;
+  margin: var(--s1) 0;
 }
 
 /* ActionsMenu's separator entry (ActionsMenu.tsx's ActionsMenuSeparator) —
@@ -1815,7 +1817,7 @@ td.cell-actions > * + * {
 .row-menu-pop hr {
   border: 0;
   border-top: 1px solid var(--line-2);
-  margin: 4px 0;
+  margin: var(--s1) 0;
 }
 
 /* Kebab trigger on a table row. */
@@ -1999,8 +2001,8 @@ td.cell-actions > * + * {
 .pal-in {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 16px;
+  gap: var(--s3);
+  padding: 0 var(--s4);
   height: 52px;
   border-bottom: 1px solid var(--line);
 }
@@ -2039,7 +2041,7 @@ td.cell-actions > * + * {
 .pal-list {
   max-height: min(420px, 56vh);
   overflow: auto;
-  padding: 6px;
+  padding: var(--s2);
 }
 
 .pal-sec {
@@ -2049,18 +2051,18 @@ td.cell-actions > * + * {
   text-transform: uppercase;
   color: var(--text-4);
   font-weight: 700;
-  padding: 10px 12px 5px;
+  padding: var(--s3) var(--s3) var(--s1);
 }
 
 .pal-item {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--s3);
   width: 100%;
   border: 0;
   background: none;
   text-align: left;
-  padding: 8px 12px;
+  padding: var(--s2) var(--s3);
   border-radius: var(--r-control);
   cursor: pointer;
   font-size: var(--t-sm);
@@ -2095,11 +2097,11 @@ td.cell-actions > * + * {
 
 .pal-foot {
   border-top: 1px solid var(--line);
-  padding: 9px 16px;
+  padding: var(--s2) var(--s4);
   font-size: var(--t-xs);
   color: var(--text-4);
   display: flex;
-  gap: 16px;
+  gap: var(--s4);
 }
 
 /* Toasts. */
@@ -2166,7 +2168,7 @@ td.cell-actions > * + * {
 .toast .t-body {
   font-size: var(--t-sm);
   color: var(--text-3);
-  margin-top: 2px;
+  margin-top: var(--s1);
 }
 
 .toast .toast-action {
@@ -2272,8 +2274,8 @@ td.cell-actions > * + * {
 .kpi-row {
   display: flex;
   align-items: flex-end;
-  gap: 10px;
-  margin-top: 9px;
+  gap: var(--s3);
+  margin-top: var(--s2);
 }
 
 .kpi-val {
@@ -2288,25 +2290,25 @@ td.cell-actions > * + * {
   font-size: .95rem;
   color: var(--text-2);
   font-weight: 500;
-  margin-left: 4px;
+  margin-left: var(--s1);
 }
 
 .kpi-trend {
   margin-left: auto;
-  margin-bottom: 3px;
+  margin-bottom: var(--s1);
 }
 
 .kpi-meta {
   font-size: var(--t-sm);
   color: var(--text-3);
-  margin-top: 7px;
+  margin-top: var(--s2);
 }
 
 /* Stat tile (Stat/StatGrid) — the non-clickable sibling of .kpi. */
 .stat {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--s2);
 }
 
 .stat .k {
@@ -2330,7 +2332,7 @@ td.cell-actions > * + * {
   font-size: .95rem;
   color: var(--text-2);
   font-weight: 500;
-  margin-left: 4px;
+  margin-left: var(--s1);
 }
 
 .stat .meta {
@@ -2360,7 +2362,7 @@ td.cell-actions > * + * {
 }
 
 .cset p {
-  margin: 4px 0 0;
+  margin: var(--s1) 0 0;
   max-width: 62ch;
 }
 
@@ -2400,7 +2402,7 @@ td.cell-actions > * + * {
 }
 
 .fsec .fs-label p {
-  margin: 6px 0 0;
+  margin: var(--s2) 0 0;
   font-size: var(--t-sm);
   color: var(--text-3);
   line-height: 1.45;
@@ -2420,8 +2422,8 @@ td.cell-actions > * + * {
 .rung {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 0;
+  gap: var(--s3);
+  padding: var(--s2) 0;
   border-bottom: 1px solid var(--line);
 }
 
@@ -2447,7 +2449,7 @@ td.cell-actions > * + * {
 
 .rung .ctl {
   display: flex;
-  gap: 2px;
+  gap: var(--s1);
   opacity: .55;
   transition: opacity .12s ease;
 }
@@ -2513,8 +2515,8 @@ td.cell-actions > * + * {
 .spec-pill .sp {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 5px 11px;
+  gap: var(--s1);
+  padding: var(--s1) var(--s3);
   border-left: 1px solid var(--line-2);
   color: var(--text-2);
 }

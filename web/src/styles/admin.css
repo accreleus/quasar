@@ -16,9 +16,9 @@
 /* Needs attention: icon, title + mono detail, age + CTA. */
 .alert-row {
   display: flex;
-  gap: 12px;
+  gap: var(--s3);
   align-items: flex-start;
-  padding: 13px var(--card-pad);
+  padding: var(--s3) var(--card-pad);
   border-bottom: 1px solid var(--line);
 }
 
@@ -63,7 +63,7 @@
   font-size: var(--t-xs);
   font-family: var(--font-mono);
   color: var(--text-3);
-  margin-top: 3px;
+  margin-top: var(--s1);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -72,7 +72,7 @@
 .alert-act {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--s3);
   flex: none;
 }
 
@@ -84,20 +84,20 @@
 
 /* Pinned to the bottom of the card so the two cards in the row end level. */
 .alert-foot {
-  padding: 11px var(--card-pad);
+  padding: var(--s3) var(--card-pad);
   margin-top: auto;
 }
 
 /* Recent activity: time, actor, action, target on one baseline. */
 .act-list {
-  padding: 6px 0;
+  padding: var(--s2) 0;
 }
 
 .act-row {
   display: flex;
-  gap: 11px;
+  gap: var(--s3);
   align-items: baseline;
-  padding: 9px var(--card-pad);
+  padding: var(--s2) var(--card-pad);
   font-size: var(--t-sm);
 }
 
@@ -136,7 +136,7 @@
 }
 
 .ov-cap-cell .bar-row + .bar-row {
-  margin-top: 5px;
+  margin-top: var(--s1);
 }
 
 .ov-trend-cell {
@@ -212,7 +212,7 @@
   text-transform: uppercase;
   color: var(--text-3);
   font-weight: 700;
-  margin-bottom: 14px;
+  margin-bottom: var(--s4);
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -232,7 +232,7 @@
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  padding: 11px 14px;
+  padding: var(--s3) var(--s4);
   background: var(--ink-2);
 }
 
@@ -266,15 +266,15 @@
    ResizeObserver in LineChart2 redraws to the shrunken wrapper width. */
 .sd-chart-card {
   min-width: 0;
-  padding: 16px;
+  padding: var(--s4);
 }
 
 .sd-chart-top {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  margin-bottom: 10px;
-  gap: 8px;
+  margin-bottom: var(--s3);
+  gap: var(--s2);
 }
 
 .sd-chart-title {
@@ -306,11 +306,30 @@
 .sd-legend {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--s1);
   margin-top: var(--s4);
   font-size: var(--t-xs);
   color: var(--text-3);
 }
+
+/* Legend keys; the colours are DiagnosticsDisclosure's COLOR_AGENT/COLOR_BROWSER. */
+.sd-key-agent { color: var(--accent); }
+.sd-key-browser { color: var(--success); margin-left: var(--s3); }
+
+.sd-chart-title .hint {
+  margin-left: var(--s2);
+  font-weight: 400;
+}
+
+.sd-chart-empty {
+  font-size: var(--t-xs);
+  padding-top: var(--s2);
+}
+
+/* Effective-media stage headings (configured / resolved / actual). */
+.sd-stage { text-transform: capitalize; }
+.sd-wrap { overflow-wrap: anywhere; }
+.sd-aside { font-size: 12px; }
 
 /* ── Session detail: the Diagnostics disclosure ─────────────── */
 .sd-diagnostics > summary {
@@ -379,7 +398,7 @@
 /* User history drawer — user identity header block */
 .drawer-user-head {
   display: flex;
-  gap: 14px;
+  gap: var(--s4);
   align-items: flex-start;
   margin-bottom: var(--s5);
 }
@@ -392,7 +411,7 @@
 .ufact {
   display: flex;
   justify-content: space-between;
-  padding: 10px 0;
+  padding: var(--s3) 0;
   border-bottom: 1px solid var(--line);
   font-size: var(--t-sm);
 }
@@ -408,8 +427,8 @@
 /* Session history items in drawer */
 .hist-item {
   display: flex;
-  gap: 13px;
-  padding: 13px 0;
+  gap: var(--s3);
+  padding: var(--s3) 0;
   border-bottom: 1px solid var(--line);
 }
 
@@ -421,7 +440,7 @@
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  margin-top: 5px;
+  margin-top: var(--s1);
   flex: none;
 }
 
@@ -434,7 +453,7 @@
   font-size: var(--t-xs);
   color: var(--text-3);
   font-family: var(--font-mono);
-  margin-top: 3px;
+  margin-top: var(--s1);
 }
 
 @media (max-width: 760px) {
@@ -480,7 +499,7 @@
   .admin-users-page .qtable tbody td {
     min-height: 0;
     height: auto;
-    padding: 12px 14px;
+    padding: var(--s3) var(--s4);
     border-bottom: 1px solid var(--line);
   }
 
@@ -491,7 +510,7 @@
   .admin-users-page .qtable tbody td::before {
     content: attr(data-label);
     display: block;
-    margin-bottom: 6px;
+    margin-bottom: var(--s2);
     color: var(--text-3);
     font-size: var(--t-xs);
     font-weight: 700;
@@ -564,7 +583,7 @@
   display: flex;
   align-items: center;
   gap: var(--s3);
-  padding: 9px var(--card-pad);
+  padding: var(--s2) var(--card-pad);
   border-bottom: 1px solid var(--line);
 }
 
@@ -583,7 +602,7 @@
 }
 
 .trace-evidence {
-  padding: 12px var(--card-pad);
+  padding: var(--s3) var(--card-pad);
   border-bottom: 1px solid var(--line);
   font-size: var(--t-sm);
   color: var(--text-2);
@@ -591,12 +610,12 @@
 }
 
 .trace-evidence-list {
-  margin: 0 0 6px;
-  padding-left: 16px;
+  margin: 0 0 var(--s2);
+  padding-left: var(--s4);
 }
 
 .trace-evidence-meta {
-  margin-top: 6px;
+  margin-top: var(--s2);
   font-size: var(--t-xs);
   color: var(--text-3);
 }
@@ -613,7 +632,7 @@
   grid-template-columns: 96px minmax(0, 1fr);
   gap: var(--s4);
   border-bottom: 1px solid var(--line);
-  padding: 9px 0 7px;
+  padding: var(--s2) 0 var(--s2);
 }
 
 .trace-lane-label {
@@ -643,7 +662,7 @@
 .trace-lane-scale-item {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--s2);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -667,7 +686,7 @@
 .trace-lane-unit {
   font-size: var(--t-xs);
   color: var(--text-3);
-  margin-left: 3px;
+  margin-left: var(--s1);
 }
 
 .trace-lane-plot {
@@ -675,7 +694,7 @@
   width: 100%;
   min-width: 0;
   height: 54px;
-  margin-top: 5px;
+  margin-top: var(--s1);
   overflow: visible;
 }
 
@@ -687,7 +706,7 @@
    annotation of the stack above rather than another lane. */
 .trace-event-row {
   align-items: center;
-  padding-top: 7px;
+  padding-top: var(--s2);
   border-bottom: 0;
 }
 
@@ -729,7 +748,7 @@
 .trace-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 22px;
+  gap: var(--s2) var(--s6);
   font-size: var(--t-xs);
   color: var(--text-3);
 }
@@ -737,7 +756,7 @@
 .trace-legend-item {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--s2);
 }
 
 .trace-legend-swatch {
@@ -760,7 +779,7 @@
   background: var(--pop-bg);
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
-  padding: 8px 12px;
+  padding: var(--s2) var(--s3);
   font-size: var(--t-xs);
   pointer-events: none;
   max-width: 240px;
@@ -772,7 +791,7 @@
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--text-4);
-  margin-bottom: 4px;
+  margin-bottom: var(--s1);
   font-weight: 700;
 }
 
@@ -780,7 +799,7 @@
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  gap: 12px;
+  gap: var(--s3);
   padding: 1px 0;
 }
 
@@ -798,7 +817,7 @@
 }
 
 .trace-tooltip-event {
-  margin-top: 4px;
+  margin-top: var(--s1);
   font-size: 9px;
   font-style: italic;
 }
@@ -815,7 +834,7 @@
 .cpair {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
   flex-wrap: wrap;
 }
 .cpair .arrow {
@@ -833,7 +852,7 @@
 /* The launch profiles a stream profile is used by, as a chip row. */
 .used-by {
   display: flex;
-  gap: 4px;
+  gap: var(--s1);
   flex-wrap: wrap;
 }
 
@@ -844,6 +863,12 @@
   overflow-wrap: anywhere;
   text-align: right;
 }
+/* Library ▸ Images: the policy/catalog card and the uninstall fine print. */
+.img-policy-error { align-items: flex-start; }
+.img-catalog-count { font-size: var(--t-sm); }
+.img-manifest-url { word-break: break-all; }
+.img-fineprint { font-size: var(--t-xs); }
+
 .image-detail-page .qtable {
   table-layout: fixed;
 }
@@ -863,7 +888,7 @@
   .image-detail-page .qtable td::before {
     content: attr(data-label);
     display: block;
-    margin-bottom: 6px;
+    margin-bottom: var(--s2);
     color: var(--text-3);
     font-size: var(--t-xs);
     font-weight: 700;

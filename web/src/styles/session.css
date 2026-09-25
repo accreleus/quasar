@@ -80,7 +80,7 @@
   display: grid;
   place-content: center;
   justify-items: center;
-  gap: 18px;
+  gap: var(--s5);
   opacity: 0;
   pointer-events: none;
   transition: opacity .35s ease;

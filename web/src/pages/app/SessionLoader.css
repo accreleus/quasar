@@ -27,7 +27,7 @@
   top: clamp(1.5rem, 4vw, 2.5rem);
   left: clamp(1.5rem, 4vw, 3rem);
   display: flex;
-  gap: 0.85rem;
+  gap: var(--s3);
   align-items: center;
 }
 
@@ -223,13 +223,13 @@
 .sl-status-foot {
   display: flex;
   justify-content: center;
-  margin-top: 1.6rem;
+  margin-top: var(--s6);
 }
 
 /* ---- Glyph rail ---- */
 .sl-rail {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--s2);
   align-items: center;
   width: min(28rem, 100%);
   margin: 0 auto;
@@ -333,14 +333,14 @@
    Small print under the phase word: the launch is still running, this only
    names what has stopped moving. */
 .sl-stall {
-  margin-top: 1.75rem;
+  margin-top: var(--s7);
   color: var(--text-3);
   font-size: var(--t-sm);
   line-height: 1.5;
 }
 
 .sl-stall-title {
-  margin: 0 0 0.25rem;
+  margin: 0 0 var(--s1);
   color: var(--text-2);
   font-weight: 500;
 }
