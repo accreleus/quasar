@@ -146,6 +146,16 @@ type admitCase struct {
 	agentExpect *admitDecision
 }
 
+// actorAdmitted and actorRefused are the recovery actor's answer where it accepts a
+// component the updater does not know: itself.
+func actorAdmitted() *admitDecision {
+	return &admitDecision{Admitted: true, Warnings: []string{}}
+}
+
+func actorRefused(reason, message string) *admitDecision {
+	return &admitDecision{Reason: reason, Message: message, Warnings: []string{}}
+}
+
 func agentGuard(component string) *admitDecision {
 	return &admitDecision{
 		Reason: ReasonInvalid,
@@ -172,6 +182,11 @@ func admitCases(t *testing.T) []admitCase {
 	cp := func(image, digest string) Component {
 		return Component{Name: "control-plane", Image: image, Digest: digest}
 	}
+	ra := func(image, digest string) Component {
+		return Component{Name: "recovery-actor", Image: image, Digest: digest}
+	}
+	actorImg := "ghcr.io/accreleus/quasar/quasar-recovery"
+	testActorDigest := "sha256:cc33" + strings.Repeat("0", 60)
 	agentImg := "ghcr.io/accreleus/quasar/quasar-node-agent"
 	controlImg := "ghcr.io/accreleus/quasar/quasar-control-plane"
 	fetchBoth := &fetchSpec{BaseURL: tvBase, Responses: map[string]assetResponse{
@@ -313,6 +328,31 @@ func admitCases(t *testing.T) []admitCase {
 			req: with(agentReq(), comps(cp(controlImg, goodDigest))), want: ReasonBusy},
 		{name: "an unknown name on the agent socket is the closed-table refusal", source: "added: the closed table is checked before the guard",
 			agent: true, cfg: tvOff(), req: with(agentReq(), func(r *ApplyRequest) { r.Components[0].Name = "quasar-updater" }), want: ReasonInvalid},
+
+		// ── the recovery actor naming itself (Rust-only). The updater never replaces
+		//    itself, so Go answers "unknown component"; the recovery actor hands over to a
+		//    successor (amendment 14, ADR 0008) and holds its image to every rule the node
+		//    agent's is held to. ──
+		{name: "the agent socket may name the recovery actor", source: "added: agent-api.md amendment 14 release_apply names recovery-actor",
+			agent: true, cfg: tvOff(), req: with(agentReq(), comps(ra(actorImg, goodDigest))), want: ReasonInvalid, agentExpect: actorAdmitted()},
+		{name: "the recovery actor first, then the node agent", source: "added: amendment 14 component order",
+			agent: true, cfg: tvOff(), req: with(agentReq(), comps(ra(actorImg, goodDigest), na(agentImg, goodDigest))), want: ReasonInvalid, agentExpect: actorAdmitted()},
+		{name: "the recovery actor's image is held to the allowlist", source: "added: amendment 14 (the actor's image is subject to the same namespace rules)",
+			agent: true, cfg: tvOff(), req: with(agentReq(), comps(ra("ghcr.io/someone-else/quasar/quasar-recovery", goodDigest))), want: ReasonInvalid,
+			agentExpect: actorRefused(ReasonNamespaceRejected, `component "recovery-actor": image "ghcr.io/someone-else/quasar/quasar-recovery" is outside this host's platform-image namespaces (ghcr.io/accreleus/quasar)`)},
+		{name: "the recovery actor's digest must be well formed", source: "added: amendment 14 (the same digest rules)",
+			agent: true, cfg: tvOff(), req: with(agentReq(), comps(ra(actorImg, "sha256:nothex"))), want: ReasonInvalid,
+			agentExpect: actorRefused(ReasonDigestMalformed, `component "recovery-actor": digest "sha256:nothex" is not sha256: + 64 lowercase hex`)},
+		{name: "the recovery actor named twice", source: "added: agent-api.md release_apply, each name at most once",
+			agent: true, cfg: tvOff(), req: with(agentReq(), comps(ra(actorImg, goodDigest), ra(actorImg, goodDigest))), want: ReasonInvalid,
+			agentExpect: actorRefused(ReasonInvalid, `component "recovery-actor" named twice`)},
+		{name: "a signed release binds the recovery actor's digest", source: "added: ADR 0003 binding covers every component a request names",
+			agent: true, cfg: keyed(SignatureModeRequire), req: with(signedReq, comps(ra(actorImg, testActorDigest), na(testAgentImage, testAgentDigest))), want: ReasonInvalid,
+			evidence: signedManifest(`{"version":"0.3.0","components":[{"name":"recovery-actor","image":"` + actorImg + `","digest":"` + testActorDigest + `"},{"name":"node-agent","image":"` + testAgentImage + `","digest":"` + testAgentDigest + `"}]}`),
+			agentExpect: actorAdmitted()},
+		{name: "a signed release that does not name the recovery actor refuses it", source: "added: ADR 0003 binding; a format-1 manifest carries no recovery-actor",
+			agent: true, cfg: keyed(SignatureModeVerify), evidence: signedEv, req: with(signedReq, comps(ra(actorImg, testActorDigest), na(testAgentImage, testAgentDigest))), want: ReasonInvalid,
+			agentExpect: actorRefused(ReasonSignatureInvalid, `the signed release manifest (key release-2026) does not describe this request: component "recovery-actor" is not in the manifest`)},
 
 		// ── signature.go checkSignature, lifted from signature_test.go ──
 		{name: "off ignores unverifiable evidence and no keys", source: tvSig + "TestCheckSignatureOffIgnoresEverything",

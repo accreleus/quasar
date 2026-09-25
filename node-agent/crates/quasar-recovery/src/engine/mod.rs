@@ -15,7 +15,9 @@ use std::time::Duration;
 
 pub use docker::DockerEngine;
 #[cfg(any(test, feature = "test-support"))]
-pub use fake::{Behaviour, FakeContainer, FakeEngine, FakeState, FakeVolume, Fault, When};
+pub use fake::{
+    Behaviour, FakeContainer, FakeEngine, FakeState, FakeVolume, Fault, Lifecycle, When,
+};
 pub use quasar_runtime::platform::{
     ContainerSpec, EngineHost, PlatformContainer as Container, PlatformImage as Image,
     PlatformVolume as Volume, RestartPolicy,

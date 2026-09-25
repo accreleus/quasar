@@ -137,7 +137,8 @@ fn machine(new: Behaviour) -> Machine {
     let socket_dir = tempfile::tempdir().unwrap();
     let socket = socket_dir.path().join("agent.sock");
     let listener = server::bind(&socket).unwrap();
-    std::thread::spawn(move || server::serve(listener, actor));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::spawn(move || server::serve(listener, actor, stop));
     Machine {
         engine,
         _machine_dir: machine_dir,

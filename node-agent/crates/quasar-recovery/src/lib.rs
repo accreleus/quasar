@@ -22,6 +22,7 @@
 pub mod actor;
 pub mod bootstrap;
 pub mod engine;
+pub mod handover;
 pub mod identity;
 pub mod journal;
 pub mod machine;

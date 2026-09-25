@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,15 +39,30 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serve until the listener fails. One thread per connection, at most
-/// [`MAX_CONNECTIONS`] at once; a connection over the limit is closed unanswered.
-pub fn serve(listener: UnixListener, actor: Arc<Actor>) -> io::Error {
+/// How often a serving loop looks at its stop flag between connections.
+const ACCEPT_POLL: Duration = Duration::from_millis(20);
+
+/// Serve until `stop` is set (`Ok`) or the listener fails. One thread per connection, at
+/// most [`MAX_CONNECTIONS`] at once; a connection over the limit is closed unanswered.
+/// A hand-over stops the old actor's loop before it releases the lease, so the successor
+/// binds a path nobody else serves.
+pub fn serve(listener: UnixListener, actor: Arc<Actor>, stop: Arc<AtomicBool>) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
     let open = Arc::new(AtomicUsize::new(0));
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
-            Err(e) => return e,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         };
+        stream.set_nonblocking(false)?;
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             open.fetch_sub(1, Ordering::SeqCst);
             warn!(

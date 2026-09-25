@@ -220,21 +220,31 @@ fn actor() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    config.agent_socket = agent_socket();
+    // A journal this process cannot write, or an attempt it can no longer drive, is
+    // settled by the next start (D8): exit so the restart policy provides one.
+    config.on_died = Box::new(|| {
+        error!(
+            token = "actor-exiting-to-settle",
+            "this recovery actor can no longer drive its attempt; exiting so the next start settles it"
+        );
+        std::process::exit(1);
+    });
     let actor =
         Arc::new(Actor::new(Arc::new(engine), config).with_status_engine(Arc::new(status_engine)));
 
     // The lease first, then the socket, then `resume`: settling an interrupted attempt can
     // take a whole verification, and the agent must be able to read its status meanwhile.
-    if let Err(e) = actor.acquire_lease() {
+    // During a hand-over the lease is held by the other actor, and this one waits.
+    if let Err(e) = actor.acquire_lease_waiting() {
         error!(token = "actor-lease-unavailable", "{e}");
         return ExitCode::FAILURE;
     }
     let socket = agent_socket();
-    let server = match server::bind(&socket) {
-        Ok(listener) => {
+    let served = match actor.serve() {
+        Ok(()) => {
             info!(socket = %socket.display(), "serving the agent socket");
-            let serving = actor.clone();
-            Some(std::thread::spawn(move || server::serve(listener, serving)))
+            true
         }
         // `resume` still runs: an interrupted attempt settles and an install completes
         // whether or not anyone can ask about it.
@@ -246,30 +256,41 @@ fn actor() -> ExitCode {
                 quasar_recovery::recipe::names::AGENT_SOCKET_VOLUME,
                 paths::AGENT_SOCKET_DIR
             );
-            None
+            false
         }
     };
 
-    // The lease is already held, so `resume` cannot answer `LeaseHeld`.
     match actor.resume() {
+        Ok(()) if actor.retired() => {}
         Ok(()) => info!("this machine's services are installed and running"),
         Err(e) => error!(
             token = "actor-resume-failed",
             "{e}; the install is retried on the next start, and status keeps being served"
         ),
     }
-
-    let Some(server) = server else {
+    if !served && !actor.retired() {
         return ExitCode::FAILURE;
-    };
-    let e = server
-        .join()
-        .unwrap_or_else(|_| std::io::Error::other("the socket thread panicked"));
-    error!(
-        token = "actor-socket-failed",
-        "the agent socket stopped: {e}"
-    );
-    ExitCode::FAILURE
+    }
+
+    // A hand-over stops this process's socket on purpose while it waits to be stopped or
+    // to take the machine back; only a socket that stopped on its own ends the process.
+    loop {
+        if actor.retired() {
+            info!(
+                token = "actor-retired",
+                "this recovery actor handed the machine over and exits"
+            );
+            return ExitCode::SUCCESS;
+        }
+        if let Some(e) = actor.serving_failed() {
+            error!(
+                token = "actor-socket-failed",
+                "the agent socket stopped: {e}"
+            );
+            return ExitCode::FAILURE;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 type Evidence = Box<dyn Fn(&Request) -> SignatureEvidence + Send + Sync>;
