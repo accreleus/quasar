@@ -519,6 +519,8 @@ pub struct VirtualDevices {
     /// messages; only the integer part is emitted. Lock covers only the
     /// accumulate+split arithmetic, not the uinput write.
     rel_accum: Mutex<(f64, f64)>,
+    /// Wheel remainders (vertical, horizontal); see `WheelAxis`.
+    wheel: Mutex<(WheelAxis, WheelAxis)>,
     /// Moonlight-style relative-mouse batching state. `None` when
     /// `QUASAR_INPUT_BATCH_MS=0` (per-arrival writes, no flush thread).
     rel_flush: Option<Arc<RelFlushState>>,
@@ -650,6 +652,7 @@ impl VirtualDevices {
             forwarded_dpad: Mutex::new(DpadHat::default()),
             last_abs: Mutex::new(None),
             rel_accum: Mutex::new((0.0, 0.0)),
+            wheel: Mutex::new((WheelAxis::default(), WheelAxis::default())),
             rel_flush,
             flush_thread,
             held: Mutex::new(HeldInputs::default()),
@@ -926,39 +929,21 @@ impl VirtualDevices {
         Ok(())
     }
 
-    /// Scroll (hi-res wheel units). `dy` is vertical, `dx` horizontal.
+    /// Scroll (hi-res wheel units, 120 per detent). `dy` is vertical, `dx`
+    /// horizontal, both in the browser's `WheelEvent` sense (`protocol/input.md`):
+    /// positive `dy` scrolls the content down. evdev's `REL_WHEEL` is the
+    /// opposite (positive = wheel rolled away from the user = scroll up), so
+    /// the vertical axis is negated here; forwarding it as-is inverted scrolling
+    /// in every app (issue #350). Horizontal already agrees (positive = right).
     pub fn scroll(&self, dx: f64, dy: f64) -> Result<()> {
-        let mut evs = Vec::with_capacity(5);
-        if dy != 0.0 {
-            // Hi-res wheel is in 1/120 of a detent; also emit a coarse notch so
-            // clients that only read REL_WHEEL still scroll.
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_WHEEL_HI_RES as u16,
-                dy.round() as i32,
-            ));
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_WHEEL as u16,
-                (dy / 120.0).round() as i32,
-            ));
-        }
-        if dx != 0.0 {
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_HWHEEL_HI_RES as u16,
-                dx.round() as i32,
-            ));
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_HWHEEL as u16,
-                (dx / 120.0).round() as i32,
-            ));
-        }
+        let evs = {
+            let mut wheel = self.wheel.lock().unwrap();
+            let (v, h) = &mut *wheel;
+            scroll_events(v, h, dx, dy)
+        };
         if evs.is_empty() {
             return Ok(());
         }
-        evs.push(syn());
         self.mouse.write(&evs).context("write scroll")?;
         Ok(())
     }
@@ -1108,6 +1093,7 @@ impl VirtualDevices {
         // Drop the fractional remainder so it doesn't bias motion in the next
         // app/session, then flush any pending batched motion so it isn't lost.
         *self.rel_accum.lock().unwrap() = (0.0, 0.0);
+        *self.wheel.lock().unwrap() = (WheelAxis::default(), WheelAxis::default());
         self.flush_pending_rel();
         Ok(())
     }
@@ -1128,6 +1114,75 @@ impl Drop for VirtualDevices {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+}
+
+/// Hi-res wheel units per detent (the kernel's `REL_WHEEL_HI_RES` convention).
+const WHEEL_DETENT: i32 = 120;
+
+/// One wheel axis's carried state. uinput wheel values are integers, and a
+/// browser sends fractions of a detent (Firefox pixel mode is ~40-60 units a
+/// notch; touch scroll is fractional). `frac` carries the sub-unit remainder of
+/// the hi-res value; `partial` carries hi-res units not yet worth a whole
+/// `REL_WHEEL` detent, so the coarse axis always agrees with the hi-res sum
+/// (as the kernel expects) instead of rounding each message to 0 on its own.
+#[derive(Default)]
+struct WheelAxis {
+    frac: f64,
+    partial: i32,
+}
+
+impl WheelAxis {
+    /// Add `delta` (hi-res units, evdev sign) and return the `(hi_res,
+    /// detents)` to emit now. A direction change drops the partial detent, as
+    /// hid-input does, so a reversal never has to cancel the old direction first.
+    fn step(&mut self, delta: f64) -> (i32, i32) {
+        let total = self.frac + delta;
+        let hi = total.trunc() as i32;
+        self.frac = total - hi as f64;
+        if hi == 0 {
+            return (0, 0);
+        }
+        if self.partial != 0 && (self.partial > 0) != (hi > 0) {
+            self.partial = 0;
+        }
+        self.partial += hi;
+        let detents = self.partial / WHEEL_DETENT;
+        self.partial -= detents * WHEEL_DETENT;
+        (hi, detents)
+    }
+}
+
+/// The evdev frame for one `ms` message (wire sign → evdev sign, see
+/// [`VirtualDevices::scroll`]), `SYN_REPORT`-terminated; empty when the
+/// message adds up to less than one hi-res unit on both axes. Pure, so the
+/// sign and accumulation are unit-testable without uinput.
+fn scroll_events(
+    vertical: &mut WheelAxis,
+    horizontal: &mut WheelAxis,
+    dx: f64,
+    dy: f64,
+) -> Vec<isys::input_event> {
+    let mut evs = Vec::with_capacity(5);
+    let axes = [
+        (vertical.step(-dy), isys::REL_WHEEL_HI_RES, isys::REL_WHEEL),
+        (
+            horizontal.step(dx),
+            isys::REL_HWHEEL_HI_RES,
+            isys::REL_HWHEEL,
+        ),
+    ];
+    for ((hi, detents), hi_code, code) in axes {
+        if hi != 0 {
+            evs.push(ev(isys::EV_REL as u16, hi_code as u16, hi));
+        }
+        if detents != 0 {
+            evs.push(ev(isys::EV_REL as u16, code as u16, detents));
+        }
+    }
+    if !evs.is_empty() {
+        evs.push(syn());
+    }
+    evs
 }
 
 /// Scale a W3C axis value (-1.0..=1.0) onto signed 16-bit stick range.
@@ -1417,6 +1472,83 @@ mod tests {
         assert!(
             abs_events.is_empty(),
             "no ABS zeroes when analog was never active"
+        );
+    }
+
+    /// Collapse a scroll frame to `(code, value)` pairs, SYN excluded.
+    fn rel(evs: &[isys::input_event]) -> Vec<(i32, i32)> {
+        evs.iter()
+            .filter(|e| e.type_ == isys::EV_REL as u16)
+            .map(|e| (e.code as i32, e.value))
+            .collect()
+    }
+
+    /// Issue #350: a browser scroll-down (positive deltaY) must reach evdev as
+    /// a negative wheel value; horizontal keeps its sign.
+    #[test]
+    fn scroll_down_is_negative_wheel_and_horizontal_keeps_sign() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        let evs = scroll_events(&mut v, &mut h, 0.0, 120.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_WHEEL_HI_RES, -120), (isys::REL_WHEEL, -1)]
+        );
+        assert_eq!(evs.last().unwrap().type_, isys::EV_SYN as u16);
+
+        let evs = scroll_events(&mut v, &mut h, 0.0, -120.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_WHEEL_HI_RES, 120), (isys::REL_WHEEL, 1)],
+            "scroll up = wheel away from the user = positive"
+        );
+
+        let evs = scroll_events(&mut v, &mut h, 120.0, 0.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_HWHEEL_HI_RES, 120), (isys::REL_HWHEEL, 1)]
+        );
+    }
+
+    /// Small deltas (Firefox pixel mode, ~48 a notch) accumulate into whole
+    /// detents instead of each rounding to 0, and REL_WHEEL always matches the
+    /// hi-res sum.
+    #[test]
+    fn small_scroll_deltas_accumulate_into_detents() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        let mut hi_sum = 0;
+        let mut detents = 0;
+        for _ in 0..5 {
+            for (code, value) in rel(&scroll_events(&mut v, &mut h, 0.0, 48.0)) {
+                if code == isys::REL_WHEEL_HI_RES {
+                    hi_sum += value;
+                } else if code == isys::REL_WHEEL {
+                    detents += value;
+                }
+            }
+        }
+        assert_eq!(hi_sum, -240);
+        assert_eq!(detents, -2, "240 hi-res units = 2 detents, none dropped");
+    }
+
+    /// Fractional deltas carry their remainder; reversing direction drops the
+    /// partial detent so the first notch the other way is not swallowed.
+    #[test]
+    fn scroll_carries_fractions_and_resets_on_reversal() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        assert!(scroll_events(&mut v, &mut h, 0.0, 0.4).is_empty());
+        assert!(scroll_events(&mut v, &mut h, 0.0, 0.4).is_empty());
+        assert_eq!(
+            rel(&scroll_events(&mut v, &mut h, 0.0, 0.4)),
+            vec![(isys::REL_WHEEL_HI_RES, -1)],
+            "0.4 x 3 reaches one hi-res unit"
+        );
+
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        scroll_events(&mut v, &mut h, 0.0, 100.0); // 100 down, no detent yet
+        assert_eq!(
+            rel(&scroll_events(&mut v, &mut h, 0.0, -120.0)),
+            vec![(isys::REL_WHEEL_HI_RES, 120), (isys::REL_WHEEL, 1)],
+            "a full notch up after a partial down is a full detent up"
         );
     }
 

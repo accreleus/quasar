@@ -37,6 +37,11 @@ own; the two do not move together, and that is deliberate.
   over Bluetooth), its buttons reach the game in the pad's own order. The session now
   says so once per pad, and the Controller & input pane notes it under that pad, with
   the fix: switch the pad to XInput mode, or connect it by cable or USB receiver.
+- **Mouse-wheel scrolling is no longer inverted (#350).** The host forwarded the browser's
+  scroll direction to the virtual mouse unchanged, but Linux counts the wheel the other
+  way round, so scrolling up moved content down in every app. Small wheel movements
+  (Firefox sends well under one notch's worth per event) now also add up into whole
+  notches instead of being dropped by apps and games that read only whole notches.
 
 ## 0.3.0 — 2026-09-13
 
