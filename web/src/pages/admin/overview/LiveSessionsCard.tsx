@@ -121,16 +121,13 @@ function SessionRow({
         </div>
       </td>
       <td>{shortHost(session.host_name)}</td>
-      <td className="right num" style={degraded ? { color: "var(--warning-text)" } : undefined}>
+      <td className={degraded ? "right num td-warning" : "right num"}>
         {fps === undefined ? "—" : Math.round(fps)}
       </td>
       <td className="ov-trend-cell">
         <Trend points={points} color={degraded ? "var(--warning)" : "var(--success)"} />
       </td>
-      <td
-        className="right num"
-        style={rtt !== undefined && rtt > LATENCY_WARN_MS ? { color: "var(--danger-text)" } : undefined}
-      >
+      <td className={rtt !== undefined && rtt > LATENCY_WARN_MS ? "right num td-danger" : "right num"}>
         {rtt === undefined ? "—" : `${Math.round(rtt)} ms`}
       </td>
       <td className="right num">{bitrate(kbps)}</td>

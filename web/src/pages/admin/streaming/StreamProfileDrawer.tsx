@@ -338,7 +338,7 @@ export function StreamProfileDrawer({
         </div>
       </div>
 
-      {error && <p className="form-error" style={{ marginTop: "var(--s4)" }}>{error}</p>}
+      {error && <p className="form-error mt4">{error}</p>}
     </Drawer>
   );
 }

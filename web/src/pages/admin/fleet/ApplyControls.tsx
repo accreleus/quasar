@@ -185,7 +185,7 @@ function ApplyHistoryRow({ attempt: a }: { attempt: PlatformApplyAttempt }) {
   const to = a.requested_digests.map((c) => shortDigest(c.digest)).join(", ");
   return (
     <div className="rel-fact stack">
-      <div className="rowflex" style={{ justifyContent: "space-between", width: "100%" }}>
+      <div className="rowflex between" style={{ width: "100%" }}>
         <span>{a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone")}</span>
         <span className="hint">{when(a.created_at)}</span>
       </div>

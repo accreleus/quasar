@@ -193,6 +193,10 @@ own; the two do not move together, and that is deliberate.
   under a role name and is read through `var(--…)`; each token holds the value it replaced, so
   nothing renders differently. The `raw-colour-css` and `raw-colour-tsx` baselines are zero,
   apart from reasoned allows for the brand mark and the artwork-sampled detail scrim.
+- **Design-lint batch C1: admin fleet, sessions, streaming, overview, settings and audit (#374).**
+  Every inline style in those admin pages has moved to the batch A utilities or to classes in
+  `admin.css` and `admin/fleet.css`; only runtime widths and opacities stay inline. Off-scale
+  spacing snapped to the 4px scale; nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API

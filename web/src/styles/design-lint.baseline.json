@@ -23,63 +23,6 @@
   "src/pages/admin/Settings.tsx": {
     "inline-style": 5
   },
-  "src/pages/admin/audit/AuditRow.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/fleet/ApplyControls.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/fleet/EnrollHostModal.tsx": {
-    "inline-style": 8
-  },
-  "src/pages/admin/fleet/FleetApply.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/fleet/HostConsole.tsx": {
-    "inline-style": 13
-  },
-  "src/pages/admin/fleet/HostExpansion.tsx": {
-    "inline-style": 11
-  },
-  "src/pages/admin/fleet/HostRow.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/fleet/HostSettings.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/fleet/ReleasesTab.tsx": {
-    "inline-style": 5
-  },
-  "src/pages/admin/fleet/console/CapabilitiesRail.tsx": {
-    "inline-style": 10
-  },
-  "src/pages/admin/fleet/console/InputDevicesRow.tsx": {
-    "inline-style": 9
-  },
-  "src/pages/admin/fleet/hostDetail/CapacityCard.tsx": {
-    "inline-style": 8
-  },
-  "src/pages/admin/fleet/hostDetail/SessionsCard.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/fleet/settings/IdleApplyPolicy.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/fleet/settings/KnobPanel.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/fleet/settings/KnobRow.tsx": {
-    "inline-style": 5
-  },
-  "src/pages/admin/fleet/settings/RestartNote.tsx": {
-    "inline-style": 7
-  },
-  "src/pages/admin/fleet/settings/SafeSettingsPolicy.tsx": {
-    "inline-style": 4
-  },
-  "src/pages/admin/fleet/settings/SettingsRail.tsx": {
-    "inline-style": 19
-  },
   "src/pages/admin/library/AppConfirmModals.tsx": {
     "inline-style": 1
   },
@@ -113,18 +56,6 @@
   "src/pages/admin/library/SteamPreparationStatus.tsx": {
     "inline-style": 14
   },
-  "src/pages/admin/overview/FleetCapacityCard.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/overview/KpiRow.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/overview/LiveSessionsCard.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/overview/RecentActivityCard.tsx": {
-    "inline-style": 1
-  },
   "src/pages/admin/people/InvitesTab.tsx": {
     "inline-style": 31
   },
@@ -133,39 +64,6 @@
   },
   "src/pages/admin/people/UsersTab.tsx": {
     "inline-style": 3
-  },
-  "src/pages/admin/sessions/LatestCards.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/sessions/SessionCharts.tsx": {
-    "inline-style": 11
-  },
-  "src/pages/admin/sessions/SessionHero.tsx": {
-    "inline-style": 10
-  },
-  "src/pages/admin/sessions/SessionRow.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/sessions/SessionsToolbar.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/settings/SettingRow.tsx": {
-    "inline-style": 5
-  },
-  "src/pages/admin/streaming/LaunchProfileDrawer.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/streaming/LaunchTab.tsx": {
-    "inline-style": 12
-  },
-  "src/pages/admin/streaming/ProfilesTab.tsx": {
-    "inline-style": 4
-  },
-  "src/pages/admin/streaming/RungEditor.tsx": {
-    "inline-style": 6
-  },
-  "src/pages/admin/streaming/StreamProfileDrawer.tsx": {
-    "inline-style": 1
   },
   "src/pages/app/home/DetailBand.tsx": {
     "inline-style": 1

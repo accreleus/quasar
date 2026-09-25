@@ -73,7 +73,7 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
             <Fact
               label="Agent restarts"
               value={
-                <span style={{ color: "var(--warning-text)" }}>
+                <span className="tone-warning">
                   {host.agent_restart_count}
                   {host.agent_last_restart_at
                     ? ` · last ${relativeTime(host.agent_last_restart_at, now)}`
@@ -134,13 +134,11 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
               key={gpu.gpu_id}
               label={`${primaryGpuLabel(gpu.vendor, gpu.model)} #${gpu.gpu_index}`}
               value={
-                <span
-                  style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}
-                >
+                <span className="col gap1 gpu-slots">
                   <span className="num">
                     {gpu.slots_reserved}/{gpu.slots_total} slots · {vramText(gpu)}
                   </span>
-                  <span style={{ display: "flex", gap: "var(--s2)", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  <span className="gpu-codecs gpu-codecs-end">
                     <GpuCodecChips codecs={gpu.codecs} />
                   </span>
                 </span>
@@ -182,12 +180,7 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
                 label="Free"
                 value={
                   <span
-                    className="num"
-                    style={
-                      (util.diskPct ?? 0) >= DISK_DANGER_PCT
-                        ? { color: "var(--danger-text)" }
-                        : undefined
-                    }
+                    className={(util.diskPct ?? 0) >= DISK_DANGER_PCT ? "num disk-danger" : "num"}
                   >
                     {bytesFromMb(storage.totalMb - storage.usedMb)}
                   </span>
@@ -204,7 +197,7 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
           ) : (
             <p className="sub">No volumes reported.</p>
           )}
-          <div style={{ marginTop: 9 }}>
+          <div className="mt2">
             <Link to="/admin/fleet/storage" onClick={(e) => e.stopPropagation()}>
               Storage detail
             </Link>

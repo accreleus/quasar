@@ -126,7 +126,7 @@ export function AuditRow({ item, expanded, onToggle }: AuditRowProps) {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  style={{ marginLeft: "auto" }}
+                  className="ml-auto"
                   onClick={handleCopy}
                 >
                   {copied ? "Copied" : (
