@@ -140,7 +140,9 @@ fn machine(new: Behaviour) -> Machine {
     let socket_dir = tempfile::tempdir().unwrap();
     let socket = socket_dir.path().join("agent.sock");
     let listener = server::bind(&socket).unwrap();
-    std::thread::spawn(move || server::serve(listener, actor));
+    std::thread::spawn(move || {
+        server::serve(listener, actor, quasar_recovery::trust::Caller::Agent)
+    });
     Machine {
         engine,
         _machine_dir: machine_dir,

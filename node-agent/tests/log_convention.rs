@@ -23,6 +23,10 @@ use source_roots::source_roots;
 /// server). Anything not listed here must be unique: two different conditions
 /// sharing a token makes the token useless for finding either one.
 const SHARED_TOKENS: &[&str] = &[
+    // One condition for every platform service the recovery actor installs (the GPU
+    // host's agent, and a control-plane machine's services): a running container differs
+    // from its recipe and is left as it is.
+    "actor-spec-differs",
     "app-exit-disposition-unrecognized",
     "audio-fallback-silent",
     "audio-unavailable-silent",
