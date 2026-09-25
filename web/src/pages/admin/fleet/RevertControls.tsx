@@ -208,7 +208,11 @@ export function FailedAttemptPanel({
       <div className="rowflex">
         <b>{attempt.node_name ?? "Host"}</b>
         <span className="muted">
-          {attempt.kind === "revert" ? "Revert failed" : "Update failed"}
+          {attempt.kind === "revert"
+            ? "Revert failed"
+            : attempt.kind === "developer_apply"
+              ? "Developer apply failed"
+              : "Update failed"}
           {attempt.reason && <> — {failureText(attempt.reason)}</>}
         </span>
         {onRevert && state.digest && (
