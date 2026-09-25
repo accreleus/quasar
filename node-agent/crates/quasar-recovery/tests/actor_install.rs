@@ -230,12 +230,56 @@ fn a_toolkit_hook_only_nvidia_host_still_gets_the_nvidia_shape() {
 #[test]
 fn an_nvidia_card_the_engine_cannot_serve_is_installed_without_the_nvidia_shape() {
     // An `nvidia` runtime entry is not evidence: only a started `--gpus all` probe is.
-    let (engine, _dir) = installed(nvidia_host(&["nvidia", "runc"], false));
+    let (engine, dir) = installed(nvidia_host(&["nvidia", "runc"], false));
     let state = engine.state();
     let agent = state.container_named(names::NODE_AGENT).unwrap();
     assert!(agent.spec.gpus.is_empty());
     assert!(!agent.spec.env.contains_key("QUASAR_GPU_NVIDIA"));
     assert_eq!(agent.status, "running");
+    // The engine's own refusal is an answer, and machine state records it.
+    let machine: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("machine.json")).unwrap()).unwrap();
+    assert_eq!(machine["inputs"]["gpu"]["gpus_served"], false);
+}
+
+/// An engine that does not answer (unreachable, a timeout, an unknown outcome) at any call
+/// of an NVIDIA install is no answer about GPUs: nothing about them is recorded, and the
+/// next start probes again and installs exactly what an undisturbed install would have.
+#[test]
+fn an_engine_failure_during_detection_is_never_recorded_as_an_answer() {
+    let (reference_engine, reference_dir) = installed(nvidia_host(&[], true));
+    let reference = reference_engine.state();
+    let reference_files = contents(reference_dir.path());
+    for call in 0..reference_engine.calls() {
+        for kind in [
+            ErrorKind::Unavailable,
+            ErrorKind::Timeout,
+            ErrorKind::UnknownOutcome,
+        ] {
+            let at = format!("call {call} {kind:?}");
+            let engine = Arc::new(FakeEngine::new(nvidia_host(&[], true)));
+            let dir = tempfile::tempdir().unwrap();
+            engine.inject(Fault {
+                call,
+                when: When::Before,
+                error: EngineError::Runtime(kind),
+            });
+            assert!(
+                actor(&engine, dir.path(), operator()).resume().is_err(),
+                "{at}: the failure was swallowed"
+            );
+            engine.clear_faults();
+            actor(&engine, dir.path(), operator())
+                .resume()
+                .unwrap_or_else(|e| panic!("{at}: the next resume failed: {e}"));
+            assert_eq!(
+                engine.state().by_name(),
+                reference.by_name(),
+                "{at}: containers"
+            );
+            assert_eq!(contents(dir.path()), reference_files, "{at}: machine state");
+        }
+    }
 }
 
 #[test]

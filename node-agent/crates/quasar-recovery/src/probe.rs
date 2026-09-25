@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::engine::{ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
+use crate::engine::{ContainerSpec, EngineError, ErrorKind, PlatformEngine, RestartPolicy};
 use crate::recipe::{labels, names, Bind, GpuFacts, GpuRequest, GpuVendor, HostDevices, ImageRef};
 
 pub const PROBE_HELPER: &str = "gpu-probe";
@@ -201,31 +201,37 @@ pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
     }
 }
 
-/// Whether the engine serves `--gpus all`, and why not when it does not. Only a crash is
-/// an error: a refused create or a failed start is the answer "no".
+/// Whether the engine serves `--gpus all`, and why not when it does not.
+///
+/// Only a definitive answer is `Ok`: the engine answered the create or the start with a
+/// refusal (`ErrorKind::Engine`, which is how it rejects a device request it cannot
+/// satisfy), or the probe ran and exited non-zero. Anything else (an unreachable engine, a
+/// timeout, an unknown outcome, a crash) is `Err`, so the caller records nothing and the
+/// next start asks again: machine inputs are never written from a non-answer.
 pub fn serves_gpus(
     engine: &dyn PlatformEngine,
     image: &ImageRef,
 ) -> Result<Result<(), String>, EngineError> {
+    let refused = |e: &EngineError| matches!(e, EngineError::Runtime(ErrorKind::Engine));
     let id = match engine.create_container(&gpus_spec(image)) {
         Ok(id) => id,
-        Err(EngineError::Crashed) => return Err(EngineError::Crashed),
-        Err(e) => return Ok(Err(format!("the engine refused to create it ({e})"))),
+        Err(e) if refused(&e) => return Ok(Err(format!("the engine refused to create it ({e})"))),
+        Err(e) => return Err(e),
     };
     let outcome = match engine.start_container(&id) {
-        Err(EngineError::Crashed) => Err(EngineError::Crashed),
-        Err(e) => Ok(Err(format!("it would not start ({e})"))),
+        Err(e) if refused(&e) => Ok(Err(format!("the engine refused to start it ({e})"))),
+        Err(e) => Err(e),
         Ok(()) => match engine.wait_container(&id, PROBE_TIMEOUT) {
-            Err(EngineError::Crashed) => Err(EngineError::Crashed),
-            Err(e) => Ok(Err(format!("it did not finish ({e})"))),
+            Err(e) => Err(e),
             Ok(0) => Ok(Ok(())),
             Ok(code) => Ok(Err(format!("it exited {code}"))),
         },
     };
-    match engine.remove_container(&id) {
-        Err(EngineError::Crashed) => Err(EngineError::Crashed),
-        Err(e) if outcome.is_ok() => Err(e),
-        _ => outcome,
+    match (engine.remove_container(&id), outcome) {
+        (Err(EngineError::Crashed), _) => Err(EngineError::Crashed),
+        (_, Err(e)) => Err(e),
+        (Err(e), Ok(_)) => Err(e),
+        (Ok(()), Ok(answer)) => Ok(answer),
     }
 }
 
