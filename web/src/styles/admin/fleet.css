@@ -214,6 +214,28 @@
   width: 30%;
 }
 
+/* "Services on this machine" (fleet-rh06-v3.html `rhServices`; its inline styles). */
+.host-detail-page .host-services-hint {
+  margin-top: 3px;
+}
+
+.host-detail-page .host-services-note {
+  padding: var(--s4) var(--card-pad);
+}
+
+.host-detail-page .host-services-desc {
+  white-space: normal;
+  max-width: 34ch;
+}
+
+.host-detail-page .host-services-version {
+  color: var(--text);
+}
+
+.host-detail-page .host-services-none {
+  color: var(--text-4);
+}
+
 /* ── Enroll host modal ─────────────────────────────────────────────── */
 
 .enroll-fact {

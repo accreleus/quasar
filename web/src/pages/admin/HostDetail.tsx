@@ -25,7 +25,9 @@ import { useAdminAction } from "../../lib/resource/action";
 import { useResource } from "../../lib/resource/react";
 import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
+import { ServicesCard } from "./fleet/hostDetail/ServicesCard";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
+import { agentOlderThanControlPlane, hostServices } from "./fleet/hostServices";
 import { AdmissionReasons, admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./fleet/AdmissionReasons";
 import { hostStateChip, hostStateLabel } from "./fleet/hostDerived";
 import { faultText } from "./fleet/releasesCopy";
@@ -40,6 +42,8 @@ interface HostDetailData {
   /** This host's platform-release faults. Empty when the read failed: a fault
    *  gates nothing, so its absence must never blank the page. */
   faults: PlatformReleaseFault[];
+  /** The installed control plane's commit, from the same read; null when unknown. */
+  controlPlaneCommit: string | null;
 }
 
 export function HostDetail() {
@@ -55,7 +59,7 @@ export function HostDetail() {
       label: "host",
       pollMs: POLL_MS,
       fetch: async (ctx): Promise<HostDetailData> => {
-        const [{ host }, gpus, faults] = await Promise.all([
+        const [{ host }, gpus, release] = await Promise.all([
           adminApi.getHost(ctx.token, id),
           adminApi.getHostGPUs(ctx.token, id).then(
             (r) => r.items,
@@ -63,11 +67,14 @@ export function HostDetail() {
           ),
           // Rides this page's one poll rather than earning a second timer.
           adminApi.getPlatformReleases(ctx.token, ctx.signal).then(
-            (v) => v.faults.filter((f) => f.host_id === id),
-            () => [],
+            (v) => ({
+              faults: v.faults.filter((f) => f.host_id === id),
+              controlPlaneCommit: v.installed?.control_plane.source_commit ?? null,
+            }),
+            () => ({ faults: [], controlPlaneCommit: null }),
           ),
         ]);
-        return { host, gpus, faults };
+        return { host, gpus, ...release };
       },
     },
     [id],
@@ -76,6 +83,7 @@ export function HostDetail() {
   const host = res.data?.host;
   const gpus = res.data?.gpus ?? null;
   const faults = res.data?.faults ?? [];
+  const controlPlaneCommit = res.data?.controlPlaneCommit ?? null;
   const now = res.updatedAt ?? Date.now();
 
   const sessions = useMemo(
@@ -155,6 +163,9 @@ export function HostDetail() {
   }
 
   const state = hostStateLabel(host);
+  const services = hostServices(host, {
+    agentOlder: agentOlderThanControlPlane(host, controlPlaneCommit, faults),
+  });
 
   return (
     <section className="page host-detail-page">
@@ -162,7 +173,11 @@ export function HostDetail() {
 
       <PageHeader
         title={host.node_name}
-        sub={[host.cpu_model, host.mem_mb != null ? bytesFromMb(host.mem_mb) : null]
+        sub={[
+          services ? "GPU host" : null,
+          host.cpu_model,
+          host.mem_mb != null ? bytesFromMb(host.mem_mb) : null,
+        ]
           .filter(Boolean)
           .join(" · ")}
         actions={
@@ -222,6 +237,15 @@ export function HostDetail() {
           fresh hardware capacity is reported.
           {host.capacity_reason ? ` ${host.capacity_reason}` : ""}
         </p>
+      )}
+
+      {services && (
+        <ServicesCard
+          nodeName={host.node_name}
+          services={services}
+          connectedSince={host.agent_connected_since}
+          now={now}
+        />
       )}
 
       <CapacityCard host={host} gpus={gpus} now={now} />

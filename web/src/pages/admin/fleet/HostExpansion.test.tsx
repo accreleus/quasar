@@ -104,6 +104,17 @@ describe("HostExpansion — the Build column", () => {
     expect(within(fact("Install")).getByText("Built from source")).toBeTruthy();
   });
 
+  // Amendment 14: an owned host's services are created by its recovery actor,
+  // and `updater_present` then says whether that actor answered.
+  it("reads an owned host as owned by Quasar, not as unknown", () => {
+    renderDrawer({ source_commit: COMMIT, install_mode: "owned", updater_present: true });
+
+    expect(within(fact("Install")).getByText("Owned by Quasar")).toBeTruthy();
+    expect(within(fact("Install")).getByTitle(/recovery actor/)).toBeTruthy();
+    expect(within(fact("Updater")).getByTitle(/recovery actor answered/)).toBeTruthy();
+    expect(within(fact("Updater")).getByText("Recovery actor")).toBeTruthy();
+  });
+
   // NULL is "nobody has said"; false is "an agent looked and found none". The
   // release surface reports them differently, so the drawer must too.
   it("does not render an unreported updater as a found-nothing one", () => {
@@ -121,6 +132,57 @@ describe("HostExpansion — the Build column", () => {
     for (const label of ["Commit", "Built", "Install", "Updater"]) {
       expect(within(fact(label)).getByText("Unknown")).toBeTruthy();
     }
+  });
+});
+
+describe("HostExpansion — the Services column (#357)", () => {
+  const owned: Partial<Host> = {
+    source_commit: COMMIT,
+    install_mode: "owned",
+    updater_present: true,
+    agent_version: "0.5.2",
+    recovery_actor_version: "0.5.2",
+    recovery_actor_source_commit: COMMIT,
+    seed_version: "0.5.0",
+  };
+
+  function services(): HTMLElement {
+    return screen.getByText("Services", { selector: ".eyebrow" }).parentElement as HTMLElement;
+  }
+
+  function service(name: string): HTMLElement {
+    return within(services()).getByText(name).closest(".exp-fact") as HTMLElement;
+  }
+
+  it("lists an owned GPU host's services and their versions", () => {
+    renderDrawer(owned);
+
+    expect(within(service("Seed")).getByText("v0.5.0")).toBeTruthy();
+    expect(within(service("Recovery actor")).getByText("v0.5.2")).toBeTruthy();
+    expect(within(service("Database")).getByText("none on this machine")).toBeTruthy();
+    expect(within(service("Control plane")).getByText("not on this machine")).toBeTruthy();
+    expect(within(service("Node agent")).getByText("v0.5.2")).toBeTruthy();
+  });
+
+  it("says not reported before the recovery actor has reported", () => {
+    renderDrawer({ ...owned, updater_present: null, recovery_actor_version: null, seed_version: null });
+
+    expect(within(service("Recovery actor")).getByText("not reported")).toBeTruthy();
+    expect(within(service("Node agent")).getByText("not reported")).toBeTruthy();
+    expect(within(service("Seed")).getByText("not reported")).toBeTruthy();
+  });
+
+  it("still lists the agent when the answering actor's version is not a release", () => {
+    renderDrawer({ ...owned, recovery_actor_version: null, agent_version: "dev" });
+
+    expect(within(service("Recovery actor")).getByText("not reported")).toBeTruthy();
+    expect(within(service("Node agent")).getByText("dev")).toBeTruthy();
+  });
+
+  it("has no Services column for a host that is not owned", () => {
+    renderDrawer({ ...owned, install_mode: "registry" });
+
+    expect(screen.queryByText("Services", { selector: ".eyebrow" })).toBeNull();
   });
 });
 

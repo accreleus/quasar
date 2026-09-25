@@ -10,6 +10,7 @@
 import { useNavigate } from "react-router-dom";
 import type { AdminActivityItem } from "../../../api/admin";
 import { ResourceStates } from "../../../components/ResourceStates";
+import { clockTime } from "../../../lib/format/clockTime";
 import { targetLabel } from "../audit/describe";
 
 export interface RecentActivityCardProps {
@@ -60,20 +61,6 @@ export function RecentActivityCard({ items, loading, error }: RecentActivityCard
       )}
     </div>
   );
-}
-
-/** Local 24-hour clock time, as the mock's audit column renders it. Local, not
- *  UTC: an operator correlating this with what they just did is reading their
- *  own wall clock. */
-export function clockTime(at: string): string {
-  const ms = Date.parse(at);
-  if (!Number.isFinite(ms)) return "—";
-  return new Date(ms).toLocaleTimeString(undefined, {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
 }
 
 function severityColor(severity: AdminActivityItem["severity"]): string {

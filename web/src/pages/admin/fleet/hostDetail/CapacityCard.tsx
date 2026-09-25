@@ -191,8 +191,8 @@ export function CapacityCard({ host, gpus, now }: CapacityCardProps) {
             <Fact
               label="Updater"
               value={
-                <span title={updaterHint(host.updater_present)}>
-                  {updaterLabel(host.updater_present)}
+                <span title={updaterHint(host.updater_present, host.install_mode)}>
+                  {updaterLabel(host.updater_present, host.install_mode)}
                 </span>
               }
             />
