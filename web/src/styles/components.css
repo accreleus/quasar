@@ -104,7 +104,7 @@
 .readiness-check {
   display: flex;
   gap: var(--s3);
-  padding: 10px 12px;
+  padding: var(--s3) var(--s3);
   border: 1px solid var(--line);
   border-radius: var(--r-control);
   background: var(--surf-inset);
@@ -180,8 +180,8 @@
 
 
 /* ---------- CHART / SPARKLINE ---------- */
-.legend { display: flex; gap: 14px; font-size: var(--t-xs); color: var(--text-3); }
-.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+.legend { display: flex; gap: var(--s4); font-size: var(--t-xs); color: var(--text-3); }
+.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: var(--s1); }
 
 
 
@@ -294,7 +294,7 @@
 .apps-field-err {
   font-size: var(--t-xs);
   color: var(--danger-text);
-  margin-top: 3px;
+  margin-top: var(--s1);
   line-height: 1.3;
 }
 
@@ -305,7 +305,7 @@
    surfaces can't visually drift the way their pre-extraction duplicates did. */
 .failure-log-tail-pre {
   max-height: 240px;
-  padding: 10px 12px;
+  padding: var(--s3) var(--s3);
   overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);

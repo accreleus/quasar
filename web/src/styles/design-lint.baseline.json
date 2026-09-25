@@ -53,9 +53,6 @@
   "src/components/icons.tsx": {
     "raw-colour-tsx": 2
   },
-  "src/components/layout.css": {
-    "spacing-scale": 2
-  },
   "src/pages/StyleguidePage.tsx": {
     "inline-style": 1
   },
@@ -234,7 +231,6 @@
     "inline-style": 1
   },
   "src/pages/app/SessionLoader.css": {
-    "spacing-scale": 5,
     "raw-colour-css": 22
   },
   "src/pages/app/home/DetailBand.tsx": {
@@ -276,59 +272,40 @@
   "src/pages/styleguide/TypeSection.tsx": {
     "inline-style": 9
   },
-  "src/pages/styleguide/styleguide.css": {
-    "spacing-scale": 14
-  },
   "src/styles.css": {
-    "spacing-scale": 2,
     "raw-colour-css": 2
   },
-  "src/styles/account.css": {
-    "spacing-scale": 5
-  },
   "src/styles/admin.css": {
-    "spacing-scale": 47,
     "raw-colour-css": 1
   },
   "src/styles/admin/audit.css": {
     "raw-colour-css": 9
   },
   "src/styles/admin/editor.css": {
-    "spacing-scale": 7,
     "raw-colour-css": 6
-  },
-  "src/styles/admin/fleet.css": {
-    "spacing-scale": 23
   },
   "src/styles/base.css": {
     "raw-colour-css": 4
   },
   "src/styles/components.css": {
-    "spacing-scale": 7,
     "raw-colour-css": 2
   },
   "src/styles/home.css": {
-    "spacing-scale": 71,
     "raw-colour-css": 25
   },
   "src/styles/hud.css": {
-    "spacing-scale": 102,
     "raw-colour-css": 6
   },
   "src/styles/login.css": {
-    "spacing-scale": 16,
     "raw-colour-css": 10
   },
   "src/styles/primitives.css": {
-    "spacing-scale": 99,
     "raw-colour-css": 73
   },
   "src/styles/session.css": {
-    "spacing-scale": 1,
     "raw-colour-css": 1
   },
   "src/styles/shell.css": {
-    "spacing-scale": 30,
     "raw-colour-css": 14
   }
 }

@@ -98,9 +98,9 @@
 .hud-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--s3);
   height: 36px;
-  padding: 0 14px;
+  padding: 0 var(--s3);
   flex: none;
   min-width: 0;
   position: relative;
@@ -110,7 +110,7 @@
 .hud-read {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--s3);
   min-width: 0;
 }
 .hud-bar .sep {
@@ -155,7 +155,7 @@
 .hud .metrics {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: var(--s3);
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -176,7 +176,7 @@
   text-decoration: none;
   font-size: 9px;
   color: var(--text-4);
-  margin-left: 2px;
+  margin-left: var(--s1);
 }
 .hud .m b.good { color: var(--success-text); }
 .hud .m b.info { color: var(--info-text); }
@@ -188,7 +188,7 @@
   background: var(--ink-4);
   border: 1px solid var(--line);
   border-radius: var(--r-xs);
-  padding: 2px 7px;
+  padding: var(--s1) var(--s2);
   white-space: nowrap;
 }
 .hud .codec-chip.warn {
@@ -213,9 +213,9 @@
   background: var(--ink-4);
   border: 1px solid var(--line-2);
   border-radius: 4px;
-  padding: 1px 5px;
+  padding: 1px var(--s1);
   color: var(--text-3);
-  margin-left: 2px;
+  margin-left: var(--s1);
 }
 
 /* ---- right cluster: tabs + direct actions ------------------------------ */
@@ -223,7 +223,7 @@
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--s1);
   flex: none;
 }
 /* Semantics-only wrapper for the tab buttons; matches the cluster's own gap so
@@ -231,7 +231,7 @@
 .hud-tabs {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--s1);
 }
 .hud-root[data-axis="v"] .hud-tabs {
   flex-direction: column;
@@ -240,7 +240,7 @@
   width: 1px;
   height: 18px;
   background: var(--line-2);
-  margin: 0 2px;
+  margin: 0 var(--s1);
   flex: none;
 }
 
@@ -303,8 +303,8 @@
   border-color: var(--danger-line);
   color: var(--danger-text);
 }
-.hud-root[data-axis="h"] .ib.danger { margin-left: 12px; }
-.hud-root[data-axis="v"] .ib.danger { margin-top: 12px; }
+.hud-root[data-axis="h"] .ib.danger { margin-left: var(--s3); }
+.hud-root[data-axis="v"] .ib.danger { margin-top: var(--s3); }
 .ib.danger:hover:not(:disabled) {
   background: var(--danger-bg);
   border-color: var(--danger-line);
@@ -319,7 +319,7 @@
 .hud .swapping {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--s2);
   font-size: var(--t-sm);
   color: var(--text-2);
 }
@@ -375,8 +375,8 @@
 .pane-head {
   display: flex;
   align-items: baseline;
-  gap: 12px;
-  padding: 11px 18px 0;
+  gap: var(--s3);
+  padding: var(--s3) var(--s5) 0;
   flex: none;
 }
 .pane-head h3 {
@@ -396,16 +396,16 @@
 }
 .pane-head .segmented { margin-left: auto; }
 .pane-head .segmented button {
-  padding: 4px 10px;
+  padding: var(--s1) var(--s3);
   font-size: var(--t-xs);
 }
 
 /* ---- pane: games ------------------------------------------------------- */
 .qs-rail {
   display: flex;
-  gap: 12px;
+  gap: var(--s3);
   overflow-x: auto;
-  padding: 8px 18px 14px;
+  padding: var(--s2) var(--s5) var(--s4);
   scrollbar-width: thin;
   align-items: flex-start;
 }
@@ -457,7 +457,7 @@
 }
 .qs .nm {
   display: block;
-  padding: 7px 10px 8px;
+  padding: var(--s2) var(--s3) var(--s2);
   font-size: var(--t-xs);
   font-weight: 600;
   color: var(--text-2);
@@ -482,24 +482,24 @@
   color: var(--text);
   background: var(--accent);
   border-radius: 4px;
-  padding: 2px 5px;
+  padding: var(--s1) var(--s1);
 }
 
 /* ---- pane: controller & input, display --------------------------------- */
 .cols {
   display: grid;
   grid-template-columns: 1.15fr 1fr 1fr;
-  gap: 26px;
-  padding: 8px 18px 14px;
+  gap: var(--s6);
+  padding: var(--s2) var(--s5) var(--s4);
   align-items: start;
   overflow-y: auto;
 }
 .capture-cta {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--s3);
   width: 100%;
-  padding: 12px 14px;
+  padding: var(--s3) var(--s4);
   border-radius: var(--r-md);
   border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   background: var(--accent-soft);
@@ -527,8 +527,8 @@
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 6px 0;
+  gap: var(--s3);
+  padding: var(--s2) 0;
   font-size: var(--t-sm);
   color: var(--text-3);
 }
@@ -542,7 +542,7 @@
 }
 .combo {
   display: inline-flex;
-  gap: 3px;
+  gap: var(--s1);
 }
 .combo kbd {
   font-family: var(--font-mono);
@@ -550,14 +550,14 @@
   background: var(--ink-4);
   border: 1px solid var(--line-2);
   border-radius: 4px;
-  padding: 2px 6px;
+  padding: var(--s1) var(--s2);
   color: var(--text-2);
 }
 .col-note {
   font-size: var(--t-xs);
   color: var(--text-4);
   line-height: 1.5;
-  margin-top: 4px;
+  margin-top: var(--s1);
 }
 .col-lb {
   font-size: var(--t-xs);
@@ -565,19 +565,19 @@
   text-transform: uppercase;
   color: var(--text-4);
   font-weight: 700;
-  padding-bottom: 4px;
+  padding-bottom: var(--s1);
 }
 .ctl-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 6px 0;
+  gap: var(--s3);
+  padding: var(--s2) 0;
   font-size: var(--t-sm);
   color: var(--text-2);
 }
 .ctl-row .segmented { margin-left: auto; }
 .ctl-row .segmented button {
-  padding: 5px 10px;
+  padding: var(--s1) var(--s3);
   font-size: var(--t-xs);
 }
 .ctl-row select { margin-left: auto; }
@@ -587,10 +587,10 @@
   background: var(--ink-3);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
-  padding: 9px 12px 6px;
+  padding: var(--s2) var(--s3) var(--s2);
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: var(--s1);
   --c: var(--text-2);
 }
 .stat-card .lb {
@@ -612,7 +612,7 @@
   text-decoration: none;
   font-size: var(--t-xs);
   color: var(--text-4);
-  margin-left: 3px;
+  margin-left: var(--s1);
 }
 /* `height: 0` is load-bearing: an <svg width:100%> with a viewBox and no height
    takes its INTRINSIC aspect ratio (100:30), so a quarter-viewport card grew a
@@ -624,7 +624,7 @@
   height: 0;
   min-height: 38px;
   display: block;
-  margin-top: 2px;
+  margin-top: var(--s1);
 }
 /* Nothing in a pane may overflow the shelf: its depth is fixed. */
 .pane .stat-cards { overflow-y: auto; }
@@ -654,8 +654,8 @@
 .diag-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 0 26px;
-  padding: 8px 18px 14px;
+  gap: 0 var(--s6);
+  padding: var(--s2) var(--s5) var(--s4);
 }
 .diag-grid table {
   width: 100%;
@@ -664,7 +664,7 @@
   font-size: var(--t-xs);
 }
 .diag-grid td {
-  padding: 3px 0;
+  padding: var(--s1) 0;
   color: var(--text-2);
 }
 .diag-grid td:first-child { color: var(--text-4); }
@@ -676,7 +676,7 @@
 /* The verdict block and the Advanced disclosure sit below the four tables:
    they are the support read, not the glanceable one. */
 .diag-extra {
-  padding: 0 18px 14px;
+  padding: 0 var(--s5) var(--s4);
   flex: none;
 }
 .diag-extra .diag-table {
@@ -686,7 +686,7 @@
   font-size: var(--t-xs);
 }
 .diag-extra .diag-table td {
-  padding: 3px 0;
+  padding: var(--s1) 0;
   color: var(--text-2);
   vertical-align: top;
 }
@@ -709,7 +709,7 @@
 .diag-advanced-toggle {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--s2);
   width: 100%;
   margin: 0;
   padding: var(--s2) 0;
@@ -733,13 +733,13 @@
 .hz-flag {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--s1);
   font-size: var(--t-xs);
   color: var(--warning-text);
   background: var(--warning-bg);
   border: 1px solid var(--warning-line);
   border-radius: var(--r-pill);
-  padding: 2px 9px;
+  padding: var(--s1) var(--s2);
   font-weight: 600;
 }
 .hz-flag svg {
@@ -776,12 +776,12 @@
   flex-direction: column;
   height: auto;
   width: 39px;
-  padding: 14px 0;
-  gap: 11px;
+  padding: var(--s3) 0;
+  gap: var(--s3);
 }
 .hud-root[data-axis="v"] .hud-read {
   flex-direction: column;
-  gap: 11px;
+  gap: var(--s3);
 }
 .hud-root[data-axis="v"] .hud-bar .sep {
   width: 16px;
@@ -792,7 +792,7 @@
 .hud-root[data-axis="v"] .codec-chip { display: none; }
 .hud-root[data-axis="v"] .metrics {
   flex-direction: column;
-  gap: 10px;
+  gap: var(--s2);
   overflow: visible;
 }
 .hud-root[data-axis="v"] .m b {
@@ -807,12 +807,12 @@
   margin-top: auto;
   flex-direction: column;
   align-items: center;
-  gap: 5px;
+  gap: var(--s1);
 }
 .hud-root[data-axis="v"] .hud-ctl .div {
   width: 16px;
   height: 1px;
-  margin: 2px 0;
+  margin: var(--s1) 0;
 }
 .hud-root[data-axis="v"] .swapping {
   flex-direction: column;
@@ -822,8 +822,8 @@
 .hud-root[data-axis="v"] .pane-head {
   flex-direction: column;
   align-items: flex-start;
-  gap: 7px;
-  padding: 12px 14px 0;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4) 0;
 }
 .hud-root[data-axis="v"] .pane-head .segmented { margin-left: 0; }
 .hud-root[data-axis="v"] .qs-rail {
@@ -831,10 +831,10 @@
   grid-template-columns: 1fr;
   grid-auto-rows: max-content;
   align-content: start;
-  gap: 10px;
+  gap: var(--s3);
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 9px 14px 14px;
+  padding: var(--s2) var(--s4) var(--s4);
 }
 .hud-root[data-axis="v"] .qs { flex: 0 0 auto; }
 .hud-root[data-axis="v"] .qs .cv {
@@ -844,16 +844,16 @@
 .hud-root[data-axis="v"] .qs .cv .glyph { font-size: 1.3rem; }
 .hud-root[data-axis="v"] .cols {
   grid-template-columns: 1fr;
-  gap: 14px;
-  padding: 9px 14px 14px;
+  gap: var(--s4);
+  padding: var(--s2) var(--s4) var(--s4);
 }
 .hud-root[data-axis="v"] .stat-card svg { min-height: 30px; }
 .hud-root[data-axis="v"] .diag-grid {
   grid-template-columns: 1fr;
   gap: 0;
-  padding: 9px 14px 14px;
+  padding: var(--s2) var(--s4) var(--s4);
 }
-.hud-root[data-axis="v"] .diag-extra { padding: 0 14px 14px; }
+.hud-root[data-axis="v"] .diag-extra { padding: 0 var(--s4) var(--s4); }
 
 /* ============================================================
    OVERLAY CHROME OUTSIDE THE HUD
@@ -868,13 +868,13 @@
   z-index: 35;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--s2);
   background: var(--hud-glass);
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
   border: 1px solid var(--danger-line);
   border-radius: var(--r-pill);
-  padding: 5px 11px 5px 9px;
+  padding: var(--s1) var(--s3) var(--s1) var(--s2);
   font-size: var(--t-xs);
   color: var(--danger-text);
   font-weight: 600;
@@ -902,13 +902,13 @@
   z-index: 30;
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--s3);
   background: oklch(0.13 0.012 267 / 0.8);
   -webkit-backdrop-filter: blur(18px);
   backdrop-filter: blur(18px);
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
-  padding: 11px 16px 11px 13px;
+  padding: var(--s3) var(--s4) var(--s3) var(--s3);
   box-shadow: var(--shadow-lg);
   font-size: var(--t-sm);
   color: var(--text-2);
@@ -940,8 +940,8 @@
   z-index: 32;
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 13px 20px;
+  gap: var(--s4);
+  padding: var(--s3) var(--s5);
   background: oklch(0.13 0.012 267 / 0.9);
   -webkit-backdrop-filter: blur(20px);
   backdrop-filter: blur(20px);
@@ -954,7 +954,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--s1);
 }
 .banner .bt strong {
   font-size: var(--t-base);
@@ -967,7 +967,7 @@
 }
 .banner .ba {
   display: flex;
-  gap: 8px;
+  gap: var(--s2);
   flex: none;
 }
 

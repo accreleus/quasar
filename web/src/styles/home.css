@@ -188,7 +188,7 @@
 }
 .home-hero-sub {
   color: var(--text-2);
-  margin-top: 18px;
+  margin-top: var(--s5);
   font-size: var(--t-lg);
   line-height: 1.55;
   max-width: 220px;
@@ -207,7 +207,9 @@
   gap: var(--s5);
   overflow-x: auto;
   scroll-snap-type: x mandatory;
-  padding: 6px 6px var(--home-rail-gutter, 22px);
+  /* design-lint-allow spacing-scale: pairs with .home-rail-fade right: -6px */
+  padding: 6px 6px var(--home-rail-gutter, var(--s6)); /* design-lint-allow spacing-scale: pairs with .home-rail-fade right: -6px */
+  /* design-lint-allow spacing-scale: negative twin of the track's 6px padding */
   margin: -6px;
   scrollbar-width: none;
   /* Clearance for the sticky topbar: arrowing up from the grid scrolls the rail
@@ -348,6 +350,7 @@
 .home-feat-play svg {
   width: 24px;
   height: 24px;
+  /* design-lint-allow spacing-scale: optical centring of the play glyph */
   margin-left: 3px;
 }
 
@@ -356,10 +359,10 @@
 .home-feat-body {
   position: relative;
   z-index: 1;
-  padding: 15px 17px 17px;
+  padding: var(--s4) var(--s4) var(--s4);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--s2);
   flex: 1;
 }
 .home-feat-kicker {
@@ -397,7 +400,7 @@
   color: var(--text-3);
   font-size: var(--t-sm);
   margin-top: auto;
-  padding-top: 8px;
+  padding-top: var(--s2);
   overflow-wrap: anywhere;
 }
 
@@ -463,13 +466,13 @@
   z-index: 1;
   max-width: var(--home-max);
   margin: 0 auto;
-  padding: 0 var(--page-pad) 96px;
+  padding: 0 var(--page-pad) calc(var(--s10) + var(--s7));
 }
 
 .lib-head {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: var(--s4);
   margin: var(--s7) 0 var(--s5);
   flex-wrap: wrap;
 }
@@ -482,7 +485,7 @@
   font-weight: 500;
 }
 .lib-head .segmented {
-  margin-left: 6px;
+  margin-left: var(--s2);
   /* The five-segment filter must scroll inside itself on a phone rather than
      widen the page. */
   min-width: 0;
@@ -496,7 +499,7 @@
    the neutral glass chip in primitives.css is the console's form. */
 .home .segmented button {
   height: auto;
-  padding: 6px 14px;
+  padding: var(--s2) var(--s4);
   border-radius: 6px;
   font-size: var(--t-sm);
 }
@@ -521,7 +524,7 @@
 .src-head {
   display: flex;
   align-items: baseline;
-  gap: 12px;
+  gap: var(--s3);
   margin: var(--s7) 0 var(--s4);
 }
 .src-head h3 {
@@ -532,7 +535,7 @@
   color: var(--text-3);
   background: var(--ink-3);
   border: 1px solid var(--line);
-  padding: 2px 9px;
+  padding: var(--s1) var(--s2);
   border-radius: var(--r-pill);
 }
 .src-head .s-sub {
@@ -587,7 +590,7 @@
   font-weight: 600;
   font-size: var(--t-sm);
   color: var(--home-fnm);
-  padding: 0 10px;
+  padding: 0 var(--s3);
 }
 /* The mock's `.playov` scrim. `::before`, since `::after` is the open tile's
    caret. */
@@ -635,7 +638,7 @@
   z-index: 5;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
   justify-content: center;
   width: 54px;
   height: 54px;
@@ -662,6 +665,7 @@
 .lib-tile-play svg {
   width: 20px;
   height: 20px;
+  /* design-lint-allow spacing-scale: optical centring of the play glyph */
   margin-left: 2px;
 }
 /* Resume is a labelled pill, not a bare glyph (UX §3.3): the press navigates to
@@ -670,7 +674,7 @@
   width: auto;
   height: 38px;
   border-radius: var(--r-pill);
-  padding: 0 16px 0 13px;
+  padding: 0 var(--s4) 0 var(--s3);
 }
 .lib-tile-play[data-action="resume"] svg {
   width: 15px;
@@ -1028,11 +1032,11 @@
 .detail .d-inner {
   position: relative;
   z-index: 2;
-  padding: 38px 42px;
+  padding: var(--s8) var(--s8);
   max-width: 560px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--s4);
   min-height: 420px;
   color: var(--d-ink);
 }
@@ -1066,7 +1070,7 @@
   align-self: flex-start;
 }
 .d-specs .sp {
-  padding: 10px 16px;
+  padding: var(--s3) var(--s4);
   border-right: 1px solid var(--line);
 }
 .d-specs .sp:last-child {
@@ -1082,14 +1086,14 @@
 .d-specs .sp .v {
   font-family: var(--font-mono);
   font-size: var(--t-base);
-  margin-top: 3px;
+  margin-top: var(--s1);
   color: var(--d-ink);
 }
 
 .d-rec {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--s2);
   font-size: var(--t-sm);
   color: var(--d-ink-2);
 }
@@ -1109,15 +1113,15 @@
   background: var(--danger);
 }
 .d-rec .btn {
-  margin-left: 10px;
+  margin-left: var(--s3);
 }
 
 .d-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--s3);
   margin-top: auto;
-  padding-top: 14px;
+  padding-top: var(--s4);
 }
 .d-actions .heart {
   width: 46px;
@@ -1137,18 +1141,18 @@
   color: var(--d-ink);
 }
 .detail .lib-why ul {
-  margin: 6px 0 0;
-  padding-left: 18px;
+  margin: var(--s2) 0 0;
+  padding-left: var(--s5);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--s1);
 }
 .detail .lib-why p {
-  margin: 7px 0 0;
+  margin: var(--s2) 0 0;
   color: var(--d-ink-3);
 }
 .detail .lib-why .btn {
-  margin-top: 10px;
+  margin-top: var(--s3);
 }
 .detail .lm-cap-fatal {
   color: var(--danger-text);
@@ -1216,8 +1220,8 @@
 .qp-head {
   display: flex;
   align-items: flex-end;
-  gap: 26px;
-  padding: 20px 26px 15px;
+  gap: var(--s6);
+  padding: var(--s5) var(--s6) var(--s4);
   border-bottom: 1px solid var(--line-2);
   flex: none;
 }
@@ -1232,13 +1236,13 @@
   font-size: var(--t-h3);
   font-weight: 700;
   line-height: 1.15;
-  margin-top: 4px;
+  margin-top: var(--s1);
 }
 .qp-spec {
   display: flex;
-  gap: 24px;
+  gap: var(--s6);
   margin-left: auto;
-  padding-right: 44px;
+  padding-right: var(--s9);
 }
 .qp-spec .sp .l {
   display: block;
@@ -1252,7 +1256,7 @@
   display: block;
   font-family: var(--font-mono);
   font-size: var(--t-sm);
-  margin-top: 3px;
+  margin-top: var(--s1);
 }
 /* The panel's own close sits where the band's does, over the panel. */
 .lo .d-close {
@@ -1271,8 +1275,8 @@
 .qp-col {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding: 14px 18px;
+  gap: var(--s2);
+  padding: var(--s4) var(--s5);
   min-height: 0;
   overflow: auto;
 }
@@ -1292,10 +1296,10 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--s3);
   width: 100%;
   text-align: left;
-  padding: 7px 12px;
+  padding: var(--s2) var(--s3);
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
   background: transparent;
@@ -1325,18 +1329,18 @@
   display: block;
   font-size: 11.5px;
   color: var(--text-3);
-  margin-top: 3px;
+  margin-top: var(--s1);
 }
 .qp-row .qr-why {
   display: block;
   font-size: 11.5px;
   color: var(--warning-text);
-  margin-top: 3px;
+  margin-top: var(--s1);
 }
 .qp-row .qr-side {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
   flex: none;
 }
 .qp-tag {
@@ -1347,7 +1351,7 @@
   color: var(--accent-text);
   background: var(--accent-soft);
   border-radius: var(--r-xs);
-  padding: 3px 8px;
+  padding: var(--s1) var(--s2);
   white-space: nowrap;
 }
 .qp-tag.risky {
@@ -1376,10 +1380,10 @@
   font-size: 11.5px;
   line-height: 1.4;
   color: var(--text-3);
-  margin-top: 2px;
+  margin-top: var(--s1);
 }
 .seg-hint + .seg-hint {
-  margin-top: 4px;
+  margin-top: var(--s1);
   opacity: 0.72;
 }
 
@@ -1388,14 +1392,14 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 24px;
-  padding: 14px 26px;
+  gap: var(--s6);
+  padding: var(--s4) var(--s6);
   border-top: 1px solid var(--line-2);
 }
 .qp-verdict {
   display: flex;
   align-items: flex-start;
-  gap: 9px;
+  gap: var(--s2);
   font-size: 12.5px;
   line-height: 1.4;
   color: var(--text-2);
@@ -1407,7 +1411,7 @@
   border-radius: 50%;
   background: var(--success);
   flex: none;
-  margin-top: 5px;
+  margin-top: var(--s1);
 }
 .qp-verdict.risky {
   color: var(--warning-text);
@@ -1424,7 +1428,7 @@
 .qp-acts {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--s3);
   flex: none;
 }
 
@@ -1439,7 +1443,7 @@
   .detail .d-inner {
     max-width: none;
     min-height: 0;
-    padding: 26px 20px;
+    padding: var(--s6) var(--s5);
   }
   .detail .hero-art::after {
     background: linear-gradient(
@@ -1461,17 +1465,17 @@
   }
   .qp-head {
     flex-wrap: wrap;
-    gap: 12px;
+    gap: var(--s3);
   }
   .qp-spec {
     margin-left: 0;
     padding-right: 0;
     flex-wrap: wrap;
-    gap: 14px;
+    gap: var(--s4);
   }
   .qp-foot {
     flex-wrap: wrap;
-    gap: 12px;
+    gap: var(--s3);
   }
 }
 

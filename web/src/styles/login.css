@@ -28,7 +28,7 @@
   display: grid;
   place-items: center;
   min-height: 100svh;
-  padding: clamp(1.5rem, 5vw, 3rem);
+  padding: clamp(var(--s6), 5vw, var(--s9));
   overflow: clip;
   isolation: isolate;
   background:
@@ -53,7 +53,7 @@
    not opacity. */
 .auth-scene .card {
   width: 100%;
-  padding: clamp(1.4rem, 3vw, 1.85rem);
+  padding: clamp(var(--s6), 3vw, var(--s7));
   border: 1px solid oklch(0.9618 0.0086 247.91/.16);
   border-radius: var(--r-feature);
   background: oklch(0.224 0.018 263/.34);
@@ -85,8 +85,8 @@
 .auth-scene .lockup {
   display: grid;
   justify-items: center;
-  gap: .85rem;
-  margin-bottom: 1.6rem;
+  gap: var(--s3);
+  margin-bottom: var(--s6);
 }
 
 .auth-scene .lockup .mark {
@@ -112,12 +112,12 @@
 /* ---------- FORM ---------- */
 .auth-scene form {
   display: grid;
-  gap: 1.05rem;
+  gap: var(--s4);
 }
 
 .auth-scene .field {
   display: grid;
-  gap: .45rem;
+  gap: var(--s2);
 }
 
 .auth-scene .field label,
@@ -131,7 +131,7 @@
   width: 100%;
   height: auto;
   min-height: 2.75rem;
-  padding: 0 .8rem;
+  padding: 0 var(--s3);
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
   background: oklch(0.105 0.01 267/.56);
@@ -166,7 +166,7 @@
 }
 
 .auth-scene .pw .input {
-  padding-right: 4.1rem;
+  padding-right: var(--s10);
 }
 
 .auth-scene .reveal {
@@ -174,7 +174,7 @@
   top: 50%;
   right: .35rem;
   transform: translateY(-50%);
-  padding: .3rem .5rem;
+  padding: var(--s1) var(--s2);
   border: 0;
   border-radius: var(--r-control);
   background: none;
@@ -212,7 +212,7 @@
 
 .auth-scene .auth-note {
   margin: 0;
-  padding: .5rem .7rem;
+  padding: var(--s2) var(--s3);
   border: 1px solid var(--success-line);
   border-radius: var(--r-control);
   background: var(--success-bg);
@@ -226,7 +226,7 @@
   display: flex;
   min-height: 2.75rem;
   align-items: center;
-  gap: .75rem;
+  gap: var(--s3);
   color: var(--text-2);
   cursor: pointer;
   font-size: .8rem;
@@ -339,5 +339,5 @@
    The step indicator and step bodies sit in the same card; give the
    indicator room without touching the steps themselves. */
 .auth-scene .step-indicator {
-  margin-bottom: 1.3rem;
+  margin-bottom: var(--s5);
 }

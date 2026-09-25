@@ -37,7 +37,7 @@
   background: var(--danger-bg);
   border: 1px solid var(--danger-line);
   border-radius: var(--r-sm);
-  padding: 10px 14px;
+  padding: var(--s3) var(--s4);
 }
 
 /* The wizard's submit reads a step larger than an app-wide `.btn` (t-sm). */
