@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quasar — Fleet: Quasar-owned machines (RH-06 reference)</title>
+<link rel="stylesheet" href="assets/console-v3.css">
+<!--
+  RH-06 (#354) console surfaces. AWAITING OWNER APPROVAL. Until #354 records it,
+  no RH-06 UI slice may land a surface from this file.
+
+  Structure follows releases-v3.html: a standalone reference page that renders
+  section renderers (assets/pages-rh06.js) into a gallery, one specimen per
+  surface and state. Every component is an existing console-v3.css class
+  rendered through ui.js helpers.
+
+  CSS added below, and why. Every value is an existing token or a value
+  console-v3.css already uses.
+   1. Page framing (body, h1, .intro): copied from releases-v3.html. Mock only.
+   2. .spec / .spec-cap: gallery captions. Mock only. Do not port.
+   3. .stage: stands in for the fixed .scrim / .dscrim so a dialog can sit in
+      page flow for a screenshot. Mock only. In the product the dialog sits on
+      the real scrim.
+   4. .modal, .modal-head, .modal-body, .modal-foot: the handoff has no
+      centred dialog. These use the drawer's own parts (.dw-head / .dw-body /
+      .dw-foot spacing) on a --r-feature panel. They match the product's
+      existing .modal in web/src/styles/primitives.css, which was derived the
+      same way.
+   5. .snippet: a copyable command. Same as the product's .enroll-snippet
+      (web/src/styles/admin/fleet.css): an inset surface with mono text.
+   6. .diag: a closed-by-default "Details" disclosure. Wire identifiers (check
+      ids, reasons, attempt ids, labels) appear only here; commands and
+      container names the operator acts on are in the copy. It uses the .rel-e
+      disclosure pattern from releases-v3 and the .aud-pre mono readout.
+   7. .rel-e / .rel-c / .rel-t / .rel-x / .rel-fact: copied unchanged from
+      releases-v3.html's pages-releases style block.
+-->
+<style>
+ /* 1. framing, as releases-v3.html */
+ body{padding:40px;max-width:1160px;margin:0 auto}
+ h1.ref{font-size:var(--t-h2);margin:0 0 6px}
+ .intro{color:var(--text-3);font-size:var(--t-sm);margin:0 0 24px;line-height:1.6;max-width:90ch}
+ .intro code{font-family:var(--font-mono);font-size:.85em;color:var(--text-2)}
+ /* 2. gallery captions (mock only) */
+ .spec{margin:0 0 var(--s9);padding-top:var(--s5);border-top:1px solid var(--line)}
+ .spec-cap{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:var(--s5)}
+ .spec-cap .num{color:var(--text-4);font-size:var(--t-xs)}
+ .spec-cap .t{font-family:var(--font-display);font-weight:600;font-size:var(--t-base);color:var(--text)}
+ .spec-cap .hint{flex-basis:100%}
+ .spec>.page{max-width:none}
+ .toc{columns:2;column-gap:var(--s8);font-size:var(--t-sm);margin:0 0 var(--s7);padding-left:18px;color:var(--text-3)}
+ .toc a{cursor:pointer}
+ /* 3. stage: a mock-only stand-in for the fixed scrim */
+ .stage{display:flex;justify-content:center;align-items:flex-start;padding:var(--s8) var(--s5);border-radius:var(--r-panel);background:oklch(0.05 0.01 267/.52);border:1px solid var(--line)} /* .dscrim's own scrim colour */
+ .stage-drawer{justify-content:flex-end;padding:0 0 0 var(--s8);overflow:hidden}
+ .stage .drawer{position:relative;inset:auto;width:min(680px,100%);box-shadow:var(--shadow-lg)}
+ /* 4. modal: drawer parts on a feature-radius panel */
+ .modal{background:color-mix(in oklch,var(--surf-panel) 94%,transparent);backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);border:1px solid var(--glass-border);border-radius:var(--r-feature);box-shadow:inset 0 1px 0 var(--glass-highlight),0 2rem 6rem oklch(0.05 0.01 267/.76);width:100%;max-width:460px}
+ .modal-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s4);padding:var(--s5) var(--s6);border-bottom:1px solid var(--line)}
+ .modal-head h3{font-size:var(--t-h3)}
+ .modal-body{padding:var(--s6)}
+ .modal-foot{display:flex;align-items:center;justify-content:flex-end;gap:var(--s3);padding:var(--s4) var(--s6);border-top:1px solid var(--line)}
+ /* 5. snippet: a copyable command (the product's .enroll-snippet) */
+ .snippet{display:flex;gap:var(--s3);align-items:flex-start;background:color-mix(in oklch,var(--surf-inset) 82%,transparent);border:1px solid var(--line);border-radius:var(--r-control);padding:9px 11px}
+ .snippet pre{flex:1;min-width:0;margin:0;font-family:var(--font-mono);font-size:var(--t-xs);line-height:1.6;color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere}
+ /* 6. diag: the one place identifiers appear */
+ .diag{margin-top:10px}
+ .diag>summary{display:inline-flex;align-items:center;gap:5px;cursor:pointer;list-style:none;font-size:var(--t-xs);color:var(--text-3)}
+ .diag>summary::-webkit-details-marker{display:none}
+ .diag>summary:hover{color:var(--text)}
+ .diag>summary svg{width:11px;height:11px;transition:transform .15s}
+ .diag[open]>summary svg{transform:rotate(90deg)}
+ .diag pre{margin:8px 0 0;font-family:var(--font-mono);font-size:var(--t-xs);line-height:1.7;color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere;background:color-mix(in oklch,var(--surf-inset) 82%,transparent);border:1px solid var(--line);border-radius:var(--r-control);padding:9px 11px}
+ /* 7. from releases-v3.html, unchanged */
+ .rel-e{border-top:1px solid var(--line)}
+ .rel-e summary{display:flex;gap:11px;align-items:baseline;padding:9px var(--card-pad);cursor:pointer;list-style:none}
+ .rel-e summary::-webkit-details-marker{display:none}
+ .rel-c{font-size:10px;font-weight:700;letter-spacing:.09em;min-width:36px;font-family:var(--font-mono)}
+ .rel-t{font-size:var(--t-sm);color:var(--text);flex:1;min-width:0}
+ .rel-x svg{width:12px;height:12px;color:var(--text-4);transform:rotate(90deg);transition:transform .15s}
+ .rel-fact{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid var(--line);font-size:var(--t-sm)}
+ .rel-fact:first-of-type{border-top:0}
+ .rel-fact>span:first-child{color:var(--text-3)}
+ .rel-fact>span:last-child{text-align:right}
+</style>
+</head>
+<body>
+<h1 class="ref">Fleet — Quasar-owned machines (RH-06)</h1>
+<p class="intro">Reference for the RH-06 console surfaces (#354), <strong>awaiting owner approval</strong>. It extends Fleet ▸ Hosts, the host page and Fleet ▸ Releases the way <code>admin-console-v3.html</code> and <code>releases-v3.html</code> draw them. Each specimen below is one surface in one state, rendered by <code>assets/pages-rh06.js</code> with the console-v3 classes and <code>ui.js</code> helpers. Dialogs sit on a stand-in scrim so they can be shown in page flow. Machine names, versions, digests and addresses are placeholders. Wording follows <code>CONTEXT.md</code>. Commands and container names the operator acts on appear in the copy and in copyable blocks; wire identifiers (check ids, reasons, attempt ids, labels) appear only under a closed “Details” disclosure. Screenshots and the surface-to-ticket table are in <code>rh06/README.md</code>.</p>
+<ol class="toc" id="toc"></ol>
+<div id="mount"></div>
+<script src="assets/ui.js"></script>
+<script src="assets/pages-rh06.js"></script>
+<script>
+// [id, surface, state, note, render]
+const SPECS=[
+ ['hosts','Fleet ▸ Hosts','normal','Each row shows the machine’s shape and one attention chip. The expanded row adds a Services column. The Enroll host button becomes Add host.',()=>pageRhHosts()],
+ ['inv-combined','1 · Service inventory','normal · combined host','The host page gains “Services on this machine”: every service on the machine with its version and owner. A machine that runs the control plane is not removed from the console.',()=>pageRhInventory('combined')],
+ ['inv-gpu','1 · Service inventory','normal · GPU host, older agent','A GPU host has no database and no control plane. An agent older than the control plane says where to update it. Its seed was started by the one-line command.',()=>pageRhInventory('gpu')],
+ ['inv-control-only','1 · Service inventory','normal · control-only host, your own database','A control-only host has no host row, so its services show on Releases ▸ Installed, each with version, owner and state. With an operator’s own database, the card says what Quasar will not do.',()=>`<div style="max-width:300px">${rhInstalled({external:true})}</div>`],
+ ['inv-control-only-unknown','1 · Service inventory','unknown · control-only host, not reported yet','The control plane reports its own version; the rest waits for the recovery actor.',()=>`<div style="max-width:300px">${rhInstalled({external:true,state:'unknown'})}</div>`],
+ ['inv-control-only-error','1 · Service inventory','error · control-only host, recovery actor not answering','',()=>`<div style="max-width:300px">${rhInstalled({external:true,state:'error'})}</div>`],
+ ['inv-unknown','1 · Service inventory','unknown · not reported yet','',()=>pageRhInventory('unknown')],
+ ['inv-error','1 · Service inventory','error · recovery actor not answering','The last report stays on screen, marked with its time.',()=>pageRhInventory('error')],
+ ['seed-missing','2 · Seed-missing warning','normal','',()=>pageRhWarning('seed')],
+ ['seed-unknown','2 · Seed-missing warning','unknown · not checked yet','',()=>pageRhWarning('seed-unknown')],
+ ['conflict','2 · Owner-conflict warning','normal · details open','The warning names the container. The Details disclosure holds the identifiers.',()=>pageRhWarning('conflict-open')],
+ ['conflict-error','2 · Owner-conflict warning','error · still in the way after Check again','',()=>pageRhWarning('conflict-error')],
+ ['floor','3 · Must update before it can be managed','normal · node agent and recovery actor below the floor','The only thing offered is an update: Settings, Local console and revert are not offered. Drain stays available.',()=>pageRhFloor('agent')],
+ ['floor-actor','3 · Must update before it can be managed','normal · recovery actor only','This update ends no sessions.',()=>pageRhFloor('actor')],
+ ['floor-unknown','3 · Must update before it can be managed','unknown · version not reported','',()=>pageRhFloor('unknown')],
+ ['floor-failed','3 · Must update before it can be managed','error · the update failed and was restored','',()=>pageRhFloor('failed')],
+ ['releases','Fleet ▸ Releases','normal','Installed shows this machine’s services. Targets explain every host that is not simply ready. Developer apply has its own card.',()=>pageRhReleases()],
+ ['add-options','4 · Add host','normal · one-line command, before creating','Tab 1 is the default. The node name is optional; expiry defaults to one hour and goes up to 30 days.',()=>stage(rhAddHost('options'))],
+ ['add-ready','4 · Add host','normal · command created','The pinned-key one-liner, in the same form as today.',()=>stage(rhAddHost('ready'))],
+ ['add-stack','4 · Add host','normal · Dockge or Arcane tab','For an external manager. The stack holds only the seed; field names are illustrative until RH06-07 fixes them.',()=>stage(rhAddHost('stack'))],
+ ['add-loading','4 · Add host','unknown · certificate not read yet','',()=>stage(rhAddHost('loading'))],
+ ['add-error','4 · Add host','error · could not create the command','',()=>stage(rhAddHost('error'))],
+ ['add-http','4 · Add host','error · page not on HTTPS','Kept from today’s enroll dialog.',()=>stage(rhAddHost('http'))],
+ ['update-own','5 · Migrating update: backup','normal · Quasar’s own database','Says that a dump is taken first, and that the update is refused if it cannot be.',()=>stage(rhUpdateModal('own'))],
+ ['update-external','5 · Migrating update: backup','normal · your own database, not yet confirmed','The fleet run needs this box ticked; Update stays disabled until then.',()=>stage(rhUpdateModal('external'))],
+ ['update-external-checked','5 · Migrating update: backup','normal · your own database, confirmed','',()=>stage(rhUpdateModal('external-checked'))],
+ ['update-unknown','5 · Migrating update: backup','unknown · free space not reported','',()=>stage(rhUpdateModal('own-unknown'))],
+ ['update-space','5 · Migrating update: backup','error · not enough free space','',()=>stage(rhUpdateModal('own-error'))],
+ ['update-refused','5 · Migrating update: backup','error · refused after starting: the dump failed','The Releases banner after the run. The recovery actor moved first, so it is already on the new release.',()=>rhRefusedBanner],
+ ['restore-own','6 · Failed migrating update: restore','normal · Quasar’s own database','The command names the dump, in the architecture’s restore --dump shape; the copy names the version it returns to. See README open question 1.',()=>rhRestore('own')],
+ ['restore-unknown','6 · Failed migrating update: restore','unknown · dump not reported yet','',()=>rhRestore('unknown')],
+ ['restore-external','6 · Failed migrating update: restore','variant · your own database','PROPOSED, not in the spec: the restore --to command for this case is open question 1 for RH06-12 (see README).',()=>rhRestore('external')],
+ ['remove-confirm','7 · Remove host','normal · confirmation','',()=>stage(rhRemove('confirm'))],
+ ['remove-progress','7 · Remove host','normal · in progress','',()=>rhRemove('progress')],
+ ['remove-offline','7 · Remove host','unknown · host not connected','',()=>stage(rhRemove('offline'))],
+ ['remove-failed','7 · Remove host','error · removal did not finish','',()=>rhRemove('failed')],
+ ['devapply','8 · Developer apply','normal · filled','Opens from Releases ▸ Developer apply, in the drawer pattern from pages-library.js.',()=>stage(rhDevApply('filled'),'drawer')],
+ ['devapply-empty','8 · Developer apply','empty','',()=>stage(rhDevApply('empty'),'drawer')],
+ ['devapply-error','8 · Developer apply','error · namespace refused, tag instead of digest','',()=>stage(rhDevApply('error'),'drawer')],
+ ['devapply-migrating','8 · Developer apply','normal · control-plane digest that migrates, Quasar’s own database','The same database rule as a migrating release: drain, never unattended, dump first or refuse.',()=>stage(rhDevApply('migrating'),'drawer')],
+ ['devapply-migrating-external','8 · Developer apply','normal · control-plane digest that migrates, your own database','Apply stays disabled until the backup is confirmed, as in the fleet run.',()=>stage(rhDevApply('migrating-external'),'drawer')]];
+document.getElementById('toc').innerHTML=SPECS.map(([id,s,st])=>`<li><a href="#s-${id}">${s}</a> — ${st}</li>`).join('');
+document.getElementById('mount').innerHTML=SPECS.map(([id,s,st,note,fn])=>`<section class="spec" id="s-${id}">
+ <div class="spec-cap"><span class="t">${s}</span><span class="chip${/^error/.test(st)?' chip-danger':/^unknown|^empty/.test(st)?'':/^variant/.test(st)?' chip-warning':' chip-accent'}">${st}</span>${note?`<span class="hint">${note}</span>`:''}</div>
+ ${fn()}</section>`).join('');
+</script>
+</body>
+</html>
