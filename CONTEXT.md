@@ -533,3 +533,66 @@ migration (`ReleaseRunsAMigration`): since #128 a recreate no longer ends a
 `running` session, so a non-migrating step lets live sessions ride through it and
 waits only for in-flight launches to settle (#153). Host steps drain as they
 always did — recreating an agent does end that host's sessions.
+
+## Deployment ownership (RH06, in shaping)
+
+**Platform service** — one long-running container that runs Quasar itself on a
+machine: the control plane, a node agent, Postgres, the updater, and later an
+optional TURN relay. Distinct from a session's containers, which the node agent
+creates and owns. _Avoid_: "stack" for a single service (a stack is the set a
+manager groups together), "platform image" (that is what a service runs, not the
+service).
+
+**Service owner** — the one actor allowed to create, replace and remove a platform
+service's container and to decide what image it runs. Every platform service has
+exactly one at a time. A restart policy restarts a container; it is never an
+owner. _Avoid_: "manager" unqualified, "supervisor".
+
+**External manager** — software other than Quasar that starts containers from its
+own definitions: the Compose CLI with the operator's files, a stack UI, an
+appliance's container templates. On a Quasar-owned machine it holds exactly one
+definition, the seed; it never holds one for a Quasar service it could redeploy.
+Quasar never edits a manager's files. _Avoid_: "orchestrator" (implies scheduling
+Quasar does not delegate), "compose" as a synonym (Compose is one external
+manager).
+
+**Seed** — the one container an external manager (or a single `docker run`)
+declares for Quasar on a machine. It only ensures the recovery actor exists, and
+is built to be stable for years; the manager, not Quasar, updates it. _Avoid_:
+"installer" (that is a script run once), "bootstrap container" once the machine
+is running (bootstrap is what the seed does the first time).
+
+**Recovery actor** — the Quasar-owned container on each machine that creates and
+replaces that machine's other platform services, and replaces itself by handing
+over to a successor. It exists because a container cannot replace itself, and it
+is what keeps a control plane recoverable while the control plane is down.
+_Avoid_: "sidecar", "watchdog", "agent" (the node agent is a different service).
+
+**Enrollment** — a node agent joining a control plane for the first time, by
+redeeming an enrollment token for its host identity. Reconnecting with an
+existing identity is not enrollment. _Avoid_: "registration" for this (every
+connection registers; only the first enrolls), "bootstrap" (that is standing up
+the first control plane).
+
+**Enrollment token** — a secret an admin mints to let one agent enroll: single use
+by default, short-lived, optionally bound to one node name, revocable, stored only
+as a hash. The static deployment-wide token is the break-glass exception.
+_Avoid_: "join token", "API key".
+
+**Host identity** — the node name and node secret by which the control plane
+recognises a host across reconnects. The agent's local state beside the secret
+(its pinned control-plane certificate, container-ownership lease and
+configuration journal) belongs to the same identity and moves with it. A new
+node name is a new host. _Avoid_: "host id" (the database key), "hostname" (the
+machine's name, which the node name only defaults to).
+
+**Combined host** — one machine running the control plane, Postgres and a node
+agent. A **GPU host** runs a node agent (and its updater) only; a
+**control-only host** runs the control plane and Postgres with no agent.
+_Avoid_: "all-in-one", "head node", "worker node".
+
+**Replacement** — moving one platform service to a new specification (usually a new
+image digest): stop the old container and keep it, start the new one, verify it, then
+discard the old one — or restore the old one if verification fails. Each replacement is
+one attempt. _Avoid_: "recreate" (the Compose mechanism), "upgrade" (a replacement can
+also revert), "rollout".
