@@ -5,8 +5,11 @@
  */
 
 import type { HostServices, ServiceRow, ServiceState } from "../hostServices";
-import { reportClock } from "../hostServices";
 import { Chip } from "../../../../components/Chip";
+import { clockTime } from "../../../../lib/format/clockTime";
+
+/** "13:48", as the mock's "as of" chips and "Last report from" read. */
+const reportClock = (at: string): string => clockTime(at, { seconds: false });
 import { elapsedWords } from "../../../../lib/format/relativeTime";
 
 export interface ServicesCardProps {

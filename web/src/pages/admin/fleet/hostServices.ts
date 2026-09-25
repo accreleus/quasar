@@ -154,14 +154,3 @@ export function hostServices(host: Host, opts: { agentOlder: boolean }): HostSer
 
   return { report, reportedAt, rows };
 }
-
-/** Local 24-hour "13:48", as the mock's "as of" chips and "Last report from" read. */
-export function reportClock(at: string): string {
-  const ms = Date.parse(at);
-  if (!Number.isFinite(ms)) return "";
-  return new Date(ms).toLocaleTimeString(undefined, {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
