@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH06 console mockups, awaiting owner approval (#354).**
+  `design_handoff_v3/screens/fleet-rh06-v3.html` extends Fleet and Fleet ▸ Releases in
+  the v3 handoff's own markup and tokens. It covers the per-machine service inventory,
+  the seed-missing and owner-conflict warnings, "must update before it can be managed",
+  the Add host dialog (one-line command or seed-only stack), the backup confirmation on
+  a migrating update, the restore command after a failed one, Remove host and Developer
+  apply, each in its normal, unknown and error states. Screenshots, the surface-to-ticket
+  table and the open questions are in `design_handoff_v3/screens/rh06/README.md`.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
