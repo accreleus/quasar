@@ -11,27 +11,6 @@
   "src/pages/StyleguidePage.tsx": {
     "inline-style": 1
   },
-  "src/pages/admin/AdminApps/editor/AccessTab.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/AdminApps/editor/ArtworkTab.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/AdminApps/editor/EditorRail.tsx": {
-    "inline-style": 6
-  },
-  "src/pages/admin/ImageDetail.tsx": {
-    "inline-style": 21
-  },
-  "src/pages/admin/ReleaseBanner.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/SecretStoreBanner.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/Settings.tsx": {
-    "inline-style": 5
-  },
   "src/pages/admin/audit/AuditRow.tsx": {
     "inline-style": 1
   },
@@ -89,39 +68,6 @@
   "src/pages/admin/fleet/settings/SettingsRail.tsx": {
     "inline-style": 19
   },
-  "src/pages/admin/library/AppConfirmModals.tsx": {
-    "inline-style": 1
-  },
-  "src/pages/admin/library/AppRow.tsx": {
-    "inline-style": 3
-  },
-  "src/pages/admin/library/AppsTab.tsx": {
-    "inline-style": 12
-  },
-  "src/pages/admin/library/ImageCleanupModal.tsx": {
-    "inline-style": 3
-  },
-  "src/pages/admin/library/PendingImportRow.tsx": {
-    "inline-style": 11
-  },
-  "src/pages/admin/library/RuntimePresetDrawer.tsx": {
-    "inline-style": 5
-  },
-  "src/pages/admin/library/ScanHealth.tsx": {
-    "inline-style": 11
-  },
-  "src/pages/admin/library/SourceRow.tsx": {
-    "inline-style": 16
-  },
-  "src/pages/admin/library/SourcesTab.tsx": {
-    "inline-style": 7
-  },
-  "src/pages/admin/library/SteamPreparation.tsx": {
-    "inline-style": 2
-  },
-  "src/pages/admin/library/SteamPreparationStatus.tsx": {
-    "inline-style": 14
-  },
   "src/pages/admin/overview/FleetCapacityCard.tsx": {
     "inline-style": 1
   },
@@ -133,15 +79,6 @@
   },
   "src/pages/admin/overview/RecentActivityCard.tsx": {
     "inline-style": 1
-  },
-  "src/pages/admin/people/InvitesTab.tsx": {
-    "inline-style": 31
-  },
-  "src/pages/admin/people/UserDrawer.tsx": {
-    "inline-style": 27
-  },
-  "src/pages/admin/people/UsersTab.tsx": {
-    "inline-style": 3
   },
   "src/pages/admin/sessions/LatestCards.tsx": {
     "inline-style": 2

@@ -188,6 +188,9 @@ own; the two do not move together, and that is deliberate.
   `.t-xs` `.t-sm` `.t-lg` `.t-h3` `.text-1` `.text-2` `.mb1` utilities (the block's top
   comment lists every utility and its token). Off-scale spacing snapped to the 4px scale;
   nothing else looks different.
+- **Design-lint batch C2: admin library, people, app editor and top-level admin pages (#375).**
+  Their inline styles have moved to utilities and token-backed classes in `admin.css` and
+  `admin/editor.css`. Off-scale spacing snapped to the 4px scale; nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API
