@@ -26,9 +26,7 @@ const mocked = vi.mocked(adminApi);
 
 const PF: PlatformPreflight = { state: "unknown", checked_at: null, checks: [] };
 const COMMIT = "a".repeat(40);
-const RA_DIGEST = "sha256:" + "9b3e".repeat(16);
 const NA_DIGEST = "sha256:" + "c05a".repeat(16);
-const RA = `ghcr.io/accreleus/quasar-recovery@${RA_DIGEST}`;
 const NA = `registry.example.invalid:5000/quasar-dev/quasar-node-agent@${NA_DIGEST}`;
 
 function host(over: Partial<PlatformHostIdentity>): PlatformHostIdentity {
@@ -151,11 +149,16 @@ describe("Developer apply", () => {
     expect(within(drawer).getByLabelText("Node agent")).toHaveAttribute("aria-invalid", "true");
     expect(drawer).toHaveTextContent("Fix the image above to continue.");
     expect(applyButton(drawer)).toBeDisabled();
+  });
 
-    fireEvent.change(within(drawer).getByLabelText("Recovery actor"), {
-      target: { value: "ghcr.io/accreleus/quasar-recovery@sha256:9b3e" },
-    });
-    expect(drawer).toHaveTextContent("Fix the two images above to continue.");
+  it("withholds the recovery actor until the actor can replace itself", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view(MIXED));
+    renderTab();
+    const drawer = await openDrawer();
+
+    const ra = within(drawer).getByLabelText("Recovery actor");
+    expect(ra).toBeDisabled();
+    expect(ra).toHaveAttribute("placeholder", "arrives with #362");
   });
 
   it("posts only the filled images, split into repository and digest", async () => {
@@ -192,7 +195,7 @@ describe("Developer apply", () => {
     renderTab();
     const drawer = await openDrawer();
 
-    fireEvent.change(within(drawer).getByLabelText("Recovery actor"), { target: { value: RA } });
+    fireEvent.change(within(drawer).getByLabelText("Node agent"), { target: { value: NA } });
     fireEvent.click(applyButton(drawer));
 
     const alert = await within(drawer).findByRole("alert");
@@ -209,7 +212,7 @@ describe("Developer apply", () => {
     renderTab();
     const drawer = await openDrawer();
 
-    fireEvent.change(within(drawer).getByLabelText("Recovery actor"), { target: { value: RA } });
+    fireEvent.change(within(drawer).getByLabelText("Node agent"), { target: { value: NA } });
     fireEvent.click(applyButton(drawer));
 
     const alert = await within(drawer).findByRole("alert");
@@ -224,7 +227,7 @@ describe("Developer apply", () => {
     const drawer = await openDrawer();
     const reads = mocked.getPlatformReleases.mock.calls.length;
 
-    fireEvent.change(within(drawer).getByLabelText("Recovery actor"), { target: { value: RA } });
+    fireEvent.change(within(drawer).getByLabelText("Node agent"), { target: { value: NA } });
     fireEvent.click(applyButton(drawer));
 
     await waitFor(() =>

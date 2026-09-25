@@ -43,9 +43,15 @@ const SLOTS: ImageSlot[] = [
   { name: "control-plane", label: "Control plane", placeholder: "namespace/quasar-control-plane@sha256:…" },
 ];
 
-/** What a GPU host's recovery actor can replace; `control-plane` is never sent
- *  to a host. */
-const HOST_COMPONENTS: ReadonlySet<ComponentName> = new Set(["recovery-actor", "node-agent"]);
+/** What a GPU host's recovery actor can replace in this build; `control-plane` is never
+ *  sent to a host. */
+const HOST_COMPONENTS: ReadonlySet<ComponentName> = new Set(["node-agent"]);
+
+/** Offered to a host by the contract, but the actor refuses it `invalid` until it can
+ *  replace itself; withheld rather than sent to a drained host for a certain refusal. */
+const WITHHELD: Partial<Record<ComponentName, string>> = {
+  "recovery-actor": "arrives with #362",
+};
 
 /** Owned GPU hosts, the only machines this build offers. */
 export function developerApplyMachines(view: PlatformReleaseView): PlatformHostIdentity[] {
@@ -106,11 +112,11 @@ export function DeveloperApplyCard({
     <>
       <Card className="card-pad">
         <div className="eyebrow">Developer apply</div>
-        <div className="hint" style={{ marginTop: 6, lineHeight: 1.5 }}>
+        <div className="hint devapply-card-hint">
           Apply a build that is not a release, by digest, from an allowed image namespace. Admins
           only; offered only on Quasar-owned machines.
         </div>
-        <Button size="sm" style={{ marginTop: "var(--s4)" }} onClick={() => setOpen(true)}>
+        <Button size="sm" className="mt4" onClick={() => setOpen(true)}>
           Developer apply…
         </Button>
       </Card>
@@ -165,7 +171,8 @@ export function DeveloperApplyDrawer({
         force: false,
       }),
     {
-      success: `Developer apply started on ${machine?.node_name ?? "the host"}.`,
+      // Accepted is not started: the attempt may wait for the host's sessions to end.
+      success: `Developer apply queued for ${machine?.node_name ?? "the host"}.`,
       // The drawer's refusal note carries the explanation; the toast only
       // reports the event, so the server's message is not shown twice.
       failure: () => "The developer apply was not started.",
@@ -207,7 +214,7 @@ export function DeveloperApplyDrawer({
         </>
       }
     >
-      <div className="note warn" style={{ marginBottom: "var(--s5)" }}>
+      <div className="note warn mb5">
         <b>For testing a build that is not a release.</b> Applies images by digest to one
         Quasar-owned machine. It is recorded as an attempt like any other, the recovery actor moves
         first, and a failed agent is put back automatically. Applying a node agent ends that
@@ -254,7 +261,12 @@ export function DeveloperApplyDrawer({
                 onChange={(v) => edit(slot.name, v)}
               />
             ) : (
-              <ImageField key={slot.name} slot={slot} value="" absent />
+              <ImageField
+                key={slot.name}
+                slot={slot}
+                value=""
+                absent={WITHHELD[slot.name] ?? "not on this machine"}
+              />
             ),
           )}
         </div>
@@ -266,10 +278,7 @@ export function DeveloperApplyDrawer({
           <p>Set on each machine. Images from anywhere else are refused.</p>
         </div>
         <div className="fs-fields">
-          <p
-            className="hint"
-            style={{ margin: 0, fontSize: "var(--t-sm)", lineHeight: 1.55, color: "var(--text-2)" }}
-          >
+          <p className="hint devapply-ns-note">
             Each machine&rsquo;s list is its{" "}
             <span className="mono">QUASAR_UPDATER_ALLOWED_NAMESPACES</span>. The control plane
             checks every image against its own copy before anything is sent.
@@ -284,13 +293,13 @@ function ImageField({
   slot,
   value,
   onChange,
-  absent = false,
+  absent,
 }: {
   slot: ImageSlot;
   value: string;
   onChange?: (value: string) => void;
-  /** The service does not run on the selected machine. */
-  absent?: boolean;
+  /** Why this service cannot be applied here (the disabled field's placeholder). */
+  absent?: string;
 }) {
   const id = `developer-apply-${slot.name}`;
   const result = !absent && value.trim() !== "" ? parseImageReference(value) : null;
@@ -304,8 +313,8 @@ function ImageField({
         id={id}
         className={["input", "mono", error ? "input-error" : ""].filter(Boolean).join(" ")}
         value={value}
-        placeholder={absent ? "not on this machine" : slot.placeholder}
-        disabled={absent}
+        placeholder={absent ?? slot.placeholder}
+        disabled={absent !== undefined}
         spellCheck={false}
         autoComplete="off"
         aria-invalid={error ? true : undefined}
@@ -327,12 +336,12 @@ function RefusalNote({ refusal }: { refusal: Refusal }) {
   if (refusal.reason) details.push(`reason: ${refusal.reason}`);
   if (refusal.message) details.push(`message: ${refusal.message}`);
   return (
-    <div className="note warn" role="alert" style={{ marginBottom: "var(--s5)" }}>
+    <div className="note warn mb5" role="alert">
       <b>Not applied.</b> {text}
       {showMessage && refusal.message && <> {refusal.message}</>}
       <details className="enroll-more mt2">
         <summary>Details</summary>
-        <p className="mono hint" style={{ margin: "var(--s2) 0 0", whiteSpace: "pre-wrap" }}>
+        <p className="mono hint devapply-detail">
           {details.join("\n")}
         </p>
       </details>
