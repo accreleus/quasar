@@ -1,14 +1,12 @@
 # The recovery actor (RH-06, docs/rh06/2026-09-24-architecture.md §5.1): one static musl
-# binary, `quasar-recovery`, in a slim image. Built ONLY by deploy/build-images.sh (role
+# binary, `quasar-recovery`, in a slim image. Built by deploy/build-images.sh (role
 # `recovery`) and asserted by deploy/image-contract.json.
 #
-# Deliberately NOT on the Dockerfile.vulkan lineage: the actor carries no GStreamer, CUDA
-# or GPU userspace (the crate's tests/gstreamer_free_convention.rs walks its lockfile
-# closure), and its release cadence must not wait on the toolchain image.
+# Off the Dockerfile.vulkan lineage: the actor carries no GStreamer, CUDA or GPU userspace
+# (tests/gstreamer_free_convention.rs), and its releases must not wait on the toolchain.
 #
-# Alpine rather than scratch: the image contract's assertions run in a shell inside the
-# image, and an operator's `docker exec quasar-recovery quasar-recovery status` needs no
-# more than the binary. TLS roots are compiled in (webpki-roots), so no CA bundle ships.
+# Alpine rather than scratch because the contract's assertions run in a shell inside the
+# image. TLS roots are compiled in (webpki-roots), so no CA bundle ships.
 
 ARG RUST_VERSION=1.94.0
 

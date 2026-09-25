@@ -1254,21 +1254,24 @@ inputs are ignored (a differing home root is logged `token="actor-input-ignored"
 
 | Variable | Default | Notes |
 |---|---|---|
-| `QUASAR_ROLE` | `gpu` | `gpu` \| `combined` \| `control-only`. Only `gpu` installs in this build. |
-| `QUASAR_ENROLLMENT` | — (**required** on first install) | The `qenr1.…` string from Admin → Fleet → Enroll host. Stored as a 0600 secret in machine state and handed to the agent as the read-only file `QUASAR_ENROLLMENT_FILE`; never put in the agent's environment. Remove it from the actor's command once the host has enrolled. |
+| `QUASAR_ROLE` | `gpu` | Only `gpu` in this build; `combined` and `control-only` are refused at start (`token="actor-role-invalid"`) until RH06-09 (#361). |
+| `QUASAR_ENROLLMENT` | — (**required** on first install) | The `qenr1.…` string from Admin → Fleet → Enroll host. Stored as a 0600 secret in machine state and handed to the agent as the read-only file `QUASAR_ENROLLMENT_FILE`; never put in the agent's environment. Read only on the first install: once machine state exists the stored secret wins and this value is ignored (logged at INFO), whatever a later start carries. A `docker run` container's environment cannot be edited, so the value stays visible in `docker inspect quasar-recovery` until the actor is recreated without it; the token is single-use and expires, so after enrollment it enrolls nothing. |
 | `QUASAR_HOME_ROOT` | — (**required** on first install) | Host path of the homes root; bound into the agent at the same path. |
 | `QUASAR_TEMPLATE_ROOT` | `/var/lib/quasar/templates` | Host path of the templates root; bound at the same path. |
 | `QUASAR_NODE_NAME` | the engine host's name | The agent's `NODE_NAME`. |
 | `QUASAR_AGENT_IMAGE` | — (**required** on first install) | The node-agent image as `repository@sha256:<digest>`; a tag is refused. The image must carry an `org.quasar.recipe` revision this actor carries, else the install stops with `recipe_unsupported` before anything is created. |
 | `QUASAR_DOCKER_SOCKET_HOST_PATH` | `/var/run/docker.sock` | Only when the actor cannot inspect its own container: the daemon-host path of the engine socket it binds into the agent. Normally learned from the actor's own mount. |
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
-| `QUASAR_RECOVERY_AGENT_SOCKET` | `/run/quasar-recovery/agent.sock` | The agent socket, inside the `quasar-recovery-agent` volume. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
+**One socket, one name.** The actor always listens at `/run/quasar-recovery/agent.sock`, inside the `quasar-recovery-agent` volume it mounts read-write; that path is fixed, not an actor input. The agent it creates mounts the same volume read-only at the same path and is told where through `QUASAR_RECOVERY_SOCKET` (see "Node agent — connection & identity"), which the actor's recipe sets. Both names come from one constant module (`quasar_runtime::owned_install`), so the two sides cannot drift.
+
 On start the actor takes the machine's lease (`actor.lease`; a second actor on the same
 volume exits `token="actor-lease-unavailable"`), creates machine state, detects the GPU
-with a disposable probe container, and creates `quasar-node-agent` from its recipe with its
+with a disposable probe container (and, when it finds an NVIDIA device, a second probe that requests
+`--gpus all`: the NVIDIA shape is installed only if the engine starts it, logged
+`token="actor-gpus-served"`, else `token="actor-gpus-refused"` with the reason), and creates `quasar-node-agent` from its recipe with its
 volumes (`quasar-agent-data`, `quasar-node-agent-secrets`, and `quasar-nvidia-driver` on an
 NVIDIA host whose engine serves `--gpus`). A second start on an installed machine changes
 nothing; an interrupted install is completed by the next start. A failed install (an
