@@ -115,6 +115,7 @@ beforeEach(() => {
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
   mocked.deleteHost.mockResolvedValue(undefined as never);
+  mocked.getPlatformIdentity.mockRejectedValue(new Error("not an owned install"));
 });
 
 describe("HostsTab — the table", () => {
