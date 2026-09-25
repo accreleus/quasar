@@ -284,8 +284,13 @@ pub(crate) fn pulse_command(socket_dir: &str) -> Vec<String> {
         // pickers. Baked into the daemon args so it lives as long as the sidecar: a live
         // `pactl load-module` does not survive a restart. First sink loaded == default
         // sink, so a default-source capture lands on its monitor.
+        //
+        // rate/channels are pinned to the Opus wire format. Unpinned, the sink starts at the
+        // daemon default 44100 and can only change rate while its monitor is idle, which it
+        // never is: pulsesrc captures it from session start (#351).
         format!(
             "--load=module-null-sink sink_name={QUASAR_SINK_NAME} \
+             rate=48000 channels=2 \
              sink_properties=\"device.class='sound' device.description='Quasar Output'\""
         ),
         // Microphone capture (client → host). These two loads MUST stay AFTER the
@@ -740,6 +745,10 @@ mod tests {
         assert_eq!(null_sinks.len(), 2, "output sink + microphone feed sink");
         assert!(null_sinks[0].contains("sink_name=quasar_output"));
         assert!(null_sinks[0].contains("device.class='sound'"));
+        // Pinned to the Opus wire format: the capture pulsesrc holds the monitor from
+        // session start, so the sink cannot switch rate once a game connects.
+        assert!(null_sinks[0].contains("rate=48000"));
+        assert!(null_sinks[0].contains("channels=2"));
         assert!(null_sinks[1].contains("sink_name=quasar_mic"));
         assert!(null_sinks[1].contains("device.class='sound'"));
         assert!(null_sinks[1].contains("device.description='Quasar Microphone Feed'"));
