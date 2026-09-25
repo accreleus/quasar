@@ -102,16 +102,13 @@ function RegistrationModeCard({ token }: { token: string }) {
   }
 
   return (
-    <div
-      className="card card-pad"
-      style={{ display: "flex", gap: "var(--s7)", alignItems: "center", flexWrap: "wrap" }}
-    >
+    <div className="card card-pad row gap7 wrap">
       <div>
         <div className="eyebrow">Registration mode</div>
         {mode === null ? (
           <LoadingState />
         ) : (
-          <div style={{ marginTop: 8 }}>
+          <div className="mt2">
             <SegmentedControl
               options={(Object.keys(MODE_COPY) as RegistrationMode[]).map((m) => ({
                 value: m,
@@ -126,7 +123,7 @@ function RegistrationModeCard({ token }: { token: string }) {
           </div>
         )}
       </div>
-      <div className="note warn" style={{ maxWidth: 460, marginLeft: "auto" }}>
+      <div className="note warn ml-auto" style={{ maxWidth: 460 }}>
         An invite code is shown <strong>once</strong>, when it is minted. It cannot be retrieved
         afterwards. Revoke and mint a new one instead.
       </div>
@@ -208,7 +205,7 @@ function MintModal({ token, onClose, onMinted }: MintModalProps) {
           value={expiresAt}
           onChange={(e) => setExpiresAt(e.target.value)}
         />
-        <div style={{ gridColumn: "1 / -1" }}>
+        <div className="inv-span-all">
           <TextareaField
             label="Note (optional)"
             value={note}
@@ -243,22 +240,11 @@ function InviteRevealModal({
         retrieved again after you close this dialog.
       </p>
 
-      <div className="mt5" style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
+      <div className="mt5 col gap4">
         <div>
           <span className="label">Invite code</span>
           <div className="row gap2 mt2">
-            <code
-              className="mono"
-              style={{
-                flex: 1,
-                background: "var(--ink-2)",
-                border: "1px solid var(--line-2)",
-                borderRadius: "var(--r-sm)",
-                padding: "8px 12px",
-                fontSize: "var(--t-sm)",
-                wordBreak: "break-all",
-              }}
-            >
+            <code className="mono inv-code t-sm">
               {invite.code}
             </code>
             <Button variant="ghost" size="sm" onClick={() => void copyToClipboard(invite.code, "Code", addToast)}>
@@ -270,18 +256,7 @@ function InviteRevealModal({
         <div>
           <span className="label">Magic link</span>
           <div className="row gap2 mt2">
-            <code
-              className="mono"
-              style={{
-                flex: 1,
-                background: "var(--ink-2)",
-                border: "1px solid var(--line-2)",
-                borderRadius: "var(--r-sm)",
-                padding: "8px 12px",
-                fontSize: "var(--t-xs)",
-                wordBreak: "break-all",
-              }}
-            >
+            <code className="mono inv-code t-xs">
               {url}
             </code>
             <Button variant="ghost" size="sm" onClick={() => void copyToClipboard(url, "Link", addToast)}>
@@ -291,7 +266,7 @@ function InviteRevealModal({
         </div>
       </div>
 
-      <p className="muted mt4" style={{ fontSize: "var(--t-xs)" }}>
+      <p className="muted mt4 t-xs">
         Anyone with this link can register {invite.role === "admin" ? "an admin " : ""}account,
         up to {invite.max_uses} time{invite.max_uses === 1 ? "" : "s"}
         {invite.expires_at ? ` · expires ${fmtDate(invite.expires_at)}` : ""}.
@@ -373,18 +348,12 @@ export function InvitesTab() {
         const sub = inviteSubLabel(i);
         return (
           <div className="stack">
-            <span className="cell-id" style={{ fontSize: "var(--t-sm)" }}>{i.code_prefix}</span>
+            <span className="cell-id t-sm">{i.code_prefix}</span>
             {sub && (
               <span
-                className="sub"
+                className="sub inv-sub-trunc"
                 title={sub}
-                style={{
-                  display: "block",
-                  maxWidth: 150,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
+                style={{ maxWidth: 150 }}
               >
                 {sub}
               </span>
@@ -420,10 +389,7 @@ export function InvitesTab() {
       width: "110px",
       align: "right",
       render: (i) => (
-        <span
-          className="mono"
-          style={{ color: inviteState(i, now) === "expired" ? "var(--danger-text)" : "var(--text-3)" }}
-        >
+        <span className={inviteState(i, now) === "expired" ? "mono inv-expired" : "mono muted"}>
           {i.expires_at ? fmtDate(i.expires_at) : "Never"}
         </span>
       ),

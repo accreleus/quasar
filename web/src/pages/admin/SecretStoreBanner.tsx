@@ -31,9 +31,8 @@ export function SecretStoreBanner() {
 
   return (
     <div
-      className="note warn mb6"
+      className="note warn mb6 center between"
       role="status"
-      style={{ alignItems: "center", justifyContent: "space-between" }}
     >
       <div>
         <b>No master key is configured on this control plane.</b> Admin-stored credentials

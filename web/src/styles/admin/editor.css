@@ -32,6 +32,17 @@
   text-decoration: underline;
 }
 
+/* Rail card: the hero frame is clipped to the card's radius. */
+.ae-rail-card {
+  overflow: hidden;
+}
+
+/* Access tab: the user picker and its button align on their bottom edge. */
+.ae-add-user {
+  align-items: flex-end;
+  max-width: 560px;
+}
+
 /* The gradient stands in for missing art, in both crops and in the rail. It is
    a design, not a broken image, so it carries the app's monogram. */
 .ae-frame {

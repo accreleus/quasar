@@ -190,6 +190,13 @@
 .qtable tbody td.td-danger { color: var(--danger-text); }
 .qtable tbody td.td-muted { color: var(--text-3); }
 
+/* ── Settings page (pages/admin/Settings.tsx) ─────────────── */
+.admin-settings-end { align-items: flex-end; }
+.admin-settings-sep {
+  border-top: 1px solid var(--line);
+  padding-top: var(--s5);
+}
+
 /* === UI-12 Admin Sessions === */
 
 /* ── Sessions table stack cell (user/app with sub-label) ─── */
@@ -590,6 +597,7 @@
   border-radius: 50%;
   margin-top: var(--s1);
   flex: none;
+  background: var(--hist-dot, transparent);
 }
 
 .hist-item .hi-app {
@@ -602,6 +610,54 @@
   color: var(--text-3);
   font-family: var(--font-mono);
   margin-top: var(--s1);
+}
+
+/* --avatar-bg is the per-user gradient from people/format.ts. Beats shell.css `.u-ava`. */
+.u-grad {
+  background: var(--avatar-bg, var(--action));
+}
+
+.drawer-user-head .u-name {
+  font-size: 1.1rem;
+}
+
+.drawer-inline {
+  display: flex;
+  gap: var(--s2);
+}
+
+.drawer-block {
+  margin-top: var(--s6);
+}
+
+/* Tucks the caption under the eyebrow's bottom margin. */
+.drawer-grants-note {
+  margin-top: calc(var(--s2) * -1);
+}
+
+/* Invites tab. */
+.inv-span-all {
+  grid-column: 1 / -1;
+}
+
+.inv-code {
+  flex: 1;
+  background: var(--ink-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  padding: var(--s2) var(--s3);
+  word-break: break-all;
+}
+
+.inv-sub-trunc {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inv-expired {
+  color: var(--danger-text);
 }
 
 @media (max-width: 760px) {
@@ -1020,11 +1076,69 @@
   overflow-wrap: anywhere;
   text-align: right;
 }
+/* ── Library: apps, sources, presets (pages/admin/library) ── */
+.lib-wrap-any { overflow-wrap: anywhere; }
+.lib-capitalize { text-transform: capitalize; }
+.lib-app-cover { flex: none; border-radius: var(--r-xs); }
+/* Beats `.cover .glyph`. */
+.lib-app-cover .glyph { font-size: var(--t-xs); }
+.lib-chip-clear {
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  margin-left: var(--s1);
+  font-size: var(--t-xs);
+}
+.lib-chip-link { cursor: pointer; border: 0; }
+.lib-check-label { cursor: pointer; }
+.lib-env-val { flex: 1.4; }
+/* Row tint holds on hover, as it did inline. */
+.qtable tbody tr.lib-pending-row,
+.qtable tbody tr.lib-pending-row:hover { background: var(--accent-soft); }
+.lib-pending-glyph {
+  flex: none;
+  border-radius: var(--r-xs);
+  border: 1px dashed var(--line-3);
+  display: grid;
+  place-content: center;
+  font-family: var(--font-display);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  color: var(--text-3);
+}
+/* Beats `.qtable tbody td { color }`. */
+.qtable tbody td.lib-pending-note { color: var(--text-3); }
+.lib-source-row {
+  flex-wrap: wrap;
+  gap: var(--s5);
+  align-items: flex-start;
+  padding: var(--card-pad);
+}
+.lib-source-sep { border-bottom: 1px solid var(--line); }
+.lib-source-actions { flex: none; }
+.lib-source-switch { margin-left: var(--s3); }
+.lib-source-children { flex-basis: 100%; }
+.lib-sources-head { margin: var(--s7) 0 var(--s3); }
+.lib-prep-status { white-space: normal; overflow-wrap: anywhere; }
+
 /* Library ▸ Images: the policy/catalog card and the uninstall fine print. */
 .img-policy-error { align-items: flex-start; }
 .img-catalog-count { font-size: var(--t-sm); }
 .img-manifest-url { word-break: break-all; }
 .img-fineprint { font-size: var(--t-xs); }
+/* Image detail page. */
+.img-desc {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.55;
+  margin: 0 0 var(--s4);
+  max-width: 70ch;
+}
+.img-faint { color: var(--text-4); }
+.img-used-by { display: flex; gap: var(--s7); flex-wrap: wrap; }
+.img-used-col { flex: 1 1 220px; }
+.img-used-head { margin-bottom: var(--s2); }
 
 .image-detail-page .qtable {
   table-layout: fixed;

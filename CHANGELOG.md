@@ -197,6 +197,9 @@ own; the two do not move together, and that is deliberate.
   Every inline style in those admin pages has moved to the batch A utilities or to classes in
   `admin.css` and `admin/fleet.css`; only runtime widths and opacities stay inline. Off-scale
   spacing snapped to the 4px scale; nothing else looks different.
+- **Design-lint batch C2: admin library, people, app editor and top-level admin pages (#375).**
+  Their inline styles have moved to utilities and token-backed classes in `admin.css` and
+  `admin/editor.css`. Off-scale spacing snapped to the 4px scale; nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API
