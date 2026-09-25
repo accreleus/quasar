@@ -3,6 +3,7 @@
 
 import { useMemo } from "react";
 import type { ReactElement } from "react";
+import { yAxisTicks } from "./Charts";
 
 // Reduce-based min/max helpers — avoid Math.min/max spread which stack-overflows
 // on large arrays (up to 1000 samples).
@@ -45,7 +46,9 @@ function scalePoints(
   const xMin = arrMin(xValues);
   const xMax = arrMax(xValues);
   const yMin = 0;
-  const yMax = arrMax(yValues) * 1.1 || 1;
+  // Same top as the gridlines, so a line sits against the right tick label.
+  const yTop = yAxisTicks(arrMax(yValues) * 1.1 || 1);
+  const yMax = yTop[yTop.length - 1];
 
   const innerW = width - PAD.left - PAD.right;
   const innerH = height - PAD.top - PAD.bottom;
@@ -67,13 +70,10 @@ function scalePoints(
     });
 }
 
-function yTicks(series: LineSeries[], count = 4): number[] {
+function yTicks(series: LineSeries[]): number[] {
   const allY = series.flatMap((s) => s.points.map((p) => p.y));
   if (allY.length === 0) return [];
-  const max = arrMax(allY) * 1.1 || 1;
-  return Array.from({ length: count + 1 }, (_, i) =>
-    Math.round((max / count) * i),
-  );
+  return yAxisTicks(arrMax(allY) * 1.1 || 1);
 }
 
 export function LineChart({ series, unit = "", height = 120 }: LineChartProps): ReactElement {

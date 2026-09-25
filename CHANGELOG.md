@@ -303,6 +303,9 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Session diagnostics charts repeated y-axis ticks for small-range metrics.** A metric
+  topping out near 1 labelled its axis 0, 0, 1, 1, 1 and raised a React duplicate-key
+  warning; ticks are now distinct whole-number steps (0, 1, 2).
 - **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
   before any host reports it ready. After the launch is accepted, the control
   plane prepares the image on the selected host with the adopted, frozen

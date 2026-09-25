@@ -1,6 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render } from "@testing-library/react";
-import { Sparkline, LineChart2 } from "./Charts";
+import { Sparkline, LineChart2, yAxisTicks } from "./Charts";
 import type { LineSeries2 } from "./Charts";
 
 // jsdom does not implement ResizeObserver — provide a stub
@@ -118,5 +118,31 @@ describe("LineChart2", () => {
     // unit appears as a <text> element in the SVG
     const texts = Array.from(container.querySelectorAll("text"));
     expect(texts.some((t) => t.textContent === "ms")).toBe(true);
+  });
+});
+
+describe("yAxisTicks", () => {
+  it("never repeats a tick for a small whole-number range", () => {
+    // A 0-1 metric (max 1.1 after headroom) used to round to 0, 0, 1, 1, 1.
+    expect(yAxisTicks(1.1)).toEqual([0, 1, 2]);
+    expect(yAxisTicks(0.3)).toEqual([0, 1]);
+  });
+
+  it("keeps four even steps for a large range, topping out at or above max", () => {
+    const ticks = yAxisTicks(1100);
+    expect(ticks).toEqual([0, 275, 550, 825, 1100]);
+    expect(new Set(yAxisTicks(1265)).size).toBe(5);
+    expect(yAxisTicks(1265).at(-1)).toBeGreaterThanOrEqual(1265);
+  });
+
+  it("renders a 0-1 series with unique tick labels and no key warning", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { container } = render(
+      <LineChart2 series={[{ label: "up", color: "var(--accent)", points: [{ x: 0, y: 0 }, { x: 1, y: 1 }] }]} />,
+    );
+    const labels = [...container.querySelectorAll("svg text")].map((t) => t.textContent);
+    expect(labels).toEqual(["0", "1", "2"]);
+    expect(error).not.toHaveBeenCalled();
+    error.mockRestore();
   });
 });

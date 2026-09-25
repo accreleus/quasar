@@ -19,6 +19,18 @@ import { useContainerWidth } from "../lib/useContainerWidth";
 const arrMin = (a: number[]) => a.reduce((m, v) => (v < m ? v : m), Infinity);
 const arrMax = (a: number[]) => a.reduce((m, v) => (v > m ? v : m), -Infinity);
 
+/**
+ * Whole-number y-axis ticks from 0 up to at least `max`, always distinct: the
+ * step is a whole number of at least 1, and a small range gets fewer ticks
+ * (max 1.1 gives 0, 1, 2). Rounding max/count instead collapsed a 0-1 metric
+ * to 0, 0, 1, 1, 1 (duplicate React keys, stacked labels).
+ */
+export function yAxisTicks(max: number, count = 4): number[] {
+  const n = Math.max(1, Math.min(count, Math.ceil(max)));
+  const step = Math.max(1, Math.ceil(max / n));
+  return Array.from({ length: n + 1 }, (_, i) => step * i);
+}
+
 // ── Sparkline ──────────────────────────────────────────────
 
 interface SparklineProps {
@@ -137,17 +149,13 @@ export function LineChart2({ series, unit = "", height = 120 }: LineChart2Props)
     const yValues = allPoints.map((p) => p.y);
     const xMin = arrMin(xValues);
     const xMax = arrMax(xValues);
-    const yMax = arrMax(yValues) * 1.1 || 1;
+    const ticks = yAxisTicks(arrMax(yValues) * 1.1 || 1);
+    const yMax = ticks[ticks.length - 1];
 
     const toSvgX = (x: number) =>
       PAD2.left + (xMax === xMin ? 0.5 : (x - xMin) / (xMax - xMin)) * innerW;
     const toSvgY = (y: number) =>
       PAD2.top + innerH - (y / yMax) * innerH;
-
-    const tickCount = 4;
-    const ticks = Array.from({ length: tickCount + 1 }, (_, i) =>
-      Math.round((yMax / tickCount) * i),
-    );
 
     const paths = series
       .filter((s) => s.points.length > 0)
