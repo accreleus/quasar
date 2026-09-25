@@ -365,6 +365,22 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		log.Info("bootstrap admin", "action", bootRes.String(), "email", cfg.BootstrapAdminEmail)
 	}
 
+	// This machine's local enrollment token (control-api.md amendment 14 §"Enrollment").
+	if cfg.LocalEnrollmentToken != "" {
+		localCtx, localCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		inserted, err := hostenroll.EnsureLocal(localCtx, pool, cfg.LocalEnrollmentToken, cfg.LocalEnrollmentNodeName)
+		localCancel()
+		if err != nil {
+			janitorStop()
+			return nil, fmt.Errorf("local enrollment: %w", err)
+		}
+		state := "already present"
+		if inserted {
+			state = "inserted"
+		}
+		log.Info("local enrollment token", "state", state, "node_name", cfg.LocalEnrollmentNodeName)
+	}
+
 	// First-run setup wizard (Spec B W1). Mint the per-boot token only when no admin
 	// exists, so a fresh instance can be claimed via POST /v1/setup/claim; otherwise
 	// remove any stale token file. Token custody: a 0600 file only, never the log (a
@@ -1052,14 +1068,25 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// over an agent connection (agent-api.md §release_apply).
 	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
 	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
+	// The control plane's own machine on an owned install; nil otherwise, and
+	// then nothing below reads a socket.
+	ownMachine := platform.NewOwnMachineReader(cfg.RecoveryControlSocket)
 	// A stale preflight must not authorise a run: dropped before an apply
 	// decision and by "Check now".
-	refreshPreflight := func() { imageResolver.Invalidate(); selfApplier.InvalidateSelf() }
+	refreshPreflight := func() {
+		imageResolver.Invalidate()
+		selfApplier.InvalidateSelf()
+		ownMachine.Invalidate()
+	}
 
 	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
 	pDeps.ControlPlanePreflight = selfApplier.PreflightFacts
+	if ownMachine != nil {
+		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts
+		pDeps.ControlPlaneMachine = ownMachine.Identity
+	}
 	pDeps.ImageFor = imageResolver.Check
 	// #169: the live registry, not the `status` column, answers "is this host's
 	// agent there". The column is stale across every control-plane restart —
@@ -1106,6 +1133,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		WithEdgeResolver(edgeApply).
 		WithFleet(fleetRunner).
 		WithDeveloperApply(developerImages, developerNamespaces)
+	if ownMachine != nil {
+		platformApply.WithOwnMachine(ownMachine)
+	}
 	// Closed after construction: the view reports the active run, and the run's
 	// skips live on the sequencer the apply handler owns.
 	pDeps.ActiveRun = platformApply.ActiveRun

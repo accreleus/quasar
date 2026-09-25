@@ -469,6 +469,19 @@ func (s *Store) HostStatus(ctx context.Context, hostID string) (string, error) {
 	return status, nil
 }
 
+// HostNodeName reads one host's node_name; ErrHostNotFound when there is none.
+func (s *Store) HostNodeName(ctx context.Context, hostID string) (string, error) {
+	var name string
+	err := s.pool.QueryRow(ctx, `SELECT node_name FROM hosts WHERE id = $1::uuid`, hostID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrHostNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("read host node_name: %w", err)
+	}
+	return name, nil
+}
+
 // Release reads one release row by id.
 func (s *Store) Release(ctx context.Context, id string) (Release, error) {
 	var r Release

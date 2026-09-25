@@ -752,9 +752,10 @@ func TestLoadAccessLog(t *testing.T) {
 // widened to single-host networks, and fail startup on a typo rather than
 // silently leaving every client sharing one rate-limit budget.
 func TestLoadTrustedProxies(t *testing.T) {
+	// No static token: its deprecation warning would be counted below.
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
+		t.Setenv("ENROLLMENT_TOKEN", "")
 	}
 
 	t.Run("default is empty", func(t *testing.T) {

@@ -97,14 +97,30 @@ type PreflightFacts struct {
 	Readiness      map[string]ReadinessFact
 	// Both; copied from the instance-wide check.
 	Image *ImageFact
+	// Control plane on an owned machine only; non-nil replaces Socket/Self.
+	OwnedActor *OwnedActorFact
+}
+
+// OwnedActorFact is whether the recovery actor answered on the control socket.
+type OwnedActorFact struct {
+	Socket   string
+	Answered bool
+	Version  string
+	Err      string
 }
 
 // PlanPreflight decides one target. Every check is evaluated (no short-circuit)
 // so the card can name every fix at once; the order is the vocabulary's.
 func PlanPreflight(kind string, f PreflightFacts) Preflight {
 	var checks []PreflightCheck
-	switch kind {
-	case TargetControlPlane:
+	switch {
+	case kind == TargetControlPlane && f.OwnedActor != nil:
+		// An owned target carries no Compose checks (amendment 14 §"Preflight").
+		checks = []PreflightCheck{
+			ownedActorSocketCheck(f.OwnedActor),
+			imageCheck(f.Image),
+		}
+	case kind == TargetControlPlane:
 		checks = []PreflightCheck{
 			cpSocketCheck(f.Socket, f.Self),
 			cpStackDirCheck(f.Self),
@@ -166,6 +182,24 @@ func cpSocketCheck(s *SocketState, self *UpdaterSelfFacts) PreflightCheck {
 		v = "of unknown version"
 	}
 	return pass(CheckUpdaterSocket, "updater "+v+" answered on "+ConfiguredUpdaterSocket())
+}
+
+// ownedActorSocketCheck keeps the updater_socket id; its detail names no
+// Compose command.
+func ownedActorSocketCheck(a *OwnedActorFact) PreflightCheck {
+	if !a.Answered {
+		detail := "the recovery actor did not answer on its control socket " + a.Socket
+		if a.Err != "" {
+			detail += ": " + a.Err
+		}
+		return fail(CheckUpdaterSocket, detail+
+			". Check that it is running (docker ps --filter name=quasar-recovery) and read its log (docker logs quasar-recovery)")
+	}
+	v := a.Version
+	if v == "" {
+		v = "of unknown version"
+	}
+	return pass(CheckUpdaterSocket, "recovery actor "+v+" answered on "+a.Socket)
 }
 
 func cpStackDirCheck(self *UpdaterSelfFacts) PreflightCheck {

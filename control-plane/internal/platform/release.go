@@ -182,10 +182,19 @@ type Fault struct {
 	Detail   string  `json:"detail"`
 }
 
-// Installed is the `installed` object of the view.
+// Installed is the `installed` object of the view. `control_plane` is the
+// binary's identity plus ControlPlaneMachine, composed by MarshalJSON.
 type Installed struct {
-	ControlPlane buildinfo.Identity `json:"control_plane"`
-	Hosts        []HostIdentity     `json:"hosts"`
+	ControlPlane        buildinfo.Identity `json:"control_plane"`
+	Hosts               []HostIdentity     `json:"hosts"`
+	ControlPlaneMachine MachineIdentity    `json:"-"`
+}
+
+func (i Installed) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ControlPlane PlatformIdentity `json:"control_plane"`
+		Hosts        []HostIdentity   `json:"hosts"`
+	}{PlatformIdentity{i.ControlPlane, i.ControlPlaneMachine}, i.Hosts})
 }
 
 // View is the whole `GET /v1/admin/platform/releases` body. `active_apply` is

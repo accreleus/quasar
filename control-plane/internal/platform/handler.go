@@ -58,6 +58,9 @@ type Deps struct {
 	ControlPlanePreflight func(ctx context.Context) PreflightFacts
 	// ImageFor is the instance-wide registry check for one release. Optional.
 	ImageFor func(ctx context.Context, r Release) *ImageFact
+	// ControlPlaneMachine is this control plane's own machine identity
+	// (OwnMachineReader.Identity). Optional: nil serves all five fields null.
+	ControlPlaneMachine func(ctx context.Context) MachineIdentity
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -89,12 +92,22 @@ func (h *Handler) Register(mux httpx.Router, admin func(http.Handler) http.Handl
 
 // The `{ "identity": … }` envelope openapi.yaml declares.
 type identityResponse struct {
-	Identity buildinfo.Identity `json:"identity"`
+	Identity PlatformIdentity `json:"identity"`
 }
 
 // No 404 shape: an unstamped build reports "dev" with two nulls, never fails.
-func (h *Handler) handleIdentity(w http.ResponseWriter, _ *http.Request) {
-	httpx.WriteJSON(w, http.StatusOK, identityResponse{Identity: buildinfo.Get()})
+func (h *Handler) handleIdentity(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteJSON(w, http.StatusOK, identityResponse{Identity: PlatformIdentity{
+		Identity:        buildinfo.Get(),
+		MachineIdentity: h.machine(r.Context()),
+	}})
+}
+
+func (h *Handler) machine(ctx context.Context) MachineIdentity {
+	if h.deps == nil || h.deps.ControlPlaneMachine == nil {
+		return MachineIdentity{}
+	}
+	return h.deps.ControlPlaneMachine(ctx)
 }
 
 // The whole Releases page in one read. READ ONLY: it writes nothing and never
@@ -193,6 +206,7 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 		ImageFor:              imageFor,
 		EdgeBranch:            edgeBranch,
 		ControlPlane:          buildinfo.Get(),
+		ControlPlaneMachine:   h.machine(ctx),
 		Hosts:                 hosts,
 		Releases:              releases,
 		CheckedAt:             status.CheckedAt,

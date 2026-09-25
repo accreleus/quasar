@@ -38,8 +38,19 @@ type Config struct {
 	AuthTokenTTL time.Duration // bearer-token lifetime (AUTH_TOKEN_TTL, e.g. "24h")
 
 	// Fleet-wide fallback for node-agent enrollment (ENROLLMENT_TOKEN). Optional:
-	// empty means only admin-minted per-host tokens enroll (#12).
+	// empty means only admin-minted per-host tokens enroll (#12). Deprecated by
+	// control-api.md amendment 14 §"Enrollment".
 	EnrollmentToken string
+
+	// This machine's single-use local enrollment token for its own agent, and
+	// the node name it is bound to; both empty, or both set
+	// (QUASAR_LOCAL_ENROLLMENT_FILE, QUASAR_LOCAL_ENROLLMENT_NODE_NAME). Never logged.
+	LocalEnrollmentToken    string
+	LocalEnrollmentNodeName string
+
+	// The recovery actor's control socket on an owned machine
+	// (QUASAR_RECOVERY_CONTROL_SOCKET). Empty: not an owned machine, never read.
+	RecoveryControlSocket string
 
 	// All three together provision the first admin at boot if none exists
 	// (control-api.md §Authorization). Never "first to register wins".
@@ -205,7 +216,7 @@ type Config struct {
 	// deployment and makes a backup unrestorable. Previous is a comma-separated
 	// list of decrypt-only predecessors ("<version>:<base64>") so a rotated
 	// deployment still reads old rows. Never logged, never returned.
-	SecretKey         string // QUASAR_SECRET_KEY
+	SecretKey         string // QUASAR_SECRET_KEY, or the file QUASAR_SECRET_KEY_FILE names
 	SecretKeyPrevious string // QUASAR_SECRET_KEY_PREVIOUS
 
 	// pprof ships enabled in production so a long-running box on someone else's
@@ -286,9 +297,25 @@ func Load() (*Config, error) {
 	// token (agentws only compares when it is non-empty), so this disables the static path
 	// rather than opening it. Contract: control-api.md §Host enrollment tokens.
 	c.EnrollmentToken = os.Getenv("ENROLLMENT_TOKEN")
-	if c.EnrollmentToken == "" {
-		slog.Warn("no static ENROLLMENT_TOKEN: only minted per-host tokens can enroll")
+	// Amendment 14 inverts the warning: unset is now the recommended state.
+	if c.EnrollmentToken != "" {
+		c.Warnings = append(c.Warnings,
+			"ENROLLMENT_TOKEN is deprecated: it retires with the RH06 contract step (RH06-15, #367), and an owned install never uses it; enroll hosts with admin-minted per-host tokens and unset it")
 	}
+
+	localFile := os.Getenv("QUASAR_LOCAL_ENROLLMENT_FILE")
+	c.LocalEnrollmentNodeName = strings.TrimSpace(os.Getenv("QUASAR_LOCAL_ENROLLMENT_NODE_NAME"))
+	if (localFile == "") != (c.LocalEnrollmentNodeName == "") {
+		return nil, fmt.Errorf("QUASAR_LOCAL_ENROLLMENT_FILE and QUASAR_LOCAL_ENROLLMENT_NODE_NAME must be set together (got only one)")
+	}
+	if localFile != "" {
+		tok, err := readSecretFile("QUASAR_LOCAL_ENROLLMENT_FILE", localFile)
+		if err != nil {
+			return nil, err
+		}
+		c.LocalEnrollmentToken = tok
+	}
+	c.RecoveryControlSocket = os.Getenv("QUASAR_RECOVERY_CONTROL_SOCKET")
 
 	c.BootstrapAdminEmail = os.Getenv("BOOTSTRAP_ADMIN_EMAIL")
 	c.BootstrapAdminUsername = os.Getenv("BOOTSTRAP_ADMIN_USERNAME")
@@ -506,7 +533,11 @@ func Load() (*Config, error) {
 
 	// internal/secrets.ParseKeyring owns the format and fails startup on a
 	// malformed key rather than at the first write.
-	c.SecretKey = os.Getenv("QUASAR_SECRET_KEY")
+	secretKey, err := envOrFile("QUASAR_SECRET_KEY")
+	if err != nil {
+		return nil, err
+	}
+	c.SecretKey = secretKey
 	c.SecretKeyPrevious = os.Getenv("QUASAR_SECRET_KEY_PREVIOUS")
 
 	// LookupEnv, not envOr: "" is the off switch, so set-but-empty must not

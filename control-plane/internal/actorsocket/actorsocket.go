@@ -191,14 +191,17 @@ const (
 // Status is the machine inventory, plus one attempt's result when a request
 // id was asked for. Stale means the engine was slow and this is the last one.
 type Status struct {
-	Actor     ActorIdentity `json:"actor"`
-	Seed      *SeedIdentity `json:"seed"`
-	Role      Role          `json:"role"`
-	Database  Database      `json:"database"`
-	Services  []Service     `json:"services"`
-	Conflicts []Conflict    `json:"conflicts"`
-	InFlight  *string       `json:"in_flight"`
-	Dumps     []Dump        `json:"dumps"`
-	Result    *Result       `json:"result"`
-	Stale     bool          `json:"stale"`
+	Actor ActorIdentity `json:"actor"`
+	Seed  *SeedIdentity `json:"seed"`
+	Role  Role          `json:"role"`
+	// NodeName is the machine's node name: on a combined host, the node name
+	// its own agent enrolls under. Nil before the machine is installed.
+	NodeName  *string    `json:"node_name"`
+	Database  Database   `json:"database"`
+	Services  []Service  `json:"services"`
+	Conflicts []Conflict `json:"conflicts"`
+	InFlight  *string    `json:"in_flight"`
+	Dumps     []Dump     `json:"dumps"`
+	Result    *Result    `json:"result"`
+	Stale     bool       `json:"stale"`
 }
