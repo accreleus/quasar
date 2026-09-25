@@ -1,14 +1,14 @@
 ---
 title: Install and startup problems
-description: The build, the containers, the GPU, and the agent registration. Symptoms with causes and fixes.
+description: The images, the containers, the GPU, and the agent registration. Symptoms with causes and fixes.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-## The build fails part way through
+## The install stops part way through
 
-**Out of disk.** The most common cause. The build needs around 25 GB and you want
-40 GB free.
+**Out of disk.** The most common cause. The published images are about 20 GB and
+you want 40 GB free. A build from source needs around 25 GB on top of that.
 
 ```bash
 df -h /var/lib/docker
@@ -58,7 +58,8 @@ curl http://127.0.0.1:9091/health
 `"connected": false` means it is alive but cannot reach the control plane.
 
 - Is `CONTROL_PLANE_URL` right, and reachable from that machine?
-- Does `ENROLLMENT_TOKEN` match the control plane's?
+- If you set the optional static `ENROLLMENT_TOKEN` rather than a minted
+  string, does it match the control plane's?
 - Is the control plane's HTTP port reachable? Enrollment uses plain HTTP on 8080
   and is exempt from the HTTPS redirect for that reason.
 - Did you paste the one-value `QUASAR_ENROLLMENT` string from Admin, Fleet,
@@ -248,9 +249,11 @@ seconds.
 
 ## Still stuck
 
-```bash
-make diagnose
-```
+Collect what the containers are saying with the commands on [Health and
+logs](/quasar/operations/health/), and attach them to a report with secrets
+removed.
 
-That collects container states, health endpoints, versions and recent errors in
-one pass, with secrets redacted.
+From a repository checkout, `make diagnose` does the same in one pass, with
+secrets redacted. It reads the checkout's own `deploy/` stack, so it only helps on
+a machine that runs Quasar from that checkout. A registry install has no checkout
+to run it from.

@@ -50,8 +50,19 @@ An instance follows one **channel** at a time.
 
 | Channel | What it lists |
 | --- | --- |
-| `stable` | Tagged releases, with notes and a published release manifest. The default. |
+| `stable` | Tagged releases, with notes and a published release manifest. Prereleases are hidden. The default. |
+| `beta` | The same tagged releases and the prereleases among them, such as a release candidate. Applied through exactly the same path as a stable release. |
 | `edge` | Whatever was last published from a branch. No version and no notes. |
+
+A prerelease has not been through a release cut. It can carry a migration that
+the next prerelease revises, and migrations only go forward, so run `beta` on an
+instance you can afford to have ahead of stable. Beta orders its list by version,
+not by build date: `0.3.0-rc.1` is below `0.3.0`, whichever was built first.
+
+**Switching back to stable never rolls you back.** No channel offers a build that
+orders below the one installed. On `0.3.0-rc.1`, stable lists nothing until
+`0.3.0` ships, and says that nothing newer has been detected. That is not a
+failure and needs no action.
 
 `edge` follows one branch, named in the **Edge branch** field beside the
 selector. That field selects nothing while the channel is stable, and it survives
@@ -152,9 +163,13 @@ A ready host offers **Apply**. What happens, in order:
 
 </Steps>
 
-A failed apply leaves the host on what it was running, records the digests it
-would have replaced, and shows the reason. There is no automatic rollback for a
-host, and the failure panel carries the commands to put it back by hand.
+A failed apply records the digests it would have replaced and shows the reason.
+If the new agent never came up, or never became healthy, the updater puts the
+previous digest back by itself: the history shows **Reverted automatically**
+beside the failed apply, and the failure carries the failed container's last log
+lines. A pull that failed changed nothing, and the old agent is still running.
+If the automatic restore also fails, both failures are recorded and the failure
+panel carries the commands to put the host back by hand.
 
 ## Update Quasar
 
@@ -164,16 +179,22 @@ configurable: **the control plane first, then every eligible host, one at a
 time.** There is no hosts-only button, because an agent is never moved past the
 control plane.
 
-<Aside type="caution" title="A control-plane update ends every session">
-Recreating the control plane drops every agent's connection to it, and an agent
-stops its sessions the moment that connection drops. So a fleet update **drains
-the whole instance first** and waits for the session count to reach zero before
-the control-plane step. This is a known limitation, tracked as
-[#128](https://github.com/accreleus/quasar/issues/128); the drain is how the
-console keeps it from being a surprise.
-</Aside>
+The run cordons every host for its whole life, so no new session starts on a
+machine it is about to update. Whether it also **waits for sessions to end**
+before the control-plane step depends on the release:
 
-After the drain, the control plane updates itself through the updater beside it,
+- **A release that runs no migration does not wait.** Live sessions stream
+  straight through the control-plane restart. The agent holds its running
+  sessions while the control plane is away, and the browser keeps the media
+  path it already has.
+- **A release that carries a migration drains the whole instance first** and
+  waits for the session count to reach zero. Every migration Quasar has shipped
+  was written assuming no session was live while it ran, so the update does not
+  gamble on it. The confirmation's checkbox ends the sessions now instead.
+
+The confirmation tells you which case you are in before you press Update.
+
+The control plane then updates itself through the updater beside it,
 and the API and the console go away for roughly twenty seconds. The build that
 boots reads back the request written down before the restart and reports the
 outcome — the process carrying out its own update cannot survive to report
@@ -225,6 +246,57 @@ version already applied is the crash loop described under [the hard
 rule](/quasar/operations/upgrading/#the-hard-rule). Agents carry no migrations,
 so they can move back — but never above the control plane's own release.
 </Aside>
+
+## Install updates automatically
+
+**Off by default.** Admin, Settings, Platform updates, **Install updates
+automatically**. With it on, Quasar applies a detected release without waiting
+for you, through exactly the fleet run the **Update Quasar** button starts: the
+control plane first, then every eligible host.
+
+- **A release that changes the database is never installed this way.** It is
+  still detected, listed and bannered, and it waits for you to press the button.
+  Such a release empties the instance before its control-plane step, and ending
+  every live session with nobody watching is not something to do on a schedule.
+- **There is no separate schedule.** An automatic update happens when release
+  detection next runs, so the [detection
+  job's](/quasar/admin/jobs/#the-release-detection-job) schedule is the window.
+  Move the job and you move the update hour.
+- **An automatic update is never forced.** It always waits for each host's own
+  sessions to end, because nobody is there to agree to losing them.
+- **A failure stops that release, not the feature.** Quasar does not retry a
+  release whose automatic run failed. A newer release is still installed, and
+  applying the failed one yourself clears the block. A run you cancel is not a
+  failure, so it is tried again on the next pass.
+
+The detection job's latest run says what happened: its summary carries
+`auto_apply`, either `started` with the run id or the reason it did not start
+(`carries_migration`, `no_release`, `not_eligible`, `in_flight`,
+`failed_before`). A fleet run started this way is marked on this page.
+
+## Release notifications
+
+The banner only helps someone who is looking. **Notifications**, on this page,
+takes a webhook URL and posts one message when detection finds a release this
+instance could move to. Slack, Discord and ntfy all accept the body as it is.
+
+1. Paste an incoming-webhook URL into **Webhook URL** and save it.
+2. Press **Send test**. A test is sent whether or not notifications are on, and
+   it never uses up a real release's notification.
+3. Press **Turn notifications on**.
+
+Treat the URL as a credential: on those services, knowing it is what lets you
+post. Quasar never logs it. Delivery is `https` only and to public addresses
+only, so a receiver on your LAN or on localhost cannot be reached directly; put
+a public endpoint such as a tunnel in front of it. Each release is announced
+once, a failed delivery is retried on the next few detection passes and then
+dropped, and a failing webhook never affects detection or the Releases page.
+
+A receiver you wrote yourself can check a signature: store a secret under
+Admin, Settings, Secrets, **Release notification signing secret**, and every
+delivery carries an
+HMAC-SHA256 signature over its timestamp and body. The header format is in the
+repository's `docs/upgrading.md`.
 
 ## History and the audit log
 

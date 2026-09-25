@@ -192,6 +192,11 @@ proxy that closes idle connections after a minute cuts sessions and drops agents
 | `quasar-postgres-data` | The database. |
 | `quasar-control-tls` | TLS certificate and artwork cache. |
 | `quasar-agent-data` | The agent's per-node enrollment secret. |
+| `quasar-updater-run` | The updater's socket and one result file per apply. |
+| `quasar-nvidia-driver` | NVIDIA hosts only. Driver userspace provisioned from the running kernel module. |
 | The managed home root | A host bind mount, not a Compose volume. User saves and installed content. |
 
-`docker compose down -v` destroys the first three and never touches the fourth.
+Compose prefixes each volume name with the project name, so on disk they read
+`<project>_quasar-postgres-data` and so on: `deploy_…` for a stack directory named
+`deploy`. `docker compose down -v` destroys every
+volume in the table and never touches the home root.

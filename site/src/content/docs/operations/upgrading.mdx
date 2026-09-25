@@ -18,13 +18,15 @@ The console enforces this for you: a release carrying a schema below the
 database's own is never listed or offered, and the control plane always moves
 before any agent.
 
-<Aside type="caution" title="A control-plane update ends every running session">
-Recreating the control plane drops every agent's connection to it, and an agent
-stops its sessions when that connection drops. This is a known limitation,
-tracked as [#128](https://github.com/accreleus/quasar/issues/128). A fleet update
-from the console therefore drains the whole instance and waits for it to be empty
-before the control-plane step, unless you tick the box that ends the sessions
-now.
+<Aside type="caution" title="A release that changes the database empties the instance first">
+A control-plane update that runs no migration does not end sessions. The agent
+holds its running sessions while the control plane restarts, and the browser
+keeps the media path it already has. A release that **carries a migration** is
+different: a fleet update from the console drains the whole instance and waits
+for it to be empty before the control-plane step, unless you tick the box that
+ends the sessions now. Every migration Quasar has shipped was written assuming
+no session was live while it ran. The update confirmation says which case you
+are in. Updating a host's agent always ends that host's sessions.
 </Aside>
 
 ## Upgrade from the console

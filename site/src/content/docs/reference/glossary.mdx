@@ -23,9 +23,9 @@ equivalent quality, and Chrome can decode it everywhere thanks to a software
 fallback.
 
 **Channel.** Which platform releases an instance is shown. `stable` is a tagged
-release with notes; `edge` is whatever was last published from a branch, with
-none. An instance follows one at a time, and switching changes what is listed,
-never what is installed.
+release with notes; `beta` is those and the prereleases among them; `edge` is
+whatever was last published from a branch, with none. An instance follows one at
+a time, and switching changes what is listed, never what is installed.
 
 **Constrained baseline.** The H.264 profile browser sessions are clamped to,
 because Chrome's WebRTC receiver cannot decode High profile from any encoder.
@@ -48,8 +48,11 @@ reservation in admission control.
 **Entitlement.** The grant that decides whether an app appears in a user's
 library. Granted to everyone or to named users.
 
-**Enrollment token.** The shared secret a node agent presents on first contact.
-After a successful enrollment the agent uses its own stored node secret instead.
+**Enrollment token.** A secret an admin mints in Admin, Fleet, Enroll host to let
+one agent enroll: single use, expiring after an hour, optionally bound to one node
+name, and stored only as a hash. After a successful enrollment the agent uses its
+own stored node secret instead. The older static, deployment-wide
+`ENROLLMENT_TOKEN` is an optional fallback.
 
 **FEC.** Forward error correction. Adds redundancy so lost packets can be
 reconstructed. Off by default and not recommended for browser clients.
@@ -69,9 +72,10 @@ in an H.264 rung.
 decodes it with operating system hardware support, so effectively macOS and
 Windows only. The catalog calls it `hevc` and the wire calls it `h265`.
 
-**Home root.** The directory on a host where managed home directories live. Must
-be the same path on every host. For saves to follow users between machines it
-must also be real shared storage, not merely that same path on each one.
+**Home root.** The directory on a host where managed home directories live. Each
+host can have its own. For saves to follow users between machines it must be real
+shared storage, not merely the same path on each one; otherwise `locality`
+placement keeps a user on the host that holds their files.
 
 **Host.** A machine running the node agent. Owns GPUs and runs sessions.
 

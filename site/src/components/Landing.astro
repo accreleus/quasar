@@ -66,6 +66,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 <span class="q-ok">quasar-postgres      healthy</span>
 <span class="q-ok">quasar-control-plane healthy</span>
 <span class="q-ok">quasar-node-agent    started</span>
+<span class="q-ok">quasar-updater       started</span>
 <span class="q-c">→ https://192.168.1.50:8443</span></code></pre>
 		</div>
 	</section>
@@ -189,7 +190,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			<dd>Per-session bundles correlate encoder, network and client signals and say which of the three caused the stutter, or refuse to guess when the browser tab was hidden.</dd>
 
 			<dt>One Compose deployment</dt>
-			<dd>Postgres, the control plane and an agent. One script builds and brings it up.</dd>
+			<dd>Postgres, the control plane, an agent and the updater. One script pulls the published images and starts them.</dd>
 		</dl>
 	</section>
 

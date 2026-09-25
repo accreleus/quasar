@@ -25,7 +25,6 @@ internal or something you should not change without a measurement.
 | Variable | Notes |
 | --- | --- |
 | `DATABASE_URL` | Postgres connection string. |
-| `ENROLLMENT_TOKEN` | Shared secret agents present on first contact. Must match on control plane and every agent. |
 | `CONTROL_PLANE_URL` | Agent side. WebSocket URL of the control plane. |
 | `POSTGRES_PASSWORD` | Compose. Generated on a fresh install. |
 
@@ -33,9 +32,12 @@ The release install has you generate these values before first boot. The
 source-build `redeploy.sh` path generates missing secrets and never overwrites
 existing ones.
 
-`CONTROL_PLANE_URL` and `ENROLLMENT_TOKEN` can also be supplied together as
-one paste: mint `QUASAR_ENROLLMENT` from Admin, Fleet, Enroll host on an
-existing host and set only that on the new one. See below.
+`ENROLLMENT_TOKEN` is **optional**. It is the older static, deployment-wide
+enrollment secret, and if you set it, it must match on the control plane and
+every agent that uses it. The console path does not need it: mint a
+single-use `QUASAR_ENROLLMENT` string from Admin, Fleet, Enroll host and set only
+that on the new host. The string carries the control-plane address too. See
+below.
 
 ## Setup and identity
 

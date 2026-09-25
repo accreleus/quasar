@@ -63,7 +63,7 @@ export const PLATFORMS = {
   debian: {
     ...SYSTEMD,
     label: 'Debian or Ubuntu',
-    note: 'Check that your Docker is Engine with Compose v2.20 or newer, not the older docker.io packages.',
+    note: 'Check that your Docker is Engine with Compose v2.30 or newer, not the older docker.io packages.',
   },
   arch: {
     ...SYSTEMD,

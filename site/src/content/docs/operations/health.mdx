@@ -12,6 +12,7 @@ import { Aside } from '@astrojs/starlight/components';
 | `quasar-postgres` | All state. Users, apps, hosts, GPUs, sessions, entitlements. |
 | `quasar-control-plane` | The Go service. API, signaling, scheduler, and it serves the web app. Applies database migrations at startup. |
 | `quasar-node-agent` | The Rust agent. Runs with host networking, drives the compositor and encoder, launches app containers. |
+| `quasar-updater` | Applies a platform release from the console: pulls the pinned images and recreates the control plane or the agent. Idle otherwise. |
 
 During a session you will also see the app container itself and a PulseAudio
 sidecar, both launched by the agent as siblings. They are not in the Compose
@@ -112,7 +113,9 @@ See [Sessions and audit log](/quasar/admin/sessions/) and
 
 The repository ships a diagnostic script that collects the state of everything in
 one pass: git revision, container states, health endpoints and recent errors from
-each container, with secrets redacted.
+each container, with secrets redacted. It is repository tooling: it runs from a
+checkout and reads that checkout's `deploy/` stack, so it only helps on a machine
+that runs Quasar from a checkout. On a registry install, use the commands above.
 
 ```bash
 make diagnose
