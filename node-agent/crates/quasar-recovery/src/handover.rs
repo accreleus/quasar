@@ -635,7 +635,7 @@ impl Actor {
                 continue;
             }
             if let Err(e) = self.serve_again() {
-                warn!(token = "actor-socket-rebind-failed", "{e}");
+                warn!(token = "actor-reclaim-socket-rebind-failed", "{e}");
             }
             let Ok(Some(j)) = self.journals.load(request_id) else {
                 return Ok(Flow::Ended);
@@ -749,8 +749,8 @@ impl Actor {
             Ok(existing) => existing,
             Err(e) => {
                 warn!(
-                    token = "actor-seed-file-unreadable",
-                    "seed.json is unreadable ({e}); it is left as it is, and a seed stays idle until it is fixed"
+                    token = "actor-handover-seed-file-unreadable",
+                    "seed.json is unreadable ({e}); it is not updated to name the verified successor, and a seed stays idle until it is fixed"
                 );
                 return;
             }
@@ -889,7 +889,7 @@ impl Actor {
                 if crashed(&e) {
                     return Err(());
                 }
-                warn!(token = "actor-handover-yield-failed", container = %target.name, "{e}");
+                warn!(token = "actor-handover-yield-policy-failed", container = %target.name, "re-enable its restart: {e}");
                 return Ok(false);
             }
         }
@@ -898,7 +898,7 @@ impl Actor {
                 if crashed(&e) {
                     return Err(());
                 }
-                warn!(token = "actor-handover-yield-failed", container = %target.name, "{e}");
+                warn!(token = "actor-handover-yield-start-failed", container = %target.name, "start it: {e}");
                 return Ok(false);
             }
         }
@@ -909,7 +909,7 @@ impl Actor {
                     return Err(());
                 }
                 warn!(
-                    token = "actor-handover-yield-failed",
+                    token = "actor-handover-self-disable-failed",
                     "disable this actor's restart: {e}"
                 );
             }
@@ -1003,7 +1003,7 @@ impl Actor {
             )),
         }
         if let Err(e) = self.serve_again() {
-            warn!(token = "actor-socket-rebind-failed", "{e}");
+            warn!(token = "actor-restore-socket-rebind-failed", "{e}");
         }
         output.push_str(&moved_before(j, i));
         self.finish(j, State::Failed, Some(failure.reason), output, restored)
