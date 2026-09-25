@@ -188,6 +188,10 @@ own; the two do not move together, and that is deliberate.
   `.t-xs` `.t-sm` `.t-lg` `.t-h3` `.text-1` `.text-2` `.mb1` utilities (the block's top
   comment lists every utility and its token). Off-scale spacing snapped to the 4px scale;
   nothing else looks different.
+- **Design-lint batch C1: admin fleet, sessions, streaming, overview, settings and audit (#374).**
+  Every inline style in those admin pages has moved to the batch A utilities or to classes in
+  `admin.css` and `admin/fleet.css`; only runtime widths and opacities stay inline. Off-scale
+  spacing snapped to the 4px scale; nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API

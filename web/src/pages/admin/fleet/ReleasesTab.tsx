@@ -297,7 +297,7 @@ function UpdateBanner({ view }: { view: PlatformReleaseView }) {
     <Card className="card-pad mb4 rel-update">
       <div className="rel-update-main">
         <div className="eyebrow">Update available</div>
-        <div className="rowflex mt3" style={{ alignItems: "baseline" }}>
+        <div className="rowflex mt3 rel-baseline">
           <span className="rel-version">
             {prefixed(from)} <span className="rel-arrow">→</span> {prefixed(releaseLabel(newest))}
           </span>
@@ -346,7 +346,7 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
           />
         ))
       )}
-      <p className="hint" style={{ padding: "2px 4px" }}>
+      <p className="hint rel-notes-src">
         Notes are sanitised from{" "}
         {releasesUrl ? (
           <a href={releasesUrl} target="_blank" rel="noreferrer noopener">
@@ -384,9 +384,9 @@ function ReleaseCard({
 
   return (
     <Card className="mb4">
-      <div className="panel-head" style={{ alignItems: "flex-start" }}>
+      <div className="panel-head rel-card-head">
         <div>
-          <div className="rowflex" style={{ alignItems: "center" }}>
+          <div className="rowflex center">
             <span className="rel-card-title">{prefixed(releaseLabel(release))}</span>
             {older ? <Chip variant="neutral">Older than installed</Chip> : latest && <Chip variant="accent">Latest</Chip>}
             {installed && (
@@ -889,7 +889,7 @@ function TargetsCard({
           {cp ? <TargetChip target={cp} older={olderEdgeCandidate(view, newest)} /> : <span className="muted">—</span>}
         </Fact>
         <Fact label="Node agents">
-          <span className="rowflex" style={{ alignItems: "center" }}>
+          <span className="rowflex center">
             <span className="num">
               {ready}/{hostTargets.length}
             </span>

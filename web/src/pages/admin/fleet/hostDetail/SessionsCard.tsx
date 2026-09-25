@@ -85,12 +85,7 @@ function SessionRow({
         </Chip>
       </td>
       <td className="right num">{fps === undefined ? "—" : Math.round(fps)}</td>
-      <td
-        className="right num"
-        style={
-          rtt !== undefined && rtt > LATENCY_WARN_MS ? { color: "var(--danger-text)" } : undefined
-        }
-      >
+      <td className={rtt !== undefined && rtt > LATENCY_WARN_MS ? "right num td-danger" : "right num"}>
         {rtt === undefined ? "—" : `${Math.round(rtt)} ms`}
       </td>
       <td className="right num">{durationBetween(session.started_at, null, now) || "—"}</td>

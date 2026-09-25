@@ -130,6 +130,10 @@
   color: var(--text-3);
 }
 
+.act-err {
+  color: var(--danger-text);
+}
+
 /* Two stacked bars per host; the width keeps them off the Sessions column. */
 .ov-cap-cell {
   width: 190px;
@@ -141,6 +145,14 @@
 
 .ov-trend-cell {
   width: 84px;
+}
+
+.ov-hb-online {
+  color: var(--success-text);
+}
+
+.kpi-meta.kpi-meta-danger {
+  color: var(--danger-text);
 }
 
 /* === UI-13 Admin Apps === */
@@ -170,6 +182,13 @@
 }
 
 /* === end UI-11b === */
+
+/* ── Table cell tones ───────────────────────────────────────
+   `.qtable tbody td` sets the cell colour; these outrank it. */
+.qtable tbody td.td-success { color: var(--success-text); }
+.qtable tbody td.td-warning { color: var(--warning-text); }
+.qtable tbody td.td-danger { color: var(--danger-text); }
+.qtable tbody td.td-muted { color: var(--text-3); }
 
 /* === UI-12 Admin Sessions === */
 
@@ -298,6 +317,35 @@
   min-width: 0; /* allow ResizeObserver wrapper to shrink in constrained grid tracks */
 }
 
+/* ── Session detail: hero and mini charts ───────────────────── */
+.page-head.shdr-head {
+  margin: 0;
+  padding: var(--card-pad) var(--card-pad) var(--s4);
+}
+
+.shdr-facts {
+  padding: var(--s4) var(--card-pad) var(--card-pad);
+  border-top: 1px solid var(--line);
+}
+
+.shdr-home {
+  padding: 0 var(--card-pad) var(--card-pad);
+}
+
+.sd-mini-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+}
+
+.sd-mini-unit {
+  margin-left: var(--s1);
+}
+
+.sd-mini-svg {
+  overflow: visible;
+}
+
 /* Failure card app-log tail styling is now shared — see
  * .failure-log-tail-pre in components.css
  * (components/SessionFailureDetail.tsx's CollapsibleLogTail). */
@@ -355,6 +403,106 @@
 .sd-diagnostics[open] > summary .sd-diag-caret {
   transform: rotate(90deg);
   color: var(--accent-text);
+}
+
+/* ── Host rail (console and settings) ─────────────────────── */
+.rail-stat {
+  font-family: var(--font-display);
+  font-size: 1.7rem;
+  font-weight: 600;
+  margin-top: var(--s2);
+}
+
+.rail-facts {
+  padding-top: var(--s4);
+  border-top: 1px solid var(--line);
+}
+
+/* ── Host console ──────────────────────────────────────────── */
+.console-group {
+  padding: var(--s5) var(--card-pad) var(--s1);
+}
+
+.console-output {
+  border-left: 2px solid var(--line-2);
+  padding-left: var(--s2);
+  gap: var(--s1);
+}
+
+.console-output-id {
+  align-self: flex-start;
+}
+
+.cset.idev-row {
+  align-items: stretch;
+}
+
+.idev-class {
+  cursor: pointer;
+}
+
+.idev-class:disabled {
+  cursor: default;
+}
+
+.table-wrap.idev-table {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+/* `.cset p` sets the margin; two classes outrank it. */
+.cset p.idev-foot {
+  margin-top: var(--s2);
+}
+
+/* ── Host settings ─────────────────────────────────────────── */
+.knob-hidden {
+  padding: 0 var(--card-pad) var(--s5);
+}
+
+.knob-env {
+  display: inline-block;
+  margin-top: var(--s1);
+}
+
+.cset p.knob-note {
+  margin-top: var(--s2);
+}
+
+.idle-review {
+  grid-column: 1 / -1;
+}
+
+.idle-fact-id {
+  overflow-wrap: anywhere;
+}
+
+/* ── Streaming: launch and stream profiles ─────────────────── */
+.lp-body {
+  padding: var(--s3) var(--card-pad) var(--card-pad);
+}
+
+.lp-desc {
+  margin-top: calc(var(--s1) * -1);
+  margin-bottom: var(--s3);
+}
+
+.sp-group-note {
+  padding: 0 var(--card-pad);
+}
+
+.sp-group-table {
+  padding: var(--s3) 0 0;
+}
+
+/* ── Settings page rows ────────────────────────────────────── */
+.setting-row {
+  padding: var(--s3) 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.setting-row-control {
+  flex: none;
 }
 
 /* === UI-14 Admin Users === */
