@@ -62,8 +62,11 @@ pub struct FakeState {
     pub host_devices: BTreeSet<String>,
     /// What a started GPU probe prints.
     pub probe_output: String,
-    /// Whether the engine can create a container that requests GPUs (`--gpus all`).
+    /// Whether the engine can start a container that requests GPUs (`--gpus all`); when
+    /// not, the start is refused with Docker's device-driver message.
     pub gpus_supported: bool,
+    /// Failures the next creates of a GPU-requesting container return, in order.
+    pub gpus_create_failures: Vec<EngineError>,
     pub unreachable: bool,
     pub next_id: u64,
 }
@@ -165,6 +168,13 @@ fn engine(kind: ErrorKind) -> EngineError {
     EngineError::Runtime(kind)
 }
 
+fn refused(status: u16, message: &str) -> EngineError {
+    EngineError::Refused {
+        status,
+        message: message.into(),
+    }
+}
+
 fn find<'a>(state: &'a FakeState, name_or_id: &str) -> Option<&'a FakeContainer> {
     state
         .containers
@@ -238,21 +248,27 @@ impl PlatformEngine for FakeEngine {
 
     fn create_container(&self, spec: &ContainerSpec) -> Result<String, EngineError> {
         self.call(|s| {
+            if !spec.gpus.is_empty() && !s.gpus_create_failures.is_empty() {
+                return Err(s.gpus_create_failures.remove(0));
+            }
             if s.container_named(&spec.name).is_some() {
-                return Err(engine(ErrorKind::Engine));
+                return Err(refused(
+                    409,
+                    &format!("Conflict. The container name \"/{}\" is already in use", spec.name),
+                ));
             }
             if !s.images.contains_key(&spec.image) {
-                return Err(engine(ErrorKind::Missing));
+                return Err(refused(404, &format!("No such image: {}", spec.image)));
             }
-            if spec
+            if let Some(d) = spec
                 .devices
                 .iter()
-                .any(|d| !s.host_devices.contains(&d.host))
+                .find(|d| !s.host_devices.contains(&d.host))
             {
-                return Err(engine(ErrorKind::Engine));
-            }
-            if !spec.gpus.is_empty() && !s.gpus_supported {
-                return Err(engine(ErrorKind::Engine));
+                return Err(refused(
+                    500,
+                    &format!("error gathering device information while adding custom device \"{}\": no such file or directory", d.host),
+                ));
             }
             // The engine creates a named volume a bind names but nobody created.
             for bind in spec.binds.iter().filter(|b| b.is_volume()) {
@@ -281,9 +297,16 @@ impl PlatformEngine for FakeEngine {
         self.call(|s| {
             let id = find_id(s, id)?;
             let output = s.probe_output.clone();
+            let gpus_supported = s.gpus_supported;
             let c = s.containers.get_mut(&id).unwrap();
             if c.status == "running" {
                 return Ok(());
+            }
+            if !c.spec.gpus.is_empty() && !gpus_supported {
+                return Err(refused(
+                    500,
+                    "could not select device driver \"\" with capabilities: [[gpu]]",
+                ));
             }
             c.starts += 1;
             // A helper runs to completion at once; only the GPU probe prints anything.

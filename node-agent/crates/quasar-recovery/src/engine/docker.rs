@@ -9,6 +9,13 @@ use super::{
     Container, ContainerSpec, EngineError, EngineHost, Image, PlatformEngine, RestartPolicy, Volume,
 };
 
+fn refused(r: quasar_runtime::platform::Refused) -> EngineError {
+    EngineError::Refused {
+        status: r.status,
+        message: r.message,
+    }
+}
+
 pub struct DockerEngine {
     client: RuntimeClient,
 }
@@ -50,10 +57,13 @@ impl PlatformEngine for DockerEngine {
         Ok(self.client.platform_containers().wait()?)
     }
     fn create_container(&self, spec: &ContainerSpec) -> Result<String, EngineError> {
-        Ok(self.client.create_container(spec.clone()).wait()?)
+        self.client
+            .create_container(spec.clone())
+            .wait()?
+            .map_err(refused)
     }
     fn start_container(&self, id: &str) -> Result<(), EngineError> {
-        Ok(self.client.start_container(id).wait()?)
+        self.client.start_container(id).wait()?.map_err(refused)
     }
     fn stop_container(&self, id: &str, grace: Duration) -> Result<(), EngineError> {
         Ok(self.client.stop_container(id, grace).wait()?)

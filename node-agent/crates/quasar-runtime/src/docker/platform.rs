@@ -1,7 +1,8 @@
 //! SDK details of the platform-service lifecycles (`crate::platform`).
 use super::{classify, credentials, discover, image_error};
 use crate::platform::{
-    ContainerSpec, EngineHost, PlatformContainer, PlatformImage, PlatformVolume, RestartPolicy,
+    ContainerSpec, EngineHost, PlatformContainer, PlatformImage, PlatformVolume, Refused,
+    RestartPolicy,
 };
 use crate::{ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::errors::Error;
@@ -19,6 +20,32 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 const MAX_LOG_BYTES: usize = 64 * 1024;
+const MAX_REFUSAL_BYTES: usize = 1024;
+
+/// The engine's definite answer to a create or start it refused, with its own words; any
+/// other failure stays a classified [`RuntimeError`].
+fn refusal(error: Error) -> Result<Refused, RuntimeError> {
+    match error {
+        Error::DockerResponseServerError {
+            status_code,
+            message,
+        } if !matches!(status_code, 401 | 403) => {
+            let mut message = message;
+            if message.len() > MAX_REFUSAL_BYTES {
+                let mut end = MAX_REFUSAL_BYTES;
+                while !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                message.truncate(end);
+            }
+            Ok(Refused {
+                status: status_code,
+                message,
+            })
+        }
+        other => Err(mutation_error(other)),
+    }
+}
 
 fn status_code(error: &Error) -> Option<u16> {
     match error {
@@ -257,9 +284,9 @@ fn engine_body(spec: &ContainerSpec) -> ContainerCreateBody {
 pub(crate) async fn create(
     config: &RuntimeConfig,
     spec: &ContainerSpec,
-) -> Result<String, RuntimeError> {
+) -> Result<Result<String, Refused>, RuntimeError> {
     let (docker, _) = discover(config).await?;
-    let created = docker
+    let created = match docker
         .create_container(
             Some(CreateContainerOptions {
                 name: Some(spec.name.clone()),
@@ -268,19 +295,25 @@ pub(crate) async fn create(
             engine_body(spec),
         )
         .await
-        .map_err(mutation_error)?;
+    {
+        Ok(created) => created,
+        Err(e) => return refusal(e).map(Err),
+    };
     if created.id.len() != 64 || !created.id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ErrorKind::Protocol.into());
     }
-    Ok(created.id)
+    Ok(Ok(created.id))
 }
 
-pub(crate) async fn start(config: &RuntimeConfig, id: &str) -> Result<(), RuntimeError> {
+pub(crate) async fn start(
+    config: &RuntimeConfig,
+    id: &str,
+) -> Result<Result<(), Refused>, RuntimeError> {
     let (docker, _) = discover(config).await?;
     match docker.start_container(id, None).await {
-        Ok(()) => Ok(()),
-        Err(e) if status_code(&e) == Some(304) => Ok(()),
-        Err(e) => Err(mutation_error(e)),
+        Ok(()) => Ok(Ok(())),
+        Err(e) if status_code(&e) == Some(304) => Ok(Ok(())),
+        Err(e) => refusal(e).map(Err),
     }
 }
 

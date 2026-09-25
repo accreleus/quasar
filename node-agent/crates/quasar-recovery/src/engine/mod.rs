@@ -26,11 +26,41 @@ pub use quasar_runtime::ErrorKind;
 pub enum EngineError {
     /// The engine answered with (or failed to answer with) this classified error.
     Runtime(ErrorKind),
-    /// [`FakeEngine`] only: the actor process "died" at this call.
+    /// The engine definitely refused this create or start, in its own words.
+    Refused { status: u16, message: String },
+    /// `FakeEngine` only: the actor process "died" at this call.
     Crashed,
 }
 
+/// Docker's answer to a device request no configured driver can meet: `could not select
+/// device driver "" with capabilities: [[gpu]]`.
+const DEVICE_REQUEST_REFUSAL: &str = "could not select device driver";
+
 impl EngineError {
+    /// The engine refused a GPU device request: the one definite "no GPUs" answer.
+    pub fn is_device_request_refusal(&self) -> bool {
+        matches!(self, EngineError::Refused { message, .. }
+            if message.to_lowercase().contains(DEVICE_REQUEST_REFUSAL))
+    }
+
+    /// Worth asking again: the engine did not answer, or failed on its side for a reason
+    /// other than refusing the request.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            EngineError::Runtime(kind) => matches!(
+                kind,
+                ErrorKind::Unavailable
+                    | ErrorKind::Timeout
+                    | ErrorKind::UnknownOutcome
+                    | ErrorKind::Busy
+            ),
+            EngineError::Refused { status, .. } => {
+                *status >= 500 && !self.is_device_request_refusal()
+            }
+            EngineError::Crashed => false,
+        }
+    }
+
     /// The engine itself could not be reached, as opposed to refusing one request.
     pub fn is_unreachable(&self) -> bool {
         matches!(
@@ -52,6 +82,9 @@ impl std::fmt::Display for EngineError {
             EngineError::Runtime(kind) => f.write_str(quasar_runtime::platform::describe(
                 &quasar_runtime::RuntimeError::from(*kind),
             )),
+            EngineError::Refused { status, message } => {
+                write!(f, "the engine refused it (HTTP {status}): {message}")
+            }
             EngineError::Crashed => f.write_str("crash injected"),
         }
     }

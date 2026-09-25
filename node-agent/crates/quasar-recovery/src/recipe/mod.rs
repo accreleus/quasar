@@ -125,21 +125,48 @@ pub enum GpuVendor {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuFacts {
-    /// `None`: no render node of a known vendor. The agent is installed anyway and its
-    /// readiness reports the gap.
+    /// The preferred GPU: NVIDIA when the machine has an NVIDIA render node. `None`: no
+    /// render node of a known vendor; the agent is installed anyway and its readiness
+    /// reports the gap.
     pub vendor: Option<GpuVendor>,
     /// The render node of `vendor`, from the node's own device evidence.
     pub render_node: Option<String>,
-    /// The engine started a probe container that requested `--gpus all`: the evidence
-    /// that holds whether it serves GPUs through an `nvidia` runtime, CDI, or the
-    /// container toolkit's hook with no runtime entry.
+    /// The engine started a probe container that requested `--gpus all`. Recorded only
+    /// when true: a "no" is decided again whenever the agent is created, so an engine that
+    /// gains the NVIDIA toolkit later is not held to an old answer.
+    #[serde(default, alias = "nvidia_runtime", skip_serializing_if = "is_false")]
     pub gpus_served: bool,
+    /// On an NVIDIA machine, the lowest other recognised render node: what the agent uses
+    /// when the engine does not serve `--gpus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<GpuNode>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuNode {
+    pub vendor: GpuVendor,
+    pub render_node: String,
 }
 
 impl GpuFacts {
     /// Whether the NVIDIA shape (the Compose NVIDIA overlay) applies.
     pub fn nvidia_shape(&self) -> bool {
         self.vendor == Some(GpuVendor::Nvidia) && self.gpus_served
+    }
+
+    /// The render node the agent is pointed at.
+    pub fn effective_render_node(&self) -> Option<&str> {
+        match &self.fallback {
+            Some(other) if self.vendor == Some(GpuVendor::Nvidia) && !self.gpus_served => {
+                Some(&other.render_node)
+            }
+            _ => self.render_node.as_deref(),
+        }
     }
 }
 
@@ -366,7 +393,8 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
     if inputs.installation_id.is_empty() {
         return Err(RenderError::Invalid("no installation id".into()));
     }
-    if let Some(node) = &inputs.gpu.render_node {
+    let fallback = inputs.gpu.fallback.as_ref().map(|f| &f.render_node);
+    for node in inputs.gpu.render_node.iter().chain(fallback) {
         let ok = node
             .strip_prefix("/dev/dri/renderD")
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
@@ -491,7 +519,11 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
         ("QUASAR_PULSE_IMAGE".into(), reference.clone()),
         (
             "QUASAR_RENDER_NODE".into(),
-            inputs.gpu.render_node.clone().unwrap_or_default(),
+            inputs
+                .gpu
+                .effective_render_node()
+                .unwrap_or_default()
+                .to_owned(),
         ),
         (AGENT_SOCKET_ENV.into(), paths::AGENT_SOCKET.into()),
     ]);

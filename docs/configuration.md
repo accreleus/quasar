@@ -1265,13 +1265,30 @@ inputs are ignored (a differing home root is logged `token="actor-input-ignored"
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
+**NVIDIA detection.** When the device probe finds an NVIDIA render node, the actor asks
+the engine, just before it creates the agent, with a second disposable probe that requests
+`--gpus all` (the evidence that holds whether `--gpus` is served by an `nvidia` runtime, CDI
+or only the container toolkit's hook).
+- It starts and exits 0: the NVIDIA shape is installed (`token="actor-gpus-served"`) and that
+  yes is recorded in machine state.
+- The engine refuses the device request ("could not select device driver") or the probe
+  exits non-zero: the agent is installed without the NVIDIA shape, pointed at the machine's
+  other GPU if it has one (`token="actor-gpus-refused"`, with the reason), and RH-02
+  readiness reports the gap. The no is not recorded: the next time the agent is created
+  (after removing it, for instance once the toolkit is installed) the engine is asked again.
+- The engine does not answer, or fails for another reason (a timeout, a transient 5xx):
+  asked up to 3 times (`token="actor-gpus-probe-retry"`), then the start fails
+  (`token="actor-resume-failed"`) before the agent is created, with nothing recorded. Any
+  other failure (a missing image, a name conflict) fails the start at once.
+- A container this actor did not create that holds a helper's name (`quasar-gpu-probe`,
+  `quasar-secrets-writer`) is left untouched, stops the start
+  (`token="actor-helper-name-taken"`) and is listed in status `conflicts`.
+
 **One socket, one name.** The actor always listens at `/run/quasar-recovery/agent.sock`, inside the `quasar-recovery-agent` volume it mounts read-write; that path is fixed, not an actor input. The agent it creates mounts the same volume read-only at the same path and is told where through `QUASAR_RECOVERY_SOCKET` (see "Node agent — connection & identity"), which the actor's recipe sets. Both names come from one constant module (`quasar_runtime::owned_install`), so the two sides cannot drift.
 
 On start the actor takes the machine's lease (`actor.lease`; a second actor on the same
 volume exits `token="actor-lease-unavailable"`), creates machine state, detects the GPU
-with a disposable probe container (and, when it finds an NVIDIA device, a second probe that requests
-`--gpus all`: the NVIDIA shape is installed only if the engine starts it, logged
-`token="actor-gpus-served"`, else `token="actor-gpus-refused"` with the reason), and creates `quasar-node-agent` from its recipe with its
+with a disposable probe container, and creates `quasar-node-agent` from its recipe with its
 volumes (`quasar-agent-data`, `quasar-node-agent-secrets`, and `quasar-nvidia-driver` on an
 NVIDIA host whose engine serves `--gpus`). A second start on an installed machine changes
 nothing; an interrupted install is completed by the next start. A failed install (an

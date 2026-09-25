@@ -15,12 +15,18 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::engine::{ContainerSpec, EngineError, ErrorKind, PlatformEngine, RestartPolicy};
-use crate::recipe::{labels, names, Bind, GpuFacts, GpuRequest, GpuVendor, HostDevices, ImageRef};
+use tracing::warn;
+
+use crate::engine::{ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
+use crate::recipe::{
+    labels, names, Bind, GpuFacts, GpuNode, GpuRequest, GpuVendor, HostDevices, ImageRef,
+};
 
 pub const PROBE_HELPER: &str = "gpu-probe";
 pub const GPUS_PROBE_HELPER: &str = "gpus-probe";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many times the `--gpus` probe is asked before a transient failure fails the start.
+pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
@@ -116,10 +122,11 @@ impl ProbeReport {
     }
 }
 
-/// The machine's GPU facts from one report: an NVIDIA node the engine can serve wins (the
-/// discrete card of a mixed host, the Compose NVIDIA overlay's case); otherwise the lowest
-/// recognised render node.
-pub fn select(report: &ProbeReport, gpus_served: bool) -> (GpuFacts, HostDevices) {
+/// The machine's GPU facts from one report: an NVIDIA render node is preferred (the
+/// discrete card of a mixed host, the Compose NVIDIA overlay's case), with the lowest other
+/// recognised node as its fallback for when the engine does not serve `--gpus`; otherwise
+/// the lowest recognised render node. Whether `--gpus` is served is decided separately.
+pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
     let mut renders: Vec<(u32, &str, GpuVendor)> = report
         .nodes
         .iter()
@@ -132,14 +139,17 @@ pub fn select(report: &ProbeReport, gpus_served: bool) -> (GpuFacts, HostDevices
         })
         .collect();
     renders.sort_by_key(|(n, node, _)| (*n, *node));
-    let nvidia = renders
-        .iter()
-        .find(|(_, _, v)| *v == GpuVendor::Nvidia && gpus_served);
-    let chosen = nvidia.or_else(|| renders.first());
+    let nvidia = renders.iter().find(|(_, _, v)| *v == GpuVendor::Nvidia);
+    let other = renders.iter().find(|(_, _, v)| *v != GpuVendor::Nvidia);
+    let chosen = nvidia.or(other);
     let gpu = GpuFacts {
         vendor: chosen.map(|(_, _, v)| *v),
         render_node: chosen.map(|(_, n, _)| (*n).to_owned()),
-        gpus_served,
+        gpus_served: false,
+        fallback: nvidia.and(other).map(|(_, n, v)| GpuNode {
+            vendor: *v,
+            render_node: (*n).to_owned(),
+        }),
     };
     let devices = HostDevices {
         dri: !report.nodes.is_empty(),
@@ -201,30 +211,56 @@ pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
     }
 }
 
-/// Whether the engine serves `--gpus all`, and why not when it does not.
-///
-/// Only a definitive answer is `Ok`: the engine answered the create or the start with a
-/// refusal (`ErrorKind::Engine`, which is how it rejects a device request it cannot
-/// satisfy), or the probe ran and exited non-zero. Anything else (an unreachable engine, a
-/// timeout, an unknown outcome, a crash) is `Err`, so the caller records nothing and the
-/// next start asks again: machine inputs are never written from a non-answer.
+/// The answer of a `--gpus all` probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpusAnswer {
+    Served,
+    /// A definite no, and why: the engine refused the device request ("could not select
+    /// device driver"), or the probe ran and exited non-zero.
+    Refused(String),
+}
+
+/// Whether the engine serves `--gpus all`. A transient failure (the engine did not answer,
+/// or failed on its side for another reason than refusing the device request) is asked
+/// again, [`GPUS_PROBE_ATTEMPTS`] times in all with `backoff` between; after that, and for
+/// any other failure (a missing image, a name conflict, a crash), `Err`: no answer, so the
+/// caller must not install on a guess.
 pub fn serves_gpus(
     engine: &dyn PlatformEngine,
     image: &ImageRef,
-) -> Result<Result<(), String>, EngineError> {
-    let refused = |e: &EngineError| matches!(e, EngineError::Runtime(ErrorKind::Engine));
+    backoff: Duration,
+) -> Result<GpusAnswer, EngineError> {
+    let mut attempt = 1;
+    loop {
+        match gpus_attempt(engine, image) {
+            Err(e) if e.is_transient() && attempt < GPUS_PROBE_ATTEMPTS => {
+                warn!(
+                    token = "actor-gpus-probe-retry",
+                    attempt, "the --gpus all probe got no answer ({e}); asking again"
+                );
+                std::thread::sleep(backoff * attempt);
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn gpus_attempt(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<GpusAnswer, EngineError> {
     let id = match engine.create_container(&gpus_spec(image)) {
         Ok(id) => id,
-        Err(e) if refused(&e) => return Ok(Err(format!("the engine refused to create it ({e})"))),
+        Err(e) if e.is_device_request_refusal() => return Ok(GpusAnswer::Refused(e.to_string())),
         Err(e) => return Err(e),
     };
     let outcome = match engine.start_container(&id) {
-        Err(e) if refused(&e) => Ok(Err(format!("the engine refused to start it ({e})"))),
+        Err(e) if e.is_device_request_refusal() => Ok(GpusAnswer::Refused(e.to_string())),
         Err(e) => Err(e),
         Ok(()) => match engine.wait_container(&id, PROBE_TIMEOUT) {
+            Ok(0) => Ok(GpusAnswer::Served),
+            Ok(code) => Ok(GpusAnswer::Refused(format!(
+                "the probe ran with the GPUs and exited {code}"
+            ))),
             Err(e) => Err(e),
-            Ok(0) => Ok(Ok(())),
-            Ok(code) => Ok(Err(format!("it exited {code}"))),
         },
     };
     match (engine.remove_container(&id), outcome) {
@@ -270,28 +306,29 @@ mod tests {
     #[test]
     fn a_system_container_with_one_passed_through_gpu_selects_that_node() {
         let report = parse(LXC_AMD).unwrap();
-        let (gpu, devices) = select(&report, false);
+        let (gpu, devices) = select(&report);
         assert_eq!(gpu.vendor, Some(GpuVendor::Amd));
         assert_eq!(gpu.render_node.as_deref(), Some("/dev/dri/renderD129"));
         assert!(devices.dri && devices.uinput && !devices.kmsg);
     }
 
     #[test]
-    fn an_nvidia_node_wins_only_when_the_engine_can_serve_it() {
+    fn an_nvidia_node_wins_only_when_the_engine_serves_it() {
         let out = "quasar-probe 1\ndev nvidiactl\nnode /dev/dri/renderD128 226:128 0x1002\nnode /dev/dri/renderD129 226:129 0x10de\nend";
         let report = parse(out).unwrap();
-        let (with, _) = select(&report, true);
-        assert_eq!(with.vendor, Some(GpuVendor::Nvidia));
-        assert_eq!(with.render_node.as_deref(), Some("/dev/dri/renderD129"));
-        assert!(with.nvidia_shape());
-        let (without, _) = select(&report, false);
-        assert_eq!(without.vendor, Some(GpuVendor::Amd));
-        assert!(!without.nvidia_shape());
+        assert!(report.has_nvidia());
+        let (mut gpu, _) = select(&report);
+        assert_eq!(gpu.vendor, Some(GpuVendor::Nvidia));
+        assert!(!gpu.nvidia_shape());
+        assert_eq!(gpu.effective_render_node(), Some("/dev/dri/renderD128"));
+        gpu.gpus_served = true;
+        assert!(gpu.nvidia_shape());
+        assert_eq!(gpu.effective_render_node(), Some("/dev/dri/renderD129"));
     }
 
     #[test]
     fn no_render_node_is_no_gpu_and_no_dri_device() {
-        let (gpu, devices) = select(&parse("quasar-probe 1\ndev kmsg\nend").unwrap(), true);
+        let (gpu, devices) = select(&parse("quasar-probe 1\ndev kmsg\nend").unwrap());
         assert_eq!(gpu.vendor, None);
         assert_eq!(gpu.render_node, None);
         assert!(!devices.dri && devices.kmsg && !devices.uinput);
@@ -299,10 +336,8 @@ mod tests {
 
     #[test]
     fn a_node_whose_vendor_sysfs_cannot_name_is_present_but_never_chosen() {
-        let (gpu, devices) = select(
-            &parse("quasar-probe 1\nnode /dev/dri/renderD128 226:128 -\nend").unwrap(),
-            false,
-        );
+        let (gpu, devices) =
+            select(&parse("quasar-probe 1\nnode /dev/dri/renderD128 226:128 -\nend").unwrap());
         assert_eq!(gpu.vendor, None);
         assert!(devices.dri);
     }

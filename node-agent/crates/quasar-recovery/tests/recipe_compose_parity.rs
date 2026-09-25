@@ -259,6 +259,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             vendor,
             render_node: render_node.map(str::to_owned),
             gpus_served: vendor == Some(GpuVendor::Nvidia),
+            fallback: None,
         },
         devices: HostDevices {
             dri: vendor.is_some(),

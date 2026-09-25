@@ -157,6 +157,7 @@ pub fn actor(engine: &Arc<FakeEngine>, dir: &Path, operator: OperatorInputs) -> 
     config.self_container = Some(ACTOR_ID.into());
     config.new_installation_id = Box::new(|| INSTALLATION.to_string());
     config.now = Box::new(|| NOW.to_string());
+    config.gpus_probe_backoff = std::time::Duration::ZERO;
     Actor::new(engine.clone(), config)
 }
 

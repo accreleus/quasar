@@ -9,7 +9,8 @@
 //! [`RuntimeClient`]'s executor under its admission and a deadline; a mutation is
 //! detached, so a spent budget reads [`ErrorKind::UnknownOutcome`], never "it failed".
 //!
-//! Nothing here returns daemon text to a caller.
+//! Daemon text reaches a caller only as a [`Refused`] create or start, which the recovery
+//! actor matches (a device request the engine cannot meet) and logs.
 
 use crate::{docker, ErrorKind, Operation, RuntimeClient, RuntimeError};
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,14 @@ pub struct GpuRequest {
 pub enum RestartPolicy {
     No,
     UnlessStopped,
+}
+
+/// The engine refused a create or start, with its HTTP status and its own message
+/// (bounded to 1 KiB).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub status: u16,
+    pub message: String,
 }
 
 /// One container as the engine reports it now.
@@ -187,8 +196,8 @@ impl RuntimeClient {
         self.submit(async move { docker::platform::list(&config).await })
     }
 
-    /// Create (never start) `spec`. Returns the new container's id.
-    pub fn create_container(&self, spec: ContainerSpec) -> Operation<String> {
+    /// Create (never start) `spec`. The new container's id, or the engine's refusal.
+    pub fn create_container(&self, spec: ContainerSpec) -> Operation<Result<String, Refused>> {
         let config = self.config().clone();
         let budget = self.deadline();
         self.submit_owned(
@@ -198,8 +207,9 @@ impl RuntimeClient {
         )
     }
 
-    /// Start; an already running container is not an error.
-    pub fn start_container(&self, id: impl Into<String>) -> Operation<()> {
+    /// Start; an already running container is not an error. `Ok(Err(_))` is the
+    /// engine's refusal.
+    pub fn start_container(&self, id: impl Into<String>) -> Operation<Result<(), Refused>> {
         let config = self.config().clone();
         let id = id.into();
         let budget = self.deadline();

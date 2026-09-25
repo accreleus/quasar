@@ -49,6 +49,8 @@ pub struct ActorConfig {
     pub new_installation_id: Box<dyn Fn() -> String + Send + Sync>,
     /// RFC 3339 UTC, for the timestamps machine state records.
     pub now: Box<dyn Fn() -> String + Send + Sync>,
+    /// Between attempts of the `--gpus` probe (multiplied by the attempt number).
+    pub gpus_probe_backoff: std::time::Duration,
 }
 
 impl ActorConfig {
@@ -65,6 +67,7 @@ impl ActorConfig {
             docker_socket_fallback: paths::ENGINE_SOCKET.into(),
             new_installation_id: Box::new(random_uuid),
             now: Box::new(rfc3339_now),
+            gpus_probe_backoff: std::time::Duration::from_secs(2),
         }
     }
 }
@@ -148,6 +151,7 @@ const PLATFORM_NAMES: &[&str] = &[
     names::CONTROL_PLANE,
     names::POSTGRES,
 ];
+const HELPER_NAMES: &[&str] = &[names::GPU_PROBE, names::SECRETS_WRITER];
 const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 const SECRETS_HELPER: &str = "secrets-writer";
 
@@ -260,6 +264,16 @@ impl Actor {
                 if c.labels.contains_key(labels::HELPER) {
                     info!(container = %c.name, "removing a helper left by an interrupted start");
                     self.engine.remove_container(&c.id)?;
+                } else {
+                    warn!(
+                        token = "actor-helper-name-taken",
+                        container = %c.name,
+                        "a container this actor did not create holds the name of its {name} helper; it is left untouched and this start stops"
+                    );
+                    return Err(ResumeError::OwnerConflict(format!(
+                        "container {name} ({}) is not this actor's helper; remove it to let the install continue",
+                        c.image
+                    )));
                 }
             }
         }
@@ -350,28 +364,11 @@ impl Actor {
                 probe::ProbeReport::default()
             }
         };
-        let gpus_served = report.has_nvidia()
-            && {
-                match probe::serves_gpus(self.engine.as_ref(), &image)? {
-                    Ok(()) => {
-                        info!(token = "actor-gpus-served", "NVIDIA: the engine started a --gpus all probe; installing the NVIDIA shape");
-                        true
-                    }
-                    Err(why) => {
-                        warn!(
-                        token = "actor-gpus-refused",
-                        "NVIDIA device found, but a --gpus all probe failed: {why}; installing without the NVIDIA shape (is the NVIDIA Container Toolkit installed for this engine?)"
-                    );
-                        false
-                    }
-                }
-            };
-        let (gpu, devices) = probe::select(&report, gpus_served);
+        let (gpu, devices) = probe::select(&report);
         match &gpu.vendor {
             Some(vendor) => info!(
                 vendor = ?vendor,
                 render_node = gpu.render_node.as_deref().unwrap_or(""),
-                nvidia_shape = gpu.nvidia_shape(),
                 "GPU detected"
             ),
             None => warn!(
@@ -472,6 +469,8 @@ impl Actor {
     }
 
     fn ensure_node_agent(&self, machine: &Machine) -> Result<(), ResumeError> {
+        let mut machine = machine.clone();
+        let machine = &mut machine;
         let role = Role::NodeAgent;
         let image = match self.dir.load_service(role)? {
             Some(record) => record.image,
@@ -482,12 +481,12 @@ impl Actor {
         self.ensure_volume(machine, names::AGENT_DATA_VOLUME, role)?;
         self.ensure_volume(machine, names::NODE_AGENT_SECRETS_VOLUME, role)?;
         self.ensure_volume(machine, names::AGENT_SOCKET_VOLUME, Role::RecoveryActor)?;
-        if machine.inputs.gpu.nvidia_shape() {
-            self.ensure_volume(machine, names::NVIDIA_DRIVER_VOLUME, role)?;
-        }
         let secrets = self.node_agent_secrets()?;
 
         if let Some(existing) = self.engine.inspect_container(role.container_name())? {
+            if machine.inputs.gpu.nvidia_shape() {
+                self.ensure_volume(machine, names::NVIDIA_DRIVER_VOLUME, role)?;
+            }
             if !self.is_ours(machine, &existing, role) {
                 return Err(ResumeError::OwnerConflict(format!(
                     "container {} ({}) is not this installation's; it is left untouched",
@@ -518,12 +517,42 @@ impl Actor {
 
         let found = self.ensure_image(&image)?;
         let revision = image_revision(&found, &image)?;
+        self.decide_gpus(machine, &image)?;
+        if machine.inputs.gpu.nvidia_shape() {
+            self.ensure_volume(machine, names::NVIDIA_DRIVER_VOLUME, role)?;
+        }
         let spec = recipe::render(role, revision, &machine.inputs, &image, &secrets)?;
         self.deliver_secrets(&image, names::NODE_AGENT_SECRETS_VOLUME, &secrets.files)?;
         let id = self.engine.create_container(&spec)?;
         self.engine.start_container(&id)?;
         info!(container = names::NODE_AGENT, image = %image.reference(), revision, "node agent created and started");
         self.record(role, revision, &image, spec)
+    }
+
+    /// On an NVIDIA machine not yet known to serve `--gpus`, ask the engine before the agent
+    /// is created. Only a yes is recorded; a definite no installs the agent without the
+    /// NVIDIA shape (readiness reports the gap) and is asked again the next time the agent
+    /// is created; no answer stops this start.
+    fn decide_gpus(&self, machine: &mut Machine, image: &ImageRef) -> Result<(), ResumeError> {
+        let gpu = &machine.inputs.gpu;
+        if gpu.vendor != Some(recipe::GpuVendor::Nvidia) || gpu.gpus_served {
+            return Ok(());
+        }
+        match probe::serves_gpus(self.engine.as_ref(), image, self.config.gpus_probe_backoff)? {
+            probe::GpusAnswer::Served => {
+                info!(
+                    token = "actor-gpus-served",
+                    "NVIDIA: the engine started a --gpus all probe; installing the NVIDIA shape"
+                );
+                machine.inputs.gpu.gpus_served = true;
+                self.dir.machine().store(machine)?;
+            }
+            probe::GpusAnswer::Refused(why) => warn!(
+                token = "actor-gpus-refused",
+                "NVIDIA device found, but the engine does not serve --gpus: {why}; installing without the NVIDIA shape (is the NVIDIA Container Toolkit installed for this engine?)"
+            ),
+        }
+        Ok(())
     }
 
     fn record(
@@ -652,7 +681,13 @@ impl Actor {
                 continue;
             }
             let compose = c.labels.get(COMPOSE_SERVICE).map(String::as_str);
-            if PLATFORM_NAMES.contains(&c.name.as_str())
+            if HELPER_NAMES.contains(&c.name.as_str()) {
+                conflicts.push(Conflict {
+                    container: c.name.clone(),
+                    image: repository_of(&c.image),
+                    why: "holds the name of a recovery-actor helper without its label".into(),
+                });
+            } else if PLATFORM_NAMES.contains(&c.name.as_str())
                 || compose.is_some_and(|s| PLATFORM_NAMES.contains(&s))
             {
                 conflicts.push(Conflict {

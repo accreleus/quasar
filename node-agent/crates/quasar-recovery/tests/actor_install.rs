@@ -236,15 +236,119 @@ fn an_nvidia_card_the_engine_cannot_serve_is_installed_without_the_nvidia_shape(
     assert!(agent.spec.gpus.is_empty());
     assert!(!agent.spec.env.contains_key("QUASAR_GPU_NVIDIA"));
     assert_eq!(agent.status, "running");
-    // The engine's own refusal is an answer, and machine state records it.
-    let machine: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.path().join("machine.json")).unwrap()).unwrap();
-    assert_eq!(machine["inputs"]["gpu"]["gpus_served"], false);
+    // A "no" is never recorded, so an engine that gains the toolkit is asked again.
+    assert!(machine_json(&dir)["inputs"]["gpu"]
+        .get("gpus_served")
+        .is_none());
+    // Once the agent exists nothing is probed again: the second start changes nothing.
+    let before = engine.state();
+    actor(&engine, dir.path(), operator()).resume().unwrap();
+    assert_eq!(engine.state(), before);
+}
+
+fn machine_json(dir: &tempfile::TempDir) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(dir.path().join("machine.json")).unwrap()).unwrap()
+}
+
+fn transient_500() -> EngineError {
+    EngineError::Refused {
+        status: 500,
+        message: "failed to create task for container: ttrpc: closed".into(),
+    }
+}
+
+#[test]
+fn a_transient_engine_failure_of_the_gpus_probe_is_asked_again_in_the_same_start() {
+    let mut state = nvidia_host(&[], true);
+    state.gpus_create_failures = vec![transient_500(), EngineError::Runtime(ErrorKind::Timeout)];
+    let (engine, dir) = installed(state);
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert_eq!(
+        agent.spec.gpus.len(),
+        1,
+        "the NVIDIA shape after two transient failures"
+    );
+    assert_eq!(machine_json(&dir)["inputs"]["gpu"]["gpus_served"], true);
+}
+
+#[test]
+fn a_gpus_probe_that_never_gets_an_answer_fails_the_start_and_the_next_one_asks_again() {
+    let mut state = nvidia_host(&[], true);
+    state.gpus_create_failures = vec![transient_500(), transient_500(), transient_500()];
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    let err = actor(&engine, dir.path(), operator()).resume().unwrap_err();
+    assert!(matches!(err, ResumeError::Engine(_)), "{err}");
+    assert!(engine.state().container_named(names::NODE_AGENT).is_none());
+    assert!(engine.state().container_named(names::GPU_PROBE).is_none());
+    assert!(machine_json(&dir)["inputs"]["gpu"]
+        .get("gpus_served")
+        .is_none());
+
+    actor(&engine, dir.path(), operator()).resume().unwrap();
+    let state = engine.state();
+    assert_eq!(
+        state
+            .container_named(names::NODE_AGENT)
+            .unwrap()
+            .spec
+            .gpus
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_gpus_probe_failure_that_is_not_about_gpus_fails_the_start_without_retrying() {
+    let mut state = nvidia_host(&[], true);
+    // One failure only: a retry would have succeeded and hidden the refusal.
+    state.gpus_create_failures = vec![EngineError::Refused {
+        status: 404,
+        message: format!("No such image: {AGENT_IMAGE}"),
+    }];
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    let err = actor(&engine, dir.path(), operator()).resume().unwrap_err();
+    assert!(err.to_string().contains("404"), "{err}");
+    assert!(engine.state().container_named(names::NODE_AGENT).is_none());
+    assert!(machine_json(&dir)["inputs"]["gpu"]
+        .get("gpus_served")
+        .is_none());
+}
+
+#[test]
+fn a_container_holding_the_probe_name_without_our_label_stops_the_start_and_is_reported() {
+    let mut state = nvidia_host(&[], true);
+    let mut squatter = state.containers[ACTOR_ID].clone();
+    squatter.id = "ab00000000000000000000000000000000000000000000000000000000000000".into();
+    squatter.spec.name = names::GPU_PROBE.into();
+    state
+        .containers
+        .insert(squatter.id.clone(), squatter.clone());
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    let a = actor(&engine, dir.path(), operator());
+
+    let err = a.resume().unwrap_err();
+    assert!(matches!(err, ResumeError::OwnerConflict(_)), "{err}");
+    assert_eq!(engine.state().containers[&squatter.id], squatter);
+    assert!(engine.state().container_named(names::NODE_AGENT).is_none());
+    let status = a.status();
+    assert!(
+        status
+            .conflicts
+            .iter()
+            .any(|c| c.container == names::GPU_PROBE),
+        "{:?}",
+        status.conflicts
+    );
 }
 
 /// An engine that does not answer (unreachable, a timeout, an unknown outcome) at any call
 /// of an NVIDIA install is no answer about GPUs: nothing about them is recorded, and the
-/// next start probes again and installs exactly what an undisturbed install would have.
+/// same start (the `--gpus` probe retries) or the next one installs exactly what an
+/// undisturbed install would have.
 #[test]
 fn an_engine_failure_during_detection_is_never_recorded_as_an_answer() {
     let (reference_engine, reference_dir) = installed(nvidia_host(&[], true));
@@ -264,10 +368,7 @@ fn an_engine_failure_during_detection_is_never_recorded_as_an_answer() {
                 when: When::Before,
                 error: EngineError::Runtime(kind),
             });
-            assert!(
-                actor(&engine, dir.path(), operator()).resume().is_err(),
-                "{at}: the failure was swallowed"
-            );
+            let _ = actor(&engine, dir.path(), operator()).resume();
             engine.clear_faults();
             actor(&engine, dir.path(), operator())
                 .resume()
