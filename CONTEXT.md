@@ -642,6 +642,13 @@ still manages, published with the release. A host **below the floor** is not fai
 it is offered only an update. _Avoid_: "minimum version" (the floor is per release
 and per component), "compatibility level".
 
+**Developer apply** — an admin applying an arbitrary digest set, typically a branch
+build from an allowlisted registry namespace, to one owned target without it being
+published as a release. It is the product lane's way to test on the path users run;
+it is never offered, never unattended, and bound by the same digest, namespace and
+ordering rules as any apply. _Avoid_: "manual update" (that is the recipe a source or
+Compose install is shown), "custom release".
+
 **Pre-update dump** — the database dump the recovery actor takes before replacing
 the control plane with a migrating release, when the database is Quasar's own. It is
 the way back from a failed migration, through one printed `restore` command; the last

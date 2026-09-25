@@ -4589,7 +4589,7 @@ export interface paths {
         put?: never;
         /**
          * Remove an owned GPU host's node agent and recovery actor (admin). NOT YET SERVED - see x-unimplemented.
-         * @description AMENDMENT 14 (#353), authored ahead of the server: `x-unimplemented: true` until the RH06 slice that implements it registers the route and removes the marker (and its entry in the drift test's reviewed allowlist) in the same change. The console's "remove host". Validates, cordons the host exactly as a per-host apply does, with force stops its sessions, then sends agent-api.md host_remove and answers 202 once the recovery actor accepts. It does NOT forget the host: once the host is offline the existing DELETE /v1/hosts/{id} does that, unchanged. A refusal after the cordon puts the host's cordon state back as it was found. Writes no platform_apply_attempts row. Audited as platform.remove.host.
+         * @description AMENDMENT 14 (#353), authored ahead of the server: `x-unimplemented: true` until the RH06 slice that implements it registers the route and removes the marker (and its entry in the drift test's reviewed allowlist) in the same change. The console's "remove host". Validates (refusing the control plane's own machine's agent before anything changes), cordons the host exactly as a per-host apply does, then checks sessions (without force a remaining session refuses 409 conflict; with force they are stopped), then sends agent-api.md host_remove and answers 202 once the recovery actor accepts. It does NOT forget the host: once the host is offline the existing DELETE /v1/hosts/{id} does that, unchanged. A refusal after the cordon puts the host's cordon state back as it was found. Writes no platform_apply_attempts row. Audited as platform.remove.host.
          */
         post: {
             parameters: {
@@ -4619,7 +4619,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description run_active; attempt_in_flight (both as for apply); host_not_eligible (the body carries `reason`: host_offline or updater_absent); host_not_removable (the host is not owned, or its agent refused because its machine also runs the control plane, or the ack carried another rejection, which the message names); conflict (non-terminal sessions remain and force is false - nothing changed). */
+                /** @description PRE-SEND, in this order, each changing nothing: run_active; attempt_in_flight (both as for apply); host_not_eligible (the body carries `reason`: host_offline or updater_absent); host_not_removable (the host is not owned, or its agent is the one on the control plane's own machine - refused before any cordon or session stop); conflict (after the cordon, non-terminal sessions remain and force is false; the cordon is restored). ACK OUTCOME: host_not_removable (the ack carried a rejection - invalid, busy, updater_absent or updater_unreachable - which the message names; the cordon is restored, and sessions a force request already stopped stay stopped). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -4629,6 +4629,80 @@ export interface paths {
                     };
                 };
                 /** @description apply_unsupported - no ack within the 10s ack timeout: the agent predates amendment 14 and nothing was removed. */
+                501: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/developer-apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Developer apply - an arbitrary digest set to one owned target (admin). NOT YET SERVED - see x-unimplemented.
+         * @description AMENDMENT 14, OWNER ADDITION on #353 (2026-09-25), beyond #352 decision 24; authored ahead of the server: `x-unimplemented: true` until the RH06 slice that implements it registers the route and removes the marker (and its drift-test allowlist entry) in the same change. The product lane (#352 decisions 15 and 22): a standalone attempt that applies the requested digests to ONE owned target - the control plane or one host - ordered recovery-actor first. Every image digest-only and under the namespace allowlist (ADR 0001; the recovery actor's allowlist is the enforcement, the control plane checks up front). ADR 0002 holds on the images' build-identity labels: a control-plane digest below the installed schema is refused, one above it MIGRATES and follows #352 decision 14 (drain, then the pre-update dump or external_backup_confirmed); a host digest set must be the installed control plane's commit or a known release at or below it. Never offered as a release, never unattended. Carries no release version, so under signature mode require it fails signature_missing; under verify it applies unsigned with the WARN. Recorded as a kind developer_apply attempt; audited as platform.apply.developer.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["PlatformDeveloperApplyRequest"];
+                };
+            };
+            responses: {
+                /** @description Accepted - the attempt was created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyAttemptEnvelope"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description run_active; attempt_in_flight; host_not_eligible (with the host's EligibilityReason, including release_above_control_plane for a commit that cannot be shown not to be ahead and below_floor); preflight_blocked (the control-plane target); target_not_owned (the target is not an owned install); image_unresolvable (a digest does not resolve as seen from the control plane, carries no readable build identity, or the images disagree on their commit); namespace_rejected (an image outside the allowlist). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description release_below_schema_version - a control-plane digest below the installed schema (ADR 0002). */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description apply_unsupported - as for the per-host apply. */
                 501: {
                     headers: {
                         [name: string]: unknown;
@@ -9056,6 +9130,22 @@ export interface components {
             built_at: string | null;
             /** @description The highest migration version the binary embeds (the 0NNN file number as an integer). ALWAYS KNOWN, because it is derived from the embedded migration set rather than a build flag - which is why it, and not semver or built_at, is the ordering key everywhere in this surface (ADR 0002). */
             schema_version: number;
+            /**
+             * @description owned when this machine's recovery actor answered; otherwise null. The enum is the host's; this amendment defines only when owned is reported.
+             * @enum {string|null}
+             */
+            install_mode?: "registry" | "source" | "owned" | null;
+            /** @description Semver of this machine's recovery actor; null when absent or unparseable. */
+            recovery_actor_version?: string | null;
+            /** @description 7-40 lowercase hex, the commit that recovery actor was built from. */
+            recovery_actor_source_commit?: string | null;
+            /** @description Opaque version of the seed the recovery actor last saw on this machine. */
+            seed_version?: string | null;
+            /**
+             * @description owned = Quasar created this database and takes its pre-update dump; external = the operator's own database, only used, so a migrating update needs external_backup_confirmed. What tells a client when to show that confirmation and backup_space. A client meeting an unrecognized value shows it as unknown.
+             * @enum {string|null}
+             */
+            database_mode?: "owned" | "external" | null;
         };
         /** @description One host's installed identity, as last reported on the agent `register` message. */
         PlatformHostIdentity: {
@@ -9078,6 +9168,8 @@ export interface components {
             updater_present: boolean | null;
             /** @description True only when all four of source_commit, built_at, install_mode and updater_present are non-null. A CLIENT MUST READ THIS RATHER THAN RE-DERIVING IT, so "what counts as known" cannot disagree between server and client. A host with identity_known false is never eligible for an apply. */
             identity_known: boolean;
+            /** @description ADDITIVE (amendment 14, owner addition on #353). SERVER-DERIVED, in the same posture as identity_known: true when the host's reported agent_version OR recovery_actor_version orders below the installed control plane's floor by SemVer precedence (an absent or unparseable version is never below). The console's "must update before it can be managed": such a host is offered only an update. It changes no eligibility, and eligible true still always carries reason null. A server implementing the amendment always serializes it; optional here, and a client reads absent as false. */
+            below_floor?: boolean;
         };
         /** @description One detected platform release (schema.md `platform_releases`). Ordering wherever a list of these appears is schema_version DESC, then built_at DESC. */
         PlatformRelease: {
@@ -9304,10 +9396,10 @@ export interface components {
              */
             run_id: string | null;
             /**
-             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded succeeded on insert (the updater reports `restored` only for a restore that came up; a restore that itself failed leaves no row and both failures in the failed apply's output), was never driven over the wire, and its requested_digests are the failed apply's previous_digests. Amendment 14 (#353): on an owned host the recovery actor did the restore, and the row names ONLY the restored component (the one whose replacement failed), which may be recovery-actor.
+             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded succeeded on insert (the updater reports `restored` only for a restore that came up; a restore that itself failed leaves no row and both failures in the failed apply's output), was never driven over the wire, and its requested_digests are the failed apply's previous_digests. Amendment 14 (#353): on an owned host the recovery actor did the restore, and the row names ONLY the restored component (the one whose replacement failed), which may be recovery-actor. Amendment 14 (owner addition on #353) APPENDS developer_apply: an admin applied an arbitrary digest set to an owned target (POST /v1/admin/platform/developer-apply); release_id is null, and it is otherwise an ordinary apply and revert source. A client meeting an unrecognized kind renders it verbatim.
              * @enum {string}
              */
-            kind: "apply" | "revert" | "auto_revert";
+            kind: "apply" | "revert" | "auto_revert" | "developer_apply";
             /** @enum {string} */
             target: "control_plane" | "host";
             /**
@@ -9430,6 +9522,22 @@ export interface components {
         };
         PlatformHostRemoveResponse: {
             host: components["schemas"]["Host"];
+        };
+        /** @description Amendment 14, owner addition on #353. The body of POST /v1/admin/platform/developer-apply. */
+        PlatformDeveloperApplyRequest: {
+            /** @enum {string} */
+            target: "control_plane" | "host";
+            /**
+             * Format: uuid
+             * @description Required when target is host; absent otherwise.
+             */
+            host_id?: string;
+            /** @description Each name at most once. A control_plane target may name control-plane and recovery-actor; a host target node-agent and recovery-actor. ORDER IS NOT SIGNIFICANT: the control plane orders recovery-actor first, as for every apply. */
+            components: components["schemas"]["ApplyComponentDigest"][];
+            /** @description Optional; absent means false. As on the per-host and fleet applies. */
+            force?: boolean;
+            /** @description Optional; absent means false. As on the fleet apply: read only for a migrating control-plane digest on an external database. */
+            external_backup_confirmed?: boolean;
         };
         PlatformApplyRunEnvelope: {
             run: components["schemas"]["PlatformApplyRun"];
