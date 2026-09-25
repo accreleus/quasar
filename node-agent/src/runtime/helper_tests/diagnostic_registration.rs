@@ -78,6 +78,9 @@ fn register() -> AgentMsg {
         built_at: None,
         install_mode: None,
         updater_present: None,
+        recovery_actor_version: None,
+        recovery_actor_source_commit: None,
+        seed_version: None,
     }
 }
 

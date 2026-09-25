@@ -295,7 +295,15 @@ impl ProbeEnv {
             // Vendor/GPU-independent: a firewall problem is as real on a GPU-less box.
             firewall: detect_firewall_posture(engine_answered),
             updater: platform_update::collect_updater(&updater_socket_path()),
-            updater_present: crate::buildinfo::install_facts().updater_present,
+            // An owned install has a recovery actor, not an updater: its `updater_present`
+            // says the actor answered, and must not make the updater's socket check fail.
+            updater_present: {
+                let facts = crate::buildinfo::install_facts();
+                match facts.install_mode {
+                    Some(crate::buildinfo::InstallMode::Owned) => None,
+                    _ => facts.updater_present,
+                }
+            },
             health: platform_update::collect_health(crate::health::addr_from_env()),
             self_identity: platform_update::HealthIdentity {
                 node: crate::logging::host_name().to_string(),

@@ -197,8 +197,7 @@ pub async fn run(cfg: Config) {
     // identity-unknown (agent-api.md §register).
     let runtime = {
         let (runtime, facts) = offload_probe(move || {
-            let facts =
-                crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime));
+            let facts = crate::buildinfo::discover(&runtime);
             (runtime, facts)
         })
         .await;
@@ -1542,6 +1541,8 @@ fn register_message(
     let (image_versions_complete, image_versions) = image_mgr
         .map(ImageManager::version_snapshot)
         .unwrap_or((false, Vec::new()));
+    // Amendment 14: the actor's identity rides only beside `install_mode: "owned"`.
+    let owned = install.install_mode == Some(crate::buildinfo::InstallMode::Owned);
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1, "template_publish_permit": 1})),
         config_policy_versions: policy_available.then(||
@@ -1560,6 +1561,13 @@ fn register_message(
         built_at: crate::buildinfo::built_at().map(str::to_string),
         install_mode: install.install_mode.map(|m| m.as_str().to_string()),
         updater_present: install.updater_present,
+        recovery_actor_version: owned
+            .then(|| install.recovery_actor_version.clone())
+            .flatten(),
+        recovery_actor_source_commit: owned
+            .then(|| install.recovery_actor_source_commit.clone())
+            .flatten(),
+        seed_version: owned.then(|| install.seed_version.clone()).flatten(),
     })
 }
 
@@ -1739,7 +1747,7 @@ async fn diagnostic_connection(
     let images = crate::images::register_images_from_state(&cfg.image_state_path());
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+        crate::buildinfo::discover(&runtime)
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -1866,7 +1874,7 @@ async fn connect_and_run(
     // forever. Offloaded because it shells out to docker.
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+        crate::buildinfo::discover(&runtime)
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -5771,6 +5779,67 @@ mod tests {
         }
         assert!(normal.get("config_policy_versions").is_some());
         assert!(normal.get("config_policy_groups").is_some());
+    }
+
+    /// Amendment 14: an owned install registers `install_mode: "owned"` with its recovery
+    /// actor's identity; every other install registers exactly as before, without the
+    /// three owned-only fields even if discovery somehow carried them.
+    #[test]
+    fn only_an_owned_install_registers_the_recovery_actor_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let register = |install: &crate::buildinfo::InstallFacts| {
+            serde_json::to_value(
+                register_message(&cfg, false, Vec::new(), install, true, true, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let owned_only = [
+            "recovery_actor_version",
+            "recovery_actor_source_commit",
+            "seed_version",
+        ];
+
+        let owned = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Owned),
+            updater_present: Some(true),
+            recovery_actor_version: Some("0.4.0".into()),
+            recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            seed_version: None,
+        });
+        assert_eq!(owned["install_mode"], "owned");
+        assert_eq!(owned["updater_present"], true);
+        assert_eq!(owned["recovery_actor_version"], "0.4.0");
+        assert_eq!(
+            owned["recovery_actor_source_commit"],
+            "cccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert!(
+            owned.get("seed_version").is_none(),
+            "absent, not null: {owned}"
+        );
+
+        let compose = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Registry),
+            updater_present: Some(true),
+            recovery_actor_version: Some("0.4.0".into()),
+            recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            seed_version: Some("0.4.0".into()),
+        });
+        assert_eq!(compose["install_mode"], "registry");
+        let unknown = register(&crate::buildinfo::InstallFacts::default());
+        assert!(unknown.get("install_mode").is_none());
+        for key in owned_only {
+            assert!(
+                compose.get(key).is_none(),
+                "{key} beside a registry install"
+            );
+            assert!(
+                unknown.get(key).is_none(),
+                "{key} beside an unknown install"
+            );
+        }
     }
 
     /// A pinned `Config` for the pin-file tests.

@@ -78,6 +78,8 @@ pub enum InstallMode {
     Registry,
     /// Built on the host: a bare local tag like `quasar-node-agent:latest`.
     Source,
+    /// Created and replaced by this machine's recovery actor (amendment 14).
+    Owned,
 }
 
 impl InstallMode {
@@ -85,6 +87,7 @@ impl InstallMode {
         match self {
             InstallMode::Registry => "registry",
             InstallMode::Source => "source",
+            InstallMode::Owned => "owned",
         }
     }
 }
@@ -96,6 +99,103 @@ impl InstallMode {
 pub struct InstallFacts {
     pub install_mode: Option<InstallMode>,
     pub updater_present: Option<bool>,
+    /// Owned installs only: what the recovery actor said about itself and the seed.
+    pub recovery_actor_version: Option<String>,
+    pub recovery_actor_source_commit: Option<String>,
+    pub seed_version: Option<String>,
+}
+
+/// Set by the recovery actor's recipe: the agent socket, whose presence in the
+/// environment is what makes this an owned install. Unset, discovery is the Compose one.
+pub const RECOVERY_SOCKET_ENV: &str = "QUASAR_RECOVERY_SOCKET";
+
+/// Well inside the actor's own status deadline plus one engine round trip.
+const ACTOR_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The part of the actor's `GET /v1/status` answer the agent reads; everything else is
+/// ignored, since the actor moves first and may be a release ahead
+/// (`testdata/recovery/socket/README.md`).
+#[derive(serde::Deserialize)]
+struct ActorStatus {
+    actor: ActorSelf,
+    #[serde(default)]
+    seed: Option<SeedSelf>,
+}
+
+#[derive(serde::Deserialize)]
+struct ActorSelf {
+    version: String,
+    commit: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SeedSelf {
+    version: String,
+}
+
+fn source_commit_shape(c: &str) -> bool {
+    (7..=40).contains(&c.len())
+        && c.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// This host's install facts: the recovery actor's answer on an owned install (the
+/// actor put [`RECOVERY_SOCKET_ENV`] in this container's environment), else Compose
+/// discovery exactly as before.
+pub fn discover(runtime: &ContainerRuntime) -> InstallFacts {
+    match std::env::var(RECOVERY_SOCKET_ENV)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        Some(socket) => discover_owned(std::path::Path::new(&socket)),
+        None => discover_install(&DockerFacts::new(runtime)),
+    }
+}
+
+/// An owned install asks its recovery actor over the agent socket. `updater_present` is
+/// whether the actor answered (amendment 14); the actor's fields go absent when it did not.
+pub fn discover_owned(socket: &std::path::Path) -> InstallFacts {
+    let mut out = InstallFacts {
+        install_mode: Some(InstallMode::Owned),
+        updater_present: Some(false),
+        ..Default::default()
+    };
+    let answer =
+        crate::release::unix_http::request(socket, "GET", "/v1/status", None, ACTOR_STATUS_TIMEOUT);
+    match answer {
+        Ok(reply) if reply.status == 200 => match serde_json::from_str::<ActorStatus>(&reply.body)
+        {
+            Ok(status) => {
+                out.updater_present = Some(true);
+                out.recovery_actor_version =
+                    Some(status.actor.version).filter(|v| !v.trim().is_empty());
+                out.recovery_actor_source_commit =
+                    Some(status.actor.commit).filter(|c| source_commit_shape(c));
+                out.seed_version = status
+                    .seed
+                    .map(|s| s.version)
+                    .filter(|v| !v.trim().is_empty());
+            }
+            Err(e) => warn!(
+                token = "install-actor-status-unreadable",
+                "install discovery: the recovery actor's status at {} is unreadable: {e}",
+                socket.display()
+            ),
+        },
+        Ok(reply) => warn!(
+            token = "install-actor-status-refused",
+            "install discovery: the recovery actor at {} answered HTTP {}",
+            socket.display(),
+            reply.status
+        ),
+        Err(e) => warn!(
+            token = "install-actor-unreachable",
+            "install discovery: no answer from the recovery actor at {}: {e}; this host reports updater_present=false until it answers",
+            socket.display()
+        ),
+    }
+    out
 }
 
 /// The compose label naming a service within a project. The updater is found by
@@ -307,6 +407,17 @@ pub fn log_startup_identity(facts: &InstallFacts) {
             .map(|p| if p { "yes" } else { "no" })
             .unwrap_or("unknown"),
     );
+    if facts.install_mode == Some(InstallMode::Owned) {
+        info!(
+            "recovery actor: version={} source_commit={} seed_version={}",
+            facts.recovery_actor_version.as_deref().unwrap_or("unknown"),
+            facts
+                .recovery_actor_source_commit
+                .as_deref()
+                .unwrap_or("unknown"),
+            facts.seed_version.as_deref().unwrap_or("none"),
+        );
+    }
     if source_commit().is_none() || built_at().is_none() {
         warn!(
             token = "buildinfo-unstamped",
@@ -397,6 +508,7 @@ mod tests {
             InstallFacts {
                 install_mode: Some(InstallMode::Registry),
                 updater_present: Some(true),
+                ..Default::default()
             }
         );
     }
@@ -416,6 +528,7 @@ mod tests {
             InstallFacts {
                 install_mode: Some(InstallMode::Source),
                 updater_present: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -433,6 +546,7 @@ mod tests {
             InstallFacts {
                 install_mode: Some(InstallMode::Source),
                 updater_present: None,
+                ..Default::default()
             }
         );
     }
@@ -488,5 +602,87 @@ mod tests {
         if STAMP_BUILT_AT == "unknown" {
             assert_eq!(built_at(), None);
         }
+    }
+
+    /// A recovery actor on a real unix socket answering one fixed reply per connection.
+    fn actor_answering(status: u16, body: String) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (dir, socket)
+    }
+
+    fn socket_fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../testdata/recovery/socket")
+            .join(name);
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        fixture["body"].to_string()
+    }
+
+    #[test]
+    fn an_owned_install_reports_what_its_recovery_actor_says() {
+        let (_dir, socket) = actor_answering(200, socket_fixture("status-gpu-host-applying.json"));
+        assert_eq!(
+            discover_owned(&socket),
+            InstallFacts {
+                install_mode: Some(InstallMode::Owned),
+                updater_present: Some(true),
+                recovery_actor_version: Some("0.4.0".into()),
+                recovery_actor_source_commit: Some(
+                    "cccccccccccccccccccccccccccccccccccccccc".into()
+                ),
+                seed_version: Some("0.4.0".into()),
+            }
+        );
+    }
+
+    /// An actor that says nothing usable is still an owned install, with the actor's
+    /// fields absent; `seed: null` is "no seed seen", not an error.
+    #[test]
+    fn an_owned_install_whose_actor_does_not_answer_reports_updater_present_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let unreachable = InstallFacts {
+            install_mode: Some(InstallMode::Owned),
+            updater_present: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(discover_owned(&dir.path().join("absent.sock")), unreachable);
+        let (_d, refusing) = actor_answering(500, "{}".into());
+        assert_eq!(discover_owned(&refusing), unreachable);
+        let (_d, garbled) = actor_answering(200, "not json".into());
+        assert_eq!(discover_owned(&garbled), unreachable);
+
+        let mut body: serde_json::Value =
+            serde_json::from_str(&socket_fixture("status-control-only-stale.json")).unwrap();
+        body["actor"]["commit"] = "unknown".into();
+        body["actor"]["version"] = "dev".into();
+        let (_d, dev) = actor_answering(200, body.to_string());
+        assert_eq!(
+            discover_owned(&dev),
+            InstallFacts {
+                install_mode: Some(InstallMode::Owned),
+                updater_present: Some(true),
+                recovery_actor_version: Some("dev".into()),
+                ..Default::default()
+            }
+        );
     }
 }
