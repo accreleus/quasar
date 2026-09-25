@@ -67,6 +67,9 @@ pub struct OperatorInputs {
     pub database_name: Option<String>,
     pub database_sslmode: Option<String>,
     pub database_password: Option<String>,
+    pub app_puid: Option<String>,
+    pub app_pgid: Option<String>,
+    pub container_network: Option<String>,
     pub trust: TrustInputs,
 }
 
@@ -628,6 +631,7 @@ impl Actor {
             socket_dir,
             trust: checked.trust.clone(),
             enroll: Default::default(),
+            app: checked.app.clone(),
         };
         if checked.control.is_some() {
             // The seed a new GPU host runs is this machine's recovery image.

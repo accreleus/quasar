@@ -275,7 +275,34 @@ pub struct Inputs {
     /// A control-plane machine: the images its Add host gives a new GPU host.
     #[serde(default, skip_serializing_if = "EnrollImages::is_empty")]
     pub enroll: EnrollImages,
+    /// Host defaults for the agent's app containers, from the seed at first install.
+    #[serde(default, skip_serializing_if = "AppInputs::is_empty")]
+    pub app: AppInputs,
 }
+
+/// Host defaults the agent gives its app containers (`QUASAR_APP_PUID`, `QUASAR_APP_PGID`,
+/// `QUASAR_CONTAINER_NETWORK`). Values of environment entries the node-agent recipe always
+/// carried, so no revision moves: `None` renders what revision 1 always rendered.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<u32>,
+    /// `none`, `bridge` or `host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_network: Option<String>,
+}
+
+impl AppInputs {
+    pub fn is_empty(&self) -> bool {
+        *self == AppInputs::default()
+    }
+}
+
+/// What `QUASAR_CONTAINER_NETWORK` accepts (docs/configuration.md).
+pub const APP_NETWORKS: &[&str] = &["none", "bridge", "host"];
 
 /// The images a control plane's Add host (#359) installs on a new GPU host, by digest
 /// (`repository@sha256:…`): the seed (this machine's recovery image) and the node agent.
@@ -601,6 +628,14 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
             ));
         }
     }
+    if let Some(n) = &inputs.app.container_network {
+        if !APP_NETWORKS.contains(&n.as_str()) {
+            return Err(RenderError::Invalid(format!(
+                "the app container network {n:?} is not one of {}",
+                APP_NETWORKS.join(", ")
+            )));
+        }
+    }
     if let Some(control) = &inputs.control {
         control::validate(control)?;
         if inputs.socket_dir.is_none() {
@@ -745,6 +780,15 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
         ),
         (AGENT_SOCKET_ENV.into(), paths::AGENT_SOCKET.into()),
     ]);
+    if let Some(puid) = inputs.app.puid {
+        env.insert("QUASAR_APP_PUID".into(), puid.to_string());
+    }
+    if let Some(pgid) = inputs.app.pgid {
+        env.insert("QUASAR_APP_PGID".into(), pgid.to_string());
+    }
+    if let Some(network) = &inputs.app.container_network {
+        env.insert("QUASAR_CONTAINER_NETWORK".into(), network.clone());
+    }
     let secrets_dir = paths::SECRETS_DIR;
     if secrets.files.contains(secrets::ENROLLMENT) {
         env.insert(

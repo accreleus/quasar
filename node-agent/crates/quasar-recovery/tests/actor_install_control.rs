@@ -704,3 +704,60 @@ fn the_control_plane_serves_add_host_this_machines_seed_and_agent_images() {
     let cp = state.container_named(names::CONTROL_PLANE).unwrap();
     assert_eq!(cp.spec.env["QUASAR_ENROLL_AGENT_IMAGE"], AGENT_IMAGE);
 }
+
+/// Host defaults for app containers (an Unraid host's 99/100) are first-install inputs; a
+/// machine that names none renders exactly what revision 1 always rendered.
+#[test]
+fn app_container_defaults_come_from_the_seed_and_reach_the_agent() {
+    let agent_env = |env: BTreeMap<String, String>| {
+        let engine = Arc::new(FakeEngine::new(seeded_host(env)));
+        let dir = tempfile::tempdir().unwrap();
+        seed(&engine, dir.path(), SEED_ID).step();
+        let id = engine
+            .state()
+            .container_named(names::RECOVERY_ACTOR)
+            .unwrap()
+            .id
+            .clone();
+        start(&engine, dir.path(), &id).resume().unwrap();
+        let agent = engine
+            .state()
+            .container_named(names::NODE_AGENT)
+            .unwrap()
+            .clone();
+        agent.spec.env
+    };
+    let mut env = seed_env();
+    env.insert("QUASAR_APP_PUID".into(), "99".into());
+    env.insert("QUASAR_APP_PGID".into(), "100".into());
+    env.insert("QUASAR_CONTAINER_NETWORK".into(), "bridge".into());
+    let set = agent_env(env);
+    assert_eq!(set["QUASAR_APP_PUID"], "99");
+    assert_eq!(set["QUASAR_APP_PGID"], "100");
+    assert_eq!(set["QUASAR_CONTAINER_NETWORK"], "bridge");
+
+    let unset = agent_env(seed_env());
+    assert_eq!(unset["QUASAR_APP_PUID"], "");
+    assert_eq!(unset["QUASAR_CONTAINER_NETWORK"], "none");
+
+    for (key, bad) in [
+        ("QUASAR_APP_PUID", "nobody"),
+        ("QUASAR_CONTAINER_NETWORK", "macvlan"),
+    ] {
+        let mut env = seed_env();
+        env.insert(key.into(), bad.into());
+        let engine = Arc::new(FakeEngine::new(seeded_host(env)));
+        let dir = tempfile::tempdir().unwrap();
+        let refused = seed(&engine, dir.path(), SEED_ID).step();
+        assert!(
+            matches!(
+                &refused,
+                Outcome::Idle {
+                    token: "seed-inputs-invalid",
+                    ..
+                }
+            ),
+            "{key}: {refused:?}"
+        );
+    }
+}

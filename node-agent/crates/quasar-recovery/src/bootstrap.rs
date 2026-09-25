@@ -5,7 +5,9 @@
 //! accepts inputs its actor would refuse.
 
 use crate::actor::OperatorInputs;
-use crate::recipe::{self, control, ControlInputs, DatabaseInputs, ImageRef, Inputs, TrustInputs};
+use crate::recipe::{
+    self, control, AppInputs, ControlInputs, DatabaseInputs, ImageRef, Inputs, TrustInputs,
+};
 use crate::socket::MachineRole;
 
 pub const ROLE: &str = "QUASAR_ROLE";
@@ -36,6 +38,11 @@ pub const TRUSTED_KEYS: &str = "QUASAR_UPDATER_TRUSTED_KEYS";
 pub const MANIFEST_BASE_URL: &str = "QUASAR_UPDATER_MANIFEST_BASE_URL";
 pub const MANIFEST_TIMEOUT_S: &str = "QUASAR_UPDATER_MANIFEST_TIMEOUT_S";
 pub const INSECURE_REGISTRIES: &str = "QUASAR_PLATFORM_INSECURE_REGISTRIES";
+
+/// Host defaults for the agent's app containers (the agent's own variables).
+pub const APP_PUID: &str = "QUASAR_APP_PUID";
+pub const APP_PGID: &str = "QUASAR_APP_PGID";
+pub const CONTAINER_NETWORK: &str = "QUASAR_CONTAINER_NETWORK";
 
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
 pub const DEFAULT_TLS_PORT: u16 = 8443;
@@ -97,6 +104,9 @@ impl Bootstrap {
                 database_name: get(DATABASE_NAME),
                 database_sslmode: get(DATABASE_SSLMODE),
                 database_password: get(DATABASE_PASSWORD),
+                app_puid: get(APP_PUID),
+                app_pgid: get(APP_PGID),
+                container_network: get(CONTAINER_NETWORK),
                 trust: TrustInputs {
                     allowed_namespaces: get(ALLOWED_NAMESPACES),
                     signature_mode: get(SIGNATURE_MODE),
@@ -200,6 +210,7 @@ impl Bootstrap {
             socket_dir: control_here.then(|| "/check".to_string()),
             trust: op.trust.clone(),
             enroll: Default::default(),
+            app: self.check_app()?,
         };
         recipe::validate(&probe).map_err(|e| e.to_string())?;
         trust_config(&op.trust)?;
@@ -213,6 +224,25 @@ impl Bootstrap {
             control,
             trust: op.trust.clone(),
             enroll_agent_image: named_agent,
+            app: self.check_app()?,
+        })
+    }
+
+    fn check_app(&self) -> Result<AppInputs, String> {
+        let op = &self.operator;
+        let id = |name: &str, raw: &Option<String>| -> Result<Option<u32>, String> {
+            raw.as_deref()
+                .map(|v| {
+                    v.trim()
+                        .parse::<u32>()
+                        .map_err(|_| format!("{name}={v:?} is not a numeric id"))
+                })
+                .transpose()
+        };
+        Ok(AppInputs {
+            puid: id(APP_PUID, &op.app_puid)?,
+            pgid: id(APP_PGID, &op.app_pgid)?,
+            container_network: op.container_network.as_ref().map(|n| n.trim().to_owned()),
         })
     }
 
@@ -303,6 +333,7 @@ pub struct Checked {
     /// The agent image a control-plane machine's Add host installs on new GPU hosts: its
     /// own agent's on a combined host, `QUASAR_AGENT_IMAGE` if named on a control-only one.
     pub enroll_agent_image: Option<ImageRef>,
+    pub app: AppInputs,
 }
 
 /// The release trust a machine's recorded settings give, parsed as the updater parses its
