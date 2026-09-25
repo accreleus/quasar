@@ -151,10 +151,6 @@
   color: var(--success-text);
 }
 
-.kpi-meta.kpi-meta-danger {
-  color: var(--danger-text);
-}
-
 /* === UI-13 Admin Apps === */
 
 /* 2-col field row */

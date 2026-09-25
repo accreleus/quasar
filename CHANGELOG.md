@@ -186,8 +186,9 @@ own; the two do not move together, and that is deliberate.
 - **Design-lint batch A: shared components and utilities (#372).** Every inline style in
   `web/src/components/` has moved to token-backed classes, and `components.css` gains the
   `.t-xs` `.t-sm` `.t-lg` `.t-h3` `.text-1` `.text-2` `.mb1` utilities (the block's top
-  comment lists every utility and its token). Off-scale spacing snapped to the 4px scale;
-  nothing else looks different.
+  comment lists every utility and its token). Off-scale spacing snapped to the 4px scale.
+  The one other visible change: bare `label.check` checkboxes (the Users table) now show the
+  pointer cursor like every other checkbox.
 - **Web design lint, batch B: raw colours into named tokens (#373).** Every hex, `oklch()`,
   `rgb()` and named colour in the web stylesheets and components now lives in `tokens.css`
   under a role name and is read through `var(--…)`; each token holds the value it replaced, so

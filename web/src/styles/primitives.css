@@ -2399,6 +2399,11 @@ td.cell-actions > * + * {
   margin-top: var(--s2);
 }
 
+/* Here, not admin.css: /styleguide renders KpiRow outside AdminLayout. */
+.kpi-meta.kpi-meta-danger {
+  color: var(--danger-text);
+}
+
 /* Stat tile (Stat/StatGrid) — the non-clickable sibling of .kpi. */
 .stat {
   display: flex;
