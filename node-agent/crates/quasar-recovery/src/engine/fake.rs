@@ -65,6 +65,9 @@ pub struct FakeState {
     /// Whether the engine can start a container that requests GPUs (`--gpus all`); when
     /// not, the start is refused with Docker's device-driver message.
     pub gpus_supported: bool,
+    /// The refusal a GPU-requesting start gets when `gpus_supported` is false; empty is
+    /// Docker's device-driver message.
+    pub gpus_refusal_message: String,
     /// Failures the next creates of a GPU-requesting container return, in order.
     pub gpus_create_failures: Vec<EngineError>,
     pub unreachable: bool,
@@ -298,15 +301,17 @@ impl PlatformEngine for FakeEngine {
             let id = find_id(s, id)?;
             let output = s.probe_output.clone();
             let gpus_supported = s.gpus_supported;
+            let gpus_refusal = if s.gpus_refusal_message.is_empty() {
+                "could not select device driver \"\" with capabilities: [[gpu]]".to_string()
+            } else {
+                s.gpus_refusal_message.clone()
+            };
             let c = s.containers.get_mut(&id).unwrap();
             if c.status == "running" {
                 return Ok(());
             }
             if !c.spec.gpus.is_empty() && !gpus_supported {
-                return Err(refused(
-                    500,
-                    "could not select device driver \"\" with capabilities: [[gpu]]",
-                ));
+                return Err(refused(500, &gpus_refusal));
             }
             c.starts += 1;
             // A helper runs to completion at once; only the GPU probe prints anything.

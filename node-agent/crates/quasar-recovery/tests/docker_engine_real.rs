@@ -195,6 +195,30 @@ fn the_gpu_probe_runs_on_a_real_engine_and_is_removed() {
     eprintln!("probe report on this engine: {report:?}");
 }
 
+/// A real engine gives the `--gpus all` probe a definite answer: served on an engine with
+/// the NVIDIA toolkit, the device-request refusal on one without. Never a start failure.
+#[test]
+#[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET and QUASAR_TEST_RECOVERY_IMAGE; creates and removes one uniquely named probe"]
+fn the_gpus_probe_gets_a_definite_answer_from_a_real_engine() {
+    let engine = engine();
+    let image = image();
+    let pinned = match ImageRef::parse(&image) {
+        Ok(r) => r.reference(),
+        Err(_) => engine.inspect_image(&image).unwrap().unwrap().repo_digests[0].clone(),
+    };
+    let answer = probe::serves_gpus(
+        engine.as_ref(),
+        &ImageRef::parse(&pinned).unwrap(),
+        Duration::from_millis(200),
+    )
+    .expect("a definite answer");
+    eprintln!("--gpus all on this engine: {answer:?}");
+    assert!(engine
+        .inspect_container(quasar_recovery::recipe::names::GPU_PROBE)
+        .unwrap()
+        .is_none());
+}
+
 #[test]
 #[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET and QUASAR_TEST_RECOVERY_PULL (a digest reference the engine can pull)"]
 fn a_pull_by_digest_makes_the_image_inspectable() {

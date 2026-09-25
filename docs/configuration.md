@@ -1271,7 +1271,7 @@ the engine, just before it creates the agent, with a second disposable probe tha
 or only the container toolkit's hook).
 - It starts and exits 0: the NVIDIA shape is installed (`token="actor-gpus-served"`) and that
   yes is recorded in machine state.
-- The engine refuses the device request ("could not select device driver") or the probe
+- The engine refuses the device request ("could not select device driver", or with CDI enabled "failed to discover GPU vendor from CDI") or the probe
   exits non-zero: the agent is installed without the NVIDIA shape, pointed at the machine's
   other GPU if it has one (`token="actor-gpus-refused"`, with the reason), and RH-02
   readiness reports the gap. The no is not recorded: the next time the agent is created

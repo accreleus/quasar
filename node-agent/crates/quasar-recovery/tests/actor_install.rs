@@ -299,6 +299,24 @@ fn a_gpus_probe_that_never_gets_an_answer_fails_the_start_and_the_next_one_asks_
     );
 }
 
+/// Docker 28+ with CDI enabled refuses `--gpus all` on an engine that has no NVIDIA
+/// device with its own words (measured on Docker 29.8, HTTP 500 at start); that is the
+/// same definite no as the older "could not select device driver".
+#[test]
+fn the_cdi_refusal_of_a_gpu_request_is_a_definite_no_too() {
+    let mut state = nvidia_host(&[], false);
+    state.gpus_refusal_message =
+        "failed to discover GPU vendor from CDI: no known GPU vendor found".into();
+    let (engine, dir) = installed(state);
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert!(agent.spec.gpus.is_empty());
+    assert_eq!(agent.status, "running");
+    assert!(machine_json(&dir)["inputs"]["gpu"]
+        .get("gpus_served")
+        .is_none());
+}
+
 #[test]
 fn a_gpus_probe_failure_that_is_not_about_gpus_fails_the_start_without_retrying() {
     let mut state = nvidia_host(&[], true);

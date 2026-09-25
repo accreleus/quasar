@@ -32,15 +32,25 @@ pub enum EngineError {
     Crashed,
 }
 
-/// Docker's answer to a device request no configured driver can meet: `could not select
-/// device driver "" with capabilities: [[gpu]]`.
-const DEVICE_REQUEST_REFUSAL: &str = "could not select device driver";
+/// Docker's answers to a GPU device request it cannot meet, lowercased: without CDI
+/// `could not select device driver "" with capabilities: [[gpu]]`; with CDI enabled
+/// (Docker 28+, measured on 29.8 as HTTP 500 at start) `failed to discover GPU vendor from
+/// CDI: no known GPU vendor found`.
+const DEVICE_REQUEST_REFUSALS: &[&str] = &[
+    "could not select device driver",
+    "failed to discover gpu vendor from cdi",
+];
 
 impl EngineError {
     /// The engine refused a GPU device request: the one definite "no GPUs" answer.
     pub fn is_device_request_refusal(&self) -> bool {
-        matches!(self, EngineError::Refused { message, .. }
-            if message.to_lowercase().contains(DEVICE_REQUEST_REFUSAL))
+        match self {
+            EngineError::Refused { message, .. } => {
+                let message = message.to_lowercase();
+                DEVICE_REQUEST_REFUSALS.iter().any(|r| message.contains(r))
+            }
+            _ => false,
+        }
     }
 
     /// Worth asking again: the engine did not answer, or failed on its side for a reason
