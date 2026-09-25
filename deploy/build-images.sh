@@ -66,7 +66,8 @@
 #
 #   THE RECIPE LABEL (ADR 0008). Every platform image (runtime, control, recovery) is
 #   stamped `org.quasar.recipe=<n>`, read from the constant in that service's own source
-#   tree (role_recipe_source); the contract asserts it. A recovery actor refuses an image
+#   tree by deploy/lib/recipe-revision.sh (which the Images workflow calls too); the
+#   contract asserts it. A recovery actor refuses an image
 #   whose revision it does not carry.
 #
 #   `profiling` (PROF-02, #389) is on-demand and NEVER promoted: no contract validation,
@@ -465,23 +466,12 @@ role_image() { case "$1" in
   updater) echo quasar-updater ;;
   recovery) echo quasar-recovery ;;
 esac; }
-# The file holding the recipe revision a platform image needs (ADR 0008), or nothing for a
-# role that is not a platform service. Each is one line, `... RECIPE_REVISION ... = <n>`.
-role_recipe_source() { case "$1" in
-  runtime)  echo "node-agent/src/recipe.rs" ;;
-  recovery) echo "node-agent/crates/quasar-recovery/src/recipe/revision.rs" ;;
-  control)  echo "control-plane/internal/buildinfo/recipe.go" ;;
-  *) echo "" ;;
-esac; }
-recipe_revision() { # recipe_revision <role>  -> the integer, or dies
-  local rel; rel="$(role_recipe_source "$1")"
-  [ -n "$rel" ] || return 0
-  local n
-  n="$(sed -n -E 's/^(pub )?const (RECIPE_REVISION: u32|RecipeRevision) = ([0-9]+);?$/\3/p' "$BUILD_CONTEXT/$rel")"
-  case "$n" in
-    ''|*[!0-9]*|*$'\n'*) die "role $1: no single recipe revision constant in $rel (expected one line like 'pub const RECIPE_REVISION: u32 = 1;')" ;;
-  esac
-  printf '%s' "$n"
+# The org.quasar.recipe value of a platform image (ADR 0008), or nothing for a role that is
+# not one. One derivation for this script and the Images workflow: deploy/lib/recipe-revision.sh.
+recipe_revision() { # recipe_revision <role>  -> the integer, nothing, or dies
+  case "$1" in runtime|control|recovery) ;; *) return 0 ;; esac
+  bash "$SCRIPT_DIR/lib/recipe-revision.sh" "$1" "$BUILD_CONTEXT" \
+    || die "role $1: could not read its recipe revision (deploy/lib/recipe-revision.sh)"
 }
 # The pre-rename name for a role, or nothing. Written as an extra LOCAL tag on the
 # same image id so an un-migrated deploy/.env, a hand-typed `docker run`, or a

@@ -36,8 +36,9 @@ own; the two do not move together, and that is deliberate.
   it again changes nothing, and an interrupted install is completed by the next start. The
   agent reads the actor's status over a new agent socket and registers `install_mode: "owned"`
   with the recovery-actor identity (amendment 14); Compose and source installs register
-  exactly as before. Platform images now carry the `org.quasar.recipe` label, asserted by the
-  image contract.
+  exactly as before. Platform images now carry the `org.quasar.recipe` label, stamped by
+  `deploy/build-images.sh` and the Images workflow from one helper
+  (`deploy/lib/recipe-revision.sh`) and asserted by the image contract.
 - **RH06 release trust ported to Rust, held to shared golden vectors (#356).** The new
   GStreamer-free crate `node-agent/crates/quasar-recovery` holds the recovery actor's
   `trust` module (the Go updater's namespace allowlist, digest-only images, closed
