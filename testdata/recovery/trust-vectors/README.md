@@ -59,3 +59,23 @@ vector names a key by label (`"public_key_of": "release-2026"`, or
 the ed25519 seed is SHA-256 of the fixed prefix in `vectorKeySeedPrefix` followed by
 the label. These keys are **public by construction** — anyone can recompute the private
 half — so they are test keys only. Never put one in `QUASAR_UPDATER_TRUSTED_KEYS`.
+
+## Where the Rust fetch differs from Go's (resolve before #367)
+
+The vectors pin the decisions; the HTTPS client under them (`trust::https`) is held to
+the Go updater's `signature_source.go` on `http.DefaultTransport` by its own tests. Where
+it cannot match Go it refuses, so each difference can only turn a Go success into a
+`signature_invalid`, never into an unverified apply. Two must be resolved before the Go
+updater is deleted (RH06-15, #367):
+
+- **Proxies.** Go routes the fetch through `HTTPS_PROXY` (honouring `NO_PROXY`). The Rust
+  client ports that decision exactly but has no proxy client, so a request Go would
+  proxy is refused. Either add CONNECT-over-https (and the proxy schemes Go accepts), or
+  document that a host behind a proxy cannot run `verify` or `require`.
+- **Trust roots.** Go uses the updater image's `ca-certificates` and honours
+  `SSL_CERT_FILE` / `SSL_CERT_DIR`. The Rust client uses webpki-roots (Mozilla's set)
+  and ignores both variables, so a mirror behind a private CA fails closed.
+
+Also different, and refusing the same way: a non-ASCII mirror host (no IDNA), HTTP/2
+(not offered), and connection reuse (none). Refusal and error message text follows Go's
+where it can; only the prefix Go authors is pinned.

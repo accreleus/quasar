@@ -17,6 +17,8 @@
 //! Go would route through `HTTPS_PROXY` fails (no proxy client here), as does a non-ASCII
 //! host (no IDNA). Roots are webpki-roots (Mozilla's set) where Go uses the image's
 //! `ca-certificates`; HTTP/2 is not offered. None of these reads a failure as unsigned.
+//! The open ones are listed in `testdata/recovery/trust-vectors/README.md` and must be
+//! resolved before the Go updater retires (#367).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,19 +86,26 @@ impl HttpsFetcher {
         version: Option<&str>,
         limit: Duration,
     ) -> SignatureEvidence {
-        let deadline = Instant::now() + limit;
+        // Past the clock's range is no deadline at all: refuse every fetch rather than wait.
+        let deadline = Instant::now().checked_add(limit);
         let mut step = probe(base, version);
         loop {
             match step {
                 Probe::Done(evidence) => return evidence,
                 Probe::Fetch(pending) => {
                     let target = pending.url();
-                    let outcome = match timeout_at(deadline, self.get(&target)).await {
-                        Ok(outcome) => outcome,
-                        Err(_) => Err(format!(
-                            "Get {}: context deadline exceeded",
+                    let outcome = match deadline {
+                        None => Err(format!(
+                            "Get {}: the manifest timeout {limit:?} is past the clock's range",
                             quote_bytes(target.as_bytes())
                         )),
+                        Some(deadline) => match timeout_at(deadline, self.get(&target)).await {
+                            Ok(outcome) => outcome,
+                            Err(_) => Err(format!(
+                                "Get {}: context deadline exceeded",
+                                quote_bytes(target.as_bytes())
+                            )),
+                        },
                     };
                     step = pending.observe(outcome);
                 }
@@ -268,34 +277,121 @@ fn display(u: &Url) -> Vec<u8> {
 /// Reads a 200 body, decoding gzip, and stops past `MAX_ASSET_BYTES` (Go's
 /// `io.LimitReader(resp.Body, MaxAssetBytes+1)`).
 async fn read_capped(mut body: hyper::body::Incoming, gzip: bool) -> Result<Vec<u8>, String> {
-    use std::io::Write as _;
-    let cap = MAX_ASSET_BYTES + 1;
-    let mut decoder = gzip.then(|| flate2::write::MultiGzDecoder::new(Vec::new()));
-    let mut plain = Vec::new();
+    let mut capped = CappedBody::new(gzip, MAX_ASSET_BYTES + 1);
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| e.to_string())?;
         let Ok(chunk) = frame.into_data() else {
             continue;
         };
-        let have = match &mut decoder {
-            Some(d) => {
-                d.write_all(&chunk).map_err(|e| format!("gzip: {e}"))?;
-                d.get_ref().len()
-            }
-            None => {
-                plain.extend_from_slice(&chunk);
-                plain.len()
-            }
-        };
-        if have >= cap {
-            let mut out = decoder.map(|d| d.get_ref().clone()).unwrap_or(plain);
-            out.truncate(cap);
-            return Ok(out);
+        if capped.push(&chunk)? {
+            return Ok(capped.into_bytes());
         }
     }
-    match decoder {
-        Some(d) => d.finish().map_err(|e| format!("gzip: {e}")),
-        None => Ok(plain),
+    capped.finish()
+}
+
+/// A body's bytes, decoded, up to `cap` and never beyond: gzip inflates into a sink that
+/// refuses the byte after `cap`, so a bomb costs at most `cap` plus the decoder's own
+/// 32 KiB window, not whatever one received chunk inflates to.
+struct CappedBody {
+    decoder: Option<flate2::write::MultiGzDecoder<Bounded>>,
+    plain: Bounded,
+    /// The most decoded bytes ever held at once.
+    #[cfg(test)]
+    peak: usize,
+}
+
+/// A byte sink that takes at most `cap` bytes, then refuses.
+struct Bounded {
+    bytes: Vec<u8>,
+    cap: usize,
+}
+
+impl Bounded {
+    fn full(&self) -> bool {
+        self.bytes.len() >= self.cap
+    }
+
+    fn take(&mut self, data: &[u8]) -> usize {
+        let n = data.len().min(self.cap - self.bytes.len());
+        self.bytes.extend_from_slice(&data[..n]);
+        n
+    }
+}
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.full() && !data.is_empty() {
+            return Err(std::io::Error::other("decoded body reached its limit"));
+        }
+        Ok(self.take(data))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CappedBody {
+    fn new(gzip: bool, cap: usize) -> Self {
+        let sink = || Bounded {
+            bytes: Vec::new(),
+            cap,
+        };
+        CappedBody {
+            decoder: gzip.then(|| flate2::write::MultiGzDecoder::new(sink())),
+            plain: sink(),
+            #[cfg(test)]
+            peak: 0,
+        }
+    }
+
+    /// Takes one received chunk; `true` once `cap` bytes are held.
+    fn push(&mut self, chunk: &[u8]) -> Result<bool, String> {
+        use std::io::Write as _;
+        let full = match &mut self.decoder {
+            Some(d) => {
+                let written = d.write_all(chunk);
+                if d.get_ref().full() {
+                    true
+                } else {
+                    written.map_err(|e| format!("gzip: {e}"))?;
+                    false
+                }
+            }
+            None => {
+                self.plain.take(chunk);
+                self.plain.full()
+            }
+        };
+        #[cfg(test)]
+        {
+            let held = self
+                .decoder
+                .as_ref()
+                .map_or(&self.plain, |d| d.get_ref())
+                .bytes
+                .len();
+            self.peak = self.peak.max(held);
+        }
+        Ok(full)
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match self.decoder {
+            Some(d) => d.get_ref().bytes.clone(),
+            None => self.plain.bytes,
+        }
+    }
+
+    fn finish(self) -> Result<Vec<u8>, String> {
+        match self.decoder {
+            Some(d) => d
+                .finish()
+                .map(|b| b.bytes)
+                .map_err(|e| format!("gzip: {e}")),
+            None => Ok(self.plain.bytes),
+        }
     }
 }
 

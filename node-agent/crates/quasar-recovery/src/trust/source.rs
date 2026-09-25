@@ -27,14 +27,19 @@ pub(crate) const MAX_ASSET_BYTES: usize = 1 << 20;
 /// Bounds both fetches together, under the agent's 30 s socket timeout.
 pub(crate) const DEFAULT_ASSET_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` as the Go updater reads it (`envInt`): blank, not a
-/// decimal integer, or not positive is the default.
+/// `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` as the Go updater reads it: `envInt` (blank, not a
+/// decimal integer, or not positive is the default), then `time.Duration(n) * time.Second`,
+/// which wraps, then `Evidence`'s "not positive is the default".
 pub fn parse_manifest_timeout(raw: &str) -> Duration {
     match raw.parse::<i64>() {
-        Ok(n) if n > 0 => Duration::from_secs(n as u64),
+        Ok(n) if n > 0 => match n.wrapping_mul(1_000_000_000) {
+            ns if ns > 0 => Duration::from_nanos(ns as u64),
+            _ => DEFAULT_ASSET_TIMEOUT,
+        },
         _ => DEFAULT_ASSET_TIMEOUT,
     }
 }
+
 /// Requests one asset fetch may make: the original and nine redirects.
 const MAX_REDIRECTS: usize = 10;
 
@@ -211,5 +216,34 @@ pub(crate) fn redirect_allowed(via: &[&str], next: &str) -> Result<(), String> {
             Err(format!("refusing a redirect from https to {next}"))
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_manifest_timeout_wraps_like_go() {
+        // Each row observed from Go: time.Duration(n) * time.Second, then envInt's and
+        // Evidence's "not positive is the default".
+        assert_eq!(parse_manifest_timeout("15"), Duration::from_secs(15));
+        assert_eq!(parse_manifest_timeout(""), DEFAULT_ASSET_TIMEOUT);
+        assert_eq!(parse_manifest_timeout("0"), DEFAULT_ASSET_TIMEOUT);
+        assert_eq!(parse_manifest_timeout("-3"), DEFAULT_ASSET_TIMEOUT);
+        assert_eq!(parse_manifest_timeout(" 5"), DEFAULT_ASSET_TIMEOUT);
+        assert_eq!(
+            parse_manifest_timeout("9223372036854775807"),
+            DEFAULT_ASSET_TIMEOUT
+        );
+        assert_eq!(
+            parse_manifest_timeout("18446744074"),
+            Duration::from_nanos(290_448_384)
+        );
+        assert_eq!(parse_manifest_timeout("18446744073"), DEFAULT_ASSET_TIMEOUT);
+        assert_eq!(
+            parse_manifest_timeout("9223372036"),
+            Duration::from_nanos(9_223_372_036_000_000_000)
+        );
     }
 }

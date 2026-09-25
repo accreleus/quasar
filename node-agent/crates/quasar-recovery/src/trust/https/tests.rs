@@ -714,3 +714,79 @@ async fn production_roots_are_webpki_and_refuse_the_test_ca() {
     );
     assert!(err.contains("tls:"), "{err}");
 }
+
+/// One incompressible MiB, then 32 MiB of zeros compressed about a thousandfold.
+fn gzip_bomb() -> Vec<u8> {
+    let mut random = vec![0u8; MAX_ASSET_BYTES];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).unwrap();
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&random).unwrap();
+    let zeros = vec![0u8; 1 << 20];
+    for _ in 0..32 {
+        enc.write_all(&zeros).unwrap();
+    }
+    enc.finish().unwrap()
+}
+
+#[test]
+fn a_gzip_bomb_is_decoded_no_further_than_the_limit() {
+    let bomb = gzip_bomb();
+    let cap = MAX_ASSET_BYTES + 1;
+    let mut body = super::CappedBody::new(true, cap);
+    let mut full = false;
+    for chunk in bomb.chunks(64 << 10) {
+        if body.push(chunk).unwrap() {
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "the limit is reached");
+    assert!(
+        body.peak <= cap,
+        "decoded {} bytes for a cap of {cap}",
+        body.peak
+    );
+    assert_eq!(body.into_bytes().len(), cap);
+}
+
+#[tokio::test]
+async fn a_gzip_bomb_is_refused() {
+    let (ca, leaf) = pki();
+    let raw = {
+        let bomb = gzip_bomb();
+        let mut r = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bomb.len()
+        )
+        .into_bytes();
+        r.extend(bomb);
+        r
+    };
+    let srv = serve(&leaf, release(Reply::Raw(raw), Reply::Ok(b"M".to_vec()))).await;
+    let err = fetch_error(
+        fetcher(&ca)
+            .evidence(&srv.base(), Some("0.3.0"), LIMIT)
+            .await,
+    );
+    assert!(err.ends_with("asset is larger than 1048576 bytes"), "{err}");
+}
+
+#[tokio::test]
+async fn a_limit_past_the_clock_is_a_fetch_error_not_a_panic() {
+    let (ca, leaf) = pki();
+    let srv = serve(
+        &leaf,
+        release(Reply::Ok(b"S".to_vec()), Reply::Ok(b"M".to_vec())),
+    )
+    .await;
+    let err = fetch_error(
+        fetcher(&ca)
+            .evidence(&srv.base(), Some("0.3.0"), Duration::MAX)
+            .await,
+    );
+    assert!(err.contains("timeout"), "{err}");
+    assert!(
+        srv.targets().is_empty(),
+        "nothing is fetched without a deadline"
+    );
+}
