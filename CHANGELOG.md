@@ -25,6 +25,17 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH06 contract amendment and decision records (#353).** The frozen contracts gain
+  amendment 14 for Quasar-owned installs, written as an additive expand step: release
+  manifest format 2 (`platform-release-manifest.v2.json`, with the recovery actor as a third
+  component and a floor), the `owned` install mode and recovery-actor and seed identity on
+  hosts, recovery-actor apply components, new failure, preflight and eligibility identifiers,
+  the external-backup confirmation and pre-update dump reference, the `host_remove` command,
+  and deprecation of the static enrollment token. The contract step that retires the Compose
+  wording, two preflight checks, the static token and format-1 publication is written but not
+  in force until RH06-15 (#367). ADR 0007 freezes the seed interface, ADR 0008 records compiled
+  recipes with the recovery actor moving first, and ADR 0004 is amended for the recovery actor
+  and a non-migrating control plane that never passed a health check. No behaviour changes yet.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds

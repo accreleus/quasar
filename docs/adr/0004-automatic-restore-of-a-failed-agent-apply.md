@@ -67,3 +67,45 @@ running and the file merely stops naming an image that never arrived.
   updater has finished replays the terminal result.
 - The updater's result output now includes the failed container's log tail, bounded
   inside the 8 KiB the wire carries. It never includes environment values.
+
+## Amendment (2026-09-25, RH06, #353): the recovery actor, and a control plane that never passed a health check
+
+On an owned machine (RH06, #352) the **recovery actor** replaces platform services instead of
+the updater, and it keeps the old container **stopped and kept**, with its restart policy
+disabled, until the new one is verified. Restoring is therefore restarting the kept container —
+no `.env.prev` and no pull. The decision above is extended, and nothing in it is withdrawn:
+
+- **The node agent**: unchanged in substance. A failed verification (`recreate_failed`,
+  `never_started`, `unhealthy`) is restored automatically, reported `restored: true`, and recorded
+  as a `kind: auto_revert` attempt beside the failed one.
+- **The recovery actor itself** is restored the same way. A successor that never verifies is
+  removed and the previous actor re-enabled and started — **failed, restored** — so a machine
+  never loses its recovery authority to a bad release.
+- **The control plane** is restored automatically when the new container **never passed a health
+  check and the release does not migrate the database**. That widens the original rule, which
+  covered only a container that never *started*: on an unchanged schema the previous control plane
+  runs against exactly the database the failed one saw, so restarting it loses nothing, and the
+  case it rescues — a broken image leaving a household install with no console — is the one
+  that left an install dead before. **A migrating control plane is never restored automatically**,
+  however early it failed: its migration may have run. That attempt ends `failed`, names the
+  pre-update dump the recovery actor took, and prints one `restore` command that loads the dump
+  into a stopped database and starts the control plane the dump belongs to. ADR 0002 holds: an
+  older control plane never runs against a newer schema.
+- **"Passed a health check" is defined per recipe**: the container's own healthcheck reported
+  healthy at least once (for the control plane, its `/health`, which also reaches the database),
+  and for the node agent additionally its `register` carrying the expected commit.
+- **One service per failure.** When one attempt replaces several components in order (the recovery
+  actor first, ADR 0008), a failure restores the component that failed; components already
+  verified stay on their new digests, and the `auto_revert` row names only the restored component.
+- **Interrupted is not failed.** An attempt interrupted before the old container was taken out of
+  service settles as *interrupted, nothing changed*; one interrupted after that continues to
+  verification on the next start and is restored under the rules above if verification fails.
+  Nothing is ever retried on its own.
+- A `registry` machine keeps the updater's behaviour described above until the Go updater retires
+  with RH06-15 (#367).
+
+Considered and rejected for the control plane: restoring automatically after a migration (a
+schema moved forward cannot be undone by restarting an older binary, and D7's automatic
+database restore was cut by the owner's R1 review), and never restoring it automatically at all
+(the pre-RH06 gap this amendment closes). The wire and storage consequences are
+`protocol/agent-api.md` and `protocol/control-api.md` amendment 14.
