@@ -87,18 +87,18 @@ export function composeEnrollmentString(opts: {
 }
 
 /**
- * The one-line installer (#100). The control plane serves `deploy/enroll-host.sh`
- * itself at `/enroll-host.sh` (the SPA build copies it into the bundle), so the
- * script is by construction the one from the tree the control plane runs. A
- * self-signed control plane is fetched with `-k --pinnedpubkey 'sha256//<spki>'`:
- * curl then trusts nothing but that key — `-k` alone would hand anyone on the
- * path a root shell. A real-CA certificate gets neither flag. The enrollment
- * string travels as an environment variable on the `sh` side, never in the URL
- * (a token in a GET lands in proxy logs and browser history).
+ * The one-line installer (#100, #359). The control plane serves `deploy/enroll-host.sh`
+ * itself at `/enroll-host.sh` (the SPA build copies it into the bundle) with the
+ * images it installs written in. A self-signed control plane is fetched with
+ * `-k --pinnedpubkey 'sha256//<spki>'`: curl then trusts nothing but that key —
+ * `-k` alone would hand anyone on the path a root shell. A real-CA certificate
+ * gets neither flag. The enrollment string travels as an environment variable on
+ * the `sh` side, never in the URL (a token in a GET lands in proxy logs and
+ * browser history).
  */
 
-/** A tag, branch or commit that is safe unquoted in a shell word. */
-const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+/** The recovery actor's node-name alphabet: safe unquoted in a shell word. */
+const SAFE_NODE_NAME = /^[A-Za-z0-9._-]{1,253}$/;
 /** The string's own alphabet: prefix, hex+colons, base64url, and a token. */
 const SAFE_ENROLLMENT = /^qenr1\.[0-9A-F:]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9._~-]+$/;
 /** base64 of a 32-byte hash, as the control plane emits `spki_sha256`. */
@@ -112,21 +112,21 @@ export function installerScriptUrl(origin: string): string | null {
 export function composeInstallCommand(opts: {
   origin: string;
   enrollment: string;
-  /** The build's source ref; omitted from the command when unknown. */
-  ref: string;
+  /** The node name the token is bound to; the agent must enroll under it. */
+  nodeName?: string | null;
   /** `spki_sha256` of the served certificate when it is self-signed; `null` for a real CA. */
   spkiPin: string | null;
 }): string | null {
   const url = installerScriptUrl(opts.origin);
   if (!url) return null;
   if (!SAFE_ENROLLMENT.test(opts.enrollment)) return null;
-  const ref = opts.ref.trim();
-  if (ref && !SAFE_REF.test(ref)) return null;
+  const nodeName = opts.nodeName?.trim() ?? "";
+  if (nodeName && !SAFE_NODE_NAME.test(nodeName)) return null;
   let fetch = "curl -fsSL";
   if (opts.spkiPin !== null) {
     if (!SAFE_PIN.test(opts.spkiPin)) return null;
     fetch += ` -k --pinnedpubkey 'sha256//${opts.spkiPin}'`;
   }
-  const env = `QUASAR_ENROLLMENT='${opts.enrollment}'${ref ? ` QUASAR_REF=${ref}` : ""}`;
+  const env = `QUASAR_ENROLLMENT='${opts.enrollment}'${nodeName ? ` QUASAR_NODE_NAME=${nodeName}` : ""}`;
   return `${fetch} ${url} | ${env} sh`;
 }

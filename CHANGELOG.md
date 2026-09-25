@@ -25,6 +25,15 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Add host: one line, or a seed-only stack for Dockge or Arcane (#359).** Admin → Fleet's
+  Enroll host becomes Add host: it mints one single-use token (optionally bound to a node name,
+  one hour to 30 days) and prints the pinned-key one-liner or, on a second tab, the seed stack.
+  The served `enroll-host.sh` is rewritten: it checks the host and offers to apply each fix, pulls
+  the seed and node-agent images by digest (`QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE`
+  on the control plane), starts the seed and waits for enrollment. It writes no compose file,
+  `.env` or install directory, changes nothing on an installed machine, and leaves nothing behind
+  when the control plane refuses the string. The seed's health check now fails while it is idle on
+  something only the operator can fix, and an unpullable agent image is logged once.
 - **Owned GPU hosts take agent updates through their recovery actor, and admins can apply a
   developer build (#360).** On an owned install the agent relays `release_apply` to its
   recovery actor, which journals every phase before acting, keeps the old agent stopped and

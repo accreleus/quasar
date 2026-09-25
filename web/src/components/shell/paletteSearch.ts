@@ -91,7 +91,7 @@ export const PALETTE_ACTIONS: readonly PaletteItem[] = [
   { id: "go-settings", label: "Go to Settings", icon: "settings", to: "/admin/settings" },
   { id: "go-account", label: "Go to Account", icon: "profile", to: "/app/account/profile" },
   { id: "toggle-appearance", label: "Toggle appearance", icon: "sun", action: "toggle-appearance" },
-  { id: "enroll-host", label: "Enroll a host", icon: "plus", to: "/admin/fleet/hosts" },
+  { id: "enroll-host", label: "Add a host", icon: "plus", to: "/admin/fleet/hosts" },
   { id: "mint-invite", label: "Mint an invite", icon: "plus", to: "/admin/people/invites" },
 ];
 
