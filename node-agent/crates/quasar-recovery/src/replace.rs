@@ -60,7 +60,7 @@ impl Actor {
             Ok(Some(j)) => j,
             Ok(None) => return,
             Err(e) => {
-                error!(token = "actor-journal-unreadable", request = %request_id, "{e}");
+                error!(token = "actor-journal-reload-failed", request = %request_id, "{e}");
                 return;
             }
         };
@@ -75,7 +75,19 @@ impl Actor {
 
     /// `resume`'s D8 step: the open attempt, if any, reaches a terminal outcome.
     pub(crate) fn settle_open(&self) -> Result<(), ResumeError> {
-        let Some(journal) = self.journals.open() else {
+        let scan = self.journals.scan();
+        if !scan.unreadable.is_empty() {
+            warn!(
+                token = "actor-journal-unreadable",
+                journals = ?scan.unreadable,
+                "an attempt journal cannot be read (corrupt, or written by a newer actor); nothing is settled, installed or admitted until it is, so a kept container it may depend on is never touched"
+            );
+            return Err(ResumeError::State(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unreadable attempt journal(s) {:?}", scan.unreadable),
+            )));
+        }
+        let Some(journal) = scan.open().cloned() else {
             return Ok(());
         };
         let id = journal.request.request_id.clone();
@@ -233,8 +245,7 @@ impl Actor {
     /// Settle an attempt interrupted before the old container was touched: remove anything
     /// it created, and end it `failed`/`interrupted`.
     fn interrupt(&self, mut j: Journal) -> Result<(), ()> {
-        let id = j.request.request_id.clone();
-        let created = match self.attempt_containers(&id) {
+        let created = match self.attempt_containers(&j) {
             Ok(created) => created,
             Err(EngineError::Crashed) => return Err(()),
             Err(e) => {
@@ -269,11 +280,28 @@ impl Actor {
         )
     }
 
-    fn attempt_containers(&self, request_id: &str) -> Result<Vec<Container>, EngineError> {
+    /// The containers this attempt created: this installation's, labelled with the
+    /// attempt, and never a container the attempt recorded as the one it replaces
+    /// (architecture §5.4). A label alone proves nothing: it survives on the running
+    /// service an earlier attempt of the same id created.
+    fn attempt_containers(&self, j: &Journal) -> Result<Vec<Container>, EngineError> {
+        let Ok(Some(machine)) = self.dir.load_machine() else {
+            return Ok(Vec::new());
+        };
+        let id = j.request.request_id.as_str();
+        let old: Vec<&String> = j
+            .steps
+            .iter()
+            .filter_map(|s| s.old_container.as_ref())
+            .collect();
         Ok(self
             .retrying(|| self.engine.list_containers())?
             .into_iter()
-            .filter(|c| c.labels.get(ATTEMPT_LABEL).map(String::as_str) == Some(request_id))
+            .filter(|c| {
+                c.labels.get(ATTEMPT_LABEL).map(String::as_str) == Some(id)
+                    && c.labels.get(labels::INSTALLATION) == Some(&machine.installation_id)
+                    && !old.contains(&&c.id)
+            })
             .collect())
     }
 
@@ -400,6 +428,18 @@ impl Actor {
                 .retrying(|| self.engine.inspect_container(&kept))
                 .map_err(|e| engine(e, Reason::RecreateFailed, "inspect the kept name"))?
             {
+                // A kept container may be the only way back for an attempt whose
+                // journal cannot be read: never remove one while any is unreadable.
+                let unreadable = self.journals.scan().unreadable;
+                if !unreadable.is_empty() {
+                    return Err(fail(
+                        Reason::RecreateFailed,
+                        format!(
+                            "container {} is kept by an earlier attempt and attempt journal(s) {unreadable:?} cannot be read; it is not removed",
+                            stale.name
+                        ),
+                    ));
+                }
                 if stale.labels.get(labels::INSTALLATION) != old.labels.get(labels::INSTALLATION) {
                     return Err(fail(
                         Reason::OwnerConflict,
@@ -426,7 +466,7 @@ impl Actor {
     fn create_new(&self, j: &mut Journal, i: usize) -> Result<(), Halt> {
         let id = j.request.request_id.clone();
         let mine = self
-            .attempt_containers(&id)
+            .attempt_containers(j)
             .map_err(|e| engine(e, Reason::RecreateFailed, "list containers"))?;
         if let Some(c) = mine.into_iter().next() {
             j.steps[i].new_container = Some(c.id);
@@ -460,7 +500,6 @@ impl Actor {
     }
 
     fn new_container(&self, j: &Journal, i: usize) -> Result<Option<Container>, Halt> {
-        let id = j.request.request_id.clone();
         if let Some(new) = &j.steps[i].new_container {
             if let Some(c) = self
                 .retrying(|| self.engine.inspect_container(new))
@@ -470,7 +509,7 @@ impl Actor {
             }
         }
         Ok(self
-            .attempt_containers(&id)
+            .attempt_containers(j)
             .map_err(|e| engine(e, Reason::RecreateFailed, "list containers"))?
             .into_iter()
             .next())

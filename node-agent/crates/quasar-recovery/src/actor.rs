@@ -313,7 +313,8 @@ impl Actor {
     /// no journal for it), or the most recent attempt's when `request_id` is `None`.
     pub fn status_for(&self, request_id: Option<&str>) -> Status {
         let mut status = self.inventory_status();
-        status.in_flight = self.journals.open().map(|j| j.request.request_id);
+        // An unreadable journal is reported as in flight: nothing is admitted past it.
+        status.in_flight = self.journals.scan().open_id();
         status.result = self.attempt_result(request_id);
         status
     }

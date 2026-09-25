@@ -10,15 +10,19 @@
 //!    treats a re-post of the in-flight id as "not busy", as the Go updater's
 //!    `AcceptedFor` did; without this step a node agent could reuse the control plane's
 //!    in-flight id and have a second request admitted. The same caller gets the same
-//!    `Accepted`, and nothing new happens; another caller is refused.
-//! 3. While `resume` is settling the machine, every submit is `busy`.
+//!    `Accepted`, and nothing new happens; another caller is refused. An id whose
+//!    journal was pruned is still spent (the used-id record), and so is one any
+//!    container carries as its attempt label: never admitted again.
+//! 3. From `acquire_lease` until `resume` returns, every submit is `busy`; so is every
+//!    submit while any journal is unreadable (it may be the open attempt).
 //! 4. **Rules per kind and per caller**, which `admit` does not look at. The agent socket
 //!    may send `replace` (agent-api.md `release_apply`) and, once RH06-14 (#366) builds it,
 //!    `remove` (`host_remove`); never `restore`, which loads a pre-update dump on the
 //!    control plane's machine. It may name only `node-agent` and `recovery-actor`; the
 //!    control socket only `control-plane` and `recovery-actor`. What a caller may name but
 //!    this build cannot yet do is refused `invalid`, saying which ticket brings it.
-//! 5. [`trust::admit`]: single flight, the component table and the confused-deputy guard,
+//! 5. Every image a registry host plus well-formed path components, then
+//!    [`trust::admit`]: single flight, the component table and the confused-deputy guard,
 //!    image and digest shape, the namespace allowlist, then ADR 0003 signatures.
 //! 6. The race guard at submission: a container holding a name this replacement needs,
 //!    without this installation's labels, is `owner_conflict`.
@@ -33,6 +37,7 @@ use tracing::{info, warn};
 use crate::actor::Actor;
 use crate::journal::{CallerTag, Journal, Phase, Step, FORMAT};
 use crate::recipe::{labels, ImageRef, Role};
+use crate::replace::ATTEMPT_LABEL;
 use crate::socket::{
     Accepted, AttemptResult, Previous, Reason, Rejection, Request, RequestKind, State,
 };
@@ -178,6 +183,25 @@ impl Actor {
                     return Err(refuse(&req, Reason::Busy, why));
                 }
             }
+            // A pruned journal's id is still spent: admitting it again would adopt the
+            // containers the earlier attempt labelled.
+            match self.journals.was_used(&req.request_id) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(refuse(
+                        &req,
+                        Reason::Invalid,
+                        format!(
+                            "request id {} was already used on this machine",
+                            req.request_id
+                        ),
+                    ))
+                }
+                Err(e) => {
+                    let why = format!("the record of used request ids cannot be read ({e})");
+                    return Err(refuse(&req, Reason::Busy, why));
+                }
+            }
         }
 
         // 3.
@@ -194,11 +218,30 @@ impl Actor {
             kind_and_caller_rules(caller, &req)?;
         }
 
-        // 5.
-        let open = self.journals.open();
+        // 5. An unreadable journal fails closed: it may be the open attempt.
+        let scan = self.journals.scan();
+        if let Some(id) = scan.unreadable.first() {
+            return Err(refuse(
+                &req,
+                Reason::Busy,
+                format!("attempt journal {id} cannot be read (corrupt, or written by a newer actor); nothing is admitted until it can"),
+            ));
+        }
+        for c in &req.components {
+            if !repository_well_formed(&c.image) {
+                return Err(refuse(
+                    &req,
+                    Reason::Invalid,
+                    format!(
+                        "component \"{}\": image {:?} is not a registry host followed by lowercase path components",
+                        c.name, c.image
+                    ),
+                ));
+            }
+        }
         let cfg = trust::Config {
             allowed_namespaces: self.config.trust.allowed_namespaces.clone(),
-            in_flight_request_id: open.as_ref().map(|j| j.request.request_id.clone()),
+            in_flight_request_id: scan.open().map(|j| j.request.request_id.clone()),
             signature: self.config.trust.signature.clone(),
         };
         let evidence = trust::wants_signature_evidence(&cfg, &req.request_id)
@@ -225,6 +268,29 @@ impl Actor {
                 ))
             }
         };
+        match self.engine.list_containers() {
+            Ok(all) => {
+                if let Some(c) = all.iter().find(|c| {
+                    c.labels.get(ATTEMPT_LABEL).map(String::as_str) == Some(req.request_id.as_str())
+                }) {
+                    return Err(refuse(
+                        &req,
+                        Reason::Invalid,
+                        format!(
+                            "request id {} was already used on this machine (container {} carries it)",
+                            req.request_id, c.name
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(refuse(
+                    &req,
+                    Reason::Busy,
+                    format!("the container engine did not answer ({e}); nothing was admitted"),
+                ))
+            }
+        }
         let mut steps = Vec::with_capacity(req.components.len());
         let mut previous = Vec::with_capacity(req.components.len());
         for c in &req.components {
@@ -319,6 +385,11 @@ impl Actor {
                 format!("the journal could not be written ({e}); nothing was admitted"),
             ));
         }
+        // After the journal: until pruned, the journal itself answers a re-post, and
+        // `prune` records the id again before it deletes one.
+        if let Err(e) = self.journals.mark_used(&req.request_id) {
+            warn!(token = "actor-used-id-unrecorded", request = %req.request_id, "the used request id could not be recorded yet ({e}); pruning records it");
+        }
         info!(
             request = %req.request_id,
             caller = ?caller,
@@ -347,6 +418,47 @@ impl Actor {
             let _ = handle.join();
         }
     }
+}
+
+/// A registry host, then lowercase path components in the distribution reference
+/// grammar: no empty, `.` or `..` segment, so a prefix match on the namespace
+/// allowlist cannot be walked out of.
+fn repository_well_formed(image: &str) -> bool {
+    let mut parts = image.split('/');
+    let host = parts.next().unwrap_or("");
+    let host_ok = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
+        && !host.starts_with(['.', '-', ':']);
+    let path: Vec<&str> = parts.collect();
+    host_ok && !path.is_empty() && path.iter().all(|p| path_component(p))
+}
+
+fn path_component(p: &str) -> bool {
+    let b = p.as_bytes();
+    let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    if b.is_empty() || !alnum(b[0]) || !alnum(b[b.len() - 1]) {
+        return false;
+    }
+    // Separators are `.`, `_`, `__` or a run of `-`, always between alphanumerics.
+    let mut i = 0;
+    while i < b.len() {
+        if alnum(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && !alnum(b[i]) {
+            i += 1;
+        }
+        let sep = &p[start..i];
+        let ok = sep == "." || sep == "_" || sep == "__" || sep.bytes().all(|c| c == b'-');
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn kept_name(canonical: &str) -> String {

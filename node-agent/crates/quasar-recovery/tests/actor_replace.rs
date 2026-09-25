@@ -482,7 +482,8 @@ fn a_crash_while_settling_is_settled_by_the_start_after_it() {
 fn a_transiently_unavailable_engine_does_not_end_the_attempt() {
     let (engine, dir) = installed(healthy());
     let start = engine.calls();
-    for offset in [2, 5, 9] {
+    // Past admission (three calls), which refuses `busy` on an engine that does not answer.
+    for offset in [4, 7, 11] {
         engine.inject(Fault {
             call: start + offset,
             when: When::Before,
@@ -679,6 +680,23 @@ fn the_agent_socket_may_ask_only_to_replace_the_agent_or_the_actor() {
         )
         .unwrap_err();
     assert_eq!(refused.reason, Reason::Invalid);
+    // The allowlist is a prefix: a path that walks out of it is refused before it.
+    for walk in [
+        "registry.example.invalid/quasar/../evil/quasar-node-agent",
+        "registry.example.invalid/quasar/./quasar-node-agent",
+        "registry.example.invalid/quasar//quasar-node-agent",
+        "registry.example.invalid/quasar/Quasar-Node-Agent",
+    ] {
+        let refused = actor
+            .submit(Caller::Agent, request(ID, "node-agent", walk, NEW_DIGEST))
+            .unwrap_err();
+        assert_eq!(
+            refused.reason,
+            Reason::Invalid,
+            "{walk}: {}",
+            refused.message
+        );
+    }
 
     // Every refusal changed nothing and journalled nothing.
     assert_eq!(actor.status().result, None);
@@ -739,50 +757,138 @@ fn a_release_under_signature_require_with_no_signature_is_refused() {
     );
 }
 
+/// The binary serves the agent socket between taking the lease and `resume`; a submit
+/// queued there must not be admitted beside the start that settles the machine. No
+/// journal is open here, so only the start flag can refuse it.
 #[test]
-fn a_submit_while_a_start_settles_the_machine_is_busy() {
-    let starting = || Behaviour {
-        health: Some("starting".into()),
-        ..Default::default()
-    };
-    let slow = ReplaceTiming {
-        verify_timeout: Duration::from_millis(800),
-        ..fast()
-    };
-    // Crash `offset` calls into an attempt; true when that leaves it open in `verifying`.
-    let crash = |engine: &Arc<FakeEngine>, dir: &std::path::Path, offset: usize| {
-        engine.inject(Fault {
-            call: engine.calls() + offset,
-            when: When::Before,
-            error: EngineError::Crashed,
-        });
-        let actor = actor_with(engine, dir, slow);
-        let open = actor.submit(Caller::Agent, agent_request(ID)).is_ok() && {
-            actor.wait_attempt();
-            result_of(&actor.status_for(Some(ID))).state == State::Verifying
-        };
-        engine.clear_faults();
-        open
-    };
-    let offset = (0..60)
-        .find(|&offset| {
-            let (engine, dir) = installed(starting());
-            crash(&engine, dir.path(), offset)
-        })
-        .expect("a crash point that leaves the attempt verifying");
-    let (engine, dir) = installed(starting());
-    assert!(crash(&engine, dir.path(), offset));
+fn a_submit_between_the_lease_and_the_end_of_resume_is_busy() {
+    let (engine, dir) = installed(healthy());
+    let actor = actor_with(&engine, dir.path(), fast());
+    actor.acquire_lease().unwrap();
+    let refused = actor.submit(Caller::Agent, agent_request(ID)).unwrap_err();
+    assert_eq!(refused.reason, Reason::Busy);
+    assert!(refused.message.contains("settling"), "{}", refused.message);
+    assert_eq!(actor.status_for(Some(ID)).result, None);
 
-    let starting = actor_with(&engine, dir.path(), slow);
-    let resuming = starting.clone();
-    let settling = std::thread::spawn(move || resuming.resume());
-    std::thread::sleep(Duration::from_millis(150));
-    let refused = starting
-        .submit(Caller::Agent, agent_request(ID2))
-        .unwrap_err();
-    assert_eq!(refused.reason, Reason::Busy, "{}", refused.message);
-    settling.join().unwrap().unwrap();
-    let result = result_of(&starting.status_for(Some(ID)));
-    assert_eq!(result.reason, Some(Reason::Unhealthy));
-    assert!(result.restored);
+    actor.resume().unwrap();
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    assert_eq!(
+        result_of(&actor.status_for(Some(ID))).state,
+        State::Succeeded
+    );
+}
+
+fn nth_id(n: usize) -> String {
+    format!("00000000-0000-4000-8000-{n:012}")
+}
+
+/// Enough finished attempts that an earlier attempt's journal is pruned.
+fn fail_many(actor: &Arc<Actor>) {
+    let missing = "sha256:ee55000000000000000000000000000000000000000000000000000000000000";
+    for n in 0..=quasar_recovery::journal::KEEP_FINISHED {
+        actor
+            .submit(
+                Caller::Agent,
+                request(&nth_id(n), "node-agent", REPO, missing),
+            )
+            .unwrap();
+        actor.wait_attempt();
+    }
+}
+
+#[test]
+fn a_request_id_whose_journal_was_pruned_is_never_admitted_again() {
+    // The agent the first attempt created still runs and still carries its id.
+    let (engine, dir) = installed(healthy());
+    let actor = actor_with(&engine, dir.path(), fast());
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    fail_many(&actor);
+    assert_eq!(
+        actor.status_for(Some(ID)).result,
+        None,
+        "the journal was not pruned"
+    );
+    let running = engine.state();
+
+    let refused = actor.submit(Caller::Agent, agent_request(ID)).unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+    actor.wait_attempt();
+    assert_eq!(engine.state(), running, "the running agent was touched");
+    assert_replaced(&engine.state(), "after the refused re-post");
+
+    // Without the used-id record, the container that carries the id still refuses it.
+    std::fs::remove_file(dir.path().join("journal/used-ids")).unwrap();
+    let refused = actor.submit(Caller::Agent, agent_request(ID)).unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+    assert!(
+        refused.message.contains("carries it"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(engine.state(), running);
+}
+
+#[test]
+fn a_spent_request_id_is_refused_even_when_no_container_carries_it() {
+    let (engine, dir) = installed(healthy());
+    let actor = actor_with(&engine, dir.path(), fast());
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    // A later replacement removes the container that carried ID.
+    actor
+        .submit(Caller::Agent, request(ID2, "node-agent", REPO, OLD_DIGEST))
+        .unwrap();
+    actor.wait_attempt();
+    assert_eq!(
+        result_of(&actor.status_for(Some(ID2))).state,
+        State::Succeeded
+    );
+    fail_many(&actor);
+    let before = engine.state();
+
+    let refused = actor.submit(Caller::Agent, agent_request(ID)).unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+    assert!(
+        refused.message.contains("already used"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(engine.state(), before);
+}
+
+#[test]
+fn an_unreadable_journal_fails_closed() {
+    for name in ["garbage", "newer format"] {
+        let (engine, dir) = installed(healthy());
+        let actor = actor_with(&engine, dir.path(), fast());
+        let journal = dir.path().join("journal");
+        if name == "garbage" {
+            std::fs::create_dir_all(&journal).unwrap();
+            std::fs::write(journal.join(format!("{ID}.json")), "{ not json").unwrap();
+        } else {
+            // A finished journal an actor of a newer format rewrote.
+            actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+            actor.wait_attempt();
+            let path = journal.join(format!("{ID}.json"));
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("\"format\":1"), "{text}");
+            std::fs::write(&path, text.replacen("\"format\":1", "\"format\":99", 1)).unwrap();
+        }
+        let before = engine.state();
+
+        let refused = actor.submit(Caller::Agent, agent_request(ID2)).unwrap_err();
+        assert_eq!(refused.reason, Reason::Busy, "{name}: {}", refused.message);
+        assert!(refused.message.contains(ID), "{name}: {}", refused.message);
+        assert_eq!(actor.status().in_flight.as_deref(), Some(ID), "{name}");
+        drop(actor);
+
+        let start = actor_with(&engine, dir.path(), fast());
+        assert!(
+            start.resume().is_err(),
+            "{name}: a start settled past an unreadable journal"
+        );
+        assert_eq!(engine.state(), before, "{name}: the engine changed");
+    }
 }

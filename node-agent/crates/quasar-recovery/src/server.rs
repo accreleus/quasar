@@ -87,6 +87,8 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     match (method, path) {
         ("GET", "/v1/status") => {
+            // TODO(#363): scope `result` by caller once the control socket exists, so the
+            // agent socket answers only for attempts the agent submitted.
             let request_id = query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("request_id="));

@@ -187,10 +187,44 @@ impl JournalDir {
     fn ensure(&self) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         match std::fs::DirBuilder::new().mode(0o700).create(&self.dir) {
-            Ok(()) => Ok(()),
+            // The new directory entry is durable only once its parent is synced.
+            Ok(()) => match self.dir.parent() {
+                Some(parent) => std::fs::File::open(parent)?.sync_all(),
+                None => Ok(()),
+            },
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Every request id this machine ever admitted, kept after its journal is pruned,
+    /// so an id is never admitted twice.
+    fn used_file(&self) -> DurableFile<Vec<String>> {
+        DurableFile::new(self.dir.join("used-ids"), "tmp")
+    }
+
+    pub fn was_used(&self, request_id: &str) -> io::Result<bool> {
+        if !self.dir.join("used-ids").exists() {
+            return Ok(false);
+        }
+        Ok(self
+            .used_file()
+            .load()?
+            .is_some_and(|ids| ids.iter().any(|id| id == request_id)))
+    }
+
+    pub fn mark_used(&self, request_id: &str) -> io::Result<()> {
+        self.ensure()?;
+        let mut ids = if self.dir.join("used-ids").exists() {
+            self.used_file().load()?.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if ids.iter().any(|id| id == request_id) {
+            return Ok(());
+        }
+        ids.push(request_id.to_owned());
+        self.used_file().store(&ids)
     }
 
     /// `request_id` must already be a uuid: it becomes a file name.
@@ -223,44 +257,79 @@ impl JournalDir {
         self.file(&journal.request.request_id).store(journal)
     }
 
-    /// Every readable journal, oldest first. One that cannot be read is skipped here and
-    /// reported by the caller that needs it.
-    pub fn all(&self) -> Vec<Journal> {
+    /// Every journal file, oldest first, and the ids of those that exist but cannot be
+    /// read. An unreadable one fails closed: it counts as an open attempt everywhere
+    /// ([`Scan::open_id`]), because it may be exactly the attempt a restore depends on.
+    pub fn scan(&self) -> Scan {
+        let mut scan = Scan::default();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
+            return scan;
         };
-        let mut out: Vec<Journal> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                let id = name.strip_suffix(".json")?;
-                self.load(id).ok().flatten()
-            })
-            .collect();
-        out.sort_by_key(|j| j.seq);
-        out
-    }
-
-    /// The attempt that is still open, if any. The journal says so, not memory.
-    pub fn open(&self) -> Option<Journal> {
-        self.all().into_iter().rev().find(Journal::is_open)
+        for e in entries.flatten() {
+            let Ok(name) = e.file_name().into_string() else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            match self.load(id) {
+                Ok(Some(j)) => scan.journals.push(j),
+                Ok(None) => {}
+                Err(_) => scan.unreadable.push(id.to_owned()),
+            }
+        }
+        scan.journals.sort_by_key(|j| j.seq);
+        scan.unreadable.sort();
+        scan
     }
 
     pub fn latest(&self) -> Option<Journal> {
-        self.all().pop()
+        self.scan().journals.pop()
     }
 
     pub fn next_seq(&self) -> u64 {
-        self.all().last().map(|j| j.seq + 1).unwrap_or(1)
+        self.scan().journals.last().map(|j| j.seq + 1).unwrap_or(1)
     }
 
-    /// Drops the oldest finished journals beyond [`KEEP_FINISHED`].
+    /// Drops the oldest finished journals beyond [`KEEP_FINISHED`]; their ids stay in the
+    /// used-id record.
     pub fn prune(&self) {
-        let finished: Vec<Journal> = self.all().into_iter().filter(|j| !j.is_open()).collect();
+        let finished: Vec<Journal> = self
+            .scan()
+            .journals
+            .into_iter()
+            .filter(|j| !j.is_open())
+            .collect();
         let excess = finished.len().saturating_sub(KEEP_FINISHED);
         for j in finished.into_iter().take(excess) {
-            let _ = std::fs::remove_file(self.dir.join(format!("{}.json", j.request.request_id)));
+            let id = &j.request.request_id;
+            if self.mark_used(id).is_ok() {
+                let _ = std::fs::remove_file(self.dir.join(format!("{id}.json")));
+            }
         }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub journals: Vec<Journal>,
+    /// Ids of journal files that exist but do not parse, or are of a format this build
+    /// does not read.
+    pub unreadable: Vec<String>,
+}
+
+impl Scan {
+    /// The attempt that is still open, if any. The journal says so, not memory.
+    pub fn open(&self) -> Option<&Journal> {
+        self.journals.iter().rev().find(|j| j.is_open())
+    }
+
+    /// The open attempt's id, an unreadable journal's first: either stops a new one.
+    pub fn open_id(&self) -> Option<String> {
+        self.unreadable
+            .first()
+            .cloned()
+            .or_else(|| self.open().map(|j| j.request.request_id.clone()))
     }
 }
 
