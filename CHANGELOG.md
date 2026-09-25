@@ -25,6 +25,12 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The host page shows an owned GPU host's services (#357).** A host whose install mode is
+  `owned` gets a "Services on this machine" card with its seed, recovery actor and node agent
+  (version, owner, state), says when the recovery actor has not reported yet or did not answer,
+  marks an offline host's rows with the time of its last report, and flags an agent on an older
+  build than the control plane. The Hosts table's expanded row gains a Services column, and the
+  install mode reads "Owned by Quasar" rather than "Unknown". Other hosts render as before.
 - **RH06 release trust ported to Rust, held to shared golden vectors (#356).** The new
   GStreamer-free crate `node-agent/crates/quasar-recovery` holds the recovery actor's
   `trust` module (the Go updater's namespace allowlist, digest-only images, closed

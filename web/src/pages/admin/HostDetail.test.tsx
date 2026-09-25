@@ -658,3 +658,189 @@ describe("HostDetail — platform-release faults", () => {
     expect(document.querySelector(".note.warn")).toBeNull();
   });
 });
+
+describe("HostDetail — services on this machine (#357)", () => {
+  const CP_COMMIT = "3f9a2c1e0c5a9d1b7a2f3e4d5c6b7a8901234567";
+  const owned = {
+    source_commit: CP_COMMIT,
+    built_at: new Date(NOW - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    install_mode: "owned" as const,
+    updater_present: true,
+    agent_version: "0.5.2",
+    recovery_actor_version: "0.5.2",
+    recovery_actor_source_commit: CP_COMMIT,
+    seed_version: null,
+  };
+
+  function releases(cpCommit: string | null = CP_COMMIT, faults: unknown[] = []) {
+    return {
+      faults,
+      installed: {
+        control_plane: { version: "0.5.2", source_commit: cpCommit, built_at: null, schema_version: 88 },
+        hosts: [],
+      },
+    } as never;
+  }
+
+  async function card(): Promise<HTMLElement> {
+    const title = await screen.findByText("Services on this machine");
+    return title.closest(".card") as HTMLElement;
+  }
+
+  function service(inCard: HTMLElement, name: string): HTMLElement {
+    return within(inCard).getByText(name).closest("tr") as HTMLElement;
+  }
+
+  beforeEach(() => {
+    mocked.getPlatformReleases.mockResolvedValue(releases());
+  });
+
+  it("shows an installed GPU host's recovery actor and node agent, owned by Quasar and running", async () => {
+    mocked.getHost.mockResolvedValue({ host: host(owned) } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).getByText("GPU host")).toBeTruthy();
+
+    const actor = service(c, "Recovery actor");
+    expect(within(actor).getByText("v0.5.2")).toBeTruthy();
+    expect(within(actor).getByText("Quasar")).toBeTruthy();
+    expect(within(actor).getByText("running")).toBeTruthy();
+
+    const agent = service(c, "Node agent");
+    expect(within(agent).getByText("v0.5.2")).toBeTruthy();
+    expect(within(agent).getByText("Quasar")).toBeTruthy();
+    expect(within(agent).getByText("running")).toBeTruthy();
+    expect(within(agent).queryByText(/older than the control plane/)).toBeNull();
+
+    expect(within(service(c, "Database")).getByText("none on this machine")).toBeTruthy();
+    expect(within(service(c, "Control plane")).getByText("not on this machine")).toBeTruthy();
+    expect(screen.getByText("GPU host · AMD Ryzen 9 9950X3D · 128 GB")).toBeTruthy();
+  });
+
+  it("says an agent on an older build than the control plane is older, and where to update it", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, agent_version: "0.5.1", source_commit: "9e8d7c6b5a4f" }),
+    } as never);
+    renderDetail();
+
+    const agent = service(await card(), "Node agent");
+    expect(within(agent).getByText("v0.5.1")).toBeTruthy();
+    expect(
+      within(agent).getByText("older than the control plane · update from Releases"),
+    ).toBeTruthy();
+  });
+
+  it("does not call an agent older when it is the one ahead of the control plane", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, source_commit: "9e8d7c6b5a4f" }),
+    } as never);
+    mocked.getPlatformReleases.mockResolvedValue(
+      releases(CP_COMMIT, [
+        { kind: "agent_ahead_of_control_plane", host_id: "c2059601", detail: "ahead" },
+      ]),
+    );
+    renderDetail();
+
+    const agent = service(await card(), "Node agent");
+    expect(within(agent).queryByText(/older than the control plane/)).toBeNull();
+  });
+
+  it("does not guess older when the control plane's build is unknown", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, source_commit: "9e8d7c6b5a4f" }),
+    } as never);
+    mocked.getPlatformReleases.mockRejectedValue(new Error("forbidden"));
+    renderDetail();
+
+    const agent = service(await card(), "Node agent");
+    expect(within(agent).queryByText(/older than the control plane/)).toBeNull();
+  });
+
+  it("shows every service as not reported until the recovery actor reports", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        ...owned,
+        node_name: "gpu-host-6",
+        updater_present: null,
+        recovery_actor_version: null,
+        recovery_actor_source_commit: null,
+        agent_connected_since: new Date(NOW - 20 * 1000).toISOString(),
+      }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(
+      within(c).getByText("Versions and owners appear once this machine’s recovery actor reports."),
+    ).toBeTruthy();
+    expect(
+      within(c).getByText(/gpu-host-6 connected 20 seconds ago and has not reported its services yet/),
+    ).toBeTruthy();
+    for (const name of ["Seed", "Recovery actor", "Node agent"]) {
+      const row = service(c, name);
+      expect(within(row).getByText("unknown")).toBeTruthy();
+      expect(within(row).queryByText(/^v\d/)).toBeNull();
+      expect(within(row).queryByText("Quasar")).toBeNull();
+    }
+  });
+
+  // An older server omits the amendment-14 fields altogether: absent reads as null.
+  it("treats absent actor fields as not reported", async () => {
+    const { recovery_actor_version: _a, recovery_actor_source_commit: _b, seed_version: _c, ...rest } =
+      owned;
+    mocked.getHost.mockResolvedValue({ host: host({ ...rest, updater_present: null }) } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(service(c, "Recovery actor")).getByText("unknown")).toBeTruthy();
+    expect(within(c).getByText(/has not reported its services yet/)).toBeTruthy();
+  });
+
+  it("says the recovery actor did not answer when the agent reports it absent", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, updater_present: false, recovery_actor_version: null }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).getByText("Could not read this machine’s services.")).toBeTruthy();
+    expect(within(c).queryByText(/has not reported its services yet/)).toBeNull();
+    expect(within(service(c, "Recovery actor")).getByText("unknown")).toBeTruthy();
+  });
+
+  it("marks an offline host's services with the time of their last report", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, status: "offline", last_registered_at: "2026-08-29T11:48:00Z" }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).getByText(/^Last report from \d\d:\d\d\.$/)).toBeTruthy();
+    for (const name of ["Recovery actor", "Node agent"]) {
+      const row = service(c, name);
+      expect(within(row).getByText(/^as of \d\d:\d\d$/)).toBeTruthy();
+      expect(within(row).queryByText("running")).toBeNull();
+    }
+  });
+
+  it("shows the seed version the recovery actor last saw, without claiming its state", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ ...owned, seed_version: "0.5.0" }) } as never);
+    renderDetail();
+
+    const seed = service(await card(), "Seed");
+    expect(within(seed).getByText("v0.5.0")).toBeTruthy();
+    expect(within(seed).getByText("unknown")).toBeTruthy();
+  });
+
+  it("draws no services card for a host that is not owned", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, install_mode: "registry", recovery_actor_version: null }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "quasar-node-1" })).toBeTruthy());
+    expect(screen.queryByText("Services on this machine")).toBeNull();
+    expect(screen.getByText("AMD Ryzen 9 9950X3D · 128 GB")).toBeTruthy();
+  });
+});

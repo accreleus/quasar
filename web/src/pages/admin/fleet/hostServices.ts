@@ -1,0 +1,168 @@
+/**
+ * An owned GPU host's service inventory (the RH-06 "Services on this machine"
+ * mock), derived from the host body's amendment-14 fields. One module so the
+ * host page's card and the host row's Services column cannot disagree.
+ *
+ * Semantics of the fields: control-api.md "Owned hosts on the host body and the
+ * release view"; agent-api.md §register, "Owned installs".
+ */
+
+import type { Host, PlatformReleaseFault } from "../../../api/types";
+import { commitsMatch } from "./releasesCopy";
+
+export type ServiceKey = "seed" | "recovery_actor" | "database" | "control_plane" | "node_agent";
+
+export type ServiceState =
+  | { kind: "running" }
+  | { kind: "unknown" }
+  /** The last report, from before the host went offline. */
+  | { kind: "as_of"; at: string }
+  /** The service does not run on this machine at all. */
+  | { kind: "absent"; text: string };
+
+export interface ServiceRow {
+  key: ServiceKey;
+  name: string;
+  description: string;
+  /** "v0.5.2", or null when not reported. */
+  version: string | null;
+  versionNote: string | null;
+  owner: string | null;
+  state: ServiceState;
+}
+
+export type InventoryReport =
+  /** The recovery actor reported, and the agent is connected. */
+  | "reported"
+  /** Nothing from the recovery actor on this connection yet. */
+  | "not_reported"
+  /** The agent says its recovery actor did not answer (`updater_present: false`). */
+  | "not_answering"
+  /** The host is offline; the rows are its last report. */
+  | "offline";
+
+export interface HostServices {
+  report: InventoryReport;
+  /** When the rows were reported: the agent's last `register`. */
+  reportedAt: string | null;
+  rows: ServiceRow[];
+}
+
+export function isOwned(host: Host): boolean {
+  return host.install_mode === "owned";
+}
+
+/**
+ * The agent is on another build than the control plane, and it is not the
+ * `agent_ahead_of_control_plane` fault. ADR 0002 never puts an agent above the
+ * control plane, so the other case is behind. Commit equality is the release
+ * view's own test (`commitsMatch`); no version ordering is re-derived here.
+ */
+export function agentOlderThanControlPlane(
+  host: Host,
+  controlPlaneCommit: string | null,
+  faults: PlatformReleaseFault[],
+): boolean {
+  if (!host.source_commit || !controlPlaneCommit) return false;
+  if (commitsMatch(host.source_commit, controlPlaneCommit)) return false;
+  return !faults.some((f) => f.kind === "agent_ahead_of_control_plane" && f.host_id === host.id);
+}
+
+/** A version reads "v0.5.2"; a non-numeric one ("dev") is shown as sent. */
+export function versionLabel(version: string | null | undefined): string | null {
+  if (!version) return null;
+  return /^\d/.test(version) ? `v${version}` : version;
+}
+
+/** Null for a host that is not owned: its page renders as it always has. */
+export function hostServices(host: Host, opts: { agentOlder: boolean }): HostServices | null {
+  if (!isOwned(host)) return null;
+
+  const actorVersion = host.recovery_actor_version ?? null;
+  const offline = host.status === "offline";
+  const report: InventoryReport =
+    offline && actorVersion
+      ? "offline"
+      : host.updater_present === false
+        ? "not_answering"
+        : actorVersion
+          ? "reported"
+          : "not_reported";
+  const reportedAt = host.last_registered_at;
+  const lastReport = (): ServiceState =>
+    reportedAt ? { kind: "as_of", at: reportedAt } : { kind: "unknown" };
+
+  // The inventory is the recovery actor's report: until it has made one, the
+  // agent's own row waits with the rest, as the mock's "not reported yet" draws it.
+  const actorReported = actorVersion != null;
+
+  const rows: ServiceRow[] = [
+    {
+      key: "seed",
+      name: "Seed",
+      description: "Makes sure the recovery actor exists. Never updated by Quasar.",
+      version: versionLabel(host.seed_version),
+      versionNote: null,
+      owner: null,
+      state: { kind: "unknown" },
+    },
+    {
+      key: "recovery_actor",
+      name: "Recovery actor",
+      description: "Creates, updates and recovers the services on this machine, and itself.",
+      version: versionLabel(actorVersion),
+      versionNote: null,
+      owner: actorReported ? "Quasar" : null,
+      state: !actorReported
+        ? { kind: "unknown" }
+        : offline
+          ? lastReport()
+          : host.updater_present === true
+            ? { kind: "running" }
+            : { kind: "unknown" },
+    },
+    {
+      key: "database",
+      name: "Database",
+      description: "No database runs on a GPU host.",
+      version: null,
+      versionNote: null,
+      owner: null,
+      state: { kind: "absent", text: "none on this machine" },
+    },
+    {
+      key: "control_plane",
+      name: "Control plane",
+      description: "Runs on another machine.",
+      version: null,
+      versionNote: null,
+      owner: null,
+      state: { kind: "absent", text: "not on this machine" },
+    },
+    {
+      key: "node_agent",
+      name: "Node agent",
+      description: "Runs this machine’s GPUs and sessions.",
+      version: actorReported ? versionLabel(host.agent_version) : null,
+      versionNote:
+        actorReported && opts.agentOlder
+          ? "older than the control plane · update from Releases"
+          : null,
+      owner: actorReported ? "Quasar" : null,
+      state: !actorReported ? { kind: "unknown" } : offline ? lastReport() : { kind: "running" },
+    },
+  ];
+
+  return { report, reportedAt, rows };
+}
+
+/** Local 24-hour "13:48", as the mock's "as of" chips and "Last report from" read. */
+export function reportClock(at: string): string {
+  const ms = Date.parse(at);
+  if (!Number.isFinite(ms)) return "";
+  return new Date(ms).toLocaleTimeString(undefined, {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}

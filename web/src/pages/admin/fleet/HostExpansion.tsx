@@ -23,6 +23,7 @@ import {
   updaterHint,
   updaterLabel,
 } from "./hostIdentity";
+import { hostServices } from "./hostServices";
 
 export interface HostExpansionProps {
   host: Host;
@@ -42,6 +43,8 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
   const util = utilisation(host, gpus);
   const storage = storageTotals(host.storage);
   const volumes = host.storage ?? [];
+  // The row carries no control-plane build, so "older" is the host page's to say.
+  const services = hostServices(host, { agentOlder: false });
 
   return (
     <>
@@ -84,6 +87,27 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
           )}
         </div>
 
+        {services && (
+          <div>
+            <div className="eyebrow">Services</div>
+            {services.rows.map((row) => (
+              <Fact
+                key={row.key}
+                label={row.name}
+                value={
+                  row.version ? (
+                    <span className="num">{row.version}</span>
+                  ) : row.state.kind === "absent" ? (
+                    row.state.text
+                  ) : (
+                    "not reported"
+                  )
+                }
+              />
+            ))}
+          </div>
+        )}
+
         <div>
           <div className="eyebrow">Build</div>
           <Fact
@@ -119,8 +143,8 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
           <Fact
             label="Updater"
             value={
-              <span title={updaterHint(host.updater_present)}>
-                {updaterLabel(host.updater_present)}
+              <span title={updaterHint(host.updater_present, host.install_mode)}>
+                {updaterLabel(host.updater_present, host.install_mode)}
               </span>
             }
           />
