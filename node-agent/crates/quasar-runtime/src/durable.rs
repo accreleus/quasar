@@ -26,10 +26,8 @@ impl<T> DurableFile<T> {
             _value: PhantomData,
         }
     }
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-    pub fn temp_path(&self) -> &Path {
+    #[cfg(test)]
+    fn temp_path(&self) -> &Path {
         &self.temp
     }
 }
@@ -183,9 +181,10 @@ mod tests {
             StateLease::acquire(&path),
             Err(LeaseError::Held(_))
         ));
-        assert!(
-            !lease_free_in_another_process(&path),
-            "another process must be refused too"
+        assert_eq!(
+            lease_attempt_in_another_process(&path),
+            Some(CHILD_HELD),
+            "another process must be refused with Held"
         );
 
         drop(first);
@@ -207,8 +206,14 @@ mod tests {
         }
     }
 
-    /// Asks a child process to take the lease; true when it could.
-    fn lease_free_in_another_process(path: &Path) -> bool {
+    /// Exit codes of [`child_tries_the_lease`], one per outcome, so a child that fails
+    /// for any other reason (panic, bad setup) can never read as a refusal.
+    const CHILD_ACQUIRED: i32 = 10;
+    const CHILD_HELD: i32 = 11;
+    const CHILD_OPEN_FAILED: i32 = 12;
+
+    /// Asks a child process to take the lease; its exit code.
+    fn lease_attempt_in_another_process(path: &Path) -> Option<i32> {
         std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
@@ -220,14 +225,18 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap()
-            .success()
+            .code()
     }
 
-    /// Child half of the cross-process check: succeeds only if it acquires the lease.
+    /// Child half of the cross-process check: exits with the code naming its outcome.
     #[test]
     #[ignore = "child process of a_held_lease_refuses_every_other_holder_until_released"]
     fn child_tries_the_lease() {
         let path = std::env::var_os("QUASAR_LEASE_TEST_PATH").unwrap();
-        StateLease::acquire(Path::new(&path)).unwrap();
+        std::process::exit(match StateLease::acquire(Path::new(&path)) {
+            Ok(_) => CHILD_ACQUIRED,
+            Err(LeaseError::Held(_)) => CHILD_HELD,
+            Err(LeaseError::Open(_)) => CHILD_OPEN_FAILED,
+        });
     }
 }

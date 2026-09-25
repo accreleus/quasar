@@ -1,16 +1,22 @@
-//! Bollard types and protocol details stay private to this adapter.
+//! The typed Docker adapter and the seam engine adapters layered on the crate use.
 //!
-//! This module is also the seam for engine adapters layered on the crate (the
-//! agent's application, helper, image and build lifecycles): [`discover`] hands
-//! them a negotiated SDK client and [`classify`] / [`image_error`] turn SDK errors
-//! into [`ErrorKind`]s. Nothing here returns daemon text to a caller.
+//! The crate carries engine discovery and its refusals, registry credentials, error
+//! classification and read-only inspection. Its adapter seam is not Bollard-free:
+//! [`discover`] returns a negotiated `bollard::Docker` and [`classify`] /
+//! [`image_error`] take Bollard errors, so adapters layered on the crate share one
+//! SDK version with it. The mutating typed lifecycles (image pull/ensure, exact removal, and
+//! container create/start/stop/remove for applications, helpers and the legacy sweep) stay in
+//! the agent because they are bound to the agent's journals; the recovery-actor slice extends
+//! this crate with its own mutating adapter.
+//!
+//! Nothing here returns daemon text to a caller.
 use crate::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 pub mod credentials;
 mod inspection;
-pub use inspection::{
-    all_container_image_ids, daemon_images, engine_storage, inspect_container,
-    inspect_image_metadata, live_containers,
+pub use inspection::{all_container_image_ids, daemon_images};
+pub(crate) use inspection::{
+    engine_storage, inspect_container, inspect_image_metadata, live_containers,
 };
 
 pub fn classify(error: Error) -> RuntimeError {

@@ -13,20 +13,12 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "support/source_roots.rs"]
+mod source_roots;
+use source_roots::source_roots;
+
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-/// Every source tree linked into the agent: its own, then the shared runtime crate's
-/// (#355), whose files are reported as `quasar-runtime/<path>`.
-fn source_roots() -> [(PathBuf, &'static str); 2] {
-    [
-        (src_root(), ""),
-        (
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/quasar-runtime/src"),
-            "quasar-runtime/",
-        ),
-    ]
 }
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {

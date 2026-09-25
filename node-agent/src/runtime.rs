@@ -769,6 +769,58 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// The agent's own resolution (`configured()` calls it, not the crate's
+    /// `from_environment`) keeps both refusals: an explicit engine selector, and a
+    /// persisted CLI context with no explicit endpoint.
+    #[test]
+    fn agent_environment_rejects_selectors_and_persisted_cli_context() {
+        if std::env::var_os("QUASAR_RUNTIME_CONTEXT_CHILD").is_some() {
+            assert_eq!(
+                config_from_environment().unwrap_err().kind,
+                ErrorKind::InvalidConfiguration
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"currentContext":"another-engine"}"#,
+        )
+        .unwrap();
+        let no_context = tempfile::tempdir().unwrap();
+        let child = |config: &std::path::Path, selector: Option<(&str, &str)>| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::tests::agent_environment_rejects_selectors_and_persisted_cli_context",
+                ])
+                .env("QUASAR_RUNTIME_CONTEXT_CHILD", "1")
+                .env("DOCKER_CONFIG", config)
+                .env_remove("DOCKER_HOST")
+                .env_remove("DOCKER_CONTEXT")
+                .env_remove("DOCKER_TLS")
+                .env_remove("DOCKER_TLS_VERIFY")
+                .env_remove("DOCKER_API_VERSION");
+            if let Some((key, value)) = selector {
+                command.env(key, value);
+            }
+            command.status().unwrap().success()
+        };
+        assert!(
+            child(dir.path(), None),
+            "a persisted CLI context must be refused"
+        );
+        // No persisted context here, so only the selector refusal can fail resolution.
+        assert!(
+            child(
+                no_context.path(),
+                Some(("DOCKER_CONTEXT", "another-engine"))
+            ),
+            "an explicit engine selector must be refused"
+        );
+    }
+
     #[test]
     fn socket_permission_denial_is_distinct_from_an_unavailable_engine() {
         use std::os::unix::{fs::PermissionsExt, process::CommandExt};

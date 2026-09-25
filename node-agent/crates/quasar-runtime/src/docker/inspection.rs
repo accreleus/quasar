@@ -95,7 +95,7 @@ fn container_inspection(
     })
 }
 
-pub async fn inspect_container(
+pub(crate) async fn inspect_container(
     config: &RuntimeConfig,
     id: &str,
 ) -> Result<Option<crate::ContainerInspection>, RuntimeError> {
@@ -119,7 +119,7 @@ async fn inspect_container_with(
     }
 }
 
-pub async fn live_containers(
+pub(crate) async fn live_containers(
     config: &RuntimeConfig,
 ) -> Result<Vec<crate::ContainerInspection>, RuntimeError> {
     let (docker, _) = discover(config).await?;
@@ -212,7 +212,9 @@ pub async fn all_container_image_ids(config: &RuntimeConfig) -> Result<Vec<Strin
         .collect()
 }
 
-pub async fn engine_storage(config: &RuntimeConfig) -> Result<crate::EngineStorage, RuntimeError> {
+pub(crate) async fn engine_storage(
+    config: &RuntimeConfig,
+) -> Result<crate::EngineStorage, RuntimeError> {
     let (docker, _) = discover(config).await?;
     let root = docker
         .info()
@@ -227,7 +229,7 @@ pub async fn engine_storage(config: &RuntimeConfig) -> Result<crate::EngineStora
     })
 }
 
-pub async fn inspect_image_metadata(
+pub(crate) async fn inspect_image_metadata(
     config: &RuntimeConfig,
     image: &str,
 ) -> Result<Option<crate::ImageMetadata>, RuntimeError> {

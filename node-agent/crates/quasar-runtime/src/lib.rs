@@ -19,6 +19,15 @@
 //!   the rule that proves a container is ours.
 //! - **Durable state.** [`DurableFile`] (write-temp, fsync, rename, fsync parent)
 //!   and [`StateLease`] (a non-blocking exclusive `flock`).
+//!
+//! The crate carries engine discovery and its refusals, registry credentials, error
+//! classification and read-only inspection. Its adapter seam is not Bollard-free:
+//! [`docker::discover`] returns a negotiated `bollard::Docker` and [`docker::classify`] /
+//! [`docker::image_error`] take Bollard errors, so adapters layered on the crate share one
+//! SDK version with it. The mutating typed lifecycles (image pull/ensure, exact removal, and
+//! container create/start/stop/remove for applications, helpers and the legacy sweep) stay in
+//! the agent because they are bound to the agent's journals; the recovery-actor slice extends
+//! this crate with its own mutating adapter.
 
 mod client;
 mod config;
