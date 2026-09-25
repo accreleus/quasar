@@ -183,6 +183,11 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Web design lint, batch B: raw colours into named tokens (#373).** Every hex, `oklch()`,
+  `rgb()` and named colour in the web stylesheets and components now lives in `tokens.css`
+  under a role name and is read through `var(--…)`; each token holds the value it replaced, so
+  nothing renders differently. The `raw-colour-css` and `raw-colour-tsx` baselines are zero,
+  apart from reasoned allows for the brand mark and the artwork-sampled detail scrim.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API

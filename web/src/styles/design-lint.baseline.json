@@ -26,9 +26,6 @@
   "src/components/Drawer.tsx": {
     "inline-style": 3
   },
-  "src/components/QuasarMark.tsx": {
-    "raw-colour-tsx": 4
-  },
   "src/components/ReadinessCard.tsx": {
     "inline-style": 16
   },
@@ -44,14 +41,8 @@
   "src/components/TextField.tsx": {
     "inline-style": 7
   },
-  "src/components/Toast.tsx": {
-    "raw-colour-tsx": 1
-  },
   "src/components/TraceViewer.tsx": {
     "inline-style": 6
-  },
-  "src/components/icons.tsx": {
-    "raw-colour-tsx": 2
   },
   "src/pages/StyleguidePage.tsx": {
     "inline-style": 1
@@ -221,9 +212,6 @@
   "src/pages/admin/streaming/StreamProfileDrawer.tsx": {
     "inline-style": 1
   },
-  "src/pages/app/SessionLoader.css": {
-    "raw-colour-css": 22
-  },
   "src/pages/app/home/DetailBand.tsx": {
     "inline-style": 1
   },
@@ -259,41 +247,5 @@
   },
   "src/pages/styleguide/TypeSection.tsx": {
     "inline-style": 9
-  },
-  "src/styles.css": {
-    "raw-colour-css": 2
-  },
-  "src/styles/admin.css": {
-    "raw-colour-css": 1
-  },
-  "src/styles/admin/audit.css": {
-    "raw-colour-css": 9
-  },
-  "src/styles/admin/editor.css": {
-    "raw-colour-css": 6
-  },
-  "src/styles/base.css": {
-    "raw-colour-css": 4
-  },
-  "src/styles/components.css": {
-    "raw-colour-css": 2
-  },
-  "src/styles/home.css": {
-    "raw-colour-css": 25
-  },
-  "src/styles/hud.css": {
-    "raw-colour-css": 6
-  },
-  "src/styles/login.css": {
-    "raw-colour-css": 10
-  },
-  "src/styles/primitives.css": {
-    "raw-colour-css": 73
-  },
-  "src/styles/session.css": {
-    "raw-colour-css": 1
-  },
-  "src/styles/shell.css": {
-    "raw-colour-css": 14
   }
 }

@@ -254,7 +254,7 @@
   height: clamp(190px, 18vw, 280px);
   border-radius: var(--r-lg);
   border: 1px solid var(--line);
-  background: linear-gradient(160deg, var(--ink-1), oklch(0 0 0) 130%);
+  background: linear-gradient(160deg, var(--ink-1), var(--ovprev-stage-floor) 130%);
   box-shadow: var(--shadow-md), var(--inset-top);
   /* Everything inside is illustrative only (OverlayPreview.tsx sweeps
      aria-hidden + tabindex="-1" onto the embedded strip) — pointer-events:
@@ -317,7 +317,7 @@
   overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
-  background: rgb(0 0 0 / 22%);
+  background: var(--failure-log-bg);
   color: var(--text-3);
   font-size: var(--t-xs);
   line-height: 1.5;

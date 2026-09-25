@@ -368,7 +368,7 @@
   font-family: var(--font-display);
   font-weight: 700;
   font-size: 0.9rem;
-  color: #fff;
+  color: var(--avatar-ink);
   flex: none;
   user-select: none;
 }
