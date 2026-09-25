@@ -261,7 +261,7 @@
       "commands": {
         "must_succeed": {
           "quasar-recovery version": "The binary starts in the image it ships in.",
-          "! grep -q ld-musl /usr/local/bin/quasar-recovery": "Statically linked: the binary names no dynamic loader, so it would run on scratch and never depends on the base image's libc."
+          "! tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | grep -q '^libc[.]musl-'": "Statically linked: the binary does not need the base image's libc (a dynamic alpine binary names libc.musl-<arch>.so.1 as DT_NEEDED; this check finds it in /sbin/apk and /bin/busybox and not in a static build), so it would run on scratch. NULs become newlines because busybox grep stops a line at a NUL."
         }
       },
 
