@@ -20,10 +20,6 @@
    ============================================================ */
 
 .auth-scene {
-  /* The login/loading alias the mock uses for its brightest ink; the app's
-     scale tops out at --text. Local to this surface by design. */
-  --fg-strong: oklch(0.985 0.004 247);
-
   position: relative;
   display: grid;
   place-items: center;
@@ -33,8 +29,8 @@
   isolation: isolate;
   background:
     radial-gradient(circle at 50% 34%, var(--accent-soft), transparent 34%),
-    radial-gradient(circle at 84% 8%, oklch(0.5998 0.2179 273.21/.07), transparent 32%),
-    linear-gradient(150deg, var(--bg), oklch(0.13 0.012 267) 58%, var(--core));
+    radial-gradient(circle at 84% 8%, var(--login-glow), transparent 32%),
+    linear-gradient(150deg, var(--bg), var(--scene-mid) 58%, var(--core));
 }
 
 .auth-scene .stack {
@@ -54,9 +50,9 @@
 .auth-scene .card {
   width: 100%;
   padding: clamp(var(--s6), 3vw, var(--s7));
-  border: 1px solid oklch(0.9618 0.0086 247.91/.16);
+  border: 1px solid var(--login-card-border);
   border-radius: var(--r-feature);
-  background: oklch(0.224 0.018 263/.34);
+  background: var(--login-card-bg);
   box-shadow: var(--shadow-lg);
   backdrop-filter: blur(14px) saturate(130%);
   -webkit-backdrop-filter: blur(14px) saturate(130%);
@@ -134,7 +130,7 @@
   padding: 0 var(--s3);
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
-  background: oklch(0.105 0.01 267/.56);
+  background: var(--login-input-bg);
   color: var(--text);
   font-size: var(--t-base);
   outline: none;
@@ -144,7 +140,7 @@
 }
 
 .auth-scene .input::placeholder {
-  color: oklch(0.6605 0.0265 259.81/.7);
+  color: var(--login-placeholder);
 }
 
 .auth-scene .input:hover {
@@ -196,7 +192,7 @@
    error time — which browsers announce for a role="alert" all the same. */
 .auth-scene .error {
   min-height: 0;
-  color: oklch(0.82 0.12 27);
+  color: var(--danger-text);
   font-size: .7rem;
 }
 
@@ -294,8 +290,8 @@
   width: .95rem;
   height: .95rem;
   flex: none;
-  border: 2px solid oklch(1 0 0/.35);
-  border-top-color: oklch(1 0 0);
+  border: 2px solid var(--login-spin-track);
+  border-top-color: var(--on-accent);
   border-radius: 50%;
   animation: auth-spin 700ms linear infinite;
 }

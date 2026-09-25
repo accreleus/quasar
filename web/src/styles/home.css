@@ -32,14 +32,6 @@
 .home {
   --home-max: 1400px;
 
-  /* Ink that sits ON artwork, so it does not follow the theme: a scrim, a
-     keyline and a caption are dark-on-bright or bright-on-dark against a poster,
-     never against the page surface. */
-  --home-scrim: oklch(0.12 0.01 285 / 0.35);
-  --home-keyline: oklch(0.1365 0.009 285 / 0.92);
-  --home-on-accent: oklch(1 0 0);
-  --home-fnm: oklch(1 0 0 / 0.85);
-
   /* Home runs a wider gutter than the console: 40px (quasar.css) against
      console-v3.css's 32. Each tier is restated because a custom property set
      here shadows tokens.css's :root declarations for everything inside. */
@@ -131,8 +123,8 @@
   background: linear-gradient(
     180deg,
     transparent 82%,
-    oklch(0.5443 0.2453 284.39 / 0.1) 94%,
-    oklch(0.7577 0.1529 231.09 / 0.06)
+    var(--home-sweep-1) 94%,
+    var(--home-sweep-2)
   );
   border-bottom: 1px solid var(--line);
 }
@@ -320,7 +312,7 @@
   background: var(--accent);
   color: var(--home-on-accent);
   box-shadow:
-    0 8px 28px -6px oklch(0.5998 0.2179 273.21 / 0.8),
+    0 8px 28px -6px var(--home-play-glow),
     0 0 0 6px var(--accent-soft-2);
   cursor: pointer;
   opacity: 0;
@@ -648,7 +640,7 @@
   background: var(--accent);
   color: var(--home-on-accent);
   box-shadow:
-    0 8px 28px -6px oklch(0.5998 0.2179 273.21 / 0.8),
+    0 8px 28px -6px var(--home-play-glow),
     0 0 0 6px var(--accent-soft-2);
   cursor: pointer;
   opacity: 0;
@@ -959,16 +951,6 @@
   box-shadow: var(--shadow-lg);
   min-height: 442px;
   display: none;
-
-  /* Ink on artwork: fixed in both themes, since the scrim behind it is. */
-  --d-ink: oklch(0.97 0.006 268);
-  --d-ink-strong: oklch(0.99 0.004 268);
-  --d-ink-2: oklch(0.86 0.012 268);
-  --d-ink-3: oklch(0.74 0.02 268);
-  --d-glass: oklch(1 0 0 / 0.1);
-  --d-glass-hover: oklch(1 0 0 / 0.17);
-  --d-glass-line: oklch(1 0 0 / 0.18);
-  --d-glass-line-hover: oklch(1 0 0 / 0.3);
 }
 .detail.show {
   display: block;
@@ -1004,7 +986,7 @@
   font-family: var(--font-display);
   font-weight: 700;
   font-size: 5rem;
-  color: oklch(1 0 0 / 0.22);
+  color: var(--detail-glyph);
 }
 /* The mock stacks TWO `.hero-art` layers over an app with artwork, so its
    .97/.72/.15 scrim composites twice; these are the resulting alphas. Ported
@@ -1016,9 +998,12 @@
   inset: 0;
   background: linear-gradient(
     90deg,
-    rgba(var(--scrim-rgb, 17, 17, 26), 0.999) 30%,
-    rgba(var(--scrim-rgb, 17, 17, 26), 0.922) 55%,
-    rgba(var(--scrim-rgb, 17, 17, 26), 0.278)
+    /* design-lint-allow raw-colour-css: rgb is sampled from the artwork at runtime (--scrim-rgb) */
+    rgba(var(--scrim-rgb, var(--detail-scrim-rgb-fallback)), 0.999) 30%,
+    /* design-lint-allow raw-colour-css: rgb is sampled from the artwork at runtime (--scrim-rgb) */
+    rgba(var(--scrim-rgb, var(--detail-scrim-rgb-fallback)), 0.922) 55%,
+    /* design-lint-allow raw-colour-css: rgb is sampled from the artwork at runtime (--scrim-rgb) */
+    rgba(var(--scrim-rgb, var(--detail-scrim-rgb-fallback)), 0.278)
   );
 }
 
@@ -1063,7 +1048,7 @@
   align-items: stretch;
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
-  background: oklch(0.16 0.012 285 / 0.55);
+  background: var(--detail-well);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   overflow: hidden;
@@ -1132,7 +1117,7 @@
 /* The band's notes sit on the scrim as well, so they take its ink. */
 .detail .note {
   color: var(--d-ink-2);
-  background: oklch(0.16 0.012 285 / 0.55);
+  background: var(--detail-well);
   border-color: var(--d-glass-line);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -1183,7 +1168,7 @@
 /* Play keeps the accent: it is the one action the band exists for. */
 .detail .d-actions .btn-primary {
   background: var(--action);
-  border-color: oklch(0.72 0.15 273.21 / 0.68);
+  border-color: var(--detail-primary-border);
   color: var(--home-on-accent);
   backdrop-filter: none;
 }
@@ -1448,8 +1433,10 @@
   .detail .hero-art::after {
     background: linear-gradient(
       180deg,
-      rgba(var(--scrim-rgb, 17, 17, 26), 0.922) 20%,
-      rgba(var(--scrim-rgb, 17, 17, 26), 0.999)
+      /* design-lint-allow raw-colour-css: rgb is sampled from the artwork at runtime (--scrim-rgb) */
+      rgba(var(--scrim-rgb, var(--detail-scrim-rgb-fallback)), 0.922) 20%,
+      /* design-lint-allow raw-colour-css: rgb is sampled from the artwork at runtime (--scrim-rgb) */
+      rgba(var(--scrim-rgb, var(--detail-scrim-rgb-fallback)), 0.999)
     );
   }
   .d-specs {

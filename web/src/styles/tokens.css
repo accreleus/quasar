@@ -161,6 +161,167 @@
      touch target, and dense mode is a desk setting with no business shrinking
      a thumb target below the 44px floor. */
   --tabbar-h: 56px;
+
+  /* ---------- COMPONENT COLOURS ----------
+     Theme-invariant: none is redeclared in the light block, and
+     `--light-*` tokens are read only under [data-theme="light"] rules.
+     Hex sources are spelled white, black and rgb(8 8 12), the same sRGB
+     colours, because this file is hex-free (tokens.test.ts). Values are
+     pinned by colour-tokens.test.ts. */
+
+  /* ---------- FIXED INK ---------- */
+  --on-accent: oklch(1 0 0);                  /* text/marks on violet fills */
+  --fg-strong: oklch(0.985 0.004 247);        /* login-v3.html brightest ink */
+  --status-glyph-ink: rgb(8 8 12);            /* glyph on a status-colour disc */
+  --avatar-ink: white;
+
+  /* ---------- CANVAS (base.css body::before) ---------- */
+  --canvas-glow-accent: oklch(0.5998 0.2179 273.21/.11);
+  --canvas-glow-action: oklch(0.5 0.19 273.21/.07);
+  --canvas-glow-accent-light: oklch(0.5998 0.2179 273.21/.09);
+  --canvas-glow-action-light: oklch(0.5 0.19 273.21/.05);
+
+  /* ---------- CHROME (shell.css) ---------- */
+  --topbar-shadow: oklch(0.02 0.01 267/.55);
+  --rail-scrim: oklch(0.02 0.01 267/.55);
+  --nav-hover: oklch(0.9618 0.0086 247.91/.05);
+  --line-faint: oklch(0.9618 0.0086 247.91/.07);  /* rail edge, table row rule */
+  --line-edge: oklch(0.9618 0.0086 247.91/.13);   /* card border, table head rule */
+
+  /* ---------- PRIMITIVES (primitives.css) ---------- */
+  --btn-shadow-near: oklch(0.05 0.01 267/.38);
+  --btn-shadow-far: oklch(0.05 0.01 267/.8);
+  --btn-press-shadow: oklch(0.05 0.01 267/.55);
+  --btn-primary-border: oklch(0.72 0.15 273.21/.68);
+  --btn-primary-border-hover: oklch(0.78 0.13 273.21/.76);
+  --btn-primary-text-shadow: oklch(0.05 0.01 267/.5);
+  --btn-primary-highlight: oklch(0.9618 0.0086 247.91/.2);
+  --btn-primary-lowlight: oklch(0.22 0.1 273.21/.72);
+  --btn-primary-glow: oklch(0.46 0.19 273.21/.8);
+  --btn-danger-border: oklch(0.69 0.19 27/.55);
+  --control-shadow: oklch(0.05 0.01 267/.45);     /* primary drop, switch recess */
+  --card-shadow-near: oklch(0.02 0.01 267/.45);
+  --card-shadow-far: oklch(0.02 0.01 267/.85);
+  --row-hover: oklch(0.9618 0.0086 247.91/.045);
+  --table-expand-seam: oklch(0.02 0.01 267/.5);
+  --status-pulse-fade: oklch(0.76 0.15 164/0);
+  --pop-shadow: oklch(0.05 0.01 267/.72);         /* menus, palette, toast, bulk bar, user menu */
+  --overlay-shadow: oklch(0.05 0.01 267/.76);     /* modal, drawer */
+  --modal-scrim: oklch(0.05 0.01 267/.6);
+  --drawer-scrim: oklch(0.05 0.01 267/.52);
+  --mono-tile-ink: oklch(1 0 0/.85);
+
+  /* ---------- LIGHT-THEME COMPONENT RULES ---------- */
+  --light-btn-bg: oklch(1 0 0/.9);
+  --light-btn-drop: oklch(0.24 0.022 268/.1);
+  --light-btn-primary-border: oklch(0.42 0.19 273.21);
+  --light-btn-primary-border-hover: oklch(0.38 0.19 273.21);
+  --light-btn-primary-highlight: oklch(1 0 0/.24);
+  --light-btn-primary-drop: oklch(0.24 0.022 268/.18);
+  --light-btn-primary-glow: oklch(0.5 0.19 273.21/.7);
+  --light-lift: oklch(1 0 0);                     /* hovered button, selected segment, thumb, active nav */
+  --light-hover-wash: oklch(0.24 0.022 268/.05);
+  --light-hover-fill: oklch(0.24 0.022 268/.06);
+  --light-row-hover: oklch(0.24 0.022 268/.035);
+  --light-table-expand-seam: oklch(0.24 0.022 268/.07);
+  --light-field-bg: oklch(1 0 0/.86);
+  --light-switch-thumb-shadow: oklch(0.24 0.022 268/.3);
+  --light-pop-bg: oklch(0.998 0.002 268/.92);
+  --light-overlay-bg: oklch(0.998 0.002 268/.95);
+  --light-scrim: oklch(0.24 0.022 268/.28);
+  --light-chip-bg: oklch(1 0 0/.8);
+  --light-bar-track: oklch(0.24 0.022 268/.1);
+  --light-chrome-highlight: oklch(1 0 0/.6);
+
+  /* ---------- COVER ART (primitives.css .cv-*, admin editor) ----------
+     Two-stop placeholder gradients; .cv-horizon starts at --accent. */
+  --cover-glyph: oklch(1 0 0 / 0.92);
+  --cover-violet-a: oklch(0.5443 0.2453 284.39);
+  --cover-violet-b: oklch(0.3727 0.1878 282.05);
+  --cover-cyan-a: oklch(0.7577 0.1529 231.09);
+  --cover-cyan-b: oklch(0.4526 0.1106 245.69);
+  --cover-horizon-b: oklch(0.3657 0.1512 273.75);
+  --cover-nebula-a: oklch(0.6054 0.2201 292.20);
+  --cover-nebula-b: oklch(0.7079 0.1770 298.27);
+  --cover-plasma-a: oklch(0.6443 0.1926 256.34);
+  --cover-plasma-b: oklch(0.3612 0.1181 259.70);
+  --cover-rose-a: oklch(0.6861 0.2061 14.99);
+  --cover-rose-b: oklch(0.4033 0.1197 4.83);
+  --editor-frame-ink: oklch(1 0 0 / 0.82);
+  --editor-cand-art: oklch(0.4600 0.1600 285);
+  --editor-cand-ink: oklch(1 0 0 / 0.85);
+
+  /* ---------- ADMIN MISC (components.css, audit.css) ---------- */
+  --ovprev-stage-floor: oklch(0 0 0);
+  --failure-log-bg: rgb(0 0 0 / 22%);
+  /* The audit readout is a console in both appearances: true black,
+     light-on-black controls. */
+  --audit-readout-bg: black;
+  --audit-detail-rule: oklch(0.9618 0.0086 247.91/.1);
+  --audit-detail-shadow: oklch(0 0 0/.95);
+  --audit-btn-ink: oklch(0.9 0.008 250);
+  --audit-btn-hover-bg: oklch(1 0 0/.1);
+  --audit-btn-hover-ink: oklch(1 0 0);
+  --audit-btn-hover-line: oklch(1 0 0/.18);
+
+  /* ---------- PRE-AUTH SCENE (login.css; SessionLoader shares the backdrop) ---------- */
+  --scene-mid: oklch(0.13 0.012 267);
+  --login-glow: oklch(0.5998 0.2179 273.21/.07);
+  --login-card-border: oklch(0.9618 0.0086 247.91/.16);
+  --login-card-bg: oklch(0.224 0.018 263/.34);
+  --login-input-bg: oklch(0.105 0.01 267/.56);
+  --login-placeholder: oklch(0.6605 0.0265 259.81/.7);
+  --login-spin-track: oklch(1 0 0/.35);
+
+  /* ---------- SESSION LOADER (pages/app/SessionLoader.css) ---------- */
+  --loader-glow-corner: oklch(0.5998 0.2179 273.21 / 7%);
+  --loader-hot: white;
+  --loader-glow-1: oklch(0.78 0.16 273);
+  --loader-glow-2: oklch(0.82 0.14 273);
+  --loader-jet-tail: oklch(0.5998 0.2179 273.21 / 60%);
+  --loader-orbit: oklch(0.5998 0.2179 273.21 / 34%);
+  --loader-orbit-b: oklch(0.72 0.12 273 / 16%);
+  --loader-disc-edge: oklch(0.42 0.19 273);
+  --loader-disc-rim: oklch(1 0 0 / 70%);
+  --loader-disc-shade: oklch(0.78 0.14 273 / 30%);
+  --loader-halo: oklch(0.5998 0.2179 273.21 / 30%);
+  --loader-done-line: oklch(0.76 0.15 164 / 45%);
+  --loader-done-bg: oklch(0.76 0.15 164 / 8%);
+  --loader-done-link: oklch(0.76 0.15 164 / 50%);
+
+  /* ---------- SESSION + HUD (styles.css, session.css, hud.css) ---------- */
+  --video-letterbox: black;
+  --session-summon-bg: oklch(0.13 0.012 267 / 0.72);
+  /* The mock's rgba(12,12,18,.74) / .86, in the token colour space. */
+  --hud-glass: oklch(0.13 0.012 267 / 0.74);
+  --hud-glass-open: oklch(0.13 0.012 267 / 0.86);
+  --hud-cover-glyph: oklch(1 0 0 / 0.9);
+  --hud-cover-vignette: oklch(0.09 0.01 267 / 0.45);
+  --hud-toast-bg: oklch(0.13 0.012 267 / 0.8);
+  --hud-banner-bg: oklch(0.13 0.012 267 / 0.9);
+
+  /* ---------- HOME (home.css) ----------
+     Ink that sits on artwork, so it does not follow the theme. */
+  --home-scrim: oklch(0.12 0.01 285 / 0.35);
+  --home-keyline: oklch(0.1365 0.009 285 / 0.92);
+  --home-on-accent: oklch(1 0 0);
+  --home-fnm: oklch(1 0 0 / 0.85);
+  --home-sweep-1: oklch(0.5443 0.2453 284.39 / 0.1);
+  --home-sweep-2: oklch(0.7577 0.1529 231.09 / 0.06);
+  --home-play-glow: oklch(0.5998 0.2179 273.21 / 0.8);
+  --d-ink: oklch(0.97 0.006 268);
+  --d-ink-strong: oklch(0.99 0.004 268);
+  --d-ink-2: oklch(0.86 0.012 268);
+  --d-ink-3: oklch(0.74 0.02 268);
+  --d-glass: oklch(1 0 0 / 0.1);
+  --d-glass-hover: oklch(1 0 0 / 0.17);
+  --d-glass-line: oklch(1 0 0 / 0.18);
+  --d-glass-line-hover: oklch(1 0 0 / 0.3);
+  --detail-glyph: oklch(1 0 0 / 0.22);
+  --detail-well: oklch(0.16 0.012 285 / 0.55);
+  --detail-primary-border: oklch(0.72 0.15 273.21 / 0.68);
+  /* rgb triple for .detail's scrim until heroPalette.ts sets --scrim-rgb. */
+  --detail-scrim-rgb-fallback: 17, 17, 26;
 }
 
 /* ---------- DENSITY ----------
