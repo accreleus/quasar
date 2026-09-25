@@ -56,6 +56,18 @@ pub(super) fn add_audio_chain(
     let audio_resample = gst::ElementFactory::make("audioresample")
         .build()
         .context("audioresample not found")?;
+    // The Opus wire format (`opus/48000/2`), not opusenc's own caps fixation. A passthrough
+    // while the capture sink stays pinned to the same format (`audio::pulse_command`).
+    let audio_raw_caps = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("audio/x-raw")
+                .field("rate", 48_000_i32)
+                .field("channels", 2_i32)
+                .build(),
+        )
+        .build()
+        .context("capsfilter not found")?;
     // Low-delay Opus: 10 ms frames halve per-packet audio latency vs the 20 ms default,
     // restricted-lowdelay drops the codec's algorithmic look-ahead (CELT-only), and CBR
     // keeps the bitrate envelope flat for the congestion controller. Enum-typed properties
@@ -85,6 +97,7 @@ pub(super) fn add_audio_chain(
         &audio_src,
         &audio_convert,
         &audio_resample,
+        &audio_raw_caps,
         &opus_enc,
         &rtp_opus_pay,
         &audio_rtp_capsfilter,
@@ -93,6 +106,7 @@ pub(super) fn add_audio_chain(
         &audio_src,
         &audio_convert,
         &audio_resample,
+        &audio_raw_caps,
         &opus_enc,
         &rtp_opus_pay,
         &audio_rtp_capsfilter,
@@ -109,4 +123,64 @@ fn audio_no_clock() -> bool {
         std::env::var("QUASAR_AUDIO_NO_CLOCK").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::settings::RuntimeSettings;
+    use crate::session::StreamParams;
+
+    fn test_audio_cfg() -> SessionConfig {
+        let settings = RuntimeSettings::baseline_with(&|_| None);
+        let stream = StreamParams {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            bitrate_kbps: 4000,
+            h264_profile: "constrained-baseline".to_string(),
+            codec: crate::session::Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
+        cfg.use_test_audio = true;
+        cfg
+    }
+
+    #[test]
+    fn opus_encoder_input_is_the_wire_format() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let tail = add_audio_chain(&pipeline, &test_audio_cfg()).expect("audio chain builds");
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        pipeline.add(&sink).unwrap();
+        tail.link(&sink).unwrap();
+        let opus_sink_pad = pipeline
+            .iterate_elements()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.factory().is_some_and(|f| f.name() == "opusenc"))
+            .and_then(|e| e.static_pad("sink"))
+            .expect("opusenc in the chain");
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let caps = loop {
+            if let Some(caps) = opus_sink_pad.current_caps() {
+                break caps;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "opusenc never negotiated"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        pipeline.set_state(gst::State::Null).unwrap();
+        let s = caps.structure(0).unwrap();
+        assert_eq!(s.get::<i32>("rate").unwrap(), 48_000);
+        assert_eq!(s.get::<i32>("channels").unwrap(), 2);
+    }
 }

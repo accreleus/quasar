@@ -24,6 +24,15 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+This branch is an edge build for #351 on top of 0.3.0, not a release.
+
+### Fixed
+- **Game audio was resampled twice on its way to the browser (#351).** The session's
+  output sink started at PulseAudio's default 44.1 kHz and could never switch to the game's
+  48 kHz, because the stream capture holds it from session start. Game audio was converted
+  down to 44.1 kHz in 16-bit, then back up to 48 kHz for Opus. The sink is now pinned to
+  48 kHz stereo, and the Opus encoder input is pinned to the same format.
+
 ## 0.3.0 — 2026-09-13
 
 ### Added
