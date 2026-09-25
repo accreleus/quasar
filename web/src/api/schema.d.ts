@@ -4578,6 +4578,73 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/platform/hosts/{id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove an owned GPU host's node agent and recovery actor (admin). NOT YET SERVED - see x-unimplemented.
+         * @description AMENDMENT 14 (#353), authored ahead of the server: `x-unimplemented: true` until the RH06 slice that implements it registers the route and removes the marker (and its entry in the drift test's reviewed allowlist) in the same change. The console's "remove host". Validates, cordons the host exactly as a per-host apply does, with force stops its sessions, then sends agent-api.md host_remove and answers 202 once the recovery actor accepts. It does NOT forget the host: once the host is offline the existing DELETE /v1/hosts/{id} does that, unchanged. A refusal after the cordon puts the host's cordon state back as it was found. Writes no platform_apply_attempts row. Audited as platform.remove.host.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["PlatformHostRemoveRequest"];
+                };
+            };
+            responses: {
+                /** @description Accepted - the host's recovery actor accepted the removal. The host as it stands (cordoned). */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformHostRemoveResponse"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description run_active; attempt_in_flight (both as for apply); host_not_eligible (the body carries `reason`: host_offline or updater_absent); host_not_removable (the host is not owned, or its agent refused because its machine also runs the control plane, or the ack carried another rejection, which the message names); conflict (non-terminal sessions remain and force is false - nothing changed). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description apply_unsupported - no ack within the 10s ack timeout: the agent predates amendment 14 and nothing was removed. */
+                501: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/platform/attempts": {
         parameters: {
             query?: never;
@@ -9355,6 +9422,14 @@ export interface components {
              * @default false
              */
             force: boolean;
+        };
+        /** @description Amendment 14 (#353). The body of POST /v1/admin/platform/hosts/{id}/remove; optional as a whole. */
+        PlatformHostRemoveRequest: {
+            /** @description Optional; absent means false. The same meaning as on the per-host apply - the operator agreeing to end the host's live sessions. False refuses 409 conflict while any non-terminal session remains; true stops them and proceeds. A client MUST name the number of sessions in its confirmation. */
+            force?: boolean;
+        };
+        PlatformHostRemoveResponse: {
+            host: components["schemas"]["Host"];
         };
         PlatformApplyRunEnvelope: {
             run: components["schemas"]["PlatformApplyRun"];
