@@ -1410,10 +1410,24 @@ revision 2 or later (it reads `ENROLLMENT_TOKEN_FILE`). Postgres defaults to the
 created once and never updated by Quasar (#352 R1); later releases change only their default
 for new installs.
 
+**Images from a test registry.** Release trust is a seed input too, recorded at first install
+(the "Recovery actor" table): to install, and later developer-apply, images from a test
+registry, add its namespace and, for a plain-HTTP registry, the registry itself:
+
+```yaml
+      QUASAR_UPDATER_ALLOWED_NAMESPACES: <test-registry>:5000/<namespace>,ghcr.io/accreleus/quasar
+      QUASAR_PLATFORM_INSECURE_REGISTRIES: <test-registry>:5000
+```
+
+The first is what the recovery actor admits a replacement under and what the control plane
+checks a developer apply against; the second lets the control plane read such an image's
+identity over HTTP. The machine's engine pulls the install's own images, so a plain-HTTP
+registry must also be in its `insecure-registries`.
+
 **What an owned control plane does not take.** Beside the inputs above, the settings a
 Compose install passes through `deploy/.env` (a certificate of your own, trusted proxies,
-allowed origins, ICE servers, placement policy, release repository and token, the registry
-allowlists, artwork keys, `PUBLIC_BASE_URL`) have no input on an owned install in this
+allowed origins, ICE servers, placement policy, release repository and token, the catalog
+registry allowlist `QUASAR_IMAGE_REGISTRY_HOSTS`, artwork keys, `PUBLIC_BASE_URL`) have no input on an owned install in this
 release: the control plane runs with its own defaults. The settings the console already
 edits (release channel, host policy, registration, app catalog, stored secrets) stay admin
 settings in the database. `tests/recipe_compose_parity.rs` lists every difference from the
@@ -1514,8 +1528,9 @@ registers as `seed_version`.
 | `QUASAR_DOCKER_SOCKET_HOST_PATH` | `/var/run/docker.sock` | Only when the actor cannot inspect its own container: the daemon-host path of the engine socket it binds into the agent. Normally learned from the actor's own mount. |
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
-| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from, with exactly the updater's rules (see "Updater" below). Read on every start, unlike the machine inputs. A developer apply from a test registry needs that registry's namespace here. |
-| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | as the updater's | ADR 0003 release signatures, verified by the actor exactly as the updater does. A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value stops the start (`token="actor-trust-config-invalid"`). |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from, with exactly the updater's rules (see "Updater" below). **A seed input** (#361): read from the seed's container at first install like the other inputs, checked, and recorded in machine state (`machine.json` `inputs.trust`), which the actor uses from then on; the seed-created actor's own environment holds none (ADR 0007's frozen profile). A developer apply from a test registry needs that registry's namespace here, set on the seed before the first install; `reconfigure` (#366) changes it later. On a control-plane machine the control plane is given the same list (its developer-apply check). A machine installed before these were recorded uses the actor's own environment, as before. |
+| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | as the updater's | ADR 0003 release signatures, verified by the actor exactly as the updater does. Seed inputs recorded at first install, exactly as the allowlist above (machine state wins over the actor's own environment once recorded). A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value refuses the install before anything is created (`token="seed-inputs-invalid"`), or stops a hand-started actor (`token="actor-trust-config-invalid"`). |
+| `QUASAR_PLATFORM_INSECURE_REGISTRIES` | unset | A combined or control-only machine: the plain-HTTP registries (`host[:port]`, comma-separated) its control plane may read a developer apply's image identity from, for a test registry. A seed input, recorded like the allowlist and passed to the control plane. The engine pulling from such a registry needs it in its own `insecure-registries`. |
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
 **NVIDIA detection.** When the device probe finds an NVIDIA render node, the actor asks

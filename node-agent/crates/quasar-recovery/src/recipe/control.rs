@@ -265,6 +265,14 @@ pub(super) fn control_plane_r1(
         ),
         (env::SECRET_KEY_FILE, secret_path(secrets::SECRET_KEY)),
         (env::CONTROL_SOCKET, paths::CONTROL_PLANE_SOCKET.into()),
+        (
+            "QUASAR_UPDATER_ALLOWED_NAMESPACES",
+            inputs.trust.allowed_namespaces.clone().unwrap_or_default(),
+        ),
+        (
+            "QUASAR_PLATFORM_INSECURE_REGISTRIES",
+            inputs.trust.insecure_registries.clone().unwrap_or_default(),
+        ),
         ("LOG_LEVEL", "info".into()),
         ("AUTH_TOKEN_TTL", "24h".into()),
         ("QUASAR_PPROF_ADDR", "127.0.0.1:6060".into()),

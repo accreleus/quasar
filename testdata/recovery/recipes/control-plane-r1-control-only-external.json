@@ -15,6 +15,7 @@
     "QUASAR_DATABASE_SSLMODE": "require",
     "QUASAR_DATABASE_USER": "quasar_app",
     "QUASAR_HTTP_REDIRECT": "auto",
+    "QUASAR_PLATFORM_INSECURE_REGISTRIES": "",
     "QUASAR_PPROF_ADDR": "127.0.0.1:6060",
     "QUASAR_PUBLIC_HOST": "quasar.example.invalid",
     "QUASAR_RECOVERY_CONTROL_SOCKET": "/run/quasar-recovery/control.sock",
@@ -22,13 +23,14 @@
     "QUASAR_TLS": "auto",
     "QUASAR_TLS_ADDR": ":8443",
     "QUASAR_TLS_HOSTS": "",
-    "QUASAR_TLS_REDIRECT_PORT": "8443"
+    "QUASAR_TLS_REDIRECT_PORT": "8443",
+    "QUASAR_UPDATER_ALLOWED_NAMESPACES": ""
   },
   "labels": {
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "control-plane",
     "io.quasar.recipe": "1",
-    "io.quasar.spec": "sha256:490c71d8efb2daeb55c0218d566834ff5559839b2a47abb194e1c356dc28b749"
+    "io.quasar.spec": "sha256:77e151022b10ab13e764348efc5fe938c8f7d6c4ddfb80d48def4d3cee730498"
   },
   "network_mode": "quasar-platform",
   "binds": [

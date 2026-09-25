@@ -284,6 +284,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         },
         control: None,
         socket_dir: None,
+        trust: Default::default(),
     }
 }
 

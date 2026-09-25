@@ -269,6 +269,53 @@ pub struct Inputs {
     /// mounts the whole volume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket_dir: Option<String>,
+    /// This machine's release-trust settings, from the seed at first install.
+    #[serde(default, skip_serializing_if = "TrustInputs::is_empty")]
+    pub trust: TrustInputs,
+}
+
+/// The release-trust settings of a machine (`docs/configuration.md` "Recovery actor"): what
+/// its recovery actor admits platform images under and, on a control-plane machine, what
+/// its control plane checks a developer apply against and reads a test registry over. Kept
+/// as the variables' raw values, which the install checked; an unset one keeps its default.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustInputs {
+    /// `QUASAR_UPDATER_ALLOWED_NAMESPACES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_namespaces: Option<String>,
+    /// `QUASAR_UPDATER_SIGNATURE_MODE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_mode: Option<String>,
+    /// `QUASAR_UPDATER_TRUSTED_KEYS` (public keys).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_keys: Option<String>,
+    /// `QUASAR_UPDATER_MANIFEST_BASE_URL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_base_url: Option<String>,
+    /// `QUASAR_UPDATER_MANIFEST_TIMEOUT_S`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_timeout_s: Option<String>,
+    /// `QUASAR_PLATFORM_INSECURE_REGISTRIES`: the control plane's plain-HTTP registries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_registries: Option<String>,
+}
+
+impl TrustInputs {
+    pub fn is_empty(&self) -> bool {
+        *self == TrustInputs::default()
+    }
+
+    fn values(&self) -> [&Option<String>; 6] {
+        [
+            &self.allowed_namespaces,
+            &self.signature_mode,
+            &self.trusted_keys,
+            &self.manifest_base_url,
+            &self.manifest_timeout_s,
+            &self.insecure_registries,
+        ]
+    }
 }
 
 /// What a combined or control-only machine's control plane is run with.
@@ -525,6 +572,13 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
     }
     if let Some(dir) = &inputs.socket_dir {
         safe_host_path("the socket volume's host path", dir)?;
+    }
+    for value in inputs.trust.values().into_iter().flatten() {
+        if value.contains(['\n', '\r', '\0']) || value.len() > 4096 {
+            return Err(RenderError::Invalid(
+                "a release-trust setting holds a line break or is longer than 4096 bytes".into(),
+            ));
+        }
     }
     if let Some(control) = &inputs.control {
         control::validate(control)?;

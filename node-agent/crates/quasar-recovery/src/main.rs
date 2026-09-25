@@ -214,7 +214,7 @@ fn actor() -> ExitCode {
         }
     };
     let machine_dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
-    let mut config = ActorConfig::new(machine_dir, role, operator);
+    let mut config = ActorConfig::new(machine_dir.clone(), role, operator);
     config.self_container = quasar_runtime::self_inspection::self_container_id();
     config.seed_container = env(profile::SEED_CONTAINER_ENV);
     if let Some(fallback) = env("QUASAR_DOCKER_SOCKET_HOST_PATH") {
@@ -237,7 +237,7 @@ fn actor() -> ExitCode {
         }
     };
     info!(engine = %engine.endpoint(), "engine");
-    match trust_from_env() {
+    match trust_from_env(machine_dir.clone()) {
         Ok((trust, evidence)) => {
             config.trust = trust;
             config.evidence = evidence;
@@ -270,6 +270,14 @@ fn actor() -> ExitCode {
     }
     // A first install learns its role from the seed's inputs; bind what it needs.
     serve_planned(&actor, &mut serving, &stopped);
+    match actor.trust() {
+        Ok(t) => info!(
+            namespaces = ?t.allowed_namespaces,
+            signature_mode = t.signature.mode.as_str(),
+            "release trust in force"
+        ),
+        Err(why) => error!(token = "actor-trust-recorded-invalid", "{why}"),
+    }
 
     if serving.is_empty() {
         return ExitCode::FAILURE;
@@ -318,7 +326,9 @@ type Evidence = Box<dyn Fn(&Request) -> SignatureEvidence + Send + Sync>;
 
 /// The updater's trust knobs, read the way the Go updater reads them
 /// (`docs/configuration.md` "Recovery actor").
-fn trust_from_env() -> Result<(TrustConfig, Evidence), String> {
+/// This start's own settings, which apply only until machine state records the seed's at
+/// install (`Actor::trust`); the fetch's base URL and timeout follow the same rule.
+fn trust_from_env(machine_dir: String) -> Result<(TrustConfig, Evidence), String> {
     let raw = |k: &str| std::env::var(k).unwrap_or_default();
     let allowed_namespaces =
         trust::parse_allowed_namespaces(&raw("QUASAR_UPDATER_ALLOWED_NAMESPACES"));
@@ -343,6 +353,20 @@ fn trust_from_env() -> Result<(TrustConfig, Evidence), String> {
                     error: format!("no runtime to fetch the release assets on: {e}"),
                 }
             }
+        };
+        let recorded = quasar_recovery::machine::MachineDir::new(&machine_dir)
+            .load_machine()
+            .ok()
+            .flatten()
+            .map(|m| m.inputs.trust)
+            .filter(|t| !t.is_empty());
+        let (base, timeout) = match recorded {
+            Some(t) => (
+                trust::parse_manifest_base_url(t.manifest_base_url.as_deref().unwrap_or(""))
+                    .unwrap_or_else(|_| base.clone()),
+                trust::parse_manifest_timeout(t.manifest_timeout_s.as_deref().unwrap_or("")),
+            ),
+            None => (base.clone(), timeout),
         };
         runtime.block_on(fetcher.evidence(&base, req.release.version.as_deref(), timeout))
     });

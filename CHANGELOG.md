@@ -33,7 +33,11 @@ own; the two do not move together, and that is deliberate.
   each container only as files (`QUASAR_DATABASE_PASSWORD_FILE`, `QUASAR_SECRET_KEY_FILE`);
   re-running the seed changes nothing, and an interrupted install completes on the next
   start. Fleet ▸ Releases ▸ Installed shows "This machine": its seed, recovery actor,
-  database (Quasar's own or yours) and control plane.
+  database (Quasar's own or yours) and control plane. Release trust
+  (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, the signature settings, and for the control plane
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES`) is now a seed input recorded in machine state at
+  first install, so a seed-created actor admits a test registry's images; the Compose
+  control-plane service passes the two developer-apply variables through.
 - **Owned GPU hosts take agent updates through their recovery actor, and admins can apply a
   developer build (#360).** On an owned install the agent relays `release_apply` to its
   recovery actor, which journals every phase before acting, keeps the old agent stopped and

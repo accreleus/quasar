@@ -531,3 +531,154 @@ fn the_control_socket_serves_the_machine_and_names_the_control_plane_as_its_call
         .values()
         .all(|c| !c.spec.name.ends_with(".kept")));
 }
+
+const TEST_NAMESPACE: &str = "registry.test.invalid:5000/rh06";
+
+fn agent_replace(id: &str, image: &str) -> quasar_recovery::socket::Request {
+    use quasar_recovery::socket::{Component, Release, Request, RequestKind};
+    Request {
+        request_id: id.into(),
+        kind: RequestKind::Replace,
+        components: vec![Component {
+            name: "node-agent".into(),
+            image: image.into(),
+            digest: format!("sha256:{}", "e".repeat(64)),
+        }],
+        release: Release {
+            id: String::new(),
+            version: None,
+            source_commit: "c".repeat(40),
+        },
+        migrates: false,
+        schema_version: None,
+        external_backup_confirmed: false,
+        dump: None,
+        purge: false,
+        wait_timeout_s: 0,
+    }
+}
+
+/// The seed's trust inputs reach an actor the seed created, whose own environment holds
+/// none (the frozen profile): recorded at first install, used from then on.
+#[test]
+fn release_trust_comes_from_the_seed_at_first_install_and_stays_in_machine_state() {
+    use quasar_recovery::socket::Reason;
+    use quasar_recovery::trust::Caller;
+    let mut env = seed_env();
+    env.insert(
+        "QUASAR_UPDATER_ALLOWED_NAMESPACES".into(),
+        TEST_NAMESPACE.into(),
+    );
+    let engine = Arc::new(FakeEngine::new(seeded_host(env)));
+    let dir = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        seed(&engine, dir.path(), SEED_ID).step(),
+        Outcome::Created { .. }
+    ));
+    let id = engine
+        .state()
+        .container_named(names::RECOVERY_ACTOR)
+        .unwrap()
+        .id
+        .clone();
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let machine = std::fs::read_to_string(dir.path().join("machine.json")).unwrap();
+    assert!(machine.contains(TEST_NAMESPACE), "{machine}");
+
+    // A later start (its own environment still empty) admits the test registry's image...
+    let actor = Arc::new(start(&engine, dir.path(), &id));
+    actor.resume().unwrap();
+    assert_eq!(
+        actor.trust().unwrap().allowed_namespaces,
+        vec![TEST_NAMESPACE]
+    );
+    let accepted = actor.submit(
+        Caller::Agent,
+        agent_replace(
+            "0b7e1d2c-3a4f-4b5c-8d6e-7f8091a2b3c4",
+            &format!("{TEST_NAMESPACE}/quasar-node-agent"),
+        ),
+    );
+    assert!(accepted.is_ok(), "{accepted:?}");
+    actor.wait_attempt();
+    // ... and still refuses anything outside it.
+    let refused = actor
+        .submit(
+            Caller::Agent,
+            agent_replace(
+                "1c8f2e3d-4b5a-4c6d-9e7f-8091a2b3c4d5",
+                "registry.elsewhere.invalid/quasar/quasar-node-agent",
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(refused.reason, Reason::NamespaceRejected);
+}
+
+#[test]
+fn a_machine_whose_seed_named_no_trust_keeps_the_default_allowlist() {
+    use quasar_recovery::socket::Reason;
+    use quasar_recovery::trust::Caller;
+    let engine = Arc::new(FakeEngine::new(seeded_host(seed_env())));
+    let dir = tempfile::tempdir().unwrap();
+    seed(&engine, dir.path(), SEED_ID).step();
+    let id = engine
+        .state()
+        .container_named(names::RECOVERY_ACTOR)
+        .unwrap()
+        .id
+        .clone();
+    let actor = Arc::new(start(&engine, dir.path(), &id));
+    actor.resume().unwrap();
+    let refused = actor
+        .submit(
+            Caller::Agent,
+            agent_replace(
+                "0b7e1d2c-3a4f-4b5c-8d6e-7f8091a2b3c4",
+                &format!("{TEST_NAMESPACE}/quasar-node-agent"),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(refused.reason, Reason::NamespaceRejected);
+}
+
+#[test]
+fn the_control_plane_takes_the_allowlist_and_the_test_registry_from_the_machine() {
+    let mut env = combined_env();
+    env.insert(
+        "QUASAR_UPDATER_ALLOWED_NAMESPACES".into(),
+        TEST_NAMESPACE.into(),
+    );
+    env.insert(
+        "QUASAR_PLATFORM_INSECURE_REGISTRIES".into(),
+        "registry.test.invalid:5000".into(),
+    );
+    let (engine, dir, id) = seeded(env);
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let state = engine.state();
+    let cp = state.container_named(names::CONTROL_PLANE).unwrap();
+    assert_eq!(
+        cp.spec.env["QUASAR_UPDATER_ALLOWED_NAMESPACES"],
+        TEST_NAMESPACE
+    );
+    assert_eq!(
+        cp.spec.env["QUASAR_PLATFORM_INSECURE_REGISTRIES"],
+        "registry.test.invalid:5000"
+    );
+}
+
+#[test]
+fn an_unreadable_trust_input_is_refused_before_anything_is_installed() {
+    let mut env = seed_env();
+    env.insert("QUASAR_UPDATER_SIGNATURE_MODE".into(), "sometimes".into());
+    let engine = Arc::new(FakeEngine::new(seeded_host(env)));
+    let dir = tempfile::tempdir().unwrap();
+    let refused = seed(&engine, dir.path(), SEED_ID).step();
+    assert!(
+        matches!(&refused, Outcome::Idle { why, .. } if why.contains("QUASAR_UPDATER_SIGNATURE_MODE")),
+        "{refused:?}"
+    );
+    assert!(engine
+        .state()
+        .container_named(names::RECOVERY_ACTOR)
+        .is_none());
+}

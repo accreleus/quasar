@@ -5,7 +5,7 @@
 //! accepts inputs its actor would refuse.
 
 use crate::actor::OperatorInputs;
-use crate::recipe::{self, control, ControlInputs, DatabaseInputs, ImageRef, Inputs};
+use crate::recipe::{self, control, ControlInputs, DatabaseInputs, ImageRef, Inputs, TrustInputs};
 use crate::socket::MachineRole;
 
 pub const ROLE: &str = "QUASAR_ROLE";
@@ -28,6 +28,14 @@ pub const DATABASE_USER: &str = "QUASAR_DATABASE_USER";
 pub const DATABASE_NAME: &str = "QUASAR_DATABASE_NAME";
 pub const DATABASE_SSLMODE: &str = "QUASAR_DATABASE_SSLMODE";
 pub const DATABASE_PASSWORD: &str = "QUASAR_DATABASE_PASSWORD";
+
+/// Release trust, read exactly as the updater reads them (`crate::trust`).
+pub const ALLOWED_NAMESPACES: &str = "QUASAR_UPDATER_ALLOWED_NAMESPACES";
+pub const SIGNATURE_MODE: &str = "QUASAR_UPDATER_SIGNATURE_MODE";
+pub const TRUSTED_KEYS: &str = "QUASAR_UPDATER_TRUSTED_KEYS";
+pub const MANIFEST_BASE_URL: &str = "QUASAR_UPDATER_MANIFEST_BASE_URL";
+pub const MANIFEST_TIMEOUT_S: &str = "QUASAR_UPDATER_MANIFEST_TIMEOUT_S";
+pub const INSECURE_REGISTRIES: &str = "QUASAR_PLATFORM_INSECURE_REGISTRIES";
 
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
 pub const DEFAULT_TLS_PORT: u16 = 8443;
@@ -89,6 +97,14 @@ impl Bootstrap {
                 database_name: get(DATABASE_NAME),
                 database_sslmode: get(DATABASE_SSLMODE),
                 database_password: get(DATABASE_PASSWORD),
+                trust: TrustInputs {
+                    allowed_namespaces: get(ALLOWED_NAMESPACES),
+                    signature_mode: get(SIGNATURE_MODE),
+                    trusted_keys: get(TRUSTED_KEYS),
+                    manifest_base_url: get(MANIFEST_BASE_URL),
+                    manifest_timeout_s: get(MANIFEST_TIMEOUT_S),
+                    insecure_registries: get(INSECURE_REGISTRIES),
+                },
             },
         })
     }
@@ -174,8 +190,10 @@ impl Bootstrap {
             devices: Default::default(),
             control: control.as_ref().map(|c| c.inputs.clone()),
             socket_dir: control_here.then(|| "/check".to_string()),
+            trust: op.trust.clone(),
         };
         recipe::validate(&probe).map_err(|e| e.to_string())?;
+        trust_config(&op.trust)?;
         Ok(Checked {
             role: self.role,
             enrollment,
@@ -184,6 +202,7 @@ impl Bootstrap {
             node_name,
             agent_image,
             control,
+            trust: op.trust.clone(),
         })
     }
 
@@ -270,6 +289,24 @@ pub struct Checked {
     pub agent_image: Option<ImageRef>,
     /// Every machine with a control plane.
     pub control: Option<CheckedControl>,
+    pub trust: TrustInputs,
+}
+
+/// The release trust a machine's recorded settings give, parsed as the updater parses its
+/// variables. Fails naming the variable.
+pub fn trust_config(t: &TrustInputs) -> Result<crate::actor::TrustConfig, String> {
+    use crate::trust;
+    let raw = |v: &Option<String>| v.clone().unwrap_or_default();
+    let mode = trust::parse_signature_mode(&raw(&t.signature_mode))
+        .map_err(|e| format!("{SIGNATURE_MODE}: {e}"))?;
+    let keys = trust::parse_trusted_keys(&raw(&t.trusted_keys))
+        .map_err(|e| format!("{TRUSTED_KEYS}: {e}"))?;
+    trust::parse_manifest_base_url(&raw(&t.manifest_base_url))
+        .map_err(|e| format!("{MANIFEST_BASE_URL}: {e}"))?;
+    Ok(crate::actor::TrustConfig {
+        allowed_namespaces: trust::parse_allowed_namespaces(&raw(&t.allowed_namespaces)),
+        signature: trust::SignaturePolicy { mode, keys },
+    })
 }
 
 /// A combined or control-only machine's control-plane inputs.

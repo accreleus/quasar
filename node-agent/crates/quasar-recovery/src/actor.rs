@@ -27,7 +27,7 @@ use crate::machine::{Machine, MachineDir, ServiceRecord, FORMAT};
 use crate::probe;
 use crate::recipe::{
     self, labels, names, paths, secrets, Bind, DatabaseInputs, ImageRef, Inputs, RenderError, Role,
-    SecretMounts,
+    SecretMounts, TrustInputs,
 };
 use crate::seed;
 use crate::socket::{
@@ -67,6 +67,7 @@ pub struct OperatorInputs {
     pub database_name: Option<String>,
     pub database_sslmode: Option<String>,
     pub database_password: Option<String>,
+    pub trust: TrustInputs,
 }
 
 impl std::fmt::Debug for OperatorInputs {
@@ -83,6 +84,7 @@ impl std::fmt::Debug for OperatorInputs {
             .field("public_host", &self.public_host)
             .field("database_host", &self.database_host)
             .field("database_password", &set(&self.database_password))
+            .field("trust", &self.trust)
             .finish_non_exhaustive()
     }
 }
@@ -537,6 +539,19 @@ impl Actor {
         }
     }
 
+    /// The release trust `submit` admits under: the settings machine state recorded at
+    /// install (the seed's), else this start's own (`ActorConfig::trust`), for a machine
+    /// installed before they were recorded.
+    pub fn trust(&self) -> Result<TrustConfig, String> {
+        match self.dir.load_machine() {
+            Ok(Some(m)) if !m.inputs.trust.is_empty() => {
+                crate::bootstrap::trust_config(&m.inputs.trust)
+            }
+            Ok(_) => Ok(self.config.trust.clone()),
+            Err(e) => Err(format!("machine state is unreadable: {e}")),
+        }
+    }
+
     /// The sockets this machine's role serves, as `(path in this container, caller, owner)`.
     /// The role is machine state's, else a first install's inputs, else this start's own.
     pub fn socket_plan(&self) -> Vec<SocketPlan> {
@@ -611,6 +626,7 @@ impl Actor {
             devices: Default::default(),
             control: checked.control.as_ref().map(|c| c.inputs.clone()),
             socket_dir,
+            trust: checked.trust.clone(),
         };
         recipe::validate(&inputs)?;
 
