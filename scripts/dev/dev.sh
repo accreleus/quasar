@@ -6,8 +6,8 @@
 # Usage:
 #   scripts/dev/dev.sh image                 Build the quasar-agent-dev:latest image.
 #   scripts/dev/dev.sh build [dir]           cargo build       (default dir: node-agent)
-#   scripts/dev/dev.sh test  [dir]           cargo test
-#   scripts/dev/dev.sh check [dir]           cargo fmt --check + clippy -D warnings
+#   scripts/dev/dev.sh test  [dir]           cargo test --workspace
+#   scripts/dev/dev.sh check [dir]           cargo fmt --all --check + clippy --workspace -D warnings
 #   scripts/dev/dev.sh cargo <args...>       arbitrary cargo invocation in node-agent
 #   scripts/dev/dev.sh go <args...>          go <args> in control-plane (golang image)
 #   scripts/dev/dev.sh go-check              go build + vet + test in control-plane
@@ -110,7 +110,7 @@ case "$cmd" in
         ;;
     test)
         dir="${1:-node-agent}"
-        in_container "/workspace/$dir" cargo test
+        in_container "/workspace/$dir" cargo test --workspace
         ;;
     bench)
         # SO-03: Criterion micro-benchmarks (e.g. node-agent encode-metrics hot path).
@@ -123,7 +123,7 @@ case "$cmd" in
     check)
         dir="${1:-node-agent}"
         in_container "/workspace/$dir" bash -lc \
-            'cargo fmt --check && cargo clippy --all-targets -- -D warnings'
+            'cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings'
         ;;
     cargo)
         in_container "/workspace/node-agent" cargo "$@"
