@@ -682,3 +682,25 @@ fn an_unreadable_trust_input_is_refused_before_anything_is_installed() {
         .container_named(names::RECOVERY_ACTOR)
         .is_none());
 }
+
+/// Add host (#359) installs on a new GPU host the seed this machine runs and its agent.
+#[test]
+fn the_control_plane_serves_add_host_this_machines_seed_and_agent_images() {
+    let (engine, dir, id) = seeded(combined_env());
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let state = engine.state();
+    let cp = state.container_named(names::CONTROL_PLANE).unwrap();
+    assert_eq!(cp.spec.env["QUASAR_ENROLL_SEED_IMAGE"], ACTOR_IMAGE);
+    assert_eq!(cp.spec.env["QUASAR_ENROLL_AGENT_IMAGE"], AGENT_IMAGE);
+
+    // A control-only machine runs no agent but names the one new hosts install.
+    let mut env = combined_env();
+    env.insert("QUASAR_ROLE".into(), "control-only".into());
+    let (engine, dir, id) = seeded(env);
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let state = engine.state();
+    assert!(state.container_named(names::NODE_AGENT).is_none());
+    assert!(!state.images.contains_key(AGENT_IMAGE));
+    let cp = state.container_named(names::CONTROL_PLANE).unwrap();
+    assert_eq!(cp.spec.env["QUASAR_ENROLL_AGENT_IMAGE"], AGENT_IMAGE);
+}

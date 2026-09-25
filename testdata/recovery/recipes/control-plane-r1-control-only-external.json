@@ -14,6 +14,8 @@
     "QUASAR_DATABASE_PORT": "5433",
     "QUASAR_DATABASE_SSLMODE": "require",
     "QUASAR_DATABASE_USER": "quasar_app",
+    "QUASAR_ENROLL_AGENT_IMAGE": "",
+    "QUASAR_ENROLL_SEED_IMAGE": "",
     "QUASAR_HTTP_REDIRECT": "auto",
     "QUASAR_PLATFORM_INSECURE_REGISTRIES": "",
     "QUASAR_PPROF_ADDR": "127.0.0.1:6060",
@@ -30,7 +32,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "control-plane",
     "io.quasar.recipe": "1",
-    "io.quasar.spec": "sha256:77e151022b10ab13e764348efc5fe938c8f7d6c4ddfb80d48def4d3cee730498"
+    "io.quasar.spec": "sha256:04808c407626c7e66c7a40aa745fb6da6fe061bdcb56503f86bea7ce7fb16b44"
   },
   "network_mode": "quasar-platform",
   "binds": [

@@ -14,6 +14,8 @@
     "QUASAR_DATABASE_PORT": "5432",
     "QUASAR_DATABASE_SSLMODE": "disable",
     "QUASAR_DATABASE_USER": "quasar",
+    "QUASAR_ENROLL_AGENT_IMAGE": "",
+    "QUASAR_ENROLL_SEED_IMAGE": "",
     "QUASAR_HOME_ROOT": "/srv/quasar/homes",
     "QUASAR_HTTP_REDIRECT": "auto",
     "QUASAR_LOCAL_ENROLLMENT_FILE": "/run/quasar-secrets/local-enrollment",
@@ -33,7 +35,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "control-plane",
     "io.quasar.recipe": "1",
-    "io.quasar.spec": "sha256:9cc606afbe48925af01e9f522750ba76d14ce97c6b0c98d5a9688e0070961a29"
+    "io.quasar.spec": "sha256:b8b525215c43a424957151970e64c97a6610515d36f9c7fa1df2e2698a5a4971"
   },
   "network_mode": "quasar-platform",
   "binds": [

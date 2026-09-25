@@ -272,6 +272,27 @@ pub struct Inputs {
     /// This machine's release-trust settings, from the seed at first install.
     #[serde(default, skip_serializing_if = "TrustInputs::is_empty")]
     pub trust: TrustInputs,
+    /// A control-plane machine: the images its Add host gives a new GPU host.
+    #[serde(default, skip_serializing_if = "EnrollImages::is_empty")]
+    pub enroll: EnrollImages,
+}
+
+/// The images a control plane's Add host (#359) installs on a new GPU host, by digest
+/// (`repository@sha256:…`): the seed (this machine's recovery image) and the node agent.
+/// Recorded at install; `None` serves none.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollImages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<ImageRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ImageRef>,
+}
+
+impl EnrollImages {
+    pub fn is_empty(&self) -> bool {
+        *self == EnrollImages::default()
+    }
 }
 
 /// The release-trust settings of a machine (`docs/configuration.md` "Recovery actor"): what

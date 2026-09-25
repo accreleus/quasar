@@ -627,7 +627,18 @@ impl Actor {
             control: checked.control.as_ref().map(|c| c.inputs.clone()),
             socket_dir,
             trust: checked.trust.clone(),
+            enroll: Default::default(),
         };
+        if checked.control.is_some() {
+            // The seed a new GPU host runs is this machine's recovery image.
+            inputs.enroll = recipe::EnrollImages {
+                seed: self
+                    .own_container()?
+                    .and_then(|me| own_image(self.engine.as_ref(), &me))
+                    .and_then(|i| ImageRef::parse(&i.reference()).ok()),
+                agent: checked.enroll_agent_image.clone(),
+            };
+        }
         recipe::validate(&inputs)?;
 
         // Refused here, before anything durable: once machine state exists it wins over

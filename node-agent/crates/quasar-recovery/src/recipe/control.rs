@@ -273,6 +273,24 @@ pub(super) fn control_plane_r1(
             "QUASAR_PLATFORM_INSECURE_REGISTRIES",
             inputs.trust.insecure_registries.clone().unwrap_or_default(),
         ),
+        (
+            "QUASAR_ENROLL_SEED_IMAGE",
+            inputs
+                .enroll
+                .seed
+                .as_ref()
+                .map(ImageRef::reference)
+                .unwrap_or_default(),
+        ),
+        (
+            "QUASAR_ENROLL_AGENT_IMAGE",
+            inputs
+                .enroll
+                .agent
+                .as_ref()
+                .map(ImageRef::reference)
+                .unwrap_or_default(),
+        ),
         ("LOG_LEVEL", "info".into()),
         ("AUTH_TOKEN_TTL", "24h".into()),
         ("QUASAR_PPROF_ADDR", "127.0.0.1:6060".into()),

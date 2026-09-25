@@ -131,7 +131,7 @@ impl Bootstrap {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| {
                         format!(
-                            "{ENROLLMENT} is required to install a GPU host (Admin → Fleet → Enroll host)"
+                            "{ENROLLMENT} is required to install a GPU host (Admin → Fleet → Add host)"
                         )
                     })?;
                 if !enrollment.starts_with("qenr1.") {
@@ -149,11 +149,19 @@ impl Bootstrap {
             (true, None) => return Err(format!("{HOME_ROOT} is required")),
             (_, home) => home.unwrap_or_default(),
         };
+        // A control-only machine runs no agent, but names the one its Add host installs.
+        let named_agent = match op.agent_image.as_deref() {
+            Some(raw) => Some(ImageRef::parse(raw).map_err(|e| format!("{AGENT_IMAGE}: {e}"))?),
+            None if agent_here => {
+                return Err(format!(
+                    "{AGENT_IMAGE}: {}",
+                    ImageRef::parse("").unwrap_err()
+                ))
+            }
+            None => None,
+        };
         let agent_image = if agent_here {
-            Some(
-                ImageRef::parse(op.agent_image.as_deref().unwrap_or(""))
-                    .map_err(|e| format!("{AGENT_IMAGE}: {e}"))?,
-            )
+            named_agent.clone()
         } else {
             None
         };
@@ -191,6 +199,7 @@ impl Bootstrap {
             control: control.as_ref().map(|c| c.inputs.clone()),
             socket_dir: control_here.then(|| "/check".to_string()),
             trust: op.trust.clone(),
+            enroll: Default::default(),
         };
         recipe::validate(&probe).map_err(|e| e.to_string())?;
         trust_config(&op.trust)?;
@@ -203,6 +212,7 @@ impl Bootstrap {
             agent_image,
             control,
             trust: op.trust.clone(),
+            enroll_agent_image: named_agent,
         })
     }
 
@@ -290,6 +300,9 @@ pub struct Checked {
     /// Every machine with a control plane.
     pub control: Option<CheckedControl>,
     pub trust: TrustInputs,
+    /// The agent image a control-plane machine's Add host installs on new GPU hosts: its
+    /// own agent's on a combined host, `QUASAR_AGENT_IMAGE` if named on a control-only one.
+    pub enroll_agent_image: Option<ImageRef>,
 }
 
 /// The release trust a machine's recorded settings give, parsed as the updater parses its
