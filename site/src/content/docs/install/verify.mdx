@@ -25,14 +25,39 @@ Postgres is reachable and migrations applied.
 
 ## 2. The containers are up
 
+{/* TODO(#361): confirm the combined and control-only lists against the owned recipes. */}
+
+Every container Quasar created on a machine carries its installation label:
+
 ```bash
-docker compose -f deploy/docker-compose.yml ps
+docker ps --filter label=io.quasar.installation
 ```
 
-You want four: `quasar-postgres`, `quasar-control-plane`, `quasar-node-agent`
-and `quasar-updater`. The first three should report healthy. The node agent runs
-with host networking, and its image healthcheck reads the local agent health
-endpoint. The updater is what lets the console update this stack later.
+| Machine | You want |
+| --- | --- |
+| Combined host | `quasar-recovery`, `quasar-postgres`, `quasar-control-plane`, `quasar-node-agent` |
+| Control-only host | `quasar-recovery`, `quasar-postgres`, `quasar-control-plane` |
+| GPU host | `quasar-recovery`, `quasar-node-agent` |
+
+Plus the seed, `quasar-seed`, which is yours rather than Quasar's and so has no
+installation label. A database you run yourself means no `quasar-postgres`. All of
+them should report healthy. The node agent runs with host networking, and its
+image healthcheck reads the local agent health endpoint.
+
+The recovery actor lists the same services, with their images and any container
+in the way:
+
+```bash
+docker exec quasar-recovery quasar-recovery status
+```
+
+In the console, each host's **Services on this machine** card shows the same
+inventory with versions.
+
+On a [legacy Compose install](/quasar/install/legacy-compose/) the services are
+Compose services instead: `docker compose -f deploy/docker-compose.yml ps` lists
+`quasar-postgres`, `quasar-control-plane`, `quasar-node-agent` and
+`quasar-updater`.
 
 ## 3. The node agent registered
 
@@ -51,10 +76,14 @@ curl http://127.0.0.1:9091/health
 
 `connected: true` is the important field. It means the agent's WebSocket to the
 control plane is up. If it is false, the agent is running but cannot reach the
-control plane. On a host added from the console, check the `QUASAR_ENROLLMENT`
-string minted from Admin, Fleet, Enroll host: it is single use and expires in an
-hour. On a host configured by hand, check `CONTROL_PLANE_URL`, and the optional
-static `ENROLLMENT_TOKEN` if you use one.
+control plane. On a GPU host, check the `QUASAR_ENROLLMENT` string it was
+installed with: minted from Admin, Fleet, Enroll host, it is single use and
+expires in an hour, so a spent or stale one needs a fresh string. The recovery
+actor hands it to the agent as a file (`QUASAR_ENROLLMENT_FILE`), never as an
+environment variable. On a combined host the agent enrolls with a local token its
+recovery actor generated, and needs nothing from you.
+
+{/* TODO(#359): the one-line command's own message for a spent or expired token, and its regenerate hint. */}
 
 ## 4. The GPU was found, and an encoder with it
 
@@ -99,17 +128,25 @@ launched.
 ## 7. Certificates cover the address you use
 
 If you reach Quasar at `https://192.168.1.50:8443` then the certificate needs to
-name `192.168.1.50`. That comes from `QUASAR_TLS_HOSTS` in `deploy/.env`, set
-before the first boot. If you missed it, or added an address later, see
-[HTTPS and certificates](/quasar/network/https/).
+name `192.168.1.50`. On a legacy Compose install that comes from
+`QUASAR_TLS_HOSTS` in `deploy/.env`, set before the first boot. If you missed it,
+or added an address later, see [HTTPS and certificates](/quasar/network/https/).
+
+{/* TODO(open, raise on #361): where an owned machine's TLS names (QUASAR_TLS_HOSTS) or own certificate are set. */}
 
 A quick check of what is being served:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
+docker exec quasar-control-plane \
   sh -c 'openssl x509 -in /var/lib/quasar-control/tls/cert.pem -noout -text' \
   | grep -A1 'Subject Alternative Name'
 ```
+
+On a legacy Compose install, use `docker compose -f deploy/docker-compose.yml exec quasar-control-plane`
+in place of `docker exec quasar-control-plane`: Compose prefixes its container
+names with the project.
+
+{/* TODO(#361): confirm the TLS state path on the owned control-plane recipe. */}
 
 ## If something failed
 

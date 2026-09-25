@@ -13,11 +13,27 @@ and Windows cannot do that, so media will not work there at all. Any systemd
 distribution with Docker should be fine. Fedora 44 is what the install is
 verified on.
 
-**Docker Engine with Compose v2.30 or newer.** The generated stack uses optional
-environment files, which require this version.
+**Docker Engine**, with Engine API 1.40 or newer (Docker 19.03 and later).
+Quasar creates its own services through the Engine API, so Compose is not
+needed. A stack manager is optional: the seed can be one `docker run` line.
 
-**About 20 GB of disk** for the images, plus room for game containers and save
-data.
+| | Status |
+| --- | --- |
+| Plain Docker Engine on Linux | Supported |
+| Dockge, Arcane | Supported, running the one-service seed stack |
+| A `docker run` seed on Unraid | Supported, as plain Docker |
+| Portainer | Not supported |
+| An Unraid Community Applications template | None ships |
+| Podman, rootless Docker | Not supported |
+| Kubernetes | Not supported |
+
+One Quasar installation per container engine.
+
+{/* TODO(#361): the quick-start script still checks for Compose 2.30 until the generator is rewritten. */}
+{/* TODO(#361): confirm the Engine API floor holds for the control-plane and Postgres recipes (per-service secret volumes are designed for API 1.40). */}
+
+**About 20 GB of disk** for the images on a machine that runs the agent, plus
+room for game containers and save data. A control-only machine needs far less.
 
 <Aside type="caution" title="Fedora's default root volume is too small">
 A stock Fedora install gives the root logical volume 15 GB. Grow it first with
@@ -78,8 +94,8 @@ sudo modprobe uinput
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 ```
 
-The compose file declares the device and the input cgroup rule, so loading the
-module is all you do.
+The agent's container declares the device and the input cgroup rule, so loading
+the module is all you do.
 
 ### One sysctl
 
@@ -91,9 +107,12 @@ sudo sysctl --system
 ```
 
 The quick-start script applies and persists this setting for your selected
-platform; a manual Compose install must configure it on the host. On Unraid, use
-the generated Unraid script, which persists the setting in `/boot/config/go`
-because `/etc` is recreated at boot. The media path sends
+platform. When you start the seed yourself, or from Dockge or Arcane, host
+preparation is yours: set it on the host, and the host's readiness card lists
+anything still missing. On Unraid, use the generated Unraid script, which
+persists the setting in `/boot/config/go` because `/etc` is recreated at boot.
+
+{/* TODO(#359): the one-line command for a GPU host also prints or applies this, the uinput persistence and the app-container AppArmor profile; say so once built. */} The media path sends
 through libnice, which never calls `setsockopt(SO_SNDBUF)`, so its UDP sockets
 inherit the kernel default of 208 KB. A keyframe burst at 8 Mbps overflows that,
 the kernel drops the overflow silently, and the bitrate estimator reads the loss

@@ -187,6 +187,26 @@ proxy that closes idle connections after a minute cuts sessions and drops agents
 
 ## Volumes
 
+On a Quasar-owned machine the recovery actor creates the volumes by fixed name:
+
+| Volume | Contents |
+| --- | --- |
+| `quasar-machine` | Machine state: the machine's inputs, its generated secrets, the record of every update, the last verified shape of each service, the pre-update dumps and the seed's state file. **Never delete it.** |
+| `quasar-recovery-agent` | The socket the agent uses to reach its recovery actor. |
+| `quasar-agent-data` | The agent's node secret and saved identity. |
+| `quasar-node-agent-secrets` | The agent's secrets, such as the enrollment string, written by the recovery actor and mounted read-only. |
+| `quasar-nvidia-driver` | NVIDIA hosts only. Driver userspace provisioned from the running kernel module. |
+| The managed home root | A host bind mount, not a volume. User saves and installed content. |
+
+{/* TODO(#361): add the control plane's and Postgres's volumes (TLS state and artwork, the database, their secret volumes) once #361 names them. */}
+{/* TODO(#366): what `uninstall` keeps (the database volume, machine state, homes) and what `--purge` removes. */}
+
+Removing the seed never removes a volume, and neither does removing a
+container. Uninstalling a machine keeps the database, machine state and homes
+unless you ask for a purge. See [Uninstalling](/quasar/operations/uninstall/).
+
+On a [legacy Compose install](/quasar/install/legacy-compose/):
+
 | Volume | Contents |
 | --- | --- |
 | `quasar-postgres-data` | The database. |

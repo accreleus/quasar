@@ -5,6 +5,9 @@ description: One command on the new machine, minted from the admin console. What
 
 import { Aside } from '@astrojs/starlight/components';
 
+{/* Keep this page's slug: the console's Enroll host dialog links to /install/second-host/ (web/src/pages/admin/fleet/EnrollHostModal.tsx). */}
+{/* TODO(#359): sections 1, 2 and "When it says no" still describe today's served script, which writes an agent-only Compose project. Rewrite them for the seed once #359 lands: the D13 form `curl -fsSL [-k --pinnedpubkey 'sha256//…'] https://<control-plane>/enroll-host.sh | QUASAR_ENROLLMENT='qenr1.…' sudo bash` (no QUASAR_REF), "Enroll host" renamed "Add host", host checks with print-or-apply fixes, the seed started with the string and home root, no compose file, .env or install directory, a re-run that changes nothing, the spent-token message and its regenerate hint, lost identity (mint a new string for the same node name; refused while the old identity is connected), logs via `docker logs quasar-node-agent`. */}
+
 Each host runs one node agent. It reports its GPUs, capacity and readiness to the
 control plane and receives sessions from it. The control plane holds no GPU state, so
 adding a host is enrolling one more agent.
@@ -14,8 +17,10 @@ adding a host is enrolling one more agent.
 On the new machine you need:
 
 - Linux with a GPU whose kernel driver is loaded (`ls /dev/dri` shows a `renderD*` node).
-- Docker Engine and the Compose v2 plugin. The installer does not install Docker.
-- On an NVIDIA host, the NVIDIA Container Toolkit.
+- Docker Engine. The installer does not install Docker.
+- On an NVIDIA host, the NVIDIA Container Toolkit. Quasar asks the engine for
+  the GPU itself and accepts the toolkit however it is wired in: an `nvidia`
+  runtime, CDI, or the toolkit's hook.
 - Root, or a user with passwordless `sudo`. The script never prompts for a password; if
   your `sudo` asks for one, open a root shell first (`sudo -i`) and paste the command
   there.
@@ -83,21 +88,27 @@ and waits until the agent logs that it is enrolled.
 Re-running the command on the same machine updates that one agent. It never starts a
 second one.
 
-## The updater comes with it
+## The recovery actor comes with it
 
-The installer starts two containers, not one: the agent, and `quasar-updater`
-beside it. That second one is what lets this host be updated from the admin
-console later, because a container cannot recreate itself. It is started first
-and deliberately without `depends_on`, so a missing updater image never stops the
-agent — the host works, it just cannot be handed a release.
+What starts on the host is the **seed**, one small container. It creates the
+host's **recovery actor**, and the recovery actor creates the node agent. The
+recovery actor is what lets this host be updated from the admin console later,
+because a container cannot replace itself. It stores the enrollment string as a
+secret file in the host's `quasar-machine` volume and hands it to the agent as a
+file, never as an environment variable.
 
-If the host's drawer under Admin, Fleet, Hosts says its updater is **None**, the
-script said so at the time: either the image could not be pulled or the service
-did not start. Set `QUASAR_UPDATER_IMAGE` in the agent's `.env` and bring the
-service up, then restart the agent — it reads updater presence once, at boot. The
-[Releases tab](/quasar/admin/releases/) shows the exact commands for that host,
-and [Upgrading](/quasar/operations/upgrading/#add-the-updater-to-an-existing-install)
-has the longer version.
+The host's page under Admin, Fleet, Hosts has a **Services on this machine**
+card: the seed, the recovery actor and the node agent, each with its version and
+owner. A seed that reads *not found* has been stopped or removed. Quasar keeps
+running without it, but a deleted recovery actor could then not be re-created,
+so start the seed again.
+
+From the host itself, the recovery actor's status lists the services it created
+and the seed it found:
+
+```bash
+docker exec quasar-recovery quasar-recovery status
+```
 
 ## When it says no
 
@@ -124,24 +135,27 @@ The last line names the reason.
   the usual cause is that the control plane's address in the string is not reachable from
   this machine.
 
-## Manual and air-gapped installs
+If the seed or the recovery actor refuses to install, its log line names the
+reason. [Install and startup
+problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor) lists
+every one.
+
+## Using Dockge or Arcane, or `docker run`
 
 The dialog keeps the bare enrollment string behind **Show the enrollment string**.
-`sh deploy/enroll-host.sh --print-compose` (from any checkout) prints the agent-only
-Compose file and `--print-nvidia-overlay` the NVIDIA overlay. Put them in a directory
-with a `.env` that sets `QUASAR_ENROLLMENT`, `NODE_NAME`, `QUASAR_HOME_ROOT` and
-`QUASAR_AGENT_IMAGE`, and `docker compose up -d`. Every knob the agent reads is in the
-[environment reference](/quasar/reference/environment/).
+With it you can start the seed yourself, as a `docker run` line or a one-service
+stack in Dockge or Arcane. [Install Quasar](/quasar/install/install/#add-a-gpu-host)
+has both. The result is the same host as the command's, without the host
+preparation: the sysctl, `uinput` and the NVIDIA toolkit are then yours, and the
+host's readiness card lists anything still missing.
 
-`--help` lists the knobs the script itself reads, including `QUASAR_RESET_IDENTITY`
-(clear this host's saved agent identity, then enroll from scratch) and `QUASAR_PROJECT`
-— the Compose project name. Compose scopes volume names to it, so it is what selects
-which saved agent identity an install uses: an enrolled host must keep the name it has,
-and a new name is a new identity. It is not a way to run two agents on one machine.
+{/* TODO(#359): the Add host dialog's second tab, "Using Dockge / Arcane? Paste this stack instead", fills in the string and the seed digest; point at it once built. */}
 
-The base `deploy/docker-compose.yml` is not a second-host install: its agent depends on
-the local stack. The service the installer prints and the base file's node-agent service
-are held identical by a test, so a device or mount added to one reaches the other.
+Private or credentialed registries are not supported, so an air-gapped install is
+not covered.
+
+A host added to a [legacy Compose install](/quasar/install/legacy-compose/#adding-a-gpu-host)
+gets that release's agent-only Compose project instead.
 
 ## Storage across hosts
 

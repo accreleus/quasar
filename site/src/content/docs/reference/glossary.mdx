@@ -36,6 +36,12 @@ scheduler. Backed by Postgres. Holds no per-host GPU state.
 **Device.** A browser Quasar has seen a user log in from, along with the decode
 capabilities it measured. Used to avoid sending a codec the client cannot play.
 
+**Developer apply.** An admin applying an arbitrary set of image digests,
+typically a branch build from an allowed registry namespace, to one
+Quasar-owned machine without it being published as a release. It is never
+offered and never unattended, and it follows the same digest, namespace and
+ordering rules as any update.
+
 **Diagnostic bundle.** A bounded window of a session's metrics, events, clock
 alignment and an automated verdict. The thing to attach to a bug report.
 
@@ -51,8 +57,12 @@ library. Granted to everyone or to named users.
 **Enrollment token.** A secret an admin mints in Admin, Fleet, Enroll host to let
 one agent enroll: single use, expiring after an hour, optionally bound to one node
 name, and stored only as a hash. After a successful enrollment the agent uses its
-own stored node secret instead. The older static, deployment-wide
-`ENROLLMENT_TOKEN` is an optional fallback.
+own stored node secret instead. On a combined host the agent uses a single-use
+local token that its recovery actor generates at install. The older static,
+deployment-wide `ENROLLMENT_TOKEN` is an optional fallback on a legacy Compose
+install, and is not used by a Quasar-owned one.
+
+{/* TODO(#367): the static ENROLLMENT_TOKEN is retired; drop the fallback sentence then. */}
 
 **FEC.** Forward error correction. Adds redundancy so lost packets can be
 reconstructed. Off by default and not recommended for browser clients.
@@ -62,8 +72,18 @@ plane first, then every eligible host in sequence. A host that cannot take it is
 skipped, which is not a failure; a target that fails stops the run where it
 stands.
 
+**Floor.** The oldest node-agent and recovery-actor release that a control-plane
+release still manages, published with the release. A host below the floor is not
+failed: it must update before it can be managed, and it is offered only an
+update.
+
 **GOP.** Group of pictures. The interval between keyframes. Defaults to 60
 frames.
+
+**Hand-over.** The recovery actor replacing itself. A successor starts beside
+it, takes over the machine only when the current actor lets go, and verifies
+itself before the old actor is discarded. A successor that never verifies is
+removed and the previous actor restored.
 
 **H.264.** The baseline video codec. Decodes everywhere. Every quality tier ends
 in an H.264 rung.
@@ -82,9 +102,10 @@ placement keeps a user on the host that holds their files.
 **ICE.** The WebRTC mechanism for discovering a network path between two peers.
 A session stuck at "checking" means ICE found no working path.
 
-**Install mode.** How a host got its platform images: from the registry, or built
-from source on the machine. A source-built host can be told about a release but
-not given one.
+**Install mode.** How a host got its platform images: from the registry, built
+from source on the machine, or **owned**, meaning created and replaced by the
+machine's recovery actor. A source-built host can be told about a release but not
+given one.
 
 **Intra refresh.** Replacing periodic keyframes with a rolling wave of
 intra-coded blocks. Vulkan encoder only, and needs a patched image.
@@ -95,6 +116,13 @@ a user picks, and what "1080p60" means in the interface.
 **Library provider.** A source of games that can be discovered automatically.
 Steam is the only one that exists today.
 
+**Machine state.** What the recovery actor keeps on its machine and nowhere
+else, in the `quasar-machine` volume: the machine's install-time inputs, its
+generated secrets, the record of each update in progress, what each service was
+last verified as, the pre-update dumps and the seed's state file. It is what lets
+the recovery actor act while the control plane is down, and it is the one volume
+that must never be deleted.
+
 **Managed home.** A user's persistent directory for one app. Single writer, which
 is why only one session per user per app can run at a time.
 
@@ -103,19 +131,40 @@ compositor and encoder, launches app containers.
 
 **NVENC.** NVIDIA's hardware encoder.
 
+**Owner conflict.** A container on a Quasar-owned machine that looks like a
+Quasar service but does not carry the installation's labels: a leftover Compose
+stack, or a definition a stack manager still holds. The recovery actor never acts
+on it and says so.
+
 **Placement.** Choosing which host runs a session. Governed by
 `QUASAR_PLACEMENT_POLICY`.
 
-**Platform release.** A matched set of Quasar's own images — the control plane
-and the node agent — built from one commit and published together. This is Quasar
-updating Quasar; app catalog images have their own versions entirely.
+**Platform release.** A matched set of Quasar's own images (the control plane, the
+node agent and the recovery actor) built from one commit and published together.
+This is Quasar updating Quasar; app catalog images have their own versions
+entirely. The seed and Postgres are not part of a release.
+
+{/* TODO(#365): the recovery actor joins the release with manifest format 2; until a release ships it, releases carry two components. */}
 
 **Playout buffer.** The client-side jitter buffer. Adapts to how evenly frames
 arrive. Uneven arrival forces a bigger buffer, and the buffer is latency.
 
+**Pre-update dump.** The database dump the recovery actor takes before it
+replaces the control plane with a release that migrates the database, when that
+database is Quasar's own. It is the way back from a failed migration, through one
+printed `restore` command, and the last three are kept on the machine. A
+database you run yourself gets no dump: its backup is yours, and you confirm it
+before the update.
+
 **Presentation interval variation.** The standard deviation of the gap between
 displayed frames. The number that matches perceived stutter. Below 12 ms is
 healthy, above 18 ms is visible.
+
+**Recovery actor.** The Quasar-owned container on each machine that creates and
+replaces that machine's other Quasar services, and replaces itself by a
+hand-over. It exists because a container cannot replace itself, and it is what
+keeps a control plane recoverable while the control plane is down. Its container
+is `quasar-recovery`.
 
 **Release manifest.** The machine-readable description of one stable platform
 release: which component images it contains, by digest, and the commit they were
@@ -126,9 +175,19 @@ disagree.
 Prefer a `/dev/dri/by-path/` name, because the numbered names can move between
 reboots.
 
+**Replacement.** Moving one Quasar service to a new image: stop the old container
+and keep it, start the new one, verify it, then discard the old one, or restore
+the old one if verification fails. One update may replace several services in
+order, the recovery actor first.
+
 **Rung.** One stream profile inside a launch profile.
 
 **Runtime preset.** A reusable container specification several apps can share.
+
+**Seed.** The one container you, or a stack manager such as Dockge or Arcane,
+declare for Quasar on a machine. It only makes sure the machine's recovery actor
+exists, and it is built to stay unchanged for years. Your manager updates it, not
+Quasar, and removing or redeploying it never stops Quasar.
 
 **Session.** One user, one app, one host, one connection.
 
@@ -142,9 +201,10 @@ browser and the GPU host, which means a LAN or a VPN.
 **Stream profile.** One concrete encode rung: codec, resolution, frame rate,
 bitrate and eligibility thresholds. Users never see these.
 
-**Updater.** The per-host actor that pulls a platform release and recreates the
-containers it replaces, because a container cannot recreate itself. It acts only
-when told to, and only on the stack it sits beside.
+**Updater.** On a legacy Compose install, the per-host service that pulls a
+platform release and recreates the containers it replaces, because a container
+cannot recreate itself. It acts only when told to, and only on the stack it sits
+beside. On a Quasar-owned machine the recovery actor does this job instead.
 
 **VA-API.** The video acceleration interface used for AMD and Intel encoding.
 

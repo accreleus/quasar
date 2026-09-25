@@ -5,6 +5,10 @@ description: Certificate warnings, name mismatches, signaling failures, and sess
 
 import { Aside } from '@astrojs/starlight/components';
 
+{/* TODO(open, raise on #361): where an owned machine's TLS names (QUASAR_TLS_HOSTS) are set; this page still says deploy/.env. */}
+
+On a [legacy Compose install](/quasar/install/legacy-compose/), put `docker compose -f deploy/docker-compose.yml exec` or `logs` in place of `docker exec` or `docker logs` in the commands on this page.
+
 ## The browser warns about the certificate
 
 Expected on a default install. Quasar generates its own certificate.
@@ -13,7 +17,7 @@ On a LAN you control, accept it. On anything less trusted, verify the fingerprin
 first, because the first visit is when the founding admin account gets claimed.
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
+docker exec quasar-control-plane \
   sh -c 'openssl x509 -in /var/lib/quasar-control/tls/cert.pem -noout -fingerprint -sha256'
 ```
 
@@ -118,8 +122,8 @@ this should work without host-side configuration.
 Check the resolver is alive:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec quasar-node-agent avahi-daemon --check
-docker compose -f deploy/docker-compose.yml exec quasar-node-agent getent hosts <name>.local
+docker exec quasar-node-agent avahi-daemon --check
+docker exec quasar-node-agent getent hosts <name>.local
 ```
 
 If that is fine, the problem is routing between client and host.

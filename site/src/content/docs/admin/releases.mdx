@@ -8,9 +8,14 @@ import admin_releases from '../../../assets/shots/admin-releases.png';
 import { Aside, Steps } from '@astrojs/starlight/components';
 
 Quasar can update itself. A **platform release** is a matched set of Quasar's own
-images — the control plane, which carries the web app, and the node agent — built
-from one commit and published together. Admin, Fleet, Releases is where you see
-which one you are on, which ones exist, and which of your machines can take one.
+images (the control plane, which carries the web app, the node agent, and the
+recovery actor that replaces them on each machine) built from one commit and
+published together. The seed and Postgres are not part of a release. Admin,
+Fleet, Releases is where you see which one you are on, which ones exist, and
+which of your machines can take one.
+
+{/* TODO(#365): the recovery actor becomes a release component with manifest format 2, which also publishes a floor. Describe the floor and `below_floor` ("must update before it can be managed") here and in Targets once built. */}
+{/* TODO(#367): the Targets reasons, preflight checks and manual recipe below still describe the updater (updater_absent, updater_stack_dir, updater_overlays). Replace them for owned hosts: updater_absent keeps its id but means no recovery actor answered; add owner_conflict (#366) and backup_space (#364). */}
 
 This is Quasar updating Quasar. It has nothing to do with the app catalog's
 images, which have their own versions and their own [rollout
@@ -35,6 +40,11 @@ by the components themselves rather than read from a configuration file.
 - **Control plane** — its version, its commit, the database schema version it is
   on, and when it was built.
 - **Node agents** — how many hosts, and how many have not reported an identity.
+- **This machine**, on a Quasar-owned install: the control plane's own machine,
+  with its install mode, its recovery actor's version and commit, the seed's
+  version, and whether the database is Quasar's own or yours.
+
+{/* TODO(#361, #363): the "This machine" block appears once the control plane's own machine is owned (combined and control-only installs). Check the labels against the built surface. */}
 
 Tagged builds containing the release-version fix report the same release version
 for the control plane and agent. Branch/source builds report `dev`; the agent’s
@@ -150,8 +160,12 @@ A ready host offers **Apply**. What happens, in order:
    skips the wait and names the count, because recreating the agent ends them
    either way. Leave it off and nothing is lost.
 
-3. **The updater on that host pulls the release's digest and recreates the
-   agent.**
+3. **The host's recovery actor replaces the agent.** It pulls the release's
+   digest, stops the old agent and keeps it, stopped and disabled, then starts
+   the new one and waits for it to run and report healthy. On a legacy Compose
+   host the updater recreates the agent instead.
+
+   {/* TODO(#362): the recovery actor moves first inside the attempt: it replaces `[recovery-actor?, node-agent]` in that order, and the first failure stops the rest. */}
 
 4. **The new agent registers**, on the release's commit, which is what resolves
    the attempt as succeeded. The old agent cannot report its own success; it is
@@ -164,12 +178,21 @@ A ready host offers **Apply**. What happens, in order:
 </Steps>
 
 A failed apply records the digests it would have replaced and shows the reason.
-If the new agent never came up, or never became healthy, the updater puts the
-previous digest back by itself: the history shows **Reverted automatically**
-beside the failed apply, and the failure carries the failed container's last log
-lines. A pull that failed changed nothing, and the old agent is still running.
-If the automatic restore also fails, both failures are recorded and the failure
-panel carries the commands to put the host back by hand.
+If the new agent never came up, or never became healthy, the previous one is put
+back by itself: on an owned host the recovery actor removes the new container and
+starts the kept one again, with no pull; on a legacy host the updater restores
+the previous digest. The history shows **Reverted automatically** beside the
+failed apply, and the failure carries the failed container's last log lines. A
+pull that failed changed nothing, and the old agent is still running. If the
+automatic restore also fails, both failures are recorded and the failure panel
+carries the commands to put the host back by hand.
+
+An update interrupted part-way, by a restart of the recovery actor, the engine or
+the machine, is finished by the recovery actor's next start before it does
+anything else. Interrupted before the old agent was touched, it ends as failed
+with the reason `interrupted` and nothing changed. After that point it carries on
+to verification. It is never retried on its own: start a new apply when you are
+ready.
 
 ## Update Quasar
 
@@ -193,6 +216,8 @@ before the control-plane step depends on the release:
   gamble on it. The confirmation's checkbox ends the sessions now instead.
 
 The confirmation tells you which case you are in before you press Update.
+
+{/* TODO(#363): on an owned install the recovery actor on the control plane's machine moves first, then replaces the control plane over the local control socket, and restores it automatically if the new one never becomes healthy on a release with no migration. TODO(#364): a migrating release takes the pre-update dump first, or needs the external-backup confirmation. */}
 
 The control plane then updates itself through the updater beside it,
 and the API and the console go away for roughly twenty seconds. The build that
@@ -221,6 +246,8 @@ beside it, and refuses the run outright when it is source-built or unknown —
 nothing moves before the control plane.
 </Aside>
 
+{/* TODO(#363): on an owned install the control plane learns its install mode from its own machine's recovery actor, over the control socket. */}
+
 ### "Quasar was updated"
 
 An admin tab left open across the control-plane step keeps polling through the
@@ -236,6 +263,8 @@ is an apply aimed backwards: same drain, same confirmation naming the live
 session count, same states, targeting the digests recorded as previous on that
 host's last succeeded update.
 
+{/* TODO(#362, #365): on an owned host a revert replaces `[node-agent, recovery-actor]` in that order, and never goes below the control plane's floor. */}
+
 It is not a version picker. The only thing on offer is the build that host was
 demonstrably running a moment ago, and the confirmation names that digest. A
 revert is itself recorded, so it can be reverted in turn.
@@ -246,6 +275,13 @@ version already applied is the crash loop described under [the hard
 rule](/quasar/operations/upgrading/#the-hard-rule). Agents carry no migrations,
 so they can move back — but never above the control plane's own release.
 </Aside>
+
+## Developer apply
+
+The **Developer apply** card applies a set of image digests to one Quasar-owned
+host without a published release: a contributor's branch build, from an allowed
+registry namespace. It is admin-only and never offered or unattended. See
+[Developer apply](/quasar/operations/upgrading/#developer-apply) for its rules.
 
 ## Install updates automatically
 
@@ -312,8 +348,10 @@ the admin who started it: `platform.apply.host`, `platform.apply.run`,
 
 ## See also
 
-- [Upgrading](/quasar/operations/upgrading/) — the manual recipes, adding the
-  updater to an existing install, and the migration rule.
+- [Upgrading](/quasar/operations/upgrading/): the migration rule, release
+  signatures and developer apply.
+- [Legacy Compose installs](/quasar/install/legacy-compose/): the updater, and
+  the by-hand recipe for a Compose stack.
 - [Jobs and schedules](/quasar/admin/jobs/) — the detection job's schedule.
 - [Environment variables](/quasar/reference/environment/#updates-and-releases) —
   every knob behind this page.

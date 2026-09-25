@@ -1,0 +1,361 @@
+---
+title: Legacy Compose installs
+description: For an install started from the Compose files and an .env file. What keeps working, what it will not be offered, and the commands it still needs.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+{/* TODO(#365): name the first release that ships Quasar-owned installs wherever this page says "that release". */}
+{/* TODO(#367): this page receives the Compose and updater material #367 retires from the other pages; re-check it against the retirement once #367 lands. */}
+
+A **legacy Compose install** is one started from `deploy/docker-compose.yml` and
+`deploy/.env`: the quick start before Quasar owned its own services, or the same
+files copied by hand. Postgres, the control plane, the node agent and
+`quasar-updater` are services in your stack, and the `.env` file holds the
+secrets.
+
+Current releases install differently: one container per machine, the seed, and
+Quasar creates and updates the rest. See [Install Quasar](/quasar/install/install/).
+
+## What happens to a legacy install
+
+- **It keeps running** on the release it has, and everything on this page keeps
+  working.
+- **It is not offered the first release that ships Quasar-owned installs, or any
+  release after it.** A legacy control plane reads a release manifest format that
+  those releases no longer publish. The console shows no new release rather than
+  an error. An install on the `edge` channel likewise stops seeing new builds.
+- **Nothing converts it in place.** The Compose updater and the `.env`-driven
+  install end with the last Compose release.
+
+To move over and keep your data, follow [Move an existing
+install](/quasar/install/move-existing/). Until you do, the rest of this page is
+what the stack still needs.
+
+## The stack directory and `.env`
+
+`deploy/.env` is the only copy of `POSTGRES_PASSWORD`, `QUASAR_SECRET_KEY` and
+the static enrollment token if you set one, and nothing regenerates them. Keep a
+copy off the machine:
+
+```bash
+cp deploy/.env quasar-env-$(date +%Y%m%d).backup
+```
+
+It contains secrets. Store it accordingly. `QUASAR_SECRET_KEY` encrypts
+credentials saved through the admin area. Lose it and those have to be entered
+again.
+
+The stack directory has to survive a reboot. On Unraid the root shell starts in
+`/root`, which is a ramdisk, so a stack created there is gone at the next boot.
+If yours is there, move it (below).
+
+## The updater service
+
+A legacy stack has four services, not three: `quasar-updater` sits beside the
+control plane and the agent so Quasar can update itself from the admin console.
+A container cannot recreate itself, which is why something else has to.
+
+It holds the Docker socket, so it is worth knowing what it will not do. It pulls
+only digests inside `QUASAR_UPDATER_ALLOWED_NAMESPACES` (the project's own
+registry namespace unless you narrow it), and it recreates only the two Quasar
+services in the stack it was started beside, which it discovers from its own
+Compose labels. It builds nothing, runs no arbitrary command, and never touches
+Postgres, your game containers, or anything else on the machine.
+
+`QUASAR_STACK_DIR` in `deploy/.env` must be the stack directory's absolute host
+path. Left unset, the updater refuses to serve and says so, rather than guess at a
+Compose invocation and recreate the wrong project's containers.
+
+<Aside type="tip" title="Podman">
+Set `QUASAR_DOCKER_SOCKET=/run/user/<uid>/podman/podman.sock`. The service
+already ships `security_opt: ["label=disable"]`, without which an
+SELinux-enforcing host refuses every call to the mounted socket.
+</Aside>
+
+Deleting the service from the file is a supported choice on a legacy stack:
+everything else works, the host reports that it has no updater, and you upgrade
+it by hand (below).
+
+### Add the updater to an existing install
+
+An install from before the updater existed shows *No updater is installed beside
+this host's stack* on the Releases tab. Once, on each host:
+
+<Steps>
+
+1. **Get the compose file that declares the service**: pull the checkout, or
+   download `deploy/docker-compose.yml` from your release's tag.
+
+2. **Tell it where the stack lives**, in `deploy/.env`. This must be the stack
+   directory's absolute **host** path: the updater rebuilds its Compose
+   invocation from its own container labels, and those record host paths.
+
+   ```bash
+   echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
+   # Set QUASAR_UPDATER_IMAGE in deploy/.env to the updater image for your release.
+   ```
+
+3. **Bring it up**, touching nothing else.
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+   ```
+
+4. **Confirm the host sees it.** In Admin, Fleet, Hosts, the host drawer's
+   **Updater** row should read *Present*. Restart the agent if it does not: it
+   reads updater presence once, at boot.
+
+</Steps>
+
+### The updater updates itself by hand
+
+It is what applies a release, so it is not one of the images a release moves and
+it is not in the release manifest. Its image is named by tag for that reason.
+Use the updater version published for your release; do not assume a `latest` tag
+exists. Pull and recreate it whenever you like. It holds no state, and an apply
+already in flight finishes regardless.
+
+```bash
+docker compose -f deploy/docker-compose.yml pull quasar-updater
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+```
+
+### Verify release signatures
+
+**Optional, and off unless you turn it on.** What gets installed is always the
+digest the release manifest pins, whether or not anything is signed. A release
+may also publish a detached signature over that manifest, and a host may check it
+before applying anything. Set two variables in that host's `deploy/.env` and
+recreate the updater:
+
+```bash
+QUASAR_UPDATER_SIGNATURE_MODE=verify
+QUASAR_UPDATER_TRUSTED_KEYS=<key-id>:<base64 public key>
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+```
+
+`verify` refuses a release whose signature does not check out, and accepts one
+that publishes no signature. `require` also refuses an unsigned release, and with
+it an **edge** release and a **revert** to a build this instance can no longer
+name, since neither carries a version a manifest could have signed.
+
+Confirm what a host is actually doing, from that host:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec quasar-updater \
+  curl -s --unix-socket /run/quasar-updater/updater.sock http://u/v1/self
+```
+
+`signature_mode`, `trusted_key_ids` and `manifest_source` are in the answer.
+Enabling either mode with no trusted keys refuses **every** update, on purpose.
+
+## Upgrade by hand
+
+For a stack without an updater, or an operator who would rather type the
+commands. The Releases page shows them filled in for the release it offers. Take
+the digests from the release's `platform-release-manifest.json` asset, which lists
+exactly two components, control plane then node agent.
+
+<Steps>
+
+1. **Back up Postgres and `deploy/.env`** (below). An update runs migrations, and
+   migrations only go forward.
+
+2. **Pin the two digests** in `deploy/.env`:
+
+   ```bash
+   QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<control-plane digest>
+   QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<node-agent digest>
+   ```
+
+3. **Pull and recreate those two services.**
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml pull quasar-control-plane quasar-node-agent
+   docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps \
+                  quasar-control-plane quasar-node-agent
+   ```
+
+4. **Verify the result.**
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml ps
+   curl http://localhost:8080/health
+   ```
+
+   Confirm the node agent re-registered under Admin, Fleet, Hosts, then launch a
+   real session.
+
+</Steps>
+
+- **Repeat every `-f` you deploy with.** An NVIDIA host that came up with
+  `-f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml` must pass
+  both files to every command above. An invocation that drops an overlay
+  recreates the containers without it.
+- **Recreating the node agent ends every session on that host.** Drain it first
+  if that matters.
+- **Recreating the control plane runs migrations**, so [the hard
+  rule](/quasar/operations/upgrading/#the-hard-rule) applies from that moment: the
+  digest you just replaced is no longer safe to pin back.
+
+### If your install ever ran a source build
+
+Both control-plane images run as uid 1000. The source-built image used to run as
+root, so on a stack that ever ran it the `quasar-control-tls` volume is owned by
+root, and a published release crash-loops with:
+
+```
+fatal: tls: write TLS key /var/lib/quasar-control/tls/key.pem: permission denied
+```
+
+Nothing is damaged. Give the volume to uid 1000, once:
+
+```bash
+docker volume ls --format '{{.Name}}' | grep quasar-control-tls
+docker run --rm -v <that name>:/t alpine chown -R 1000:1000 /t
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-control-plane
+```
+
+## Back up and restore
+
+Take a database dump before every upgrade:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec -T quasar-postgres \
+  pg_dump -U quasar -Fc quasar > quasar-$(date +%Y%m%d-%H%M).dump
+```
+
+This is also the dump that [Move an existing
+install](/quasar/install/move-existing/) carries into a new install.
+
+To restore into this same stack:
+
+<Steps>
+
+1. **Stop the control plane.** Never restore over a live database.
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml stop quasar-control-plane
+   ```
+
+2. **Restore the dump.**
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml exec -T quasar-postgres \
+     pg_restore -U quasar -d quasar --clean --if-exists --no-owner --no-privileges \
+     --exit-on-error < quasar-20260810-1430.dump
+   ```
+
+3. **Restore `deploy/.env`**, in particular `QUASAR_SECRET_KEY`. A restored
+   database with a different secret key has credentials it cannot decrypt.
+
+4. **Start the control plane** and let it apply any migrations.
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml start quasar-control-plane
+   ```
+
+</Steps>
+
+On each host the updater also leaves `.env.prev` beside `deploy/.env`: the
+environment file exactly as it was before the last apply. It is the fastest way to
+see which digests were replaced on a machine whose history you no longer have.
+
+## Moving an existing stack
+
+Do this if your stack directory is somewhere that will not survive a reboot, and
+it still exists. On Unraid that means anything under `/root`. It is a move, not a
+reinstall: the credentials in `.env` are irreplaceable.
+
+```bash
+cp=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-control-plane')
+old=$(docker inspect "$cp" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}')
+new=/mnt/user/appdata/quasar/deploy     # persistent storage on this host
+
+docker compose -f "$old/docker-compose.yml" down
+install -d -m 0700 "$(dirname "$new")"
+mv "$old" "$new"
+sed -i "s|^QUASAR_STACK_DIR=.*|QUASAR_STACK_DIR=$new|" "$new/.env"
+docker compose -f "$new/docker-compose.yml" up -d
+```
+
+Keep the directory named `deploy`. Compose takes the project name from it, so
+renaming it strands the existing containers and volumes under the old project.
+`down` without `-v` leaves the database and save data alone.
+
+## Recovering a stack written to a ramdisk
+
+If the directory is already gone, the containers are probably still running:
+Docker restarts them from its own state, so the stack looks healthy while
+`docker-compose.yml` and `.env` no longer exist. The next `docker compose` command
+or upgrade is where it surfaces.
+
+**Recover the credentials before stopping or removing anything.** They exist only
+in the running containers now: the control plane holds the secret key and the
+enrollment token, the database password is on Postgres. Address them by service
+label, since container names carry a project prefix.
+
+```bash
+cp=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-control-plane')
+docker inspect "$cp" --format '{{ range .Config.Env }}{{ println . }}{{ end }}' \
+  | grep -E '^(QUASAR_SECRET_KEY|ENROLLMENT_TOKEN)='
+
+pg=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-postgres')
+docker inspect "$pg" --format '{{ range .Config.Env }}{{ println . }}{{ end }}' \
+  | grep -E '^POSTGRES_PASSWORD='
+```
+
+Then rebuild the stack directory **by hand**, on persistent storage, reusing
+those values. Do not generate new credentials: the existing database still
+expects the old password.
+
+1. `install -d -m 0700 /mnt/user/appdata/quasar/deploy`, keeping the directory
+   named `deploy` so the Compose project name is unchanged.
+2. Save the `deploy/docker-compose.yml` from your release's tag into it.
+3. Write `.env` with the **recovered** values, and set `QUASAR_STACK_DIR` to the
+   new absolute path.
+4. `docker compose -f /mnt/user/appdata/quasar/deploy/docker-compose.yml up -d`.
+
+## Adding a GPU host
+
+The one-line command in Admin, Fleet, Enroll host is served by your control plane
+from its own tree, so a legacy control plane keeps installing agent stacks the way
+its release does: an agent-only Compose project in `/opt/quasar-agent`, with the
+agent, the updater and a mode-0600 `.env` holding the enrollment string.
+Re-running it on the same machine updates that one agent.
+
+For a manual install, `sh deploy/enroll-host.sh --print-compose` (from a
+checkout at your release's tag) prints the agent-only Compose file and
+`--print-nvidia-overlay` the NVIDIA overlay. Put them in a directory with a
+`.env` that sets `QUASAR_ENROLLMENT`, `NODE_NAME`, `QUASAR_HOME_ROOT` and
+`QUASAR_AGENT_IMAGE`, and `docker compose up -d`.
+
+## Health and logs
+
+```bash
+docker compose -f deploy/docker-compose.yml ps
+docker compose -f deploy/docker-compose.yml logs -f quasar-control-plane
+docker compose -f deploy/docker-compose.yml logs -f quasar-node-agent
+```
+
+## Stop, and uninstall
+
+Stop, keeping everything:
+
+```bash
+docker compose -f deploy/docker-compose.yml down
+```
+
+Stop and destroy the database, the agent's enrollment secret, the TLS
+certificate and the artwork cache:
+
+```bash
+docker compose -f deploy/docker-compose.yml down -v
+```
+
+<Aside type="danger" title="No confirmation, no undo">
+There is no prompt. This is a plain Docker volume removal. It never touches the
+home root, which is a bind mount, and it leaves `deploy/.env` in place, secrets
+and all. Remove that with `shred -u deploy/.env` when you mean to.
+</Aside>

@@ -28,6 +28,16 @@ shape.
 The web app only ever talks to the control plane. It never contacts a node agent
 directly, even though the video comes from one.
 
+### And one container that installs them
+
+Something has to create those services and replace them on an update, and a
+container cannot replace itself. So each machine also runs Quasar's **recovery
+actor**, which creates that machine's control plane and Postgres, or its node
+agent, or all three, through the Docker Engine API, and replaces itself when it
+is updated. What you start is smaller still: the **seed**, one container whose
+only job is to make sure the recovery actor exists. See [Install
+Quasar](/quasar/install/install/).
+
 ## What happens when you press play
 
 1. The browser asks the control plane for a session.

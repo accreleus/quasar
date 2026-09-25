@@ -5,6 +5,8 @@ description: Quasar generates its own certificate on first boot. How to trust it
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
+{/* TODO(open, raise on #361): QUASAR_TLS_HOSTS, adding a name later and supplying your own certificate all edit deploy/.env and recreate the container. An owned machine has no such file; say where these are set once #361 decides, and move the commands to `docker exec quasar-control-plane`. */}
+
 HTTPS is not optional here. Gamepads, Keyboard Lock and microphone capture all
 need a secure context, so an HTTP-only deployment quietly loses three features.
 

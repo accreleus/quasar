@@ -5,10 +5,16 @@ description: The settings a self-hoster is likely to touch, grouped by what they
 
 import { Aside } from '@astrojs/starlight/components';
 
-Deployment and process settings are supplied through environment variables in
-`deploy/.env`. Instance settings and many host settings are persisted and
-editable through the admin UI; where both exist, the table notes whether the
-environment is a seed, fallback, or authoritative override.
+On a Quasar-owned machine you write only the **seed inputs** below, in the seed's
+`docker run` line or stack. The recovery actor renders every service's settings
+from them and keeps the result in the machine's own state. On a [legacy Compose
+install](/quasar/install/legacy-compose/) or a source checkout, deployment and
+process settings are environment variables in `deploy/.env`. Instance settings
+and many host settings are persisted and editable through the admin UI; where
+both exist, the table notes whether the environment is a seed, fallback, or
+authoritative override.
+
+{/* TODO(open, raise on #361): most control-plane variables on this page (TLS names or own certificate, trusted proxies, the allowed-origins override, placement policy, release repository and token, bootstrap admin, registration mode) have no place on an owned machine in the RH-06 design. Say for each where it is set once #361 decides. */}
 
 Many node agent settings can also be overridden per host from Admin, Fleet, Hosts,
 Settings, which is easier than editing a file on every machine.
@@ -20,7 +26,38 @@ The full catalogue including debug and development settings lives in
 internal or something you should not change without a measurement.
 </Aside>
 
-## Required
+## Seed inputs
+
+What the seed and the recovery actor read, **once**, on a clean machine. After
+the first install the machine's own state wins and later values are ignored, so
+the enrollment string can be removed from the stack. See [Install
+Quasar](/quasar/install/install/).
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_ROLE` | `gpu` | The machine's role: `gpu`, `combined` or `control-only`. |
+| `QUASAR_ENROLLMENT` | required on a GPU host | The single-use `qenr1.…` string from Admin, Fleet, Enroll host. Stored as a secret file and handed to the agent as a file, never as an environment variable. |
+| `QUASAR_HOME_ROOT` | required | Host path of the home root, bound into the agent at the same path. |
+| `QUASAR_TEMPLATE_ROOT` | `/var/lib/quasar/templates` | Host path of the template root. Set it explicitly, as the home root's sibling. |
+| `QUASAR_NODE_NAME` | the machine's host name | The agent's node name. A node name bound into the enrollment string must match. |
+| `QUASAR_AGENT_IMAGE` | required on a machine with an agent | The node-agent image as `repository@sha256:<digest>`. A tag is refused, and so is an image whose container shape this recovery actor does not carry. |
+
+{/* TODO(#361): combined and control-only are refused by the current build; add the inputs #361 fixes (public host, control-plane and Postgres image selection, ports, external-database settings) and whether a control-only machine takes QUASAR_HOME_ROOT and QUASAR_AGENT_IMAGE. */}
+
+The seed itself also needs two mounts, not variables: the engine socket, and the
+`quasar-machine` volume read-only at `/var/lib/quasar-machine`.
+
+### The recovery actor's own settings
+
+The recovery actor pulls platform images only from
+`QUASAR_UPDATER_ALLOWED_NAMESPACES` (default `ghcr.io/accreleus/quasar`) and
+checks release signatures under `QUASAR_UPDATER_SIGNATURE_MODE` and
+`QUASAR_UPDATER_TRUSTED_KEYS`, with the same rules as the legacy updater below.
+Unlike the seed inputs, it reads these on every start.
+
+{/* TODO(#361): a seed-created actor gets only the frozen profile's environment, so these cannot be set on it today (found in #360's live run). #361 is to read them from the seed at first install and keep them in machine state; #366's reconfigure changes them later. Document how once built. */}
+
+## Required on a legacy Compose install
 
 | Variable | Notes |
 | --- | --- |
@@ -160,7 +197,10 @@ value that used to be hardcoded. Do not change them without a measurement.
 
 ## Updates and releases
 
-The updater service, on every host that has one:
+On a [legacy Compose install](/quasar/install/legacy-compose/), the updater
+service, on every host that has one:
+
+{/* TODO(#367): the updater and these rows retire with #367. */}
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
