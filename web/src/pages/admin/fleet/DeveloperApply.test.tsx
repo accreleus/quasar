@@ -28,6 +28,8 @@ const PF: PlatformPreflight = { state: "unknown", checked_at: null, checks: [] }
 const COMMIT = "a".repeat(40);
 const NA_DIGEST = "sha256:" + "c05a".repeat(16);
 const NA = `registry.example.invalid:5000/quasar-dev/quasar-node-agent@${NA_DIGEST}`;
+const RA_DIGEST = "sha256:" + "9b3e".repeat(16);
+const RA = `registry.example.invalid:5000/quasar-dev/quasar-recovery@${RA_DIGEST}`;
 
 function host(over: Partial<PlatformHostIdentity>): PlatformHostIdentity {
   return {
@@ -151,14 +153,32 @@ describe("Developer apply", () => {
     expect(applyButton(drawer)).toBeDisabled();
   });
 
-  it("withholds the recovery actor until the actor can replace itself", async () => {
+  it("offers the recovery actor beside the node agent", async () => {
     mocked.getPlatformReleases.mockResolvedValue(view(MIXED));
+    mocked.developerApply.mockResolvedValue({ attempt: {} as PlatformApplyAttempt });
     renderTab();
     const drawer = await openDrawer();
 
     const ra = within(drawer).getByLabelText("Recovery actor");
-    expect(ra).toBeDisabled();
-    expect(ra).toHaveAttribute("placeholder", "arrives with #362");
+    expect(ra).toBeEnabled();
+    expect(ra).toHaveAttribute("placeholder", "namespace/quasar-recovery@sha256:…");
+    fireEvent.change(within(drawer).getByLabelText("Node agent"), { target: { value: NA } });
+    fireEvent.change(ra, { target: { value: RA } });
+    fireEvent.click(applyButton(drawer));
+
+    await waitFor(() => expect(mocked.developerApply).toHaveBeenCalledTimes(1));
+    expect(mocked.developerApply.mock.calls[0][1].components).toEqual([
+      {
+        name: "recovery-actor",
+        image: "registry.example.invalid:5000/quasar-dev/quasar-recovery",
+        digest: RA_DIGEST,
+      },
+      {
+        name: "node-agent",
+        image: "registry.example.invalid:5000/quasar-dev/quasar-node-agent",
+        digest: NA_DIGEST,
+      },
+    ]);
   });
 
   it("posts only the filled images, split into repository and digest", async () => {
@@ -266,5 +286,47 @@ describe("Developer apply", () => {
 
     const row = await screen.findByText((_, el) => el?.textContent === "Developer apply · Updated");
     expect(row).toBeInTheDocument();
+  });
+
+  it("names each component of an attempt that moved the recovery actor first", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view(MIXED));
+    const attempt = (id: string, requested: { name: string; digest: string }[]) =>
+      ({
+        id,
+        run_id: null,
+        kind: "apply",
+        target: "host",
+        host_id: "h1",
+        node_name: "gpu-host-2",
+        release_id: null,
+        requested_digests: requested.map((c) => ({ ...c, image: "img" })),
+        previous_digests: requested.map((c) => ({
+          name: c.name,
+          digest: "sha256:" + "1111".repeat(16),
+        })),
+        state: "succeeded",
+        reason: null,
+        sessions_remaining: null,
+        force: false,
+        output: "",
+        requested_by: "u1",
+        created_at: "2026-09-25T11:00:00Z",
+        started_at: null,
+        finished_at: null,
+      }) as PlatformApplyAttempt;
+    mocked.listPlatformAttempts.mockResolvedValue({
+      attempts: [
+        attempt("a1", [
+          { name: "recovery-actor", digest: RA_DIGEST },
+          { name: "node-agent", digest: NA_DIGEST },
+        ]),
+        attempt("a2", [{ name: "recovery-actor", digest: RA_DIGEST }]),
+      ],
+    });
+    renderTab();
+
+    expect(await screen.findByText(/^Recovery actor 111111111111/)).toBeInTheDocument();
+    expect(screen.getByText(/^Node agent 111111111111/)).toBeInTheDocument();
+    expect(screen.getByText("Recovery actor · gpu-host-2")).toBeInTheDocument();
   });
 });

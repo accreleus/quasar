@@ -1205,7 +1205,7 @@ func (f *FleetRunner) hostPhase(ctx context.Context, run ApplyRun) bool {
 				"could not record the scheduling state of "+nodeName(t)+" before updating it")
 			return false
 		}
-		attempt, err := f.createHostAttempt(ctx, run, hostID)
+		attempt, err := f.createHostAttempt(ctx, run, hostID, view)
 		if errors.Is(err, ErrAttemptInFlight) {
 			// The run is not applying to this host after all: another attempt
 			// owns it, and owns its scheduling state too. Undo what the step
@@ -1295,7 +1295,7 @@ func (f *FleetRunner) createControlPlaneAttempt(ctx context.Context, run ApplyRu
 	})
 }
 
-func (f *FleetRunner) createHostAttempt(ctx context.Context, run ApplyRun, hostID string) (Attempt, error) {
+func (f *FleetRunner) createHostAttempt(ctx context.Context, run ApplyRun, hostID string, view View) (Attempt, error) {
 	release, err := f.store.Release(ctx, run.ReleaseID)
 	if err != nil {
 		return Attempt{}, err
@@ -1304,6 +1304,8 @@ func (f *FleetRunner) createHostAttempt(ctx context.Context, run ApplyRun, hostI
 	if err != nil {
 		return Attempt{}, err
 	}
+	// ADR 0008: the host's recovery actor first, when it is not on the release.
+	components = OrderHostComponents(components, release.SourceCommit, hostIdentity(view, hostID), controlPlaneMachineUnknown)
 	if len(components) == 0 {
 		return Attempt{}, fmt.Errorf("release %s names no node-agent image", releaseLabel(release))
 	}

@@ -25,6 +25,15 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
+  machine to a successor: it starts beside the running actor, takes the machine's lease only
+  when it is handed over, keeps the old actor stopped and disabled until it has verified
+  itself, and only then becomes the actor `seed.json` names. A successor that never verifies
+  is removed and the previous actor runs again (`failed`, restored); every crash, engine
+  restart or deletion part-way settles to a stated outcome with one actor running. Host
+  attempts move the actor first and the agent second (a revert the other way round), a later
+  failure restores only the agent, the agent re-registers so the console shows the new actor
+  version, and Developer apply now accepts a recovery-actor digest.
 - **Owned GPU hosts take agent updates through their recovery actor, and admins can apply a
   developer build (#360).** On an owned install the agent relays `release_apply` to its
   recovery actor, which journals every phase before acting, keeps the old agent stopped and

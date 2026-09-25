@@ -17,7 +17,7 @@ pub(crate) mod unix_http;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -121,6 +121,10 @@ pub struct ReleaseManager {
     /// [`UNREACHABLE_AFTER`] in millis, overridable so tests do not sleep for
     /// three minutes to observe a timeout.
     unreachable_after_ms: AtomicU64,
+    /// Set just before the terminal state of an apply that replaced the recovery actor
+    /// under this still-connected agent (amendment 14, §register): the connection closes
+    /// once it has forwarded that state and re-dials, so `register` carries the new actor.
+    redial: AtomicBool,
 }
 
 /// Detaches the upstream sender on every connection-end path, so a poller
@@ -157,7 +161,29 @@ impl ReleaseManager {
             upstream: RwLock::new(None),
             inflight: Mutex::new(None),
             unreachable_after_ms: AtomicU64::new(UNREACHABLE_AFTER.as_millis() as u64),
+            redial: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the connection should re-dial now that it forwarded a terminal
+    /// `release_state` (see `redial`). Consumed by the call.
+    pub fn take_redial(&self) -> bool {
+        self.redial.swap(false, Ordering::SeqCst)
+    }
+
+    /// The recovery actor answering now is not the one this agent registered: an apply
+    /// named `recovery-actor` and the actor moved.
+    fn actor_replaced(&self, res: &UpdaterResult) -> bool {
+        if !matches!(self.actor, Actor::Recovery)
+            || !res.components.iter().any(|c| c.name == "recovery-actor")
+        {
+            return false;
+        }
+        let now = crate::buildinfo::discover_owned(&self.socket);
+        let registered = crate::buildinfo::install_facts();
+        now.updater_present == Some(true)
+            && (now.recovery_actor_source_commit != registered.recovery_actor_source_commit
+                || now.recovery_actor_version != registered.recovery_actor_version)
     }
 
     fn appliable(&self) -> &'static [&'static str] {
@@ -404,6 +430,9 @@ impl ReleaseManager {
                         if last.as_deref() != Some(res.state.as_str()) {
                             last = Some(res.state.clone());
                             info!("release apply {request_id}: {}", res.state);
+                            if terminal && mgr.actor_replaced(&res) {
+                                mgr.redial.store(true, Ordering::SeqCst);
+                            }
                             mgr.send_blocking(res.into_msg());
                         }
                         if terminal {

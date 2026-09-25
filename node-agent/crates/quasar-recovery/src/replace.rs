@@ -450,8 +450,16 @@ impl Actor {
         let old = self
             .retrying(|| self.engine.inspect_container(role.container_name()))
             .map_err(|e| engine(e, Reason::RecreateFailed, "inspect the running container"))?;
+        let itself = |c: &Container| {
+            role == Role::RecoveryActor
+                && self
+                    .config
+                    .self_container
+                    .as_deref()
+                    .is_some_and(|me| same_container(me, &c.id))
+        };
         if let Some(old) = &old {
-            if !self.is_ours(&machine, old, role) {
+            if !itself(old) && !self.is_ours(&machine, old, role) {
                 return Err(fail(
                     Reason::OwnerConflict,
                     format!(

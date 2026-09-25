@@ -343,6 +343,17 @@ needing a human (successor cannot start at all after the old one was stopped) is
 printed one-line fix and by the seed, which re-creates an actor from `seed.json`'s verified
 digest if none exists.
 
+*Implementation note (#362):* the hand-over is the recovery-actor component of an ordinary
+attempt journal (`quasar-recovery` `handover.rs`); its settle table is per party (old actor,
+successor, or an actor the seed re-created after every actor container was removed) in
+`settle.rs`. The successor's self-check covers the engine, machine state and the journal;
+its verification is answering `GET /v1/status` on its own agent socket with its container
+running (an agent `hello` is not built). A successor restarted three times without
+verifying hands the machine back. The successor keeps the running actor's
+`QUASAR_UPDATER_*`, `QUASAR_SEED_CONTAINER` and `RUST_LOG`, so a hand-over never resets a
+machine's trust configuration. An actor that cannot take the lease waits for it. Every
+machine state a hand-over leaves is a seed fixture (`testdata/recovery/seed/actors/rh06-10`).
+
 ### 5.7 The seed
 
 - `quasar-recovery seed`: every 30 s, if `seed.json` says `uninstalled`, log and idle; if a

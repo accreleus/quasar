@@ -57,6 +57,7 @@ type applyStore interface {
 	SetPreviousDigests(ctx context.Context, attemptID string, previous []PreviousDigest) error
 	CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error)
 	OpenHostAttempt(ctx context.Context, hostID string) (Attempt, string, error)
+	HostActorCommit(ctx context.Context, hostID string) (*string, error)
 	OpenAttempts(ctx context.Context) ([]Attempt, error)
 	TerminalStandaloneAttemptsWithOwnedHolds(ctx context.Context) ([]Attempt, error)
 	Release(ctx context.Context, id string) (Release, error)
@@ -690,14 +691,26 @@ func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep Relea
 	if failed.Kind != KindApply && failed.Kind != KindDeveloperApply {
 		return
 	}
-	requested := restoredDigests(failed.RequestedDigests, rep.Previous)
+	restored := failed.RequestedDigests
+	if len(restored) > 1 && failed.HostID != nil {
+		// The restored agent registered before relaying this, so the host's
+		// recorded actor is the one serving now.
+		onWant := false
+		if want := r.attemptCommit(ctx, failed); want != "" {
+			if actor, err := r.store.HostActorCommit(ctx, *failed.HostID); err == nil && actor != nil {
+				onWant = commitsMatch(want, *actor)
+			}
+		}
+		restored = restoredComponents(restored, onWant)
+	}
+	requested := restoredDigests(restored, rep.Previous)
 	if len(requested) == 0 {
 		r.log.Warn("release_state says restored but named no previous digest; no auto_revert recorded",
 			"attempt_id", failed.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-revert-unrecorded")
 		return
 	}
-	previous := make([]PreviousDigest, 0, len(failed.RequestedDigests))
-	for _, c := range failed.RequestedDigests {
+	previous := make([]PreviousDigest, 0, len(restored))
+	for _, c := range restored {
 		d := c.Digest
 		previous = append(previous, PreviousDigest{Name: c.Name, Digest: &d})
 	}
@@ -712,6 +725,52 @@ func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep Relea
 	}
 	r.log.Warn("apply automatically reverted by the updater", "attempt_id", failed.ID,
 		"auto_revert_id", row.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-reverted")
+}
+
+// attemptCommit is the commit an attempt moves its host to: its release's, or a
+// developer apply's images'. Empty when neither can be named.
+func (r *Runner) attemptCommit(ctx context.Context, a Attempt) string {
+	if a.ReleaseID != nil {
+		if rel, err := r.store.Release(ctx, *a.ReleaseID); err == nil {
+			return rel.SourceCommit
+		}
+	}
+	if a.Kind == KindDeveloperApply {
+		if ev, err := r.developerCommit(ctx, a); err == nil {
+			return ev.commit
+		}
+	}
+	return ""
+}
+
+// names reports whether an attempt's components include `name`.
+func names(components []ComponentDigest, name string) bool {
+	for _, c := range components {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// namesOnly reports whether `name` is the attempt's only component.
+func namesOnly(components []ComponentDigest, name string) bool {
+	return len(components) == 1 && components[0].Name == name
+}
+
+// restoredComponents is the one component a failed, restored attempt put back
+// (ADR 0004 amendment, "one service per failure"): components are replaced in
+// order and the first failure stops the sequence, so it is the first one not on
+// the requested commit. `actorOnWant` is whether the host's recovery actor reports
+// the attempt's commit now; the wire names no per-component outcome.
+func restoredComponents(requested []ComponentDigest, actorOnWant bool) []ComponentDigest {
+	if len(requested) > 1 && requested[0].Name == ComponentRecovery && actorOnWant {
+		return requested[1:2]
+	}
+	if len(requested) > 1 {
+		return requested[:1]
+	}
+	return requested
 }
 
 // restoredDigests pairs the failed apply's components with the previous digests
@@ -748,6 +807,11 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 	if sourceCommit == nil || *sourceCommit == "" {
 		return
 	}
+	// Amendment 14: a request naming only the recovery actor never replaced the
+	// agent, so its register proves nothing; the relayed terminal state decides.
+	if namesOnly(a.RequestedDigests, ComponentRecovery) {
+		return
+	}
 	if wantCommit == "" && a.Kind == KindDeveloperApply {
 		ev, err := r.developerCommit(ctx, a)
 		if err != nil {
@@ -764,7 +828,12 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 	}
 	if wantCommit == "" {
 		// A revert to a build this instance can no longer name has no commit
-		// to match; its evidence rule is in apply_revert.go.
+		// to match; its evidence rule is in apply_revert.go. One that also moves
+		// the recovery actor has no commit to check the actor against either, so
+		// the relayed outcome decides.
+		if names(a.RequestedDigests, ComponentRecovery) {
+			return
+		}
 		r.revertRegisterEvidence(ctx, a, *sourceCommit)
 		return
 	}
@@ -776,6 +845,20 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 				"host_id", hostID, "attempt_id", a.ID, "reported", *sourceCommit, "wanted", wantCommit)
 		}
 		return
+	}
+	// ...and one that named the recovery actor too succeeds only once the actor
+	// serving the host reports the same commit (amendment 14).
+	if names(a.RequestedDigests, ComponentRecovery) {
+		actor, err := r.store.HostActorCommit(ctx, hostID)
+		if err != nil {
+			r.log.Warn("register: could not read the host's recovery actor commit", "host_id", hostID, "attempt_id", a.ID, "err", err)
+			return
+		}
+		if actor == nil || !commitsMatch(wantCommit, *actor) {
+			r.log.Info("register reports the requested agent but not the requested recovery actor; the relayed outcome decides",
+				"host_id", hostID, "attempt_id", a.ID)
+			return
+		}
 	}
 	done, err := r.store.SucceedAttempt(ctx, a.ID)
 	if err != nil {

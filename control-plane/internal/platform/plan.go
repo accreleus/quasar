@@ -422,7 +422,10 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 	if !h.Known() {
 		return ReasonIdentityUnknown
 	}
-	if commitsMatch(*h.SourceCommit, newest.SourceCommit) {
+	// Amendment 14: an owned host is up to date only when its recovery actor is on
+	// the release too, where the release names one.
+	if commitsMatch(*h.SourceCommit, newest.SourceCommit) &&
+		!(releaseNamesActor(*newest) && actorBehindRelease(h, newest.SourceCommit)) {
 		return ReasonUpToDate
 	}
 	// Its images were never pulled, so there is nothing to re-pin.

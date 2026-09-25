@@ -103,6 +103,12 @@ type HostIdentity struct {
 	// identity shape, hence unserialized like AgentConnected.
 	Readiness           json.RawMessage `json:"-"`
 	ReadinessReportedAt *time.Time      `json:"-"`
+
+	// RecoveryActorSourceCommit is the commit of the recovery actor serving an
+	// owned host (hosts.recovery_actor_source_commit, amendment 14): what orders
+	// a host attempt actor first. Unserialized: the host body carries it, the
+	// release view's frozen identity shape does not.
+	RecoveryActorSourceCommit *string `json:"-"`
 }
 
 // Known is `identity_known`: all four fields present. A host with any of them

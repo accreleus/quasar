@@ -70,15 +70,25 @@ func PlanRevert(in RevertInputs) RevertDecision {
 	if in.LastSucceeded == nil {
 		return RevertDecision{Code: CodeNothingToRevert}
 	}
-	prev := nodeAgentPrevious(in.LastSucceeded.PreviousDigests)
-	if prev == nil || prev.Digest == nil || *prev.Digest == "" {
-		// A null digest is "nobody looked": nothing that can be sent.
-		return RevertDecision{Code: CodeNothingToRevert}
+	// The agent first, put back by the newer recovery actor, then the actor
+	// handing itself back (amendment 14; ADR 0008). A null digest is "nobody
+	// looked", and a component with no repository has no `image@digest` (a
+	// guessed one is a different image, ADR 0001): neither can be sent.
+	requested := make([]ComponentDigest, 0, 2)
+	for _, name := range []string{ComponentNodeAgent, ComponentRecovery} {
+		prev := previousOf(in.LastSucceeded.PreviousDigests, name)
+		if prev == nil || prev.Digest == nil || *prev.Digest == "" {
+			continue
+		}
+		image := revertImage(in.PreviousRelease, in.LastSucceeded, name)
+		if image == "" {
+			continue
+		}
+		requested = append(requested, ComponentDigest{Name: name, Image: image, Digest: *prev.Digest})
 	}
-	image := revertImage(in.PreviousRelease, in.LastSucceeded)
-	if image == "" {
-		// No repository, no `image@digest`; a guessed one is a different
-		// image (ADR 0001).
+	if len(requested) == 0 || (requested[0].Name != ComponentNodeAgent && names(in.LastSucceeded.RequestedDigests, ComponentNodeAgent)) {
+		// The agent's own previous digest is what a revert restores first; one
+		// that cannot be sent is nothing to revert, whatever the actor's is.
 		return RevertDecision{Code: CodeNothingToRevert}
 	}
 	// ADR 0002's ceiling, reachable only if the control plane was moved
@@ -89,7 +99,7 @@ func PlanRevert(in RevertInputs) RevertDecision {
 
 	d := RevertDecision{
 		OK:        true,
-		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: image, Digest: *prev.Digest}},
+		Requested: requested,
 		Previous:  revertedFrom(in.LastSucceeded.RequestedDigests),
 	}
 	if in.PreviousRelease != nil {
@@ -99,28 +109,33 @@ func PlanRevert(in RevertInputs) RevertDecision {
 	return d
 }
 
-// nodeAgentPrevious is the node-agent entry: the only component a host is sent.
+// nodeAgentPrevious is the node-agent entry: what names the build a revert returns to.
 func nodeAgentPrevious(prev []PreviousDigest) *PreviousDigest {
+	return previousOf(prev, ComponentNodeAgent)
+}
+
+func previousOf(prev []PreviousDigest, name string) *PreviousDigest {
 	for i := range prev {
-		if prev[i].Name == ComponentNodeAgent {
+		if prev[i].Name == name {
 			return &prev[i]
 		}
 	}
 	return nil
 }
 
-// revertImage is the repository the restored digest composes against: the
-// manifest's, else the one this host was sent last time. Never a default.
-func revertImage(release *Release, last *Attempt) string {
+// revertImage is the repository component `name`'s restored digest composes
+// against: the manifest's, else the one this host was sent last time. Never a
+// default.
+func revertImage(release *Release, last *Attempt, name string) string {
 	if release != nil {
 		for _, c := range releaseComponents(*release) {
-			if c.Name == ComponentNodeAgent && c.Image != "" {
+			if c.Name == name && c.Image != "" {
 				return c.Image
 			}
 		}
 	}
 	for _, c := range last.RequestedDigests {
-		if c.Name == ComponentNodeAgent && c.Image != "" {
+		if c.Name == name && c.Image != "" {
 			return c.Image
 		}
 	}

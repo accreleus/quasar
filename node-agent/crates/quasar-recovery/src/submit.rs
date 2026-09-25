@@ -357,8 +357,16 @@ impl Actor {
                                 ),
                             ));
                         }
-                        if existing.labels.get(labels::INSTALLATION)
-                            != Some(&machine.installation_id)
+                        // This actor's own container, started by hand without the
+                        // labels, is not a conflict: it is what hands over.
+                        let itself = self
+                            .config
+                            .self_container
+                            .as_deref()
+                            .is_some_and(|me| same_container(me, &existing.id));
+                        if !itself
+                            && existing.labels.get(labels::INSTALLATION)
+                                != Some(&machine.installation_id)
                         {
                             return Err(refuse(
                                 &req,

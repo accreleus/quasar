@@ -242,6 +242,12 @@ func (h *ApplyHandler) handleHostApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ADR 0008: the host's recovery actor first, when it is not on the release.
+	components = OrderHostComponents(components, release.SourceCommit, hostIdentity(view, hostID), controlPlaneMachineUnknown)
+	if len(components) == 0 {
+		writeNotEligible(w, ReasonUpToDate)
+		return
+	}
 	previous, err := h.previousDigests(ctx, hostID, components)
 	if err != nil {
 		h.internal(w, "read previous digests", err)
@@ -364,8 +370,8 @@ func hostTargetReason(v View, hostID string) string {
 	return ReasonIdentityUnknown
 }
 
-// releaseComponents is the node-agent component of a release's manifest, and
-// only that: the control-plane component is never sent to a host.
+// releaseComponents is what a release's manifest may send a host (the node agent,
+// and the recovery actor when the manifest names one), never the control plane.
 func releaseComponents(r Release) []ComponentDigest {
 	if len(r.Manifest) == 0 {
 		return nil
@@ -374,8 +380,24 @@ func releaseComponents(r Release) []ComponentDigest {
 	if err != nil {
 		return nil
 	}
-	return NodeAgentComponents(m)
+	return HostComponentsOf(m)
 }
+
+// hostIdentity is the view's identity of one host (zero when it lists none).
+func hostIdentity(v View, hostID string) HostIdentity {
+	for _, h := range v.Installed.Hosts {
+		if h.HostID == hostID {
+			return h
+		}
+	}
+	return HostIdentity{HostID: hostID}
+}
+
+// The control plane cannot yet tell which registered host shares its machine (its
+// own machine's recovery actor reports that over the control socket, RH06-11 #363),
+// so every host step is ordered as a GPU host's. The actor refuses the agent socket's
+// `recovery-actor` on a combined machine, so that case fails `invalid`, never ahead.
+const controlPlaneMachineUnknown = false
 
 func actorID(r *http.Request) string {
 	if u, ok := auth.UserFromContext(r.Context()); ok {

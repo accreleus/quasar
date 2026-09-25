@@ -348,7 +348,7 @@ func admitCases(t *testing.T) []admitCase {
 			agentExpect: actorRefused(ReasonInvalid, `component "recovery-actor" named twice`)},
 		{name: "a signed release binds the recovery actor's digest", source: "added: ADR 0003 binding covers every component a request names",
 			agent: true, cfg: keyed(SignatureModeRequire), req: with(signedReq, comps(ra(actorImg, testActorDigest), na(testAgentImage, testAgentDigest))), want: ReasonInvalid,
-			evidence: signedManifest(`{"version":"0.3.0","components":[{"name":"recovery-actor","image":"` + actorImg + `","digest":"` + testActorDigest + `"},{"name":"node-agent","image":"` + testAgentImage + `","digest":"` + testAgentDigest + `"}]}`),
+			evidence:    signedManifest(`{"version":"0.3.0","components":[{"name":"recovery-actor","image":"` + actorImg + `","digest":"` + testActorDigest + `"},{"name":"node-agent","image":"` + testAgentImage + `","digest":"` + testAgentDigest + `"}]}`),
 			agentExpect: actorAdmitted()},
 		{name: "a signed release that does not name the recovery actor refuses it", source: "added: ADR 0003 binding; a format-1 manifest carries no recovery-actor",
 			agent: true, cfg: keyed(SignatureModeVerify), evidence: signedEv, req: with(signedReq, comps(ra(actorImg, testActorDigest), na(testAgentImage, testAgentDigest))), want: ReasonInvalid,

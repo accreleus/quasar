@@ -379,6 +379,21 @@ func (s *Store) SetPreviousDigests(ctx context.Context, attemptID string, previo
 	return nil
 }
 
+// HostActorCommit is the commit the host's recovery actor reported on its last
+// register (hosts.recovery_actor_source_commit, amendment 14); nil when none.
+func (s *Store) HostActorCommit(ctx context.Context, hostID string) (*string, error) {
+	var commit *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT recovery_actor_source_commit FROM hosts WHERE id = $1::uuid`, hostID).Scan(&commit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrHostNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read the host's recovery actor commit: %w", err)
+	}
+	return commit, nil
+}
+
 // OpenHostAttempt returns a host's open attempt and the source_commit of the
 // release it is moving to, which is what a post-apply `register` is matched
 // against. The commit is empty when the attempt names no release row.
