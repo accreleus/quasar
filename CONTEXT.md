@@ -491,7 +491,7 @@ pipeline), "certificate" (there is no chain and no expiry).
 release and recreates the containers it replaces, because a container cannot
 recreate itself. It acts only when told to, and only on the stack it sits beside.
 On an owned machine the recovery actor does this job instead, and the updater
-retires with RH06 (in shaping). _Avoid_: "sidecar" in prose (that is how it is
+retires with RH06-15 (#367). _Avoid_: "sidecar" in prose (that is how it is
 deployed, not what it is), "agent" (the agent asks; the updater acts).
 
 **Install mode** — how a host got its platform images: from the registry, built
@@ -502,9 +502,9 @@ install is always pinned; the word adds nothing).
 
 **Attempt** — one target's move to one digest set: the control plane, or one
 host. Every apply produces one, whether it succeeded or failed, and it is the
-only durable record of what that target was on before. Every attempt ends in a
-stated outcome: succeeded, failed (restored or not), or interrupted with nothing
-changed. _Avoid_: "job" (an attempt is operator-initiated and rides no schedule),
+only durable record of what that target was on before. Every attempt ends in one
+of two terminal states: succeeded, or failed (restored or not). A failure whose
+reason is `interrupted` means nothing changed. _Avoid_: "job" (an attempt is operator-initiated and rides no schedule),
 "task".
 
 **Preflight** — the per-target evaluation, on the release view, of whether the
@@ -622,8 +622,11 @@ the whole platform feature), "restart".
 **Recipe** — the container shape for one role (control plane, node agent, Postgres,
 recovery actor) compiled into the recovery actor. A **recipe revision** numbers one
 shape; each platform image names the revision it needs, and an actor refuses a
-revision it does not carry before anything stops. _Avoid_: "template" (that was the
-rejected image-carried alternative), "compose service".
+revision it does not carry before anything stops. Not the "manual recipe": that
+older phrase names the command block an operator copies (a failure's `previous`
+digests are "the restore recipe"), which is a different thing. _Avoid_: "template"
+(that was the rejected image-carried alternative), "compose service", bare "recipe"
+where the manual command block could be meant.
 
 **Machine inputs** — the few install-time facts a machine's recipes are rendered
 with: role, node name, home and template roots, public host, ports, control URL,

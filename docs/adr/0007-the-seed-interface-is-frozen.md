@@ -72,10 +72,15 @@ fails either direction is a new seed interface, which needs its own ADR and owne
 
 - The seed is built never to need an update; if one ever does, the console says so and the
   operator updates it in the manager. The recovery actor reports the seed's version, or its
-  absence, on the agent's `register` (`protocol/agent-api.md` amendment 14, `seed_version`).
+  absence, on the agent's `register` (`protocol/agent-api.md` amendment 14, `seed_version`) and,
+  for the control plane's own machine, through `PlatformIdentity.seed_version`
+  (`protocol/control-api.md` amendment 14, "The control plane's own machine").
 - Removing or redeploying the seed never removes or restarts Quasar. A missing seed only means a
   deleted recovery actor cannot be re-created on that machine.
 - The seed pins nothing about the actor beyond `seed.json`; a manager that updates the seed image
   is harmless, because a seed never replaces an existing actor.
 - The interface lives here rather than in `protocol/`: it is machine-local, and the recovery
   actor's sockets and journal, which it sits beside, are explicitly not frozen there.
+
+This decision was approved through the #353 contract amendment: an Opus contract review returned
+APPROVED on round 4, and the owner's standing approval on #352, widened on #353, is the sign-off.

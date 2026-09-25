@@ -34,9 +34,12 @@ control plane or node agent is always that release's actor (#352 decisions 5 and
 - **Rule C — refuse before stopping.** An actor asked to render a revision it does not carry
   (reachable only by a hand-built developer apply that omits the actor) fails
   `recipe_unsupported` after the pull and before anything stops: nothing changed.
-- **The A1 exception to ADR 0002's "never ahead".** On the control plane's own machine the
-  recovery actor may be **one release ahead** of the control plane while a control-plane
-  replacement is in flight, or after one failed and was restored. Nowhere else: what is offered
+- **The A1 exception to ADR 0002's "never ahead"** (decision A1,
+  `docs/rh06/2026-09-24-decisions.md`). On the control plane's own machine the recovery actor may be **one release ahead** of the
+  control plane while a control-plane replacement is in flight, or after one failed and was
+  restored. A developer apply may, in the same two situations, put it ahead by a **branch commit**
+  rather than by one release; that is within A1's intent (`protocol/control-api.md` amendment 14,
+  "Developer apply"). Nowhere else: what is offered
   (host eligibility, revert targets) still never puts an agent or an actor above the control
   plane. ADR 0002's reason for "control plane first" is the database schema, and the actor carries
   none, so moving it first does not weaken that rule.
@@ -51,15 +54,18 @@ control plane or node agent is always that release's actor (#352 decisions 5 and
   image can only select among shapes the actor already has. Because the actor moves first and both
   are built from one commit, the coupling costs one more file touched per shape change, not an
   extra release.
-- **Image-carried templates** (designs 2 and 3 of the RH06 architecture). They remove the "every
+- **Image-carried templates** (designs 2 and 3 of the RH06 architecture,
+  `docs/rh06/designs/2-declarative-service-specs.md` and `docs/rh06/designs/3-rust-runtime-reuse.md`,
+  compared in `docs/rh06/2026-09-24-architecture.md`). They remove the "every
   shape change is an actor change" coupling, but add a template vocabulary and format discipline
   that becomes a long-lived contract, and move the authority boundary into a document an image
   supplies. Recorded as the path to take if container shapes start changing faster than releases,
   or if third parties build Quasar-compatible images.
-- **Fully rendered service specifications in Postgres** (design 2). The largest contract, and a
+- **Fully rendered service specifications in Postgres** (design 2,
+  `docs/rh06/designs/2-declarative-service-specs.md`). The largest contract, and a
   second desired-state system beside RH05's host policy. Revive if operators need per-service
   configuration beyond machine inputs.
-- **Keeping D9's "the actor is never ahead" literally.** Every container-shape change would then
+- **Keeping D9's "the actor is never ahead" literally** (`docs/rh06/2026-09-24-decisions.md`). Every container-shape change would then
   take two releases, or need the template language above.
 
 ## Consequences
@@ -73,3 +79,6 @@ control plane or node agent is always that release's actor (#352 decisions 5 and
 - The floor is part of every release (`platform-release-manifest.v2.json`), and a host whose agent or
   actor is below the installed control plane's floor reads `below_floor` for anything but an update
   (`protocol/control-api.md` amendment 14).
+
+This decision was approved through the #353 contract amendment: an Opus contract review returned
+APPROVED on round 4, and the owner's standing approval on #352, widened on #353, is the sign-off.

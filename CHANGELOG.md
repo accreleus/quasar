@@ -44,22 +44,13 @@ own; the two do not move together, and that is deliberate.
   a migrating update, the restore command after a failed one, Remove host and Developer
   apply, each in its normal, unknown and error states. Screenshots, the surface-to-ticket
   table and the open questions are in `design_handoff_v3/screens/rh06/README.md`.
-- **RH06 contract amendment and decision records (#353).** The frozen contracts gain
-  amendment 14 for Quasar-owned installs, written as an additive expand step: release
-  manifest format 2 (`platform-release-manifest.v2.json`, with the recovery actor as a third
-  component and a floor), the `owned` install mode and recovery-actor and seed identity on
-  hosts, recovery-actor apply components, new failure, preflight and eligibility identifiers,
-  the external-backup confirmation and pre-update dump reference, the `host_remove` command
-  and its admin route (`POST /v1/admin/platform/hosts/{id}/remove`, specified ahead of the
-  server), and deprecation of the static enrollment token. By owner decision on #353 the
-  amendment also adds a `below_floor` read signal on each host's release identity, a
-  developer-apply route (`POST /v1/admin/platform/developer-apply`, specified ahead of the
-  server) for applying a branch build to an owned install, and the control plane's own machine
-  identity (install mode, recovery-actor and seed versions, database mode). The contract step that retires the Compose
-  wording, two preflight checks, the static token and format-1 publication is written but not
-  in force until RH06-15 (#367). ADR 0007 freezes the seed interface, ADR 0008 records compiled
-  recipes with the recovery actor moving first, and ADR 0004 is amended for the recovery actor
-  and a non-migrating control plane that never passed a health check. No behaviour changes yet.
+- **RH06 contract amendment and decision records (#353).** Amendment 14 adds the contract
+  surface for Quasar-owned installs as an additive expand step: release manifest format 2,
+  the `owned` install mode, recovery-actor apply components, host removal and new failure,
+  preflight and eligibility identifiers. By owner decision it also adds a `below_floor` read
+  signal, a developer-apply route and the control plane's own machine identity. The contract
+  step retiring the Compose wording and the static token is not in force until RH06-15
+  (#367). ADRs 0007 and 0008 are new and ADR 0004 is amended. No behaviour changes yet.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
