@@ -53,6 +53,13 @@ type Config struct {
 	// (QUASAR_RECOVERY_CONTROL_SOCKET). Empty: not an owned machine, never read.
 	RecoveryControlSocket string
 
+	// This machine's shape, set by the recovery actor that created this control
+	// plane: "combined" or "control_only" and the machine's node name, both or
+	// neither (QUASAR_MACHINE_ROLE, QUASAR_MACHINE_NODE_NAME). Served as
+	// PlatformIdentity machine_role / machine_node_name.
+	MachineRole     string
+	MachineNodeName string
+
 	// All three together provision the first admin at boot if none exists
 	// (control-api.md §Authorization). Never "first to register wins".
 	BootstrapAdminEmail    string // BOOTSTRAP_ADMIN_EMAIL
@@ -320,6 +327,14 @@ func Load() (*Config, error) {
 		c.LocalEnrollmentToken = tok
 	}
 	c.RecoveryControlSocket = os.Getenv("QUASAR_RECOVERY_CONTROL_SOCKET")
+	c.MachineRole = strings.TrimSpace(os.Getenv("QUASAR_MACHINE_ROLE"))
+	c.MachineNodeName = strings.TrimSpace(os.Getenv("QUASAR_MACHINE_NODE_NAME"))
+	if (c.MachineRole == "") != (c.MachineNodeName == "") {
+		return nil, fmt.Errorf("QUASAR_MACHINE_ROLE and QUASAR_MACHINE_NODE_NAME must be set together (got only one)")
+	}
+	if c.MachineRole != "" && c.MachineRole != "combined" && c.MachineRole != "control_only" {
+		return nil, fmt.Errorf("QUASAR_MACHINE_ROLE %q: must be combined or control_only", c.MachineRole)
+	}
 
 	c.BootstrapAdminEmail = os.Getenv("BOOTSTRAP_ADMIN_EMAIL")
 	c.BootstrapAdminUsername = os.Getenv("BOOTSTRAP_ADMIN_USERNAME")

@@ -59,6 +59,7 @@ pub struct OperatorInputs {
     pub postgres_image: Option<String>,
     pub public_host: Option<String>,
     pub tls_hosts: Option<String>,
+    pub trusted_proxies: Option<String>,
     pub http_port: Option<String>,
     pub tls_port: Option<String>,
     pub database_host: Option<String>,

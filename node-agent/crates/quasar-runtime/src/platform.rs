@@ -236,6 +236,8 @@ pub struct PlatformVolume {
     /// Where the volume's data lives on the engine host (the `local` driver's
     /// `Mountpoint`), when the engine reports one: a daemon-host path a bind can name.
     pub mountpoint: Option<String>,
+    /// The volume driver (`local`, or a plugin's name).
+    pub driver: String,
 }
 
 /// A user-defined network, as far as the recovery actor needs one.

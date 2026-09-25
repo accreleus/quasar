@@ -20,6 +20,7 @@ pub const CONTROL_PLANE_IMAGE: &str = "QUASAR_CONTROL_PLANE_IMAGE";
 pub const POSTGRES_IMAGE: &str = "QUASAR_POSTGRES_IMAGE";
 pub const PUBLIC_HOST: &str = "QUASAR_PUBLIC_HOST";
 pub const TLS_HOSTS: &str = "QUASAR_TLS_HOSTS";
+pub const TRUSTED_PROXIES: &str = "QUASAR_TRUSTED_PROXIES";
 pub const HTTP_PORT: &str = "QUASAR_HTTP_PORT";
 pub const TLS_PORT: &str = "QUASAR_TLS_PORT";
 /// Setting this makes the database the operator's own (#352 R1-Q1); the other
@@ -96,6 +97,7 @@ impl Bootstrap {
                 postgres_image: get(POSTGRES_IMAGE),
                 public_host: get(PUBLIC_HOST),
                 tls_hosts: get(TLS_HOSTS),
+                trusted_proxies: get(TRUSTED_PROXIES),
                 http_port: get(HTTP_PORT),
                 tls_port: get(TLS_PORT),
                 database_host: get(DATABASE_HOST),
@@ -305,6 +307,12 @@ impl Bootstrap {
             postgres_image,
             database_password,
             inputs: ControlInputs {
+                machine_role: if self.role == MachineRole::Combined {
+                    recipe::ControlRole::Combined
+                } else {
+                    recipe::ControlRole::ControlOnly
+                },
+                trusted_proxies: op.trusted_proxies.clone(),
                 http_port,
                 tls_port,
                 public_host: op.public_host.clone().map(|h| h.trim().to_owned()),

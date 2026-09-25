@@ -514,17 +514,17 @@ export function InstalledCard({
   updatedAt: number | null;
 }) {
   const cp = view.installed.control_plane;
+  const hosts = view.installed.hosts;
   // The last report of this machine seen on this page, for when its recovery actor stops
   // answering (the identity then reads null, as for a machine that is not owned).
   const last = useRef<MachineReport | null>(null);
   const at = updatedAt ?? Date.now();
-  const machine = thisMachine(cp, last.current, (t) =>
+  const machine = thisMachine(cp, last.current, hosts, (t) =>
     clockTime(new Date(t).toISOString(), { seconds: false }),
   );
   useEffect(() => {
     if (isOwnedMachine(cp)) last.current = { identity: cp, at };
   }, [cp, at]);
-  const hosts = view.installed.hosts;
   const repo = view.source_repo ?? "";
   const commitUrl = gh(repo, `commit/${cp.source_commit}`);
   const versions = new Set(hosts.map((h) => h.agent_version).filter(Boolean));

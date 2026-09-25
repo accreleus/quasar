@@ -32,9 +32,17 @@ func ownedMachine(role actorsocket.Role, node string) *fakeOwnMachine {
 // newOwnMachineDevHarness is newDevHarness with the control plane's own machine wired.
 func newOwnMachineDevHarness(t *testing.T, own OwnMachineSource) *devHarness {
 	t.Helper()
+	return newShapedDevHarness(t, own, MachineShape{})
+}
+
+// newShapedDevHarness also wires the machine shape the control plane's own
+// configuration names (QUASAR_MACHINE_ROLE, QUASAR_MACHINE_NODE_NAME).
+func newShapedDevHarness(t *testing.T, own OwnMachineSource, shape MachineShape) *devHarness {
+	t.Helper()
 	images := &fakeDevImages{commit: commitB}
 	h := newApplyHarness(t, func(_ *applyHarness, handler *ApplyHandler) {
-		handler.WithDeveloperApply(images, []string{"registry.example.invalid/dev"}).WithOwnMachine(own)
+		handler.WithDeveloperApply(images, []string{"registry.example.invalid/dev"}).
+			WithOwnMachine(own).WithMachineShape(shape)
 	})
 	mustExec(t, h.pool, `UPDATE hosts SET install_mode = 'owned' WHERE id = $1::uuid`, h.hostID)
 	return &devHarness{applyHarness: h, images: images}
@@ -64,9 +72,10 @@ func TestDeveloperApplyToTheControlPlaneOnAnOwnedMachine(t *testing.T) {
 }
 
 // A combined host's own agent takes node-agent only: its actor moves in the
-// control-plane step.
+// control-plane step. Decided from the control plane's own configuration, so it
+// holds with the recovery actor silent (fail closed).
 func TestDeveloperApplyToTheCombinedHostNamesOnlyTheAgent(t *testing.T) {
-	h := newOwnMachineDevHarness(t, ownedMachine(actorsocket.RoleCombined, "gpu-01"))
+	h := newShapedDevHarness(t, &fakeOwnMachine{}, MachineShape{Role: MachineRoleCombined, NodeName: "gpu-01"})
 	code, out := h.post(t, devURL, h.adminToken, h.body(agentComponent(), actorComponent()))
 	if code != http.StatusBadRequest || errCode(t, out) != "validation_failed" {
 		t.Fatalf("actor to the combined host = %d %s, want 400 validation_failed", code, out)
@@ -86,13 +95,13 @@ func TestDeveloperApplyToTheCombinedHostNamesOnlyTheAgent(t *testing.T) {
 }
 
 func TestDeveloperApplyToAnotherHostMayNameTheActor(t *testing.T) {
-	for name, own := range map[string]OwnMachineSource{
-		"a different node":           ownedMachine(actorsocket.RoleCombined, "some-other-machine"),
-		"control-only, same name":    ownedMachine(actorsocket.RoleControlOnly, "gpu-01"),
-		"combined, actor not answer": &fakeOwnMachine{m: ownedMachine(actorsocket.RoleCombined, "gpu-01").m},
+	for name, shape := range map[string]MachineShape{
+		"a different node":        {Role: MachineRoleCombined, NodeName: "some-other-machine"},
+		"control-only, same name": {Role: MachineRoleControlOnly, NodeName: "gpu-01"},
+		"not an owned machine":    {},
 	} {
 		t.Run(name, func(t *testing.T) {
-			h := newOwnMachineDevHarness(t, own)
+			h := newShapedDevHarness(t, ownedMachine(actorsocket.RoleCombined, "gpu-01"), shape)
 			if code, out := h.post(t, devURL, h.adminToken, h.body(agentComponent(), actorComponent())); code != http.StatusAccepted {
 				t.Fatalf("= %d %s, want 202", code, out)
 			}

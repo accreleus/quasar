@@ -497,6 +497,7 @@ fn volume(v: bollard::models::Volume) -> PlatformVolume {
         name: v.name,
         labels: v.labels.into_iter().collect(),
         mountpoint: Some(v.mountpoint).filter(|m| m.starts_with('/')),
+        driver: v.driver,
     }
 }
 

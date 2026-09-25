@@ -33,14 +33,51 @@ const (
 	DatabaseModeExternal = "external"
 )
 
-// MachineIdentity is the five optional `PlatformIdentity` fields. nil is
-// unknown, and all five are always serialized.
+// MachineIdentity is the seven optional `PlatformIdentity` fields. nil is
+// unknown, and all seven are always serialized. MachineRole and MachineNodeName
+// come from this control plane's configuration (MachineShape), the rest from
+// its recovery actor.
 type MachineIdentity struct {
 	InstallMode               *string `json:"install_mode"`
 	RecoveryActorVersion      *string `json:"recovery_actor_version"`
 	RecoveryActorSourceCommit *string `json:"recovery_actor_source_commit"`
 	SeedVersion               *string `json:"seed_version"`
 	DatabaseMode              *string `json:"database_mode"`
+	MachineRole               *string `json:"machine_role"`
+	MachineNodeName           *string `json:"machine_node_name"`
+}
+
+// `machine_role` values.
+const (
+	MachineRoleCombined    = "combined"
+	MachineRoleControlOnly = "control_only"
+)
+
+// MachineShape is what the recovery actor that created this control plane
+// wrote into its configuration (QUASAR_MACHINE_ROLE, QUASAR_MACHINE_NODE_NAME).
+// Known without asking the actor; the zero value is not an owned machine.
+type MachineShape struct {
+	Role     string
+	NodeName string
+}
+
+// Apply fills the two fields it owns; the others are left as they are.
+func (s MachineShape) Apply(m MachineIdentity) MachineIdentity {
+	if s.Role == "" || s.NodeName == "" {
+		return m
+	}
+	role, node := s.Role, s.NodeName
+	m.MachineRole, m.MachineNodeName = &role, &node
+	return m
+}
+
+// CombinedNodeName is the node name of the agent sharing this control plane's
+// machine, when it is a combined host.
+func (s MachineShape) CombinedNodeName() (string, bool) {
+	if s.Role != MachineRoleCombined || s.NodeName == "" {
+		return "", false
+	}
+	return s.NodeName, true
 }
 
 // PlatformIdentity is the wire `PlatformIdentity`: the binary's own stamps,
@@ -150,7 +187,7 @@ func (r *OwnMachineReader) Read(ctx context.Context) (OwnMachine, bool) {
 	return m, ok
 }
 
-// Identity is the five `PlatformIdentity` fields; all null when not owned.
+// Identity is the five actor-read `PlatformIdentity` fields; all null when not owned.
 func (r *OwnMachineReader) Identity(ctx context.Context) MachineIdentity {
 	m, _ := r.Read(ctx)
 	return m.Identity

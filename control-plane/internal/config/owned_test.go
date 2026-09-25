@@ -223,3 +223,30 @@ func TestRecoveryControlSocketIsOptional(t *testing.T) {
 		t.Fatalf("set socket: %v %q", err, c.RecoveryControlSocket)
 	}
 }
+
+func TestMachineShape(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://test")
+	for _, tc := range []struct {
+		role, node string
+		ok         bool
+	}{
+		{"", "", true},
+		{"combined", "living-room-pc", true},
+		{"control_only", "attic-server", true},
+		{"combined", "", false},
+		{"", "living-room-pc", false},
+		{"gpu", "gpu-host-2", false},
+		{"control-only", "attic-server", false},
+	} {
+		t.Setenv("QUASAR_MACHINE_ROLE", tc.role)
+		t.Setenv("QUASAR_MACHINE_NODE_NAME", tc.node)
+		c, err := Load()
+		if (err == nil) != tc.ok {
+			t.Errorf("role=%q node=%q: err=%v, want ok=%v", tc.role, tc.node, err, tc.ok)
+			continue
+		}
+		if err == nil && (c.MachineRole != tc.role || c.MachineNodeName != tc.node) {
+			t.Errorf("role=%q node=%q: loaded %q %q", tc.role, tc.node, c.MachineRole, c.MachineNodeName)
+		}
+	}
+}

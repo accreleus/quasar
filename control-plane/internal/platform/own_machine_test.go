@@ -209,7 +209,7 @@ func TestOwnedControlPlanePreflight(t *testing.T) {
 	}
 }
 
-var machineKeys = []string{"install_mode", "recovery_actor_version", "recovery_actor_source_commit", "seed_version", "database_mode"}
+var machineKeys = []string{"install_mode", "recovery_actor_version", "recovery_actor_source_commit", "seed_version", "database_mode", "machine_role", "machine_node_name"}
 
 func TestIdentityServesTheOwnMachineFields(t *testing.T) {
 	path, _ := serveStatus(t, fixtureBody(t, "status-combined-idle.json"))
@@ -273,5 +273,33 @@ func TestReleaseViewCarriesTheOwnMachineOnInstalledControlPlane(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"hosts":`) {
 		t.Errorf("installed.hosts dropped: %s", raw)
+	}
+}
+
+// machine_role / machine_node_name come from the control plane's own
+// configuration, so they are served with the recovery actor silent.
+func TestIdentityServesTheMachineShapeWhetherOrNotTheActorAnswers(t *testing.T) {
+	silent := NewOwnMachineReader(filepath.Join(t.TempDir(), "absent.sock"))
+	h := NewHandler(&Deps{
+		ControlPlaneMachine: silent.Identity,
+		MachineShape:        MachineShape{Role: MachineRoleControlOnly, NodeName: "attic-server"},
+	}, nil)
+	rec := httptest.NewRecorder()
+	h.handleIdentity(rec, httptest.NewRequest(http.MethodGet, "/v1/admin/platform/identity", nil))
+	var body struct {
+		Identity map[string]any `json:"identity"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Identity["machine_role"] != "control_only" || body.Identity["machine_node_name"] != "attic-server" {
+		t.Errorf("identity = %s, want the configured shape", rec.Body.String())
+	}
+	if body.Identity["install_mode"] != nil {
+		t.Errorf("install_mode = %v with the actor silent, want null", body.Identity["install_mode"])
+	}
+	// Half a shape is no shape.
+	if got := (MachineShape{Role: MachineRoleCombined}).Apply(MachineIdentity{}); got.MachineRole != nil {
+		t.Errorf("a role without a node name was served: %+v", got)
 	}
 }

@@ -92,6 +92,10 @@ impl Actor {
     pub(crate) fn socket_volume_host_path(&self) -> Result<String, ResumeError> {
         let volume = names::AGENT_SOCKET_VOLUME;
         match self.engine.inspect_volume(volume)? {
+            Some(v) if v.driver != "local" => Err(ResumeError::Inputs(format!(
+                "the {volume} volume uses the {:?} driver; a combined or control-only machine binds its socket directories by host path, which needs the engine's local volume driver",
+                v.driver
+            ))),
             Some(v) => v.mountpoint.ok_or_else(|| {
                 ResumeError::Inputs(format!(
                     "the {volume} volume reports no host path, so its socket directories cannot be given to the control plane and the agent; a combined or control-only machine needs the engine's local volume driver"

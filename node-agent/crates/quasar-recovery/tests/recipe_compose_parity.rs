@@ -401,6 +401,9 @@ const ALLOWED_CONTROL_PLANE: &[(&str, &str, &str)] = &[
     ("-env", "ENROLLMENT_TOKEN", "the static token retires (D10); the machine's own agent enrolls with the local token"),
     ("+env", "QUASAR_LOCAL_ENROLLMENT_FILE", "the combined host's single-use local enrollment token, as a file"),
     ("+env", "QUASAR_LOCAL_ENROLLMENT_NODE_NAME", "the node name the local token is bound to"),
+    ("+env", "QUASAR_MACHINE_ROLE", "the machine's shape, which the control plane serves as machine_role"),
+    ("+env", "QUASAR_MACHINE_NODE_NAME", "the machine's node name, served as machine_node_name"),
+    ("~env", "QUASAR_ENV: compose \"\", recipe \"production\"", "an owned control plane refuses the dev-only agent-auth mint at boot"),
     ("+env", "QUASAR_RECOVERY_CONTROL_SOCKET", "the control socket: how the control plane reaches its machine's recovery actor (D6(a))"),
     ("-bind", "quasar-updater-run:/run/quasar-updater", "the Go updater has no place on an owned machine: the recovery actor replaces it"),
     ("+bind", "/var/lib/docker/volumes/quasar-recovery-agent/_data/control:/run/quasar-recovery:ro", "the control socket's directory, and nothing else of the socket volume"),
@@ -423,10 +426,8 @@ const COMPOSE_ONLY_KNOBS: &[&str] = &[
     "QUASAR_STORAGE_PROVIDER",
     "QUASAR_LIBRARY_PROVIDERS",
     "QUASAR_PLACEMENT_POLICY",
-    "QUASAR_TRUSTED_PROXIES",
     "QUASAR_ICE_SERVERS",
     "QUASAR_DEV_AGENT_AUTH",
-    "QUASAR_ENV",
     "PUBLIC_BASE_URL",
     "QUASAR_SECRET_KEY_PREVIOUS",
     "QUASAR_STEAMGRIDDB_API_KEY",
@@ -451,6 +452,8 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
     let base = deploy("docker-compose.yml");
     let mut inputs = inputs(Some(GpuVendor::Amd));
     inputs.control = Some(ControlInputs {
+        machine_role: quasar_recovery::recipe::ControlRole::Combined,
+        trusted_proxies: None,
         http_port: 8080,
         tls_port: 8443,
         public_host: Some("quasar.example.invalid".into()),

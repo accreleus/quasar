@@ -86,6 +86,9 @@ pub(super) fn validate(control: &ControlInputs) -> Result<(), RenderError> {
     if let Some(host) = &control.public_host {
         host_like("the public host", host)?;
     }
+    if let Some(proxies) = &control.trusted_proxies {
+        trusted_proxies(proxies)?;
+    }
     if let Some(hosts) = &control.tls_hosts {
         for host in hosts.split(',').map(str::trim).filter(|h| !h.is_empty()) {
             host_like("a TLS host", host)?;
@@ -112,6 +115,38 @@ pub(super) fn validate(control: &ControlInputs) -> Result<(), RenderError> {
                 "the database sslmode {sslmode:?} is not one of {}",
                 SSL_MODES.join(", ")
             )));
+        }
+    }
+    Ok(())
+}
+
+/// The control plane's rules for `QUASAR_TRUSTED_PROXIES` (`internal/config` `envCIDRs`):
+/// comma-separated CIDRs or bare addresses, and never a /0, which would let every caller
+/// choose its own rate-limit key (#438).
+pub fn trusted_proxies(raw: &str) -> Result<(), RenderError> {
+    for field in raw.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+        let bad = |why: &str| {
+            RenderError::Invalid(format!("QUASAR_TRUSTED_PROXIES entry {field:?}: {why}"))
+        };
+        let (addr, prefix) = match field.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (field, None),
+        };
+        let ip: std::net::IpAddr = addr.parse().map_err(|_| {
+            bad("each entry must be a CIDR (172.18.0.0/16, fd00::/8) or a bare IP address")
+        })?;
+        if let Some(p) = prefix {
+            let bits = if ip.is_ipv4() { 32 } else { 128 };
+            let n: u32 = p
+                .parse()
+                .ok()
+                .filter(|n| *n <= bits)
+                .ok_or_else(|| bad("the prefix length is not valid for this address"))?;
+            if n == 0 {
+                return Err(bad(
+                    "a /0 trusts every address there is, which disables the rate limiters entirely; name the proxy's own network instead",
+                ));
+            }
         }
     }
     Ok(())
@@ -291,6 +326,14 @@ pub(super) fn control_plane_r1(
                 .map(ImageRef::reference)
                 .unwrap_or_default(),
         ),
+        (
+            "QUASAR_TRUSTED_PROXIES",
+            control.trusted_proxies.clone().unwrap_or_default(),
+        ),
+        // Refuses the dev-only agent-auth mint at boot; the recipe never sets it.
+        ("QUASAR_ENV", "production".into()),
+        ("QUASAR_MACHINE_ROLE", control.machine_role.as_str().into()),
+        ("QUASAR_MACHINE_NODE_NAME", inputs.node_name.clone()),
         ("LOG_LEVEL", "info".into()),
         ("AUTH_TOKEN_TTL", "24h".into()),
         ("QUASAR_PPROF_ADDR", "127.0.0.1:6060".into()),

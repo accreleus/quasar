@@ -252,6 +252,8 @@ pub fn combined(database: DatabaseInputs) -> Inputs {
     let mut i = inputs(Some(GpuVendor::Amd));
     i.node_name = "living-room-pc".into();
     i.control = Some(ControlInputs {
+        machine_role: quasar_recovery::recipe::ControlRole::Combined,
+        trusted_proxies: None,
         http_port: 8080,
         tls_port: 8443,
         public_host: Some("quasar.example.invalid".into()),
@@ -311,6 +313,8 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
     control_only.home_root = String::new();
     control_only.template_root = quasar_recovery::recipe::default_template_root();
     control_only.node_name = "attic-server".into();
+    control_only.control.as_mut().unwrap().machine_role =
+        quasar_recovery::recipe::ControlRole::ControlOnly;
     let spec = render(
         Role::ControlPlane,
         1,

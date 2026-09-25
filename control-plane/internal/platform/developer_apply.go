@@ -196,6 +196,12 @@ func (h *ApplyHandler) WithOwnMachine(src OwnMachineSource) *ApplyHandler {
 	return h
 }
 
+// WithMachineShape wires the control plane's own machine shape (its configuration).
+func (h *ApplyHandler) WithMachineShape(shape MachineShape) *ApplyHandler {
+	h.machineShape = shape
+	return h
+}
+
 func writeRefusal(w http.ResponseWriter, code, reason, message string) {
 	if code == CodeHostNotEligible {
 		var body notEligible
@@ -257,8 +263,10 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 		h.internal(w, "read host", err)
 		return
 	}
-	// On a combined host the actor moves in the control-plane step.
-	if ownNode, ok := own.CombinedNodeName(); ownOK && ok && ownNode == nodeName {
+	// On a combined host the actor moves in the control-plane step. Decided from
+	// this control plane's own configuration, so it holds (fail closed) whether or
+	// not the recovery actor answers.
+	if ownNode, ok := h.machineShape.CombinedNodeName(); ok && ownNode == nodeName {
 		for _, c := range components {
 			if c.Name != ComponentNodeAgent {
 				httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,

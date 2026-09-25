@@ -5,7 +5,7 @@
  */
 
 import { Fragment } from "react";
-import type { GPUAvailability, Host } from "../../../api/types";
+import type { GPUAvailability, Host, PlatformIdentity } from "../../../api/types";
 import { ActionsMenu, type ActionsMenuEntry } from "../../../components/ActionsMenu";
 import { Bar } from "../../../components/Bar";
 import { Chip } from "../../../components/Chip";
@@ -43,6 +43,8 @@ export interface HostRowProps {
   actionPending: boolean;
   /** The last drain/uncordon on this row failed; shown in the drawer. */
   actionError?: string;
+  /** The control plane's own identity: which host shares its machine. */
+  controlPlane?: PlatformIdentity | null;
   now: number;
 }
 
@@ -176,6 +178,7 @@ export function HostRow(props: HostRowProps) {
               gpus={gpus}
               gpuError={props.gpuError}
               actionError={props.actionError}
+              controlPlane={props.controlPlane}
               now={now}
             />
           </td>

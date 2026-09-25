@@ -1088,6 +1088,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts
 		pDeps.ControlPlaneMachine = ownMachine.Identity
 	}
+	pDeps.MachineShape = machineShape(cfg)
 	pDeps.ImageFor = imageResolver.Check
 	// #169: the live registry, not the `status` column, answers "is this host's
 	// agent there". The column is stale across every control-plane restart —
@@ -1137,6 +1138,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	if ownMachine != nil {
 		platformApply.WithOwnMachine(ownMachine)
 	}
+	platformApply.WithMachineShape(machineShape(cfg))
 	// Closed after construction: the view reports the active run, and the run's
 	// skips live on the sequencer the apply handler owns.
 	pDeps.ActiveRun = platformApply.ActiveRun
@@ -1387,4 +1389,17 @@ func (s *Services) Stop() {
 		s.applyRunner.Close()
 	}
 	s.coordinator.Close()
+}
+
+// machineShape is this control plane's own machine shape. A combined host's
+// agent is also known by the local enrollment token's node name, which only a
+// combined host's recovery actor sets.
+func machineShape(cfg *config.Config) platform.MachineShape {
+	if cfg.MachineRole != "" {
+		return platform.MachineShape{Role: cfg.MachineRole, NodeName: cfg.MachineNodeName}
+	}
+	if cfg.LocalEnrollmentNodeName != "" {
+		return platform.MachineShape{Role: platform.MachineRoleCombined, NodeName: cfg.LocalEnrollmentNodeName}
+	}
+	return platform.MachineShape{}
 }

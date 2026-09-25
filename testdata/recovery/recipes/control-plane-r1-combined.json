@@ -16,10 +16,13 @@
     "QUASAR_DATABASE_USER": "quasar",
     "QUASAR_ENROLL_AGENT_IMAGE": "",
     "QUASAR_ENROLL_SEED_IMAGE": "",
+    "QUASAR_ENV": "production",
     "QUASAR_HOME_ROOT": "/srv/quasar/homes",
     "QUASAR_HTTP_REDIRECT": "auto",
     "QUASAR_LOCAL_ENROLLMENT_FILE": "/run/quasar-secrets/local-enrollment",
     "QUASAR_LOCAL_ENROLLMENT_NODE_NAME": "living-room-pc",
+    "QUASAR_MACHINE_NODE_NAME": "living-room-pc",
+    "QUASAR_MACHINE_ROLE": "combined",
     "QUASAR_PLATFORM_INSECURE_REGISTRIES": "",
     "QUASAR_PPROF_ADDR": "127.0.0.1:6060",
     "QUASAR_PUBLIC_HOST": "quasar.example.invalid",
@@ -29,13 +32,14 @@
     "QUASAR_TLS_ADDR": ":8443",
     "QUASAR_TLS_HOSTS": "",
     "QUASAR_TLS_REDIRECT_PORT": "8443",
+    "QUASAR_TRUSTED_PROXIES": "",
     "QUASAR_UPDATER_ALLOWED_NAMESPACES": ""
   },
   "labels": {
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "control-plane",
     "io.quasar.recipe": "1",
-    "io.quasar.spec": "sha256:b8b525215c43a424957151970e64c97a6610515d36f9c7fa1df2e2698a5a4971"
+    "io.quasar.spec": "sha256:a4301c9437ed2edb213afafb31b38488c12414c1923baa4430552f9ae92c61a9"
   },
   "network_mode": "quasar-platform",
   "binds": [

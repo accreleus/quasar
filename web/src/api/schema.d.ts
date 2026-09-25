@@ -9146,6 +9146,13 @@ export interface components {
              * @enum {string|null}
              */
             database_mode?: "owned" | "external" | null;
+            /**
+             * @description Non-null exactly when a recovery actor created this control plane, whether or not the actor is answering (install_mode alone reads null then); null on a Compose or source control plane, and from an older server. A client meeting an unknown value shows the shape as unknown and treats no host as this machine's.
+             * @enum {string|null}
+             */
+            machine_role?: "combined" | "control_only" | null;
+            /** @description Non-null exactly when machine_role is. On combined, the node name the machine's own agent registers under. A client identifies the control plane's own host only when machine_role is combined and the host's node_name equals this; never on control_only, where a GPU host could share the name. */
+            machine_node_name?: string | null;
         };
         /** @description One host's installed identity, as last reported on the agent `register` message. */
         PlatformHostIdentity: {

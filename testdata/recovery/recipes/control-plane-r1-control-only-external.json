@@ -16,7 +16,10 @@
     "QUASAR_DATABASE_USER": "quasar_app",
     "QUASAR_ENROLL_AGENT_IMAGE": "",
     "QUASAR_ENROLL_SEED_IMAGE": "",
+    "QUASAR_ENV": "production",
     "QUASAR_HTTP_REDIRECT": "auto",
+    "QUASAR_MACHINE_NODE_NAME": "attic-server",
+    "QUASAR_MACHINE_ROLE": "control_only",
     "QUASAR_PLATFORM_INSECURE_REGISTRIES": "",
     "QUASAR_PPROF_ADDR": "127.0.0.1:6060",
     "QUASAR_PUBLIC_HOST": "quasar.example.invalid",
@@ -26,13 +29,14 @@
     "QUASAR_TLS_ADDR": ":8443",
     "QUASAR_TLS_HOSTS": "",
     "QUASAR_TLS_REDIRECT_PORT": "8443",
+    "QUASAR_TRUSTED_PROXIES": "",
     "QUASAR_UPDATER_ALLOWED_NAMESPACES": ""
   },
   "labels": {
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "control-plane",
     "io.quasar.recipe": "1",
-    "io.quasar.spec": "sha256:04808c407626c7e66c7a40aa745fb6da6fe061bdcb56503f86bea7ce7fb16b44"
+    "io.quasar.spec": "sha256:6d3637057e0ef64c412aec2e41a7ca425cfd2bbb9f4d9c1ffcfc38832a929c9b"
   },
   "network_mode": "quasar-platform",
   "binds": [

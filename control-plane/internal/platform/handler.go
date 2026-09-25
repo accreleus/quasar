@@ -61,6 +61,9 @@ type Deps struct {
 	// ControlPlaneMachine is this control plane's own machine identity
 	// (OwnMachineReader.Identity). Optional: nil serves all five fields null.
 	ControlPlaneMachine func(ctx context.Context) MachineIdentity
+	// MachineShape is this control plane's own machine shape, from its
+	// configuration. Zero: machine_role and machine_node_name serve null.
+	MachineShape MachineShape
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -104,10 +107,14 @@ func (h *Handler) handleIdentity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) machine(ctx context.Context) MachineIdentity {
-	if h.deps == nil || h.deps.ControlPlaneMachine == nil {
+	if h.deps == nil {
 		return MachineIdentity{}
 	}
-	return h.deps.ControlPlaneMachine(ctx)
+	var m MachineIdentity
+	if h.deps.ControlPlaneMachine != nil {
+		m = h.deps.ControlPlaneMachine(ctx)
+	}
+	return h.deps.MachineShape.Apply(m)
 }
 
 // The whole Releases page in one read. READ ONLY: it writes nothing and never

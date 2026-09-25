@@ -58,6 +58,8 @@ pub struct FakeVolume {
     pub labels: BTreeMap<String, String>,
     /// Path inside the volume → (content, mode).
     pub files: BTreeMap<String, (Vec<u8>, u32)>,
+    /// `None` is the `local` driver.
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -512,6 +514,7 @@ impl PlatformEngine for FakeEngine {
                 name: name.into(),
                 labels: v.labels.clone(),
                 mountpoint: Some(mountpoint(name)),
+                driver: v.driver.clone().unwrap_or_else(|| "local".into()),
             }))
         })
     }
@@ -525,11 +528,13 @@ impl PlatformEngine for FakeEngine {
             let v = s.volumes.entry(name.into()).or_insert_with(|| FakeVolume {
                 labels: labels.clone(),
                 files: BTreeMap::new(),
+                driver: None,
             });
             Ok(Volume {
                 name: name.into(),
                 labels: v.labels.clone(),
                 mountpoint: Some(mountpoint(name)),
+                driver: v.driver.clone().unwrap_or_else(|| "local".into()),
             })
         })
     }

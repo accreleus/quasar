@@ -32,8 +32,12 @@ own; the two do not move together, and that is deliberate.
   database password, secret key and local token are generated into machine state and reach
   each container only as files (`QUASAR_DATABASE_PASSWORD_FILE`, `QUASAR_SECRET_KEY_FILE`);
   re-running the seed changes nothing, and an interrupted install completes on the next
-  start. Fleet ▸ Releases ▸ Installed shows "This machine": its seed, recovery actor,
-  database (Quasar's own or yours) and control plane. Release trust
+  start. Fleet ▸ Releases ▸ Installed shows "This machine": its name and shape, seed,
+  recovery actor, database (Quasar's own or yours), control plane and node agent, even
+  before its recovery actor has reported; a combined host's own page shows the control plane
+  and database running there, and is not removed from the console. The platform identity
+  gains `machine_role` and `machine_node_name` (amendment 14), served from the control
+  plane's own configuration. `QUASAR_TRUSTED_PROXIES` is an optional seed input. Release trust
   (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, the signature settings, and for the control plane
   `QUASAR_PLATFORM_INSECURE_REGISTRIES`) is now a seed input recorded in machine state at
   first install, so a seed-created actor admits a test registry's images; the Compose

@@ -705,6 +705,84 @@ fn the_control_plane_serves_add_host_this_machines_seed_and_agent_images() {
     assert_eq!(cp.spec.env["QUASAR_ENROLL_AGENT_IMAGE"], AGENT_IMAGE);
 }
 
+/// The control plane knows its machine's shape from its own configuration, and takes
+/// trusted proxies from the seed under its own rules.
+#[test]
+fn the_control_plane_is_told_its_machine_shape_and_trusted_proxies() {
+    let mut env = combined_env();
+    env.insert(
+        "QUASAR_TRUSTED_PROXIES".into(),
+        "172.18.0.0/16,10.1.2.3".into(),
+    );
+    let (engine, dir, id) = seeded(env);
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let state = engine.state();
+    let cp = state.container_named(names::CONTROL_PLANE).unwrap();
+    assert_eq!(cp.spec.env["QUASAR_MACHINE_ROLE"], "combined");
+    assert_eq!(cp.spec.env["QUASAR_MACHINE_NODE_NAME"], "gpu-host-01");
+    assert_eq!(
+        cp.spec.env["QUASAR_TRUSTED_PROXIES"],
+        "172.18.0.0/16,10.1.2.3"
+    );
+    assert_eq!(cp.spec.env["QUASAR_ENV"], "production");
+
+    let mut env = combined_env();
+    env.insert("QUASAR_ROLE".into(), "control-only".into());
+    let (engine, dir, id) = seeded(env);
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let state = engine.state();
+    let cp = state.container_named(names::CONTROL_PLANE).unwrap();
+    assert_eq!(cp.spec.env["QUASAR_MACHINE_ROLE"], "control_only");
+    assert_eq!(cp.spec.env["QUASAR_TRUSTED_PROXIES"], "");
+
+    for bad in ["0.0.0.0/0", "::/0", "not-an-address", "10.0.0.0/33"] {
+        let mut env = combined_env();
+        env.insert("QUASAR_TRUSTED_PROXIES".into(), bad.into());
+        let engine = Arc::new(FakeEngine::new(control_host(env)));
+        let dir = tempfile::tempdir().unwrap();
+        let refused = seed(&engine, dir.path(), SEED_ID).step();
+        assert!(
+            matches!(&refused, Outcome::Idle { why, .. } if why.contains("QUASAR_TRUSTED_PROXIES")),
+            "{bad}: {refused:?}"
+        );
+    }
+}
+
+/// An actor put back by a revert reads machine state a newer actor wrote.
+#[test]
+fn machine_state_with_inputs_this_actor_does_not_know_still_loads() {
+    let (engine, dir, id) = seeded(combined_env());
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let path = dir.path().join("machine.json");
+    let mut machine: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    machine["inputs"]["an_input_from_a_later_release"] = serde_json::json!("x");
+    machine["inputs"]["control"]["another_later_input"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_vec(&machine).unwrap()).unwrap();
+    let before = engine.state().by_name();
+    start(&engine, dir.path(), &id)
+        .resume()
+        .expect("unknown machine inputs are ignored");
+    assert_eq!(engine.state().by_name(), before);
+}
+
+#[test]
+fn a_socket_volume_on_another_driver_is_refused_with_the_reason() {
+    let (engine, dir, id) = seeded(combined_env());
+    engine.with_state(|s| {
+        s.volumes
+            .get_mut(names::AGENT_SOCKET_VOLUME)
+            .unwrap()
+            .driver = Some("nfs-plugin".into());
+    });
+    let err = start(&engine, dir.path(), &id).resume().unwrap_err();
+    assert!(
+        matches!(&err, ResumeError::Inputs(why) if why.contains("local volume driver") && why.contains("nfs-plugin")),
+        "{err}"
+    );
+    assert!(!dir.path().join("machine.json").exists());
+}
+
 /// Host defaults for app containers (an Unraid host's 99/100) are first-install inputs; a
 /// machine that names none renders exactly what revision 1 always rendered.
 #[test]

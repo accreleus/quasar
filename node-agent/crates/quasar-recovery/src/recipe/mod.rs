@@ -170,7 +170,6 @@ pub enum GpuVendor {
 /// What the disposable probe learned about the machine's GPU (architecture §5.3 "GPU facts
 /// detected by a disposable probe").
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GpuFacts {
     /// The preferred GPU: NVIDIA when the machine has an NVIDIA render node. `None`: no
     /// render node of a known vendor; the agent is installed anyway and its readiness
@@ -194,7 +193,6 @@ fn is_false(b: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GpuNode {
     pub vendor: GpuVendor,
     pub render_node: String,
@@ -220,7 +218,6 @@ impl GpuFacts {
 /// Optional host device nodes. The engine refuses to create a container that names a
 /// device the host lacks, and system containers often lack some of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HostDevices {
     pub dri: bool,
     pub uinput: bool,
@@ -239,11 +236,15 @@ impl Default for HostDevices {
 
 /// The machine inputs a recipe is rendered with. Only ever grows, each with a default.
 ///
+/// Unknown fields are ignored, here and in every nested input, so an actor put back by a
+/// revert reads machine state a newer actor wrote. It renders only the inputs its own
+/// recipes know, which is what it rendered before; `ImageRef` and `ContainerSpec` stay
+/// strict.
+///
 /// On a GPU host the agent takes the control plane's URL and pin from the enrollment
 /// string, so there is no control URL. A combined host's agent reaches the control plane
 /// on its own machine, at the loopback address of `control.http_port`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Inputs {
     pub installation_id: String,
     pub node_name: String,
@@ -284,7 +285,6 @@ pub struct Inputs {
 /// `QUASAR_CONTAINER_NETWORK`). Values of environment entries the node-agent recipe always
 /// carried, so no revision moves: `None` renders what revision 1 always rendered.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AppInputs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub puid: Option<u32>,
@@ -308,7 +308,6 @@ pub const APP_NETWORKS: &[&str] = &["none", "bridge", "host"];
 /// (`repository@sha256:…`): the seed (this machine's recovery image) and the node agent.
 /// Recorded at install; `None` serves none.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EnrollImages {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<ImageRef>,
@@ -327,7 +326,6 @@ impl EnrollImages {
 /// its control plane checks a developer apply against and reads a test registry over. Kept
 /// as the variables' raw values, which the install checked; an unset one keeps its default.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TrustInputs {
     /// `QUASAR_UPDATER_ALLOWED_NAMESPACES`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -368,8 +366,9 @@ impl TrustInputs {
 
 /// What a combined or control-only machine's control plane is run with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ControlInputs {
+    /// `combined` or `control_only`: the control plane serves it as `machine_role`.
+    pub machine_role: ControlRole,
     /// The host port of the control plane's HTTP listener (agents and `/health`).
     pub http_port: u16,
     /// The host port of its HTTPS listener (the console).
@@ -380,12 +379,32 @@ pub struct ControlInputs {
     /// More SANs for the generated certificate (`QUASAR_TLS_HOSTS`), comma-separated.
     #[serde(default)]
     pub tls_hosts: Option<String>,
+    /// The reverse proxies whose X-Forwarded-For the control plane honours
+    /// (`QUASAR_TRUSTED_PROXIES`), checked with the control plane's rules.
+    #[serde(default)]
+    pub trusted_proxies: Option<String>,
     pub database: DatabaseInputs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlRole {
+    Combined,
+    ControlOnly,
+}
+
+impl ControlRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlRole::Combined => "combined",
+            ControlRole::ControlOnly => "control_only",
+        }
+    }
 }
 
 /// Whose database the control plane uses (`CONTEXT.md` "Machine inputs": database mode).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "mode")]
+#[serde(rename_all = "snake_case", tag = "mode")]
 pub enum DatabaseInputs {
     /// A Postgres this machine's recovery actor created, on the platform network.
     Owned,
