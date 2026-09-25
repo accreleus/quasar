@@ -9,7 +9,7 @@ Quasar is a premium self-hosted cloud-gaming platform. This package covers the *
 - **Session overlay** (`session-overlay-v3.html`) — the in-stream HUD, a docked morphing pill/shelf
 - **Admin console** (`admin-console-v3.html`) — the full operations console (activity, fleet, library, app editor, people, account)
 
-**RH-06 additions: awaiting owner approval (#354).** `screens/fleet-rh06-v3.html`, with the section renderer `screens/assets/pages-rh06.js`, adds the Quasar-owned-machine surfaces to Fleet and Fleet ▸ Releases: the per-machine service inventory, the seed-missing and owner-conflict warnings, "must update before it can be managed", the Add host dialog, the backup confirmation on a migrating update, the restore command after a failed one, Remove host and Developer apply. Screenshots, the surface-to-ticket table and the open questions are in `screens/rh06/README.md`. No RH-06 slice may land UI for these surfaces until #354 records the owner's approval.
+**RH-06 additions: approved by the owner, 2026-09-25 (#354).** `screens/fleet-rh06-v3.html`, with the section renderer `screens/assets/pages-rh06.js`, adds the Quasar-owned-machine surfaces to Fleet and Fleet ▸ Releases: the per-machine service inventory, the seed-missing and owner-conflict warnings, "must update before it can be managed", the Add host dialog, the backup confirmation on a migrating update, the restore command after a failed one, Remove host and Developer apply. Screenshots, the surface-to-ticket table and the open questions are in `screens/rh06/README.md`. RH-06 UI slices build and visually verify against them.
 
 This supersedes the earlier `design_handoff_quasar` package. Where the two differ, **v3 wins**: IBM Plex type instead of Space Grotesk/Hanken, Michroma for the wordmark, oklch tokens, squarer radii, denser chrome.
 
@@ -34,7 +34,7 @@ design_handoff_v3/
     ├── home.html                ← uses assets/quasar.css + home-v3.css + quasar.js
     ├── admin-console-v3.html    ← uses assets/console-v3.css + data.js + ui.js + pages-*.js
     ├── releases-v3.html         ← self-contained: Fleet ▸ Releases, the platform updater tab (installed vs available, per-release changelog rows, targets rollup, channel, apply history); releases-v3.png is its render
-    ├── fleet-rh06-v3.html       ← RH-06 (awaiting owner approval, #354): Quasar-owned machines — service inventory, warnings, must-update, Add host, backup/restore, remove host, developer apply; uses console-v3.css + ui.js + pages-rh06.js
+    ├── fleet-rh06-v3.html       ← RH-06 (approved, #354): Quasar-owned machines — service inventory, warnings, must-update, Add host, backup/restore, remove host, developer apply; uses console-v3.css + ui.js + pages-rh06.js
     ├── rh06/                    ← its screenshots (one per surface and state) + README (state list, surface → ticket table, open questions)
     └── assets/
         ├── console-v3.css       ← v3 token contract + console/HUD component styles (source of truth)

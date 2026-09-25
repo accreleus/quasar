@@ -1,7 +1,9 @@
 # RH-06 console surfaces — mockups (#354)
 
-**Status: awaiting owner approval (#354).** Until the owner's approval is recorded on
-#354, no RH-06 slice may land the UI part of a surface below. Non-UI work can go ahead.
+**Status: approved by the owner on 2026-09-25 (#354), with no notes.** Every surface
+and state below is the approved design for its implementing slice. The open questions at
+the end were accepted as the mock draws them; the restore commands' exact flags are
+still fixed by #364 (see question 1).
 
 - Mockup: [`../fleet-rh06-v3.html`](../fleet-rh06-v3.html). It is a standalone reference
   page, built the same way as `releases-v3.html`. Each specimen is one surface in one state.
@@ -203,7 +205,7 @@ it from the UI).
 | "Seed not checked yet" (the actor's seed check has not run since it restarted) | seed-unknown | #358 / #366 |
 | Per-component outcomes inside one attempt (recovery actor succeeded, node agent restored) | floor-failed, update-refused Details | #360 / #363 / #353 (`release_state` components) |
 
-## Open questions for the owner
+## Open questions for the owner (accepted as mocked, 2026-09-25)
 
 1. **The restore commands — both PROPOSED, not spec. Decide in #364 / #352.**
    - *Quasar's own database* (`restore-own`). The mock uses the architecture's shape: the

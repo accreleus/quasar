@@ -36,7 +36,7 @@ own; the two do not move together, and that is deliberate.
   against both implementations; 31 fixtures in `testdata/recovery/socket` round-trip
   identically through the Rust types and the new Go `internal/actorsocket`. Nothing runs
   the port yet: the Go updater stays in place until RH06-15.
-- **RH06 console mockups, awaiting owner approval (#354).**
+- **RH06 console mockups, approved by the owner (#354).**
   `design_handoff_v3/screens/fleet-rh06-v3.html` extends Fleet and Fleet ▸ Releases in
   the v3 handoff's own markup and tokens. It covers the per-machine service inventory,
   the seed-missing and owner-conflict warnings, "must update before it can be managed",
