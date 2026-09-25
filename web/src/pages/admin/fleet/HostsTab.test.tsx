@@ -126,7 +126,7 @@ describe("HostsTab — the table", () => {
       expect(screen.getByText("1 of 2 hosts online · 1 session running")).toBeTruthy(),
     );
     expect(screen.getByRole("button", { name: "Refresh" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Enroll host" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add host" })).toBeTruthy();
     expect(within(screen.getByRole("tab", { name: /Hosts/ })).getByText("2")).toBeTruthy();
   });
 
@@ -182,7 +182,7 @@ describe("HostsTab — the table", () => {
     renderTab();
 
     await waitFor(() => expect(screen.getByText("No hosts enrolled")).toBeTruthy());
-    expect(screen.getAllByRole("button", { name: "Enroll host" }).length).toBe(2);
+    expect(screen.getAllByRole("button", { name: "Add host" }).length).toBe(2);
   });
 });
 
@@ -442,11 +442,11 @@ describe("HostsTab — the row menu", () => {
   });
 });
 
-describe("HostsTab — enroll", () => {
+describe("HostsTab — add host", () => {
   const openEnroll = async () => {
     renderTab();
     await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "Enroll host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add host" }));
   };
 
   // #12: the modal composes a wss:// enrollment string from the page origin. jsdom's
@@ -459,7 +459,7 @@ describe("HostsTab — enroll", () => {
     expect(screen.getByRole("dialog")).toBeTruthy();
     expect(screen.getByTestId("enroll-needs-https")).toBeTruthy();
     expect(screen.queryByText(/ws:\/\/localhost/)).toBeNull();
-    expect(screen.queryByRole("button", { name: "Mint enrollment string" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create command" })).toBeNull();
     expect(mocked.mintHostEnrollment).not.toHaveBeenCalled();
   });
 

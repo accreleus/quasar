@@ -236,15 +236,7 @@
   color: var(--text-4);
 }
 
-/* ── Enroll host modal ─────────────────────────────────────────────── */
-
-.enroll-fact {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: var(--t-sm);
-  color: var(--text-2);
-}
+/* ── Add host modal ────────────────────────────────────────────────── */
 
 /* A value block wraps rather than scrolling out of the dialog: an operator
    copies it with the button, but has to be able to read it first. */
@@ -285,8 +277,61 @@
 .enroll-more[open] > summary::before {
   content: "▾ ";
 }
-.enroll-more > .enroll-fact {
+/* Add host (#359): design_handoff_v3/screens/rh06 add-*.png, `rhAddHost` in
+   assets/pages-rh06.js. The copyable block is .enroll-snippet above. */
+.addhost-tabs {
+  margin: 0 0 var(--s5);
+}
+.addhost-lead {
+  font-size: var(--t-base);
+  margin: 0 0 6px;
+}
+.addhost-intro {
+  margin: 0 0 var(--s4);
+  font-size: var(--t-sm);
+  line-height: 1.55;
+}
+.addhost-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 170px;
+  gap: var(--s4);
+  margin-bottom: var(--s4);
+}
+.addhost-optional {
+  font-weight: 400;
+}
+.addhost-facts {
+  margin-bottom: var(--s4);
+}
+.addhost-fp {
+  font-size: var(--t-xs);
+}
+.addhost-note {
+  margin-bottom: var(--s4);
+}
+.addhost-snippet {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.addhost-sub {
+  margin-top: 3px;
+}
+.addhost-explain {
+  margin: var(--s4) 0 0;
+  line-height: 1.6;
+}
+.addhost-nowrap {
+  white-space: nowrap;
+}
+.addhost-more {
+  margin-top: 10px;
+}
+.addhost-more > .addhost-snippet {
   margin-top: var(--s2);
+}
+.addhost-prep {
+  margin-top: var(--s4);
 }
 
 /* Releases (Fleet › Releases). */

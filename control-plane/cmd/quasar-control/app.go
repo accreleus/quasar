@@ -21,6 +21,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/crud"
 	"github.com/accreleus/quasar/control-plane/internal/devauth"
 	"github.com/accreleus/quasar/control-plane/internal/devices"
+	"github.com/accreleus/quasar/control-plane/internal/enrollscript"
 	"github.com/accreleus/quasar/control-plane/internal/health"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
@@ -1362,6 +1363,10 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	if s.cfg.WebRoot != "" {
 		s.log.Info("serving SPA", "root", s.cfg.WebRoot)
 		mux.Handle("/", httpx.SPAHandler(s.cfg.WebRoot))
+		mux.Handle("/enroll-host.sh", enrollscript.Handler(s.cfg.WebRoot, s.cfg.EnrollPins, s.log))
+		if s.cfg.EnrollPins.SeedImage == "" || s.cfg.EnrollPins.AgentImage == "" {
+			s.log.Warn("Add host has no images to install: set QUASAR_ENROLL_SEED_IMAGE and QUASAR_ENROLL_AGENT_IMAGE")
+		}
 	}
 }
 

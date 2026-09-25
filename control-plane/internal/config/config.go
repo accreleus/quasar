@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/db"
+	"github.com/accreleus/quasar/control-plane/internal/enrollscript"
 	"github.com/accreleus/quasar/control-plane/internal/ice"
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
@@ -60,6 +61,9 @@ type Config struct {
 
 	// Non-empty serves the built SPA on non-API paths: same-origin, no proxy.
 	WebRoot string // QUASAR_WEB_ROOT (e.g. /app/web pointing at web/dist)
+
+	// The images /enroll-host.sh and the Add host stack install, by digest.
+	EnrollPins enrollscript.Pins // QUASAR_ENROLL_SEED_IMAGE, QUASAR_ENROLL_AGENT_IMAGE
 
 	// Empty / "spread" / "least-loaded" all select least-loaded (P3-02).
 	PlacementPolicy string // QUASAR_PLACEMENT_POLICY
@@ -321,6 +325,18 @@ func Load() (*Config, error) {
 	c.BootstrapAdminUsername = os.Getenv("BOOTSTRAP_ADMIN_USERNAME")
 	c.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
 	c.WebRoot = os.Getenv("QUASAR_WEB_ROOT")
+	c.EnrollPins = enrollscript.Pins{
+		SeedImage:  strings.TrimSpace(os.Getenv("QUASAR_ENROLL_SEED_IMAGE")),
+		AgentImage: strings.TrimSpace(os.Getenv("QUASAR_ENROLL_AGENT_IMAGE")),
+	}
+	for _, pin := range [][2]string{
+		{"QUASAR_ENROLL_SEED_IMAGE", c.EnrollPins.SeedImage},
+		{"QUASAR_ENROLL_AGENT_IMAGE", c.EnrollPins.AgentImage},
+	} {
+		if pin[1] != "" && !enrollscript.ValidImage(pin[1]) {
+			return nil, fmt.Errorf("%s %q: must be repository@sha256:<64 lowercase hex>, never a tag", pin[0], pin[1])
+		}
+	}
 	c.PlacementPolicy = os.Getenv("QUASAR_PLACEMENT_POLICY")
 	// These reach admission SQL; the veto must never brick the fleet (#383).
 	minFree, err := envInt32("QUASAR_VRAM_MIN_FREE_MB", 1024, 0)

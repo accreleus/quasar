@@ -41,7 +41,7 @@ then arrive as files.
 | `QUASAR_LOCAL_ENROLLMENT_FILE` | unset | A combined host: the single-use **local enrollment token** its recovery actor generated for this machine's own node agent. At boot the control plane stores it hashed in `host_enrollments` (single use, no expiry, no minting admin, bound to `QUASAR_LOCAL_ENROLLMENT_NODE_NAME`); a token already present is left as it is, so a restart never re-arms a spent one. Set together with `QUASAR_LOCAL_ENROLLMENT_NODE_NAME`; an empty file fails startup. |
 | `QUASAR_LOCAL_ENROLLMENT_NODE_NAME` | unset | The node name the local enrollment token is bound to; no other node can redeem it. Set together with `QUASAR_LOCAL_ENROLLMENT_FILE`. |
 | `QUASAR_RECOVERY_CONTROL_SOCKET` | unset | An owned machine only (the recipe sets `/run/quasar-recovery/control.sock`): its recovery actor's control socket. When set, the control plane reads its own machine's identity from it (`install_mode`, `recovery_actor_version`, `recovery_actor_source_commit`, `seed_version`, `database_mode` on `GET /v1/admin/platform/identity` and the release view), at most every 30 s; the control-plane target's `updater_socket` preflight check checks this socket, and `updater_stack_dir` / `updater_overlays` are not evaluated. Unset: not an owned machine, and no socket is read. |
-| `ENROLLMENT_TOKEN` | unset (optional since #12; **deprecated**, amendment 14) | **Deprecated:** retires with the RH06 contract step (RH06-15, #367); a control plane logs one WARN at boot while it is set, and nothing when it is unset (the recommended state). Owned installs never use it. The fleet-wide static enrollment token. **Since #12 this is the fallback, not the primary path**: an admin mints per-host tokens in Admin → Fleet → Enroll host (`POST /v1/admin/hosts/enrollments` — hashed at rest, single-use, one-hour expiry, optionally bound to one `node_name`) and the agent presents either. Unset, only minted per-host tokens (and a combined host's local token) can enroll — the right end state once every host has joined. Existing agents that enrolled with it keep reconnecting with their node secret regardless. Keep it set on a single-host install (the local agent dials `ws://localhost` and enrolls with it on first boot). Treat it as a break-glass credential — it can enroll *any* node name, and (#96) it is refused only while the host it names has a live agent. |
+| `ENROLLMENT_TOKEN` | unset (optional since #12; **deprecated**, amendment 14) | **Deprecated:** retires with the RH06 contract step (RH06-15, #367); a control plane logs one WARN at boot while it is set, and nothing when it is unset (the recommended state). Owned installs never use it. The fleet-wide static enrollment token. **Since #12 this is the fallback, not the primary path**: an admin mints per-host tokens in Admin → Fleet → Add host (`POST /v1/admin/hosts/enrollments` — hashed at rest, single-use, one-hour expiry, optionally bound to one `node_name`) and the agent presents either. Unset, only minted per-host tokens (and a combined host's local token) can enroll — the right end state once every host has joined. Existing agents that enrolled with it keep reconnecting with their node secret regardless. Keep it set on a single-host install (the local agent dials `ws://localhost` and enrolls with it on first boot). Treat it as a break-glass credential — it can enroll *any* node name, and (#96) it is refused only while the host it names has a live agent. |
 | `QUASAR_IMAGE_REGISTRY_HOSTS` | `ghcr.io` | Comma-separated registry-host allowlist for the image-management digest resolver (P3): manifest HEADs and token-realm fetches are refused for any other host, which is the SSRF containment on catalog-supplied registry refs (enforced by the shared `internal/outbound` client since #105). The allowlist names the hosts actually contacted, so a Docker Hub ref needs `docker.io,registry-1.docker.io,auth.docker.io` — the ref's registry, its API endpoint, and its token realm. **Also gates catalog-supplied artwork URLs (#456):** a provider app's `cover_url` is accepted only when it is an `https` URL on one of these hosts; anything else (relative path, plain http, off-allowlist host) falls back to the shipped gradient tile. **The edge release channel reuses this list** for the platform component images, with `QUASAR_PLATFORM_REGISTRY` added to it automatically. **A registry that serves blobs by redirect needs its blob host on this list too:** reading an image's labels fetches a config blob, and GHCR answers that with a `307` to `pkg-containers.githubusercontent.com`, which is followed only if allowed. `ghcr.io` implies that host automatically; any other redirecting registry must have its blob host added here by hand, or edge detection fails with a refused redirect. |
 | `QUASAR_LIBRARY_PROVIDERS` | `steam` | Comma-separated allowlist of `library_provider` names the P5 auto-ensure may install on a discovery enable. The local trust boundary on catalog-declared providers: a catalog image marking itself a provider outside this list is never auto-installed. Passed through the base compose file. |
 | `LISTEN_ADDR` | `:8080` | HTTP listen address; must contain a port. Agent-facing surface (`/agent/ws` enrollment, `/v1/agent/*`, `/health`) always serves here in plain HTTP. When the HTTPS listener is on (default), **browser-facing routes on this listener redirect to HTTPS** instead of being served — see `QUASAR_HTTP_REDIRECT`. |
@@ -72,6 +72,8 @@ then arrive as files.
 | `QUASAR_ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to open `/v1/signal`, e.g. `https://play.example.com,http://admin.lan:8080`. Each entry must be an exact `http(s)://host[:port]` origin: no path, query, fragment, credentials, or other scheme; an invalid non-empty entry fails control-plane startup without echoing its value. **Since migration 0064 this is an OVERRIDE, not the only source** (first-run wizard v2 §S6e): the allow-list is now an admin-editable column (`instance_settings.allowed_origins`, `PATCH /v1/admin/settings`), and this variable — **when set, including to the empty string** — wins outright and the column is not consulted. Setting it to `""` is therefore the way to pin the list off from the environment. **Leave it unset to manage the list from the admin UI**; existing deployments that set it keep their exact current behaviour. `GET /v1/admin/access-check` reports which source is in force. When neither is configured, only same-origin browser requests are allowed — which is not "deny all", and is why a plain LAN install works with nothing set. Missing `Origin` remains allowed for browserless tooling and still requires a valid single-use signaling token. |
 | `QUASAR_ICE_SERVERS` | unset (no ICE servers) | **EXPERIMENTAL, UNSUPPORTED, OFF BY DEFAULT.** ICE servers handed to the browser (#509), as a JSON array of W3C `RTCIceServer` objects, served on `signaling.ice_servers` with every launch and reconnect. **Unset or `[]` is the default and the only supported configuration**: host candidates only, which is what a shared LAN or a VPN joining the two ends needs, and what Quasar did before this knob existed. Nobody gets a relay without setting it explicitly. It is listed here because the variable exists in the code and is read at startup, not because relaying is a capability Quasar offers or supports: it has never been operated outside our own LAN, Quasar ships no TURN server, and the single static `username`/`credential` pair it carries reaches every user who launches a session. A malformed value, a non-ICE scheme, a `turn:` entry missing credentials, or a `stun:` entry carrying them all fail the boot with a message naming the problem, because the failure this validation prevents is otherwise silent. Startup logs the resolved list with credentials redacted, or says none is configured. |
 | `QUASAR_WEB_ROOT` | unset | When set, serve the built SPA from this dir for non-API paths (same-origin deploy). Compose points it at `web/dist` mounted as `/app/web`. |
+| `QUASAR_ENROLL_SEED_IMAGE` | unset | The seed image Admin → Fleet → Add host installs on a new GPU host, as `repository@sha256:<digest>` (the `quasar-recovery` image; a tag fails startup). See "Add host" below. |
+| `QUASAR_ENROLL_AGENT_IMAGE` | unset | The node-agent image Add host installs, as `repository@sha256:<digest>` (a tag fails startup). See "Add host" below. |
 | `QUASAR_PLACEMENT_POLICY` | spread | `""` \| `spread` \| `least-loaded` → spread (default); `locality` → prefer the host holding the user's home (P3-02/P5-07). Unknown value = startup error. |
 | `QUASAR_SESSION_GRACE_SECS` | `120` | **Control plane.** How long a host may be silent before the stale-host sweep fails its sessions and marks it offline (#128). A disconnect no longer reaps `running` sessions — the agent holds them across a control-plane restart and re-reports them on its first heartbeat — so this is the backstop for a host that never returns. Measured from `max(last_heartbeat_at, control-plane boot)`: the boot term stops a control plane that restarts after a quiet period from reaping every session before any agent can reconnect. **Must exceed the agent's own grace plus its maximum reconnect backoff (30 s)**; with the agent default of 90 s, 120 s meets that exactly. `0` disables the sweep entirely (a host that never returns then holds its sessions and their reservations indefinitely) — it is a deliberate kill switch, not a shorter window. The sweep ticks at a quarter of this (minimum 5 s), and is inert when agent connectivity is not wired — a backstop that cannot tell a live host from a dead one must reap nothing rather than everything. |
 | `QUASAR_VRAM_MIN_FREE_MB` | `1024` | Live free-VRAM admission floor (#383). A GPU accepts a new session only if its most recent agent-reported free-VRAM sample, debited for launches the sample cannot see yet, is at least this. **Advisory, not a reservation** — encode slots remain the race-safe reservation; this only refuses a GPU that is *already* out of memory. `0` disables the veto entirely (slots-only admission) and is the kill switch. Fails **open** in every unknown case: no sample, stale sample, or a card whose `vram_mb_total` is ≤ this floor (an AMD APU's UMA carve-out). A veto rejection is a retryable `503 capacity_exhausted` and logs the GPU plus every number it judged on. Note a floor above a card's total does **not** make that card unusable: the veto abstains, the card stays servable, and any rejection there is ordinary encode-slot exhaustion. |
@@ -337,13 +339,13 @@ Read in `node-agent/src/config.rs`. `CONTROL_PLANE_URL` is **required**.
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_ENROLLMENT` | unset | **The one-paste way to join a second host (#12).** Admin → Fleet → Enroll host also prints a one-line installer (`deploy/enroll-host.sh`, #100, served by the control plane itself at `/enroll-host.sh`; a self-signed control plane is fetched with `curl --pinnedpubkey`) that consumes this string on the new machine: host preflights, the agent image pinned to the running release, an agent-only Compose file plus a 0600 `.env` holding this variable, the agent started and watched until enrolled — see `deploy/README.md` "Multi-host". The enrollment string itself: `qenr1.<FINGERPRINT>.<base64url(wss-url)>.<token>`. It supplies the control-plane URL, the certificate fingerprint to pin, and a minted single-use enrollment token in one value — the fingerprint is first and verbatim (uppercase colon-separated SHA-256, exactly as the control plane logs it) so you can compare it by eye before pasting. The agent refuses a string carrying a `ws://` URL. Precedence when other variables are also set: `CONTROL_PLANE_URL` overrides the URL inside it (logged at WARN — split-horizon deployments) **but only with another `wss://` address — a `ws://` override is fatal even with `QUASAR_ALLOW_PLAINTEXT_AGENT=1`**, because it would send the string's own token in cleartext (unset `QUASAR_ENROLLMENT` and use `ENROLLMENT_TOKEN` if cleartext is really intended); `CONTROL_PLANE_FINGERPRINT` overrides the fingerprint inside it (WARN — the certificate-rotation path); an `ENROLLMENT_TOKEN` that *differs* from the token inside it is fatal; a saved pin that differs from the configured one is superseded with a WARN. An empty fingerprint segment (`qenr1..`) means the control plane is behind a real-CA certificate and is logged as such at connect, so a mispasted string is visible. Once enrolled, the pin is saved beside the node secret (`NODE_SECRET_PATH` + `.tls`) and this variable can be removed. |
+| `QUASAR_ENROLLMENT` | unset | **The one-paste way to join a second host (#12).** Admin → Fleet → Add host also prints a one-line installer (`deploy/enroll-host.sh`, served by the control plane itself at `/enroll-host.sh`; a self-signed control plane is fetched with `curl --pinnedpubkey`) that hands this string to the seed on the new machine, whose recovery actor gives it to the agent as `QUASAR_ENROLLMENT_FILE` — see "Add host" below. The enrollment string itself: `qenr1.<FINGERPRINT>.<base64url(wss-url)>.<token>`. It supplies the control-plane URL, the certificate fingerprint to pin, and a minted single-use enrollment token in one value — the fingerprint is first and verbatim (uppercase colon-separated SHA-256, exactly as the control plane logs it) so you can compare it by eye before pasting. The agent refuses a string carrying a `ws://` URL. Precedence when other variables are also set: `CONTROL_PLANE_URL` overrides the URL inside it (logged at WARN — split-horizon deployments) **but only with another `wss://` address — a `ws://` override is fatal even with `QUASAR_ALLOW_PLAINTEXT_AGENT=1`**, because it would send the string's own token in cleartext (unset `QUASAR_ENROLLMENT` and use `ENROLLMENT_TOKEN` if cleartext is really intended); `CONTROL_PLANE_FINGERPRINT` overrides the fingerprint inside it (WARN — the certificate-rotation path); an `ENROLLMENT_TOKEN` that *differs* from the token inside it is fatal; a saved pin that differs from the configured one is superseded with a WARN. An empty fingerprint segment (`qenr1..`) means the control plane is behind a real-CA certificate and is logged as such at connect, so a mispasted string is visible. Once enrolled, the pin is saved beside the node secret (`NODE_SECRET_PATH` + `.tls`) and this variable can be removed. |
 | `QUASAR_ENROLLMENT_FILE` | unset | The file twin of `QUASAR_ENROLLMENT` (#357): a path whose contents (trimmed) are the enrollment string, with exactly the same meaning. On an owned install the recovery actor sets it to `/run/quasar-secrets/enrollment`, a read-only file in the agent's secrets volume, so the string never enters the container environment. Setting both variables is a startup error; an unreadable file is a startup error naming the path, never the contents; an empty file is the same as no enrollment string. Unset, `QUASAR_ENROLLMENT` behaves exactly as before. |
 | `QUASAR_RECOVERY_SOCKET` | unset | Set only by the recovery actor's recipe (#357): the agent socket, `/run/quasar-recovery/agent.sock`. Its presence makes this an **owned** install: before every `register` the agent reads the actor's `GET /v1/status` there and registers `install_mode: "owned"`, `updater_present` = whether the actor answered, and the actor's `recovery_actor_version`, `recovery_actor_source_commit` and `seed_version` (agent-api.md amendment 14). No answer logs `token="install-actor-unreachable"` and registers `updater_present: false`. Unset (Compose and source installs), install discovery is the Compose one, unchanged. Do not set it by hand. |
 | `CONTROL_PLANE_URL` | — (**required** unless `QUASAR_ENROLLMENT` supplies it) | Control-plane WebSocket, e.g. `ws://localhost:8080` or `wss://cp.example:8443` (HTTP base for the agent pull channels is derived from it: `ws→http`, `wss→https`, strips `/agent/ws`). **`wss://` works (#12)** and both agent clients — the websocket and the node-secret HTTP polls — verify the same way: **pinned** to the control plane's leaf certificate when a fingerprint is known (from `QUASAR_ENROLLMENT`, `CONTROL_PLANE_FINGERPRINT`, or the saved pin), else against the bundled WebPKI roots (a real certificate, e.g. the Caddy overlay). Under a pin, SAN and expiry are not checked — the pin is the identity, and the self-signed default routinely lacks the LAN name or IP you dial. **`ws://` is cleartext**: the enrollment token and the node secret cross it as plain JSON. It is allowed without ceremony only to loopback (`localhost` / `127.0.0.0/8` / `::1`, the single-host compose default); to any other host the agent refuses to start unless `QUASAR_ALLOW_PLAINTEXT_AGENT=1`. |
 | `CONTROL_PLANE_FINGERPRINT` | unset | Manual certificate pin: the SHA-256 the control plane logs at startup (`fingerprint=…`, also on the admin Access panel and `GET /v1/admin/access-check`). Accepts `AB:CD:…`, lowercase, bare hex, or a `sha256:` prefix. Use it to **rotate**: after a control-plane certificate is re-issued every pinned agent stops connecting (it logs `token="cp-tls-pin-mismatch"` with the expected and observed values) until this is updated — one value per host, no re-enrollment, the node secret and host row survive. Overrides the fingerprint inside `QUASAR_ENROLLMENT` and the saved pin. Does nothing on a `ws://` URL (logged at WARN). |
 | `QUASAR_ALLOW_PLAINTEXT_AGENT` | unset (off) | `1`/`true` permits a `ws://` control-plane URL to a **non-loopback** host. Only for a network you own end to end (a VPN or private link) and only as a transition: the credentials are on the wire. Every connect logs the policy. Existing single-host installs dial loopback and never need this. |
-| `ENROLLMENT_TOKEN` | unset | Presented on first enrollment; must match the control-plane's. Optional once the node secret is persisted (`NODE_SECRET_PATH`). An empty/whitespace-only value is treated as unset. **#519: if there is no persisted node secret AND this is unset/empty, the agent cannot ever register — it logs `token="boot-enrollment-unconfigured"` naming this variable and the admin Hosts page, then exits non-zero** (after a short delay, so a `restart: unless-stopped` compose policy crash-loops visibly rather than hot-spinning) instead of idling forever in the reconnect loop while `docker compose ps` shows it healthy. Get a token from Admin → Fleet → Enroll host (a minted per-host token, or the whole enrollment string via `QUASAR_ENROLLMENT`), or copy the static `ENROLLMENT_TOKEN` from the control plane's `deploy/.env`. |
+| `ENROLLMENT_TOKEN` | unset | Presented on first enrollment; must match the control-plane's. Optional once the node secret is persisted (`NODE_SECRET_PATH`). An empty/whitespace-only value is treated as unset. **#519: if there is no persisted node secret AND this is unset/empty, the agent cannot ever register — it logs `token="boot-enrollment-unconfigured"` naming this variable and the admin Hosts page, then exits non-zero** (after a short delay, so a `restart: unless-stopped` compose policy crash-loops visibly rather than hot-spinning) instead of idling forever in the reconnect loop while `docker compose ps` shows it healthy. Get a token from Admin → Fleet → Add host (a minted per-host token, or the whole enrollment string via `QUASAR_ENROLLMENT`), or copy the static `ENROLLMENT_TOKEN` from the control plane's `deploy/.env`. |
 | `ENROLLMENT_TOKEN_FILE` | unset | The file twin of `ENROLLMENT_TOKEN` (#361): a path whose contents (trimmed) are the token, with the same meaning. A combined host's recovery actor gives its own agent the machine's single-use local enrollment token this way, from the agent's secrets volume. Setting both is refused at start; an unreadable file names the variable, never its contents. Read by agents of recipe revision 2 or later. |
 | `NODE_NAME` | system hostname | Stable identity for the host; also scopes the default secret path. |
 | `NODE_SECRET_PATH` | `/tmp/quasar-{NODE_NAME}-secret` | Where the per-node secret (issued at enrollment) is persisted. In compose this is a named volume so it survives restarts. The certificate pin learned at the first verified `wss://` connection is saved next to it as `<path>.tls` (0600, created atomically, never following a symlink). On a **reconnect** it is refreshed only when `CONTROL_PLANE_FINGERPRINT` supplies a different pin — the operator-driven rotation path; a pin arriving via the enrollment string never overwrites an existing file. A register that **mints a node secret** (a first enrollment, or the #199 re-enrollment below) does refresh it whatever named the pin: that register replaces the identity the saved pin belonged to, and the pin being written is the one that just verified the handshake — otherwise a host re-enrolled onto a second control plane keeps the first one's fingerprint and cannot connect at all once `QUASAR_ENROLLMENT` is removed. The managed-image state is `<path>.images.json`. **#199 — this file outlives the control plane that minted it.** The agent presents the saved secret in preference to `ENROLLMENT_TOKEN`/`QUASAR_ENROLLMENT`, so a machine re-enrolled against a *different* control plane arrives holding a credential that one has never issued and is refused `host_not_found`. The agent recovers on its own: it re-registers **once per reject** with the configured enrollment token, which mints a fresh identity and overwrites this file (logged `token="cp-register-stale-identity"`). Once per reject, not latched — a control plane that is merely mid-restore still gets the saved secret offered on the next attempt. With no token configured there is nothing to fall back on: the agent logs `token="cp-register-stale-identity-unresolvable"` naming this path and the reset route, and `deploy/enroll-host.sh --reset-identity` (or `QUASAR_RESET_IDENTITY=1`) does the clearing. Container ownership is persisted in `<path>.container-owner` (0600), locked for the agent process lifetime. Keep it with the node state: a concurrent agent sharing this state or a malformed owner file fails startup with `boot-container-ownership-unavailable`. Startup cleanup removes only matching-owner session/audio containers; foreign and legacy unlabelled containers are preserved for manual review. Never delete or replace the owner file while an agent runs. |
@@ -1270,15 +1272,20 @@ docker run -d --name quasar-seed --restart unless-stopped \
   --security-opt label=disable \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v quasar-machine:/var/lib/quasar-machine:ro \
+  -e QUASAR_ROLE=gpu \
   -e QUASAR_ENROLLMENT='qenr1.…' \
-  -e QUASAR_HOME_ROOT=/srv/quasar/homes \
+  -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
+  -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
   -e QUASAR_AGENT_IMAGE=<registry>/quasar-node-agent@sha256:<digest> \
   <registry>/quasar-recovery@sha256:<digest> seed
 ```
 
-The same seed as a Compose stack (Dockge, Arcane). The top-level `name:` matters: without it
-a stack names the volume `<project>_quasar-machine`, which is not the machine's state volume,
-and the seed refuses to start the install (`token="seed-self-invalid"`, naming what it found).
+The same seed as a Compose stack (Dockge, Arcane), exactly as Admin → Fleet → Add host
+writes it (a test holds the two identical). The top-level `name:` matters: without it a stack
+names the volume `<project>_quasar-machine`, which is not the machine's state volume, and the
+seed refuses to start the install (`token="seed-self-invalid"`, naming what it found). Set
+`QUASAR_TEMPLATE_ROOT` whenever you move the home root: the recovery actor and the node agent
+default it differently.
 
 ```yaml
 services:
@@ -1287,13 +1294,15 @@ services:
     command: seed
     restart: unless-stopped
     security_opt: [label=disable]
+    environment:
+      QUASAR_ROLE: gpu
+      QUASAR_ENROLLMENT: qenr1.…
+      QUASAR_HOME_ROOT: /var/lib/quasar/homes
+      QUASAR_TEMPLATE_ROOT: /var/lib/quasar/templates
+      QUASAR_AGENT_IMAGE: <registry>/quasar-node-agent@sha256:<digest>
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - quasar-machine:/var/lib/quasar-machine:ro
-    environment:
-      QUASAR_ENROLLMENT: qenr1.…
-      QUASAR_HOME_ROOT: /srv/quasar/homes
-      QUASAR_AGENT_IMAGE: <registry>/quasar-node-agent@sha256:<digest>
 volumes:
   quasar-machine:
     name: quasar-machine
@@ -1356,8 +1365,8 @@ volumes:
     name: quasar-machine
 ```
 
-A **control-only** host sets `QUASAR_ROLE=control-only` and drops `QUASAR_AGENT_IMAGE`
-(`QUASAR_HOME_ROOT` is optional: with it, the control plane uses host-path homes at that
+A **control-only** host sets `QUASAR_ROLE=control-only`; its `QUASAR_AGENT_IMAGE` creates no
+agent here and is only what Add host installs on new GPU hosts (`QUASAR_HOME_ROOT` is optional: with it, the control plane uses host-path homes at that
 path, which must then be the same path on every GPU host). To use **your own database**,
 add its settings under the control plane's own names; the password is then the one secret
 that also lives in your manager's configuration, by your choice of database (#352 R1-Q1),
@@ -1403,7 +1412,9 @@ SETUP`) while no admin exists: `docker exec quasar-control-plane cat /run/quasar
 `BOOTSTRAP_ADMIN_*` is not an input of an owned install.
 
 **Which images.** `QUASAR_CONTROL_PLANE_IMAGE` and `QUASAR_AGENT_IMAGE` are seed inputs,
-by digest, like the GPU host's agent image; a combined host's agent image must declare recipe
+by digest, like the GPU host's agent image (a control-only machine names the agent image only
+for Add host, which installs it on new GPU hosts, with this machine's recovery image as their
+seed); a combined host's agent image must declare recipe
 revision 2 or later (it reads `ENROLLMENT_TOKEN_FILE`). Postgres defaults to the
 `postgres:16-alpine` digest this recovery-actor release carries
 (`recipe::control::DEFAULT_POSTGRES_IMAGE`); `QUASAR_POSTGRES_IMAGE` pins another. It is
@@ -1469,7 +1480,10 @@ container id in that window does not recognise the unstarted actor as its own an
 logging `token="seed-actor-unstarted"`; `docker start quasar-recovery` finishes it.
 
 `docker exec quasar-seed quasar-recovery status` prints what the last look came to; the
-image's health check uses it. The console shows the seed's version on the host's "Services
+image's health check uses it, so a stack manager shows the seed **unhealthy** while it is
+idle on something only the operator can clear (every idle row above except
+`seed-uninstalled`) and while it has stopped looking; the reason is its one log line. The
+agent image's pull is said once (INFO), then only the WARN above. The console shows the seed's version on the host's "Services
 on this machine" card, `unknown` for a running seed whose version the actor could not read,
 and "not found" when the recovery actor finds no running seed (a stopped seed re-creates
 nothing, so it reads as none: start it again). `SIGTERM` and `SIGINT` stop the seed (and the
@@ -1483,6 +1497,57 @@ by digest, `state: active`. The actor the seed creates has exactly the compiled 
 the engine socket, `quasar-machine` and `quasar-recovery-agent` volumes, command `actor`,
 the labels `io.quasar.installation` and `io.quasar.platform-service=recovery-actor`, and
 `QUASAR_SEED_CONTAINER` naming the seed's container.
+
+### Add host: the one-line command and the stack (#359)
+
+Admin → Fleet → Add host mints one single-use enrollment token (optionally bound to a node
+name; one hour by default, up to 30 days) and gives it two ways onto a new GPU host: the
+one-line command (default) and, on its second tab, the seed-only stack above for Dockge or
+Arcane. Both install the two images the control plane is configured with:
+
+| Variable (control plane) | Meaning |
+|---|---|
+| `QUASAR_ENROLL_SEED_IMAGE` | The seed, `<registry>/quasar-recovery@sha256:<digest>`. The seed's first actor is created from it. |
+| `QUASAR_ENROLL_AGENT_IMAGE` | The node agent, `<registry>/quasar-node-agent@sha256:<digest>`. |
+
+The control plane writes them into the `/enroll-host.sh` it serves, and the dialog reads them
+back from that script for its stack, so the two cannot name different seeds. Unset, the
+dialog says so and creates nothing. A tag in either fails startup: the seed refuses one.
+
+The command is
+
+```
+curl -fsSL [-k --pinnedpubkey 'sha256//…'] https://<control-plane>/enroll-host.sh \
+  | QUASAR_ENROLLMENT='qenr1.…' [QUASAR_NODE_NAME=<name>] sh
+```
+
+run as root (or with passwordless sudo) on a machine with Docker. It checks the host (a DRM
+render node, `/dev/uinput`, unprivileged user namespaces, the NVIDIA Container Toolkit on
+NVIDIA) and loads the app-container AppArmor profile; a failed check stops before anything
+is started and prints its fix, which it applies when asked (a `y` at the terminal,
+`QUASAR_ENROLL_FIX=1`, or `… | sh -s -- --fix`). Then it pulls both images, starts the seed
+exactly as the `docker run` above (`QUASAR_TEMPLATE_ROOT` always set, beside the home root)
+and waits until the agent has enrolled. It writes no compose file, `.env` or install
+directory. Its own inputs: `QUASAR_HOME_ROOT` (default `/var/lib/quasar/homes`),
+`QUASAR_TEMPLATE_ROOT`, `QUASAR_NODE_NAME`, `QUASAR_SEED_IMAGE` / `QUASAR_AGENT_IMAGE`
+(override the served images), `QUASAR_ENROLL_APPARMOR_PERSIST=1`, `QUASAR_ENROLL_DRY_RUN=1`;
+`sh enroll-host.sh --help` lists them.
+
+- **Run again** on an installed machine (one with a recovery actor), it starts and changes
+  nothing and reports the agent. A run interrupted before the recovery actor existed is
+  completed by running the command again (its seed is replaced).
+- **A refused string** (expired, already used, bound to another node name, a live agent under
+  that name, a certificate that does not match its pin): on a machine this run installed, the
+  install is taken away again and the message says to create a new command. On a machine
+  installed earlier, the install keeps the string it was installed with, so run the new
+  command with `QUASAR_RESET_IDENTITY=1`: it removes this machine's seed, recovery actor, node
+  agent and their volumes (the agent's saved identity included, never the homes) first. It
+  refuses on a machine that runs a control plane.
+- A machine still running the pre-RH06 Compose-installed agent, or a seed a stack manager
+  started, is refused with what to remove first.
+
+With the stack, preparing the host is the operator's job; the host's readiness card lists
+what is missing once it enrolls.
 
 ## Recovery actor (`quasar-recovery`, RH-06)
 
@@ -1513,11 +1578,11 @@ registers as `seed_version`.
 | Variable | Default | Notes |
 |---|---|---|
 | `QUASAR_ROLE` | `gpu` | `gpu`, `combined` or `control-only`; anything else is refused at start (`token="actor-role-invalid"`). |
-| `QUASAR_ENROLLMENT` | — (**required** on a GPU host's first install) | The `qenr1.…` string from Admin → Fleet → Enroll host. Stored as a 0600 secret in machine state and handed to the agent as the read-only file `QUASAR_ENROLLMENT_FILE`; never put in the agent's environment. Read only on the first install: once machine state exists the stored secret wins and this value is ignored (logged at INFO), whatever a later start carries. A `docker run` container's environment cannot be edited, so the value stays visible in `docker inspect quasar-recovery` until the actor is recreated without it; the token is single-use and expires, so after enrollment it enrolls nothing. |
+| `QUASAR_ENROLLMENT` | — (**required** on a GPU host's first install) | The `qenr1.…` string from Admin → Fleet → Add host. Stored as a 0600 secret in machine state and handed to the agent as the read-only file `QUASAR_ENROLLMENT_FILE`; never put in the agent's environment. Read only on the first install: once machine state exists the stored secret wins and this value is ignored (logged at INFO), whatever a later start carries. A `docker run` container's environment cannot be edited, so the value stays visible in `docker inspect quasar-recovery` until the actor is recreated without it; the token is single-use and expires, so after enrollment it enrolls nothing. |
 | `QUASAR_HOME_ROOT` | — (**required** on first install of a machine with an agent) | Host path of the homes root; bound into the agent at the same path, and the control plane's `QUASAR_HOME_ROOT` on a combined host. Optional on a control-only host. |
 | `QUASAR_TEMPLATE_ROOT` | `templates` beside the home root | Host path of the templates root; bound at the same path. The default is the agent's own (`{QUASAR_HOME_ROOT}/../templates`, normalised: `/srv/quasar/homes` → `/srv/quasar/templates`); `/var/lib/quasar/templates` on a machine with no home root. A machine installed before this default keeps the root its machine state recorded. |
 | `QUASAR_NODE_NAME` | the engine host's name | The agent's `NODE_NAME`; on a combined host also the node name its local enrollment token is bound to. |
-| `QUASAR_AGENT_IMAGE` | — (**required** on first install of a machine with an agent) | The node-agent image as `repository@sha256:<digest>`; a tag is refused. The image must carry an `org.quasar.recipe` revision this actor carries (on a combined host, 2 or later), else the install stops with `recipe_unsupported` before anything is created. |
+| `QUASAR_AGENT_IMAGE` | — (**required** on first install of a machine with an agent) | The node-agent image as `repository@sha256:<digest>`; a tag is refused. The image must carry an `org.quasar.recipe` revision this actor carries (on a combined host, 2 or later), else the install stops with `recipe_unsupported` before anything is created. On a combined or control-only machine it is also the agent image the control plane's Add host installs on new GPU hosts (`QUASAR_ENROLL_AGENT_IMAGE`, #359), beside this machine's own recovery image as their seed (`QUASAR_ENROLL_SEED_IMAGE`); a control-only machine creates no agent from it, and without it Add host has no agent to offer. Both are recorded at install. |
 | `QUASAR_CONTROL_PLANE_IMAGE` | — (**required** on a combined or control-only first install) | The control-plane image as `repository@sha256:<digest>`, of a recipe revision this actor carries (`org.quasar.recipe`, stamped by `deploy/build-images.sh control`). |
 | `QUASAR_POSTGRES_IMAGE` | the `postgres:16-alpine` digest this release carries | A Quasar-owned database's image, by digest. Created once, never updated (#352 R1). Refused together with `QUASAR_DATABASE_HOST`. |
 | `QUASAR_PUBLIC_HOST` | unset | The name or address the console is reached by: a SAN on the control plane's self-signed certificate (the control plane's own `QUASAR_PUBLIC_HOST`). Set it: the control plane's container cannot see the machine's LAN address by itself. |

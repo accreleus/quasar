@@ -19,7 +19,7 @@ import { useFleetContext } from "../../../lib/fleet/FleetContext";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
 import { useSectionHead } from "../../../components/shell/sectionHead";
-import { EnrollHostModal } from "./EnrollHostModal";
+import { AddHostModal } from "./AddHostModal";
 import { HostRow } from "./HostRow";
 import "../../../styles/admin/fleet.css";
 
@@ -169,7 +169,7 @@ export function HostsTab() {
         </Button>
         <Button variant="primary" onClick={() => setEnrollOpen(true)}>
           <IconPlus />
-          Enroll host
+          Add host
         </Button>
       </>
     ),
@@ -228,7 +228,7 @@ export function HostsTab() {
             <p>A GPU machine running the node agent registers itself and appears here.</p>
             <Button variant="primary" onClick={() => setEnrollOpen(true)}>
               <IconPlus />
-              Enroll host
+              Add host
             </Button>
           </div>
         ) : !fleet.loading && visible.length === 0 ? (
@@ -295,7 +295,11 @@ export function HostsTab() {
         )}
       </div>
 
-      <EnrollHostModal open={enrollOpen} onClose={() => setEnrollOpen(false)} />
+      <AddHostModal
+        open={enrollOpen}
+        onClose={() => setEnrollOpen(false)}
+        connectedNodeNames={hosts.filter((h) => h.status === "online").map((h) => h.node_name)}
+      />
 
       {forgetTarget &&
         (() => {

@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use quasar_recovery::engine::{EngineError, ErrorKind, FakeEngine, FakeState, Fault, Image, When};
 use quasar_recovery::recipe::names;
 use quasar_recovery::seed::file::{ActorImage, SeedFile, SeedState};
-use quasar_recovery::seed::{profile, Outcome};
+use quasar_recovery::seed::{
+    profile, status_body, status_report, Outcome, Seed, SeedConfig, INTERVAL,
+};
 use support::*;
 
 fn new_machine(env: BTreeMap<String, String>) -> (Arc<FakeEngine>, tempfile::TempDir) {
@@ -854,4 +856,92 @@ fn a_failed_engine_call_during_a_first_look_converges_to_exactly_one_running_act
             }
         }
     }
+}
+
+#[test]
+fn an_agent_image_that_cannot_be_pulled_is_said_once_however_many_looks() {
+    let missing = "registry.example.invalid/quasar/quasar-node-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let mut env = seed_env();
+    env.insert("QUASAR_AGENT_IMAGE".into(), missing.into());
+    let (engine, dir) = new_machine(env);
+
+    let (outcomes, log) = logged(&engine, dir.path(), 4);
+    for outcome in &outcomes {
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Retry {
+                    token: "seed-agent-image-unavailable",
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(
+        log.matches("pulling an image the install names").count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("seed-agent-image-unavailable").count(),
+        1,
+        "{log}"
+    );
+}
+
+/// Two looks of a seed that writes its status file, then what its health check reads.
+fn health_after_looks(engine: &Arc<FakeEngine>, dir: &std::path::Path) -> (String, bool) {
+    let status = tempfile::NamedTempFile::new().unwrap();
+    let mut config = SeedConfig::new(dir);
+    config.self_container = Some(SEED_ID.into());
+    config.new_installation_id = Box::new(|| INSTALLATION.to_string());
+    config.status_file = Some(status.path().to_path_buf());
+    let mut seed = Seed::new(engine.clone(), config);
+    seed.step();
+    seed.step();
+    let body = std::fs::read_to_string(status.path()).unwrap();
+    let now = body.lines().next().unwrap().parse::<u64>().unwrap();
+    status_report(&body, now)
+}
+
+#[test]
+fn the_seeds_health_check_fails_while_it_is_idle_on_something_only_the_operator_can_fix() {
+    let mut env = seed_env();
+    env.remove("QUASAR_ENROLLMENT");
+    let (engine, dir) = new_machine(env);
+    let (line, healthy) = health_after_looks(&engine, dir.path());
+    assert!(!healthy, "{line}");
+    assert!(line.contains("QUASAR_ENROLLMENT"), "{line}");
+
+    let (engine, dir) = new_machine(seed_env());
+    let (line, healthy) = health_after_looks(&engine, dir.path());
+    assert!(healthy, "a seed whose actor exists is healthy: {line}");
+
+    let (engine, dir) = installed();
+    let mut file = seed_file(&dir);
+    file.state = SeedState::Uninstalled;
+    std::fs::write(
+        dir.path().join("seed.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    let (line, healthy) = health_after_looks(&engine, dir.path());
+    assert!(healthy, "uninstalled is idle by intent: {line}");
+}
+
+#[test]
+fn a_seed_that_stopped_looking_is_unhealthy_and_an_older_status_file_reads_healthy() {
+    let present = Outcome::Present {
+        container: names::RECOVERY_ACTOR.into(),
+    };
+    let body = status_body(1_000, &present);
+    assert!(status_report(&body, 1_000).1);
+    assert!(!status_report(&body, 1_000 + 3 * INTERVAL.as_secs() + 1).1);
+    assert!(status_report("1000\nrecovery actor present (quasar-recovery)\n", 1_000).1);
+    let retry = Outcome::Retry {
+        token: "seed-engine-unreachable",
+        why: "the container engine did not answer".into(),
+    };
+    assert!(status_report(&status_body(1_000, &retry), 1_000).1);
 }

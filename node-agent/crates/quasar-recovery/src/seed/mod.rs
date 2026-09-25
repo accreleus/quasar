@@ -247,6 +247,13 @@ impl Outcome {
         }
     }
 
+    /// Whether the seed's health check passes after this look. Idle on something only the
+    /// operator can clear is unhealthy, so a stack manager shows what the log line says;
+    /// an uninstalled machine is idle by intent, and a retry is transient.
+    pub fn healthy(&self) -> bool {
+        !matches!(self, Outcome::Idle { token, .. } if *token != "seed-uninstalled")
+    }
+
     /// One line for `quasar-recovery status` in the seed's container.
     pub fn summary(&self) -> String {
         match self {
@@ -256,6 +263,35 @@ impl Outcome {
             Outcome::Retry { why, .. } => format!("retrying: {why}"),
         }
     }
+}
+
+const UNHEALTHY: &str = "unhealthy";
+
+/// The seed's status file, rewritten after every look. Read back only by
+/// [`status_report`] in the same container; not an interface.
+pub fn status_body(now_secs: u64, outcome: &Outcome) -> String {
+    let health = if outcome.healthy() {
+        "healthy"
+    } else {
+        UNHEALTHY
+    };
+    format!("{now_secs}\n{}\n{health}\n", outcome.summary())
+}
+
+/// What `quasar-recovery status` prints in the seed's container, and whether its health
+/// check passes: the last look is at most three intervals old and was
+/// [`Outcome::healthy`]. A file without the health line reads as healthy.
+pub fn status_report(body: &str, now_secs: u64) -> (String, bool) {
+    let mut lines = body.lines();
+    let at: u64 = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    let summary = lines.next().unwrap_or("no look yet");
+    let healthy = lines.next().map(str::trim) != Some(UNHEALTHY);
+    let age = now_secs.saturating_sub(at);
+    let fresh = age <= 3 * INTERVAL.as_secs();
+    (format!("seed: {summary} ({age} s ago)"), fresh && healthy)
 }
 
 pub struct SeedConfig {
@@ -336,7 +372,7 @@ impl Seed {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let tmp = path.with_extension("tmp");
-            let body = format!("{now}\n{}\n", outcome.summary());
+            let body = status_body(now, &outcome);
             if std::fs::write(&tmp, body).is_ok() {
                 let _ = std::fs::rename(&tmp, path);
             }
@@ -523,7 +559,17 @@ impl Seed {
         let found = match self.engine.inspect_image(&reference) {
             Ok(Some(found)) => found,
             Ok(None) => {
-                info!(image = %reference, "pulling an image the install names");
+                // Once: a pull that keeps failing is the one WARN line, not INFO every look.
+                let retrying = matches!(
+                    &self.last,
+                    Some(Outcome::Retry {
+                        token: "seed-agent-image-unavailable",
+                        ..
+                    })
+                );
+                if !retrying {
+                    info!(image = %reference, "pulling an image the install names");
+                }
                 if let Err(e) = self.engine.pull(&reference) {
                     return Err(unavailable(e.to_string()));
                 }

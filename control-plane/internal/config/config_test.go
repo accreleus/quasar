@@ -930,3 +930,23 @@ func TestLoadEnrollmentTokenIsOptional(t *testing.T) {
 		t.Fatalf("EnrollmentToken = %q, want empty", c.EnrollmentToken)
 	}
 }
+
+func TestLoadEnrollPinsTakeOnlyADigest(t *testing.T) {
+	seed := "registry.example.invalid/quasar/quasar-recovery@sha256:" + strings.Repeat("a", 64)
+	agent := "registry.example.invalid/quasar/quasar-node-agent@sha256:" + strings.Repeat("b", 64)
+	t.Setenv("DATABASE_URL", "postgres://test")
+	t.Setenv("QUASAR_ENROLL_SEED_IMAGE", seed)
+	t.Setenv("QUASAR_ENROLL_AGENT_IMAGE", agent)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.EnrollPins.SeedImage != seed || c.EnrollPins.AgentImage != agent {
+		t.Fatalf("EnrollPins = %+v", c.EnrollPins)
+	}
+
+	t.Setenv("QUASAR_ENROLL_AGENT_IMAGE", "registry.example.invalid/quasar/quasar-node-agent:0.6.0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QUASAR_ENROLL_AGENT_IMAGE") {
+		t.Fatalf("a tag must fail startup naming the variable, got %v", err)
+	}
+}

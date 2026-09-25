@@ -123,23 +123,14 @@ fn explain(body: &str) {
     }
 }
 
-/// Healthy while the seed keeps looking: its last look is at most three intervals old.
 fn seed_status(body: &str) -> ExitCode {
-    let mut lines = body.lines();
-    let at: u64 = lines
-        .next()
-        .and_then(|l| l.trim().parse().ok())
-        .unwrap_or(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let age = now.saturating_sub(at);
-    println!(
-        "seed: {} ({age} s ago)",
-        lines.next().unwrap_or("no look yet")
-    );
-    if age <= 3 * seed::INTERVAL.as_secs() {
+    let (line, healthy) = seed::status_report(body, now);
+    println!("{line}");
+    if healthy {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
