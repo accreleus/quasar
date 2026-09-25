@@ -46,6 +46,37 @@ pub struct ContainerSpec {
     pub security_opt: Vec<String>,
     pub init: bool,
     pub restart: RestartPolicy,
+    /// Ports published on the engine host, for a container on a bridge network. Omitted
+    /// from the JSON when empty, so a shape without any hashes as it did before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PublishedPort>,
+    /// A healthcheck of the container's own, for an image that declares none. `None`
+    /// keeps the image's. Omitted from the JSON when `None`, as `ports`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Healthcheck>,
+}
+
+/// One published port: `host_ip:host_port` on the engine host to `container_port/tcp`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedPort {
+    pub container_port: u16,
+    pub host_port: u16,
+    /// `None` publishes on every host address, as `-p <host>:<container>` does.
+    pub host_ip: Option<String>,
+}
+
+/// The Engine API `HealthConfig`, in seconds. `test` is its `Test` array
+/// (`["CMD-SHELL", "..."]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Healthcheck {
+    pub test: Vec<String>,
+    pub interval_s: u64,
+    pub timeout_s: u64,
+    pub retries: u32,
+    pub start_period_s: u64,
 }
 
 /// One bind: `source` is an absolute daemon-host path, or the name of a named volume.
@@ -200,6 +231,16 @@ pub struct EngineHost {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformVolume {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+    /// Where the volume's data lives on the engine host (the `local` driver's
+    /// `Mountpoint`), when the engine reports one: a daemon-host path a bind can name.
+    pub mountpoint: Option<String>,
+}
+
+/// A user-defined network, as far as the recovery actor needs one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformNetwork {
     pub name: String,
     pub labels: BTreeMap<String, String>,
 }
@@ -382,6 +423,41 @@ impl RuntimeClient {
         let budget = self.deadline();
         self.submit_owned(
             async move { docker::platform::create_volume(&config, &name, labels).await },
+            budget,
+            true,
+        )
+    }
+
+    /// `Ok(None)` is a conclusively missing network.
+    pub fn inspect_network(&self, name: impl Into<String>) -> Operation<Option<PlatformNetwork>> {
+        let config = self.config().clone();
+        let name = name.into();
+        self.submit(async move { docker::platform::inspect_network(&config, &name).await })
+    }
+
+    /// Create a bridge network, on which containers find each other by name.
+    pub fn create_network(
+        &self,
+        name: impl Into<String>,
+        labels: BTreeMap<String, String>,
+    ) -> Operation<PlatformNetwork> {
+        let config = self.config().clone();
+        let name = name.into();
+        let budget = self.deadline();
+        self.submit_owned(
+            async move { docker::platform::create_network(&config, &name, labels).await },
+            budget,
+            true,
+        )
+    }
+
+    /// A missing network is not an error; one in use is [`ErrorKind::Busy`].
+    pub fn remove_network(&self, name: impl Into<String>) -> Operation<()> {
+        let config = self.config().clone();
+        let name = name.into();
+        let budget = self.deadline();
+        self.submit_owned(
+            async move { docker::platform::remove_network(&config, &name).await },
             budget,
             true,
         )

@@ -10,6 +10,7 @@
 //! listed (and tested) in `tests/recipe_compose_parity.rs`. Golden rendered
 //! specifications live in `testdata/recovery/recipes/`.
 
+pub mod control;
 pub mod revision;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +18,9 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
-pub use quasar_runtime::platform::{Bind, ContainerSpec, Device, GpuRequest, RestartPolicy};
+pub use quasar_runtime::platform::{
+    Bind, ContainerSpec, Device, GpuRequest, Healthcheck, PublishedPort, RestartPolicy,
+};
 
 /// Deterministic names of what the recovery actor creates (architecture §5.4).
 pub mod names {
@@ -39,6 +42,18 @@ pub mod names {
     pub const GPU_PROBE: &str = "quasar-gpu-probe";
     /// The never-started helper through which a secrets volume is written.
     pub const SECRETS_WRITER: &str = "quasar-secrets-writer";
+    /// The control plane's own state (its TLS pair, the artwork cache): a named volume, so
+    /// it outlives every replacement of the container.
+    pub const CONTROL_DATA_VOLUME: &str = "quasar-control-data";
+    /// The control plane's per-service secrets volume.
+    pub const CONTROL_PLANE_SECRETS_VOLUME: &str = "quasar-control-plane-secrets";
+    /// A Quasar-owned database's data.
+    pub const POSTGRES_DATA_VOLUME: &str = "quasar-postgres-data";
+    /// Postgres's per-service secrets volume.
+    pub const POSTGRES_SECRETS_VOLUME: &str = "quasar-postgres-secrets";
+    /// The bridge network on which the control plane reaches a Quasar-owned Postgres by
+    /// name. Nothing else joins it.
+    pub const PLATFORM_NETWORK: &str = "quasar-platform";
 }
 
 /// Labels (architecture §5.4, ADR 0007/0008).
@@ -66,12 +81,41 @@ pub mod paths {
     /// The fixed runtime directory the agent shares, same path, with its sessions.
     pub const AGENT_RUNTIME_DIR: &str = "/run/quasar-agent";
     pub const NVIDIA_DRIVER_DIR: &str = "/opt/quasar/nvidia-driver";
+
+    /// On a combined or control-only machine the socket volume holds one subdirectory per
+    /// socket, and each container is given only its own, by a bind of that subdirectory's
+    /// daemon-host path (Engine API 1.40 has no volume sub-paths).
+    pub const AGENT_SOCKET_SUBDIR: &str = "agent";
+    pub const CONTROL_SOCKET_SUBDIR: &str = "control";
+    /// The agent socket inside the actor on a combined host.
+    pub const SPLIT_AGENT_SOCKET: &str = "/run/quasar-recovery/agent/agent.sock";
+    /// The control socket inside the actor.
+    pub const CONTROL_SOCKET: &str = "/run/quasar-recovery/control/control.sock";
+    /// Where the control plane sees its socket directory, and the socket in it.
+    pub const CONTROL_PLANE_SOCKET_DIR: &str = "/run/quasar-recovery";
+    pub const CONTROL_PLANE_SOCKET: &str = "/run/quasar-recovery/control.sock";
+    /// The control plane's state directory (`QUASAR_TLS_DIR` defaults under it).
+    pub const CONTROL_DATA_DIR: &str = "/var/lib/quasar-control";
+    pub const POSTGRES_DATA_DIR: &str = "/var/lib/postgresql/data";
 }
+
+/// The uid and gid the control-plane image runs as (`deploy/Dockerfile.control.prod`,
+/// the `quasar` user of the quasar-base family). Its secret files and its control socket
+/// are owned by it.
+pub const CONTROL_PLANE_UID: u32 = 1000;
 
 /// The secret files a recipe knows how to consume.
 pub mod secrets {
     /// The operator's enrollment string (`qenr1.…`), for the agent to redeem.
     pub const ENROLLMENT: &str = "enrollment";
+    /// The database password: generated for a Quasar-owned Postgres, the operator's for
+    /// an external database (copied from the seed's inputs at first boot).
+    pub const DATABASE_PASSWORD: &str = "database-password";
+    /// `QUASAR_SECRET_KEY`: base64 of 32 random bytes, generated at install.
+    pub const SECRET_KEY: &str = "secret-key";
+    /// A combined host's single-use local enrollment token, which the control plane
+    /// inserts as a `host_enrollments` row and its own agent redeems.
+    pub const LOCAL_ENROLLMENT: &str = "local-enrollment";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -195,9 +239,9 @@ impl Default for HostDevices {
 
 /// The machine inputs a recipe is rendered with. Only ever grows, each with a default.
 ///
-/// No control URL: on a GPU host the agent takes the control plane's URL and pin from the
-/// enrollment string, so there is nothing to override. The combined install (#361) adds it
-/// for the local agent.
+/// On a GPU host the agent takes the control plane's URL and pin from the enrollment
+/// string, so there is no control URL. A combined host's agent reaches the control plane
+/// on its own machine, at the loopback address of `control.http_port`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Inputs {
@@ -215,8 +259,65 @@ pub struct Inputs {
     pub gpu: GpuFacts,
     #[serde(default)]
     pub devices: HostDevices,
+    /// A combined or control-only machine: what its control plane is run with. `None` on
+    /// a GPU host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<ControlInputs>,
+    /// A combined or control-only machine: the daemon-host path of the socket volume,
+    /// whose `agent/` and `control/` subdirectories are bound into the node agent and the
+    /// control plane (`paths::AGENT_SOCKET_SUBDIR`). `None` on a GPU host, whose agent
+    /// mounts the whole volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_dir: Option<String>,
 }
 
+/// What a combined or control-only machine's control plane is run with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlInputs {
+    /// The host port of the control plane's HTTP listener (agents and `/health`).
+    pub http_port: u16,
+    /// The host port of its HTTPS listener (the console).
+    pub tls_port: u16,
+    /// The name or address the console is reached by: a SAN on the generated certificate.
+    #[serde(default)]
+    pub public_host: Option<String>,
+    /// More SANs for the generated certificate (`QUASAR_TLS_HOSTS`), comma-separated.
+    #[serde(default)]
+    pub tls_hosts: Option<String>,
+    pub database: DatabaseInputs,
+}
+
+/// Whose database the control plane uses (`CONTEXT.md` "Machine inputs": database mode).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "mode")]
+pub enum DatabaseInputs {
+    /// A Postgres this machine's recovery actor created, on the platform network.
+    Owned,
+    /// The operator's own database: Quasar only uses it. Its password is a secret in
+    /// machine state, never an input.
+    External {
+        host: String,
+        port: u16,
+        user: String,
+        name: String,
+        sslmode: String,
+    },
+}
+
+/// The template root beside a home root, as the agent defaults it
+/// (`{QUASAR_HOME_ROOT}/../templates`): `/srv/quasar/homes` → `/srv/quasar/templates`.
+pub fn template_root_beside(home_root: &str) -> String {
+    match std::path::Path::new(home_root).parent() {
+        Some(parent) if parent != std::path::Path::new("") => {
+            parent.join("templates").to_string_lossy().into_owned()
+        }
+        _ => default_template_root(),
+    }
+}
+
+/// For a machine with no home root (a control-only machine), and for machine state
+/// written before the template root was recorded.
 pub fn default_template_root() -> String {
     "/var/lib/quasar/templates".into()
 }
@@ -305,9 +406,14 @@ impl Book {
     /// Postgres arrive with the combined install).
     pub fn window(role: Role) -> Option<RangeInclusive<u32>> {
         match role {
-            Role::NodeAgent => Some(1..=1),
+            // Revision 2: the agent reads `ENROLLMENT_TOKEN_FILE`, which a combined host's
+            // agent is given. A GPU host's agent has the same shape at both.
+            Role::NodeAgent => Some(1..=2),
             Role::RecoveryActor => Some(1..=revision::RECIPE_REVISION),
-            Role::ControlPlane | Role::Postgres => None,
+            Role::ControlPlane => Some(1..=1),
+            // The Postgres image carries no recipe label: its revision is this actor's own
+            // (`control::POSTGRES_REVISION`).
+            Role::Postgres => Some(1..=1),
         }
     }
 
@@ -330,9 +436,26 @@ pub fn render(
     }
     validate(inputs)?;
     let mut spec = match role {
-        Role::NodeAgent => node_agent_r1(inputs, image, secrets),
+        Role::NodeAgent => {
+            // A revision-1 agent reads no `ENROLLMENT_TOKEN_FILE`, so it cannot be a
+            // combined host's agent.
+            if inputs.control.is_some() && revision < 2 {
+                return Err(RenderError::Unsupported { role, revision });
+            }
+            if inputs.home_root.is_empty() {
+                return Err(RenderError::Invalid(
+                    "a node agent needs a home root".into(),
+                ));
+            }
+            let mut spec = node_agent_r1(inputs, image, secrets);
+            if inputs.control.is_some() {
+                control::local_agent(&mut spec, inputs, secrets)?;
+            }
+            spec
+        }
         Role::RecoveryActor => recovery_actor_r1(inputs, image),
-        Role::ControlPlane | Role::Postgres => unreachable!("not in the book"),
+        Role::ControlPlane => control::control_plane_r1(inputs, image, secrets)?,
+        Role::Postgres => control::postgres_r1(inputs, image, secrets)?,
     };
     spec.labels.extend([
         (labels::INSTALLATION.into(), inputs.installation_id.clone()),
@@ -355,7 +478,7 @@ pub fn spec_digest(spec: &ContainerSpec) -> String {
     format!("sha256:{hex}")
 }
 
-fn safe_host_path(what: &str, path: &str) -> Result<(), RenderError> {
+pub(crate) fn safe_host_path(what: &str, path: &str) -> Result<(), RenderError> {
     let p = std::path::Path::new(path);
     if !p.is_absolute()
         || path == "/"
@@ -373,7 +496,11 @@ fn safe_host_path(what: &str, path: &str) -> Result<(), RenderError> {
 /// The checks `render` applies to machine inputs, for a caller that wants them before it
 /// commits the inputs to machine state.
 pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
-    safe_host_path("the home root", &inputs.home_root)?;
+    // Only a control-only machine has no home root; a node agent refuses to render
+    // without one.
+    if !inputs.home_root.is_empty() || inputs.control.is_none() {
+        safe_host_path("the home root", &inputs.home_root)?;
+    }
     safe_host_path("the template root", &inputs.template_root)?;
     safe_host_path("the engine socket", &inputs.docker_socket)?;
     if inputs.home_root == inputs.template_root {
@@ -396,6 +523,17 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
     if inputs.installation_id.is_empty() {
         return Err(RenderError::Invalid("no installation id".into()));
     }
+    if let Some(dir) = &inputs.socket_dir {
+        safe_host_path("the socket volume's host path", dir)?;
+    }
+    if let Some(control) = &inputs.control {
+        control::validate(control)?;
+        if inputs.socket_dir.is_none() {
+            return Err(RenderError::Invalid(
+                "a combined or control-only machine needs its socket volume's host path".into(),
+            ));
+        }
+    }
     let fallback = inputs.gpu.fallback.as_ref().map(|f| &f.render_node);
     for node in inputs.gpu.render_node.iter().chain(fallback) {
         let ok = node
@@ -410,7 +548,7 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
     Ok(())
 }
 
-fn bind(source: &str, target: &str, read_only: bool) -> Bind {
+pub(crate) fn bind(source: &str, target: &str, read_only: bool) -> Bind {
     Bind {
         source: source.into(),
         target: target.into(),
@@ -506,7 +644,9 @@ const NVIDIA_ENV: &[(&str, &str)] = &[
     ("LIBVA_MESSAGING_LEVEL", "0"),
 ];
 
-pub use quasar_runtime::owned_install::{AGENT_SOCKET_ENV, ENROLLMENT_FILE_ENV};
+pub use quasar_runtime::owned_install::{
+    AGENT_SOCKET_ENV, ENROLLMENT_FILE_ENV, ENROLLMENT_TOKEN_FILE_ENV,
+};
 
 fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> ContainerSpec {
     let reference = image.reference();
@@ -613,6 +753,8 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
         security_opt: Vec::new(),
         init: true,
         restart: RestartPolicy::UnlessStopped,
+        ports: Vec::new(),
+        healthcheck: None,
     }
 }
 
@@ -642,5 +784,7 @@ fn recovery_actor_r1(inputs: &Inputs, image: &ImageRef) -> ContainerSpec {
         security_opt: vec!["label=disable".into()],
         init: false,
         restart: RestartPolicy::UnlessStopped,
+        ports: Vec::new(),
+        healthcheck: None,
     }
 }

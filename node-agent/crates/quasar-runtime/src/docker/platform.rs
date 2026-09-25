@@ -1,14 +1,14 @@
 //! SDK details of the platform-service lifecycles (`crate::platform`).
 use super::{classify, credentials, discover, image_error};
 use crate::platform::{
-    ContainerSpec, EngineHost, PlatformContainer, PlatformImage, PlatformVolume, Refused,
-    RestartPolicy,
+    ContainerSpec, EngineHost, PlatformContainer, PlatformImage, PlatformNetwork, PlatformVolume,
+    Refused, RestartPolicy,
 };
 use crate::{ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::errors::Error;
 use bollard::models::{
-    ContainerCreateBody, ContainerUpdateBody, DeviceMapping, DeviceRequest, HostConfig,
-    RestartPolicyNameEnum, VolumeCreateRequest,
+    ContainerCreateBody, ContainerUpdateBody, DeviceMapping, DeviceRequest, HealthConfig,
+    HostConfig, NetworkCreateRequest, PortBinding, RestartPolicyNameEnum, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, ListContainersOptions, LogsOptions,
@@ -244,14 +244,40 @@ fn engine_body(spec: &ContainerSpec) -> ContainerCreateBody {
         RestartPolicy::No => RestartPolicyNameEnum::NO,
         RestartPolicy::UnlessStopped => RestartPolicyNameEnum::UNLESS_STOPPED,
     };
+    const NANOS: i64 = 1_000_000_000;
+    let secs = |s: u64| (s.min(i64::MAX as u64 / NANOS as u64) as i64) * NANOS;
+    let port_key = |p: &crate::platform::PublishedPort| format!("{}/tcp", p.container_port);
+    let exposed: Vec<String> = spec.ports.iter().map(port_key).collect();
+    let mut bindings: std::collections::HashMap<String, Option<Vec<PortBinding>>> =
+        Default::default();
+    for p in &spec.ports {
+        bindings
+            .entry(port_key(p))
+            .or_insert_with(|| Some(Vec::new()))
+            .get_or_insert_with(Vec::new)
+            .push(PortBinding {
+                host_ip: p.host_ip.clone(),
+                host_port: Some(p.host_port.to_string()),
+            });
+    }
     ContainerCreateBody {
         image: Some(spec.image.clone()),
+        exposed_ports: (!exposed.is_empty()).then_some(exposed),
+        healthcheck: spec.healthcheck.as_ref().map(|h| HealthConfig {
+            test: Some(h.test.clone()),
+            interval: Some(secs(h.interval_s)),
+            timeout: Some(secs(h.timeout_s)),
+            retries: Some(i64::from(h.retries)),
+            start_period: Some(secs(h.start_period_s)),
+            start_interval: None,
+        }),
         entrypoint: spec.entrypoint.clone(),
         cmd: spec.cmd.clone(),
         env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
         labels: Some(spec.labels.clone().into_iter().collect()),
         host_config: Some(HostConfig {
             network_mode: spec.network_mode.clone(),
+            port_bindings: (!bindings.is_empty()).then_some(bindings),
             binds: Some(spec.binds.iter().map(|b| b.to_engine()).collect()),
             devices: Some(
                 spec.devices
@@ -470,7 +496,50 @@ fn volume(v: bollard::models::Volume) -> PlatformVolume {
     PlatformVolume {
         name: v.name,
         labels: v.labels.into_iter().collect(),
+        mountpoint: Some(v.mountpoint).filter(|m| m.starts_with('/')),
     }
+}
+
+pub(crate) async fn inspect_network(
+    config: &RuntimeConfig,
+    name: &str,
+) -> Result<Option<PlatformNetwork>, RuntimeError> {
+    let (docker, _) = discover(config).await?;
+    match docker
+        .inspect_network(
+            name,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+    {
+        Ok(n) => Ok(Some(PlatformNetwork {
+            name: n.name.unwrap_or_else(|| name.to_owned()),
+            labels: n.labels.unwrap_or_default().into_iter().collect(),
+        })),
+        Err(e) if status_code(&e) == Some(404) => Ok(None),
+        Err(e) => Err(classify(e)),
+    }
+}
+
+pub(crate) async fn create_network(
+    config: &RuntimeConfig,
+    name: &str,
+    labels: BTreeMap<String, String>,
+) -> Result<PlatformNetwork, RuntimeError> {
+    let (docker, _) = discover(config).await?;
+    docker
+        .create_network(NetworkCreateRequest {
+            name: name.to_owned(),
+            driver: Some("bridge".into()),
+            labels: Some(labels.clone().into_iter().collect()),
+            ..Default::default()
+        })
+        .await
+        .map_err(mutation_error)?;
+    Ok(PlatformNetwork {
+        name: name.to_owned(),
+        labels,
+    })
 }
 
 pub(crate) async fn inspect_volume(
@@ -500,6 +569,18 @@ pub(crate) async fn create_volume(
         .await
         .map(volume)
         .map_err(mutation_error)
+}
+
+pub(crate) async fn remove_network(config: &RuntimeConfig, name: &str) -> Result<(), RuntimeError> {
+    let (docker, _) = discover(config).await?;
+    match docker.remove_network(name).await {
+        Ok(()) => Ok(()),
+        Err(e) if status_code(&e) == Some(404) => Ok(()),
+        Err(e) if status_code(&e) == Some(403) || status_code(&e) == Some(409) => {
+            Err(ErrorKind::Busy.into())
+        }
+        Err(e) => Err(mutation_error(e)),
+    }
 }
 
 pub(crate) async fn remove_volume(config: &RuntimeConfig, name: &str) -> Result<(), RuntimeError> {

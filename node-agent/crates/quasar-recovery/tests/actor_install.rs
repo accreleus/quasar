@@ -466,7 +466,7 @@ fn a_container_holding_the_agent_name_without_our_labels_is_never_touched() {
 
 #[test]
 fn an_agent_image_without_a_revision_this_actor_carries_is_refused_before_anything_is_created() {
-    for label in [None, Some("2"), Some("one")] {
+    for label in [None, Some("3"), Some("one")] {
         let mut state = amd_host();
         state
             .registry
@@ -584,6 +584,7 @@ fn status_reports_the_machine_inventory_in_the_socket_shape() {
             },
             "seed": null,
             "role": "gpu",
+            "node_name": "gpu-host-01",
             "database": "none",
             "services": [
                 {

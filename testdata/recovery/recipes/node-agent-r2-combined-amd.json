@@ -1,0 +1,178 @@
+{
+  "name": "quasar-node-agent",
+  "image": "registry.example.invalid/quasar/quasar-node-agent@sha256:bb22000000000000000000000000000000000000000000000000000000000000",
+  "entrypoint": [
+    "/usr/local/bin/quasar-node-agent-entrypoint"
+  ],
+  "cmd": null,
+  "env": {
+    "CONTROL_PLANE_URL": "ws://127.0.0.1:8080",
+    "ENROLLMENT_TOKEN_FILE": "/run/quasar-secrets/local-enrollment",
+    "GST_DEBUG": "",
+    "LIBGL_ALWAYS_SOFTWARE": "",
+    "LIBVA_TRACE": "",
+    "MALLOC_ARENA_MAX": "",
+    "MALLOC_MMAP_THRESHOLD_": "",
+    "MALLOC_TRIM_THRESHOLD_": "",
+    "MESA_LOADER_DRIVER_OVERRIDE": "",
+    "NODE_NAME": "living-room-pc",
+    "NODE_SECRET_PATH": "/var/lib/quasar-agent/node-secret",
+    "QUASAR_ABR": "1",
+    "QUASAR_ABR_CLIFF_GUARD_FRAC": "",
+    "QUASAR_ABR_DEADBAND": "",
+    "QUASAR_ABR_DOWN_DWELL_MS": "",
+    "QUASAR_ABR_EWMA_ALPHA": "",
+    "QUASAR_ABR_FLOOR_KBPS": "",
+    "QUASAR_ABR_FLOOR_RATIO": "0.3",
+    "QUASAR_ABR_MAX_DOWN_STEP": "",
+    "QUASAR_ABR_MAX_UP_STEP": "",
+    "QUASAR_ABR_MIN_INTERVAL_MS": "",
+    "QUASAR_ABR_MODE": "smooth",
+    "QUASAR_APP_PGID": "",
+    "QUASAR_APP_PUID": "",
+    "QUASAR_APP_SHM_SIZE": "1g",
+    "QUASAR_APP_STOP_TIMEOUT_SECS": "10",
+    "QUASAR_AUDIO_DISABLED": "",
+    "QUASAR_AUDIO_NO_CLOCK": "",
+    "QUASAR_AUDIO_REQUIRED": "",
+    "QUASAR_CAPTURE_H264": "",
+    "QUASAR_CONTAINER_NETWORK": "none",
+    "QUASAR_ENCODER": "",
+    "QUASAR_FEC_ARM_LOSS_PCT": "",
+    "QUASAR_FEC_ARM_WINDOWS": "",
+    "QUASAR_FEC_DISARM_WINDOWS": "",
+    "QUASAR_FEC_MAX_FLAPS": "",
+    "QUASAR_FEC_MODE": "",
+    "QUASAR_FEC_PERCENTAGE": "0",
+    "QUASAR_FEC_WINDOW_S": "",
+    "QUASAR_HEALTH_ADDR": "127.0.0.1:9091",
+    "QUASAR_HOMES_FREE_SPACE_FLOOR_GIB": "",
+    "QUASAR_HOMES_GC": "",
+    "QUASAR_HOMES_GC_DRY_RUN": "",
+    "QUASAR_HOMES_GC_RETENTION_HOURS": "",
+    "QUASAR_HOME_ROOT": "/srv/quasar/homes",
+    "QUASAR_INPUT_BATCH_MS": "",
+    "QUASAR_INPUT_CHANNEL_MODE": "",
+    "QUASAR_INPUT_CONTROLLER_NUDGE": "",
+    "QUASAR_INPUT_TRACE": "",
+    "QUASAR_INTRA_REFRESH": "0",
+    "QUASAR_INTRA_REFRESH_PERIOD": "0",
+    "QUASAR_LATENCY_PROBE": "0",
+    "QUASAR_MALLOC_TRIM": "",
+    "QUASAR_NVIDIA_DRIVER_HOST_PATH": "",
+    "QUASAR_PULSE_IMAGE": "registry.example.invalid/quasar/quasar-node-agent@sha256:bb22000000000000000000000000000000000000000000000000000000000000",
+    "QUASAR_QUEUE_BUFFERS": "3",
+    "QUASAR_RECOVERY_SOCKET": "/run/quasar-recovery/agent.sock",
+    "QUASAR_RENDER_NODE": "/dev/dri/renderD129",
+    "QUASAR_SLICES": "8",
+    "QUASAR_TARGET_USAGE": "6",
+    "QUASAR_TEMPLATE_ALLOW_CROSSFS": "",
+    "QUASAR_TEMPLATE_CLONE_MODE": "",
+    "QUASAR_TEMPLATE_MIN_FREE_BYTES": "",
+    "QUASAR_TEMPLATE_ROOT": "/var/lib/quasar/templates",
+    "QUASAR_TEMPLATE_SETTLE_SECS": "",
+    "QUASAR_TEMPLATE_WARMUP_TIMEOUT_SECS": "",
+    "QUASAR_TRACE_ENC_PTS": "",
+    "QUASAR_TRACE_RTP_MARKER": "",
+    "QUASAR_TRACE_RTP_TS": "",
+    "QUASAR_VULKAN_AV1": "",
+    "QUASAR_VULKAN_H264": "",
+    "QUASAR_VULKAN_HEVC": "",
+    "QUASAR_ZEROCOPY": "0",
+    "RUST_LOG": "info",
+    "WOLF_VULKAN_RING": "",
+    "XDG_RUNTIME_DIR": "/run/quasar-agent"
+  },
+  "labels": {
+    "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+    "io.quasar.platform-service": "node-agent",
+    "io.quasar.recipe": "2",
+    "io.quasar.spec": "sha256:fd5a5a13b0e4fd6f6bae48dd9bea0e5e66b6f7c6f1d064929dc17bb82fa7a2b9"
+  },
+  "network_mode": "host",
+  "binds": [
+    {
+      "source": "/dev/input",
+      "target": "/dev/input",
+      "read_only": false
+    },
+    {
+      "source": "/dev",
+      "target": "/host/dev",
+      "read_only": true
+    },
+    {
+      "source": "/etc/os-release",
+      "target": "/host/etc/os-release",
+      "read_only": true
+    },
+    {
+      "source": "/sys/kernel",
+      "target": "/host/sys/kernel",
+      "read_only": true
+    },
+    {
+      "source": "/run/quasar-agent",
+      "target": "/run/quasar-agent",
+      "read_only": false
+    },
+    {
+      "source": "/var/lib/docker/volumes/quasar-recovery-agent/_data/agent",
+      "target": "/run/quasar-recovery",
+      "read_only": true
+    },
+    {
+      "source": "quasar-node-agent-secrets",
+      "target": "/run/quasar-secrets",
+      "read_only": true
+    },
+    {
+      "source": "/srv/quasar/homes",
+      "target": "/srv/quasar/homes",
+      "read_only": false
+    },
+    {
+      "source": "quasar-agent-data",
+      "target": "/var/lib/quasar-agent",
+      "read_only": false
+    },
+    {
+      "source": "/var/lib/quasar/templates",
+      "target": "/var/lib/quasar/templates",
+      "read_only": false
+    },
+    {
+      "source": "/var/run/docker.sock",
+      "target": "/var/run/docker.sock",
+      "read_only": false
+    }
+  ],
+  "devices": [
+    {
+      "host": "/dev/dri",
+      "container": "/dev/dri",
+      "permissions": "rwm"
+    },
+    {
+      "host": "/dev/uinput",
+      "container": "/dev/uinput",
+      "permissions": "rwm"
+    },
+    {
+      "host": "/dev/kmsg",
+      "container": "/dev/kmsg",
+      "permissions": "r"
+    }
+  ],
+  "device_cgroup_rules": [
+    "c 13:* rmw"
+  ],
+  "gpus": [],
+  "cap_add": [
+    "NET_ADMIN",
+    "SYSLOG"
+  ],
+  "security_opt": [],
+  "init": true,
+  "restart": "unless-stopped"
+}

@@ -204,6 +204,10 @@ pub struct Status {
     pub actor: ActorIdentity,
     pub seed: Option<SeedIdentity>,
     pub role: MachineRole,
+    /// This machine's node name (machine inputs): on a combined host, the node name its
+    /// own agent enrolls under, which is how the control plane knows which registered
+    /// host shares its machine. `null` before the machine is installed.
+    pub node_name: Option<String>,
     pub database: DatabaseMode,
     #[serde(deserialize_with = "null_as_empty")]
     pub services: Vec<Service>,

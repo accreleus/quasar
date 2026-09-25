@@ -23,7 +23,7 @@ commands:
   seed      keep this machine's recovery actor in existence: create it on a first install
             (inputs: docs/configuration.md \"Seed\"), re-create it if it is deleted
   actor     run the recovery actor: install or complete this machine's services, then
-            serve the agent socket (docs/configuration.md \"Recovery actor\")
+            serve its sockets (docs/configuration.md \"Recovery actor\")
   status    print this machine's inventory, as the running actor serves it (in the seed's
             container: what the seed last did)
   version   print this build's version and commit
@@ -74,25 +74,52 @@ fn main() -> ExitCode {
     }
 }
 
-/// Fixed, not configurable: the agent's recipe names the same path (`QUASAR_RECOVERY_SOCKET`
-/// in the agent), and an actor listening anywhere else would never be reached.
-fn agent_socket() -> PathBuf {
-    paths::AGENT_SOCKET.into()
-}
+/// Every socket an actor may serve, in this container. Fixed, not configurable: the recipes
+/// name the same paths, and an actor listening anywhere else would never be reached.
+const SOCKETS: &[&str] = &[
+    paths::AGENT_SOCKET,
+    paths::SPLIT_AGENT_SOCKET,
+    paths::CONTROL_SOCKET,
+];
 
+/// The inventory as the running actor serves it on the first of its sockets that answers,
+/// then (on stderr) what is not as this machine's role needs it.
 fn status() -> ExitCode {
     if let Ok(body) = std::fs::read_to_string(SEED_STATUS_FILE) {
         return seed_status(&body);
     }
-    match server::fetch_status(&agent_socket()) {
-        Ok(body) => {
-            println!("{body}");
-            ExitCode::SUCCESS
+    let mut last = None;
+    for socket in SOCKETS {
+        if !std::path::Path::new(socket).exists() {
+            continue;
         }
-        Err(e) => {
-            eprintln!("quasar-recovery status: {e}");
-            ExitCode::FAILURE
+        match server::fetch_status(std::path::Path::new(socket)) {
+            Ok(body) => {
+                println!("{body}");
+                explain(&body);
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => last = Some(format!("{socket}: {e}")),
         }
+    }
+    eprintln!(
+        "quasar-recovery status: {}",
+        last.unwrap_or_else(|| "no recovery-actor socket in this container".into())
+    );
+    ExitCode::FAILURE
+}
+
+fn explain(body: &str) {
+    let Ok(status) = serde_json::from_str::<quasar_recovery::socket::Status>(body) else {
+        return;
+    };
+    let dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
+    let machine = quasar_recovery::machine::MachineDir::new(dir)
+        .load_machine()
+        .ok()
+        .flatten();
+    for line in quasar_recovery::explain::explain(&status, machine.as_ref()) {
+        eprintln!("{line}");
     }
 }
 
@@ -223,32 +250,15 @@ fn actor() -> ExitCode {
     let actor =
         Arc::new(Actor::new(Arc::new(engine), config).with_status_engine(Arc::new(status_engine)));
 
-    // The lease first, then the socket, then `resume`: settling an interrupted attempt can
+    // The lease first, then the sockets, then `resume`: settling an interrupted attempt can
     // take a whole verification, and the agent must be able to read its status meanwhile.
     if let Err(e) = actor.acquire_lease() {
         error!(token = "actor-lease-unavailable", "{e}");
         return ExitCode::FAILURE;
     }
-    let socket = agent_socket();
-    let server = match server::bind(&socket) {
-        Ok(listener) => {
-            info!(socket = %socket.display(), "serving the agent socket");
-            let serving = actor.clone();
-            Some(std::thread::spawn(move || server::serve(listener, serving)))
-        }
-        // `resume` still runs: an interrupted attempt settles and an install completes
-        // whether or not anyone can ask about it.
-        Err(e) => {
-            error!(
-                token = "actor-socket-bind-failed",
-                "cannot create the agent socket at {}: {e} (is the {} volume mounted at {}?)",
-                socket.display(),
-                quasar_recovery::recipe::names::AGENT_SOCKET_VOLUME,
-                paths::AGENT_SOCKET_DIR
-            );
-            None
-        }
-    };
+    let (stopped, servers) = std::sync::mpsc::channel::<std::io::Error>();
+    let mut serving: Vec<PathBuf> = Vec::new();
+    serve_planned(&actor, &mut serving, &stopped);
 
     // The lease is already held, so `resume` cannot answer `LeaseHeld`.
     match actor.resume() {
@@ -258,18 +268,50 @@ fn actor() -> ExitCode {
             "{e}; the install is retried on the next start, and status keeps being served"
         ),
     }
+    // A first install learns its role from the seed's inputs; bind what it needs.
+    serve_planned(&actor, &mut serving, &stopped);
 
-    let Some(server) = server else {
+    if serving.is_empty() {
         return ExitCode::FAILURE;
-    };
-    let e = server
-        .join()
-        .unwrap_or_else(|_| std::io::Error::other("the socket thread panicked"));
-    error!(
-        token = "actor-socket-failed",
-        "the agent socket stopped: {e}"
-    );
+    }
+    drop(stopped);
+    let e = servers
+        .recv()
+        .unwrap_or_else(|_| std::io::Error::other("every socket thread ended"));
+    error!(token = "actor-socket-failed", "a socket stopped: {e}");
     ExitCode::FAILURE
+}
+
+/// Binds and serves every socket of [`Actor::socket_plan`] not already served.
+fn serve_planned(
+    actor: &Arc<Actor>,
+    serving: &mut Vec<PathBuf>,
+    stopped: &std::sync::mpsc::Sender<std::io::Error>,
+) {
+    for plan in actor.socket_plan() {
+        if serving.contains(&plan.path) {
+            continue;
+        }
+        match server::bind_owned(&plan.path, plan.owner) {
+            Ok(listener) => {
+                info!(socket = %plan.path.display(), caller = ?plan.caller, "serving");
+                let (actor, stopped, caller) = (actor.clone(), stopped.clone(), plan.caller);
+                std::thread::spawn(move || {
+                    let _ = stopped.send(server::serve(listener, actor, caller));
+                });
+                serving.push(plan.path);
+            }
+            // `resume` still runs: an interrupted attempt settles and an install completes
+            // whether or not anyone can ask about it.
+            Err(e) => error!(
+                token = "actor-socket-bind-failed",
+                "cannot create the socket {}: {e} (is the {} volume mounted at {}?)",
+                plan.path.display(),
+                quasar_recovery::recipe::names::AGENT_SOCKET_VOLUME,
+                paths::AGENT_SOCKET_DIR
+            ),
+        }
+    }
 }
 
 type Evidence = Box<dyn Fn(&Request) -> SignatureEvidence + Send + Sync>;

@@ -10,6 +10,7 @@
     },
     "seed": null,
     "role": "control_only",
+    "node_name": "attic-server",
     "database": "external",
     "services": [
       {

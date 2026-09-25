@@ -76,6 +76,8 @@ fn spec(name: &str, image: &str, script: &str, binds: Vec<Bind>) -> ContainerSpe
         security_opt: Vec::new(),
         init: true,
         restart: RestartPolicy::No,
+        ports: Vec::new(),
+        healthcheck: None,
     }
 }
 
@@ -181,6 +183,140 @@ fn containers_volumes_and_archives_round_trip_through_a_real_engine() {
         .expect("removing a missing container is not an error");
     engine.remove_volume(&volume).unwrap();
     assert!(engine.inspect_volume(&volume).unwrap().is_none());
+}
+
+/// What a combined host needs of the engine (#361): a labelled bridge network on which
+/// containers find each other by name, a published port, a healthcheck of the container's
+/// own, and a volume's host path bound as a directory into another container.
+#[test]
+#[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET and QUASAR_TEST_RECOVERY_IMAGE; creates and removes only uniquely named assets"]
+fn networks_ports_healthchecks_and_volume_subdirectories_work_on_a_real_engine() {
+    use quasar_recovery::recipe::{Healthcheck, PublishedPort};
+    let engine = engine();
+    let image = image();
+    let network = unique("net");
+    let volume = unique("sockets");
+    let (server, client, writer) = (unique("server"), unique("client"), unique("writer"));
+    let _cleanup = Cleanup {
+        engine: engine.clone(),
+        containers: vec![server.clone(), client.clone(), writer.clone()],
+        volumes: vec![volume.clone()],
+    };
+    struct NetworkCleanup(Arc<DockerEngine>, String);
+    impl Drop for NetworkCleanup {
+        fn drop(&mut self) {
+            let _ = self.0.remove_network(&self.1);
+        }
+    }
+    let _net = NetworkCleanup(engine.clone(), network.clone());
+
+    assert!(engine.inspect_network(&network).unwrap().is_none());
+    let labels = BTreeMap::from([("io.quasar.test".to_string(), network.clone())]);
+    engine.create_network(&network, &labels).unwrap();
+    assert_eq!(
+        engine.inspect_network(&network).unwrap().unwrap().labels,
+        labels
+    );
+
+    let port = 20000 + (std::process::id() % 20000) as u16;
+    let mut s = spec(&server, &image, "sleep 60", Vec::new());
+    s.network_mode = Some(network.clone());
+    s.ports = vec![PublishedPort {
+        container_port: 8080,
+        host_port: port,
+        host_ip: Some("127.0.0.1".into()),
+    }];
+    s.healthcheck = Some(Healthcheck {
+        test: vec!["CMD-SHELL".into(), "true".into()],
+        interval_s: 1,
+        timeout_s: 1,
+        retries: 3,
+        start_period_s: 0,
+    });
+    let id = engine.create_container(&s).unwrap();
+    engine.start_container(&id).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let c = engine.inspect_container(&id).unwrap().unwrap();
+        if c.health.as_deref() == Some("healthy") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never healthy: {c:?}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // Found by name on the network.
+    let mut c = spec(
+        &client,
+        &image,
+        &format!("getent hosts {server} || ping -c1 -W2 {server}"),
+        Vec::new(),
+    );
+    c.network_mode = Some(network.clone());
+    let cid = engine.create_container(&c).unwrap();
+    engine.start_container(&cid).unwrap();
+    assert_eq!(
+        engine
+            .wait_container(&cid, Duration::from_secs(60))
+            .unwrap(),
+        0
+    );
+    engine.remove_container(&cid).unwrap();
+
+    // A volume's host path, one subdirectory of it bound elsewhere.
+    engine.create_volume(&volume, &BTreeMap::new()).unwrap();
+    let mountpoint = engine
+        .inspect_volume(&volume)
+        .unwrap()
+        .unwrap()
+        .mountpoint
+        .expect("the local driver reports a host path");
+    let w = spec(
+        &writer,
+        &image,
+        "mkdir -p /v/agent /v/control && echo agent > /v/agent/x && echo control > /v/control/x",
+        vec![Bind {
+            source: volume.clone(),
+            target: "/v".into(),
+            read_only: false,
+        }],
+    );
+    let wid = engine.create_container(&w).unwrap();
+    engine.start_container(&wid).unwrap();
+    assert_eq!(
+        engine
+            .wait_container(&wid, Duration::from_secs(60))
+            .unwrap(),
+        0
+    );
+    engine.remove_container(&wid).unwrap();
+    let r = spec(
+        &client,
+        &image,
+        "cat /only/x; ls /only",
+        vec![Bind {
+            source: format!("{mountpoint}/control"),
+            target: "/only".into(),
+            read_only: true,
+        }],
+    );
+    let rid = engine.create_container(&r).unwrap();
+    engine.start_container(&rid).unwrap();
+    assert_eq!(
+        engine
+            .wait_container(&rid, Duration::from_secs(60))
+            .unwrap(),
+        0
+    );
+    let logs = engine.logs_tail(&rid, 20).unwrap();
+    assert!(
+        logs.contains("control") && !logs.contains("agent"),
+        "{logs}"
+    );
+    engine.remove_container(&rid).unwrap();
+    engine.remove_container(&id).unwrap();
+    engine.remove_network(&network).unwrap();
+    assert!(engine.inspect_network(&network).unwrap().is_none());
 }
 
 #[test]
