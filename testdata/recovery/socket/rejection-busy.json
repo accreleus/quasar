@@ -1,0 +1,9 @@
+{
+  "shape": "rejection",
+  "about": "Single flight: refuse, never queue.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "reason": "busy",
+    "message": "request 11111111-2222-3333-4444-555555555555 is still in flight"
+  }
+}

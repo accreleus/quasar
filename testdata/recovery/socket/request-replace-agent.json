@@ -1,0 +1,25 @@
+{
+  "shape": "request",
+  "about": "The agent relay's replace: one component, a published version, every optional field at its default and wait_timeout_s omitted.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "kind": "replace",
+    "components": [
+      {
+        "name": "node-agent",
+        "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+        "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "release": {
+      "id": "rel-0.3.0",
+      "version": "0.3.0",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "migrates": false,
+    "schema_version": null,
+    "external_backup_confirmed": false,
+    "dump": null,
+    "purge": false
+  }
+}

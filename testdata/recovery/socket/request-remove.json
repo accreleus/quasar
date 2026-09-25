@@ -1,0 +1,19 @@
+{
+  "shape": "request",
+  "about": "Remove this machine's platform services (GPU-host removal / uninstall), deleting data.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "kind": "remove",
+    "components": [],
+    "release": {
+      "id": "",
+      "version": null,
+      "source_commit": ""
+    },
+    "migrates": false,
+    "schema_version": null,
+    "external_backup_confirmed": false,
+    "dump": null,
+    "purge": true
+  }
+}

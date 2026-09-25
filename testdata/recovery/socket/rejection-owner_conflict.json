@@ -1,0 +1,9 @@
+{
+  "shape": "rejection",
+  "about": "A target container this installation does not own (the race guard; RH06-01 draft vocabulary).",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "reason": "owner_conflict",
+    "message": "a quasar-control-plane container not created by this installation exists; it is left alone"
+  }
+}

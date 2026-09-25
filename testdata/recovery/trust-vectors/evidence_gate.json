@@ -1,0 +1,66 @@
+{
+  "kind": "evidence_gate",
+  "about": "server.go signatureEvidence: whether a request's release assets are fetched at all (only when a mode is enabled and the host is not busy with another request).",
+  "vectors": [
+    {
+      "name": "off fetches nothing",
+      "source": "go:control-plane/internal/updater/signature_server_test.go:TestServerFetchesNothingWhenSigningIsOff",
+      "signature_mode": "off",
+      "in_flight_request_id": "",
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "expect": {
+        "fetches": false
+      }
+    },
+    {
+      "name": "verify fetches",
+      "source": "go:control-plane/internal/updater/signature_server_test.go:TestServerAcceptsAMissingSignatureUnderVerify",
+      "signature_mode": "verify",
+      "in_flight_request_id": "",
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "expect": {
+        "fetches": true
+      }
+    },
+    {
+      "name": "require fetches",
+      "source": "go:control-plane/internal/updater/signature_server_test.go:TestServerRefusesAMissingSignatureUnderRequire",
+      "signature_mode": "require",
+      "in_flight_request_id": "",
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "expect": {
+        "fetches": true
+      }
+    },
+    {
+      "name": "busy fetches nothing",
+      "source": "added: server.go signatureEvidence answers busy without a network call",
+      "signature_mode": "require",
+      "in_flight_request_id": "11111111-2222-3333-4444-555555555555",
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "expect": {
+        "fetches": false
+      }
+    },
+    {
+      "name": "re-posting the in-flight id fetches",
+      "source": "added: server.go signatureEvidence",
+      "signature_mode": "require",
+      "in_flight_request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "expect": {
+        "fetches": true
+      }
+    },
+    {
+      "name": "off and busy fetches nothing",
+      "source": "added: server.go signatureEvidence",
+      "signature_mode": "off",
+      "in_flight_request_id": "11111111-2222-3333-4444-555555555555",
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "expect": {
+        "fetches": false
+      }
+    }
+  ]
+}

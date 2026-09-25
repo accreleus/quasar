@@ -1,0 +1,9 @@
+{
+  "shape": "rejection",
+  "about": "require, and the release publishes no signature.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "reason": "signature_missing",
+    "message": "this host requires a signed release and this one carries no signature: release 0.3.0 publishes no platform-release-manifest.json.sig asset"
+  }
+}

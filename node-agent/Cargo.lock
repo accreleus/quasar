@@ -1605,6 +1605,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "quasar-recovery"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "flate2",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "regex",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
 name = "quasar-runtime"
 version = "0.1.0"
 dependencies = [
