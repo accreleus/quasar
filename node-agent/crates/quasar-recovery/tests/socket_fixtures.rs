@@ -62,7 +62,8 @@ fn round_trip<T: DeserializeOwned + Serialize>(name: &str, body: &Value) -> T {
 fn every_fixture_round_trips_through_the_rust_types_and_the_vocabulary_is_covered() {
     let mut shapes = BTreeSet::new();
     let mut kinds = BTreeSet::new();
-    let mut reasons: BTreeSet<String> = BTreeSet::new();
+    let mut rejections: BTreeSet<String> = BTreeSet::new();
+    let mut failures: BTreeSet<String> = BTreeSet::new();
     let mut restored = BTreeSet::new();
     let mut results: Vec<AttemptResult> = Vec::new();
     for (name, f) in fixtures() {
@@ -81,7 +82,7 @@ fn every_fixture_round_trips_through_the_rust_types_and_the_vocabulary_is_covere
                     !matches!(r.reason, Reason::Other(_)),
                     "{name}: an unknown reason in a fixture"
                 );
-                reasons.insert(r.reason.as_str().to_owned());
+                rejections.insert(r.reason.as_str().to_owned());
             }
             "result" => results.push(round_trip(&name, &f.body)),
             "status" => {
@@ -107,7 +108,7 @@ fn every_fixture_round_trips_through_the_rust_types_and_the_vocabulary_is_covere
             r.request_id
         );
         if let Some(reason) = &r.reason {
-            reasons.insert(reason.as_str().to_owned());
+            failures.insert(reason.as_str().to_owned());
             restored.insert(r.restored);
         }
     }
@@ -137,13 +138,32 @@ fn every_fixture_round_trips_through_the_rust_types_and_the_vocabulary_is_covere
     .map(|s| format!("{s:?}"))
     .collect();
     assert_eq!(states, all_states);
-    let known: BTreeSet<String> = Reason::KNOWN
-        .iter()
-        .map(|r| r.as_str().to_owned())
-        .collect();
+    let names = |rs: &[Reason]| {
+        rs.iter()
+            .map(|r| r.as_str().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
     assert_eq!(
-        reasons, known,
-        "every reason is covered by a rejection or a failed result"
+        rejections,
+        names(Reason::REJECTIONS),
+        "rejection fixtures cover exactly the rejection reasons"
+    );
+    assert_eq!(
+        failures,
+        names(Reason::FAILURES),
+        "failed results cover exactly the failure reasons"
+    );
+    let mut both = names(Reason::REJECTIONS);
+    both.extend(names(Reason::FAILURES));
+    assert_eq!(
+        both,
+        names(Reason::KNOWN),
+        "every known reason is a rejection or a failure"
+    );
+    assert_eq!(
+        Reason::REJECTIONS.len() + Reason::FAILURES.len(),
+        Reason::KNOWN.len(),
+        "and not both"
     );
     assert_eq!(
         restored,

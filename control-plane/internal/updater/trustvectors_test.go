@@ -553,10 +553,12 @@ func TestTrustVectorsPassAgainstGo(t *testing.T) {
 	}
 	sort.Strings(names)
 	total, ran := 0, 0
+	kinds := map[string]bool{}
 	seen := map[string]bool{}
 	for _, file := range names {
 		f := files[file]
 		total += len(f.Vectors)
+		kinds[f.Kind] = true
 		for _, raw := range f.Vectors {
 			var head struct {
 				Name string `json:"name"`
@@ -645,6 +647,11 @@ func TestTrustVectorsPassAgainstGo(t *testing.T) {
 				t.Fatalf("%s: unknown vector kind %q (both runners must know every kind)", file, f.Kind)
 			}
 			ran++
+		}
+	}
+	for _, k := range []string{kindAdmit, kindVerifySignature, kindEvidence, kindEvidenceGate, kindConfig, kindRedirect} {
+		if !kinds[k] {
+			t.Errorf("no vector file of kind %q: every kind must be on disk and run", k)
 		}
 	}
 	if ran != total || ran == 0 {

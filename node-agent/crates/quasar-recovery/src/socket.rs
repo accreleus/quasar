@@ -242,6 +242,29 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Refuse a submit before anything is journalled.
+    pub const REJECTIONS: &'static [Reason] = &[
+        Reason::Invalid,
+        Reason::Busy,
+        Reason::NamespaceRejected,
+        Reason::DigestMalformed,
+        Reason::SignatureMissing,
+        Reason::SignatureInvalid,
+        Reason::BackupUnconfirmed,
+        Reason::OwnerConflict,
+    ];
+
+    /// End an admitted attempt in state `failed`.
+    pub const FAILURES: &'static [Reason] = &[
+        Reason::PullFailed,
+        Reason::RecreateFailed,
+        Reason::NeverStarted,
+        Reason::Unhealthy,
+        Reason::RecipeUnsupported,
+        Reason::BackupFailed,
+        Reason::Interrupted,
+    ];
+
     /// Every identifier this build knows, in vocabulary order.
     pub const KNOWN: &'static [Reason] = &[
         Reason::Invalid,

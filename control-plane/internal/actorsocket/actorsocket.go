@@ -63,55 +63,66 @@ type Accepted struct {
 // Rejection answers a refused submit; nothing was journalled.
 type Rejection struct {
 	RequestID string `json:"request_id,omitempty"`
-	Reason    string `json:"reason"`
+	Reason    Reason `json:"reason"`
 	Message   string `json:"message"`
 }
 
-// States: agent-api.md release_state.
+// State is agent-api.md release_state's state.
+type State string
+
 const (
-	StatePending    = "pending"
-	StatePulling    = "pulling"
-	StateRecreating = "recreating"
-	StateVerifying  = "verifying"
-	StateSucceeded  = "succeeded"
-	StateFailed     = "failed"
+	StatePending    State = "pending"
+	StatePulling    State = "pulling"
+	StateRecreating State = "recreating"
+	StateVerifying  State = "verifying"
+	StateSucceeded  State = "succeeded"
+	StateFailed     State = "failed"
 )
 
-// Reasons: agent-api.md release_state's closed vocabulary as the actor emits
+// Reason is agent-api.md release_state's closed vocabulary as the actor emits
 // it, then the RH-06 identifiers of the RH06-01 draft amendment (#353). A
 // reason this build does not know is kept and rendered verbatim.
+type Reason string
+
 const (
-	ReasonInvalid           = "invalid"
-	ReasonNamespaceRejected = "namespace_rejected"
-	ReasonDigestMalformed   = "digest_malformed"
-	ReasonBusy              = "busy"
-	ReasonPullFailed        = "pull_failed"
-	ReasonRecreateFailed    = "recreate_failed"
-	ReasonNeverStarted      = "never_started"
-	ReasonUnhealthy         = "unhealthy"
-	ReasonSignatureMissing  = "signature_missing"
-	ReasonSignatureInvalid  = "signature_invalid"
-	ReasonRecipeUnsupported = "recipe_unsupported"
-	ReasonOwnerConflict     = "owner_conflict"
-	ReasonBackupFailed      = "backup_failed"
-	ReasonBackupUnconfirmed = "backup_unconfirmed"
-	ReasonInterrupted       = "interrupted"
+	ReasonInvalid           Reason = "invalid"
+	ReasonNamespaceRejected Reason = "namespace_rejected"
+	ReasonDigestMalformed   Reason = "digest_malformed"
+	ReasonBusy              Reason = "busy"
+	ReasonPullFailed        Reason = "pull_failed"
+	ReasonRecreateFailed    Reason = "recreate_failed"
+	ReasonNeverStarted      Reason = "never_started"
+	ReasonUnhealthy         Reason = "unhealthy"
+	ReasonSignatureMissing  Reason = "signature_missing"
+	ReasonSignatureInvalid  Reason = "signature_invalid"
+	ReasonRecipeUnsupported Reason = "recipe_unsupported"
+	ReasonOwnerConflict     Reason = "owner_conflict"
+	ReasonBackupFailed      Reason = "backup_failed"
+	ReasonBackupUnconfirmed Reason = "backup_unconfirmed"
+	ReasonInterrupted       Reason = "interrupted"
 )
 
-// KnownReasons is the vocabulary above, in order.
-var KnownReasons = []string{
-	ReasonInvalid, ReasonNamespaceRejected, ReasonDigestMalformed, ReasonBusy,
-	ReasonPullFailed, ReasonRecreateFailed, ReasonNeverStarted, ReasonUnhealthy,
-	ReasonSignatureMissing, ReasonSignatureInvalid, ReasonRecipeUnsupported,
-	ReasonOwnerConflict, ReasonBackupFailed, ReasonBackupUnconfirmed, ReasonInterrupted,
+// RejectionReasons refuse a submit before anything is journalled.
+var RejectionReasons = []Reason{
+	ReasonInvalid, ReasonBusy, ReasonNamespaceRejected, ReasonDigestMalformed,
+	ReasonSignatureMissing, ReasonSignatureInvalid, ReasonBackupUnconfirmed, ReasonOwnerConflict,
 }
+
+// FailureReasons end an admitted attempt in state failed.
+var FailureReasons = []Reason{
+	ReasonPullFailed, ReasonRecreateFailed, ReasonNeverStarted, ReasonUnhealthy,
+	ReasonRecipeUnsupported, ReasonBackupFailed, ReasonInterrupted,
+}
+
+// KnownReasons is every reason this build emits.
+var KnownReasons = append(append([]Reason{}, RejectionReasons...), FailureReasons...)
 
 // Result is one attempt's observable state. Reason is non-nil exactly when
 // State is failed; an interrupted attempt is failed/interrupted, Restored false.
 type Result struct {
 	RequestID  string      `json:"request_id"`
-	State      string      `json:"state"`
-	Reason     *string     `json:"reason"`
+	State      State       `json:"state"`
+	Reason     *Reason     `json:"reason"`
 	Components []Component `json:"components"`
 	Previous   []Previous  `json:"previous"`
 	Output     string      `json:"output"`
@@ -159,15 +170,22 @@ type Dump struct {
 	SizeBytes     int64  `json:"size_bytes"`
 }
 
-// Machine roles and database modes.
-const (
-	RoleCombined    = "combined"
-	RoleGPU         = "gpu"
-	RoleControlOnly = "control_only"
+// Role is what a machine runs (CONTEXT.md "Combined host").
+type Role string
 
-	DatabaseOwned    = "owned"
-	DatabaseExternal = "external"
-	DatabaseNone     = "none"
+const (
+	RoleCombined    Role = "combined"
+	RoleGPU         Role = "gpu"
+	RoleControlOnly Role = "control_only"
+)
+
+// Database is who owns the control plane's database.
+type Database string
+
+const (
+	DatabaseOwned    Database = "owned"
+	DatabaseExternal Database = "external"
+	DatabaseNone     Database = "none"
 )
 
 // Status is the machine inventory, plus one attempt's result when a request
@@ -175,8 +193,8 @@ const (
 type Status struct {
 	Actor     ActorIdentity `json:"actor"`
 	Seed      *SeedIdentity `json:"seed"`
-	Role      string        `json:"role"`
-	Database  string        `json:"database"`
+	Role      Role          `json:"role"`
+	Database  Database      `json:"database"`
 	Services  []Service     `json:"services"`
 	Conflicts []Conflict    `json:"conflicts"`
 	InFlight  *string       `json:"in_flight"`

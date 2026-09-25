@@ -3,10 +3,14 @@ package actorsocket
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -103,10 +107,12 @@ func TestEveryFixtureRoundTripsThroughTheGoTypes(t *testing.T) {
 	}
 }
 
-// The fixtures cover every shape, every request kind, every state, every
-// reason, and both restored outcomes of a failure.
+// The fixtures cover every shape, request kind and state, every rejection
+// reason with a rejection and every failure reason with a failed result (never
+// the other way round), and both restored outcomes of a failure.
 func TestFixturesCoverTheVocabulary(t *testing.T) {
-	shapes, kinds, states, reasons := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
+	shapes, kinds, states := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	rejections, failures := map[string]bool{}, map[string]bool{}
 	restored := map[bool]bool{}
 	results := []Result{}
 	for _, f := range loadFixtures(t) {
@@ -119,7 +125,7 @@ func TestFixturesCoverTheVocabulary(t *testing.T) {
 		case "rejection":
 			var r Rejection
 			_ = json.Unmarshal(f.Body, &r)
-			reasons[r.Reason] = true
+			rejections[string(r.Reason)] = true
 		case "result":
 			var r Result
 			_ = json.Unmarshal(f.Body, &r)
@@ -133,36 +139,123 @@ func TestFixturesCoverTheVocabulary(t *testing.T) {
 		}
 	}
 	for _, r := range results {
-		states[r.State] = true
+		states[string(r.State)] = true
 		if (r.Reason != nil) != (r.State == StateFailed) {
 			t.Errorf("result %s: reason must be set exactly when failed", r.State)
 		}
 		if r.Reason != nil {
-			reasons[*r.Reason] = true
+			failures[string(*r.Reason)] = true
 			restored[r.Restored] = true
 		}
 		if (r.FinishedAt != nil) != (r.State == StateSucceeded || r.State == StateFailed) {
 			t.Errorf("result %s: finished_at must be set exactly when terminal", r.State)
 		}
 	}
-	want := func(what string, got map[string]bool, all ...string) {
+	exactly := func(what string, got map[string]bool, all ...string) {
 		t.Helper()
-		var missing []string
+		want := map[string]bool{}
 		for _, a := range all {
-			if !got[a] {
-				missing = append(missing, a)
-			}
+			want[a] = true
 		}
-		sort.Strings(missing)
-		if len(missing) > 0 {
-			t.Errorf("no fixture covers %s %v", what, missing)
+		if !reflect.DeepEqual(got, want) {
+			keys := func(m map[string]bool) []string {
+				out := []string{}
+				for k := range m {
+					out = append(out, k)
+				}
+				sort.Strings(out)
+				return out
+			}
+			t.Errorf("%s: fixtures cover %v, want exactly %v", what, keys(got), keys(want))
 		}
 	}
-	want("shape", shapes, "request", "accepted", "rejection", "status", "result")
-	want("kind", kinds, string(KindReplace), string(KindRestore), string(KindRemove))
-	want("state", states, StatePending, StatePulling, StateRecreating, StateVerifying, StateSucceeded, StateFailed)
-	want("reason", reasons, KnownReasons...)
+	strs := func(rs []Reason) []string {
+		out := []string{}
+		for _, r := range rs {
+			out = append(out, string(r))
+		}
+		return out
+	}
+	exactly("shapes", shapes, "request", "accepted", "rejection", "status", "result")
+	exactly("request kinds", kinds, string(KindReplace), string(KindRestore), string(KindRemove))
+	exactly("states", states, string(StatePending), string(StatePulling), string(StateRecreating),
+		string(StateVerifying), string(StateSucceeded), string(StateFailed))
+	exactly("rejection reasons", rejections, strs(RejectionReasons)...)
+	exactly("failure reasons", failures, strs(FailureReasons)...)
 	if !restored[true] || !restored[false] {
 		t.Errorf("fixtures must cover a failure both restored and not: %v", restored)
+	}
+}
+
+// reasonBlock returns the string values of the const block in file that
+// declares ident, so a reason added beside it is seen here.
+func reasonBlock(t *testing.T, file, ident string) []string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		var values []string
+		declares := false
+		for _, spec := range gd.Specs {
+			vs := spec.(*ast.ValueSpec)
+			for i, name := range vs.Names {
+				if name.Name == ident {
+					declares = true
+				}
+				if i < len(vs.Values) {
+					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						v, _ := strconv.Unquote(lit.Value)
+						values = append(values, v)
+					}
+				}
+			}
+		}
+		if declares {
+			return values
+		}
+	}
+	t.Fatalf("%s declares no %s", file, ident)
+	return nil
+}
+
+// The actor's reasons must include every reason the Go updater emits and every
+// failure reason the platform package records, apart from the four the
+// platform observes about an updater rather than receives from one. Guards
+// drift until the ActorClient adapter unifies the vocabularies.
+func TestReasonsIncludeTheUpdaterAndPlatformVocabularies(t *testing.T) {
+	known := map[string]bool{}
+	for _, r := range KnownReasons {
+		known[string(r)] = true
+	}
+	observedByOthers := map[string]bool{"updater_absent": true, "updater_unreachable": true, "timeout": true, "unsupported": true}
+
+	updater := append(reasonBlock(t, "../updater/plan.go", "ReasonInvalid"),
+		reasonBlock(t, "../updater/signature.go", "ReasonSignatureMissing")...)
+	for _, r := range updater {
+		if !known[r] {
+			t.Errorf("updater reason %q is missing from actorsocket.KnownReasons", r)
+		}
+	}
+	platform := reasonBlock(t, "../platform/apply.go", "ReasonUpdaterAbsentFailure")
+	inPlatform := map[string]bool{}
+	for _, r := range platform {
+		inPlatform[r] = true
+		if !known[r] && !observedByOthers[r] {
+			t.Errorf("platform reason %q is missing from actorsocket.KnownReasons", r)
+		}
+	}
+	for r := range observedByOthers {
+		if !inPlatform[r] || known[r] {
+			t.Errorf("%q must be a platform reason the actor never emits", r)
+		}
+	}
+	if len(updater) < 10 || len(platform) < 14 {
+		t.Fatalf("parsed %d updater and %d platform reasons: the const blocks moved", len(updater), len(platform))
 	}
 }

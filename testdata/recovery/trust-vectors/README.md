@@ -8,9 +8,9 @@ The behaviour of the release trust gates, written down as data, so the Go update
 - Go: `TestTrustVectorsPassAgainstGo` in `control-plane/internal/updater/trustvectors_test.go`
   (`make test-go`).
 - Rust: `every_trust_vector_passes_against_the_rust_port` in
-  `node-agent/crates/quasar-recovery/tests/trust_vectors.rs` (`make test-rust`).
+  `node-agent/crates/quasar-recovery/src/trust/vector_tests.rs` (`make test-rust`).
 
-Each runner fails on a file or a `kind` it does not know, runs every vector in every
+Each runner fails on a file or a `kind` it does not know, or a kind that is missing, runs every vector in every
 file, and checks that the count it ran equals the count on disk. A vector one side does
 not run is therefore a failing test, not a silent gap.
 
