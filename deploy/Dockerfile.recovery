@@ -1,0 +1,44 @@
+# The recovery actor (RH-06, docs/rh06/2026-09-24-architecture.md §5.1): one static musl
+# binary, `quasar-recovery`, in a slim image. Built ONLY by deploy/build-images.sh (role
+# `recovery`) and asserted by deploy/image-contract.json.
+#
+# Deliberately NOT on the Dockerfile.vulkan lineage: the actor carries no GStreamer, CUDA
+# or GPU userspace (the crate's tests/gstreamer_free_convention.rs walks its lockfile
+# closure), and its release cadence must not wait on the toolchain image.
+#
+# Alpine rather than scratch: the image contract's assertions run in a shell inside the
+# image, and an operator's `docker exec quasar-recovery quasar-recovery status` needs no
+# more than the binary. TLS roots are compiled in (webpki-roots), so no CA bundle ships.
+
+ARG RUST_VERSION=1.94.0
+
+FROM rust:${RUST_VERSION}-alpine AS build
+RUN apk add --no-cache musl-dev
+COPY node-agent /src/node-agent
+ARG SOURCE_COMMIT=unknown
+ARG QUASAR_VERSION=
+# The stamps quasar_recovery::identity reads with option_env!.
+RUN cd /src/node-agent \
+    && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" QUASAR_VERSION="${QUASAR_VERSION}" \
+       cargo build --release --locked -p quasar-recovery --bin quasar-recovery \
+    && install -Dm0755 target/release/quasar-recovery /out/quasar-recovery
+
+FROM alpine:3.22 AS runtime
+COPY --from=build /out/quasar-recovery /usr/local/bin/quasar-recovery
+
+# Healthy while the actor serves its agent socket.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/quasar-recovery", "status"]
+
+# Root is required: the actor drives the container engine through its mounted socket.
+ENTRYPOINT ["/usr/local/bin/quasar-recovery"]
+CMD ["actor"]
+
+# Provenance, last so a wall-clock BUILT_AT invalidates nothing above it. The recipe
+# revision label (org.quasar.recipe) is stamped by build-images.sh from
+# node-agent/crates/quasar-recovery/src/recipe/revision.rs.
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+LABEL org.quasar.image.role="recovery" \
+      org.quasar.source.commit="${SOURCE_COMMIT}" \
+      org.quasar.built.at="${BUILT_AT}"
