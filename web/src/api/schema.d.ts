@@ -4656,7 +4656,7 @@ export interface paths {
         put?: never;
         /**
          * Developer apply - an arbitrary digest set to one owned target (admin). NOT YET SERVED - see x-unimplemented.
-         * @description AMENDMENT 14, OWNER ADDITION on #353 (2026-09-25), beyond #352 decision 24; authored ahead of the server: `x-unimplemented: true` until the RH06 slice that implements it registers the route and removes the marker (and its drift-test allowlist entry) in the same change. The product lane (#352 decisions 15 and 22): a standalone attempt that applies the requested digests to ONE owned target - the control plane or one host - ordered recovery-actor first. Every image digest-only and under the namespace allowlist (ADR 0001; the recovery actor's allowlist is the enforcement, the control plane checks up front). ADR 0002 holds on the images' build-identity labels: a control-plane digest below the installed schema is refused, one above it MIGRATES and follows #352 decision 14 (drain, then the pre-update dump or external_backup_confirmed); a host digest set must be the installed control plane's commit or a known release at or below it. Never offered as a release, never unattended. Carries no release version, so under signature mode require it fails signature_missing; under verify it applies unsigned with the WARN. Recorded as a kind developer_apply attempt; audited as platform.apply.developer.
+         * @description AMENDMENT 14, OWNER ADDITION on #353 (2026-09-25), beyond #352 decision 24; authored ahead of the server: `x-unimplemented: true` until the RH06 slice that implements it registers the route and removes the marker (and its drift-test allowlist entry) in the same change. The product lane (#352 decisions 15 and 22): a standalone attempt that applies the requested digests to ONE owned target - the control plane or one host - ordered recovery-actor first. Every image digest-only and under the namespace allowlist (ADR 0001; the recovery actor's allowlist is the enforcement, the control plane checks up front). ADR 0002 holds on the images' build-identity labels: a control-plane digest below the installed schema is refused, one above it MIGRATES and follows #352 decision 14 (drain, then the pre-update dump or external_backup_confirmed); a request that does not name control-plane, whatever its target, must carry the installed control plane's commit or a known release's commit at or below it; a control_plane target names recovery-actor only together with control-plane, and a request for the agent on the control plane's own machine names only node-agent. Never offered as a release, never unattended. Carries no release version, so under signature mode require it fails signature_missing; under verify it applies unsigned with the WARN. Recorded as a kind developer_apply attempt; audited as platform.apply.developer.
          */
         post: {
             parameters: {
@@ -9131,7 +9131,7 @@ export interface components {
             /** @description The highest migration version the binary embeds (the 0NNN file number as an integer). ALWAYS KNOWN, because it is derived from the embedded migration set rather than a build flag - which is why it, and not semver or built_at, is the ordering key everywhere in this surface (ADR 0002). */
             schema_version: number;
             /**
-             * @description owned when this machine's recovery actor answered; otherwise null. The enum is the host's; this amendment defines only when owned is reported.
+             * @description owned when this machine's recovery actor answered; otherwise null. The enum is the host's; this amendment defines only when owned is reported. A transient failure to reach the actor also reads null, so a developer apply to the control-plane target is refused 409 target_not_owned until it answers; the updater_socket preflight surfaces that condition.
              * @enum {string|null}
              */
             install_mode?: "registry" | "source" | "owned" | null;
@@ -9532,7 +9532,7 @@ export interface components {
              * @description Required when target is host; absent otherwise.
              */
             host_id?: string;
-            /** @description Each name at most once. A control_plane target may name control-plane and recovery-actor; a host target node-agent and recovery-actor. ORDER IS NOT SIGNIFICANT: the control plane orders recovery-actor first, as for every apply. */
+            /** @description Each name at most once. A control_plane target may name control-plane and recovery-actor, but names recovery-actor ONLY TOGETHER WITH control-plane (A1); a host target may name node-agent and recovery-actor, except that a request for the agent on the control plane's own machine names ONLY node-agent (that machine's actor moves in the control-plane step). Either violation is 400 validation_failed. A request that does not name control-plane, whatever its target, is bound by the host commit rule: the installed control plane's own commit, or a known release's commit at or below it. ORDER IS NOT SIGNIFICANT: the control plane orders recovery-actor first, as for every apply. */
             components: components["schemas"]["ApplyComponentDigest"][];
             /** @description Optional; absent means false. As on the per-host and fleet applies. */
             force?: boolean;
