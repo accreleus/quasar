@@ -172,6 +172,15 @@ describe("HostExpansion — the Services column (#357)", () => {
     expect(within(service("Seed")).getByText("not reported")).toBeTruthy();
   });
 
+  it("names the seed's owner beside its version, and says when none was found (#358)", () => {
+    const { unmount } = renderDrawer(owned);
+    expect(within(service("Seed")).getByText(/· external manager/)).toBeTruthy();
+    unmount();
+
+    renderDrawer({ ...owned, seed_version: null });
+    expect(within(service("Seed")).getByText("not found")).toBeTruthy();
+  });
+
   it("still lists the agent when the answering actor's version is not a release", () => {
     renderDrawer({ ...owned, recovery_actor_version: null, agent_version: "dev" });
 

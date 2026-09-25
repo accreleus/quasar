@@ -479,6 +479,21 @@ fn an_agent_image_without_a_revision_this_actor_carries_is_refused_before_anythi
             "{label:?}: {err}"
         );
         assert!(engine.state().container_named(names::NODE_AGENT).is_none());
+        // Nothing durable either: machine state would win over corrected inputs.
+        let files: Vec<_> = tree(dir.path())
+            .into_keys()
+            .filter(|f| f != "actor.lease")
+            .collect();
+        assert!(files.is_empty(), "{label:?}: {files:?}");
+
+        // The same machine, started again with an image the actor carries, installs.
+        engine.with_state(|s| {
+            s.registry
+                .insert(AGENT_IMAGE.into(), agent_image(Some("1")));
+            s.images.remove(AGENT_IMAGE);
+        });
+        actor(&engine, dir.path(), operator()).resume().unwrap();
+        assert!(engine.state().container_named(names::NODE_AGENT).is_some());
     }
 }
 

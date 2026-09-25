@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use quasar_runtime::{LeaseError, StateLease};
 use tracing::{info, warn};
 
+use crate::bootstrap::Bootstrap;
 use crate::engine::{Container, ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
 use crate::journal::JournalDir;
 use crate::machine::{Machine, MachineDir, ServiceRecord, FORMAT};
@@ -27,8 +28,10 @@ use crate::probe;
 use crate::recipe::{
     self, labels, names, paths, secrets, Bind, ImageRef, Inputs, RenderError, Role, SecretMounts,
 };
+use crate::seed;
 use crate::socket::{
-    ActorIdentity, AttemptResult, Conflict, DatabaseMode, MachineRole, Request, Service, Status,
+    ActorIdentity, AttemptResult, Conflict, DatabaseMode, MachineRole, Request, SeedIdentity,
+    Service, Status,
 };
 use crate::trust::{SignatureEvidence, SignaturePolicy};
 
@@ -49,6 +52,9 @@ pub struct ActorConfig {
     pub operator: OperatorInputs,
     /// This process's own container, when it runs in one.
     pub self_container: Option<String>,
+    /// The seed container that created this actor (`QUASAR_SEED_CONTAINER`): where a first
+    /// install reads its inputs, and the first place the reported seed is looked for.
+    pub seed_container: Option<String>,
     /// The engine socket's daemon-host path when self-inspection cannot tell.
     pub docker_socket_fallback: String,
     pub new_installation_id: Box<dyn Fn() -> String + Send + Sync>,
@@ -119,6 +125,7 @@ impl ActorConfig {
             role,
             operator,
             self_container: None,
+            seed_container: None,
             docker_socket_fallback: paths::ENGINE_SOCKET.into(),
             new_installation_id: Box::new(random_uuid),
             now: Box::new(rfc3339_now),
@@ -193,6 +200,7 @@ impl From<RenderError> for ResumeError {
 struct Inventory {
     services: Vec<Service>,
     conflicts: Vec<Conflict>,
+    seed: Option<SeedIdentity>,
 }
 
 pub struct Actor {
@@ -208,8 +216,11 @@ pub struct Actor {
     pub(crate) gate: Mutex<()>,
     /// The thread driving the attempt `submit` admitted, until it has finished.
     pub(crate) worker: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Set while `resume` runs: a submit then is refused `busy`.
+    /// Set by `acquire_lease` and `resume`, cleared when `resume` returns: a submit then
+    /// is refused `busy`, so one queued on a socket served before `resume` cannot race it.
     pub(crate) resuming: std::sync::atomic::AtomicBool,
+    /// Seed identities by image id: an image's labels never change.
+    seed_images: Mutex<BTreeMap<String, SeedIdentity>>,
 }
 
 const PLATFORM_NAMES: &[&str] = &[
@@ -236,6 +247,7 @@ impl Actor {
             gate: Mutex::new(()),
             worker: Mutex::new(None),
             resuming: std::sync::atomic::AtomicBool::new(false),
+            seed_images: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -253,7 +265,10 @@ impl Actor {
 
     /// Take the machine's lease without doing anything else, so the binary can serve
     /// `status` while `resume` settles an open attempt. `resume` takes it too.
+    /// Submits are refused `busy` from here until `resume` returns.
     pub fn acquire_lease(&self) -> Result<(), ResumeError> {
+        self.resuming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.take_lease()
     }
 
@@ -274,10 +289,12 @@ impl Actor {
         let machine = match self.dir.load_machine()? {
             Some(machine) => {
                 self.note_ignored_inputs(&machine);
+                self.note_label_mismatch(&machine);
                 machine
             }
             None => self.first_install()?,
         };
+        self.ensure_seed_file(&machine)?;
         match machine.role {
             MachineRole::Gpu => self.ensure_node_agent(&machine),
             other => Err(ResumeError::Unsupported(format!(
@@ -328,7 +345,7 @@ impl Actor {
             .unwrap_or(self.config.role);
         Status {
             actor: self.identity(),
-            seed: None,
+            seed: inventory.seed,
             role,
             database: match role {
                 MachineRole::Gpu => DatabaseMode::None,
@@ -368,6 +385,49 @@ impl Actor {
         }
     }
 
+    fn own_container(&self) -> Result<Option<Container>, EngineError> {
+        match &self.config.self_container {
+            Some(id) => self.engine.inspect_container(id),
+            None => Ok(None),
+        }
+    }
+
+    /// Records this actor's image in `seed.json` when no actor has yet, so a seed can
+    /// re-create it. An existing file is left alone: only a verified hand-over rewrites the
+    /// image, and only an uninstall the state (ADR 0007).
+    fn ensure_seed_file(&self, machine: &Machine) -> Result<(), ResumeError> {
+        match self.dir.load_seed_file() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    token = "actor-seed-file-unreadable",
+                    "seed.json is unreadable ({e}); it is left as it is, and a seed stays idle until it is fixed"
+                );
+                return Ok(());
+            }
+        }
+        let Some(image) = self
+            .own_container()?
+            .and_then(|me| own_image(self.engine.as_ref(), &me))
+        else {
+            warn!(
+                token = "actor-seed-file-unwritten",
+                "this actor cannot tell its own image digest, so seed.json is not written and a seed cannot re-create this actor if it is deleted; run the actor by digest"
+            );
+            return Ok(());
+        };
+        let file = seed::file::SeedFile {
+            format_version: seed::file::FORMAT_VERSION,
+            installation_id: machine.installation_id.clone(),
+            recovery_actor_image: image,
+            state: seed::file::SeedState::Active,
+        };
+        self.dir.store_seed_file(&file)?;
+        info!(image = %file.recovery_actor_image.reference(), "seed.json records this recovery actor");
+        Ok(())
+    }
+
     /// A probe or secrets writer left by a crash is removed; nothing else is touched.
     fn sweep_helpers(&self) -> Result<(), ResumeError> {
         for name in [names::GPU_PROBE, names::SECRETS_WRITER] {
@@ -391,6 +451,26 @@ impl Actor {
         Ok(())
     }
 
+    /// A seed that found no `seed.json` on an installed machine labelled this actor with a
+    /// new installation. Machine state wins; the seed then sees no actor of the installation
+    /// `seed.json` names and says `seed-name-taken`, until this container is re-created.
+    /// Only a diagnosis: an engine that does not answer here is left to the steps after it.
+    fn note_label_mismatch(&self, machine: &Machine) {
+        let label = self
+            .own_container()
+            .ok()
+            .flatten()
+            .and_then(|me| me.labels.get(labels::INSTALLATION).cloned());
+        if let Some(label) = label.filter(|l| *l != machine.installation_id) {
+            warn!(
+                token = "actor-installation-label-differs",
+                "this container is labelled installation {label}, machine state is installation {}; machine state wins. Remove this container (docker rm -f {}) and the seed re-creates it with the right label",
+                machine.installation_id,
+                names::RECOVERY_ACTOR
+            );
+        }
+    }
+
     fn note_ignored_inputs(&self, machine: &Machine) {
         let op = &self.config.operator;
         if op.enrollment.is_some() {
@@ -410,60 +490,63 @@ impl Actor {
         }
     }
 
+    /// The inputs of a first install: the seed's, read from the container that created this
+    /// actor, or, for an actor started by hand, this process's own.
+    fn install_inputs(&self) -> Result<Bootstrap, ResumeError> {
+        let Some(seed) = &self.config.seed_container else {
+            return Ok(Bootstrap {
+                role: self.config.role,
+                operator: self.config.operator.clone(),
+            });
+        };
+        // A seed redeployed since it created this actor has a new id: any seed will do.
+        let containers = self.engine.list_containers()?;
+        let container = seed::find(&containers, Some(seed)).ok_or_else(|| {
+            ResumeError::Inputs(format!(
+                "no seed container is on this machine (the one that created this actor, {seed}, is gone), so a first install has no inputs; start the seed with its inputs, then restart this actor (docker restart {})",
+                names::RECOVERY_ACTOR
+            ))
+        })?;
+        Bootstrap::from_env(&container.env).map_err(ResumeError::Inputs)
+    }
+
     fn first_install(&self) -> Result<Machine, ResumeError> {
-        if self.config.role != MachineRole::Gpu {
+        let boot = self.install_inputs()?;
+        if boot.role != MachineRole::Gpu {
             return Err(ResumeError::Unsupported(format!(
                 "machine role {:?}; only `gpu` installs in this build (combined and control-only arrive with #361)",
-                self.config.role
+                boot.role
             )));
         }
-        let op = &self.config.operator;
-        let enrollment = op
-            .enrollment
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                ResumeError::Inputs(
-                    "QUASAR_ENROLLMENT is required to install a GPU host (Admin → Fleet → Enroll host)".into(),
-                )
-            })?;
-        if !enrollment.starts_with("qenr1.") {
-            return Err(ResumeError::Inputs(
-                "QUASAR_ENROLLMENT is not an enrollment string (expected `qenr1.…`)".into(),
-            ));
-        }
-        let home_root = op
-            .home_root
-            .clone()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ResumeError::Inputs("QUASAR_HOME_ROOT is required".into()))?;
-        let image = ImageRef::parse(op.agent_image.as_deref().unwrap_or(""))
-            .map_err(|e| ResumeError::Inputs(format!("QUASAR_AGENT_IMAGE: {e}")))?;
         let host = self.engine.host()?;
-        let node_name = op
-            .node_name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| host.name.clone())
-            .unwrap_or_else(|| "quasar-node".into());
+        let checked = boot
+            .check(host.name.as_deref())
+            .map_err(ResumeError::Inputs)?;
+        let enrollment = checked.enrollment.as_str();
+        let image = checked.agent_image.clone();
+        // A seed-created actor carries the installation id the seed chose; adopting it keeps
+        // the seed's labels, machine state and seed.json naming one installation.
+        let installation_id = self
+            .own_container()?
+            .and_then(|me| me.labels.get(labels::INSTALLATION).cloned())
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| (self.config.new_installation_id)());
         let mut inputs = Inputs {
-            installation_id: (self.config.new_installation_id)(),
-            node_name,
-            home_root,
-            template_root: op
-                .template_root
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(recipe::default_template_root),
+            installation_id,
+            node_name: checked.node_name.clone(),
+            home_root: checked.home_root.clone(),
+            template_root: checked.template_root.clone(),
             docker_socket: self.docker_socket_host_path()?,
             gpu: Default::default(),
             devices: Default::default(),
         };
         recipe::validate(&inputs)?;
 
+        // Refused here, before anything durable: once machine state exists it wins over
+        // corrected inputs.
+        let found = self.ensure_image(&image)?;
+        node_agent_revision(&found, &image)?;
         self.dir.store_secret(secrets::ENROLLMENT, enrollment)?;
-        self.ensure_image(&image)?;
         let report = match probe::run(self.engine.as_ref(), &image) {
             Ok(report) => report,
             Err(probe::ProbeError::Engine(e)) => return Err(e.into()),
@@ -747,22 +830,8 @@ impl Actor {
         let Ok(Some(me)) = self.status_engine.inspect_container(id) else {
             return identity;
         };
-        let repository = repository_of(&me.image);
-        identity.image = repository.clone();
-        identity.digest = match me.image.split_once('@') {
-            Some((_, digest)) => Some(digest.to_owned()),
-            None => self
-                .status_engine
-                .inspect_image(&me.image_id)
-                .ok()
-                .flatten()
-                .and_then(|i| {
-                    i.repo_digests.into_iter().find_map(|d| {
-                        let (repo, digest) = d.split_once('@')?;
-                        (repo == repository).then(|| digest.to_owned())
-                    })
-                }),
-        };
+        identity.image = repository_of(&me.image);
+        identity.digest = own_image(self.status_engine.as_ref(), &me).map(|i| i.digest);
         *self.identity.lock().unwrap() = Some(identity.clone());
         identity
     }
@@ -816,11 +885,71 @@ impl Actor {
             }
         }
         services.sort_by_key(|s| (s.role != Role::RecoveryActor.as_str(), s.role.clone()));
+        let seed = seed::find_running(&containers, self.config.seed_container.as_deref())
+            .map(|c| self.seed_identity(c));
         Ok(Inventory {
             services,
             conflicts,
+            seed,
         })
     }
+
+    /// The seed's version is its image's `org.quasar.version` label; an image without one
+    /// is this actor's own when the ids match. A seed whose version cannot be read is still
+    /// a seed: it is reported as [`SEED_VERSION_UNKNOWN`], never as absent, since absent
+    /// reads "not found" on the console.
+    fn seed_identity(&self, seed: &Container) -> SeedIdentity {
+        if let Some(known) = self.seed_images.lock().unwrap().get(&seed.image_id) {
+            return known.clone();
+        }
+        let digest_of_ref = seed.image.split_once('@').map(|(_, d)| d.to_owned());
+        let Ok(image) = self.status_engine.inspect_image(&seed.image_id) else {
+            return SeedIdentity {
+                version: SEED_VERSION_UNKNOWN.into(),
+                digest: digest_of_ref,
+            };
+        };
+        let version = image
+            .as_ref()
+            .and_then(|i| i.labels.get(labels::IMAGE_VERSION))
+            .map(|v| crate::identity::normalized_version(v).to_owned())
+            .or_else(|| {
+                let own = self.config.self_container.as_deref()?;
+                let me = self.status_engine.inspect_container(own).ok()??;
+                (me.image_id == seed.image_id).then(|| crate::identity::version().to_owned())
+            })
+            .unwrap_or_else(|| SEED_VERSION_UNKNOWN.into());
+        let repository = repository_of(&seed.image);
+        let digest =
+            digest_of_ref.or_else(|| image.as_ref().and_then(|i| digest_for(i, &repository)));
+        let identity = SeedIdentity { version, digest };
+        if image.is_some() {
+            self.seed_images
+                .lock()
+                .unwrap()
+                .insert(seed.image_id.clone(), identity.clone());
+        }
+        identity
+    }
+}
+
+/// A container's image as `repository@sha256:…`: its configured reference when that is
+/// digest-pinned, else the registry digest the engine knows for its repository.
+fn own_image(engine: &dyn PlatformEngine, me: &Container) -> Option<seed::file::ActorImage> {
+    if let Some(pinned) = seed::file::ActorImage::parse(&me.image) {
+        return Some(pinned);
+    }
+    let repository = repository_of(&me.image);
+    let image = engine.inspect_image(&me.image_id).ok()??;
+    let digest = digest_for(&image, &repository)?;
+    seed::file::ActorImage::parse(&format!("{repository}@{digest}"))
+}
+
+fn digest_for(image: &crate::engine::Image, repository: &str) -> Option<String> {
+    image.repo_digests.iter().find_map(|d| {
+        let (repo, digest) = d.split_once('@')?;
+        (repo == repository).then(|| digest.to_owned())
+    })
 }
 
 fn service(c: &Container, role: &str) -> Service {
@@ -834,13 +963,34 @@ fn service(c: &Container, role: &str) -> Service {
     }
 }
 
+/// The reported version of a seed that exists but whose version could not be read.
+/// `seed_version` is opaque (agent-api.md amendment 14): no consumer may parse or
+/// special-case this value (ADR 0007).
+pub const SEED_VERSION_UNKNOWN: &str = "unknown";
+
 /// `registry/repo:tag@sha256:…` → `registry/repo`.
-fn repository_of(reference: &str) -> String {
+pub(crate) fn repository_of(reference: &str) -> String {
     let without_digest = reference.split('@').next().unwrap_or(reference);
     match without_digest.rsplit_once(':') {
         Some((repo, tag)) if !tag.contains('/') => repo.to_owned(),
         _ => without_digest.to_owned(),
     }
+}
+
+/// The node-agent recipe revision `image` declares, refused unless this actor carries it.
+pub(crate) fn node_agent_revision(
+    image: &crate::engine::Image,
+    reference: &ImageRef,
+) -> Result<u32, ResumeError> {
+    let revision = image_revision(image, reference)?;
+    if !recipe::Book::supports(Role::NodeAgent, revision) {
+        return Err(RenderError::Unsupported {
+            role: Role::NodeAgent,
+            revision,
+        }
+        .into());
+    }
+    Ok(revision)
 }
 
 fn image_revision(image: &crate::engine::Image, reference: &ImageRef) -> Result<u32, ResumeError> {
@@ -875,7 +1025,7 @@ fn tar_of(entries: &[(String, String)]) -> Result<Vec<u8>, ResumeError> {
     Ok(builder.into_inner()?)
 }
 
-fn random_uuid() -> String {
+pub(crate) fn random_uuid() -> String {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut b = [0u8; 16];
     SystemRandom::new()

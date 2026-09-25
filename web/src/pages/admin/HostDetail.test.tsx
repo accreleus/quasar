@@ -850,13 +850,37 @@ describe("HostDetail — services on this machine (#357)", () => {
     }
   });
 
-  it("shows the seed version the recovery actor last saw, without claiming its state", async () => {
+  it("shows the seed the recovery actor found: its version, its external owner, running (#358)", async () => {
     mocked.getHost.mockResolvedValue({ host: host({ ...owned, seed_version: "0.5.0" }) } as never);
     renderDetail();
 
     const seed = service(await card(), "Seed");
     expect(within(seed).getByText("v0.5.0")).toBeTruthy();
+    expect(within(seed).getByText("External manager")).toBeTruthy();
+    expect(within(seed).getByText("running")).toBeTruthy();
+  });
+
+  it("says no seed was found when the answering recovery actor reports none (#358)", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ ...owned, seed_version: null }) } as never);
+    renderDetail();
+
+    const seed = service(await card(), "Seed");
+    expect(within(seed).getByText("not found")).toBeTruthy();
+    expect(within(seed).queryByText("External manager")).toBeNull();
+    expect(within(seed).queryByText("running")).toBeNull();
+    // The rest of the machine is unaffected.
+    expect(within(service(await card(), "Node agent")).getByText("running")).toBeTruthy();
+  });
+
+  it("does not call the seed missing while the recovery actor has not answered (#358)", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, updater_present: false, recovery_actor_version: null }),
+    } as never);
+    renderDetail();
+
+    const seed = service(await card(), "Seed");
     expect(within(seed).getByText("unknown")).toBeTruthy();
+    expect(within(seed).queryByText("not found")).toBeNull();
   });
 
   it("draws no services card for a host that is not owned", async () => {

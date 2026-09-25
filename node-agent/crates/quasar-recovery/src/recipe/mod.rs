@@ -51,6 +51,9 @@ pub mod labels {
     pub const HELPER: &str = "io.quasar.helper";
     /// The image label naming the recipe revision an image needs (ADR 0008).
     pub const IMAGE_RECIPE: &str = "org.quasar.recipe";
+    /// The recovery image's release version (`deploy/Dockerfile.recovery`): how an actor
+    /// tells which version a seed runs.
+    pub const IMAGE_VERSION: &str = "org.quasar.version";
 }
 
 /// Fixed paths inside the containers the recipes describe.
