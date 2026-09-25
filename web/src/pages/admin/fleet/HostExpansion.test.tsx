@@ -165,10 +165,18 @@ describe("HostExpansion — the Services column (#357)", () => {
   });
 
   it("says not reported before the recovery actor has reported", () => {
-    renderDrawer({ ...owned, recovery_actor_version: null, seed_version: null });
+    renderDrawer({ ...owned, updater_present: null, recovery_actor_version: null, seed_version: null });
 
     expect(within(service("Recovery actor")).getByText("not reported")).toBeTruthy();
+    expect(within(service("Node agent")).getByText("not reported")).toBeTruthy();
     expect(within(service("Seed")).getByText("not reported")).toBeTruthy();
+  });
+
+  it("still lists the agent when the answering actor's version is not a release", () => {
+    renderDrawer({ ...owned, recovery_actor_version: null, agent_version: "dev" });
+
+    expect(within(service("Recovery actor")).getByText("not reported")).toBeTruthy();
+    expect(within(service("Node agent")).getByText("dev")).toBeTruthy();
   });
 
   it("has no Services column for a host that is not owned", () => {

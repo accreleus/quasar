@@ -8,6 +8,7 @@
  */
 
 import type { Host, PlatformReleaseFault } from "../../../api/types";
+import { shortCommit } from "./hostIdentity";
 import { commitsMatch } from "./releasesCopy";
 
 export type ServiceKey = "seed" | "recovery_actor" | "database" | "control_plane" | "node_agent";
@@ -32,13 +33,13 @@ export interface ServiceRow {
 }
 
 export type InventoryReport =
-  /** The recovery actor reported, and the agent is connected. */
+  /** `updater_present: true`, and the agent is connected. */
   | "reported"
-  /** Nothing from the recovery actor on this connection yet. */
+  /** `updater_present` null or absent: the agent has not said. */
   | "not_reported"
-  /** The agent says its recovery actor did not answer (`updater_present: false`). */
+  /** `updater_present: false`: the recovery actor did not answer. */
   | "not_answering"
-  /** The host is offline; the rows are its last report. */
+  /** `updater_present: true` on an offline host; the rows are its last report. */
   | "offline";
 
 export interface HostServices {
@@ -78,23 +79,27 @@ export function versionLabel(version: string | null | undefined): string | null 
 export function hostServices(host: Host, opts: { agentOlder: boolean }): HostServices | null {
   if (!isOwned(host)) return null;
 
-  const actorVersion = host.recovery_actor_version ?? null;
+  // `updater_present` is whether the actor answered (agent-api.md §register,
+  // "Owned installs"), not `recovery_actor_version`: a branch build reports
+  // "dev", which the control plane stores NULL.
+  const answered = host.updater_present === true;
   const offline = host.status === "offline";
-  const report: InventoryReport =
-    offline && actorVersion
+  const report: InventoryReport = answered
+    ? offline
       ? "offline"
-      : host.updater_present === false
-        ? "not_answering"
-        : actorVersion
-          ? "reported"
-          : "not_reported";
+      : "reported"
+    : host.updater_present === false
+      ? "not_answering"
+      : "not_reported";
   const reportedAt = host.last_registered_at;
   const lastReport = (): ServiceState =>
     reportedAt ? { kind: "as_of", at: reportedAt } : { kind: "unknown" };
+  const liveOrLast = (): ServiceState => (offline ? lastReport() : { kind: "running" });
 
-  // The inventory is the recovery actor's report: until it has made one, the
-  // agent's own row waits with the rest, as the mock's "not reported yet" draws it.
-  const actorReported = actorVersion != null;
+  const actorVersion = versionLabel(host.recovery_actor_version);
+  const actorCommit = host.recovery_actor_source_commit
+    ? ` · commit ${shortCommit(host.recovery_actor_source_commit)}`
+    : "";
 
   const rows: ServiceRow[] = [
     {
@@ -110,16 +115,10 @@ export function hostServices(host: Host, opts: { agentOlder: boolean }): HostSer
       key: "recovery_actor",
       name: "Recovery actor",
       description: "Creates, updates and recovers the services on this machine, and itself.",
-      version: versionLabel(actorVersion),
-      versionNote: null,
-      owner: actorReported ? "Quasar" : null,
-      state: !actorReported
-        ? { kind: "unknown" }
-        : offline
-          ? lastReport()
-          : host.updater_present === true
-            ? { kind: "running" }
-            : { kind: "unknown" },
+      version: answered ? actorVersion : null,
+      versionNote: answered && !actorVersion ? `version not reported${actorCommit}` : null,
+      owner: answered ? "Quasar" : null,
+      state: answered ? liveOrLast() : { kind: "unknown" },
     },
     {
       key: "database",
@@ -143,13 +142,13 @@ export function hostServices(host: Host, opts: { agentOlder: boolean }): HostSer
       key: "node_agent",
       name: "Node agent",
       description: "Runs this machine’s GPUs and sessions.",
-      version: actorReported ? versionLabel(host.agent_version) : null,
+      // The inventory is the recovery actor's report: until it answers, the
+      // agent's row waits with the rest, as the mock's "not reported yet" draws it.
+      version: answered ? versionLabel(host.agent_version) : null,
       versionNote:
-        actorReported && opts.agentOlder
-          ? "older than the control plane · update from Releases"
-          : null,
-      owner: actorReported ? "Quasar" : null,
-      state: !actorReported ? { kind: "unknown" } : offline ? lastReport() : { kind: "running" },
+        answered && opts.agentOlder ? "older than the control plane · update from Releases" : null,
+      owner: answered ? "Quasar" : null,
+      state: answered ? liveOrLast() : { kind: "unknown" },
     },
   ];
 

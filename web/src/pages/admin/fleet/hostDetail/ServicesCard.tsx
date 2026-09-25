@@ -91,9 +91,9 @@ function Row({ row }: { row: ServiceRow }) {
         </div>
       </td>
       <td>
-        {row.version ? (
+        {row.version || row.versionNote ? (
           <div className="stack">
-            <span className="num host-services-version">{row.version}</span>
+            {row.version ? <span className="num host-services-version">{row.version}</span> : DASH}
             {row.versionNote && <span className="sub">{row.versionNote}</span>}
           </div>
         ) : (

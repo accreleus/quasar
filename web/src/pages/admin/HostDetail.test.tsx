@@ -718,6 +718,32 @@ describe("HostDetail — services on this machine (#357)", () => {
     expect(screen.getByText("GPU host · AMD Ryzen 9 9950X3D · 128 GB")).toBeTruthy();
   });
 
+  // A branch-built actor reports version "dev", which the control plane stores
+  // NULL; `updater_present` is what says it answered (amendment 14).
+  it("reads an answering recovery actor with no version as installed, showing its commit", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, recovery_actor_version: null, agent_version: "dev" }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).queryByText(/has not reported its services yet/)).toBeNull();
+    expect(
+      within(c).getByText(
+        "Each Quasar service has one owner. On this machine every service but the seed is owned by its recovery actor.",
+      ),
+    ).toBeTruthy();
+
+    const actor = service(c, "Recovery actor");
+    expect(within(actor).getByText("version not reported · commit 3f9a2c1e0c5a")).toBeTruthy();
+    expect(within(actor).getByText("Quasar")).toBeTruthy();
+    expect(within(actor).getByText("running")).toBeTruthy();
+
+    const agent = service(c, "Node agent");
+    expect(within(agent).getByText("dev")).toBeTruthy();
+    expect(within(agent).getByText("running")).toBeTruthy();
+  });
+
   it("says an agent on an older build than the control plane is older, and where to update it", async () => {
     mocked.getHost.mockResolvedValue({
       host: host({ ...owned, agent_version: "0.5.1", source_commit: "9e8d7c6b5a4f" }),
