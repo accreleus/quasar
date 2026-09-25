@@ -25,6 +25,15 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH06 release trust ported to Rust, held to shared golden vectors (#356).** The new
+  GStreamer-free crate `node-agent/crates/quasar-recovery` holds the recovery actor's
+  `trust` module (the Go updater's namespace allowlist, digest-only images, closed
+  component table, request gates and ADR 0003 off/verify/require verification, plus the
+  agent-socket confused-deputy guard) and its control-socket shapes. 282 vectors in
+  `testdata/recovery/trust-vectors`, generated from the Go updater and its tests, pass
+  against both implementations; 31 fixtures in `testdata/recovery/socket` round-trip
+  identically through the Rust types and the new Go `internal/actorsocket`. Nothing runs
+  the port yet: the Go updater stays in place until RH06-15.
 - **RH06 console mockups, awaiting owner approval (#354).**
   `design_handoff_v3/screens/fleet-rh06-v3.html` extends Fleet and Fleet ▸ Releases in
   the v3 handoff's own markup and tokens. It covers the per-machine service inventory,
