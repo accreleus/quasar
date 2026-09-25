@@ -611,24 +611,30 @@ if [ "$DRY" != 1 ]; then
   fi
   other_seed="$(dk ps -a --no-trunc --format '{{.Names}}|{{.Command}}' 2>/dev/null \
     | grep 'quasar-recovery seed"*$' | cut -d'|' -f1 | grep -vx "$SEED" | head -n 1 || true)"
-  if [ -n "$other_seed" ] && [ "$RESET_IDENTITY" != 1 ]; then
+  # Refused with a reset too: that seed would survive it and re-create the actor.
+  if [ -n "$other_seed" ]; then
     host_error "this machine already has a seed, '$other_seed', started by a stack manager or by hand. Quasar is installed through that one: keep it and remove this command, or remove that seed first."
   fi
 fi
 
+volumes_of() { dk volume ls -q "$@" 2>/dev/null || true; }
+
 # remove_install: this machine's GPU-host install, containers before volumes (a
 # volume a container still holds cannot be removed). Homes are host paths and stay.
+# Never on a machine holding a control plane or Quasar's Postgres, or their data.
 remove_install() {
-  if [ -n "$(names_of --filter label=io.quasar.platform-service=control-plane)" ]; then
-    host_error "this machine runs a Quasar control plane; removing its install is not this script's job."
-  fi
+  for role in control-plane postgres; do
+    if [ -n "$(names_of --filter "label=io.quasar.platform-service=$role")$(volumes_of --filter "label=io.quasar.platform-service=$role")" ]; then
+      host_error "this machine holds a Quasar $role (a container or its volume); removing its install is not this script's job."
+    fi
+  done
   seed_c=""
   [ -z "$(state_of "$SEED")" ] || seed_c="$SEED"
   # The seed first: it would re-create a removed recovery actor.
   for c in $seed_c $(names_of --filter label=io.quasar.installation); do
     dk rm -f "$c" >/dev/null 2>&1 || host_error "could not remove container $c; remove it by hand and re-run."
   done
-  for v in $(dk volume ls -q --filter label=io.quasar.installation 2>/dev/null || true) $MACHINE_VOLUME; do
+  for v in $(volumes_of --filter label=io.quasar.installation) $MACHINE_VOLUME; do
     if dk volume inspect "$v" >/dev/null 2>&1; then
       dk volume rm "$v" >/dev/null 2>&1 || host_error "could not remove volume $v; something still holds it."
     fi
@@ -642,7 +648,12 @@ if [ "$DRY" != 1 ]; then
     ok "removed this machine's GPU-host install (QUASAR_RESET_IDENTITY): it enrolls from scratch"
   fi
   actors="$(names_of --filter label=io.quasar.platform-service=recovery-actor)"
-  if [ -n "$actors" ] || dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then fresh=0; fi
+  # Anything of an installation already here makes this run not the installer:
+  # a refused string then removes nothing.
+  if [ -n "$actors$(names_of --filter label=io.quasar.installation)$(volumes_of --filter label=io.quasar.installation)" ] ||
+     dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then
+    fresh=0
+  fi
 fi
 machine_name="$(dk info --format '{{.Name}}' 2>/dev/null || hostname)"
 shown_name="${node_name:-$machine_name}"
@@ -695,11 +706,14 @@ else
     printf 'QUASAR_AGENT_IMAGE=%s\n' "$agent_image"
     [ -z "$node_name" ] || printf 'QUASAR_NODE_NAME=%s\n' "$node_name"
   } > "$env_file"
+  run_ok=1
   dk run -d --name "$SEED" --restart unless-stopped --security-opt label=disable \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$MACHINE_VOLUME:/var/lib/quasar-machine:ro" \
-    --env-file "$env_file" "$seed_image" seed >/dev/null ||
-    host_error "the seed did not start: docker run failed (output above)"
+    --env-file "$env_file" "$seed_image" seed >/dev/null || run_ok=0
+  # The engine has read it; the token stays on disk no longer than that.
+  rm -f "$env_file"
+  [ "$run_ok" = 1 ] || host_error "the seed did not start: docker run failed (output above)"
   ok "started the seed ($SEED); it creates the recovery actor, which creates the node agent"
 fi
 
