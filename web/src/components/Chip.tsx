@@ -44,7 +44,7 @@ interface LiveDotProps {
 
 export function LiveDot({ label = "Live" }: LiveDotProps) {
   return (
-    <span className="row gap2 text-2" style={{ fontSize: "var(--t-sm)", display: "inline-flex", alignItems: "center", gap: "var(--s2)" }}>
+    <span className="live-label center gap2 text-2 t-sm">
       <span className="live-dot" aria-hidden="true" />
       {label}
     </span>

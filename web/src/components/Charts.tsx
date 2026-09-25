@@ -11,7 +11,7 @@
  * Both Sparkline and LineChart2 are resize-debounced via ResizeObserver.
  */
 import { useMemo } from "react";
-import type { ReactElement } from "react";
+import type { CSSProperties, ReactElement } from "react";
 import { useContainerWidth } from "../lib/useContainerWidth";
 
 // ── helpers ────────────────────────────────────────────────
@@ -75,7 +75,7 @@ export function Sparkline({
         viewBox={`0 0 ${width} ${height}`}
         width={width}
         height={height}
-        style={{ display: "block", overflow: "visible" }}
+        className="chart-svg"
         aria-hidden="true"
       >
         {fill && areaPath && (
@@ -166,17 +166,12 @@ export function LineChart2({ series, unit = "", height = 120 }: LineChart2Props)
     <div ref={containerRef} style={{ width: "100%" }}>
       {/* legend */}
       {series.length > 1 && (
-        <div className="mb1" style={{ display: "flex", gap: 12 }}>
+        <div className="row mb1">
           {series.map((s) => (
             <span
               key={s.label}
-              style={{
-                fontSize: 11,
-                color: s.color,
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-              }}
+              className="chart-key row gap1 t-xs"
+              style={{ "--series-color": s.color } as CSSProperties}
             >
               <svg width={16} height={2}>
                 <line x1={0} y1={1} x2={16} y2={1} stroke={s.color} strokeWidth={2} />
@@ -190,7 +185,7 @@ export function LineChart2({ series, unit = "", height = 120 }: LineChart2Props)
         viewBox={`0 0 ${width} ${height}`}
         width={width}
         height={height}
-        style={{ display: "block", overflow: "visible" }}
+        className="chart-svg"
       >
         {/* grid + y ticks */}
         {ticks.map((t) => {
@@ -252,7 +247,7 @@ export function LineChart2({ series, unit = "", height = 120 }: LineChart2Props)
         />
       </svg>
       {series.length === 1 && (
-        <div style={{ textAlign: "center", fontSize: 10, color: "var(--text-3)" }}>
+        <div className="chart-caption muted">
           {series[0].label}
         </div>
       )}

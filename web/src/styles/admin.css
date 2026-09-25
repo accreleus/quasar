@@ -668,11 +668,13 @@
   text-overflow: ellipsis;
 }
 
+/* --swatch: the series or event colour, set per element by TraceViewer.tsx. */
 .trace-lane-swatch {
   width: 10px;
   height: 2px;
   border-radius: 1px;
   flex: none;
+  background: var(--swatch, transparent);
 }
 
 /* The lane's headline reading: the newest sample of its primary series. */
@@ -721,6 +723,7 @@
   width: 2px;
   height: 12px;
   border-radius: 1px;
+  background: var(--swatch, transparent);
 }
 
 /* ── Axis ───────────────────────────────────────────────────────────────────
@@ -764,6 +767,7 @@
   height: 10px;
   border-radius: 1px;
   flex: none;
+  background: var(--swatch, transparent);
 }
 
 .trace-axis-note {
@@ -803,6 +807,10 @@
   padding: 1px 0;
 }
 
+.trace-tooltip-series {
+  color: var(--swatch, currentColor);
+}
+
 .trace-tooltip-val {
   font-family: var(--font-mono);
   color: var(--text);
@@ -820,6 +828,7 @@
   margin-top: var(--s1);
   font-size: 9px;
   font-style: italic;
+  color: var(--swatch, currentColor);
 }
 
 /* ---------- NOTE ----------

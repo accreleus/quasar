@@ -170,9 +170,9 @@ export function ReadinessCard({
     return (
       <div key={c.id} className={rowClass} data-testid={`readiness-check-${c.id}`}>
         <div className="host-setting-copy">
-          <div className="row gap2" style={{ alignItems: "center" }}>
+          <div className="row gap2">
             <ReadinessGlyph status={c.status} />
-            <h3 style={{ fontSize: "var(--t-sm)" }}>{c.id === "nvidia_vulkan_av1_compatibility" ? "Vulkan AV1 compatibility" : c.id.replaceAll("_", " ")}</h3>
+            <h3 className="rdy-title">{c.id === "nvidia_vulkan_av1_compatibility" ? "Vulkan AV1 compatibility" : c.id.replaceAll("_", " ")}</h3>
             {blocksLabel && (
               <span data-testid={`readiness-blocks-${c.id}`} title={blocksLabel}>
                 <Chip variant={c.status === "fail" ? "danger" : "neutral"} className="chip-sm">
@@ -197,8 +197,7 @@ export function ReadinessCard({
           </div>
           <p>{c.summary}</p>
           {provenance && (
-            // .host-setting-copy p out-specifies .muted, so the small-print colour is set here.
-            <p style={{ fontSize: "var(--t-xs)", color: "var(--text-3)" }} data-testid={`readiness-provenance-${c.id}`}>
+            <p className="rdy-provenance" data-testid={`readiness-provenance-${c.id}`}>
               {provenance}
             </p>
           )}
@@ -211,7 +210,7 @@ export function ReadinessCard({
           )}
           {/* Below the text, not in the heading row: a narrow grid tile has no room for a button beside the title. */}
           {(canSetOverride || (overridden && onClearOverride)) && (
-            <div className="row gap2" style={{ marginTop: "var(--s2)" }}>
+            <div className="row gap2 mt2">
               {canSetOverride && (
                 <Button
                   variant="danger"
@@ -263,20 +262,20 @@ export function ReadinessCard({
 
       {/* #254: host-local by definition — never a claim about browser reachability
        (CONTEXT.md "Host readiness vs browser reachability"). */}
-      <p className="muted" style={{ fontSize: "var(--t-xs)", marginBottom: 0 }} data-testid="readiness-host-local-note">
+      <p className="muted t-xs mb0" data-testid="readiness-host-local-note">
         Readiness is what this host can establish about itself. It does not show whether a browser can reach the host; that depends on the network between them.
       </p>
 
       {advisoryNote}
 
       {gate?.state === "abstaining" && gate.blocking.length > 0 && (
-        <p className="note warn" data-testid="readiness-gate-abstaining" style={{ marginBottom: 0 }}>
+        <p className="note warn mb0" data-testid="readiness-gate-abstaining">
           This report is stale, so nothing is blocked until the host reports again.
         </p>
       )}
 
       {!hasChecks && (
-        <p className="muted" style={{ marginBottom: 0 }} data-testid="readiness-empty">
+        <p className="muted mb0" data-testid="readiness-empty">
           {checks == null ? "This host has not reported readiness checks yet." : "No readiness checks reported."}
         </p>
       )}
@@ -290,7 +289,7 @@ export function ReadinessCard({
             </div>
           ))}
           {groups.length === 0 && (
-            <p className="muted" style={{ marginBottom: 0 }}>
+            <p className="muted mb0">
               Nothing to check on this host beyond what is listed below.
             </p>
           )}
@@ -302,7 +301,7 @@ export function ReadinessCard({
           <summary>
             {notApplicable.length} {notApplicable.length === 1 ? "check" : "checks"} not applicable to this host
           </summary>
-          <div className={listClass} style={{ marginTop: "var(--s3)" }}>
+          <div className={`${listClass} mt3`}>
             {notApplicable.map(renderCheck)}
           </div>
         </details>
@@ -312,7 +311,7 @@ export function ReadinessCard({
         <div className="col gap3" data-testid="readiness-inert-overrides">
           <div className="eyebrow">Inert overrides</div>
           {inertOverrides.map((o) => (
-            <div key={o.check_id} className="row gap2" style={{ alignItems: "center" }}>
+            <div key={o.check_id} className="row gap2">
               <span className="mono">{o.check_id}</span>
               <span className="muted t-xs">
                 This host no longer reports this check, so the override does nothing.
@@ -334,7 +333,7 @@ export function ReadinessCard({
       )}
 
       {footnote && (
-        <p className="muted" style={{ fontSize: "var(--t-xs)", marginTop: "var(--s3)", marginBottom: 0 }}>
+        <p className="muted t-xs mt3 mb0">
           {footnote}
         </p>
       )}

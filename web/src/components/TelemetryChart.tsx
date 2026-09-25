@@ -2,7 +2,7 @@
 // Uses dark-theme CSS variables from styles.css; no external charting dependency.
 
 import { useMemo } from "react";
-import type { ReactElement } from "react";
+import type { CSSProperties, ReactElement } from "react";
 
 // Reduce-based min/max helpers — avoid Math.min/max spread which stack-overflows
 // on large arrays (up to 1000 samples).
@@ -92,9 +92,13 @@ export function LineChart({ series, unit = "", height = 120 }: LineChartProps): 
     <div style={{ width: "100%" }}>
       {/* legend */}
       {series.length > 1 && (
-        <div style={{ display: "flex", gap: 12, marginBottom: 4 }}>
+        <div className="row mb1">
           {series.map((s) => (
-            <span key={s.label} style={{ fontSize: 11, color: s.color, display: "flex", alignItems: "center", gap: 4 }}>
+            <span
+              key={s.label}
+              className="chart-key row gap1 t-xs"
+              style={{ "--series-color": s.color } as CSSProperties}
+            >
               <svg width={16} height={2}><line x1={0} y1={1} x2={16} y2={1} stroke={s.color} strokeWidth={2} /></svg>
               {s.label}
             </span>
@@ -103,7 +107,8 @@ export function LineChart({ series, unit = "", height = 120 }: LineChartProps): 
       )}
       <svg
         viewBox={`0 0 ${width} ${height}`}
-        style={{ width: "100%", height, display: "block", overflow: "visible" }}
+        className="chart-svg"
+        style={{ width: "100%", height }}
       >
         {/* grid lines + y-axis ticks */}
         {ticks.map((t) => {
@@ -168,7 +173,7 @@ export function LineChart({ series, unit = "", height = 120 }: LineChartProps): 
         />
       </svg>
       {series.length === 1 && (
-        <div style={{ textAlign: "center", fontSize: 10, color: "var(--muted)" }}>
+        <div className="chart-caption muted">
           {series[0].label}
         </div>
       )}
@@ -196,55 +201,27 @@ export function StackedBar({ segments, totalLabel }: StackedBarProps): ReactElem
   return (
     <div style={{ width: "100%" }}>
       {/* bar */}
-      <div
-        style={{
-          display: "flex",
-          height: 16,
-          borderRadius: 4,
-          overflow: "hidden",
-          border: "1px solid var(--border)",
-        }}
-      >
+      <div className="stacked-bar">
         {segments.map((seg) => (
           <div
             key={seg.label}
             title={`${seg.label}: ${seg.value.toFixed(1)} ms`}
-            style={{
-              width: `${(seg.value / total) * 100}%`,
-              background: seg.color,
-              transition: "width 0.3s",
-            }}
+            className="stacked-seg"
+            style={{ width: `${(seg.value / total) * 100}%`, "--seg-color": seg.color } as CSSProperties}
           />
         ))}
       </div>
       {/* legend */}
-      <div
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          gap: "4px 12px",
-          marginTop: 6,
-          fontSize: 11,
-        }}
-      >
+      <div className="stacked-legend mt2 t-xs">
         {segments.map((seg) => (
-          <span key={seg.label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span
-              style={{
-                display: "inline-block",
-                width: 8,
-                height: 8,
-                borderRadius: 2,
-                background: seg.color,
-                flexShrink: 0,
-              }}
-            />
-            <span style={{ color: "var(--muted)" }}>{seg.label}</span>
+          <span key={seg.label} className="row gap1">
+            <span className="stacked-swatch" style={{ "--seg-color": seg.color } as CSSProperties} />
+            <span className="muted">{seg.label}</span>
             <span className="text-1">{seg.value.toFixed(1)} ms</span>
           </span>
         ))}
         {totalLabel && (
-          <span style={{ color: "var(--muted)" }}>
+          <span className="muted">
             total <span className="text-1">{total.toFixed(1)} ms</span>
           </span>
         )}

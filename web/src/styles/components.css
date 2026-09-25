@@ -130,9 +130,25 @@
   overflow-wrap: anywhere;
 }
 
+/* Two classes deep so they outrank the `h3` / `p` rules above. */
+.host-setting-copy .rdy-title {
+  font-size: var(--t-sm);
+}
+
+.host-setting-copy .rdy-provenance {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
 .host-setting-copy code {
   color: var(--text-3);
   font-size: var(--t-xs);
+}
+
+/* CopyableCommand.tsx: a shell command is one long token run. */
+.copyable-cmd {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 /* Restart-class knob whose agent-reported `effective` value disagrees with the
@@ -225,6 +241,28 @@
 
 
 /* ---------- CHART / SPARKLINE ---------- */
+/* Charts.tsx and TelemetryChart.tsx. --series-color / --seg-color are set per
+   element from the caller's series colour. */
+.chart-svg { display: block; overflow: visible; }
+.chart-key { color: var(--series-color, currentColor); }
+.chart-caption { text-align: center; font-size: 10px; }
+.stacked-bar {
+  display: flex;
+  height: 16px;
+  border-radius: var(--r-control);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.stacked-seg { background: var(--seg-color, transparent); transition: width 0.3s; }
+.stacked-legend { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); }
+.stacked-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--seg-color, transparent);
+  flex-shrink: 0;
+}
 .legend { display: flex; gap: var(--s4); font-size: var(--t-xs); color: var(--text-3); }
 .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: var(--s1); }
 

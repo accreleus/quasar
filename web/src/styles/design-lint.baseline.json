@@ -1,51 +1,9 @@
 {
-  "src/components/ActionsMenu.tsx": {
-    "inline-style": 1
-  },
-  "src/components/Avatar.tsx": {
-    "inline-style": 3
-  },
-  "src/components/Bar.tsx": {
-    "inline-style": 1
-  },
-  "src/components/Breadcrumbs.tsx": {
-    "inline-style": 1
-  },
-  "src/components/BulkBar.tsx": {
-    "inline-style": 21
-  },
-  "src/components/Charts.tsx": {
-    "inline-style": 14
-  },
-  "src/components/Chip.tsx": {
-    "inline-style": 4
-  },
-  "src/components/CopyableCommand.tsx": {
-    "inline-style": 7
-  },
-  "src/components/Drawer.tsx": {
-    "inline-style": 3
-  },
   "src/components/QuasarMark.tsx": {
     "raw-colour-tsx": 4
   },
-  "src/components/ReadinessCard.tsx": {
-    "inline-style": 15
-  },
-  "src/components/Table.tsx": {
-    "inline-style": 4
-  },
-  "src/components/TelemetryChart.tsx": {
-    "inline-style": 33
-  },
-  "src/components/TextField.tsx": {
-    "inline-style": 7
-  },
   "src/components/Toast.tsx": {
     "raw-colour-tsx": 1
-  },
-  "src/components/TraceViewer.tsx": {
-    "inline-style": 6
   },
   "src/components/icons.tsx": {
     "raw-colour-tsx": 2
