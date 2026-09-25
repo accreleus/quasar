@@ -29,7 +29,9 @@ own; the two do not move together, and that is deliberate.
   GStreamer-free crate `node-agent/crates/quasar-recovery` holds the recovery actor's
   `trust` module (the Go updater's namespace allowlist, digest-only images, closed
   component table, request gates and ADR 0003 off/verify/require verification, plus the
-  agent-socket confused-deputy guard) and its control-socket shapes. 282 vectors in
+  agent-socket confused-deputy guard), the HTTPS client that fetches a release's manifest
+  and signature itself (Go's timeouts, redirect policy, body cap and gzip handling; it
+  refuses rather than fetch around an `HTTPS_PROXY`), and its control-socket shapes. 282 vectors in
   `testdata/recovery/trust-vectors`, generated from the Go updater and its tests, pass
   against both implementations; 31 fixtures in `testdata/recovery/socket` round-trip
   identically through the Rust types and the new Go `internal/actorsocket`. Nothing runs

@@ -184,7 +184,7 @@ than releases.
 | crate `quasar-recovery` → `actor` | `Actor::submit(caller, Request) -> Result<Accepted, Rejection>`, `Actor::status(request_id) -> Status`, `Actor::resume() -> Result<()>` | New; the deep module. Journal, machine state, lease, hand-over and a pure `settle` are internal |
 | `quasar-recovery` → `engine` port | `PlatformEngine` trait: pull, image inspect/tag, container create/start/stop/update-restart/rename/remove/inspect/list/logs-tail/wait, volume create/inspect/remove, info | Two adapters: the real one over `quasar-runtime`'s Docker facade (Engine API ≥ 1.40) and an in-memory fake with fault and crash injection |
 | `quasar-recovery` → `recipe` | `render(role, rev, &Inputs, &ImageRef, &SecretMounts) -> Result<ContainerSpec, RenderError>`; `Book::supports(role, rev)`; `Book::window(role)` | Pure; golden-file tested; carries what `deploy/docker-compose.yml` + the NVIDIA overlay describe today |
-| `quasar-recovery` → `trust` | `admit(&Request, &Config, &SignatureEvidence) -> Result<(), Rejection>` | **Port** of `updater/plan.go:158-256` (allowlist, digest, component and request gates) and `signature.go`/`signature_source.go` (ADR 0003), with the Go test cases turned into shared golden vectors; security-reviewed slice |
+| `quasar-recovery` → `trust` | `admit(Caller, &Request, &Config, Option<&SignatureEvidence>) -> Result<Admitted, Rejection>`; `HttpsFetcher::evidence(base, version, deadline) -> SignatureEvidence` | **Port** of `updater/plan.go:158-256` (allowlist, digest, component and request gates) and `signature.go`/`signature_source.go` (ADR 0003), with the Go test cases turned into shared golden vectors; security-reviewed slice |
 | `quasar-recovery` binary | Subcommands `seed`, `actor`, `restore`, `uninstall`, `status`, `reconfigure` | Replaces `cmd/quasar-updater`; one static musl binary, one slim image (`deploy/Dockerfile.recovery`, not on the Vulkan lineage) |
 
 **Changed (Go, `control-plane`)**
@@ -249,7 +249,7 @@ impl Actor {
   not create; a control plane is never started against a newer schema.
 - Terminal outcomes: `succeeded`, `failed` (with `restored: true|false`), `interrupted`
   (nothing changed). Reasons: today's closed set plus `recipe_unsupported`, `owner_conflict`,
-  `backup_failed`, `backup_unconfirmed`, `interrupted`.
+  `backup_failed`, `backup_unconfirmed`, `interrupted`. On the wire `interrupted` is `state: failed` + `reason: interrupted` (`release_state` has no such state).
 
 ### 5.3 Container shape and version skew
 
