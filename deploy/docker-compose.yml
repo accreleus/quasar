@@ -177,6 +177,9 @@ services:
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       # SPA: mount web/dist at QUASAR_WEB_ROOT so the CP serves it from /.
       QUASAR_WEB_ROOT: /app/web
+      # Add host: the seed and node-agent images, by digest, a new GPU host installs.
+      QUASAR_ENROLL_SEED_IMAGE: ${QUASAR_ENROLL_SEED_IMAGE:-}
+      QUASAR_ENROLL_AGENT_IMAGE: ${QUASAR_ENROLL_AGENT_IMAGE:-}
       # Cover artwork (UI-P7). SHIPS OFF: with no API key nothing is fetched,
       # no third party is contacted, and every app renders its gradient tile.
       # The default QUASAR_ARTWORK_DIR (/var/lib/quasar-control/artwork) already
