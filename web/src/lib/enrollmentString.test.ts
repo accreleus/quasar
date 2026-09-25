@@ -64,7 +64,7 @@ describe("enrollment string", () => {
   });
 });
 
-describe("one-line installer (#100)", () => {
+describe("one-line installer (#100, #359)", () => {
   const FULL = `qenr1.${FP}.d3NzOi8vY3A.tok`;
   const PIN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE=";
 
@@ -75,30 +75,29 @@ describe("one-line installer (#100)", () => {
   });
 
   it("pins the self-signed control plane's key: -k is only ever paired with --pinnedpubkey", () => {
-    const cmd = composeInstallCommand({ origin: "https://cp.example:8443", enrollment: FULL, ref: "v1.2.3", spkiPin: PIN });
+    const cmd = composeInstallCommand({ origin: "https://cp.example:8443", enrollment: FULL, spkiPin: PIN });
     expect(cmd).toBe(
-      `curl -fsSL -k --pinnedpubkey 'sha256//${PIN}' https://cp.example:8443/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' QUASAR_REF=v1.2.3 sh`,
+      `curl -fsSL -k --pinnedpubkey 'sha256//${PIN}' https://cp.example:8443/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' sh`,
     );
   });
 
   it("uses plain CA verification for a real certificate: no -k, no pin", () => {
-    const cmd = composeInstallCommand({ origin: "https://play.example.com", enrollment: FULL, ref: "v1.2.3", spkiPin: null });
-    expect(cmd).toBe(
-      `curl -fsSL https://play.example.com/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' QUASAR_REF=v1.2.3 sh`,
-    );
+    const cmd = composeInstallCommand({ origin: "https://play.example.com", enrollment: FULL, spkiPin: null });
+    expect(cmd).toBe(`curl -fsSL https://play.example.com/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' sh`);
     expect(cmd).not.toMatch(/ -k| --insecure|pinnedpubkey/);
   });
 
-  it("passes the string and the ref as environment, never in the URL; drops the ref when the build has none", () => {
-    const cmd = composeInstallCommand({ origin: "https://cp.example:8443", enrollment: FULL, ref: "", spkiPin: PIN }) ?? "";
-    expect(cmd.endsWith(`| QUASAR_ENROLLMENT='${FULL}' sh`)).toBe(true);
-    expect(cmd).not.toContain("QUASAR_REF");
+  it("carries the node name a bound token needs, as environment beside the string, never in the URL", () => {
+    const cmd =
+      composeInstallCommand({ origin: "https://cp.example:8443", enrollment: FULL, nodeName: "gpu-host-6", spkiPin: PIN }) ?? "";
+    expect(cmd.endsWith(`| QUASAR_ENROLLMENT='${FULL}' QUASAR_NODE_NAME=gpu-host-6 sh`)).toBe(true);
     expect(cmd.indexOf(FULL)).toBeGreaterThan(cmd.indexOf("|"));
+    expect(cmd).not.toContain("QUASAR_REF");
   });
 
   it("refuses anything that would break out of the shell quoting or is not a real pin", () => {
-    const base = { origin: "https://cp.example:8443", enrollment: FULL, ref: "v1.2.3", spkiPin: PIN };
-    expect(composeInstallCommand({ ...base, ref: "v1; rm -rf /" })).toBeNull();
+    const base = { origin: "https://cp.example:8443", enrollment: FULL, spkiPin: PIN };
+    expect(composeInstallCommand({ ...base, nodeName: "gpu; rm -rf /" })).toBeNull();
     expect(composeInstallCommand({ ...base, enrollment: "qenr1..abc.tok'; id #" })).toBeNull();
     expect(composeInstallCommand({ ...base, enrollment: "" })).toBeNull();
     expect(composeInstallCommand({ ...base, spkiPin: "not-a-pin'" })).toBeNull();
