@@ -417,6 +417,19 @@ else
 fi
 rm -f "$tmp/bin/nvidia-ctk"
 
+# A system container sees every GPU in /sys but only its own device nodes.
+mk_root "$tmp/root" 0x10de; reset_engine
+rm "$tmp/root/dev/dri/renderD128"
+mkdir -p "$tmp/root/sys/class/drm/renderD129/device"
+printf '0x1002\n' > "$tmp/root/sys/class/drm/renderD129/device/vendor"
+: > "$tmp/root/dev/dri/renderD129"
+run_installer sysfs-only-gpu "${OK_ENV[@]}"
+if [ "$RC" -eq 0 ] && grep -q 'gpu: amd (/dev/dri/renderD129)' <<<"$OUT" && ! grep -q 'NVIDIA' <<<"$OUT"; then
+  pass "a GPU listed in /sys without its device node is not this machine's: the AMD node is used"
+else
+  fail "sysfs-only gpu" "rc=$RC out=$(grep -i gpu <<<"$OUT" | head -3)"
+fi
+
 # ── 6. re-runs, refusals, interrupted runs ───────────────────────────────────
 mk_root "$tmp/root"
 installed_machine 'INFO quasar_node_agent::agent: reconnected as host 3f2c…'

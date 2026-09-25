@@ -478,12 +478,16 @@ if [ -r "$ROOT/etc/os-release" ]; then
 fi
 
 # GPU: sysfs is the kernel's own view; the same source the agent's readiness reads.
+# /sys/class/drm is not namespaced, so inside a system container it also lists
+# GPUs whose device node the container was never given: only a node that exists
+# counts.
 gpu=""; render_node=""
 for vendor_file in "$ROOT"/sys/class/drm/renderD*/device/vendor; do
   [ -r "$vendor_file" ] || continue
   vendor="$(tr -d '[:space:]' < "$vendor_file")"
   node_dir="${vendor_file%/device/vendor}"
   candidate="/dev/dri/${node_dir##*/}"
+  [ -e "$ROOT$candidate" ] || continue
   case "$vendor" in
     0x10de) gpu=nvidia; render_node="$candidate"; break ;;
     0x1002) [ -z "$gpu" ] && { gpu=amd; render_node="$candidate"; } ;;
