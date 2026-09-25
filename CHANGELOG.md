@@ -24,6 +24,14 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **CI tests the virtual keyboard, mouse and gamepad against a real kernel.** The node-agent
+  job now loads `uinput` on the runner, creates the session's devices for real and reads them
+  back through evdev: identity, key and axis sets, button and d-pad mapping, scroll sign.
+  The #348 `UI_SET_PHYS` bug, which failed every session launch while every unit test
+  passed, fails this suite. Run it locally with `make test-uinput` on a host with
+  `/dev/uinput`.
+
 ### Fixed
 - **Steam no longer swaps the X and Y gamepad buttons (#348).** The session's virtual
   gamepad now presents as a wired Xbox 360 controller (045e:028e, USB) with exactly the

@@ -100,7 +100,7 @@ DRY_RUN ?= 0
 export VERSION DRY_RUN
 
 .PHONY: help init doctor config-check verify docs-metrics-sync docs-trace \
-	test test-go test-rust test-web \
+	test test-go test-rust test-uinput test-web \
         test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
@@ -150,6 +150,10 @@ test-go: ## Control-plane: gofmt, build, vet, unit tests (no DB — see test-db)
 test-rust: ## Node-agent: fmt, clippy -D warnings, unit tests (in the dev container)
 	@bash $(DX)/common.sh require-local test-rust
 	@bash scripts/verify.sh agent
+
+test-uinput: ## Node-agent virtual input against this host's real /dev/uinput (root, in a container)
+	@bash $(DX)/common.sh require-local test-uinput
+	@bash scripts/verify.sh uinput
 
 test-web: ## Web SPA: install, typecheck, unit tests, production build
 	@bash $(DX)/common.sh require-local test-web
