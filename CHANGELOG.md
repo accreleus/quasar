@@ -32,6 +32,11 @@ own; the two do not move together, and that is deliberate.
   The device name no longer carries the session id (it moved to `phys`), so a layout saved
   in Steam survives into the next session. In console mode a forwarded physical pad's d-pad
   now reaches the game whether the pad reports it as a hat or as buttons.
+- **A controller your browser doesn't recognise is no longer scrambled silently (#348).**
+  When the browser reports a pad without the standard layout (seen with an 8BitDo pad
+  over Bluetooth), its buttons reach the game in the pad's own order. The session now
+  says so once per pad, and the Controller & input pane notes it under that pad, with
+  the fix: switch the pad to XInput mode, or connect it by cable or USB receiver.
 
 ## 0.3.0 — 2026-09-13
 
