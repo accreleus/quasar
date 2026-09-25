@@ -416,8 +416,7 @@ that opens closed again. Load it as root on the GPU host:
 sudo apparmor_parser -r -W deploy/apparmor/quasar-app
 ```
 
-`deploy/enroll-host.sh` does this for you on a host it enrolls, from
-`/opt/quasar-agent/apparmor/quasar-app`. Loading kernel policy needs root on the host, so
+`deploy/enroll-host.sh` does this for you on a host it adds. Loading kernel policy needs root on the host, so
 the node agent never does it itself; it only reads which profiles are loaded and picks
 accordingly. Confirm with `sudo aa-status | grep quasar-app` — the profile should be
 listed in enforce mode, and a profile in *complain* mode enforces nothing — and the host's
@@ -739,60 +738,53 @@ shared network needs.
 
 ### Multi-host: add a GPU host with one command
 
-**The agent link is TLS, pinned, and one paste (#12); the install is one line (#100).**
-In Admin → Fleet → Enroll host (open the console over `https://`), mint an enrollment
-string. The dialog prints a command of the form
+**The agent link is TLS, pinned, and one paste (#12); the install is one line (#359).**
+In Admin → Fleet → Add host (open the console over `https://`), optionally name the host
+and choose how long the command lives, then create it. The dialog prints a command of the
+form
 
 ```bash
 curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
-  | QUASAR_ENROLLMENT='qenr1.…' QUASAR_REF=<ref> sh
+  | QUASAR_ENROLLMENT='qenr1.…' [QUASAR_NODE_NAME=<name>] sh
 ```
 
 Run it on the new machine as root, or as a user with **passwordless** sudo (the script
-never prompts; with a password-asking sudo it stops and says so — open a root shell with
-`sudo -i` and paste the command there). Docker must already be installed.
+never lets sudo prompt; with a password-asking sudo it stops and says so — open a root
+shell with `sudo -i` and paste the command there). Docker must already be installed.
 
 The control plane serves the script itself (`/enroll-host.sh`, copied into the SPA at
-build time from `deploy/enroll-host.sh`), so it is the script from the tree the control
-plane runs. With the default self-signed certificate the command carries
-`-k --pinnedpubkey 'sha256//…'` — both flags, never one: `--pinnedpubkey` alone still
-fails a self-signed certificate with `self-signed certificate (18)`, because curl
-validates the chain before it checks the pin. Together, curl trusts nothing but that public key, whose hash
-the dialog read from the same certificate it shows the fingerprint of — `-k` on its own
-would let anyone on the path feed the new host a root shell. With a real-CA certificate
-neither flag appears. `<ref>` is the tag or commit the control plane was built from and
-selects the matching agent image tag. The enrollment string travels as an environment
-variable, not in a URL: it is single-use and expires in an hour, which is what makes a
-shell-history exposure bounded.
+build time from `deploy/enroll-host.sh`) with the seed and node-agent images it installs
+written in by digest (`QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` in the
+control plane's `deploy/.env`; `docs/configuration.md` "Add host"). With the default
+self-signed certificate the command carries `-k --pinnedpubkey 'sha256//…'` — both flags,
+never one: `--pinnedpubkey` alone still fails a self-signed certificate with
+`self-signed certificate (18)`, because curl validates the chain before it checks the pin.
+Together, curl trusts nothing but that public key, whose hash the dialog read from the
+same certificate it shows the fingerprint of — `-k` on its own would let anyone on the
+path feed the new host a root shell. With a real-CA certificate neither flag appears. The
+enrollment string travels as an environment variable, not in a URL: it is single-use and
+expires, which is what makes a shell-history exposure bounded.
 
-The script prints each step. It checks the host the way the agent's readiness does
-(Docker + Compose v2, a DRM render node, `/dev/uinput`, unprivileged user namespaces
-including the Ubuntu 24.04+ AppArmor knob from #76, the NVIDIA Container Toolkit on an
-NVIDIA host), then writes `/opt/quasar-agent/docker-compose.yml` (the node-agent service
-alone, plus the NVIDIA overlay when needed) and a 0600 `/opt/quasar-agent/.env` — the
-only place the string lands. On an AppArmor host it also writes
-`/opt/quasar-agent/apparmor/quasar-app` and loads it with `apparmor_parser` (`QUASAR_ENROLL_APPARMOR_PERSIST=1` additionally installs it in `/etc/apparmor.d` so it
-survives a reboot). Then it starts the one agent service and waits until it logs
-`enrolled as host`, or names the failure (an expired or used token, a certificate that
-does not match the pin, a container that exited). Re-running it updates that agent in
-place; it never adds a second one. It never edits the firewall: media reachability is
-reported by the host's readiness in Admin → Fleet, with the exact rule.
+The script prints each step. It checks the host the way the agent's readiness does (Docker,
+a DRM render node, `/dev/uinput`, unprivileged user namespaces including the Ubuntu 24.04+
+AppArmor knob from #76, the NVIDIA Container Toolkit on an NVIDIA host) and loads the
+app-container AppArmor profile. A failed check stops before anything is started and prints
+its fix; at a terminal it offers to apply it, and `QUASAR_ENROLL_FIX=1` applies it without
+asking. Then it pulls both images and starts the one container Quasar asks an operator
+for, the **seed** (`quasar-seed`, `docs/configuration.md` "Seed"), with the enrollment
+string in a 0600 env file. The seed creates the recovery actor, which creates the node
+agent; the script waits until the agent logs `enrolled as host`, or names the failure. It
+writes no compose file, no `.env` and no install directory, and it never edits the
+firewall: media reachability is reported by the host's readiness in Admin → Fleet, with the
+exact rule. Running it again on an installed machine changes nothing. A string the control
+plane refuses (expired, used, bound to another name) leaves nothing behind on a machine the
+run installed: create a new command and run it. `sh enroll-host.sh --help` lists every
+input; read it first if you like — the same `curl` piped into `less` instead of `sh`, or
+`deploy/enroll-host.sh` in this tree.
 
-Inputs it reads: `QUASAR_ENROLLMENT` (required), `QUASAR_REF`, `QUASAR_AGENT_IMAGE`
-(an explicit digest reference, overriding the ref-derived tag), `QUASAR_DIR`
-(default `/opt/quasar-agent`), `NODE_NAME` (default: the hostname), `QUASAR_HOME_ROOT`
-(default `/var/lib/quasar/homes`), `QUASAR_RENDER_NODE`; `QUASAR_ENROLL_APPARMOR_PERSIST=1`;
-`QUASAR_ENROLL_DRY_RUN=1` prints the plan and touches nothing. Read it first if you like: the same `curl` piped
-into `less` instead of `sh`, or `deploy/enroll-host.sh` in this tree.
-
-**Manual / air-gapped path.** `sh deploy/enroll-host.sh --print-compose` prints the
-agent-only Compose file, `--print-nvidia-overlay` the NVIDIA overlay and
-`--print-apparmor-profile` the app-container AppArmor profile; put them in a
-directory with a `.env` that sets `QUASAR_ENROLLMENT` (and `NODE_NAME`,
-`QUASAR_HOME_ROOT`, `QUASAR_AGENT_IMAGE`) and `docker compose up -d`. The base
-`deploy/docker-compose.yml` is not a second-host install: its agent depends on the
-local stack. That printed service and the base file's node-agent service are held
-identical by `TestEnrollHostComposeMatchesBase`.
+**Dockge or Arcane.** The dialog's second tab gives the same seed as a stack instead. Host
+preparation is then yours; the host's readiness card lists what is missing once it
+enrolls.
 
 What the string carries: the control plane's `wss://` URL, the SHA-256 fingerprint of
 its certificate — first and verbatim, so you can compare it against the control plane's
