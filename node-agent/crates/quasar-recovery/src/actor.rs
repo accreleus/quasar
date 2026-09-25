@@ -1,5 +1,6 @@
-//! The recovery actor (architecture §5.2): `resume` and `status`. `submit` arrives with the
-//! replacement slice (#360).
+//! The recovery actor (architecture §5.2): `resume`, `status` and `submit`. Submission,
+//! the attempt journal, the settle table and the node agent's replacement live in
+//! [`crate::submit`], [`crate::journal`], [`crate::settle`] and [`crate::replace`].
 //!
 //! `resume` runs once per start. It takes the machine's lease, creates machine state on a
 //! clean machine, and makes sure every service this machine's role requires exists and
@@ -20,12 +21,16 @@ use quasar_runtime::{LeaseError, StateLease};
 use tracing::{info, warn};
 
 use crate::engine::{Container, ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
+use crate::journal::JournalDir;
 use crate::machine::{Machine, MachineDir, ServiceRecord, FORMAT};
 use crate::probe;
 use crate::recipe::{
     self, labels, names, paths, secrets, Bind, ImageRef, Inputs, RenderError, Role, SecretMounts,
 };
-use crate::socket::{ActorIdentity, Conflict, DatabaseMode, MachineRole, Service, Status};
+use crate::socket::{
+    ActorIdentity, AttemptResult, Conflict, DatabaseMode, MachineRole, Request, Service, Status,
+};
+use crate::trust::{SignatureEvidence, SignaturePolicy};
 
 /// What the operator gave this start. Read only on a clean machine: once machine state
 /// exists it wins and these are ignored (`CONTEXT.md` "Machine inputs").
@@ -51,6 +56,56 @@ pub struct ActorConfig {
     pub now: Box<dyn Fn() -> String + Send + Sync>,
     /// Between attempts of the `--gpus` probe (multiplied by the attempt number).
     pub gpus_probe_backoff: std::time::Duration,
+    /// The release trust configuration `submit` admits requests under.
+    pub trust: TrustConfig,
+    /// Gathers ADR 0003 signature evidence for a request; called only when signing is on.
+    pub evidence: Box<dyn Fn(&Request) -> SignatureEvidence + Send + Sync>,
+    pub timing: ReplaceTiming,
+}
+
+/// This machine's trust knobs: `QUASAR_UPDATER_ALLOWED_NAMESPACES`,
+/// `QUASAR_UPDATER_SIGNATURE_MODE` and `QUASAR_UPDATER_TRUSTED_KEYS`, as the updater reads
+/// them (`docs/configuration.md` "Recovery actor").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustConfig {
+    pub allowed_namespaces: Vec<String>,
+    pub signature: SignaturePolicy,
+}
+
+impl Default for TrustConfig {
+    fn default() -> Self {
+        TrustConfig {
+            allowed_namespaces: crate::trust::parse_allowed_namespaces(""),
+            signature: SignaturePolicy::default(),
+        }
+    }
+}
+
+/// A replacement's clocks. Fields, not constants, so a test can compress them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplaceTiming {
+    /// How long a new container has to run and pass its health check, unless the request
+    /// names its own `wait_timeout_s` (the updater's default, 300 s).
+    pub verify_timeout: std::time::Duration,
+    /// Between two looks at a container being verified or restored.
+    pub poll: std::time::Duration,
+    /// A container stopped by a replacement gets this long before it is killed.
+    pub stop_grace: std::time::Duration,
+    /// An engine call that fails transiently is asked again this many times.
+    pub retries: u32,
+    pub retry_backoff: std::time::Duration,
+}
+
+impl Default for ReplaceTiming {
+    fn default() -> Self {
+        ReplaceTiming {
+            verify_timeout: std::time::Duration::from_secs(300),
+            poll: std::time::Duration::from_secs(2),
+            stop_grace: std::time::Duration::from_secs(30),
+            retries: 5,
+            retry_backoff: std::time::Duration::from_secs(2),
+        }
+    }
 }
 
 impl ActorConfig {
@@ -68,6 +123,11 @@ impl ActorConfig {
             new_installation_id: Box::new(random_uuid),
             now: Box::new(rfc3339_now),
             gpus_probe_backoff: std::time::Duration::from_secs(2),
+            trust: TrustConfig::default(),
+            evidence: Box::new(|_| SignatureEvidence::FetchError {
+                error: "this recovery actor has no release-asset fetcher configured".into(),
+            }),
+            timing: ReplaceTiming::default(),
         }
     }
 }
@@ -136,13 +196,20 @@ struct Inventory {
 }
 
 pub struct Actor {
-    engine: Arc<dyn PlatformEngine>,
+    pub(crate) engine: Arc<dyn PlatformEngine>,
     status_engine: Arc<dyn PlatformEngine>,
-    config: ActorConfig,
-    dir: MachineDir,
+    pub(crate) config: ActorConfig,
+    pub(crate) dir: MachineDir,
+    pub(crate) journals: JournalDir,
     lease: Mutex<Option<StateLease>>,
     last: Mutex<Option<Inventory>>,
     identity: Mutex<Option<ActorIdentity>>,
+    /// Serialises admission, so two submits cannot both find no open attempt.
+    pub(crate) gate: Mutex<()>,
+    /// The thread driving the attempt `submit` admitted, until it has finished.
+    pub(crate) worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set while `resume` runs: a submit then is refused `busy`.
+    pub(crate) resuming: std::sync::atomic::AtomicBool,
 }
 
 const PLATFORM_NAMES: &[&str] = &[
@@ -161,10 +228,14 @@ impl Actor {
             status_engine: engine.clone(),
             engine,
             dir: MachineDir::new(config.machine_dir.clone()),
+            journals: JournalDir::new(&config.machine_dir),
             config,
             lease: Mutex::new(None),
             last: Mutex::new(None),
             identity: Mutex::new(None),
+            gate: Mutex::new(()),
+            worker: Mutex::new(None),
+            resuming: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -180,9 +251,26 @@ impl Actor {
         self.lease.lock().unwrap().is_some()
     }
 
+    /// Take the machine's lease without doing anything else, so the binary can serve
+    /// `status` while `resume` settles an open attempt. `resume` takes it too.
+    pub fn acquire_lease(&self) -> Result<(), ResumeError> {
+        self.take_lease()
+    }
+
     pub fn resume(&self) -> Result<(), ResumeError> {
+        use std::sync::atomic::Ordering;
+        self.resuming.store(true, Ordering::SeqCst);
+        let result = self.resume_inner();
+        self.resuming.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn resume_inner(&self) -> Result<(), ResumeError> {
         self.take_lease()?;
         self.sweep_helpers()?;
+        // D8: an attempt a restart left open reaches its outcome before anything else
+        // looks at the machine's services, and no new attempt is started here.
+        self.settle_open()?;
         let machine = match self.dir.load_machine()? {
             Some(machine) => {
                 self.note_ignored_inputs(&machine);
@@ -199,8 +287,31 @@ impl Actor {
     }
 
     /// The machine inventory. Never fails: when the engine does not answer, the last
-    /// inventory is returned with `stale: true`.
+    /// inventory is returned with `stale: true`. `result` is the most recent attempt's.
     pub fn status(&self) -> Status {
+        self.status_for(None)
+    }
+
+    /// [`Actor::status`], with `result` the named attempt's (`null` when this machine has
+    /// no journal for it), or the most recent attempt's when `request_id` is `None`.
+    pub fn status_for(&self, request_id: Option<&str>) -> Status {
+        let mut status = self.inventory_status();
+        status.in_flight = self.journals.open().map(|j| j.request.request_id);
+        status.result = self.attempt_result(request_id);
+        status
+    }
+
+    fn attempt_result(&self, request_id: Option<&str>) -> Option<AttemptResult> {
+        match request_id {
+            Some(id) if crate::submit::is_uuid(id) => {
+                self.journals.load(id).ok().flatten().map(|j| j.result)
+            }
+            Some(_) => None,
+            None => self.journals.latest().map(|j| j.result),
+        }
+    }
+
+    fn inventory_status(&self) -> Status {
         let (inventory, stale) = match self.inventory() {
             Ok(inventory) => {
                 *self.last.lock().unwrap() = Some(inventory.clone());
@@ -409,7 +520,10 @@ impl Actor {
         Ok(self.config.docker_socket_fallback.clone())
     }
 
-    fn ensure_image(&self, image: &ImageRef) -> Result<crate::engine::Image, ResumeError> {
+    pub(crate) fn ensure_image(
+        &self,
+        image: &ImageRef,
+    ) -> Result<crate::engine::Image, ResumeError> {
         let reference = image.reference();
         if let Some(found) = self.engine.inspect_image(&reference)? {
             return Ok(found);
@@ -423,7 +537,7 @@ impl Actor {
             )))
     }
 
-    fn owned_labels(&self, machine: &Machine, role: Role) -> BTreeMap<String, String> {
+    pub(crate) fn owned_labels(&self, machine: &Machine, role: Role) -> BTreeMap<String, String> {
         BTreeMap::from([
             (
                 labels::INSTALLATION.to_string(),
@@ -452,12 +566,12 @@ impl Actor {
         }
     }
 
-    fn is_ours(&self, machine: &Machine, c: &Container, role: Role) -> bool {
+    pub(crate) fn is_ours(&self, machine: &Machine, c: &Container, role: Role) -> bool {
         c.labels.get(labels::INSTALLATION) == Some(&machine.installation_id)
             && c.labels.get(labels::PLATFORM_SERVICE).map(String::as_str) == Some(role.as_str())
     }
 
-    fn node_agent_secrets(&self) -> Result<SecretMounts, ResumeError> {
+    pub(crate) fn node_agent_secrets(&self) -> Result<SecretMounts, ResumeError> {
         let mut files = BTreeSet::new();
         if self.dir.load_secret(secrets::ENROLLMENT)?.is_some() {
             files.insert(secrets::ENROLLMENT.to_string());
@@ -555,7 +669,7 @@ impl Actor {
         Ok(())
     }
 
-    fn record(
+    pub(crate) fn record(
         &self,
         role: Role,
         revision: u32,
@@ -575,7 +689,7 @@ impl Actor {
 
     /// Writes the secret files into a service's secrets volume through a helper container
     /// that is created, never started, and removed.
-    fn deliver_secrets(
+    pub(crate) fn deliver_secrets(
         &self,
         image: &ImageRef,
         volume: &str,

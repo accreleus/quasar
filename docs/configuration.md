@@ -1263,6 +1263,8 @@ inputs are ignored (a differing home root is logged `token="actor-input-ignored"
 | `QUASAR_DOCKER_SOCKET_HOST_PATH` | `/var/run/docker.sock` | Only when the actor cannot inspect its own container: the daemon-host path of the engine socket it binds into the agent. Normally learned from the actor's own mount. |
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from, with exactly the updater's rules (see "Updater" below). Read on every start, unlike the machine inputs. A developer apply from a test registry needs that registry's namespace here. |
+| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | as the updater's | ADR 0003 release signatures, verified by the actor exactly as the updater does. A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value stops the start (`token="actor-trust-config-invalid"`). |
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
 **NVIDIA detection.** When the device probe finds an NVIDIA render node, the actor asks
@@ -1283,6 +1285,23 @@ or only the container toolkit's hook).
 - A container this actor did not create that holds a helper's name (`quasar-gpu-probe`,
   `quasar-secrets-writer`) is left untouched, stops the start
   (`token="actor-helper-name-taken"`) and is listed in status `conflicts`.
+
+**Replacing the node agent (#360).** The agent relays a `release_apply` to its actor over
+the agent socket (`POST /v1/submit`), which may name only `node-agent` and
+`recovery-actor` (replacing the actor itself arrives with RH06-10). The actor journals
+every phase to `journal/<request-id>.json` in machine state before acting on it, pulls,
+stops the old agent, disables its restart policy and renames it
+`quasar-node-agent.kept`, creates and starts the new one, and waits up to 300 s (or the
+request's `wait_timeout_s`) for it to run and report healthy. A new agent that does not
+is removed and the kept one put back (`restored: true`, ADR 0004); a verified one
+replaces it and the kept one is removed. One attempt at a time; a re-post of the same
+request id is answered from the journal. If the actor, the engine or the machine
+restarts part-way, the next start settles the attempt before anything else: interrupted
+before the old agent was touched, it ends `failed`/`interrupted` with nothing changed;
+after, it continues to verification. Nothing is retried on its own. Tokens:
+`actor-attempt-failed`, `actor-verification-failed`, `actor-submit-refused`,
+`actor-journal-write-failed`. `docker exec quasar-recovery quasar-recovery status`
+shows the last attempt's result.
 
 **One socket, one name.** The actor always listens at `/run/quasar-recovery/agent.sock`, inside the `quasar-recovery-agent` volume it mounts read-write; that path is fixed, not an actor input. The agent it creates mounts the same volume read-only at the same path and is told where through `QUASAR_RECOVERY_SOCKET` (see "Node agent — connection & identity"), which the actor's recipe sets. Both names come from one constant module (`quasar_runtime::owned_install`), so the two sides cannot drift.
 

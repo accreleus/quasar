@@ -130,6 +130,9 @@ pkg-config = "0.3"
 # Test-only owner injection on the shared `RuntimeConfig` (`diagnostic_owner`); a dev
 # dependency, so no production build carries it.
 quasar-runtime = { path = "crates/quasar-runtime", features = ["test-support"] }
+# #360: the owned-install relay is tested against the real recovery actor and its
+# in-memory engine.
+quasar-recovery = { path = "crates/quasar-recovery", features = ["test-support"] }
 # SO-03: micro-benchmark the per-frame encode-metrics hot path (record_encode_in/out).
 criterion = "0.8"
 # P5-03: temporary directories for home module unit tests.

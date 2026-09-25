@@ -1,12 +1,16 @@
-//! Agent-side client for this host's updater (`CONTEXT.md`).
+//! Agent-side client for this host's updater or recovery actor (`CONTEXT.md`).
 //!
 //! The agent relays and does not author: `release_apply` is validated, acked on
 //! acceptance, POSTed to the local socket, and every `release_state` after that
-//! is a re-frame of the updater's result file. This module runs no compose
-//! command, keeps no apply state, and performs no session logic at any point
+//! is a re-frame of the actor's result. This module runs no compose command,
+//! keeps no apply state, and performs no session logic at any point
 //! (agent-api.md `release_state`).
 //!
-//! The socket and the result file are NOT a frozen interface
+//! Two actors speak the same result shape: the Go updater on a `registry` stack
+//! (`POST /v1/apply`, results in a shared directory) and, on an `owned` install
+//! (`QUASAR_RECOVERY_SOCKET` set by the actor's recipe), the recovery actor on its
+//! agent socket (`POST /v1/submit`, `GET /v1/status?request_id=`), whose journal
+//! outlives both the agent and the actor. Neither socket is frozen
 //! (protocol/schema.md §"Not frozen: the updater's local socket").
 
 pub(crate) mod unix_http;
@@ -42,8 +46,23 @@ const POLL_DEADLINE: Duration = Duration::from_secs(2 * 3600);
 
 /// What this build may apply. `control-plane` is absent: a control plane asking
 /// an agent to replace the control plane is a confused deputy, and this makes it
-/// unrepresentable (agent-api.md `release_apply`).
+/// unrepresentable (agent-api.md `release_apply`). `recovery-actor` is relayed
+/// only to a recovery actor (amendment 14): the Go updater never replaces itself.
 const APPLIABLE_COMPONENTS: &[&str] = &["node-agent"];
+const OWNED_APPLIABLE_COMPONENTS: &[&str] = &["node-agent", "recovery-actor"];
+
+/// Which actor the socket reaches.
+enum Actor {
+    Updater { results_dir: PathBuf },
+    Recovery,
+}
+
+/// The part of the recovery actor's `GET /v1/status` the relay reads.
+#[derive(Deserialize)]
+struct ActorStatus {
+    #[serde(default)]
+    result: Option<UpdaterResult>,
+}
 
 /// The updater's result file, which carries `release_state`'s fields under the
 /// same names. Extra fields (`commands`, `release`) are ignored.
@@ -94,7 +113,7 @@ struct UpdaterError {
 
 pub struct ReleaseManager {
     socket: PathBuf,
-    results_dir: PathBuf,
+    actor: Actor,
     upstream: RwLock<Option<mpsc::Sender<AgentMsg>>>,
     /// Single-flight per host: refuse, never queue. Holds the request id of the
     /// apply whose poller is still running.
@@ -118,16 +137,44 @@ impl Drop for UpstreamGuard {
 
 impl ReleaseManager {
     pub fn new(socket: impl Into<PathBuf>, results_dir: impl Into<PathBuf>) -> Arc<Self> {
+        Self::with_actor(
+            socket.into(),
+            Actor::Updater {
+                results_dir: results_dir.into(),
+            },
+        )
+    }
+
+    /// An owned install: the recovery actor on its agent socket.
+    pub fn owned(socket: impl Into<PathBuf>) -> Arc<Self> {
+        Self::with_actor(socket.into(), Actor::Recovery)
+    }
+
+    fn with_actor(socket: PathBuf, actor: Actor) -> Arc<Self> {
         Arc::new(ReleaseManager {
-            socket: socket.into(),
-            results_dir: results_dir.into(),
+            socket,
+            actor,
             upstream: RwLock::new(None),
             inflight: Mutex::new(None),
             unreachable_after_ms: AtomicU64::new(UNREACHABLE_AFTER.as_millis() as u64),
         })
     }
 
+    fn appliable(&self) -> &'static [&'static str] {
+        match self.actor {
+            Actor::Updater { .. } => APPLIABLE_COMPONENTS,
+            Actor::Recovery => OWNED_APPLIABLE_COMPONENTS,
+        }
+    }
+
     pub fn from_env() -> Arc<Self> {
+        if let Some(socket) = std::env::var(crate::buildinfo::RECOVERY_SOCKET_ENV)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+        {
+            return Self::owned(socket);
+        }
         let sock = std::env::var("QUASAR_UPDATER_SOCKET")
             .ok()
             .filter(|s| !s.is_empty())
@@ -224,7 +271,7 @@ impl ReleaseManager {
         components: Vec<ReleaseComponent>,
         force: bool,
     ) -> AgentMsg {
-        if let Some(reason) = validate(&request_id, &components) {
+        if let Some(reason) = validate(&request_id, &components, self.appliable()) {
             warn!(
                 token = "release-apply-rejected",
                 "release_apply {request_id} rejected: {reason}"
@@ -263,17 +310,38 @@ impl ReleaseManager {
             }
         }
 
-        let body = serde_json::json!({
-            "request_id": request_id,
-            "components": components,
-            "release": release,
-        })
-        .to_string();
+        let (path, body) = match self.actor {
+            Actor::Updater { .. } => (
+                "/v1/apply",
+                serde_json::json!({
+                    "request_id": request_id,
+                    "components": components,
+                    "release": release,
+                }),
+            ),
+            // The actor's request shape (testdata/recovery/socket). An agent only ever
+            // asks for a replacement; no migration, dump or purge can come from here.
+            Actor::Recovery => (
+                "/v1/submit",
+                serde_json::json!({
+                    "request_id": request_id,
+                    "kind": "replace",
+                    "components": components,
+                    "release": release,
+                    "migrates": false,
+                    "schema_version": null,
+                    "external_backup_confirmed": false,
+                    "dump": null,
+                    "purge": false,
+                }),
+            ),
+        };
+        let body = body.to_string();
 
         let reply = unix_http::request(
             &self.socket,
             "POST",
-            "/v1/apply",
+            path,
             Some(&body),
             Duration::from_secs(30),
         );
@@ -371,6 +439,10 @@ impl ReleaseManager {
     /// the socket is unavailable — the same file either way, and the direct read
     /// keeps an apply observable while the updater itself restarts.
     fn read_result(&self, request_id: &str) -> Option<UpdaterResult> {
+        let results_dir = match &self.actor {
+            Actor::Updater { results_dir } => results_dir,
+            Actor::Recovery => return self.actor_result(Some(request_id)),
+        };
         let over_socket = unix_http::request(
             &self.socket,
             "GET",
@@ -390,7 +462,30 @@ impl ReleaseManager {
                 return None;
             }
         }
-        self.read_result_file(&self.results_dir.join(format!("{request_id}.json")))
+        self.read_result_file(&results_dir.join(format!("{request_id}.json")))
+    }
+
+    /// One attempt's result from the recovery actor's status (the most recent attempt's
+    /// when `request_id` is `None`); `None` when the actor has none or did not answer.
+    fn actor_result(&self, request_id: Option<&str>) -> Option<UpdaterResult> {
+        let path = match request_id {
+            Some(id) => format!("/v1/status?request_id={id}"),
+            None => "/v1/status".to_string(),
+        };
+        let reply =
+            unix_http::request(&self.socket, "GET", &path, None, Duration::from_secs(10)).ok()?;
+        if reply.status != 200 {
+            return None;
+        }
+        match serde_json::from_str::<ActorStatus>(&reply.body) {
+            Ok(status) => status
+                .result
+                .filter(|r| request_id.is_none_or(|id| r.request_id == id)),
+            Err(e) => {
+                debug!("recovery actor status unparsable: {e}");
+                None
+            }
+        }
     }
 
     fn read_result_file(&self, path: &Path) -> Option<UpdaterResult> {
@@ -409,7 +504,19 @@ impl ReleaseManager {
     /// updater rewrites the file on every state change, so it tracks
     /// `updated_at` without parsing a timestamp.
     fn replayable_results(&self) -> Vec<UpdaterResult> {
-        let Ok(entries) = std::fs::read_dir(&self.results_dir) else {
+        let results_dir = match &self.actor {
+            Actor::Updater { results_dir } => results_dir,
+            // The actor keeps the journal: its most recent attempt is the only one an
+            // agent can still speak for (single flight). Age is its `updated_at`.
+            Actor::Recovery => {
+                return self
+                    .actor_result(None)
+                    .filter(|r| replay_worthy_for(r, rfc3339_age(&r.updated_at), self.appliable()))
+                    .into_iter()
+                    .collect()
+            }
+        };
+        let Ok(entries) = std::fs::read_dir(results_dir) else {
             return Vec::new();
         };
         let mut by_id: BTreeMap<String, UpdaterResult> = BTreeMap::new();
@@ -481,11 +588,15 @@ fn is_terminal(state: &str) -> bool {
 /// plane, a dropped live attempt is not. So a non-terminal result is kept at any
 /// age, and a terminal one whose age is unknown is kept too.
 fn replay_worthy(res: &UpdaterResult, age: Option<Duration>) -> bool {
+    replay_worthy_for(res, age, APPLIABLE_COMPONENTS)
+}
+
+fn replay_worthy_for(res: &UpdaterResult, age: Option<Duration>, appliable: &[&str]) -> bool {
     let all_ours = !res.components.is_empty()
         && res
             .components
             .iter()
-            .all(|c| APPLIABLE_COMPONENTS.contains(&c.name.as_str()));
+            .all(|c| appliable.contains(&c.name.as_str()));
     if !all_ours {
         return false;
     }
@@ -500,6 +611,15 @@ fn replay_worthy(res: &UpdaterResult, age: Option<Duration>) -> bool {
 fn file_age(path: &Path) -> Option<Duration> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     SystemTime::now().duration_since(modified).ok()
+}
+
+/// The age of an RFC 3339 timestamp; `None` when unparseable or in the future, which
+/// [`replay_worthy`] treats as "unknown, keep".
+fn rfc3339_age(stamp: &str) -> Option<Duration> {
+    let at =
+        time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339).ok()?;
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(at.unix_timestamp()).ok()?);
+    SystemTime::now().duration_since(at).ok()
 }
 
 fn unreachable_msg(request_id: &str) -> AgentMsg {
@@ -538,7 +658,11 @@ fn nack(id: String, reason: &str) -> AgentMsg {
 /// Ack-time validation; the rejection reason, or None to proceed. The namespace
 /// allowlist is host configuration the agent does not hold, so
 /// `namespace_rejected` reaches the ack by relay rather than from here.
-fn validate(request_id: &str, components: &[ReleaseComponent]) -> Option<&'static str> {
+fn validate(
+    request_id: &str,
+    components: &[ReleaseComponent],
+    appliable: &[&str],
+) -> Option<&'static str> {
     if !is_uuid(request_id) {
         return Some("invalid");
     }
@@ -546,7 +670,7 @@ fn validate(request_id: &str, components: &[ReleaseComponent]) -> Option<&'stati
         return Some("invalid");
     }
     for c in components {
-        if !APPLIABLE_COMPONENTS.contains(&c.name.as_str()) {
+        if !appliable.contains(&c.name.as_str()) {
             return Some("invalid");
         }
         if c.image.is_empty() || image_has_tag_or_digest(&c.image) {
@@ -592,3 +716,6 @@ fn is_uuid(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_owned;
