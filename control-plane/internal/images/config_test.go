@@ -184,3 +184,22 @@ func TestRegistryEgressHostsAddsExtras(t *testing.T) {
 		t.Fatalf("hosts = %v, want the env host kept", hosts)
 	}
 }
+
+// The plain-HTTP reader reaches a named test registry by its host:port, over
+// http, and nothing else.
+func TestPlainHTTPResolverReadsOnlyItsNamedRegistries(t *testing.T) {
+	reg := newConfigRegistry(t, `{"org.quasar.source.commit":"`+strings.Repeat("a", 40)+`"}`)
+	host := strings.TrimPrefix(reg.srv.URL, "http://")
+	r := NewPlainHTTPRegistryResolver(map[string]struct{}{host: {}}, inspectTimeout)
+
+	cfg, err := r.InspectConfig(context.Background(), host+"/dev/quasar-node-agent@"+digestOf(reg.index))
+	if err != nil {
+		t.Fatalf("InspectConfig: %v", err)
+	}
+	if cfg.Label("org.quasar.source.commit") != strings.Repeat("a", 40) {
+		t.Fatalf("labels = %v", cfg.Labels)
+	}
+	if _, err := r.InspectConfig(context.Background(), "ghcr.io/acme/app@"+digestOf(reg.index)); err == nil {
+		t.Fatal("a registry the operator did not name was read")
+	}
+}

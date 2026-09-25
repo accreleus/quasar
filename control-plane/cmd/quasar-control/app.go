@@ -40,6 +40,7 @@ import (
 	signalpkg "github.com/accreleus/quasar/control-plane/internal/signal"
 	"github.com/accreleus/quasar/control-plane/internal/storage"
 	"github.com/accreleus/quasar/control-plane/internal/telemetry"
+	"github.com/accreleus/quasar/control-plane/internal/updater"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -991,7 +992,19 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// halfway. Uncordon's ErrHostNotResumable on an offline host is expected —
 	// a host mid-recreate has no agent, and its register brings it back online.
 	admissionStore := admission.NewStore(pool)
+	// Developer apply (amendment 14): the namespaces checked up front, and where
+	// the images' build identity is read — the allowed namespaces' registries over
+	// the hardened client, plus any plain-HTTP test registry the operator names.
+	developerNamespaces := updater.ParseNamespaces(os.Getenv("QUASAR_UPDATER_ALLOWED_NAMESPACES"))
+	insecureRegistries := platform.ConfiguredInsecureRegistries()
+	developerImages := platform.NewRegistryDeveloperImages(platform.RoutedInspector{
+		Plain:      images.NewPlainHTTPRegistryResolver(insecureRegistries, 30*time.Second),
+		PlainHosts: insecureRegistries,
+		TLS: images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(
+			append(platform.NamespaceHosts(developerNamespaces), platform.ConfiguredPlatformRegistry())...)),
+	})
 	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
+		DeveloperCommit: developerImages.Commit,
 		AcquireOwned: func(ctx context.Context, attemptID, hostID string) error {
 			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
 			return err
@@ -1091,7 +1104,8 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
 		WithPreflightRefresh(refreshPreflight).
 		WithEdgeResolver(edgeApply).
-		WithFleet(fleetRunner)
+		WithFleet(fleetRunner).
+		WithDeveloperApply(developerImages, developerNamespaces)
 	// Closed after construction: the view reports the active run, and the run's
 	// skips live on the sequencer the apply handler owns.
 	pDeps.ActiveRun = platformApply.ActiveRun

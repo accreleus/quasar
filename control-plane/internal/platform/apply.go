@@ -15,6 +15,9 @@ const (
 	// wait (ADR 0004). Recorded terminal on insert beside the failed apply;
 	// never driven over the wire.
 	KindAutoRevert = "auto_revert"
+	// An admin's arbitrary digest set on one owned target, release_id NULL
+	// (control-api.md §"Developer apply", migration 0096). Otherwise an apply.
+	KindDeveloperApply = "developer_apply"
 )
 
 // `ApplyAttemptState`. The six middle values are exactly agent-api.md
@@ -74,13 +77,18 @@ const (
 	ReasonTimeout              = "timeout"
 	ReasonUnsupported          = "unsupported"
 
-	// Emitted by an updater with QUASAR_UPDATER_SIGNATURE_MODE on, which is off
-	// by default. Not yet in openapi.yaml's `ApplyFailureReason` enum — adding
-	// them is an additive amendment, Opus + sign-off; until then they travel the
-	// contract's own path for an unrecognised identifier, stored and rendered
-	// verbatim. Client copy: web/src/pages/admin/fleet/releasesCopy.ts.
+	// Emitted with QUASAR_UPDATER_SIGNATURE_MODE on, which is off by default.
+	// Client copy: web/src/pages/admin/fleet/releasesCopy.ts.
 	ReasonSignatureMissing = "signature_missing"
 	ReasonSignatureInvalid = "signature_invalid"
+
+	// Amendment 14: only an owned machine's recovery actor emits these.
+	// `interrupted` is a failed attempt that changed nothing.
+	ReasonRecipeUnsupported = "recipe_unsupported"
+	ReasonOwnerConflict     = "owner_conflict"
+	ReasonBackupFailed      = "backup_failed"
+	ReasonBackupUnconfirmed = "backup_unconfirmed"
+	ReasonInterrupted       = "interrupted"
 )
 
 // KnownFailureReason reports whether reason is one this build recognises. An
@@ -91,7 +99,9 @@ func KnownFailureReason(reason string) bool {
 	case ReasonUpdaterAbsentFailure, ReasonBusy, ReasonInvalid, ReasonNamespaceRejected,
 		ReasonDigestMalformed, ReasonPullFailed, ReasonRecreateFailed, ReasonNeverStarted,
 		ReasonUnhealthy, ReasonUpdaterUnreachable, ReasonTimeout, ReasonUnsupported,
-		ReasonSignatureMissing, ReasonSignatureInvalid:
+		ReasonSignatureMissing, ReasonSignatureInvalid,
+		ReasonRecipeUnsupported, ReasonOwnerConflict, ReasonBackupFailed,
+		ReasonBackupUnconfirmed, ReasonInterrupted:
 		return true
 	}
 	return false

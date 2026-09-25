@@ -97,7 +97,7 @@ type applyHarness struct {
 // fake agent and a view whose control-plane identity is synthesized (a test
 // binary carries no build stamps, so every host would otherwise read
 // control_plane_not_first).
-func newApplyHarness(t *testing.T) *applyHarness {
+func newApplyHarness(t *testing.T, opts ...func(*applyHarness, *ApplyHandler)) *applyHarness {
 	t.Helper()
 	pool := testDB(t)
 	ctx := context.Background()
@@ -163,10 +163,13 @@ func newApplyHarness(t *testing.T) *applyHarness {
 	h.adminToken, h.userToken = adminTok.Plaintext, userTok.Plaintext
 
 	mux := http.NewServeMux()
-	NewApplyHandler(store, h.runner, view, audit.NewStore(pool), testLogger()).
-		Register(mux, func(next http.Handler) http.Handler {
-			return authHandler.RequireAuth(authHandler.RequireAdmin(next))
-		})
+	handler := NewApplyHandler(store, h.runner, view, audit.NewStore(pool), testLogger())
+	for _, o := range opts {
+		o(h, handler)
+	}
+	handler.Register(mux, func(next http.Handler) http.Handler {
+		return authHandler.RequireAuth(authHandler.RequireAdmin(next))
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	h.base = srv.URL

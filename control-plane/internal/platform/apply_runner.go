@@ -95,6 +95,11 @@ type ApplyDeps struct {
 	// Connected reports whether this host's agent is on the wire right now.
 	// Nil reads as connected, which sends and lets the send's own error decide.
 	Connected func(hostID string) bool
+	// DeveloperCommit reads the commit a developer apply's images carry, for an
+	// attempt this process did not create (a restart re-adopted it). A
+	// developer_apply row has no release to name its commit, and its digests
+	// name it immutably. Nil fails such an attempt before the send.
+	DeveloperCommit func(ctx context.Context, components []ComponentDigest) (string, error)
 }
 
 // Runner drives every in-flight attempt. Its state is the goroutine set and the
@@ -118,6 +123,9 @@ type Runner struct {
 	// Cleared ONLY by a register: a register is the only evidence the build
 	// changed (agent-api.md).
 	unsupported map[string]bool
+	// attempt id → the commit a developer apply's images carry: its success
+	// evidence and its release_apply provenance.
+	developerCommits map[string]string
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -131,17 +139,18 @@ func NewRunner(store applyStore, deps ApplyDeps, log *slog.Logger) *Runner {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
-		store:        store,
-		deps:         deps,
-		log:          log,
-		AckTimeout:   DefaultAckTimeout,
-		Deadline:     DefaultApplyDeadline,
-		PollInterval: DefaultApplyPoll,
-		ConnectWait:  DefaultConnectWait,
-		running:      make(map[string]context.CancelFunc),
-		unsupported:  make(map[string]bool),
-		baseCtx:      ctx,
-		stop:         cancel,
+		store:            store,
+		deps:             deps,
+		log:              log,
+		AckTimeout:       DefaultAckTimeout,
+		Deadline:         DefaultApplyDeadline,
+		PollInterval:     DefaultApplyPoll,
+		ConnectWait:      DefaultConnectWait,
+		running:          make(map[string]context.CancelFunc),
+		unsupported:      make(map[string]bool),
+		developerCommits: make(map[string]string),
+		baseCtx:          ctx,
+		stop:             cancel,
 	}
 }
 
@@ -231,6 +240,34 @@ func (r *Runner) markUnsupported(hostID string) {
 	r.mu.Lock()
 	r.unsupported[hostID] = true
 	r.mu.Unlock()
+}
+
+// RememberDeveloperCommit records the commit the developer apply endpoint read
+// off the attempt's images, so neither the send nor the register hook reads
+// the registry again.
+func (r *Runner) RememberDeveloperCommit(attemptID, commit string) {
+	r.mu.Lock()
+	r.developerCommits[attemptID] = commit
+	r.mu.Unlock()
+}
+
+// developerCommit is the commit a developer_apply attempt must register on.
+func (r *Runner) developerCommit(ctx context.Context, a Attempt) (string, error) {
+	r.mu.Lock()
+	commit, ok := r.developerCommits[a.ID]
+	r.mu.Unlock()
+	if ok {
+		return commit, nil
+	}
+	if r.deps.DeveloperCommit == nil {
+		return "", errors.New("no registry reader is wired to read the images' commit")
+	}
+	commit, err := r.deps.DeveloperCommit(ctx, a.RequestedDigests)
+	if err != nil {
+		return "", err
+	}
+	r.RememberDeveloperCommit(a.ID, commit)
+	return commit, nil
 }
 
 // drive is one attempt, start to terminal.
@@ -373,6 +410,17 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	}
 
 	release := ReleaseRef{SourceCommit: ""}
+	if a.Kind == KindDeveloperApply {
+		// No release: `id` "", `version` null, and the images' own commit
+		// (agent-api.md §release_apply, amendment 14).
+		commit, err := r.developerCommit(ctx, a)
+		if err != nil {
+			r.log.Error("apply: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			r.fail(a.ID, ReasonInvalid, "the images' build identity could not be read: "+err.Error())
+			return false
+		}
+		release = ReleaseRef{SourceCommit: commit}
+	}
 	if a.ReleaseID != nil {
 		rel, err := r.store.Release(ctx, *a.ReleaseID)
 		if err != nil {
@@ -611,7 +659,7 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 // (ADR 0004). Only after the apply is terminal, so the open-target index is
 // free; only for an apply, never for a revert that failed.
 func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep ReleaseStateReport) {
-	if failed.Kind != KindApply {
+	if failed.Kind != KindApply && failed.Kind != KindDeveloperApply {
 		return
 	}
 	requested := restoredDigests(failed.RequestedDigests, rep.Previous)
@@ -671,6 +719,15 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 	}
 	if sourceCommit == nil || *sourceCommit == "" {
 		return
+	}
+	if wantCommit == "" && a.Kind == KindDeveloperApply {
+		commit, err := r.developerCommit(ctx, a)
+		if err != nil {
+			// The actor's relayed outcome or the deadline decides.
+			r.log.Warn("register: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			return
+		}
+		wantCommit = commit
 	}
 	if wantCommit == "" {
 		// A revert to a build this instance can no longer name has no commit
