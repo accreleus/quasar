@@ -1,28 +1,35 @@
-//! `quasar-recovery`: the recovery actor binary. Its inputs are environment variables so a
-//! manager's stack or a single `docker run -e …` can supply them; `docs/configuration.md`
-//! "Recovery actor" lists them.
+//! `quasar-recovery`: the recovery actor and the seed, one binary. Their inputs are
+//! environment variables so a manager's stack or a single `docker run -e …` can supply
+//! them; `docs/configuration.md` "Seed" and "Recovery actor" list them.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quasar_recovery::actor::{Actor, ActorConfig, OperatorInputs, ResumeError};
+use quasar_recovery::actor::{Actor, ActorConfig, ResumeError};
+use quasar_recovery::bootstrap::Bootstrap;
 use quasar_recovery::engine::DockerEngine;
 use quasar_recovery::recipe::paths;
-use quasar_recovery::socket::MachineRole;
-use quasar_recovery::{identity, server};
+use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
+use quasar_recovery::{identity, server, shutdown};
 use tracing::{error, info};
 
 const USAGE: &str = "usage: quasar-recovery <command>
 
 commands:
+  seed      keep this machine's recovery actor in existence: create it on a first install
+            (inputs: docs/configuration.md \"Seed\"), re-create it if it is deleted
   actor     run the recovery actor: install or complete this machine's services, then
-            serve the agent socket (inputs: docs/configuration.md \"Recovery actor\")
-  status    print this machine's inventory, as the running actor serves it
+            serve the agent socket (docs/configuration.md \"Recovery actor\")
+  status    print this machine's inventory, as the running actor serves it (in the seed's
+            container: what the seed last did)
   version   print this build's version and commit
 
-seed, restore, uninstall and reconfigure are not in this build.";
+restore, uninstall and reconfigure are not in this build.";
+
+/// In the seed's own container only: what its last look came to, for the health check.
+const SEED_STATUS_FILE: &str = "/tmp/quasar-seed.status";
 
 /// A status answer must come back well inside the agent's own socket timeout.
 const STATUS_ENGINE_DEADLINE: Duration = Duration::from_secs(3);
@@ -34,6 +41,9 @@ fn env(key: &str) -> Option<String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // Dispatched before anything the actor initialises, so no actor start-up path can
+        // reach the seed.
+        Some("seed") => seed_mode(),
         Some("actor") => actor(),
         Some("status") => status(),
         Some("version") | Some("--version") => {
@@ -44,7 +54,7 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Some("seed") | Some("restore") | Some("uninstall") | Some("reconfigure") => {
+        Some("restore") | Some("uninstall") | Some("reconfigure") => {
             eprintln!(
                 "quasar-recovery: `{}` is not in this build\n\n{USAGE}",
                 args[0]
@@ -69,6 +79,9 @@ fn agent_socket() -> PathBuf {
 }
 
 fn status() -> ExitCode {
+    if let Ok(body) = std::fs::read_to_string(SEED_STATUS_FILE) {
+        return seed_status(&body);
+    }
     match server::fetch_status(&agent_socket()) {
         Ok(body) => {
             println!("{body}");
@@ -81,18 +94,30 @@ fn status() -> ExitCode {
     }
 }
 
-/// Only `gpu` installs in this build; the combined and control-only roles arrive with #361.
-fn parse_role(raw: &str) -> Result<MachineRole, String> {
-    match raw {
-        "gpu" => Ok(MachineRole::Gpu),
-        "combined" | "control-only" => Err(format!(
-            "QUASAR_ROLE={raw} is not installed by this build (combined and control-only machines arrive with RH06-09, #361); use gpu"
-        )),
-        other => Err(format!("QUASAR_ROLE={other:?} is not a role; this build installs gpu")),
+/// Healthy while the seed keeps looking: its last look is at most three intervals old.
+fn seed_status(body: &str) -> ExitCode {
+    let mut lines = body.lines();
+    let at: u64 = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.saturating_sub(at);
+    println!(
+        "seed: {} ({age} s ago)",
+        lines.next().unwrap_or("no look yet")
+    );
+    if age <= 3 * seed::INTERVAL.as_secs() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
-fn actor() -> ExitCode {
+fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -100,29 +125,69 @@ fn actor() -> ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
+}
+
+fn install_signals(what: &'static str) -> Result<(), ExitCode> {
+    shutdown::install(what).map_err(|e| {
+        error!(
+            token = "signals-unavailable",
+            "cannot install the SIGTERM handler: {e}"
+        );
+        ExitCode::FAILURE
+    })
+}
+
+fn seed_mode() -> ExitCode {
+    init_logging();
+    if let Err(code) = install_signals("seed") {
+        return code;
+    }
+    info!(
+        version = identity::version(),
+        commit = identity::source_commit(),
+        "seed starting"
+    );
+    let engine = match DockerEngine::from_environment() {
+        Ok(engine) => engine,
+        Err(e) => {
+            error!(
+                token = "seed-engine-config",
+                "the container engine endpoint is unusable: {e}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    info!(engine = %engine.endpoint(), "engine");
+    let mut config =
+        SeedConfig::new(env("QUASAR_MACHINE_DIR").unwrap_or_else(|| profile::MACHINE_DIR.into()));
+    config.self_container = quasar_runtime::self_inspection::self_container_id();
+    config.status_file = Some(SEED_STATUS_FILE.into());
+    Seed::new(Arc::new(engine), config).run()
+}
+
+fn actor() -> ExitCode {
+    init_logging();
+    if let Err(code) = install_signals("recovery actor") {
+        return code;
+    }
     info!(
         version = identity::version(),
         commit = identity::source_commit(),
         "recovery actor starting"
     );
 
-    let role = match parse_role(&env("QUASAR_ROLE").unwrap_or_else(|| "gpu".into())) {
-        Ok(role) => role,
+    // A seed-created actor reads its install inputs from the seed's container instead.
+    let Bootstrap { role, operator } = match Bootstrap::from_process_env() {
+        Ok(boot) => boot,
         Err(why) => {
             error!(token = "actor-role-invalid", "{why}");
             return ExitCode::from(2);
         }
     };
-    let operator = OperatorInputs {
-        enrollment: env("QUASAR_ENROLLMENT"),
-        home_root: env("QUASAR_HOME_ROOT"),
-        template_root: env("QUASAR_TEMPLATE_ROOT"),
-        node_name: env("QUASAR_NODE_NAME"),
-        agent_image: env("QUASAR_AGENT_IMAGE"),
-    };
     let machine_dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
     let mut config = ActorConfig::new(machine_dir, role, operator);
     config.self_container = quasar_runtime::self_inspection::self_container_id();
+    config.seed_container = env(profile::SEED_CONTAINER_ENV);
     if let Some(fallback) = env("QUASAR_DOCKER_SOCKET_HOST_PATH") {
         config.docker_socket_fallback = fallback;
     }

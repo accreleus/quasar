@@ -124,6 +124,10 @@ pub struct PlatformContainer {
     pub restart: Option<RestartPolicy>,
     /// Every mount, as `(source or volume name, destination, read_only)`.
     pub mounts: Vec<(String, String, bool)>,
+    /// The process the container runs: the resolved entrypoint, then its arguments.
+    pub command: Vec<String>,
+    /// `Config.Env` as `KEY=value`. May hold secrets: never log it.
+    pub env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

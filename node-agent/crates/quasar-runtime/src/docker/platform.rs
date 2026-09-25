@@ -167,6 +167,12 @@ async fn inspect_with(
     };
     let config = info.config.ok_or(ErrorKind::Protocol)?;
     let state = info.state.ok_or(ErrorKind::Protocol)?;
+    let command = info
+        .path
+        .filter(|p| !p.is_empty())
+        .into_iter()
+        .chain(info.args.unwrap_or_default())
+        .collect();
     let restart = info
         .host_config
         .and_then(|h| h.restart_policy)
@@ -207,6 +213,8 @@ async fn inspect_with(
             .filter(|w| w != "none"),
         restart,
         mounts,
+        command,
+        env: config.env.unwrap_or_default(),
     }))
 }
 

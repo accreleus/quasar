@@ -1,0 +1,46 @@
+[
+  {
+    "name": "quasar-node-agent",
+    "labels": {
+      "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+      "io.quasar.platform-service": "node-agent"
+    },
+    "status": "running",
+    "command": [
+      "/usr/local/bin/quasar-node-agent-entrypoint"
+    ]
+  },
+  {
+    "name": "quasar-recovery.kept",
+    "labels": {
+      "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+      "io.quasar.platform-service": "recovery-actor"
+    },
+    "status": "exited",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "actor"
+    ]
+  },
+  {
+    "name": "quasar-recovery.next",
+    "labels": {
+      "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+      "io.quasar.platform-service": "recovery-actor"
+    },
+    "status": "running",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "actor"
+    ]
+  },
+  {
+    "name": "quasar-seed",
+    "labels": {},
+    "status": "running",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "seed"
+    ]
+  }
+]
