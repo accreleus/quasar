@@ -103,6 +103,10 @@
   color: var(--text);
 }
 
+.crumbs .crumb {
+  display: contents;
+}
+
 .crumbs .cur {
   color: var(--text-2);
   font-weight: 500;
@@ -819,6 +823,16 @@
 
 .mono-tile.grad { background: var(--brand-grad); }
 
+/* Avatar.tsx sets --avatar-fs from the tile size. */
+.mono-tile.avatar { font-size: var(--avatar-fs, 1em); }
+
+.mono-tile.avatar > img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
 /* Capability pills on a device card. */
 .caps {
   display: flex;
@@ -1108,6 +1122,20 @@ textarea.input {
   display: flex;
   align-items: center;
   gap: var(--s3);
+  cursor: pointer;
+}
+
+.switch-row.is-disabled {
+  cursor: not-allowed;
+}
+
+.switch-row .switch-label {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.switch-row.is-disabled .switch-label {
+  color: var(--text-4);
 }
 
 /* Checkbox: a 15px accent square, drawn on the native control. */
@@ -1118,6 +1146,12 @@ textarea.input {
   font-size: var(--t-sm);
   color: var(--text-2);
   min-height: 2.75rem;
+  cursor: pointer;
+}
+
+/* `label` outranks login.css's later `.auth-scene .check { cursor: pointer }`. */
+label.check.is-disabled {
+  cursor: not-allowed;
 }
 
 .check input {
@@ -1289,6 +1323,14 @@ table.qtable {
 
 [data-density="dense"] .qtable tbody td {
   padding: var(--s1) var(--s3);
+}
+
+/* Table.tsx's no-rows cell. Specific enough to beat the page-scoped
+   `.qtable tbody td:first-child` overrides in admin.css, which loads later. */
+.qtable tbody tr.qtable-empty-row > td:only-child {
+  text-align: center;
+  color: var(--text-3);
+  padding: var(--s8);
 }
 
 .qtable tbody tr:last-child td {
@@ -1587,6 +1629,12 @@ td.cell-actions > * + * {
   flex: none;
 }
 
+/* Gauge.tsx: the arc starts at 9 o'clock on the darker track. A bare `.gauge`
+   (CapacityCard's no-reading state) keeps the default. */
+.gauge.gauge-meter {
+  background: conic-gradient(from -90deg, var(--gc) calc(var(--p) * 1%), var(--ink-5) 0);
+}
+
 .gauge::before {
   content: "";
   position: absolute;
@@ -1622,6 +1670,11 @@ td.cell-actions > * + * {
   width: 74px;
   height: 20px;
   overflow: visible;
+}
+
+/* LiveDot's wrapper; utilities add the alignment, gap, colour and size. */
+.live-label {
+  display: inline-flex;
 }
 
 .live-dot {
@@ -1921,6 +1974,13 @@ td.cell-actions > * + * {
   font-weight: 600;
   color: var(--text);
   margin: 0;
+}
+
+/* Drawer.tsx's kicker keeps its own case and tracking. */
+.drawer-head .drawer-eyebrow {
+  text-transform: none;
+  letter-spacing: 0;
+  margin-bottom: var(--s1);
 }
 
 .modal-body,
@@ -2234,6 +2294,41 @@ td.cell-actions > * + * {
 .bulk-bar .bulk-count span {
   font-family: var(--font-mono);
   color: var(--accent-text);
+}
+
+.bulk-bar .bulk-sep {
+  width: 1px;
+  height: 20px;
+  background: var(--line-2);
+  flex-shrink: 0;
+}
+
+.bulk-bar .bulk-action {
+  padding: var(--s2) var(--s4);
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-2);
+  background: var(--ink-5);
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  transition: background 0.15s;
+}
+
+.bulk-bar .bulk-action-danger {
+  border-color: var(--danger-line);
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+.bulk-bar .bulk-clear {
+  margin-left: var(--s2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  padding: var(--s1) var(--s2);
+  border-radius: var(--r-sm);
 }
 
 /* `.tabbar` (components.css) is fixed to the bottom below 820px in the user

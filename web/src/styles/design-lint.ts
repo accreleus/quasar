@@ -334,7 +334,8 @@ export const INLINE_STYLE_ALLOWLIST: ReadonlySet<string> = new Set([
 
 /**
  * The single-declaration utilities in components.css, keyed `cssProp:value`.
- * The scan test asserts every entry is still declared there.
+ * The scan test asserts every entry is still declared there. One class per key:
+ * `.text-2` has no entry because `color:var(--text-2)` already names `.sec`.
  */
 export const UTILITIES: ReadonlyMap<string, string> = new Map([
   ["flex-direction:column", "col"],
@@ -356,6 +357,7 @@ export const UTILITIES: ReadonlyMap<string, string> = new Map([
   ["margin-top:var(--s3)", "mt3"],
   ["margin-top:var(--s4)", "mt4"],
   ["margin-top:var(--s5)", "mt5"],
+  ["margin-bottom:var(--s1)", "mb1"],
   ["margin-bottom:var(--s3)", "mb3"],
   ["margin-bottom:var(--s4)", "mb4"],
   ["margin-bottom:var(--s5)", "mb5"],
@@ -363,6 +365,11 @@ export const UTILITIES: ReadonlyMap<string, string> = new Map([
   ["margin-left:auto", "ml-auto"],
   ["white-space:nowrap", "nowrap"],
   ["text-align:right", "right"],
+  ["font-size:var(--t-xs)", "t-xs"],
+  ["font-size:var(--t-sm)", "t-sm"],
+  ["font-size:var(--t-lg)", "t-lg"],
+  ["font-size:var(--t-h3)", "t-h3"],
+  ["color:var(--text)", "text-1"],
   ["color:var(--text-3)", "muted"],
   ["color:var(--muted)", "muted"],
   ["color:var(--text-2)", "sec"],

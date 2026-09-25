@@ -130,9 +130,25 @@
   overflow-wrap: anywhere;
 }
 
+/* Two classes deep so they outrank the `h3` / `p` rules above. */
+.host-setting-copy .rdy-title {
+  font-size: var(--t-sm);
+}
+
+.host-setting-copy .rdy-provenance {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
 .host-setting-copy code {
   color: var(--text-3);
   font-size: var(--t-xs);
+}
+
+/* CopyableCommand.tsx: a shell command is one long token run. */
+.copyable-cmd {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 /* Restart-class knob whose agent-reported `effective` value disagrees with the
@@ -160,7 +176,38 @@
 }
 
 
-/* ---------- UTILITIES ---------- */
+/* ---------- UTILITIES ----------
+   Single-purpose classes, one token each. Reach for these before writing a
+   page class; design-lint.ts UTILITIES names them in its fixes.
+   A utility is one class deep, so a page rule like `.x p { font-size }`
+   outranks it; check the element's other selectors first.
+
+   Layout
+     .row      display: flex; align-items: center; gap: --s3
+     .col      display: flex; flex-direction: column
+     .between  justify-content: space-between
+     .wrap     flex-wrap: wrap
+     .grow     flex: 1
+     .center   align-items: center
+   Gap
+     .gap1–.gap7   gap: --s1 … --s7
+   Margin (.m0/.mb0 first, so "m0 mt1" keeps the step)
+     .m0       margin: 0
+     .mb0      margin-bottom: 0
+     .mt1–.mt5 margin-top: --s1 … --s5
+     .mb1      margin-bottom: --s1
+     .mb3–.mb6 margin-bottom: --s3 … --s6
+     .ml-auto  margin-left: auto
+   Text
+     .nowrap   white-space: nowrap
+     .right    text-align: right
+     .t-xs .t-sm .t-lg .t-h3   font-size: --t-xs / --t-sm / --t-lg / --t-h3
+     .text-1   color: --text
+     .text-2   color: --text-2
+     .sec      color: --text-2 (same as .text-2)
+     .muted    color: --text-3 (the only --text-3 class)
+     .tone-warning  color: --warning-text
+     .tone-info     color: --info-text */
 .row { display: flex; align-items: center; gap: var(--s3); }
 .col { display: flex; flex-direction: column; }
 .between { justify-content: space-between; }
@@ -170,17 +217,23 @@
 .gap1 { gap: var(--s1); }
 .gap2 { gap: var(--s2); } .gap3 { gap: var(--s3); } .gap4 { gap: var(--s4); }
 .gap5 { gap: var(--s5); } .gap6 { gap: var(--s6); } .gap7 { gap: var(--s7); }
-/* .m0/.mb0 come first so a side-specific step after them wins: "m0 mt1". */
 .m0 { margin: 0; }
 .mb0 { margin-bottom: 0; }
 .mt1 { margin-top: var(--s1); }
 .mt2 { margin-top: var(--s2); } .mt3 { margin-top: var(--s3); } .mt4 { margin-top: var(--s4); }
 .mt5 { margin-top: var(--s5); }
+.mb1 { margin-bottom: var(--s1); }
 .mb3 { margin-bottom: var(--s3); } .mb4 { margin-bottom: var(--s4); }
 .mb5 { margin-bottom: var(--s5); } .mb6 { margin-bottom: var(--s6); }
 .ml-auto { margin-left: auto; }
 .nowrap { white-space: nowrap; }
 .right { text-align: right; }
+.t-xs { font-size: var(--t-xs); }
+.t-sm { font-size: var(--t-sm); }
+.t-lg { font-size: var(--t-lg); }
+.t-h3 { font-size: var(--t-h3); }
+.text-1 { color: var(--text); }
+.text-2 { color: var(--text-2); }
 .muted { color: var(--text-3); }
 .sec { color: var(--text-2); }
 .tone-warning { color: var(--warning-text); }
@@ -188,6 +241,28 @@
 
 
 /* ---------- CHART / SPARKLINE ---------- */
+/* Charts.tsx and TelemetryChart.tsx. --series-color / --seg-color are set per
+   element from the caller's series colour. */
+.chart-svg { display: block; overflow: visible; }
+.chart-key { color: var(--series-color, currentColor); }
+.chart-caption { text-align: center; font-size: 10px; }
+.stacked-bar {
+  display: flex;
+  height: 16px;
+  border-radius: var(--r-control);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.stacked-seg { background: var(--seg-color, transparent); transition: width 0.3s; }
+.stacked-legend { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); }
+.stacked-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--seg-color, transparent);
+  flex-shrink: 0;
+}
 .legend { display: flex; gap: var(--s4); font-size: var(--t-xs); color: var(--text-3); }
 .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: var(--s1); }
 

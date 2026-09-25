@@ -1,7 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { render } from "@testing-library/react";
 import { Sparkline, LineChart2 } from "./Charts";
 import type { LineSeries2 } from "./Charts";
+import { LineChart } from "./TelemetryChart";
+import { yTicks } from "./chartTicks";
 
 // jsdom does not implement ResizeObserver — provide a stub
 class MockResizeObserver {
@@ -118,5 +120,40 @@ describe("LineChart2", () => {
     // unit appears as a <text> element in the SVG
     const texts = Array.from(container.querySelectorAll("text"));
     expect(texts.some((t) => t.textContent === "ms")).toBe(true);
+  });
+});
+
+describe("y-axis ticks", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const series = (ys: number[]): LineSeries2[] => [
+    { label: "s", color: "var(--info)", points: ys.map((y, x) => ({ x, y })) },
+  ];
+  const tickLabels = (container: HTMLElement) =>
+    [...container.querySelectorAll("svg text")].map((t) => t.textContent);
+
+  it("keeps a normal range on today's integer ticks", () => {
+    expect(yTicks(60 * 1.1)).toEqual([0, 17, 33, 50, 66]);
+    for (const Chart of [LineChart2, LineChart]) {
+      const { container, unmount } = render(<Chart series={series([0, 30, 60])} />);
+      expect(tickLabels(container)).toEqual(["0", "17", "33", "50", "66"]);
+      unmount();
+    }
+  });
+
+  it("gives a small range distinct ticks with short labels", () => {
+    expect(yTicks(1 * 1.1)).toEqual([0, 0.3, 0.6, 0.8, 1.1]);
+    expect(yTicks(0.011)).toEqual([0, 0.003, 0.006, 0.008, 0.011]);
+  });
+
+  it.each([
+    ["LineChart2", LineChart2],
+    ["TelemetryChart LineChart", LineChart],
+  ])("%s renders a 0–1 series without a duplicate-key warning", (_name, Chart) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { container } = render(<Chart series={series([0, 1, 0, 1])} />);
+    expect(error).not.toHaveBeenCalled();
+    const labels = tickLabels(container);
+    expect(new Set(labels).size).toBe(labels.length);
   });
 });
