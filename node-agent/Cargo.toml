@@ -10,7 +10,7 @@ license = "MIT"
 # here still builds only the agent (plus the crate as its dependency), and every
 # fmt/clippy/test gate passes `--workspace` / `--all` explicitly.
 [workspace]
-members = ["crates/quasar-runtime"]
+members = ["crates/quasar-runtime", "crates/quasar-recovery"]
 
 [dependencies]
 # #355: the engine facade, ownership labels and durable-state primitives.

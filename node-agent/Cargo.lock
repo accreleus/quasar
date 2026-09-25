@@ -1605,6 +1605,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "quasar-recovery"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "regex",
+ "ring",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "quasar-runtime"
 version = "0.1.0"
 dependencies = [
