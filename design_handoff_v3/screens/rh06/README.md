@@ -8,14 +8,30 @@
 - Section renderer: [`../assets/pages-rh06.js`](../assets/pages-rh06.js). It uses the
   `console-v3.css` classes and the `ui.js` helpers (`head`, `tabs`, `chip`, `sdot`, `bar`,
   `menu`, `tableCard`, `icon`).
-- Screenshots: this directory. Desktop captures are 1440 px wide (1080 px of content).
-  The `narrow-*` captures are 900 px wide. Each was rendered with headless Chromium
-  (Playwright 1.49.1) from the HTML above.
+- Screenshots: this directory, 41 specimens plus two narrow captures, about 4 MB in
+  total. Each PNG is one specimen cropped to its element. Desktop PNGs are 1080 px wide
+  (a 1440 px viewport; the page is 1160 px wide with 40 px padding). The `narrow-*` PNGs
+  are 820 px wide (a 900 px viewport). They were rendered with headless Chromium
+  (Playwright 1.49.1) from the HTML above, at device scale 1.
 - Product authority: `docs/rh06/2026-09-24-decisions.md` (D1–D17, R1, A1–A3; R1 overrides)
   and `docs/rh06/2026-09-24-architecture.md`. The specification is #352.
 
 Machine names, versions, digests, addresses and the enrollment string are placeholders.
 The stack snippet's field names are illustrative until RH06-07 fixes them (D11).
+
+The sample fleet is one consistent story. Where specimens name the same machine, they
+agree with each other.
+
+| Machine | Shape | Story |
+|---|---|---|
+| living-room-pc | Combined host | runs the control plane; database is Quasar's own; seed declared in an external manager |
+| gpu-host-2 | GPU host | no seed found |
+| gpu-host-3 | GPU host | node agent and recovery actor below the floor |
+| gpu-host-4 | GPU host | node agent older than the control plane; seed started by the one-line command; the Remove host specimens |
+| study-pc | GPU host | owner conflict |
+| gpu-host-5 | GPU host | offline |
+| gpu-host-6 | GPU host | just enrolled from Add host (the "not reported yet" specimen) |
+| attic-server | Control-only host | a separate install using the operator's own database (Releases ▸ Installed and the migrating Developer apply variants only) |
 
 ## Where each surface lives
 
@@ -37,7 +53,9 @@ The stack snippet's field names are illustrative until RH06-07 fixes them (D11).
 | – | Fleet ▸ Hosts (context) | normal: shapes, attention chips, Services column, Add host | [`hosts.png`](hosts.png), [`narrow-hosts.png`](narrow-hosts.png) |
 | 1 | Service inventory | normal: combined host, Quasar's own database | [`inv-combined.png`](inv-combined.png) |
 | 1 | Service inventory | normal: GPU host (no database, no control plane), agent older than the control plane | [`inv-gpu.png`](inv-gpu.png) |
-| 1 | Service inventory | normal: control-only host, operator's own database (Releases ▸ Installed) | [`inv-control-only.png`](inv-control-only.png) |
+| 1 | Service inventory | normal: control-only host, operator's own database (Releases ▸ Installed; version, owner and state per service) | [`inv-control-only.png`](inv-control-only.png) |
+| 1 | Service inventory | unknown: control-only host, not reported yet | [`inv-control-only-unknown.png`](inv-control-only-unknown.png) |
+| 1 | Service inventory | error: control-only host, recovery actor not answering | [`inv-control-only-error.png`](inv-control-only-error.png) |
 | 1 | Service inventory | unknown: not reported yet | [`inv-unknown.png`](inv-unknown.png) |
 | 1 | Service inventory | error: recovery actor not answering (last report shown with its time) | [`inv-error.png`](inv-error.png) |
 | 2 | Seed-missing warning | normal | [`seed-missing.png`](seed-missing.png) |
@@ -47,7 +65,7 @@ The stack snippet's field names are illustrative until RH06-07 fixes them (D11).
 | 3 | Must update before it can be managed | normal: node agent and recovery actor below the floor | [`floor.png`](floor.png) |
 | 3 | Must update before it can be managed | normal: recovery actor only (ends no sessions) | [`floor-actor.png`](floor-actor.png) |
 | 3 | Must update before it can be managed | unknown: version not reported | [`floor-unknown.png`](floor-unknown.png) |
-| 3 | Must update before it can be managed | error: update failed, previous agent put back | [`floor-failed.png`](floor-failed.png) |
+| 3 | Must update before it can be managed | error: update failed; the recovery actor moved first and stays on the new release, and the node agent was put back | [`floor-failed.png`](floor-failed.png) |
 | – | Fleet ▸ Releases (context) | normal: migrating release, Installed inventory, Targets reasons, Developer apply card | [`releases.png`](releases.png), [`narrow-releases.png`](narrow-releases.png) |
 | 4 | Add host | normal: one-line command tab (default), before creating; node name and expiry | [`add-options.png`](add-options.png) |
 | 4 | Add host | normal: pinned-key one-liner created | [`add-ready.png`](add-ready.png) |
@@ -60,10 +78,10 @@ The stack snippet's field names are illustrative until RH06-07 fixes them (D11).
 | 5 | Migrating update: backup | normal: operator's own database, confirmed | [`update-external-checked.png`](update-external-checked.png) |
 | 5 | Migrating update: backup | unknown: free space not reported | [`update-unknown.png`](update-unknown.png) |
 | 5 | Migrating update: backup | error: not enough free space | [`update-space.png`](update-space.png) |
-| 5 | Migrating update: backup | error: refused after starting, dump failed (Releases banner) | [`update-refused.png`](update-refused.png) |
-| 6 | Failed migrating update: restore | normal: Quasar's own database; one command naming the dump and the version | [`restore-own.png`](restore-own.png) |
+| 5 | Migrating update: backup | error: refused after starting, dump failed (Releases banner); the control plane was not replaced and the recovery actor is already on the new release (A1) | [`update-refused.png`](update-refused.png) |
+| 6 | Failed migrating update: restore | normal: Quasar's own database; the command names the dump, the copy names the version it returns to | [`restore-own.png`](restore-own.png) |
 | 6 | Failed migrating update: restore | unknown: dump not reported yet | [`restore-unknown.png`](restore-unknown.png) |
-| 6 | Failed migrating update: restore | variant: operator's own database (proposed, see open question 1) | [`restore-external.png`](restore-external.png) |
+| 6 | Failed migrating update: restore | variant: operator's own database (**PROPOSED**, see open question 1) | [`restore-external.png`](restore-external.png) |
 | 7 | Remove host | normal: confirmation | [`remove-confirm.png`](remove-confirm.png) |
 | 7 | Remove host | normal: in progress (waiting for sessions) | [`remove-progress.png`](remove-progress.png) |
 | 7 | Remove host | unknown: host not connected | [`remove-offline.png`](remove-offline.png) |
@@ -71,6 +89,8 @@ The stack snippet's field names are illustrative until RH06-07 fixes them (D11).
 | 8 | Developer apply | normal: filled | [`devapply.png`](devapply.png) |
 | 8 | Developer apply | empty | [`devapply-empty.png`](devapply-empty.png) |
 | 8 | Developer apply | error: namespace refused, tag instead of digest | [`devapply-error.png`](devapply-error.png) |
+| 8 | Developer apply | normal: control-plane digest that migrates, Quasar's own database (dump first, stop if it cannot be taken) | [`devapply-migrating.png`](devapply-migrating.png) |
+| 8 | Developer apply | normal: control-plane digest that migrates, operator's own database (confirmation required) | [`devapply-migrating-external.png`](devapply-migrating-external.png) |
 
 ## Surface → implementing RH-06 ticket
 
@@ -91,6 +111,7 @@ Assignments follow each ticket's "What to build" and acceptance lines.
 | Releases view on an owned install (non-migrating update) | #363 RH06-11: Control-plane replacement without a migration | "The Releases view matches the mockup." |
 | Remove host (confirmation, progress, offline, failure) | #366 RH06-14 | "Console warnings and remove host match the mockups." |
 | Developer apply | #360 RH06-08: Agent replacement through the relay, and developer apply | "Developer apply is admin-only … UI matches the mockup." |
+| Developer apply of a migrating control-plane digest (backup rule) | #360 RH06-08 for the drawer; #364 RH06-12 for the dump and confirmation it reuses | The same Decision 14 database rule as a migrating release. |
 
 Tickets with no console surface of their own:
 - #353 RH06-01 (contracts). It supplies the identifiers these surfaces read: `below_floor`,
@@ -106,11 +127,20 @@ Tickets with no console surface of their own:
 - The wording uses `CONTEXT.md` terms: Seed, Recovery actor, Service owner, External
   manager, Combined host / GPU host / Control-only host, Enrollment, Attempt, Fleet run,
   Replacement, Platform release.
-- Implementation identifiers (`owner_conflict`, `below_floor`, `backup_failed`, attempt ids,
-  labels) appear only under a closed **Details** disclosure (`.diag`). This follows how the
-  audit log treats key/value detail.
+- What the operator acts on appears in the copy: the commands they run (in copyable
+  blocks) and the name of a container they must remove. Wire identifiers — check ids
+  (`owner_conflict`), eligibility and failure reasons (`below_floor`, `backup_failed`),
+  attempt ids, container labels — appear only under a closed **Details** disclosure
+  (`.diag`). This follows how the audit log treats key/value detail.
 - Stated wherever it applies: migrating updates are never applied unattended (D14), and an
   agent update ends that host's sessions (D9). A recovery-actor-only update ends none.
+- Every update moves the machine's recovery actor first (Decision 13). So a failure at a
+  later step (a dump refused, a node agent that never became healthy) leaves the actor on
+  the new release. The copy says so; it does not claim "nothing changed". On the control
+  plane's own machine, the actor running one release ahead is expected (A1).
+- The glossary term is **External manager**. The Add host tab is labelled "Dockge or
+  Arcane", the two managers RH-06 supports, and its body opens with the spec's line,
+  "Using Dockge or Arcane? Paste this stack instead."
 
 ## What is new to the handoff, and why
 
@@ -123,15 +153,15 @@ are composed from existing tokens and parts. The CSS lives in the `<style>` of
 | `.modal`, `.modal-head/-body/-foot` | the drawer's `dw-head/-body/-foot` spacing on a `--r-feature` panel with the palette's glass | `.modal` in `web/src/styles/primitives.css` (same derivation) |
 | `.snippet` | `--surf-inset`, `--line`, `--r-control`, mono `--t-xs` | `.enroll-snippet` in `web/src/styles/admin/fleet.css` |
 | `.diag` | the `.rel-e` disclosure from releases-v3 and the `.aud-pre` mono readout | none yet |
-| `.stage`, `.spec*` | mock framing only (a stand-in scrim, gallery captions) | not to be ported |
+| `.stage`, `.spec*` | mock framing only: a stand-in scrim (the `.dscrim` colour, `oklch(0.05 0.01 267/.52)`) and gallery captions | not to be ported |
 
 **Flag: no pattern to borrow.** The centred dialog has no handoff precedent. The product's
 existing `Modal` is the closest match, and this follows it.
 
 ## Visual verification
 
-The mockup and the existing mocks were rendered with the same headless Chromium at
-1440 px and compared side by side:
+The mockup and the existing mocks were rendered with the same headless Chromium in a
+1440 px viewport and compared side by side:
 
 - Fleet ▸ Hosts against `admin-console-v3.html#/fleet/hosts`.
 - The host page against `#/fleet/hosts/c2059601`.
@@ -140,7 +170,7 @@ The mockup and the existing mocks were rendered with the same headless Chromium 
 
 Typography (IBM Plex Sans/Mono, the `--t-*` scale), table heads, rows and bars, tabs,
 segmented controls, buttons, notes, cards, the drawer's `fsec` grid and the rail cards all
-match. They are the same classes. The key surfaces were also rendered at 900 px, and the
+match. They are the same classes. The key surfaces were also rendered in a 900 px viewport, and the
 cards wrap as the existing mocks do.
 
 Deviations and observations:
@@ -149,20 +179,56 @@ Deviations and observations:
   `.chip-success` and so on at equal specificity. `releases-v3.png`'s PRE-RELEASE chip is
   grey for this reason. The RH-06 chips keep their intended `chip-warning` class and render
   the same way. This was left alone: fixing it restyles every existing mock.
-- On Releases the split grid stays two columns at 900 px, because the split is inline, as
+- On Releases the split grid stays two columns in a 900 px viewport, because the split is inline, as
   in releases-v3.
+
+## Data the mock assumes — needs a source in RH06-01 or the implementing slice
+
+The mock shows these values, but no approved contract field carries them yet. Each needs
+a field in the RH06-01 amendment (#353), or the implementing slice must supply it (or drop
+it from the UI).
+
+| Value shown | Where | Likely owner |
+|---|---|---|
+| The operator's database address (`db.example:5432`) and a "reachable" state | inventory (host page, Releases ▸ Installed), backup dialog, restore variant | #361 / #353 (inventory status) |
+| Quasar's own Postgres version ("Postgres 16.4") | host-page inventory | #361 / #353 |
+| Per-service state (running / not found / as of HH:MM) and the time of the last report | every inventory specimen | #357 / #361 / #353 (status shape) |
+| The seed's owner kind (external manager vs `docker run`) | inventory Owner column | #358 (see open question 4) |
+| Machine shape per host (Combined / GPU / Control-only) | Hosts rows, inventory | #357 / #361 / #353 (host body) |
+| The dump's size and the machine's free space ("about 1.4 GB; 212 GB free"; "0.6 GB is free") | backup dialog, Developer apply | #364 / #353 (preflight `backup_space`) |
+| The dump's name and the time it was taken | restore card | #364 / #353 (attempt dump reference) |
+| That a *developer-apply* control-plane digest migrates, and its schema step (88 → 91) | Developer apply migrating states | #360 / #364 (image-carried schema version) |
+| Allowed namespaces listed "set on each machine" | Developer apply | #360 (the allowlist lives with the actor; the console needs to read it) |
+| Removal progress (sessions still to end, longest duration, who started it) | remove-progress | #366 |
+| "Seed not checked yet" (the actor's seed check has not run since it restarted) | seed-unknown | #358 / #366 |
+| Per-component outcomes inside one attempt (recovery actor succeeded, node agent restored) | floor-failed, update-refused Details | #360 / #363 / #353 (`release_state` components) |
 
 ## Open questions for the owner
 
-1. **Restore with an operator's own database.** D7/R1 specify `restore` against Quasar's
-   own dump. For an external database, the mock proposes: the operator restores their own
-   backup, then runs `restore --to <version>`, which starts that control plane only if the
-   schema matches. This is not specified. #364 should confirm it or replace it.
+1. **The restore commands — both PROPOSED, not spec. Decide in #364 / #352.**
+   - *Quasar's own database* (`restore-own`). The mock uses the architecture's shape: the
+     seed image run with `restore --dump <dump>`
+     (`… quasar-recovery@sha256:… restore --dump 2026-09-25T1402Z-schema-88`). It names
+     the dump but not the version. The version it returns to (v0.5.2, the release the dump
+     was taken under) is stated in the copy beside it. #354 asks for "the exact one-line
+     restore command naming the dump and the version it returns to". **Decide** whether
+     the command itself must also carry the version (for example a `--to <version>`
+     flag). If so, the actor has to refuse a version that does not match the dump.
+   - *Operator's own database* (`restore-external`). D7/R1 define `restore` only against
+     Quasar's own dump. The mock proposes: the operator restores their own backup with
+     their own tools, then runs `restore --to <version>`. That starts the named control
+     plane only if the database's schema matches it, and refuses otherwise. **Neither the
+     flag nor this flow is in the spec.** Confirm it, replace it, or state that this case
+     prints no command.
 2. **Removing an offline GPU host.** The mock refuses (Remove disabled, with an
    explanation), because the actor must be reachable to remove containers, and R1 cut
    "forget this host's credentials". Confirm, or specify what should happen.
-3. **"Offered only an update" (D9).** Read as: Settings, Local console and revert are not
-   offered while below the floor. Drain and Remove stay available.
+3. **"Offered only an update" (D9).** D9's wording restricts only release actions: "is
+   offered only an update" (so no revert). **The mock goes beyond that.** It also hides
+   Settings and Local console (RH-05 host policy) while a host is below the floor, on the
+   reading that "cannot be managed" covers them too. Drain and Remove stay available.
+   Confirm the wider reading, or narrow it to release actions only. That would restore
+   Settings and Local console in `floor*.png`.
 4. **Seed owner display.** The mock shows "External manager" for a stack-managed seed and
    "You (docker run)" for one started by the one-line command. This assumes the recovery
    actor can tell the two apart (for example from the seed's container labels). If it

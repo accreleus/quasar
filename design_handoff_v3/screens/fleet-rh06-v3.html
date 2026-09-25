@@ -28,9 +28,10 @@
       same way.
    5. .snippet: a copyable command. Same as the product's .enroll-snippet
       (web/src/styles/admin/fleet.css): an inset surface with mono text.
-   6. .diag: a closed-by-default "Details" disclosure. This is the only place
-      implementation identifiers appear. It uses the .rel-e disclosure pattern
-      from releases-v3 and the .aud-pre mono readout.
+   6. .diag: a closed-by-default "Details" disclosure. Wire identifiers (check
+      ids, reasons, attempt ids, labels) appear only here; commands and
+      container names the operator acts on are in the copy. It uses the .rel-e
+      disclosure pattern from releases-v3 and the .aud-pre mono readout.
    7. .rel-e / .rel-c / .rel-t / .rel-x / .rel-fact: copied unchanged from
       releases-v3.html's pages-releases style block.
 -->
@@ -50,7 +51,7 @@
  .toc{columns:2;column-gap:var(--s8);font-size:var(--t-sm);margin:0 0 var(--s7);padding-left:18px;color:var(--text-3)}
  .toc a{cursor:pointer}
  /* 3. stage: a mock-only stand-in for the fixed scrim */
- .stage{display:flex;justify-content:center;align-items:flex-start;padding:var(--s8) var(--s5);border-radius:var(--r-panel);background:oklch(0.05 0.01 267/.6);border:1px solid var(--line)}
+ .stage{display:flex;justify-content:center;align-items:flex-start;padding:var(--s8) var(--s5);border-radius:var(--r-panel);background:oklch(0.05 0.01 267/.52);border:1px solid var(--line)} /* .dscrim's own scrim colour */
  .stage-drawer{justify-content:flex-end;padding:0 0 0 var(--s8);overflow:hidden}
  .stage .drawer{position:relative;inset:auto;width:min(680px,100%);box-shadow:var(--shadow-lg)}
  /* 4. modal: drawer parts on a feature-radius panel */
@@ -85,7 +86,7 @@
 </head>
 <body>
 <h1 class="ref">Fleet — Quasar-owned machines (RH-06)</h1>
-<p class="intro">Reference for the RH-06 console surfaces (#354), <strong>awaiting owner approval</strong>. It extends Fleet ▸ Hosts, the host page and Fleet ▸ Releases the way <code>admin-console-v3.html</code> and <code>releases-v3.html</code> draw them. Each specimen below is one surface in one state, rendered by <code>assets/pages-rh06.js</code> with the console-v3 classes and <code>ui.js</code> helpers. Dialogs sit on a stand-in scrim so they can be shown in page flow. Machine names, versions, digests and addresses are placeholders. Wording follows <code>CONTEXT.md</code>; identifiers appear only under a closed “Details” disclosure. Screenshots and the surface-to-ticket table are in <code>rh06/README.md</code>.</p>
+<p class="intro">Reference for the RH-06 console surfaces (#354), <strong>awaiting owner approval</strong>. It extends Fleet ▸ Hosts, the host page and Fleet ▸ Releases the way <code>admin-console-v3.html</code> and <code>releases-v3.html</code> draw them. Each specimen below is one surface in one state, rendered by <code>assets/pages-rh06.js</code> with the console-v3 classes and <code>ui.js</code> helpers. Dialogs sit on a stand-in scrim so they can be shown in page flow. Machine names, versions, digests and addresses are placeholders. Wording follows <code>CONTEXT.md</code>. Commands and container names the operator acts on appear in the copy and in copyable blocks; wire identifiers (check ids, reasons, attempt ids, labels) appear only under a closed “Details” disclosure. Screenshots and the surface-to-ticket table are in <code>rh06/README.md</code>.</p>
 <ol class="toc" id="toc"></ol>
 <div id="mount"></div>
 <script src="assets/ui.js"></script>
@@ -95,8 +96,10 @@
 const SPECS=[
  ['hosts','Fleet ▸ Hosts','normal','Each row shows the machine’s shape and one attention chip. The expanded row adds a Services column. The Enroll host button becomes Add host.',()=>pageRhHosts()],
  ['inv-combined','1 · Service inventory','normal · combined host','The host page gains “Services on this machine”: every service on the machine with its version and owner. A machine that runs the control plane is not removed from the console.',()=>pageRhInventory('combined')],
- ['inv-gpu','1 · Service inventory','normal · GPU host, older agent','A GPU host has no database and no control plane. An agent older than the control plane says where to update it.',()=>pageRhInventory('gpu')],
- ['inv-control-only','1 · Service inventory','normal · control-only host, your own database','A control-only host has no host row, so its services show on Releases ▸ Installed. With an operator’s own database, the card says what Quasar will not do.',()=>`<div style="max-width:300px">${rhInstalled({external:true})}</div>`],
+ ['inv-gpu','1 · Service inventory','normal · GPU host, older agent','A GPU host has no database and no control plane. An agent older than the control plane says where to update it. Its seed was started by the one-line command.',()=>pageRhInventory('gpu')],
+ ['inv-control-only','1 · Service inventory','normal · control-only host, your own database','A control-only host has no host row, so its services show on Releases ▸ Installed, each with version, owner and state. With an operator’s own database, the card says what Quasar will not do.',()=>`<div style="max-width:300px">${rhInstalled({external:true})}</div>`],
+ ['inv-control-only-unknown','1 · Service inventory','unknown · control-only host, not reported yet','The control plane reports its own version; the rest waits for the recovery actor.',()=>`<div style="max-width:300px">${rhInstalled({external:true,state:'unknown'})}</div>`],
+ ['inv-control-only-error','1 · Service inventory','error · control-only host, recovery actor not answering','',()=>`<div style="max-width:300px">${rhInstalled({external:true,state:'error'})}</div>`],
  ['inv-unknown','1 · Service inventory','unknown · not reported yet','',()=>pageRhInventory('unknown')],
  ['inv-error','1 · Service inventory','error · recovery actor not answering','The last report stays on screen, marked with its time.',()=>pageRhInventory('error')],
  ['seed-missing','2 · Seed-missing warning','normal','',()=>pageRhWarning('seed')],
@@ -110,7 +113,7 @@ const SPECS=[
  ['releases','Fleet ▸ Releases','normal','Installed shows this machine’s services. Targets explain every host that is not simply ready. Developer apply has its own card.',()=>pageRhReleases()],
  ['add-options','4 · Add host','normal · one-line command, before creating','Tab 1 is the default. The node name is optional; expiry defaults to one hour and goes up to 30 days.',()=>stage(rhAddHost('options'))],
  ['add-ready','4 · Add host','normal · command created','The pinned-key one-liner, in the same form as today.',()=>stage(rhAddHost('ready'))],
- ['add-stack','4 · Add host','normal · stack-manager tab','The stack holds only the seed; field names are illustrative until RH06-07 fixes them.',()=>stage(rhAddHost('stack'))],
+ ['add-stack','4 · Add host','normal · Dockge or Arcane tab','For an external manager. The stack holds only the seed; field names are illustrative until RH06-07 fixes them.',()=>stage(rhAddHost('stack'))],
  ['add-loading','4 · Add host','unknown · certificate not read yet','',()=>stage(rhAddHost('loading'))],
  ['add-error','4 · Add host','error · could not create the command','',()=>stage(rhAddHost('error'))],
  ['add-http','4 · Add host','error · page not on HTTPS','Kept from today’s enroll dialog.',()=>stage(rhAddHost('http'))],
@@ -119,17 +122,19 @@ const SPECS=[
  ['update-external-checked','5 · Migrating update: backup','normal · your own database, confirmed','',()=>stage(rhUpdateModal('external-checked'))],
  ['update-unknown','5 · Migrating update: backup','unknown · free space not reported','',()=>stage(rhUpdateModal('own-unknown'))],
  ['update-space','5 · Migrating update: backup','error · not enough free space','',()=>stage(rhUpdateModal('own-error'))],
- ['update-refused','5 · Migrating update: backup','error · refused after starting: the dump failed','The Releases banner after the run.',()=>rhRefusedBanner],
- ['restore-own','6 · Failed migrating update: restore','normal · Quasar’s own database','One command that names the dump and the version it returns to.',()=>rhRestore('own')],
+ ['update-refused','5 · Migrating update: backup','error · refused after starting: the dump failed','The Releases banner after the run. The recovery actor moved first, so it is already on the new release.',()=>rhRefusedBanner],
+ ['restore-own','6 · Failed migrating update: restore','normal · Quasar’s own database','The command names the dump, in the architecture’s restore --dump shape; the copy names the version it returns to. See README open question 1.',()=>rhRestore('own')],
  ['restore-unknown','6 · Failed migrating update: restore','unknown · dump not reported yet','',()=>rhRestore('unknown')],
- ['restore-external','6 · Failed migrating update: restore','variant · your own database','Proposed. The command for this case is an open question for RH06-12 (see README).',()=>rhRestore('external')],
+ ['restore-external','6 · Failed migrating update: restore','variant · your own database','PROPOSED, not in the spec: the restore --to command for this case is open question 1 for RH06-12 (see README).',()=>rhRestore('external')],
  ['remove-confirm','7 · Remove host','normal · confirmation','',()=>stage(rhRemove('confirm'))],
  ['remove-progress','7 · Remove host','normal · in progress','',()=>rhRemove('progress')],
  ['remove-offline','7 · Remove host','unknown · host not connected','',()=>stage(rhRemove('offline'))],
  ['remove-failed','7 · Remove host','error · removal did not finish','',()=>rhRemove('failed')],
  ['devapply','8 · Developer apply','normal · filled','Opens from Releases ▸ Developer apply, in the drawer pattern from pages-library.js.',()=>stage(rhDevApply('filled'),'drawer')],
  ['devapply-empty','8 · Developer apply','empty','',()=>stage(rhDevApply('empty'),'drawer')],
- ['devapply-error','8 · Developer apply','error · namespace refused, tag instead of digest','',()=>stage(rhDevApply('error'),'drawer')]];
+ ['devapply-error','8 · Developer apply','error · namespace refused, tag instead of digest','',()=>stage(rhDevApply('error'),'drawer')],
+ ['devapply-migrating','8 · Developer apply','normal · control-plane digest that migrates, Quasar’s own database','The same database rule as a migrating release: drain, never unattended, dump first or refuse.',()=>stage(rhDevApply('migrating'),'drawer')],
+ ['devapply-migrating-external','8 · Developer apply','normal · control-plane digest that migrates, your own database','Apply stays disabled until the backup is confirmed, as in the fleet run.',()=>stage(rhDevApply('migrating-external'),'drawer')]];
 document.getElementById('toc').innerHTML=SPECS.map(([id,s,st])=>`<li><a href="#s-${id}">${s}</a> — ${st}</li>`).join('');
 document.getElementById('mount').innerHTML=SPECS.map(([id,s,st,note,fn])=>`<section class="spec" id="s-${id}">
  <div class="spec-cap"><span class="t">${s}</span><span class="chip${/^error/.test(st)?' chip-danger':/^unknown|^empty/.test(st)?'':/^variant/.test(st)?' chip-warning':' chip-accent'}">${st}</span>${note?`<span class="hint">${note}</span>`:''}</div>
