@@ -1,20 +1,20 @@
 //! SDK details for read-only installation and storage facts.
 use super::{classify, discover};
-use crate::runtime::{ErrorKind, RuntimeConfig, RuntimeError};
+use crate::{ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 
-fn mount_kind(value: &str) -> crate::runtime::MountKind {
+fn mount_kind(value: &str) -> crate::MountKind {
     match value {
-        "bind" => crate::runtime::MountKind::Bind,
-        "volume" => crate::runtime::MountKind::Volume,
-        "tmpfs" => crate::runtime::MountKind::Tmpfs,
-        other => crate::runtime::MountKind::Other(other.to_owned()),
+        "bind" => crate::MountKind::Bind,
+        "volume" => crate::MountKind::Volume,
+        "tmpfs" => crate::MountKind::Tmpfs,
+        other => crate::MountKind::Other(other.to_owned()),
     }
 }
 
 fn container_inspection(
     info: bollard::models::ContainerInspectResponse,
-) -> Result<crate::runtime::ContainerInspection, RuntimeError> {
+) -> Result<crate::ContainerInspection, RuntimeError> {
     let id = info
         .id
         .filter(|value| !value.is_empty())
@@ -57,7 +57,7 @@ fn container_inspection(
             let source = mount
                 .source
                 .filter(|value| !value.is_empty())
-                .map(|value| crate::runtime::DaemonHostPath(value.into()));
+                .map(|value| crate::DaemonHostPath(value.into()));
             let usable_source = source.as_ref().is_some_and(|source| {
                 source.0.is_absolute()
                     && !source
@@ -67,18 +67,16 @@ fn container_inspection(
             });
             if matches!(
                 kind,
-                crate::runtime::MountKind::Bind
-                    | crate::runtime::MountKind::Volume
-                    | crate::runtime::MountKind::Other(_)
+                crate::MountKind::Bind | crate::MountKind::Volume | crate::MountKind::Other(_)
             ) && !usable_source
             {
                 return Err(ErrorKind::Protocol.into());
             }
             let name = mount.name.filter(|value| !value.is_empty());
-            if matches!(kind, crate::runtime::MountKind::Volume) && name.is_none() {
+            if matches!(kind, crate::MountKind::Volume) && name.is_none() {
                 return Err(ErrorKind::Protocol.into());
             }
-            Ok(crate::runtime::Mount {
+            Ok(crate::Mount {
                 kind,
                 source,
                 name,
@@ -87,7 +85,7 @@ fn container_inspection(
             })
         })
         .collect::<Result<Vec<_>, RuntimeError>>()?;
-    Ok(crate::runtime::ContainerInspection {
+    Ok(crate::ContainerInspection {
         id,
         image_id,
         configured_image,
@@ -97,10 +95,10 @@ fn container_inspection(
     })
 }
 
-pub(crate) async fn inspect_container(
+pub async fn inspect_container(
     config: &RuntimeConfig,
     id: &str,
-) -> Result<Option<crate::runtime::ContainerInspection>, RuntimeError> {
+) -> Result<Option<crate::ContainerInspection>, RuntimeError> {
     if id.trim().is_empty() || id.contains(['/', '?', '#', '\0']) {
         return Err(ErrorKind::InvalidConfiguration.into());
     }
@@ -111,7 +109,7 @@ pub(crate) async fn inspect_container(
 async fn inspect_container_with(
     docker: &Docker,
     id: &str,
-) -> Result<Option<crate::runtime::ContainerInspection>, RuntimeError> {
+) -> Result<Option<crate::ContainerInspection>, RuntimeError> {
     match docker.inspect_container(id, None).await {
         Ok(info) => Ok(Some(container_inspection(info)?)),
         Err(Error::DockerResponseServerError {
@@ -121,9 +119,9 @@ async fn inspect_container_with(
     }
 }
 
-pub(crate) async fn live_containers(
+pub async fn live_containers(
     config: &RuntimeConfig,
-) -> Result<Vec<crate::runtime::ContainerInspection>, RuntimeError> {
+) -> Result<Vec<crate::ContainerInspection>, RuntimeError> {
     let (docker, _) = discover(config).await?;
     let listed = docker
         .list_containers(Some(bollard::query_parameters::ListContainersOptions {
@@ -165,9 +163,9 @@ pub(crate) async fn live_containers(
 /// A complete daemon inventory. Ref enumeration is required before the agent can
 /// claim that old managed versions are classified; the legacy current record is
 /// insufficient evidence.
-pub(crate) async fn daemon_images(
+pub async fn daemon_images(
     config: &RuntimeConfig,
-) -> Result<Vec<crate::runtime::DaemonImage>, RuntimeError> {
+) -> Result<Vec<crate::DaemonImage>, RuntimeError> {
     let (docker, _) = discover(config).await?;
     let images = docker
         .list_images(Some(bollard::query_parameters::ListImagesOptions {
@@ -188,15 +186,13 @@ pub(crate) async fn daemon_images(
                 .chain(image.repo_digests)
                 .filter(|r| r != "<none>:<none>")
                 .collect();
-            Ok(crate::runtime::DaemonImage { id: image.id, refs })
+            Ok(crate::DaemonImage { id: image.id, refs })
         })
         .collect()
 }
 
 /// Includes running and stopped containers, regardless of Quasar ownership.
-pub(crate) async fn all_container_image_ids(
-    config: &RuntimeConfig,
-) -> Result<Vec<String>, RuntimeError> {
+pub async fn all_container_image_ids(config: &RuntimeConfig) -> Result<Vec<String>, RuntimeError> {
     let (docker, _) = discover(config).await?;
     let containers = docker
         .list_containers(Some(bollard::query_parameters::ListContainersOptions {
@@ -216,9 +212,7 @@ pub(crate) async fn all_container_image_ids(
         .collect()
 }
 
-pub(crate) async fn engine_storage(
-    config: &RuntimeConfig,
-) -> Result<crate::runtime::EngineStorage, RuntimeError> {
+pub async fn engine_storage(config: &RuntimeConfig) -> Result<crate::EngineStorage, RuntimeError> {
     let (docker, _) = discover(config).await?;
     let root = docker
         .info()
@@ -228,15 +222,15 @@ pub(crate) async fn engine_storage(
         .filter(|value| !value.is_empty())
         .filter(|value| std::path::Path::new(value).is_absolute())
         .ok_or(ErrorKind::Protocol)?;
-    Ok(crate::runtime::EngineStorage {
-        root: crate::runtime::DaemonHostPath(root.into()),
+    Ok(crate::EngineStorage {
+        root: crate::DaemonHostPath(root.into()),
     })
 }
 
-pub(crate) async fn inspect_image_metadata(
+pub async fn inspect_image_metadata(
     config: &RuntimeConfig,
     image: &str,
-) -> Result<Option<crate::runtime::ImageMetadata>, RuntimeError> {
+) -> Result<Option<crate::ImageMetadata>, RuntimeError> {
     if image.trim().is_empty() {
         return Err(ErrorKind::InvalidConfiguration.into());
     }
@@ -244,7 +238,7 @@ pub(crate) async fn inspect_image_metadata(
     match docker.inspect_image(image).await {
         Ok(info) => {
             let config = info.config.ok_or(ErrorKind::Protocol)?;
-            Ok(Some(crate::runtime::ImageMetadata {
+            Ok(Some(crate::ImageMetadata {
                 id: info
                     .id
                     .filter(|value| !value.is_empty())

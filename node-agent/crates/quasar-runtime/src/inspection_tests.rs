@@ -2,6 +2,7 @@
 use super::*;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
+use std::time::Duration;
 
 const VERSION: &str = r#"{"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"}"#;
 

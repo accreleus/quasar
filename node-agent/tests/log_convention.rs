@@ -56,6 +56,18 @@ fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
+/// Every source tree linked into the agent: its own, then the shared runtime crate's
+/// (#355), whose files are reported as `quasar-runtime/<path>`.
+fn source_roots() -> [(PathBuf, &'static str); 2] {
+    [
+        (src_root(), ""),
+        (
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/quasar-runtime/src"),
+            "quasar-runtime/",
+        ),
+    ]
+}
+
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
@@ -98,17 +110,18 @@ fn is_code(line: &str, start: usize) -> bool {
 /// the first argument. `gst::loggable_error!` and friends are not tracing macros
 /// and are skipped — the `!` must be preceded by exactly `warn` or `error`.
 fn collect_sites() -> Vec<Site> {
-    let root = src_root();
     let mut files = Vec::new();
-    rs_files(&root, &mut files);
+    for (root, prefix) in source_roots() {
+        let mut found = Vec::new();
+        rs_files(&root, &mut found);
+        files.extend(found.into_iter().map(|path| {
+            let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
+            (format!("{prefix}{rel}"), path)
+        }));
+    }
     let mut sites = Vec::new();
-    for path in files {
+    for (rel, path) in files {
         let text = std::fs::read_to_string(&path).expect("read source file");
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
         for (idx, line) in text.lines().enumerate() {
             for name in ["warn", "error"] {
                 let pat = format!("{name}!(");

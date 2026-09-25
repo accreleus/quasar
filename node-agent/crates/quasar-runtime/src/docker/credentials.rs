@@ -1,9 +1,9 @@
 //! Read the existing Docker login configuration; never expose credentials in errors.
-use super::*;
+use crate::{ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::auth::DockerCredentials;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub(super) async fn load(
+pub async fn load(
     config: &RuntimeConfig,
     image: &str,
 ) -> Result<Option<DockerCredentials>, RuntimeError> {
@@ -164,7 +164,7 @@ async fn resolve(
 
 /// Classic builds need a registry configuration, including private FROM images.
 /// Match Docker CLI's login discovery without invoking its engine CLI.
-pub(super) async fn load_all(
+pub async fn load_all(
     config: &RuntimeConfig,
 ) -> Result<Option<std::collections::HashMap<String, DockerCredentials>>, RuntimeError> {
     let Some(value) = read_config(config).await? else {

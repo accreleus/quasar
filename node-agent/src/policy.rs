@@ -2,12 +2,12 @@
 //! (`policy_catalog::NEXT_SESSION_GROUPS`). The journal is committed before
 //! mutating the session settings snapshot.
 
+use quasar_runtime::DurableFile;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -1310,20 +1310,7 @@ impl PolicyAgent {
 }
 
 fn persist_journal(path: &Path, journal: &Journal) -> std::io::Result<()> {
-    let tmp = path.with_extension("policy.tmp");
-    let bytes = serde_json::to_vec(&journal.on_disk()).map_err(std::io::Error::other)?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp)?;
-    f.write_all(&bytes)?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        OpenOptions::new().read(true).open(parent)?.sync_all()?;
-    }
-    Ok(())
+    DurableFile::new(path, "policy.tmp").store(&journal.on_disk())
 }
 
 fn record_restart_phase(

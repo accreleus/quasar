@@ -1,16 +1,15 @@
-//! Bollard types and protocol details stay private to this adapter.
-use super::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
+//! Bollard types and protocol details stay private to this adapter. The engine
+//! seam it builds on (discovery, classification, credentials, read-only
+//! inspection) is `quasar_runtime::docker`.
+use super::{ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 use futures_util::StreamExt;
+use quasar_runtime::docker::{
+    all_container_image_ids, classify, credentials, daemon_images, discover, image_error,
+};
 use std::sync::OnceLock;
 pub(super) mod application;
 mod build;
-mod credentials;
-mod inspection;
-pub(super) use inspection::{
-    all_container_image_ids, daemon_images, engine_storage, inspect_container,
-    inspect_image_metadata, live_containers,
-};
 pub(super) mod helpers;
 pub(super) mod legacy;
 pub(super) use build::build as build_image;
@@ -99,54 +98,6 @@ pub enum ExactRemoval {
     Referenced,
     IdentityMismatch,
     StillPresent,
-}
-
-fn classify(error: Error) -> RuntimeError {
-    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-    while let Some(current) = cause {
-        if current
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-        {
-            return ErrorKind::PermissionDenied.into();
-        }
-        cause = current.source();
-    }
-    match error {
-        Error::DockerResponseServerError {
-            status_code: 401 | 403,
-            ..
-        } => ErrorKind::PermissionDenied,
-        Error::DockerResponseServerError { .. } => ErrorKind::Engine,
-        Error::RequestTimeoutError => ErrorKind::Timeout,
-        Error::SocketNotFoundError(_)
-        | Error::IOError { .. }
-        | Error::HyperLegacyError { .. }
-        | Error::HyperResponseError { .. } => ErrorKind::Unavailable,
-        _ => ErrorKind::Protocol,
-    }
-    .into()
-}
-
-fn image_error(error: Error) -> RuntimeError {
-    let message = match &error {
-        Error::DockerStreamError { error } => error.as_str(),
-        Error::DockerResponseServerError { message, .. } => message.as_str(),
-        _ => return ErrorKind::UnknownOutcome.into(),
-    }
-    .to_lowercase();
-    if message.contains("no space left") {
-        ErrorKind::InsufficientDisk.into()
-    } else if message.contains("unauthorized")
-        || message.contains("denied")
-        || message.contains("authentication required")
-    {
-        ErrorKind::RegistryDenied.into()
-    } else if message.contains("manifest unknown") || message.contains("manifest not found") {
-        ErrorKind::ManifestMissing.into()
-    } else {
-        classify(error)
-    }
 }
 
 /// One reconciliation policy for every mutation of a reference.
@@ -347,87 +298,6 @@ pub(super) async fn remove_image(config: &RuntimeConfig, image: &str) -> Result<
     }
 }
 
-fn version(raw: Option<&str>) -> Result<ApiVersion, RuntimeError> {
-    let (major, minor) = raw
-        .and_then(|s| s.split_once('.'))
-        .ok_or(ErrorKind::Protocol)?;
-    Ok(ApiVersion {
-        major: major.parse().map_err(|_| ErrorKind::Protocol)?,
-        minor: minor.parse().map_err(|_| ErrorKind::Protocol)?,
-    })
-}
-
-pub(super) async fn discover(config: &RuntimeConfig) -> Result<(Docker, EngineInfo), RuntimeError> {
-    // Bollard's exists() check can hide permission errors on a parent directory.
-    tokio::fs::metadata(&config.socket)
-        .await
-        .map_err(|e| classify(e.into()))?;
-    let docker = Docker::connect_with_unix(
-        config.socket.to_str().unwrap(),
-        config.deadline.as_secs().max(1),
-        bollard::API_DEFAULT_VERSION,
-    )
-    .map_err(classify)?;
-    let reported = docker.version().await.map_err(classify)?;
-    let min = version(reported.min_api_version.as_deref())?;
-    let max = version(reported.api_version.as_deref())?;
-    // This slice uses the discovery/inspection contract at the module's API floor,
-    // which is also what the readiness wording quotes (#266).
-    let floor = super::API_FLOOR;
-    let ceiling = ApiVersion {
-        major: bollard::API_DEFAULT_VERSION.major_version,
-        minor: bollard::API_DEFAULT_VERSION.minor_version,
-    };
-    let selected = max.min(ceiling);
-    if min > max {
-        return Err(ErrorKind::Protocol.into());
-    }
-    if selected < floor || selected < min || selected.major != 1 {
-        return Err(ErrorKind::IncompatibleApi.into());
-    }
-    let info = EngineInfo {
-        name: reported
-            .platform
-            .map(|p| p.name)
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "unknown".into()),
-        version: reported
-            .version
-            .filter(|v| !v.is_empty())
-            .ok_or(ErrorKind::Protocol)?,
-        api_version: selected,
-        server_min_api: min,
-        server_max_api: max,
-    };
-    // Pin the actual wire path. Bollard 0.21.1's URI join discards its version
-    // prefix for absolute endpoint paths; negotiation must affect requests too.
-    let docker = Docker::connect_with_unix(
-        config.socket.to_str().unwrap(),
-        config.deadline.as_secs().max(1),
-        &bollard::ClientVersion {
-            major_version: selected.major,
-            minor_version: selected.minor,
-        },
-    )
-    .map_err(classify)?
-    .with_request_modifier(move |mut request| {
-        let mut parts = request.uri().clone().into_parts();
-        let path = parts
-            .path_and_query
-            .as_ref()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
-        parts.path_and_query = Some(
-            format!("/v{selected}{path}")
-                .parse()
-                .expect("valid versioned path"),
-        );
-        *request.uri_mut() = parts.try_into().expect("valid engine URI");
-        request
-    });
-    Ok((docker, info))
-}
-
 pub(super) async fn inspect_image(
     config: &RuntimeConfig,
     image: &str,
@@ -467,50 +337,6 @@ pub(super) async fn image_info(
     image: &str,
 ) -> Result<Option<super::ImageInfo>, RuntimeError> {
     Ok(image_state(docker, image).await?.map(|s| s.info))
-}
-
-/// One read-only `/info`, folded into [`super::EngineFacts`]. No CDI spec dir reported by
-/// the engine (`None`) is distinct from CDI reported but disabled (empty `spec_dirs`).
-pub(super) async fn inspect_engine(
-    config: &RuntimeConfig,
-) -> Result<super::EngineFacts, RuntimeError> {
-    let (docker, info) = discover(config).await?;
-    let sys = docker.info().await.map_err(classify)?;
-    let cgroup_version = sys.cgroup_version.and_then(|v| {
-        let v = v.to_string();
-        (!v.is_empty()).then_some(v)
-    });
-    let mut runtimes: Vec<String> = sys.runtimes.unwrap_or_default().into_keys().collect();
-    runtimes.sort();
-    let cdi = sys.cdi_spec_dirs.map(|spec_dirs| {
-        let devices = sys
-            .discovered_devices
-            .unwrap_or_default()
-            .into_iter()
-            .map(|device| {
-                let id = device
-                    .id
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| "unknown".into());
-                let source = device
-                    .source
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| "unknown".into());
-                format!("{id} ({source})")
-            })
-            .collect();
-        super::CdiFacts { spec_dirs, devices }
-    });
-    Ok(super::EngineFacts {
-        info,
-        operating_system: sys.operating_system,
-        architecture: sys.architecture,
-        cgroup_version,
-        security_options: sys.security_options.unwrap_or_default(),
-        runtimes,
-        default_runtime: sys.default_runtime,
-        cdi,
-    })
 }
 
 #[cfg(test)]
