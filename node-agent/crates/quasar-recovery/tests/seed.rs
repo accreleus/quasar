@@ -395,7 +395,11 @@ fn a_seed_finishes_its_own_create_after_a_crash_between_create_and_start() {
     });
     let before = engine.state();
     let outcome = seed(&engine, dir.path(), redeployed).step();
-    assert!(matches!(outcome, Outcome::Present { .. }), "{outcome:?}");
+    assert!(
+        matches!(&outcome, Outcome::Idle { token: "seed-actor-unstarted", why }
+            if why.contains("docker start quasar-recovery")),
+        "{outcome:?}"
+    );
     assert_eq!(engine.state(), before);
 }
 
@@ -472,8 +476,14 @@ fn an_actor_whose_seed_was_redeployed_before_the_first_install_reads_the_new_see
     seed(&engine, dir.path(), SEED_ID).step();
     let id = actor_id(&engine.state());
     let redeployed = "5eed400000000000000000000000000000000000000000000000000000000000";
+    // The original is left stopped beside the redeployed one: the running seed wins.
     engine.with_state(|s| {
-        s.containers.remove(SEED_ID);
+        let original = s.containers.get_mut(SEED_ID).unwrap();
+        original.status = "exited".into();
+        original
+            .spec
+            .env
+            .insert("QUASAR_NODE_NAME".into(), "stale-host".into());
         let mut env = seed_env();
         env.insert("QUASAR_NODE_NAME".into(), "renamed-host".into());
         s.containers.insert(

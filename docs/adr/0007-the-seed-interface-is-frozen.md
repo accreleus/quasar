@@ -46,8 +46,7 @@ own image. It never stops, replaces or removes anything, and never talks to the 
 
 ## Clarification: finishing its own create
 
-*(Proposed with #358; the Opus contract review under the standing RH06-01 process rules on
-it.)* Creating a container and starting it are two Engine API calls, so a seed can stop
+Creating a container and starting it are two Engine API calls, so a seed can stop
 between them: a crash, an engine restart, a create whose outcome it never saw. Left alone,
 the container it created counts as "a recovery actor exists" and is never started. We clarify
 that **starting a container the seed itself created and never started finishes that create;
@@ -64,7 +63,15 @@ every recovery actor: each actor container it creates, a hand-over's successor i
 carries at least one more label in the `io.quasar.` namespace (its recipe revision and
 specification digest do), so no actor-created container matches even if it copied
 `QUASAR_SEED_CONTAINER`. A seed redeployed under a new container id does not start its
-predecessor's unstarted create; `docker start` of that container does.
+predecessor's unstarted create; it logs that `docker start` of that container finishes it.
+
+A recovery actor that finds a running seed but cannot read its version reports
+`seed_version` as the value `unknown` rather than leaving it absent, since absent reads "no
+seed found". The value stays opaque, as amendment 14 defines `seed_version`: no consumer may
+parse or special-case `unknown` (or any other value).
+
+This clarification was approved by the Opus contract review on #358, 2026-09-25, under the
+owner's standing approval recorded on #352.
 
 ## The contract-test obligation
 

@@ -198,7 +198,7 @@ impl Actor {
         let machine = match self.dir.load_machine()? {
             Some(machine) => {
                 self.note_ignored_inputs(&machine);
-                self.note_label_mismatch(&machine)?;
+                self.note_label_mismatch(&machine);
                 machine
             }
             None => self.first_install()?,
@@ -340,9 +340,12 @@ impl Actor {
     /// A seed that found no `seed.json` on an installed machine labelled this actor with a
     /// new installation. Machine state wins; the seed then sees no actor of the installation
     /// `seed.json` names and says `seed-name-taken`, until this container is re-created.
-    fn note_label_mismatch(&self, machine: &Machine) -> Result<(), ResumeError> {
+    /// Only a diagnosis: an engine that does not answer here is left to the steps after it.
+    fn note_label_mismatch(&self, machine: &Machine) {
         let label = self
-            .own_container()?
+            .own_container()
+            .ok()
+            .flatten()
             .and_then(|me| me.labels.get(labels::INSTALLATION).cloned());
         if let Some(label) = label.filter(|l| *l != machine.installation_id) {
             warn!(
@@ -352,7 +355,6 @@ impl Actor {
                 names::RECOVERY_ACTOR
             );
         }
-        Ok(())
     }
 
     fn note_ignored_inputs(&self, machine: &Machine) {
@@ -844,11 +846,12 @@ fn service(c: &Container, role: &str) -> Service {
     }
 }
 
-/// `registry/repo:tag@sha256:…` → `registry/repo`.
 /// The reported version of a seed that exists but whose version could not be read.
-/// `seed_version` is opaque (agent-api.md amendment 14), so this is a value, not an absence.
+/// `seed_version` is opaque (agent-api.md amendment 14): no consumer may parse or
+/// special-case this value (ADR 0007).
 pub const SEED_VERSION_UNKNOWN: &str = "unknown";
 
+/// `registry/repo:tag@sha256:…` → `registry/repo`.
 pub(crate) fn repository_of(reference: &str) -> String {
     let without_digest = reference.split('@').next().unwrap_or(reference);
     match without_digest.rsplit_once(':') {

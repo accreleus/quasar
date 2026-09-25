@@ -1294,7 +1294,7 @@ given) and the `quasar-machine` volume at `/var/lib/quasar-machine`, read-only, 
 `QUASAR_NODE_NAME`, `QUASAR_AGENT_IMAGE`). The seed checks them before it creates anything,
 including that the agent image can be pulled and declares a recipe revision the actor
 carries (it pulls it). The actor reads them from the seed's container once, on the clean
-machine (a redeployed seed with a new container id is found by what it runs), so the
+machine (a redeployed seed with a new container id is found by what it runs, a running seed first), so the
 enrollment string never enters the actor's environment. Once the machine is installed they
 are not needed again, and the enrollment string can be removed from the stack.
 
@@ -1324,8 +1324,8 @@ Every 30 s (and at start) it looks once and logs only a change, so each conditio
 same seed container starts that actor: a container named `quasar-recovery`, never started,
 with only the two seed labels and this seed's own container id in `QUASAR_SEED_CONTAINER`
 (ADR 0007, "Finishing its own create"). It starts nothing else. A seed redeployed with a new
-container id in that window does not recognise the unstarted actor as its own and leaves it;
-`docker start quasar-recovery` finishes it.
+container id in that window does not recognise the unstarted actor as its own and leaves it,
+logging `token="seed-actor-unstarted"`; `docker start quasar-recovery` finishes it.
 
 `docker exec quasar-seed quasar-recovery status` prints what the last look came to; the
 image's health check uses it. The console shows the seed's version on the host's "Services

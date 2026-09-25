@@ -101,6 +101,16 @@ fn is_own_unstarted(c: &Container, me: Option<&str>) -> bool {
             .contains(&format!("{}={me}", profile::SEED_CONTAINER_ENV))
 }
 
+/// The seed container that created `c` and never started it, when `c` is such a create:
+/// the shape [`is_own_unstarted`] recognises, whichever seed it names.
+fn unstarted_create_of(c: &Container) -> Option<&str> {
+    let seed = c
+        .env
+        .iter()
+        .find_map(|kv| kv.strip_prefix(&format!("{}=", profile::SEED_CONTAINER_ENV)))?;
+    is_own_unstarted(c, Some(seed)).then_some(seed)
+}
+
 /// `me` is the seed's own full container id, when known.
 pub fn decide(read: &SeedRead, containers: &[Container], me: Option<&str>) -> Decision {
     let (installation, image) = match read {
@@ -155,13 +165,14 @@ pub fn is_seed(c: &Container) -> bool {
     program == Some("quasar-recovery") && c.command.get(1).map(String::as_str) == Some("seed")
 }
 
-/// The machine's seed, running or not: the container that created the actor (`hint`, from
-/// `QUASAR_SEED_CONTAINER`), else any seed, a running one first. A manager redeploy gives
-/// the seed a new id, which is why the hint alone is not enough.
+/// The machine's seed, a running one first: the running seed, preferring the one that
+/// created the actor (`hint`, from `QUASAR_SEED_CONTAINER`), else that one stopped, else any.
+/// A manager redeploy gives the seed a new id, which is why the hint alone is not enough.
 pub fn find<'a>(containers: &'a [Container], hint: Option<&str>) -> Option<&'a Container> {
     let seeds = || containers.iter().filter(|c| is_seed(c));
-    hint.and_then(|h| seeds().find(|c| c.id == h || c.name == h))
-        .or_else(|| seeds().find(|c| c.running))
+    let hinted = |c: &&Container| hint.is_some_and(|h| c.id == h || c.name == h);
+    find_running(containers, hint)
+        .or_else(|| seeds().find(hinted))
         .or_else(|| seeds().next())
 }
 
@@ -223,6 +234,7 @@ impl Outcome {
                 "seed-file-unknown-format" => warn!(token = "seed-file-unknown-format", "{why}"),
                 "seed-file-unreadable" => warn!(token = "seed-file-unreadable", "{why}"),
                 "seed-name-taken" => warn!(token = "seed-name-taken", "{why}"),
+                "seed-actor-unstarted" => warn!(token = "seed-actor-unstarted", "{why}"),
                 "seed-engine-unreachable" => warn!(token = "seed-engine-unreachable", "{why}"),
                 "seed-pull-failed" => warn!(token = "seed-pull-failed", "{why}"),
                 "seed-agent-image-unavailable" => {
@@ -385,7 +397,21 @@ impl Seed {
                 let installation = c.labels.get(INSTALLATION_LABEL).cloned();
                 self.start_own(c.id.clone(), c.image.clone(), installation.unwrap_or_default())
             }
-            Decision::ActorPresent { container } => Outcome::Present { container },
+            Decision::ActorPresent { container } => {
+                let creator = containers
+                    .iter()
+                    .find(|c| c.name == container)
+                    .and_then(unstarted_create_of);
+                match creator {
+                    Some(other) => Outcome::Idle {
+                        token: "seed-actor-unstarted",
+                        why: format!(
+                            "{container} was created by another seed container ({other}) and never started; this seed does not start it (ADR 0007). Run docker start {container}"
+                        ),
+                    },
+                    None => Outcome::Present { container },
+                }
+            }
             Decision::NameTaken { container } => Outcome::Idle {
                 token: "seed-name-taken",
                 why: format!(
