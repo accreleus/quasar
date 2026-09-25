@@ -240,12 +240,12 @@ export function StackedBar({ segments, totalLabel }: StackedBarProps): ReactElem
               }}
             />
             <span style={{ color: "var(--muted)" }}>{seg.label}</span>
-            <span style={{ color: "var(--text)" }}>{seg.value.toFixed(1)} ms</span>
+            <span className="text-1">{seg.value.toFixed(1)} ms</span>
           </span>
         ))}
         {totalLabel && (
           <span style={{ color: "var(--muted)" }}>
-            total <span style={{ color: "var(--text)" }}>{total.toFixed(1)} ms</span>
+            total <span className="text-1">{total.toFixed(1)} ms</span>
           </span>
         )}
       </div>

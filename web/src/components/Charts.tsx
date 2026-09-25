@@ -166,7 +166,7 @@ export function LineChart2({ series, unit = "", height = 120 }: LineChart2Props)
     <div ref={containerRef} style={{ width: "100%" }}>
       {/* legend */}
       {series.length > 1 && (
-        <div style={{ display: "flex", gap: 12, marginBottom: 4 }}>
+        <div className="mb1" style={{ display: "flex", gap: 12 }}>
           {series.map((s) => (
             <span
               key={s.label}

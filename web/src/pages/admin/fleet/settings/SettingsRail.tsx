@@ -29,7 +29,7 @@ export function SettingsRail({
     <div className="col gap4">
       <div className="card card-pad">
         <div className="eyebrow">Host</div>
-        <h3 style={{ fontSize: "var(--t-h3)", marginTop: 6 }}>{host?.node_name ?? "Unknown host"}</h3>
+        <h3 className="t-h3" style={{ marginTop: 6 }}>{host?.node_name ?? "Unknown host"}</h3>
         <div className="mono" style={{ color: "var(--text-3)", fontSize: "var(--t-xs)", marginTop: 3 }}>
           {host?.id}
         </div>

@@ -40,8 +40,8 @@ export function ChartCard({ title, unit, series, color, precision = 0 }: ChartCa
       <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
         <span className="eyebrow">{title}</span>
         <span
-          className="num"
-          style={{ marginLeft: "auto", fontSize: "var(--t-lg)", color: "var(--text)" }}
+          className="num t-lg"
+          style={{ marginLeft: "auto", color: "var(--text)" }}
         >
           {current === null ? "—" : current.toFixed(precision)}
           <span style={{ fontSize: "var(--t-xs)", color: "var(--text-3)", marginLeft: 3 }}>

@@ -15,10 +15,10 @@
     "inline-style": 21
   },
   "src/components/Charts.tsx": {
-    "inline-style": 15
+    "inline-style": 14
   },
   "src/components/Chip.tsx": {
-    "inline-style": 5
+    "inline-style": 4
   },
   "src/components/CopyableCommand.tsx": {
     "inline-style": 7
@@ -30,16 +30,13 @@
     "raw-colour-tsx": 4
   },
   "src/components/ReadinessCard.tsx": {
-    "inline-style": 16
-  },
-  "src/components/SecretField.tsx": {
-    "inline-style": 1
+    "inline-style": 15
   },
   "src/components/Table.tsx": {
     "inline-style": 4
   },
   "src/components/TelemetryChart.tsx": {
-    "inline-style": 35
+    "inline-style": 33
   },
   "src/components/TextField.tsx": {
     "inline-style": 7
@@ -132,7 +129,7 @@
     "inline-style": 4
   },
   "src/pages/admin/fleet/settings/SettingsRail.tsx": {
-    "inline-style": 20
+    "inline-style": 19
   },
   "src/pages/admin/library/AppConfirmModals.tsx": {
     "inline-style": 1
@@ -192,7 +189,7 @@
     "inline-style": 2
   },
   "src/pages/admin/sessions/SessionCharts.tsx": {
-    "inline-style": 12
+    "inline-style": 11
   },
   "src/pages/admin/sessions/SessionHero.tsx": {
     "inline-style": 10

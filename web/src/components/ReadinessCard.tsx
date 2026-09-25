@@ -314,7 +314,7 @@ export function ReadinessCard({
           {inertOverrides.map((o) => (
             <div key={o.check_id} className="row gap2" style={{ alignItems: "center" }}>
               <span className="mono">{o.check_id}</span>
-              <span className="muted" style={{ fontSize: "var(--t-xs)" }}>
+              <span className="muted t-xs">
                 This host no longer reports this check, so the override does nothing.
               </span>
               {onClearOverride && (
