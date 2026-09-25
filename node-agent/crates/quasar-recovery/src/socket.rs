@@ -5,6 +5,9 @@
 //! field added on one side and not the other fails a test on both. Field spellings of
 //! [`AttemptResult`] are the Go updater's result file's (`updater/result.go`), so the
 //! agent's `release_state` relay stays a re-frame.
+//!
+//! What the actor reads ([`Request`] and its parts) refuses unknown fields; what it writes
+//! does not, because the actor moves first and an older reader must accept a newer one.
 
 use std::fmt;
 
@@ -44,6 +47,7 @@ pub enum RequestKind {
 pub struct Request {
     pub request_id: String,
     pub kind: RequestKind,
+    #[serde(deserialize_with = "null_as_empty")]
     pub components: Vec<Component>,
     pub release: Release,
     #[serde(default)]
@@ -67,9 +71,13 @@ fn is_zero(n: &i64) -> bool {
     *n == 0
 }
 
+/// A Go nil slice encodes as `null`; read it as empty. The field is still required.
+fn null_as_empty<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+}
+
 /// The digest a component was on before, `null` (never omitted) when it could not be told.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Previous {
     pub name: String,
     pub digest: Option<String>,
@@ -77,15 +85,14 @@ pub struct Previous {
 
 /// The answer to an admitted submit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Accepted {
     pub request_id: String,
+    #[serde(deserialize_with = "null_as_empty")]
     pub previous: Vec<Previous>,
 }
 
 /// The answer to a refused submit. Nothing was journalled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Rejection {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub request_id: String,
@@ -114,12 +121,13 @@ impl State {
 /// One attempt's observable state. `reason` is non-null exactly when `state` is `failed`;
 /// an interrupted attempt is `failed` with reason `interrupted` and `restored: false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AttemptResult {
     pub request_id: String,
     pub state: State,
     pub reason: Option<Reason>,
+    #[serde(deserialize_with = "null_as_empty")]
     pub components: Vec<Component>,
+    #[serde(deserialize_with = "null_as_empty")]
     pub previous: Vec<Previous>,
     pub output: String,
     pub started_at: String,
@@ -146,7 +154,6 @@ pub enum DatabaseMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ActorIdentity {
     pub version: String,
     pub commit: String,
@@ -155,7 +162,6 @@ pub struct ActorIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SeedIdentity {
     pub version: String,
     pub digest: Option<String>,
@@ -163,7 +169,6 @@ pub struct SeedIdentity {
 
 /// One platform service's container as the actor last inspected it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Service {
     /// `control-plane`, `node-agent`, `postgres` or `recovery-actor`.
     pub role: String,
@@ -179,7 +184,6 @@ pub struct Service {
 /// A container that looks like a platform service but lacks this installation's labels
 /// (the race guard): reported, never acted on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Conflict {
     pub container: String,
     pub image: String,
@@ -187,7 +191,6 @@ pub struct Conflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Dump {
     pub name: String,
     pub schema_version: i64,
@@ -197,15 +200,17 @@ pub struct Dump {
 
 /// The machine inventory, plus one attempt's result when a request id was asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Status {
     pub actor: ActorIdentity,
     pub seed: Option<SeedIdentity>,
     pub role: MachineRole,
     pub database: DatabaseMode,
+    #[serde(deserialize_with = "null_as_empty")]
     pub services: Vec<Service>,
+    #[serde(deserialize_with = "null_as_empty")]
     pub conflicts: Vec<Conflict>,
     pub in_flight: Option<String>,
+    #[serde(deserialize_with = "null_as_empty")]
     pub dumps: Vec<Dump>,
     pub result: Option<AttemptResult>,
     /// True when the inventory is the last one because the engine was slow to answer.

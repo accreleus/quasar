@@ -1,0 +1,26 @@
+{
+  "shape": "request",
+  "about": "A migrating control-plane replace from the control socket: schema version, external-backup confirmation and an explicit wait.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "kind": "replace",
+    "components": [
+      {
+        "name": "control-plane",
+        "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+        "digest": "sha256:aa11000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "release": {
+      "id": "rel-0.4.0",
+      "version": "0.4.0",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "migrates": true,
+    "schema_version": 81,
+    "external_backup_confirmed": true,
+    "dump": null,
+    "purge": false,
+    "wait_timeout_s": 600
+  }
+}
