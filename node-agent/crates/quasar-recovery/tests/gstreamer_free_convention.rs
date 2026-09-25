@@ -70,13 +70,35 @@ fn forbidden(name: &str) -> bool {
 #[test]
 fn the_recovery_crate_links_nothing_from_gstreamer_glib_or_cuda() {
     let deps = closure("quasar-recovery");
-    // Not vacuous: the walk reaches the verifier and the regex engine.
-    assert!(deps.contains("ring") && deps.contains("regex"), "{deps:?}");
+    // Not vacuous: the walk reaches the verifier, the regex engine and the fetch stack.
+    for crate_name in ["ring", "regex", "rustls", "hyper", "tokio", "webpki-roots"] {
+        assert!(
+            deps.contains(crate_name),
+            "{crate_name} missing from {deps:?}"
+        );
+    }
     let bad: Vec<_> = deps.iter().filter(|name| forbidden(name)).collect();
     assert!(
         bad.is_empty(),
         "quasar-recovery must stay GStreamer/CUDA-free (the recovery actor is a slim static binary): {bad:?}"
     );
+}
+
+/// The release-asset fetch trusts webpki-roots over ring, never the OS store, OpenSSL or
+/// aws-lc (whose build would also leave the slim static image).
+#[test]
+fn the_fetch_stack_is_ring_and_webpki_only() {
+    let deps = closure("quasar-recovery");
+    let bad: Vec<_> = deps
+        .iter()
+        .filter(|n| {
+            n.starts_with("aws-lc")
+                || n.starts_with("openssl")
+                || n.contains("native-certs")
+                || n == &"native-tls"
+        })
+        .collect();
+    assert!(bad.is_empty(), "{bad:?}");
 }
 
 /// The detector itself: the agent's closure does carry GStreamer.

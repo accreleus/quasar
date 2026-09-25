@@ -8,14 +8,14 @@ use ring::signature::{UnparsedPublicKey, ED25519};
 use super::golang::base64::decode_std;
 use super::golang::json::{decode_signature_document, unmarshal_signed_manifest, DocumentError};
 use super::golang::text::{quote, quote_bytes, to_lower_ascii_keyword, trim_space};
-use super::{reject, Admission, Rejection};
+use super::{reject, Admitted, Rejection};
 use crate::socket::{Reason, Request};
 
 /// The only algorithm this build verifies. Entries in any other are skipped.
-pub const SIGNATURE_ALGORITHM: &str = "ed25519";
+pub(crate) const SIGNATURE_ALGORITHM: &str = "ed25519";
 
 /// The version of the `.sig` envelope, not of the manifest or the release.
-pub const SIGNATURE_DOCUMENT_FORMAT_VERSION: i64 = 1;
+pub(crate) const SIGNATURE_DOCUMENT_FORMAT_VERSION: i64 = 1;
 
 const PUBLIC_KEY_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
@@ -63,13 +63,9 @@ impl SignaturePolicy {
     pub fn enabled(&self) -> bool {
         self.mode != SignatureMode::Off
     }
-
-    /// Key labels for reports and messages, never key material.
-    pub fn key_ids(&self) -> Vec<String> {
-        key_ids(&self.keys)
-    }
 }
 
+/// Key labels for messages, never key material.
 fn key_ids(keys: &[TrustedKey]) -> Vec<String> {
     keys.iter().map(|k| key_label(&k.id).to_owned()).collect()
 }
@@ -101,9 +97,9 @@ pub(super) fn check(
     req: &Request,
     pol: &SignaturePolicy,
     evidence: Option<&SignatureEvidence>,
-) -> Result<Admission, Rejection> {
+) -> Result<Admitted, Rejection> {
     if !pol.enabled() {
-        return Ok(Admission { unverified: None });
+        return Ok(Admitted { unverified: None });
     }
     // Fail closed: verifying against no keys would look on while checking nothing.
     if pol.keys.is_empty() {
@@ -138,7 +134,7 @@ pub(super) fn check(
                 "applying an UNVERIFIED release: {why} (mode=verify accepts this; mode=require would refuse it)"
             );
             tracing::warn!(token = "release-apply-unverified", "{msg}");
-            Ok(Admission {
+            Ok(Admitted {
                 unverified: Some(msg),
             })
         }
@@ -163,7 +159,7 @@ pub(super) fn check(
                     ),
                 )
             })?;
-            Ok(Admission { unverified: None })
+            Ok(Admitted { unverified: None })
         }
     }
 }
@@ -171,7 +167,7 @@ pub(super) fn check(
 /// Checks the detached document over the manifest bytes and returns the id of the
 /// trusted key that verified it. Any entry under any trusted key is enough; `key_id` only
 /// decides which key is tried first.
-pub fn verify_manifest_signature(
+pub(crate) fn verify_manifest_signature(
     manifest: &[u8],
     document: &[u8],
     keys: &[TrustedKey],

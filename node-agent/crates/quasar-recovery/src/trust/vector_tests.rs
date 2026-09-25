@@ -1,4 +1,5 @@
-//! The shared release-trust golden vectors (#356), run against the Rust port.
+//! The shared release-trust golden vectors (#356), run against the Rust port. In the crate
+//! rather than under `tests/` so the probe and the redirect rule stay crate-private.
 //!
 //! `control-plane/internal/updater/trustvectors_test.go` runs the same files against the
 //! Go updater, and its case table generates them. Both runners know every kind, run
@@ -9,16 +10,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use quasar_recovery::socket::{Component, Release, Request, RequestKind};
-use quasar_recovery::trust::{
-    admit, parse_allowed_namespaces, parse_manifest_base_url, parse_signature_mode,
-    parse_trusted_keys, probe, redirect_allowed, verify_manifest_signature,
-    wants_signature_evidence, AssetResponse, Caller, Config, SignatureEvidence, SignaturePolicy,
-    TrustedKey,
-};
 use ring::signature::KeyPair as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+use super::signature::verify_manifest_signature;
+use super::source::{probe, redirect_allowed, AssetResponse};
+use super::{
+    admit, parse_allowed_namespaces, parse_manifest_base_url, parse_signature_mode,
+    parse_trusted_keys, wants_signature_evidence, Caller, Config, SignatureEvidence,
+    SignaturePolicy, TrustedKey,
+};
+use crate::socket::{Component, Release, Request, RequestKind};
 
 fn vector_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../testdata/recovery/trust-vectors")
@@ -541,8 +544,10 @@ fn run_config(v: &ConfigVector) {
 }
 
 fn run_redirect(v: &RedirectVector) {
-    let via: Vec<&str> = v.via.iter().map(String::as_str).collect();
-    let got = match redirect_allowed(&via, &v.next) {
+    let scheme = |u: &str| super::golang::url::parse(u).expect("vector URL").scheme;
+    let via: Vec<String> = v.via.iter().map(|u| scheme(u)).collect();
+    let via: Vec<&str> = via.iter().map(String::as_str).collect();
+    let got = match redirect_allowed(&via, &scheme(&v.next)) {
         Ok(()) => json!({"allowed": true}),
         Err(e) => json!({"allowed": false, "error": e}),
     };
@@ -568,6 +573,14 @@ fn every_trust_vector_passes_against_the_rust_port() {
         "no vector files: the guard must never pass vacuously"
     );
 
+    const KINDS: [&str; 6] = [
+        "admit",
+        "config",
+        "evidence",
+        "evidence_gate",
+        "redirect",
+        "verify_signature",
+    ];
     let (mut total, mut ran) = (0, 0);
     let mut seen = HashSet::new();
     let mut per_kind: BTreeMap<String, usize> = BTreeMap::new();
@@ -579,7 +592,9 @@ fn every_trust_vector_passes_against_the_rust_port() {
         );
         let file: VectorFile =
             serde_json::from_slice(&std::fs::read(path).expect("read")).expect("vector file");
+        assert!(!file.vectors.is_empty(), "{path:?}: an empty vector file");
         total += file.vectors.len();
+        let mut ran_in_file = 0;
         for raw in &file.vectors {
             let name = raw["name"].as_str().unwrap_or_default().to_owned();
             assert!(
@@ -632,10 +647,19 @@ fn every_trust_vector_passes_against_the_rust_port() {
                     "{path:?}: unknown vector kind {other:?} (both runners must know every kind)"
                 ),
             }
-            *per_kind.entry(file.kind.clone()).or_default() += 1;
-            ran += 1;
+            ran_in_file += 1;
         }
+        assert_eq!(
+            ran_in_file,
+            file.vectors.len(),
+            "{path:?}: every vector in the file ran"
+        );
+        *per_kind.entry(file.kind.clone()).or_default() += ran_in_file;
+        ran += ran_in_file;
     }
+    assert!(ran > 0, "no vectors ran");
     assert_eq!(ran, total);
+    let kinds: Vec<&str> = per_kind.keys().map(String::as_str).collect();
+    assert_eq!(kinds, KINDS, "every vector kind is present on disk and ran");
     eprintln!("ran {ran} trust vectors: {per_kind:?}");
 }

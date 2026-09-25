@@ -1,13 +1,11 @@
 //! Fetching a release's manifest and signature: port of
-//! `control-plane/internal/updater/signature_source.go`, with the network behind a port.
+//! `control-plane/internal/updater/signature_source.go`.
 //!
 //! The verifier fetches both assets itself, from a host-local base URL, by the request's
 //! `release.version`; nothing the requester sends is trusted as evidence. [`probe`] is the
 //! whole decision and does no I/O: it names each URL to fetch and classifies each outcome
-//! into [`SignatureEvidence`]. An HTTPS adapter implements the transport and must
-//! (a) follow redirects only as [`redirect_allowed`] permits, (b) bound both fetches by
-//! [`DEFAULT_ASSET_TIMEOUT`], and (c) hand over at most `MAX_ASSET_BYTES + 1` bytes of a
-//! 200 body; any failure to complete a fetch is an `Err`, which is never read as unsigned.
+//! into [`SignatureEvidence`]. `https::HttpsFetcher` drives it over the network; any
+//! failure to complete a fetch is an `Err`, which is never read as unsigned.
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -19,17 +17,26 @@ use super::golang::url;
 use super::signature::SignatureEvidence;
 
 /// The org's own releases. `{version}` is the only substitution.
-pub const DEFAULT_MANIFEST_BASE_URL: &str =
+pub(crate) const DEFAULT_MANIFEST_BASE_URL: &str =
     "https://github.com/accreleus/quasar/releases/download/v{version}/";
-pub const MANIFEST_ASSET_NAME: &str = "platform-release-manifest.json";
-pub const SIGNATURE_ASSET_NAME: &str = "platform-release-manifest.json.sig";
+pub(crate) const MANIFEST_ASSET_NAME: &str = "platform-release-manifest.json";
+pub(crate) const SIGNATURE_ASSET_NAME: &str = "platform-release-manifest.json.sig";
 
 /// Larger than any real asset by three orders of magnitude.
-pub const MAX_ASSET_BYTES: usize = 1 << 20;
+pub(crate) const MAX_ASSET_BYTES: usize = 1 << 20;
 /// Bounds both fetches together, under the agent's 30 s socket timeout.
-pub const DEFAULT_ASSET_TIMEOUT: Duration = Duration::from_secs(15);
-/// Redirects an adapter may follow for one asset.
-pub const MAX_REDIRECTS: usize = 10;
+pub(crate) const DEFAULT_ASSET_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` as the Go updater reads it (`envInt`): blank, not a
+/// decimal integer, or not positive is the default.
+pub fn parse_manifest_timeout(raw: &str) -> Duration {
+    match raw.parse::<i64>() {
+        Ok(n) if n > 0 => Duration::from_secs(n as u64),
+        _ => DEFAULT_ASSET_TIMEOUT,
+    }
+}
+/// Requests one asset fetch may make: the original and nine redirects.
+const MAX_REDIRECTS: usize = 10;
 
 /// The version is a wire value concatenated into a URL path, so it must be strict semver.
 static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -80,20 +87,20 @@ pub fn parse_manifest_base_url(raw: &str) -> Result<ManifestBaseUrl, String> {
 
 /// A completed HTTP exchange. Anything that did not complete is an `Err` instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssetResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
+pub(crate) struct AssetResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
 }
 
 /// Either the evidence is decided, or one more asset must be fetched.
 #[derive(Debug)]
-pub enum Probe {
+pub(crate) enum Probe {
     Fetch(PendingFetch),
     Done(SignatureEvidence),
 }
 
 #[derive(Debug)]
-pub struct PendingFetch {
+pub(crate) struct PendingFetch {
     version: String,
     base: String,
     /// Set once the signature asset has been read; the manifest is fetched next.
@@ -101,7 +108,7 @@ pub struct PendingFetch {
 }
 
 /// Starts gathering evidence for `version` (the request's `release.version`).
-pub fn probe(base: &ManifestBaseUrl, version: Option<&str>) -> Probe {
+pub(crate) fn probe(base: &ManifestBaseUrl, version: Option<&str>) -> Probe {
     let v = trim_space(version.unwrap_or(""));
     if v.is_empty() {
         // An edge build or a revert to an unnamed build: nothing could have signed it.
@@ -124,9 +131,10 @@ pub fn probe(base: &ManifestBaseUrl, version: Option<&str>) -> Probe {
     })
 }
 
+#[cfg(test)]
 impl Probe {
     /// Drives the probe with a blocking fetcher.
-    pub fn run(
+    pub(crate) fn run(
         self,
         mut fetch: impl FnMut(&str) -> Result<AssetResponse, String>,
     ) -> SignatureEvidence {
@@ -145,7 +153,7 @@ impl Probe {
 
 impl PendingFetch {
     /// The asset to fetch: the signature first, since it alone decides absence.
-    pub fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         let asset = if self.signature.is_none() {
             SIGNATURE_ASSET_NAME
         } else {
@@ -154,7 +162,7 @@ impl PendingFetch {
         format!("{}{asset}", self.base)
     }
 
-    pub fn observe(self, outcome: Result<AssetResponse, String>) -> Probe {
+    pub(crate) fn observe(self, outcome: Result<AssetResponse, String>) -> Probe {
         let url = self.url();
         let outcome = outcome.and_then(|r| {
             if r.status == 200 && r.body.len() > MAX_ASSET_BYTES {
@@ -191,22 +199,17 @@ impl PendingFetch {
     }
 }
 
-/// The redirect policy for one asset: at most [`MAX_REDIRECTS`], and never from an https
-/// origin to anything but https (a plaintext hop could forge the 404 that reads as
-/// "unsigned"). `via` is every URL requested so far, the original first.
-pub fn redirect_allowed(via: &[&str], next: &str) -> Result<(), String> {
+/// The redirect policy (`CheckRedirect`): at most nine redirects, and never from an
+/// https origin to anything but https, where a forged 404 would read as "unsigned".
+/// `via` holds the scheme of every request made so far, the original first.
+pub(crate) fn redirect_allowed(via: &[&str], next: &str) -> Result<(), String> {
     if via.len() >= MAX_REDIRECTS {
         return Err(format!("stopped after {MAX_REDIRECTS} redirects"));
     }
-    let scheme = |u: &str| url::parse(u).map(|p| p.scheme);
-    let Some(first) = via.first() else {
-        return Ok(());
-    };
-    match (scheme(first), scheme(next)) {
-        (Ok(origin), Ok(to)) if origin == "https" && to != "https" => {
-            Err(format!("refusing a redirect from https to {to}"))
+    match via.first() {
+        Some(&"https") if next != "https" => {
+            Err(format!("refusing a redirect from https to {next}"))
         }
-        (Ok(_), Ok(_)) => Ok(()),
-        _ => Err("refusing a redirect to or from a URL that does not parse".into()),
+        _ => Ok(()),
     }
 }

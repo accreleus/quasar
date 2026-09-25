@@ -4,34 +4,33 @@
 //!
 //! "The same" is defined by `testdata/recovery/trust-vectors/`, which the Go package also
 //! runs. A divergence from a vector is a bug here; a Go behaviour that looks wrong is
-//! reported, not changed. Pure: no clock, no I/O ([`probe`] names the fetches, the caller
-//! performs them).
+//! reported, not changed. [`admit`] is pure apart from the WARN it emits for an unverified
+//! apply; the network is [`HttpsFetcher`]'s, which gathers the [`SignatureEvidence`].
 
 mod golang;
+mod https;
 mod signature;
 mod source;
+#[cfg(test)]
+mod vector_tests;
 
 use std::fmt;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
+pub use https::HttpsFetcher;
 pub use signature::{
-    parse_signature_mode, parse_trusted_keys, verify_manifest_signature, SignatureEvidence,
-    SignatureMode, SignaturePolicy, TrustedKey, SIGNATURE_ALGORITHM,
-    SIGNATURE_DOCUMENT_FORMAT_VERSION,
+    parse_signature_mode, parse_trusted_keys, SignatureEvidence, SignatureMode, SignaturePolicy,
+    TrustedKey,
 };
-pub use source::{
-    parse_manifest_base_url, probe, redirect_allowed, AssetResponse, ManifestBaseUrl, PendingFetch,
-    Probe, DEFAULT_ASSET_TIMEOUT, DEFAULT_MANIFEST_BASE_URL, MANIFEST_ASSET_NAME, MAX_ASSET_BYTES,
-    MAX_REDIRECTS, SIGNATURE_ASSET_NAME,
-};
+pub use source::{parse_manifest_base_url, parse_manifest_timeout, ManifestBaseUrl};
 
 use crate::socket::{Reason, Request};
 use golang::text::quote;
 
 /// The only namespace a platform release comes from unless an operator says otherwise.
-pub const DEFAULT_ALLOWED_NAMESPACES: &[&str] = &["ghcr.io/accreleus/quasar"];
+pub(crate) const DEFAULT_ALLOWED_NAMESPACES: &[&str] = &["ghcr.io/accreleus/quasar"];
 
 /// The closed component table. The actor never accepts a request naming itself or
 /// anything else (`quasar-updater`, `postgres`, ...): those are `invalid`.
@@ -81,7 +80,7 @@ fn reject(reason: Reason, message: String) -> Rejection {
 /// An admitted request.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Admission {
+pub struct Admitted {
     /// The WARN line of an unverified apply under `verify`, already logged by [`admit`].
     pub unverified: Option<String>,
 }
@@ -101,7 +100,7 @@ pub fn admit(
     req: &Request,
     cfg: &Config,
     evidence: Option<&SignatureEvidence>,
-) -> Result<Admission, Rejection> {
+) -> Result<Admitted, Rejection> {
     if !UUID_RE.is_match(&req.request_id) {
         return Err(reject(
             Reason::Invalid,
