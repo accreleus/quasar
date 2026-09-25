@@ -58,7 +58,7 @@ textarea:focus-visible,
 .session-root {
   position: fixed;
   inset: 0;
-  background: #000;
+  background: var(--video-letterbox);
   display: flex;
   flex-direction: column;
 }
@@ -92,7 +92,7 @@ textarea:focus-visible,
   min-height: 0;
   width: 100%;
   object-fit: contain;
-  background: #000;
+  background: var(--video-letterbox);
   display: block;
   touch-action: none;
   -webkit-touch-callout: none;

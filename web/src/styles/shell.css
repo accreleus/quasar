@@ -55,7 +55,7 @@
   backdrop-filter: blur(26px) saturate(112%);
   -webkit-backdrop-filter: blur(26px) saturate(112%);
   border-bottom: 1px solid var(--glass-border);
-  box-shadow: 0 1px 0 oklch(0.02 0.01 267/.55);
+  box-shadow: 0 1px 0 var(--topbar-shadow);
   position: relative;
   z-index: 40;
 }
@@ -207,7 +207,7 @@
   height: 26px;
   border-radius: 50%;
   background: var(--action);
-  color: oklch(1 0 0);
+  color: var(--on-accent);
   display: grid;
   place-content: center;
   font-family: var(--font-mono);
@@ -254,7 +254,7 @@
   -webkit-backdrop-filter: blur(28px);
   border: 1px solid var(--glass-border);
   border-radius: var(--r-panel);
-  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem var(--pop-shadow);
   opacity: 0;
   visibility: hidden;
   transform: translateY(-4px);
@@ -372,7 +372,7 @@
   background: color-mix(in oklch, var(--surf-chrome) 84%, transparent);
   /* The inner light edge that separates the rail's glass from the page's
      without a second hairline — the same trick the topbar's bottom uses. */
-  box-shadow: inset -1px 0 0 oklch(0.9618 0.0086 247.91/.07);
+  box-shadow: inset -1px 0 0 var(--line-faint);
   backdrop-filter: blur(26px) saturate(112%);
   -webkit-backdrop-filter: blur(26px) saturate(112%);
   display: flex;
@@ -536,7 +536,7 @@
 
 .nav a:hover {
   color: var(--text);
-  background: oklch(0.9618 0.0086 247.91/.05);
+  background: var(--nav-hover);
   text-decoration: none;
 }
 
@@ -616,7 +616,7 @@
     position: fixed;
     inset: 0;
     z-index: 55;
-    background: oklch(0.02 0.01 267/.55);
+    background: var(--rail-scrim);
     backdrop-filter: blur(3px);
     -webkit-backdrop-filter: blur(3px);
   }
@@ -749,22 +749,22 @@
    overrides primitives.css carries for the classes it kept. */
 [data-theme="light"] .user-btn:hover,
 [data-theme="light"] .user-btn[aria-expanded="true"] {
-  background: oklch(0.24 0.022 268/.06);
+  background: var(--light-hover-fill);
   color: var(--text);
 }
 
 [data-theme="light"] .cmdk {
-  background-color: oklch(1 0 0/.86);
+  background-color: var(--light-field-bg);
   border-color: var(--line-2);
 }
 
 [data-theme="light"] .user-pop {
-  background: oklch(0.998 0.002 268/.92);
+  background: var(--light-pop-bg);
   box-shadow: var(--shadow-lg);
 }
 
 [data-theme="light"] .up-item:hover {
-  background: oklch(0.24 0.022 268/.05);
+  background: var(--light-hover-wash);
 }
 
 [data-theme="light"] .u-ava {
@@ -772,20 +772,20 @@
 }
 
 [data-theme="light"] .rail-item:hover {
-  background: oklch(0.24 0.022 268/.05);
+  background: var(--light-hover-wash);
 }
 
 [data-theme="light"] .nav a.active {
-  background: oklch(1 0 0);
+  background: var(--light-lift);
   border: 1px solid var(--line-2);
   box-shadow: var(--shadow-sm);
 }
 
 [data-theme="light"] .topbar,
 [data-theme="light"] .tabbar {
-  box-shadow: 0 1px 0 oklch(1 0 0/.6);
+  box-shadow: 0 1px 0 var(--light-chrome-highlight);
 }
 
 [data-theme="light"] .rail-scrim {
-  background: oklch(0.24 0.022 268/.28);
+  background: var(--light-scrim);
 }

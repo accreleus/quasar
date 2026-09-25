@@ -97,6 +97,26 @@
   padding: var(--s1) 0;
 }
 
+/* A GPU's slots line over its codec chips, right-aligned in the fact. */
+.gpu-slots {
+  align-items: flex-end;
+}
+
+/* GPU codec chips: the hosts drawer and host detail's capacity card. */
+.gpu-codecs {
+  display: flex;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.gpu-codecs-end {
+  justify-content: flex-end;
+}
+
+.disk-danger {
+  color: var(--danger-text);
+}
+
 /* ── Jobs ─────────────────────────────────────────────────────────── */
 
 /* The one wrapping cell in the console's tables: `.qtable tbody td` is nowrap,
@@ -217,6 +237,12 @@
   width: 30%;
 }
 
+/* Two classes: outranks `.bar-row`'s gap. */
+.bar-row.cap-codecs {
+  flex-wrap: wrap;
+  row-gap: var(--s1);
+}
+
 /* ── Enroll host modal ─────────────────────────────────────────────── */
 
 .enroll-fact {
@@ -268,6 +294,11 @@
 }
 .enroll-more > .enroll-fact {
   margin-top: var(--s2);
+}
+
+/* Flush notes: outranks the stacked-surface margin in primitives.css. */
+.modal .modal-body .note.enroll-note {
+  margin: 0;
 }
 
 /* Releases (Fleet › Releases). */
@@ -348,6 +379,18 @@
   font-size: 1.25rem;
   font-weight: 600;
   color: var(--text);
+}
+
+.panel-head.rel-card-head {
+  align-items: flex-start;
+}
+
+.rowflex.rel-baseline {
+  align-items: baseline;
+}
+
+.rel-notes-src {
+  padding: var(--s1);
 }
 
 /* One changelog bullet: a tag gutter, a one-line title, its issue chips, and

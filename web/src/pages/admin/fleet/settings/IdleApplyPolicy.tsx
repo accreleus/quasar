@@ -42,7 +42,7 @@ function valueText(value: unknown): string {
 
 function reviewDetails(reviewed: Reviewed) {
   const automaticHardware = reviewed.sources.encoder === "automatic" || reviewed.sources.render_node === "automatic";
-  return <div style={{ gridColumn: "1 / -1" }}>
+  return <div className="idle-review">
     <p className="hint">Review revision <code>{reviewed.preview.revision}</code>, content digest <code>{reviewed.preview.content_sha256}</code>.</p>
     {automaticHardware && <p className="hint">The host reported an accessible GPU and a passing media probe for its current settings. After the approved restart, the agent probes the exact encoder and device shown below before marking them applied.</p>}
     <h4>Resolved settings and sources</h4>
@@ -55,7 +55,7 @@ function reviewDetails(reviewed: Reviewed) {
     <p className="hint">Facts digest: <code>{reviewed.preview.prerequisites_sha256}</code></p>
     <ul>
       {reviewed.preview.prerequisites.map((fact) => <li key={`${fact.kind}:${fact.id}`}>
-        <code>{fact.kind}</code>: <code style={{ overflowWrap: "anywhere" }}>{fact.id}</code>
+        <code>{fact.kind}</code>: <code className="idle-fact-id">{fact.id}</code>
       </li>)}
     </ul>
   </div>;

@@ -23,9 +23,6 @@
    ============================================================ */
 
 :root {
-  /* The mock's rgba(12,12,18,.74) / .86, in the token colour space. */
-  --hud-glass: oklch(0.13 0.012 267 / 0.74);
-  --hud-glass-open: oklch(0.13 0.012 267 / 0.86);
   --hud-morph: 0.36s cubic-bezier(0.2, 0.85, 0.25, 1);
   /* Shelf depth: the only thing that changes between sections, which is what
      keeps the bar the same size across a tab switch. */
@@ -43,6 +40,9 @@
   position: fixed;
   z-index: 20;
   display: flex;
+  /* Per dock, from `dockLayout` via the inline custom properties. */
+  flex-direction: var(--hud-dir, row);
+  border-radius: var(--hud-radius, 0);
   overflow: hidden;
   background: var(--hud-glass);
   -webkit-backdrop-filter: blur(22px) saturate(150%);
@@ -66,7 +66,8 @@
 }
 
 /* Docked at every size: flush against its edge. Width/height/radius/direction
-   come from `dockLayout` as inline styles — this is only the anchoring. */
+   come from `dockLayout` (inline, the last two as custom properties) — this is
+   only the anchoring. */
 .hud-root[data-axis="h"] .hud {
   left: 50%;
   transform: translateX(-50%);
@@ -445,7 +446,7 @@
   font-family: var(--font-display);
   font-weight: 700;
   font-size: 1.4rem;
-  color: oklch(1 0 0 / 0.9);
+  color: var(--hud-cover-glyph);
   mix-blend-mode: overlay;
 }
 .qs .cv::after {
@@ -453,7 +454,7 @@
   position: absolute;
   inset: 0;
   z-index: 2;
-  background: radial-gradient(120% 90% at 50% -10%, transparent 45%, oklch(0.09 0.01 267 / 0.45));
+  background: radial-gradient(120% 90% at 50% -10%, transparent 45%, var(--hud-cover-vignette));
 }
 .qs .nm {
   display: block;
@@ -903,7 +904,7 @@
   display: flex;
   align-items: center;
   gap: var(--s3);
-  background: oklch(0.13 0.012 267 / 0.8);
+  background: var(--hud-toast-bg);
   -webkit-backdrop-filter: blur(18px);
   backdrop-filter: blur(18px);
   border: 1px solid var(--line-2);
@@ -942,7 +943,7 @@
   align-items: center;
   gap: var(--s4);
   padding: var(--s3) var(--s5);
-  background: oklch(0.13 0.012 267 / 0.9);
+  background: var(--hud-banner-bg);
   -webkit-backdrop-filter: blur(20px);
   backdrop-filter: blur(20px);
   border-bottom: 1px solid var(--danger-line);

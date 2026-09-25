@@ -153,7 +153,7 @@ export function EnrollHostModal({
       }
     >
       {!wssUrl ? (
-        <p className="note warn" style={{ margin: 0 }} data-testid="enroll-needs-https">
+        <p className="note warn enroll-note" data-testid="enroll-needs-https">
           <b>Open this page over HTTPS to enroll a remote host.</b> From an http:// page the string
           would tell the agent to dial <span className="mono">ws://</span>, which carries the enrollment
           token and node secret across the network in cleartext.
@@ -161,7 +161,7 @@ export function EnrollHostModal({
       ) : (
         <div className="fs-fields">
           {!result && (
-            <p className="sub" style={{ margin: 0 }}>
+            <p className="sub m0">
               One command enrolls a machine with Docker and a GPU. Mint a single-use string, run the
               command there as root, and the host appears in this table when its agent connects.
             </p>
@@ -183,12 +183,12 @@ export function EnrollHostModal({
             />
           )}
           {cert.kind === "proxied" && (
-            <p className="hint" style={{ margin: 0 }}>
+            <p className="hint m0">
               {cert.reason}
             </p>
           )}
           {cert.kind === "error" && (
-            <p className="note warn" style={{ margin: 0 }}>
+            <p className="note warn enroll-note">
               {cert.message}
             </p>
           )}
@@ -201,7 +201,7 @@ export function EnrollHostModal({
             </div>
           )}
           {error && (
-            <p className="note warn" style={{ margin: 0 }} role="alert">
+            <p className="note warn enroll-note" role="alert">
               {error}
             </p>
           )}
@@ -214,7 +214,7 @@ export function EnrollHostModal({
                 label="Copy install command"
                 caption={`Run on the new host as root — single use, ${expiry}`}
               />
-              <p className="hint" style={{ margin: 0 }}>
+              <p className="hint m0">
                 This control plane serves the script. The script checks the host, pins the agent image
                 to this release, starts the agent and reports when it is enrolled; it never edits the
                 firewall.
@@ -237,7 +237,7 @@ export function EnrollHostModal({
           )}
           {result && !result.command && (
             <>
-              <p className="note warn" style={{ margin: 0 }} data-testid="enroll-no-installer">
+              <p className="note warn enroll-note" data-testid="enroll-no-installer">
                 The install command could not be composed for this certificate. Use the enrollment
                 string with the agent&apos;s own Compose file — see{" "}
                 <a href={SECOND_HOST_DOCS} target="_blank" rel="noreferrer">
@@ -258,7 +258,7 @@ function BareString({ value, expiry }: { value: string; expiry: string }) {
   return (
     <>
       <Snippet text={value} testId="enroll-string" label="Copy enrollment string" caption={`Enrollment string — single use, ${expiry}`} />
-      <p className="hint" style={{ margin: 0 }}>
+      <p className="hint m0">
         Shown once. Set it as <span className="mono">QUASAR_ENROLLMENT</span> for the agent; after its
         first connection the pin is saved beside the node secret and the string can be removed.
       </p>

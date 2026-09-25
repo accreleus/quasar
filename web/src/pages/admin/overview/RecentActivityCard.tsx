@@ -49,7 +49,7 @@ export function RecentActivityCard({ items, loading, error }: RecentActivityCard
               <span className="act-time num">{clockTime(item.created_at)}</span>
               <div className="act-body">
                 <span className="act-actor">{item.actor_username ?? "system"}</span>{" "}
-                <span className="mono" style={{ color: severityColor(item.severity) }}>
+                <span className={`mono ${severityClass(item.severity)}`}>
                   {item.action}
                 </span>{" "}
                 <span className="act-target">{targetLabel(item)}</span>
@@ -76,8 +76,8 @@ export function clockTime(at: string): string {
   });
 }
 
-function severityColor(severity: AdminActivityItem["severity"]): string {
-  if (severity === "err") return "var(--danger-text)";
-  if (severity === "warn") return "var(--warning-text)";
-  return "var(--text-3)";
+function severityClass(severity: AdminActivityItem["severity"]): string {
+  if (severity === "err") return "act-err";
+  if (severity === "warn") return "tone-warning";
+  return "muted";
 }

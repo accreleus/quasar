@@ -78,7 +78,7 @@ export function SourcesTab() {
 
   return (
     <section className="page">
-      <div className="eyebrow" style={{ marginBottom: 10 }}>
+      <div className="eyebrow mb3">
         Content sources
       </div>
       <div className="card mb6">
@@ -90,7 +90,7 @@ export function SourcesTab() {
               description="Discovers titles from the Steam library installed on your hosts. Importing one creates an app that inherits the Proton GPU preset."
               meta={
                 data.unpublishedError ? (
-                  <p className="form-error" role="alert" style={{ margin: 0 }}>
+                  <p className="form-error m0" role="alert">
                     Could not read pending discovery items: {data.unpublishedError}
                   </p>
                 ) : data.unpublishedLoading ? (
@@ -122,11 +122,11 @@ export function SourcesTab() {
             >
               <SteamPreparation settings={data.settings} />
               {ls.inert_reason && (
-                <div className="note warn" style={{ marginTop: "var(--s3)" }}>
+                <div className="note warn mt3">
                   <div>{inertReasonCopy(ls.inert_reason)}</div>
                 </div>
               )}
-              <div style={{ marginTop: "var(--s3)" }}>
+              <div className="mt3">
                 <Button variant="ghost" size="sm" onClick={() => setShowHealth((v) => !v)}>
                   {showHealth ? "Hide scan health" : "Show scan health"}
                 </Button>
@@ -160,7 +160,7 @@ export function SourcesTab() {
         )}
       </div>
 
-      <div className="eyebrow" style={{ margin: "var(--s7) 0 10px" }}>
+      <div className="eyebrow lib-sources-head">
         Artwork providers
       </div>
       <div className="card mb6">
@@ -181,7 +181,7 @@ export function SourcesTab() {
               switchLabel="SteamGridDB"
               switchTitle="Artwork lookup is automatic once a key is configured. This switch is informational."
             >
-              <div style={{ marginTop: "var(--s4)", maxWidth: 560 }}>
+              <div className="mt4" style={{ maxWidth: 560 }}>
                 <SecretField
                   secret={data.artworkSecret}
                   masterKeyConfigured={data.secretsData.master_key_configured}
@@ -200,7 +200,7 @@ export function SourcesTab() {
         )}
       </div>
 
-      <div className="note" style={{ marginTop: "var(--s4)" }}>
+      <div className="note mt4">
         Artwork providers are tried in order. Apps with no match keep their gradient tile.
       </div>
     </section>

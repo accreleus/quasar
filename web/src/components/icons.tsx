@@ -323,7 +323,7 @@ export function IconStatusSuccess(props: IconProps) {
   return (
     <svg {...iconAttrsPlain(props)}>
       <circle cx="8" cy="8" r="8" fill="var(--success)" />
-      <path d="M4.5 8.2l2.2 2.2 4-4.4" stroke="#08080c" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M4.5 8.2l2.2 2.2 4-4.4" stroke="var(--status-glyph-ink)" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -332,7 +332,7 @@ export function IconStatusDanger(props: IconProps) {
   return (
     <svg {...iconAttrsPlain(props)}>
       <circle cx="8" cy="8" r="8" fill="var(--danger)" />
-      <path d="M8 4.4v4.2M8 11.2v.2" stroke="#08080c" strokeWidth={1.8} strokeLinecap="round" />
+      <path d="M8 4.4v4.2M8 11.2v.2" stroke="var(--status-glyph-ink)" strokeWidth={1.8} strokeLinecap="round" />
     </svg>
   );
 }

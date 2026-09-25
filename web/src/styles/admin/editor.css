@@ -32,17 +32,28 @@
   text-decoration: underline;
 }
 
+/* Rail card: the hero frame is clipped to the card's radius. */
+.ae-rail-card {
+  overflow: hidden;
+}
+
+/* Access tab: the user picker and its button align on their bottom edge. */
+.ae-add-user {
+  align-items: flex-end;
+  max-width: 560px;
+}
+
 /* The gradient stands in for missing art, in both crops and in the rail. It is
    a design, not a broken image, so it carries the app's monogram. */
 .ae-frame {
   position: relative;
   overflow: hidden;
-  background: linear-gradient(150deg, oklch(0.5443 0.2453 284.39), oklch(0.3727 0.1878 282.05));
+  background: linear-gradient(150deg, var(--cover-violet-a), var(--cover-violet-b));
   display: grid;
   place-content: center;
   font-family: var(--font-display);
   font-weight: 600;
-  color: oklch(1 0 0 / 0.82);
+  color: var(--editor-frame-ink);
   letter-spacing: 0.03em;
   border-radius: var(--r-sm);
   border: 1px solid var(--line-2);
@@ -117,11 +128,11 @@
   place-content: center;
   aspect-ratio: 2 / 3;
   border-radius: var(--r-xs);
-  background: linear-gradient(160deg, oklch(0.4600 0.1600 285), oklch(0.5443 0.2453 284.39));
+  background: linear-gradient(160deg, var(--editor-cand-art), var(--cover-violet-a));
   font-style: normal;
   font-family: var(--font-display);
   font-size: 15px;
-  color: oklch(1 0 0 / 0.85);
+  color: var(--editor-cand-ink);
 }
 
 .ae-cand i img {

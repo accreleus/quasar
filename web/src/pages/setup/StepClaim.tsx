@@ -54,7 +54,7 @@ export function StepClaim({ onClaimed }: StepClaimProps) {
   return (
     <form className="card login-card" onSubmit={onSubmit} noValidate>
       {/* No wordmark here: the wizard's AuthCard already carries the lockup. */}
-      <p className="sub" style={{ textAlign: "center", margin: 0 }}>
+      <p className="sub setup-claim-lede m0">
         This is a fresh Quasar instance with no administrator yet. Paste the
         one-time setup token to create the first admin account.
       </p>
@@ -134,7 +134,7 @@ export function StepClaim({ onClaimed }: StepClaimProps) {
       )}
 
       {alreadyClaimed ? (
-        <Link to="/login" className="btn btn-primary btn-block" style={{ textDecoration: "none" }}>
+        <Link to="/login" className="btn btn-primary btn-block">
           Go to sign in
         </Link>
       ) : (

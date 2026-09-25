@@ -88,7 +88,7 @@ export function SessionsToolbar({
       </select>
 
       <div className="right">
-        <span style={{ fontSize: "var(--t-xs)", color: "var(--text-3)" }}>Auto-refresh</span>
+        <span className="t-xs muted">Auto-refresh</span>
         <button
           type="button"
           className="switch"

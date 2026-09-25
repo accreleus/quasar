@@ -4,7 +4,7 @@
  * say "n/a" instead of drawing a zero.
  */
 
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import type { GPUAvailability, Host, HostStorageVolume } from "../../../../api/types";
 import { Bar, Gauge } from "../../../../components/Bar";
@@ -28,10 +28,6 @@ import {
   updaterHint,
   updaterLabel,
 } from "../hostIdentity";
-
-/** A gauge with no reading: the track, and the word for it. Never a 0 % arc,
- *  which would read as a confirmed zero. */
-const unknownGauge = { "--p": 0 } as CSSProperties;
 
 export interface CapacityCardProps {
   host: Host;
@@ -75,7 +71,7 @@ export function CapacityCard({ host, gpus, now }: CapacityCardProps) {
         ))}
 
         <div className="cap-row" data-testid="cap-row-memory">
-          <span className="gauge" style={unknownGauge}>
+          <span className="gauge">
             <span>n/a</span>
           </span>
           <div className="cap-detail">
@@ -104,7 +100,7 @@ export function CapacityCard({ host, gpus, now }: CapacityCardProps) {
 
         <div className="cap-row" data-testid="cap-row-storage">
           {gaugePct == null ? (
-            <span className="gauge" style={unknownGauge}>
+            <span className="gauge">
               <span>n/a</span>
             </span>
           ) : (
@@ -220,7 +216,7 @@ function GpuRow({ gpu }: { gpu: GPUAvailability }) {
       {vramKnown ? (
         <Gauge percent={vramPct} color={toneColor(vramPct)} />
       ) : (
-        <span className="gauge" style={unknownGauge}>
+        <span className="gauge">
           <span>n/a</span>
         </span>
       )}
@@ -250,9 +246,9 @@ function GpuRow({ gpu }: { gpu: GPUAvailability }) {
           value={`${gpu.slots_reserved} / ${gpu.slots_total}`}
           variant={tone(slotPct)}
         />
-        <div className="bar-row" style={{ flexWrap: "wrap", rowGap: 4 }}>
+        <div className="bar-row cap-codecs">
           <span className="lbl">CODECS</span>
-          <span style={{ display: "flex", gap: "var(--s2)", flexWrap: "wrap" }}>
+          <span className="gpu-codecs">
             <GpuCodecChips codecs={gpu.codecs} />
           </span>
         </div>

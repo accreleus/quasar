@@ -384,14 +384,7 @@ export function AppsTab() {
                   type="button"
                   onClick={clearPreset}
                   aria-label="Clear runtime preset filter"
-                  style={{
-                    border: 0,
-                    background: "none",
-                    color: "inherit",
-                    cursor: "pointer",
-                    marginLeft: 4,
-                    fontSize: 11,
-                  }}
+                  className="lib-chip-clear"
                 >
                   ✕
                 </button>
@@ -445,8 +438,8 @@ export function AppsTab() {
                   />
                 ))}
                 {filtered.apps.length === 0 && filtered.pending.length === 0 && (
-                  <tr>
-                    <td colSpan={8} style={{ textAlign: "center", color: "var(--text-3)", padding: "var(--s8)" }}>
+                  <tr className="qtable-empty-row">
+                    <td colSpan={8}>
                       {query ? `No apps matching "${query}"` : "No apps match these filters."}
                     </td>
                   </tr>
@@ -510,7 +503,7 @@ export function AppsTab() {
             artwork provider. Locked apps, those with an admin correction or upload, are skipped
             unless force is on.
           </p>
-          <label className="row gap3 center" style={{ marginTop: "var(--s3)", cursor: "pointer" }}>
+          <label className="row gap3 center mt3 lib-check-label">
             <input
               type="checkbox"
               checked={reresolveForce}
@@ -518,7 +511,7 @@ export function AppsTab() {
             />
             Overwrite locked artwork too
           </label>
-          <p className="muted mt3" style={{ fontSize: "var(--t-sm)" }}>
+          <p className="muted mt3 t-sm">
             Requests are spaced out, so a large catalogue takes a moment.
           </p>
         </Modal>

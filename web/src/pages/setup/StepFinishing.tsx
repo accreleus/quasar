@@ -165,20 +165,20 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
 
   return (
     <div
-      className="card login-card"
-      style={{ width: "100%", maxWidth: 640, display: "flex", flexDirection: "column", gap: "var(--s5)" }}
+      className="card login-card col gap5"
+      style={{ width: "100%", maxWidth: 640 }}
     >
       <div>
-        <h2 style={{ margin: 0 }}>Finishing touches</h2>
-        <p className="sub" style={{ marginTop: 6 }}>
+        <h2 className="m0">Finishing touches</h2>
+        <p className="sub mt2">
           Last step. Settings below are optional and can be changed later from{" "}
           <strong>Admin → Settings</strong>. You can also check your first stream before finishing.
         </p>
       </div>
 
       <div>
-        <h3 style={{ margin: "0 0 6px" }}>Cover artwork</h3>
-        <p className="field-hint" style={{ margin: "0 0 12px" }}>
+        <h3 className="setup-subhead">Cover artwork</h3>
+        <p className="field-hint m0 mb3">
           Without a key here, apps show a plain gradient tile instead of cover art. You can skip
           this — it can be set later from an app's Artwork panel, or from{" "}
           <strong>Admin → Settings</strong>.
@@ -199,7 +199,7 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
 
         {/* S3 stays directly under the artwork key — below the mic toggle it
             read as a microphone warning (operator review). */}
-        <div className="note warn" role="status" style={{ marginTop: "var(--s4)" }}>
+        <div className="note warn mt4" role="status">
           <div>
             <b>Back up deploy/.env now.</b> It holds <code>QUASAR_SECRET_KEY</code> — lose it and
             every credential stored here, including any artwork key you just entered, becomes
@@ -209,8 +209,8 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
       </div>
 
       <div>
-        <h3 style={{ margin: "0 0 6px" }}>Voice chat</h3>
-        <p className="field-hint" style={{ margin: "0 0 12px" }}>
+        <h3 className="setup-subhead">Voice chat</h3>
+        <p className="field-hint m0 mb3">
           Lets users talk into a game through the browser microphone. The page has to be a secure
           context (HTTPS, or localhost) or the browser will not expose a microphone at all,
           whatever this setting says. Chrome also negotiates OPUS at 48&nbsp;kHz stereo and refuses
@@ -236,7 +236,7 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
       </div>
 
       <div>
-        <h3 style={{ margin: "0 0 6px" }}>Try your first stream</h3>
+        <h3 className="setup-subhead">Try your first stream</h3>
         <p className="field-hint">
           A ready host still needs a browser streaming check. Open your library in a new tab,
           launch an installed app with the H.264 720p60 profile if available, then return here.

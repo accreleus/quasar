@@ -72,7 +72,7 @@ function SettingsSection({
       <div className="panel-head">
         <div>
           <span className="panel-title">{title}</span>
-          <div className="hint" style={{ marginTop: 3 }}>
+          <div className="hint mt1">
             {hint}
           </div>
         </div>
@@ -175,7 +175,7 @@ export function Settings() {
               label="Allowed origins"
               hint="Browser origins allowed to call this control plane, one per line; leave empty to allow only this host"
             >
-              <div className="col gap2" style={{ minWidth: 280, alignItems: "flex-end" }}>
+              <div className="col gap2 admin-settings-end" style={{ minWidth: 280 }}>
                 <textarea
                   className="input"
                   aria-label="Allowed origins"
@@ -226,7 +226,7 @@ export function Settings() {
               />
             </SettingRow>
             <SettingRow label="Scan interval" hint="Minutes between scans, 15 to 10080">
-              <div className="col gap2" style={{ alignItems: "flex-end" }}>
+              <div className="col gap2 admin-settings-end">
                 <input
                   className="input"
                   type="number"
@@ -386,7 +386,7 @@ export function Settings() {
                   {otherSecrets.map((secret, i) => (
                     <div
                       key={secret.name}
-                      style={i > 0 ? { borderTop: "1px solid var(--line)", paddingTop: "var(--s5)" } : undefined}
+                      className={i > 0 ? "admin-settings-sep" : undefined}
                     >
                       {token && (
                         <SecretField

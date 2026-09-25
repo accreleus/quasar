@@ -120,7 +120,7 @@ export function HostSettings() {
             onRestartNow={() => void s.handleRestart(false)}
           />
 
-          <div className="split" style={{ marginTop: "var(--s4)", gridTemplateColumns: "minmax(0,1fr) 300px" }}>
+          <div className="split mt4" style={{ gridTemplateColumns: "minmax(0,1fr) 300px" }}>
             <div>
               <SafeSettingsPolicy hostId={id} knobs={s.knobs} renderNodeOptions={s.renderNodeOptions} onOwnedKeys={onOwnedKeys} />
               <IdleApplyPolicy hostId={id} />
@@ -152,7 +152,7 @@ export function HostSettings() {
                 }
               >
                 {s.showAdvanced ? legacy.advanced.map(renderKnob) : (
-                  <p className="hint" style={{ padding: "0 var(--card-pad) var(--s5)" }}>
+                  <p className="hint knob-hidden">
                     {legacy.advanced.length} advanced controls hidden.
                   </p>
                 )}
