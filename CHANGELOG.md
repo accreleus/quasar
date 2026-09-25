@@ -25,6 +25,20 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The recovery actor installs a GPU host's agent (#357).** `quasar-recovery actor`, a static
+  Rust binary in the new slim `quasar-recovery` image (`deploy/build-images.sh recovery`, its
+  own image-contract role), is started by hand on a GPU host with an enrollment string, a home
+  root and a digest-pinned agent image. It creates its machine state, stores the enrollment
+  string as a 0600 secret, detects the GPU with a disposable probe container, and creates
+  `quasar-node-agent` from a compiled recipe that matches the Compose definitions (golden
+  specifications per GPU vendor and a parity test against `deploy/docker-compose.yml`). The
+  secret reaches the agent only as a read-only file (`QUASAR_ENROLLMENT_FILE`, new). Starting
+  it again changes nothing, and an interrupted install is completed by the next start. The
+  agent reads the actor's status over a new agent socket and registers `install_mode: "owned"`
+  with the recovery-actor identity (amendment 14); Compose and source installs register
+  exactly as before. Platform images now carry the `org.quasar.recipe` label, stamped by
+  `deploy/build-images.sh` and the Images workflow from one helper
+  (`deploy/lib/recipe-revision.sh`) and asserted by the image contract.
 - **RH06 release trust ported to Rust, held to shared golden vectors (#356).** The new
   GStreamer-free crate `node-agent/crates/quasar-recovery` holds the recovery actor's
   `trust` module (the Go updater's namespace allowlist, digest-only images, closed

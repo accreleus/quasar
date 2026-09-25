@@ -14,6 +14,7 @@ use crate::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 pub mod credentials;
 mod inspection;
+pub(crate) mod platform;
 pub use inspection::{all_container_image_ids, daemon_images};
 pub(crate) use inspection::{
     engine_storage, inspect_container, inspect_image_metadata, live_containers,

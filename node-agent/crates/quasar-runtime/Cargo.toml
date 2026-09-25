@@ -22,6 +22,10 @@ serde_json = "1"
 libc = "0.2"
 # Registry `auth` entries in the Docker CLI config are base64 `user:password`.
 base64 = "0.23"
+# The pull, wait and log streams (already in the lock through bollard).
+futures-util = { version = "0.3", features = ["sink"] }
+# The archive upload body.
+bytes = "1"
 
 [features]
 # Test-only owner injection on `RuntimeConfig` (`diagnostic_owner`), for adapters

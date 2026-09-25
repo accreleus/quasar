@@ -162,8 +162,10 @@
           "org.quasar.pins.plugins-rs",
           "org.quasar.pins.base",
           "org.quasar.source.commit",
-          "org.quasar.built.at"
+          "org.quasar.built.at",
+          "org.quasar.recipe"
         ],
+        "_recipe_note": "org.quasar.recipe (ADR 0008): the recipe revision this agent image needs, stamped by build-images.sh from node-agent/src/recipe.rs. A recovery actor refuses to install an image without it (recipe_unsupported).",
         "_notes": "Provenance. Without these, an image pulled from GHCR or built on another box is opaque and `qimg status` cannot say which pins produced it — which is how Tower and hermes drifted under one tag undetected (2026-07-26). The build report is the richer local record; these labels are what make ANY image self-describing."
       }
     },
@@ -237,6 +239,51 @@
         "_root_note": "Root is REQUIRED here: the updater talks to the mounted docker socket and writes the stack's .env at its host path. Documented in deploy/Dockerfile.updater."
       }
     },
+    "recovery": {
+      "_role": "The RH-06 recovery actor (Dockerfile.recovery): one static musl binary, quasar-recovery, on alpine. Creates and replaces a machine's platform services through the mounted engine socket. NOT on the Dockerfile.vulkan lineage.",
+      "size_max_mb": 40,
+      "_size_note": "alpine:3.22 is ~8MB and the binary ~10-15MB. A GStreamer, CUDA or toolchain leak would blow far past this; if the ceiling breaks, find out what grew before raising it in a commit that says why.",
+
+      "binaries": {
+        "required": ["quasar-recovery"],
+        "forbidden": ["gst-inspect-1.0", "gst-launch-1.0", "docker", "podman", "cargo", "rustc", "gcc", "cc"],
+        "_forbidden_notes": {
+          "gst-inspect-1.0": "The actor never touches media: no GStreamer may reach this image (the crate is GStreamer-free by test).",
+          "docker": "The actor talks to the engine only through its Unix-socket API, as the agent does (#239)."
+        }
+      },
+
+      "paths": {
+        "required": ["/usr/local/bin/quasar-recovery"],
+        "forbidden": ["/opt/gst", "/usr/lib/gstreamer-1.0", "/usr/lib64/gstreamer-1.0", "/usr/local/cargo", "/src"]
+      },
+
+      "commands": {
+        "must_succeed": {
+          "quasar-recovery version": "The binary starts in the image it ships in.",
+          "! tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | grep -q FakeEngine": "The in-memory test engine (feature test-support) never ships: a build that enabled it would carry an engine that answers anything.",
+          "! tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | grep -q '^libc[.]musl-'": "Statically linked: the binary does not need the base image's libc (a dynamic alpine binary names libc.musl-<arch>.so.1 as DT_NEEDED; this check finds it in /sbin/apk and /bin/busybox and not in a static build), so it would run on scratch. NULs become newlines because busybox grep stops a line at a NUL."
+        }
+      },
+
+      "labels": {
+        "required": [
+          "org.quasar.image.role=recovery",
+          "org.quasar.source.commit",
+          "org.quasar.built.at",
+          "org.quasar.recipe"
+        ],
+        "_notes": "No org.quasar.pins.base: not built on the quasar-base family. org.quasar.recipe is the revision of the actor's own container shape (node-agent/crates/quasar-recovery/src/recipe/revision.rs), which the seed and a hand-over render (ADR 0007/0008)."
+      },
+
+      "image_config": {
+        "entrypoint_or_cmd_contains": "quasar-recovery",
+        "healthcheck_required": true,
+        "must_not_run_as_root": false,
+        "_root_note": "Root is required: the actor drives the container engine through the mounted socket."
+      }
+    },
+
     "control": {
       "_role": "Control-plane production image (Dockerfile.control.prod). Static Go binary + embedded web SPA on quasar-base.",
       "size_max_mb": 400,
@@ -258,8 +305,10 @@
           "org.quasar.pins.base",
           "org.quasar.source.commit",
           "org.quasar.built.at",
-          "org.quasar.schema.version"
+          "org.quasar.schema.version",
+          "org.quasar.recipe"
         ],
+        "_recipe_note": "org.quasar.recipe (ADR 0008): the recipe revision this control-plane image needs, stamped by build-images.sh from control-plane/internal/buildinfo/recipe.go.",
         "_notes": "Provenance, the same assertion the runtime role carries. org.quasar.schema.version is the control role's alone: the edge release channel reads the highest embedded migration off the published image, since a branch build ships no release manifest, and a control-plane image without it is unorderable and never offered as an update (#111). The control plane also SERVES its identity (GET /v1/admin/platform/identity) from linker stamps passed by the same build args, so a missing label here means the served identity is unstamped too."
       },
       "image_config": {

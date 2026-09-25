@@ -531,12 +531,21 @@ jobs:
                 | sed -n 's/^0*\([0-9][0-9]*\)_.*\.up\.sql$/\1/p' | sort -n | tail -1)"
           test -n "$n"
           echo "version=$n" >> "$GITHUB_OUTPUT"
+      - name: Recipe revision
+        id: recipe
+        # org.quasar.recipe (ADR 0008), which the control role of the contract requires.
+        # The same derivation deploy/build-images.sh uses.
+        run: |
+          rev="$(bash deploy/lib/recipe-revision.sh control)"
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/Dockerfile.control.prod
+          labels: |
+            org.quasar.recipe=${{ steps.recipe.outputs.revision }}
           # `push-by-digest=true` with no `tags:`. The manifest is uploaded and
           # addressable, and nothing names it. That is the whole point of the split:
           # an artifact that fails the contract below was never reachable.
@@ -601,12 +610,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Recipe revision
+        id: recipe
+        # org.quasar.recipe (ADR 0008): the runtime role of the contract requires it, and a
+        # recovery actor refuses an agent image without it. Same derivation as
+        # deploy/build-images.sh.
+        run: |
+          rev="$(bash deploy/lib/recipe-revision.sh runtime)"
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/Dockerfile.vulkan
+          labels: |
+            org.quasar.recipe=${{ steps.recipe.outputs.revision }}
           # Dockerfile.vulkan is multi-target and BuildKit's no-target default is "last
           # stage wins", which historically built the ~10.7 GB CUDA image and tagged it
           # quasar-node-agent. Always pass an explicit target, whatever is last today.
