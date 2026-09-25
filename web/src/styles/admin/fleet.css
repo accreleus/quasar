@@ -475,3 +475,16 @@
 @media (max-width: 1240px) {
   .rel-split { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Storage tab: the ownership card's inner rows and the delete modal's facts. */
+.storage-pad {
+  padding: var(--s4);
+}
+
+.storage-facts {
+  font-size: var(--t-sm);
+}
+
+.storage-id {
+  overflow-wrap: anywhere;
+}

@@ -104,9 +104,6 @@
   "src/pages/admin/fleet/ReleasesTab.tsx": {
     "inline-style": 5
   },
-  "src/pages/admin/fleet/StorageTab.tsx": {
-    "inline-style": 37
-  },
   "src/pages/admin/fleet/console/CapabilitiesRail.tsx": {
     "inline-style": 10
   },
@@ -149,9 +146,6 @@
   "src/pages/admin/library/ImageCleanupModal.tsx": {
     "inline-style": 3
   },
-  "src/pages/admin/library/ImagesTab.tsx": {
-    "inline-style": 24
-  },
   "src/pages/admin/library/PendingImportRow.tsx": {
     "inline-style": 11
   },
@@ -193,9 +187,6 @@
   },
   "src/pages/admin/people/UsersTab.tsx": {
     "inline-style": 3
-  },
-  "src/pages/admin/sessions/DiagnosticsDisclosure.tsx": {
-    "inline-style": 41
   },
   "src/pages/admin/sessions/LatestCards.tsx": {
     "inline-style": 2
@@ -253,9 +244,6 @@
   },
   "src/pages/setup/StepFinishing.tsx": {
     "inline-style": 11
-  },
-  "src/pages/setup/StepHosts.tsx": {
-    "inline-style": 74
   },
   "src/pages/setup/StepIndicator.tsx": {
     "inline-style": 4

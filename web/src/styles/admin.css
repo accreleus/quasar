@@ -312,6 +312,25 @@
   color: var(--text-3);
 }
 
+/* Legend keys; the colours are DiagnosticsDisclosure's COLOR_AGENT/COLOR_BROWSER. */
+.sd-key-agent { color: var(--accent); }
+.sd-key-browser { color: var(--success); margin-left: var(--s3); }
+
+.sd-chart-title .hint {
+  margin-left: var(--s2);
+  font-weight: 400;
+}
+
+.sd-chart-empty {
+  font-size: var(--t-xs);
+  padding-top: var(--s2);
+}
+
+/* Effective-media stage headings (configured / resolved / actual). */
+.sd-stage { text-transform: capitalize; }
+.sd-wrap { overflow-wrap: anywhere; }
+.sd-aside { font-size: 12px; }
+
 /* ── Session detail: the Diagnostics disclosure ─────────────── */
 .sd-diagnostics > summary {
   display: flex;
@@ -844,6 +863,12 @@
   overflow-wrap: anywhere;
   text-align: right;
 }
+/* Library ▸ Images: the policy/catalog card and the uninstall fine print. */
+.img-policy-error { align-items: flex-start; }
+.img-catalog-count { font-size: var(--t-sm); }
+.img-manifest-url { word-break: break-all; }
+.img-fineprint { font-size: var(--t-xs); }
+
 .image-detail-page .qtable {
   table-layout: fixed;
 }

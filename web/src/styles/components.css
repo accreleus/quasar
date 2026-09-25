@@ -167,16 +167,24 @@
 .wrap { flex-wrap: wrap; }
 .grow { flex: 1; }
 .center { align-items: center; }
+.gap1 { gap: var(--s1); }
 .gap2 { gap: var(--s2); } .gap3 { gap: var(--s3); } .gap4 { gap: var(--s4); }
-.gap5 { gap: var(--s5); } .gap6 { gap: var(--s6); }
+.gap5 { gap: var(--s5); } .gap6 { gap: var(--s6); } .gap7 { gap: var(--s7); }
+/* .m0/.mb0 come first so a side-specific step after them wins: "m0 mt1". */
+.m0 { margin: 0; }
+.mb0 { margin-bottom: 0; }
+.mt1 { margin-top: var(--s1); }
 .mt2 { margin-top: var(--s2); } .mt3 { margin-top: var(--s3); } .mt4 { margin-top: var(--s4); }
 .mt5 { margin-top: var(--s5); }
 .mb3 { margin-bottom: var(--s3); } .mb4 { margin-bottom: var(--s4); }
 .mb5 { margin-bottom: var(--s5); } .mb6 { margin-bottom: var(--s6); }
+.ml-auto { margin-left: auto; }
 .nowrap { white-space: nowrap; }
 .right { text-align: right; }
 .muted { color: var(--text-3); }
 .sec { color: var(--text-2); }
+.tone-warning { color: var(--warning-text); }
+.tone-info { color: var(--info-text); }
 
 
 /* ---------- CHART / SPARKLINE ---------- */
