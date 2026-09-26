@@ -331,7 +331,7 @@ impl Actor {
                     return Err(refuse(
                         &req,
                         Reason::Invalid,
-                        "a restore holds this machine's database (it has not finished, or a fresh install awaits one); finish it with the restore command first. Nothing was changed",
+                        "a restore holds this machine's database (it has not finished); run the restore command again first. Nothing was changed",
                     ))
                 }
                 Err(e) => {

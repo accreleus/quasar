@@ -9,8 +9,8 @@
 //! ```text
 //! schema-floor.json   the database may be at this schema or above: no control plane
 //!                     whose image declares less is created, started or put back
-//! database-hold.json  no control plane is created or started: a fresh install awaits
-//!                     its restore, or a restore stopped part-way
+//! database-hold.json  no control plane is created or started: a restore stopped
+//!                     part-way
 //! restore-point.json  what the last migrating control-plane replacement returns to
 //! ```
 
@@ -156,8 +156,6 @@ pub struct SchemaFloor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldReason {
-    /// A fresh install whose seed asked for a restore before the first boot.
-    AwaitRestore,
     /// A restore stopped the control plane and has not finished loading and starting it.
     RestoreIncomplete,
 }

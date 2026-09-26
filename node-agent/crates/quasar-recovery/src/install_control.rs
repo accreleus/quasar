@@ -134,16 +134,12 @@ impl Actor {
                 Ok(())
             })?;
         }
-        // A restore owns the database until it finishes, and a fresh install awaiting one
-        // has none yet: no control plane is created or started meanwhile (`crate::restore`).
+        // A restore owns the database until it finishes: no control plane is created or
+        // started meanwhile (`crate::restore`).
         match crate::database::load_hold(self.dir.root()) {
             Ok(None) => {}
             Ok(Some(hold)) => {
                 let why = match hold.reason {
-                    crate::database::HoldReason::AwaitRestore => format!(
-                        "this install awaits a restore before its control plane's first boot: run `docker exec -i {} quasar-recovery restore --dump - < <your pg_dump file>`",
-                        names::RECOVERY_ACTOR
-                    ),
                     crate::database::HoldReason::RestoreIncomplete => format!(
                         "a restore stopped before it finished, so the database may be partly loaded; run the same restore command again (`docker exec {} quasar-recovery restore --list` lists the dumps)",
                         names::RECOVERY_ACTOR

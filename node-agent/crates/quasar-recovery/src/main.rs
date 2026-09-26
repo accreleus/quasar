@@ -35,11 +35,6 @@ commands:
               restore --to <version>                on your own database, once you have
                                                     restored your backup: start that
                                                     control plane if the schema matches
-              restore --dump -                      a fresh install (seed started with
-                                                    QUASAR_AWAIT_RESTORE=1): load a
-                                                    pg_dump --format=custom file from stdin
-                                                    (docker exec -i ... < file) before the
-                                                    control plane's first boot
   version   print this build's version and commit
 
 uninstall and reconfigure are not in this build.";
@@ -156,29 +151,6 @@ fn restore(args: &[String]) -> ExitCode {
     }
     if list || (dump.is_none() && to.is_none()) {
         return list_dumps(&socket);
-    }
-    if dump.as_deref() == Some("-") {
-        let machine_dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
-        let dir = quasar_recovery::dump::DumpDir::new(std::path::Path::new(&machine_dir));
-        let name = format!(
-            "import-{}",
-            quasar_recovery::dump::stamp(&quasar_recovery::actor::rfc3339_now())
-        );
-        let written = dir
-            .ensure()
-            .and_then(|()| {
-                quasar_recovery::dump::write_import(std::io::stdin().lock(), &dir.partial(&name))
-            })
-            .and_then(|n| dir.complete(&name).map(|()| n));
-        match written {
-            Ok(n) => eprintln!("read {n} bytes from stdin as {name}"),
-            Err(e) => {
-                let _ = std::fs::remove_file(dir.partial(&name));
-                eprintln!("quasar-recovery restore: the dump could not be read from stdin: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-        dump = Some(name);
     }
     let id = quasar_recovery::actor::random_request_id();
     let req = quasar_recovery::restore::request(id.clone(), dump, to);

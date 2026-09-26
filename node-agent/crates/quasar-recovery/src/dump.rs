@@ -5,7 +5,7 @@
 //! Not a frozen interface: the name is opaque everywhere else (control-api.md
 //! `pre_update_dump`), and only this module and the `restore` command read the files.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use quasar_runtime::DurableFile;
@@ -16,7 +16,7 @@ use crate::socket::Dump;
 
 pub const FORMAT: u32 = 1;
 
-/// How many pre-update dumps a machine keeps (#352 decision 14). Imports are not counted.
+/// How many pre-update dumps a machine keeps (#352 decision 14).
 pub const KEEP: usize = 3;
 
 /// A custom-format archive begins with these bytes (`pg_dump --format=custom`).
@@ -33,11 +33,11 @@ pub struct DumpRecord {
     pub created_at: String,
     pub size_bytes: i64,
     pub sha256: String,
-    /// The attempt that took it; `None` for an import.
+    /// The attempt that took it.
     #[serde(default)]
     pub request_id: Option<String>,
     /// The control plane the database was on when the dump was taken: the one a restore of
-    /// it starts. `None` for an import, which starts this machine's installed one.
+    /// it starts.
     #[serde(default)]
     pub control_plane: Option<ImageRef>,
     #[serde(default)]
@@ -45,9 +45,6 @@ pub struct DumpRecord {
     /// The version a restore of this dump returns to, as the printed command's `--to`.
     #[serde(default)]
     pub returns_to: Option<String>,
-    /// Loaded from an operator's file (a pre-RH-06 stack's `pg_dump`) rather than taken here.
-    #[serde(default)]
-    pub imported: bool,
 }
 
 impl DumpRecord {
@@ -61,8 +58,8 @@ impl DumpRecord {
     }
 }
 
-/// `20260925T100000Z-schema-88`, with `-<8 hex>` when two dumps would share a second; an
-/// import is `import-20260925T100000Z`. Anything else is refused before it names a file.
+/// `20260925T100000Z-schema-88`, with `-<8 hex>` when two dumps would share a second.
+/// Anything else is refused before it names a file.
 pub fn valid_name(name: &str) -> bool {
     let stamp = |s: &str| {
         let b = s.as_bytes();
@@ -72,9 +69,6 @@ pub fn valid_name(name: &str) -> bool {
             && b[9..15].iter().all(u8::is_ascii_digit)
             && b[15] == b'Z'
     };
-    if let Some(rest) = name.strip_prefix("import-") {
-        return stamp(rest);
-    }
     let Some((ts, rest)) = name.split_once("-schema-") else {
         return false;
     };
@@ -203,7 +197,7 @@ impl DumpDir {
         Ok(())
     }
 
-    /// Every `.partial`: a dump or an import a crash stopped half-way.
+    /// Every `.partial`: a dump a crash stopped half-way.
     pub fn remove_partials(&self) -> io::Result<()> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Ok(());
@@ -216,11 +210,10 @@ impl DumpDir {
         Ok(())
     }
 
-    /// Keeps the newest [`KEEP`] pre-update dumps and every import; `keep` is never removed.
+    /// Keeps the newest [`KEEP`] pre-update dumps; `keep` is never removed.
     pub fn prune(&self, keep: &str) -> io::Result<Vec<String>> {
         let mut removed = Vec::new();
-        let taken: Vec<DumpRecord> = self.list().into_iter().filter(|r| !r.imported).collect();
-        for r in taken.into_iter().skip(KEEP) {
+        for r in self.list().into_iter().skip(KEEP) {
             if r.name != keep {
                 self.remove(&r.name)?;
                 removed.push(r.name);
@@ -262,20 +255,6 @@ pub fn examine(path: &Path) -> io::Result<(i64, String, bool)> {
         .map(|b| format!("{b:02x}"))
         .collect();
     Ok((size, hex, head == MAGIC))
-}
-
-/// Copies `input` to `partial` and fsyncs it: the `restore --dump -` import.
-pub fn write_import(mut input: impl Read, partial: &Path) -> io::Result<u64> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(partial)?;
-    let n = io::copy(&mut input, &mut out)?;
-    out.flush()?;
-    out.sync_all()?;
-    Ok(n)
 }
 
 /// What the pre-update dump of a database this size may need: the database's own size (a
@@ -321,7 +300,6 @@ mod tests {
         for ok in [
             "20260925T100000Z-schema-88",
             "20260925T100000Z-schema-88-7a1f6f1e",
-            "import-20260925T100000Z",
         ] {
             assert!(valid_name(ok), "{ok}");
         }
@@ -332,7 +310,7 @@ mod tests {
             "20260925T100000Z-schema-88.dump",
             "20260925T100000Z-schema-88-7A1F6F1E",
             "20260925T1000Z-schema-88",
-            "import-2026",
+            "import-20260925T100000Z",
             "20260925T100000Z-schema-88/../../secrets",
         ] {
             assert!(!valid_name(bad), "{bad}");

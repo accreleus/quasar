@@ -257,7 +257,6 @@ impl Actor {
             control_plane: Some(old_image.clone()),
             recipe_revision: Some(old_revision),
             returns_to: Some(returns_to.to_owned()),
-            imported: false,
         };
         if let Err(e) = dir.store(&record) {
             let _ = dir.remove(&name);
@@ -346,10 +345,17 @@ impl Actor {
                 "\nNo restore point was recorded for this attempt, so no restore command can be printed.",
             ),
         }
+        // The log carries the command too: `docker logs quasar-recovery` is where an
+        // operator looks when the console is down.
+        let command = point
+            .as_ref()
+            .map(|p| database::restore_command(p.dump.as_deref(), &p.returns_to))
+            .unwrap_or_default();
         warn!(
             token = "actor-migrating-control-plane-failed",
             request = %j.request.request_id,
             reason = %failure.reason,
+            restore = %command,
             "a migrating control plane did not verify; it is not restored automatically"
         );
         self.finish(j, State::Failed, Some(failure.reason), output, false)

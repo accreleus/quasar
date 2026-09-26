@@ -1,8 +1,7 @@
-//! The operator's `restore` (#352 decisions 14 and 20, R1): load a dump into a stopped
-//! database and start the control plane it belongs to; or, on an operator-supplied
+//! The operator's `restore` (#352 decision 14, R1): load a pre-update dump into a stopped
+//! database and start the control plane it was taken under; or, on an operator-supplied
 //! database the operator restored with their own tools, start the control plane whose
-//! schema it matches; or load a pre-RH-06 stack's `pg_dump` into a fresh install before
-//! its control plane's first boot.
+//! schema it matches. Only dumps this machine's actor took are restored.
 //!
 //! Submitted only on the operator socket, which lives in the actor's own container
 //! (`docker exec quasar-recovery quasar-recovery restore …`), and journalled and settled
@@ -83,13 +82,6 @@ pub struct Restore {
     pub phase: RestorePhase,
     /// The dump loaded; `None` on an external database.
     pub dump: Option<String>,
-    /// The dump is an operator's file: loaded into a fresh install, whose installed
-    /// control plane then migrates it forward on its first boot.
-    #[serde(default)]
-    pub imported: bool,
-    /// No control plane was ever created on this machine.
-    #[serde(default)]
-    pub fresh_install: bool,
     pub control_plane: ImageRef,
     #[serde(default)]
     pub recipe_revision: Option<u32>,
@@ -255,14 +247,11 @@ impl Actor {
     /// is read at `checking`.
     fn plan_restore(&self, machine: &Machine, req: &Request) -> Result<Restore, String> {
         let owned = Self::is_owned_database(machine);
-        let fresh = self.control_plane_never_created()?;
         let to = req.release.version.clone().filter(|v| !v.is_empty());
         let dumps = DumpDir::new(self.dir.root());
         let mut plan = Restore {
             phase: RestorePhase::Admitted,
             dump: None,
-            imported: false,
-            fresh_install: fresh,
             control_plane: ImageRef {
                 repository: String::new(),
                 digest: String::new(),
@@ -288,20 +277,6 @@ impl Actor {
                     return Err(format!("there is no dump named {name} on this machine (`restore --list` lists them)"));
                 }
                 plan.dump = Some(name.to_owned());
-                if name.starts_with("import-") {
-                    if !fresh {
-                        return Err(format!(
-                            "an imported dump is loaded only into a fresh install, before its control plane's first boot; this machine's control plane has run. Install afresh with {}=1 on the seed, then restore",
-                            crate::bootstrap::AWAIT_RESTORE
-                        ));
-                    }
-                    plan.imported = true;
-                    plan.control_plane = machine
-                        .install_images
-                        .get(&Role::ControlPlane)
-                        .cloned()
-                        .ok_or("machine state names no control-plane image to start")?;
-                } else {
                     let record = dumps
                         .load(name)
                         .map_err(|e| format!("the record of dump {name} cannot be read ({e})"))?
@@ -321,7 +296,6 @@ impl Actor {
                     plan.schema_version = Some(record.schema_version);
                     plan.returns_to = record.returns_to.clone();
                     plan.created_at = Some(record.created_at.clone());
-                }
             }
             (None, false) => {
                 let to = to.ok_or(
@@ -342,21 +316,6 @@ impl Actor {
             }
         }
         Ok(plan)
-    }
-
-    /// No control plane was ever created here: no record of one, and no container.
-    fn control_plane_never_created(&self) -> Result<bool, String> {
-        let recorded = self
-            .dir
-            .load_service(Role::ControlPlane)
-            .map_err(|e| format!("services/control-plane.json cannot be read ({e})"))?
-            .is_some();
-        let running = self
-            .engine
-            .inspect_container(names::CONTROL_PLANE)
-            .map_err(|e| format!("the container engine did not answer ({e})"))?
-            .is_some();
-        Ok(!recorded && !running)
     }
 
     fn restore_mut<'a>(&self, j: &'a mut Journal) -> &'a mut Restore {
@@ -473,22 +432,12 @@ impl Actor {
                 schema.version
             )));
         }
-        let matches = if plan.imported {
-            schema.version <= target
-        } else {
-            schema.version == target
-        };
-        if !matches {
+        if schema.version != target {
             let to = plan
                 .returns_to
                 .as_deref()
                 .unwrap_or("the control plane to start");
-            return Err(nothing_changed(if plan.imported {
-                format!(
-                    "the dump is at schema {}, newer than this install's control plane (schema {target}); install the release that dump was taken under, or a newer one",
-                    schema.version
-                )
-            } else if plan.dump.is_some() {
+            return Err(nothing_changed(if plan.dump.is_some() {
                 format!(
                     "the dump is at schema {} but {to} is a control plane of schema {target}: they do not belong together",
                     schema.version
@@ -677,9 +626,8 @@ impl Actor {
         Ok(())
     }
 
-    /// `starting`: on a fresh install the install itself continues and creates its
-    /// control plane; otherwise the failed and kept control planes go, and the one the
-    /// database matches is created from its recipe and started.
+    /// `starting`: the failed and kept control planes go, and the one the database matches
+    /// is created from its recipe and started.
     fn start_restored(&self, j: &mut Journal) -> Result<(), Halt> {
         let mut machine = self.restore_machine()?;
         let plan = self.restore_mut(j).clone();
@@ -689,57 +637,41 @@ impl Actor {
                     .map_err(|_| Halt::Died)?;
             }
         }
-        if plan.fresh_install {
-            database::clear_hold(self.dir.root()).map_err(|_| Halt::Died)?;
-            match self.ensure_control_machine(&machine) {
-                Ok(()) => {}
-                Err(crate::actor::ResumeError::Engine(EngineError::Crashed)) => {
-                    return Err(Halt::Died)
+        let id = j.request.request_id.clone();
+        for name in [
+            names::CONTROL_PLANE.to_string(),
+            kept_name(names::CONTROL_PLANE),
+        ] {
+            let found = self
+                .retrying(|| self.engine.inspect_container(&name))
+                .map_err(|e| crate::replace::engine(e, Reason::RecreateFailed, "inspect"))?;
+            if let Some(c) = found {
+                if c.labels.get(ATTEMPT_LABEL) == Some(&id) {
+                    continue;
                 }
-                Err(e) => {
-                    return Err(fail(
-                        Reason::RecreateFailed,
-                        format!("the database is restored, but the install could not create its control plane: {e}"),
-                    ))
-                }
+                self.retrying(|| self.engine.remove_container(&c.id))
+                    .map_err(|e| {
+                        crate::replace::engine(
+                            e,
+                            Reason::RecreateFailed,
+                            "remove the old control plane",
+                        )
+                    })?;
             }
-        } else {
-            let id = j.request.request_id.clone();
-            for name in [
-                names::CONTROL_PLANE.to_string(),
-                kept_name(names::CONTROL_PLANE),
-            ] {
-                let found = self
-                    .retrying(|| self.engine.inspect_container(&name))
-                    .map_err(|e| crate::replace::engine(e, Reason::RecreateFailed, "inspect"))?;
-                if let Some(c) = found {
-                    if c.labels.get(ATTEMPT_LABEL) == Some(&id) {
-                        continue;
-                    }
-                    self.retrying(|| self.engine.remove_container(&c.id))
-                        .map_err(|e| {
-                            crate::replace::engine(
-                                e,
-                                Reason::RecreateFailed,
-                                "remove the old control plane",
-                            )
-                        })?;
-                }
-            }
-            let mine = self
-                .retrying(|| self.engine.inspect_container(names::CONTROL_PLANE))
-                .map_err(|e| crate::replace::engine(e, Reason::RecreateFailed, "inspect"))?
-                .filter(|c| c.labels.get(ATTEMPT_LABEL) == Some(&id));
-            let container = match mine {
-                Some(c) => c.id,
-                None => self.create_restored(&mut machine, &plan, &id)?,
-            };
-            self.retrying(|| self.engine.start_container(&container))
-                .map_err(|e| {
-                    crate::replace::engine(e, Reason::NeverStarted, "start the control plane")
-                })?;
-            self.restore_mut(j).new_container = Some(container);
         }
+        let mine = self
+            .retrying(|| self.engine.inspect_container(names::CONTROL_PLANE))
+            .map_err(|e| crate::replace::engine(e, Reason::RecreateFailed, "inspect"))?
+            .filter(|c| c.labels.get(ATTEMPT_LABEL) == Some(&id));
+        let container = match mine {
+            Some(c) => c.id,
+            None => self.create_restored(&mut machine, &plan, &id)?,
+        };
+        self.retrying(|| self.engine.start_container(&container))
+            .map_err(|e| {
+                crate::replace::engine(e, Reason::NeverStarted, "start the control plane")
+            })?;
+        self.restore_mut(j).new_container = Some(container);
         Ok(())
     }
 
@@ -834,22 +766,14 @@ impl Actor {
     fn finish_restore(&self, j: &mut Journal) -> Result<(), ()> {
         let plan = self.restore_mut(j).clone();
         database::clear_hold(self.dir.root()).map_err(|_| ())?;
-        if plan.imported {
-            if let Some(name) = &plan.dump {
-                let _ = DumpDir::new(self.dir.root()).remove(name);
-            }
-        }
         let schema = plan.schema_version.unwrap_or_default();
-        let output = match (&plan.dump, plan.imported) {
-            (Some(name), true) => format!(
-                "Loaded {name} (schema {schema}) into this install's database before its first boot. The control plane migrates it forward as it starts; re-enroll each GPU host under its old node name."
-            ),
-            (Some(name), false) => format!(
+        let output = match &plan.dump {
+            Some(name) => format!(
                 "Restored dump {name} (schema {schema}, taken {}) into Quasar's database and started control plane {} again. Anything written after the dump was taken is gone.",
                 plan.created_at.as_deref().unwrap_or("before the update"),
                 plan.returns_to.as_deref().unwrap_or("")
             ),
-            (None, _) => format!(
+            None => format!(
                 "Your database is at schema {schema}; started control plane {} against it.",
                 plan.returns_to.as_deref().unwrap_or("")
             ),
