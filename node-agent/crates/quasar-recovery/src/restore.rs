@@ -867,7 +867,7 @@ impl Actor {
                     }
                 }
                 Ok(_) => {}
-                Err(e) => warn!(token = "actor-restore-mark-unwritten", dump = %name, "{e}"),
+                Err(e) => warn!(token = "actor-restore-record-unreadable", dump = %name, "{e}"),
             }
         }
         let point = database::load_point(root).ok().flatten();

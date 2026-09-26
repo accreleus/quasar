@@ -325,8 +325,9 @@ describe("Releases after a migrating control-plane update went wrong", () => {
     expect(card).toHaveTextContent("v0.6.0 failed after changing the database");
     expect(card).toHaveTextContent("To go back to v0.5.2, run this on living-room-pc.");
     // The dump's time, read from its name, as the mock says it.
-    expect(card).toHaveTextContent("loads the dump taken at 25 Sep 2026, 14:02 — before the migration, under v0.5.2 —");
-    expect(card).toHaveTextContent("Anything written after 25 Sep 2026, 14:02 is lost.");
+    // The month's short form is the ICU data's ("Sep" or "Sept").
+    expect(card).toHaveTextContent(/loads the dump taken at 25 Sept? 2026, 14:02 — before the migration, under v0\.5\.2 —/);
+    expect(card).toHaveTextContent(/Anything written after 25 Sept? 2026, 14:02 is lost\./);
     expect(within(card).getByTestId("restore-command")).toHaveTextContent(OWN_CMD);
     expect(card).toHaveTextContent("Run on living-room-pc as root");
     expect(within(card).getByRole("button", { name: "Copy restore command" })).toBeInTheDocument();

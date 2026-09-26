@@ -203,7 +203,8 @@ describe("FleetApplyButton", () => {
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/then 3 eligible hosts, to/)).toBeInTheDocument();
-    expect(within(dialog).getByText("0.3.0")).toBeInTheDocument();
+    // With its version prefix, as the restore card names releases.
+    expect(within(dialog).getByText("v0.3.0")).toBeInTheDocument();
     expect(within(dialog).getByText(/ends every live session on 3 hosts/)).toBeInTheDocument();
     expect(within(dialog).getByText(/lose contact for about 20 seconds/)).toBeInTheDocument();
   });
