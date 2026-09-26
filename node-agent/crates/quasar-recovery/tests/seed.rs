@@ -354,6 +354,124 @@ fn the_seed_never_replaces_restarts_or_starts_an_actor_it_did_not_just_create() 
     assert_eq!(engine.state(), before, "a hand-over successor was started");
 }
 
+/// #381: an actor stopped with `docker stop` stays stopped, so the seed says so, unhealthy,
+/// from its second look on. It still starts nothing (ADR 0007).
+#[test]
+fn an_actor_the_operator_stopped_is_reported_on_the_second_look_and_never_started() {
+    let _serial = serial();
+    let (engine, dir) = installed();
+    let id = actor_id(&engine.state());
+    engine.with_state(|s| s.containers.get_mut(&id).unwrap().status = "exited".into());
+    let before = engine.state();
+
+    let (outcomes, log) = logged(&engine, dir.path(), 3);
+    assert!(
+        matches!(outcomes[0], Outcome::Present { .. }),
+        "one look is not enough: {outcomes:?}"
+    );
+    for outcome in &outcomes[1..] {
+        match outcome {
+            Outcome::Idle {
+                token: "seed-actor-stopped",
+                why,
+            } => assert!(why.contains("docker start quasar-recovery"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(log.matches("seed-actor-stopped").count(), 1, "{log}");
+    assert_eq!(engine.state(), before, "the seed touched the engine");
+
+    let (line, healthy) = health_after_looks(&engine, dir.path());
+    assert!(!healthy, "{line}");
+    assert!(line.contains("docker start quasar-recovery"), "{line}");
+
+    // Started again by the operator: present and healthy.
+    engine.with_state(|s| s.containers.get_mut(&id).unwrap().status = "running".into());
+    let (line, healthy) = health_after_looks(&engine, dir.path());
+    assert!(healthy, "{line}");
+}
+
+#[test]
+fn no_running_actor_is_reported_only_while_the_machine_is_installed() {
+    let _serial = serial();
+
+    // A hand-over's moment with the old actor kept and its successor running.
+    let (engine, dir) = installed();
+    let id = actor_id(&engine.state());
+    engine.with_state(|s| {
+        let mut kept = s.containers.remove(&id).unwrap();
+        kept.spec.name = "quasar-recovery.kept".into();
+        kept.status = "exited".into();
+        kept.restart = quasar_recovery::engine::RestartPolicy::No;
+        let mut next = kept.clone();
+        next.id = "ac10000000000000000000000000000000000000000000000000000000000000".into();
+        next.spec.name = "quasar-recovery".into();
+        next.status = "running".into();
+        s.containers.insert(kept.id.clone(), kept);
+        s.containers.insert(next.id.clone(), next);
+    });
+    let (outcomes, _) = logged(&engine, dir.path(), 3);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Outcome::Present { .. })),
+        "{outcomes:?}"
+    );
+
+    // An interrupted hand-over: nothing runs, so it is reported with the way back.
+    engine.with_state(|s| {
+        let next = s.container_named("quasar-recovery").unwrap().id.clone();
+        s.containers.get_mut(&next).unwrap().status = "created".into();
+    });
+    let before = engine.state();
+    let (outcomes, _) = logged(&engine, dir.path(), 2);
+    match &outcomes[1] {
+        Outcome::Idle {
+            token: "seed-actor-stopped",
+            why,
+        } => assert!(why.contains(quasar_recovery::handover::FIX), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(engine.state(), before);
+
+    // Uninstalled: the uninstall stopped the actor, and the seed only idles on the marker.
+    let (engine, dir) = installed();
+    let id = actor_id(&engine.state());
+    engine.with_state(|s| {
+        let actor = s.containers.get_mut(&id).unwrap();
+        actor.status = "exited".into();
+        actor.restart = quasar_recovery::engine::RestartPolicy::No;
+    });
+    let mut file = seed_file(&dir);
+    file.state = SeedState::Uninstalled;
+    std::fs::write(
+        dir.path().join("seed.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    let (outcomes, _) = logged(&engine, dir.path(), 3);
+    assert!(
+        outcomes.iter().all(|o| matches!(
+            o,
+            Outcome::Idle {
+                token: "seed-uninstalled",
+                ..
+            }
+        )),
+        "{outcomes:?}"
+    );
+
+    // An uninstall with no seed.json to mark: no installation is known, so nothing is said.
+    std::fs::remove_file(dir.path().join("seed.json")).unwrap();
+    let (outcomes, _) = logged(&engine, dir.path(), 3);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Outcome::Present { .. })),
+        "{outcomes:?}"
+    );
+}
+
 /// The seed was stopped between creating the actor and starting it (a crash, an engine
 /// restart); the same seed container, started again, finishes its own create. It knows
 /// itself only by its 12-character `$HOSTNAME` there, and still recognises the full id it

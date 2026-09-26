@@ -1515,6 +1515,7 @@ Every 30 s (and at start) it looks once and logs only a change, so each conditio
 | `token="seed-uninstalled"` | `seed.json` says this machine was uninstalled; the seed stays idle. |
 | `token="seed-file-unknown-format"` / `seed-file-unreadable` | `seed.json` is of a format other than 1, or invalid; the seed stays idle rather than guess. |
 | `token="seed-name-taken"` | A container named `quasar-recovery` exists without this installation's labels (for instance an actor started by hand, below): it is left alone. Remove it and the seed creates the actor. |
+| `token="seed-actor-stopped"` | On an installed machine, no recovery actor of this installation has run for two looks in a row (#381). Usually `quasar-recovery` was stopped with `docker stop` or `docker kill`, which the engine never restarts: nothing on the machine is replaced or recovered until it runs again, and a replacement it had started (of the control plane, say) waits unfinished. `docker start quasar-recovery` finishes it. After an interrupted hand-over the line names the way back instead, `docker start quasar-recovery.kept 2>/dev/null \|\| docker start quasar-recovery`. The seed starts no existing actor itself (ADR 0007). |
 | `seed-engine-unreachable`, `seed-pull-failed`, `seed-create-failed`, `seed-start-failed` | Retried at the next look. |
 
 **Its own unfinished create.** If the seed stops between creating the actor and starting it

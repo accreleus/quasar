@@ -9,7 +9,8 @@
 //! - the only actor is one this seed created and never started: start it, finishing its
 //!   own create (ADR 0007, "Finishing its own create");
 //! - otherwise a container carrying both labels exists, in any state and under any name (a
-//!   hand-over's kept and successor containers included): nothing;
+//!   hand-over's kept and successor containers included): nothing. When none of them has
+//!   run for two looks it says so (`seed-actor-stopped`, unhealthy) and still starts nothing;
 //! - otherwise create the actor from the profile, from `seed.json`'s verified image or, on
 //!   a first install (no `seed.json`), from the seed's own image with a new installation.
 //!
@@ -27,7 +28,7 @@ use tracing::{error, info, warn};
 
 use crate::actor::repository_of;
 use crate::bootstrap::{self, Bootstrap};
-use crate::engine::{Container, PlatformEngine};
+use crate::engine::{Container, PlatformEngine, RestartPolicy};
 use crate::recipe::ImageRef;
 use crate::shutdown;
 use file::{ActorImage, SeedRead, SeedState};
@@ -109,6 +110,47 @@ fn unstarted_create_of(c: &Container) -> Option<&str> {
         .iter()
         .find_map(|kv| kv.strip_prefix(&format!("{}=", profile::SEED_CONTAINER_ENV)))?;
     is_own_unstarted(c, Some(seed)).then_some(seed)
+}
+
+/// The actors of an active installation when none of them runs; `None` otherwise. Only
+/// reported ([`Outcome::Idle`] `seed-actor-stopped`): the seed starts no existing actor.
+fn stopped_actors<'a>(read: &SeedRead, containers: &'a [Container]) -> Option<Vec<&'a Container>> {
+    let SeedRead::Found(f) = read else {
+        return None;
+    };
+    if f.state != SeedState::Active {
+        return None;
+    }
+    let actors: Vec<&Container> = containers
+        .iter()
+        .filter(|c| is_actor(c, Some(&f.installation_id)))
+        .collect();
+    let stopped = |c: &&Container| matches!(c.status.as_str(), "exited" | "dead" | "created");
+    (!actors.is_empty() && actors.iter().all(stopped)).then_some(actors)
+}
+
+fn stopped_why(actors: &[&Container]) -> String {
+    match actors {
+        // Exited with its restart policy intact: an operator's docker stop or docker kill,
+        // which the engine never restarts. Quasar disables the policy of any actor it stops.
+        [only] if only.status == "exited" && only.restart == Some(RestartPolicy::UnlessStopped) => {
+            format!(
+                "the recovery actor {name} is stopped (docker stop or docker kill), and the engine never restarts a container stopped that way, so nothing on this machine is replaced or recovered until it runs, including a replacement it had started. Run docker start {name}; it finishes what it was doing",
+                name = only.name,
+            )
+        }
+        _ => {
+            let each: Vec<String> = actors
+                .iter()
+                .map(|c| format!("{} {}", c.name, c.status))
+                .collect();
+            format!(
+                "no recovery actor of this installation is running ({}), so nothing on this machine is replaced or recovered until one is. Run {}",
+                each.join(", "),
+                crate::handover::FIX,
+            )
+        }
+    }
 }
 
 /// `me` is the seed's own full container id, when known.
@@ -235,6 +277,7 @@ impl Outcome {
                 "seed-file-unreadable" => warn!(token = "seed-file-unreadable", "{why}"),
                 "seed-name-taken" => warn!(token = "seed-name-taken", "{why}"),
                 "seed-actor-unstarted" => warn!(token = "seed-actor-unstarted", "{why}"),
+                "seed-actor-stopped" => warn!(token = "seed-actor-stopped", "{why}"),
                 "seed-engine-unreachable" => warn!(token = "seed-engine-unreachable", "{why}"),
                 "seed-pull-failed" => warn!(token = "seed-pull-failed", "{why}"),
                 "seed-agent-image-unavailable" => {
@@ -327,6 +370,9 @@ pub struct Seed {
     engine: Arc<dyn PlatformEngine>,
     config: SeedConfig,
     last: Option<Outcome>,
+    /// The actors the previous look found none of running: reported once a second look
+    /// finds the same, so a hand-over's moment between two actors is never reported.
+    stopped: Option<Vec<String>>,
 }
 
 fn invalid_self(why: String) -> Outcome {
@@ -356,6 +402,7 @@ impl Seed {
             engine,
             config,
             last: None,
+            stopped: None,
         }
     }
 
@@ -389,7 +436,8 @@ impl Seed {
     }
 
     /// One look at the machine, and the one action it may call for.
-    pub fn tick(&self) -> Outcome {
+    pub fn tick(&mut self) -> Outcome {
+        let previously_stopped = self.stopped.take();
         let read = file::read(&self.config.machine_dir);
         let looks = matches!(read, SeedRead::Missing)
             || matches!(&read, SeedRead::Found(f) if f.state == SeedState::Active);
@@ -445,7 +493,22 @@ impl Seed {
                             "{container} was created by another seed container ({other}) and never started; this seed does not start it (ADR 0007). Run docker start {container}"
                         ),
                     },
-                    None => Outcome::Present { container },
+                    None => match stopped_actors(&read, &containers) {
+                        Some(actors) => {
+                            let ids: Vec<String> = actors.iter().map(|c| c.id.clone()).collect();
+                            let settled = previously_stopped.as_ref() == Some(&ids);
+                            self.stopped = Some(ids);
+                            if settled {
+                                Outcome::Idle {
+                                    token: "seed-actor-stopped",
+                                    why: stopped_why(&actors),
+                                }
+                            } else {
+                                Outcome::Present { container }
+                            }
+                        }
+                        None => Outcome::Present { container },
+                    },
                 }
             }
             Decision::NameTaken { container } => Outcome::Idle {
