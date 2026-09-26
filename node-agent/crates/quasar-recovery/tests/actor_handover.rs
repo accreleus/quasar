@@ -234,6 +234,9 @@ struct Lab {
     handover: Mutex<HandoverTiming>,
     /// Whether the simulated node agent polls the agent socket, as its relay does.
     agent_polls: AtomicBool,
+    /// Set by the first submit: the relay polls from then on, as the agent's does
+    /// throughout an attempt. Not before, so every install makes the same engine calls.
+    relaying: AtomicBool,
     /// The test removed every actor container on purpose: until the seed has looked, a
     /// seed that would create one is right, not racing.
     operator_removed: AtomicBool,
@@ -316,6 +319,7 @@ impl Lab {
             no_socket: Mutex::new(Vec::new()),
             handover: Mutex::new(handover_timing()),
             agent_polls: AtomicBool::new(true),
+            relaying: AtomicBool::new(false),
             operator_removed: AtomicBool::new(false),
             me: me.clone(),
             stop: AtomicBool::new(false),
@@ -333,7 +337,7 @@ impl Lab {
             if lab.stop.load(Ordering::SeqCst) {
                 return;
             }
-            if lab.agent_polls.load(Ordering::SeqCst) {
+            if lab.relaying.load(Ordering::SeqCst) && lab.agent_polls.load(Ordering::SeqCst) {
                 let _ = quasar_recovery::server::fetch_status(&lab.socket());
             }
             drop(lab);
@@ -640,6 +644,7 @@ impl Lab {
     /// Submit on the running actor's agent socket path, as the agent's relay does.
     fn submit(&self, req: Request) -> Result<(), quasar_recovery::socket::Rejection> {
         let actor = self.serving().expect("an actor serves");
+        self.relaying.store(true, Ordering::SeqCst);
         actor.submit(Caller::Agent, req).map(|_| ())
     }
 
