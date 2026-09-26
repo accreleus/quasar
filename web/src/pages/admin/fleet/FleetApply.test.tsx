@@ -175,6 +175,23 @@ describe("FleetApplyButton", () => {
     expect(screen.queryByRole("button", { name: "Update Quasar" })).not.toBeInTheDocument();
   });
 
+  // #363: an owned control plane takes no migration until its pre-update dump
+  // exists (#364), so the run would stop before anything moved.
+  it("is disabled for a migrating release on an owned control plane, and only then", () => {
+    const owned = (migrates: boolean) => {
+      const v = view({ available: [release({ migrates, schema_version: migrates ? 75 : 74 })] });
+      Object.assign(v.installed.control_plane, { install_mode: "owned", machine_role: "combined", machine_node_name: "gpu-01" });
+      return v;
+    };
+    const { unmount } = renderButton(owned(true));
+    const button = screen.getByRole("button", { name: "Update Quasar" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", expect.stringContaining("cannot take in this version yet"));
+    unmount();
+    renderButton(owned(false));
+    expect(screen.getByRole("button", { name: "Update Quasar" })).toBeEnabled();
+  });
+
   it("is absent when this instance is already on the newest release", () => {
     renderButton(view({ available: [release({ source_commit: CP_COMMIT })] }));
     expect(screen.queryByRole("button", { name: "Update Quasar" })).not.toBeInTheDocument();

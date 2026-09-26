@@ -231,6 +231,14 @@ func (r *OwnMachineReader) read(ctx context.Context) (OwnMachine, bool, time.Tim
 	var m OwnMachine
 	if err == nil {
 		m = OwnMachineFromStatus(st)
+		if st.Actor.Commit != "" && m.Identity.RecoveryActorSourceCommit == nil {
+			log := r.Log
+			if log == nil {
+				log = slog.Default()
+			}
+			log.Warn("the recovery actor reports a commit that is not a commit; its actor-first ordering treats it as behind",
+				"socket", r.socket, "commit", st.Actor.Commit)
+		}
 	} else {
 		log := r.Log
 		if log == nil {

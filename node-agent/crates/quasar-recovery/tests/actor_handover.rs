@@ -1884,6 +1884,26 @@ fn a_control_plane_step_moves_the_actor_first_then_the_control_plane() {
     );
 }
 
+/// The way to move only the actor on the control plane's machine: name the control
+/// plane's current digest beside it. The actor hands over; the control plane is replaced
+/// by the same image and comes back.
+#[test]
+fn a_control_plane_machines_actor_moves_with_its_current_control_plane() {
+    let lab = Lab::combined();
+    let agent = lab.container(names::NODE_AGENT);
+    let current = Component {
+        name: "control-plane".into(),
+        image: CONTROL_REPO.into(),
+        digest: CONTROL_IMAGE.split_once('@').unwrap().1.into(),
+    };
+    lab.submit(request(vec![actor_component(), current]))
+        .unwrap();
+    let result = lab.outcome("actor with the current control plane");
+    assert_succeeded(&lab, &result, "actor with the current control plane");
+    assert_one_control_plane(&lab, CONTROL_IMAGE, "actor with the current control plane");
+    assert_eq!(lab.container(names::NODE_AGENT).id, agent.id);
+}
+
 /// ADR 0004 amendment and A1: a non-migrating control plane that never passes a health
 /// check is put back automatically; the actor that moved first stays on the new release.
 #[test]

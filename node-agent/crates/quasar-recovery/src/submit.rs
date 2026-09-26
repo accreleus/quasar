@@ -143,7 +143,10 @@ fn kind_and_caller_rules(
     }
     // A1 (ADR 0008): on the control plane's own machine the actor may lead the control
     // plane only while a control-plane replacement is in flight, so it moves only in the
-    // control-plane step, never alone (control-api.md §"Developer apply").
+    // control-plane step, never alone (control-api.md §"Developer apply"). To move only
+    // the actor there, name `[recovery-actor, control-plane]` with the control plane's
+    // current digest: the control plane is replaced by itself (a restart, sessions ride
+    // through). Guarded by a_control_plane_machines_actor_moves_with_its_current_control_plane.
     let names_actor = req.components.iter().any(|c| c.name == "recovery-actor");
     let names_control_plane = req.components.iter().any(|c| c.name == "control-plane");
     if caller == Caller::ControlPlane && names_actor && !names_control_plane {
