@@ -24,7 +24,7 @@ func hostStatus(t *testing.T, pool *pgxpool.Pool, hostID string) string {
 
 func TestReconnectPreservesOwnedRestrictionAfterOfflineProjection(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHostWithSecret(t, pool, "owned-reconnect-host", "secret-rh05")
 	holds := admission.NewStore(pool)
 	ctx := context.Background()
@@ -59,7 +59,7 @@ func setHostStatus(t *testing.T, pool *pgxpool.Pool, hostID, status string) {
 // cordon, and it already handles a connected draining host.
 func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHostWithSecret(t, pool, "cordoned-reconnect-host", "secret-140")
 
 	setHostStatus(t, pool, hostID, "draining")
@@ -84,16 +84,15 @@ func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 // path: re-enrolling a known node_name is not an uncordon either.
 func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
-	const token = "shared-enrollment-token-140"
-	res, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.0", token, token)
+	res, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatalf("initial enroll: %v", err)
 	}
 	setHostStatus(t, pool, res.HostID, "draining")
 
-	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", token, token); err != nil {
+	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", testEnrollmentToken); err != nil {
 		t.Fatalf("re-enroll: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "draining" {
@@ -101,7 +100,7 @@ func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 	}
 
 	setHostStatus(t, pool, res.HostID, "offline")
-	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.2", token, token); err != nil {
+	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.2", testEnrollmentToken); err != nil {
 		t.Fatalf("third enroll: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "online" {

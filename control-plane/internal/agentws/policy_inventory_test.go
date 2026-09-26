@@ -18,7 +18,7 @@ func TestFreshV2EmptyGroupSeedMapAckKeepsAdmissionClosed(t *testing.T) {
 	pool := testPool(t)
 	store := hostcfg.NewStore(pool)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := NewHandler(pool, "test-token", log, nil, nil, nil, store, nil)
+	h := NewHandler(pool, log, nil, nil, nil, store, nil)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -122,7 +122,7 @@ func TestBlockedPolicyInventoryRefreshesOnCurrentConnection(t *testing.T) {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := NewRegistry(log)
-	h := NewHandler(pool, "test-token", log, registry, nil, nil, store, nil)
+	h := NewHandler(pool, log, registry, nil, nil, store, nil)
 	t.Cleanup(h.Close)
 	c := newConn(hostID, nil)
 	c.policyTyped = true
@@ -177,7 +177,7 @@ func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := NewRegistry(log)
-	h := NewHandler(pool, "test-token", log, registry, nil, nil, store, nil)
+	h := NewHandler(pool, log, registry, nil, nil, store, nil)
 	t.Cleanup(h.Close)
 	c := newConn(hostID, nil)
 	c.policyTyped = true

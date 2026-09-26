@@ -27,7 +27,6 @@ func ownedDatabaseEnv(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("QUASAR_DATABASE_HOST", "postgres")
 	t.Setenv("QUASAR_DATABASE_PASSWORD", "")
-	t.Setenv("ENROLLMENT_TOKEN", "")
 }
 
 func TestDatabasePasswordFileCompletesTheHostForm(t *testing.T) {
@@ -187,35 +186,19 @@ func TestLocalEnrollment(t *testing.T) {
 	}
 }
 
-// control-api.md amendment 14 §"Enrollment": one WARN when a static value is
-// set, nothing when it is unset.
-func TestStaticEnrollmentTokenWarnsOnlyWhenSet(t *testing.T) {
+// The static ENROLLMENT_TOKEN is retired (control-api.md "RH06 contract step"):
+// a leftover value is not read, so it neither enrolls nor warns.
+func TestStaticEnrollmentTokenIsNotRead(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "")
+	t.Setenv("ENROLLMENT_TOKEN", "a-static-value")
 	c, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Warnings) != 0 {
-		t.Fatalf("unset ENROLLMENT_TOKEN warned: %v", c.Warnings)
-	}
-
-	t.Setenv("ENROLLMENT_TOKEN", "a-static-value")
-	c, err = Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(c.Warnings) != 1 {
-		t.Fatalf("Warnings = %v, want exactly one", c.Warnings)
-	}
-	w := c.Warnings[0]
-	for _, want := range []string{"ENROLLMENT_TOKEN", "deprecated", "RH06-15", "#367", "owned"} {
-		if !strings.Contains(w, want) {
-			t.Errorf("warning %q lacks %q", w, want)
+	for _, w := range c.Warnings {
+		if strings.Contains(w, "ENROLLMENT_TOKEN") || strings.Contains(w, "a-static-value") {
+			t.Errorf("a retired variable was read: %q", w)
 		}
-	}
-	if strings.Contains(w, "a-static-value") {
-		t.Error("the warning quotes the token")
 	}
 }
 

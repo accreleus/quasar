@@ -606,7 +606,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	originResolver := origins.NewResolver(cfg.AllowedOrigins, cfg.AllowedOriginsSet, settingsStore, log)
 	signalHandler := signalpkg.NewHandler(sessionStore, agentRegistry, relayBus, log, originResolver).
 		WithTrustedProxies(cfg.TrustedProxies)
-	agentHandler := agentws.NewHandler(pool, cfg.EnrollmentToken, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore, idleBoot).
+	agentHandler := agentws.NewHandler(pool, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore, idleBoot).
 		WithTrustedProxies(cfg.TrustedProxies)
 	// CM-09 item 2: console re-eval hook, set after both exist. A plain func value
 	// because session must not import agentws.Handler, only its agentws.Events subset.
@@ -1094,6 +1094,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 
 	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
+	pDeps.ControlPlanePreflight = func(context.Context) platform.PreflightFacts {
+		return platform.PreflightFacts{NoRecoveryActor: true}
+	}
 	if ownMachine != nil {
 		ownMachine.Log = log
 		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts

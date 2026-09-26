@@ -68,10 +68,9 @@ func TestRegisterWiresIdentityThroughTheAdminMiddleware(t *testing.T) {
 	}
 }
 
-// #184 through the view: a control plane whose socket volume is not mounted
-// reads Blocked on its own target, with the recreate named — the diagnosis the
-// bare "not installed" used to hide.
-func TestReleaseViewNamesTheUnmountedSocketVolume(t *testing.T) {
+// Through the view: a control plane with no recovery actor reads Blocked on its
+// own target, and says why and what replaces it.
+func TestReleaseViewNamesAControlPlaneWithNoRecoveryActor(t *testing.T) {
 	h := NewHandler(&Deps{
 		Channel:  func(context.Context) (string, string, error) { return ChannelStable, "develop", nil },
 		Hosts:    func(context.Context) ([]HostIdentity, error) { return nil, nil },
@@ -80,7 +79,7 @@ func TestReleaseViewNamesTheUnmountedSocketVolume(t *testing.T) {
 			return DetectionStatus{}, nil
 		},
 		UpdaterPresent:        func() bool { return false },
-		ControlPlanePreflight: func(context.Context) PreflightFacts { return PreflightFacts{Socket: &SocketState{}} },
+		ControlPlanePreflight: func(context.Context) PreflightFacts { return PreflightFacts{NoRecoveryActor: true} },
 	}, nil)
 	v, err := h.ReleaseView(context.Background())
 	if err != nil {
@@ -91,8 +90,8 @@ func TestReleaseViewNamesTheUnmountedSocketVolume(t *testing.T) {
 		t.Fatalf("control-plane target = %+v, want a blocked preflight", cp)
 	}
 	sock := cp.Preflight.Checks[0]
-	if sock.ID != CheckUpdaterSocket || sock.Status != CheckFail || !strings.Contains(sock.Detail, "--force-recreate --no-deps quasar-control-plane") {
-		t.Fatalf("updater_socket = %+v, want the recreate named", sock)
+	if sock.ID != CheckUpdaterSocket || sock.Status != CheckFail || !strings.Contains(sock.Detail, "not installed with the seed") {
+		t.Fatalf("updater_socket = %+v, want the missing recovery actor named", sock)
 	}
 	// With no release listed the image check is unknown, not a fault.
 	if img := cp.Preflight.Checks[len(cp.Preflight.Checks)-1]; img.ID != CheckImageResolvable || img.Status != CheckUnknown {

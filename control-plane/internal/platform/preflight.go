@@ -83,9 +83,11 @@ type PreflightFacts struct {
 	Readiness      map[string]ReadinessFact
 	// Both; copied from the instance-wide check.
 	Image *ImageFact
-	// Control plane on an owned machine only; nil is a control plane with no
-	// recovery actor.
+	// Control plane on an owned machine only.
 	OwnedActor *OwnedActorFact
+	// Control plane only: this control plane has no recovery actor at all (it was
+	// not installed with the seed). False with a nil OwnedActor is "not looked".
+	NoRecoveryActor bool
 	// Host only: an owned host carries owner_conflict.
 	OwnedHost bool
 }
@@ -111,9 +113,14 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 			ownedConflictCheck(f.OwnedActor),
 			imageCheck(f.Image),
 		}
-	case kind == TargetControlPlane:
+	case kind == TargetControlPlane && f.NoRecoveryActor:
 		checks = []PreflightCheck{
 			noActorCheck(),
+			imageCheck(f.Image),
+		}
+	case kind == TargetControlPlane:
+		checks = []PreflightCheck{
+			unknown(CheckUpdaterSocket, "the recovery actor was not asked"),
 			imageCheck(f.Image),
 		}
 	case f.OwnedHost:

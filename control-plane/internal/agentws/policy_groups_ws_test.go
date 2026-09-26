@@ -176,7 +176,7 @@ func connectTypedAgent(t *testing.T, pool *pgxpool.Pool, h *Handler, advertised 
 func TestRegisterEchoesEveryNextSessionGroupButNotHardware(t *testing.T) {
 	pool := testPool(t)
 	store := hostcfg.NewStore(pool)
-	h := NewHandler(pool, "test-token", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, store, nil)
+	h := NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, store, nil)
 	t.Cleanup(h.Close)
 	advertised := append(hostcfg.NextSessionPolicyGroups(), "hardware", "not_a_group")
 	sort.Strings(advertised)
@@ -193,7 +193,7 @@ func TestTypedAgentEveryNextSessionGroupReportsIndependently(t *testing.T) {
 	pool := testPool(t)
 	store := hostcfg.NewStore(pool)
 	ctx := context.Background()
-	h := NewHandler(pool, "test-token", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, store, nil)
+	h := NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, store, nil)
 	t.Cleanup(h.Close)
 	groups := hostcfg.NextSessionPolicyGroups()
 	agent, _ := connectTypedAgent(t, pool, h, groups, map[string]any{
@@ -306,7 +306,7 @@ func TestGroupExecutionUnavailableParksAnyKnownGroup(t *testing.T) {
 	pool := testPool(t)
 	store := hostcfg.NewStore(pool)
 	ctx := context.Background()
-	h := NewHandler(pool, "test-token", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, store, nil)
+	h := NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, store, nil)
 	t.Cleanup(h.Close)
 	agent, _ := connectTypedAgent(t, pool, h, []string{"gop", "slices"}, nil)
 	if _, err := store.SavePolicy(ctx, agent.hostID, "0", map[string]hostcfg.PolicyChoice{"gop": {Source: "explicit", Value: float64(90)}, "slices": {Source: "explicit", Value: float64(4)}}, nil); err != nil {
@@ -326,7 +326,7 @@ func TestGroupExecutionUnavailableParksAnyKnownGroup(t *testing.T) {
 func TestWithdrawStaleProbeCodecsOnlyWhenTheProbedValueDiffers(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	for _, tc := range []struct {
 		effective, want string
 	}{

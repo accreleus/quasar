@@ -14,12 +14,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
-
-func updaterResult(reason string) updater.Result {
-	return updater.Result{State: updater.StateFailed, Reason: &reason, Restored: true, Output: "container exited"}
-}
 
 // The owned control plane's step, over a REAL unix socket speaking the control
 // socket's shapes (testdata/recovery/socket), to a fake recovery actor.
@@ -369,10 +364,9 @@ func TestAdoptPastTheDeadlineReadsAnAlreadyTerminalResult(t *testing.T) {
 	if _, err := store.MintRequestID(context.Background(), "cp-1"); err != nil {
 		t.Fatal(err)
 	}
-	up := &fakeUpdater{}
-	reason := ReasonNeverStarted
-	up.setResult(updaterResult(reason))
-	self := testSelfApplier(t, store, NewUpdaterClient(serveUpdater(t, up)))
+	id, _ := store.AttemptRequestID(context.Background(), "cp-1")
+	actor := &fakeActor{result: actorResult(id, actorsocket.StateFailed, actorsocket.Reason(ReasonNeverStarted), true)}
+	self := testSelfApplier(t, store, NewActorClient(serveActor(t, actor)))
 	if !self.Adopt(context.Background(), open, testCommit) {
 		t.Fatal("Adopt reported the attempt unresolved")
 	}

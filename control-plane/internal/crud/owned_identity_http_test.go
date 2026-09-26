@@ -7,6 +7,9 @@ package crud
 // view"; openapi.yaml Host). Real Postgres: TEST_DATABASE_URL-gated.
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -30,7 +33,16 @@ const (
 // agentEndpoint serves the real agent WebSocket handler over the same pool.
 func agentEndpoint(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
-	h := agentws.NewHandler(pool, "test-token", slog.New(slog.NewTextHandler(io.Discard, nil)),
+	// Every enrollment redeems a minted token (the static ENROLLMENT_TOKEN is
+	// retired); enroll() presents this one.
+	sum := sha256.Sum256([]byte("test-token"))
+	if _, err := pool.Exec(context.Background(), `INSERT INTO host_enrollments (token_hash, created_by, node_name, max_uses, expires_at, note)
+		VALUES ($1, NULL, NULL, 1000000, NULL, 'test fixture')
+		ON CONFLICT (token_hash) DO UPDATE SET used_count = 0, revoked_at = NULL, expires_at = NULL,
+		    node_name = NULL, max_uses = 1000000`, hex.EncodeToString(sum[:])); err != nil {
+		t.Fatalf("seed the test enrollment token: %v", err)
+	}
+	h := agentws.NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		nil, nil, nil, nil, nil)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)

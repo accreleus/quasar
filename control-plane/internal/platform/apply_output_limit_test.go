@@ -2,8 +2,8 @@ package platform
 
 // The 8192 that bounds an attempt's `output` is written out in four places: the
 // CHECK in migration 0075, agentws.maxReleaseOutputLen (the wire hop's cut),
-// platform.applyOutputLimit (every writer's cut) and updater.OutputTailBytes
-// (the tail the updater keeps in the first place). Nothing made them agree, and
+// platform.applyOutputLimit (every writer's cut) and the recovery actor's
+// journal::OUTPUT_LIMIT (the tail it keeps in the first place). Nothing made them agree, and
 // the failure mode of disagreement is silent: Postgres REFUSES an oversized
 // output rather than truncating it, so a terminal write is simply lost and the
 // attempt hangs until its deadline.
@@ -12,11 +12,11 @@ package platform
 // pattern, and needs no database: the migrations are embedded.
 
 import (
+	"os"
 	"regexp"
 	"strconv"
 	"testing"
 
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 	"github.com/accreleus/quasar/control-plane/migrations"
 )
 
@@ -50,9 +50,19 @@ func TestApplyOutputLimitMatchesSQL(t *testing.T) {
 		t.Errorf("applyOutputLimit = %d, migration 0075's CHECK = %d: a write the CHECK refuses is a "+
 			"terminal state that never lands", applyOutputLimit, want)
 	}
-	// The updater's own tail is the same number for the same reason: what it
-	// keeps has to fit in the column the relay eventually writes it to.
-	if updater.OutputTailBytes != want {
-		t.Errorf("updater.OutputTailBytes = %d, migration 0075's CHECK = %d", updater.OutputTailBytes, want)
+	// The actor's own tail is the same number for the same reason: what it keeps
+	// has to fit in the column the relay eventually writes it to.
+	raw, err := os.ReadFile("../../../node-agent/crates/quasar-recovery/src/journal.rs")
+	if err != nil {
+		t.Fatalf("read the recovery actor's journal.rs: %v", err)
+	}
+	m := actorOutputLimit.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatal("journal.rs no longer declares `pub const OUTPUT_LIMIT: usize = N;`")
+	}
+	if m[1] != strconv.Itoa(want) {
+		t.Errorf("the recovery actor's OUTPUT_LIMIT = %s, migration 0075's CHECK = %d", m[1], want)
 	}
 }
+
+var actorOutputLimit = regexp.MustCompile(`pub const OUTPUT_LIMIT: usize = (\d+);`)

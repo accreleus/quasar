@@ -721,7 +721,7 @@ func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep Relea
 	}
 	row, err := r.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
 		Failed: failed, Requested: requested, Previous: previous,
-		Output: "restored by the updater after the apply failed (" + orEmpty(rep.Reason) + ")",
+		Output: "restored by the recovery actor after the apply failed (" + orEmpty(rep.Reason) + ")",
 	})
 	if err != nil {
 		r.log.Error("could not record the updater's automatic restore", "attempt_id", failed.ID,

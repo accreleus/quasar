@@ -74,7 +74,7 @@ func TestIdleOfferAfterCompletedCurrentJournal(t *testing.T) {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := NewRegistry(log)
-	h := NewHandler(pool, "test-token", log, registry, nil, nil, store, nil, boot)
+	h := NewHandler(pool, log, registry, nil, nil, store, nil, boot)
 	t.Cleanup(h.Close)
 	c := newConn(hostID, nil)
 	c.policyTyped = true

@@ -51,7 +51,7 @@ const amendment11Payload = `[
 
 func TestAmendment11ReadinessSurvivesTheWriteSeam(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 

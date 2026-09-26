@@ -4,9 +4,8 @@
 // Not a frozen interface. The Rust twin is
 // node-agent/crates/quasar-recovery/src/socket.rs; both decode and re-encode
 // every fixture in testdata/recovery/socket to the same JSON, so a field added
-// on one side only fails a test on both. Result keeps the Go updater's
-// result-file spellings (internal/updater/result.go), so the agent's
-// release_state relay stays a re-frame.
+// on one side only fails a test on both. Result keeps `release_state`'s
+// spellings, so the agent's release_state relay stays a re-frame.
 package actorsocket
 
 // Component is one image to move.
@@ -164,7 +163,7 @@ type Conflict struct {
 	// Image is the configured reference, tag or digest included.
 	Image string `json:"image"`
 	// Role is the role it looks like: control-plane | node-agent | postgres |
-	// recovery-actor | updater (the Go updater of a Compose install).
+	// recovery-actor | updater (a leftover Compose `quasar-updater`).
 	Role string `json:"role"`
 	Why  string `json:"why"`
 }

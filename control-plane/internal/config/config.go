@@ -38,11 +38,6 @@ type Config struct {
 
 	AuthTokenTTL time.Duration // bearer-token lifetime (AUTH_TOKEN_TTL, e.g. "24h")
 
-	// Fleet-wide fallback for node-agent enrollment (ENROLLMENT_TOKEN). Optional:
-	// empty means only admin-minted per-host tokens enroll (#12). Deprecated by
-	// control-api.md amendment 14 §"Enrollment".
-	EnrollmentToken string
-
 	// This machine's single-use local enrollment token for its own agent, and
 	// the node name it is bound to; both empty, or both set
 	// (QUASAR_LOCAL_ENROLLMENT_FILE, QUASAR_LOCAL_ENROLLMENT_NODE_NAME). Never logged.
@@ -300,18 +295,6 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("QUASAR_DB_LOCK_TIMEOUT %q: must be a positive Go duration", v)
 		}
 		c.DBLockTimeout = d
-	}
-
-	// Optional since #12: a deployment can enroll entirely with admin-minted per-host
-	// tokens, and requiring the fleet-wide static one would force every operator to keep
-	// the credential the minted tokens exist to replace. Empty never matches any presented
-	// token (agentws only compares when it is non-empty), so this disables the static path
-	// rather than opening it. Contract: control-api.md §Host enrollment tokens.
-	c.EnrollmentToken = os.Getenv("ENROLLMENT_TOKEN")
-	// Amendment 14 inverts the warning: unset is now the recommended state.
-	if c.EnrollmentToken != "" {
-		c.Warnings = append(c.Warnings,
-			"ENROLLMENT_TOKEN is deprecated: it retires with the RH06 contract step (RH06-15, #367), and an owned install never uses it; enroll hosts with admin-minted per-host tokens and unset it")
 	}
 
 	localFile := os.Getenv("QUASAR_LOCAL_ENROLLMENT_FILE")

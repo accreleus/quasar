@@ -63,7 +63,7 @@ func nilDepServices(t *testing.T) *Services {
 		sessionHandler:  session.NewHandler(nil, nil),
 		deviceHandler:   devices.NewHandler(nil, nil),
 		signalHandler:   signalpkg.NewHandler(nil, nil, nil, log, origins.NewResolver("", false, nil, log)),
-		agentHandler:    agentws.NewHandler(nil, "", log, nil, nil, nil, nil, nil),
+		agentHandler:    agentws.NewHandler(nil, log, nil, nil, nil, nil, nil),
 		storageHandler:  storage.NewHandler(nil),
 		cfgHandler:      hostcfg.NewHandler(nil, nil, nil),
 		settingsHandler: settings.NewHandler(nil),

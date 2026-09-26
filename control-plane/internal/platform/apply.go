@@ -125,13 +125,13 @@ type PreviousDigest struct {
 }
 
 // The component the control plane is allowed to send to a host. The
-// control-plane component is applied by the updater beside IT and never over an
+// control-plane component is applied by the recovery actor beside IT, never over an
 // agent connection (agent-api.md §release_apply), so it is filtered out here
 // rather than trusted to be absent.
 const ComponentNodeAgent = "node-agent"
 
-// The component the control plane applies to ITSELF, over its own host's
-// updater socket. Never sent to a host.
+// The component the control plane applies to ITSELF, over its own machine's
+// control socket. Never sent to a host.
 const ComponentControlPlane = "control-plane"
 
 // Attempt is one `platform_apply_attempts` row and the `PlatformApplyAttempt`
