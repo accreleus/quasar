@@ -540,6 +540,12 @@ own; the two do not move together, and that is deliberate.
   interrupted hand-over); it still starts no existing actor. The `updater_socket` readiness
   check, the control-plane preflight and the console's manual path for an owned machine say
   the same, and the recovery runbook in `docs/upgrading.md` has the case.
+- **The seed starts a recovery actor the operator stopped (#381).** Per ADR 0007's owner-
+  approved clarification "An actor stopped from outside", a seed that finds the one actor of
+  an installed machine exited with its `unless-stopped` policy intact, on two looks at least
+  30 s apart, starts it (`seed-actor-started`), and the replacement it was running completes.
+  A kept actor, a disabled policy, two actors, an uninstalled machine and one with no
+  `seed.json` are never started; those stay reported as `seed-actor-stopped`.
 - **The release preflight inventory matches the image build again (#383).**
   `scripts/release/release-manifest.json` lists the three vendored patches
   `deploy/Dockerfile.vulkan` applies and the gst-wayland-display pin in `deploy/pins.env`,

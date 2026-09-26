@@ -708,7 +708,12 @@ impl Lab {
         }
         let state = self.engine.state();
         let containers: Vec<Container> = state.containers.values().map(view).collect();
-        let decided = seed::decide(&file::read(self.dir.path()), &containers, Some(SEED_ID));
+        let decided = seed::decide(
+            &file::read(self.dir.path()),
+            &containers,
+            Some(SEED_ID),
+            None,
+        );
         if matches!(decided, Decision::Create { .. } | Decision::StartOwn { .. }) {
             self.races
                 .lock()

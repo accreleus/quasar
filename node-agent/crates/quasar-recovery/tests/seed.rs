@@ -354,14 +354,19 @@ fn the_seed_never_replaces_restarts_or_starts_an_actor_it_did_not_just_create() 
     assert_eq!(engine.state(), before, "a hand-over successor was started");
 }
 
-/// #381: an actor stopped with `docker stop` stays stopped, so the seed says so, unhealthy,
-/// from its second look on. It still starts nothing (ADR 0007).
+/// A kept actor, its restart policy `no`, is Quasar's own stop: never started, and reported
+/// from the second look on (ADR 0007, "An actor stopped from outside").
 #[test]
-fn an_actor_the_operator_stopped_is_reported_on_the_second_look_and_never_started() {
+fn an_actor_quasar_stopped_is_reported_and_never_started() {
     let _serial = serial();
     let (engine, dir) = installed();
     let id = actor_id(&engine.state());
-    engine.with_state(|s| s.containers.get_mut(&id).unwrap().status = "exited".into());
+    engine.with_state(|s| {
+        let actor = s.containers.get_mut(&id).unwrap();
+        actor.spec.name = "quasar-recovery.kept".into();
+        actor.status = "exited".into();
+        actor.restart = quasar_recovery::engine::RestartPolicy::No;
+    });
     let before = engine.state();
 
     let (outcomes, log) = logged(&engine, dir.path(), 3);
@@ -374,21 +379,201 @@ fn an_actor_the_operator_stopped_is_reported_on_the_second_look_and_never_starte
             Outcome::Idle {
                 token: "seed-actor-stopped",
                 why,
-            } => assert!(why.contains("docker start quasar-recovery"), "{why}"),
+            } => assert!(why.contains(quasar_recovery::handover::FIX), "{why}"),
             other => panic!("{other:?}"),
         }
     }
     assert_eq!(log.matches("seed-actor-stopped").count(), 1, "{log}");
+    assert!(!log.contains("seed-actor-started"), "{log}");
     assert_eq!(engine.state(), before, "the seed touched the engine");
 
     let (line, healthy) = health_after_looks(&engine, dir.path());
     assert!(!healthy, "{line}");
-    assert!(line.contains("docker start quasar-recovery"), "{line}");
+}
 
-    // Started again by the operator: present and healthy.
-    engine.with_state(|s| s.containers.get_mut(&id).unwrap().status = "running".into());
+const NEW_AGENT: &str = "registry.example.invalid/quasar/quasar-node-agent@sha256:dd44000000000000000000000000000000000000000000000000000000000000";
+const ATTEMPT: &str = "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22";
+
+/// The seed-created actor, trusting the test registry so it admits a replacement.
+fn replacing_actor(
+    engine: &Arc<FakeEngine>,
+    dir: &std::path::Path,
+    id: &str,
+) -> Arc<quasar_recovery::actor::Actor> {
+    use quasar_recovery::actor::{ActorConfig, OperatorInputs, ReplaceTiming, TrustConfig};
+    use std::time::Duration;
+    let mut config = ActorConfig::new(
+        dir,
+        quasar_recovery::socket::MachineRole::Gpu,
+        OperatorInputs::default(),
+    );
+    config.self_container = Some(id.into());
+    config.seed_container = Some(SEED_ID.into());
+    config.now = Box::new(|| NOW.to_string());
+    config.gpus_probe_backoff = Duration::ZERO;
+    config.trust = TrustConfig {
+        allowed_namespaces: vec!["registry.example.invalid/quasar".into()],
+        signature: Default::default(),
+    };
+    config.timing = ReplaceTiming {
+        verify_timeout: Duration::from_millis(200),
+        poll: Duration::from_millis(1),
+        stop_grace: Duration::from_secs(1),
+        retries: 2,
+        retry_backoff: Duration::ZERO,
+    };
+    Arc::new(quasar_recovery::actor::Actor::new(engine.clone(), config))
+}
+
+fn agent_replacement() -> quasar_recovery::socket::Request {
+    use quasar_recovery::socket::{Component, Release, Request, RequestKind};
+    let (image, digest) = NEW_AGENT.split_once('@').unwrap();
+    Request {
+        request_id: ATTEMPT.into(),
+        kind: RequestKind::Replace,
+        components: vec![Component {
+            name: "node-agent".into(),
+            image: image.into(),
+            digest: digest.into(),
+        }],
+        release: Release {
+            id: "rel-0.4.0".into(),
+            version: Some("0.4.0".into()),
+            source_commit: "cccccccccccccccccccccccccccccccccccccccc".into(),
+        },
+        migrates: false,
+        schema_version: None,
+        external_backup_confirmed: false,
+        dump: None,
+        purge: false,
+        wait_timeout_s: 0,
+        from_version: None,
+        force_again: false,
+    }
+}
+
+/// An installed machine whose actor died with a replacement verifying its new agent, and
+/// whose container the operator then stopped: exited, restart policy intact.
+fn stopped_mid_replacement() -> (Arc<FakeEngine>, tempfile::TempDir, String) {
+    use quasar_recovery::socket::State;
+    for offset in 0..80 {
+        let (engine, dir) = installed();
+        engine.with_state(|s| {
+            s.registry.insert(
+                NEW_AGENT.into(),
+                Image {
+                    id: "sha256:d0d0000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
+                    repo_digests: vec![NEW_AGENT.into()],
+                    labels: BTreeMap::from([("org.quasar.recipe".to_string(), "1".to_string())]),
+                },
+            );
+            s.behaviour.insert(
+                NEW_AGENT.into(),
+                quasar_recovery::engine::Behaviour {
+                    health: Some("healthy".into()),
+                    ..Default::default()
+                },
+            );
+        });
+        let id = actor_id(&engine.state());
+        engine.inject(Fault {
+            call: engine.calls() + offset,
+            when: When::After,
+            error: EngineError::Crashed,
+        });
+        let actor = replacing_actor(&engine, dir.path(), &id);
+        if actor
+            .submit(quasar_recovery::trust::Caller::Agent, agent_replacement())
+            .is_err()
+        {
+            continue;
+        }
+        actor.wait_attempt();
+        engine.clear_faults();
+        let state = actor.status_for(Some(ATTEMPT)).result.map(|r| r.state);
+        drop(actor);
+        if state == Some(State::Verifying) {
+            engine.with_state(|s| s.containers.get_mut(&id).unwrap().status = "exited".into());
+            return (engine, dir, id);
+        }
+    }
+    panic!("no crash point left the attempt verifying");
+}
+
+/// #381: started on the second look, and the attempt it was running then completes.
+#[test]
+fn an_actor_the_operator_stopped_is_started_on_the_second_look_and_finishes_its_attempt() {
+    use quasar_recovery::socket::State;
+    let _serial = serial();
+    let (engine, dir, id) = stopped_mid_replacement();
+    let starts = |engine: &Arc<FakeEngine>| engine.state().containers[&id].starts;
+    let before = starts(&engine);
+
+    let (outcomes, log) = logged(&engine, dir.path(), 2);
+    assert!(
+        matches!(outcomes[0], Outcome::Present { .. }),
+        "one look is not enough: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[1],
+        Outcome::Started {
+            container: names::RECOVERY_ACTOR.into(),
+            id: id.clone(),
+        }
+    );
+    assert!(log.contains("seed-actor-started"), "{log}");
+    assert_eq!(starts(&engine), before + 1);
+    assert_eq!(engine.state().containers[&id].status, "running");
+
+    replacing_actor(&engine, dir.path(), &id).resume().unwrap();
+    let actor = replacing_actor(&engine, dir.path(), &id);
+    let result = actor.status_for(Some(ATTEMPT)).result.unwrap();
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    assert_eq!(actor.status().in_flight, None);
+    let agent = engine
+        .state()
+        .container_named(names::NODE_AGENT)
+        .unwrap()
+        .clone();
+    assert_eq!(agent.spec.image, NEW_AGENT);
+
     let (line, healthy) = health_after_looks(&engine, dir.path());
     assert!(healthy, "{line}");
+}
+
+#[test]
+fn two_stopped_actors_are_never_started() {
+    let _serial = serial();
+    let (engine, dir) = installed();
+    let id = actor_id(&engine.state());
+    engine.with_state(|s| {
+        let mut kept = s.containers.remove(&id).unwrap();
+        kept.spec.name = "quasar-recovery.kept".into();
+        kept.status = "exited".into();
+        let mut next = kept.clone();
+        next.id = "ac10000000000000000000000000000000000000000000000000000000000000".into();
+        next.spec.name = "quasar-recovery".into();
+        next.spec
+            .labels
+            .insert(quasar_recovery::recipe::labels::RECIPE.into(), "1".into());
+        kept.restart = quasar_recovery::engine::RestartPolicy::No;
+        s.containers.insert(kept.id.clone(), kept);
+        s.containers.insert(next.id.clone(), next);
+    });
+    let before = engine.state();
+    let (outcomes, _) = logged(&engine, dir.path(), 3);
+    assert!(
+        outcomes[1..].iter().all(|o| matches!(
+            o,
+            Outcome::Idle {
+                token: "seed-actor-stopped",
+                ..
+            }
+        )),
+        "{outcomes:?}"
+    );
+    assert_eq!(engine.state(), before);
 }
 
 #[test]
@@ -473,6 +658,42 @@ fn no_running_actor_is_reported_only_while_the_machine_is_installed() {
             .iter()
             .all(|o| matches!(o, Outcome::Present { .. })),
         "{outcomes:?}"
+    );
+
+    // Neither is started even with the restart policy intact: only an active seed.json
+    // names the installation whose actor may be started.
+    let before = engine.state();
+    engine.with_state(|s| {
+        s.containers.get_mut(&id).unwrap().restart =
+            quasar_recovery::engine::RestartPolicy::UnlessStopped
+    });
+    let (outcomes, _) = logged(&engine, dir.path(), 3);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Outcome::Present { .. })),
+        "no seed.json: {outcomes:?}"
+    );
+    std::fs::write(
+        dir.path().join("seed.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    let (outcomes, _) = logged(&engine, dir.path(), 3);
+    assert!(
+        outcomes.iter().all(|o| matches!(
+            o,
+            Outcome::Idle {
+                token: "seed-uninstalled",
+                ..
+            }
+        )),
+        "uninstalled: {outcomes:?}"
+    );
+    assert_eq!(
+        engine.state().containers[&id].starts,
+        before.containers[&id].starts,
+        "an actor was started"
     );
 }
 
@@ -1052,6 +1273,7 @@ fn health_after_looks(engine: &Arc<FakeEngine>, dir: &std::path::Path) -> (Strin
     config.self_container = Some(SEED_ID.into());
     config.new_installation_id = Box::new(|| INSTALLATION.to_string());
     config.status_file = Some(status.path().to_path_buf());
+    config.clock = looks_an_interval_apart();
     let mut seed = Seed::new(engine.clone(), config);
     seed.step();
     seed.step();
