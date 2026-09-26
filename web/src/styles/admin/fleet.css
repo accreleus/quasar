@@ -543,6 +543,15 @@
 .rel-detail > summary::-webkit-details-marker {
   display: none;
 }
+/* In the 300 px rail the table's cells wrap and pad as the rail's facts do, so its
+   last column (Apply, Revert) stays inside the card at 1440 px (#363). */
+.rel-detail .qtable thead th,
+.rel-detail .qtable tbody td {
+  padding-left: 6px;
+  padding-right: 6px;
+  white-space: normal;
+}
+.rel-detail .qtable tbody td { height: auto; }
 
 /* Developer apply (#360): design_handoff_v3/screens/rh06 devapply*.png, the rail
    card `rhDevCard` and the drawer `rhDevApply` in assets/pages-rh06.js. */

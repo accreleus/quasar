@@ -84,6 +84,24 @@ func TestAnOwnedControlPlaneStepMovesTheActorFirstThenTheControlPlane(t *testing
 	}
 }
 
+// #352 decision 14: a non-migrating control plane is an ordinary unattended step
+// on an owned machine too.
+func TestAnUnattendedRunUpdatesAnOwnedControlPlane(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.run.Unattended = true
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := ownedFleet(t, store, d, &fakeOwnMachine{})
+	f.SchemaVersion = fakeReleaseSchema
+
+	run := runToEnd(t, f, store)
+	if run.State != RunSucceeded {
+		t.Fatalf("run = %q (%v), want succeeded", run.State, run.Error)
+	}
+	if steps := d.steps(); len(steps) == 0 || steps[0] != TargetControlPlane {
+		t.Fatalf("steps = %v, want the control plane first", steps)
+	}
+}
+
 // A migrating step needs the pre-update dump (RH06-12, #364): refused before
 // the fleet is cordoned, drained or sent anything, so refusing changes nothing.
 func TestAMigratingControlPlaneStepOnAnOwnedMachineIsRefusedBeforeAnythingMoves(t *testing.T) {
