@@ -17,6 +17,7 @@ import { primaryGpuLabel } from "../../../lib/gpu";
 import { admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./AdmissionReasons";
 import { HostExpansion } from "./HostExpansion";
 import { hostFlag } from "./hostWarnings";
+import { isControlPlaneMachine, isOwned } from "./hostServices";
 import {
   distinctGpuVendors,
   groupGpusByModel,
@@ -62,6 +63,13 @@ export function HostRow(props: HostRowProps) {
   const offline = host.status === "offline";
   const live = host.capacity?.active_sessions ?? 0;
   const flag = hostFlag(host);
+  // The machine's shape, for an owned host (mock rh06/hosts): the control plane's own
+  // machine is the combined host, by the contract's rule; every other one is a GPU host.
+  const shape = isOwned(host)
+    ? isControlPlaneMachine(host, props.controlPlane)
+      ? "Combined host"
+      : "GPU host"
+    : null;
 
   return (
     <>
@@ -116,6 +124,7 @@ export function HostRow(props: HostRowProps) {
           </div>
           <div className="sub mono host-row-id" title={host.id}>
             {shortId(host.id)}
+            {shape ? ` · ${shape}` : ""}
             {state !== "online" ? ` · ${state}` : ""}
           </div>
         </td>

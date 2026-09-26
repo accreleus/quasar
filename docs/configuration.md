@@ -1284,7 +1284,10 @@ The same seed as a Compose stack (Dockge, Arcane), exactly as Admin → Fleet �
 writes it (a test holds the two identical). The volume's own `name: quasar-machine` matters:
 without it Compose names the volume `<project>_quasar-machine`, which is not the machine's
 state volume, and the seed refuses to start the install (`token="seed-self-invalid"`, naming
-what it found). A top-level `name:` is not needed, and a stack manager that names projects by
+what it found). `container_name: quasar-seed` keeps the seed under the name the commands in
+this section use (`docker exec quasar-seed …`) rather than Compose's `<project>-quasar-seed-1`;
+the one-line command's seed has the same name, so a machine runs one or the other, never both.
+A top-level `name:` is not needed, and a stack manager that names projects by
 their directory (Dockge) is better without one. Set
 `QUASAR_TEMPLATE_ROOT` whenever you move the home root: the recovery actor and the node agent
 default it differently.
@@ -1292,6 +1295,7 @@ default it differently.
 ```yaml
 services:
   quasar-seed:
+    container_name: quasar-seed
     image: "<registry>/quasar-recovery@sha256:<digest>"
     command: seed
     restart: unless-stopped
@@ -1348,6 +1352,7 @@ The same combined host as a one-service stack (Dockge, Arcane):
 ```yaml
 services:
   quasar-seed:
+    container_name: quasar-seed
     image: <registry>/quasar-recovery@sha256:<digest>
     command: seed
     restart: unless-stopped

@@ -8,7 +8,7 @@
  */
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
@@ -474,3 +474,67 @@ describe("HostsTab — add host", () => {
     expect(screen.queryByTestId("enroll-command")).toBeNull();
   });
 });
+
+describe("HostsTab — owned hosts (#366)", () => {
+  const owned = { install_mode: "owned", updater_present: true, seed_version: "0.5.0" } as Partial<Host>;
+
+  it("labels each owned row with its machine shape, the control plane's own as the combined host", async () => {
+    setFleet([
+      host({ ...owned, id: "a1", node_name: "living-room-pc" }),
+      host({ ...owned, id: "b2", node_name: "gpu-host-2", status: "offline" }),
+      host({ id: "c3", node_name: "compose-host" }),
+    ]);
+    mocked.getPlatformIdentity.mockResolvedValue({
+      identity: { machine_role: "combined", machine_node_name: "living-room-pc" },
+    } as never);
+    renderTab();
+
+    await waitFor(() => expect(screen.getByText("a1 · Combined host")).toBeTruthy());
+    expect(screen.getByText("b2 · GPU host · offline")).toBeTruthy();
+    expect(screen.getByText("c3")).toBeTruthy();
+  });
+
+  it("chips a missing seed and, before it, an owner conflict", async () => {
+    setFleet([
+      host({ ...owned, id: "a1", node_name: "gpu-host-2", seed_version: null }),
+      host({
+        ...owned,
+        id: "b2",
+        node_name: "study-pc",
+        seed_version: null,
+        readiness: [{ id: "owner_conflict", status: "fail", summary: "x", remediation: "" }] as never,
+      }),
+    ]);
+    renderTab();
+
+    const seedRow = (await screen.findByText("gpu-host-2")).closest("tr") as HTMLElement;
+    expect(within(seedRow).getByText("no seed")).toBeTruthy();
+    const conflictRow = screen.getByText("study-pc").closest("tr") as HTMLElement;
+    expect(within(conflictRow).getByText("owner conflict")).toBeTruthy();
+    expect(within(conflictRow).queryByText("no seed")).toBeNull();
+  });
+
+  it("sends Remove host for an owned GPU host to its page, where its recovery actor removes it", async () => {
+    setFleet([host({ ...owned })]);
+    render(
+      <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
+        <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
+          <Routes>
+            <Route path="/admin/fleet/hosts" element={<HostsTab />} />
+            <Route path="/admin/fleet/hosts/:id" element={<LocationProbe />} />
+          </Routes>
+        </SectionHeadProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+    expect(await screen.findByText("/admin/fleet/hosts/c2059601?remove=1")).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+  });
+});
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div>{`${loc.pathname}${loc.search}`}</div>;
+}

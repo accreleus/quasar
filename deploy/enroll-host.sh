@@ -641,6 +641,11 @@ if [ "$DRY" != 1 ]; then
   fi
   other_seed="$(dk ps -a --no-trunc --format '{{.Names}}|{{.Command}}' 2>/dev/null \
     | grep 'quasar-recovery seed"*$' | cut -d'|' -f1 | grep -vx "$SEED" | head -n 1 || true)"
+  # The documented stacks name their seed quasar-seed too: one a stack manager runs
+  # carries Compose's project label, and is not this script's to replace or remove.
+  if [ -z "$other_seed" ] && [ -n "$(dk inspect -f '{{with index .Config.Labels "com.docker.compose.project"}}{{.}}{{end}}' "$SEED" 2>/dev/null || true)" ]; then
+    other_seed="$SEED"
+  fi
   # Refused with a reset too: that seed would survive it and re-create the actor.
   if [ -n "$other_seed" ]; then
     host_error "this machine already has a seed, '$other_seed', started by a stack manager or by hand. Quasar is installed through that one: keep it and remove this command, or remove that seed first."
@@ -817,7 +822,17 @@ wait_beat() {
 }
 while :; do
   if [ -n "$(state_of "$AGENT")" ]; then
-    line="$(dk logs --tail 2000 "$AGENT" 2>&1 | grep -E 'enrolled as host|reconnected as host|auth_failed|cp-tls-pin-mismatch|cp-register-stale-identity-unresolvable|boot-enrollment-unconfigured' | tail -n 1 || true)"
+    agent_log="$(dk logs --tail 2000 "$AGENT" 2>&1 || true)"
+    line="$(printf '%s\n' "$agent_log" | grep -E 'enrolled as host|reconnected as host|auth_failed|cp-tls-pin-mismatch|cp-register-stale-identity-unresolvable|boot-enrollment-unconfigured' | tail -n 1 || true)"
+    # An agent this run installed may reconnect right after it enrolls (its policy-seed
+    # reconnect): its enrollment is the verdict, not the reconnect that follows it.
+    if [ -z "$actors" ]; then
+      case "$line" in
+        *'reconnected as host'*)
+          enrolled_line="$(printf '%s\n' "$agent_log" | grep 'enrolled as host' | tail -n 1 || true)"
+          [ -z "$enrolled_line" ] || line="$enrolled_line" ;;
+      esac
+    fi
     case "$line" in
       *'enrolled as host'*) verdict=enrolled ;;
       *'reconnected as host'*) verdict=reconnected ;;

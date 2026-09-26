@@ -131,6 +131,7 @@ case "$cmd" in
     [ -d "$S/c/$last" ] || { echo "Error: No such object: $last" >&2; exit 1; }
     case "${1:-}|${2:-}" in
       *'io.quasar.installation'*) label_value "$S/c/$last" io.quasar.installation ;;
+      *'com.docker.compose.project'*) label_value "$S/c/$last" com.docker.compose.project ;;
       *'.Config.Image'*) echo "mock.example/quasar/quasar-recovery@sha256:$(printf 'a%.0s' $(seq 64))" ;;
       *) cat "$S/c/$last/state"; echo ;;
     esac
@@ -503,6 +504,15 @@ else
   fail "regenerated command" "rc=$RC out=$(tail -3 <<<"$OUT")"
 fi
 
+reset_engine
+run_installer enroll-then-reconnect QUASAR_ENROLLMENT="$WSS_BLOB" \
+  MOCK_AGENT_LOG="$ENROLLED_LOG"$'\n''2026-09-25T10:00:02Z INFO quasar_node_agent::agent: reconnected as host 3f2c…'
+if [ "$RC" -eq 0 ] && grep -q 'enrolled: this host' <<<"$OUT" && ! grep -q 'already enrolled' <<<"$OUT"; then
+  pass "a fresh install whose agent reconnects right after enrolling reports the enrollment, not a saved identity"
+else
+  fail "enroll then reconnect" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+
 installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
 run_installer spent-installed QUASAR_ENROLLMENT="$WSS_BLOB"
 if [ "$RC" -eq 1 ] && grep -q 'QUASAR_RESET_IDENTITY=1' <<<"$OUT" && nothing_started && [ -d "$state/c/quasar-node-agent" ]; then
@@ -537,6 +547,14 @@ if [ "$RC" -eq 1 ] && grep -q 'Quasar postgres' <<<"$OUT" && nothing_started && 
   pass "reset where Quasar's Postgres data lives (its volume alone): refused, nothing removed"
 else
   fail "reset db volume" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
+container quasar-seed running "/usr/local/bin/quasar-recovery seed" com.docker.compose.project=quasar
+run_installer reset-named-manager-seed "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
+if [ "$RC" -eq 1 ] && grep -q "already has a seed, 'quasar-seed'" <<<"$OUT" && nothing_started && [ -d "$state/c/quasar-recovery" ]; then
+  pass "a stack manager's seed named quasar-seed (the documented stack): refused, never replaced or removed"
+else
+  fail "named manager seed" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
 fi
 installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
 container dockge-quasar-seed-1 running "/usr/local/bin/quasar-recovery seed"

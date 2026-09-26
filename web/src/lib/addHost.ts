@@ -96,6 +96,8 @@ export function composeSeedStack(i: SeedStackInputs): string {
   return [
     "services:",
     "  quasar-seed:",
+    // The name the documented `docker exec quasar-seed …` commands use.
+    "    container_name: quasar-seed",
     `    image: ${q(i.seedImage)}`,
     "    command: seed",
     "    restart: unless-stopped",
