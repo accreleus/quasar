@@ -646,9 +646,13 @@ fn reconfigure(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if !plan.replaced.is_empty() && !yes {
-        println!(
-            "Nothing was changed. Drain the host if it has sessions, then run again with --yes."
-        );
+        if plan.replaced.iter().any(|r| r == "node-agent") {
+            println!(
+                "Nothing was changed. Drain the host if it has sessions, then run again with --yes."
+            );
+        } else {
+            println!("Nothing was changed. Run again with --yes to apply it.");
+        }
         return ExitCode::from(3);
     }
     let done = match ask(false) {
@@ -769,7 +773,7 @@ fn report_reconfigure(
         }
         None => {
             eprintln!(
-                "The attempt ended {:?} ({reason}), and the actor has not recorded how the reconfigure settled yet; `quasar-recovery status` and {} show it.\n{}",
+                "The attempt ended {:?} ({reason}), and the actor has not recorded how the reconfigure settled yet; {} in machine state (GET /v1/reconfigure on the operator socket) shows it once it has.\n{}",
                 result.state,
                 quasar_recovery::reconfigure::RECORD_FILE,
                 result.output

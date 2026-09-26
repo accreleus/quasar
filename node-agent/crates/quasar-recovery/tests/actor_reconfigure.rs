@@ -473,15 +473,25 @@ fn a_control_only_machine_takes_every_control_plane_input_and_no_home_root() {
     assert_eq!(m.settled(), "applied");
     assert!(m.named(names::NODE_AGENT).is_none(), "no agent appears");
 
-    let refused = actor
-        .reconfigure(changes(&[("QUASAR_HOME_ROOT", "/mnt/quasar/homes")]))
-        .expect_err("no agent, no home root");
-    assert_eq!(refused.reason, Reason::Invalid);
-    assert!(
-        refused.message.contains("control-only"),
-        "{}",
-        refused.message
-    );
+    let before = m.inputs();
+    for (key, value) in [
+        ("QUASAR_HOME_ROOT", "/mnt/quasar/homes"),
+        ("QUASAR_TEMPLATE_ROOT", "/mnt/quasar/templates"),
+        ("QUASAR_APP_PUID", "99"),
+        ("QUASAR_APP_PGID", "100"),
+        ("QUASAR_CONTAINER_NETWORK", "bridge"),
+    ] {
+        let refused = actor
+            .reconfigure(changes(&[(key, value)]))
+            .expect_err("no agent to act on it");
+        assert_eq!(refused.reason, Reason::Invalid, "{key}");
+        assert!(
+            refused.message.contains("control-only"),
+            "{key}: {}",
+            refused.message
+        );
+    }
+    assert_eq!(m.inputs(), before, "nothing was recorded");
     m.never_a_migration("control-only");
 }
 
@@ -709,6 +719,146 @@ fn an_agent_that_does_not_verify_after_the_control_plane_did_is_partial_and_a_re
         .reconfigure(dry(&[("QUASAR_HTTP_PORT", "18080")]))
         .unwrap();
     assert!(plan.replaced.is_empty(), "nothing left behind: {plan:?}");
+}
+
+/// Setting a value back while the agent is behind on it moves only what does not run it:
+/// the agent left on the old port already runs the old port again.
+#[test]
+fn a_service_already_on_the_new_inputs_is_not_re_created() {
+    let m = Machine::install(combined_env());
+    let actor = m.actor();
+    let old_agent = m.agent().id;
+    m.engine.with_state(|s| {
+        s.behaviour.insert(
+            AGENT_IMAGE.into(),
+            Behaviour {
+                health: Some("unhealthy".into()),
+                ..Default::default()
+            },
+        );
+    });
+    run(&actor, changes(&[("QUASAR_HTTP_PORT", "18080")]));
+    assert_eq!(m.settled(), "partial");
+    m.engine.with_state(|s| {
+        s.behaviour.remove(AGENT_IMAGE);
+    });
+
+    let plan = actor
+        .reconfigure(dry(&[("QUASAR_HTTP_PORT", "8080")]))
+        .unwrap();
+    assert_eq!(
+        plan.replaced,
+        vec!["control-plane"],
+        "the agent already runs 8080"
+    );
+    assert!(
+        !plan.notes.join(" ").contains("sessions."),
+        "no session ends: {:?}",
+        plan.notes
+    );
+    let (_, result) = run(&actor, changes(&[("QUASAR_HTTP_PORT", "8080")]));
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    assert_eq!(m.agent().id, old_agent, "the agent was not re-created");
+    assert_eq!(host_ports(&m.control_plane())[0], 8080);
+    let record = m.record().unwrap();
+    assert_eq!(record["outcome"]["settled"], "applied");
+    assert!(record["outcome"].get("behind").is_none(), "{record}");
+}
+
+/// Two operators, one after the other: B's reconfigure arrives while A's worker is still
+/// settling A. B waits for it, so A's settle cannot write A's record and inputs over B's.
+#[test]
+fn a_reconfigure_waits_for_the_previous_ones_settle_and_is_not_overwritten_by_it() {
+    use std::sync::{Condvar, Mutex};
+    #[derive(Default)]
+    struct Hold {
+        watch: Option<std::path::PathBuf>,
+        holding: bool,
+        released: bool,
+        used: bool,
+    }
+    let m = Machine::install(combined_env());
+    let hold = Arc::new((Mutex::new(Hold::default()), Condvar::new()));
+    let clock = hold.clone();
+    // The first clock read after A's journal is terminal is A's worker settling A: it is
+    // held there until the test releases it.
+    let actor = m.actor_with(move |c| {
+        c.now = Box::new(move || {
+            let (lock, cv) = &*clock;
+            let mut h = lock.lock().unwrap();
+            // Any finished journal: the machine has none before A's.
+            let terminal = h.watch.as_ref().is_some_and(|dir| {
+                std::fs::read_dir(dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|e| {
+                        std::fs::read(e.path())
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                            .is_some_and(|j| !j["result"]["finished_at"].is_null())
+                    })
+            });
+            if terminal && !h.used {
+                h.used = true;
+                h.holding = true;
+                cv.notify_all();
+                while !h.released {
+                    h = cv.wait(h).unwrap();
+                }
+            }
+            NOW.to_string()
+        });
+    });
+    hold.0.lock().unwrap().watch = Some(m.dir.path().join("journal"));
+    actor
+        .reconfigure(changes(&[("QUASAR_TLS_PORT", "18443")]))
+        .unwrap()
+        .request_id
+        .unwrap();
+    {
+        let (lock, cv) = &*hold;
+        let mut h = lock.lock().unwrap();
+        while !h.holding {
+            h = cv.wait(h).unwrap();
+        }
+    }
+
+    let second = actor.clone();
+    let b_thread = std::thread::spawn(move || {
+        second.reconfigure(changes(&[("QUASAR_TRUSTED_PROXIES", "10.0.0.1")]))
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!b_thread.is_finished(), "B waits for A's settle");
+    {
+        let (lock, cv) = &*hold;
+        lock.lock().unwrap().released = true;
+        cv.notify_all();
+    }
+    let b = b_thread
+        .join()
+        .unwrap()
+        .expect("B admitted")
+        .request_id
+        .expect("B replaces the control plane");
+    actor.wait_attempt();
+
+    assert_eq!(
+        actor.status_for(Some(&b)).result.unwrap().state,
+        State::Succeeded
+    );
+    let record = m.record().unwrap();
+    assert_eq!(record["request_id"], b.as_str(), "B's record, not A's");
+    assert_eq!(record["outcome"]["settled"], "applied");
+    let inputs = m.inputs();
+    assert_eq!(inputs["control"]["tls_port"], NEW_TLS, "A's change");
+    assert_eq!(
+        inputs["control"]["trusted_proxies"], "10.0.0.1",
+        "B's change"
+    );
+    let cp = m.control_plane();
+    assert_eq!(env(&cp, "QUASAR_TRUSTED_PROXIES"), "10.0.0.1");
+    assert_eq!(host_ports(&cp)[1], NEW_TLS);
 }
 
 // ----- a kill or an engine restart at every phase -----

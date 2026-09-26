@@ -36,7 +36,9 @@ func TestTheControlSocketDuringAReconfigureHoldsNoResultOfTheControlPlanes(t *te
 
 // A row this control plane sent is decided by the actor's result for it, never
 // by the booted binary alone, and never by the operator's attempt in flight:
-// with no result for it the row fails closed.
+// with no result for it the row fails closed. Defence in depth: the actor admits
+// one attempt at a time, so this row cannot really be verifying while the
+// operator's attempt is in flight.
 func TestABootMidReconfigureNeverTakesTheBusyMachineAsItsOwnVerdict(t *testing.T) {
 	path, _ := serveStatus(t, fixtureBody(t, reconfigureFixture))
 	open := ownedAttempt(AttemptVerifying)

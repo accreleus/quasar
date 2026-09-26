@@ -46,7 +46,9 @@ pub const RECORD_FILE: &str = "reconfigure.json";
 const RECORD_FORMAT: u32 = 1;
 
 /// `reconfigure.json`: the last reconfigure that replaced a service, and once settled its
-/// outcome. Not a frozen interface; an older actor reads it and ignores `outcome`.
+/// outcome. Not a frozen interface. An actor from before `outcome` (#366) does not know a
+/// record is settled: it settles one whose journal failed or was pruned again, putting
+/// `before` back, so an actor handed back to such a predecessor must not meet a settled one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub format: u32,
@@ -126,6 +128,14 @@ const EVERYWHERE: &[&str] = &[
     var::APP_PGID,
     var::CONTAINER_NETWORK,
 ];
+/// What only a node agent renders: refused on a control-only machine, which has none.
+const AGENT_ONLY: &[&str] = &[
+    var::HOME_ROOT,
+    var::TEMPLATE_ROOT,
+    var::APP_PUID,
+    var::APP_PGID,
+    var::CONTAINER_NETWORK,
+];
 pub const ENROLL_SEED_IMAGE: &str = var::ENROLL_SEED_IMAGE;
 pub const ENROLL_AGENT_IMAGE: &str = var::ENROLL_AGENT_IMAGE;
 const CONTROL_ONLY: &[&str] = &[
@@ -189,9 +199,9 @@ fn apply_fields(
                 "{key} configures a control plane, and this machine runs none"
             ));
         }
-        if key == var::HOME_ROOT && role == MachineRole::ControlOnly {
+        if role == MachineRole::ControlOnly && AGENT_ONLY.contains(&key.as_str()) {
             return Err(format!(
-                "{key}: a control-only machine runs no node agent, so it has no home root"
+                "{key} configures the node agent, and a control-only machine runs none"
             ));
         }
         let trust = &mut after.trust;
@@ -378,35 +388,25 @@ impl Actor {
         }
     }
 
-    /// The services whose rendered specification `after` moves, in replacement order,
-    /// with those a partly applied reconfigure left behind that `after` still moves.
-    fn moved_by(
-        &self,
-        before: &Inputs,
-        after: &Inputs,
-        behind: &[Role],
-    ) -> Result<Vec<Role>, String> {
+    /// The services `after` moves, in replacement order: a replaceable one whose verified
+    /// specification is not the one `after` renders, which also catches up one a partly
+    /// applied reconfigure left behind and leaves alone one already on `after`. Postgres and
+    /// the actor are compared render to render, since their records need not be renders.
+    fn moved_by(&self, before: &Inputs, after: &Inputs) -> Result<Vec<Role>, String> {
         let mut moved = Vec::new();
         for role in ORDER {
             let Some(new) = self.spec_with(role, after)? else {
                 continue;
             };
-            let catch_up = behind.contains(&role) && !self.runs(role, after);
-            if self.spec_with(role, before)? != Some(new) || catch_up {
+            let moves = match role {
+                Role::ControlPlane | Role::NodeAgent => !self.runs(role, after),
+                Role::Postgres | Role::RecoveryActor => self.spec_with(role, before)? != Some(new),
+            };
+            if moves {
                 moved.push(role);
             }
         }
         Ok(moved)
-    }
-
-    /// The services the last reconfigure left on their previous specification.
-    fn left_behind(&self) -> Vec<Role> {
-        match self.dir.reconfigure_file().load() {
-            Ok(Some(Record {
-                outcome: Some(o), ..
-            })) => o.behind,
-            _ => Vec::new(),
-        }
     }
 
     /// The operator's reconfigure. `Ok` with no `request_id`: nothing needed re-creating
@@ -448,7 +448,7 @@ impl Actor {
         let (after, changed) = apply(&machine.inputs, machine.role, &req.changes)
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;
         let replaced = self
-            .moved_by(&machine.inputs, &after, &self.left_behind())
+            .moved_by(&machine.inputs, &after)
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;
         if let Some(why) = replaced.iter().find_map(|r| not_replaceable(*r)) {
             return Err(refuse(
@@ -478,7 +478,12 @@ impl Actor {
         }
         // No attempt is open, so a record left unsettled belongs to a finished attempt:
         // settle it now rather than answer busy until the next start. One that cannot be
-        // read is never overwritten.
+        // read is never overwritten. That attempt's worker may still be settling it: it is
+        // joined first, under the gate, or it could write its record and inputs over this
+        // one's. It never takes the gate, so this cannot deadlock.
+        if let Some(done) = self.worker.lock().unwrap().take() {
+            let _ = done.join();
+        }
         self.settle_reconfigure();
         match self.dir.reconfigure_file().load() {
             Ok(None) => {}
@@ -878,7 +883,9 @@ pub fn variables(role: Option<MachineRole>) -> Vec<&'static str> {
         out.extend(CONTROL_ONLY.iter().copied());
     }
     if role == Some(MachineRole::ControlOnly) {
-        out.remove(var::HOME_ROOT);
+        for key in AGENT_ONLY {
+            out.remove(key);
+        }
     }
     out.into_iter().collect()
 }

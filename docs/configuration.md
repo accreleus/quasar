@@ -1929,12 +1929,13 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --dry-run QUASAR_HOM
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
 ```
 
-It takes the seed's variable names. On every machine: `QUASAR_HOME_ROOT` (not on a
-control-only machine, which has no agent), `QUASAR_TEMPLATE_ROOT`, the release trust
+It takes the seed's variable names. On every machine, the release trust
 (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
 `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`,
-`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
-`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`. On a combined or
+`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`). On a machine with
+a node agent (a GPU host or a combined host), the agent's inputs: `QUASAR_HOME_ROOT`,
+`QUASAR_TEMPLATE_ROOT`, `QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`;
+a control-only machine runs no agent, so it refuses them. On a combined or
 control-only machine also the control plane's inputs: `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_HOSTS`,
 `QUASAR_TRUSTED_PROXIES`, `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT`, `QUASAR_ENROLL_SEED_IMAGE`
 and `QUASAR_ENROLL_AGENT_IMAGE`. An empty value unsets an optional one.
