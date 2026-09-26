@@ -144,6 +144,14 @@ describe("host state", () => {
     expect(hostStateChip(host)).toBe("danger");
   });
 
+  it("keeps a host whose only failure is an owner conflict online: it blocks updates, not sessions (#366)", () => {
+    const conflict = { id: "owner_conflict", status: "fail", summary: "quasar-node-agent-1 …" };
+    expect(hostStateLabel({ ...online, readiness: [conflict] })).toBe("online");
+    expect(hostStateDot({ ...online, readiness: [conflict] })).not.toBe("bad");
+    const both = { ...online, readiness: [conflict, { id: "gpu", status: "fail", summary: "no GPU" }] };
+    expect(hostStateLabel(both)).toBe("degraded");
+  });
+
   it("calls an online host with a failed capacity report degraded", () => {
     expect(hostStateLabel({ ...online, capacity_detection: "failed" })).toBe("degraded");
   });

@@ -1,4 +1,4 @@
--- 0103 down. History loses which dump a failed migrating update named; the dumps
+-- 0097 down. History loses which dump a failed migrating update named; the dumps
 -- themselves are in each machine's machine state and are untouched.
 BEGIN;
 

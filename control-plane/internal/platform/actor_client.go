@@ -74,7 +74,10 @@ func (c *ActorClient) Self(context.Context) (UpdaterSelf, error) {
 	return UpdaterSelf{}, errors.New("an owned machine has no Compose stack to report")
 }
 
-// ActorRequest is the control-socket submit for one control-plane step.
+// ActorRequest is the control-socket submit for one control-plane step. It
+// leaves wait_timeout_s unset, so the actor's own verify timeout (300 s) is the
+// new control plane's health budget; DefaultApplyDeadline bounds the attempt
+// only while the actor is silent (apply_self.go followVerdict).
 func ActorRequest(req SelfRequest) actorsocket.Request {
 	out := actorsocket.Request{
 		RequestID: req.RequestID,

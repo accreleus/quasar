@@ -1284,7 +1284,10 @@ The same seed as a Compose stack (Dockge, Arcane), exactly as Admin → Fleet �
 writes it (a test holds the two identical). The volume's own `name: quasar-machine` matters:
 without it Compose names the volume `<project>_quasar-machine`, which is not the machine's
 state volume, and the seed refuses to start the install (`token="seed-self-invalid"`, naming
-what it found). A top-level `name:` is not needed, and a stack manager that names projects by
+what it found). `container_name: quasar-seed` keeps the seed under the name the commands in
+this section use (`docker exec quasar-seed …`) rather than Compose's `<project>-quasar-seed-1`;
+the one-line command's seed has the same name, so a machine runs one or the other, never both.
+A top-level `name:` is not needed, and a stack manager that names projects by
 their directory (Dockge) is better without one. Set
 `QUASAR_TEMPLATE_ROOT` whenever you move the home root: the recovery actor and the node agent
 default it differently.
@@ -1292,6 +1295,7 @@ default it differently.
 ```yaml
 services:
   quasar-seed:
+    container_name: quasar-seed
     image: "<registry>/quasar-recovery@sha256:<digest>"
     command: seed
     restart: unless-stopped
@@ -1348,6 +1352,7 @@ The same combined host as a one-service stack (Dockge, Arcane):
 ```yaml
 services:
   quasar-seed:
+    container_name: quasar-seed
     image: <registry>/quasar-recovery@sha256:<digest>
     command: seed
     restart: unless-stopped
@@ -1391,7 +1396,7 @@ same host or a network you trust.
 
 Once the machine is installed, machine state holds the password and wins over the stack, so
 `QUASAR_DATABASE_PASSWORD` can be removed from the stack and its `.env` (changing it there
-changes nothing; `reconfigure`, #366, changes it).
+changes nothing, and the database is fixed at install).
 
 What the recovery actor then does, in order, each step decided by what already exists (a
 second start changes nothing; an interrupted install completes on the next start):
@@ -1555,6 +1560,12 @@ The control plane writes them into the `/enroll-host.sh` it serves, and the dial
 back from that script for its stack, so the two cannot name different seeds. Unset, the
 dialog says so and creates nothing. A tag in either fails startup: the seed refuses one.
 
+Both paths also carry the control plane's own release trust, `QUASAR_UPDATER_ALLOWED_NAMESPACES`
+and `QUASAR_PLATFORM_INSECURE_REGISTRIES` when set, into the seed's inputs of the same names,
+so the new machine records the trust its control plane checks a developer apply against: it
+admits the same namespaces, and pulls over plain HTTP from the same registries. Unset, the
+seed keeps its defaults. A value with a quote or a control character fails startup.
+
 The command is
 
 ```
@@ -1592,7 +1603,10 @@ dry run it is refused as contradictory.
   agent and their volumes (the agent's saved identity included, never the homes) first. It
   refuses on a machine that holds a control plane or Quasar's Postgres, or their volumes. The
   unlabelled `quasar-recovery-agent` volume goes too unless a container still mounts it; then
-  the run names what it left in place.
+  the run names what it left in place. Afterwards the run reports the host as enrolled afresh.
+- **A machine removed from the console** (or uninstalled keeping its data) is added back by the
+  command without `QUASAR_RESET_IDENTITY`: it clears the old install the same way, then
+  installs afresh.
 - A machine still running the pre-RH06 Compose-installed agent, or a seed a stack manager
   started, is refused with what to remove first.
 
@@ -1703,12 +1717,14 @@ releases `actor.lease`; the successor takes it (`token="actor-handover-taking-ov
 stops the old actor, disables its restart policy, renames it `quasar-recovery.kept`, takes
 the name `quasar-recovery`, and verifies: it answers on each of its own sockets within 60 s
 (time the container engine does not answer is not counted, up to ten minutes, so a
-live-restore daemon restart does not fail a healthy successor), and on a GPU host another
-process reaches one of its sockets within a further 60 s. That is normally the node agent,
-whose relay polls status throughout an attempt and, when it connects to a socket that is
-still dark (a daemon restart can start it first), keeps asking for up to 90 s
-(`token="release-actor-dark"` if it never answers); an operator's `quasar-recovery status`
-counts too. An agent that is down leaves the successor unverified. Only then is `.kept` removed and `seed.json` rewritten to name the new image
+live-restore daemon restart does not fail a healthy successor), and on a GPU host the node
+agent polls this attempt's status on the agent socket (`GET /v1/status?request_id=<id>`)
+within a further 60 s. Its relay makes that call throughout an attempt and, when it connects
+to a socket that is still dark (a daemon restart can start it first), keeps asking for up to
+90 s and then adopts the attempt (`token="release-actor-dark"` if it never answers). Nothing
+else counts: the image's healthcheck and an operator's `quasar-recovery status` mark their
+requests as the actor's own and name no attempt. An agent that is down leaves the successor
+unverified. Only then is `.kept` removed and `seed.json` rewritten to name the new image
 (`token="actor-seed-file-updated"`). A successor that never becomes ready, never takes the
 lease, fails to verify, or is started three times without verifying is removed and the
 previous actor runs again: `failed`, `restored: true`. Every restart point settles to a
@@ -1770,8 +1786,8 @@ automatically (ADR 0004 amendment):
 
   `--to` is the version the control plane was on (the dump records it); a dump that returns to
   another version is refused. The command talks to the actor over an operator socket in the
-  actor's own container (`/run/quasar-recovery-operator/operator.sock`, in no volume, so only
-  `docker exec` reaches it; `QUASAR_OPERATOR_SOCKET` overrides the path for the command) and
+  actor's own container (`/run/quasar-operator/operator.sock`, the one `reconfigure` uses; in
+  no volume, so only `docker exec` reaches it) and
   follows the restore to its end. Before anything is touched the restore checks the dump's
   checksum, that `pg_restore` reads it, that it is not marked dirty, and that its schema is the
   one the control plane it returns to declares; a corrupt or mismatched dump is refused with
@@ -1809,6 +1825,98 @@ docker run -d --name quasar-recovery --restart unless-stopped \
   -e QUASAR_AGENT_IMAGE=<registry>/quasar-node-agent@sha256:<digest> \
   <registry>/quasar-recovery@sha256:<digest> actor
 ```
+
+
+### Taking a machine apart: remove host and `uninstall` (#366)
+
+A GPU host is removed from the console: Admin → Fleet → the host → Remove host. The control
+plane drains it, waits for its sessions to end, and sends `host_remove`; the host's recovery
+actor records the removal, removes the node agent, then itself. Homes and volumes stay, and
+so does the seed, which from then on stays idle (`token="seed-uninstalled"`). Forget the host
+once it is offline. A host that is not connected cannot be removed this way. A removal that
+stops part-way leaves the host visibly there: Retry removal on its page, the recovery actor's
+next start, or `uninstall` on the machine finishes it.
+
+**Bringing a removed GPU host back** is Add host: create a command with the same node name and
+run it on the machine. The one-line command finds the removed install, clears it (its volumes
+and the agent's old identity; never the homes, which are host directories) and installs
+afresh, and the control plane keeps the host's history under its node name. The same holds
+after a GPU host's `uninstall` that kept its data. A kept-data `uninstall` is otherwise for
+decommissioning or moving a machine: there is no command that reinstates the old install on
+its kept data.
+
+Any machine, a combined or control-only one included, is taken apart on the machine, with the
+console up or down, by running the recovery image with `uninstall` in its own container. The
+seed runs that image and outlives an uninstall, so take the image from it (or name the
+`quasar-recovery@sha256:…` digest yourself):
+
+```sh
+docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine \
+  "$(docker inspect -f '{{.Config.Image}}' quasar-seed)" uninstall
+```
+
+For `--purge`, which refuses while a seed exists, note the image first:
+`img=$(docker inspect -f '{{.Config.Image}}' quasar-seed)`, remove the seed the way you started
+it, then run the same command with `"$img" uninstall --purge`. Each uninstall prints the exact
+command, with the image, to run next.
+
+- It marks the machine uninstalled first (`uninstalled.json`, and `seed.json` `uninstalled`),
+  so neither the seed nor an actor started by hand brings anything back
+  (`token="actor-machine-uninstalled"`), then stops the recovery actor, then removes this
+  installation's containers in reverse order: node agent, control plane, Postgres, recovery
+  actor. It never touches a container the installation did not create.
+- It keeps the database volume, the machine-state volume, the agent's identity and the homes.
+  It refuses while the recovery actor has an attempt in flight, and inside the actor's own
+  container. Interrupted, it leaves the machine down; running it again finishes it.
+- `--purge` also deletes this installation's volumes and network and empties machine state.
+  It needs a typed confirmation: at a terminal it asks for the node name, or pass
+  `--confirm <node name>` (or the installation id). It refuses while a seed is on the machine:
+  remove the seed first, the way you started it. For a Quasar-owned database it first takes a
+  final `pg_dump` (custom format) into the `quasar-final-dump` volume, which a purge never
+  deletes, or into `--dump-to <absolute host directory>`; if the dump fails nothing is deleted.
+  An operator's own database is never dumped or touched. Afterwards remove the emptied volume
+  with `docker volume rm quasar-machine`. `--confirm` and `--dump-to` without `--purge` are
+  refused.
+- The one-line command's `QUASAR_RESET_IDENTITY=1` runs `uninstall --purge` for the
+  installation it finds, from its containers, its labelled volumes or machine state, with the
+  seed's image when the installed recovery actor predates `uninstall`.
+
+### Changing machine inputs: `reconfigure` (#366)
+
+Run inside the recovery actor, which holds the machine's lease:
+
+```sh
+docker exec -it quasar-recovery quasar-recovery reconfigure --dry-run QUASAR_HOME_ROOT=/mnt/homes
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
+```
+
+It takes the seed's variable names: `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`, the release
+trust (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
+`QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`,
+`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
+`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`. An empty value unsets an
+optional one. The role, node name, database and images are fixed at install (images move by an
+update).
+
+A change is checked as an install would check it, then applied as a replacement with the
+same digests: each service whose container the change moves is replaced, verified, and
+restored if it does not verify, and the new inputs stay only if it succeeded. Re-creating the
+node agent ends that host's sessions, so a change that does needs `--yes`. A change no
+container renders (the signature mode, say) is only recorded. This release re-creates only
+the node agent this way, so it is for GPU hosts: a change that moves the control plane's
+container (anything the control plane renders, including the home root or trust on a combined
+host, and every control-plane-only variable) is refused: control-plane replacement (RH06-11,
+#363) serves updates, and a reconfigure does not drive it yet. `reconfigure.json` records a
+reconfigure in flight; one that cannot be read is never overwritten: reconfigure is refused,
+and the actor's next start sets it aside as `reconfigure.json.unreadable`
+(`token="reconfigure-record-set-aside"`). Machine state then keeps that reconfigure's **new**
+inputs, which the node agent runs only if its replacement succeeded, and the actor logs a
+node agent whose container differs from what it would render. Compare the agent's container
+(`docker inspect quasar-node-agent`) with machine state. A reconfigure changes only values
+that differ from machine state, so to keep the old values reconfigure to them; to keep the new
+ones, reconfigure to the old values and then to the new. Delete
+`reconfigure.json.unreadable` once you are done with it.
 
 ---
 

@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use crate::actor::Actor;
 use crate::database::{self, DbError, DbOp, RestorePoint};
-use crate::dump::{self, DumpDir, DumpRecord};
+use crate::dump_dir::{self as dump, DumpDir, DumpRecord};
 use crate::engine::{EngineError, Image};
 use crate::journal::{tail_output, Failure, Journal, LOG_TAIL_LIMIT};
 use crate::machine::Machine;

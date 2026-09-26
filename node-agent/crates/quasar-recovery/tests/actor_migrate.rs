@@ -895,38 +895,58 @@ fn only_the_operator_socket_takes_a_restore() {
     let body = serde_json::to_string(&restore_request(&nth_id(2), Some(&dump), None)).unwrap();
     let control = m.knobs.sockets.join("control/control.sock");
     let (code, answer) =
-        quasar_recovery::server::call(&control, "POST", "/v1/submit", &body).unwrap();
+        quasar_recovery::operator::call(&control, "POST", "/v1/submit", Some(&body)).unwrap();
     assert_eq!(code, 400, "{answer}");
     assert!(answer.contains("operator's command"), "{answer}");
 
-    let operator = actor.operator_socket();
-    assert!(
-        !operator.starts_with(&m.knobs.sockets),
-        "{operator:?} is inside the socket volume"
-    );
+    // The operator socket as main.rs serves it (its real path is inside the actor's own
+    // container, outside the socket volume), on a path of this test's own.
+    let dir = std::env::temp_dir().join(format!("qr-op-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let operator = dir.join("operator.sock");
+    let _ = std::fs::remove_file(&operator);
+    let listener = std::os::unix::net::UnixListener::bind(&operator).unwrap();
+    {
+        let actor = actor.clone();
+        std::thread::spawn(move || quasar_recovery::operator::serve(listener, actor));
+    }
     let (code, answer) =
-        quasar_recovery::server::call(&operator, "POST", "/v1/submit", &body).unwrap();
+        quasar_recovery::operator::call(&operator, "POST", "/v1/restore", Some(&body)).unwrap();
     assert_eq!(code, 202, "{answer}");
     actor.wait_attempt();
-    let (code, answer) = quasar_recovery::server::call(
+    let (code, answer) = quasar_recovery::operator::call(
         &operator,
         "GET",
         &format!("/v1/status?request_id={}", nth_id(2)),
-        "",
+        None,
     )
     .unwrap();
     assert_eq!(code, 200);
     let status: quasar_recovery::socket::Status = serde_json::from_str(&answer).unwrap();
     assert_eq!(status.result.unwrap().state, State::Succeeded);
+    assert_eq!(
+        actor
+            .status_operator(Some(&nth_id(2)))
+            .result
+            .unwrap()
+            .state,
+        State::Succeeded,
+        "the restore is the operator's"
+    );
     // The control socket never sees the operator's attempt.
-    let (_, answer) = quasar_recovery::server::call(
+    let (_, answer) = quasar_recovery::operator::call(
         &control,
         "GET",
         &format!("/v1/status?request_id={}", nth_id(2)),
-        "",
+        None,
     )
     .unwrap();
     let status: quasar_recovery::socket::Status = serde_json::from_str(&answer).unwrap();
     assert!(status.result.is_none());
-    let _ = std::fs::remove_dir_all(operator.parent().unwrap());
+    // Nor does a replacement request on the operator socket become a restore.
+    let replace = serde_json::to_string(&update(&nth_id(3), 81)).unwrap();
+    let (code, answer) =
+        quasar_recovery::operator::call(&operator, "POST", "/v1/restore", Some(&replace)).unwrap();
+    assert_eq!(code, 400, "{answer}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

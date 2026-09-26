@@ -23,14 +23,14 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::actor::Actor;
-use crate::engine::{ContainerSpec, EngineError, Image, RestartPolicy};
+use crate::engine::{ContainerSpec, EngineError, Image, PlatformEngine, RestartPolicy};
 use crate::machine::Machine;
 use crate::recipe::{
     self, control, labels, names, paths, secrets, Bind, DatabaseInputs, ImageRef, Role,
 };
 
 /// The helper's container name: one attempt at a time, so one helper at a time.
-pub const HELPER: &str = "quasar-db-helper";
+pub const HELPER: &str = names::DB_HELPER;
 
 /// The image label naming the schema version a control-plane image migrates to
 /// (`deploy/Dockerfile.control.prod`).
@@ -416,44 +416,12 @@ impl Actor {
         file: Option<&str>,
     ) -> Result<(i64, String), DbError> {
         let spec = self.helper_spec(machine, op, file)?;
-        if let Some(stale) = self.retrying(|| self.engine.inspect_container(HELPER))? {
-            if !stale.labels.contains_key(labels::HELPER) {
-                return Err(DbError::Failed(format!(
-                    "a container this actor did not create holds the name {HELPER}; remove it"
-                )));
-            }
-            self.retrying(|| self.engine.remove_container(&stale.id))?;
-        }
         let image = ImageRef::parse(&spec.image).map_err(|e| DbError::Failed(e.to_string()))?;
         self.ensure_image(&image).map_err(|e| match e {
             crate::actor::ResumeError::Engine(EngineError::Crashed) => DbError::Crashed,
             e => DbError::Failed(format!("the database helper's image: {e}")),
         })?;
-        let id = self.retrying(|| self.engine.create_container(&spec))?;
-        let ran = (|| -> Result<(i64, String), DbError> {
-            self.retrying(|| self.engine.start_container(&id))?;
-            let code = self
-                .engine
-                .wait_container(&id, self.config.database_timeout)?;
-            let logs = match self.engine.logs_tail(&id, 200) {
-                Err(EngineError::Crashed) => return Err(DbError::Crashed),
-                other => other.unwrap_or_default(),
-            };
-            Ok((code, logs))
-        })();
-        // A process that died does nothing more: the next start removes the helper.
-        if matches!(ran, Err(DbError::Crashed)) {
-            return Err(DbError::Crashed);
-        }
-        match self.retrying(|| self.engine.remove_container(&id)) {
-            Err(EngineError::Crashed) => return Err(DbError::Crashed),
-            Err(e) => tracing::warn!(
-                token = "actor-db-helper-not-removed",
-                "the database helper could not be removed ({e}); the next start removes it"
-            ),
-            Ok(()) => {}
-        }
-        let (code, logs) = ran?;
+        let (code, logs) = run_helper(self.engine.as_ref(), &spec, self.config.database_timeout)?;
         info!(op = op.label(), code, "database helper finished");
         Ok((code, logs))
     }
@@ -539,6 +507,62 @@ impl Actor {
             .and_then(|found| found.labels.get(labels::IMAGE_RECIPE)?.trim().parse().ok());
         Ok(rev.map(|rev| (image, rev)))
     }
+}
+
+/// Runs one disposable helper container to completion: its exit code and the tail of its
+/// output. One of the same name a crash left behind is removed first, but only when it
+/// carries the same helper label; the helper is removed on every path this process lives
+/// through. Shared by the pre-update dump and restore (`DbOp`) and `uninstall --purge`'s
+/// final dump (`crate::dump`).
+pub(crate) fn run_helper(
+    engine: &dyn PlatformEngine,
+    spec: &ContainerSpec,
+    timeout: Duration,
+) -> Result<(i64, String), DbError> {
+    let kind = spec.labels.get(labels::HELPER).cloned().unwrap_or_default();
+    if let Some(stale) = engine.inspect_container(&spec.name)? {
+        if stale.labels.get(labels::HELPER) != Some(&kind) {
+            return Err(DbError::Failed(format!(
+                "a container this actor did not create holds the name {}; remove it and run again",
+                spec.name
+            )));
+        }
+        engine.remove_container(&stale.id)?;
+    }
+    let id = engine.create_container(spec)?;
+    let ran = (|| -> Result<(i64, String), DbError> {
+        engine.start_container(&id)?;
+        let code = match engine.wait_container(&id, timeout) {
+            Ok(code) => code,
+            Err(EngineError::Runtime(crate::engine::ErrorKind::Timeout)) => {
+                return Err(DbError::Failed(format!(
+                    "{} did not finish within {} minutes",
+                    spec.name,
+                    timeout.as_secs() / 60
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let logs = match engine.logs_tail(&id, 200) {
+            Err(EngineError::Crashed) => return Err(DbError::Crashed),
+            other => other.unwrap_or_default(),
+        };
+        Ok((code, logs))
+    })();
+    // A process that died does nothing more: the next start sweeps the helper.
+    if matches!(ran, Err(DbError::Crashed)) {
+        return Err(DbError::Crashed);
+    }
+    match engine.remove_container(&id) {
+        Err(EngineError::Crashed) => return Err(DbError::Crashed),
+        Err(e) => tracing::warn!(
+            token = "actor-db-helper-not-removed",
+            container = %spec.name,
+            "a helper could not be removed ({e}); the next start removes it"
+        ),
+        Ok(()) => {}
+    }
+    ran
 }
 
 /// The recipe revision a control-plane image declares, if this actor renders it.

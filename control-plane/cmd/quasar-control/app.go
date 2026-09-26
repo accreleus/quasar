@@ -88,6 +88,7 @@ type Services struct {
 	// The apply half (#116). Nil in a route-recorder build; Register only takes
 	// method values, so the drift test still sees the routes.
 	platformApply  *platform.ApplyHandler
+	platformRemove *platform.RemoveHandler
 	platformNotify *platform.NotifyHandler
 	applyRunner    *platform.Runner
 	fleetRunner    *platform.FleetRunner
@@ -1074,6 +1075,13 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	if cfg.RecoveryControlSocket != "" {
 		selfExecutor = platform.NewActorClient(cfg.RecoveryControlSocket)
 	}
+	// Two facts say "owned": the socket picks the executor, the machine shape
+	// the fleet run's owned rules. The recovery actor's recipe sets both; one
+	// without the other is a hand-edited configuration.
+	if owned, shaped := cfg.RecoveryControlSocket != "", applyMachineShape(cfg).Role != ""; owned != shaped {
+		log.Warn("owned-install configuration is half set: the control socket and the machine shape disagree",
+			"token", "owned-install-config-mismatch", "control_socket_set", owned, "machine_shape_set", shaped)
+	}
 	selfApplier := platform.NewSelfApplier(platformStore, selfExecutor, log)
 	selfApplier.DeveloperCommit = developerImages.Commit
 	selfApplier.DeveloperSchema = developerImages.SchemaOf
@@ -1158,6 +1166,46 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		fleetRunner.WithOwnMachine(ownMachine)
 	}
 	platformApply.WithMachineShape(applyMachineShape(cfg))
+	// Remove host (amendment 14). "Cordon exactly as a per-host apply does" would use the
+	// attempt owner, but a removal writes no attempt row for that owner to belong to, so
+	// it takes the manual-drain owner: a removal that stops part-way then leaves a drain
+	// the operator can lift from the console.
+	platformRemove := platform.NewRemoveHandler(platform.RemoveDeps{
+		Store:     platformStore,
+		Connected: agentRegistry.IsConnected,
+		// The shape the recovery actor wrote into this control plane's configuration,
+		// known whether or not the actor answers (control-api.md, machine_node_name).
+		OwnNodeName: func(context.Context) (string, bool) {
+			return applyMachineShape(cfg).CombinedNodeName()
+		},
+		Cordon: func(ctx context.Context, hostID string) (func(context.Context), error) {
+			held, err := admissionStore.List(ctx, hostID)
+			if err != nil {
+				return nil, err
+			}
+			found := false
+			for _, r := range held {
+				found = found || r.OwnerKind == admission.Manual
+			}
+			if _, err := admissionStore.Acquire(ctx, hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+				return nil, err
+			}
+			return func(ctx context.Context) {
+				if found {
+					return
+				}
+				if _, err := admissionStore.Release(ctx, hostID, admission.ManualOwner, agentRegistry.IsConnected(hostID)); err != nil {
+					log.Warn("host removal: the cordon it took could not be lifted", "host_id", hostID, "err", err)
+				}
+			}, nil
+		},
+		StopSessions: coordinator.StopHostSessions,
+		Send: func(ctx context.Context, hostID, requestID string) (platform.Ack, error) {
+			ack, err := agentRegistry.SendHostRemove(ctx, hostID, requestID)
+			return platform.Ack{OK: ack.OK, Error: ack.Error}, err
+		},
+		Host: crudHandler.HostBody,
+	}, auditStore, log)
 	// Closed after construction: the view reports the active run, and the run's
 	// skips live on the sequencer the apply handler owns.
 	pDeps.ActiveRun = platformApply.ActiveRun
@@ -1177,6 +1225,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// into scheduling mid-update. Here, nothing is active in the database, no run
 	// has been started by this process, and the API is not serving yet.
 	fleetRunner.ResumeCordonRestores(context.Background())
+	// The three adopters partition the open attempts: applyRunner every host
+	// attempt, fleetRunner a run's control-plane attempt (run_id set), and
+	// selfDeveloper a standalone control-plane attempt (run_id NULL).
 	fleetRunner.Adopt(context.Background())
 	selfDeveloper.Adopt(context.Background())
 
@@ -1311,6 +1362,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		consoleHandler:   consoleHandler,
 		platformHandler:  platformHandler,
 		platformApply:    platformApply,
+		platformRemove:   platformRemove,
 		applyRunner:      applyRunner,
 		fleetRunner:      fleetRunner,
 		selfDeveloper:    selfDeveloper,
@@ -1357,6 +1409,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	s.consoleHandler.Register(mux, admin)
 	s.platformHandler.Register(mux, admin)
 	s.platformApply.Register(mux, admin)
+	s.platformRemove.Register(mux, admin)
 	s.platformNotify.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)

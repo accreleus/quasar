@@ -104,13 +104,15 @@ type OwnMachine struct {
 	// DumpFreeBytes is the free space where the pre-update dumps are written
 	// (preflight backup_space); nil when not reported.
 	DumpFreeBytes *int64
+	// Conflicts are the race guard's owner conflicts, for the preflight.
+	Conflicts []actorsocket.Conflict
 }
 
 // OwnMachineFromStatus derives the identity from one status answer. A value
 // the contract cannot use is null, never passed through.
 func OwnMachineFromStatus(st actorsocket.Status) OwnMachine {
 	owned := InstallOwned
-	m := OwnMachine{ActorVersion: st.Actor.Version, DumpFreeBytes: st.DumpFreeBytes}
+	m := OwnMachine{ActorVersion: st.Actor.Version, DumpFreeBytes: st.DumpFreeBytes, Conflicts: st.Conflicts}
 	m.Identity.InstallMode = &owned
 	if agentws.ValidRecoveryActorVersion(st.Actor.Version) {
 		v := st.Actor.Version
@@ -210,7 +212,7 @@ func (r *OwnMachineReader) PreflightFacts(ctx context.Context) PreflightFacts {
 		return PreflightFacts{}
 	}
 	m, ok, at, err := r.read(ctx)
-	fact := &OwnedActorFact{Socket: r.socket, Answered: ok, Version: m.ActorVersion,
+	fact := &OwnedActorFact{Socket: r.socket, Answered: ok, Version: m.ActorVersion, Conflicts: m.Conflicts,
 		DatabaseMode: m.Identity.DatabaseMode, DumpFreeBytes: m.DumpFreeBytes}
 	if err != nil {
 		fact.Err = err.Error()
@@ -235,6 +237,14 @@ func (r *OwnMachineReader) read(ctx context.Context) (OwnMachine, bool, time.Tim
 	var m OwnMachine
 	if err == nil {
 		m = OwnMachineFromStatus(st)
+		if st.Actor.Commit != "" && m.Identity.RecoveryActorSourceCommit == nil {
+			log := r.Log
+			if log == nil {
+				log = slog.Default()
+			}
+			log.Warn("the recovery actor reports a commit that is not a commit; its actor-first ordering treats it as behind",
+				"socket", r.socket, "commit", st.Actor.Commit)
+		}
 	} else {
 		log := r.Log
 		if log == nil {

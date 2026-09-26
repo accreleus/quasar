@@ -245,10 +245,6 @@ func devOnlyOperation(t *testing.T, op yaml.Node) bool {
 // that registers the route.
 var allowedUnimplemented = map[string]struct{}{
 	"GET /v1/sessions/{}/events": {}, // parked session-events SSE amendment
-	// RH06 amendment 14 (#353): the owned-GPU-host remove route, authored ahead of
-	// the server. The RH06 slice that registers it removes this entry and the
-	// operation's x-unimplemented marker in the same change.
-	"POST /v1/admin/platform/hosts/{}/remove": {},
 }
 
 // unimplementedOperation reports whether an OpenAPI operation carries

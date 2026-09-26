@@ -25,6 +25,25 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Race guard, remove host, `uninstall` and `reconfigure` (#366).** A container that looks
+  like a Quasar platform service but was not created by the machine's installation (a
+  leftover Compose stack, a definition a manager still holds) is never acted on: the recovery
+  actor reports it, the agent raises readiness check `owner_conflict`, the control plane
+  blocks that target's updates, and the console warns on the host page, the host row and
+  Releases. The console also warns when no seed is found, keeps a recovery actor's last report
+  on screen when it stops answering, and removes an owned GPU host (drain, wait for its
+  sessions, `POST /v1/admin/platform/hosts/{id}/remove`, agent `host_remove`). On the
+  machine, `quasar-recovery uninstall` removes the installation's containers and keeps its
+  data; `--purge` deletes the data too after a typed confirmation and a final `pg_dump` of a
+  Quasar-owned database. `quasar-recovery reconfigure` changes a GPU host's inputs (home root,
+  release trust, app defaults) through a verified replacement on the same digests. A removed
+  GPU host is added back with Add host under the same node name. The agent re-registers when
+  its recovery actor's reported identity changes, so the console sees a seed go missing or
+  come back without an agent restart.
+- **Add host carries the control plane's release trust (#366).** The one-line command and the
+  Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane
+  admits the developer applies that control plane accepts.
 - **A migrating update of an owned control plane dumps the database first (#364).** Before it
   replaces the control plane with a release that migrates the database, the recovery actor
   dumps a Quasar-owned database (refusing the update if the dump fails or does not fit) and
@@ -318,6 +337,13 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Owned installs in the console and Add host (#366, from #361's live run).** Owned host rows
+  name the machine's shape (GPU host, combined host); setup shows the owned install's
+  setup-token command (`docker exec quasar-control-plane cat /run/quasar/setup-token`), and
+  its last step says to keep the `quasar-machine` volume rather than back up `deploy/.env`.
+  The one-line command reports a fresh enrollment rather than the reconnect that follows it,
+  and after `QUASAR_RESET_IDENTITY=1` says the host enrolled afresh. The documented seed stacks
+  and Add host's stack name the seed `quasar-seed` (`container_name`).
 - **The node agent's container-runtime layer is its own GStreamer-free crate (#355).**
   `node-agent/crates/quasar-runtime` now holds the engine facade (socket discovery and
   its refusals, the bounded client, error classification, registry credentials,
@@ -453,6 +479,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A recovery actor successor is verified only by the node agent (#362).** On a GPU host the
+  successor's own image healthcheck counted as the node agent reaching it, so a successor
+  verified with no agent running. Only the agent relay's poll of the attempt's status counts
+  now, and the actor's own `status` requests say they are its own. A failed attempt's output
+  also embeds the failed container's log lines without terminal colour codes.
 - **The one-line Add host command, after its first live run (#359).** A spent-token reset
   also removes the unlabelled `quasar-recovery-agent` volume unless a container still mounts
   it, and then says what it left instead of "nothing was left". `--fix-only` prepares a host

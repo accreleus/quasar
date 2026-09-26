@@ -1512,15 +1512,16 @@ impl std::fmt::Display for PolicySeedReconnect {
 
 impl std::error::Error for PolicySeedReconnect {}
 
-/// The recovery actor was replaced under this connection (agent-api.md §register, owned
-/// installs): reconnect once so `register` reports the actor now serving. Not an
-/// enrollment, and it ends no session.
+/// The recovery actor was replaced, or its reported identity changed (the seed went
+/// missing or came back, the actor stopped or started answering), under this connection
+/// (agent-api.md §register, owned installs): reconnect once so `register` reports it. Not
+/// an enrollment, and it ends no session.
 #[derive(Debug)]
 struct ActorIdentityReconnect;
 
 impl std::fmt::Display for ActorIdentityReconnect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("recovery actor replaced")
+        f.write_str("the recovery actor's identity changed")
     }
 }
 
@@ -2324,6 +2325,10 @@ async fn connect_and_run(
                     ReadinessRefresh::Done(Ok(checks)) => {
                         readiness_busy = false;
                         mgr.readiness.refreshed(checks, SystemTime::now());
+                        if crate::buildinfo::owned_identity_changed() {
+                            info!(token = "owned-identity-redial", "the recovery actor now reports a different identity (actor, seed or whether it answers); reconnecting so register carries it");
+                            return Err(ActorIdentityReconnect.into());
+                        }
                     }
                     ReadinessRefresh::Done(Err(error)) => {
                         readiness_busy = false;
@@ -4413,6 +4418,9 @@ impl SessionManager {
                 self.release_mgr
                     .handle_apply(id, request_id, release, components, force),
             ),
+            ControlMsg::HostRemove { id, request_id } => {
+                Some(crate::host_remove::handle(id, &request_id))
+            }
             ControlMsg::Registered { .. } => {
                 warn!(
                     token = "duplicate-registered",

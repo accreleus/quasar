@@ -175,6 +175,23 @@ describe("FleetApplyButton", () => {
     expect(screen.queryByRole("button", { name: "Update Quasar" })).not.toBeInTheDocument();
   });
 
+  // #364: an owned control plane takes a migration behind its pre-update dump, so
+  // the #363 refusal is gone; preflight backup_space is what can block it now.
+  it("is offered for a migrating release on an owned control plane", () => {
+    const owned = (migrates: boolean) => {
+      const v = view({ available: [release({ migrates, schema_version: migrates ? 75 : 74 })] });
+      Object.assign(v.installed.control_plane, { install_mode: "owned", machine_role: "combined", machine_node_name: "gpu-01" });
+      return v;
+    };
+    const { unmount } = renderButton(owned(true));
+    const button = screen.getByRole("button", { name: "Update Quasar" });
+    expect(button).toBeEnabled();
+    expect(button).not.toHaveAttribute("title");
+    unmount();
+    renderButton(owned(false));
+    expect(screen.getByRole("button", { name: "Update Quasar" })).toBeEnabled();
+  });
+
   it("is absent when this instance is already on the newest release", () => {
     renderButton(view({ available: [release({ source_commit: CP_COMMIT })] }));
     expect(screen.queryByRole("button", { name: "Update Quasar" })).not.toBeInTheDocument();

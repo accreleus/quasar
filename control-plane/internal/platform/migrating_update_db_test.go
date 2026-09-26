@@ -1,6 +1,6 @@
 // A migrating update of an owned control plane (#364) against a real Postgres:
 // the fleet apply's external-backup confirmation through the admin route and
-// its audit, and the attempt's pre-update dump reference (migration 0103).
+// its audit, and the attempt's pre-update dump reference (migration 0097).
 package platform
 
 import (

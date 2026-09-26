@@ -1,4 +1,4 @@
--- 0103: the pre-update dump reference on control-plane attempts (amendment 14,
+-- 0097: the pre-update dump reference on control-plane attempts (amendment 14,
 -- #353; protocol/schema.md platform_apply_attempts.pre_update_dump and
 -- "RH06 — amendment 14"). Written by the migrating-update slice (#364).
 --
@@ -6,7 +6,7 @@
 -- name is the one the recovery actor's `restore` command takes; the dump itself
 -- stays in that machine's machine state, never in Postgres.
 --
--- Once applied, never deploy a control-plane binary embedding only <= 0102:
+-- Once applied, never deploy a control-plane binary embedding only <= 0096:
 -- boot's m.Up() crash-loops on a database ahead of the binary.
 BEGIN;
 

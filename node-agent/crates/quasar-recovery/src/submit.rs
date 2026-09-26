@@ -15,17 +15,19 @@
 //!    container carries as its attempt label: never admitted again.
 //! 3. From `acquire_lease` until `resume` returns, every submit is `busy`; so is every
 //!    submit while any journal is unreadable (it may be the open attempt).
-//! 4. **Rules per kind and per caller**, which `admit` does not look at. The agent socket
-//!    may send `replace` (agent-api.md `release_apply`) and, once RH06-14 (#366) builds it,
-//!    `remove` (`host_remove`); never `restore`, which loads a pre-update dump on the
+//! 4. **Rules per kind and per caller**, which `admit` does not look at. A `remove`
+//!    (`host_remove`) is admitted by [`crate::remove`] before any of them, and on a machine
+//!    being uninstalled nothing else is. The agent socket may send `replace` (agent-api.md
+//!    `release_apply`) and `remove`; never `restore`, which loads a pre-update dump on the
 //!    control plane's machine. It may name only `node-agent` and `recovery-actor`, and the
 //!    actor only on a GPU host; the control socket only `control-plane` and
 //!    `recovery-actor`, the actor only together with the control plane (A1, ADR 0008),
 //!    and only on a machine that runs a control plane. A request naming `recovery-actor`
 //!    needs this actor to be the container under the actor's name: it is what hands over.
 //!    What a caller may name but this build cannot yet do is refused `invalid`, saying
-//!    which ticket brings it; `restore` is never a socket request but the operator's
-//!    command (`crate::restore`).
+//!    which ticket brings it; the control socket's `restore` is refused, because a restore
+//!    is the operator's command (`crate::restore`), and its `remove` too: a control-plane
+//!    machine is taken apart by `uninstall` on the machine.
 //!
 //!    A migrating control plane on an operator-supplied database needs the operator's
 //!    confirmation of a backup (`backup_unconfirmed` otherwise), and no control plane is
@@ -33,8 +35,9 @@
 //! 5. Every image a registry host plus well-formed path components, then
 //!    [`trust::admit`]: single flight, the component table and the confused-deputy guard,
 //!    image and digest shape, the namespace allowlist, then ADR 0003 signatures.
-//! 6. The race guard at submission: a container holding a name this replacement needs,
-//!    without this installation's labels, is `owner_conflict`.
+//! 6. The race guard at submission ([`crate::race_guard`]): any owner conflict on the
+//!    machine, or a container holding a name this replacement needs without this
+//!    installation's labels, is `owner_conflict`.
 //!
 //! Every refusal happens before the first journal record, so a refusal changed nothing.
 
@@ -103,13 +106,8 @@ fn kind_and_caller_rules(
                 "the agent socket may not ask for a restore: a restore loads a pre-update dump on the control plane's machine and is the operator's command",
             ))
         }
-        (Caller::Agent, RequestKind::Remove) => {
-            return Err(refuse(
-                req,
-                Reason::Invalid,
-                "removing this machine's services (host_remove) is not in this build; it arrives with RH06-14 (#366). Nothing was changed",
-            ))
-        }
+        // Admitted by `submit_remove` before these rules.
+        (Caller::Agent, RequestKind::Remove) => {}
         (Caller::ControlPlane, RequestKind::Restore) => {
             return Err(refuse(
                 req,
@@ -147,7 +145,10 @@ fn kind_and_caller_rules(
     }
     // A1 (ADR 0008): on the control plane's own machine the actor may lead the control
     // plane only while a control-plane replacement is in flight, so it moves only in the
-    // control-plane step, never alone (control-api.md §"Developer apply").
+    // control-plane step, never alone (control-api.md §"Developer apply"). To move only
+    // the actor there, name `[recovery-actor, control-plane]` with the control plane's
+    // current digest: the control plane is replaced by itself (a restart, sessions ride
+    // through). Guarded by a_control_plane_machines_actor_moves_with_its_current_control_plane.
     let names_actor = req.components.iter().any(|c| c.name == "recovery-actor");
     let names_control_plane = req.components.iter().any(|c| c.name == "control-plane");
     if caller == Caller::ControlPlane && names_actor && !names_control_plane {
@@ -250,6 +251,17 @@ impl Actor {
             ));
         }
 
+        if req.kind == RequestKind::Remove && is_uuid(&req.request_id) {
+            return self.submit_remove(caller, req);
+        }
+        if let Some(why) = crate::uninstall::uninstalled(&self.dir) {
+            return Err(refuse(
+                &req,
+                Reason::Invalid,
+                format!("{why}; nothing is replaced on it"),
+            ));
+        }
+
         // 4.
         if is_uuid(&req.request_id) {
             let role = self
@@ -345,6 +357,18 @@ impl Actor {
         }
         match self.engine.list_containers() {
             Ok(all) => {
+                let conflicts = crate::race_guard::conflicts(
+                    &all,
+                    Some(&machine.installation_id),
+                    self.config.self_container.as_deref(),
+                );
+                if !conflicts.is_empty() {
+                    return Err(refuse(
+                        &req,
+                        Reason::OwnerConflict,
+                        crate::race_guard::refusal(&conflicts),
+                    ));
+                }
                 if let Some(c) = all.iter().find(|c| {
                     c.labels.get(ATTEMPT_LABEL).map(String::as_str) == Some(req.request_id.as_str())
                 }) {

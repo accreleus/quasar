@@ -34,6 +34,7 @@ pub mod gpu_vendor;
 pub mod health;
 mod home_cleanup;
 pub mod host_probe;
+pub mod host_remove;
 pub mod images;
 pub mod jobs;
 /// Log spans + the WARN/ERROR `token=` convention (`.claude/rules/agent-logging.md`).

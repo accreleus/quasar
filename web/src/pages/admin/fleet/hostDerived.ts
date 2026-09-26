@@ -6,6 +6,9 @@
 
 import { needsAttention, type AttentionHost } from "../../../lib/fleet/deriveAlerts";
 
+/** control-api.md amendment 14 §"Preflight"; the warning itself is hostWarnings.ts. */
+const OWNER_CONFLICT = "owner_conflict";
+
 // ── Inputs ───────────────────────────────────────────────────────────────────
 
 // Inputs are structural rather than the generated API types, like
@@ -181,10 +184,17 @@ export function schedulingLabel(host: { status: string }): string {
  *
  * `status` alone would call a host with a failed capacity report or a failed
  * readiness check "online" — the row an operator most needs to spot. Same
- * predicate as the rail badge (`needsAttention`), so they cannot disagree.
+ * predicate as the rail badge (`needsAttention`), so they cannot disagree, with
+ * one exception: a failing `owner_conflict` blocks only this machine's updates,
+ * not its sessions, so the host stays "online" and its row carries the owner
+ * conflict chip instead (design_handoff_v3 screens/rh06 hosts, conflict).
  */
 export function hostStateLabel(host: HostLike): string {
-  return host.status === "online" && needsAttention(host) ? "degraded" : host.status;
+  const serving = {
+    ...host,
+    readiness: (host.readiness ?? []).filter((check) => check.id !== OWNER_CONFLICT),
+  };
+  return host.status === "online" && needsAttention(serving) ? "degraded" : host.status;
 }
 
 /** `.sdot` modifier for that state (mock: ok / warn / bad / off). */

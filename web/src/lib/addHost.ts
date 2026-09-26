@@ -30,18 +30,33 @@ export function isDigestRef(ref: string): boolean {
   return !repo.slice(repo.lastIndexOf("/") + 1).includes(":");
 }
 
-export type ServedImages = { seedImage: string; agentImage: string };
+export type ServedImages = {
+  seedImage: string;
+  agentImage: string;
+  /** The control plane's release trust, which the seed records as the machine's. */
+  allowedNamespaces?: string;
+  insecureRegistries?: string;
+};
 
-/** The two images the served script installs, or null when the control plane
- *  names none (or an image is not a digest pin). */
+/** The two images the served script installs, and the trust it passes, or null when
+ *  the control plane names no images (or an image is not a digest pin). */
 export function readServedImages(script: string): ServedImages | null {
+  const line = (name: string) => new RegExp(`^${name}='([^']*)'$`, "m").exec(script)?.[1] ?? "";
   const pin = (name: string) => {
-    const m = new RegExp(`^${name}='([^']*)'$`, "m").exec(script);
-    return m && isDigestRef(m[1]) ? m[1] : null;
+    const v = line(name);
+    return isDigestRef(v) ? v : null;
   };
   const seedImage = pin("PINNED_SEED_IMAGE");
   const agentImage = pin("PINNED_AGENT_IMAGE");
-  return seedImage && agentImage ? { seedImage, agentImage } : null;
+  if (!seedImage || !agentImage) return null;
+  const allowedNamespaces = line("PINNED_ALLOWED_NAMESPACES");
+  const insecureRegistries = line("PINNED_INSECURE_REGISTRIES");
+  return {
+    seedImage,
+    agentImage,
+    ...(allowedNamespaces ? { allowedNamespaces } : {}),
+    ...(insecureRegistries ? { insecureRegistries } : {}),
+  };
 }
 
 export type Expiry = { label: string; ms: number };
@@ -77,6 +92,8 @@ export type SeedStackInputs = {
   enrollment: string;
   nodeName?: string | null;
   homeRoot?: string;
+  allowedNamespaces?: string;
+  insecureRegistries?: string;
 };
 
 /** The seed alone, as a Compose stack. The top-level `name:` keeps the volume
@@ -92,10 +109,14 @@ export function composeSeedStack(i: SeedStackInputs): string {
     `QUASAR_HOME_ROOT: ${q(home)}`,
     `QUASAR_TEMPLATE_ROOT: ${q(templateRootFor(home))}`,
     `QUASAR_AGENT_IMAGE: ${q(i.agentImage)}`,
+    ...(i.allowedNamespaces ? [`QUASAR_UPDATER_ALLOWED_NAMESPACES: ${q(i.allowedNamespaces)}`] : []),
+    ...(i.insecureRegistries ? [`QUASAR_PLATFORM_INSECURE_REGISTRIES: ${q(i.insecureRegistries)}`] : []),
   ];
   return [
     "services:",
     "  quasar-seed:",
+    // The name the documented `docker exec quasar-seed …` commands use.
+    "    container_name: quasar-seed",
     `    image: ${q(i.seedImage)}`,
     "    command: seed",
     "    restart: unless-stopped",

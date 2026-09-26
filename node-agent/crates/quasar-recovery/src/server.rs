@@ -53,20 +53,6 @@ pub fn bind_owned(path: &Path, owner: Option<(u32, u32)>) -> io::Result<UnixList
     Ok(listener)
 }
 
-/// Who a socket serves: the caller its mount makes it (the agent or the control plane), or
-/// the operator, whose socket sits in the actor's own container and takes `restore` only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Door {
-    Socket(Caller),
-    Operator,
-}
-
-impl From<Caller> for Door {
-    fn from(caller: Caller) -> Self {
-        Door::Socket(caller)
-    }
-}
-
 /// How often a serving loop looks at its stop flag between connections.
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
@@ -77,10 +63,9 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 pub fn serve(
     listener: UnixListener,
     actor: Arc<Actor>,
-    door: impl Into<Door>,
+    caller: Caller,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let door = door.into();
     listener.set_nonblocking(true)?;
     let open = Arc::new(AtomicUsize::new(0));
     loop {
@@ -101,7 +86,7 @@ pub fn serve(
             open.fetch_sub(1, Ordering::SeqCst);
             warn!(
                 token = "actor-socket-busy",
-                socket = socket_name(door),
+                socket = socket_name(caller),
                 "too many connections; one closed unanswered"
             );
             continue;
@@ -109,23 +94,22 @@ pub fn serve(
         let actor = actor.clone();
         let open = open.clone();
         std::thread::spawn(move || {
-            if let Err(e) = answer(stream, &actor, door) {
-                debug!(socket = socket_name(door), "{e}");
+            if let Err(e) = answer(stream, &actor, caller) {
+                debug!(socket = socket_name(caller), "{e}");
             }
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn socket_name(door: Door) -> &'static str {
-    match door {
-        Door::Socket(Caller::Agent) => "agent",
-        Door::Socket(Caller::ControlPlane) => "control",
-        Door::Operator => "operator",
+fn socket_name(caller: Caller) -> &'static str {
+    match caller {
+        Caller::Agent => "agent",
+        Caller::ControlPlane => "control",
     }
 }
 
-fn answer(mut stream: UnixStream, actor: &Arc<Actor>, door: Door) -> io::Result<()> {
+fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut head = Vec::new();
@@ -144,9 +128,6 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, door: Door) -> io::Result<
         l.split_once(':')
             .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(SELF_PROBE_HEADER))
     });
-    if !own_probe {
-        actor.note_external_request();
-    }
     let mut first = head.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -155,14 +136,14 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, door: Door) -> io::Result<
             let request_id = query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("request_id="));
-            let status = match door {
-                Door::Socket(caller) => actor.status_as(caller, request_id),
-                Door::Operator => actor.status_operator(request_id),
-            };
-            let body = serde_json::to_string(&status).map_err(io::Error::other)?;
+            if let Some(id) = request_id.filter(|_| !own_probe) {
+                actor.note_attempt_poll(id);
+            }
+            let body = serde_json::to_string(&actor.status_as(caller, request_id))
+                .map_err(io::Error::other)?;
             respond(&mut stream, 200, &body)
         }
-        ("POST", "/v1/submit") => submit(&mut stream, &head, actor, door),
+        ("POST", "/v1/submit") => submit(&mut stream, &head, actor, caller),
         (_, "/v1/status") | (_, "/v1/submit") => {
             respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
         }
@@ -172,7 +153,12 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, door: Door) -> io::Result<
 
 /// `POST /v1/submit`: the caller is the socket's, because authority follows the mount.
 /// `202` with the `Accepted`, `409` (`busy`) or `400` with the `Rejection`.
-fn submit(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>, door: Door) -> io::Result<()> {
+fn submit(
+    stream: &mut UnixStream,
+    head: &str,
+    actor: &Arc<Actor>,
+    caller: Caller,
+) -> io::Result<()> {
     let length = head
         .lines()
         .find_map(|l| {
@@ -199,11 +185,7 @@ fn submit(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>, door: Door) -
             return respond(stream, 400, &body);
         }
     };
-    let answered = match door {
-        Door::Socket(caller) => actor.submit(caller, request),
-        Door::Operator => actor.submit_restore(request),
-    };
-    match answered {
+    match actor.submit(caller, request) {
         Ok(accepted) => {
             let body = serde_json::to_string(&accepted).map_err(io::Error::other)?;
             respond(stream, 202, &body)
@@ -212,7 +194,7 @@ fn submit(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>, door: Door) -
             warn!(
                 token = "actor-submit-refused",
                 reason = %rejection.reason,
-                socket = socket_name(door),
+                socket = socket_name(caller),
                 "a submit was refused: {}", rejection.message
             );
             let status = if rejection.reason == Reason::Busy {
@@ -245,44 +227,27 @@ fn respond(stream: &mut UnixStream, status: u16, body: &str) -> io::Result<()> {
     stream.flush()
 }
 
-/// One request on a socket: the status code and the body.
-pub fn call(path: &Path, method: &str, target: &str, body: &str) -> io::Result<(u16, String)> {
-    let mut stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    let request = format!(
-        "{method} {target} HTTP/1.0\r\nHost: recovery\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    let mut raw = String::new();
-    stream.take(4 * 1024 * 1024).read_to_string(&mut raw)?;
-    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
-    let code = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .ok_or_else(|| io::Error::other(format!("the actor answered {head:?}")))?;
-    Ok((code, body.to_owned()))
-}
-
-/// The operator's `quasar-recovery status`: one `GET /v1/status`, the body as served.
+/// One `GET /v1/status`, the body as served: the operator's `quasar-recovery status`, the
+/// image's healthcheck, and an actor probing its own sockets. Always marked, so it is never
+/// taken for the node agent (`crate::handover`, agent contact).
 pub fn fetch_status(path: &Path) -> io::Result<String> {
-    status_request(path, "")
+    status_request(path, "/v1/status", &format!("{SELF_PROBE_HEADER}: 1\r\n"))
 }
 
-/// Marks a request the serving actor makes to itself: not another process reaching it,
-/// which is what a successor's verification waits for (`crate::handover`).
+/// Marks a request made by this binary rather than by the node agent.
 const SELF_PROBE_HEADER: &str = "X-Quasar-Self-Probe";
 
-/// [`fetch_status`] from the serving actor itself.
-pub(crate) fn probe_self(path: &Path) -> io::Result<String> {
-    status_request(path, &format!("{SELF_PROBE_HEADER}: 1\r\n"))
+/// The node agent relay's poll of one attempt, as its own client sends it (unmarked). For
+/// tests standing in for the agent.
+#[cfg(any(test, feature = "test-support"))]
+pub fn poll_attempt_as_agent(path: &Path, request_id: &str) -> io::Result<String> {
+    status_request(path, &format!("/v1/status?request_id={request_id}"), "")
 }
 
-fn status_request(path: &Path, extra_header: &str) -> io::Result<String> {
+fn status_request(path: &Path, target: &str, extra_header: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    let request = format!("GET /v1/status HTTP/1.0\r\nHost: recovery\r\n{extra_header}\r\n");
+    let request = format!("GET {target} HTTP/1.0\r\nHost: recovery\r\n{extra_header}\r\n");
     stream.write_all(request.as_bytes())?;
     let mut raw = String::new();
     stream.take(4 * 1024 * 1024).read_to_string(&mut raw)?;

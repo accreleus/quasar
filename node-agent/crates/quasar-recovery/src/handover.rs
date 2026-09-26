@@ -36,7 +36,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::actor::Actor;
 use crate::engine::{Container, ContainerSpec, EngineError, RestartPolicy};
-use crate::journal::{tail_output, Failure, Journal, Phase, LOG_TAIL_LIMIT};
+use crate::journal::{embedded_log_tail, Failure, Journal, Phase};
 use crate::recipe::{self, labels, names, ImageRef, Role};
 use crate::replace::{engine, fail, moved_before, same_container, Halt, ATTEMPT_LABEL, CRASHED};
 use crate::settle::{Party, RECOVERY_ACTOR};
@@ -784,7 +784,7 @@ impl Actor {
     /// Time the engine does not answer does not count against `verify`, up to
     /// [`ENGINE_OUTAGE_LIMIT`] of them: with live-restore the containers keep running
     /// through a daemon restart, and a healthy successor is not failed for it.
-    fn verify_successor(&self, _j: &Journal, _i: usize) -> Result<(), Halt> {
+    fn verify_successor(&self, j: &Journal, _i: usize) -> Result<(), Halt> {
         let timing = self.config.handover;
         let mut deadline = Instant::now() + timing.verify;
         let outage_limit = timing.verify * ENGINE_OUTAGE_LIMIT;
@@ -797,7 +797,7 @@ impl Actor {
             let tick = Instant::now();
             let silent = match self.socket_plan() {
                 Ok(plan) => plan.into_iter().find_map(|p| {
-                    crate::server::probe_self(&p.path)
+                    crate::server::fetch_status(&p.path)
                         .err()
                         .map(|e| format!("its socket {} did not answer ({e})", p.path.display()))
                 }),
@@ -825,7 +825,7 @@ impl Actor {
                 }
             };
             let why = match (silent, running) {
-                (None, Some(true)) => return self.await_agent_contact(),
+                (None, Some(true)) => return self.await_agent_contact(&j.request.request_id),
                 (Some(why), _) => why,
                 (None, Some(false)) => "its container is not running".to_string(),
                 (None, None) => "the container engine did not answer".to_string(),
@@ -844,11 +844,12 @@ impl Actor {
     }
 
     /// The second half of verifying on a GPU host (architecture §5.6): the node agent
-    /// reconnects, which its relay does by polling status on the agent socket throughout
-    /// an attempt. Any request that is not this process's own probe counts, on any of its
-    /// sockets, so an operator's `docker exec … quasar-recovery status` does too; none
-    /// within `agent_contact` is not verified.
-    fn await_agent_contact(&self) -> Result<(), Halt> {
+    /// reaches this process. Only its relay's call counts, a poll of this attempt's status
+    /// (`GET /v1/status?request_id=<id>`), which it makes throughout an attempt and resumes
+    /// on reconnect. This binary's own requests (its probes, the image healthcheck, an
+    /// operator's `quasar-recovery status`) never do. None within `agent_contact` is not
+    /// verified.
+    fn await_agent_contact(&self, request_id: &str) -> Result<(), Halt> {
         let gpu = matches!(
             self.dir.load_machine(),
             Ok(Some(m)) if m.role == crate::socket::MachineRole::Gpu
@@ -862,14 +863,14 @@ impl Actor {
             if self.killed() {
                 return Err(Halt::Died);
             }
-            if self.external_requests() > 0 {
+            if self.attempt_polled(request_id) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(fail(
                     Reason::Unhealthy,
                     format!(
-                        "the successor did not verify: no node agent reached its agent socket within {}s",
+                        "the successor did not verify: the node agent did not poll this attempt on its agent socket within {}s",
                         timing.agent_contact.as_secs()
                     ),
                 ));
@@ -1187,7 +1188,7 @@ impl Actor {
             match self.engine.logs_tail(&c.id, 40) {
                 Ok(tail) if !tail.trim_end().is_empty() => {
                     output.push_str(&format!("\n--- last lines of {} ---\n", c.name));
-                    output.push_str(&tail_output(tail.trim_end(), LOG_TAIL_LIMIT));
+                    output.push_str(&embedded_log_tail(&tail));
                 }
                 Err(e) if crash(&e) => return Err(()),
                 _ => {}

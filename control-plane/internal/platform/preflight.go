@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 )
 
 // Preflight (CONTEXT.md). semantics: control-api.md §"Self-update hardening"
@@ -28,6 +30,9 @@ const (
 	// Amendment 14: room for the pre-update dump, on an owned control plane
 	// whose database is Quasar's own.
 	CheckBackupSpace = "backup_space"
+	// Amendment 14: carried only by an owned target. For a host it is also the
+	// agent's readiness check id (node-agent readiness/owner_conflict.rs).
+	CheckOwnerConflict = "owner_conflict"
 )
 
 // Per-check status and the folded state.
@@ -106,14 +111,18 @@ type PreflightFacts struct {
 	// and the size of this control plane's database (nil: not read).
 	Migrates      *bool
 	DatabaseBytes *int64
+	// Host only: an owned host carries owner_conflict and no Compose checks.
+	OwnedHost bool
 }
 
-// OwnedActorFact is whether the recovery actor answered on the control socket.
+// OwnedActorFact is whether the recovery actor answered on the control socket,
+// and the owner conflicts it reported when it did.
 type OwnedActorFact struct {
-	Socket   string
-	Answered bool
-	Version  string
-	Err      string
+	Socket    string
+	Answered  bool
+	Version   string
+	Err       string
+	Conflicts []actorsocket.Conflict
 	// DatabaseMode is `owned` or `external` as the actor reported it; nil unknown.
 	DatabaseMode  *string
 	DumpFreeBytes *int64
@@ -128,6 +137,7 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 		// An owned target carries no Compose checks (amendment 14 §"Preflight").
 		checks = []PreflightCheck{
 			ownedActorSocketCheck(f.OwnedActor),
+			ownedConflictCheck(f.OwnedActor),
 			imageCheck(f.Image),
 		}
 		// A silent actor has not said whose database it is; the check then reads
@@ -140,6 +150,14 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 			cpSocketCheck(f.Socket, f.Self),
 			cpStackDirCheck(f.Self),
 			cpOverlaysCheck(f.Self),
+			imageCheck(f.Image),
+		}
+	case f.OwnedHost:
+		checks = []PreflightCheck{
+			agentConnectedCheck(f.AgentConnected),
+			readinessCheck(CheckUpdaterSocket, f.Readiness),
+			readinessCheck(CheckHealthAddrBindable, f.Readiness),
+			readinessCheck(CheckOwnerConflict, f.Readiness),
 			imageCheck(f.Image),
 		}
 	default:
@@ -215,6 +233,30 @@ func ownedActorSocketCheck(a *OwnedActorFact) PreflightCheck {
 		v = "of unknown version"
 	}
 	return pass(CheckUpdaterSocket, "recovery actor "+v+" answered on "+a.Socket)
+}
+
+// ownedConflictCheck lifts the race guard's report (recovery-actor
+// race_guard.rs): any container that looks like a Quasar service without this
+// installation's labels blocks the target.
+func ownedConflictCheck(a *OwnedActorFact) PreflightCheck {
+	if !a.Answered {
+		return unknown(CheckOwnerConflict, "not evaluated: the recovery actor did not answer")
+	}
+	if len(a.Conflicts) == 0 {
+		return pass(CheckOwnerConflict, "no container on this machine looks like a Quasar service without being this installation's")
+	}
+	names := make([]string, 0, len(a.Conflicts))
+	each := make([]string, 0, len(a.Conflicts))
+	for _, c := range a.Conflicts {
+		names = append(names, c.Container)
+		line := c.Container + " (" + c.Image + ")"
+		if c.Why != "" {
+			line += ": " + c.Why
+		}
+		each = append(each, line)
+	}
+	return fail(CheckOwnerConflict, "the recovery actor never acts on a container it did not create, and these look like Quasar services: "+
+		strings.Join(each, "; ")+". Remove them and the stack or manager definition that recreates them: docker rm -f "+strings.Join(names, " "))
 }
 
 func cpStackDirCheck(self *UpdaterSelfFacts) PreflightCheck {
@@ -388,5 +430,6 @@ func HostPreflightFacts(h HostIdentity, image *ImageFact) PreflightFacts {
 		AgentConnected: h.AgentConnected,
 		Readiness:      ReadinessFacts(h.Readiness),
 		Image:          image,
+		OwnedHost:      h.InstallMode != nil && *h.InstallMode == InstallOwned,
 	}
 }

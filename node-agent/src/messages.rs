@@ -1238,6 +1238,13 @@ pub enum ControlMsg {
         #[serde(default)]
         force: bool,
     },
+    /// Remove this owned GPU host's node agent and recovery actor (agent-api.md
+    /// `host_remove`, amendment 14): handed to the recovery actor, acked on acceptance, and
+    /// followed by nothing, since this agent is the first thing removed.
+    HostRemove {
+        id: String,
+        request_id: String,
+    },
     /// Future additions land here until handled.
     #[serde(other)]
     Unknown,

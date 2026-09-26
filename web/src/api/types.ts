@@ -101,6 +101,7 @@ export type PlatformApplyRun = Schemas["PlatformApplyRun"];
 export type PlatformApplySkip = Schemas["PlatformApplySkip"];
 export type PlatformApplyRequest = Schemas["PlatformApplyRequest"];
 export type PlatformDeveloperApplyRequest = Schemas["PlatformDeveloperApplyRequest"];
+export type PlatformHostRemoveRequest = Schemas["PlatformHostRemoveRequest"];
 export type ApplyComponentDigest = Schemas["ApplyComponentDigest"];
 export type PlatformApplyRunEnvelope = Schemas["PlatformApplyRunEnvelope"];
 export type PlatformApplyRunsResponse = Schemas["PlatformApplyRunsResponse"];

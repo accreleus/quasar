@@ -1089,6 +1089,20 @@ export function applyPlatformReleaseToHost(
 
 /** Apply an arbitrary digest set to one owned target. 202 with a
  *  `developer_apply` attempt, watched through active_apply like any other. */
+/** Remove an owned GPU host's node agent and recovery actor (control-api.md amendment
+ *  14, "Removing an owned GPU host"). `202` once its recovery actor accepts. */
+export function removePlatformHost(
+  token: string,
+  id: string,
+  req: import("./types").PlatformHostRemoveRequest = {},
+): Promise<{ host: import("./types").Host }> {
+  return apiFetch<{ host: import("./types").Host }>(`/admin/platform/hosts/${id}/remove`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
 export function developerApply(
   token: string,
   req: PlatformDeveloperApplyRequest,

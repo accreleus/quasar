@@ -52,8 +52,10 @@
     "conflicts": [
       {
         "container": "deploy-quasar-control-plane-1",
-        "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
-        "why": "a legacy Compose service name without this installation's labels"
+        "id": "9c41d7e0b2a3",
+        "image": "ghcr.io/accreleus/quasar/quasar-control-plane:0.3.0",
+        "role": "control-plane",
+        "why": "part of the Compose project deploy, probably left from an older Compose install"
       }
     ],
     "in_flight": null,

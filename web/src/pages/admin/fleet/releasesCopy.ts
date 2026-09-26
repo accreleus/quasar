@@ -35,7 +35,17 @@ const PREFLIGHT_CHECK_TEXT: Record<string, string> = {
   agent_connected: "agent connected",
   health_addr_bindable: "agent health port free",
   backup_space: "room for the database dump",
+  owner_conflict: "no other owner’s container in the way",
 };
+
+/** A failing check as a holdout reads it, when that is not "Blocked: <label>". */
+const HOLDOUT_TEXT: Record<string, string> = {
+  owner_conflict: "another owner’s container in the way",
+};
+
+export function holdoutCheckText(id: string): string | null {
+  return HOLDOUT_TEXT[id] ?? null;
+}
 
 export function preflightCheckText(id: string): string {
   return PREFLIGHT_CHECK_TEXT[id] ?? id;

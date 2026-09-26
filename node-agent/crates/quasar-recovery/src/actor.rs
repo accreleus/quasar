@@ -30,7 +30,6 @@ use crate::recipe::{
     SecretMounts, TrustInputs,
 };
 use crate::seed;
-use crate::server::Door;
 use crate::socket::{
     ActorIdentity, AttemptResult, Conflict, DatabaseMode, MachineRole, Request, SeedIdentity,
     Service, Status,
@@ -118,6 +117,9 @@ pub struct ActorConfig {
     /// How long an install waits for Postgres, then the control plane, to report healthy
     /// before it creates what depends on it (and creates it anyway, logged).
     pub healthy_wait: std::time::Duration,
+    /// Between accepting a host removal and removing the agent that relayed it
+    /// ([`crate::remove`]), so its ack reaches the control plane first.
+    pub remove_grace: std::time::Duration,
     pub handover: HandoverTiming,
     /// The directory [`Actor::socket_plan`]'s sockets are served under. Fixed in the
     /// binary: the recipes name the same paths.
@@ -133,10 +135,6 @@ pub struct ActorConfig {
     pub free_space: FreeSpace,
     /// How long one database operation (a dump, a load) may run.
     pub database_timeout: std::time::Duration,
-    /// The operator socket (`crate::restore`), in this container's own filesystem and no
-    /// volume, so only a process started in this container (`docker exec`) reaches it.
-    /// `None`: `operator.sock` in `<socket_dir>-operator`, beside the socket volume.
-    pub operator_socket: Option<PathBuf>,
     /// Fault injection: called after every committed phase with the component's name and
     /// the phase; `true` makes the process die right there.
     #[cfg(any(test, feature = "test-support"))]
@@ -250,13 +248,13 @@ impl ActorConfig {
             }),
             timing: ReplaceTiming::default(),
             healthy_wait: std::time::Duration::from_secs(180),
+            remove_grace: crate::remove::DEFAULT_GRACE,
             handover: HandoverTiming::default(),
             socket_dir: paths::AGENT_SOCKET_DIR.into(),
             on_died: Box::new(|| {}),
             machine_dir_host: None,
-            free_space: Box::new(crate::dump::free_bytes),
+            free_space: Box::new(crate::dump_dir::free_bytes),
             database_timeout: crate::database::DEFAULT_TIMEOUT,
-            operator_socket: None,
             #[cfg(any(test, feature = "test-support"))]
             crash_after: None,
         }
@@ -354,6 +352,8 @@ pub struct Actor {
     /// Set by `acquire_lease` and `resume`, cleared when `resume` returns: a submit then
     /// is refused `busy`, so one queued on a socket served before `resume` cannot race it.
     pub(crate) resuming: std::sync::atomic::AtomicBool,
+    /// A console removal is being driven in this process; a retry does not start another.
+    pub(crate) removing: Arc<std::sync::atomic::AtomicBool>,
     /// Seed identities by image id: an image's labels never change.
     seed_images: Mutex<BTreeMap<String, SeedIdentity>>,
     /// The agent socket's serving loop, while this process serves it.
@@ -365,7 +365,8 @@ pub struct Actor {
     /// This process is gone: a test stands it in for the process dying.
     killed: std::sync::atomic::AtomicBool,
     /// Requests another process made on this actor's agent socket.
-    external_requests: std::sync::atomic::AtomicU64,
+    /// Attempts whose status another process polled on one of this process's sockets.
+    polled_attempts: Mutex<BTreeSet<String>>,
 }
 
 struct ServerHandle {
@@ -374,18 +375,6 @@ struct ServerHandle {
     thread: std::thread::JoinHandle<io::Result<()>>,
 }
 
-const PLATFORM_NAMES: &[&str] = &[
-    names::NODE_AGENT,
-    names::RECOVERY_ACTOR,
-    names::CONTROL_PLANE,
-    names::POSTGRES,
-];
-const HELPER_NAMES: &[&str] = &[
-    names::GPU_PROBE,
-    names::SECRETS_WRITER,
-    crate::database::HELPER,
-];
-const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 const SECRETS_HELPER: &str = "secrets-writer";
 
 impl Actor {
@@ -402,23 +391,30 @@ impl Actor {
             gate: Mutex::new(()),
             worker: Mutex::new(None),
             resuming: std::sync::atomic::AtomicBool::new(false),
+            removing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             seed_images: Mutex::new(BTreeMap::new()),
             server: Mutex::new(Vec::new()),
             me: std::sync::OnceLock::new(),
             retired: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
-            external_requests: std::sync::atomic::AtomicU64::new(0),
+            polled_attempts: Mutex::new(BTreeSet::new()),
         }
     }
 
-    pub(crate) fn note_external_request(&self) {
-        self.external_requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    /// A poll of `request_id`'s status that was not this binary's own (`crate::server`).
+    pub(crate) fn note_attempt_poll(&self, request_id: &str) {
+        if !crate::submit::is_uuid(request_id) {
+            return;
+        }
+        let mut polled = self.polled_attempts.lock().unwrap();
+        if polled.len() >= 16 {
+            polled.clear();
+        }
+        polled.insert(request_id.to_owned());
     }
 
-    pub(crate) fn external_requests(&self) -> u64 {
-        self.external_requests
-            .load(std::sync::atomic::Ordering::SeqCst)
+    pub(crate) fn attempt_polled(&self, request_id: &str) -> bool {
+        self.polled_attempts.lock().unwrap().contains(request_id)
     }
 
     /// Serve `status` through a separate engine client, typically one with a short
@@ -520,48 +516,29 @@ impl Actor {
             }
         };
         let mut failed = Vec::new();
-        // The operator's socket is served wherever a control plane is; a GPU host has no
-        // database to restore.
-        let operator = plan
-            .iter()
-            .any(|p| p.caller == crate::trust::Caller::ControlPlane)
-            .then(|| (self.operator_socket(), Door::Operator, None));
-        let doors = plan
-            .into_iter()
-            .map(|p| (p.path, Door::Socket(p.caller), p.owner))
-            .chain(operator);
-        for (path, door, owner) in doors {
-            if servers.iter().any(|h| h.path == path) {
+        for p in plan {
+            if servers.iter().any(|h| h.path == p.path) {
                 continue;
             }
-            let listener = match crate::server::bind_owned(&path, owner) {
+            let listener = match crate::server::bind_owned(&p.path, p.owner) {
                 Ok(listener) => listener,
                 Err(e) => {
-                    failed.push((path, e));
+                    failed.push((p.path, e));
                     continue;
                 }
             };
-            info!(socket = %path.display(), door = ?door, "serving");
+            info!(socket = %p.path.display(), caller = ?p.caller, "serving");
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (flag, actor) = (stop.clone(), actor.clone());
+            let (flag, actor, caller) = (stop.clone(), actor.clone(), p.caller);
             let thread =
-                std::thread::spawn(move || crate::server::serve(listener, actor, door, flag));
-            servers.push(ServerHandle { path, stop, thread });
+                std::thread::spawn(move || crate::server::serve(listener, actor, caller, flag));
+            servers.push(ServerHandle {
+                path: p.path,
+                stop,
+                thread,
+            });
         }
         failed
-    }
-
-    /// Where the operator socket is served (`ActorConfig::operator_socket`).
-    pub fn operator_socket(&self) -> PathBuf {
-        self.config.operator_socket.clone().unwrap_or_else(|| {
-            let dir = &self.config.socket_dir;
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            dir.with_file_name(format!("{name}-operator"))
-                .join("operator.sock")
-        })
     }
 
     /// Whether any socket is being served.
@@ -642,6 +619,27 @@ impl Actor {
 
     fn resume_inner(&self) -> Result<(), ResumeError> {
         self.take_lease()?;
+        // An uninstall or a console removal has started here: nothing is installed,
+        // settled or re-created, whoever started this actor (ADR 0007: the seed idles too).
+        if let Some(why) = crate::uninstall::uninstalled(&self.dir) {
+            // A console removal a previous process did not finish is finished here; every
+            // step is remove-if-present. An operator's uninstall is left to the operator.
+            if let Ok(Some(marker)) = self.dir.load_uninstall() {
+                if marker.by == crate::uninstall::By::Console && marker.finished_at.is_none() {
+                    info!(
+                        token = "actor-removal-resumed",
+                        "a console removal did not finish; finishing it"
+                    );
+                    self.remove_services();
+                    return Ok(());
+                }
+            }
+            warn!(
+                token = "actor-machine-uninstalled",
+                "{why}; this recovery actor installs and replaces nothing. `quasar-recovery uninstall` finishes the removal"
+            );
+            return Ok(());
+        }
         // D8: an attempt a restart left open reaches its outcome before anything else
         // looks at the machine's services, and no new attempt is started here. First, so
         // nothing else a start does can leave a hand-over waiting on this process.
@@ -649,6 +647,8 @@ impl Actor {
         if self.retired() {
             return Ok(());
         }
+        // A reconfigure keeps its new inputs only if its attempt succeeded.
+        self.settle_reconfigure_on_start();
         self.sweep_helpers()?;
         let machine = match self.dir.load_machine()? {
             Some(machine) => {
@@ -748,7 +748,7 @@ impl Actor {
             None => DatabaseMode::Owned,
         };
         let (dumps, dump_free_bytes) = if database == DatabaseMode::Owned && machine.is_some() {
-            let dir = crate::dump::DumpDir::new(self.dir.root());
+            let dir = crate::dump_dir::DumpDir::new(self.dir.root());
             let dumps = dir.list().into_iter().map(|d| d.wire()).collect();
             let at = if dir.path().is_dir() {
                 dir.path()
@@ -850,7 +850,7 @@ impl Actor {
 
     /// A probe or secrets writer left by a crash is removed; nothing else is touched.
     fn sweep_helpers(&self) -> Result<(), ResumeError> {
-        for name in HELPER_NAMES {
+        for name in names::HELPERS {
             if let Some(c) = self.engine.inspect_container(name)? {
                 if c.labels.contains_key(labels::HELPER) {
                     info!(container = %c.name, "removing a helper left by an interrupted start");
@@ -1340,7 +1340,6 @@ impl Actor {
             .map(|m| m.installation_id);
         let me = self.config.self_container.as_deref();
         let mut services = Vec::new();
-        let mut conflicts = Vec::new();
         for c in &containers {
             if c.labels.contains_key(labels::HELPER) {
                 continue;
@@ -1355,29 +1354,9 @@ impl Actor {
                 if let Some(role) = c.labels.get(labels::PLATFORM_SERVICE) {
                     services.push(service(c, role));
                 }
-                continue;
-            }
-            let compose = c.labels.get(COMPOSE_SERVICE).map(String::as_str);
-            if HELPER_NAMES.contains(&c.name.as_str()) {
-                conflicts.push(Conflict {
-                    container: c.name.clone(),
-                    image: repository_of(&c.image),
-                    why: "holds the name of a recovery-actor helper without its label".into(),
-                });
-            } else if PLATFORM_NAMES.contains(&c.name.as_str())
-                || compose.is_some_and(|s| PLATFORM_NAMES.contains(&s))
-            {
-                conflicts.push(Conflict {
-                    container: c.name.clone(),
-                    image: repository_of(&c.image),
-                    why: if compose.is_some() {
-                        "a Compose service named like a Quasar platform service, without this installation's labels".into()
-                    } else {
-                        "a Quasar platform service name without this installation's labels".into()
-                    },
-                });
             }
         }
+        let conflicts = crate::race_guard::conflicts(&containers, installation.as_deref(), me);
         services.sort_by_key(|s| (s.role != Role::RecoveryActor.as_str(), s.role.clone()));
         let seed = seed::find_running(&containers, self.config.seed_container.as_deref())
             .map(|c| self.seed_identity(c));
@@ -1429,7 +1408,10 @@ impl Actor {
 
 /// A container's image as `repository@sha256:…`: its configured reference when that is
 /// digest-pinned, else the registry digest the engine knows for its repository.
-fn own_image(engine: &dyn PlatformEngine, me: &Container) -> Option<seed::file::ActorImage> {
+pub(crate) fn own_image(
+    engine: &dyn PlatformEngine,
+    me: &Container,
+) -> Option<seed::file::ActorImage> {
     if let Some(pinned) = seed::file::ActorImage::parse(&me.image) {
         return Some(pinned);
     }

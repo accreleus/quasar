@@ -3,9 +3,9 @@
 //! database the operator restored with their own tools, start the control plane whose
 //! schema it matches. Only dumps this machine's actor took are restored.
 //!
-//! Submitted only on the operator socket, which lives in the actor's own container
-//! (`docker exec quasar-recovery quasar-recovery restore …`), and journalled and settled
-//! like a replacement:
+//! Submitted only on the operator socket (`crate::operator`, `POST /v1/restore`), which lives
+//! in the actor's own container (`docker exec quasar-recovery quasar-recovery restore …`),
+//! and journalled and settled like a replacement:
 //!
 //! ```text
 //! admitted → checking → stopping → loading (Quasar's own database) → starting → verifying
@@ -25,10 +25,10 @@ use tracing::{info, warn};
 
 use crate::actor::Actor;
 use crate::database::{self, DbError, DbOp, Hold, HoldReason};
-use crate::dump::{self, DumpDir};
+use crate::dump_dir::{self as dump, DumpDir};
 use crate::engine::EngineError;
 use crate::install_control::CONTROL_PLANE_FILES;
-use crate::journal::{tail_output, CallerTag, Failure, Journal, FORMAT, LOG_TAIL_LIMIT};
+use crate::journal::{tail_output, CallerTag, Failure, Journal, LOG_TAIL_LIMIT, RESTORE_FORMAT};
 use crate::machine::Machine;
 use crate::recipe::{self, names, Book, ImageRef, Role};
 use crate::replace::{fail, Halt, ATTEMPT_LABEL};
@@ -36,9 +36,6 @@ use crate::socket::{
     Accepted, AttemptResult, MachineRole, Reason, Rejection, Request, RequestKind, State,
 };
 use crate::submit::{is_uuid, kept_name};
-
-/// Inside the actor's container only: no volume holds it.
-pub const OPERATOR_SOCKET: &str = "/run/quasar-recovery-operator/operator.sock";
 
 /// The phase a restore is about to act on, or is acting on (as `journal::Phase`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,7 +195,7 @@ impl Actor {
 
         let now = self.now();
         let journal = Journal {
-            format: FORMAT,
+            format: RESTORE_FORMAT,
             seq: self.journals.next_seq(),
             caller: CallerTag::Operator,
             request: req.clone(),

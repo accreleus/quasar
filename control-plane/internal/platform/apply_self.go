@@ -313,6 +313,10 @@ type SelfApplier struct {
 	// release_apply provenance and its success evidence, since the row names no
 	// release. Nil fails such an attempt before the send.
 	DeveloperCommit func(ctx context.Context, components []ComponentDigest) (string, error)
+	// VerdictSilence is how long, from the apply deadline on, a verdict executor
+	// may give no answer for a request before the attempt times out.
+	VerdictSilence time.Duration
+
 	// DeveloperSchema reads the schema a developer apply's control-plane image
 	// declares, which decides whether it migrates. Nil sends it as not
 	// migrating, and the recovery actor still reads the image's own label.
@@ -341,8 +345,13 @@ func NewSelfApplier(store selfStore, up UpdaterAPI, log logger) *SelfApplier {
 		Deadline:       DefaultApplyDeadline,
 		PollInterval:   DefaultApplyPoll,
 		InstallModeTTL: DefaultInstallModeTTL,
+		VerdictSilence: DefaultVerdictSilence,
 	}
 }
+
+// DefaultVerdictSilence outlasts a hand-over's control-socket gap (the successor
+// re-binds it) with room to spare.
+const DefaultVerdictSilence = 2 * time.Minute
 
 // UpdaterPresent reports whether this control plane could apply itself at all.
 func (s *SelfApplier) UpdaterPresent() bool {
@@ -460,6 +469,9 @@ func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 		if errors.Is(err, ErrAttemptNotFound) {
 			return // resolved underneath us: a cancel, or a boot-adopted terminal state
 		}
+		if err != nil && ctx.Err() != nil {
+			return // shutting down, not a failure of the apply
+		}
 		if err != nil {
 			s.log.Error("self-apply: could not persist the request id", "attempt_id", a.ID, "err", err)
 			s.fail(a.ID, ReasonUpdaterUnreachable, "")
@@ -468,16 +480,19 @@ func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 		if !s.send(dctx, a, requestID) {
 			return
 		}
-		s.poll(dctx, a.ID, requestID)
+		s.poll(ctx, a, requestID)
 		return
 	}
 	requestID, err := s.store.AttemptRequestID(ctx, a.ID)
+	if ctx.Err() != nil {
+		return // shutting down: the next boot's Adopt resolves the row
+	}
 	if err != nil || requestID == "" {
 		s.log.Error("self-apply: a sent attempt carries no request id", "attempt_id", a.ID, "err", err)
 		s.fail(a.ID, ReasonUpdaterUnreachable, "")
 		return
 	}
-	s.poll(dctx, a.ID, requestID)
+	s.poll(ctx, a, requestID)
 }
 
 func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) bool {
@@ -541,29 +556,102 @@ func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) boo
 	return true
 }
 
-// poll relays the result file onto the attempt until it is terminal. It
-// normally does not return: the recreate kills this process partway through,
-// and Adopt finishes the row on the next boot.
-func (s *SelfApplier) poll(ctx context.Context, attemptID, requestID string) {
+// poll relays the result onto the attempt until it is terminal. It normally
+// does not return: the recreate kills this process partway through, and Adopt
+// finishes the row on the next boot. ctx carries no deadline: the apply
+// deadline is measured here from the attempt's start. A cancelled ctx is this
+// process shutting down, which leaves the row open for the next boot.
+func (s *SelfApplier) poll(ctx context.Context, a Attempt, requestID string) {
+	if s.verdicts() {
+		if s.followVerdict(ctx, a, requestID) == verdictTimeout {
+			s.fail(a.ID, ReasonTimeout, "the recovery actor did not answer for this request within the apply deadline")
+		}
+		return
+	}
+	dctx, cancel := context.WithDeadline(ctx, attemptStart(a).Add(s.Deadline))
+	defer cancel()
 	for {
+		// Read before honouring the deadline: a restored control plane may boot
+		// after it, onto a result that is already terminal.
+		// The reads take ctx, not dctx: an expired deadline must not fail them.
+		if cur, err := s.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+			return
+		}
+		if res, err := s.updater.Result(ctx, requestID); err == nil && s.record(ctx, a.ID, res) {
+			return
+		}
 		select {
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				s.log.Warn("self-apply: deadline expired with no terminal state", "attempt_id", attemptID)
-				s.fail(attemptID, ReasonTimeout, "")
+		case <-dctx.Done():
+			if errors.Is(dctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				s.log.Warn("self-apply: deadline expired with no terminal state", "attempt_id", a.ID)
+				s.fail(a.ID, ReasonTimeout, "")
 			}
 			return
 		case <-time.After(s.PollInterval):
 		}
-		if a, err := s.store.Attempt(ctx, attemptID); err == nil && TerminalAttemptState(a.State) {
-			return
+	}
+}
+
+// verdict is how following a verdict executor's result ended.
+type verdict int
+
+const (
+	// verdictResolved: the attempt is terminal.
+	verdictResolved verdict = iota
+	// verdictShutdown: this process is stopping (the actor stops the control
+	// plane it replaces or restores). Nothing was written, so the row stays
+	// open and the next boot's Adopt records the actor's real verdict.
+	verdictShutdown
+	// verdictTimeout: from the apply deadline on, the actor gave no answer for
+	// this request for VerdictSilence. Fail closed, never success.
+	verdictTimeout
+)
+
+func (s *SelfApplier) verdicts() bool {
+	v, ok := s.updater.(verdictExecutor)
+	return ok && v.ResultIsVerdict()
+}
+
+func attemptStart(a Attempt) time.Time {
+	if a.StartedAt != nil {
+		return *a.StartedAt
+	}
+	return a.CreatedAt
+}
+
+// followVerdict relays the recovery actor's result for requestID until it is
+// terminal. While the actor answers a non-terminal state it is waited for past
+// the apply deadline: its own verify and restore timeouts bound the attempt, and
+// a control plane on a slow link may boot after the deadline and still be put
+// back. Only an actor that has not answered for this request, from the deadline
+// on, for VerdictSilence times the attempt out.
+func (s *SelfApplier) followVerdict(ctx context.Context, a Attempt, requestID string) verdict {
+	deadline := attemptStart(a).Add(s.Deadline)
+	var answered time.Time
+	for {
+		if cur, err := s.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+			return verdictResolved
 		}
-		res, err := s.updater.Result(ctx, requestID)
-		if err != nil {
-			continue // no result file yet, or a socket that went away with us
+		if res, err := s.updater.Result(ctx, requestID); err == nil {
+			if s.record(ctx, a.ID, res) {
+				return verdictResolved
+			}
+			if res.State != updater.StateSucceeded && res.State != updater.StateFailed {
+				answered = time.Now()
+			}
 		}
-		if s.record(ctx, attemptID, res) {
-			return
+		if ctx.Err() != nil {
+			return verdictShutdown
+		}
+		if now := time.Now(); !now.Before(deadline) && now.Sub(answered) >= s.VerdictSilence {
+			s.log.Warn("self-apply: the recovery actor gave no verdict by the apply deadline",
+				"attempt_id", a.ID, "request_id", requestID)
+			return verdictTimeout
+		}
+		select {
+		case <-ctx.Done():
+			return verdictShutdown
+		case <-time.After(s.PollInterval):
 		}
 	}
 }
@@ -623,17 +711,39 @@ func (s *SelfApplier) record(ctx context.Context, attemptID string, res updater.
 //     this is exactly the branch a restore lands in, and it is recorded failed
 //     with its reason (#113 finding 5).
 //
+// On an owned machine (a verdict executor) step 1 waits for the recovery
+// actor's terminal result instead: the actor may still put the old control
+// plane back, stopping this one first.
+//
 // Returns false when the attempt is still open: it was never sent, and the
-// caller re-drives it.
+// caller re-drives it. A cancelled ctx (this process shutting down) returns
+// true with nothing written; the caller must not re-drive then either.
 func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) bool {
 	id := s.Identity()
 	if wantCommit != "" && id.SourceCommit != nil && commitsMatch(*id.SourceCommit, wantCommit) {
 		// On an owned machine this build may yet be put back: it is the evidence
-		// only once the recovery actor has verified it, or stopped answering.
-		if s.awaitVerdict(ctx, a) {
+		// only once the recovery actor has verified it.
+		if s.verdicts() {
+			requestID, err := s.store.AttemptRequestID(ctx, a.ID)
+			if ctx.Err() != nil {
+				return true // shutting down: nothing is decided, the next boot adopts
+			}
+			if err != nil || requestID == "" {
+				// Fail closed: without a request id there is no verdict to wait for,
+				// so nothing is recorded; the caller re-drives, which fails the row
+				// with a name rather than calling an unverified build a success.
+				s.log.Warn("self-apply: an owned attempt's request id is unreadable; not deciding it", "attempt_id", a.ID, "err", err)
+				return false
+			}
+			if s.followVerdict(ctx, a, requestID) == verdictTimeout {
+				s.fail(a.ID, ReasonTimeout, "the recovery actor gave no verdict within the apply deadline; this build is serving but was never verified")
+			}
 			return true
 		}
 		if done, err := s.store.SucceedAttempt(ctx, a.ID); err != nil {
+			if ctx.Err() != nil {
+				return true
+			}
 			s.log.Warn("self-apply: could not resolve the adopted attempt", "attempt_id", a.ID, "err", err)
 			return false
 		} else if done {
@@ -643,6 +753,9 @@ func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) b
 		return true
 	}
 	requestID, err := s.store.AttemptRequestID(ctx, a.ID)
+	if ctx.Err() != nil {
+		return true // shutting down: nothing is decided, the next boot adopts
+	}
 	if err != nil {
 		s.log.Warn("self-apply: could not read the attempt's request id", "attempt_id", a.ID, "err", err)
 		return false
@@ -652,51 +765,8 @@ func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) b
 	}
 	s.log.Warn("re-adopting a control-plane apply left in flight by a restart",
 		"attempt_id", a.ID, "state", a.State)
-	started := a.CreatedAt
-	if a.StartedAt != nil {
-		started = *a.StartedAt
-	}
-	dctx, cancel := context.WithDeadline(ctx, started.Add(s.Deadline))
-	defer cancel()
-	s.poll(dctx, a.ID, requestID)
+	s.poll(ctx, a, requestID)
 	return true
-}
-
-// awaitVerdict relays a verdict executor's result for a sent attempt until it is
-// terminal, and reports whether the attempt is resolved. False when the executor
-// is not one, the attempt was never sent, or the apply deadline passed with no
-// verdict: the caller then falls back to the booted-binary evidence.
-func (s *SelfApplier) awaitVerdict(ctx context.Context, a Attempt) bool {
-	if v, ok := s.updater.(verdictExecutor); !ok || !v.ResultIsVerdict() {
-		return false
-	}
-	requestID, err := s.store.AttemptRequestID(ctx, a.ID)
-	if err != nil || requestID == "" {
-		return false
-	}
-	started := a.CreatedAt
-	if a.StartedAt != nil {
-		started = *a.StartedAt
-	}
-	dctx, cancel := context.WithDeadline(ctx, started.Add(s.Deadline))
-	defer cancel()
-	for {
-		if cur, err := s.store.Attempt(dctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
-			return true
-		}
-		if res, err := s.updater.Result(dctx, requestID); err == nil && s.record(dctx, a.ID, res) {
-			return true
-		}
-		select {
-		case <-dctx.Done():
-			if errors.Is(dctx.Err(), context.DeadlineExceeded) {
-				s.log.Warn("self-apply: no verdict from the recovery actor by the deadline; this build is serving on the commit, so it is the evidence",
-					"attempt_id", a.ID)
-			}
-			return false
-		case <-time.After(s.PollInterval):
-		}
-	}
 }
 
 // dumpRecorder is a selfStore that keeps an attempt's pre_update_dump (*Store).
