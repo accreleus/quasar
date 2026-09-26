@@ -130,7 +130,9 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 			ownedActorSocketCheck(f.OwnedActor),
 			imageCheck(f.Image),
 		}
-		if db := f.OwnedActor.DatabaseMode; db != nil && *db == DatabaseModeOwned {
+		// A silent actor has not said whose database it is; the check then reads
+		// unknown rather than vanishing (amendment 14 §"Preflight").
+		if db := f.OwnedActor.DatabaseMode; !f.OwnedActor.Answered || (db != nil && *db == DatabaseModeOwned) {
 			checks = append(checks, backupSpaceCheck(f))
 		}
 	case kind == TargetControlPlane:

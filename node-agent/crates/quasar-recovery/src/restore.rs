@@ -227,7 +227,7 @@ impl Actor {
             ));
         }
         if let Err(e) = self.journals.mark_used(&req.request_id) {
-            warn!(token = "actor-used-id-unrecorded", request = %req.request_id, "{e}");
+            warn!(token = "actor-restore-id-unrecorded", request = %req.request_id, "{e}");
         }
         info!(request = %req.request_id, dump = ?req.dump, "restore admitted");
         let actor = self.clone();
@@ -619,7 +619,7 @@ impl Actor {
         }
         let schema = plan.schema_version.expect("checking found the schema");
         self.set_floor(schema, &j.request.request_id).map_err(|e| {
-            warn!(token = "actor-schema-floor-unwritten", "{e}");
+            warn!(token = "actor-restore-floor-unwritten", "{e}");
             Halt::Died
         })?;
         info!(dump = %name, schema, "dump loaded");

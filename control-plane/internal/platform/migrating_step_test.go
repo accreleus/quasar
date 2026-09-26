@@ -205,6 +205,11 @@ func TestBackupSpaceIsJudgedAgainstTheDumpTheDatabaseNeeds(t *testing.T) {
 			t.Errorf("%s: blocked=%v", tc.name, p.Blocked())
 		}
 	}
+	// A silent actor has not said whose database it is: unknown, never missing.
+	silent := PlanPreflight(TargetControlPlane, PreflightFacts{OwnedActor: &OwnedActorFact{}, Migrates: &yes})
+	if c := silent.Checks[len(silent.Checks)-1]; c.ID != CheckBackupSpace || c.Status != CheckUnknown {
+		t.Fatalf("silent actor: %+v, want backup_space unknown", c)
+	}
 	// An operator's own database is never dumped, so it has no such check.
 	external := DatabaseModeExternal
 	p := PlanPreflight(TargetControlPlane, PreflightFacts{
