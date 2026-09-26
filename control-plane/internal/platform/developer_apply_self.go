@@ -131,6 +131,10 @@ func (r *SelfDeveloperRunner) drive(ctx context.Context, a Attempt, adopted bool
 		r.fail(a.ID, fmt.Sprintf("could not read the hosts to cordon: %v", err))
 		return
 	}
+	if err != nil {
+		r.log.Warn("developer apply: could not read the hosts to re-take their holds on adoption; resolving the attempt anyway",
+			"attempt_id", a.ID, "err", err)
+	}
 	// Re-taken on adoption too: the restart this attempt caused is exactly
 	// when a hold's projection may have been lifted underneath it. An adopted
 	// attempt may already be in the actor's hands, so it is never failed here.

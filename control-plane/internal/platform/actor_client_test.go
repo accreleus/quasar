@@ -286,6 +286,23 @@ func TestOwnedAdoptTimesOutFailClosedWhenTheActorIsSilent(t *testing.T) {
 	}
 }
 
+// No request id means no verdict to wait for: the booted binary is never taken
+// as success on its own, and the caller re-drives the attempt.
+func TestOwnedAdoptWithNoRequestIDDecidesNothing(t *testing.T) {
+	open := ownedAttempt(AttemptQueued)
+	store := newFakeStore(open)
+	self := testSelfApplier(t, store, NewActorClient(serveActor(t, &fakeActor{})))
+	self.Identity = func() buildinfo.Identity {
+		return buildinfo.Identity{Version: "0.9.0", SourceCommit: strPtr(testCommit)}
+	}
+	if self.Adopt(context.Background(), open, testCommit) {
+		t.Fatal("Adopt resolved an owned attempt with no request id")
+	}
+	if got := store.snapshot("cp-1").State; got != AttemptQueued {
+		t.Fatalf("state = %q, want it left for the re-drive", got)
+	}
+}
+
 // A slow link: the actor is still verifying past the apply deadline. It keeps
 // answering, so it is waited for, and its verdict decides.
 func TestOwnedAdoptWaitsPastTheDeadlineWhileTheActorIsStillVerifying(t *testing.T) {

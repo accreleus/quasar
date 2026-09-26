@@ -695,12 +695,17 @@ func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) b
 			if ctx.Err() != nil {
 				return true // shutting down: nothing is decided, the next boot adopts
 			}
-			if err == nil && requestID != "" {
-				if s.followVerdict(ctx, a, requestID) == verdictTimeout {
-					s.fail(a.ID, ReasonTimeout, "the recovery actor gave no verdict within the apply deadline; this build is serving but was never verified")
-				}
-				return true
+			if err != nil || requestID == "" {
+				// Fail closed: without a request id there is no verdict to wait for,
+				// so nothing is recorded; the caller re-drives, which fails the row
+				// with a name rather than calling an unverified build a success.
+				s.log.Warn("self-apply: an owned attempt's request id is unreadable; not deciding it", "attempt_id", a.ID, "err", err)
+				return false
 			}
+			if s.followVerdict(ctx, a, requestID) == verdictTimeout {
+				s.fail(a.ID, ReasonTimeout, "the recovery actor gave no verdict within the apply deadline; this build is serving but was never verified")
+			}
+			return true
 		}
 		if done, err := s.store.SucceedAttempt(ctx, a.ID); err != nil {
 			if ctx.Err() != nil {
