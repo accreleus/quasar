@@ -61,6 +61,9 @@ type Deps struct {
 	// ControlPlaneMachine is this control plane's own machine identity
 	// (OwnMachineReader.Identity). Optional: nil serves all five fields null.
 	ControlPlaneMachine func(ctx context.Context) MachineIdentity
+	// ControlPlaneDatabaseBytes is this control plane's database size, read
+	// for preflight backup_space on an owned machine; nil is not read.
+	ControlPlaneDatabaseBytes func(ctx context.Context) (int64, error)
 	// MachineShape is this control plane's own machine shape, from its
 	// configuration. Zero: machine_role and machine_node_name serve null.
 	MachineShape MachineShape
@@ -201,6 +204,13 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	var cpPreflight PreflightFacts
 	if h.deps.ControlPlanePreflight != nil {
 		cpPreflight = h.deps.ControlPlanePreflight(ctx)
+	}
+	if cpPreflight.OwnedActor != nil && h.deps.ControlPlaneDatabaseBytes != nil {
+		if n, err := h.deps.ControlPlaneDatabaseBytes(ctx); err == nil {
+			cpPreflight.DatabaseBytes = &n
+		} else {
+			h.log.Warn("platform: could not read the database size for backup_space", "err", err)
+		}
 	}
 	var imageFor func(Release) *ImageFact
 	if h.deps.ImageFor != nil {

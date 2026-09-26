@@ -8,7 +8,9 @@
 //!
 //! `POST /v1/reconfigure` (a [`ReconfigureRequest`]) answers `200` with a [`Planned`] when
 //! nothing needed re-creating (or for a dry run), `202` with one naming the attempt,
-//! `409`/`400` with a `Rejection`. `GET /v1/status?request_id=` is the actor's status.
+//! `409`/`400` with a `Rejection`. `POST /v1/restore` (a `socket::Request` of kind
+//! `restore`, `crate::restore`) answers `202` with an `Accepted`, `409`/`400` with a
+//! `Rejection`. `GET /v1/status?request_id=` is the actor's status.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -20,7 +22,7 @@ use tracing::{debug, warn};
 
 use crate::actor::Actor;
 use crate::reconfigure::{Planned, ReconfigureRequest};
-use crate::socket::{Reason, Rejection};
+use crate::socket::{Reason, Rejection, Request};
 
 pub const SOCKET: &str = "/run/quasar-operator/operator.sock";
 
@@ -69,21 +71,39 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
                 serde_json::to_string(&actor.status_for(request_id)).map_err(io::Error::other)?;
             respond(&mut stream, 200, &body)
         }
-        ("POST", "/v1/reconfigure") => {
-            let length = head
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.trim()
-                        .eq_ignore_ascii_case("content-length")
-                        .then(|| v.trim().parse::<usize>().ok())?
-                })
-                .unwrap_or(0);
-            if length > MAX_BODY {
+        ("POST", "/v1/restore") => {
+            let Some(body) = read_body(&mut stream, &head)? else {
                 return respond(&mut stream, 413, r#"{"error":"request_too_large"}"#);
+            };
+            let answer = match serde_json::from_slice::<Request>(&body) {
+                Ok(req) => actor.submit_restore(req),
+                Err(e) => Err(Rejection {
+                    request_id: String::new(),
+                    reason: Reason::Invalid,
+                    message: format!("not a restore request: {e}"),
+                }),
+            };
+            match answer {
+                Ok(accepted) => {
+                    let body = serde_json::to_string(&accepted).map_err(io::Error::other)?;
+                    respond(&mut stream, 202, &body)
+                }
+                Err(rejection) => {
+                    warn!(token = "actor-restore-refused", reason = %rejection.reason, "a restore was refused: {}", rejection.message);
+                    let status = if rejection.reason == Reason::Busy {
+                        409
+                    } else {
+                        400
+                    };
+                    let body = serde_json::to_string(&rejection).map_err(io::Error::other)?;
+                    respond(&mut stream, status, &body)
+                }
             }
-            let mut body = vec![0u8; length];
-            stream.read_exact(&mut body)?;
+        }
+        ("POST", "/v1/reconfigure") => {
+            let Some(body) = read_body(&mut stream, &head)? else {
+                return respond(&mut stream, 413, r#"{"error":"request_too_large"}"#);
+            };
             let answer = match serde_json::from_slice::<ReconfigureRequest>(&body) {
                 Ok(req) => actor.reconfigure(req),
                 Err(e) => Err(Rejection {
@@ -116,6 +136,25 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
         }
         _ => respond(&mut stream, 404, r#"{"error":"not_found"}"#),
     }
+}
+
+/// The request body, by its `Content-Length`; `None` when it is over the limit.
+fn read_body(stream: &mut UnixStream, head: &str) -> io::Result<Option<Vec<u8>>> {
+    let length = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    if length > MAX_BODY {
+        return Ok(None);
+    }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body)?;
+    Ok(Some(body))
 }
 
 fn respond(stream: &mut UnixStream, status: u16, body: &str) -> io::Result<()> {

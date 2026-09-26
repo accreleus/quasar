@@ -46,6 +46,10 @@ pub mod names {
     pub const FINAL_DUMP: &str = "quasar-final-dump";
     /// Where that dump goes unless the operator names a directory: a purge never deletes it.
     pub const FINAL_DUMP_VOLUME: &str = "quasar-final-dump";
+    /// The disposable helper a migrating update's dump and a restore run in (`crate::database`).
+    pub const DB_HELPER: &str = "quasar-db-helper";
+    /// Every disposable helper the actor creates and removes: a crash may leave one.
+    pub const HELPERS: &[&str] = &[GPU_PROBE, SECRETS_WRITER, FINAL_DUMP, DB_HELPER];
     /// The control plane's own state (its TLS pair, the artwork cache): a named volume, so
     /// it outlives every replacement of the container.
     pub const CONTROL_DATA_VOLUME: &str = "quasar-control-data";

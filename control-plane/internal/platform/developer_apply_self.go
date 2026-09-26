@@ -9,15 +9,12 @@ import (
 
 // A developer apply to the control-plane target of an owned machine: a
 // standalone control-plane attempt (no run) that behaves as a fleet run's
-// non-migrating control-plane step (control-api.md §"Developer apply"). It
-// cordons every host for its duration with an admission restriction owned by
-// the attempt, and releases them once the attempt is terminal, which on the
-// normal path is a later boot of this control plane.
-
-// ownedMigratingRefusal is what every path that meets a migrating control-plane
-// step on an owned machine answers until the pre-update dump exists.
-const ownedMigratingRefusal = "this control plane migrates the database, and updating a Quasar-owned control plane " +
-	"across a migration (with its pre-update dump) arrives with RH06-12 (#364); nothing was changed"
+// control-plane step (control-api.md §"Developer apply"). It cordons every host
+// for its duration with an admission restriction owned by the attempt, and
+// releases them once the attempt is terminal, which on the normal path is a
+// later boot of this control plane. A digest that migrates drains the instance
+// first, as a migrating release does (#352 decision 14); the recovery actor then
+// takes the pre-update dump or holds the operator to their confirmed backup.
 
 // PlatformHold is one host's admission restriction owned by an attempt.
 type PlatformHold struct {
@@ -30,6 +27,8 @@ type selfDeveloperStore interface {
 	Attempt(ctx context.Context, attemptID string) (Attempt, error)
 	OpenAttempts(ctx context.Context) ([]Attempt, error)
 	FleetInFlightSessions(ctx context.Context) (int, error)
+	FleetNonTerminalSessions(ctx context.Context) (int, error)
+	SetWaitingSessions(ctx context.Context, attemptID string, remaining int) error
 	FailAttempt(ctx context.Context, attemptID, reason, output string) error
 	TerminalStandaloneControlPlaneHolds(ctx context.Context) ([]PlatformHold, error)
 }
@@ -46,6 +45,17 @@ type SelfDeveloperRunner struct {
 
 	InFlightSettle time.Duration
 	PollWait       time.Duration
+	// Deadline bounds a migrating attempt's drain, from its created_at.
+	Deadline time.Duration
+	// Migrates reads whether the attempt's control-plane image moves the
+	// schema forward. Nil, or an unreadable answer, reads as migrating: an
+	// unneeded drain costs sessions visibly, a missing one runs a migration
+	// under live sessions.
+	Migrates func(ctx context.Context, components []ComponentDigest) (bool, error)
+
+	// migrates holds what admission decided per attempt (NoteDeveloperSchema),
+	// so prepare reads no registry. In memory only, like the self-applier's.
+	migrates sync.Map
 
 	mu      sync.Mutex
 	running map[string]bool
@@ -61,7 +71,7 @@ func NewSelfDeveloperRunner(store selfDeveloperStore, self selfDriver, cordons F
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SelfDeveloperRunner{
 		store: store, self: self, cordons: cordons, commit: commit, log: log,
-		InFlightSettle: DefaultInFlightSettle, PollWait: DefaultApplyPoll,
+		InFlightSettle: DefaultInFlightSettle, PollWait: DefaultApplyPoll, Deadline: DefaultApplyDeadline,
 		running: map[string]bool{}, baseCtx: ctx, stop: cancel,
 	}
 }
@@ -164,12 +174,12 @@ func (r *SelfDeveloperRunner) drive(ctx context.Context, a Attempt, adopted bool
 					"attempt_id", a.ID, "err", err)
 			}
 		}
-		if !r.self.Adopt(ctx, a, commit) && ctx.Err() == nil {
-			r.settleInFlight(ctx)
+		// Never re-driven while shutting down (#363): that would fail a row
+		// whose verdict the next boot reads.
+		if !r.self.Adopt(ctx, a, commit) && ctx.Err() == nil && r.prepare(ctx, a) {
 			r.self.Apply(ctx, a)
 		}
-	} else {
-		r.settleInFlight(ctx)
+	} else if r.prepare(ctx, a) {
 		r.self.Apply(ctx, a)
 	}
 	// Normally unreached: the replacement ends this process mid-poll and the
@@ -177,6 +187,110 @@ func (r *SelfDeveloperRunner) drive(ctx context.Context, a Attempt, adopted bool
 	if cur, err := r.store.Attempt(context.WithoutCancel(ctx), a.ID); err == nil && TerminalAttemptState(cur.State) {
 		r.releaseAll(a.ID)
 	}
+}
+
+// developerSchemaNoter is a self driver that keeps the schema admission read.
+type developerSchemaNoter interface {
+	NoteDeveloperSchema(attemptID string, schema int)
+}
+
+// NoteDeveloperSchema keeps what the admission read of the attempt's
+// control-plane image: whether it migrates, for the drain, and its schema, for
+// the send. Call it before Start: a registry that stops answering after the
+// drain then cannot fail the attempt.
+func (r *SelfDeveloperRunner) NoteDeveloperSchema(attemptID string, schema int, migrates bool) {
+	r.migrates.Store(attemptID, migrates)
+	if n, ok := r.self.(developerSchemaNoter); ok {
+		n.NoteDeveloperSchema(attemptID, schema)
+	}
+}
+
+// ConfirmExternalBackup hands the operator's confirmation of their own
+// database's backup to the self-applier that sends the attempt.
+func (r *SelfDeveloperRunner) ConfirmExternalBackup(attemptID string) {
+	if c, ok := r.self.(backupConfirmer); ok {
+		c.ConfirmExternalBackup(attemptID)
+	}
+}
+
+// prepare is what the step owes the instance's sessions before it is sent, as
+// the fleet's prepareFleet decides it: a migrating digest drains the instance
+// (under force, stopping what runs), anything else lets in-flight launches
+// settle. False means the attempt resolved (a deadline) or the process is
+// stopping.
+func (r *SelfDeveloperRunner) prepare(ctx context.Context, a Attempt) bool {
+	migrates := true
+	if noted, ok := r.migrates.Load(a.ID); ok {
+		migrates = noted.(bool)
+	} else if r.Migrates != nil {
+		if m, err := r.Migrates(ctx, a.RequestedDigests); err == nil {
+			migrates = m
+		} else {
+			r.log.Warn("developer apply: could not tell whether the image migrates; draining the instance",
+				"attempt_id", a.ID, "err", err)
+		}
+	}
+	if !migrates {
+		r.settleInFlight(ctx)
+		return true
+	}
+	return r.drainForMigration(ctx, a)
+}
+
+// drainForMigration waits for the instance to hold no session, from a count that
+// was read (a failed read is never zero), stopping them first under force.
+func (r *SelfDeveloperRunner) drainForMigration(ctx context.Context, a Attempt) bool {
+	count := func() (int, bool) {
+		n, err := r.store.FleetNonTerminalSessions(ctx)
+		if err != nil {
+			r.log.Error("developer apply: could not count the instance's sessions", "attempt_id", a.ID, "err", err)
+			return 0, false
+		}
+		return n, true
+	}
+	remaining, known := count()
+	if known {
+		_ = r.store.SetWaitingSessions(ctx, a.ID, remaining)
+	}
+	if a.Force && (!known || remaining != 0) && r.cordons.DrainOwned != nil {
+		hosts, err := r.store.Hosts(ctx)
+		if err != nil {
+			r.log.Warn("developer apply: could not read the hosts to drain", "attempt_id", a.ID, "err", err)
+		}
+		for _, h := range hosts {
+			if err := r.cordons.DrainOwned(ctx, a.ID, h.HostID); err != nil {
+				r.log.Warn("developer apply: could not drain a host", "attempt_id", a.ID, "host_id", h.HostID, "err", err)
+			}
+		}
+		remaining, known = count()
+	}
+	deadline := a.CreatedAt.Add(r.Deadline)
+	for !known || remaining != 0 {
+		if time.Now().After(deadline) {
+			fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := r.store.FailAttempt(fctx, a.ID, ReasonTimeout,
+				"the instance did not drain before the deadline, so the migrating control plane was not sent"); err != nil {
+				r.log.Error("developer apply: could not record the failure", "attempt_id", a.ID, "err", err)
+			}
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(r.PollWait):
+		}
+		if cur, err := r.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+			return false
+		}
+		if n, ok := count(); ok {
+			remaining, known = n, true
+			_ = r.store.SetWaitingSessions(ctx, a.ID, remaining)
+		} else {
+			known = false
+		}
+	}
+	return true
 }
 
 // settleInFlight lets launches already placed finish arriving, as the fleet's

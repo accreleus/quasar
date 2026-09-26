@@ -109,7 +109,7 @@ fn looks_like(c: &Container) -> Option<(&'static str, String)> {
             format!("labelled as a Quasar {}", noun(role.as_str())),
         ));
     }
-    if [names::GPU_PROBE, names::SECRETS_WRITER, names::FINAL_DUMP].contains(&c.name.as_str()) {
+    if names::HELPERS.contains(&c.name.as_str()) {
         return Some((
             Role::RecoveryActor.as_str(),
             "holds the name of a recovery-actor helper without its label".into(),

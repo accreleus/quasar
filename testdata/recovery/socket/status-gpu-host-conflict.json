@@ -41,6 +41,7 @@
     ],
     "in_flight": null,
     "dumps": [],
+    "dump_free_bytes": null,
     "result": null,
     "stale": false
   }

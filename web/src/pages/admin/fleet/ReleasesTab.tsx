@@ -18,6 +18,8 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
   JobsResponse,
+  PlatformApplyAttempt,
+  PlatformApplyAttemptsResponse,
   PlatformHostIdentity,
   PlatformRelease,
   PlatformReleaseTarget,
@@ -58,6 +60,14 @@ import {
 } from "./ApplyControls";
 import { DeveloperApplyCard } from "./DeveloperApply";
 import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel, LastRunPanel } from "./FleetApply";
+import {
+  failedMigration,
+  failedMigrationStatus,
+  ownedControlPlane,
+  refusedDump,
+  restoreCardFor,
+} from "./migratingUpdate";
+import { RefusedBanner, RestoreCard } from "./MigratingUpdateCards";
 import { blockingChecks, holdoutText, unknownChecks } from "./preflight";
 import {
   FailedAttemptPanel,
@@ -71,8 +81,10 @@ import {
   hasUpdate,
   olderEdgeCandidate,
   preflightCheckText,
+  prefixed,
   releaseLabel,
   shortCommit,
+  stamp,
 } from "./releasesCopy";
 import "../../../styles/admin/fleet.css";
 
@@ -88,28 +100,6 @@ const CHANNEL_OPTIONS: { value: ReleaseChannel; label: string }[] = [
 
 function when(iso: string | null | undefined): string {
   return iso ? relativeTime(iso) : "—";
-}
-
-/** An instant as the console prints a release's publication: "5 Sep 2026,
- *  14:59". UTC, because every timestamp on this page is a UTC instant and the
- *  next-check line beside it is a UTC cron. */
-function stamp(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  const date = new Intl.DateTimeFormat("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC",
-  }).format(d);
-  const time = new Intl.DateTimeFormat("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-    timeZone: "UTC",
-  }).format(d);
-  return `${date}, ${time}`;
 }
 
 /** "Mon 02:00 UTC" — the detection job's next scheduled run. */
@@ -175,6 +165,26 @@ export function ReleasesTab() {
   const nextCheck = useNextCheck();
   // Bumped on every apply, so the history reloads without polling it too.
   const [applied, setApplied] = useState(0);
+  // The apply history, read once here: the rail lists it, and the banner reads its newest
+  // control-plane attempt for a refused dump or a failed migration (#364).
+  const history = useResource<PlatformApplyAttemptsResponse>(
+    {
+      label: "apply history",
+      fetch: ({ token: t, signal }) => adminApi.listPlatformAttempts(t, { limit: 50 }, signal),
+    },
+    [applied],
+  );
+  // An attempt that settles while the view polls changes the history too.
+  const activeKey = (view?.active_apply?.attempts ?? []).map((a) => `${a.id}:${a.state}`).join(",") +
+    `|${view?.active_apply?.run?.id ?? ""}`;
+  const lastActiveKey = useRef(activeKey);
+  const refreshHistory = history.refresh;
+  useEffect(() => {
+    if (lastActiveKey.current === activeKey) return;
+    lastActiveKey.current = activeKey;
+    void refreshHistory({ silent: true });
+  }, [activeKey, refreshHistory]);
+  const attempts = history.data?.attempts ?? [];
 
   // "Check now" is the jobs run-now action: this page's read never triggers
   // detection (control-api.md).
@@ -195,7 +205,11 @@ export function ReleasesTab() {
           <IconRefresh /> Check now
         </Button>
         {view && (
-          <FleetApplyButton view={view} onStarted={() => void res.refresh()}>
+          <FleetApplyButton
+            view={view}
+            onStarted={() => void res.refresh()}
+            onRecheck={() => res.refresh()}
+          >
             <IconDownload /> Update Quasar
           </FleetApplyButton>
         )}
@@ -233,7 +247,7 @@ export function ReleasesTab() {
             </Card>
           ) : (
             <>
-              <UpdateBanner view={view} />
+              <AttentionBanner view={view} attempts={attempts} />
               <LastRunPanel
                 key={applied}
                 targets={view.targets}
@@ -261,7 +275,15 @@ export function ReleasesTab() {
               <ChannelCard view={view} onSaved={() => void res.refresh()} />
               <NotificationsCard view={view} onSaved={() => void res.refresh()} />
               <RailCard title="Apply history">
-                <ApplyHistory refreshKey={applied} />
+                <ApplyHistory
+                  loading={history.loading}
+                  error={history.errorMessage}
+                  attempts={history.data?.attempts}
+                  statusFor={(a) => {
+                    const failed = failedMigration(a, view);
+                    return failed ? failedMigrationStatus(failed) : null;
+                  }}
+                />
               </RailCard>
               <FaultsCard view={view} />
               <DeveloperApplyCard
@@ -277,6 +299,23 @@ export function ReleasesTab() {
       )}
     </>
   );
+}
+
+/** What sits above the split: after a failed migrating control-plane update the restore
+ *  card, after a refused dump the refusal, and otherwise the update banner (rh06
+ *  restore-*.png, update-refused.png). */
+function AttentionBanner({
+  view,
+  attempts,
+}: {
+  view: PlatformReleaseView;
+  attempts: PlatformApplyAttempt[];
+}) {
+  const restore = restoreCardFor(attempts, view);
+  if (restore) return <RestoreCard view={view} failed={restore} />;
+  const refused = refusedDump(attempts, view);
+  if (refused) return <RefusedBanner view={view} refused={refused} />;
+  return <UpdateBanner view={view} />;
 }
 
 /** The banner above the split: the version step this instance can take, or the
@@ -348,13 +387,21 @@ function UpdateWhy({ view, migrates }: { view: PlatformReleaseView; migrates: bo
       </>
     );
   }
-  // An owned control plane cannot yet take a migration: its pre-update dump is #364's.
-  if (view.installed.control_plane.machine_role != null) {
+  // An owned control plane takes a migration behind a way back (#364): Quasar's own
+  // database is dumped first; the operator's own needs their confirmed backup.
+  if (ownedControlPlane(view)) {
+    const mode = view.installed.control_plane.database_mode;
+    const first =
+      mode === "owned"
+        ? "Quasar dumps its database before the control plane moves"
+        : mode === "external"
+          ? "Quasar needs your confirmation that you have a current backup of your own database before the control plane moves"
+          : "before the control plane moves, Quasar dumps its own database, or needs your confirmation of a backup of yours";
     return (
       <>
-        This release changes the database, so it is never applied unattended. Updating a
-        Quasar-owned control plane across a database change is not available in this version
-        yet; the update stops before anything moves.
+        This release changes the database, so it is never applied unattended. The update waits
+        for every session to end, and {first}. Each host&rsquo;s sessions end when that host is
+        updated.
       </>
     );
   }
@@ -364,11 +411,6 @@ function UpdateWhy({ view, migrates }: { view: PlatformReleaseView; migrates: bo
       update waits for every session to end before the control plane moves.
     </>
   );
-}
-
-/** A version reads as "v0.2.0"; a bare commit (edge) does not take the v. */
-function prefixed(label: string): string {
-  return /^\d/.test(label) ? `v${label}` : label;
 }
 
 function ReleaseFeed({ view }: { view: PlatformReleaseView }) {

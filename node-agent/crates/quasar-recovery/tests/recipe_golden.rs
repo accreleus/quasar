@@ -106,6 +106,46 @@ fn recovery_actor_revision_1_renders_its_golden_specification() {
     check("recovery-actor-r1.json", &spec);
 }
 
+/// The operator socket (`restore`, `reconfigure`) may change machine inputs and replace
+/// the database, so only a process inside the actor's own container may reach it: no
+/// revision of the actor's recipe mounts anything over its directory.
+#[test]
+fn no_recovery_actor_revision_mounts_the_operator_socket() {
+    let image = ImageRef::parse(ACTOR_IMAGE).unwrap();
+    let dir = Path::new(quasar_recovery::operator::SOCKET)
+        .parent()
+        .unwrap();
+    let mut rendered = 0;
+    for revision in [1, 2] {
+        for inputs in [
+            inputs(None),
+            combined(DatabaseInputs::Owned),
+            combined(external()),
+        ] {
+            let Ok(spec) = render(
+                Role::RecoveryActor,
+                revision,
+                &inputs,
+                &image,
+                &SecretMounts::default(),
+            ) else {
+                continue;
+            };
+            rendered += 1;
+            for bind in &spec.binds {
+                let target = Path::new(&bind.target);
+                assert!(
+                    !dir.starts_with(target) && !target.starts_with(dir),
+                    "revision {revision} mounts {} over the operator socket's {}",
+                    bind.target,
+                    dir.display()
+                );
+            }
+        }
+    }
+    assert!(rendered > 0, "no actor revision rendered");
+}
+
 #[test]
 fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
     let image = ImageRef::parse(AGENT_IMAGE).unwrap();
