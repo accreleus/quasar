@@ -168,8 +168,8 @@ describe("HostDetail — owner conflict (#366)", () => {
     const note = (await screen.findByText("Another owner’s container is in the way on gpu-host-4.")).closest(
       ".note",
     ) as HTMLElement;
-    expect(within(note).getByText(/quasar-node-agent-1 looks like a Quasar node agent/)).toBeTruthy();
-    expect(within(note).getByText(/will not update this machine while that container exists/)).toBeTruthy();
+    expect(note.textContent).toMatch(/quasar-node-agent-1 looks like a Quasar node agent/);
+    expect(note.textContent).toMatch(/will not update this machine while that container exists/);
     const details = within(note).getByText("Details").closest("details") as HTMLElement;
     expect(details.hasAttribute("open")).toBe(false);
     expect(within(details).getByText(/readiness check: owner_conflict/)).toBeTruthy();

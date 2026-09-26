@@ -27,7 +27,7 @@ commands:
   status    print this machine's inventory, as the running actor serves it (in the seed's
             container: what the seed last did)
   uninstall [--purge [--confirm <node name>] [--dump-to <host dir>]]
-            remove this machine's Quasar services, in their own container (docs/uninstall.md);
+            remove this machine's Quasar services, in its own container (docs/configuration.md);
             keeps the database, machine state and homes unless --purge
   reconfigure [--dry-run] [--yes] VARIABLE=value...
             change machine inputs (home root, release trust, Add host images, ...) through

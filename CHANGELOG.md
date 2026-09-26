@@ -25,6 +25,20 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Race guard, remove host, `uninstall` and `reconfigure` (#366).** A container that looks
+  like a Quasar platform service but was not created by the machine's installation (a
+  leftover Compose stack, a definition a manager still holds) is never acted on: the recovery
+  actor reports it, the agent raises readiness check `owner_conflict`, the control plane
+  blocks that target's updates, and the console warns on the host page, the host row and
+  Releases. The console also warns when no seed is found, keeps a recovery actor's last report
+  on screen when it stops answering, and removes an owned GPU host (drain, wait for its
+  sessions, `POST /v1/admin/platform/hosts/{id}/remove`, agent `host_remove`). On the
+  machine, `quasar-recovery uninstall` removes the installation's containers and keeps its
+  data; `--purge` deletes the data too after a typed confirmation and a final `pg_dump` of a
+  Quasar-owned database. `quasar-recovery reconfigure` changes machine inputs (home root,
+  release trust, Add host images, app defaults) through a verified replacement on the same
+  digests. The agent re-registers when its recovery actor's reported identity changes, so the
+  console sees a seed go missing or come back without an agent restart.
 - **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
   machine to a successor: it starts beside the running actor, takes the machine's lease only
   when it is handed over, keeps the old actor stopped and disabled until it has verified

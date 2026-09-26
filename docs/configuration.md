@@ -1396,7 +1396,7 @@ same host or a network you trust.
 
 Once the machine is installed, machine state holds the password and wins over the stack, so
 `QUASAR_DATABASE_PASSWORD` can be removed from the stack and its `.env` (changing it there
-changes nothing; `reconfigure`, #366, changes it).
+changes nothing, and the database is fixed at install).
 
 What the recovery actor then does, in order, each step decided by what already exists (a
 second start changes nothing; an interrupted install completes on the next start):
@@ -1765,6 +1765,72 @@ docker run -d --name quasar-recovery --restart unless-stopped \
   -e QUASAR_AGENT_IMAGE=<registry>/quasar-node-agent@sha256:<digest> \
   <registry>/quasar-recovery@sha256:<digest> actor
 ```
+
+
+### Taking a machine apart: remove host and `uninstall` (#366)
+
+A GPU host is removed from the console: Admin → Fleet → the host → Remove host. The control
+plane drains it, waits for its sessions to end, and sends `host_remove`; the host's recovery
+actor records the removal, removes the node agent, then itself. Homes and volumes stay, and
+so does the seed, which from then on stays idle (`token="seed-uninstalled"`). Forget the host
+once it is offline. A host that is not connected cannot be removed this way; a removal that
+stops part-way leaves the host visibly there, and `uninstall` on the machine finishes it.
+
+Any machine, a combined or control-only one included, is taken apart on the machine, with the
+console up or down, by running the recovery image with `uninstall` in its own container:
+
+```sh
+docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine \
+  "$(docker inspect -f '{{.Config.Image}}' quasar-recovery)" uninstall
+```
+
+- It marks the machine uninstalled first (`uninstalled.json`, and `seed.json` `uninstalled`),
+  so neither the seed nor an actor started by hand brings anything back
+  (`token="actor-machine-uninstalled"`), then stops the recovery actor, then removes this
+  installation's containers in reverse order: node agent, control plane, Postgres, recovery
+  actor. It never touches a container the installation did not create.
+- It keeps the database volume, the machine-state volume, the agent's identity and the homes.
+  It refuses while the recovery actor has an attempt in flight, and inside the actor's own
+  container. Interrupted, it leaves the machine down; running it again finishes it.
+- `--purge` also deletes this installation's volumes and network and empties machine state.
+  It needs a typed confirmation: at a terminal it asks for the node name, or pass
+  `--confirm <node name>` (or the installation id). It refuses while a seed is on the machine:
+  remove the seed first, the way you started it. For a Quasar-owned database it first takes a
+  final `pg_dump` (custom format) into the `quasar-final-dump` volume, which a purge never
+  deletes, or into `--dump-to <absolute host directory>`; if the dump fails nothing is deleted.
+  An operator's own database is never dumped or touched. Afterwards remove the emptied volume
+  with `docker volume rm quasar-machine`.
+- The one-line command's `QUASAR_RESET_IDENTITY=1` runs `uninstall --purge` for the
+  installation it finds.
+
+### Changing machine inputs: `reconfigure` (#366)
+
+Run inside the recovery actor, which holds the machine's lease:
+
+```sh
+docker exec -it quasar-recovery quasar-recovery reconfigure --dry-run QUASAR_HOME_ROOT=/mnt/homes
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
+```
+
+It takes the seed's variable names: `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`, the release
+trust (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
+`QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`,
+`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
+`QUASAR_APP_PUID`, `QUASAR_APP_PGID`, `QUASAR_CONTAINER_NETWORK`, and on a control-plane
+machine `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_HOSTS`, `QUASAR_TRUSTED_PROXIES`,
+`QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT`, and the Add host images `QUASAR_ENROLL_SEED_IMAGE`
+and `QUASAR_ENROLL_AGENT_IMAGE`. An empty value unsets an optional one. The role, node name,
+database and images are fixed at install (images move by an update).
+
+A change is checked as an install would check it, then applied as a replacement with the
+same digests: each service whose container the change moves is replaced, verified, and
+restored if it does not verify, and the new inputs stay only if it succeeded. Re-creating the
+node agent ends that host's sessions, so a change that does needs `--yes`. A change no
+container renders (the signature mode, say) is only recorded. This release re-creates only
+the node agent this way: a change that moves the control plane's container (the home root or
+trust on a combined host, the Add host images) is refused until control-plane replacement
+exists (RH06-11, #363).
 
 ---
 
