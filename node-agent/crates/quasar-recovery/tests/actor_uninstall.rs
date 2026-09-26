@@ -433,6 +433,107 @@ fn a_removal_takes_the_agent_then_the_actor_and_nothing_brings_them_back() {
     );
 }
 
+/// An actor whose removal waits long enough after answering for a test to arm a fault.
+fn slow_removal_actor(
+    engine: &Arc<FakeEngine>,
+    dir: &std::path::Path,
+    actor_id: &str,
+) -> Arc<Actor> {
+    let mut config = ActorConfig::new(dir, MachineRole::Gpu, OperatorInputs::default());
+    config.self_container = Some(actor_id.into());
+    config.seed_container = Some(SEED_ID.into());
+    let mut config = configure(config);
+    config.remove_grace = Duration::from_millis(150);
+    Arc::new(Actor::new(engine.clone(), config))
+}
+
+/// Accepts a removal and makes it stop at the node agent: after the grace, the actor's
+/// restart change and the listing, the agent's stop fails.
+fn removal_stopped_at_the_agent(engine: &Arc<FakeEngine>, actor: &Arc<Actor>) {
+    actor
+        .submit(Caller::Agent, remove_request(ID))
+        .expect("accepted");
+    let base = engine.calls();
+    engine.inject(Fault {
+        call: base + 2,
+        when: When::Before,
+        error: EngineError::Runtime(ErrorKind::Unavailable),
+    });
+    actor.wait_attempt();
+    engine.clear_faults();
+    assert!(
+        engine.state().container_named(names::NODE_AGENT).is_some(),
+        "the removal stopped part-way, at the node agent"
+    );
+}
+
+#[test]
+fn a_removal_that_stopped_part_way_is_finished_by_a_retry_with_a_new_request_id() {
+    let (engine, dir, actor_id) = seeded_gpu_host();
+    let id = installation(&engine);
+    let actor = slow_removal_actor(&engine, dir.path(), &actor_id);
+    removal_stopped_at_the_agent(&engine, &actor);
+
+    // The console mints a new request id for every POST.
+    actor
+        .submit(Caller::Agent, remove_request(ID2))
+        .expect("the retry is accepted");
+    actor.wait_attempt();
+    let state = engine.state();
+    assert!(
+        ours(&state, &id).is_empty(),
+        "left: {:?}",
+        ours(&state, &id)
+    );
+    assert!(state.containers.contains_key(SEED_ID));
+}
+
+#[test]
+fn a_removal_that_stopped_part_way_is_finished_by_the_actors_next_start() {
+    let (engine, dir, actor_id) = seeded_gpu_host();
+    let id = installation(&engine);
+    removal_stopped_at_the_agent(&engine, &slow_removal_actor(&engine, dir.path(), &actor_id));
+
+    running_actor(&engine, dir.path(), &actor_id)
+        .resume()
+        .expect("resume finishes the removal");
+    let state = engine.state();
+    assert!(
+        ours(&state, &id).is_empty(),
+        "left: {:?}",
+        ours(&state, &id)
+    );
+}
+
+#[test]
+fn a_removal_is_refused_unchanged_while_the_machine_is_being_uninstalled_on_the_machine() {
+    let (engine, dir, actor_id) = seeded_gpu_host();
+    let id = installation(&engine);
+    // An uninstall stopped part-way: the agent's stop fails after the actor was stopped.
+    let base = engine.calls();
+    engine.inject(Fault {
+        call: base + 3,
+        when: When::Before,
+        error: EngineError::Runtime(ErrorKind::Unavailable),
+    });
+    uninstaller(&engine, dir.path())
+        .run(&Options::default())
+        .expect_err("stopped part-way");
+    engine.clear_faults();
+    let before = ours(&engine.state(), &id);
+
+    let refused = running_actor(&engine, dir.path(), &actor_id)
+        .submit(Caller::Agent, remove_request(ID2))
+        .expect_err("the operator's uninstall owns this machine");
+    assert_eq!(refused.reason, Reason::Invalid);
+    assert!(
+        refused.message.contains("uninstalled on the machine"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(ours(&engine.state(), &id), before, "nothing was changed");
+}
+
 #[test]
 fn a_removal_is_refused_unchanged_off_the_agent_socket_or_carrying_anything() {
     let (engine, dir, actor_id) = seeded_gpu_host();
@@ -1049,4 +1150,82 @@ fn a_combined_host_home_root_reconfigure_is_refused_until_control_plane_replacem
     assert!(refused.message.contains("#363"), "{}", refused.message);
     assert_eq!(machine_home(dir.path()), HOME);
     assert!(!dir.path().join("reconfigure.json").exists());
+}
+
+// ----- records a reconfigure leaves -----
+
+#[test]
+fn an_unreadable_reconfigure_record_is_never_overwritten_and_the_next_start_sets_it_aside() {
+    let (engine, dir, actor_id) = seeded_gpu_host();
+    let record = dir.path().join("reconfigure.json");
+    std::fs::write(&record, b"{ not json").unwrap();
+
+    let actor = running_actor(&engine, dir.path(), &actor_id);
+    let refused = actor
+        .reconfigure(changes(&[("QUASAR_HOME_ROOT", NEW_HOME)]))
+        .expect_err("fails closed");
+    assert_eq!(refused.reason, Reason::Invalid);
+    assert!(
+        refused.message.contains("unreadable"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        std::fs::read(&record).unwrap(),
+        b"{ not json",
+        "left as it was"
+    );
+    assert_eq!(machine_home(dir.path()), HOME);
+
+    let started = running_actor(&engine, dir.path(), &actor_id);
+    started.resume().expect("resume");
+    assert!(!record.exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("reconfigure.json.unreadable")).unwrap(),
+        b"{ not json",
+        "kept for the operator"
+    );
+    let done = started
+        .reconfigure(changes(&[("QUASAR_HOME_ROOT", NEW_HOME)]))
+        .expect("admitted once it is set aside");
+    assert!(done.request_id.is_some());
+    started.wait_attempt();
+    assert_eq!(machine_home(dir.path()), NEW_HOME);
+}
+
+/// A journal written by a later build with a caller this one does not know: it reads, its
+/// finished attempt does not hold the machine, and its id is another caller's.
+#[test]
+fn a_journal_from_an_unknown_caller_is_read_as_another_callers_and_does_not_hold_the_machine() {
+    let (engine, dir, actor_id) = seeded_gpu_host();
+    let actor = running_actor(&engine, dir.path(), &actor_id);
+    let request = actor
+        .reconfigure(changes(&[("QUASAR_HOME_ROOT", NEW_HOME)]))
+        .expect("admitted")
+        .request_id
+        .expect("journalled");
+    actor.wait_attempt();
+
+    let path = dir.path().join("journal").join(format!("{request}.json"));
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(journal["caller"], "operator");
+    journal["caller"] = "a-later-caller".into();
+    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+    let started = running_actor(&engine, dir.path(), &actor_id);
+    started.resume().expect("resume");
+    let result = started
+        .status_for(Some(&request))
+        .result
+        .expect("the journal still reads");
+    assert_eq!(result.state, State::Succeeded);
+    let refused = started
+        .submit(Caller::Agent, replace_request(&request))
+        .expect_err("another caller's id");
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+    started
+        .submit(Caller::Agent, replace_request(ID2))
+        .expect("nothing holds the machine");
+    started.wait_attempt();
 }

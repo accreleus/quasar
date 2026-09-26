@@ -30,8 +30,9 @@ commands:
             remove this machine's Quasar services, in its own container (docs/configuration.md);
             keeps the database, machine state and homes unless --purge
   reconfigure [--dry-run] [--yes] VARIABLE=value...
-            change machine inputs (home root, release trust, Add host images, ...) through
-            a verified replacement; run it inside the recovery actor (docker exec)
+            change a GPU host's inputs (home root, release trust, app defaults, ...) through
+            a verified replacement; run it inside the recovery actor (docker exec). A change
+            that moves the control plane's container is refused in this build
   version   print this build's version and commit
 
 restore is not in this build.";
@@ -388,8 +389,13 @@ fn uninstall(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let purge = args.iter().any(|a| a == "--purge");
+    if !purge && (confirm.is_some() || dump_to.is_some()) {
+        eprintln!("quasar-recovery uninstall: --confirm and --dump-to belong to --purge; without it nothing is deleted or dumped\n\n{USAGE}");
+        return ExitCode::from(2);
+    }
     let opts = uninstall::Options {
-        purge: args.iter().any(|a| a == "--purge"),
+        purge,
         confirm,
         dump_to,
     };

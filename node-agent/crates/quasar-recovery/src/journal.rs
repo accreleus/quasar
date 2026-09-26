@@ -32,6 +32,10 @@ pub enum CallerTag {
     Agent,
     /// The operator's `reconfigure` on the operator socket (`crate::operator`).
     Operator,
+    /// A caller a later build added. The journal stays readable, so its attempt settles as
+    /// usual, and a re-post of its id is refused as another caller's. Never written new.
+    #[serde(other)]
+    Other,
 }
 
 /// One component's progress. The phase names the step that is **about to be, or being,

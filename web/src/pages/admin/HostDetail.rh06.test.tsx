@@ -278,6 +278,24 @@ describe("HostDetail — remove host (#366)", () => {
     expect(mocked.drainHost).not.toHaveBeenCalled();
   });
 
+  it("keeps waiting when the server still counts a session the poll no longer shows", async () => {
+    mocked.removePlatformHost.mockRejectedValueOnce(
+      new ApiError(409, "conflict", "1 session(s) are still live on this host"),
+    );
+    renderDetail();
+    fireEvent.click(await screen.findByRole("button", { name: /Remove host/ }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: /Remove host/ }));
+    await waitFor(() => expect(mocked.removePlatformHost).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("Removing gpu-host-4.")).toBeTruthy();
+    expect(screen.queryByText("Removing gpu-host-4 did not finish.")).toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(11_000);
+    });
+    await waitFor(() => expect(mocked.removePlatformHost).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/removing the node agent, then\s+itself/)).toBeTruthy();
+  });
+
   it("cancels a removal that is waiting, lifting the drain it took", async () => {
     setFleet([session()]);
     renderDetail();

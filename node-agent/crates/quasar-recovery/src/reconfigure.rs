@@ -1,5 +1,5 @@
-//! `quasar-recovery reconfigure` (#352 decision A2): changing a machine's inputs — its home
-//! root, release trust, the images Add host installs, app-container defaults — after install.
+//! `quasar-recovery reconfigure` (#352 decision A2): changing a machine's inputs (its home
+//! root, release trust, app-container defaults) after install.
 //!
 //! A reconfigure is a **Replacement with the same digests and new machine inputs**: each
 //! service whose rendered specification the change moves is replaced through the attempt
@@ -24,7 +24,7 @@ use std::io;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::actor::Actor;
 use crate::bootstrap as var;
@@ -370,11 +370,27 @@ impl Actor {
                 format!("attempt {open} is in flight; reconfigure once it has finished"),
             ));
         }
-        if self.dir.reconfigure_file().load().ok().flatten().is_some() {
-            return Err(refuse(
-                Reason::Busy,
-                "a reconfigure is still being settled; try again in a moment",
-            ));
+        // No attempt is open, so a record left here belongs to a finished attempt: settle it
+        // now rather than answer busy until the next start. One that cannot be read is
+        // never overwritten.
+        self.settle_reconfigure();
+        match self.dir.reconfigure_file().load() {
+            Ok(None) => {}
+            Ok(Some(r)) => {
+                return Err(refuse(
+                    Reason::Busy,
+                    format!(
+                        "reconfigure {} could not be settled yet (see this actor's log); nothing was changed",
+                        r.request_id
+                    ),
+                ))
+            }
+            Err(e) => {
+                return Err(refuse(
+                    Reason::Invalid,
+                    format!("{RECORD_FILE} is unreadable ({e}); nothing was changed. The recovery actor's next start sets it aside"),
+                ))
+            }
         }
         let containers = self.engine.list_containers().map_err(|e| {
             refuse(
@@ -576,13 +592,40 @@ impl Actor {
     /// the new inputs stay only if the replacement succeeded. Idempotent; `resume` calls it
     /// after settling the open attempt.
     pub(crate) fn settle_reconfigure(&self) {
+        self.settle_reconfigure_record(false);
+    }
+
+    /// [`Actor::settle_reconfigure`] on a start: a record that cannot be read is set aside
+    /// (never deleted or overwritten) and reported, so it does not refuse every later
+    /// reconfigure. Machine state keeps its inputs, which are the new ones.
+    pub(crate) fn settle_reconfigure_on_start(&self) {
+        self.settle_reconfigure_record(true);
+    }
+
+    fn settle_reconfigure_record(&self, set_aside: bool) {
         let record = match self.dir.reconfigure_file().load() {
             Ok(Some(r)) => r,
             Ok(None) => return,
+            Err(e) if set_aside => {
+                let from = self.dir.root().join(RECORD_FILE);
+                let to = self.dir.root().join(format!("{RECORD_FILE}.unreadable"));
+                match std::fs::rename(&from, &to) {
+                    Ok(()) => error!(
+                        token = "reconfigure-record-set-aside",
+                        "{RECORD_FILE} was unreadable ({e}) and is kept as {}; machine state keeps the inputs of that reconfigure, which the node agent may not run if it did not succeed. Run reconfigure again with the values you want",
+                        to.display()
+                    ),
+                    Err(re) => error!(
+                        token = "reconfigure-record-stuck",
+                        "{RECORD_FILE} is unreadable ({e}) and could not be set aside ({re}); reconfigure is refused until it is removed"
+                    ),
+                }
+                return;
+            }
             Err(e) => {
                 warn!(
                     token = "reconfigure-record-unreadable",
-                    "{RECORD_FILE} is unreadable ({e}); it is left as it is"
+                    "{RECORD_FILE} is unreadable ({e}); the recovery actor's next start sets it aside"
                 );
                 return;
             }

@@ -54,7 +54,8 @@ pub enum By {
 pub struct Marker {
     pub format: u32,
     pub by: By,
-    /// The `host_remove` request, for a console removal: a re-post is the same removal.
+    /// The `host_remove` request that started a console removal. A later one, whatever its
+    /// id, drives the same removal again.
     #[serde(default)]
     pub request_id: Option<String>,
     #[serde(default)]
@@ -288,6 +289,7 @@ impl Uninstall {
             .engine
             .list_containers()
             .map_err(|e| refused(engine_err("list containers", e)))?;
+        let image = self.image_to_run(&containers);
         let me = self.self_container.clone();
         let is_me = |c: &Container| {
             me.as_deref()
@@ -298,7 +300,7 @@ impl Uninstall {
             if ours(std::slice::from_ref(me), &id, Role::RecoveryActor).len() == 1 {
                 return Err(refused(format!(
                     "uninstall stops the recovery actor, so it cannot run inside it; run it in its own container: {}",
-                    command_line(&machine, "uninstall")
+                    command_line(&image, "uninstall")
                 )));
             }
         }
@@ -446,6 +448,15 @@ impl Uninstall {
                 names::POSTGRES_DATA_VOLUME,
                 names::MACHINE_VOLUME,
                 if machine.inputs.home_root.is_empty() { String::new() } else { format!(" under {}", machine.inputs.home_root) }
+            ));
+            if machine.role == crate::socket::MachineRole::Gpu {
+                report.say(
+                    "To bring this host back, add it from Admin → Fleet → Add host with the same node name: its history and homes are kept.",
+                );
+            }
+            report.say(format!(
+                "To delete the data as well: {}",
+                command_line(&image, "uninstall --purge")
             ));
         }
         Ok(report)
@@ -710,13 +721,33 @@ fn noun(role: Role) -> &'static str {
 }
 
 /// The documented way to run an operator command beside the recovery actor: its own
-/// container on the actor's image, with the engine socket and machine state.
-pub fn command_line(machine: &Machine, command: &str) -> String {
-    let _ = machine;
+/// container on the recovery image, with the engine socket and machine state. `image` is
+/// printed as it is: after an uninstall no `quasar-recovery` container is left to inspect.
+pub fn command_line(image: &str, command: &str) -> String {
     format!(
-        "docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -v {}:{} \"$(docker inspect -f '{{{{.Config.Image}}}}' {})\" {command}",
+        "docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -v {}:{} {image} {command}",
         names::MACHINE_VOLUME,
         crate::recipe::paths::MACHINE_DIR,
-        names::RECOVERY_ACTOR
     )
+}
+
+impl Uninstall {
+    /// The recovery image to run this command with again: the one it runs from, else the
+    /// one `seed.json` names, else a placeholder.
+    fn image_to_run(&self, containers: &[Container]) -> String {
+        let me = self.self_container.as_deref();
+        containers
+            .iter()
+            .find(|c| me.is_some_and(|m| c.id.starts_with(m) || m.starts_with(&c.id)))
+            .and_then(|c| crate::actor::own_image(self.engine.as_ref(), c))
+            .map(|i| i.reference())
+            .or_else(|| {
+                self.dir
+                    .load_seed_file()
+                    .ok()
+                    .flatten()
+                    .map(|s| s.recovery_actor_image.reference())
+            })
+            .unwrap_or_else(|| "<registry>/quasar-recovery@sha256:<digest>".to_owned())
+    }
 }

@@ -35,10 +35,15 @@ own; the two do not move together, and that is deliberate.
   sessions, `POST /v1/admin/platform/hosts/{id}/remove`, agent `host_remove`). On the
   machine, `quasar-recovery uninstall` removes the installation's containers and keeps its
   data; `--purge` deletes the data too after a typed confirmation and a final `pg_dump` of a
-  Quasar-owned database. `quasar-recovery reconfigure` changes machine inputs (home root,
-  release trust, Add host images, app defaults) through a verified replacement on the same
-  digests. The agent re-registers when its recovery actor's reported identity changes, so the
-  console sees a seed go missing or come back without an agent restart.
+  Quasar-owned database. `quasar-recovery reconfigure` changes a GPU host's inputs (home root,
+  release trust, app defaults) through a verified replacement on the same digests. A removed
+  GPU host is added back with Add host under the same node name. The agent re-registers when
+  its recovery actor's reported identity changes, so the console sees a seed go missing or
+  come back without an agent restart.
+- **Add host carries the control plane's release trust (#366).** The one-line command and the
+  Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane
+  admits the developer applies that control plane accepts.
 - **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
   machine to a successor: it starts beside the running actor, takes the machine's lease only
   when it is handed over, keeps the old actor stopped and disabled until it has verified
@@ -315,6 +320,13 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Owned installs in the console and Add host (#366, from #361's live run).** Owned host rows
+  name the machine's shape (GPU host, combined host); setup shows the owned install's
+  setup-token command (`docker exec quasar-control-plane cat /run/quasar/setup-token`), and
+  its last step says to keep the `quasar-machine` volume rather than back up `deploy/.env`.
+  The one-line command reports a fresh enrollment rather than the reconnect that follows it,
+  and after `QUASAR_RESET_IDENTITY=1` says the host enrolled afresh. The documented seed stacks
+  and Add host's stack name the seed `quasar-seed` (`container_name`).
 - **The node agent's container-runtime layer is its own GStreamer-free crate (#355).**
   `node-agent/crates/quasar-runtime` now holds the engine facade (socket discovery and
   its refusals, the bounded client, error classification, registry credentials,

@@ -214,7 +214,7 @@ func TestRemoveHostCordonsSendsHostRemoveAndAudits(t *testing.T) {
 	}
 	var d map[string]any
 	_ = json.Unmarshal(details, &d)
-	if action != "platform.remove.host" || d["node_name"] != "gpu-host-4" || d["force"] != false || d["request_id"] != removeRequestID {
+	if _, extra := d["request_id"]; action != "platform.remove.host" || d["node_name"] != "gpu-host-4" || d["force"] != false || extra {
 		t.Errorf("audit = %s %s", action, details)
 	}
 	var attempts int

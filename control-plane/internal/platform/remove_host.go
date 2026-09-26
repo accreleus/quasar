@@ -188,6 +188,9 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 			"this host's agent did not answer the removal, so it predates it and nothing was removed; update it first")
 		return
 	case err != nil:
+		// Undeliverable: the agent's connection is gone (the send found none, or it closed
+		// before an ack). The contract's word for "nobody to tell" is host_offline; a
+		// removal the actor did accept shows as the host staying offline.
 		restore(ctx)
 		writeNotEligible(w, ReasonHostOffline)
 		return
@@ -198,10 +201,10 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// control-api.md amendment 14: the host id, node_name and force, nothing more.
 	audit.TryRecord(ctx, h.auditor, actorID(r), "platform.remove.host", "host", hostID, map[string]any{
-		"node_name":  host.NodeName,
-		"force":      req.Force,
-		"request_id": requestID,
+		"node_name": host.NodeName,
+		"force":     req.Force,
 	})
 	body, err := h.deps.Host(ctx, hostID)
 	if err != nil {

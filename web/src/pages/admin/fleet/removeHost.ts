@@ -34,10 +34,14 @@ export interface Removal {
   detail?: string;
   /** Whether this removal took the drain, so cancelling it lifts the drain. */
   drained: boolean;
+  /** Waiting: not asked again before this (ms), after the server still counted a session. */
+  notBefore?: number;
 }
 
 /** How long an accepted removal may leave the host connected before it reads as stuck. */
 export const REMOVAL_STALL_MS = 90_000;
+/** How long a removal the server refused for a live session waits before asking again. */
+export const RESEND_AFTER_MS = 5_000;
 
 const removals = new Map<string, Removal>();
 /** Hosts whose removal request is on the wire: it is sent once. */
@@ -81,6 +85,7 @@ export function nextStep(
 ): NextStep {
   if (r.phase === "waiting") {
     if (host.status === "offline") return "disconnected";
+    if (r.notBefore != null && now < r.notBefore) return null;
     return liveSessions === 0 ? "send" : null;
   }
   if (r.phase === "sent") {
@@ -109,20 +114,32 @@ export function useHostRemoval(host: Host | undefined, liveSessions: number, now
   const removal = useRemoval(host?.id ?? "");
 
   const send = useAdminAction(
-    async (hostId: string) => {
-      if (!token) return;
+    async (hostId: string): Promise<"sent" | "wait"> => {
+      if (!token) return "wait";
       sending.add(hostId);
       try {
         await adminApi.removePlatformHost(token, hostId, {});
+        return "sent";
+      } catch (e) {
+        // `409 conflict`: the server still counts a session the fleet poll no longer
+        // shows. The removal keeps waiting and asks again after the next poll.
+        if (e instanceof ApiError && e.code === "conflict") return "wait";
+        throw e;
       } finally {
         sending.delete(hostId);
       }
     },
     {
       failure: "Could not remove the host",
-      onSuccess: (_r, hostId) => {
+      onSuccess: (result, hostId) => {
         const r = getRemoval(hostId);
-        if (r) setRemoval(hostId, { ...r, phase: "sent", sentAt: Date.now() });
+        if (!r) return;
+        setRemoval(
+          hostId,
+          result === "sent"
+            ? { ...r, phase: "sent", sentAt: Date.now() }
+            : { ...r, phase: "waiting", notBefore: Date.now() + RESEND_AFTER_MS },
+        );
       },
       onFailure: (e, hostId) => {
         const r = getRemoval(hostId);

@@ -1142,8 +1142,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		platformApply.WithOwnMachine(ownMachine)
 	}
 	platformApply.WithMachineShape(applyMachineShape(cfg))
-	// Remove host (amendment 14): cordons like an operator drain, so a removal that
-	// stops part-way leaves a host the operator can resume from the console.
+	// Remove host (amendment 14). "Cordon exactly as a per-host apply does" would use the
+	// attempt owner, but a removal writes no attempt row for that owner to belong to, so
+	// it takes the manual-drain owner: a removal that stops part-way then leaves a drain
+	// the operator can lift from the console.
 	platformRemove := platform.NewRemoveHandler(platform.RemoveDeps{
 		Store:     platformStore,
 		Connected: agentRegistry.IsConnected,

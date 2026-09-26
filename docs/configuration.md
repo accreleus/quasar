@@ -1560,6 +1560,11 @@ The control plane writes them into the `/enroll-host.sh` it serves, and the dial
 back from that script for its stack, so the two cannot name different seeds. Unset, the
 dialog says so and creates nothing. A tag in either fails startup: the seed refuses one.
 
+Both paths also carry the control plane's own release trust, `QUASAR_UPDATER_ALLOWED_NAMESPACES`
+and `QUASAR_PLATFORM_INSECURE_REGISTRIES` when set, into the seed's inputs of the same names,
+so the new machine records the trust its control plane checks a developer apply against. Unset,
+the seed keeps its defaults. A value with a quote or a control character fails startup.
+
 The command is
 
 ```
@@ -1597,7 +1602,10 @@ dry run it is refused as contradictory.
   agent and their volumes (the agent's saved identity included, never the homes) first. It
   refuses on a machine that holds a control plane or Quasar's Postgres, or their volumes. The
   unlabelled `quasar-recovery-agent` volume goes too unless a container still mounts it; then
-  the run names what it left in place.
+  the run names what it left in place. Afterwards the run reports the host as enrolled afresh.
+- **A machine removed from the console** (or uninstalled keeping its data) is added back by the
+  command without `QUASAR_RESET_IDENTITY`: it clears the old install the same way, then
+  installs afresh.
 - A machine still running the pre-RH06 Compose-installed agent, or a seed a stack manager
   started, is refused with what to remove first.
 
@@ -1773,17 +1781,33 @@ A GPU host is removed from the console: Admin → Fleet → the host → Remove 
 plane drains it, waits for its sessions to end, and sends `host_remove`; the host's recovery
 actor records the removal, removes the node agent, then itself. Homes and volumes stay, and
 so does the seed, which from then on stays idle (`token="seed-uninstalled"`). Forget the host
-once it is offline. A host that is not connected cannot be removed this way; a removal that
-stops part-way leaves the host visibly there, and `uninstall` on the machine finishes it.
+once it is offline. A host that is not connected cannot be removed this way. A removal that
+stops part-way leaves the host visibly there: Retry removal on its page, the recovery actor's
+next start, or `uninstall` on the machine finishes it.
+
+**Bringing a removed GPU host back** is Add host: create a command with the same node name and
+run it on the machine. The one-line command finds the removed install, clears it (its volumes
+and the agent's old identity; never the homes, which are host directories) and installs
+afresh, and the control plane keeps the host's history under its node name. The same holds
+after a GPU host's `uninstall` that kept its data. A kept-data `uninstall` is otherwise for
+decommissioning or moving a machine: there is no command that reinstates the old install on
+its kept data.
 
 Any machine, a combined or control-only one included, is taken apart on the machine, with the
-console up or down, by running the recovery image with `uninstall` in its own container:
+console up or down, by running the recovery image with `uninstall` in its own container. The
+seed runs that image and outlives an uninstall, so take the image from it (or name the
+`quasar-recovery@sha256:…` digest yourself):
 
 ```sh
 docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
   -v quasar-machine:/var/lib/quasar-machine \
-  "$(docker inspect -f '{{.Config.Image}}' quasar-recovery)" uninstall
+  "$(docker inspect -f '{{.Config.Image}}' quasar-seed)" uninstall
 ```
+
+For `--purge`, which refuses while a seed exists, note the image first:
+`img=$(docker inspect -f '{{.Config.Image}}' quasar-seed)`, remove the seed the way you started
+it, then run the same command with `"$img" uninstall --purge`. Each uninstall prints the exact
+command, with the image, to run next.
 
 - It marks the machine uninstalled first (`uninstalled.json`, and `seed.json` `uninstalled`),
   so neither the seed nor an actor started by hand brings anything back
@@ -1800,9 +1824,11 @@ docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
   final `pg_dump` (custom format) into the `quasar-final-dump` volume, which a purge never
   deletes, or into `--dump-to <absolute host directory>`; if the dump fails nothing is deleted.
   An operator's own database is never dumped or touched. Afterwards remove the emptied volume
-  with `docker volume rm quasar-machine`.
+  with `docker volume rm quasar-machine`. `--confirm` and `--dump-to` without `--purge` are
+  refused.
 - The one-line command's `QUASAR_RESET_IDENTITY=1` runs `uninstall --purge` for the
-  installation it finds.
+  installation it finds, from its containers, its labelled volumes or machine state, with the
+  seed's image when the installed recovery actor predates `uninstall`.
 
 ### Changing machine inputs: `reconfigure` (#366)
 
@@ -1817,20 +1843,21 @@ It takes the seed's variable names: `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`, 
 trust (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
 `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`,
 `QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
-`QUASAR_APP_PUID`, `QUASAR_APP_PGID`, `QUASAR_CONTAINER_NETWORK`, and on a control-plane
-machine `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_HOSTS`, `QUASAR_TRUSTED_PROXIES`,
-`QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT`, and the Add host images `QUASAR_ENROLL_SEED_IMAGE`
-and `QUASAR_ENROLL_AGENT_IMAGE`. An empty value unsets an optional one. The role, node name,
-database and images are fixed at install (images move by an update).
+`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`. An empty value unsets an
+optional one. The role, node name, database and images are fixed at install (images move by an
+update).
 
 A change is checked as an install would check it, then applied as a replacement with the
 same digests: each service whose container the change moves is replaced, verified, and
 restored if it does not verify, and the new inputs stay only if it succeeded. Re-creating the
 node agent ends that host's sessions, so a change that does needs `--yes`. A change no
 container renders (the signature mode, say) is only recorded. This release re-creates only
-the node agent this way: a change that moves the control plane's container (the home root or
-trust on a combined host, the Add host images) is refused until control-plane replacement
-exists (RH06-11, #363).
+the node agent this way, so it is for GPU hosts: a change that moves the control plane's
+container (anything the control plane renders, including the home root or trust on a combined
+host, and every control-plane-only variable) is refused until control-plane replacement exists
+(RH06-11, #363). `reconfigure.json` records a reconfigure in flight; one that cannot be read is
+never overwritten: reconfigure is refused, and the actor's next start sets it aside as
+`reconfigure.json.unreadable` (`token="reconfigure-record-set-aside"`).
 
 ---
 

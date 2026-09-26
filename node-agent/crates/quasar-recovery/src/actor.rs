@@ -336,6 +336,8 @@ pub struct Actor {
     /// Set by `acquire_lease` and `resume`, cleared when `resume` returns: a submit then
     /// is refused `busy`, so one queued on a socket served before `resume` cannot race it.
     pub(crate) resuming: std::sync::atomic::AtomicBool,
+    /// A console removal is being driven in this process; a retry does not start another.
+    pub(crate) removing: Arc<std::sync::atomic::AtomicBool>,
     /// Seed identities by image id: an image's labels never change.
     seed_images: Mutex<BTreeMap<String, SeedIdentity>>,
     /// The agent socket's serving loop, while this process serves it.
@@ -372,6 +374,7 @@ impl Actor {
             gate: Mutex::new(()),
             worker: Mutex::new(None),
             resuming: std::sync::atomic::AtomicBool::new(false),
+            removing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             seed_images: Mutex::new(BTreeMap::new()),
             server: Mutex::new(Vec::new()),
             me: std::sync::OnceLock::new(),
@@ -596,6 +599,18 @@ impl Actor {
         // An uninstall or a console removal has started here: nothing is installed,
         // settled or re-created, whoever started this actor (ADR 0007: the seed idles too).
         if let Some(why) = crate::uninstall::uninstalled(&self.dir) {
+            // A console removal a previous process did not finish is finished here; every
+            // step is remove-if-present. An operator's uninstall is left to the operator.
+            if let Ok(Some(marker)) = self.dir.load_uninstall() {
+                if marker.by == crate::uninstall::By::Console && marker.finished_at.is_none() {
+                    info!(
+                        token = "actor-removal-resumed",
+                        "a console removal did not finish; finishing it"
+                    );
+                    self.remove_services();
+                    return Ok(());
+                }
+            }
             warn!(
                 token = "actor-machine-uninstalled",
                 "{why}; this recovery actor installs and replaces nothing. `quasar-recovery uninstall` finishes the removal"
@@ -610,7 +625,7 @@ impl Actor {
             return Ok(());
         }
         // A reconfigure keeps its new inputs only if its attempt succeeded.
-        self.settle_reconfigure();
+        self.settle_reconfigure_on_start();
         self.sweep_helpers()?;
         let machine = match self.dir.load_machine()? {
             Some(machine) => {

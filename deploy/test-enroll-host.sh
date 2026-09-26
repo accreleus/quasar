@@ -143,9 +143,12 @@ case "$cmd" in
     case "$sub" in
       inspect) [ -d "$S/v/$last" ]; exit ;;
       ls)
-        want=""
-        for a in "$@"; do case "$a" in label=*) want="${a#label=}" ;; esac; done
-        for d in "$S"/v/*; do [ -d "$d" ] && { [ -z "$want" ] || has_label "$d" "$want"; } && echo "${d##*/}"; done
+        want=""; fmt=""
+        for a in "$@"; do case "$a" in label=*) want="${a#label=}" ;; *'.Label'*) fmt="$a" ;; esac; done
+        for d in "$S"/v/*; do
+          [ -d "$d" ] && { [ -z "$want" ] || has_label "$d" "$want"; } || continue
+          if [ -n "$fmt" ]; then label_value "$d" io.quasar.installation; else echo "${d##*/}"; fi
+        done
         exit 0 ;;
       rm) [ "${MOCK_VOLUME_RM_OK:-1}" = 1 ] || { echo "mock: volume is in use" >&2; exit 1; }; rm -rf "${S:?}/v/$last"; exit 0 ;;
     esac
@@ -161,13 +164,20 @@ case "$cmd" in
     # The recovery actor's `uninstall --purge --confirm <id>`: what carries the id goes;
     # it empties the machine-state volume it mounts but cannot remove it.
     case " $* " in
+      # A read of machine state: $S/v/quasar-machine/files/<name>.
+      *" --entrypoint cat "*)
+        cat "$S/v/quasar-machine/files/${last##*/}" 2>/dev/null; exit ;;
       *" uninstall "*)
         [ "${MOCK_UNINSTALL_OK:-1}" = 1 ] || exit 1
+        # An actor image from before uninstall existed refuses the command.
+        case " $* " in *" mock.example/quasar/quasar-recovery@"*) [ "${MOCK_ACTOR_NO_UNINSTALL:-0}" = 1 ] && exit 2 ;; esac
         id=""; prev=""
         for a in "$@"; do [ "$prev" = --confirm ] && id="$a"; prev="$a"; done
         for d in "$S"/c/* "$S"/v/*; do
           [ -d "$d" ] && [ -n "$id" ] && has_label "$d" "io.quasar.installation=$id" && rm -rf "$d"
         done
+        rm -rf "${S:?}/v/quasar-machine/files"
+        printf '%s\n' "$*" >> "$S/uninstalls"
         exit 0 ;;
     esac
     envf=""; name=""; args=("$@"); i=0
@@ -261,8 +271,10 @@ run_installer() {
 }
 ENROLLED_LOG='2026-09-25T10:00:00Z INFO quasar_node_agent::agent: enrolled as host 3f2c…; node_secret saved to /var/lib/quasar-agent/node-secret'
 OK_ENV=(QUASAR_ENROLLMENT="$WSS_BLOB" MOCK_AGENT_LOG="$ENROLLED_LOG")
-started() { grep -q '^run ' <<<"$DOCKER_LOG"; }
-nothing_started() { ! grep -qE '^(run|pull|start|rm) ' <<<"$DOCKER_LOG"; }
+# A read of machine state (`run --rm --entrypoint cat`) starts nothing.
+acted() { grep -v -- '--entrypoint cat ' <<<"$DOCKER_LOG" || true; }
+started() { acted | grep -q '^run '; }
+nothing_started() { ! acted | grep -qE '^(run|pull|start|rm) '; }
 engine_empty() { [ -z "$(ls -A "$state/c")" ] && [ -z "$(ls -A "$state/v")" ]; }
 
 # ── 1. the string is required and never cleartext ────────────────────────────
@@ -532,6 +544,83 @@ if [ "$RC" -eq 0 ] && [ -n "$uninstall_at" ] && grep -q '^volume rm quasar-machi
 else
   fail "reset identity" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
 fi
+# A host removed from the console: its actor and agent are gone, the seed idles on
+# seed.json "uninstalled", and its volumes and machine state still name inst-0.
+removed_machine() {
+  reset_engine
+  container quasar-seed running "/usr/local/bin/quasar-recovery seed"
+  volume quasar-machine
+  mkdir -p "$state/v/quasar-machine/files"
+  printf '{\n  "format": 1,\n  "installation_id": "inst-0",\n  "role": "gpu"\n}\n' > "$state/v/quasar-machine/files/machine.json"
+  printf '{"format":1,"state":"uninstalled"}\n' > "$state/v/quasar-machine/files/seed.json"
+  printf '{"format":1,"by":"console"}\n' > "$state/v/quasar-machine/files/uninstalled.json"
+  volume quasar-agent-data io.quasar.installation=inst-0
+  volume quasar-node-agent-secrets io.quasar.installation=inst-0
+  volume quasar-recovery-agent
+}
+removed_machine
+run_installer re-add "${OK_ENV[@]}" QUASAR_NODE_NAME=gpu-host-4
+uninstall_at="$(grep -n ' uninstall --purge --confirm inst-0$' <<<"$DOCKER_LOG" | cut -d: -f1)"
+if [ "$RC" -eq 0 ] && [ -n "$uninstall_at" ] && grep -q 'added back' <<<"$OUT" && grep -q 'homes are kept' <<<"$OUT" \
+   && [ "$(grep -n '^rm -f quasar-seed' <<<"$DOCKER_LOG" | head -n 1 | cut -d: -f1)" -lt "$uninstall_at" ] \
+   && [ "$uninstall_at" -lt "$(grep -n '^run -d --name quasar-seed' <<<"$DOCKER_LOG" | cut -d: -f1)" ] \
+   && grep -q '^QUASAR_NODE_NAME=gpu-host-4$' "$state/seed.env" && grep -q 'enrolled' <<<"$OUT" \
+   && grep -q 'io.quasar.installation=inst-1' "$state/v/quasar-agent-data/labels" \
+   && grep -q 'io.quasar.installation=inst-1' "$state/v/quasar-node-agent-secrets/labels"; then
+  pass "after console removal, re-add: the old install is purged by its id from machine state (homes kept), then a fresh install under the same node name"
+else
+  fail "re-add after removal" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+removed_machine
+rm -rf "$state/v/quasar-machine"
+run_installer reset-volumes-only "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
+if [ "$RC" -eq 0 ] && grep -q ' uninstall --purge --confirm inst-0$' <<<"$DOCKER_LOG" \
+   && grep -q 'io.quasar.installation=inst-1' "$state/v/quasar-agent-data/labels"; then
+  pass "reset with no labelled container left: the installation is named by its labelled volumes and purged"
+else
+  fail "reset volumes only" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
+run_installer reset-old-actor "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1 MOCK_ACTOR_NO_UNINSTALL=1
+if [ "$RC" -eq 0 ] && grep -q "mock.example/quasar/quasar-recovery@.* uninstall --purge --confirm inst-0$" <<<"$DOCKER_LOG" \
+   && grep -q "$SEED_IMG uninstall --purge --confirm inst-0$" "$state/uninstalls" && grep -q 'enrolled' <<<"$OUT"; then
+  pass "reset where the actor predates uninstall: the seed's image runs it instead"
+else
+  fail "reset old actor" "rc=$RC docker=[$(grep -E ' uninstall ' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
+run_installer reset-reconnect-verdict "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1 \
+  MOCK_AGENT_LOG='2026-09-25T10:00:02Z INFO quasar_node_agent::agent: reconnected as host 3f2c…'
+if [ "$RC" -eq 0 ] && grep -q 'enrolled afresh' <<<"$OUT" && ! grep -q 'saved identity' <<<"$OUT"; then
+  pass "after QUASAR_RESET_IDENTITY=1 the verdict says the host enrolled afresh, never that it kept a saved identity"
+else
+  fail "reset verdict" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+
+# The control plane's release trust rides the served script into the seed's inputs.
+served_trust="$tmp/served-trust.sh"
+trust_ns="$(grep -o "PINNED_ALLOWED_NAMESPACES='[^']*'" "$pins")"
+trust_insecure="$(grep -o "PINNED_INSECURE_REGISTRIES='[^']*'" "$pins")"
+sed -e "s|^PINNED_ALLOWED_NAMESPACES=''\$|$trust_ns|" -e "s|^PINNED_INSECURE_REGISTRIES=''\$|$trust_insecure|" "$served" > "$served_trust"
+ns_value="$(sed -n 's/.*"allowed_namespaces": *"\([^"]*\)".*/\1/p' "$pins")"
+insecure_value="$(sed -n 's/.*"insecure_registries": *"\([^"]*\)".*/\1/p' "$pins")"
+reset_engine
+SCRIPT="$served_trust" run_installer trust "${OK_ENV[@]}"
+if [ "$RC" -eq 0 ] && [ -n "$ns_value" ] && grep -qxF "QUASAR_UPDATER_ALLOWED_NAMESPACES=$ns_value" "$state/seed.env" \
+   && grep -qxF "QUASAR_PLATFORM_INSECURE_REGISTRIES=$insecure_value" "$state/seed.env" \
+   && grep -qF "trusted:       $ns_value" <<<"$OUT"; then
+  pass "the served release trust reaches the seed as the machine's QUASAR_UPDATER_ALLOWED_NAMESPACES and QUASAR_PLATFORM_INSECURE_REGISTRIES"
+else
+  fail "served trust" "rc=$RC env=[$(cat "$state/seed.env" 2>/dev/null)] out=$(tail -3 <<<"$OUT")"
+fi
+reset_engine
+run_installer no-trust "${OK_ENV[@]}"
+if [ "$RC" -eq 0 ] && ! grep -q 'QUASAR_UPDATER_ALLOWED_NAMESPACES\|QUASAR_PLATFORM_INSECURE_REGISTRIES' "$state/seed.env"; then
+  pass "a control plane with no trust configured passes none: the seed keeps its defaults"
+else
+  fail "no trust" "rc=$RC env=[$(cat "$state/seed.env" 2>/dev/null)]"
+fi
+
 installed_machine "$ENROLLED_LOG"
 container quasar-control-plane running "/usr/local/bin/quasar-control" io.quasar.installation=inst-0 io.quasar.platform-service=control-plane
 run_installer reset-combined "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1

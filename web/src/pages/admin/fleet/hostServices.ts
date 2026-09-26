@@ -188,7 +188,7 @@ export function hostServices(
       // found no seed. Nothing on the wire says how the seed was started, so one owner
       // label covers a manager's stack and a `docker run` (mock open question 4).
       version: answered ? seedVersion : null,
-      versionNote: null,
+      versionNote: answered && seedVersion ? "declared in an external manager" : null,
       owner: answered && seedVersion ? "External manager" : null,
       state: !answered ? { kind: "unknown" } : seedVersion ? liveOrLast() : { kind: "not_found" },
     },

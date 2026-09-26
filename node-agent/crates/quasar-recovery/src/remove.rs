@@ -13,8 +13,10 @@
 //! reaches the control plane, it disables its own restart, removes the node agent (which
 //! ends the agent's connection: that is the control plane's evidence), and removes its own
 //! container, which ends this process. A removal that stops part-way leaves the host
-//! visibly there, and `uninstall` on the machine finishes it.
+//! visibly there; the console's retry (a new request id), this actor's next start, or
+//! `uninstall` on the machine finishes it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +31,23 @@ use crate::uninstall::{self, By, Marker, MARKER_FORMAT};
 
 /// Between answering the agent and removing it, so its `ack` reaches the control plane.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(3);
+
+/// Marks a removal as running for its lifetime, so a removal that stopped part-way can be
+/// started again.
+struct Running(Arc<AtomicBool>);
+
+impl Running {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Running(flag)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 fn refuse(req: &Request, reason: Reason, message: impl Into<String>) -> Rejection {
     Rejection {
@@ -84,12 +103,19 @@ impl Actor {
                 "this machine also runs the control plane; take it apart with the uninstall command on the machine. Nothing was changed",
             ));
         }
-        // Idempotent: a re-sent command after a lost ack is the same removal.
+        // A console removal already recorded is driven again whatever the request id: the
+        // control plane mints one per POST, and every step is remove-if-present, so a retry
+        // after a removal stopped part-way finishes it.
         if let Ok(Some(marker)) = self.dir.load_uninstall() {
-            info!(request = %req.request_id, "a removal was already recorded; answering it again");
-            if marker.by == By::Console && marker.request_id.as_deref() == Some(&req.request_id) {
-                self.start_removal();
+            if marker.by == By::Operator {
+                return Err(refuse(
+                    &req,
+                    Reason::Invalid,
+                    "this machine is being uninstalled on the machine; the uninstall command finishes it. Nothing was changed",
+                ));
             }
+            info!(request = %req.request_id, "a removal was already recorded; driving it again");
+            self.start_removal();
             return Ok(Accepted {
                 request_id: req.request_id,
                 previous: Vec::new(),
@@ -133,22 +159,26 @@ impl Actor {
         })
     }
 
+    /// Starts the removal, after whatever the worker is still finishing (a reconfigure's
+    /// settle, say), so an accepted removal always runs. One already running is left to run.
     fn start_removal(self: &Arc<Self>) {
+        if self.removing.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let actor = self.clone();
         let mut worker = self.worker.lock().unwrap();
-        if let Some(done) = worker.take() {
-            if !done.is_finished() {
-                // The removal (or an attempt) is still being driven: nothing to start.
-                *worker = Some(done);
-                return;
+        let before = worker.take();
+        *worker = Some(std::thread::spawn(move || {
+            if let Some(before) = before {
+                let _ = before.join();
             }
-            let _ = done.join();
-        }
-        *worker = Some(std::thread::spawn(move || actor.remove_services()));
+            actor.remove_services();
+        }));
     }
 
     /// The node agent, then this actor. Every step is "remove if present".
-    fn remove_services(&self) {
+    pub(crate) fn remove_services(&self) {
+        let _running = Running::new(self.removing.clone());
         std::thread::sleep(self.config.remove_grace);
         let Ok(Some(machine)) = self.dir.load_machine() else {
             return;

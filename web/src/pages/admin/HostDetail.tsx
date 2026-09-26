@@ -275,6 +275,7 @@ export function HostDetail() {
             {(inFlight?.phase === "waiting" || inFlight?.phase === "sent") && (
               <Chip variant="info">removing</Chip>
             )}
+            {inFlight?.phase === "failed" && hasOperatorDrain(host) && <Chip>drained</Chip>}
             <Button
               variant="ghost"
               onClick={() => navigate(`/admin/fleet/hosts/${host.id}/console`)}

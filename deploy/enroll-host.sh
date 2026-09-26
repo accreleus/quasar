@@ -48,6 +48,9 @@ Inputs (environment):
   QUASAR_TEMPLATE_ROOT  home-template root, default `templates` beside the home root
   QUASAR_SEED_IMAGE     the seed image, repository@sha256:… (default: served below)
   QUASAR_AGENT_IMAGE    the node-agent image, repository@sha256:… (default: served)
+  QUASAR_UPDATER_ALLOWED_NAMESPACES, QUASAR_PLATFORM_INSECURE_REGISTRIES
+                        this machine's release trust (default: the serving control
+                        plane's own, served below)
   QUASAR_ENROLL_FIX=1   apply a failed check's fix without asking; =0 never ask
   QUASAR_ENROLL_APPARMOR_PERSIST=1  also install the AppArmor profile in
                         /etc/apparmor.d so it survives a reboot (QUASAR_ENROLL_FIX=1
@@ -72,8 +75,12 @@ HELP
 
 # Written by the control plane that serves this script (internal/enrollscript), each
 # line replaced whole; empty in the repository. testdata/enroll-host/pins.json pins it.
+# The last two are that control plane's release trust, which the seed records as this
+# machine's, so a developer apply it admits is admitted here too.
 PINNED_SEED_IMAGE=''
 PINNED_AGENT_IMAGE=''
+PINNED_ALLOWED_NAMESPACES=''
+PINNED_INSECURE_REGISTRIES=''
 
 ROOT="${QUASAR_ENROLL_ROOT:-}"          # test seam: fake /proc,/sys,/dev,/etc root
 TAIL_SECS="${QUASAR_ENROLL_TAIL_SECS:-180}"
@@ -415,6 +422,8 @@ is_digest_ref() {
 }
 seed_image="${QUASAR_SEED_IMAGE:-$PINNED_SEED_IMAGE}"
 agent_image="${QUASAR_AGENT_IMAGE:-$PINNED_AGENT_IMAGE}"
+allowed_namespaces="${QUASAR_UPDATER_ALLOWED_NAMESPACES:-$PINNED_ALLOWED_NAMESPACES}"
+insecure_registries="${QUASAR_PLATFORM_INSECURE_REGISTRIES:-$PINNED_INSECURE_REGISTRIES}"
 [ -n "$seed_image" ] && [ -n "$agent_image" ] || usage_error "this script names no seed or node-agent image to install. The control plane that served it has none configured: set QUASAR_ENROLL_SEED_IMAGE and QUASAR_ENROLL_AGENT_IMAGE there (docs/configuration.md \"Add host\"), or give QUASAR_SEED_IMAGE and QUASAR_AGENT_IMAGE here."
 is_digest_ref "$seed_image" || usage_error "the seed image '$seed_image' is not pinned by digest (repository@sha256:…)"
 is_digest_ref "$agent_image" || usage_error "the node-agent image '$agent_image' is not pinned by digest (repository@sha256:…)"
@@ -654,6 +663,24 @@ fi
 
 volumes_of() { dk volume ls -q "$@" 2>/dev/null || true; }
 
+# machine_file <name>: a file of the machine-state volume, read-only, empty when absent.
+machine_file() {
+  dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1 || return 0
+  dk run --rm --security-opt label=disable --entrypoint cat \
+    -v "$MACHINE_VOLUME:/var/lib/quasar-machine:ro" "$seed_image" \
+    "/var/lib/quasar-machine/$1" 2>/dev/null || true
+}
+# json_string <key>: the first "key": "value" on stdin.
+json_string() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1; }
+
+# uninstall_with <image> <installation>: the recovery actor's own purge of it.
+uninstall_with() {
+  dk run --rm --security-opt label=disable \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$MACHINE_VOLUME:/var/lib/quasar-machine" \
+    "$1" uninstall --purge --confirm "$2" >/dev/null 2>&1
+}
+
 # remove_install: this machine's GPU-host install, by the recovery actor's own
 # `uninstall --purge` (#366): it removes only what the installation created, and its
 # volumes. Homes are host paths and stay. Never on a machine holding a control plane
@@ -665,20 +692,22 @@ remove_install() {
     fi
   done
   # The installation, and the image to uninstall it with: the actor's, else the seed's.
+  # A removed host has no container left, so its labelled volumes or machine state name it.
   inst=""; uninstall_image="$seed_image"
   for c in $(names_of --filter label=io.quasar.platform-service=recovery-actor) $(names_of --filter label=io.quasar.installation); do
     inst="$(dk inspect -f '{{index .Config.Labels "io.quasar.installation"}}' "$c" 2>/dev/null || true)"
     [ -z "$inst" ] || { uninstall_image="$(dk inspect -f '{{.Config.Image}}' "$c" 2>/dev/null || echo "$seed_image")"; break; }
   done
+  [ -n "$inst" ] || inst="$(dk volume ls --filter label=io.quasar.installation --format '{{.Label "io.quasar.installation"}}' 2>/dev/null | sed '/^$/d' | head -n 1 || true)"
+  [ -n "$inst" ] || inst="$(machine_file machine.json | json_string installation_id)"
   # The seed first: it is this script's own, and it would re-create a removed actor.
   if [ -n "$(state_of "$SEED")" ]; then
     dk rm -f "$SEED" >/dev/null 2>&1 || host_error "could not remove the seed $SEED; remove it by hand and re-run."
   fi
   if [ -n "$inst" ]; then
-    dk run --rm --security-opt label=disable \
-      -v /var/run/docker.sock:/var/run/docker.sock \
-      -v "$MACHINE_VOLUME:/var/lib/quasar-machine" \
-      "$uninstall_image" uninstall --purge --confirm "$inst" >/dev/null ||
+    # An actor older than uninstall (#366) refuses the command: the seed's image has it.
+    uninstall_with "$uninstall_image" "$inst" ||
+      { [ "$uninstall_image" != "$seed_image" ] && uninstall_with "$seed_image" "$inst"; } ||
       host_error "the recovery actor's uninstall of installation $inst did not finish; run this command again, which continues it."
   fi
   # uninstall empties the machine-state volume it has mounted; the volume goes here.
@@ -697,11 +726,18 @@ remove_install() {
   fi
 }
 
-actors=""; fresh=1
+actors=""; fresh=1; reinstalled=0
 if [ "$DRY" != 1 ]; then
   if [ "$RESET_IDENTITY" = 1 ]; then
-    remove_install
+    remove_install; reinstalled=1
     ok "removed this machine's GPU-host install (QUASAR_RESET_IDENTITY): it enrolls from scratch"
+    [ -z "$LEFT" ] || warn "left in place: $LEFT"
+  elif [ -z "$(names_of --filter label=io.quasar.platform-service=recovery-actor)" ] &&
+       { [ -n "$(machine_file uninstalled.json)" ] || [ "$(machine_file seed.json | json_string state)" = uninstalled ]; }; then
+    # Removed from the console, or uninstalled keeping its data: adding it back is this
+    # command. The old install goes, homes stay, and it enrolls afresh under its node name.
+    remove_install; reinstalled=1
+    ok "this machine was removed from Quasar; its old install was cleared (homes are kept) and it is added back"
     [ -z "$LEFT" ] || warn "left in place: $LEFT"
   fi
   actors="$(names_of --filter label=io.quasar.platform-service=recovery-actor)"
@@ -730,6 +766,8 @@ else
   say "  template root: $template_root"
   say "  seed image:    $seed_image"
   say "  agent image:   $agent_image"
+  [ -z "$allowed_namespaces" ] || say "  trusted:       $allowed_namespaces"
+  [ -z "$insecure_registries" ] || say "  plain HTTP:    $insecure_registries"
   if [ "$DRY" = 1 ]; then
     say ""
     say "dry run: nothing pulled, nothing started."
@@ -762,6 +800,8 @@ else
     printf 'QUASAR_TEMPLATE_ROOT=%s\n' "$template_root"
     printf 'QUASAR_AGENT_IMAGE=%s\n' "$agent_image"
     [ -z "$node_name" ] || printf 'QUASAR_NODE_NAME=%s\n' "$node_name"
+    [ -z "$allowed_namespaces" ] || printf 'QUASAR_UPDATER_ALLOWED_NAMESPACES=%s\n' "$allowed_namespaces"
+    [ -z "$insecure_registries" ] || printf 'QUASAR_PLATFORM_INSECURE_REGISTRIES=%s\n' "$insecure_registries"
   } > "$env_file"
   run_ok=1
   dk run -d --name "$SEED" --restart unless-stopped --security-opt label=disable \
@@ -892,7 +932,9 @@ summary() {
 
 case "$verdict" in
   enrolled)
-    if [ -n "$actors" ]; then
+    if [ "$reinstalled" = 1 ]; then
+      ok "enrolled afresh: this host is now '$shown_name' in Admin → Fleet."
+    elif [ -n "$actors" ]; then
       ok "already enrolled: this host is '$shown_name' in Admin → Fleet."
     else
       ok "enrolled: this host is now '$shown_name' in Admin → Fleet."
@@ -900,7 +942,12 @@ case "$verdict" in
     summary
     exit 0 ;;
   reconnected|connected)
-    ok "already enrolled: the node agent is connected to the control plane with its saved identity."
+    # After a reset or a re-add no saved identity is left: whatever answered enrolled now.
+    if [ "$reinstalled" = 1 ]; then
+      ok "enrolled afresh: this host is now '$shown_name' in Admin → Fleet."
+    else
+      ok "already enrolled: the node agent is connected to the control plane with its saved identity."
+    fi
     summary
     exit 0 ;;
   live)
