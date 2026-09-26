@@ -1324,7 +1324,14 @@ agent and control-plane images declare a recipe revision the actor carries (it p
 The actor reads them from the seed's container once, on the clean
 machine (a redeployed seed with a new container id is found by what it runs, a running seed first), so the
 enrollment string never enters the actor's environment. Once the machine is installed they
-are not needed again, and the enrollment string can be removed from the stack.
+are not needed again. **The enrollment string is single use**: it is spent when the host
+enrolls, and you can delete it from the stack then. Left in place it is harmless: a seed that
+the manager updates, restarts or re-creates on an installed machine finds the recovery actor
+and creates nothing, and no input is read again. A host removed from the console, or
+uninstalled keeping its data, is not brought back by redeploying its stack: its seed stays
+idle. Clear it first (`uninstall --purge`, "Taking a machine apart" below), then deploy the
+stack with a new string from Add host, or add it back with the one-line command, which clears
+it for you.
 
 ### Combined and control-only machines (#361)
 

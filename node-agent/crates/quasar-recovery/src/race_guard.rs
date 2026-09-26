@@ -45,14 +45,27 @@ pub fn conflicts(
     installation: Option<&str>,
     me: Option<&str>,
 ) -> Vec<Conflict> {
+    // A look-alike in the same Compose project as this machine's seed is a stack manager's
+    // current definition, not a leftover install.
+    let seed_projects: Vec<&str> = containers
+        .iter()
+        .filter(|c| crate::seed::is_seed(c))
+        .filter_map(|c| c.labels.get(COMPOSE_PROJECT).map(String::as_str))
+        .collect();
     containers
         .iter()
-        .filter_map(|c| conflict(c, installation, me))
+        .filter_map(|c| conflict(c, installation, me, &seed_projects))
         .collect()
 }
 
-/// The conflict `c` is, if it is one.
-pub fn conflict(c: &Container, installation: Option<&str>, me: Option<&str>) -> Option<Conflict> {
+/// The conflict `c` is, if it is one. `seed_projects` are the Compose projects of the seeds
+/// on the machine.
+fn conflict(
+    c: &Container,
+    installation: Option<&str>,
+    me: Option<&str>,
+    seed_projects: &[&str],
+) -> Option<Conflict> {
     if me.is_some_and(|me| same_id(me, &c.id)) || crate::seed::is_seed(c) {
         return None;
     }
@@ -66,6 +79,9 @@ pub fn conflict(c: &Container, installation: Option<&str>, me: Option<&str>) -> 
     let (role, why) = looks_like(c)?;
     let why = match (label, c.labels.get(COMPOSE_PROJECT)) {
         (Some(other), _) => format!("{why}, of another installation ({other})"),
+        (None, Some(project)) if seed_projects.contains(&project.as_str()) => format!(
+            "defined in the Compose project {project} beside this machine's seed, so the stack manager runs it; take it out of that stack"
+        ),
         (None, Some(project)) => format!(
             "part of the Compose project {project}, probably left from an older Compose install"
         ),

@@ -85,8 +85,12 @@ fn main() -> ExitCode {
 }
 
 /// Every socket an actor may serve, in this container. Fixed, not configurable: the recipes
-/// name the same paths, and an actor listening anywhere else would never be reached.
+/// name the same paths, and an actor listening anywhere else would never be reached. The
+/// operator socket comes first: it is the only one whose `result` is the machine's latest
+/// attempt whoever submitted it (the others show only their own caller's), so an operator's
+/// `reconfigure` is visible here.
 const SOCKETS: &[&str] = &[
+    operator::SOCKET,
     paths::AGENT_SOCKET,
     paths::SPLIT_AGENT_SOCKET,
     paths::CONTROL_SOCKET,
