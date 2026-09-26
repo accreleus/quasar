@@ -4,7 +4,17 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+# #355: the node-agent directory is also a workspace root, so the GStreamer-free
+# runtime crate the recovery actor reuses builds from the same tree and the same
+# single Cargo.lock. The root package stays the default member: a bare `cargo build`
+# here still builds only the agent (plus the crate as its dependency), and every
+# fmt/clippy/test gate passes `--workspace` / `--all` explicitly.
+[workspace]
+members = ["crates/quasar-runtime", "crates/quasar-recovery"]
+
 [dependencies]
+# #355: the engine facade, ownership labels and durable-state primitives.
+quasar-runtime = { path = "crates/quasar-runtime" }
 tempfile = "3"
 anyhow = "1"
 # Docker context ignore matching (already pinned transitively in Cargo.lock).
@@ -117,6 +127,12 @@ cuda = []
 pkg-config = "0.3"
 
 [dev-dependencies]
+# Test-only owner injection on the shared `RuntimeConfig` (`diagnostic_owner`); a dev
+# dependency, so no production build carries it.
+quasar-runtime = { path = "crates/quasar-runtime", features = ["test-support"] }
+# #360: the owned-install relay is tested against the real recovery actor and its
+# in-memory engine.
+quasar-recovery = { path = "crates/quasar-recovery", features = ["test-support"] }
 # SO-03: micro-benchmark the per-frame encode-metrics hot path (record_encode_in/out).
 criterion = "0.8"
 # P5-03: temporary directories for home module unit tests.

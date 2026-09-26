@@ -165,7 +165,8 @@ fn the_gpu_probe_lifecycle_budget_stays_where_the_arithmetic_put_it() {
 /// whole refresh's worth of them still lands inside the staleness window.
 #[test]
 fn the_engine_inspection_budget_stays_small() {
-    let text = production("runtime.rs");
+    // Defined by the shared runtime crate (#355); the agent re-exports it.
+    let text = production("../crates/quasar-runtime/src/client.rs");
     assert!(
         text.contains("pub const ENGINE_INSPECTION_BUDGET: Duration = Duration::from_secs(5)"),
         "ENGINE_INSPECTION_BUDGET is the one knob the refresh-path bound rests on; \

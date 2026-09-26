@@ -1,0 +1,71 @@
+{
+  "shape": "status",
+  "about": "A GPU host mid-replacement: the in-flight attempt's result is included.",
+  "body": {
+    "actor": {
+      "version": "0.4.0",
+      "commit": "cccccccccccccccccccccccccccccccccccccccc",
+      "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+      "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+    },
+    "seed": {
+      "version": "0.4.0",
+      "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+    },
+    "role": "gpu",
+    "node_name": "gpu-host-4",
+    "database": "none",
+    "services": [
+      {
+        "role": "recovery-actor",
+        "container": "quasar-recovery",
+        "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+        "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000",
+        "state": "running",
+        "health": "healthy"
+      },
+      {
+        "role": "node-agent",
+        "container": "quasar-node-agent",
+        "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+        "digest": "sha256:1b7e000000000000000000000000000000000000000000000000000000000def",
+        "state": "running",
+        "health": "healthy"
+      }
+    ],
+    "conflicts": [],
+    "in_flight": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "dumps": [],
+    "dump_free_bytes": null,
+    "result": {
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "state": "pulling",
+      "reason": null,
+      "components": [
+        {
+          "name": "node-agent",
+          "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+          "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "previous": [
+        {
+          "name": "node-agent",
+          "digest": "sha256:1b7e000000000000000000000000000000000000000000000000000000000def"
+        }
+      ],
+      "output": "",
+      "started_at": "2026-09-25T11:04:02Z",
+      "updated_at": "2026-09-25T11:04:31Z",
+      "finished_at": null,
+      "restored": false,
+      "release": {
+        "id": "rel-0.3.0",
+        "version": "0.3.0",
+        "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+      },
+      "dump": null
+    },
+    "stale": false
+  }
+}

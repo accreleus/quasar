@@ -28,6 +28,13 @@ On first boot, if no admin exists, the control plane writes a random token to a
 file inside the container. It is never logged and never printed. Read it with:
 
 ```bash
+docker exec quasar-control-plane cat /run/quasar/setup-token
+```
+
+On a [legacy Compose install](/quasar/install/legacy-compose/), run it through
+Compose from the stack directory instead:
+
+```bash
 docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
   cat /run/quasar/setup-token
 ```
@@ -45,8 +52,11 @@ restarts before you claim. Read it again; do not reuse an old one.
 
 ### Or skip the wizard entirely
 
-If you would rather provision the admin from configuration, set all three of
-these in `deploy/.env` before the first boot:
+Not on an owned install: the seed takes no admin account, so the setup token is
+the way in. On a [legacy Compose install](/quasar/install/legacy-compose/) or a
+source checkout, the control plane can instead provision the admin from three
+settings at its first boot. Set all three in `deploy/.env` before the first
+boot:
 
 ```bash
 BOOTSTRAP_ADMIN_EMAIL=you@example.com
@@ -101,8 +111,17 @@ not writable, input device rules absent.
 
 Nothing here blocks you. A failing check warns and links you to Admin, Fleet,
 Hosts. For storage, the wizard can keep the agent-reported root or select one of
-its subdirectories. Moving to an entirely different root requires changing
-`QUASAR_HOME_ROOT` and redeploying so the bind mount moves too.
+its subdirectories. Moving to an entirely different root means changing the
+machine's home root, so the bind mount moves too. On an owned host that is
+`reconfigure`, run inside its recovery actor, which replaces the agent with the
+new root and puts it back if it does not verify. On a combined host it replaces
+the control plane first, then the agent:
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
+```
+
+Changing the root does not move existing homes; see [Storage](/quasar/admin/hosts/#storage).
 
 <Shot
 	label="Setup wizard, hosts step"
@@ -140,8 +159,10 @@ Admin, Settings:
 - Add a SteamGridDB API key for cover artwork.
 - Enable or disable browser microphone capture.
 - Start the first Steam library scan when discovery is enabled.
-- Back up `deploy/.env`, which contains the irreplaceable
-  `QUASAR_SECRET_KEY`.
+- A reminder that `QUASAR_SECRET_KEY` cannot be recovered. On an owned install it
+  lives in the `quasar-machine` volume, the one volume on each machine that must
+  never be deleted, and the wizard says so. On a legacy Compose install it is in
+  `deploy/.env`, and the wizard tells you to back that file up.
 
 The scan is best-effort. A failed or slow scan does not trap you in the wizard;
 you can run it later from the administration area.

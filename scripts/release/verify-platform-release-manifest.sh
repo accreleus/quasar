@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Verify a detached platform-release-manifest signature against one or more
-# trusted public keys — the shell twin of the updater's verifier
-# (control-plane/internal/updater/signature.go `VerifyManifestSignature`), for
-# the release job's self-check and for an operator checking a release by hand.
+# trusted public keys — the shell twin of the recovery actor's verifier
+# (node-agent/crates/quasar-recovery/src/trust/signature.rs), for the release job's self-check and for an operator checking a release
+# by hand.
 #
-# THE NORMATIVE VERIFIER IS THE UPDATER'S. This script must agree with it: any
+# THE NORMATIVE VERIFIER IS THE RECOVERY ACTOR'S. This script must agree with it: any
 # signature by any trusted key verifies the document, and the key_id is a label,
 # never what makes a signature good.
 #

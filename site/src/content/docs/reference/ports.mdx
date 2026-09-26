@@ -187,11 +187,44 @@ proxy that closes idle connections after a minute cuts sessions and drops agents
 
 ## Volumes
 
+On a Quasar-owned machine the recovery actor creates the volumes by fixed name:
+
+| Volume | Contents |
+| --- | --- |
+| `quasar-machine` | Machine state: the machine's inputs, its generated secrets, the record of every update, the last verified shape of each service, the pre-update dumps and the seed's state file. **Never delete it.** |
+| `quasar-recovery-agent` | The socket the agent uses to reach its recovery actor. |
+| `quasar-agent-data` | The agent's node secret and saved identity. |
+| `quasar-node-agent-secrets` | The agent's secrets, such as the enrollment string, written by the recovery actor and mounted read-only. |
+| `quasar-nvidia-driver` | NVIDIA hosts only. Driver userspace provisioned from the running kernel module. |
+| `quasar-postgres-data` | The first machine, with Quasar's own database: the database. |
+| `quasar-postgres-secrets` | The database password, as a file for Postgres. |
+| `quasar-control-data` | The first machine: the control plane's TLS certificate and artwork cache. It outlives every replacement of the container. |
+| `quasar-control-plane-secrets` | The control plane's database password, secret key and, on a combined host, local enrollment token, as files. |
+| `quasar-final-dump` | Only after `uninstall --purge` on a machine with Quasar's own database: the final dump. A purge never deletes it. |
+| The managed home root | A host bind mount, not a volume. User saves and installed content. |
+
+The first machine also has a `quasar-platform` bridge network, on which the
+control plane reaches Postgres by name.
+
+Removing the seed never removes a volume, and neither does removing a
+container. Uninstalling a machine keeps the database, machine state, the agent's
+identity and the homes. `uninstall --purge` removes this installation's volumes
+and network and empties machine state, after a final dump of Quasar's own
+database; it never touches the homes, or a database you run yourself. See
+[Uninstalling](/quasar/operations/uninstall/).
+
+On a [legacy Compose install](/quasar/install/legacy-compose/):
+
 | Volume | Contents |
 | --- | --- |
 | `quasar-postgres-data` | The database. |
 | `quasar-control-tls` | TLS certificate and artwork cache. |
 | `quasar-agent-data` | The agent's per-node enrollment secret. |
+| `quasar-updater-run` | The updater's socket and one result file per apply. |
+| `quasar-nvidia-driver` | NVIDIA hosts only. Driver userspace provisioned from the running kernel module. |
 | The managed home root | A host bind mount, not a Compose volume. User saves and installed content. |
 
-`docker compose down -v` destroys the first three and never touches the fourth.
+Compose prefixes each volume name with the project name, so on disk they read
+`<project>_quasar-postgres-data` and so on: `deploy_…` for a stack directory named
+`deploy`. `docker compose down -v` destroys every
+volume in the table and never touches the home root.

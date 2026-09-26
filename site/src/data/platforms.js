@@ -6,7 +6,8 @@
  * module have to be persisted in /boot/config/go instead. It is also Slackware
  * rather than systemd, so `systemctl restart docker` does not exist there. A
  * quick start that ignored either would produce an install that works until the
- * machine is rebooted and then quietly streams badly.
+ * machine is rebooted and then quietly streams badly. The script never restarts
+ * Docker, so the init system matters only for these two settings.
  *
  * The systemd distributions differ from each other only in ways this wizard
  * does not touch (package managers, which we never invoke), so they share one
@@ -45,7 +46,6 @@ grep -q 'modprobe uinput' /boot/config/go || echo 'modprobe uinput' >> /boot/con
 
 const SYSTEMD = {
   sudo: 'sudo ',
-  dockerRestart: 'sudo systemctl restart docker',
   sysctl: () => systemdSysctl('sudo '),
   module: () => systemdModule('sudo '),
   defaultUid: 1000,
@@ -63,7 +63,7 @@ export const PLATFORMS = {
   debian: {
     ...SYSTEMD,
     label: 'Debian or Ubuntu',
-    note: 'Check that your Docker is Engine with Compose v2.20 or newer, not the older docker.io packages.',
+    note: 'Use Docker Engine from Docker\'s own repository. The older docker.io packages may predate what Quasar needs.',
   },
   arch: {
     ...SYSTEMD,
@@ -77,7 +77,6 @@ export const PLATFORMS = {
   },
   unraid: {
     sudo: '',
-    dockerRestart: '/etc/rc.d/rc.docker restart',
     sysctl: unraidSysctl,
     module: unraidModule,
     defaultUid: 99,
@@ -86,7 +85,7 @@ export const PLATFORMS = {
     ownerLabel: 'uid 99 and gid 100, the Unraid convention',
     label: 'Unraid',
     note:
-      'Unraid runs / from a ramdisk, so the sysctl and the uinput module are persisted in /boot/config/go rather than /etc. It is not systemd either, so Docker restarts through /etc/rc.d/rc.docker. The script handles all three. Commands run without sudo because the Unraid shell is already root.',
+      'Unraid runs / from a ramdisk, so the sysctl and the uinput module are persisted in /boot/config/go rather than /etc, and the script does that. Commands run without sudo because the Unraid shell is already root. In Dockge, keep the stacks directory under /mnt/user/appdata so the stack survives a reboot.',
   },
 };
 

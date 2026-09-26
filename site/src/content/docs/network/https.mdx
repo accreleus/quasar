@@ -1,6 +1,6 @@
 ---
 title: HTTPS and certificates
-description: Quasar generates its own certificate on first boot. How to trust it properly, and how to supply your own instead.
+description: Quasar generates its own certificate on first boot. Which names it claims, and how to trust it properly.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
@@ -17,15 +17,18 @@ On first boot the control plane writes a self-signed certificate into its state
 directory and reuses it from then on. Nothing to configure, and no re-prompting
 after a restart.
 
-The one thing you must get right is which names it claims. Set them before you
-start the stack:
+The one thing you must get right is which names it claims. On an owned install
+they are two seed inputs, read at the first install:
 
-```bash
-QUASAR_TLS_HOSTS=192.168.1.50,quasar.lan
+```yaml
+      QUASAR_PUBLIC_HOST: "192.0.2.50"
+      QUASAR_TLS_HOSTS: "quasar.lan,quasar.vpn.example"
 ```
 
 List every address anyone will type into a browser. LAN IP, hostname, VPN
-address, all of them.
+address, all of them. Get them right the first time: they can be changed later
+with `reconfigure`, but the certificate then has to be re-issued (below). On a legacy Compose install the list is `QUASAR_TLS_HOSTS`
+in `deploy/.env`.
 
 <Aside type="caution" title="Without this you get a name error, not a trust prompt">
 Left unset, the certificate names `localhost`, the loopback addresses, and
@@ -33,7 +36,7 @@ whatever the control plane can see on its own interfaces. That last set is the
 trap: it runs in a container, so it sees a Docker bridge address like
 `172.18.0.3` and never the host's real LAN address.
 
-Visit `https://192.168.1.50:8443` and you get `ERR_CERT_COMMON_NAME_INVALID`.
+Visit `https://192.0.2.50:8443` and you get `ERR_CERT_COMMON_NAME_INVALID`.
 Clicking through does not help, because the certificate does not claim that
 address at all. There is nothing to trust.
 </Aside>
@@ -63,8 +66,7 @@ Access, set to Always Trust. On Windows it is the Trusted Root Certification
 Authorities store. On Linux it varies by distribution, usually
 `/usr/local/share/ca-certificates` followed by `update-ca-certificates`.
 
-Trusting it only helps if it names the address you actually use, so fix
-`QUASAR_TLS_HOSTS` first.
+Trusting it only helps if it names the address you actually use.
 
 ### Check the fingerprint first
 
@@ -76,14 +78,34 @@ The control plane logs the fingerprint at startup. Compare it against what your
 browser shows:
 
 ```bash
-docker compose -f deploy/docker-compose.yml logs quasar-control-plane | grep fingerprint
+docker logs quasar-control-plane 2>&1 | grep fingerprint
 ```
+
+On a legacy Compose install, use `docker compose -f deploy/docker-compose.yml logs
+quasar-control-plane` instead.
 
 ## Adding a name later
 
-The certificate is generated once and kept for ten years, so adding a name to
-`QUASAR_TLS_HOSTS` afterwards does nothing by itself. Delete the certificate and
-let it regenerate.
+**On an owned install**, the names are machine inputs of the first machine.
+Change them with `reconfigure`, which replaces the control plane with the new
+names, then re-issue the certificate, which is generated once and kept:
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
+  QUASAR_TLS_HOSTS=quasar.lan,quasar.vpn.example,192.0.2.50
+docker exec quasar-control-plane rm -f /var/lib/quasar-control/tls/cert.pem /var/lib/quasar-control/tls/key.pem
+docker restart quasar-control-plane
+```
+
+The new certificate has a new fingerprint. Browsers ask again, and GPU hosts you
+added stop connecting until you add them again from **Admin, Fleet, Add host**. A
+combined host's own agent is not affected. To avoid that, reach Quasar by a name
+the certificate already has, or put a [reverse proxy](/quasar/network/reverse-proxy/)
+in front for the new name.
+
+On a legacy Compose install the certificate is generated once and kept for ten
+years, so adding a name to `QUASAR_TLS_HOSTS` afterwards does nothing by itself.
+Delete the certificate and let it regenerate.
 
 <Steps>
 
@@ -109,9 +131,13 @@ old one warns again, and every machine you added it to needs the new one.
 
 ## Supplying your own certificate
 
-If you have a certificate already, from an internal certificate authority or a
-public one for a name you own, Quasar will serve it instead. Mount both PEM
-files into the container and point at them:
+**An owned install takes no certificate of its own in this release.** To serve a
+certificate from your own authority, or a public one for a name you own, put a
+[reverse proxy](/quasar/network/reverse-proxy/) in front that terminates TLS with
+it.
+
+On a legacy Compose install, Quasar will serve it directly. Mount both PEM files
+into the container and point at them in `deploy/.env`:
 
 ```bash
 QUASAR_TLS_CERT=/etc/quasar/tls/cert.pem
@@ -148,14 +174,23 @@ an explicit list. See [Behind a reverse proxy](/quasar/network/reverse-proxy/).
 
 ## Turning TLS off
 
-```bash
-QUASAR_TLS=off
-```
-
-HTTP only, and you lose gamepads, Escape capture and microphone with it. Only do
-this when something in front of Quasar is providing HTTPS.
+A legacy Compose install can set `QUASAR_TLS=off` in `deploy/.env`: HTTP only, and
+you lose gamepads, Escape capture and microphone with it. Only do this when
+something in front of Quasar is providing HTTPS. An owned install always serves
+HTTPS on its TLS port; a proxy in front simply forwards to the HTTP port instead.
 
 ## Settings
+
+On an owned install:
+
+| Seed input | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_PUBLIC_HOST` | unset | The name or address the console is reached by. The certificate claims it. |
+| `QUASAR_TLS_HOSTS` | unset | More names and IPs the certificate claims, comma-separated. |
+| `QUASAR_TLS_PORT` | `8443` | The host port of the HTTPS listener. Browser routes on the HTTP port redirect here. |
+| `QUASAR_HTTP_PORT` | `8080` | The host port of the HTTP listener. |
+
+On a legacy Compose install, in `deploy/.env`:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |

@@ -56,6 +56,12 @@ type RegisterMsg struct {
 	BuiltAt        *string `json:"built_at"`
 	InstallMode    *string `json:"install_mode"`
 	UpdaterPresent *bool   `json:"updater_present"`
+
+	// Owned-install identity (amendment 14): read only beside install_mode
+	// "owned", replaced wholesale like the four above.
+	RecoveryActorVersion      *string `json:"recovery_actor_version"`
+	RecoveryActorSourceCommit *string `json:"recovery_actor_source_commit"`
+	SeedVersion               *string `json:"seed_version"`
 }
 
 // AuthEnrollment is the auth field on first contact.

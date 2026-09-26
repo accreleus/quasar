@@ -88,6 +88,14 @@ pub enum AgentMsg {
         install_mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         updater_present: Option<bool>,
+        /// Owned installs (amendment 14): sent only beside `install_mode: "owned"`, each
+        /// omitted when the recovery actor did not say.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_actor_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_actor_source_commit: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seed_version: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source_policy_versions: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1230,6 +1238,13 @@ pub enum ControlMsg {
         #[serde(default)]
         force: bool,
     },
+    /// Remove this owned GPU host's node agent and recovery actor (agent-api.md
+    /// `host_remove`, amendment 14): handed to the recovery actor, acked on acceptance, and
+    /// followed by nothing, since this agent is the first thing removed.
+    HostRemove {
+        id: String,
+        request_id: String,
+    },
     /// Future additions land here until handled.
     #[serde(other)]
     Unknown,
@@ -1989,6 +2004,9 @@ mod tests {
             built_at: None,
             install_mode: None,
             updater_present: None,
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"], serde_json::json!([]));
@@ -2017,6 +2035,9 @@ mod tests {
             built_at: None,
             install_mode: None,
             updater_present: None,
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         for key in [
@@ -2024,6 +2045,9 @@ mod tests {
             "built_at",
             "install_mode",
             "updater_present",
+            "recovery_actor_version",
+            "recovery_actor_source_commit",
+            "seed_version",
         ] {
             assert!(json.get(key).is_none(), "{key} must be absent, got {json}");
         }
@@ -2050,6 +2074,9 @@ mod tests {
             install_mode: Some("registry".to_string()),
             // `false` is a real answer and must reach the wire.
             updater_present: Some(false),
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -2085,6 +2112,9 @@ mod tests {
             built_at: None,
             install_mode: None,
             updater_present: None,
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"][0]["image_id"], "steam");

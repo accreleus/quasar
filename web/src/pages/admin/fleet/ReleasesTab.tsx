@@ -11,13 +11,15 @@
  * targets card's "Per-host detail" disclosure.
  *
  * The per-host apply half is #116 (ApplyControls.tsx); fleet apply and revert
- * are #117/#118.
+ * are #117/#118; developer apply is #360 (DeveloperApply.tsx).
  */
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
   JobsResponse,
+  PlatformApplyAttempt,
+  PlatformApplyAttemptsResponse,
   PlatformHostIdentity,
   PlatformRelease,
   PlatformReleaseTarget,
@@ -38,6 +40,9 @@ import { TextField } from "../../../components/TextField";
 import { IconChevronDown, IconDownload, IconRefresh } from "../../../components/icons";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { relativeTime } from "../../../lib/format/relativeTime";
+import { clockTime } from "../../../lib/format/clockTime";
+import { ThisMachineBlock } from "./ThisMachine";
+import { isOwnedMachine, thisMachine, type MachineReport } from "./thisMachine";
 import { manualUpdatePath } from "../../../lib/platform/manualUpdate";
 import {
   parseReleaseNotes,
@@ -53,7 +58,16 @@ import {
   attemptForTarget,
   useHostSessionCounts,
 } from "./ApplyControls";
+import { DeveloperApplyCard } from "./DeveloperApply";
 import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel, LastRunPanel } from "./FleetApply";
+import {
+  failedMigration,
+  failedMigrationStatus,
+  ownedControlPlane,
+  refusedDump,
+  restoreCardFor,
+} from "./migratingUpdate";
+import { RefusedBanner, RestoreCard } from "./MigratingUpdateCards";
 import { blockingChecks, holdoutText, unknownChecks } from "./preflight";
 import {
   FailedAttemptPanel,
@@ -67,8 +81,10 @@ import {
   hasUpdate,
   olderEdgeCandidate,
   preflightCheckText,
+  prefixed,
   releaseLabel,
   shortCommit,
+  stamp,
 } from "./releasesCopy";
 import "../../../styles/admin/fleet.css";
 
@@ -84,28 +100,6 @@ const CHANNEL_OPTIONS: { value: ReleaseChannel; label: string }[] = [
 
 function when(iso: string | null | undefined): string {
   return iso ? relativeTime(iso) : "—";
-}
-
-/** An instant as the console prints a release's publication: "5 Sep 2026,
- *  14:59". UTC, because every timestamp on this page is a UTC instant and the
- *  next-check line beside it is a UTC cron. */
-function stamp(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  const date = new Intl.DateTimeFormat("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC",
-  }).format(d);
-  const time = new Intl.DateTimeFormat("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-    timeZone: "UTC",
-  }).format(d);
-  return `${date}, ${time}`;
 }
 
 /** "Mon 02:00 UTC" — the detection job's next scheduled run. */
@@ -171,6 +165,26 @@ export function ReleasesTab() {
   const nextCheck = useNextCheck();
   // Bumped on every apply, so the history reloads without polling it too.
   const [applied, setApplied] = useState(0);
+  // The apply history, read once here: the rail lists it, and the banner reads its newest
+  // control-plane attempt for a refused dump or a failed migration (#364).
+  const history = useResource<PlatformApplyAttemptsResponse>(
+    {
+      label: "apply history",
+      fetch: ({ token: t, signal }) => adminApi.listPlatformAttempts(t, { limit: 50 }, signal),
+    },
+    [applied],
+  );
+  // An attempt that settles while the view polls changes the history too.
+  const activeKey = (view?.active_apply?.attempts ?? []).map((a) => `${a.id}:${a.state}`).join(",") +
+    `|${view?.active_apply?.run?.id ?? ""}`;
+  const lastActiveKey = useRef(activeKey);
+  const refreshHistory = history.refresh;
+  useEffect(() => {
+    if (lastActiveKey.current === activeKey) return;
+    lastActiveKey.current = activeKey;
+    void refreshHistory({ silent: true });
+  }, [activeKey, refreshHistory]);
+  const attempts = history.data?.attempts ?? [];
 
   // "Check now" is the jobs run-now action: this page's read never triggers
   // detection (control-api.md).
@@ -191,7 +205,11 @@ export function ReleasesTab() {
           <IconRefresh /> Check now
         </Button>
         {view && (
-          <FleetApplyButton view={view} onStarted={() => void res.refresh()}>
+          <FleetApplyButton
+            view={view}
+            onStarted={() => void res.refresh()}
+            onRecheck={() => res.refresh()}
+          >
             <IconDownload /> Update Quasar
           </FleetApplyButton>
         )}
@@ -229,7 +247,7 @@ export function ReleasesTab() {
             </Card>
           ) : (
             <>
-              <UpdateBanner view={view} />
+              <AttentionBanner view={view} attempts={attempts} />
               <LastRunPanel
                 key={applied}
                 targets={view.targets}
@@ -245,7 +263,7 @@ export function ReleasesTab() {
               <ReleaseFeed view={view} />
             </div>
             <div className="rel-rail">
-              <InstalledCard view={view} />
+              <InstalledCard view={view} updatedAt={res.updatedAt ?? null} />
               <TargetsCard
                 view={view}
                 refreshKey={applied}
@@ -257,15 +275,47 @@ export function ReleasesTab() {
               <ChannelCard view={view} onSaved={() => void res.refresh()} />
               <NotificationsCard view={view} onSaved={() => void res.refresh()} />
               <RailCard title="Apply history">
-                <ApplyHistory refreshKey={applied} />
+                <ApplyHistory
+                  loading={history.loading}
+                  error={history.errorMessage}
+                  attempts={history.data?.attempts}
+                  statusFor={(a) => {
+                    const failed = failedMigration(a, view);
+                    return failed ? failedMigrationStatus(failed) : null;
+                  }}
+                />
               </RailCard>
               <FaultsCard view={view} />
+              <DeveloperApplyCard
+                view={view}
+                onApplied={() => {
+                  setApplied((n) => n + 1);
+                  void res.refresh();
+                }}
+              />
             </div>
           </div>
         </>
       )}
     </>
   );
+}
+
+/** What sits above the split: after a failed migrating control-plane update the restore
+ *  card, after a refused dump the refusal, and otherwise the update banner (rh06
+ *  restore-*.png, update-refused.png). */
+function AttentionBanner({
+  view,
+  attempts,
+}: {
+  view: PlatformReleaseView;
+  attempts: PlatformApplyAttempt[];
+}) {
+  const restore = restoreCardFor(attempts, view);
+  if (restore) return <RestoreCard view={view} failed={restore} />;
+  const refused = refusedDump(attempts, view);
+  if (refused) return <RefusedBanner view={view} refused={refused} />;
+  return <UpdateBanner view={view} />;
 }
 
 /** The banner above the split: the version step this instance can take, or the
@@ -301,6 +351,7 @@ function UpdateBanner({ view }: { view: PlatformReleaseView }) {
           <span className="rel-version">
             {prefixed(from)} <span className="rel-arrow">→</span> {prefixed(releaseLabel(newest))}
           </span>
+          {newest.migrates && <Chip variant="warning">Changes the database</Chip>}
           {newest.prerelease && <Chip variant="warning">Pre-release</Chip>}
         </div>
         <div className="hint mt2">
@@ -309,16 +360,57 @@ function UpdateBanner({ view }: { view: PlatformReleaseView }) {
         </div>
       </div>
       <div className="hint rel-update-why">
-        Updating moves the control plane first, then each eligible host in sequence, stopping at
-        the first failure. Hosts are cordoned during their apply and wait for zero sessions.
+        <UpdateWhy view={view} migrates={newest.migrates ?? true} />
       </div>
     </Card>
   );
 }
 
-/** A version reads as "v0.2.0"; a bare commit (edge) does not take the v. */
-function prefixed(label: string): string {
-  return /^\d/.test(label) ? `v${label}` : label;
+/** Whether any machine of this instance is Quasar-owned: then every update moves that
+ *  machine's recovery actor first (ADR 0008). */
+function ownedFleet(view: PlatformReleaseView): boolean {
+  return (
+    isOwnedMachine(view.installed.control_plane) ||
+    view.installed.hosts.some((h) => h.install_mode === "owned")
+  );
+}
+
+/** The banner's account of what the update does to sessions. */
+function UpdateWhy({ view, migrates }: { view: PlatformReleaseView; migrates: boolean }) {
+  const order =
+    "Updating moves the control plane first, then each eligible host in sequence, stopping at the first failure.";
+  if (!migrates) {
+    return (
+      <>
+        {order} This release does not change the database, so live sessions keep streaming while
+        the control plane restarts. Each host&rsquo;s sessions end when that host is updated.
+      </>
+    );
+  }
+  // An owned control plane takes a migration behind a way back (#364): Quasar's own
+  // database is dumped first; the operator's own needs their confirmed backup.
+  if (ownedControlPlane(view)) {
+    const mode = view.installed.control_plane.database_mode;
+    const first =
+      mode === "owned"
+        ? "Quasar dumps its database before the control plane moves"
+        : mode === "external"
+          ? "Quasar needs your confirmation that you have a current backup of your own database before the control plane moves"
+          : "before the control plane moves, Quasar dumps its own database, or needs your confirmation of a backup of yours";
+    return (
+      <>
+        This release changes the database, so it is never applied unattended. The update waits
+        for every session to end, and {first}. Each host&rsquo;s sessions end when that host is
+        updated.
+      </>
+    );
+  }
+  return (
+    <>
+      {order} This release changes the database, so it is never applied unattended, and the
+      update waits for every session to end before the control plane moves.
+    </>
+  );
 }
 
 function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
@@ -355,7 +447,8 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
         ) : (
           "GitHub Releases"
         )}
-        {repo && ` on ${repo}`}. The updater follows the version tag; images are applied by digest.
+        {repo && ` on ${repo}`}.{" "}
+        Each machine’s recovery actor applies images by digest, never by tag.
       </p>
     </>
   );
@@ -495,18 +588,32 @@ function NoNotes({ release, edge }: { release: PlatformRelease; edge: boolean })
   );
 }
 
-function InstalledCard({ view }: { view: PlatformReleaseView }) {
+export function InstalledCard({
+  view,
+  updatedAt,
+}: {
+  view: PlatformReleaseView;
+  updatedAt: number | null;
+}) {
   const cp = view.installed.control_plane;
   const hosts = view.installed.hosts;
+  // The last report of this machine seen on this page, for when its recovery actor stops
+  // answering (the identity then reads null, as for a machine that is not owned).
+  const last = useRef<MachineReport | null>(null);
+  const at = updatedAt ?? Date.now();
+  const machine = thisMachine(cp, last.current, hosts, (t) =>
+    clockTime(new Date(t).toISOString(), { seconds: false }),
+  );
+  useEffect(() => {
+    if (isOwnedMachine(cp)) last.current = { identity: cp, at };
+  }, [cp, at]);
   const repo = view.source_repo ?? "";
   const commitUrl = gh(repo, `commit/${cp.source_commit}`);
-  const versions = new Set(hosts.map((h) => h.agent_version).filter(Boolean));
-  const agents =
-    hosts.length === 0
-      ? "none registered"
-      : `${hosts.length} host${hosts.length === 1 ? "" : "s"} · ${
-          versions.size === 1 ? prefixed([...versions][0] as string) : "mixed"
-        }`;
+  const onCp = hosts.filter((h) => cp.version && h.agent_version === cp.version).length;
+  const agentSpread =
+    onCp === hosts.length
+      ? `all on ${prefixed(cp.version)}`
+      : `${onCp} on ${prefixed(cp.version)} · ${hosts.length - onCp} older`;
 
   return (
     <RailCard title="Installed">
@@ -525,7 +632,17 @@ function InstalledCard({ view }: { view: PlatformReleaseView }) {
       <Fact label="Schema">
         <span className="num">{cp.schema_version}</span>
       </Fact>
-      <Fact label="Node agents">{agents}</Fact>
+      <Fact label="Node agents">
+        {hosts.length === 0 ? (
+          "none registered"
+        ) : (
+          <span className="rel-fact-sub">
+            {hosts.length} host{hosts.length === 1 ? "" : "s"}
+            {cp.version && <div className="hint rel-machine-hint">{agentSpread}</div>}
+          </span>
+        )}
+      </Fact>
+      <ThisMachineBlock machine={machine} now={at} />
       {view.last_error && (
         <p className="form-error mt3" role="alert">
           Last release check failed: {view.last_error}
@@ -826,6 +943,9 @@ function TargetsCard({
   const ready = hostTargets.filter((t) => t.eligible).length;
   const holdouts = hostTargets.filter((t) => !t.eligible).slice(0, 3);
   const moreHoldouts = hostTargets.length - ready - holdouts.length;
+  // Offered only the update (amendment 14 below_floor): never a revert.
+  const belowFloor = new Set(view.installed.hosts.filter((h) => h.below_floor).map((h) => h.host_id));
+  const mustUpdate = hostTargets.filter((t) => t.eligible && t.host_id && belowFloor.has(t.host_id));
 
   const columns: TableColumn<PlatformReleaseTarget>[] = [
     {
@@ -833,25 +953,26 @@ function TargetsCard({
       header: "Target",
       render: (t) => (t.kind === "control_plane" ? "Control plane" : t.node_name),
     },
+    // Three columns, the reason under the state: the rail is 300 px, and a fourth
+    // column pushed Revert out of it.
     {
       key: "state",
       header: "State",
-      width: "220px",
       render: (t) => {
         const open = attemptForTarget(attempts, t);
         if (open) return <AttemptProgress attempt={open} />;
-        return <TargetChip target={t} older={t.kind === "control_plane" && olderEdgeCandidate(view, newest)} />;
+        const why = holdoutText(t);
+        return (
+          <span className="stack">
+            <TargetChip target={t} older={t.kind === "control_plane" && olderEdgeCandidate(view, newest)} />
+            {why && <span className="hint">{why}</span>}
+          </span>
+        );
       },
-    },
-    {
-      key: "why",
-      header: "Why",
-      render: (t) => (attemptForTarget(attempts, t) ? "" : holdoutText(t)),
     },
     {
       key: "action",
       header: "",
-      width: "170px",
       render: (t) => {
         // The control plane is #117's, and it is never revertible (ADR 0002).
         // An apply that has been sent cannot be forced or cancelled, so an open
@@ -859,18 +980,18 @@ function TargetsCard({
         if (t.kind !== "host" || !t.host_id || attemptForTarget(attempts, t)) return null;
         const back = reverts.get(t.host_id);
         return (
-          <>
+          <span className="stack">
             {t.eligible && newest && (
-              <Button variant="ghost" onClick={() => setConfirming(t)}>
+              <Button variant="ghost" size="sm" onClick={() => setConfirming(t)}>
                 Apply
               </Button>
             )}
-            {back?.digest && (
-              <Button variant="ghost" onClick={() => setReverting(t)}>
+            {back?.digest && !belowFloor.has(t.host_id) && (
+              <Button variant="ghost" size="sm" onClick={() => setReverting(t)}>
                 Revert
               </Button>
             )}
-          </>
+          </span>
         );
       },
     },
@@ -883,6 +1004,7 @@ function TargetsCard({
           ? `Evaluated against ${prefixed(releaseLabel(newest))}. `
           : "Nothing is listed to evaluate against. "}
         Control plane goes first; hosts follow in sequence, cordoned during their apply.
+        {ownedFleet(view) && " Each machine’s recovery actor is updated before its other services."}
       </p>
       <div className="mt3">
         <Fact label="Control plane">
@@ -900,8 +1022,14 @@ function TargetsCard({
           </span>
         </Fact>
       </div>
-      {holdouts.length > 0 && (
+      {holdouts.length + mustUpdate.length > 0 && (
         <div className="mt2">
+          {mustUpdate.map((t) => (
+            <div className="rel-holdout" key={`floor-${t.host_id}`}>
+              <span>{t.node_name}</span>
+              <span className="hint">must update first · included</span>
+            </div>
+          ))}
           {holdouts.map((t) => (
             <div className="rel-holdout" key={t.host_id ?? "cp"}>
               <span>{t.node_name}</span>

@@ -28,7 +28,9 @@ const (
 	DefaultAckTimeout = 10 * time.Second
 	// The overall apply deadline. Generous: a cold pull of a platform image on
 	// a slow link legitimately takes minutes, and this exists so a run can
-	// never wedge forever on one target.
+	// never wedge forever on one target. On an owned control plane it bounds
+	// only a silent recovery actor: one still answering is waited for, and its
+	// 300 s verify default (ActorRequest sends no wait_timeout_s) is the budget.
 	DefaultApplyDeadline = 15 * time.Minute
 	// How often the drain is re-counted, and how often a sent attempt is
 	// re-read for a terminal state written by the relay.
@@ -57,6 +59,7 @@ type applyStore interface {
 	SetPreviousDigests(ctx context.Context, attemptID string, previous []PreviousDigest) error
 	CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error)
 	OpenHostAttempt(ctx context.Context, hostID string) (Attempt, string, error)
+	HostActorCommit(ctx context.Context, hostID string) (*string, error)
 	OpenAttempts(ctx context.Context) ([]Attempt, error)
 	TerminalStandaloneAttemptsWithOwnedHolds(ctx context.Context) ([]Attempt, error)
 	Release(ctx context.Context, id string) (Release, error)
@@ -95,6 +98,11 @@ type ApplyDeps struct {
 	// Connected reports whether this host's agent is on the wire right now.
 	// Nil reads as connected, which sends and lets the send's own error decide.
 	Connected func(hostID string) bool
+	// DeveloperCommit reads the commit a developer apply's images carry, for an
+	// attempt this process did not create (a restart re-adopted it). A
+	// developer_apply row has no release to name its commit, and its digests
+	// name it immutably. Nil fails such an attempt before the send.
+	DeveloperCommit func(ctx context.Context, components []ComponentDigest) (string, error)
 }
 
 // Runner drives every in-flight attempt. Its state is the goroutine set and the
@@ -118,6 +126,9 @@ type Runner struct {
 	// Cleared ONLY by a register: a register is the only evidence the build
 	// changed (agent-api.md).
 	unsupported map[string]bool
+	// attempt id → the commit a developer apply's images carry: its success
+	// evidence and its release_apply provenance.
+	developerCommits map[string]developerEvidence
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -131,17 +142,18 @@ func NewRunner(store applyStore, deps ApplyDeps, log *slog.Logger) *Runner {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
-		store:        store,
-		deps:         deps,
-		log:          log,
-		AckTimeout:   DefaultAckTimeout,
-		Deadline:     DefaultApplyDeadline,
-		PollInterval: DefaultApplyPoll,
-		ConnectWait:  DefaultConnectWait,
-		running:      make(map[string]context.CancelFunc),
-		unsupported:  make(map[string]bool),
-		baseCtx:      ctx,
-		stop:         cancel,
+		store:            store,
+		deps:             deps,
+		log:              log,
+		AckTimeout:       DefaultAckTimeout,
+		Deadline:         DefaultApplyDeadline,
+		PollInterval:     DefaultApplyPoll,
+		ConnectWait:      DefaultConnectWait,
+		running:          make(map[string]context.CancelFunc),
+		unsupported:      make(map[string]bool),
+		developerCommits: make(map[string]developerEvidence),
+		baseCtx:          ctx,
+		stop:             cancel,
 	}
 }
 
@@ -207,6 +219,13 @@ func (r *Runner) Start(a Attempt) {
 			cancel()
 		}()
 		r.drive(ctx, a)
+		if a.Kind == KindDeveloperApply {
+			rctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+			if cur, err := r.store.Attempt(rctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+				r.forgetDeveloperCommit(a.ID)
+			}
+			done()
+		}
 	}()
 }
 
@@ -230,6 +249,55 @@ func (r *Runner) Supported(hostID string) bool {
 func (r *Runner) markUnsupported(hostID string) {
 	r.mu.Lock()
 	r.unsupported[hostID] = true
+	r.mu.Unlock()
+}
+
+// developerEvidence is what a developer_apply attempt's success rule needs.
+type developerEvidence struct {
+	commit string
+	// A register on `commit` proves nothing when the host already ran it: the old
+	// agent a failed attempt restored registers the same commit, possibly before its
+	// relayed failure (agent-api.md §release_state, "A successful node-agent apply
+	// is usually never reported…"). Then only the relayed outcome decides.
+	registerIsEvidence bool
+}
+
+// RememberDeveloperCommit records the commit the developer apply endpoint read
+// off the attempt's images and the commit the host ran before it, so neither the
+// send nor the register hook reads the registry again.
+func (r *Runner) RememberDeveloperCommit(attemptID, commit string, hostCommitBefore *string) {
+	r.mu.Lock()
+	r.developerCommits[attemptID] = developerEvidence{
+		commit:             commit,
+		registerIsEvidence: hostCommitBefore != nil && !commitsMatch(*hostCommitBefore, commit),
+	}
+	r.mu.Unlock()
+}
+
+// developerCommit is the commit a developer_apply attempt carries, and whether a
+// register on it is success evidence. An attempt re-adopted after a restart does
+// not know the host's earlier commit, so for it only the relayed outcome decides.
+func (r *Runner) developerCommit(ctx context.Context, a Attempt) (developerEvidence, error) {
+	r.mu.Lock()
+	ev, ok := r.developerCommits[a.ID]
+	r.mu.Unlock()
+	if ok {
+		return ev, nil
+	}
+	if r.deps.DeveloperCommit == nil {
+		return developerEvidence{}, errors.New("no registry reader is wired to read the images' commit")
+	}
+	commit, err := r.deps.DeveloperCommit(ctx, a.RequestedDigests)
+	if err != nil {
+		return developerEvidence{}, err
+	}
+	r.RememberDeveloperCommit(a.ID, commit, nil)
+	return developerEvidence{commit: commit}, nil
+}
+
+func (r *Runner) forgetDeveloperCommit(attemptID string) {
+	r.mu.Lock()
+	delete(r.developerCommits, attemptID)
 	r.mu.Unlock()
 }
 
@@ -373,6 +441,17 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	}
 
 	release := ReleaseRef{SourceCommit: ""}
+	if a.Kind == KindDeveloperApply {
+		// No release: `id` "", `version` null, and the images' own commit
+		// (agent-api.md §release_apply, amendment 14).
+		ev, err := r.developerCommit(ctx, a)
+		if err != nil {
+			r.log.Error("apply: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			r.fail(a.ID, ReasonInvalid, "the images' build identity could not be read: "+err.Error())
+			return false
+		}
+		release = ReleaseRef{SourceCommit: ev.commit}
+	}
 	if a.ReleaseID != nil {
 		rel, err := r.store.Release(ctx, *a.ReleaseID)
 		if err != nil {
@@ -611,23 +690,38 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 // (ADR 0004). Only after the apply is terminal, so the open-target index is
 // free; only for an apply, never for a revert that failed.
 func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep ReleaseStateReport) {
-	if failed.Kind != KindApply {
+	if failed.Kind != KindApply && failed.Kind != KindDeveloperApply {
 		return
 	}
-	requested := restoredDigests(failed.RequestedDigests, rep.Previous)
+	restored := failed.RequestedDigests
+	if len(restored) > 1 && failed.HostID != nil {
+		// The restored agent registered before relaying this, so the host's
+		// recorded actor is the one serving now.
+		// Neither commit known: which component was restored cannot be told, and a
+		// guessed row would offer the wrong revert.
+		want := r.attemptCommit(ctx, failed)
+		actor, err := r.store.HostActorCommit(ctx, *failed.HostID)
+		if want == "" || err != nil || actor == nil {
+			r.log.Warn("release_state says restored, but which component was put back cannot be told; no auto_revert recorded",
+				"attempt_id", failed.ID, "host_id", *failed.HostID, "token", "apply-auto-revert-component-unknown")
+			return
+		}
+		restored = restoredComponents(restored, commitsMatch(want, *actor))
+	}
+	requested := restoredDigests(restored, rep.Previous)
 	if len(requested) == 0 {
 		r.log.Warn("release_state says restored but named no previous digest; no auto_revert recorded",
 			"attempt_id", failed.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-revert-unrecorded")
 		return
 	}
-	previous := make([]PreviousDigest, 0, len(failed.RequestedDigests))
-	for _, c := range failed.RequestedDigests {
+	previous := make([]PreviousDigest, 0, len(restored))
+	for _, c := range restored {
 		d := c.Digest
 		previous = append(previous, PreviousDigest{Name: c.Name, Digest: &d})
 	}
 	row, err := r.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
 		Failed: failed, Requested: requested, Previous: previous,
-		Output: "restored by the updater after the apply failed (" + orEmpty(rep.Reason) + ")",
+		Output: "restored by the recovery actor after the apply failed (" + orEmpty(rep.Reason) + ")",
 	})
 	if err != nil {
 		r.log.Error("could not record the updater's automatic restore", "attempt_id", failed.ID,
@@ -636,6 +730,52 @@ func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep Relea
 	}
 	r.log.Warn("apply automatically reverted by the updater", "attempt_id", failed.ID,
 		"auto_revert_id", row.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-reverted")
+}
+
+// attemptCommit is the commit an attempt moves its host to: its release's, or a
+// developer apply's images'. Empty when neither can be named.
+func (r *Runner) attemptCommit(ctx context.Context, a Attempt) string {
+	if a.ReleaseID != nil {
+		if rel, err := r.store.Release(ctx, *a.ReleaseID); err == nil {
+			return rel.SourceCommit
+		}
+	}
+	if a.Kind == KindDeveloperApply {
+		if ev, err := r.developerCommit(ctx, a); err == nil {
+			return ev.commit
+		}
+	}
+	return ""
+}
+
+// names reports whether an attempt's components include `name`.
+func names(components []ComponentDigest, name string) bool {
+	for _, c := range components {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// namesOnly reports whether `name` is the attempt's only component.
+func namesOnly(components []ComponentDigest, name string) bool {
+	return len(components) == 1 && components[0].Name == name
+}
+
+// restoredComponents is the one component a failed, restored attempt put back
+// (ADR 0004 amendment, "one service per failure"): components are replaced in
+// order and the first failure stops the sequence, so it is the first one not on
+// the requested commit. `actorOnWant` is whether the host's recovery actor reports
+// the attempt's commit now; the wire names no per-component outcome.
+func restoredComponents(requested []ComponentDigest, actorOnWant bool) []ComponentDigest {
+	if len(requested) > 1 && requested[0].Name == ComponentRecovery && actorOnWant {
+		return requested[1:2]
+	}
+	if len(requested) > 1 {
+		return requested[:1]
+	}
+	return requested
 }
 
 // restoredDigests pairs the failed apply's components with the previous digests
@@ -672,9 +812,33 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 	if sourceCommit == nil || *sourceCommit == "" {
 		return
 	}
+	// Amendment 14: a request naming only the recovery actor never replaced the
+	// agent, so its register proves nothing; the relayed terminal state decides.
+	if namesOnly(a.RequestedDigests, ComponentRecovery) {
+		return
+	}
+	if wantCommit == "" && a.Kind == KindDeveloperApply {
+		ev, err := r.developerCommit(ctx, a)
+		if err != nil {
+			// The actor's relayed outcome or the deadline decides.
+			r.log.Warn("register: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			return
+		}
+		if !ev.registerIsEvidence {
+			r.log.Info("register during a developer apply of the commit the host already ran; the relayed outcome decides",
+				"host_id", hostID, "attempt_id", a.ID)
+			return
+		}
+		wantCommit = ev.commit
+	}
 	if wantCommit == "" {
 		// A revert to a build this instance can no longer name has no commit
-		// to match; its evidence rule is in apply_revert.go.
+		// to match; its evidence rule is in apply_revert.go. One that also moves
+		// the recovery actor has no commit to check the actor against either, so
+		// the relayed outcome decides.
+		if names(a.RequestedDigests, ComponentRecovery) {
+			return
+		}
 		r.revertRegisterEvidence(ctx, a, *sourceCommit)
 		return
 	}
@@ -686,6 +850,20 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 				"host_id", hostID, "attempt_id", a.ID, "reported", *sourceCommit, "wanted", wantCommit)
 		}
 		return
+	}
+	// ...and one that named the recovery actor too succeeds only once the actor
+	// serving the host reports the same commit (amendment 14).
+	if names(a.RequestedDigests, ComponentRecovery) {
+		actor, err := r.store.HostActorCommit(ctx, hostID)
+		if err != nil {
+			r.log.Warn("register: could not read the host's recovery actor commit", "host_id", hostID, "attempt_id", a.ID, "err", err)
+			return
+		}
+		if actor == nil || !commitsMatch(wantCommit, *actor) {
+			r.log.Info("register reports the requested agent but not the requested recovery actor; the relayed outcome decides",
+				"host_id", hostID, "attempt_id", a.ID)
+			return
+		}
 	}
 	done, err := r.store.SucceedAttempt(ctx, a.ID)
 	if err != nil {

@@ -10,11 +10,12 @@
 // The gamepad readout is telemetry, so it lives in a memoized child subscribing
 // via `register` (#139) — its re-renders never reach the rest of the pane.
 
-import { memo, useEffect, useState } from "react";
+import { Fragment, memo, useEffect, useState } from "react";
 import { SCALING_MODES, type ScalingMode } from "../../../../settings/displayPreferences";
 import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../../../webrtc/telemetry";
 import { IconGamepadLarge } from "../icons";
 import type { TelemetryRegistrar } from "../HudBar";
+import { isStandardMapping } from "../../../../input/capture";
 
 export interface InputPaneProps {
   register: TelemetryRegistrar;
@@ -65,6 +66,11 @@ export function shortGamepadLabel(id: string): string {
   return label.length > 40 ? `${label.slice(0, 39)}…` : label;
 }
 
+/** Shared by the pad's note here and the one-off toast (SessionPage). */
+export const NON_STANDARD_PAD_ADVICE =
+  "its buttons may be mixed up in the game. Switch it to XInput mode, or connect " +
+  "it with a cable or its USB receiver instead of Bluetooth.";
+
 /**
  * Isolated telemetry subtree: gamepad count + per-pad identity. `pads` and
  * `gamepadCount` come from the same snapshot, so they can never disagree.
@@ -81,10 +87,17 @@ const Gamepads = memo(function Gamepads({ register }: { register: TelemetryRegis
         <b className="mono">{count}</b>
       </div>
       {pads.map((pad) => (
-        <div className="ov-kv" key={pad.index}>
-          <span>Slot {pad.index + 1}</span>
-          <b title={pad.id}>{shortGamepadLabel(pad.id)}</b>
-        </div>
+        <Fragment key={pad.index}>
+          <div className="ov-kv">
+            <span>Slot {pad.index + 1}</span>
+            <b title={pad.id}>{shortGamepadLabel(pad.id)}</b>
+          </div>
+          {!isStandardMapping(pad) && (
+            <div className="col-note">
+              Your browser doesn’t recognise this controller, so {NON_STANDARD_PAD_ADVICE}
+            </div>
+          )}
+        </Fragment>
       ))}
       {count === 0 && (
         <div className="col-note">

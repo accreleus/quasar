@@ -55,7 +55,7 @@ export function FleetCapacityCard({ hosts, slots, loading, error, now }: FleetCa
         {!loading && hosts.length === 0 ? (
           <div className="empty">
             <h3>No hosts enrolled</h3>
-            <p>Enroll a host to give the fleet somewhere to run sessions.</p>
+            <p>Add a host to give the fleet somewhere to run sessions.</p>
           </div>
         ) : (
           <table className="qtable">

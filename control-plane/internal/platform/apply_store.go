@@ -35,7 +35,7 @@ var (
 const attemptColumns = `a.id::text, a.run_id::text, a.kind, a.target, a.host_id::text,
 	h.node_name, a.release_id::text, a.requested_digests, a.previous_digests,
 	a.state, a.reason, a.sessions_remaining, a.force, a.output,
-	a.requested_by::text, a.created_at, a.started_at, a.finished_at`
+	a.requested_by::text, a.created_at, a.started_at, a.finished_at, a.pre_update_dump`
 
 const attemptFrom = ` FROM platform_apply_attempts a LEFT JOIN hosts h ON h.id = a.host_id`
 
@@ -45,7 +45,7 @@ const terminalStatesSQL = `('succeeded','failed','cancelled')`
 
 // applyOutputLimit is `platform_apply_attempts.output`'s CHECK (migration
 // 0075). Pinned against the migration by TestApplyOutputLimitMatchesSQL; the
-// same number is agentws.maxReleaseOutputLen and updater.OutputTailBytes.
+// same number is agentws.maxReleaseOutputLen and the recovery actor's OUTPUT_LIMIT.
 const applyOutputLimit = 8192
 
 // boundApplyOutput makes an output writable. Postgres REFUSES a value the CHECK
@@ -55,7 +55,7 @@ const applyOutputLimit = 8192
 // own upstream: the relay cuts a byte tail that can start mid-rune, the JSON
 // hop can substitute a 3-byte U+FFFD per bad byte and push a bounded output
 // past the cap, and the control plane's own apply (apply_self.go) reads its
-// result straight off the updater's socket with no bound at all.
+// result straight off the recovery actor's socket with no bound at all.
 //
 // The cut is from the FRONT, like the wire hop's: the error is at the end.
 func boundApplyOutput(s string) string {
@@ -64,7 +64,7 @@ func boundApplyOutput(s string) string {
 	}
 	// NUL is valid UTF-8 and Postgres still refuses it in a `text` value
 	// (SQLSTATE 22021), which is the same lost-terminal-write this function
-	// exists to prevent. Nothing upstream strips it: the updater tails bytes,
+	// exists to prevent. Nothing upstream strips it: the actor tails bytes,
 	// JSON carries \u0000 end to end, and the wire hop only cuts for length. A
 	// container that dies with binary in its last log lines is all it takes.
 	s = strings.ReplaceAll(s, "\x00", "")
@@ -77,7 +77,8 @@ func scanAttempt(row pgx.Row) (Attempt, error) {
 	var requested, previous []byte
 	if err := row.Scan(&a.ID, &a.RunID, &a.Kind, &a.Target, &a.HostID, &a.NodeName,
 		&a.ReleaseID, &requested, &previous, &a.State, &a.Reason, &a.SessionsRemaining,
-		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt); err != nil {
+		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt,
+		&a.PreUpdateDump); err != nil {
 		return Attempt{}, err
 	}
 	a.RequestedDigests = make([]ComponentDigest, 0)
@@ -379,6 +380,21 @@ func (s *Store) SetPreviousDigests(ctx context.Context, attemptID string, previo
 	return nil
 }
 
+// HostActorCommit is the commit the host's recovery actor reported on its last
+// register (hosts.recovery_actor_source_commit, amendment 14); nil when none.
+func (s *Store) HostActorCommit(ctx context.Context, hostID string) (*string, error) {
+	var commit *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT recovery_actor_source_commit FROM hosts WHERE id = $1::uuid`, hostID).Scan(&commit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrHostNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read the host's recovery actor commit: %w", err)
+	}
+	return commit, nil
+}
+
 // OpenHostAttempt returns a host's open attempt and the source_commit of the
 // release it is moving to, which is what a post-apply `register` is matched
 // against. The commit is empty when the attempt names no release row.
@@ -395,7 +411,8 @@ func (s *Store) OpenHostAttempt(ctx context.Context, hostID string) (Attempt, st
 		 ORDER BY a.created_at DESC LIMIT 1
 	`, hostID).Scan(&a.ID, &a.RunID, &a.Kind, &a.Target, &a.HostID, &a.NodeName,
 		&a.ReleaseID, &requested, &previous, &a.State, &a.Reason, &a.SessionsRemaining,
-		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt, &commit)
+		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt,
+		&a.PreUpdateDump, &commit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Attempt{}, "", ErrAttemptNotFound
 	}
@@ -467,6 +484,19 @@ func (s *Store) HostStatus(ctx context.Context, hostID string) (string, error) {
 		return "", fmt.Errorf("read host status: %w", err)
 	}
 	return status, nil
+}
+
+// HostNodeName reads one host's node_name; ErrHostNotFound when there is none.
+func (s *Store) HostNodeName(ctx context.Context, hostID string) (string, error) {
+	var name string
+	err := s.pool.QueryRow(ctx, `SELECT node_name FROM hosts WHERE id = $1::uuid`, hostID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrHostNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("read host node_name: %w", err)
+	}
+	return name, nil
 }
 
 // Release reads one release row by id.

@@ -16,7 +16,7 @@ when-to-use guidance) is [`docs/developer-tooling.md`](docs/developer-tooling.md
 ```
 make init          # idempotent first-time setup: protocol submodule, devtools image, doctor
 make doctor        # environment check — docker, go, node, submodule, disk; remote is ADVISORY
-make config-check  # every compose file set parses; .env keys diffed against docs (advisory)
+make config-check  # every compose file set parses; .env keys diffed against docs, retired updater keys flagged (advisory)
 make status        # stack state: healthy / degraded / stopped / failed — never guesses
 make diagnose      # one page: git state, instance, stack, health, versions, recent errors
 ```

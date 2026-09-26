@@ -243,15 +243,151 @@
   row-gap: var(--s1);
 }
 
-/* ── Enroll host modal ─────────────────────────────────────────────── */
+/* "Services on this machine" (fleet-rh06-v3.html `rhServices`; its inline styles). */
+.host-detail-page .host-services-hint {
+  margin-top: var(--s1);
+}
 
-.enroll-fact {
+.host-detail-page .host-services-note {
+  padding: var(--s4) var(--card-pad);
+}
+
+.host-detail-page .host-services-desc {
+  white-space: normal;
+  max-width: 34ch;
+}
+
+.host-detail-page .host-services-version {
+  color: var(--text);
+}
+
+.host-detail-page .host-services-none {
+  color: var(--text-4);
+}
+
+/* `rhRemoveFoot` for a machine that runs the control plane. */
+.host-detail-page .host-services-foot {
+  border-top: 1px solid var(--line);
+}
+
+.host-detail-page .host-services-foot .hint {
+  margin: 0;
+  max-width: 70ch;
+  line-height: 1.55;
+}
+
+/* `rhRemoveFoot` for a GPU host: the hint beside its danger button. */
+.host-detail-page .host-services-foot-row {
   display: flex;
-  flex-direction: column;
+  gap: var(--s5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.host-detail-page .host-services-foot-row .hint {
+  flex: 1;
+  min-width: 260px;
+  max-width: none;
+}
+
+/* `rhServices`: another owner's container, in the way. */
+.host-detail-page .host-services-warning {
+  color: var(--warning-text);
+}
+
+/* ── RH-06 warnings and remove host (fleet-rh06-v3.html; its inline styles) ── */
+
+/* `.diag`: the closed "Details" disclosure, the one place identifiers appear. */
+.rh-diag {
+  margin-top: var(--s2);
+}
+
+.rh-diag > summary {
+  display: inline-flex;
+  align-items: center;
   gap: var(--s1);
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.rh-diag > summary::-webkit-details-marker {
+  display: none;
+}
+
+.rh-diag > summary:hover {
+  color: var(--text);
+}
+
+.rh-diag > summary svg {
+  width: 11px;
+  height: 11px;
+  transition: transform 0.15s;
+}
+
+.rh-diag[open] > summary svg {
+  transform: rotate(90deg);
+}
+
+.rh-diag pre {
+  margin: var(--s2) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: color-mix(in oklch, var(--surf-inset) 82%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  padding: var(--s2) var(--s3);
+}
+
+/* A warning's own actions (`pageRhWarning`: Check again). */
+.rh-note-actions {
+  display: flex;
+  gap: var(--s2);
+  margin-top: var(--s2);
+}
+
+/* A note with its action beside it (`rhRemove`, failed). */
+.rh-note-row {
+  display: flex;
+  gap: var(--s5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.rh-note-body {
+  flex: 1;
+  min-width: 280px;
+}
+
+/* The remove-host dialog's copy (`rhRemove`). */
+.rm-host-copy {
+  margin: 0 0 var(--s3);
   font-size: var(--t-sm);
   color: var(--text-2);
+  line-height: 1.6;
 }
+
+.rm-host-copy b {
+  color: var(--text);
+}
+
+.rm-host-note {
+  margin-bottom: var(--s3);
+}
+
+/* Why the one action of "Must update before it can be managed" (#365, `pageRhFloor`) is
+   not available right now, under the note's text. */
+.host-detail-page .host-floor-why {
+  display: block;
+  margin-top: var(--s1);
+}
+
+/* ── Add host modal ────────────────────────────────────────────────── */
 
 /* A value block wraps rather than scrolling out of the dialog: an operator
    copies it with the button, but has to be able to read it first. */
@@ -292,13 +428,61 @@
 .enroll-more[open] > summary::before {
   content: "▾ ";
 }
-.enroll-more > .enroll-fact {
+/* Add host (#359): design_handoff_v3/screens/rh06 add-*.png, `rhAddHost` in
+   assets/pages-rh06.js. The copyable block is .enroll-snippet above. */
+.addhost-tabs {
+  margin: 0 0 var(--s5);
+}
+.addhost-lead {
+  font-size: var(--t-base);
+  margin: 0 0 var(--s2);
+}
+.addhost-intro {
+  margin: 0 0 var(--s4);
+  font-size: var(--t-sm);
+  line-height: 1.55;
+}
+.addhost-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 170px;
+  gap: var(--s4);
+  margin-bottom: var(--s4);
+}
+.addhost-optional {
+  font-weight: 400;
+}
+.addhost-facts {
+  margin-bottom: var(--s4);
+}
+.addhost-fp {
+  font-size: var(--t-xs);
+}
+.addhost-note {
+  margin-bottom: var(--s4);
+}
+.addhost-snippet {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.addhost-sub {
+  margin-top: var(--s1);
+}
+.addhost-explain {
+  margin: var(--s4) 0 0;
+  line-height: 1.6;
+}
+.addhost-nowrap {
+  white-space: nowrap;
+}
+.addhost-more {
   margin-top: var(--s2);
 }
-
-/* Flush notes: outranks the stacked-surface margin in primitives.css. */
-.modal .modal-body .note.enroll-note {
-  margin: 0;
+.addhost-more > .addhost-snippet {
+  margin-top: var(--s2);
+}
+.addhost-prep {
+  margin-top: var(--s4);
 }
 
 /* Releases (Fleet › Releases). */
@@ -512,6 +696,61 @@
 .rel-detail > summary::-webkit-details-marker {
   display: none;
 }
+/* In the 300 px rail the table's cells wrap and pad as the rail's facts do, so its
+   last column (Apply, Revert) stays inside the card at 1440 px (#363). */
+.rel-detail .qtable thead th,
+.rel-detail .qtable tbody td {
+  /* design-lint-allow spacing-scale: the 300px rail keeps its last column inside the card only at 6px */
+  padding-inline: 6px;
+  white-space: normal;
+}
+.rel-detail .qtable tbody td { height: auto; }
+
+/* Developer apply (#360): design_handoff_v3/screens/rh06 devapply*.png, the rail
+   card `rhDevCard` and the drawer `rhDevApply` in assets/pages-rh06.js. */
+.devapply-card-hint { margin-top: var(--s2); line-height: 1.5; }
+.devapply-ns-note {
+  margin: 0;
+  font-size: var(--t-sm);
+  line-height: 1.55;
+  color: var(--text-2);
+}
+.devapply-detail { margin: var(--s2) 0 0; white-space: pre-wrap; }
+
+/* A migrating update gone wrong (#364): rh06 update-refused / restore-*.png, `rhRefusedBanner`
+   and `rhRestore` in assets/pages-rh06.js, whose inline styles these carry. */
+.rel-alert-eyebrow.warning { color: var(--warning-text); }
+.rel-alert-eyebrow.danger { color: var(--danger-text); }
+.rel-refused-body {
+  margin: var(--s2) 0 0;
+  font-size: var(--t-sm);
+  line-height: 1.55;
+  max-width: 80ch;
+}
+.rel-alert-body {
+  margin: var(--s4) 0;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.6;
+  max-width: 84ch;
+}
+.rel-restore-hint { margin: var(--s3) 0 0; line-height: 1.55; }
+.rel-history-failed { color: var(--danger-text); }
+
+/* The control plane's own machine in Releases > Installed (#361): `rhInstalled` in
+   design_handoff_v3/screens/assets/pages-rh06.js, screenshots rh06/inv-control-only*. */
+.rel-machine { margin-top: var(--s5); }
+.rel-machine-title { margin-top: var(--s1); }
+.rel-machine-note { margin-top: var(--s2); font-size: var(--t-xs); }
+.rel-machine-rows { margin-top: var(--s2); }
+.rel-machine-rows .rel-fact { align-items: flex-start; }
+.rel-machine-rows .rel-fact > span:last-child { text-align: right; }
+.rel-machine-hint { margin-top: var(--s1); }
+/* A rail value with a line under it ("6 hosts" over "4 on v0.5.2 · 2 older"), as
+   `rhInstalled`'s Node agents fact draws it (#363). */
+.rel-fact-sub { display: block; text-align: right; }
+.rel-machine-none { color: var(--text-4); }
+.rel-machine-foot { margin: var(--s2) 0 0; line-height: 1.5; }
 
 /* Keep the scoped Releases rail from overriding the shared split breakpoint. */
 .rel-split > * { min-width: 0; }

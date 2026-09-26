@@ -12,7 +12,6 @@ import { ACTIVE_SESSION_STATES } from "../../../api/sessionStates";
 import type {
   AdminSessionsResponse,
   PlatformApplyAttempt,
-  PlatformApplyAttemptsResponse,
   PlatformRelease,
   PlatformReleaseTarget,
 } from "../../../api/types";
@@ -158,44 +157,87 @@ function when(iso: string | null | undefined): string {
 /** Apply history: what this instance has done to itself, newest first. Drawn as
  *  the rail's compact list (design_handoff_v3/screens/releases-v3.html), not a
  *  table: it sits in a 300px column. */
-export function ApplyHistory({ refreshKey }: { refreshKey: number }) {
-  const res = useResource<PlatformApplyAttemptsResponse>(
-    {
-      label: "apply history",
-      fetch: ({ token, signal }) => adminApi.listPlatformAttempts(token, { limit: 50 }, signal),
-    },
-    [refreshKey],
-  );
-
+export function ApplyHistory({
+  loading,
+  error,
+  attempts,
+  statusFor,
+}: {
+  loading: boolean;
+  error: string | null | undefined;
+  attempts: PlatformApplyAttempt[] | undefined;
+  /** A row's outcome line when the caller knows more than the attempt's state
+   *  ("Failed · not restored · dump kept", #364); null keeps the default. */
+  statusFor?: (attempt: PlatformApplyAttempt) => string | null;
+}) {
   return (
     <>
-      <ResourceStates loading={res.loading} error={res.errorMessage} />
-      {res.data &&
-        (res.data.attempts.length === 0 ? (
+      <ResourceStates loading={loading} error={error ?? null} />
+      {attempts &&
+        (attempts.length === 0 ? (
           <p className="muted">Nothing has been applied on this instance yet.</p>
         ) : (
-          res.data.attempts.map((a) => <ApplyHistoryRow key={a.id} attempt={a} />)
+          attempts.map((a) => (
+            <ApplyHistoryRow key={a.id} attempt={a} status={statusFor?.(a) ?? null} />
+          ))
         ))}
     </>
   );
 }
 
-function ApplyHistoryRow({ attempt: a }: { attempt: PlatformApplyAttempt }) {
-  const from = a.previous_digests.map((p) => shortDigest(p.digest)).join(", ") || "unknown";
-  const to = a.requested_digests.map((c) => shortDigest(c.digest)).join(", ");
+/** How the history names an attempt's components. */
+const COMPONENT_NAMES: Record<string, string> = {
+  "recovery-actor": "Recovery actor",
+  "node-agent": "Node agent",
+  "control-plane": "Control plane",
+};
+
+function ApplyHistoryRow({
+  attempt: a,
+  status,
+}: {
+  attempt: PlatformApplyAttempt;
+  status: string | null;
+}) {
+  const machine = a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone");
+  // An attempt that moves the recovery actor (it moves first, ADR 0008) says so per
+  // component, as the RH-06 mock's history does.
+  const movesActor = a.requested_digests.some((c) => c.name === "recovery-actor");
+  const lines = movesActor
+    ? a.requested_digests.map((c) => ({
+        label: COMPONENT_NAMES[c.name] ?? c.name,
+        from: shortDigest(a.previous_digests.find((p) => p.name === c.name)?.digest ?? null),
+        to: shortDigest(c.digest),
+      }))
+    : [
+        {
+          label: null,
+          from: a.previous_digests.map((p) => shortDigest(p.digest)).join(", ") || "unknown",
+          to: a.requested_digests.map((c) => shortDigest(c.digest)).join(", "),
+        },
+      ];
   return (
     <div className="rel-fact stack">
       <div className="rowflex between" style={{ width: "100%" }}>
-        <span>{a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone")}</span>
+        <span>
+          {movesActor && a.requested_digests.length === 1 ? `Recovery actor · ${machine}` : machine}
+        </span>
         <span className="hint">{when(a.created_at)}</span>
       </div>
-      <span className="mono hint">
-        {from} → {to}
-      </span>
-      <span className="hint">
-        <span>{attemptKindText(a.kind)}</span> · {attemptStateText(a.state)}
-        {a.reason && ` · ${failureText(a.reason)}`}
-      </span>
+      {lines.map((l) => (
+        <span key={l.label ?? "all"} className="mono hint">
+          {l.label && movesActor && a.requested_digests.length > 1 && `${l.label} `}
+          {l.from} → {l.to}
+        </span>
+      ))}
+      {status ? (
+        <span className="hint rel-history-failed">{status}</span>
+      ) : (
+        <span className="hint">
+          <span>{attemptKindText(a.kind)}</span> · {attemptStateText(a.state)}
+          {a.reason && ` · ${failureText(a.reason)}`}
+        </span>
+      )}
     </div>
   );
 }

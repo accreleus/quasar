@@ -1,0 +1,61 @@
+[package]
+name = "quasar-recovery"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The Quasar recovery actor: its library (actor, recipes, engine port, trust gates, socket shapes) and the quasar-recovery binary"
+
+[[bin]]
+name = "quasar-recovery"
+path = "src/main.rs"
+
+# Like quasar-runtime, this crate must never depend on gstreamer*, glib or anything
+# CUDA: the recovery actor is a small static binary in a slim image
+# (tests/gstreamer_free_convention.rs walks the lockfile closure).
+#
+# Every requirement is written exactly as the agent (or bollard, for the hyper family)
+# already enables it, so the single workspace Cargo.lock resolves them to the versions
+# and features it already carries and adds no package.
+[dependencies]
+# The engine facade, the platform-service lifecycles and the durable-state primitives.
+quasar-runtime = { path = "../quasar-runtime" }
+# The secrets archive and the fake engine's reading of it.
+tar = "0.4"
+# statvfs, for the free space a pre-update dump needs.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+# Ed25519 verification, and the TLS provider below.
+ring = "0.17"
+tracing = "0.1"
+base64 = "0.23"
+# The release-asset fetch (trust::https). ring, never aws-lc-rs; webpki roots, never
+# the OS store, as the agent's control-plane link.
+tokio = { version = "1", features = ["full"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+# Go's transport requests and transparently decodes gzip.
+flate2 = "1"
+
+# The binary's log output (a verify-mode WARN from `trust::admit` must be visible).
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[features]
+# The in-memory engine adapter, for tests. Never enabled by the binary.
+test-support = []
+
+[dev-dependencies]
+# The crate's own tests use the in-memory engine.
+quasar-recovery = { path = ".", features = ["test-support"] }
+tempfile = "3"
+# The recipe parity test parses deploy/docker-compose.yml. Test-only: never in the binary.
+serde_yaml = "0.9"

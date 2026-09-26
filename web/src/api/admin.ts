@@ -40,6 +40,7 @@ import type {
   PlatformApplyAttemptEnvelope,
   PlatformApplyAttemptsResponse,
   PlatformApplyRequest,
+  PlatformDeveloperApplyRequest,
   PlatformApplyRunEnvelope,
   PlatformApplyRunsResponse,
   PlatformIdentity,
@@ -285,8 +286,8 @@ export function revokeHostEnrollment(token: string, id: string): Promise<void> {
 /** This request's reachability. The enroll-host flow reads the certificate
  *  fingerprint from here, so the value it pins is the one THIS browser session
  *  was served — and tells the operator to compare it against the startup log. */
-export function accessCheck(token: string): Promise<AccessCheck> {
-  return apiFetch<AccessCheck>("/admin/access-check", { token });
+export function accessCheck(token: string, signal?: AbortSignal): Promise<AccessCheck> {
+  return apiFetch<AccessCheck>("/admin/access-check", { token, signal });
 }
 
 // ── App catalog (P2-08) ───────────────────────────────────────────────────────
@@ -1080,6 +1081,33 @@ export function applyPlatformReleaseToHost(
   req: { release_id: string; force?: boolean },
 ): Promise<PlatformApplyAttemptEnvelope> {
   return apiFetch<PlatformApplyAttemptEnvelope>(`/admin/platform/hosts/${hostId}/apply`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Apply an arbitrary digest set to one owned target. 202 with a
+ *  `developer_apply` attempt, watched through active_apply like any other. */
+/** Remove an owned GPU host's node agent and recovery actor (control-api.md amendment
+ *  14, "Removing an owned GPU host"). `202` once its recovery actor accepts. */
+export function removePlatformHost(
+  token: string,
+  id: string,
+  req: import("./types").PlatformHostRemoveRequest = {},
+): Promise<{ host: import("./types").Host }> {
+  return apiFetch<{ host: import("./types").Host }>(`/admin/platform/hosts/${id}/remove`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+export function developerApply(
+  token: string,
+  req: PlatformDeveloperApplyRequest,
+): Promise<PlatformApplyAttemptEnvelope> {
+  return apiFetch<PlatformApplyAttemptEnvelope>("/admin/platform/developer-apply", {
     method: "POST",
     body: req,
     token,

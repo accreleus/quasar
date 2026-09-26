@@ -1,0 +1,707 @@
+{
+  "kind": "config",
+  "about": "The operator knobs: ParseSignatureMode (QUASAR_UPDATER_SIGNATURE_MODE), ParseTrustedKeys (QUASAR_UPDATER_TRUSTED_KEYS; `{public_key_of:LABEL}` stands for a derived vector key), ParseNamespaces (QUASAR_UPDATER_ALLOWED_NAMESPACES) and ParseManifestBaseURL (QUASAR_UPDATER_MANIFEST_BASE_URL).",
+  "vectors": [
+    {
+      "name": "mode \"\"",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "",
+      "expect": {
+        "ok": true,
+        "mode": "off"
+      }
+    },
+    {
+      "name": "mode \"off\"",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "off",
+      "expect": {
+        "ok": true,
+        "mode": "off"
+      }
+    },
+    {
+      "name": "mode \" OFF \"",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": " OFF ",
+      "expect": {
+        "ok": true,
+        "mode": "off"
+      }
+    },
+    {
+      "name": "mode \"verify\"",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "verify",
+      "expect": {
+        "ok": true,
+        "mode": "verify"
+      }
+    },
+    {
+      "name": "mode \"require\"",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "require",
+      "expect": {
+        "ok": true,
+        "mode": "require"
+      }
+    },
+    {
+      "name": "mode \"Require\"",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "Require",
+      "expect": {
+        "ok": true,
+        "mode": "require"
+      }
+    },
+    {
+      "name": "mode \"requre\" is loud",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "requre",
+      "expect": {
+        "ok": false,
+        "error": "\"requre\" is not a signature mode (want off, verify or require)"
+      }
+    },
+    {
+      "name": "mode \"on\" is loud",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "on",
+      "expect": {
+        "ok": false,
+        "error": "\"on\" is not a signature mode (want off, verify or require)"
+      }
+    },
+    {
+      "name": "mode \"1\" is loud",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "1",
+      "expect": {
+        "ok": false,
+        "error": "\"1\" is not a signature mode (want off, verify or require)"
+      }
+    },
+    {
+      "name": "mode \"true\" is loud",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "true",
+      "expect": {
+        "ok": false,
+        "error": "\"true\" is not a signature mode (want off, verify or require)"
+      }
+    },
+    {
+      "name": "mode \"strict\" is loud",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "parse": "signature_mode",
+      "raw": "strict",
+      "expect": {
+        "ok": false,
+        "error": "\"strict\" is not a signature mode (want off, verify or require)"
+      }
+    },
+    {
+      "name": "mode with a tab and a newline",
+      "source": "added: strings.TrimSpace",
+      "parse": "signature_mode",
+      "raw": "\tverify\n",
+      "expect": {
+        "ok": true,
+        "mode": "verify"
+      }
+    },
+    {
+      "name": "mode with a dotted capital I lowers to require",
+      "source": "added: strings.ToLower maps U+0130 to i",
+      "parse": "signature_mode",
+      "raw": "REQUİRE",
+      "expect": {
+        "ok": true,
+        "mode": "require"
+      }
+    },
+    {
+      "name": "mode with a non-breaking space",
+      "source": "added: strings.TrimSpace is Unicode-aware",
+      "parse": "signature_mode",
+      "raw": " require ",
+      "expect": {
+        "ok": true,
+        "mode": "require"
+      }
+    },
+    {
+      "name": "two labelled keys",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "old:{public_key_of:release-2025}, new:{public_key_of:release-2026}",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "old",
+            "public_key_of": "release-2025"
+          },
+          {
+            "id": "new",
+            "public_key_of": "release-2026"
+          }
+        ]
+      }
+    },
+    {
+      "name": "an unlabelled key",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "{public_key_of:release-2025}",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "",
+            "public_key_of": "release-2025"
+          }
+        ]
+      }
+    },
+    {
+      "name": "the same key twice is one trust decision",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "a:{public_key_of:release-2025},b:{public_key_of:release-2025}",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "a",
+            "public_key_of": "release-2025"
+          }
+        ]
+      }
+    },
+    {
+      "name": "blank is no keys",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "  ",
+      "expect": {
+        "ok": true,
+        "keys": []
+      }
+    },
+    {
+      "name": "not base64",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "nope",
+      "expect": {
+        "ok": false,
+        "error": "trusted key \"nope\" decodes to 3 bytes, not the 32 of an ed25519 public key"
+      }
+    },
+    {
+      "name": "too short",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "k:c2hvcnQ=",
+      "expect": {
+        "ok": false,
+        "error": "trusted key \"k\" decodes to 5 bytes, not the 32 of an ed25519 public key"
+      }
+    },
+    {
+      "name": "one byte too long",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "k:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expect": {
+        "ok": false,
+        "error": "trusted key \"k\" decodes to 33 bytes, not the 32 of an ed25519 public key"
+      }
+    },
+    {
+      "name": "empty entries are skipped",
+      "source": "added: ParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": " , ,{public_key_of:release-2025},",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "",
+            "public_key_of": "release-2025"
+          }
+        ]
+      }
+    },
+    {
+      "name": "the label and key are trimmed",
+      "source": "added: ParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "  old key : {public_key_of:release-2025}  ",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "old key",
+            "public_key_of": "release-2025"
+          }
+        ]
+      }
+    },
+    {
+      "name": "an empty label",
+      "source": "added: ParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": ":{public_key_of:release-2025}",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "",
+            "public_key_of": "release-2025"
+          }
+        ]
+      }
+    },
+    {
+      "name": "the first colon is the separator",
+      "source": "added: ParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "a:b:{public_key_of:release-2025}",
+      "expect": {
+        "ok": false,
+        "error": "trusted key \"a\" is not standard base64: illegal base64 data at input byte 1"
+      }
+    },
+    {
+      "name": "unpadded base64",
+      "source": "added: StdEncoding requires padding",
+      "parse": "trusted_keys",
+      "raw": "k:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expect": {
+        "ok": false,
+        "error": "trusted key \"k\" is not standard base64: illegal base64 data at input byte 40"
+      }
+    },
+    {
+      "name": "an unlabelled bad key is named by its first twelve characters",
+      "source": "added: ParseTrustedKeys labelOf",
+      "parse": "trusted_keys",
+      "raw": "c2hvcnQ=c2hvcnQ=c2hvcnQ=",
+      "expect": {
+        "ok": false,
+        "error": "trusted key \"c2hvcnQ=c2hv…\" is not standard base64: illegal base64 data at input byte 8"
+      }
+    },
+    {
+      "name": "one bad key fails the whole list",
+      "source": "added: ParseTrustedKeys",
+      "parse": "trusted_keys",
+      "raw": "{public_key_of:release-2025},k:c2hvcnQ=",
+      "expect": {
+        "ok": false,
+        "error": "trusted key \"k\" decodes to 5 bytes, not the 32 of an ed25519 public key"
+      }
+    },
+    {
+      "name": "two namespaces, trimmed",
+      "source": "go:control-plane/internal/updater/plan_test.go:TestParseNamespaces",
+      "parse": "allowed_namespaces",
+      "raw": " ghcr.io/a/b/ , ghcr.io/c/d ",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "ghcr.io/a/b",
+          "ghcr.io/c/d"
+        ]
+      }
+    },
+    {
+      "name": "unset is the org default",
+      "source": "go:control-plane/internal/updater/plan_test.go:TestUnsetNamespaceKnobIsTheOrgDefault",
+      "parse": "allowed_namespaces",
+      "raw": "",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ]
+      }
+    },
+    {
+      "name": "blank is the org default",
+      "source": "go:control-plane/internal/updater/plan_test.go:TestUnsetNamespaceKnobIsTheOrgDefault",
+      "parse": "allowed_namespaces",
+      "raw": "  ",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ]
+      }
+    },
+    {
+      "name": "a lone comma is the org default",
+      "source": "go:control-plane/internal/updater/plan_test.go:TestUnsetNamespaceKnobIsTheOrgDefault",
+      "parse": "allowed_namespaces",
+      "raw": ",",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ]
+      }
+    },
+    {
+      "name": "a spaced comma is the org default",
+      "source": "go:control-plane/internal/updater/plan_test.go:TestUnsetNamespaceKnobIsTheOrgDefault",
+      "parse": "allowed_namespaces",
+      "raw": " , ",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ]
+      }
+    },
+    {
+      "name": "every trailing slash is trimmed",
+      "source": "added: ParseNamespaces",
+      "parse": "allowed_namespaces",
+      "raw": "registry.example.invalid/x//",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "registry.example.invalid/x"
+        ]
+      }
+    },
+    {
+      "name": "a lone slash is nothing",
+      "source": "added: ParseNamespaces",
+      "parse": "allowed_namespaces",
+      "raw": "/",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ]
+      }
+    },
+    {
+      "name": "case is kept",
+      "source": "added: ParseNamespaces",
+      "parse": "allowed_namespaces",
+      "raw": "GHCR.io/Accreleus",
+      "expect": {
+        "ok": true,
+        "namespaces": [
+          "GHCR.io/Accreleus"
+        ]
+      }
+    },
+    {
+      "name": "blank is the org's releases",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseManifestBaseURL",
+      "parse": "manifest_base_url",
+      "raw": "",
+      "expect": {
+        "ok": true,
+        "base_url": "https://github.com/accreleus/quasar/releases/download/v{version}/"
+      }
+    },
+    {
+      "name": "a missing trailing slash is added",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseManifestBaseURL",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example/quasar/{version}",
+      "expect": {
+        "ok": true,
+        "base_url": "https://mirror.example/quasar/{version}/"
+      }
+    },
+    {
+      "name": "http is refused",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseManifestBaseURL",
+      "parse": "manifest_base_url",
+      "raw": "http://mirror.example/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"http://mirror.example/{version}/\" is not https; the release manifest must be fetched over TLS"
+      }
+    },
+    {
+      "name": "no placeholder is refused",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseManifestBaseURL",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example/releases/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror.example/releases/\" contains no {version} placeholder, so it cannot name a release's assets"
+      }
+    },
+    {
+      "name": "ftp is refused",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseManifestBaseURL",
+      "parse": "manifest_base_url",
+      "raw": "ftp://mirror.example/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"ftp://mirror.example/{version}/\" is not https; the release manifest must be fetched over TLS"
+      }
+    },
+    {
+      "name": "a relative URL has no host",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestParseManifestBaseURL",
+      "parse": "manifest_base_url",
+      "raw": "/relative/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"/relative/{version}/\" is not https; the release manifest must be fetched over TLS"
+      }
+    },
+    {
+      "name": "an uppercase scheme is https",
+      "source": "added: url.Parse lowercases the scheme",
+      "parse": "manifest_base_url",
+      "raw": "HTTPS://mirror.example/{version}/",
+      "expect": {
+        "ok": true,
+        "base_url": "HTTPS://mirror.example/{version}/"
+      }
+    },
+    {
+      "name": "surrounding space is trimmed",
+      "source": "added: ParseManifestBaseURL",
+      "parse": "manifest_base_url",
+      "raw": "  https://mirror.example/{version}/ \n",
+      "expect": {
+        "ok": true,
+        "base_url": "https://mirror.example/{version}/"
+      }
+    },
+    {
+      "name": "userinfo is allowed",
+      "source": "added: url.Parse",
+      "parse": "manifest_base_url",
+      "raw": "https://user@mirror.example/{version}/",
+      "expect": {
+        "ok": true,
+        "base_url": "https://user@mirror.example/{version}/"
+      }
+    },
+    {
+      "name": "a port is allowed",
+      "source": "added: url.Parse",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example:8443/{version}/",
+      "expect": {
+        "ok": true,
+        "base_url": "https://mirror.example:8443/{version}/"
+      }
+    },
+    {
+      "name": "an empty port is allowed",
+      "source": "added: url.Parse validOptionalPort",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example:/{version}/",
+      "expect": {
+        "ok": true,
+        "base_url": "https://mirror.example:/{version}/"
+      }
+    },
+    {
+      "name": "the placeholder may sit in the query",
+      "source": "added: ParseManifestBaseURL only needs the placeholder somewhere",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example/?v={version}",
+      "expect": {
+        "ok": true,
+        "base_url": "https://mirror.example/?v={version}/"
+      }
+    },
+    {
+      "name": "an IPv6 literal",
+      "source": "added: url.Parse parseHost",
+      "parse": "manifest_base_url",
+      "raw": "https://[2001:db8::1]/{version}/",
+      "expect": {
+        "ok": true,
+        "base_url": "https://[2001:db8::1]/{version}/"
+      }
+    },
+    {
+      "name": "a scheme with no slashes has no host",
+      "source": "added: url.Parse opaque",
+      "parse": "manifest_base_url",
+      "raw": "https:mirror.example/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https:mirror.example/{version}/\" names no host"
+      }
+    },
+    {
+      "name": "an empty authority has no host",
+      "source": "added: url.Parse",
+      "parse": "manifest_base_url",
+      "raw": "https:///{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https:///{version}/\" names no host"
+      }
+    },
+    {
+      "name": "userinfo with no host has no host",
+      "source": "added: url.Parse",
+      "parse": "manifest_base_url",
+      "raw": "https://user@/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://user@/{version}/\" names no host"
+      }
+    },
+    {
+      "name": "a non-numeric port",
+      "source": "added: url.Parse validOptionalPort",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example:abc/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror.example:abc/{version}/\" is not a URL: parse \"https://mirror.example:abc/0.0.0/\": invalid port \":abc\" after host"
+      }
+    },
+    {
+      "name": "a space in the host",
+      "source": "added: url.Parse host characters",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror example/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror example/{version}/\" is not a URL: parse \"https://mirror example/0.0.0/\": invalid character \" \" in host name"
+      }
+    },
+    {
+      "name": "a pipe in the host",
+      "source": "added: url.Parse host characters",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror|x.example/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror|x.example/{version}/\" is not a URL: parse \"https://mirror|x.example/0.0.0/\": invalid character \"|\" in host name"
+      }
+    },
+    {
+      "name": "a bad escape in the path",
+      "source": "added: url.Parse path escapes",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example/{version}/%zz",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror.example/{version}/%zz/\" is not a URL: parse \"https://mirror.example/0.0.0/%zz/\": invalid URL escape \"%zz\""
+      }
+    },
+    {
+      "name": "an escaped ASCII byte in the host",
+      "source": "added: url.Parse host escapes",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror%2eexample/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror%2eexample/{version}/\" is not a URL: parse \"https://mirror%2eexample/0.0.0/\": invalid URL escape \"%2e\""
+      }
+    },
+    {
+      "name": "a control byte",
+      "source": "added: url.Parse control characters",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror.example/{version}/\\x7f/\" is not a URL: parse \"https://mirror.example/0.0.0/\\x7f/\": net/url: invalid control character in URL"
+      }
+    },
+    {
+      "name": "a bad escape in the fragment",
+      "source": "added: url.Parse fragment escapes",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror.example/{version}/#%zz",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror.example/{version}/#%zz/\" is not a URL: parse \"https://mirror.example/0.0.0/#%zz/\": invalid URL escape \"%zz\""
+      }
+    },
+    {
+      "name": "a leading colon",
+      "source": "added: url.Parse missing scheme",
+      "parse": "manifest_base_url",
+      "raw": "://mirror.example/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"://mirror.example/{version}/\" is not a URL: parse \"://mirror.example/0.0.0/\": missing protocol scheme"
+      }
+    },
+    {
+      "name": "an IPv4 address in brackets",
+      "source": "added: url.Parse parseHost",
+      "parse": "manifest_base_url",
+      "raw": "https://[192.0.2.1]/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://[192.0.2.1]/{version}/\" is not a URL: parse \"https://[192.0.2.1]/0.0.0/\": invalid IP-literal"
+      }
+    },
+    {
+      "name": "a bracket inside the host",
+      "source": "added: url.Parse parseHost",
+      "parse": "manifest_base_url",
+      "raw": "https://mirror[1]/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://mirror[1]/{version}/\" is not a URL: parse \"https://mirror[1]/0.0.0/\": invalid IP-literal"
+      }
+    },
+    {
+      "name": "an unclosed bracket",
+      "source": "added: url.Parse parseHost",
+      "parse": "manifest_base_url",
+      "raw": "https://[2001:db8::1/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"https://[2001:db8::1/{version}/\" is not a URL: parse \"https://[2001:db8::1/0.0.0/\": missing ']' in host"
+      }
+    },
+    {
+      "name": "brackets around a non-address",
+      "source": "added: url.Parse parseHost (net/netip text is not pinned)",
+      "parse": "manifest_base_url",
+      "raw": "https://[mirror]/{version}/",
+      "expect": {
+        "ok": false,
+        "error_prefix": "\"https://[mirror]/{version}/\" is not a URL: parse \"https://[mirror]/0.0.0/\": invalid host: "
+      }
+    },
+    {
+      "name": "a first segment with a colon and no scheme",
+      "source": "added: url.Parse",
+      "parse": "manifest_base_url",
+      "raw": "1a:b/{version}/",
+      "expect": {
+        "ok": false,
+        "error": "\"1a:b/{version}/\" is not a URL: parse \"1a:b/0.0.0/\": first path segment in URL cannot contain colon"
+      }
+    }
+  ]
+}

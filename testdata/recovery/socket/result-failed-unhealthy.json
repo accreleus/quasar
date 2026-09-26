@@ -1,0 +1,33 @@
+{
+  "shape": "result",
+  "about": "Terminal: a control plane that passed a health check is not restored automatically; previous is the recipe.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "state": "failed",
+    "reason": "unhealthy",
+    "components": [
+      {
+        "name": "control-plane",
+        "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+        "digest": "sha256:aa11000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "previous": [
+      {
+        "name": "control-plane",
+        "digest": "sha256:1b7e000000000000000000000000000000000000000000000000000000000def"
+      }
+    ],
+    "output": "migration 0081 failed\n",
+    "started_at": "2026-09-25T11:04:02Z",
+    "updated_at": "2026-09-25T11:04:31Z",
+    "finished_at": "2026-09-25T11:04:31Z",
+    "restored": false,
+    "release": {
+      "id": "rel-0.3.0",
+      "version": "0.3.0",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "dump": null
+  }
+}

@@ -38,7 +38,7 @@ func TestFailedJournalBeginReleasesAuthenticatedConnection(t *testing.T) {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := NewRegistry(log)
-	h := NewHandler(pool, "test-token", log, registry, nil, nil, hostcfg.NewStore(pool), nil)
+	h := NewHandler(pool, log, registry, nil, nil, hostcfg.NewStore(pool), nil)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

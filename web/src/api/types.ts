@@ -46,6 +46,9 @@ export interface ApiErrorBody {
      *  the session is not (steam-library-discovery spec §2.2). */
     session_id?: string;
   };
+  /** On `409 host_not_eligible`: the host's `EligibilityReason`, a top-level
+   *  sibling of `error` (control-api.md §"Platform-release apply"). */
+  reason?: string;
 }
 
 // ── Invites + instance settings (LP-SEC-01) ──────────────────────────────────
@@ -97,6 +100,9 @@ export type PlatformApplyAttemptsResponse = Schemas["PlatformApplyAttemptsRespon
 export type PlatformApplyRun = Schemas["PlatformApplyRun"];
 export type PlatformApplySkip = Schemas["PlatformApplySkip"];
 export type PlatformApplyRequest = Schemas["PlatformApplyRequest"];
+export type PlatformDeveloperApplyRequest = Schemas["PlatformDeveloperApplyRequest"];
+export type PlatformHostRemoveRequest = Schemas["PlatformHostRemoveRequest"];
+export type ApplyComponentDigest = Schemas["ApplyComponentDigest"];
 export type PlatformApplyRunEnvelope = Schemas["PlatformApplyRunEnvelope"];
 export type PlatformApplyRunsResponse = Schemas["PlatformApplyRunsResponse"];
 export type ApplyAttemptState = Schemas["ApplyAttemptState"];

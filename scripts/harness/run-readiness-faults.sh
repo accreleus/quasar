@@ -34,8 +34,7 @@
 #     quasar-probe- (node-agent/src/container_ownership.rs,
 #     node-agent/src/session/audio.rs).
 #   - compose services: quasar-postgres, quasar-control-plane,
-#     quasar-node-agent, quasar-updater — this harness starts only the first
-#     three (never quasar-updater, which touches nothing under test).
+#     quasar-node-agent; the agent starts once a minted enrollment token exists.
 #   - NVIDIA hosts need -f deploy/docker-compose.nvidia.yml (driver volume
 #     quasar-nvidia-driver, gpus: all, LD_LIBRARY_PATH, …).
 #   - schema version: control-plane's own Postgres schema_migrations.version
@@ -311,7 +310,9 @@ harness_note "control_port" "$CONTROL_PORT"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/${RID}-work.XXXXXX")"
 API="http://127.0.0.1:${CONTROL_PORT}"
-ENROLLMENT_TOKEN="${RID}-enroll-$(rand_hex 8)"
+# Minted after login (the static enrollment token is retired): one token, up to
+# 100 uses, shared by the real agent and every scripted host.
+ENROLLMENT_TOKEN=""
 ADMIN_EMAIL="${RID}-admin@quasar.local"
 ADMIN_PASS="Rh02Harness!$(rand_hex 4)"
 
@@ -957,7 +958,6 @@ QUASAR_TLS=off
 QUASAR_CONTROL_IMAGE=$CONTROL_IMAGE
 QUASAR_AGENT_IMAGE=$AGENT_IMAGE
 POSTGRES_PASSWORD=${RID}-pg
-ENROLLMENT_TOKEN=$ENROLLMENT_TOKEN
 BOOTSTRAP_ADMIN_EMAIL=$ADMIN_EMAIL
 BOOTSTRAP_ADMIN_USERNAME=${RID}-admin
 BOOTSTRAP_ADMIN_PASSWORD=$ADMIN_PASS
@@ -1136,10 +1136,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Bring the stack up — ONLY the three services under test: never
-# quasar-updater, which touches nothing this harness exercises. ────────────
+# ── Bring the stack up: the control plane first, the agent once a token is
+# minted for it. ────────────────────────────────────────────────────────────
 echo "== starting stack (RID=$RID, compose files: ${COMPOSE_FILES[*]}) =="
-compose_cmd up -d quasar-postgres quasar-control-plane quasar-node-agent
+compose_cmd up -d quasar-postgres quasar-control-plane
 STACK_UP=1
 
 wait_for_control_plane() { curl -sS --connect-timeout 2 --max-time 5 -o /dev/null "$API/health"; }
@@ -1154,6 +1154,14 @@ LOGIN_RAW=$(http_raw POST auth/login "" "{\"email\":\"$ADMIN_EMAIL\",\"password\
 ADMIN_TOK=$(http_body "$LOGIN_RAW" | json_get access_token)
 [ -n "$ADMIN_TOK" ] || { fail "login: admin token not obtained"; exit 1; }
 pass "login: admin token obtained"
+
+# ── Enrollment token, then the agent ────────────────────────────────────────
+MINT_RAW=$(http_raw POST admin/hosts/enrollments "$ADMIN_TOK" "{\"max_uses\":100,\"note\":\"$RID harness\"}")
+ENROLLMENT_TOKEN=$(http_body "$MINT_RAW" | json_get enrollment.token)
+[ -n "$ENROLLMENT_TOKEN" ] || { fail "enrollment: no token minted (HTTP $(http_status "$MINT_RAW"))"; exit 1; }
+printf 'ENROLLMENT_TOKEN=%s\n' "$ENROLLMENT_TOKEN" >>"$ENV_FILE"
+pass "enrollment: token minted"
+compose_cmd up -d quasar-node-agent
 
 # Image source-commit labels (org.quasar.source.commit) and the real
 # schema version (control-plane's own Postgres schema_migrations.version) —

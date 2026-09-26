@@ -70,7 +70,7 @@ const hostFail = `[{"id":"input_probe","status":"fail","summary":"s","remediatio
 // in which the host is blocked on paper and schedulable in fact.
 func TestReadinessReportDerivesTheHostVerdictInOneCall(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -106,7 +106,7 @@ func TestReadinessReportDerivesTheHostVerdictInOneCall(t *testing.T) {
 // derive anything either — including the freshness stamp the gate keys on.
 func TestReadinessAbsentOrMalformedReportChangesNothing(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -136,7 +136,7 @@ func TestReadinessAbsentOrMalformedReportChangesNothing(t *testing.T) {
 // have blocks nothing — the write ignores it by construction.
 func TestReadinessGPUScopeBlocksOnlyTheNamedGPU(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	addGPURow(t, pool, hostID, 0)
 	addGPURow(t, pool, hostID, 1)
@@ -169,7 +169,7 @@ func TestReadinessGPUScopeBlocksOnlyTheNamedGPU(t *testing.T) {
 // unblocked and be schedulable until the next report.
 func TestReadinessVerdictFollowsALaterGPUSet(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -198,7 +198,7 @@ func TestReadinessVerdictFollowsALaterGPUSet(t *testing.T) {
 // about.
 func TestReadinessOverrideLiftsTheBlockOnRecompute(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -241,7 +241,7 @@ func TestReadinessOverrideLiftsTheBlockOnRecompute(t *testing.T) {
 // advisory rule was written to prevent (ADR 0005).
 func TestReadinessProxyAndUnknownNeverDerive(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	addGPURow(t, pool, hostID, 0)
 	ctx := context.Background()
@@ -271,7 +271,7 @@ func TestReadinessProxyAndUnknownNeverDerive(t *testing.T) {
 // no block, even beside a passing H.264 probe on the same GPU.
 func TestReadinessUnsupportedIsStoredVerbatimAndBlocksNothing(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	addGPURow(t, pool, hostID, 0)
 	addGPURow(t, pool, hostID, 1)
@@ -310,7 +310,7 @@ func TestReadinessUnsupportedIsStoredVerbatimAndBlocksNothing(t *testing.T) {
 // distinct: `homes` excludes only the launches that mount a managed home.
 func TestReadinessHomesScopeDerivesItsOwnColumn(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	report := `[{"id":"homes_root_writable","status":"fail","summary":"s","remediation":"r",

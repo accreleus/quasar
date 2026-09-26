@@ -225,6 +225,65 @@ fn device_name(kind: &str, tag: &str) -> String {
     format!("Quasar Virtual {kind} [{tag}]")
 }
 
+/// The gamepad's device name. Deliberately NOT session-tagged (the tag goes in
+/// `phys`, see `gamepad_phys`): SDL 2.26+ folds a CRC of the name into the
+/// controller GUID, so a per-session name would key any layout a user saves in
+/// Steam to that one session. It must keep the "Quasar Virtual" prefix, which
+/// `physical_input` uses to never grab a session's own virtual devices.
+const GAMEPAD_NAME: &str = "Quasar Virtual Gamepad";
+
+/// Per-session `phys` for the gamepad, carrying the tag `device_name` carries
+/// for the keyboard and mouse (visible in `/proc/bus/input/devices`).
+fn gamepad_phys(tag: &str) -> String {
+    format!("quasar/{tag}/input0")
+}
+
+/// The gamepad presents as a wired Xbox 360 controller (`xpad`, 045e:028e) on
+/// `BUS_USB`, not a synthetic `ab1e` ID. SDL, Steam and games that read evdev
+/// directly all know this device and apply the xpad layout to it; for an
+/// unknown ID SDL invents a mapping from button-code order, which reads the
+/// positional `BTN_WEST`/`BTN_NORTH` the wrong way round (issue #348). The
+/// capabilities in `create_gamepad` must therefore match what xpad exposes for
+/// this device exactly, or SDL's known mapping points at the wrong indices.
+fn gamepad_input_id() -> InputId {
+    InputId {
+        bustype: isys::BUS_USB,
+        vendor: 0x045e,
+        product: 0x028e,
+        version: 0x0114,
+    }
+}
+
+/// `UI_SET_PHYS` as the kernel defines it: `_IOW('U', 108, char *)`, so the
+/// size field is a POINTER's size. `input_linux`'s `set_phys` declares the
+/// argument as `c_char` (size 1), producing a request number the kernel does
+/// not recognise (EINVAL), which failed every session launch on the first
+/// #348 edge build. Direction/size/type/nr use the generic `_IOC` layout
+/// (x86-64, arm64).
+const UI_SET_PHYS: u64 = (1 << 30)
+    | ((std::mem::size_of::<*const libc::c_char>() as u64) << 16)
+    | ((b'U' as u64) << 8)
+    | 108;
+
+/// Set a uinput device's `phys` string (before `create`).
+fn set_phys(h: &UInputHandle<File>, phys: &str) -> Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let phys = std::ffi::CString::new(phys).context("phys contains a NUL byte")?;
+    // SAFETY: valid open uinput fd; the kernel copies the NUL-terminated
+    // string (strndup_user) before returning, so `phys` outlives the call.
+    let rc = unsafe {
+        libc::ioctl(
+            h.as_fd().as_raw_fd(),
+            UI_SET_PHYS as libc::Ioctl,
+            phys.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("UI_SET_PHYS");
+    }
+    Ok(())
+}
+
 /// Stable-ish synthetic IDs so the devices are recognizable in logs / udev.
 fn input_id(product: u16) -> InputId {
     InputId {
@@ -372,7 +431,7 @@ struct HeldInputs {
     keys: std::collections::BTreeSet<u16>,
     mouse_buttons: std::collections::BTreeSet<u16>,
     pad_buttons: std::collections::BTreeSet<u16>,
-    /// True when any trigger or stick was last written nonzero, so
+    /// True when any trigger, stick or d-pad hat was last written nonzero, so
     /// `drain_releases` knows to zero them.
     pad_analog_active: bool,
 }
@@ -442,7 +501,10 @@ impl HeldInputs {
             for &(_, abs_code) in PAD_AXES {
                 gamepad.push(ev(isys::EV_ABS as u16, abs_code, 0));
             }
-            for &(_, abs_code, _) in PAD_TRIGGERS {
+            for &(_, abs_code) in PAD_TRIGGERS {
+                gamepad.push(ev(isys::EV_ABS as u16, abs_code, 0));
+            }
+            for &(_, _, abs_code) in PAD_HATS {
                 gamepad.push(ev(isys::EV_ABS as u16, abs_code, 0));
             }
             self.pad_analog_active = false;
@@ -480,6 +542,9 @@ pub struct VirtualDevices {
     /// Last gamepad snapshot, for state-on-change diffing (`gp` arrives at frame
     /// rate; only transitions are emitted).
     last_pad: Mutex<PadSnapshot>,
+    /// Held `BTN_DPAD_*` of a forwarded physical pad, folded onto the hat
+    /// (see `DpadHat`).
+    forwarded_dpad: Mutex<DpadHat>,
     /// Last absolute pointer position (output pixels) so `ma` can emit a delta on
     /// the relative virtual mouse. `None` until the first `ma` seeds it.
     last_abs: Mutex<Option<(f64, f64)>>,
@@ -489,6 +554,8 @@ pub struct VirtualDevices {
     /// messages; only the integer part is emitted. Lock covers only the
     /// accumulate+split arithmetic, not the uinput write.
     rel_accum: Mutex<(f64, f64)>,
+    /// Wheel remainders (vertical, horizontal); see `WheelAxis`.
+    wheel: Mutex<(WheelAxis, WheelAxis)>,
     /// Moonlight-style relative-mouse batching state. `None` when
     /// `QUASAR_INPUT_BATCH_MS=0` (per-arrival writes, no flush thread).
     rel_flush: Option<Arc<RelFlushState>>,
@@ -502,6 +569,58 @@ pub struct VirtualDevices {
 #[derive(Default)]
 struct PadSnapshot {
     buttons: Vec<bool>,
+}
+
+/// Held d-pad buttons of a forwarded physical pad. The virtual pad has only a
+/// hat d-pad (xpad's shape), so a pad reporting its d-pad as `BTN_DPAD_*`
+/// would otherwise lose it: uinput drops codes the device didn't declare.
+#[derive(Default)]
+struct DpadHat {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+}
+
+impl DpadHat {
+    /// Rewrite `BTN_DPAD_*` key events in one frame to `ABS_HAT0X/Y`; every
+    /// other event passes through unchanged and in order.
+    fn translate(&mut self, events: &[isys::input_event]) -> Vec<isys::input_event> {
+        events
+            .iter()
+            .map(|e| {
+                if e.type_ != isys::EV_KEY as u16 {
+                    return *e;
+                }
+                let held = e.value != 0;
+                let (axis, value) = match e.code as i32 {
+                    isys::BTN_DPAD_UP => {
+                        self.up = held;
+                        (isys::ABS_HAT0Y, self.down as i32 - self.up as i32)
+                    }
+                    isys::BTN_DPAD_DOWN => {
+                        self.down = held;
+                        (isys::ABS_HAT0Y, self.down as i32 - self.up as i32)
+                    }
+                    isys::BTN_DPAD_LEFT => {
+                        self.left = held;
+                        (isys::ABS_HAT0X, self.right as i32 - self.left as i32)
+                    }
+                    isys::BTN_DPAD_RIGHT => {
+                        self.right = held;
+                        (isys::ABS_HAT0X, self.right as i32 - self.left as i32)
+                    }
+                    _ => return *e,
+                };
+                isys::input_event {
+                    type_: isys::EV_ABS as u16,
+                    code: axis as u16,
+                    value,
+                    ..*e
+                }
+            })
+            .collect()
+    }
 }
 
 impl VirtualDevices {
@@ -565,8 +684,10 @@ impl VirtualDevices {
             udev_records,
             udev_export_ids: Mutex::new(None),
             last_pad: Mutex::new(PadSnapshot::default()),
+            forwarded_dpad: Mutex::new(DpadHat::default()),
             last_abs: Mutex::new(None),
             rel_accum: Mutex::new((0.0, 0.0)),
+            wheel: Mutex::new((WheelAxis::default(), WheelAxis::default())),
             rel_flush,
             flush_thread,
             held: Mutex::new(HeldInputs::default()),
@@ -684,15 +805,15 @@ impl VirtualDevices {
         h.set_evbit(EventKind::Key)?;
         h.set_evbit(EventKind::Absolute)?;
         h.set_evbit(EventKind::Synchronize)?;
+        // Exactly xpad's key set: no BTN_TL2/TR2 and no BTN_DPAD_*. SDL numbers
+        // buttons by key-code order, so any extra bit shifts the indices its
+        // Xbox 360 mapping expects (back/start/guide would land one off).
         for &(_, code) in PAD_BUTTONS.iter() {
             // set_keybit wants a typed Key; the codes are all valid BTN_* values.
             if let Some(key) = key_from_code(code) {
                 h.set_keybit(key)?;
             }
         }
-        // Trigger digital fallbacks (W3C exposes triggers as buttons 6/7).
-        h.set_keybit(Key::ButtonTL2)?;
-        h.set_keybit(Key::ButtonTR2)?;
 
         let stick = AbsoluteInfo {
             value: 0,
@@ -706,6 +827,14 @@ impl VirtualDevices {
             value: 0,
             minimum: TRIGGER_MIN,
             maximum: TRIGGER_MAX,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        };
+        let hat = AbsoluteInfo {
+            value: 0,
+            minimum: -1,
+            maximum: 1,
             fuzz: 0,
             flat: 0,
             resolution: 0,
@@ -735,12 +864,28 @@ impl VirtualDevices {
                 axis: AbsoluteAxis::RZ,
                 info: trigger,
             },
+            // D-pad as a hat, as xpad reports it (SDL's mapping reads `h0.*`).
+            AbsoluteInfoSetup {
+                axis: AbsoluteAxis::Hat0X,
+                info: hat,
+            },
+            AbsoluteInfoSetup {
+                axis: AbsoluteAxis::Hat0Y,
+                info: hat,
+            },
         ];
         for s in &abs {
             h.set_absbit(s.axis)?;
         }
-        let name = device_name("Gamepad", tag);
-        h.create(&input_id(0x0003), name.as_bytes(), 0, &abs)?;
+        // Best-effort: `phys` is only a label, and must never cost the session
+        // its input devices (`VirtualDevices::create` failing ends the launch).
+        if let Err(e) = set_phys(&h, &gamepad_phys(tag)) {
+            tracing::warn!(
+                token = "vinput-set-phys-failed",
+                "gamepad phys not set (device still created): {e:#}"
+            );
+        }
+        h.create(&gamepad_input_id(), GAMEPAD_NAME.as_bytes(), 0, &abs)?;
         Ok(h)
     }
 
@@ -864,39 +1009,21 @@ impl VirtualDevices {
         Ok(())
     }
 
-    /// Scroll (hi-res wheel units). `dy` is vertical, `dx` horizontal.
+    /// Scroll (hi-res wheel units, 120 per detent). `dy` is vertical, `dx`
+    /// horizontal, both in the browser's `WheelEvent` sense (`protocol/input.md`):
+    /// positive `dy` scrolls the content down. evdev's `REL_WHEEL` is the
+    /// opposite (positive = wheel rolled away from the user = scroll up), so
+    /// the vertical axis is negated here; forwarding it as-is inverted scrolling
+    /// in every app (issue #350). Horizontal already agrees (positive = right).
     pub fn scroll(&self, dx: f64, dy: f64) -> Result<()> {
-        let mut evs = Vec::with_capacity(5);
-        if dy != 0.0 {
-            // Hi-res wheel is in 1/120 of a detent; also emit a coarse notch so
-            // clients that only read REL_WHEEL still scroll.
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_WHEEL_HI_RES as u16,
-                dy.round() as i32,
-            ));
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_WHEEL as u16,
-                (dy / 120.0).round() as i32,
-            ));
-        }
-        if dx != 0.0 {
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_HWHEEL_HI_RES as u16,
-                dx.round() as i32,
-            ));
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_HWHEEL as u16,
-                (dx / 120.0).round() as i32,
-            ));
-        }
+        let evs = {
+            let mut wheel = self.wheel.lock().unwrap();
+            let (v, h) = &mut *wheel;
+            scroll_events(v, h, dx, dy)
+        };
         if evs.is_empty() {
             return Ok(());
         }
-        evs.push(syn());
         self.mouse.write(&evs).context("write scroll")?;
         Ok(())
     }
@@ -915,19 +1042,22 @@ impl VirtualDevices {
                 evs.push(ev(isys::EV_KEY as u16, code, pressed as i32));
             }
         }
-        // Triggers (W3C buttons 6/7) -> ABS_Z/ABS_RZ + digital fallback.
-        for &(idx, abs_code, btn_code) in PAD_TRIGGERS.iter() {
+        // Triggers (W3C buttons 6/7) -> ABS_Z/ABS_RZ (analog only, as xpad).
+        for &(idx, abs_code) in PAD_TRIGGERS.iter() {
             let v = buttons.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let was = last.buttons.get(idx).copied().unwrap_or(false);
-            let pressed = v >= 0.5;
             evs.push(ev(
                 isys::EV_ABS as u16,
                 abs_code,
                 (v * TRIGGER_MAX as f64).round() as i32,
             ));
-            if pressed != was {
-                evs.push(ev(isys::EV_KEY as u16, btn_code, pressed as i32));
-            }
+        }
+        // D-pad (W3C buttons 12-15) -> ABS_HAT0X/HAT0Y.
+        for &(neg, pos, abs_code) in PAD_HATS.iter() {
+            evs.push(ev(
+                isys::EV_ABS as u16,
+                abs_code,
+                hat_value(buttons, neg, pos),
+            ));
         }
         // Sticks (W3C axes 0..=3) -> ABS_X/Y/RX/RY, scaled to signed 16-bit.
         for &(idx, abs_code) in PAD_AXES.iter() {
@@ -950,20 +1080,16 @@ impl VirtualDevices {
                     held.note_pad_button(code, pressed);
                 }
             }
-            for &(idx, _, btn_code) in PAD_TRIGGERS.iter() {
-                let pressed = buttons.get(idx).copied().unwrap_or(0.0) >= 0.5;
-                let was = last.buttons.get(idx).copied().unwrap_or(false);
-                if pressed != was {
-                    held.note_pad_button(btn_code, pressed);
-                }
-            }
             let any_trigger = PAD_TRIGGERS
                 .iter()
-                .any(|&(idx, _, _)| buttons.get(idx).copied().unwrap_or(0.0) != 0.0);
+                .any(|&(idx, _)| buttons.get(idx).copied().unwrap_or(0.0) != 0.0);
             let any_stick = PAD_AXES
                 .iter()
                 .any(|&(idx, _)| axes.get(idx).copied().unwrap_or(0.0) != 0.0);
-            held.note_pad_analog(any_trigger || any_stick);
+            let any_hat = PAD_HATS
+                .iter()
+                .any(|&(neg, pos, _)| hat_value(buttons, neg, pos) != 0);
+            held.note_pad_analog(any_trigger || any_stick || any_hat);
         }
 
         last.buttons = (0..buttons.len()).map(|i| buttons[i] >= 0.5).collect();
@@ -1006,9 +1132,13 @@ impl VirtualDevices {
     /// Forward a physical controller's already-framed evdev events into the
     /// session gamepad. Linux gamepads use the same BTN_*/ABS_* event ABI as the
     /// virtual Xbox-style device, so no Wayland/compositor path is involved.
+    ///
+    /// Codes the virtual pad doesn't declare are dropped by uinput; `BTN_DPAD_*`
+    /// is the one worth keeping, so it is folded onto the hat first.
     pub fn forward_gamepad_frame(&self, events: &[isys::input_event]) -> Result<()> {
+        let events = self.forwarded_dpad.lock().unwrap().translate(events);
         self.gamepad
-            .write(events)
+            .write(&events)
             .map(|_| ())
             .context("forward physical gamepad frame")
     }
@@ -1043,6 +1173,7 @@ impl VirtualDevices {
         // Drop the fractional remainder so it doesn't bias motion in the next
         // app/session, then flush any pending batched motion so it isn't lost.
         *self.rel_accum.lock().unwrap() = (0.0, 0.0);
+        *self.wheel.lock().unwrap() = (WheelAxis::default(), WheelAxis::default());
         self.flush_pending_rel();
         Ok(())
     }
@@ -1074,6 +1205,75 @@ impl Drop for VirtualDevices {
     }
 }
 
+/// Hi-res wheel units per detent (the kernel's `REL_WHEEL_HI_RES` convention).
+const WHEEL_DETENT: i32 = 120;
+
+/// One wheel axis's carried state. uinput wheel values are integers, and a
+/// browser sends fractions of a detent (Firefox pixel mode is ~40-60 units a
+/// notch; touch scroll is fractional). `frac` carries the sub-unit remainder of
+/// the hi-res value; `partial` carries hi-res units not yet worth a whole
+/// `REL_WHEEL` detent, so the coarse axis always agrees with the hi-res sum
+/// (as the kernel expects) instead of rounding each message to 0 on its own.
+#[derive(Default)]
+struct WheelAxis {
+    frac: f64,
+    partial: i32,
+}
+
+impl WheelAxis {
+    /// Add `delta` (hi-res units, evdev sign) and return the `(hi_res,
+    /// detents)` to emit now. A direction change drops the partial detent, as
+    /// hid-input does, so a reversal never has to cancel the old direction first.
+    fn step(&mut self, delta: f64) -> (i32, i32) {
+        let total = self.frac + delta;
+        let hi = total.trunc() as i32;
+        self.frac = total - hi as f64;
+        if hi == 0 {
+            return (0, 0);
+        }
+        if self.partial != 0 && (self.partial > 0) != (hi > 0) {
+            self.partial = 0;
+        }
+        self.partial += hi;
+        let detents = self.partial / WHEEL_DETENT;
+        self.partial -= detents * WHEEL_DETENT;
+        (hi, detents)
+    }
+}
+
+/// The evdev frame for one `ms` message (wire sign → evdev sign, see
+/// [`VirtualDevices::scroll`]), `SYN_REPORT`-terminated; empty when the
+/// message adds up to less than one hi-res unit on both axes. Pure, so the
+/// sign and accumulation are unit-testable without uinput.
+fn scroll_events(
+    vertical: &mut WheelAxis,
+    horizontal: &mut WheelAxis,
+    dx: f64,
+    dy: f64,
+) -> Vec<isys::input_event> {
+    let mut evs = Vec::with_capacity(5);
+    let axes = [
+        (vertical.step(-dy), isys::REL_WHEEL_HI_RES, isys::REL_WHEEL),
+        (
+            horizontal.step(dx),
+            isys::REL_HWHEEL_HI_RES,
+            isys::REL_HWHEEL,
+        ),
+    ];
+    for ((hi, detents), hi_code, code) in axes {
+        if hi != 0 {
+            evs.push(ev(isys::EV_REL as u16, hi_code as u16, hi));
+        }
+        if detents != 0 {
+            evs.push(ev(isys::EV_REL as u16, code as u16, detents));
+        }
+    }
+    if !evs.is_empty() {
+        evs.push(syn());
+    }
+    evs
+}
+
 /// Scale a W3C axis value (-1.0..=1.0) onto signed 16-bit stick range.
 fn scale_stick(v: f64) -> i32 {
     if v >= 0.0 {
@@ -1083,30 +1283,48 @@ fn scale_stick(v: f64) -> i32 {
     }
 }
 
-/// W3C Standard Gamepad button index → evdev BTN_* code (digital buttons).
+/// W3C Standard Gamepad button index → evdev BTN_* code (digital buttons),
+/// in the `xpad` convention the Xbox 360 identity promises (`gamepad_input_id`).
+/// xpad emits `BTN_X`/`BTN_Y` for the Xbox X/Y buttons, and those alias
+/// `BTN_NORTH`/`BTN_WEST`: the *positional* reading of the names
+/// (`Documentation/input/gamepad.rst`) is the opposite, and following it is
+/// what swapped X and Y in Steam (issue #348). Do not "correct" these two.
 const PAD_BUTTONS: &[(usize, u16)] = &[
-    (0, isys::BTN_SOUTH as u16),       // A
-    (1, isys::BTN_EAST as u16),        // B
-    (2, isys::BTN_WEST as u16),        // X
-    (3, isys::BTN_NORTH as u16),       // Y
-    (4, isys::BTN_TL as u16),          // LB
-    (5, isys::BTN_TR as u16),          // RB
-    (8, isys::BTN_SELECT as u16),      // Back/View
-    (9, isys::BTN_START as u16),       // Start/Menu
-    (10, isys::BTN_THUMBL as u16),     // L3
-    (11, isys::BTN_THUMBR as u16),     // R3
-    (12, isys::BTN_DPAD_UP as u16),    // Dpad up
-    (13, isys::BTN_DPAD_DOWN as u16),  // Dpad down
-    (14, isys::BTN_DPAD_LEFT as u16),  // Dpad left
-    (15, isys::BTN_DPAD_RIGHT as u16), // Dpad right
-    (16, isys::BTN_MODE as u16),       // Guide
+    (0, isys::BTN_SOUTH as u16),   // A     (BTN_A)
+    (1, isys::BTN_EAST as u16),    // B     (BTN_B)
+    (2, isys::BTN_NORTH as u16),   // X     (BTN_X, as xpad)
+    (3, isys::BTN_WEST as u16),    // Y     (BTN_Y, as xpad)
+    (4, isys::BTN_TL as u16),      // LB
+    (5, isys::BTN_TR as u16),      // RB
+    (8, isys::BTN_SELECT as u16),  // Back/View
+    (9, isys::BTN_START as u16),   // Start/Menu
+    (10, isys::BTN_THUMBL as u16), // L3
+    (11, isys::BTN_THUMBR as u16), // R3
+    (16, isys::BTN_MODE as u16),   // Guide
 ];
 
-/// W3C trigger button index → (ABS axis code, digital BTN_* fallback).
-const PAD_TRIGGERS: &[(usize, u16, u16)] = &[
-    (6, isys::ABS_Z as u16, isys::BTN_TL2 as u16),  // LT
-    (7, isys::ABS_RZ as u16, isys::BTN_TR2 as u16), // RT
+/// W3C trigger button index → ABS axis code. Analog only: xpad has no digital
+/// trigger buttons, and adding BTN_TL2/TR2 would shift SDL's button indices.
+const PAD_TRIGGERS: &[(usize, u16)] = &[
+    (6, isys::ABS_Z as u16),  // LT
+    (7, isys::ABS_RZ as u16), // RT
 ];
+
+/// D-pad: (W3C negative-direction button, positive-direction button, hat
+/// axis). xpad reports the d-pad as `ABS_HAT0X`/`HAT0Y` (-1/0/1), up and left
+/// negative.
+const PAD_HATS: &[(usize, usize, u16)] = &[
+    (14, 15, isys::ABS_HAT0X as u16), // left / right
+    (12, 13, isys::ABS_HAT0Y as u16), // up / down
+];
+
+/// Hat axis value from a pair of opposing W3C d-pad buttons. Both held (a
+/// worn pad, or a remapped keyboard) cancel to centred rather than favouring
+/// one side.
+fn hat_value(buttons: &[f64], neg: usize, pos: usize) -> i32 {
+    let held = |i: usize| buttons.get(i).is_some_and(|v| *v >= 0.5);
+    held(pos) as i32 - held(neg) as i32
+}
 
 /// W3C axis index → evdev ABS axis code (sticks).
 const PAD_AXES: &[(usize, u16)] = &[
@@ -1129,11 +1347,134 @@ mod tests {
     fn device_names_are_session_tagged_and_unique() {
         let a = "sess-a";
         let b = "sess-b";
-        for kind in ["Keyboard", "Mouse", "Gamepad"] {
+        for kind in ["Keyboard", "Mouse"] {
             assert!(device_name(kind, a).contains(a));
             assert!(device_name(kind, a).contains(kind));
             assert_ne!(device_name(kind, a), device_name(kind, b));
         }
+        // The gamepad carries its tag in `phys` instead of the name.
+        assert!(gamepad_phys(a).contains(a));
+        assert_ne!(gamepad_phys(a), gamepad_phys(b));
+    }
+
+    /// The request number must be the kernel's `UI_SET_PHYS`
+    /// (`_IOW('U', 108, char *)`), not input_linux's 1-byte variant.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn ui_set_phys_matches_the_kernel_request_number() {
+        assert_eq!(UI_SET_PHYS, 0x4008_556c);
+        // input_linux's `ui_set_phys` sizes the argument as one byte.
+        assert_ne!(UI_SET_PHYS, 0x4001_556c);
+    }
+
+    /// The gamepad name is stable across sessions (SDL folds it into the
+    /// controller GUID) and keeps the prefix `physical_input` excludes by.
+    #[test]
+    fn gamepad_name_is_stable_and_excluded_from_physical_grab() {
+        assert!(GAMEPAD_NAME.contains("Quasar Virtual"));
+        assert!(!GAMEPAD_NAME.contains('['), "no session tag in the name");
+    }
+
+    /// Issue #348: each W3C button lands on the evdev code xpad emits for it.
+    /// X/Y in particular are BTN_NORTH/BTN_WEST (== BTN_X/BTN_Y), not the
+    /// positional reading, or SDL/Steam swap them.
+    #[test]
+    fn pad_buttons_follow_xpad_codes() {
+        let expect: &[(usize, u16)] = &[
+            (0, isys::BTN_A as u16),
+            (1, isys::BTN_B as u16),
+            (2, isys::BTN_X as u16),
+            (3, isys::BTN_Y as u16),
+            (4, isys::BTN_TL as u16),
+            (5, isys::BTN_TR as u16),
+            (8, isys::BTN_SELECT as u16),
+            (9, isys::BTN_START as u16),
+            (10, isys::BTN_THUMBL as u16),
+            (11, isys::BTN_THUMBR as u16),
+            (16, isys::BTN_MODE as u16),
+        ];
+        assert_eq!(PAD_BUTTONS, expect);
+        assert_eq!(isys::BTN_X, isys::BTN_NORTH);
+        assert_eq!(isys::BTN_Y, isys::BTN_WEST);
+        assert_eq!(
+            PAD_TRIGGERS,
+            &[(6, isys::ABS_Z as u16), (7, isys::ABS_RZ as u16)]
+        );
+        assert_eq!(
+            PAD_AXES,
+            &[
+                (0, isys::ABS_X as u16),
+                (1, isys::ABS_Y as u16),
+                (2, isys::ABS_RX as u16),
+                (3, isys::ABS_RY as u16),
+            ]
+        );
+    }
+
+    /// SDL numbers a Linux joystick's buttons in key-code order and its Xbox 360
+    /// mapping reads `a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,
+    /// back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10`. The key set the
+    /// device exposes must reproduce exactly that order.
+    #[test]
+    fn pad_key_order_matches_sdl_xbox360_mapping() {
+        let mut codes: Vec<(u16, usize)> = PAD_BUTTONS.iter().map(|&(i, c)| (c, i)).collect();
+        codes.sort();
+        let w3c_by_sdl_index: Vec<usize> = codes.into_iter().map(|(_, i)| i).collect();
+        // A, B, X, Y, LB, RB, Back, Start, Guide, L3, R3
+        assert_eq!(w3c_by_sdl_index, vec![0, 1, 2, 3, 4, 5, 8, 9, 16, 10, 11]);
+    }
+
+    /// A forwarded pad's `BTN_DPAD_*` become hat events carrying the combined
+    /// state of both directions on the axis; other events pass through.
+    #[test]
+    fn forwarded_dpad_buttons_become_hat_events() {
+        let key = |code: i32, value: i32| ev(isys::EV_KEY as u16, code as u16, value);
+        let mut d = DpadHat::default();
+
+        let out = d.translate(&[key(isys::BTN_DPAD_LEFT, 1), syn()]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            (out[0].type_, out[0].code, out[0].value),
+            (isys::EV_ABS as u16, isys::ABS_HAT0X as u16, -1)
+        );
+        assert_eq!(out[1].type_, isys::EV_SYN as u16, "SYN passes through");
+
+        let out = d.translate(&[key(isys::BTN_DPAD_RIGHT, 1)]);
+        assert_eq!(out[0].value, 0, "left+right cancel");
+        let out = d.translate(&[key(isys::BTN_DPAD_LEFT, 0)]);
+        assert_eq!(out[0].value, 1, "right alone after left released");
+
+        let out = d.translate(&[key(isys::BTN_DPAD_UP, 1)]);
+        assert_eq!((out[0].code, out[0].value), (isys::ABS_HAT0Y as u16, -1));
+
+        let out = d.translate(&[key(isys::BTN_SOUTH, 1)]);
+        assert_eq!(
+            (out[0].type_, out[0].code, out[0].value),
+            (isys::EV_KEY as u16, isys::BTN_SOUTH as u16, 1),
+            "non-dpad keys untouched"
+        );
+    }
+
+    /// D-pad buttons fold onto the hat: up/left negative, opposing presses
+    /// cancel, missing indices read as released.
+    #[test]
+    fn dpad_buttons_map_to_hat() {
+        let mut b = vec![0.0; 17];
+        assert_eq!(hat_value(&b, 12, 13), 0);
+        b[12] = 1.0;
+        assert_eq!(hat_value(&b, 12, 13), -1, "up");
+        b[13] = 1.0;
+        assert_eq!(hat_value(&b, 12, 13), 0, "up+down cancel");
+        b[12] = 0.0;
+        assert_eq!(hat_value(&b, 12, 13), 1, "down");
+        assert_eq!(hat_value(&[], 14, 15), 0, "short button array");
+        assert_eq!(
+            PAD_HATS,
+            &[
+                (14, 15, isys::ABS_HAT0X as u16),
+                (12, 13, isys::ABS_HAT0Y as u16),
+            ]
+        );
     }
 
     /// Press-then-release leaves nothing held; a second drain is empty.
@@ -1205,7 +1546,10 @@ mod tests {
             .iter()
             .filter(|e| e.type_ == isys::EV_ABS as u16)
             .collect();
-        assert_eq!(abs_zeros.len(), PAD_AXES.len() + PAD_TRIGGERS.len());
+        assert_eq!(
+            abs_zeros.len(),
+            PAD_AXES.len() + PAD_TRIGGERS.len() + PAD_HATS.len()
+        );
         assert!(abs_zeros.iter().all(|e| e.value == 0));
 
         let r2 = h.drain_releases();
@@ -1227,6 +1571,83 @@ mod tests {
         assert!(
             abs_events.is_empty(),
             "no ABS zeroes when analog was never active"
+        );
+    }
+
+    /// Collapse a scroll frame to `(code, value)` pairs, SYN excluded.
+    fn rel(evs: &[isys::input_event]) -> Vec<(i32, i32)> {
+        evs.iter()
+            .filter(|e| e.type_ == isys::EV_REL as u16)
+            .map(|e| (e.code as i32, e.value))
+            .collect()
+    }
+
+    /// Issue #350: a browser scroll-down (positive deltaY) must reach evdev as
+    /// a negative wheel value; horizontal keeps its sign.
+    #[test]
+    fn scroll_down_is_negative_wheel_and_horizontal_keeps_sign() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        let evs = scroll_events(&mut v, &mut h, 0.0, 120.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_WHEEL_HI_RES, -120), (isys::REL_WHEEL, -1)]
+        );
+        assert_eq!(evs.last().unwrap().type_, isys::EV_SYN as u16);
+
+        let evs = scroll_events(&mut v, &mut h, 0.0, -120.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_WHEEL_HI_RES, 120), (isys::REL_WHEEL, 1)],
+            "scroll up = wheel away from the user = positive"
+        );
+
+        let evs = scroll_events(&mut v, &mut h, 120.0, 0.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_HWHEEL_HI_RES, 120), (isys::REL_HWHEEL, 1)]
+        );
+    }
+
+    /// Small deltas (Firefox pixel mode, ~48 a notch) accumulate into whole
+    /// detents instead of each rounding to 0, and REL_WHEEL always matches the
+    /// hi-res sum.
+    #[test]
+    fn small_scroll_deltas_accumulate_into_detents() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        let mut hi_sum = 0;
+        let mut detents = 0;
+        for _ in 0..5 {
+            for (code, value) in rel(&scroll_events(&mut v, &mut h, 0.0, 48.0)) {
+                if code == isys::REL_WHEEL_HI_RES {
+                    hi_sum += value;
+                } else if code == isys::REL_WHEEL {
+                    detents += value;
+                }
+            }
+        }
+        assert_eq!(hi_sum, -240);
+        assert_eq!(detents, -2, "240 hi-res units = 2 detents, none dropped");
+    }
+
+    /// Fractional deltas carry their remainder; reversing direction drops the
+    /// partial detent so the first notch the other way is not swallowed.
+    #[test]
+    fn scroll_carries_fractions_and_resets_on_reversal() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        assert!(scroll_events(&mut v, &mut h, 0.0, 0.4).is_empty());
+        assert!(scroll_events(&mut v, &mut h, 0.0, 0.4).is_empty());
+        assert_eq!(
+            rel(&scroll_events(&mut v, &mut h, 0.0, 0.4)),
+            vec![(isys::REL_WHEEL_HI_RES, -1)],
+            "0.4 x 3 reaches one hi-res unit"
+        );
+
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        scroll_events(&mut v, &mut h, 0.0, 100.0); // 100 down, no detent yet
+        assert_eq!(
+            rel(&scroll_events(&mut v, &mut h, 0.0, -120.0)),
+            vec![(isys::REL_WHEEL_HI_RES, 120), (isys::REL_WHEEL, 1)],
+            "a full notch up after a partial down is a full detent up"
         );
     }
 

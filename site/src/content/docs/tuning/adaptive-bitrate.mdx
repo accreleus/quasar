@@ -20,8 +20,9 @@ bandwidth estimate, and moves the target as conditions change.
 
 ## The two modes
 
-Set with `QUASAR_ABR_MODE`, globally in `deploy/.env` or per host under Admin,
-Hosts, Settings.
+Set per host under Admin, Fleet, Hosts, Settings. On a legacy Compose install or a
+source checkout, `QUASAR_ABR_MODE` in `deploy/.env` sets it for the whole host
+too; an owned install takes no agent environment of its own.
 
 ### `smooth`, the default
 

@@ -1,0 +1,107 @@
+---
+title: Replace a Compose install
+description: A Compose install is not converted or migrated. It keeps working until you replace it with a fresh install from the seed.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+An install started from `deploy/docker-compose.yml` and `deploy/.env` is a
+[legacy Compose install](/quasar/install/legacy-compose/). Installs owned by
+Quasar are a different shape, and nothing converts one into the other:
+
+- **The old install keeps working** on the release it has. It is never offered a
+  release that ships owned installs, so nothing updates it out from under you,
+  and the console shows no new release rather than an error. You can take your
+  time.
+- **Replacing it is a fresh install.** The new install starts with an empty
+  database: new accounts, a new app library, new hosts. Nothing from the old
+  database is carried across, and there is no supported way to carry it yet.
+  Restoring a dump taken from a Compose install into a new one is planned
+  ([#380](https://github.com/accreleus/quasar/issues/380)); until it ships,
+  plan for a clean start.
+- **Homes stay where they are, and come back by name.** Nothing is copied. A
+  home lives at `<home root>/<user>/<app>`, so when the new install uses the same
+  home root and you re-create a user and an app under the same names, that user
+  finds their saves and installed games again. What is not carried across is the
+  database and its accounts
+  ([#380](https://github.com/accreleus/quasar/issues/380)).
+
+## Before you start
+
+- Read [Install Quasar](/quasar/install/install/) once, so the new shape is
+  familiar: one container per machine, the seed, and Quasar creates the rest.
+- Keep a dump of the old database and a copy of `deploy/.env`, as the [legacy
+  backup](/quasar/install/legacy-compose/#back-up-and-restore) takes them. The
+  new install cannot use them, but they are your way back to the old one.
+- Plan a window with no one playing. Stopping the old stack ends every session.
+
+## Replacing it
+
+<Steps>
+
+1. **Stop each GPU host's old agent stack**, on each GPU host other than the
+   first machine. The one-line command put it in `/opt/quasar-agent`:
+
+   ```bash
+   docker compose --project-directory /opt/quasar-agent down
+   ```
+
+2. **Stop the old stack on the first machine**, without `-v`, from its stack
+   directory:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml down
+   ```
+
+   Leaving off `-v` keeps the old database and volumes, so the old install can
+   come back. The old containers must be gone, not merely stopped: a leftover
+   Quasar container that the new install did not create is an owner conflict,
+   which Quasar refuses to act around, and it would also hold ports 8080 and
+   8443. The [quick start](/quasar/start/quickstart/) script stops if it finds
+   one.
+
+3. **Install the first machine with the seed.** Use the [quick
+   start](/quasar/start/quickstart/), or follow [Install the first
+   machine](/quasar/install/install/#install-the-first-machine). Give it the
+   **same home root** as the old stack's.
+
+4. **Claim the new install** as in [First-run setup](/quasar/install/first-run/),
+   then add apps and users again, **under the same names** as before, so each
+   user's homes are found where they are.
+
+5. **Add each GPU host** from the new console, under Admin, Fleet, Add host, as
+   in [Add a second GPU host](/quasar/install/second-host/), with the same home
+   root it used before.
+
+6. **Verify** as in [Check your install](/quasar/install/verify/): hosts online
+   and a real session that plays.
+
+</Steps>
+
+<Aside type="caution" title="Keep the old install until you are sure">
+Do not run `docker compose down -v`, delete the old volumes, or remove the old
+`deploy/.env` until the new install has run a real session. To go back, take the
+new install apart (see [Uninstalling](/quasar/operations/uninstall/)), then bring
+the old stack back with `docker compose -f deploy/docker-compose.yml up -d` from
+its stack directory.
+</Aside>
+
+## What does not come across
+
+- **Anything in the database**: accounts, the app library and its artwork, host
+  names and history, profiles, stored secrets and settings.
+- **The old stack's files.** There is no compose file and no `.env` in the new
+  install, and most `deploy/.env` settings have no input on it: the [environment
+  reference](/quasar/reference/environment/) lists what an owned install takes.
+- **Portainer.** It is not a supported manager for the new install. Plain Docker
+  Engine, Dockge and Arcane are, and a `docker run` seed on Unraid counts as plain
+  Docker.
+
+## Staying on Compose
+
+You do not have to replace it yet. A legacy install keeps working on its release,
+with the commands on [Legacy Compose installs](/quasar/install/legacy-compose/).
+It simply stops receiving updates.
+
+Building from source with Compose remains available for contributors. It is not
+a supported install. See [Set up a checkout](/quasar/developer/getting-started/).

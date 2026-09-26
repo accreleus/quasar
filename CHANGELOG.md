@@ -25,11 +25,205 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH-06 acceptance map (#368).** `docs/rh06/2026-09-26-acceptance.md` ties every user story
+  in the RH-06 specification (#352) to the ticket and the evidence that cover it, and records
+  #368's own acceptance rows as covered, run for #368 (a combined install and a control-only
+  install declared in Arcane, an NVIDIA GPU host added from a control-only console, and
+  #386's reconfigure recipes on hardware), skipped by the owner (the reboot row) or dropped
+  (the pre-RH-06 dump restore, now #380). It promotes nothing.
+- **Format-2 releases with a floor, and hosts that must update first (#365).** Releases now
+  publish `platform-release-manifest.v2.json` (control plane, node agent and recovery actor
+  by digest, plus the oldest agent and recovery actor this release still manages) and no
+  longer the format-1 asset, so a control plane from before owned installs never offers
+  one; the images workflow builds and promotes the recovery image with the other two, and
+  branch builds are tagged `o2-<branch>` so old edge installs are not offered them either.
+  A release is refused at publication when its recovery actor cannot render its images'
+  recipes, does not reach back to the floor, or when the floor lies above the previous
+  release. A host whose agent or recovery actor is below the floor reads "must update
+  before it can be managed" on its page, in Fleet ▸ Hosts and in Releases' targets, and is
+  offered only the update: revert and developer apply of a release below the floor are
+  refused. Add host now installs the installed release's own seed and agent images, with
+  `QUASAR_ENROLL_SEED_IMAGE` / `QUASAR_ENROLL_AGENT_IMAGE` as overrides and an owned
+  machine's install-time images as the last resort (`QUASAR_ENROLL_FALLBACK_*`,
+  control-plane recipe revision 2). The recovery actor verifies release signatures
+  against the format-2 asset pair, the release-time check also refuses a release the
+  previous release's recovery actor could not hand over to, and an edge build moves an
+  owned host's recovery actor too. Nothing is published until the Compose updater
+  retires (#367).
+- **Race guard, remove host, `uninstall` and `reconfigure` (#366).** A container that looks
+  like a Quasar platform service but was not created by the machine's installation (a
+  leftover Compose stack, a definition a manager still holds) is never acted on: the recovery
+  actor reports it, the agent raises readiness check `owner_conflict`, the control plane
+  blocks that target's updates, and the console warns on the host page, the host row and
+  Releases. The console also warns when no seed is found, keeps a recovery actor's last report
+  on screen when it stops answering, and removes an owned GPU host (drain, wait for its
+  sessions, `POST /v1/admin/platform/hosts/{id}/remove`, agent `host_remove`). On the
+  machine, `quasar-recovery uninstall` removes the installation's containers and keeps its
+  data; `--purge` deletes the data too after a typed confirmation and a final `pg_dump` of a
+  Quasar-owned database. `quasar-recovery reconfigure` changes a GPU host's inputs (home root,
+  release trust, app defaults) through a verified replacement on the same digests. A removed
+  GPU host is added back with Add host under the same node name. The agent re-registers when
+  its recovery actor's reported identity changes, so the console sees a seed go missing or
+  come back without an agent restart.
+- **`reconfigure` changes the control plane's inputs (#386).** On a combined or control-only machine, `quasar-recovery reconfigure` changes the public host, TLS names, ports, trusted proxies, release trust and a combined host's home root by replacing the control plane on the same digest (then the node agent where it moves too), restoring it with the old inputs if it never becomes healthy; `reconfigure.json` records how it settled, and the database and node name are refused, naming the reinstall.
+- **Add host carries the control plane's release trust (#366).** The one-line command and the
+  Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane
+  admits the developer applies that control plane accepts.
+- **A migrating update of an owned control plane dumps the database first (#364).** Before it
+  replaces the control plane with a release that migrates the database, the recovery actor
+  dumps a Quasar-owned database (refusing the update if the dump fails or does not fit) and
+  keeps the last three dumps; an operator's own database needs the operator's confirmation of
+  a current backup instead. A failed migrating update is never restored automatically: Fleet ▸
+  Releases and the actor's output print one `restore` command, which loads the dump into a
+  stopped database and starts the control plane it was taken under. An older control plane is
+  never started against a newer schema. On an operator's own database a failed migrating control
+  plane is stopped, and `restore --to` starts the old one once they have restored their backup.
+  The Update dialog shows the dump's space or the backup confirmation, and a refused or failed
+  migrating update its banner or restore card. A developer apply's Apply button stays enabled
+  on an operator's own database, with a hint, because the console cannot know a digest
+  migrates before the server reads the image; the server fails a migrating one
+  `backup_unconfirmed` unless the backup was confirmed.
+- **An owned control plane is updated by its recovery actor (#363).** On a combined or
+  control-only install the fleet run's control-plane step, and a developer apply to the
+  control plane, go over the machine's control socket: the recovery actor moves itself first
+  when it is behind, then keeps the old control plane stopped until the new one passes its
+  health check, and puts it back automatically when it never does. Live sessions keep
+  streaming through it, and the booted control plane counts as the evidence only once the
+  actor has verified it. A session ended by an agent restart now
+  says so, and Fleet ▸ Releases keeps its per-host detail inside the rail.
+- **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
+  machine to a successor: it starts beside the running actor, takes the machine's lease only
+  when it is handed over, keeps the old actor stopped and disabled until it has verified
+  itself, and only then becomes the actor `seed.json` names. A successor that never verifies
+  is removed and the previous actor runs again (`failed`, restored); every crash, engine
+  restart or deletion part-way settles to a stated outcome with one actor running. Host
+  attempts move the actor first and the agent second (a revert the other way round), a later
+  failure restores only the agent, the agent re-registers so the console shows the new actor
+  version, and Developer apply now accepts a recovery-actor digest. The control plane's own
+  combined host moves its actor only with the control plane. An actor rewriting machine state
+  keeps the fields it does not know, so a revert erases nothing a newer actor recorded. Only
+  a hand-over's two actors wait for the machine's lease: any other actor process exits, so a
+  duplicate never takes the machine mid-hand-over. A node agent that connects before its
+  recovery actor serves again keeps asking for up to 90 s.
+- **Combined and control-only installs from one seed (#361).** `QUASAR_ROLE=combined` or
+  `control-only` on the seed installs Postgres (or uses your own database, named by
+  `QUASAR_DATABASE_*`), the control plane and, on a combined host, its own node agent, which
+  enrolls once with a single-use local token instead of the static `ENROLLMENT_TOKEN`. The
+  database password, secret key and local token are generated into machine state and reach
+  each container only as files (`QUASAR_DATABASE_PASSWORD_FILE`, `QUASAR_SECRET_KEY_FILE`);
+  re-running the seed changes nothing, and an interrupted install completes on the next
+  start. Fleet ▸ Releases ▸ Installed shows "This machine": its name and shape, seed,
+  recovery actor, database (Quasar's own or yours), control plane and node agent, even
+  before its recovery actor has reported; a combined host's own page shows the control plane
+  and database running there, and is not removed from the console. The platform identity
+  gains `machine_role` and `machine_node_name` (amendment 14), served from the control
+  plane's own configuration. `QUASAR_TRUSTED_PROXIES` is an optional seed input. Release trust
+  (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, the signature settings, and for the control plane
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES`) is now a seed input recorded in machine state at
+  first install, so a seed-created actor admits a test registry's images; the Compose
+  control-plane service passes the two developer-apply variables through.
+- **Add host: one line, or a seed-only stack for Dockge or Arcane (#359).** Admin → Fleet's
+  Enroll host becomes Add host: it mints one single-use token (optionally bound to a node name,
+  one hour to 30 days) and prints the pinned-key one-liner or, on a second tab, the seed stack.
+  The served `enroll-host.sh` is rewritten: it checks the host and offers to apply each fix, pulls
+  the seed and node-agent images by digest (`QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE`
+  on the control plane), starts the seed and waits for enrollment. It writes no compose file,
+  `.env` or install directory, changes nothing on an installed machine, and leaves nothing behind
+  when the control plane refuses the string. The seed's health check now fails while it is idle on
+  something only the operator can fix, and an unpullable agent image is logged once.
+- **Owned GPU hosts take agent updates through their recovery actor, and admins can apply a
+  developer build (#360).** On an owned install the agent relays `release_apply` to its
+  recovery actor, which journals every phase before acting, keeps the old agent stopped and
+  disabled until the new one runs healthy, restores it automatically when the new one does not
+  (recorded with its `auto_revert` row), and after any restart of the actor, the engine or the
+  machine ends an interrupted attempt in a stated outcome (`interrupted` when nothing had
+  changed) without retrying it. Per-host apply and revert work on owned hosts as on registry
+  hosts. `POST /v1/admin/platform/developer-apply` (admin only) applies a digest set from an
+  allowed namespace to one owned host as a `developer_apply` attempt (migration 0096), with a
+  Developer apply card and drawer on Fleet ▸ Releases; the control-plane target answers
+  `target_not_owned` until the control plane's own machine is owned. New knob
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES` for a contributor's plain-HTTP test registry.
+- **The seed: one container that keeps a machine's recovery actor in existence (#358).**
+  `quasar-recovery seed` (the same image, started by digest with the GPU host's bootstrap
+  inputs, `docs/configuration.md` "Seed") checks those inputs, the agent image included
+  (pulled, and of a recipe revision the actor carries), then creates exactly one recovery
+  actor from its own image, and finishes its own create if it was stopped between create and
+  start. Afterwards it re-creates one only if none exists, from the last verified actor digest
+  in `seed.json`, and otherwise does nothing. It never replaces an actor, writes no machine
+  state, and idles with one log line on invalid inputs, an unknown `seed.json` format or an
+  uninstalled marker. `seed.json` format 1, the two labels and the compiled actor profile
+  follow ADR 0007 (with a clarification on finishing its own create) and are pinned by a
+  contract test over fixtures per released actor (`testdata/recovery/seed/`, first set added).
+  The actor reads a first install's inputs from the seed's container, writes nothing durable
+  until they and the agent image pass, records `seed.json`, and reports the running seed's
+  version (new `org.quasar.version` image label, `unknown` when unreadable), which the host's
+  services card shows, or "not found". The actor and the seed now stop on SIGTERM/SIGINT with
+  exit 0 instead of being killed after Docker's timeout.
+- **The recovery actor installs a GPU host's agent (#357).** `quasar-recovery actor`, a static
+  Rust binary in the new slim `quasar-recovery` image (`deploy/build-images.sh recovery`, its
+  own image-contract role), is started by hand on a GPU host with an enrollment string, a home
+  root and a digest-pinned agent image. It creates its machine state, stores the enrollment
+  string as a 0600 secret, detects the GPU with a disposable probe container, and creates
+  `quasar-node-agent` from a compiled recipe that matches the Compose definitions (golden
+  specifications per GPU vendor and a parity test against `deploy/docker-compose.yml`). The
+  secret reaches the agent only as a read-only file (`QUASAR_ENROLLMENT_FILE`, new). Starting
+  it again changes nothing, and an interrupted install is completed by the next start. The
+  agent reads the actor's status over a new agent socket and registers `install_mode: "owned"`
+  with the recovery-actor identity (amendment 14); Compose and source installs register
+  exactly as before. Platform images now carry the `org.quasar.recipe` label, stamped by
+  `deploy/build-images.sh` and the Images workflow from one helper
+  (`deploy/lib/recipe-revision.sh`) and asserted by the image contract.
+- **The control plane stores and serves an owned host's recovery-actor identity (#357).**
+  Migration 0095 widens `hosts.install_mode` to admit `owned` and adds the nullable
+  `recovery_actor_version`, `recovery_actor_source_commit` and `seed_version` columns
+  (amendment 14). An agent registering `install_mode: "owned"` has them stored wholesale on
+  every `register`, absent as null, and an actor version that is not
+  `MAJOR.MINOR.PATCH[-prerelease]` is stored null. They are ignored beside any other mode.
+  The host body (`GET /v1/hosts`, `GET /v1/hosts/{id}`) always serializes all three. An owned
+  host is eligible for platform releases exactly like a `registry` host; agents that send
+  none of the fields register as before.
+- **The host page shows an owned GPU host's services (#357).** A host whose install mode is
+  `owned` gets a "Services on this machine" card with its seed, recovery actor and node agent
+  (version, owner, state), says when the recovery actor has not reported yet or did not answer,
+  marks an offline host's rows with the time of its last report, and flags an agent on an older
+  build than the control plane. The Hosts table's expanded row gains a Services column, and the
+  install mode reads "Owned by Quasar" rather than "Unknown". Other hosts render as before.
+- **RH06 release trust ported to Rust, held to shared golden vectors (#356).** The new
+  GStreamer-free crate `node-agent/crates/quasar-recovery` holds the recovery actor's
+  `trust` module (the Go updater's namespace allowlist, digest-only images, closed
+  component table, request gates and ADR 0003 off/verify/require verification, plus the
+  agent-socket confused-deputy guard), the HTTPS client that fetches a release's manifest
+  and signature itself (Go's timeouts, redirect policy, body cap and gzip handling; it
+  refuses rather than fetch around an `HTTPS_PROXY`), and its control-socket shapes. 282 vectors in
+  `testdata/recovery/trust-vectors`, generated from the Go updater and its tests, pass
+  against both implementations; 31 fixtures in `testdata/recovery/socket` round-trip
+  identically through the Rust types and the new Go `internal/actorsocket`. Nothing runs
+  the port yet: the Go updater stays in place until RH06-15.
+- **RH06 console mockups, approved by the owner (#354).**
+  `design_handoff_v3/screens/fleet-rh06-v3.html` extends Fleet and Fleet ▸ Releases in
+  the v3 handoff's own markup and tokens. It covers the per-machine service inventory,
+  the seed-missing and owner-conflict warnings, "must update before it can be managed",
+  the Add host dialog (one-line command or seed-only stack), the backup confirmation on
+  a migrating update, the restore command after a failed one, Remove host and Developer
+  apply, each in its normal, unknown and error states. Screenshots, the surface-to-ticket
+  table and the open questions are in `design_handoff_v3/screens/rh06/README.md`.
+- **RH06 contract amendment and decision records (#353).** Amendment 14 adds the contract
+  surface for Quasar-owned installs as an additive expand step: release manifest format 2,
+  the `owned` install mode, recovery-actor apply components, host removal and new failure,
+  preflight and eligibility identifiers. By owner decision it also adds a `below_floor` read
+  signal, a developer-apply route and the control plane's own machine identity. The contract
+  step retiring the Compose wording and the static token is not in force until RH06-15
+  (#367). ADRs 0007 and 0008 are new and ADR 0004 is amended. No behaviour changes yet.
 - **Design lint for the web client (#370).** `npm run lint:design` checks every
   stylesheet and component for off-scale spacing, raw colours and inline styles, and
   each failure names the token or utility class to use instead. A per-file baseline
   records the existing debt and only ratchets down. CSS spacing now snaps to the 4px
   token scale, so gaps and padding shift by a few pixels across the UI.
+- **`DESIGN.md`, the UI spec.** Colour roles, the spacing scale, density, where styles
+  live and when inline styles are allowed, plus a table of the places Quasar overrides
+  the v3 mocks. It takes precedence over `design_handoff_v3/`, which stays the
+  reference for composition.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
@@ -172,6 +366,21 @@ own; the two do not move together, and that is deliberate.
 - RH-02 acceptance evidence (#265): fresh installs on the AMD test host, the NVIDIA test host and natively on an Unraid host, each with a captured readiness card, one real session, and the #264 harness rerun; the acceptance report is `docs/reports/2026-09-19-rh02-acceptance.md`. No product code changed.
 
 ### Removed
+- **The Compose updater, and with it the Compose install (#367). An existing install is
+  replaced, not migrated.** The Go updater (`internal/updater`, `cmd/quasar-updater`, the
+  `quasar-updater` image and Compose service and its shared volume), the Compose preflight
+  checks `updater_stack_dir` and `updater_overlays` (retired and reserved in the contract),
+  the node agent's Compose-label install discovery and the static `ENROLLMENT_TOKEN` are
+  gone: a control plane accepts only a token minted by Add host or its machine's local
+  token, and every update is made by the machine's recovery actor. The release reader reads
+  only the format-2 manifest. **An install made from the Compose files is not converted and
+  its data is not carried across:** it keeps running on its release, which is never offered
+  one that ships owned installs, and it is replaced by a fresh install from the seed (the
+  site's "Replace a Compose install"). Restoring a pre-RH-06 dump into a new install is
+  planned as #380. Every release until RH-07 is an edge build. The Compose files in
+  `deploy/` remain contributor tooling for building from source; `make config-check` warns
+  on a retired key left in `deploy/.env`. Amendment 14's contract step is in force
+  (protocol pin `e98088b`).
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every
   runtime operation it performs — discovery, image presence/pull/build/removal,
   application launch/observe/stop/cleanup, the audio sidecar, diagnostic and driver
@@ -183,6 +392,31 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The quick start and the site describe owned installs (#367).** The Quick Start writes
+  the seed for a combined, control-only or GPU host: a host script that pins the edge
+  channel's images by digest, refuses a host still running a Compose stack, and starts one
+  container, or the same seed as a one-service stack for Dockge or Arcane, with a `.env`
+  only for your own database's password. It generates no secret. The install, upgrade,
+  backup, restore, uninstall, HTTPS, proxy and reference pages cover owned installs, and the
+  site's draft markers are resolved. The release notes' footer lists the manifest's
+  components instead of the Compose recipe.
+- **Owned installs in the console and Add host (#366, from #361's live run).** Owned host rows
+  name the machine's shape (GPU host, combined host); setup shows the owned install's
+  setup-token command (`docker exec quasar-control-plane cat /run/quasar/setup-token`), and
+  its last step says to keep the `quasar-machine` volume rather than back up `deploy/.env`.
+  The one-line command reports a fresh enrollment rather than the reconnect that follows it,
+  and after `QUASAR_RESET_IDENTITY=1` says the host enrolled afresh. The documented seed stacks
+  and Add host's stack name the seed `quasar-seed` (`container_name`).
+- **The node agent's container-runtime layer is its own GStreamer-free crate (#355).**
+  `node-agent/crates/quasar-runtime` now holds the engine facade (socket discovery and
+  its refusals, the bounded client, error classification, registry credentials,
+  read-only container/image/engine inspection), the ownership label and owned-container
+  proof, container self-inspection, and two durable-state primitives: `DurableFile`
+  (write-temp, fsync, rename, fsync parent; the host-policy journal commits through it)
+  and `StateLease` (the non-blocking `flock` behind the ownership lease). It builds and
+  tests without GStreamer, glib or CUDA, so the RH-06 recovery actor can link it. Pure
+  refactor: agent behaviour, log tokens and wire messages are unchanged. `node-agent/` is
+  now a Cargo workspace; the Rust gates run with `--workspace`.
 - **Design-lint batch A: shared components and utilities (#372).** Every inline style in
   `web/src/components/` has moved to token-backed classes, and `components.css` gains the
   `.t-xs` `.t-sm` `.t-lg` `.t-h3` `.text-1` `.text-2` `.mb1` utilities (the block's top
@@ -330,6 +564,87 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Add host installs the seed the control plane's machine runs after a developer apply
+  (#385).** Below an override and the installed release, Add host now offers the image of
+  the recovery actor answering on the control plane's own machine, and that machine's
+  running node agent, before the install-time `QUASAR_ENROLL_FALLBACK_*` images. A developer
+  apply is no release, so the served command used to name the seed the machine was installed
+  with, which on a host removed from the console could not clear its uninstalled state.
+- **A recovery actor stopped with `docker stop` or `docker kill` is reported, not silent
+  (#381).** Docker never restarts a container stopped that way, so a machine whose actor was
+  stopped mid-replacement stayed without a control plane until someone noticed. The seed now
+  logs `seed-actor-stopped` and turns unhealthy when no recovery actor of the installation has
+  run for two looks, naming `docker start quasar-recovery` (or the way back after an
+  interrupted hand-over); it still starts no existing actor. The `updater_socket` readiness
+  check, the control-plane preflight and the console's manual path for an owned machine say
+  the same, and the recovery runbook in `docs/upgrading.md` has the case.
+- **The seed starts a recovery actor the operator stopped (#381).** Per ADR 0007's owner-
+  approved clarification "An actor stopped from outside", a seed that finds the one actor of
+  an installed machine exited with its `unless-stopped` policy intact, on two looks at least
+  30 s apart, starts it (`seed-actor-started`), and the replacement it was running completes.
+  A kept actor, a disabled policy, two actors, an uninstalled machine and one with no
+  `seed.json` are never started; those stay reported as `seed-actor-stopped`.
+- **The release preflight inventory matches the image build again (#383).**
+  `scripts/release/release-manifest.json` lists the three vendored patches
+  `deploy/Dockerfile.vulkan` applies and the gst-wayland-display pin in `deploy/pins.env`,
+  so `scripts/release/test-release-preflight.sh` passes.
+- **Steam no longer swaps the X and Y gamepad buttons (#348).** The session's virtual
+  gamepad now presents as a wired Xbox 360 controller (045e:028e, USB) with exactly the
+  buttons, triggers and hat d-pad the kernel `xpad` driver exposes, so SDL, Steam and games
+  that read the controller directly apply their known Xbox layout instead of guessing one.
+  The device name no longer carries the session id (it moved to `phys`), so a layout saved
+  in Steam survives into the next session. In console mode a forwarded physical pad's d-pad
+  now reaches the game whether the pad reports it as a hat or as buttons.
+- **A controller your browser doesn't recognise is no longer scrambled silently (#348).**
+  When the browser reports a pad without the standard layout (seen with an 8BitDo pad
+  over Bluetooth), its buttons reach the game in the pad's own order. The session now
+  says so once per pad, and the Controller & input pane notes it under that pad, with
+  the fix: switch the pad to XInput mode, or connect it by cable or USB receiver.
+- **Mouse-wheel scrolling is no longer inverted (#350).** The host forwarded the browser's
+  scroll direction to the virtual mouse unchanged, but Linux counts the wheel the other
+  way round, so scrolling up moved content down in every app. Small wheel movements
+  (Firefox sends well under one notch's worth per event) now also add up into whole
+  notches instead of being dropped by apps and games that read only whole notches.
+- **Owned installs: two #366 details from its live run.** A container that looks like a Quasar
+  service and is defined in the same Compose project as the machine's seed is reported as that
+  stack manager's (take it out of the stack), not as a leftover install. `quasar-recovery status`
+  inside the recovery actor answers from the operator's socket, so it shows the machine's
+  latest attempt, an operator's `reconfigure` included, rather than only the node agent's.
+- **Remove host tells a disconnected owned host by its heartbeats (#366).** An owned host
+  whose agent is gone keeps an admission hold and reads `draining`, never `offline`, so the
+  console offered the removal to a host nobody could tell, reported the refusal as the
+  recovery actor's, and would have called a finished removal stuck. It now reads six missed
+  heartbeats as not connected, and says so when a host went away before it was asked.
+- **Adding a removed host back lifts its removal's drain (#366).** A console removal cordons the
+  host with the operator's drain when none was held; adding the machine back onto the same host
+  row left it `draining`, so nothing could be placed on it until an admin undrained it. The new
+  enrollment now releases that drain, and only that one: an operator's own drain, and every
+  platform hold, stay. The remove route's refusal for a host that is not connected now speaks of
+  the removal, not a release, and `enroll-host.sh` shows what the recovery actor's `uninstall`
+  said when it fails, rather than only that it did not finish.
+- **A recovery actor successor is verified only by the node agent (#362).** On a GPU host the
+  successor's own image healthcheck counted as the node agent reaching it, so a successor
+  verified with no agent running. Only the agent relay's poll of the attempt's status counts
+  now, and the actor's own `status` requests say they are its own. A failed attempt's output
+  also embeds the failed container's log lines without terminal colour codes.
+- **The one-line Add host command, after its first live run (#359).** A spent-token reset
+  also removes the unlabelled `quasar-recovery-agent` volume unless a container still mounts
+  it, and then says what it left instead of "nothing was left". `--fix-only` prepares a host
+  for the Dockge / Arcane stack without an enrollment string (a dry run still applies no fix).
+  `curl … | sh -s -- --help` prints the help. The agent's own messages say Add host, and the
+  seed's documented time to unhealthy is corrected to about two minutes.
+- **A combined or control-only machine's recovery actor no longer holds every start on an
+  unhealthy dependency (#361).** It waits for Postgres, then the control plane, only before
+  creating what needs them, so a restart of an installed machine answers release requests at
+  once instead of refusing them as busy for up to six minutes.
+- **The documentation site no longer states facts that stopped being true.** A control-plane
+  update without a migration does not end sessions, and a fleet run with no control-plane step
+  cordons each host only when it reaches it; a host whose new agent never came up is
+  restored automatically (ADR 0004); the `beta` channel, unattended updates and release
+  notifications are documented; the stack's container and volume lists include the updater and
+  the NVIDIA driver volume; the static `ENROLLMENT_TOKEN` is optional; each host may have its own
+  home root; the Debian note asks for Compose 2.30; `make diagnose` is marked as needing a
+  checkout. The site's compose snapshot is regenerated, so `npm run build` passes again.
 - **Session charts with a small range drew duplicate y-axis ticks (#372).** A metric like
   `ladder_res_rung` (0–1) got ticks `0, 0, 1, 1, 1`: overlapping gridlines and a React
   duplicate-key warning. Ticks now take the fewest decimals that keep them distinct
@@ -918,7 +1233,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.5 — 2026-09-07
 
 ### Fixed
-
 - `deploy/redeploy.sh`'s header no longer claims that running sessions survive a
   control-plane-only deploy. They do not, and have not: recreating the control
   plane ends every session on the host (#128). Drain first if the sessions
@@ -979,7 +1293,6 @@ own; the two do not move together, and that is deliberate.
   preparation off preserves existing homes, templates and running sessions (#145).
 
 ### Fixed
-
 - Release publication waits for the updater image to be validated and promoted,
   so its installation instructions cannot advertise a missing updater tag.
 - Agent startup cleanup only removes its own session and audio containers;
@@ -1012,7 +1325,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.3 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update no longer re-cordons each host moments after it finishes (#140,
   second half).** The per-host apply inside a fleet run found the host already draining
   — the run's own cordon — took it for an admin's, and restored it a few milliseconds
@@ -1022,7 +1334,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.2 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update from v0.2.0 no longer leaves every host `draining` when it
   finishes (#140).** The v0.2.0 control plane cordoned the fleet with nothing to record
   it in; when the new control plane picked the run up it found every host draining, took
@@ -1037,7 +1348,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.1 — 2026-09-05
 
 ### Fixed
-
 - **A fleet update no longer fails on the first host right after the control plane
   updates itself (#117).** When the new control plane came back and picked the run up,
   it moved to the first host before the agents had reconnected, recorded the miss as
@@ -1220,7 +1530,6 @@ own; the two do not move together, and that is deliberate.
   The release view also gains an additive `source_repo` field.
 
 ### Fixed
-
 - **Installing a release no longer requires building it.** The documented quick start
   told self-hosters to run `deploy/redeploy.sh <profile> vX.Y.Z`, which compiles the web
   client and both runtime images from source — roughly 25 minutes and 25 GB of Docker

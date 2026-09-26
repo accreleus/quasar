@@ -48,8 +48,9 @@ name: Images
 # bytes for one digest, so "the thing validated" and "the thing promoted" are the
 # same object by construction, not by timing.
 #
-# FAILURE LEAVES CONSUMERS WHERE THEY WERE. Both images promote or neither does
-# (`promote` needs every validate job). Inside `promote`, the pre-promotion
+# FAILURE LEAVES CONSUMERS WHERE THEY WERE. The three platform images (control
+# plane, node agent, recovery actor) promote together or not at all (`promote`
+# needs every validate job). Inside `promote`, the pre-promotion
 # `:latest` digest of each package is recorded first and restored by an
 # `if: failure()` step, so a partial run cannot strand half a publish.
 #
@@ -74,12 +75,14 @@ name: Images
 #
 # Consumption story (issue #449 — self-hosters previously had to compile
 # GStreamer + the Rust agent from source, ~25 min / ~25 GB per install):
-# this workflow is the ONLY thing that publishes the two runtime images a
+# this workflow is the ONLY thing that publishes the runtime images a
 # self-hoster (or a deploy host) actually pulls:
 #   ghcr.io/accreleus/quasar/quasar-control-plane (control plane, prod target)
 #   ghcr.io/accreleus/quasar/quasar-node-agent    (the universal node agent —
 #                                                     AMD/Intel VA, Vulkan AND NVIDIA)
-# There were three until #545 retired the separate NVIDIA image (quasar-nv). An NVIDIA
+# plus the recovery actor an owned machine runs (and seeds from):
+#   ghcr.io/accreleus/quasar/quasar-recovery
+# A separate NVIDIA image (quasar-nv) existed until #545 retired it. An NVIDIA
 # host pulls quasar-node-agent like everyone else and the agent fetches the CUDA
 # userspace it needs at run time; the difference is the compose overlay, not the image.
 # `deploy/` compose consumes these via QUASAR_NODE_IMAGE (the base/nvidia
@@ -115,8 +118,13 @@ name: Images
 #   enable={{is_default_branch}}` rule, that means `:latest` tracks whichever of
 #   `main` or the newest release tag was published most recently — which is what
 #   deploy/README.md promises ("`:latest` is the only moving tag guaranteed to
-#   resolve"). A dispatch on any other branch publishes only `sha-<sha>` and the
-#   branch name; it can never move `:latest` or mint a version tag.
+#   resolve"). A dispatch on any other branch publishes only `sha-<sha>` and
+#   `o2-<branch>`; it can never move `:latest` or mint a version tag.
+#
+#   Branch tags are the `o2-` family (`type=ref,event=branch,prefix=o2-`), and the
+#   bare `:<branch>` tag is never moved: a pre-RH-06 control plane follows
+#   `quasar-control-plane:<branch>` on the edge channel and must not be offered a
+#   build it cannot run (control-plane/internal/platform/edge.go EdgeTagPrefix).
 #
 #   The metadata is computed in the PROMOTE job, not the build jobs. Tag naming
 #   is a promotion decision; a build job that knew the final tags would be one
@@ -153,7 +161,7 @@ name: Images
 # The one automatic trigger is a `v*` TAG PUSH (#104/#108), which is the release
 # lever: pushing `vX.Y.Z` on `main` publishes a stable platform release — images,
 # the version tag set, a GitHub Release whose body is that version's CHANGELOG
-# section, and the `platform-release-manifest.json` asset the control plane reads
+# section, and the `platform-release-manifest.v2.json` asset the control plane reads
 # (scripts/release/platform-release-manifest.md). A prerelease semver tag
 # (`v0.2.0-rc.1`) publishes a GitHub prerelease instead. Tags are pushed by hand,
 # a few times a release, so this costs no ambient Actions minutes.
@@ -172,8 +180,8 @@ concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: true
 
-# Read-only floor. `packages: write` is granted PER JOB, and now only to the three
-# that put bytes or tags in the registry — the jobs that JUDGE an artifact
+# Read-only floor. `packages: write` is granted PER JOB, and only to the jobs that
+# put bytes or tags in the registry (the toolchain, build-* and promote*) — the jobs that JUDGE an artifact
 # (validate-*, preflight) run without it, so a gate cannot publish what it just
 # approved. Every third-party action below is pinned to a full commit sha (the
 # trailing comment is the version that sha was) — a tag is mutable, and these run
@@ -210,7 +218,7 @@ jobs:
   # same moving `:latest` — so it should meet the same conditions however the run
   # started. The consequence a maintainer will notice: a tag on a branch can no
   # longer be dispatched to publish a version tag. Dispatch on the BRANCH for
-  # that (it publishes `sha-*` and the branch name, never `:X.Y.Z`).
+  # that (it publishes `sha-*` and `o2-<branch>`, never `:X.Y.Z`).
   release-gate:
     name: release gate (tags only; no-op on a branch)
     runs-on: ubuntu-latest
@@ -531,12 +539,21 @@ jobs:
                 | sed -n 's/^0*\([0-9][0-9]*\)_.*\.up\.sql$/\1/p' | sort -n | tail -1)"
           test -n "$n"
           echo "version=$n" >> "$GITHUB_OUTPUT"
+      - name: Recipe revision
+        id: recipe
+        # org.quasar.recipe (ADR 0008), which the control role of the contract requires.
+        # The same derivation deploy/build-images.sh uses.
+        run: |
+          rev="$(bash deploy/lib/recipe-revision.sh control)"
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/Dockerfile.control.prod
+          labels: |
+            org.quasar.recipe=${{ steps.recipe.outputs.revision }}
           # `push-by-digest=true` with no `tags:`. The manifest is uploaded and
           # addressable, and nothing names it. That is the whole point of the split:
           # an artifact that fails the contract below was never reachable.
@@ -601,12 +618,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Recipe revision
+        id: recipe
+        # org.quasar.recipe (ADR 0008): the runtime role of the contract requires it, and a
+        # recovery actor refuses an agent image without it. Same derivation as
+        # deploy/build-images.sh.
+        run: |
+          rev="$(bash deploy/lib/recipe-revision.sh runtime)"
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/Dockerfile.vulkan
+          labels: |
+            org.quasar.recipe=${{ steps.recipe.outputs.revision }}
           # Dockerfile.vulkan is multi-target and BuildKit's no-target default is "last
           # stage wins", which historically built the ~10.7 GB CUDA image and tagged it
           # quasar-node-agent. Always pass an explicit target, whatever is last today.
@@ -638,6 +665,55 @@ jobs:
           # shared with the dev boxes.
           cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent-cache:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent-cache:buildcache,mode=max
+
+  build-recovery-actor:
+    name: build quasar-recovery (digest only)
+    needs: [release-gate, inputs]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Recipe revision
+        id: recipe
+        # org.quasar.recipe (ADR 0008), the actor's own container shape. Same derivation as
+        # deploy/build-images.sh.
+        run: |
+          rev="$(bash deploy/lib/recipe-revision.sh recovery)"
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile.recovery
+          target: runtime
+          labels: |
+            org.quasar.recipe=${{ steps.recipe.outputs.revision }}
+          outputs: type=image,name=${{ env.REGISTRY_NS }}/quasar-recovery,push-by-digest=true,name-canonical=true,push=true
+          # See the control-plane lane for why attestations are off here.
+          provenance: false
+          sbom: false
+          # The args deploy/build-images.sh passes for the recovery role. Not on the
+          # quasar-base family, so no QUASAR_BASE_IMAGE. QUASAR_VERSION is the gate's
+          # v-less version (empty on a branch), as build-images.sh passes it: it becomes
+          # the org.quasar.version label a seed's version is read from.
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            BUILT_AT=${{ needs.inputs.outputs.built_at }}
+            QUASAR_VERSION=${{ needs.release-gate.outputs.version }}
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-recovery-cache:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-recovery-cache:buildcache,mode=max
 
   # ── Phase 2: the repo's own contract, run against the exact pushed digest ──
   #
@@ -734,6 +810,45 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  validate-recovery-actor:
+    name: contract - quasar-recovery
+    needs: build-recovery-actor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate against deploy/image-contract.json
+        env:
+          REF: ${{ env.REGISTRY_NS }}/quasar-recovery@${{ needs.build-recovery-actor.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "validating $REF"
+          bash deploy/validate-image.sh \
+            --image "$REF" --role recovery \
+            --pull --require-digest-ref --no-gpu \
+            --json "$RUNNER_TEMP/contract-recovery.json"
+      - name: Record the verdict on the run
+        if: always()
+        run: |
+          set -uo pipefail
+          f="$RUNNER_TEMP/contract-recovery.json"
+          [ -f "$f" ] || { echo "no contract report produced" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          {
+            echo "### Contract: quasar-recovery"
+            echo ""
+            echo '```json'
+            cat "$f"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ── Phase 3: the candidate as a whole ──────────────────────────────────────
   #
   # validate-* judge each image in isolation. This judges the RELEASE INPUTS:
@@ -741,13 +856,13 @@ jobs:
   # is present, the compose inputs exist, the protocol submodule matches its
   # superproject pin. On a release-tag dispatch it additionally runs strict
   # (`--require-artifact-images`), which refuses anything but exact
-  # name@sha256 references for both artifacts and the base — the digests it is
+  # name@sha256 references for every artifact and the base — the digests it is
   # handed are the same job outputs the promote job will tag.
   #
   # `contents: read` only. No registry credential reaches this job at all.
   preflight:
     name: release preflight (candidate inputs)
-    needs: [inputs, toolchain, build-control-plane, build-node-agent]
+    needs: [inputs, toolchain, build-control-plane, build-node-agent, build-recovery-actor]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -768,6 +883,7 @@ jobs:
           TOOLCHAIN_IMAGE: ${{ needs.toolchain.outputs.ref }}
           QUASAR_CONTROL_IMAGE: ${{ env.REGISTRY_NS }}/quasar-control-plane@${{ needs.build-control-plane.outputs.digest }}
           QUASAR_AGENT_IMAGE: ${{ env.REGISTRY_NS }}/quasar-node-agent@${{ needs.build-node-agent.outputs.digest }}
+          QUASAR_RECOVERY_IMAGE: ${{ env.REGISTRY_NS }}/quasar-recovery@${{ needs.build-recovery-actor.outputs.digest }}
           RELEASE_CANDIDATE: ${{ needs.inputs.outputs.release_candidate }}
         run: |
           set -euo pipefail
@@ -798,8 +914,10 @@ jobs:
       - inputs
       - build-control-plane
       - build-node-agent
+      - build-recovery-actor
       - validate-control-plane
       - validate-node-agent
+      - validate-recovery-actor
       - preflight
     runs-on: ubuntu-latest
     permissions:
@@ -821,9 +939,10 @@ jobs:
           images: ${{ env.REGISTRY_NS }}/quasar-control-plane
           # `type=semver` is the release lever: dispatching on the `vX.Y.Z` tag
           # adds `:X.Y.Z` here (see the versioned-release-tags note in the header).
+          # `o2-<branch>`, never the bare branch tag (header, "Branch tags").
           tags: |
             type=sha,prefix=sha-
-            type=ref,event=branch
+            type=ref,event=branch,prefix=o2-
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
           # Stated, not inherited: `auto` is metadata-action's default and moves
@@ -838,7 +957,20 @@ jobs:
           images: ${{ env.REGISTRY_NS }}/quasar-node-agent
           tags: |
             type=sha,prefix=sha-
-            type=ref,event=branch
+            type=ref,event=branch,prefix=o2-
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            latest=auto
+
+      - name: Image metadata (recovery actor)
+        id: meta_recovery
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY_NS }}/quasar-recovery
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch,prefix=o2-
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
           flavor: |
@@ -853,7 +985,7 @@ jobs:
         run: |
           set -euo pipefail
           out=""
-          for repo in quasar-control-plane quasar-node-agent; do
+          for repo in quasar-control-plane quasar-node-agent quasar-recovery; do
             ref="$REGISTRY_NS/$repo"
             d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref:latest" 2>/dev/null || true)"
             echo "  $ref:latest = ${d:-<none>}"
@@ -870,8 +1002,10 @@ jobs:
         env:
           CONTROL_SRC: ${{ env.REGISTRY_NS }}/quasar-control-plane@${{ needs.build-control-plane.outputs.digest }}
           AGENT_SRC: ${{ env.REGISTRY_NS }}/quasar-node-agent@${{ needs.build-node-agent.outputs.digest }}
+          RECOVERY_SRC: ${{ env.REGISTRY_NS }}/quasar-recovery@${{ needs.build-recovery-actor.outputs.digest }}
           CONTROL_TAGS: ${{ steps.meta_control.outputs.tags }}
           AGENT_TAGS: ${{ steps.meta_agent.outputs.tags }}
+          RECOVERY_TAGS: ${{ steps.meta_recovery.outputs.tags }}
         run: |
           set -euo pipefail
 
@@ -920,7 +1054,8 @@ jobs:
           # Tag sets arrive through the environment, never interpolated into this
           # script body: GitHub expression substitution inside a run block is
           # TEXTUAL, and a ref name is attacker-influenceable input in the general
-          # case. Reading them as "$CONTROL_TAGS" / "$AGENT_TAGS" keeps them data.
+          # case. Reading them as "$CONTROL_TAGS" / "$AGENT_TAGS" / "$RECOVERY_TAGS"
+          # keeps them data.
           tag_args() { # tag_args <newline-separated tags> -> prints one --tag/<tag> per line
             local t
             while IFS= read -r t; do
@@ -952,10 +1087,10 @@ jobs:
             done
           }
 
-          # WRITE BOTH, THEN VERIFY BOTH — deliberately two passes, not
+          # WRITE ALL THREE, THEN VERIFY ALL THREE — deliberately two passes, not
           # write-and-verify per package.
           #
-          # The header promises "both images promote or neither does". A single
+          # The header promises the images promote together or not at all. A single
           # interleaved pass could not deliver that: with `set -e`, a failed
           # verification on the control plane aborted the step before the node agent
           # was tagged at all, so the run that motivated this fix left
@@ -969,13 +1104,15 @@ jobs:
           # if a `create` call itself fails against the registry, the packages can
           # still end up unevenly tagged. In that case, as in every other, the
           # rollback step below puts every `:latest` back — `:latest` is the only tag
-          # deploy/README.md promises will resolve, and `sha-*`/branch tags are names
-          # nothing followed before this run.
-          write_tags "$CONTROL_SRC" "$CONTROL_TAGS"
-          write_tags "$AGENT_SRC"   "$AGENT_TAGS"
+          # deploy/README.md promises will resolve. `sha-*` and `o2-<branch>` are not
+          # restored; the rollback step says why that is safe for the edge channel.
+          write_tags "$CONTROL_SRC"  "$CONTROL_TAGS"
+          write_tags "$AGENT_SRC"    "$AGENT_TAGS"
+          write_tags "$RECOVERY_SRC" "$RECOVERY_TAGS"
 
-          verify_tags "$CONTROL_SRC" "$CONTROL_TAGS"
-          verify_tags "$AGENT_SRC"   "$AGENT_TAGS"
+          verify_tags "$CONTROL_SRC"  "$CONTROL_TAGS"
+          verify_tags "$AGENT_SRC"    "$AGENT_TAGS"
+          verify_tags "$RECOVERY_SRC" "$RECOVERY_TAGS"
 
           {
             echo "### Promoted"
@@ -984,25 +1121,33 @@ jobs:
             echo "| --- | --- |"
             echo "| quasar-control-plane | \`${CONTROL_SRC##*@}\` |"
             echo "| quasar-node-agent | \`${AGENT_SRC##*@}\` |"
+            echo "| quasar-recovery | \`${RECOVERY_SRC##*@}\` |"
             echo ""
             echo '```'
-            printf '%s\n%s\n' "$CONTROL_TAGS" "$AGENT_TAGS"
+            printf '%s\n%s\n%s\n' "$CONTROL_TAGS" "$AGENT_TAGS" "$RECOVERY_TAGS"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # A promotion is several registry writes and cannot be atomic. If one of them
       # fails, consumers must end where they started rather than on a half-moved
       # `:latest` — so put EVERY `:latest` back to the digest recorded above,
-      # including one whose own promotion succeeded. Both images ship together or
-      # neither does; a control plane on the new digest and an agent on the old one
-      # is a worse state than a clean no-op.
+      # including one whose own promotion succeeded. The three images ship together
+      # or not at all; a control plane on the new digest and an agent or actor on the
+      # old one is a worse state than a clean no-op.
       #
       # SCOPE, stated so nobody reads more into a green rollback than is there: only
-      # `:latest` is restored. `sha-<sha>` and the branch tag are new names nothing
-      # followed before this run, so leaving them pointing at an unpromoted digest
-      # harms no consumer. The one case needing a human is a RE-dispatch on an
-      # already-published `vX.Y.Z`: `:X.Y.Z` may have moved and is not restored here.
-      # Re-dispatch the workflow on that tag once the cause is fixed.
+      # `:latest` is restored. `o2-<branch>` and `sha-<sha>` are left where the failed
+      # run put them, and an RH-06 control plane on the edge channel does follow them:
+      # detection reads all three images off `o2-<branch>` and refuses a set whose
+      # `org.quasar.source.commit` labels disagree, so a half-moved branch tag is
+      # reported, not offered (control-plane/internal/platform/edge.go
+      # ErrEdgeComponentsDisagree), and `sha-<sha>` is only resolved for a build
+      # detection accepted. The residual: if quasar-recovery had no `o2-<branch>`
+      # yet and its write failed, the build reads as one with no recovery actor and
+      # moves hosts' agents alone. Re-dispatch once the cause is fixed. The other
+      # case needing a human is a RE-dispatch on an already-published `vX.Y.Z`:
+      # `:X.Y.Z` may have moved and is not restored here. Re-dispatch the workflow on
+      # that tag once the cause is fixed.
       - name: Roll :latest back if the promotion did not complete
         if: failure() && steps.rollback.outcome == 'success'
         env:
@@ -1063,195 +1208,24 @@ jobs:
             printf '%s\n' "$PREVIOUS"
             echo '```'
             echo ""
-            echo "Not restored: \`sha-*\` and branch tags (nothing followed them), and"
+            echo "Not restored: \`sha-*\` and \`o2-<branch>\` (edge detection refuses a set"
+            echo "whose images disagree; re-dispatch to publish the build whole), and"
             echo "\`:X.Y.Z\` on a re-dispatched release tag — re-dispatch to fix that one."
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
-
-  # ── The updater lane, which is deliberately its own end-to-end chain ───────
-  #
-  # Same four phases as the other artifacts — build by digest, validate that
-  # digest, promote tags onto it — but with its OWN promote job rather than a
-  # third arm of `promote` above. The updater applies the two-component
-  # manifest and remains independently tagged; it is not a manifest component
-  # or a digest input to strict preflight. GitHub Release publication still
-  # waits for promote-updater, because its install footer advertises that tag.
-  build-updater:
-    name: build quasar-updater (digest only)
-    needs: inputs
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: deploy/Dockerfile.updater
-          target: runtime
-          outputs: type=image,name=${{ env.REGISTRY_NS }}/quasar-updater,push-by-digest=true,name-canonical=true,push=true
-          # Same reasoning as the other two lanes: a plain image manifest keeps
-          # "the thing validated is the thing promoted" checkable by eye.
-          provenance: false
-          sbom: false
-          # No QUASAR_BASE_IMAGE: this is the one image not built on the
-          # quasar-base family. Its base is the upstream docker CLI image,
-          # which is where the compose plugin comes from.
-          build-args: |
-            SOURCE_COMMIT=${{ github.sha }}
-            BUILT_AT=${{ needs.inputs.outputs.built_at }}
-          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-updater-cache:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-updater-cache:buildcache,mode=max
-
-  validate-updater:
-    name: contract - quasar-updater
-    needs: build-updater
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Validate against deploy/image-contract.json
-        env:
-          REF: ${{ env.REGISTRY_NS }}/quasar-updater@${{ needs.build-updater.outputs.digest }}
-        run: |
-          set -euo pipefail
-          echo "validating $REF"
-          bash deploy/validate-image.sh \
-            --image "$REF" --role updater \
-            --pull --require-digest-ref --no-gpu \
-            --json "$RUNNER_TEMP/contract-updater.json"
-      - name: Record the verdict on the run
-        if: always()
-        run: |
-          set -uo pipefail
-          f="$RUNNER_TEMP/contract-updater.json"
-          [ -f "$f" ] || { echo "no contract report produced" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
-          {
-            echo "### Contract: quasar-updater"
-            echo ""
-            echo '```json'
-            cat "$f"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  promote-updater:
-    name: promote quasar-updater
-    needs: [build-updater, validate-updater]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.REGISTRY_NS }}/quasar-updater
-          tags: |
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-          flavor: |
-            latest=auto
-      - name: Record the current :latest digest (rollback point)
-        id: rollback
-        run: |
-          set -euo pipefail
-          d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
-                "$REGISTRY_NS/quasar-updater:latest" 2>/dev/null || true)"
-          echo "previous=${d}" >> "$GITHUB_OUTPUT"
-          echo "quasar-updater:latest = ${d:-<none>}"
-      - name: Promote the validated digest
-        env:
-          SRC: ${{ env.REGISTRY_NS }}/quasar-updater@${{ needs.build-updater.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          # `imagetools create` WRAPS the manifest in a fresh index, so a tag's
-          # own digest can never equal the validated one. Assert set equality of
-          # the platform manifests instead — same rule as the `promote` job.
-          target_digests() {
-            local ref="$1" raw out
-            raw="$(docker buildx imagetools inspect --raw "$ref")"
-            out="$(printf '%s' "$raw" | jq -r '
-              if has("manifests") then
-                [ .manifests[]
-                  | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
-                  | .digest ] | sort | join(",")
-              else "" end')"
-            if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
-            docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref"
-          }
-          args=()
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            args+=(--tag "$t")
-          done <<< "$TAGS"
-          [ "${#args[@]}" -gt 0 ] || { echo "::error::no tags computed"; exit 1; }
-          docker buildx imagetools create "${args[@]}" "$SRC"
-
-          want="$(target_digests "$SRC")"
-          for (( i=1; i<${#args[@]}; i+=2 )); do
-            got="$(target_digests "${args[$i]}")"
-            [ "$got" = "$want" ] || {
-              echo "::error::${args[$i]} resolves to [$got], expected [$want]"; exit 1; }
-            echo "  verified ${args[$i]} -> $want"
-          done
-          {
-            echo "### Promoted quasar-updater"
-            echo ""
-            echo '```'
-            echo "${SRC##*@}"
-            printf '%s\n' "$TAGS"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Roll :latest back if the promotion did not complete
-        if: failure() && steps.rollback.outcome == 'success' && steps.rollback.outputs.previous != ''
-        env:
-          PREVIOUS: ${{ steps.rollback.outputs.previous }}
-        run: |
-          set -uo pipefail
-          echo "restoring quasar-updater:latest to $PREVIOUS"
-          docker buildx imagetools create \
-            --tag "$REGISTRY_NS/quasar-updater:latest" \
-            "$REGISTRY_NS/quasar-updater@$PREVIOUS" || true
 
   # ── Phase 5: publish the release itself (tag pushes only) ──────────────────
   #
   # Promotion put the bytes where a puller can reach them. This job is what makes
   # the release EXIST for a human and for the control plane: a GitHub Release
   # whose body is the tag's CHANGELOG section, carrying
-  # `platform-release-manifest.json` (scripts/release/platform-release-manifest.md)
-  # as its only asset. A prerelease semver tag publishes a GitHub prerelease, which
-  # the `stable` channel ignores.
+  # `platform-release-manifest.v2.json` (scripts/release/platform-release-manifest.md)
+  # and, when signed, its `.sig` as its only assets. A prerelease semver tag
+  # publishes a GitHub prerelease, which the `stable` channel ignores.
+  #
+  # No format-1 asset is published (protocol/control-api.md "RH06 contract step",
+  # item 4): its last reader, the Compose updater, retired with #367, and a control
+  # plane that predates format 2 is never offered this release.
   #
   # It runs LAST on purpose. The notes and the manifest are cheap; the images are
   # not. Publishing a release that names digests which failed validation would be
@@ -1268,18 +1242,17 @@ jobs:
   # not an improvement. The fix is to RE-RUN this job (Actions → the run → "Re-run
   # failed jobs"): every step is idempotent by construction. The generator rewrites
   # the manifest from the same inputs, the digest cross-check re-reads the registry,
+  # the release-time check skips the release's own tag among the known releases,
   # `gh release create` is skipped when the release already exists (the body is
   # edited instead), and the asset upload is `--clobber`.
   #
   # `contents: write` is granted here and nowhere else in this workflow — creating a
   # Release is the only thing in the lane that writes to the repository. `packages:
-  # read` is for the digest cross-check, which reads the registry and never writes
-  # to it: this job cannot move a tag.
+  # read` is for the digest cross-check and the release-time check, which read the
+  # registry and never write to it: this job cannot move a tag.
   release:
     name: publish the GitHub Release
-    # The release footer advertises the updater version too. Never publish a
-    # release until that independently built/validated image has been promoted.
-    needs: [release-gate, inputs, build-control-plane, build-node-agent, promote, promote-updater]
+    needs: [release-gate, inputs, build-control-plane, build-node-agent, build-recovery-actor, promote]
     if: needs.release-gate.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -1311,16 +1284,19 @@ jobs:
           BUILT_AT: ${{ needs.inputs.outputs.built_at }}
           CONTROL_DIGEST: ${{ needs.build-control-plane.outputs.digest }}
           AGENT_DIGEST: ${{ needs.build-node-agent.outputs.digest }}
+          RECOVERY_DIGEST: ${{ needs.build-recovery-actor.outputs.digest }}
         run: |
           set -euo pipefail
-          manifest="$RUNNER_TEMP/platform-release-manifest.json"
+          manifest="$RUNNER_TEMP/platform-release-manifest.v2.json"
 
+          # The floor is read from control-plane/internal/buildinfo/floor.go.
           bash scripts/release/generate-platform-release-manifest.sh \
             --version "$VERSION" \
             --source-commit "$COMMIT" \
             --built-at "$BUILT_AT" \
             --control-digest "$CONTROL_DIGEST" \
             --agent-digest "$AGENT_DIGEST" \
+            --recovery-digest "$RECOVERY_DIGEST" \
             --registry-ns "$REGISTRY_NS" \
             --output "$manifest"
 
@@ -1330,13 +1306,40 @@ jobs:
           # depends on the generator's internals to have tied the file to THIS
           # run's tag and build digests.
           bash scripts/release/validate-platform-release-manifest.sh "$manifest" \
+            --expect-format 2 \
             --expect-version "$VERSION" \
             --expect-control-digest "$CONTROL_DIGEST" \
-            --expect-agent-digest "$AGENT_DIGEST"
+            --expect-agent-digest "$AGENT_DIGEST" \
+            --expect-recovery-digest "$RECOVERY_DIGEST"
 
           echo "path=$manifest" >> "$GITHUB_OUTPUT"
           echo "schema_version=$(jq -r .schema_version "$manifest")" >> "$GITHUB_OUTPUT"
           cat "$manifest"
+
+      # ADR 0008's release-time check: the candidate recovery actor must render its
+      # own release's images and reach its floor across every published format-2
+      # release, and the floor must not strand what the previous release managed.
+      - name: Check the release against the published releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+        run: |
+          set -euo pipefail
+          inputs="$RUNNER_TEMP/release-compatibility"
+          bash scripts/release/collect-release-compatibility-inputs.sh \
+            --manifest "$MANIFEST" --repo "$REPO" --out "$inputs"
+          # Written only when a format-2 release precedes this one (check (d)).
+          previous=()
+          if [ -f "$inputs/previous-actor-windows.json" ]; then
+            previous=(--previous-actor-windows "$inputs/previous-actor-windows.json")
+          fi
+          bash scripts/release/check-release-compatibility.sh \
+            --manifest "$MANIFEST" \
+            --known "$inputs/known" \
+            --recipes "$inputs/recipes.json" \
+            --actor-windows "$inputs/actor-windows.json" \
+            "${previous[@]+"${previous[@]}"}"
 
       - name: Assert the promoted :X.Y.Z tags carry the manifest's digests
         env:
@@ -1371,7 +1374,7 @@ jobs:
 
           # WHY THIS EXISTS. The manifest is the machine-readable claim "version
           # X.Y.Z is these digests"; the `:X.Y.Z` tag is what a consumer following
-          # the version resolves. If those two ever disagreed, an updater pinning
+          # the version resolves. If those two ever disagreed, an apply pinning
           # the manifest's digest and an operator pulling the tag would install
           # different bytes under one version number. Both come from the same job
           # outputs today, so this can only fail if something outside this run
@@ -1452,7 +1455,7 @@ jobs:
             echo "| field | value |"
             echo "| --- | --- |"
             echo "| signed by | \`$signed_by\` |"
-            echo "| asset | \`platform-release-manifest.json.sig\` |"
+            echo "| asset | \`platform-release-manifest.v2.json.sig\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Extract the release notes from CHANGELOG.md
@@ -1474,22 +1477,17 @@ jobs:
           # the docs tell them to take the digests "from the release"; the manifest
           # asset carries them for machines, this footer carries the same values for
           # people. Generated from the validated manifest, never typed.
-          cp_digest="$(jq -r '.components[] | select(.name=="control-plane") | .digest' "$MANIFEST")"
-          agent_digest="$(jq -r '.components[] | select(.name=="node-agent") | .digest' "$MANIFEST")"
           {
             echo
             echo "## Install or upgrade"
             echo
-            echo "Pins for \`deploy/.env\` (the two digests are the ones \`platform-release-manifest.json\` names; the updater follows the version tag):"
+            echo "The images of this release, by digest, as \`$(basename "$MANIFEST")\` names them:"
             echo
             echo '```'
-            echo "QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@${cp_digest}"
-            echo "QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@${agent_digest}"
-            echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:${VERSION}"
-            echo "QUASAR_STACK_DIR=<absolute host path of your deploy directory>"
+            jq -r '.components[] | "\(.name)  \(.image)@\(.digest)"' "$MANIFEST"
             echo '```'
             echo
-            echo "Then, with the same \`-f\` list you installed with: \`docker compose -f deploy/docker-compose.yml pull && docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps quasar-control-plane quasar-updater quasar-node-agent\` — or, on an instance that already runs the updater, apply it from Admin ▸ Fleet ▸ Releases. New install: https://accreleus.github.io/quasar/install/install/ · Upgrading: https://accreleus.github.io/quasar/operations/upgrading/"
+            echo "An install made with the seed is updated from Admin ▸ Fleet ▸ Releases. A new install starts from the seed: https://accreleus.github.io/quasar/install/install/ · An install made from the Compose files before Quasar-owned installs is not offered this release; replace it with a fresh seed install: https://accreleus.github.io/quasar/install/move-existing/ · Upgrading: https://accreleus.github.io/quasar/operations/upgrading/"
           } >> "$notes"
           echo "path=$notes" >> "$GITHUB_OUTPUT"
           wc -c < "$notes"
@@ -1527,7 +1525,8 @@ jobs:
             gh release create "$TAG" "${create[@]}"
           fi
 
-          # --clobber so a re-run replaces the asset instead of failing on it.
+          # --clobber so a re-run replaces the asset instead of failing on it. The
+          # asset name is the file's: platform-release-manifest.v2.json.
           gh release upload "$TAG" "$MANIFEST" --clobber
           # The signature is a separate asset, uploaded only when one was made:
           # a host in `verify` mode reads its absence as an unsigned release.
@@ -1545,6 +1544,7 @@ jobs:
           PRERELEASE: ${{ needs.release-gate.outputs.prerelease }}
           CONTROL_DIGEST: ${{ needs.build-control-plane.outputs.digest }}
           AGENT_DIGEST: ${{ needs.build-node-agent.outputs.digest }}
+          RECOVERY_DIGEST: ${{ needs.build-recovery-actor.outputs.digest }}
           SCHEMA_VERSION: ${{ steps.manifest.outputs.schema_version }}
           URL: ${{ steps.publish.outputs.url }}
         run: |
@@ -1559,5 +1559,6 @@ jobs:
             echo "| schema_version | \`${SCHEMA_VERSION:-?}\` |"
             echo "| quasar-control-plane | \`$CONTROL_DIGEST\` |"
             echo "| quasar-node-agent | \`$AGENT_DIGEST\` |"
+            echo "| quasar-recovery | \`$RECOVERY_DIGEST\` |"
             echo "| release | ${URL:-not published} |"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -450,8 +450,8 @@ is evidence only that browser can supply; no readiness check claims it.
 ## Platform releases
 
 **Platform release** — a matched set of Quasar's own images (control plane, which
-carries the web client, and node agent) built from one commit and published
-together. It is Quasar updating Quasar, and it never reaches the app catalog:
+carries the web client, and node agent; from RH06 also the recovery actor) built
+from one commit and published together. It is Quasar updating Quasar, and it never reaches the app catalog:
 catalog images have their own version and push machinery. _Avoid_: "update"
 (overloaded — catalog images are also "updated", and `redeploy.sh` "updates" a
 source checkout), "image version" (that is the catalog term), "build" (a build
@@ -487,27 +487,30 @@ people; any signature by any trusted key verifies. _Avoid_: "signing key" for
 the public half (the signing key is private and lives only in the release
 pipeline), "certificate" (there is no chain and no expiry).
 
-**Updater** — the per-host actor that pulls a platform release and recreates the
-containers it replaces, because a container cannot recreate itself. It acts only
-when told to, and only on the stack it sits beside. _Avoid_: "sidecar" in
-prose (that is how it is deployed, not what it is), "agent" (the agent asks; the
-updater acts).
+**Updater** — the contract's word for whatever replaces a target's containers,
+kept in `updater_present`, `updater_absent` and `updater_unreachable`: since the
+Compose updater retired with RH06-15 (#367) it is the machine's **recovery actor**.
+A pre-RH06 Compose install ran a `quasar-updater` service, which nothing ships any
+more. _Avoid_: "the updater" in new prose (say "recovery actor"), "sidecar".
 
-**Install mode** — how a host got its platform images: from the registry, or
-built from source on the host. A source-built host can be told about a release
-but not given one. _Avoid_: "dev host" (a source-built host may be production),
-"pinned" (a registry install is always pinned; the word adds nothing).
+**Install mode** — how a host got its platform images: from the registry, built
+from source on the host, or **owned** — created and replaced by the machine's
+recovery actor. A source-built host can be told about a release but not given one.
+_Avoid_: "dev host" (a source-built host may be production), "pinned" (a registry
+install is always pinned; the word adds nothing).
 
 **Attempt** — one target's move to one digest set: the control plane, or one
 host. Every apply produces one, whether it succeeded or failed, and it is the
-only durable record of what that target was on before. _Avoid_: "job" (an
-attempt is operator-initiated and rides no schedule), "task".
+only durable record of what that target was on before. Every attempt ends in one
+of two terminal states: succeeded, or failed (restored or not). A failure whose
+reason is `interrupted` means nothing changed. _Avoid_: "job" (an attempt is operator-initiated and rides no schedule),
+"task".
 
 **Preflight** — the per-target evaluation, on the release view, of whether the
-stack around a target is shaped so an apply can be carried out at all: the
-updater reachable, the stack directory and overlays it will act on the ones the
-target was started with, the health port the next agent start needs, the
-release's images resolvable. Distinct from *eligibility* (may this target take
+machinery around a target is shaped so an apply can be carried out at all: the
+recovery actor reachable, on an owned machine no conflicting container and room for
+a pre-update dump, the health port the next
+agent start needs, the release's images resolvable. Distinct from *eligibility* (may this target take
 the release) and from a host's *readiness* (can it run sessions); a host's own
 readiness checks are inputs to its preflight. A blocked preflight is one
 eligibility reason among the others. _Avoid_: "conformance check" (the checks
@@ -533,3 +536,134 @@ migration (`ReleaseRunsAMigration`): since #128 a recreate no longer ends a
 `running` session, so a non-migrating step lets live sessions ride through it and
 waits only for in-flight launches to settle (#153). Host steps drain as they
 always did — recreating an agent does end that host's sessions.
+
+## Deployment ownership (RH06, in shaping)
+
+These terms describe RH06 as specified (#352) and as the contract amendment (amendment 14,
+#353) spells it; its contract step is in force since RH06-15 (#367).
+
+**Platform service** — one long-running container that runs Quasar itself on a
+machine: the control plane, a node agent, Postgres, the recovery actor, and later
+an optional TURN relay. Distinct from a session's containers, which the node agent
+creates and owns. _Avoid_: "stack" for a single service (a stack is the set a
+manager groups together), "platform image" (that is what a service runs, not the
+service).
+
+**Service owner** — the one actor allowed to create, replace and remove a platform
+service's container and to decide what image it runs. Every platform service has
+exactly one at a time. A restart policy restarts a container; it is never an
+owner. _Avoid_: "manager" unqualified, "supervisor".
+
+**External manager** — software other than Quasar that starts containers from its
+own definitions: the Compose CLI with the operator's files, a stack UI, an
+appliance's container templates. On a Quasar-owned machine it holds exactly one
+definition, the seed; it never holds one for a Quasar service it could redeploy.
+Quasar never edits a manager's files. _Avoid_: "orchestrator" (implies scheduling
+Quasar does not delegate), "compose" as a synonym (Compose is one external
+manager).
+
+**Seed** — the one container an external manager (or a single `docker run`)
+declares for Quasar on a machine. It only ensures the recovery actor exists, and
+is built to be stable for years; the manager, not Quasar, updates it. _Avoid_:
+"installer" (that is a script run once), "bootstrap container" once the machine
+is running (bootstrap is what the seed does the first time).
+
+**Recovery actor** — the Quasar-owned container on each machine that creates and
+replaces that machine's other platform services, and replaces itself by handing
+over to a successor. It exists because a container cannot replace itself, and it
+is what keeps a control plane recoverable while the control plane is down.
+_Avoid_: "sidecar", "watchdog", "agent" (the node agent is a different service).
+
+**Enrollment** — a node agent joining a control plane for the first time, by
+redeeming an enrollment token for its host identity. Reconnecting with an
+existing identity is not enrollment. _Avoid_: "registration" for this (every
+connection registers; only the first enrolls), "bootstrap" (that is standing up
+the first control plane).
+
+**Enrollment token** — a secret an admin mints to let one agent enroll: single use
+by default, short-lived, optionally bound to one node name, revocable, stored only
+as a hash. A combined or control-only machine's own agent uses a single-use local
+enrollment token its recovery actor generates at install. The static
+deployment-wide token retired with RH06; it is no exception to keep. _Avoid_: "join token", "API key", "break-glass token".
+
+**Host identity** — the node name and node secret by which the control plane
+recognises a host across reconnects. The agent's local state beside the secret
+(its pinned control-plane certificate, container-ownership lease and
+configuration journal) belongs to the same identity and moves with it. A new
+node name is a new host. _Avoid_: "host id" (the database key), "hostname" (the
+machine's name, which the node name only defaults to).
+
+**Combined host** — one machine running the control plane, Postgres and a node
+agent. A **GPU host** runs a node agent (and its recovery actor) only; a
+**control-only host** runs the control plane and Postgres with no agent. Every
+owned machine also runs its recovery actor. _Avoid_: "all-in-one", "head node",
+"worker node".
+
+**Replacement** — moving one platform service to a new specification (usually a new
+image digest): stop the old container and keep it, start the new one, verify it, then
+discard the old one — or restore the old one if verification fails. An attempt may
+replace several services in order, the recovery actor first. _Avoid_: "recreate" (the
+Compose mechanism), "upgrade" (a replacement can also revert), "rollout".
+
+**Kept container** — the old container a replacement has stopped, with its restart
+policy disabled, and holds until the new one is verified. Restoring is starting it
+again, with no pull. It is the recovery actor's own, never an owner conflict.
+_Avoid_: "backup container", "previous container" when the kept one is meant.
+
+**Hand-over** — the recovery actor replacing itself: a successor starts beside it,
+takes the machine's single lease only when the current actor releases it, and
+verifies itself before the old actor is discarded. A successor that never verifies
+is removed and the previous actor re-enabled. _Avoid_: "self-update" (that names
+the whole platform feature), "restart".
+
+**Recipe** — the container shape for one role (control plane, node agent, Postgres,
+recovery actor) compiled into the recovery actor. A **recipe revision** numbers one
+shape; each platform image names the revision it needs, and an actor refuses a
+revision it does not carry before anything stops. Not the "manual recipe": that
+older phrase names the command block an operator copies (a failure's `previous`
+digests are "the restore recipe"), which is a different thing. _Avoid_: "template"
+(that was the rejected image-carried alternative), "compose service", bare "recipe"
+where the manual command block could be meant.
+
+**Machine inputs** — the few install-time facts a machine's recipes are rendered
+with: role, node name, home and template roots, public host, TLS hosts, trusted
+proxies, ports, control URL, detected GPU facts, database mode, release trust (the
+namespace allowlist, signature settings and insecure registries), the images Add host
+installs, and app-container defaults. They change only by a reconfigure, which is a
+replacement with the same image and new inputs. _Avoid_: "settings" (agent settings
+are host policy), "config".
+
+**Machine state** — what the recovery actor keeps on its machine and nowhere else:
+the machine inputs, the generated secrets, the attempt journal, the last verified
+specification of each service, the pre-update dumps and the seed's state file. It
+is what lets the actor act while the control plane is down. _Avoid_: "machine
+config", "the volume" unqualified.
+
+**Floor** — the oldest node-agent and recovery-actor release a control-plane release
+still manages, published with the release. A host **below the floor** is not failed:
+it is offered only an update. _Avoid_: "minimum version" (the floor is per release
+and per component), "compatibility level".
+
+**Developer apply** — an admin applying an arbitrary digest set, typically a branch
+build from an allowlisted registry namespace, to one owned target without it being
+published as a release. It is the product lane's way to test on the path users run;
+it is never offered, never unattended, and bound by the same digest, namespace and
+ordering rules as any apply. _Avoid_: "manual update" (that is the recipe a source or
+Compose install is shown), "custom release".
+
+**Pre-update dump** — the database dump the recovery actor takes before replacing
+the control plane with a migrating release, when the database is Quasar's own. It is
+the way back from a failed migration, through one printed `restore` command; the last
+three are kept on the machine. An operator's own database gets no dump: its backup
+is the operator's, confirmed before the update. _Avoid_: "backup" unqualified,
+"recovery bundle" (withdrawn with RH06's review).
+
+**Schema floor** — the lowest schema a machine's database may be at, recorded in machine state
+by the recovery actor before a migrating control plane starts and lowered only by a `restore`.
+No control plane whose image declares a lower schema is created, started or put back on that
+machine. _Avoid_: "floor" unqualified (that is the release floor above).
+
+**Owner conflict** — a container on an owned machine that looks like a Quasar
+platform service but lacks the installation's labels: a leftover Compose stack, a
+definition a manager still holds. The recovery actor never acts on it and says so.
+_Avoid_: "orphan", "foreign service".

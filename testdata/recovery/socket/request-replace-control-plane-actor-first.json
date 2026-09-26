@@ -1,0 +1,30 @@
+{
+  "shape": "request",
+  "about": "The control plane's own step on an owned machine, as the control plane sends it (#363): the recovery actor first, then the control plane, a release that does not migrate, the actor's default wait.",
+  "body": {
+    "request_id": "3c8e2a61-5b7d-4e19-a0f4-6d2b9c1e7f30",
+    "kind": "replace",
+    "components": [
+      {
+        "name": "recovery-actor",
+        "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+        "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "name": "control-plane",
+        "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+        "digest": "sha256:aa11000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "release": {
+      "id": "8f0c7d52-1e3a-4b6c-9d2f-5a7e1b3c9d04",
+      "version": "0.4.0",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "migrates": false,
+    "schema_version": 96,
+    "external_backup_confirmed": false,
+    "dump": null,
+    "purge": false
+  }
+}

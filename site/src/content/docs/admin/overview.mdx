@@ -27,8 +27,10 @@ because the server refuses every request behind it.
 
 There is no client-side admin flag to flip.
 
-The first admin is provisioned by whoever runs the host, either through the
-first-run wizard's token or through `BOOTSTRAP_ADMIN_*` environment variables.
+The first admin is provisioned by whoever runs the host, through the first-run
+wizard's setup token. An owned install uses only that; a legacy Compose install
+or a source checkout can instead set the `BOOTSTRAP_ADMIN_*` environment
+variables.
 Registration only ever creates ordinary users, so nobody can promote themselves
 by signing up first.
 

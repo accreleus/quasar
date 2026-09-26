@@ -9,7 +9,6 @@ import (
 func TestLoadTLSModeResolution(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("default is auto+self-signed", func(t *testing.T) {
@@ -118,7 +117,6 @@ func TestLoadTLSModeResolution(t *testing.T) {
 func TestLoadHTTPRedirect(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("default: on, port from TLSAddr", func(t *testing.T) {
@@ -191,7 +189,6 @@ func TestLoadHTTPRedirect(t *testing.T) {
 func TestLoadValidatesClientVersions(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	for _, tc := range []struct {
@@ -237,7 +234,6 @@ func TestLoadValidatesClientVersions(t *testing.T) {
 func TestLoadVramAdmissionKnobs(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("defaults", func(t *testing.T) {
@@ -323,7 +319,6 @@ func TestLoadVramAdmissionKnobs(t *testing.T) {
 
 func TestLoadValidatesAllowedOrigins(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "test-token")
 
 	for _, tc := range []struct {
 		name, origins string
@@ -354,7 +349,6 @@ func TestLoadValidatesAllowedOrigins(t *testing.T) {
 
 func TestLoadArtworkDefaultsToOff(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "test-token")
 
 	c, err := Load()
 	if err != nil {
@@ -384,7 +378,6 @@ func TestLoadArtworkDefaultsToOff(t *testing.T) {
 
 func TestLoadArtworkEnvKeyIsCarriedAsAFallback(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	t.Setenv("QUASAR_STEAMGRIDDB_API_KEY", "an-env-key")
 
 	c, err := Load()
@@ -417,7 +410,6 @@ func TestLoadArtworkEnvKeyIsCarriedAsAFallback(t *testing.T) {
 // set a key and misspelled the provider would otherwise get no explanation.
 func TestLoadRejectsUnknownArtworkProvider(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	t.Setenv("QUASAR_ARTWORK_PROVIDER", "steamgridb") // one 'd' short
 
 	_, err := Load()
@@ -439,7 +431,6 @@ func TestLoadRejectsBadArtworkKnobs(t *testing.T) {
 	} {
 		t.Run(tc.key+"="+tc.val, func(t *testing.T) {
 			t.Setenv("DATABASE_URL", "postgres://test")
-			t.Setenv("ENROLLMENT_TOKEN", "test-token")
 			t.Setenv(tc.key, tc.val)
 			if _, err := Load(); err == nil {
 				t.Fatalf("%s=%q must fail startup", tc.key, tc.val)
@@ -455,7 +446,6 @@ func TestLoadRejectsBadArtworkKnobs(t *testing.T) {
 func TestLoadPprofAddr(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("defaults to loopback and enabled", func(t *testing.T) {
@@ -542,7 +532,6 @@ func TestLoadPprofAddr(t *testing.T) {
 func TestLoadLibraryScanIntervalOverride(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("unset leaves Set false", func(t *testing.T) {
@@ -585,7 +574,6 @@ func TestLoadLibraryScanIntervalOverride(t *testing.T) {
 func TestLoadSteamAppDetailsLookupOverride(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("unset leaves Set false", func(t *testing.T) {
@@ -623,7 +611,6 @@ func TestLoadSteamAppDetailsLookupOverride(t *testing.T) {
 func TestTelemetryRetentionKnobs(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("defaults are 1h rolling / 24h post-mortem", func(t *testing.T) {
@@ -695,7 +682,6 @@ func TestTelemetryRetentionKnobs(t *testing.T) {
 func TestLoadAccessLog(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("default is errors", func(t *testing.T) {
@@ -752,9 +738,9 @@ func TestLoadAccessLog(t *testing.T) {
 // widened to single-host networks, and fail startup on a typo rather than
 // silently leaving every client sharing one rate-limit budget.
 func TestLoadTrustedProxies(t *testing.T) {
+	// No static token: its deprecation warning would be counted below.
 	base := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://test")
-		t.Setenv("ENROLLMENT_TOKEN", "test-token")
 	}
 
 	t.Run("default is empty", func(t *testing.T) {
@@ -865,7 +851,6 @@ func TestLoadTrustedProxies(t *testing.T) {
 // sets nothing gets no ICE servers, exactly as before the knob existed.
 func TestLoadICEServersDefaultsToNone(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "test-token")
 
 	c, err := Load()
 	if err != nil {
@@ -878,7 +863,6 @@ func TestLoadICEServersDefaultsToNone(t *testing.T) {
 
 func TestLoadICEServers(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "test-token")
 
 	for _, tc := range []struct {
 		name, value string
@@ -911,21 +895,37 @@ func TestLoadICEServers(t *testing.T) {
 	}
 }
 
-// --- enrollment token (#12) --------------------------------------------------
-
-// A deployment can enroll entirely with admin-minted per-host tokens, so the
-// fleet-wide static one is optional. Empty must load, and must stay empty:
-// agentws only compares a non-empty configured token, so "" is "the static path
-// is off", never a wildcard that matches whatever an agent presents.
-func TestLoadEnrollmentTokenIsOptional(t *testing.T) {
+func TestLoadEnrollPinsTakeOnlyADigest(t *testing.T) {
+	seed := "registry.example.invalid/quasar/quasar-recovery@sha256:" + strings.Repeat("a", 64)
+	agent := "registry.example.invalid/quasar/quasar-node-agent@sha256:" + strings.Repeat("b", 64)
 	t.Setenv("DATABASE_URL", "postgres://test")
-	t.Setenv("ENROLLMENT_TOKEN", "")
-
+	t.Setenv("QUASAR_ENROLL_SEED_IMAGE", seed)
+	t.Setenv("QUASAR_ENROLL_AGENT_IMAGE", agent)
 	c, err := Load()
 	if err != nil {
-		t.Fatalf("Load without ENROLLMENT_TOKEN: %v", err)
+		t.Fatal(err)
 	}
-	if c.EnrollmentToken != "" {
-		t.Fatalf("EnrollmentToken = %q, want empty", c.EnrollmentToken)
+	if c.EnrollPins.SeedImage != seed || c.EnrollPins.AgentImage != agent {
+		t.Fatalf("EnrollPins = %+v", c.EnrollPins)
+	}
+
+	t.Setenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE", seed)
+	t.Setenv("QUASAR_ENROLL_FALLBACK_AGENT_IMAGE", agent)
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.EnrollFallback.SeedImage != seed || c.EnrollFallback.AgentImage != agent {
+		t.Fatalf("EnrollFallback = %+v", c.EnrollFallback)
+	}
+	t.Setenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE", "registry.example.invalid/quasar/quasar-recovery:0.6.0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QUASAR_ENROLL_FALLBACK_SEED_IMAGE") {
+		t.Fatalf("a tagged fallback must fail startup naming the variable, got %v", err)
+	}
+	t.Setenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE", seed)
+
+	t.Setenv("QUASAR_ENROLL_AGENT_IMAGE", "registry.example.invalid/quasar/quasar-node-agent:0.6.0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QUASAR_ENROLL_AGENT_IMAGE") {
+		t.Fatalf("a tag must fail startup naming the variable, got %v", err)
 	}
 }

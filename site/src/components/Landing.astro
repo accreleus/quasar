@@ -61,12 +61,14 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 				<span class="q-dot"></span><span class="q-dot"></span><span class="q-dot"></span>
 				<span class="q-term-name">install</span>
 			</div>
-			<pre><code><span class="q-c"># the quick start writes these two files for you</span>
-<span class="q-p">$</span> docker compose -f deploy/docker-compose.yml up -d
-<span class="q-ok">quasar-postgres      healthy</span>
-<span class="q-ok">quasar-control-plane healthy</span>
-<span class="q-ok">quasar-node-agent    started</span>
-<span class="q-c">→ https://192.168.1.50:8443</span></code></pre>
+			<pre><code><span class="q-c"># the quick start writes this for you: one container, the seed</span>
+<span class="q-p">$</span> docker run -d --name quasar-seed … quasar-recovery@sha256:… seed
+<span class="q-p">$</span> docker ps --filter label=io.quasar.installation --format '&#123;&#123;.Names&#125;&#125;'
+<span class="q-ok">quasar-recovery</span>
+<span class="q-ok">quasar-postgres</span>
+<span class="q-ok">quasar-control-plane</span>
+<span class="q-ok">quasar-node-agent</span>
+<span class="q-c">→ https://192.0.2.50:8443</span></code></pre>
 		</div>
 	</section>
 
@@ -188,8 +190,8 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			<dt>Diagnostics that name the cause</dt>
 			<dd>Per-session bundles correlate encoder, network and client signals and say which of the three caused the stutter, or refuse to guess when the browser tab was hidden.</dd>
 
-			<dt>One Compose deployment</dt>
-			<dd>Postgres, the control plane and an agent. One script builds and brings it up.</dd>
+			<dt>One container per machine</dt>
+			<dd>The seed starts Quasar's recovery actor, which installs and updates the rest: Postgres, the control plane and an agent. No compose file, no secrets to generate.</dd>
 		</dl>
 	</section>
 

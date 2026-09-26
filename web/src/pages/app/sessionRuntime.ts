@@ -35,7 +35,7 @@
 import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
-import { setupCapture } from "../../input/capture";
+import { setupCapture, type GamepadIdentity } from "../../input/capture";
 import { QuasarSession, type RebindOutcome } from "../../webrtc/session";
 import type { RecoveryState } from "../../webrtc/recovery";
 import { PlayoutController, resolveInitialPlayoutMs } from "../../webrtc/playout";
@@ -157,6 +157,10 @@ export interface SessionRuntimeCallbacks {
    *  instance). Optional and purely informational: the page raises the
    *  explanatory toast; the runtime keeps working with browser-owned Esc. */
   onKeyboardLockRefused?(error: unknown): void;
+  /** A controller the browser doesn't recognise started sending (capture.ts
+   *  fires this once per pad). Optional and informational: the page explains
+   *  that its buttons may be mixed up; the pad is still forwarded. */
+  onNonStandardGamepad?(pad: GamepadIdentity): void;
   /** A disconnect signature was seen on the status channel. The host-lost poll
    *  stays on the page: hostLost is page state and the poller is page-owned. */
   onDisconnectSuspected(): void;
@@ -481,6 +485,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       isFullscreen: () => document.fullscreenElement != null,
       onSummonOverlay: () => cfg.callbacks.onSummonOverlay(),
       onKeyboardLockRefused: (error) => cfg.callbacks.onKeyboardLockRefused?.(error),
+      onNonStandardGamepad: (pad) => cfg.callbacks.onNonStandardGamepad?.(pad),
     });
     captureCleanup = capture.cleanup;
     captureKbSync = capture.syncKeyboardLock;

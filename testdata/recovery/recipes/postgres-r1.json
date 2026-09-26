@@ -1,0 +1,47 @@
+{
+  "name": "quasar-postgres",
+  "image": "docker.io/library/postgres@sha256:dd44000000000000000000000000000000000000000000000000000000000000",
+  "entrypoint": null,
+  "cmd": null,
+  "env": {
+    "POSTGRES_DB": "quasar",
+    "POSTGRES_PASSWORD_FILE": "/run/quasar-secrets/database-password",
+    "POSTGRES_USER": "quasar"
+  },
+  "labels": {
+    "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+    "io.quasar.platform-service": "postgres",
+    "io.quasar.recipe": "1",
+    "io.quasar.spec": "sha256:406d5a416118b779b8cf672552b9eb82b91865faf2a730a6bb362c3a521d80a3"
+  },
+  "network_mode": "quasar-platform",
+  "binds": [
+    {
+      "source": "quasar-postgres-secrets",
+      "target": "/run/quasar-secrets",
+      "read_only": true
+    },
+    {
+      "source": "quasar-postgres-data",
+      "target": "/var/lib/postgresql/data",
+      "read_only": false
+    }
+  ],
+  "devices": [],
+  "device_cgroup_rules": [],
+  "gpus": [],
+  "cap_add": [],
+  "security_opt": [],
+  "init": false,
+  "restart": "unless-stopped",
+  "healthcheck": {
+    "test": [
+      "CMD-SHELL",
+      "pg_isready -U quasar -d quasar"
+    ],
+    "interval_s": 5,
+    "timeout_s": 3,
+    "retries": 12,
+    "start_period_s": 0
+  }
+}

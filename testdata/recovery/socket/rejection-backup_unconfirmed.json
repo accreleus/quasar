@@ -1,0 +1,9 @@
+{
+  "shape": "rejection",
+  "about": "A migrating update against an external database without ExternalBackupConfirmed (RH06-01 draft vocabulary).",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "reason": "backup_unconfirmed",
+    "message": "this release migrates an external database; confirm it has been backed up"
+  }
+}

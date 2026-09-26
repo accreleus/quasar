@@ -1,0 +1,105 @@
+{
+  "kind": "redirect",
+  "about": "signature_source.go's redirect policy: follow at most ten redirects, and never from an https origin to anything but https.",
+  "vectors": [
+    {
+      "name": "https to https is followed",
+      "source": "added: signature_source.go client CheckRedirect",
+      "via": [
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+      ],
+      "next": "https://storage.example.invalid/asset",
+      "expect": {
+        "allowed": true
+      }
+    },
+    {
+      "name": "https to http is refused",
+      "source": "added: signature_source.go client CheckRedirect (a plaintext hop could forge a 404)",
+      "via": [
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+      ],
+      "next": "http://storage.example.invalid/asset",
+      "expect": {
+        "allowed": false,
+        "error": "refusing a redirect from https to http"
+      }
+    },
+    {
+      "name": "https to an uppercase HTTP is refused",
+      "source": "added: the scheme is compared after url.Parse lowercases it",
+      "via": [
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+      ],
+      "next": "HTTP://storage.example.invalid/asset",
+      "expect": {
+        "allowed": false,
+        "error": "refusing a redirect from https to http"
+      }
+    },
+    {
+      "name": "a later hop off TLS is refused",
+      "source": "added: the rule is about the first request's scheme",
+      "via": [
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://storage.example.invalid/asset"
+      ],
+      "next": "http://storage.example.invalid/asset",
+      "expect": {
+        "allowed": false,
+        "error": "refusing a redirect from https to http"
+      }
+    },
+    {
+      "name": "nine hops are followed",
+      "source": "added: the ten-redirect bound",
+      "via": [
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+      ],
+      "next": "https://storage.example.invalid/asset",
+      "expect": {
+        "allowed": true
+      }
+    },
+    {
+      "name": "the tenth redirect is refused",
+      "source": "added: the ten-redirect bound",
+      "via": [
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+        "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+      ],
+      "next": "https://storage.example.invalid/asset",
+      "expect": {
+        "allowed": false,
+        "error": "stopped after 10 redirects"
+      }
+    },
+    {
+      "name": "a plaintext origin may redirect to plaintext",
+      "source": "added: only an https origin is held to https (the base URL is always https)",
+      "via": [
+        "http://mirror.example.invalid/a"
+      ],
+      "next": "http://storage.example.invalid/asset",
+      "expect": {
+        "allowed": true
+      }
+    }
+  ]
+}

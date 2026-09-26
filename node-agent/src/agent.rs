@@ -197,8 +197,7 @@ pub async fn run(cfg: Config) {
     // identity-unknown (agent-api.md §register).
     let runtime = {
         let (runtime, facts) = offload_probe(move || {
-            let facts =
-                crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime));
+            let facts = crate::buildinfo::discover(&runtime);
             (runtime, facts)
         })
         .await;
@@ -475,6 +474,11 @@ pub async fn run(cfg: Config) {
                     sleep(Duration::from_millis(250)).await;
                     continue;
                 }
+                if e.downcast_ref::<ActorIdentityReconnect>().is_some() {
+                    sessions.registered_this_connection = false;
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 // #128: hold the running sessions instead of stopping them. The
                 // media path is agent-to-browser and needs nothing from the
                 // control plane while it is away, and on reconnect the control
@@ -542,8 +546,9 @@ pub async fn run(cfg: Config) {
                             token = "agent-registration-unhealthy",
                             "agent has failed to connect/register {failures} times in a row with no \
                              successful registration since; the health endpoint now reports \
-                             unhealthy so `docker compose ps` surfaces this — check ENROLLMENT_TOKEN \
-                             validity and control-plane reachability"
+                             unhealthy so the container engine surfaces this — check that the \
+                             enrollment token is one this control plane minted and not yet spent, \
+                             and control-plane reachability"
                         );
                     }
                 }
@@ -1508,6 +1513,21 @@ impl std::fmt::Display for PolicySeedReconnect {
 
 impl std::error::Error for PolicySeedReconnect {}
 
+/// The recovery actor was replaced, or its reported identity changed (the seed went
+/// missing or came back, the actor stopped or started answering), under this connection
+/// (agent-api.md §register, owned installs): reconnect once so `register` reports it. Not
+/// an enrollment, and it ends no session.
+#[derive(Debug)]
+struct ActorIdentityReconnect;
+
+impl std::fmt::Display for ActorIdentityReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the recovery actor's identity changed")
+    }
+}
+
+impl std::error::Error for ActorIdentityReconnect {}
+
 /// Open the control-plane socket and split it.
 ///
 /// #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
@@ -1542,6 +1562,8 @@ fn register_message(
     let (image_versions_complete, image_versions) = image_mgr
         .map(ImageManager::version_snapshot)
         .unwrap_or((false, Vec::new()));
+    // Amendment 14: the actor's identity rides only beside `install_mode: "owned"`.
+    let owned = install.install_mode == Some(crate::buildinfo::InstallMode::Owned);
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1, "template_publish_permit": 1})),
         config_policy_versions: policy_available.then(||
@@ -1560,6 +1582,13 @@ fn register_message(
         built_at: crate::buildinfo::built_at().map(str::to_string),
         install_mode: install.install_mode.map(|m| m.as_str().to_string()),
         updater_present: install.updater_present,
+        recovery_actor_version: owned
+            .then(|| install.recovery_actor_version.clone())
+            .flatten(),
+        recovery_actor_source_commit: owned
+            .then(|| install.recovery_actor_source_commit.clone())
+            .flatten(),
+        seed_version: owned.then(|| install.seed_version.clone()).flatten(),
     })
 }
 
@@ -1739,7 +1768,7 @@ async fn diagnostic_connection(
     let images = crate::images::register_images_from_state(&cfg.image_state_path());
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+        crate::buildinfo::discover(&runtime)
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -1866,7 +1895,7 @@ async fn connect_and_run(
     // forever. Offloaded because it shells out to docker.
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+        crate::buildinfo::discover(&runtime)
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -2087,11 +2116,7 @@ async fn connect_and_run(
     info!("capacity report sent");
     if let Some(ledger) = sessions.mgr.home_cleanup.as_mut() {
         for session_id in ledger.take_recovered() {
-            send(
-                &mut tx,
-                &qualified_home_terminal(&session_id, crate::home_cleanup::TerminalKind::Failed),
-            )
-            .await?;
+            send(&mut tx, &recovered_terminal(&session_id)).await?;
         }
     }
 
@@ -2301,6 +2326,10 @@ async fn connect_and_run(
                     ReadinessRefresh::Done(Ok(checks)) => {
                         readiness_busy = false;
                         mgr.readiness.refreshed(checks, SystemTime::now());
+                        if crate::buildinfo::owned_identity_changed() {
+                            info!(token = "owned-identity-redial", "the recovery actor now reports a different identity (actor, seed or whether it answers); reconnecting so register carries it");
+                            return Err(ActorIdentityReconnect.into());
+                        }
                     }
                     ReadinessRefresh::Done(Err(error)) => {
                         readiness_busy = false;
@@ -2783,6 +2812,11 @@ async fn connect_and_run(
                     continue;
                 };
                 send(&mut tx, &msg).await?;
+                let terminal = matches!(&msg, AgentMsg::ReleaseState { state, .. } if state == "succeeded" || state == "failed");
+                if terminal && release_mgr.take_redial() {
+                    info!(token = "release-actor-redial", "this host's recovery actor was replaced; reconnecting so register carries its identity");
+                    return Err(ActorIdentityReconnect.into());
+                }
             }
             // A host probe concluded, was deferred, or its check went not-applicable /
             // forgotten. Applying is pure in-memory work; the result reaches the
@@ -4385,6 +4419,9 @@ impl SessionManager {
                 self.release_mgr
                     .handle_apply(id, request_id, release, components, force),
             ),
+            ControlMsg::HostRemove { id, request_id } => {
+                Some(crate::host_remove::handle(id, &request_id))
+            }
             ControlMsg::Registered { .. } => {
                 warn!(
                     token = "duplicate-registered",
@@ -4754,6 +4791,21 @@ fn ack(id: String, ok: bool, error: Option<String>) -> AgentMsg {
     AgentMsg::Ack { id, ok, error }
 }
 
+/// `session_state.error` for a session the previous agent process was still running when it
+/// ended. No `reason_code` fits (agent-api.md defines only `app_exited_early`), so the prose
+/// field carries it: an agent update ends that host's sessions (#352 decision 9).
+const RECOVERED_SESSION_ERROR: &str = "the node agent restarted while this session was running \
+     (the agent was updated, replaced or stopped), so the session ended";
+
+/// The terminal report for a session found live in the previous agent process's ledger.
+fn recovered_terminal(session_id: &str) -> AgentMsg {
+    let mut msg = qualified_home_terminal(session_id, crate::home_cleanup::TerminalKind::Failed);
+    if let AgentMsg::SessionState { error, .. } = &mut msg {
+        *error = Some(RECOVERED_SESSION_ERROR.to_string());
+    }
+    msg
+}
+
 fn qualified_home_terminal(
     session_id: &str,
     terminal: crate::home_cleanup::TerminalKind,
@@ -5007,7 +5059,7 @@ fn enrollment_reachable(cfg: &Config) -> Result<(), String> {
         _ => Err(format!(
             "no persisted node_secret at {} and neither QUASAR_ENROLLMENT nor ENROLLMENT_TOKEN \
              is set: this agent can never register as-is. Paste the enrollment string from \
-             Admin -> Fleet -> Enroll host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
+             Admin -> Fleet -> Add host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
              docs/configuration.md#enrollment_token), then restart the container.",
             cfg.node_secret_path
         )),
@@ -5186,7 +5238,7 @@ fn stale_identity_message(node_secret_path: &str, kind: StaleIdentity) -> String
         StaleIdentity::Unresolvable => format!(
             "{cause}, and no enrollment token is configured — every reconnect will be refused the \
              same way. Clear the saved identity and enroll again: the command from \
-             Admin -> Fleet -> Enroll host does the clearing with QUASAR_RESET_IDENTITY=1, or \
+             Admin -> Fleet -> Add host does the clearing with QUASAR_RESET_IDENTITY=1, or \
              stop this agent and delete {node_secret_path} yourself (in a container install that \
              file is inside the agent's data volume, so removing that volume is the same thing)."
         ),
@@ -5771,6 +5823,67 @@ mod tests {
         }
         assert!(normal.get("config_policy_versions").is_some());
         assert!(normal.get("config_policy_groups").is_some());
+    }
+
+    /// Amendment 14: an owned install registers `install_mode: "owned"` with its recovery
+    /// actor's identity; every other install registers exactly as before, without the
+    /// three owned-only fields even if discovery somehow carried them.
+    #[test]
+    fn only_an_owned_install_registers_the_recovery_actor_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let register = |install: &crate::buildinfo::InstallFacts| {
+            serde_json::to_value(
+                register_message(&cfg, false, Vec::new(), install, true, true, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let owned_only = [
+            "recovery_actor_version",
+            "recovery_actor_source_commit",
+            "seed_version",
+        ];
+
+        let owned = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Owned),
+            updater_present: Some(true),
+            recovery_actor_version: Some("0.4.0".into()),
+            recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            seed_version: None,
+        });
+        assert_eq!(owned["install_mode"], "owned");
+        assert_eq!(owned["updater_present"], true);
+        assert_eq!(owned["recovery_actor_version"], "0.4.0");
+        assert_eq!(
+            owned["recovery_actor_source_commit"],
+            "cccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert!(
+            owned.get("seed_version").is_none(),
+            "absent, not null: {owned}"
+        );
+
+        let compose = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Registry),
+            updater_present: Some(true),
+            recovery_actor_version: Some("0.4.0".into()),
+            recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            seed_version: Some("0.4.0".into()),
+        });
+        assert_eq!(compose["install_mode"], "registry");
+        let unknown = register(&crate::buildinfo::InstallFacts::default());
+        assert!(unknown.get("install_mode").is_none());
+        for key in owned_only {
+            assert!(
+                compose.get(key).is_none(),
+                "{key} beside a registry install"
+            );
+            assert!(
+                unknown.get(key).is_none(),
+                "{key} beside an unknown install"
+            );
+        }
     }
 
     /// A pinned `Config` for the pin-file tests.
@@ -6826,10 +6939,10 @@ mod tests {
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
     /// touches neither disk nor a docker daemon.
-    /// A ReleaseManager pointed at paths that do not exist: `present()` is false,
-    /// so nothing in these tests can reach a socket.
+    /// A ReleaseManager with no recovery actor: `present()` is false, so nothing in
+    /// these tests can reach a socket.
     fn test_release_mgr() -> Arc<ReleaseManager> {
-        ReleaseManager::new("/nonexistent/updater.sock", "/nonexistent/results")
+        ReleaseManager::without_actor()
     }
 
     fn test_image_mgr() -> Arc<ImageManager> {
@@ -9295,5 +9408,22 @@ mod tests {
         );
         assert_eq!(next.app_boot_timeout, Some(Duration::from_secs(42)));
         assert_ne!(running.app_boot_timeout, next.app_boot_timeout);
+    }
+
+    /// A session live when the previous agent process ended (an agent update ends that
+    /// host's sessions) is reported failed with a stated reason, not with every field null.
+    #[test]
+    fn a_session_the_previous_agent_process_ran_ends_failed_with_a_stated_reason() {
+        let json = serde_json::to_value(recovered_terminal("0b9f5d3a-0000-4000-8000-000000000001"))
+            .unwrap();
+        assert_eq!(json["type"], "session_state");
+        assert_eq!(json["state"], "failed");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("node agent restarted")),
+            "{json}"
+        );
+        assert!(json.get("reason_code").is_none(), "{json}");
     }
 }

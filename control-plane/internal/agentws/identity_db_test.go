@@ -2,6 +2,7 @@ package agentws
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ func readIdentity(t *testing.T, pool *pgxpool.Pool, hostID string) storedIdentit
 
 func TestReplaceHostIdentityStoresAllFourFields(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	// A fresh host is identity-unknown: nothing has said anything yet.
@@ -74,7 +75,7 @@ func TestReplaceHostIdentityStoresAllFourFields(t *testing.T) {
 // storage/codecs/readiness, which are keep-if-absent.
 func TestReplaceHostIdentityNullsEveryAbsentFieldOnTheNextRegister(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	known, _ := identityFromRegister(RegisterMsg{
@@ -106,7 +107,7 @@ func TestReplaceHostIdentityNullsEveryAbsentFieldOnTheNextRegister(t *testing.T)
 // would refuse the write and take the whole registration down with it.
 func TestReplaceHostIdentityDropsAnUnknownInstallModeRatherThanFailingTheWrite(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	id, dropped := identityFromRegister(RegisterMsg{
@@ -242,4 +243,96 @@ func TestMigration0074DownDropsEverythingItAdded(t *testing.T) {
 	if n != 0 {
 		t.Error("platform_releases survived the down migration")
 	}
+}
+
+// Migration 0095 round trip inside a rolled-back transaction (see
+// TestMigration0074DownDropsEverythingItAdded for why not Steps(-1)): the down
+// must survive a live owned row, and the up must re-apply over its result.
+func TestMigration0095RoundTripsAnOwnedHost(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	// The files carry their own BEGIN/COMMIT, which must not end the test's
+	// transaction early.
+	read := func(name string) string {
+		sql, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		s := strings.Replace(string(sql), "BEGIN;", "", 1)
+		return strings.Replace(s, "COMMIT;", "", 1)
+	}
+	up, down := read("0095_owned_install_identity.up.sql"), read("0095_owned_install_identity.down.sql")
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var ownedID, registryID string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO hosts (node_name, status, install_mode, recovery_actor_version,
+		                   recovery_actor_source_commit, seed_version)
+		VALUES ('mig95-owned', 'online', 'owned', '0.4.0', 'abcdef0', '0.4.0') RETURNING id::text`).
+		Scan(&ownedID); err != nil {
+		t.Fatalf("insert owned host: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO hosts (node_name, status, install_mode)
+		VALUES ('mig95-registry', 'online', 'registry') RETURNING id::text`).Scan(&registryID); err != nil {
+		t.Fatalf("insert registry host: %v", err)
+	}
+
+	if _, err := tx.Exec(ctx, down); err != nil {
+		t.Fatalf("down migration with a live owned row: %v", err)
+	}
+	var n int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns WHERE table_name = 'hosts'
+		  AND column_name IN ('recovery_actor_version','recovery_actor_source_commit','seed_version')`).
+		Scan(&n); err != nil {
+		t.Fatalf("count columns: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("%d of the three added columns survived the down migration", n)
+	}
+	var owned, registry *string
+	if err := tx.QueryRow(ctx, `SELECT
+		(SELECT install_mode FROM hosts WHERE id::text = $1),
+		(SELECT install_mode FROM hosts WHERE id::text = $2)`, ownedID, registryID).
+		Scan(&owned, &registry); err != nil {
+		t.Fatalf("read modes: %v", err)
+	}
+	if owned != nil {
+		t.Errorf("owned host after down: install_mode = %q, want NULL (identity-unknown)", *owned)
+	}
+	if registry == nil || *registry != "registry" {
+		t.Errorf("registry host after down: install_mode = %v, want untouched", registry)
+	}
+	refused := func(label, sql string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, `SAVEPOINT refused`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, sql, args...); err == nil {
+			t.Error(label)
+		}
+		if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT refused`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused("the narrowed CHECK still admits 'owned' after down",
+		`UPDATE hosts SET install_mode = 'owned' WHERE id::text = $1`, ownedID)
+
+	if _, err := tx.Exec(ctx, up); err != nil {
+		t.Fatalf("up migration after down: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE hosts SET install_mode = 'owned', recovery_actor_version = '0.4.0',
+		       recovery_actor_source_commit = 'abcdef0', seed_version = '0.4.0'
+		WHERE id::text = $1`, ownedID); err != nil {
+		t.Errorf("owned write after re-up: %v", err)
+	}
+	refused("the widened CHECK admits a value outside (registry, source, owned)",
+		`UPDATE hosts SET install_mode = 'kubernetes' WHERE id::text = $1`, ownedID)
 }

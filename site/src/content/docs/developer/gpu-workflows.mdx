@@ -49,6 +49,36 @@ explicit `HOST=`. Destructive fleet, database, volume, or image operations still
 require operator authorisation.
 </Aside>
 
+## Two lanes: source builds and owned installs
+
+Everything above is the **contributor lane**: a stack built from source and run
+with Compose. It is fast to iterate on, it is not a supported install, and a
+recovery actor never acts on it. The console shows it the `redeploy.sh` recipe
+rather than offering it a release.
+
+The **product lane** runs a branch build on exactly the path users run: images
+from `deploy/build-images.sh`, pushed to a registry namespace you control under a
+content-addressed tag, installed with the seed, and moved with a **developer
+apply** from Admin, Fleet, Releases. Both the control plane and each machine's
+recovery actor check the registry namespace, and on an owned install both lists
+come from the seed inputs `QUASAR_UPDATER_ALLOWED_NAMESPACES` and, for a
+plain-HTTP registry, `QUASAR_PLATFORM_INSECURE_REGISTRIES`, recorded at the first
+install. Install a product-lane machine with the test registry already in them:
+
+```yaml
+      QUASAR_UPDATER_ALLOWED_NAMESPACES: "<test-registry>:5000/<namespace>,ghcr.io/accreleus/quasar"
+      QUASAR_PLATFORM_INSECURE_REGISTRIES: "<test-registry>:5000"
+```
+
+The engine that pulls the images also needs a plain-HTTP registry in its own
+`insecure-registries`. Any machine can widen its list later with `reconfigure`;
+on the first machine that replaces the control plane. The rules are under [Developer
+apply](/quasar/operations/upgrading/#developer-apply).
+
+A machine is in one lane at a time. Move a shared test host between lanes
+deliberately, one host at a time, and follow the shared-host preflight in
+`AGENTS.md` before you do.
+
 ## Inspect a live session
 
 ```bash

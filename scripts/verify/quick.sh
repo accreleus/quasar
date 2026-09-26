@@ -8,6 +8,6 @@ run "repository whitespace" git diff --check --ignore-submodules=all
 bash scripts/verify/control.sh
 bash scripts/verify/web.sh
 cd /workspace/node-agent
-run "Rust formatting" cargo fmt --check
+run "Rust formatting" cargo fmt --all --check
 skip "Rust clippy and Linux unit tests are in ./scripts/verify.sh agent or full"
 skip "hardware validation requires Tower/hermes and is never included in laptop PASS"

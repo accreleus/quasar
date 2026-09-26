@@ -3,6 +3,7 @@ package agentws
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -49,8 +50,7 @@ func TestMintedEnrollmentTokenIsSingleUse(t *testing.T) {
 		t.Fatalf("mint: %v", err)
 	}
 
-	// The static config token is deliberately NOT the one being presented.
-	res, err := st.enrollHost(ctx, "minted-1", "0.1.0", plaintext, "static-token")
+	res, err := st.enrollHost(ctx, "minted-1", "0.1.0", plaintext)
 	if err != nil {
 		t.Fatalf("first enrollment with a minted token: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestMintedEnrollmentTokenIsSingleUse(t *testing.T) {
 		t.Fatal("enrollment returned no node secret")
 	}
 
-	if _, err := st.enrollHost(ctx, "minted-2", "0.1.0", plaintext, "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
+	if _, err := st.enrollHost(ctx, "minted-2", "0.1.0", plaintext); !errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("replay of a single-use token: got %v, want ErrInvalidEnrollmentToken", err)
 	}
 }
@@ -77,7 +77,7 @@ func TestMintedEnrollmentTokenRefusals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint expired: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "n-exp", "0.1.0", expired, ""); !errors.Is(err, ErrInvalidEnrollmentToken) {
+	if _, err := st.enrollHost(ctx, "n-exp", "0.1.0", expired); !errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("expired token: got %v, want ErrInvalidEnrollmentToken", err)
 	}
 
@@ -88,7 +88,7 @@ func TestMintedEnrollmentTokenRefusals(t *testing.T) {
 	if err := mint.Revoke(ctx, row.ID); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "n-rev", "0.1.0", revoked, ""); !errors.Is(err, ErrInvalidEnrollmentToken) {
+	if _, err := st.enrollHost(ctx, "n-rev", "0.1.0", revoked); !errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("revoked token: got %v, want ErrInvalidEnrollmentToken", err)
 	}
 
@@ -97,26 +97,23 @@ func TestMintedEnrollmentTokenRefusals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint bound: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "the-wrong-host", "0.1.0", bound, ""); !errors.Is(err, ErrInvalidEnrollmentToken) {
+	if _, err := st.enrollHost(ctx, "the-wrong-host", "0.1.0", bound); !errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("bound token on another node: got %v, want ErrInvalidEnrollmentToken", err)
 	}
-	if _, err := st.enrollHost(ctx, "the-right-host", "0.1.0", bound, ""); err != nil {
+	if _, err := st.enrollHost(ctx, "the-right-host", "0.1.0", bound); err != nil {
 		t.Fatalf("bound token on its own node: %v", err)
 	}
 }
 
-// Existing deployments carry only the static ENROLLMENT_TOKEN. It must keep working
-// across this upgrade, and a wrong value must still be refused.
-func TestStaticEnrollmentTokenStillWorks(t *testing.T) {
+// The static ENROLLMENT_TOKEN is retired: a value that was never minted enrolls
+// nothing, whatever the control plane's environment still holds.
+func TestAStaticEnrollmentTokenNoLongerEnrolls(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	st := storeWithMintedTokens(pool, func(string) bool { return false })
 
-	if _, err := st.enrollHost(ctx, "legacy-host", "0.1.0", "static-token", "static-token"); err != nil {
-		t.Fatalf("static token enrollment: %v", err)
-	}
-	if _, err := st.enrollHost(ctx, "legacy-host-2", "0.1.0", "wrong", "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
-		t.Fatalf("wrong static token: got %v, want ErrInvalidEnrollmentToken", err)
+	if _, err := st.enrollHost(ctx, "legacy-host", "0.1.0", "a-static-value"); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("an unminted token: got %v, want ErrInvalidEnrollmentToken", err)
 	}
 }
 
@@ -133,7 +130,7 @@ func TestEnrollmentCannotTakeOverAConnectedHost(t *testing.T) {
 
 	// The incumbent enrolls while nothing is connected yet.
 	connected = false
-	first, err := st.enrollHost(ctx, "contested", "0.1.0", "static-token", "static-token")
+	first, err := st.enrollHost(ctx, "contested", "0.1.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatalf("initial enrollment: %v", err)
 	}
@@ -141,7 +138,7 @@ func TestEnrollmentCannotTakeOverAConnectedHost(t *testing.T) {
 	// Its agent is now live: a second enrollment under the same name is refused, even
 	// though the credential presented is perfectly valid.
 	connected = true
-	if _, err := st.enrollHost(ctx, "contested", "0.1.0", "static-token", "static-token"); !errors.Is(err, ErrHostAgentConnected) {
+	if _, err := st.enrollHost(ctx, "contested", "0.1.0", testEnrollmentToken); !errors.Is(err, ErrHostAgentConnected) {
 		t.Fatalf("takeover while connected: got %v, want ErrHostAgentConnected", err)
 	}
 
@@ -161,7 +158,7 @@ func TestEnrollmentCannotTakeOverAConnectedHost(t *testing.T) {
 	if err := st.markOffline(ctx, first.HostID); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "contested", "0.1.0", "static-token", "static-token"); err != nil {
+	if _, err := st.enrollHost(ctx, "contested", "0.1.0", testEnrollmentToken); err != nil {
 		t.Fatalf("re-enrolling a disconnected host: %v", err)
 	}
 }
@@ -186,15 +183,15 @@ func TestBadCredentialNeverRevealsALiveHost(t *testing.T) {
 	connected := false
 	st := storeWithMintedTokens(pool, func(string) bool { return connected })
 
-	if _, err := st.enrollHost(ctx, "oracle-host", "0.1.0", "static-token", "static-token"); err != nil {
+	if _, err := st.enrollHost(ctx, "oracle-host", "0.1.0", testEnrollmentToken); err != nil {
 		t.Fatalf("initial enrollment: %v", err)
 	}
 	connected = true
 
-	if _, err := st.enrollHost(ctx, "oracle-host", "0.1.0", "wrong", "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
+	if _, err := st.enrollHost(ctx, "oracle-host", "0.1.0", "wrong"); !errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("bad credential on a live node_name: got %v, want ErrInvalidEnrollmentToken", err)
 	}
-	if _, err := st.enrollHost(ctx, "no-such-host", "0.1.0", "wrong", "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
+	if _, err := st.enrollHost(ctx, "no-such-host", "0.1.0", "wrong"); !errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("bad credential on an unknown node_name: got %v, want ErrInvalidEnrollmentToken", err)
 	}
 }
@@ -210,7 +207,7 @@ func TestRefusedTakeoverDoesNotBurnAMintedToken(t *testing.T) {
 	st := storeWithMintedTokens(pool, func(string) bool { return connected })
 	mint := hostenroll.NewStore(pool)
 
-	first, err := st.enrollHost(ctx, "burned", "0.1.0", "static-token", "static-token")
+	first, err := st.enrollHost(ctx, "burned", "0.1.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatalf("initial enrollment: %v", err)
 	}
@@ -220,7 +217,7 @@ func TestRefusedTakeoverDoesNotBurnAMintedToken(t *testing.T) {
 	}
 
 	connected = true
-	if _, err := st.enrollHost(ctx, "burned", "0.1.0", plaintext, ""); !errors.Is(err, ErrHostAgentConnected) {
+	if _, err := st.enrollHost(ctx, "burned", "0.1.0", plaintext); !errors.Is(err, ErrHostAgentConnected) {
 		t.Fatalf("takeover while connected: got %v, want ErrHostAgentConnected", err)
 	}
 	if n := usedCount(t, pool, row.ID); n != 0 {
@@ -231,7 +228,7 @@ func TestRefusedTakeoverDoesNotBurnAMintedToken(t *testing.T) {
 	if err := st.markOffline(ctx, first.HostID); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "burned", "0.1.0", plaintext, ""); err != nil {
+	if _, err := st.enrollHost(ctx, "burned", "0.1.0", plaintext); err != nil {
 		t.Fatalf("the same token once the host is gone: %v", err)
 	}
 	if n := usedCount(t, pool, row.ID); n != 1 {
@@ -246,11 +243,11 @@ func TestEnrollmentRefusesAHostOnlyTheDatabaseCallsLive(t *testing.T) {
 	ctx := context.Background()
 	st := storeWithMintedTokens(pool, func(string) bool { return false }) // nothing local
 
-	res, err := st.enrollHost(ctx, "other-replica", "0.1.0", "static-token", "static-token")
+	res, err := st.enrollHost(ctx, "other-replica", "0.1.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatalf("initial enrollment: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", "static-token", "static-token"); !errors.Is(err, ErrHostAgentConnected) {
+	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", testEnrollmentToken); !errors.Is(err, ErrHostAgentConnected) {
 		t.Fatalf("takeover of an online row: got %v, want ErrHostAgentConnected", err)
 	}
 
@@ -259,7 +256,7 @@ func TestEnrollmentRefusesAHostOnlyTheDatabaseCallsLive(t *testing.T) {
 	if err := st.markOffline(ctx, res.HostID); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", "static-token", "static-token"); err != nil {
+	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", testEnrollmentToken); err != nil {
 		t.Fatalf("re-enrolling an offline row: %v", err)
 	}
 }
@@ -276,7 +273,7 @@ func TestRedemptionOutageIsNotAnAuthFailure(t *testing.T) {
 		redeemEnrollment: func(context.Context, hostenroll.DBTX, string, string) error { return outage },
 	}
 
-	_, err := st.enrollHost(ctx, "outage-host", "0.1.0", "some-token", "static-token")
+	_, err := st.enrollHost(ctx, "outage-host", "0.1.0", "some-token")
 	if errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("a redemption outage was reported as an auth failure: %v", err)
 	}
@@ -285,17 +282,45 @@ func TestRedemptionOutageIsNotAnAuthFailure(t *testing.T) {
 	}
 }
 
-// A store built without a redeemer (older wiring, or a test fixture) must refuse the
-// unknown token rather than panic on the pre-auth path; the static token still enrolls.
+// A store built without a redeemer must refuse every token rather than panic on
+// the pre-auth path.
 func TestEnrollmentWithoutMintedTokenSupport(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	st := &agentStore{pool: pool}
 
-	if _, err := st.enrollHost(ctx, "no-minting", "0.1.0", "whatever", "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
-		t.Fatalf("minted token with no redeemer wired: got %v, want ErrInvalidEnrollmentToken", err)
+	for _, token := range []string{"whatever", testEnrollmentToken} {
+		if _, err := st.enrollHost(ctx, "no-minting", "0.1.0", token); !errors.Is(err, ErrInvalidEnrollmentToken) {
+			t.Fatalf("%q with no redeemer wired: got %v, want ErrInvalidEnrollmentToken", token, err)
+		}
 	}
-	if _, err := st.enrollHost(ctx, "no-minting", "0.1.0", "static-token", "static-token"); err != nil {
-		t.Fatalf("static token with no redeemer wired: %v", err)
+}
+
+// A combined machine's own agent enrolls with its local token (control-api.md
+// amendment 14 §"Enrollment").
+func TestLocalEnrollmentTokenEnrollsItsOwnNodeOnly(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	st := storeWithMintedTokens(pool, func(string) bool { return false })
+	local := fmt.Sprintf("local-token-%d", time.Now().UnixNano())
+
+	if _, err := hostenroll.EnsureLocal(ctx, pool, local, "combined-own"); err != nil {
+		t.Fatalf("ensure local: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "combined-other", "0.1.0", local); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("local token on another node: got %v, want ErrInvalidEnrollmentToken", err)
+	}
+	res, err := st.enrollHost(ctx, "combined-own", "0.1.0", local)
+	if err != nil {
+		t.Fatalf("local token on its own node: %v", err)
+	}
+	if res.NodeSecret == "" {
+		t.Fatal("enrollment returned no node secret")
+	}
+	if err := st.markOffline(ctx, res.HostID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "combined-own", "0.1.0", local); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("replay of the spent local token: got %v, want ErrInvalidEnrollmentToken", err)
 	}
 }

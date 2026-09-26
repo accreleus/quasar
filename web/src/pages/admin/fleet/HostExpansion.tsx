@@ -6,7 +6,12 @@
 
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
-import type { GPUAvailability, Host, HostStorageVolume } from "../../../api/types";
+import type {
+  GPUAvailability,
+  Host,
+  HostStorageVolume,
+  PlatformIdentity,
+} from "../../../api/types";
 import { Bar } from "../../../components/Bar";
 import { ReadinessCard } from "../../../components/ReadinessCard";
 import { LOW_STORAGE_PCT } from "../../../lib/fleet/deriveAlerts";
@@ -23,6 +28,7 @@ import {
   updaterHint,
   updaterLabel,
 } from "./hostIdentity";
+import { hostServices } from "./hostServices";
 
 export interface HostExpansionProps {
   host: Host;
@@ -32,16 +38,30 @@ export interface HostExpansionProps {
   gpuError: string | null;
   /** Inline result of the last drain/uncordon on this row. */
   actionError?: string;
+  /** The control plane's own identity: whether this host shares its machine. */
+  controlPlane?: PlatformIdentity | null;
+  /** Below the floor: no local console or settings are offered. */
+  belowFloor?: boolean;
   now: number;
 }
 
 /** Free share under which the storage column turns red (mock: dp >= 90 used). */
 const DISK_DANGER_PCT = 90;
 
-export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostExpansionProps) {
+export function HostExpansion({
+  host,
+  gpus,
+  gpuError,
+  actionError,
+  controlPlane,
+  belowFloor = false,
+  now,
+}: HostExpansionProps) {
   const util = utilisation(host, gpus);
   const storage = storageTotals(host.storage);
   const volumes = host.storage ?? [];
+  // The row carries no control-plane build, so "older" is the host page's to say.
+  const services = hostServices(host, { agentOlder: false, machine: controlPlane });
 
   return (
     <>
@@ -84,6 +104,32 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
           )}
         </div>
 
+        {services && (
+          <div>
+            <div className="eyebrow">Services</div>
+            {services.rows.map((row) => (
+              <Fact
+                key={row.key}
+                label={row.name}
+                value={
+                  row.version ? (
+                    <>
+                      <span className="num">{row.version}</span>
+                      {row.key === "seed" && row.owner ? ` · ${row.owner.toLowerCase()}` : ""}
+                    </>
+                  ) : row.state.kind === "absent" ? (
+                    row.state.text
+                  ) : row.state.kind === "not_found" ? (
+                    "not found"
+                  ) : (
+                    "not reported"
+                  )
+                }
+              />
+            ))}
+          </div>
+        )}
+
         <div>
           <div className="eyebrow">Build</div>
           <Fact
@@ -119,8 +165,8 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
           <Fact
             label="Updater"
             value={
-              <span title={updaterHint(host.updater_present)}>
-                {updaterLabel(host.updater_present)}
+              <span title={updaterHint(host.updater_present, host.install_mode)}>
+                {updaterLabel(host.updater_present, host.install_mode)}
               </span>
             }
           />
@@ -210,12 +256,16 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
             <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}`}>
               Open host
             </Link>
-            <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/console`}>
-              Local console
-            </Link>
-            <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/settings`}>
-              Host settings
-            </Link>
+            {!belowFloor && (
+              <>
+                <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/console`}>
+                  Local console
+                </Link>
+                <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/settings`}>
+                  Host settings
+                </Link>
+              </>
+            )}
           </div>
         </div>
       </div>

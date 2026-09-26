@@ -23,6 +23,8 @@ export class ApiError extends Error {
   /** Seconds from the `Retry-After` response HEADER, not the JSON envelope, and
    *  only on `503 capacity_exhausted`. Undefined otherwise. */
   readonly retryAfterSeconds?: number;
+  /** The top-level `reason` beside `409 host_not_eligible`. */
+  readonly reason?: string;
 
   constructor(
     status: number,
@@ -31,6 +33,7 @@ export class ApiError extends Error {
     liveSessions?: number,
     sessionId?: string,
     retryAfterSeconds?: number,
+    reason?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -39,6 +42,7 @@ export class ApiError extends Error {
     this.liveSessions = liveSessions;
     this.sessionId = sessionId;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.reason = reason;
   }
 }
 
@@ -59,12 +63,14 @@ async function parseError(res: Response): Promise<ApiError> {
   let message = res.statusText || "request failed";
   let liveSessions: number | undefined;
   let sessionId: string | undefined;
+  let reason: string | undefined;
   try {
     const data = (await res.json()) as Partial<ApiErrorBody>;
     if (data?.error?.code) code = data.error.code;
     if (data?.error?.message) message = data.error.message;
     if (typeof data?.error?.live_sessions === "number") liveSessions = data.error.live_sessions;
     if (typeof data?.error?.session_id === "string") sessionId = data.error.session_id;
+    if (typeof data?.reason === "string") reason = data.reason;
   } catch {
     // Non-JSON error body (e.g. a proxy 502) — keep the status-derived defaults.
   }
@@ -78,7 +84,7 @@ async function parseError(res: Response): Promise<ApiError> {
     const parsed = Number(retryAfterHeader);
     if (Number.isFinite(parsed) && parsed >= 0) retryAfterSeconds = parsed;
   }
-  return new ApiError(res.status, code, message, liveSessions, sessionId, retryAfterSeconds);
+  return new ApiError(res.status, code, message, liveSessions, sessionId, retryAfterSeconds, reason);
 }
 
 /**

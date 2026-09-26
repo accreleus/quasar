@@ -26,6 +26,12 @@ type PlanInputs struct {
 	SourceRepo string
 
 	ControlPlane buildinfo.Identity
+	// Floor is the control plane's declared floor (buildinfo.DeclaredFloor): what
+	// each host's served `below_floor` is judged against. The zero value judges no
+	// host below it.
+	Floor buildinfo.Floor
+	// The machine it runs on, served beside it; no decision reads it.
+	ControlPlaneMachine MachineIdentity
 
 	// In the order the host list uses: `targets` and `installed.hosts` must
 	// agree with GET /v1/hosts.
@@ -78,7 +84,7 @@ func PlanRelease(in PlanInputs) View {
 	}
 
 	available := offerable(in.Releases, channel, in.ControlPlane)
-	hosts := withDerivedIdentity(in.Hosts)
+	hosts := withDerivedIdentity(in.Hosts, in.Floor)
 	open := openTargets(in.OpenAttempts)
 	fleet := fleetState{
 		runActive:      in.ActiveRun != nil,
@@ -92,6 +98,10 @@ func PlanRelease(in PlanInputs) View {
 	}
 	cpFacts := in.ControlPlanePreflight
 	cpFacts.Image = image
+	if len(available) > 0 {
+		migrates := ReleaseRunsAMigration(available[0], in.ControlPlane.SchemaVersion)
+		cpFacts.Migrates = &migrates
+	}
 
 	v := View{
 		Channel:    channel,
@@ -100,8 +110,9 @@ func PlanRelease(in PlanInputs) View {
 		CheckedAt:  rfc3339OrNil(in.CheckedAt),
 		LastError:  in.LastError,
 		Installed: Installed{
-			ControlPlane: in.ControlPlane,
-			Hosts:        hosts,
+			ControlPlane:        in.ControlPlane,
+			Hosts:               hosts,
+			ControlPlaneMachine: in.ControlPlaneMachine,
 		},
 		Available: available,
 		Targets:   targets(available, in.ControlPlane, hosts, open, fleet, cpFacts, image),
@@ -313,11 +324,13 @@ func belowInstalledVersion(r Release, cp buildinfo.Identity) bool {
 	return semver.ComparePrecedence(candidate, installed) < 0
 }
 
-// withDerivedIdentity fills identity_known, which is served, never re-derived.
-func withDerivedIdentity(hosts []HostIdentity) []HostIdentity {
+// withDerivedIdentity fills identity_known and below_floor, which are served, never
+// re-derived.
+func withDerivedIdentity(hosts []HostIdentity, floor buildinfo.Floor) []HostIdentity {
 	out := make([]HostIdentity, 0, len(hosts))
 	for _, h := range hosts {
 		h.IdentityKnown = h.Known()
+		h.BelowFloor = HostBelowFloor(h, floor)
 		out = append(out, h)
 	}
 	return out
@@ -339,7 +352,7 @@ func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity, o
 		h := hosts[i]
 		hostID, nodeName := h.HostID, h.NodeName
 		pre := PlanPreflight(TargetHost, HostPreflightFacts(h, image))
-		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h, open[hostID], fleet, pre), pre))
+		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, image, cp, h, open[hostID], fleet, pre), pre))
 	}
 	return out
 }
@@ -415,14 +428,18 @@ func edgeOlderThanInstalled(release Release, cp buildinfo.Identity) bool {
 // hostReason: "" means eligible. The contract fixes the precedence as the order
 // below, durable facts outranking transient ones: an offline source-built host
 // reports install_mode_source, because reconnecting would not change it.
-func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState, pre Preflight) string {
+// image is the registry check for newest (available[0]).
+func hostReason(newest *Release, image *ImageFact, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState, pre Preflight) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
 	if !h.Known() {
 		return ReasonIdentityUnknown
 	}
-	if commitsMatch(*h.SourceCommit, newest.SourceCommit) {
+	// Amendment 14: an owned host is up to date only when its recovery actor is on
+	// the release too, where the release names one.
+	if commitsMatch(*h.SourceCommit, newest.SourceCommit) &&
+		!(releaseNamesActor(*newest, image) && actorBehindRelease(h, newest.SourceCommit)) {
 		return ReasonUpToDate
 	}
 	// Its images were never pulled, so there is nothing to re-pin.

@@ -1,0 +1,38 @@
+[package]
+name = "quasar-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Quasar's container-engine facade, ownership labels and durable-state primitives, without GStreamer or CUDA"
+
+# This crate is linked by the node agent and (RH-06) the recovery actor. It must
+# never depend on gstreamer*, glib or anything CUDA: the actor is a small static
+# binary in a slim image, and `cargo tree -p quasar-runtime` is how that is checked.
+#
+# Every requirement below is written exactly as the agent writes it, so the single
+# workspace Cargo.lock resolves both to the same version and nothing is bumped.
+[dependencies]
+# The engine SDK. Pinned exactly, like the agent: Bollard 0.21.1's URI join is
+# worked around in `docker::discover`, so a bump is a reviewed change, not a resolve.
+bollard = { version = "=0.21.1", default-features = false, features = ["pipe"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+# Registry `auth` entries in the Docker CLI config are base64 `user:password`.
+base64 = "0.23"
+# The pull, wait and log streams (already in the lock through bollard).
+futures-util = { version = "0.3", features = ["sink"] }
+# The archive upload body.
+bytes = "1"
+
+[features]
+# Test-only owner injection on `RuntimeConfig` (`diagnostic_owner`), for adapters
+# layered on this crate whose HTTP fixtures must not depend on process-global
+# ownership state. The agent enables it from its dev-dependencies only, so no
+# production build carries the field.
+test-support = []
+
+[dev-dependencies]
+tempfile = "3"

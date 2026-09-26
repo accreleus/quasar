@@ -517,7 +517,7 @@ describe("ReleasesTab", () => {
     renderTab();
 
     // "Apply · Updated", the row's own state line, over its digest step.
-    expect(await screen.findByText("Apply")).toBeInTheDocument();
+    expect(await screen.findByText("Apply", { selector: "span" })).toBeInTheDocument();
     expect(screen.getByText(/Updated/)).toBeInTheDocument();
     expect(screen.getByText(/111111111111/)).toBeInTheDocument();
   });
@@ -589,14 +589,14 @@ describe("ReleasesTab › manual update paths", () => {
     expect(screen.queryByRole("button", { name: /^apply/i })).not.toBeInTheDocument();
   });
 
-  it("a host with no updater shows the one-time updater addition and the registry recipe", async () => {
+  it("a host with no recovery actor shows the registry recipe and no updater to add", async () => {
     mocked.getPlatformReleases.mockResolvedValue(
       ineligible("updater_absent", { updater_present: false }),
     );
     renderTab();
 
     const block = await screen.findByTestId("manual-h1");
-    expect(block).toHaveTextContent("up -d --no-deps quasar-updater");
+    expect(block).not.toHaveTextContent("quasar-updater");
     expect(block).toHaveTextContent("pull quasar-control-plane quasar-node-agent");
     expect(block).toHaveTextContent("QUASAR_CONTROL_IMAGE=");
   });
@@ -785,7 +785,7 @@ describe("preflight on the targets card (#187)", () => {
         preflight: {
           state: "unknown",
           checked_at: null,
-          checks: [{ id: "updater_overlays", status: "unknown", detail: "the agent has not reported this check" }],
+          checks: [{ id: "health_addr_bindable", status: "unknown", detail: "the agent has not reported this check" }],
         },
       },
     ] as PlatformReleaseView["targets"];
@@ -794,5 +794,65 @@ describe("preflight on the targets card (#187)", () => {
 
     expect((await screen.findAllByText("Ready")).length).toBeGreaterThan(0);
     expect(await screen.findByTestId("preflight-h1")).toHaveTextContent("not evaluated");
+  });
+});
+
+describe("Releases on an owned control plane (#363)", () => {
+  function ownedView(migrates: boolean): PlatformReleaseView {
+    const v = eligibleHostView({ available: [release({ migrates, schema_version: migrates ? 75 : 74 })] });
+    Object.assign(v.installed.control_plane, {
+      install_mode: "owned",
+      machine_role: "combined",
+      machine_node_name: "gpu-host-01",
+    });
+    v.installed.hosts[0].install_mode = "owned";
+    return v;
+  }
+
+  it("says every machine's recovery actor moves first, and that sessions ride a non-migrating update", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView(false));
+    renderTab();
+    expect(await screen.findByText(/Each machine’s recovery actor is updated before its other services/)).toBeInTheDocument();
+    expect(screen.getByText(/live sessions keep streaming while the control plane restarts/)).toBeInTheDocument();
+    expect(screen.queryByText("Changes the database")).not.toBeInTheDocument();
+  });
+
+  it("says a migrating release dumps Quasar's own database before the control plane moves", async () => {
+    const v = ownedView(true);
+    Object.assign(v.installed.control_plane, { database_mode: "owned" });
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+    expect(await screen.findByText("Changes the database")).toBeInTheDocument();
+    expect(screen.getByText(/never applied unattended/)).toHaveTextContent(
+      "Quasar dumps its database before the control plane moves",
+    );
+    expect(screen.queryByText(/not available in this version/)).not.toBeInTheDocument();
+  });
+
+  it("says a migrating release on the operator's own database needs their confirmed backup", async () => {
+    const v = ownedView(true);
+    Object.assign(v.installed.control_plane, { database_mode: "external" });
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+    expect(await screen.findByText(/never applied unattended/)).toHaveTextContent(
+      "needs your confirmation that you have a current backup of your own database",
+    );
+  });
+
+  it("keeps the per-host detail to three columns, so Revert stays inside the rail", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView(false));
+    renderTab();
+    await screen.findByText("Per-host detail");
+    openPerHostDetail();
+    const heads = screen.getAllByRole("columnheader").map((th) => th.textContent);
+    expect(heads).toEqual(["Target", "State", ""]);
+  });
+
+  it("counts the agents on the control plane's version under the host total", async () => {
+    const v = ownedView(false);
+    v.installed.hosts.push({ ...v.installed.hosts[0], host_id: "h2", node_name: "gpu-host-02", agent_version: "0.0.9" });
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+    expect(await screen.findByText("1 on v0.1.0 · 1 older")).toBeInTheDocument();
   });
 });

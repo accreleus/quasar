@@ -9,9 +9,9 @@ import (
 
 func TestNewEnrollmentDefaultsSupportedHardwareToAutomatic(t *testing.T) {
 	pool := testPool(t)
-	store := &agentStore{pool: pool}
+	store := storeWithMintedTokens(pool, nil)
 	ctx := context.Background()
-	newHost, err := store.enrollHost(ctx, "automatic-new-host", "0.3.0", "token", "token")
+	newHost, err := store.enrollHost(ctx, "automatic-new-host", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +26,7 @@ func TestNewEnrollmentDefaultsSupportedHardwareToAutomatic(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET status='offline',agent_disconnected_at=now() WHERE id=$1::uuid`, newHost.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.1", "token", "token"); err != nil {
+	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.1", testEnrollmentToken); err != nil {
 		t.Fatal(err)
 	}
 	policy := hostcfg.NewStore(pool)
@@ -57,7 +57,7 @@ func TestNewEnrollmentDefaultsSupportedHardwareToAutomatic(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET status='offline',agent_disconnected_at=now() WHERE id=$1::uuid`, newHost.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.2", "token", "token"); err != nil {
+	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.2", testEnrollmentToken); err != nil {
 		t.Fatal(err)
 	}
 	view, err = hostcfg.NewStore(pool).GetPolicy(ctx, newHost.HostID)
@@ -72,9 +72,9 @@ func TestNewEnrollmentDefaultsSupportedHardwareToAutomatic(t *testing.T) {
 func TestNewEnrollmentSeedsUntouchedHardwareAfterUnrelatedTypedEdit(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	store := &agentStore{pool: pool}
+	store := storeWithMintedTokens(pool, nil)
 	policy := hostcfg.NewStore(pool)
-	host, err := store.enrollHost(ctx, "automatic-after-idle-edit", "0.3.0", "token", "token")
+	host, err := store.enrollHost(ctx, "automatic-after-idle-edit", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestCapabilityEchoDoesNotInferAutomaticOnExistingOrEditedHost(t *testing.T)
 	pool := testPool(t)
 	ctx := context.Background()
 	policy := hostcfg.NewStore(pool)
-	store := &agentStore{pool: pool}
+	store := storeWithMintedTokens(pool, nil)
 	for _, tc := range []struct {
 		name, hostID, want string
 	}{
@@ -129,7 +129,7 @@ func TestCapabilityEchoDoesNotInferAutomaticOnExistingOrEditedHost(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			hostID := tc.hostID
 			if hostID == "" {
-				result, err := store.enrollHost(ctx, "automatic-edited-host", "0.3.0", "token", "token")
+				result, err := store.enrollHost(ctx, "automatic-edited-host", "0.3.0", testEnrollmentToken)
 				if err != nil {
 					t.Fatal(err)
 				}

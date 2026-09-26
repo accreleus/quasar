@@ -9,6 +9,7 @@ import { Button } from "../../../components/Button";
 import type { ChipVariant } from "../../../components/Chip";
 import { Chip } from "../../../components/Chip";
 import { IconCheck, IconChevronRight, IconCopy } from "../../../components/icons";
+import { clockTime } from "../../../lib/format/clockTime";
 import { actorLabel } from "./auditFilters";
 import { detailReadout, summaryLine, targetLabel } from "./describe";
 
@@ -18,19 +19,9 @@ const SEVERITY_VARIANT: Record<AdminActivitySeverity, ChipVariant> = {
   info: "neutral",
 };
 
-/** Local 24-hour HH:MM:SS — `hour12:false` so a PM row never grows an AM/PM
- *  suffix past the 88px Time column, and so the string is deterministic
- *  enough to assert on directly in a test (locale still supplies separators,
- *  but this repo's test/build locale is en-US throughout). Deliberately not
- *  `lib/format.ts`'s `fmtTime` (locale-default hour cycle, includes AM/PM). */
-function auditTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString(undefined, {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
+/** 24-hour, so a PM row never grows an AM/PM suffix past the 88px Time column.
+ *  Not `fmtTime` (locale-default hour cycle, includes AM/PM). */
+const auditTime = (iso: string): string => clockTime(iso);
 
 /** `copyAudit`'s clipboard text: "{time}  {actor}  {action}  {target}\n{pre}". */
 export function copyText(item: AdminActivityItem): string {

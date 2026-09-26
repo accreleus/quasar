@@ -21,99 +21,35 @@ func checkByID(t *testing.T, p Preflight, id string) PreflightCheck {
 	return PreflightCheck{}
 }
 
-func healthySelf() *UpdaterSelfFacts {
-	return &UpdaterSelfFacts{
-		Version:     "0.2.5",
-		StackDir:    "/srv/quasar/deploy",
-		ConfigFiles: []string{"/srv/quasar/deploy/docker-compose.yml"},
-		ServiceConfigFiles: map[string][]string{
-			"quasar-control-plane": {"/srv/quasar/deploy/docker-compose.yml"},
-			"quasar-node-agent":    {"/srv/quasar/deploy/docker-compose.yml"},
-		},
-	}
-}
-
-func TestControlPlanePreflightSocketThreeWay(t *testing.T) {
-	// #184: three situations used to read as one "not installed".
-	cases := []struct {
-		name   string
-		socket *SocketState
-		self   *UpdaterSelfFacts
-		status string
-		wants  string
-	}{
-		{"no mount directory", &SocketState{}, nil, CheckFail, "recreate"},
-		{"directory but no socket", &SocketState{DirExists: true}, nil, CheckFail, "quasar-updater"},
-		{"socket but no answer", &SocketState{DirExists: true, SocketExists: true}, &UpdaterSelfFacts{Err: "dial: refused"}, CheckFail, "did not answer"},
-		{"answered", &SocketState{DirExists: true, SocketExists: true}, healthySelf(), CheckPass, "0.2.5"},
-		{"nobody looked", nil, nil, CheckUnknown, ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			p := PlanPreflight(TargetControlPlane, PreflightFacts{Socket: tc.socket, Self: tc.self})
-			c := checkByID(t, p, CheckUpdaterSocket)
-			if c.Status != tc.status || !strings.Contains(c.Detail, tc.wants) {
-				t.Fatalf("updater_socket = %+v, want %s containing %q", c, tc.status, tc.wants)
-			}
-		})
-	}
-	// The mount-directory case must NAME THE FIX: it is the one an operator
-	// cannot guess from "not installed".
-	p := PlanPreflight(TargetControlPlane, PreflightFacts{Socket: &SocketState{}})
-	if d := checkByID(t, p, CheckUpdaterSocket).Detail; !strings.Contains(d, "--force-recreate") {
-		t.Fatalf("no-mount detail must carry the recreate command, got %q", d)
-	}
-}
-
-func TestControlPlanePreflightStackDirAndOverlays(t *testing.T) {
-	ok := PlanPreflight(TargetControlPlane, PreflightFacts{
-		Socket: &SocketState{true, true}, Self: healthySelf(), Image: &ImageFact{}})
-	if ok.State != PreflightOK {
-		t.Fatalf("state = %s, want ok: %+v", ok.State, ok.Checks)
-	}
-
-	// An overlay the control plane was started with and the updater was not.
-	drift := healthySelf()
-	drift.ServiceConfigFiles["quasar-control-plane"] = []string{
-		"/srv/quasar/deploy/docker-compose.yml", "/srv/quasar/deploy/overlays/docker-compose.dev.yml"}
-	p := PlanPreflight(TargetControlPlane, PreflightFacts{Socket: &SocketState{true, true}, Self: drift, Image: &ImageFact{}})
-	c := checkByID(t, p, CheckUpdaterOverlays)
-	if c.Status != CheckFail || !strings.Contains(c.Detail, "quasar-control-plane") || !strings.Contains(c.Detail, "docker-compose.dev.yml") {
-		t.Fatalf("overlay drift = %+v, want fail naming the service and the overlay", c)
+// A control plane with no recovery actor (not installed with the seed) cannot be
+// updated from the console; its check says so and names no Compose command.
+func TestControlPlanePreflightWithNoRecoveryActor(t *testing.T) {
+	p := PlanPreflight(TargetControlPlane, PreflightFacts{NoRecoveryActor: true, Image: &ImageFact{}})
+	c := checkByID(t, p, CheckUpdaterSocket)
+	if c.Status != CheckFail || !strings.Contains(c.Detail, "seed") || strings.Contains(c.Detail, "docker compose") {
+		t.Fatalf("updater_socket = %+v, want a fail naming the seed and no compose command", c)
 	}
 	if p.State != PreflightBlocked {
 		t.Fatalf("state = %s, want blocked", p.State)
 	}
+	assertNoRetiredChecks(t, p)
+}
 
-	// A service with no container is nothing to compare, not a mismatch.
-	absent := healthySelf()
-	absent.ServiceConfigFiles["quasar-node-agent"] = nil
-	if c := checkByID(t, PlanPreflight(TargetControlPlane, PreflightFacts{Socket: &SocketState{true, true}, Self: absent}), CheckUpdaterOverlays); c.Status != CheckPass {
-		t.Fatalf("absent service = %+v, want pass", c)
-	}
-
-	// An updater that predates the overlay report: unknown, never blocked.
-	old := healthySelf()
-	old.ServiceConfigFiles = nil
-	p = PlanPreflight(TargetControlPlane, PreflightFacts{Socket: &SocketState{true, true}, Self: old, Image: &ImageFact{}})
-	if c := checkByID(t, p, CheckUpdaterOverlays); c.Status != CheckUnknown {
-		t.Fatalf("old updater = %+v, want unknown", c)
-	}
-	if p.State != PreflightUnknown {
-		t.Fatalf("state = %s, want unknown", p.State)
-	}
-
-	// No discovered stack at all.
-	none := &UpdaterSelfFacts{Version: "0.2.5"}
-	if c := checkByID(t, PlanPreflight(TargetControlPlane, PreflightFacts{Socket: &SocketState{true, true}, Self: none}), CheckUpdaterStackDir); c.Status != CheckFail || !strings.Contains(c.Detail, "QUASAR_STACK_DIR") {
-		t.Fatalf("undiscovered stack = %+v, want fail naming QUASAR_STACK_DIR", c)
+// updater_stack_dir and updater_overlays are retired: no target evaluates or
+// emits them (control-api.md "RH06 contract step").
+func assertNoRetiredChecks(t *testing.T, p Preflight) {
+	t.Helper()
+	for _, c := range p.Checks {
+		if c.ID == "updater_stack_dir" || c.ID == "updater_overlays" {
+			t.Fatalf("retired check %s emitted: %+v", c.ID, p.Checks)
+		}
 	}
 }
 
 func TestHostPreflightReadsTheAgentsOwnChecks(t *testing.T) {
 	connected := true
 	readiness := json.RawMessage(`[
-	  {"id":"updater_socket","status":"pass","summary":"updater 0.2.5 answered","remediation":""},
+	  {"id":"updater_socket","status":"warn","summary":"the recovery actor answered slowly","remediation":"x"},
 	  {"id":"updater_stack_dir","status":"pass","summary":"/srv/quasar/deploy","remediation":""},
 	  {"id":"updater_overlays","status":"warn","summary":"could not compare","remediation":"x"},
 	  {"id":"health_addr_bindable","status":"fail","summary":"127.0.0.1:9091 is answered by node gpu-01 pid 4121, not this agent","remediation":"free the port (ss -ltnp | grep 9091) or set QUASAR_HEALTH_ADDR"},
@@ -133,10 +69,12 @@ func TestHostPreflightReadsTheAgentsOwnChecks(t *testing.T) {
 	if bind.Status != CheckFail || !strings.Contains(bind.Detail, "pid 4121") || !strings.Contains(bind.Detail, "QUASAR_HEALTH_ADDR") {
 		t.Fatalf("health_addr_bindable = %+v, want fail carrying the summary AND the remediation", bind)
 	}
-	if c := checkByID(t, p, CheckUpdaterOverlays); c.Status != CheckPass {
+	if c := checkByID(t, p, CheckUpdaterSocket); c.Status != CheckPass {
 		t.Fatalf("warn must read as an advisory pass, got %+v", c)
 	}
-	// An unrelated readiness failure (a GPU check) is not a preflight fact.
+	// An older agent still reporting the retired Compose checks: they are not
+	// lifted, and neither is an unrelated readiness failure (a GPU check).
+	assertNoRetiredChecks(t, p)
 	for _, c := range p.Checks {
 		if c.ID == "render_node" {
 			t.Fatal("render_node leaked into preflight")

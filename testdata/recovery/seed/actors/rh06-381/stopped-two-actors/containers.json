@@ -1,0 +1,53 @@
+[
+  {
+    "name": "quasar-node-agent",
+    "labels": {
+      "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+      "io.quasar.platform-service": "node-agent"
+    },
+    "status": "running",
+    "command": [
+      "/usr/local/bin/quasar-node-agent-entrypoint"
+    ]
+  },
+  {
+    "id": "ac00000000000000000000000000000000000000000000000000000000000000",
+    "name": "quasar-recovery.kept",
+    "labels": {
+      "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+      "io.quasar.platform-service": "recovery-actor"
+    },
+    "status": "exited",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "actor"
+    ],
+    "restart": "no"
+  },
+  {
+    "id": "ac10000000000000000000000000000000000000000000000000000000000000",
+    "name": "quasar-recovery",
+    "labels": {
+      "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+      "io.quasar.platform-service": "recovery-actor",
+      "io.quasar.recipe": "1",
+      "io.quasar.spec": "sha256:5bec000000000000000000000000000000000000000000000000000000000000"
+    },
+    "status": "exited",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "actor"
+    ],
+    "restart": "unless-stopped"
+  },
+  {
+    "id": "5eed000000000000000000000000000000000000000000000000000000000000",
+    "name": "quasar-seed",
+    "labels": {},
+    "status": "running",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "seed"
+    ]
+  }
+]

@@ -15,25 +15,35 @@ const REASON_TEXT: Record<string, string> = {
   identity_unknown: "This target has not reported what it is running.",
   up_to_date: "Already on the newest release.",
   install_mode_source: "Built from source on the host — update it with git, not from here.",
-  updater_absent: "No updater is installed beside this host's stack.",
+  updater_absent: "No recovery actor answers on this machine: it was not installed with the seed, or its actor is down.",
   host_offline: "The host's agent is not connected.",
   release_above_control_plane: "Waiting on the control plane: this release carries a newer schema.",
   control_plane_not_first: "Waiting on the control plane, which moves first.",
   preflight_blocked: "A preflight check failed on this target; the check below names the fix.",
   attempt_in_flight: "An update is already in flight on this target.",
   run_active: "A fleet update is already running.",
+  below_floor: "Must update before it can be managed: its node agent or recovery actor is below this control plane's floor.",
 };
 
 /** The closed preflight check vocabulary (amendment 9), as short labels. An
  *  unknown id renders verbatim. */
 const PREFLIGHT_CHECK_TEXT: Record<string, string> = {
-  updater_socket: "updater reachable",
-  updater_stack_dir: "updater sees the stack directory",
-  updater_overlays: "compose files match the updater's",
+  updater_socket: "recovery actor reachable",
   image_resolvable: "release images resolve at the registry",
   agent_connected: "agent connected",
   health_addr_bindable: "agent health port free",
+  backup_space: "room for the database dump",
+  owner_conflict: "no other owner’s container in the way",
 };
+
+/** A failing check as a holdout reads it, when that is not "Blocked: <label>". */
+const HOLDOUT_TEXT: Record<string, string> = {
+  owner_conflict: "another owner’s container in the way",
+};
+
+export function holdoutCheckText(id: string): string | null {
+  return HOLDOUT_TEXT[id] ?? null;
+}
 
 export function preflightCheckText(id: string): string {
   return PREFLIGHT_CHECK_TEXT[id] ?? id;
@@ -45,7 +55,7 @@ const SKIP_PHRASE: Record<string, string> = {
   host_offline: "offline",
   preflight_blocked: "a preflight check failed",
   install_mode_source: "built from source",
-  updater_absent: "no updater",
+  updater_absent: "no recovery actor",
   attempt_in_flight: "another update in flight",
 };
 
@@ -58,6 +68,7 @@ const ATTEMPT_KIND_TEXT: Record<string, string> = {
   apply: "Apply",
   revert: "Revert",
   auto_revert: "Reverted automatically",
+  developer_apply: "Developer apply",
 };
 
 export function attemptKindText(kind: string): string {
@@ -79,7 +90,7 @@ const FAULT_TEXT: Record<string, string> = {
 const ATTEMPT_STATE_TEXT: Record<string, string> = {
   queued: "Queued",
   waiting_sessions: "Waiting for sessions to end",
-  pending: "Handed to the updater",
+  pending: "Handed to the recovery actor",
   pulling: "Pulling the image",
   recreating: "Recreating the agent",
   verifying: "Verifying",
@@ -112,7 +123,7 @@ export function runStateText(state: string): string {
  *  mapping serves progress, history and an ack rejection. An identifier this
  *  build does not know renders verbatim. */
 const FAILURE_TEXT: Record<string, string> = {
-  updater_absent: "No updater is installed beside this host's stack.",
+  updater_absent: "No recovery actor answers on this machine: it was not installed with the seed, or its actor is down.",
   busy: "An update was already in flight on this host.",
   invalid: "The update request was rejected as un-actionable.",
   namespace_rejected: "The image is outside this host's platform-image namespace.",
@@ -121,11 +132,20 @@ const FAILURE_TEXT: Record<string, string> = {
   recreate_failed: "The container could not be recreated — this host's agent is stopped.",
   never_started: "The new container never started.",
   unhealthy: "The new container started but never became healthy.",
-  updater_unreachable: "The updater could not be reached.",
+  updater_unreachable: "The recovery actor could not be reached.",
   timeout: "The update did not finish in time.",
   unsupported: "This host's agent predates the update feature; update it another way.",
   signature_missing: "This host requires a signed release and this one is not signed.",
   signature_invalid: "The release's signature did not verify against this host's trusted keys.",
+  recipe_unsupported:
+    "This machine's recovery actor does not know how to install this image; nothing changed. Update the recovery actor first.",
+  owner_conflict: "Another owner's container is in the way on this machine; nothing was replaced.",
+  backup_failed:
+    "Quasar could not dump its database, so the control plane was not replaced and the database was not touched.",
+  backup_unconfirmed:
+    "This update changes the database and no backup of your own database was confirmed, so the control plane was not replaced.",
+  interrupted:
+    "The recovery actor restarted before it had touched the service it was replacing, so that service was not changed and nothing was retried. Anything this update had already replaced stays updated; the details say what.",
 };
 
 export function failureText(reason: string | null | undefined): string {
@@ -134,23 +154,23 @@ export function failureText(reason: string | null | undefined): string {
 }
 
 /** What a failure left running on the host. Keyed on the same closed
- *  vocabulary: a failure past the health wait IS restored by the updater
+ *  vocabulary: a failure past the health wait IS restored by the recovery actor
  *  itself (ADR 0004), so one fixed "nothing was rolled back" line was false for
  *  half of them (#201). "" for a reason this build does not know — no sentence
  *  beats a guess about what a host is running. */
 const UNTOUCHED = "Nothing was applied: this host is still running the build it had.";
 
 const RESTORE_ATTEMPTED =
-  "The new container did not come up. The updater puts the previous build back itself when " +
+  "The new container did not come up. The recovery actor puts the previous build back itself when " +
   "that happens; the apply history shows an automatic revert when it worked.";
 
-/** The same restore, told for a failed REVERT (#202). The updater still
+/** The same restore, told for a failed REVERT (#202). The recovery actor still
  *  performs it — `restoreWorthy` keys on the reason and the components, not on
  *  which button was pressed — but the build it puts back is the one the revert
  *  was leaving, not "the previous build", and no history row records it:
  *  recordAutoRevert writes an `auto_revert` only for an apply. */
 const RESTORE_ATTEMPTED_REVERT =
-  "The new container did not come up. The updater puts the build this revert was leaving back " +
+  "The new container did not come up. The recovery actor puts the build this revert was leaving back " +
   "itself when that happens, and records nothing for it: the history shows only this failure.";
 
 const AFTER_FAILURE_TEXT: Record<string, string> = {
@@ -169,11 +189,11 @@ const AFTER_FAILURE_TEXT: Record<string, string> = {
   never_started: RESTORE_ATTEMPTED,
   unhealthy: RESTORE_ATTEMPTED,
   // One identifier, two histories: the control plane writes it for an apply it
-  // never handed over, and the agent emits it for one the updater had already
+  // never handed over, and the agent emits it for one the actor had already
   // accepted and then stopped answering for — by which point the old container
   // can be gone (agent-api.md). Neither may be claimed.
   updater_unreachable:
-    "The updater stopped answering, so how far this apply got cannot be read from here — " +
+    "The recovery actor stopped answering, so how far this apply got cannot be read from here — " +
     "check the host itself.",
   // Both builds are unaccounted for: the apply expired with no verdict, which
   // is what the attempt's own output explains.
@@ -219,6 +239,33 @@ export function releaseLabel(release: PlatformRelease): string {
   return release.version || shortCommit(release.source_commit);
 }
 
+/** A version reads as "v0.2.0"; a bare commit (edge) does not take the v. */
+export function prefixed(label: string): string {
+  return /^\d/.test(label) ? `v${label}` : label;
+}
+
+/** An instant as the console prints a release's publication: "5 Sep 2026,
+ *  14:59". UTC, because every timestamp on this page is a UTC instant and the
+ *  next-check line beside it is a UTC cron. */
+export function stamp(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const date = new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(d);
+  const time = new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZone: "UTC",
+  }).format(d);
+  return `${date}, ${time}`;
+}
+
 export function shortCommit(commit: string | null | undefined): string {
   if (!commit) return "unknown";
   return commit.slice(0, 12);
@@ -258,4 +305,44 @@ export function commitsMatch(a: string | null | undefined, b: string | null | un
   if (!a || !b) return false;
   const [x, y] = a.length <= b.length ? [a, b] : [b, a];
   return y.toLowerCase().startsWith(x.toLowerCase());
+}
+
+/** A developer apply refused before anything started (control-api.md
+ *  §"Developer apply", Errors). */
+const DEVELOPER_REFUSAL_TEXT: Record<string, string> = {
+  namespace_rejected: "An image is not under a namespace this machine allows.",
+  image_unresolvable:
+    "A digest did not resolve at the registry as the control plane sees it, carries no build identity, or the images were built from different commits.",
+  target_not_owned: "This machine is not a Quasar-owned install, so it cannot take a developer apply.",
+  attempt_in_flight: "An update is already in flight on this machine.",
+  run_active: "A fleet update is running. Try again once it has finished.",
+  apply_unsupported: "This machine's agent does not accept updates from the console.",
+  release_below_schema_version:
+    "This control-plane image carries an older database schema than the installed one, and the control plane never moves below its database.",
+  preflight_blocked: "A preflight check failed on the control plane.",
+  not_found: "This host is no longer registered.",
+};
+
+/** `release_above_control_plane` means something else on this route: the
+ *  images' commit is not one the control plane can place at or below itself. */
+const DEVELOPER_NOT_ELIGIBLE_TEXT: Record<string, string> = {
+  release_above_control_plane:
+    "These images were built from a commit the control plane cannot show is at or below its own. Use images built from the installed control plane's commit or an earlier release.",
+};
+
+/** The sentence for a refused developer apply. `showMessage` is true where the
+ *  server's own message adds what the sentence cannot (which image). An
+ *  unmapped code shows the server's message. */
+export function developerRefusalText(
+  code: string,
+  reason: string | undefined,
+  message: string,
+): { text: string; showMessage: boolean } {
+  if (code === "host_not_eligible") {
+    const why = reason ? (DEVELOPER_NOT_ELIGIBLE_TEXT[reason] ?? eligibilityText(reason)) : "";
+    return { text: `This host cannot take a developer apply right now. ${why}`.trim(), showMessage: false };
+  }
+  const text = code === "validation_failed" ? undefined : DEVELOPER_REFUSAL_TEXT[code];
+  if (!text) return { text: message, showMessage: false };
+  return { text, showMessage: code === "namespace_rejected" };
 }

@@ -25,9 +25,11 @@ import { Modal } from "../../../components/Modal";
 import { Table, type TableColumn } from "../../../components/Table";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
+import { IconRefresh } from "../../../components/icons";
 import { AttemptProgress } from "./ApplyControls";
+import { BACKUP_SPACE, databasePlan, machineName, ownedControlPlane, type DatabasePlan } from "./migratingUpdate";
 import { blockingChecks, partialSummary, willBeSkipped } from "./preflight";
-import { eligibilityText, hasUpdate, preflightCheckText, releaseLabel, runStateText } from "./releasesCopy";
+import { eligibilityText, hasUpdate, prefixed, preflightCheckText, releaseLabel, runStateText } from "./releasesCopy";
 
 function eligibleHosts(targets: PlatformReleaseTarget[]): PlatformReleaseTarget[] {
   return targets.filter((t) => t.kind === "host" && t.eligible);
@@ -50,10 +52,13 @@ function controlPlaneBlocker(targets: PlatformReleaseTarget[]): string | null {
 export function FleetApplyButton({
   view,
   onStarted,
+  onRecheck,
   children,
 }: {
   view: PlatformReleaseView;
   onStarted: () => void;
+  /** Re-read the release view: the dialog's "Check again" after freeing space (#364). */
+  onRecheck?: () => Promise<unknown> | void;
   /** The label, so the head can put its icon in front of it. */
   children?: ReactNode;
 }) {
@@ -67,16 +72,24 @@ export function FleetApplyButton({
   // not a refusal: the run then goes straight to the hosts.
   const blocked = controlPlaneBlocker(view.targets);
   const cp = view.targets.find((t) => t.kind === "control_plane");
-  const blockingCheck = cp && blocked === "preflight_blocked" ? blockingChecks(cp)[0] : undefined;
+  const failing = cp && blocked === "preflight_blocked" ? blockingChecks(cp) : [];
+  const blockingCheck = failing[0];
   const title = blockingCheck
     ? `${preflightCheckText(blockingCheck.id)}: ${blockingCheck.detail}`
     : blocked
       ? eligibilityText(blocked)
       : undefined;
+  // A dump that does not fit is the one refusal the dialog itself explains, with the
+  // server's numbers and "Check again" (rh06 update-space.png); Update stays disabled in it.
+  const onlySpace = failing.length > 0 && failing.every((c) => c.id === BACKUP_SPACE);
 
   return (
     <>
-      <Button onClick={() => setConfirming(true)} disabled={blocked != null} title={title}>
+      <Button
+        onClick={() => setConfirming(true)}
+        disabled={blocked != null && !onlySpace}
+        title={title}
+      >
         {children ?? "Update Quasar"}
       </Button>
       {confirming && (
@@ -84,6 +97,7 @@ export function FleetApplyButton({
           view={view}
           onClose={() => setConfirming(false)}
           onStarted={onStarted}
+          onRecheck={onRecheck}
         />
       )}
     </>
@@ -96,13 +110,17 @@ function FleetApplyModal({
   view,
   onClose,
   onStarted,
+  onRecheck,
 }: {
   view: PlatformReleaseView;
   onClose: () => void;
   onStarted: () => void;
+  onRecheck?: () => Promise<unknown> | void;
 }) {
   const { token } = useAuth();
   const [force, setForce] = useState(false);
+  const [backupConfirmed, setBackupConfirmed] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
   const newest = view.available[0];
   const hosts = eligibleHosts(view.targets).length;
   // Consent names the partial outcome up front: the hosts this run will pass
@@ -113,10 +131,30 @@ function FleetApplyModal({
   // before the control-plane step, and that policy must not be re-derived here.
   // No release to apply reads as migrating — the cautious answer.
   const migrates = newest?.migrates ?? true;
+  // What the control-plane step does about the database first (#364), from the server's
+  // own fields: database_mode and the backup_space check.
+  const database = databasePlan(view, migrates);
+  const blocked =
+    database.kind === "no_space" || (database.kind === "external" && !backupConfirmed);
+
+  const recheck = async () => {
+    if (!onRecheck) return;
+    setRechecking(true);
+    try {
+      await onRecheck();
+    } finally {
+      setRechecking(false);
+    }
+  };
 
   const apply = useAdminAction(
     async () =>
-      adminApi.applyPlatformReleaseToFleet(token ?? "", { release_id: newest.id, force }),
+      adminApi.applyPlatformReleaseToFleet(token ?? "", {
+        release_id: newest.id,
+        force,
+        // Read only for a migrating release on an external database, so sent only then.
+        ...(database.kind === "external" ? { external_backup_confirmed: backupConfirmed } : {}),
+      }),
     {
       success: `Updating this instance to ${releaseLabel(newest)}.`,
       failure: (e) => ({
@@ -140,17 +178,33 @@ function FleetApplyModal({
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={() => void apply.run()} disabled={apply.pending != null}>
+          {database.kind === "no_space" && onRecheck && (
+            <Button onClick={() => void recheck()} disabled={rechecking}>
+              <IconRefresh /> Check again
+            </Button>
+          )}
+          <Button
+            variant="primary"
+            onClick={() => void apply.run()}
+            disabled={apply.pending != null || blocked}
+          >
             Update
           </Button>
         </>
       }
+      maxWidth={database.kind === "none" ? undefined : 540}
     >
       <p>
         Update the control plane, then {hosts} eligible host{hosts === 1 ? "" : "s"}, to{" "}
-        <b>{releaseLabel(newest)}</b>.
+        <b>{prefixed(releaseLabel(newest))}</b>.
       </p>
-      {migrates ? (
+      {migrates && ownedControlPlane(view) ? (
+        <p>
+          This release changes the database. The update waits for every session on the instance
+          to end before it starts, and the control plane restarts: this page loses contact for
+          about a minute. Each host&rsquo;s sessions end when that host is updated.
+        </p>
+      ) : migrates ? (
         <p>
           The control plane updates first and restarts; this page will lose contact for about 20
           seconds. This release changes the database, so the update waits for every session on the
@@ -163,6 +217,12 @@ function FleetApplyModal({
           that host is updated.
         </p>
       )}
+      <DatabaseNote
+        plan={database}
+        machine={machineName(view)}
+        confirmed={backupConfirmed}
+        onConfirm={setBackupConfirmed}
+      />
       {skipped.length > 0 && (
         <div className="note" data-testid="fleet-will-skip">
           <p>
@@ -191,6 +251,84 @@ function FleetApplyModal({
       </p>
     </Modal>
   );
+}
+
+/** The dialog's database paragraph for a migrating update of an owned control plane
+ *  (rh06 update-own / -unknown / -space / -external / -external-checked). A backup_space
+ *  detail is the server's prose, rendered verbatim and never parsed. */
+function DatabaseNote({
+  plan,
+  machine,
+  confirmed,
+  onConfirm,
+}: {
+  plan: DatabasePlan;
+  machine: string;
+  confirmed: boolean;
+  onConfirm: (confirmed: boolean) => void;
+}) {
+  const stops =
+    "the update stops there: the control plane is not replaced and the database is not touched.";
+  switch (plan.kind) {
+    case "none":
+      return null;
+    case "dump":
+      return (
+        <div className="note" data-testid="fleet-database">
+          <b>Quasar dumps its database first.</b>{" "}
+          {plan.space === "pass" ? (
+            <>
+              Before the control plane on {machine} is replaced, its recovery actor dumps
+              Quasar&rsquo;s database. {plan.detail && <>{plan.detail} </>}If the dump cannot be
+              taken, {stops} The last three dumps are kept on that machine.
+            </>
+          ) : (
+            <>
+              {plan.detail ??
+                `Free space on ${machine} has not been reported, so it is checked just before the dump.`}{" "}
+              If there is not enough, or the dump fails, {stops}
+            </>
+          )}
+        </div>
+      );
+    case "no_space":
+      return (
+        <div className="note warn" data-testid="fleet-database">
+          <b>Not enough free space for the database dump.</b> {plan.detail} Without the dump the
+          update cannot start.
+        </div>
+      );
+    case "external":
+      return (
+        <>
+          <div className="note warn" data-testid="fleet-database">
+            <b>Quasar does not back up your database.</b> It uses your database as it is and never
+            dumps, restores or upgrades it. Take a backup with your own tools before you continue:
+            it is the only way back if the update fails.
+          </div>
+          <label className="rowflex">
+            <input
+              type="checkbox"
+              checked={confirmed}
+              onChange={(e) => onConfirm(e.target.checked)}
+            />
+            <span>
+              I have a current backup of this database, taken after the last change I want to
+              keep.
+            </span>
+          </label>
+          {!confirmed && <p className="hint">Update stays unavailable until you confirm.</p>}
+        </>
+      );
+    case "unreported":
+      return (
+        <div className="note warn" data-testid="fleet-database">
+          <b>The database has not been reported yet.</b> The recovery actor on {machine} has not
+          said whether this is Quasar&rsquo;s own database or yours. Before the control plane
+          moves, Quasar dumps its own database, or needs your confirmation of a backup of yours.
+        </div>
+      );
+  }
 }
 
 const RUN_STATE_CHIP: Record<string, ChipVariant> = {

@@ -57,7 +57,7 @@ func i32(v int32) *int32 { return &v }
 // the admin UI flicker to "unknown" on every mixed-version fleet heartbeat.
 func TestVramSamplePersistsAndAbsentKeyDoesNotClobber(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	seedGPURow(t, pool, hostID, 0, 16384)
 	ctx := context.Background()
@@ -108,7 +108,7 @@ func TestVramSamplePersistsAndAbsentKeyDoesNotClobber(t *testing.T) {
 // stamped with a fresh DB now(), would look authoritative.
 func TestVramSampleMonotonicGuard(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	seedGPURow(t, pool, hostID, 0, 16384)
 	ctx := context.Background()
@@ -152,7 +152,7 @@ func TestVramSampleMonotonicGuard(t *testing.T) {
 // it just told us nothing usable.
 func TestVramSampleImplausibleStoresNull(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	const total = 8192
 	seedGPURow(t, pool, hostID, 0, total)
@@ -216,7 +216,7 @@ func TestVramSampleImplausibleStoresNull(t *testing.T) {
 // unbounded number of UPDATEs by inflating one heartbeat field.
 func TestVramSampleCappedAtReportedGPUCount(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	seedGPURow(t, pool, hostID, 0, 8192)
 	seedGPURow(t, pool, hostID, 1, 8192)
@@ -250,7 +250,7 @@ func TestVramSampleCappedAtReportedGPUCount(t *testing.T) {
 // distinction was learned the hard way on hermes.
 func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	ctx := context.Background()
 
 	prime := func(hostID string) {
@@ -273,7 +273,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 	}
 
 	t.Run("reconnect", func(t *testing.T) {
-		res, err := s.enrollHost(ctx, "vram-reconnect", "v0", "tok", "tok")
+		res, err := s.enrollHost(ctx, "vram-reconnect", "v0", testEnrollmentToken)
 		if err != nil {
 			t.Fatalf("enroll: %v", err)
 		}
@@ -286,7 +286,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 	})
 
 	t.Run("re-enrollment", func(t *testing.T) {
-		res, err := s.enrollHost(ctx, "vram-reenroll", "v0", "tok", "tok")
+		res, err := s.enrollHost(ctx, "vram-reenroll", "v0", testEnrollmentToken)
 		if err != nil {
 			t.Fatalf("enroll: %v", err)
 		}
@@ -297,7 +297,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 		if err := s.markOffline(ctx, res.HostID); err != nil {
 			t.Fatalf("mark offline: %v", err)
 		}
-		if _, err := s.enrollHost(ctx, "vram-reenroll", "v0", "tok", "tok"); err != nil {
+		if _, err := s.enrollHost(ctx, "vram-reenroll", "v0", testEnrollmentToken); err != nil {
 			t.Fatalf("re-enroll: %v", err)
 		}
 		assertCleared(res.HostID, "enrollHost")
@@ -310,7 +310,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 	// could write it: the admission harness reported "vram_sampled_at is null
 	// (never sampled)" against a host that had been reporting fine minutes earlier.
 	t.Run("routine capacity report preserves the sample", func(t *testing.T) {
-		res, err := s.enrollHost(ctx, "vram-capacity", "v0", "tok", "tok")
+		res, err := s.enrollHost(ctx, "vram-capacity", "v0", testEnrollmentToken)
 		if err != nil {
 			t.Fatalf("enroll: %v", err)
 		}
@@ -330,7 +330,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 	})
 
 	t.Run("identity change at the same index", func(t *testing.T) {
-		res, err := s.enrollHost(ctx, "vram-identity", "v0", "tok", "tok")
+		res, err := s.enrollHost(ctx, "vram-identity", "v0", testEnrollmentToken)
 		if err != nil {
 			t.Fatalf("enroll: %v", err)
 		}
@@ -357,7 +357,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 // telemetry must never be able to cause that.
 func TestVramQueueDrainsAndCoalesces(t *testing.T) {
 	pool := testPool(t)
-	store := &agentStore{pool: pool}
+	store := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	seedGPURow(t, pool, hostID, 0, 16384)
 

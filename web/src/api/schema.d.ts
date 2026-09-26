@@ -4446,7 +4446,7 @@ export interface paths {
         put?: never;
         /**
          * Apply one platform release to one host (admin).
-         * @description A STANDALONE attempt - no run, no fleet ordering - refused while a fleet run is active. ONLY THE NODE-AGENT IMAGE IS SENT; the control-plane component is never sent to a host. With force false the host is cordoned and the attempt sits in waiting_sessions until the non-terminal session count reaches zero; with force true the wait is skipped and the N sessions running are stopped, and a client MUST show N in the confirmation - force is the operator agreeing to end N live sessions. The host is uncordoned afterwards whatever the outcome, unless it was already cordoned when the apply started.
+         * @description A STANDALONE attempt - no run, no fleet ordering - refused while a fleet run is active. ONLY THE NODE-AGENT IMAGE IS SENT to a registry host; an owned host (amendment 14, #353) is also sent the release's recovery-actor image, first, when its actor is not on the release. The control-plane component is never sent to a host. With force false the host is cordoned and the attempt sits in waiting_sessions until the non-terminal session count reaches zero; with force true the wait is skipped and the N sessions running are stopped, and a client MUST show N in the confirmation - force is the operator agreeing to end N live sessions. The host is uncordoned afterwards whatever the outcome, unless it was already cordoned when the apply started.
          */
         post: {
             parameters: {
@@ -4552,7 +4552,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description nothing_to_revert (no succeeded attempt on this host, or its last succeeded attempt recorded no previous digests); host_not_eligible (with `reason`); attempt_in_flight; run_active. */
+                /** @description nothing_to_revert (no succeeded attempt on this host, or its last succeeded attempt recorded no previous digests); host_not_eligible (with `reason`; since amendment 14 that reason may be below_floor); attempt_in_flight; run_active. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -4562,6 +4562,147 @@ export interface paths {
                     };
                 };
                 /** @description apply_unsupported - as for apply. */
+                501: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/hosts/{id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove an owned GPU host's node agent and recovery actor (admin).
+         * @description AMENDMENT 14 (#353); served since RH06-14 (#366). The console's "remove host". Validates (refusing the control plane's own machine's agent before anything changes), cordons the host exactly as a per-host apply does, then checks sessions (without force a remaining session refuses 409 conflict; with force they are stopped), then sends agent-api.md host_remove and answers 202 once the recovery actor accepts. It does NOT forget the host: once the host is offline the existing DELETE /v1/hosts/{id} does that, unchanged. A refusal after the cordon puts the host's cordon state back as it was found. Writes no platform_apply_attempts row. Audited as platform.remove.host.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["PlatformHostRemoveRequest"];
+                };
+            };
+            responses: {
+                /** @description Accepted - the host's recovery actor accepted the removal. The host as it stands (cordoned). */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformHostRemoveResponse"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description PRE-SEND, in this order, each changing nothing: run_active; attempt_in_flight (both as for apply); host_not_eligible (the body carries `reason`: host_offline or updater_absent); host_not_removable (the host is not owned, or its agent is the one on the control plane's own machine - refused before any cordon or session stop); conflict (after the cordon, non-terminal sessions remain and force is false; the cordon is restored). ACK OUTCOME: host_not_removable (the ack carried a rejection - invalid, busy, updater_absent or updater_unreachable - which the message names; the cordon is restored, and sessions a force request already stopped stay stopped). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description apply_unsupported - no ack within the 10s ack timeout: the agent predates amendment 14 and nothing was removed. */
+                501: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/developer-apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Developer apply - an arbitrary digest set to one owned target (admin).
+         * @description AMENDMENT 14, OWNER ADDITION on #353 (2026-09-25), beyond #352 decision 24; served since RH06-08 (#360). The product lane (#352 decisions 15 and 22): a standalone attempt that applies the requested digests to ONE owned target - the control plane or one host - ordered recovery-actor first. Every image digest-only and under the namespace allowlist (ADR 0001; the recovery actor's allowlist is the enforcement, the control plane checks up front). ADR 0002 holds on the images' build-identity labels: a control-plane digest below the installed schema is refused, one above it MIGRATES and follows #352 decision 14 (drain, then the pre-update dump or external_backup_confirmed); a request that does not name control-plane, whatever its target, must carry the installed control plane's commit or a known release's commit at or below it; a control_plane target names recovery-actor only together with control-plane, and a request for the agent on the control plane's own machine names only node-agent. Never offered as a release, never unattended. Carries no release version, so under signature mode require it fails signature_missing; under verify it applies unsigned with the WARN. Recorded as a kind developer_apply attempt; audited as platform.apply.developer.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["PlatformDeveloperApplyRequest"];
+                };
+            };
+            responses: {
+                /** @description Accepted - the attempt was created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyAttemptEnvelope"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description run_active; attempt_in_flight; host_not_eligible (with the host's EligibilityReason, including release_above_control_plane for a commit that cannot be shown not to be ahead and below_floor); preflight_blocked (the control-plane target); target_not_owned (the target is not an owned install); image_unresolvable (a digest does not resolve as seen from the control plane, carries no readable build identity, or the images disagree on their commit); namespace_rejected (an image outside the allowlist). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description release_below_schema_version - a control-plane digest below the installed schema (ADR 0002). */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description apply_unsupported - as for the per-host apply. */
                 501: {
                     headers: {
                         [name: string]: unknown;
@@ -8552,12 +8693,18 @@ export interface components {
              */
             built_at: string | null;
             /**
-             * @description How this host got its platform images (CONTEXT.md "Install mode"): registry = pulled published images, source = built on the host. A source host can be TOLD about a platform release but never given one.
+             * @description How this host got its platform images (CONTEXT.md "Install mode"): registry = pulled published images, source = built on the host, owned (amendment 14, #353) = created and replaced by the machine's recovery actor. A source host can be TOLD about a platform release but never given one. A client meeting an unrecognized mode shows it as unknown.
              * @enum {string|null}
              */
-            install_mode: "registry" | "source" | null;
-            /** @description Whether an updater sits on this host's stack. NULL IS NOT false: null = no amendment-aware agent has registered, false = an agent looked and found none. */
+            install_mode: "registry" | "source" | "owned" | null;
+            /** @description Whether an updater sits on this host's stack. NULL IS NOT false: null = no amendment-aware agent has registered, false = an agent looked and found none. On an owned host (amendment 14): whether its recovery actor answered on the agent socket. */
             updater_present: boolean | null;
+            /** @description Semver (no leading v) of the recovery actor serving this host's machine. Compared with the installed control plane's floor (below_floor). */
+            recovery_actor_version?: string | null;
+            /** @description The git commit that recovery actor was built from: 7-40 lowercase hex, stored exactly as sent. With source_commit, what up_to_date compares on an owned host. */
+            recovery_actor_source_commit?: string | null;
+            /** @description Opaque version of the seed the recovery actor last saw on the machine. Informational; nothing is decided on it (ADR 0007). */
+            seed_version?: string | null;
             /** @description Summed over this host's REPORTED GPUs. Null - not a zeroed object - when the host has no schedulable GPUs to sum: none reported yet, or `capacity_detection` is not `ok`, which is the same condition under which `GET /v1/hosts/{id}/gpus` returns an empty list. "Nothing to say" and "zero capacity" are different facts and a fleet gauge must not draw the first as the second. */
             capacity: components["schemas"]["HostCapacity"];
         };
@@ -8983,6 +9130,29 @@ export interface components {
             built_at: string | null;
             /** @description The highest migration version the binary embeds (the 0NNN file number as an integer). ALWAYS KNOWN, because it is derived from the embedded migration set rather than a build flag - which is why it, and not semver or built_at, is the ordering key everywhere in this surface (ADR 0002). */
             schema_version: number;
+            /**
+             * @description owned when this machine's recovery actor answered; otherwise null. The enum is the host's; this amendment defines only when owned is reported. A transient failure to reach the actor also reads null, so a developer apply to the control-plane target is refused 409 target_not_owned until it answers; the updater_socket preflight surfaces that condition.
+             * @enum {string|null}
+             */
+            install_mode?: "registry" | "source" | "owned" | null;
+            /** @description Semver of this machine's recovery actor; null when absent or unparseable. */
+            recovery_actor_version?: string | null;
+            /** @description 7-40 lowercase hex, the commit that recovery actor was built from. */
+            recovery_actor_source_commit?: string | null;
+            /** @description Opaque version of the seed the recovery actor last saw on this machine. */
+            seed_version?: string | null;
+            /**
+             * @description owned = Quasar created this database and takes its pre-update dump; external = the operator's own database, only used, so a migrating update needs external_backup_confirmed. What tells a client when to show that confirmation and backup_space. A client meeting an unrecognized value shows it as unknown.
+             * @enum {string|null}
+             */
+            database_mode?: "owned" | "external" | null;
+            /**
+             * @description Non-null exactly when a recovery actor created this control plane, whether or not the actor is answering (install_mode alone reads null then); null on a Compose or source control plane, and from an older server. A client meeting an unknown value shows the shape as unknown and treats no host as this machine's.
+             * @enum {string|null}
+             */
+            machine_role?: "combined" | "control_only" | null;
+            /** @description Non-null exactly when machine_role is. On combined, the node name the machine's own agent registers under. A client identifies the control plane's own host only when machine_role is combined and the host's node_name equals this; never on control_only, where a GPU host could share the name. */
+            machine_node_name?: string | null;
         };
         /** @description One host's installed identity, as last reported on the agent `register` message. */
         PlatformHostIdentity: {
@@ -8996,12 +9166,17 @@ export interface components {
             source_commit: string | null;
             /** Format: date-time */
             built_at: string | null;
-            /** @enum {string|null} */
-            install_mode: "registry" | "source" | null;
-            /** @description Whether an updater sits on this host's stack. NULL IS NOT false: null = no amendment-aware agent has registered, false = an agent looked and found none. The first is an old agent, the second a real gap an operator must close. */
+            /**
+             * @description owned is appended by amendment 14 (#353) and is eligible exactly like registry.
+             * @enum {string|null}
+             */
+            install_mode: "registry" | "source" | "owned" | null;
+            /** @description Whether an updater sits on this host's stack. NULL IS NOT false: null = no amendment-aware agent has registered, false = an agent looked and found none. The first is an old agent, the second a real gap an operator must close. On an owned host (amendment 14): whether its recovery actor answered on the agent socket. */
             updater_present: boolean | null;
             /** @description True only when all four of source_commit, built_at, install_mode and updater_present are non-null. A CLIENT MUST READ THIS RATHER THAN RE-DERIVING IT, so "what counts as known" cannot disagree between server and client. A host with identity_known false is never eligible for an apply. */
             identity_known: boolean;
+            /** @description ADDITIVE (amendment 14, owner addition on #353). SERVER-DERIVED, in the same posture as identity_known: true when the host's reported agent_version OR recovery_actor_version orders below the installed control plane's floor by SemVer precedence (an absent or unparseable version is never below). The console's "must update before it can be managed": such a host is offered only an update. It changes no eligibility, and eligible true still always carries reason null. A server implementing the amendment always serializes it; optional here, and a client reads absent as false. */
+            below_floor?: boolean;
         };
         /** @description One detected platform release (schema.md `platform_releases`). Ordering wherever a list of these appears is schema_version DESC, then built_at DESC. */
         PlatformRelease: {
@@ -9032,8 +9207,8 @@ export interface components {
             notes: string;
             /** @description On edge, the GitHub compare link from the installed control plane's source_commit to this release's. Null on stable (the notes are that), and null on edge when the installed commit is unknown - there is nothing to compare from. */
             compare_url: string | null;
-            /** @description The release manifest asset verbatim. NULL ON EDGE, which publishes no asset. */
-            manifest: components["schemas"]["ReleaseManifest"] | null;
+            /** @description The release manifest asset verbatim. NULL ON EDGE, which publishes no asset. Amendment 14 (#353): the format-2 asset (platform-release-manifest.v2.json) when the release publishes one and this control plane reads it, else the format-1 asset; a client tells them apart by format_version. */
+            manifest: components["schemas"]["ReleaseManifest"] | components["schemas"]["ReleaseManifestV2"] | null;
             /** @description ADDITIVE, amendment 6 (#153). True when applying this release runs at least one migration on this instance - its schema_version is above the installed control plane's. THE ONE THING that decides whether a fleet apply's control-plane step drains the instance (see the apply section), so it is DERIVED AND SERVED rather than left to a client to re-derive, exactly as identity_known is: a client twin of the rule would keep naming the old policy after the rule moved. Always present. With no release to apply, read the cautious answer, true. */
             migrates: boolean;
             /**
@@ -9043,10 +9218,10 @@ export interface components {
             discovered_at: string;
         };
         /**
-         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases". AMENDMENT 2 (#104/#114) APPENDS attempt_in_flight and run_active AT THE END, so no existing evaluation changes: they are the most transient facts on the list, and amendment 1's rule that durable reasons outrank transient ones fixes their position. attempt_in_flight precedes run_active because it is about THIS target. AMENDMENT 9 (#185) INSERTS preflight_blocked after control_plane_not_first and before the two transient ones: a stack shape (an unmounted socket volume, a squatted health port) is a durable fact, and the rule that durable reasons outrank transient ones is what fixes its position. The only target whose answer changes is one that is BOTH blocked and mid-apply, which now reads preflight_blocked. The failing check and its fix are on the same target's `preflight`. A preflight of `unknown` never produces this reason.
+         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases". AMENDMENT 2 (#104/#114) APPENDS attempt_in_flight and run_active AT THE END, so no existing evaluation changes: they are the most transient facts on the list, and amendment 1's rule that durable reasons outrank transient ones fixes their position. attempt_in_flight precedes run_active because it is about THIS target. AMENDMENT 9 (#185) INSERTS preflight_blocked after control_plane_not_first and before the two transient ones: a stack shape (an unmounted socket volume, a squatted health port) is a durable fact, and the rule that durable reasons outrank transient ones is what fixes its position. The only target whose answer changes is one that is BOTH blocked and mid-apply, which now reads preflight_blocked. The failing check and its fix are on the same target's `preflight`. A preflight of `unknown` never produces this reason. AMENDMENT 14 (#353) APPENDS below_floor: the host's agent or recovery actor would be, or already is, older than the floor the installed control plane declares (the oldest agent and recovery-actor release it still manages). It is produced by the per-host revert refusal (409 host_not_eligible) and NEVER on a targets entry - a target is evaluated for an update to available[0], which is what a below-floor host is offered - so it takes no position in the precedence above. Amendment 14 also reads "install mode is registry" as "registry or owned", and up_to_date on an owned host as "agent AND recovery actor on the release's commit".
          * @enum {string}
          */
-        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first" | "preflight_blocked" | "attempt_in_flight" | "run_active";
+        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first" | "preflight_blocked" | "attempt_in_flight" | "run_active" | "below_floor";
         /** @description One target's eligibility, EVALUATED AGAINST available[0] - the newest listed release - and against nothing else. This surface carries no per-release eligibility matrix and a client must not present one. */
         PlatformReleaseTarget: {
             /** @enum {string} */
@@ -9065,10 +9240,10 @@ export interface components {
             preflight: components["schemas"]["PlatformPreflight"];
         };
         /**
-         * @description The CLOSED vocabulary of pre-update checks (amendment 9, #185). The three a host's agent can answer about itself - updater_socket, updater_stack_dir, health_addr_bindable - are ALSO that agent's readiness check ids (agent-api.md `readiness`), so preflight and the host's readiness card say the same words about the same fact. Full per-value semantics: control-api.md §"Self-update hardening".
+         * @description The CLOSED vocabulary of pre-update checks (amendment 9, #185). The ones a host's agent can answer about itself - updater_socket, health_addr_bindable - are ALSO that agent's readiness check ids (agent-api.md `readiness`), so preflight and the host's readiness card say the same words about the same fact. Full per-value semantics: control-api.md §"Self-update hardening". AMENDMENT 14 (#353) APPENDS owner_conflict (both targets, owned only: a Quasar-looking container without this installation's labels is on the machine; also the host agent's readiness check id, never carrying blocks) and backup_space (the control-plane target, owned with a Quasar-owned database only: room for the pre-update dump when available[0] migrates). updater_stack_dir and updater_overlays RETIRED with RH06-15 (#367, the RH06 contract step): no target emits them, they are removed from this enum, and both ids stay reserved (never reused). A client meeting an unrecognized id renders it verbatim.
          * @enum {string}
          */
-        PreflightCheckId: "updater_socket" | "updater_stack_dir" | "updater_overlays" | "image_resolvable" | "agent_connected" | "health_addr_bindable";
+        PreflightCheckId: "updater_socket" | "image_resolvable" | "agent_connected" | "health_addr_bindable" | "owner_conflict" | "backup_space";
         PlatformPreflightCheck: {
             id: components["schemas"]["PreflightCheckId"];
             /** @description Known values: "pass", "fail", "unknown" - unknown means the collector could not look (an agent predating the check, an updater that did not answer), which is itself a finding but not a blocker. DELIBERATELY NOT AN ENUM, for the same reason ReadinessCheck.status is not: a consumer MUST pass an unrecognized value through rather than reject it. */
@@ -9187,18 +9362,18 @@ export interface components {
          */
         ApplyRunState: "pending" | "running" | "succeeded" | "failed" | "cancelled" | "succeeded_partial";
         /**
-         * @description One target's attempt state. The six middle values are EXACTLY agent-api.md release_state.state, relayed unchanged. queued and waiting_sessions are control-plane-only and precede the wire (the command has not been sent); cancelled applies ONLY to an attempt a cancel caught in one of those two states - CANCEL NEVER INTERRUPTS AN ATTEMPT THAT HAS BEEN SENT.
+         * @description One target's attempt state. The six middle values are EXACTLY agent-api.md release_state.state, relayed unchanged. queued and waiting_sessions are control-plane-only and precede the wire (the command has not been sent); cancelled applies ONLY to an attempt a cancel caught in one of those two states - CANCEL NEVER INTERRUPTS AN ATTEMPT THAT HAS BEEN SENT. Amendment 14 (#353) rewords, without changing any value: recreating means the target's actor is replacing a component's container (on an owned machine the old one is stopped and kept until the new one is verified), not a Compose command.
          * @enum {string}
          */
         ApplyAttemptState: "queued" | "waiting_sessions" | "pending" | "pulling" | "recreating" | "verifying" | "succeeded" | "failed" | "cancelled";
         /**
-         * @description Why an attempt failed. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text, shared verbatim with agent-api.md release_state.reason and with the release_apply ack's error, so ONE client-side mapping serves the wire, this API and the history. Non-null exactly when the state is failed. "unsupported" is written by the control plane and never sent on the wire: no ack arrived within the 10s ack timeout, so the agent build predates the amendment. A client meeting an unrecognized value renders it verbatim. "signature_missing" and "signature_invalid" are amendment 5's two APPENDED values (#120): a host that requires a signed release met an unsigned one, and a manifest signature that did not verify (bad signature, untrusted key, digests not named by the signed manifest, a signature that could not be fetched, or verification on with no trusted keys - all fail closed). Signature verification is OFF BY DEFAULT (ADR 0003), so neither occurs unless an operator turns it on. Full per-value semantics: agent-api.md §release_state.
+         * @description Why an attempt failed. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text, shared verbatim with agent-api.md release_state.reason and with the release_apply ack's error, so ONE client-side mapping serves the wire, this API and the history. Non-null exactly when the state is failed. "unsupported" is written by the control plane and never sent on the wire: no ack arrived within the 10s ack timeout, so the agent build predates the amendment. A client meeting an unrecognized value renders it verbatim. "signature_missing" and "signature_invalid" are amendment 5's two APPENDED values (#120): a host that requires a signed release met an unsigned one, and a manifest signature that did not verify (bad signature, untrusted key, digests not named by the signed manifest, a signature that could not be fetched, or verification on with no trusted keys - all fail closed). Signature verification is OFF BY DEFAULT (ADR 0003), so neither occurs unless an operator turns it on. AMENDMENT 14 (#353) APPENDS five values, produced only by an owned machine and each meaning "nothing changed": recipe_unsupported (the recovery actor lacks the recipe revision an image declares, ADR 0008), owner_conflict (a Quasar-looking container without this installation's labels is in the way), backup_failed (control plane, migrating release, Quasar-owned database: the pre-update dump could not be taken), backup_unconfirmed (control plane, migrating release, external database, no external_backup_confirmed) and interrupted (the actor, engine or machine restarted before the old container was taken out of service; settled, never retried). Amendment 14 also confirms signature_missing and signature_invalid as members. Full per-value semantics: agent-api.md §release_state.
          * @enum {string}
          */
-        ApplyFailureReason: "updater_absent" | "busy" | "invalid" | "namespace_rejected" | "digest_malformed" | "pull_failed" | "recreate_failed" | "never_started" | "unhealthy" | "updater_unreachable" | "timeout" | "unsupported" | "signature_missing" | "signature_invalid";
+        ApplyFailureReason: "updater_absent" | "busy" | "invalid" | "namespace_rejected" | "digest_malformed" | "pull_failed" | "recreate_failed" | "never_started" | "unhealthy" | "updater_unreachable" | "timeout" | "unsupported" | "signature_missing" | "signature_invalid" | "recipe_unsupported" | "owner_conflict" | "backup_failed" | "backup_unconfirmed" | "interrupted";
         /** @description One component of a platform release, pinned. Same shape as ReleaseManifestComponent and as agent-api.md release_apply.components. */
         ApplyComponentDigest: {
-            /** @description The component. Only "node-agent" is ever sent to a host; "control-plane" is applied by the updater beside the control plane and never over an agent connection. */
+            /** @description The component. Only "node-agent" is ever sent to a registry host; an owned host (amendment 14, #353) may also be sent "recovery-actor", and the ORDER of the list is the order of replacement. "control-plane" is applied by the updater or recovery actor beside the control plane and never over an agent connection. */
             name: string;
             /** @description Registry repository reference with NO TAG AND NO DIGEST. Consumers compose image@digest (ADR 0001). */
             image: string;
@@ -9228,10 +9403,10 @@ export interface components {
              */
             run_id: string | null;
             /**
-             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded succeeded on insert (the updater reports `restored` only for a restore that came up; a restore that itself failed leaves no row and both failures in the failed apply's output), was never driven over the wire, and its requested_digests are the failed apply's previous_digests.
+             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded succeeded on insert (the updater reports `restored` only for a restore that came up; a restore that itself failed leaves no row and both failures in the failed apply's output), was never driven over the wire, and its requested_digests are the failed apply's previous_digests. Amendment 14 (#353): on an owned host the recovery actor did the restore, and the row names ONLY the restored component (the one whose replacement failed), which may be recovery-actor. Amendment 14 (owner addition on #353) APPENDS developer_apply: an admin applied an arbitrary digest set to an owned target (POST /v1/admin/platform/developer-apply); release_id is null, and it is otherwise an ordinary apply and revert source. A client meeting an unrecognized kind renders it verbatim.
              * @enum {string}
              */
-            kind: "apply" | "revert" | "auto_revert";
+            kind: "apply" | "revert" | "auto_revert" | "developer_apply";
             /** @enum {string} */
             target: "control_plane" | "host";
             /**
@@ -9256,8 +9431,10 @@ export interface components {
             sessions_remaining: number | null;
             /** @description Skip the zero-sessions wait and stop what is running. The agent does no session logic on it: it records which decision the control plane made. */
             force: boolean;
-            /** @description The bounded tail (last 8192 bytes, truncated from the front at a line boundary) of the failing step's output. "" when there is nothing to report. NEVER a credential or an environment value. */
+            /** @description The bounded tail (last 8192 bytes, truncated from the front at a line boundary) of the failing step's output. "" when there is nothing to report. NEVER a credential or an environment value. Amendment 14 (#353): a failed MIGRATING control-plane attempt on an owned machine is never restored automatically, and its output ends with the one-line restore command naming pre_update_dump and the version it returns to. */
             output: string;
+            /** @description ADDITIVE (amendment 14, #353). The DUMP REFERENCE: the name of the pre-update dump the recovery actor took before replacing the control plane with a migrating release, exactly as the operator passes it to the restore command. Opaque - display it, never parse it. Null on every host attempt, on a non-migrating or external-database control-plane attempt, and on a registry control plane. A server implementing the amendment always serializes it; optional here so a client still accepts an older server (absent reads as null). */
+            pre_update_dump?: string | null;
             /** Format: uuid */
             requested_by: string | null;
             /** Format: date-time */
@@ -9325,6 +9502,8 @@ export interface components {
              * @description ADDITIVE (amendment 9, #185). The succeeded_partial run this apply is finishing; recorded on the new run as retry_of and nothing else changes. 404 not_found when no such run exists.
              */
             retry_of?: string;
+            /** @description ADDITIVE (amendment 14, #353). Optional; absent means false. The operator's confirmation that a current backup of an OPERATOR-SUPPLIED database exists. Read only when the release migrates and the control plane's machine is owned with an external database; without it that control-plane step fails backup_unconfirmed before anything is stopped, and the run stops there. Ignored everywhere else (a Quasar-owned database gets a pre-update dump). Recorded in the platform.apply.run audit event; not stored on the run. */
+            external_backup_confirmed?: boolean;
         };
         PlatformHostApplyRequest: {
             /** Format: uuid */
@@ -9335,13 +9514,37 @@ export interface components {
              */
             force: boolean;
         };
-        /** @description A revert takes no target: the digests are the previous_digests recorded on this host's last succeeded attempt, and nothing else. THERE IS NO VERSION PICKER (ADR 0002). */
+        /** @description A revert takes no target: the digests are the previous_digests recorded on this host's last succeeded attempt, and nothing else. THERE IS NO VERSION PICKER (ADR 0002). Amendment 14 (#353): on an owned host it also puts the recovery actor back when those digests name it, and it is refused host_not_eligible / below_floor from or to an agent or recovery actor below the installed control plane's floor. */
         PlatformHostRevertRequest: {
             /**
              * @description As for apply.
              * @default false
              */
             force: boolean;
+        };
+        /** @description Amendment 14 (#353). The body of POST /v1/admin/platform/hosts/{id}/remove; optional as a whole. */
+        PlatformHostRemoveRequest: {
+            /** @description Optional; absent means false. The same meaning as on the per-host apply - the operator agreeing to end the host's live sessions. False refuses 409 conflict while any non-terminal session remains; true stops them and proceeds. A client MUST name the number of sessions in its confirmation. */
+            force?: boolean;
+        };
+        PlatformHostRemoveResponse: {
+            host: components["schemas"]["Host"];
+        };
+        /** @description Amendment 14, owner addition on #353. The body of POST /v1/admin/platform/developer-apply. */
+        PlatformDeveloperApplyRequest: {
+            /** @enum {string} */
+            target: "control_plane" | "host";
+            /**
+             * Format: uuid
+             * @description Required when target is host; absent otherwise.
+             */
+            host_id?: string;
+            /** @description Each name at most once. A control_plane target may name control-plane and recovery-actor, but names recovery-actor ONLY TOGETHER WITH control-plane (A1); a host target may name node-agent and recovery-actor, except that a request for the agent on the control plane's own machine names ONLY node-agent (that machine's actor moves in the control-plane step). Either violation is 400 validation_failed. A request that does not name control-plane, whatever its target, is bound by the host commit rule: the installed control plane's own commit, or a known release's commit at or below it. ORDER IS NOT SIGNIFICANT: the control plane orders recovery-actor first, as for every apply. */
+            components: components["schemas"]["ApplyComponentDigest"][];
+            /** @description Optional; absent means false. As on the per-host and fleet applies. */
+            force?: boolean;
+            /** @description Optional; absent means false. As on the fleet apply: read only for a migrating control-plane digest on an external database. */
+            external_backup_confirmed?: boolean;
         };
         PlatformApplyRunEnvelope: {
             run: components["schemas"]["PlatformApplyRun"];
@@ -9387,6 +9590,39 @@ export interface components {
             image: string;
             /** @description sha256:<64 lowercase hex>. The only form that cannot be moved under a running fleet. */
             digest: string;
+        };
+        /** @description AMENDMENT 14 (#353). The platform-release-manifest.v2.json asset of an RH06-era release: format 1's fields with their grammar and meaning unchanged, THREE components and a FLOOR. Published under its own asset name so a consumer that reads only the format-1 asset never sees it. Served back VERBATIM as PlatformRelease.manifest. A signed release carries platform-release-manifest.v2.json.sig, ADR 0003's document format over this asset's exact bytes. Full semantics: control-api.md §"RH06 — Quasar-owned installation", "Release manifest format 2". */
+        ReleaseManifestV2: {
+            /** @description 2 for this shape. A consumer that meets a format_version it does not know treats the manifest as INVALID (manifest_invalid) rather than guessing. */
+            format_version: number;
+            /** @description Semver without a leading "v". */
+            version: string;
+            /** @description Mirrors the tag's prerelease status. */
+            prerelease: boolean;
+            /** @description 40 lowercase hex. One commit for every component. */
+            source_commit: string;
+            /** Format: date-time */
+            built_at: string;
+            /** @description The highest migration the release's control-plane image embeds (ADR 0002's ordering key). */
+            schema_version: number;
+            /** @description EXACTLY THREE ENTRIES, IN THIS NORMATIVE ORDER: control-plane, node-agent, recovery-actor - validated positionally, as in format 1. The seed and Postgres are never components. */
+            components: components["schemas"]["ReleaseManifestV2Component"][];
+            /** @description EXACTLY TWO ENTRIES, IN THIS ORDER: node-agent, recovery-actor. Each names the OLDEST release of that component this release's control plane still manages (CONTEXT.md "Floor"); a host below it reads below_floor and is offered only an update. No floor version may order above the manifest's own version. */
+            floor: components["schemas"]["ReleaseManifestFloorEntry"][];
+        };
+        ReleaseManifestV2Component: {
+            /** @enum {string} */
+            name: "control-plane" | "node-agent" | "recovery-actor";
+            /** @description A registry reference with NO TAG AND NO DIGEST, exactly as in format 1 (ADR 0001). */
+            image: string;
+            /** @description sha256:<64 lowercase hex>. */
+            digest: string;
+        };
+        ReleaseManifestFloorEntry: {
+            /** @enum {string} */
+            name: "node-agent" | "recovery-actor";
+            /** @description Semver without a leading "v" - the same grammar as ReleaseManifestV2.version. Compared by SemVer precedence. */
+            version: string;
         };
         /** @description The PUBLIC metadata of a certificate. Every field here is already disclosed by any TLS handshake with this listener. THERE IS DELIBERATELY NO FIELD THAT COULD HOLD KEY MATERIAL, and adding one would be the bug this shape exists to prevent. */
         TLSCertificateInfo: {

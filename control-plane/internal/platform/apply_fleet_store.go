@@ -284,11 +284,15 @@ func (s *Store) RequestCancel(ctx context.Context, runID string) (ApplyRun, erro
 // host_id is always NULL; the zero uuid in the single-flight index is what
 // makes two open control-plane attempts impossible.
 type NewControlPlaneAttempt struct {
+	// Kind is KindApply when empty; a developer apply names no release.
+	Kind      string
 	RunID     *string
 	ReleaseID *string
 	Requested []ComponentDigest
 	Previous  []PreviousDigest
 	Actor     *string
+	// Force is a developer apply's; a fleet run's step reads the run's.
+	Force bool
 }
 
 // CreateControlPlaneAttempt inserts a `queued` control-plane attempt.
@@ -301,14 +305,18 @@ func (s *Store) CreateControlPlaneAttempt(ctx context.Context, in NewControlPlan
 	if err != nil {
 		return Attempt{}, fmt.Errorf("encode previous_digests: %w", err)
 	}
+	kind := in.Kind
+	if kind == "" {
+		kind = KindApply
+	}
 	var id string
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO platform_apply_attempts
 		    (run_id, kind, target, release_id, requested_digests, previous_digests,
-		     state, requested_by)
-		VALUES ($1::uuid, 'apply', 'control_plane', $2::uuid, $3::jsonb, $4::jsonb, 'queued', $5::uuid)
+		     state, requested_by, force)
+		VALUES ($1::uuid, $6, 'control_plane', $2::uuid, $3::jsonb, $4::jsonb, 'queued', $5::uuid, $7)
 		RETURNING id::text
-	`, in.RunID, in.ReleaseID, requested, previous, in.Actor).Scan(&id)
+	`, in.RunID, in.ReleaseID, requested, previous, in.Actor, kind, in.Force).Scan(&id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
@@ -336,7 +344,8 @@ func (s *Store) OpenControlPlaneAttempt(ctx context.Context) (Attempt, string, e
 		 ORDER BY a.created_at DESC LIMIT 1
 	`).Scan(&a.ID, &a.RunID, &a.Kind, &a.Target, &a.HostID, &a.NodeName,
 		&a.ReleaseID, &requested, &previous, &a.State, &a.Reason, &a.SessionsRemaining,
-		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt, &commit)
+		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt,
+		&a.PreUpdateDump, &commit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Attempt{}, "", ErrAttemptNotFound
 	}

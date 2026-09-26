@@ -1,0 +1,25 @@
+{
+  "shape": "request",
+  "about": "An edge build or a revert with no release version: release.version is null (ADR 0003: require refuses it, verify applies it with a WARN).",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "kind": "replace",
+    "components": [
+      {
+        "name": "node-agent",
+        "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+        "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "release": {
+      "id": "",
+      "version": null,
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "migrates": false,
+    "schema_version": null,
+    "external_backup_confirmed": false,
+    "dump": null,
+    "purge": false
+  }
+}

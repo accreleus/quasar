@@ -26,3 +26,11 @@ independently but never to a release newer than the control plane.
   the additive agent-api discipline already permits.
 - A host whose agent is newer than the control plane is a fault the release surface
   reports, not a state it can create.
+
+## Note (2026-09-25, RH06, #353)
+
+The decision above is unchanged. ADR 0008 records one exception to "never ahead of the control
+plane" for the RH06 recovery actor (decision A1): on the control plane's own machine the
+recovery actor may lead the control plane while a control-plane replacement is in flight, or
+after one failed and was restored. The actor carries no database schema, which is what this
+rule protects; agents are unaffected.

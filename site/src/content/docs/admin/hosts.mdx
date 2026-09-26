@@ -62,14 +62,55 @@ reported itself.
 | --- | --- |
 | Commit | The commit the agent was built from. |
 | Built | When that build was made. |
-| Install | **Registry** (published images) or **Built from source** (images compiled on the machine). A source-built host can be told about a release but never given one. |
-| Updater | **Present** or **None**. Whether a `quasar-updater` service sits beside this host's stack, which is what can recreate its agent. |
+| Install | **Owned by Quasar** (the host's services are created and replaced by its recovery actor), **Registry** (published images on a legacy Compose stack) or **Built from source** (images compiled on the machine). A source-built host can be told about a release but never given one. |
+| Updater | On an owned host, **Recovery actor** when its recovery actor answered the agent, or **Not answering**, when a release cannot be applied there. On any other host, **None**: it has no recovery actor, so a release cannot be applied there. A legacy Compose host on a release from before owned installs may still read **Present**, for the `quasar-updater` service in its stack. |
 
 Any of these can read **Unknown**, and on an agent from before the self-update
 feature they all will: it has no way to say what it is running. Such a host keeps
 working exactly as before — it simply cannot be updated from the console until it
 is upgraded once by hand, after which it reports its identity like any other. The
 Releases tab shows the recipe for it.
+
+### Services on this machine
+
+An owned host's page has a **Services on this machine** card, and the host's
+expanded row in the Fleet table shows the same facts. It lists the seed, the
+recovery actor and the node agent, each with its version and owner:
+
+- The **seed** is owned by your external manager (Dockge, Arcane or a `docker run`
+  line), and Quasar never updates it. It reads *not found* when the recovery actor
+  finds no running seed: Quasar keeps running, but a deleted recovery actor could
+  then not be re-created, so start the seed again. It reads *unknown* when a seed
+  is running but its version could not be read.
+- The **recovery actor** and the **node agent** are owned by the recovery actor.
+
+If the recovery actor did not answer the agent, the card says so; sessions are
+unaffected. For an offline host it shows the last report, with its time.
+
+On a **combined host** the card also lists the database (*Quasar's own* or *Your
+own*) and the control plane. A **control-only** machine runs no agent, so it has no host
+row: its services appear under Admin, Fleet, Releases, Installed, as **This
+machine**.
+
+Two warnings can appear above the card:
+
+- **No seed found.** Quasar is running normally, but if this machine's recovery
+  actor is ever deleted, nothing will re-create it. Start the seed again.
+- **Another owner's container is in the way.** A container that looks like a
+  Quasar service but was not created by this installation, such as a leftover
+  Compose stack. The recovery actor never touches it, and updates to this
+  machine are blocked until you remove it, and whatever re-creates it.
+
+A GPU host's card has **Remove host** in its footer (see [Draining and
+removing](#draining-and-removing)). A combined host's card says instead that the
+machine runs the control plane, so it is not removed from here: it is taken
+apart with `uninstall` on the machine (see
+[Uninstalling](/quasar/operations/uninstall/)).
+
+A host whose node agent or recovery actor is below the control plane's floor
+reads **Must update before it can be managed**. It keeps running, but the console
+offers it only the update that lifts it; see [Updating
+Quasar](/quasar/admin/releases/).
 
 An agent **newer than the control plane** turns up as *Agent ahead of the control
 plane* under Needs attention. Nothing is broken, but it is the wrong way round —
@@ -162,14 +203,24 @@ Otherwise a user's saves are on whichever host happened to run the session.
 Drain stops a host accepting new sessions while letting existing ones finish.
 Do this before maintenance.
 
-Once it is empty, stop the agent on that machine and forget the host here.
+To take a host out of the fleet, press **Remove host** on its page. It drains
+the host, waits for its sessions to end, then has the host's recovery actor
+remove the node agent and itself. Forget the host here once the page says it was
+removed. Adding the machine back under the same node name keeps its history and
+lifts the drain the removal took, but not one you set yourself. The
+homes and the host's seed stay on the machine; see
+[Uninstalling](/quasar/operations/uninstall/). A host that is not connected is
+removed with `uninstall` on the machine instead: the console counts a host as
+not connected after about a minute without a heartbeat, even while it reads
+*draining*, and refuses the removal then with "nothing was removed".
 
 ## The console
 
 Each host has a console page for local-display mode, where the host renders to a
-physically attached screen, not to a browser. It needs additional
-privileges and a separate compose overlay, and it is not part of the default
-deployment.
+physically attached screen, not to a browser. It needs additional privileges and
+a separate compose overlay, and it is not part of the default deployment. An
+owned install has no way to enable it in this release: the recovery actor
+creates the agent without those privileges, and there is no input for them.
 
 ## Storage
 

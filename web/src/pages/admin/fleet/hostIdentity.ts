@@ -26,6 +26,8 @@ export function installModeLabel(mode: Host["install_mode"]): string {
       return "Registry";
     case "source":
       return "Built from source";
+    case "owned":
+      return "Owned by Quasar";
     default:
       return "Unknown";
   }
@@ -39,22 +41,38 @@ export function installModeHint(mode: Host["install_mode"]): string | undefined 
       return "This host runs published platform images.";
     case "source":
       return "This host's images were built on it; a platform release can be shown but not applied.";
+    case "owned":
+      return "This host's services are created and replaced by its recovery actor.";
     default:
       return "No agent has reported how this host was installed.";
   }
 }
 
-export function updaterLabel(present: Host["updater_present"]): string {
+/** On an owned host `updater_present` answers "did its recovery actor answer
+ *  on the agent socket" (amendment 14), so the words follow the mode. */
+export function updaterLabel(
+  present: Host["updater_present"],
+  mode: Host["install_mode"] = null,
+): string {
+  if (mode === "owned" && present === true) return "Recovery actor";
+  if (mode === "owned" && present === false) return "Not answering";
   if (present === true) return "Present";
   if (present === false) return "None";
   return "Unknown";
 }
 
-export function updaterHint(present: Host["updater_present"]): string {
-  if (present === true) return "An updater sits beside this host's agent.";
+export function updaterHint(
+  present: Host["updater_present"],
+  mode: Host["install_mode"] = null,
+): string {
+  if (mode === "owned" && present === true)
+    return "This host's recovery actor answered the agent.";
+  if (mode === "owned" && present === false)
+    return "This host's recovery actor did not answer the agent — a release cannot be applied here.";
+  if (present === true) return "This host's recovery actor answered the agent.";
   if (present === false)
-    return "The agent looked and found no updater on this stack — a release cannot be applied here.";
-  return "No agent has reported whether an updater is present.";
+    return "This host has no recovery actor: it was not installed with the seed, so a release cannot be applied here.";
+  return "No agent has reported whether a recovery actor is present.";
 }
 
 /** True only when all four identity fields are known. The eligibility model

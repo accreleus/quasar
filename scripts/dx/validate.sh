@@ -219,7 +219,6 @@ boot_local_stack() {
     -v "$RUN_STATE_DIR":/run/quasar \
     -w /w \
     -e DATABASE_URL="postgres://quasar:quasar@$PG:5432/quasar?sslmode=disable" \
-    -e ENROLLMENT_TOKEN=validate-enroll-token \
     -e BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
     -e BOOTSTRAP_ADMIN_USERNAME=admin \
     -e BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PASS" \

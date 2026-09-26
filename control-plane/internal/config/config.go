@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/db"
+	"github.com/accreleus/quasar/control-plane/internal/enrollscript"
 	"github.com/accreleus/quasar/control-plane/internal/ice"
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
@@ -37,9 +38,22 @@ type Config struct {
 
 	AuthTokenTTL time.Duration // bearer-token lifetime (AUTH_TOKEN_TTL, e.g. "24h")
 
-	// Fleet-wide fallback for node-agent enrollment (ENROLLMENT_TOKEN). Optional:
-	// empty means only admin-minted per-host tokens enroll (#12).
-	EnrollmentToken string
+	// This machine's single-use local enrollment token for its own agent, and
+	// the node name it is bound to; both empty, or both set
+	// (QUASAR_LOCAL_ENROLLMENT_FILE, QUASAR_LOCAL_ENROLLMENT_NODE_NAME). Never logged.
+	LocalEnrollmentToken    string
+	LocalEnrollmentNodeName string
+
+	// The recovery actor's control socket on an owned machine
+	// (QUASAR_RECOVERY_CONTROL_SOCKET). Empty: not an owned machine, never read.
+	RecoveryControlSocket string
+
+	// This machine's shape, set by the recovery actor that created this control
+	// plane: "combined" or "control_only" and the machine's node name, both or
+	// neither (QUASAR_MACHINE_ROLE, QUASAR_MACHINE_NODE_NAME). Served as
+	// PlatformIdentity machine_role / machine_node_name.
+	MachineRole     string
+	MachineNodeName string
 
 	// All three together provision the first admin at boot if none exists
 	// (control-api.md §Authorization). Never "first to register wins".
@@ -49,6 +63,11 @@ type Config struct {
 
 	// Non-empty serves the built SPA on non-API paths: same-origin, no proxy.
 	WebRoot string // QUASAR_WEB_ROOT (e.g. /app/web pointing at web/dist)
+
+	// The images /enroll-host.sh and the Add host stack install, by digest.
+	EnrollPins enrollscript.Pins // QUASAR_ENROLL_SEED_IMAGE, QUASAR_ENROLL_AGENT_IMAGE
+	// Below the installed release's images: the machine's install-time images.
+	EnrollFallback enrollscript.Pins // QUASAR_ENROLL_FALLBACK_SEED_IMAGE, QUASAR_ENROLL_FALLBACK_AGENT_IMAGE
 
 	// Empty / "spread" / "least-loaded" all select least-loaded (P3-02).
 	PlacementPolicy string // QUASAR_PLACEMENT_POLICY
@@ -205,7 +224,7 @@ type Config struct {
 	// deployment and makes a backup unrestorable. Previous is a comma-separated
 	// list of decrypt-only predecessors ("<version>:<base64>") so a rotated
 	// deployment still reads old rows. Never logged, never returned.
-	SecretKey         string // QUASAR_SECRET_KEY
+	SecretKey         string // QUASAR_SECRET_KEY, or the file QUASAR_SECRET_KEY_FILE names
 	SecretKeyPrevious string // QUASAR_SECRET_KEY_PREVIOUS
 
 	// pprof ships enabled in production so a long-running box on someone else's
@@ -280,20 +299,62 @@ func Load() (*Config, error) {
 		c.DBLockTimeout = d
 	}
 
-	// Optional since #12: a deployment can enroll entirely with admin-minted per-host
-	// tokens, and requiring the fleet-wide static one would force every operator to keep
-	// the credential the minted tokens exist to replace. Empty never matches any presented
-	// token (agentws only compares when it is non-empty), so this disables the static path
-	// rather than opening it. Contract: control-api.md §Host enrollment tokens.
-	c.EnrollmentToken = os.Getenv("ENROLLMENT_TOKEN")
-	if c.EnrollmentToken == "" {
-		slog.Warn("no static ENROLLMENT_TOKEN: only minted per-host tokens can enroll")
+	localFile := os.Getenv("QUASAR_LOCAL_ENROLLMENT_FILE")
+	c.LocalEnrollmentNodeName = strings.TrimSpace(os.Getenv("QUASAR_LOCAL_ENROLLMENT_NODE_NAME"))
+	if (localFile == "") != (c.LocalEnrollmentNodeName == "") {
+		return nil, fmt.Errorf("QUASAR_LOCAL_ENROLLMENT_FILE and QUASAR_LOCAL_ENROLLMENT_NODE_NAME must be set together (got only one)")
+	}
+	if localFile != "" {
+		tok, err := readSecretFile("QUASAR_LOCAL_ENROLLMENT_FILE", localFile)
+		if err != nil {
+			return nil, err
+		}
+		c.LocalEnrollmentToken = tok
+	}
+	c.RecoveryControlSocket = os.Getenv("QUASAR_RECOVERY_CONTROL_SOCKET")
+	c.MachineRole = strings.TrimSpace(os.Getenv("QUASAR_MACHINE_ROLE"))
+	c.MachineNodeName = strings.TrimSpace(os.Getenv("QUASAR_MACHINE_NODE_NAME"))
+	if (c.MachineRole == "") != (c.MachineNodeName == "") {
+		return nil, fmt.Errorf("QUASAR_MACHINE_ROLE and QUASAR_MACHINE_NODE_NAME must be set together (got only one)")
+	}
+	if c.MachineRole != "" && c.MachineRole != "combined" && c.MachineRole != "control_only" {
+		return nil, fmt.Errorf("QUASAR_MACHINE_ROLE %q: must be combined or control_only", c.MachineRole)
 	}
 
 	c.BootstrapAdminEmail = os.Getenv("BOOTSTRAP_ADMIN_EMAIL")
 	c.BootstrapAdminUsername = os.Getenv("BOOTSTRAP_ADMIN_USERNAME")
 	c.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
 	c.WebRoot = os.Getenv("QUASAR_WEB_ROOT")
+	c.EnrollPins = enrollscript.Pins{
+		SeedImage:  strings.TrimSpace(os.Getenv("QUASAR_ENROLL_SEED_IMAGE")),
+		AgentImage: strings.TrimSpace(os.Getenv("QUASAR_ENROLL_AGENT_IMAGE")),
+		// A host added from here trusts what this control plane trusts: its developer
+		// applies are checked against the same allowlist on both sides.
+		AllowedNamespaces:  strings.TrimSpace(os.Getenv("QUASAR_UPDATER_ALLOWED_NAMESPACES")),
+		InsecureRegistries: strings.TrimSpace(os.Getenv("QUASAR_PLATFORM_INSECURE_REGISTRIES")),
+	}
+	for _, trust := range [][2]string{
+		{"QUASAR_UPDATER_ALLOWED_NAMESPACES", c.EnrollPins.AllowedNamespaces},
+		{"QUASAR_PLATFORM_INSECURE_REGISTRIES", c.EnrollPins.InsecureRegistries},
+	} {
+		if !enrollscript.ValidTrustValue(trust[1]) {
+			return nil, fmt.Errorf("%s %q: carries a quote or a control character", trust[0], trust[1])
+		}
+	}
+	c.EnrollFallback = enrollscript.Pins{
+		SeedImage:  strings.TrimSpace(os.Getenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE")),
+		AgentImage: strings.TrimSpace(os.Getenv("QUASAR_ENROLL_FALLBACK_AGENT_IMAGE")),
+	}
+	for _, pin := range [][2]string{
+		{"QUASAR_ENROLL_SEED_IMAGE", c.EnrollPins.SeedImage},
+		{"QUASAR_ENROLL_AGENT_IMAGE", c.EnrollPins.AgentImage},
+		{"QUASAR_ENROLL_FALLBACK_SEED_IMAGE", c.EnrollFallback.SeedImage},
+		{"QUASAR_ENROLL_FALLBACK_AGENT_IMAGE", c.EnrollFallback.AgentImage},
+	} {
+		if pin[1] != "" && !enrollscript.ValidImage(pin[1]) {
+			return nil, fmt.Errorf("%s %q: must be repository@sha256:<64 lowercase hex>, never a tag", pin[0], pin[1])
+		}
+	}
 	c.PlacementPolicy = os.Getenv("QUASAR_PLACEMENT_POLICY")
 	// These reach admission SQL; the veto must never brick the fleet (#383).
 	minFree, err := envInt32("QUASAR_VRAM_MIN_FREE_MB", 1024, 0)
@@ -506,7 +567,11 @@ func Load() (*Config, error) {
 
 	// internal/secrets.ParseKeyring owns the format and fails startup on a
 	// malformed key rather than at the first write.
-	c.SecretKey = os.Getenv("QUASAR_SECRET_KEY")
+	secretKey, err := envOrFile("QUASAR_SECRET_KEY")
+	if err != nil {
+		return nil, err
+	}
+	c.SecretKey = secretKey
 	c.SecretKeyPrevious = os.Getenv("QUASAR_SECRET_KEY_PREVIOUS")
 
 	// LookupEnv, not envOr: "" is the off switch, so set-but-empty must not

@@ -1,66 +1,121 @@
 ---
 title: Uninstalling
-description: Stopping cleanly, what a volume wipe destroys, and what it leaves behind.
+description: What removing the seed does and does not do, stopping cleanly, removing a machine, and the host changes to undo.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-There is no uninstall script. Removal is a Compose command plus some manual
-cleanup.
+This page describes a Quasar-owned install. A [legacy Compose
+install](/quasar/install/legacy-compose/#stop-and-uninstall) is stopped and removed
+with Compose.
+
+## Removing the seed does not remove Quasar
+
+Deleting the seed's stack in Dockge or Arcane, or `docker rm` of a `docker run`
+seed, removes **only the seed**. Quasar keeps running on that machine. A redeploy
+of the stack likewise only touches the seed. What you lose without a seed is the
+ability to re-create the recovery actor if that is ever deleted, so the console
+shows the seed as *not found* until you start it again.
+
+Removing data is never a side effect of managing the stack.
 
 ## Stop, keeping everything
 
+Stop the machine's containers. The agent first, then the control plane and
+Postgres on the machine that has them:
+
 ```bash
-docker compose -f deploy/docker-compose.yml down
+docker stop quasar-node-agent
 ```
 
-Containers stop, volumes are untouched. Bring it back with the same deploy
-command and everything is as you left it.
+```bash
+docker stop quasar-control-plane quasar-postgres
+```
 
+Nothing is removed. `docker start` brings each back as it was, Postgres first.
 This is what you want for maintenance.
 
-## Stop and destroy the state
+## Remove a GPU host from the console
+
+For a GPU host, open it under Admin, Fleet, Hosts and press **Remove host**. The
+control plane drains it, waits for its sessions to end, then tells the host's
+recovery actor, which removes the node agent and then itself. The homes, the
+volumes and the seed stay; the seed from then on stays idle. **Forget** the host
+once the console says it was removed.
+
+A host whose agent is not connected cannot be removed this way: the console says
+it "is not connected, so its recovery actor could not be asked; nothing was
+removed". Use `uninstall` on the machine instead (below). The console counts a
+host as not connected after about a minute without a heartbeat, even while it
+still reads *draining*. A removal that stops part-way leaves the host visibly there;
+**Retry removal** on its page, the recovery actor's next start, or `uninstall` on
+the machine finishes it.
+
+To bring a removed host back, create a command in Add host with the same node
+name and run it on the machine. It clears the removed install and installs
+afresh, and the host keeps its history. The drain the removal took is lifted when
+the host enrolls again; a drain you set yourself before the removal stays. If
+clearing the removed install fails, the command prints what `uninstall` said;
+run it again to continue.
+
+## Uninstall a machine
+
+Any machine, the first one included, is taken apart on the machine itself with
+the recovery image's `uninstall`, run in its own container. It works with the
+console down. Take the image from the seed, which outlives an uninstall:
 
 ```bash
-docker compose -f deploy/docker-compose.yml down -v
+docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine \
+  "$(docker inspect -f '{{.Config.Image}}' quasar-seed)" uninstall
 ```
 
-<Aside type="danger" title="No confirmation, no undo">
-There is no prompt. This is a plain Docker volume removal.
-</Aside>
+It marks the machine uninstalled first, so neither the seed nor anything else
+brings it back, then removes the containers this installation created, in
+reverse order: node agent, control plane, Postgres, recovery actor. It never
+touches a container it did not create, and **keeps your data**:
 
-Destroyed:
+- the database volume, for a database Quasar owns;
+- the `quasar-machine` volume;
+- the agent's identity;
+- the home directories.
 
-- **The database.** Every user, app, host, session and entitlement. Gone.
-- **The agent's enrollment secret.** The agent will re-enroll using the token.
-- **The TLS certificate.** A new one is generated on next boot, with a new
-  fingerprint, so every client re-trusts.
-- **The artwork cache.** Re-fetched.
+It refuses while an update is in flight. Interrupted, it leaves the machine down,
+and running it again finishes it. Each run prints the exact command to run next.
 
-Not destroyed:
+**`--purge` also removes that data**: this installation's volumes and network,
+and the contents of machine state. It refuses while a seed is on the machine, so
+note the image first, remove the seed the way you started it, then purge:
 
-- **User home directories**, if you configured a host path. They are a bind
-  mount, not a Compose volume, so `down -v` never touches them. This is
-  deliberate, and it is the reason a host path is the better storage choice.
-- **Container images.**
-- **`deploy/.env`**, secrets and all.
+```bash
+img=$(docker inspect -f '{{.Config.Image}}' quasar-seed)
+docker rm -f quasar-seed                  # or remove the stack in Dockge or Arcane
+docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine "$img" uninstall --purge
+docker volume rm quasar-machine
+```
+
+- It asks for the machine's node name at the terminal, or takes
+  `--confirm <node name>`.
+- For a database Quasar owns, it first takes one final `pg_dump` into the
+  `quasar-final-dump` volume, which a purge never deletes, or into
+  `--dump-to <absolute host directory>`. If the dump fails, nothing is deleted.
+- A database you run yourself is never dumped or touched.
 
 ## Full removal
 
 <Steps>
 
-1. **Drain and stop additional agents** using the agent-only packaging you
-   installed on those machines. The shipped base Compose file is a complete
-   stack, not a safe generic command for a second host.
-
-2. **Take a final backup** if there is any chance you want the data. See
+1. **Take a final backup** if there is any chance you want the data. See
    [Backup and restore](/quasar/operations/backup/).
 
-3. **Bring the stack down with volumes.**
+2. **Remove each GPU host** from the console, then **uninstall the first
+   machine**, as above, with `--purge` if you want the data gone. The purge has
+   you remove the seed first; on a machine you uninstalled without `--purge`,
+   remove the seed from Dockge or Arcane, or with `docker rm -f quasar-seed`.
 
-   ```bash
-   docker compose -f deploy/docker-compose.yml down -v
-   ```
+3. **Remove the final dump**, once you no longer want it:
+   `docker volume rm quasar-final-dump`.
 
 4. **Remove the home directories.** Resolve the effective root for every host
    under Admin, Fleet, Hosts and verify each exact path before removal. These are
@@ -71,7 +126,8 @@ Not destroyed:
    sudo rm -rf -- <verified-managed-home-root>
    ```
 
-5. **Remove the images.**
+5. **Remove the images**: `quasar-recovery`, `quasar-control-plane` and
+   `quasar-node-agent`, plus the Postgres image on the first machine.
 
    ```bash
    docker image ls --filter reference='ghcr.io/accreleus/quasar/*'
@@ -82,22 +138,17 @@ Not destroyed:
    removing, and be careful with a blanket prune if you have other things on this
    machine.
 
-6. **Remove the environment file.**
-
-   ```bash
-   shred -u deploy/.env
-   ```
-
-7. **Remove the checkout.** First leave it, print its absolute path, and verify
-   that no backups or unrelated files were placed inside it. Delete that exact
-   directory using your normal file-management tool.
+6. **Remove the `.env`** of a stack that held your own database's settings, if
+   you used one. There is no other `.env` to remove.
 
 </Steps>
 
 ## Host changes to undo
 
-Quasar asks you to make three changes outside Docker. None are removed by any of
-the above.
+Quasar asks you to make changes outside Docker, and the one-line command for a GPU
+host makes some of them itself when you let it apply its fixes. None are removed
+by any of the above. Check each file before removing it: another program may
+depend on the same setting.
 
 The socket buffer sysctl:
 
@@ -105,11 +156,48 @@ The socket buffer sysctl:
 sudo rm /etc/sysctl.d/99-quasar.conf
 ```
 
-The uinput module load, if you added it and nothing else needs it:
+The user-namespace sysctls the one-line command writes when it applies a fix.
+Depending on the host, the file holds `kernel.apparmor_restrict_unprivileged_userns=0`
+(the Ubuntu 24.04 and later default is `1`), `kernel.unprivileged_userns_clone=1`
+or `user.max_user_namespaces=15000`. Read it, remove it, then set each value back
+to your distribution's default, or reboot:
+
+```bash
+cat /etc/sysctl.d/99-quasar-userns.conf
+```
+
+```bash
+sudo rm /etc/sysctl.d/99-quasar-userns.conf
+```
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+```
+
+The last command is for Ubuntu 24.04 and later; use the value your distribution
+ships for any other line the file held.
+
+The uinput module load, if you added it or the one-line command did, and nothing
+else needs it:
 
 ```bash
 sudo rm /etc/modules-load.d/uinput.conf
 ```
+
+On Unraid the quick start persists both through `/boot/config/go` instead: remove
+its `sysctl -w net.core.wmem_default=2097152` and `modprobe uinput` lines there.
+
+The app-container AppArmor profile the one-line command loads on an AppArmor
+host. Loaded, it lasts until the next boot. The command also installs it to load
+at every boot when run with `QUASAR_ENROLL_FIX=1`, `--fix` or
+`QUASAR_ENROLL_APPARMOR_PERSIST=1`. Answering `y` at a fix prompt does not persist
+it. If the file exists, remove it:
+
+```bash
+sudo rm /etc/apparmor.d/quasar-app
+```
+
+`uninstall` does not unload the profile. A reboot does, once the file is gone.
 
 Any TLS certificate you added to your machines' trust stores.
 
@@ -119,11 +207,15 @@ Do not tear down the whole deployment for this.
 
 <Steps>
 
-1. Drain the host in Admin, Fleet, Hosts so it stops taking new sessions.
-2. Wait for its sessions to finish.
-3. Stop the agent on that machine.
-4. Forget the host in Admin, Fleet, Hosts.
+1. Open the host in Admin, Fleet, Hosts and press **Remove host**. It drains the
+   host, waits for its sessions to end, then removes its agent and recovery actor.
+2. Forget the host once the console says it was removed.
+3. Remove its seed from the machine when you are ready. It stays idle until you
+   do.
 
 </Steps>
+
+A host whose agent is not connected is removed with `uninstall` on that machine
+instead.
 
 Its home directories stay where they are. Move or delete them when you are ready.

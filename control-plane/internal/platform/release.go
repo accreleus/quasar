@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 )
 
@@ -80,6 +81,11 @@ type HostIdentity struct {
 	InstallMode    *string `json:"install_mode"`
 	UpdaterPresent *bool   `json:"updater_present"`
 	IdentityKnown  bool    `json:"identity_known"`
+	// BelowFloor is amendment 14's read signal: the agent or the recovery actor
+	// orders below the installed control plane's floor (floor.go). Derived and
+	// served, never left to a client to re-derive, like IdentityKnown; it changes
+	// no eligibility.
+	BelowFloor bool `json:"below_floor"`
 	// AgentConnected is whether this host's agent has a live socket to THIS
 	// control-plane process, as the agent registry sees it right now.
 	//
@@ -102,6 +108,16 @@ type HostIdentity struct {
 	// identity shape, hence unserialized like AgentConnected.
 	Readiness           json.RawMessage `json:"-"`
 	ReadinessReportedAt *time.Time      `json:"-"`
+
+	// RecoveryActorSourceCommit is the commit of the recovery actor serving an
+	// owned host (hosts.recovery_actor_source_commit, amendment 14): what orders
+	// a host attempt actor first. Unserialized: the host body carries it, the
+	// release view's frozen identity shape does not.
+	RecoveryActorSourceCommit *string `json:"-"`
+	// RecoveryActorVersion is hosts.recovery_actor_version (amendment 14): with
+	// AgentVersion, what the floor is judged against. Unserialized for the same
+	// reason.
+	RecoveryActorVersion *string `json:"-"`
 }
 
 // Known is `identity_known`: all four fields present. A host with any of them
@@ -115,10 +131,13 @@ const (
 	HostOffline = "offline"
 )
 
-// Install modes (schema.md hosts.install_mode).
+// Install modes (schema.md hosts.install_mode), defined once in agentws.
 const (
-	InstallRegistry = "registry"
-	InstallSource   = "source"
+	InstallRegistry = agentws.InstallRegistry
+	InstallSource   = agentws.InstallSource
+	// InstallOwned is eligible exactly as InstallRegistry (control-api.md
+	// §"Owned hosts on the host body and the release view").
+	InstallOwned = agentws.InstallOwned
 )
 
 // Target kinds.
@@ -148,6 +167,10 @@ const (
 	// state this build has no table for; #116 evaluates them.
 	ReasonAttemptInFlight = "attempt_in_flight"
 	ReasonRunActive       = "run_active"
+
+	// Amendment 14. Never a `targets` reason: only the revert and developer-apply
+	// refusals carry it (floor.go).
+	ReasonBelowFloor = "below_floor"
 )
 
 // Target is one target's eligibility, evaluated against available[0] only.
@@ -178,10 +201,19 @@ type Fault struct {
 	Detail   string  `json:"detail"`
 }
 
-// Installed is the `installed` object of the view.
+// Installed is the `installed` object of the view. `control_plane` is the
+// binary's identity plus ControlPlaneMachine, composed by MarshalJSON.
 type Installed struct {
-	ControlPlane buildinfo.Identity `json:"control_plane"`
-	Hosts        []HostIdentity     `json:"hosts"`
+	ControlPlane        buildinfo.Identity `json:"control_plane"`
+	Hosts               []HostIdentity     `json:"hosts"`
+	ControlPlaneMachine MachineIdentity    `json:"-"`
+}
+
+func (i Installed) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ControlPlane PlatformIdentity `json:"control_plane"`
+		Hosts        []HostIdentity   `json:"hosts"`
+	}{PlatformIdentity{i.ControlPlane, i.ControlPlaneMachine}, i.Hosts})
 }
 
 // View is the whole `GET /v1/admin/platform/releases` body. `active_apply` is

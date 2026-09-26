@@ -1,7 +1,7 @@
 # Runtime API cutover and recovery
 
 The node agent uses the Quasar runtime interface and Bollard for Docker operations.
-The updater still owns its separate Compose workflow. This guide covers a planned
+This guide covers a planned
 agent replacement, with sessions drained; it does not resume running sessions.
 Promotion from the initiative branch requires explicit owner approval of the
 [#240 acceptance evidence](https://github.com/accreleus/quasar/issues/240).

@@ -65,7 +65,6 @@ type Handler struct {
 	OnPreparationReport func(string)
 	store               *agentStore
 	log                 *slog.Logger
-	enrollmentToken     string
 	registry            *Registry
 	events              Events
 	relay               *RelayBus
@@ -208,15 +207,14 @@ func (s *consoleAutoState) finishLaunch(hostID, sessionID string, launched bool)
 	}
 }
 
-// NewHandler constructs a Handler. enrollmentToken is the pre-shared token from
-// ENROLLMENT_TOKEN; pool is the Postgres connection pool; registry tracks live
+// NewHandler constructs a Handler. pool is the Postgres connection pool; registry tracks live
 // agent connections; events is the coordinator's callback surface; relay routes
 // agent→browser signaling; consoleStore backs the CM-01 console-config
 // snapshot push + reported-capabilities upsert. Any nil argument uses a safe
 // no-op default (consoleStore nil simply skips console_config / capabilities).
 // approvalBoot is the durable RH05 boot written before admission starts; tests
 // without that lifecycle may omit it.
-func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, registry *Registry, events Events, relay *RelayBus, cfgStore *hostcfg.Store, consoleStore *console.Store, approvalBoot ...string) *Handler {
+func NewHandler(pool *pgxpool.Pool, log *slog.Logger, registry *Registry, events Events, relay *RelayBus, cfgStore *hostcfg.Store, consoleStore *console.Store, approvalBoot ...string) *Handler {
 	if registry == nil {
 		registry = NewRegistry(log)
 	}
@@ -238,18 +236,17 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 			isAgentConnected: registry.IsConnected,
 			redeemEnrollment: hostenroll.Redeem,
 		},
-		log:             log,
-		enrollmentToken: enrollmentToken,
-		registry:        registry,
-		events:          events,
-		relay:           relay,
-		cfgStore:        cfgStore,
-		consoleStore:    consoleStore,
-		consoleAuto:     newConsoleAutoState(),
-		failures:        ratelimit.NewFailureLimiter(enrollmentFailureLimit, enrollmentFailureTTL, enrollmentFailureMaxIPs),
-		imageEvents:     noopImageEvents{},
-		releaseEvents:   noopReleaseEvents{},
-		imageLimiter:    newImageStateLimiter(),
+		log:           log,
+		registry:      registry,
+		events:        events,
+		relay:         relay,
+		cfgStore:      cfgStore,
+		consoleStore:  consoleStore,
+		consoleAuto:   newConsoleAutoState(),
+		failures:      ratelimit.NewFailureLimiter(enrollmentFailureLimit, enrollmentFailureTTL, enrollmentFailureMaxIPs),
+		imageEvents:   noopImageEvents{},
+		releaseEvents: noopReleaseEvents{},
+		imageLimiter:  newImageStateLimiter(),
 	}
 	h.diagnostics = newDiagnosticQueue(events, log)
 	h.vram = newVramQueue(h.store, log)
@@ -1908,8 +1905,7 @@ func (h *Handler) writeError(conn *websocket.Conn, code, msg string) {
 func (h *Handler) resolveAuth(ctx context.Context, reg RegisterMsg) (registerResult, error) {
 	var tryEnroll AuthEnrollment
 	if json.Unmarshal(reg.Auth, &tryEnroll) == nil && tryEnroll.EnrollmentToken != "" {
-		return h.store.enrollHost(ctx, reg.NodeName, reg.AgentVersion,
-			tryEnroll.EnrollmentToken, h.enrollmentToken)
+		return h.store.enrollHost(ctx, reg.NodeName, reg.AgentVersion, tryEnroll.EnrollmentToken)
 	}
 	var tryReconnect AuthReconnect
 	if json.Unmarshal(reg.Auth, &tryReconnect) == nil && tryReconnect.NodeSecret != "" {

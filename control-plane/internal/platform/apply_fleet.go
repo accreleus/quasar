@@ -142,11 +142,7 @@ func (m ManifestOrEdge) HostComponents(ctx context.Context, r Release) ([]Compon
 	if m.Edge == nil {
 		return nil, errors.New("this release carries no manifest and this control plane cannot reach the registry to resolve one")
 	}
-	c, err := m.Edge.NodeAgentComponent(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-	return []ComponentDigest{c}, nil
+	return EdgeHostComponents(ctx, m.Edge, r)
 }
 
 func (m ManifestOrEdge) ControlPlaneComponents(ctx context.Context, r Release) ([]ComponentDigest, error) {
@@ -162,11 +158,7 @@ func (m ManifestOrEdge) ControlPlaneComponents(ctx context.Context, r Release) (
 	if m.Edge == nil {
 		return nil, errors.New("this release carries no manifest and this control plane cannot reach the registry to resolve one")
 	}
-	c, err := m.Edge.ControlPlaneComponent(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-	return []ComponentDigest{c}, nil
+	return EdgeControlPlaneComponents(ctx, m.Edge, r)
 }
 
 // FleetRunner drives fleet runs. Its only in-process state is the goroutine set
@@ -191,6 +183,11 @@ type FleetRunner struct {
 	// buildinfo call at the point of use, so a test can put a release on either
 	// side of it.
 	SchemaVersion int
+	// machineShape is this control plane's own machine shape, from its configuration.
+	machineShape MachineShape
+	// ownMachine is what this control plane's own recovery actor reports; nil
+	// is not an owned machine.
+	ownMachine OwnMachineSource
 
 	mu sync.Mutex
 	// run id → cancel, bounded at one by the active-run index.
@@ -200,6 +197,8 @@ type FleetRunner struct {
 	adopted map[string]bool
 	// run ids with a skip the store refused to record: fail towards partial.
 	unrecordedSkips map[string]bool
+	// run ids whose operator confirmed a backup of their own database.
+	confirmed map[string]bool
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -221,9 +220,29 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 		running:         make(map[string]context.CancelFunc),
 		adopted:         make(map[string]bool),
 		unrecordedSkips: make(map[string]bool),
+		confirmed:       make(map[string]bool),
 		baseCtx:         ctx,
 		stop:            cancel,
 	}
+}
+
+// WithMachineShape wires the control plane's own machine shape (its configuration).
+func (f *FleetRunner) WithMachineShape(shape MachineShape) *FleetRunner {
+	f.machineShape = shape
+	return f
+}
+
+// WithOwnMachine wires this control plane's own recovery actor, whose commit
+// decides whether the control-plane step moves the actor first (ADR 0008).
+func (f *FleetRunner) WithOwnMachine(src OwnMachineSource) *FleetRunner {
+	f.ownMachine = src
+	return f
+}
+
+// ownedControlPlane: a recovery actor created this control plane, known from
+// its own configuration whether or not the actor is answering.
+func (f *FleetRunner) ownedControlPlane() bool {
+	return f.machineShape.Role != ""
 }
 
 // Start drives one run. Idempotent per run: a second Start for a run already
@@ -392,8 +411,8 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 			f.log.Warn("fleet apply: could not record the current target", "run_id", run.ID, "err", err)
 		}
 		cp = &a
-		if f.prepareFleet(ctx, run, a) {
-			// Normally never returns: the updater recreates this container
+		if f.backupAllowsTheStep(ctx, run, a) && f.prepareFleet(ctx, run, a) {
+			// Normally never returns: the recovery actor replaces this container
 			// partway through, and the next boot's Adopt resolves the row.
 			f.self.Apply(ctx, a)
 		}
@@ -406,8 +425,10 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 		if !f.adoptCordons(ctx, run.ID) {
 			return false
 		}
-		if !f.self.Adopt(ctx, *cp, f.releaseCommit(ctx, run.ReleaseID)) {
-			if f.prepareFleet(ctx, run, *cp) {
+		// Never re-driven while shutting down: that would fail a row whose
+		// verdict the next boot reads.
+		if !f.self.Adopt(ctx, *cp, f.releaseCommit(ctx, run.ReleaseID)) && ctx.Err() == nil {
+			if f.backupAllowsTheStep(ctx, run, *cp) && f.prepareFleet(ctx, run, *cp) {
 				f.self.Apply(ctx, *cp) // never sent; re-drive it
 			}
 		}
@@ -1126,6 +1147,64 @@ func (f *FleetRunner) restoreCordons(parent context.Context, runID string) bool 
 	return restored
 }
 
+// backupConfirmer is a self driver that carries the operator's external-backup
+// confirmation to its actor (SelfApplier.ConfirmExternalBackup).
+type backupConfirmer interface{ ConfirmExternalBackup(attemptID string) }
+
+// ConfirmExternalBackup records that the operator who started runID confirmed a
+// current backup of their own database (control-api.md external_backup_confirmed).
+// In memory only, by the contract: a control plane restarted before the step is
+// sent fails it backup_unconfirmed. Call it before Start.
+func (f *FleetRunner) ConfirmExternalBackup(runID string) {
+	f.mu.Lock()
+	f.confirmed[runID] = true
+	f.mu.Unlock()
+}
+
+func (f *FleetRunner) backupConfirmed(runID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.confirmed[runID]
+}
+
+// externalDatabase: this control plane's recovery actor says its database is the
+// operator's own. Unknown reads as not: the actor refuses the step itself.
+func (f *FleetRunner) externalDatabase(ctx context.Context) bool {
+	if f.ownMachine == nil {
+		return false
+	}
+	own, ok := f.ownMachine.Read(ctx)
+	return ok && own.Identity.DatabaseMode != nil && *own.Identity.DatabaseMode == DatabaseModeExternal
+}
+
+// backupAllowsTheStep is #352 decision 14 on an owned machine, before the fleet
+// is cordoned, drained or sent anything: a migrating step on the operator's own
+// database needs their confirmation, and fails backup_unconfirmed without it. A
+// Quasar-owned database gets its pre-update dump from the recovery actor. False
+// means the attempt is resolved.
+func (f *FleetRunner) backupAllowsTheStep(ctx context.Context, run ApplyRun, a Attempt) bool {
+	if !f.ownedControlPlane() || !f.releaseRunsAMigration(ctx, run) {
+		return true
+	}
+	confirmed := f.backupConfirmed(run.ID)
+	if f.externalDatabase(ctx) && !confirmed {
+		f.log.Warn("fleet apply: a migrating step on an operator's own database without a confirmed backup",
+			"run_id", run.ID, "attempt_id", a.ID, "token", "owned-backup-unconfirmed")
+		fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := f.store.FailAttempt(fctx, a.ID, ReasonBackupUnconfirmed,
+			"this release changes the database, and no current backup of your own database was confirmed. "+
+				"Quasar never dumps an operator's database: take a backup with your own tools, then update again, confirming it. Nothing was changed"); err != nil {
+			f.log.Error("fleet apply: could not record the failure", "attempt_id", a.ID, "err", err)
+		}
+		return false
+	}
+	if c, ok := f.self.(backupConfirmer); ok && confirmed {
+		c.ConfirmExternalBackup(a.ID)
+	}
+	return true
+}
+
 func (f *FleetRunner) failAttempt(attemptID, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1205,7 +1284,7 @@ func (f *FleetRunner) hostPhase(ctx context.Context, run ApplyRun) bool {
 				"could not record the scheduling state of "+nodeName(t)+" before updating it")
 			return false
 		}
-		attempt, err := f.createHostAttempt(ctx, run, hostID)
+		attempt, err := f.createHostAttempt(ctx, run, hostID, view)
 		if errors.Is(err, ErrAttemptInFlight) {
 			// The run is not applying to this host after all: another attempt
 			// owns it, and owns its scheduling state too. Undo what the step
@@ -1279,6 +1358,15 @@ func (f *FleetRunner) createControlPlaneAttempt(ctx context.Context, run ApplyRu
 	if err != nil {
 		return Attempt{}, err
 	}
+	// ADR 0008: on an owned machine its recovery actor first, when it is not on
+	// the release.
+	var actorCommit *string
+	if f.ownMachine != nil {
+		if own, ok := f.ownMachine.Read(ctx); ok {
+			actorCommit = own.Identity.RecoveryActorSourceCommit
+		}
+	}
+	components = OrderControlPlaneComponents(components, release.SourceCommit, f.ownedControlPlane(), actorCommit)
 	if len(components) == 0 {
 		return Attempt{}, fmt.Errorf("release %s names no control-plane image", releaseLabel(release))
 	}
@@ -1295,7 +1383,7 @@ func (f *FleetRunner) createControlPlaneAttempt(ctx context.Context, run ApplyRu
 	})
 }
 
-func (f *FleetRunner) createHostAttempt(ctx context.Context, run ApplyRun, hostID string) (Attempt, error) {
+func (f *FleetRunner) createHostAttempt(ctx context.Context, run ApplyRun, hostID string, view View) (Attempt, error) {
 	release, err := f.store.Release(ctx, run.ReleaseID)
 	if err != nil {
 		return Attempt{}, err
@@ -1304,6 +1392,9 @@ func (f *FleetRunner) createHostAttempt(ctx context.Context, run ApplyRun, hostI
 	if err != nil {
 		return Attempt{}, err
 	}
+	// ADR 0008: the host's recovery actor first, when it is not on the release.
+	host := hostIdentity(view, hostID)
+	components = OrderHostComponents(components, release.SourceCommit, host, f.machineShape.SharesMachineWith(host.NodeName))
 	if len(components) == 0 {
 		return Attempt{}, fmt.Errorf("release %s names no node-agent image", releaseLabel(release))
 	}
@@ -1343,6 +1434,9 @@ func (f *FleetRunner) finish(runID, state, errText string) {
 	// Every terminal transition comes through here, which is what makes the
 	// fleet cordon impossible to leak.
 	defer f.settleCordons(context.Background(), runID)
+	f.mu.Lock()
+	delete(f.confirmed, runID)
+	f.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := f.store.FinishRun(ctx, runID, state, errText); err != nil {
