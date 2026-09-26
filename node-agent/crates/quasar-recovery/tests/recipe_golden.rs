@@ -154,7 +154,7 @@ fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
         (Role::NodeAgent, 3),
         (Role::RecoveryActor, 2),
         (Role::ControlPlane, 0),
-        (Role::ControlPlane, 2),
+        (Role::ControlPlane, 3),
         (Role::Postgres, 2),
     ] {
         assert_eq!(
@@ -371,7 +371,55 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
     check("control-plane-r1-control-only-external.json", &spec);
     let spec = render(Role::NodeAgent, 2, &owned, &agent, &local_agent_secrets()).unwrap();
     check("node-agent-r2-combined-amd.json", &spec);
+
+    // Revision 2 (#365): Add host's install-time images are fallbacks below the installed
+    // release, and only the operator's overrides reach QUASAR_ENROLL_*.
+    let mut enrolling = owned.clone();
+    enrolling.enroll = quasar_recovery::recipe::EnrollImages {
+        seed: Some(ImageRef::parse(ACTOR_IMAGE).unwrap()),
+        agent: Some(agent.clone()),
+        agent_override: Some(ImageRef::parse(OVERRIDE_AGENT_IMAGE).unwrap()),
+        ..Default::default()
+    };
+    let spec = render(
+        Role::ControlPlane,
+        2,
+        &enrolling,
+        &cp,
+        &control_secrets(true),
+    )
+    .unwrap();
+    check("control-plane-r2-combined.json", &spec);
+    assert_eq!(spec.env["QUASAR_ENROLL_SEED_IMAGE"], "");
+    assert_eq!(spec.env["QUASAR_ENROLL_AGENT_IMAGE"], OVERRIDE_AGENT_IMAGE);
+    assert_eq!(spec.env["QUASAR_ENROLL_FALLBACK_SEED_IMAGE"], ACTOR_IMAGE);
+    assert_eq!(spec.env["QUASAR_ENROLL_FALLBACK_AGENT_IMAGE"], AGENT_IMAGE);
+    let spec = render(
+        Role::ControlPlane,
+        2,
+        &control_only,
+        &cp,
+        &control_secrets(false),
+    )
+    .unwrap();
+    check("control-plane-r2-control-only-external.json", &spec);
+
+    // Revision 1 has no fallback variables: an override, else the install-time image.
+    let spec = render(
+        Role::ControlPlane,
+        1,
+        &enrolling,
+        &cp,
+        &control_secrets(true),
+    )
+    .unwrap();
+    assert_eq!(spec.env["QUASAR_ENROLL_SEED_IMAGE"], ACTOR_IMAGE);
+    assert_eq!(spec.env["QUASAR_ENROLL_AGENT_IMAGE"], OVERRIDE_AGENT_IMAGE);
+    assert!(!spec.env.contains_key("QUASAR_ENROLL_FALLBACK_SEED_IMAGE"));
 }
+
+const OVERRIDE_AGENT_IMAGE: &str =
+    "registry.example.invalid/dev/quasar-node-agent@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 #[test]
 fn a_gpu_hosts_agent_has_the_same_shape_at_revisions_1_and_2() {

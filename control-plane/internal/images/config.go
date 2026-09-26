@@ -47,6 +47,11 @@ func (c ImageConfig) Label(name string) string { return strings.TrimSpace(c.Labe
 // named it. Never retried into a success.
 var ErrDigestMismatch = errors.New("registry content does not match its digest")
 
+// ErrRegistryNotFound: the registry answered 404, so the reference names nothing
+// there (an image that was never published under that tag). Any other failure is
+// not this: an outage never reads as "not published".
+var ErrRegistryNotFound = errors.New("not found at the registry")
+
 // ImageInspector is what a caller depends on; RegistryResolver implements it.
 type ImageInspector interface {
 	InspectConfig(ctx context.Context, ref string) (ImageConfig, error)
@@ -264,6 +269,9 @@ func (r *RegistryResolver) tryGet(ctx context.Context, url, accept, token string
 			return nil, ch, nil
 		}
 		return nil, "", fmt.Errorf("get %s: unauthorized", url)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, "", fmt.Errorf("get %s: status 404: %w", url, ErrRegistryNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("get %s: status %d", url, resp.StatusCode)

@@ -223,6 +223,7 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 		ImageFor:              imageFor,
 		EdgeBranch:            edgeBranch,
 		ControlPlane:          buildinfo.Get(),
+		Floor:                 buildinfo.DeclaredFloor(),
 		ControlPlaneMachine:   h.machine(ctx),
 		Hosts:                 hosts,
 		Releases:              releases,

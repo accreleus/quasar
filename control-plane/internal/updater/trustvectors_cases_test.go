@@ -639,6 +639,8 @@ type evidenceCase struct {
 	version      *string
 	responses    map[string]assetResponse
 	prefix       string
+	// 2: the recovery actor's format-2 asset pair (amendment 14); 0 is the updater's.
+	assetFormat int
 }
 
 func evidenceCases(t *testing.T) []evidenceCase {
@@ -691,6 +693,19 @@ func evidenceCases(t *testing.T) []evidenceCase {
 		{name: "0.0.0 is a release version", source: "added: signature_source.go versionRe", version: strptr("0.0.0"),
 			responses: map[string]assetResponse{tvURL("0.0.0", SignatureAssetName): tvOK(sigDoc), tvURL("0.0.0", ManifestAssetName): tvOK(m)}},
 	}
+	// The recovery actor reads the format-2 pair; a release publishing only it is signed
+	// or unsigned by that pair alone, and the format-1 pair beside it is never read.
+	v2Sig, v2Manifest := tvURL("0.3.0", SignatureAssetNameV2), tvURL("0.3.0", ManifestAssetNameV2)
+	cases = append(cases,
+		evidenceCase{name: "format 2: both assets present", source: "added: the recovery actor fetches the v2 pair (control-api.md amendment 14)",
+			version: strptr("0.3.0"), assetFormat: 2, responses: map[string]assetResponse{v2Sig: tvOK(sigDoc), v2Manifest: tvOK(m)}},
+		evidenceCase{name: "format 2: no v2 signature is an absence even beside a format-1 pair", source: "added: the recovery actor fetches the v2 pair",
+			version: strptr("0.3.0"), assetFormat: 2, responses: map[string]assetResponse{v2Manifest: tvOK(m), tvSigURL: tvOK(sigDoc), tvManifestURL: tvOK(m)}},
+		evidenceCase{name: "format 2: a v2 signature with no v2 manifest is a failure", source: "added: the recovery actor fetches the v2 pair",
+			version: strptr("0.3.0"), assetFormat: 2, responses: map[string]assetResponse{v2Sig: tvOK(sigDoc), tvManifestURL: tvOK(m)}},
+		evidenceCase{name: "format 1: a v2-only release reads as unsigned to the updater", source: "added: the updater keeps the format-1 pair until it retires (#367)",
+			version: strptr("0.3.0"), responses: map[string]assetResponse{v2Sig: tvOK(sigDoc), v2Manifest: tvOK(m)}},
+	)
 	for _, v := range []string{"../../etc/passwd", "0.3.0/../..", "0.3.0?x=1", "latest", "v0.3.0", "0.3.0 0.4.0", "0.3.0%2f", "01.2.3"} {
 		cases = append(cases, evidenceCase{name: "refused version " + v, source: tvSource + "TestEvidenceRefusesAVersionItWillNotPutInAURL", version: strptr(v), responses: both})
 	}
@@ -922,7 +937,7 @@ func generateTrustVectors(t *testing.T) map[string][]byte {
 	// evidence
 	var evs []any
 	for _, c := range evidenceCases(t) {
-		v := evidenceVector{Name: c.name, Source: c.source, Version: c.version, Fetch: fetchSpec{BaseURL: tvBase, Responses: c.responses}}
+		v := evidenceVector{Name: c.name, Source: c.source, Version: c.version, Fetch: fetchSpec{BaseURL: tvBase, Responses: c.responses, AssetFormat: c.assetFormat}}
 		got := goEvidence(t, v)
 		// Keep a large body in its compact spelling.
 		for _, r := range c.responses {

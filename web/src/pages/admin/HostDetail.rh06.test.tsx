@@ -126,6 +126,7 @@ beforeEach(() => {
       hosts: [],
     },
   } as never);
+  mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] } as never);
   mocked.drainHost.mockResolvedValue({ host: host({ status: "draining" }) } as never);
   mocked.uncordonHost.mockResolvedValue({ host: host() } as never);
   mocked.removePlatformHost.mockResolvedValue({ host: host({ status: "draining" }) } as never);

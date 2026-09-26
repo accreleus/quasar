@@ -8,9 +8,10 @@
 # Alpine rather than scratch because the contract's assertions run in a shell inside the
 # image. TLS roots are compiled in (webpki-roots), so no CA bundle ships.
 
-ARG RUST_VERSION=1.94.0
-
-FROM rust:${RUST_VERSION}-alpine AS build
+# Bases are digest-pinned, as release preflight requires of a release artifact
+# (scripts/release/release-manifest.json). rust:1.94.0-alpine, the RUST_VERSION of
+# deploy/pins.env:
+FROM rust@sha256:ff0adc35894eb79586ce752a1b5a9eadc88b938c56d8f2b4b537b6258ff3fa10 AS build
 RUN apk add --no-cache musl-dev
 COPY node-agent /src/node-agent
 ARG SOURCE_COMMIT=unknown
@@ -21,7 +22,8 @@ RUN cd /src/node-agent \
        cargo build --release --locked -p quasar-recovery --bin quasar-recovery \
     && install -Dm0755 target/release/quasar-recovery /out/quasar-recovery
 
-FROM alpine:3.22 AS runtime
+# alpine:3.22
+FROM alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS runtime
 COPY --from=build /out/quasar-recovery /usr/local/bin/quasar-recovery
 
 # Healthy while the actor serves its agent socket.

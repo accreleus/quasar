@@ -237,8 +237,12 @@ pub(super) fn postgres_r1(
 
 /// The control plane, revision 1: `quasar-control-plane` of `deploy/docker-compose.yml`
 /// with its database password and secret key as files, the control socket in place of the
-/// updater's volume, and, on a combined host, the local enrollment token.
-pub(super) fn control_plane_r1(
+/// updater's volume, and, on a combined host, the local enrollment token. Revision 2 (#365)
+/// changes Add host's images only: `QUASAR_ENROLL_*` carry just the operator's overrides and
+/// the install-time images move to `QUASAR_ENROLL_FALLBACK_*`, below the installed
+/// release's. Revision 1 gives an override, else the install-time image, as before.
+pub(super) fn control_plane(
+    revision: u32,
     inputs: &Inputs,
     image: &ImageRef,
     secrets: &SecretMounts,
@@ -312,24 +316,6 @@ pub(super) fn control_plane_r1(
             inputs.trust.insecure_registries.clone().unwrap_or_default(),
         ),
         (
-            "QUASAR_ENROLL_SEED_IMAGE",
-            inputs
-                .enroll
-                .seed
-                .as_ref()
-                .map(ImageRef::reference)
-                .unwrap_or_default(),
-        ),
-        (
-            "QUASAR_ENROLL_AGENT_IMAGE",
-            inputs
-                .enroll
-                .agent
-                .as_ref()
-                .map(ImageRef::reference)
-                .unwrap_or_default(),
-        ),
-        (
             "QUASAR_TRUSTED_PROXIES",
             control.trusted_proxies.clone().unwrap_or_default(),
         ),
@@ -345,6 +331,35 @@ pub(super) fn control_plane_r1(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
+    let reference = |i: Option<&ImageRef>| i.map(ImageRef::reference).unwrap_or_default();
+    let e = &inputs.enroll;
+    if revision >= 2 {
+        env.insert(
+            "QUASAR_ENROLL_SEED_IMAGE".into(),
+            reference(e.seed_override.as_ref()),
+        );
+        env.insert(
+            "QUASAR_ENROLL_AGENT_IMAGE".into(),
+            reference(e.agent_override.as_ref()),
+        );
+        env.insert(
+            "QUASAR_ENROLL_FALLBACK_SEED_IMAGE".into(),
+            reference(e.seed.as_ref()),
+        );
+        env.insert(
+            "QUASAR_ENROLL_FALLBACK_AGENT_IMAGE".into(),
+            reference(e.agent.as_ref()),
+        );
+    } else {
+        env.insert(
+            "QUASAR_ENROLL_SEED_IMAGE".into(),
+            reference(e.seed_override.as_ref().or(e.seed.as_ref())),
+        );
+        env.insert(
+            "QUASAR_ENROLL_AGENT_IMAGE".into(),
+            reference(e.agent_override.as_ref().or(e.agent.as_ref())),
+        );
+    }
     if !inputs.home_root.is_empty() {
         env.insert("QUASAR_HOME_ROOT".into(), inputs.home_root.clone());
     }

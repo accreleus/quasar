@@ -136,6 +136,13 @@ pub enum Role {
 }
 
 impl Role {
+    pub const ALL: [Role; 4] = [
+        Role::ControlPlane,
+        Role::NodeAgent,
+        Role::Postgres,
+        Role::RecoveryActor,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Role::ControlPlane => "control-plane",
@@ -146,14 +153,7 @@ impl Role {
     }
 
     pub fn parse(s: &str) -> Option<Role> {
-        [
-            Role::ControlPlane,
-            Role::NodeAgent,
-            Role::Postgres,
-            Role::RecoveryActor,
-        ]
-        .into_iter()
-        .find(|r| r.as_str() == s)
+        Role::ALL.into_iter().find(|r| r.as_str() == s)
     }
 
     /// The container name the actor gives this role.
@@ -330,13 +330,19 @@ pub const APP_NETWORKS: &[&str] = &["none", "bridge", "host"];
 
 /// The images a control plane's Add host (#359) installs on a new GPU host, by digest
 /// (`repository@sha256:…`): the seed (this machine's recovery image) and the node agent.
-/// Recorded at install; `None` serves none.
+/// Recorded at install; `None` serves none. `seed`/`agent` are the install-time images, the
+/// control plane's last resort; `*_override` are the operator's `QUASAR_ENROLL_*` seed
+/// inputs, which win over the installed release's images (#365).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EnrollImages {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<ImageRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<ImageRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_override: Option<ImageRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_override: Option<ImageRef>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -559,7 +565,9 @@ impl Book {
             // agent is given. A GPU host's agent has the same shape at both.
             Role::NodeAgent => Some(1..=2),
             Role::RecoveryActor => Some(1..=revision::RECIPE_REVISION),
-            Role::ControlPlane => Some(1..=1),
+            // Revision 2: Add host's images arrive as operator overrides plus install-time
+            // fallbacks, so the installed release's images can come between (#365).
+            Role::ControlPlane => Some(1..=2),
             // The Postgres image carries no recipe label: its revision is this actor's own
             // (`control::POSTGRES_REVISION`).
             Role::Postgres => Some(1..=1),
@@ -568,6 +576,23 @@ impl Book {
 
     pub fn supports(role: Role, revision: u32) -> bool {
         Book::window(role).is_some_and(|w| w.contains(&revision))
+    }
+
+    /// Every role's window as one JSON line, a role with none omitted. The shape
+    /// `scripts/release/check-release-compatibility.sh` reads from `quasar-recovery recipes`.
+    pub fn windows_json() -> String {
+        let windows: serde_json::Map<String, serde_json::Value> = Role::ALL
+            .into_iter()
+            .filter_map(|role| {
+                Book::window(role).map(|w| {
+                    (
+                        role.as_str().to_string(),
+                        serde_json::json!({ "from": w.start(), "to": w.end() }),
+                    )
+                })
+            })
+            .collect();
+        serde_json::json!({ "format_version": 1, "windows": windows }).to_string()
     }
 }
 
@@ -603,7 +628,7 @@ pub fn render(
             spec
         }
         Role::RecoveryActor => recovery_actor_r1(inputs, image),
-        Role::ControlPlane => control::control_plane_r1(inputs, image, secrets)?,
+        Role::ControlPlane => control::control_plane(revision, inputs, image, secrets)?,
         Role::Postgres => control::postgres_r1(inputs, image, secrets)?,
     };
     spec.labels.extend([
@@ -959,5 +984,39 @@ fn recovery_actor_r1(inputs: &Inputs, image: &ImageRef) -> ContainerSpec {
         restart: RestartPolicy::UnlessStopped,
         ports: Vec::new(),
         healthcheck: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_json_is_one_line_with_every_window() {
+        let line = Book::windows_json();
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.starts_with(r#"{"format_version":1,"windows":{"control-plane":{"from":"#),
+            "{line}"
+        );
+        let doc: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(doc.as_object().unwrap().len(), 2, "{line}");
+        assert_eq!(doc["format_version"], 1);
+        let windows = doc["windows"].as_object().unwrap();
+        let mut carried = 0;
+        for role in Role::ALL {
+            match Book::window(role) {
+                Some(w) => {
+                    carried += 1;
+                    assert_eq!(
+                        windows[role.as_str()],
+                        serde_json::json!({ "from": w.start(), "to": w.end() }),
+                        "{line}"
+                    );
+                }
+                None => assert!(!windows.contains_key(role.as_str()), "{line}"),
+            }
+        }
+        assert_eq!(windows.len(), carried, "{line}");
     }
 }

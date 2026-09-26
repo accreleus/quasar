@@ -40,6 +40,8 @@ export interface HostExpansionProps {
   actionError?: string;
   /** The control plane's own identity: whether this host shares its machine. */
   controlPlane?: PlatformIdentity | null;
+  /** Below the floor: no local console or settings are offered. */
+  belowFloor?: boolean;
   now: number;
 }
 
@@ -52,6 +54,7 @@ export function HostExpansion({
   gpuError,
   actionError,
   controlPlane,
+  belowFloor = false,
   now,
 }: HostExpansionProps) {
   const util = utilisation(host, gpus);
@@ -260,12 +263,16 @@ export function HostExpansion({
             <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}`}>
               Open host
             </Link>
-            <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/console`}>
-              Local console
-            </Link>
-            <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/settings`}>
-              Host settings
-            </Link>
+            {!belowFloor && (
+              <>
+                <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/console`}>
+                  Local console
+                </Link>
+                <Link className="btn btn-sm btn-ghost" to={`/admin/fleet/hosts/${host.id}/settings`}>
+                  Host settings
+                </Link>
+              </>
+            )}
           </div>
         </div>
       </div>

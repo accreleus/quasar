@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "windows": {
+    "node-agent": {
+      "from": 1,
+      "to": 2
+    },
+    "postgres": {
+      "from": 1,
+      "to": 1
+    },
+    "recovery-actor": {
+      "from": 1,
+      "to": 1
+    }
+  }
+}

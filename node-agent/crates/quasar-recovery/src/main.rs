@@ -10,7 +10,7 @@ use std::time::Duration;
 use quasar_recovery::actor::{Actor, ActorConfig, TrustConfig};
 use quasar_recovery::bootstrap::Bootstrap;
 use quasar_recovery::engine::DockerEngine;
-use quasar_recovery::recipe::paths;
+use quasar_recovery::recipe::{paths, Book};
 use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
 use quasar_recovery::socket::{Request, State};
 use quasar_recovery::trust::{self, SignatureEvidence};
@@ -46,7 +46,9 @@ commands:
               --force-again                         restore a dump that was already
                                                     restored (discards what was written
                                                     since then)
-  version   print this build's version and commit";
+  version   print this build's version and commit
+  recipes   print the recipe revisions this build renders, per role, as one JSON line
+            (read by scripts/release/check-release-compatibility.sh)";
 
 /// In the seed's own container only: what its last look came to, for the health check.
 const SEED_STATUS_FILE: &str = "/tmp/quasar-seed.status";
@@ -75,6 +77,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("restore") => restore(&args[1..]),
+        // No machine state, socket or engine: the release job runs it with `--network none`.
+        Some("recipes") => {
+            println!("{}", Book::windows_json());
+            ExitCode::SUCCESS
+        }
         Some("uninstall") => uninstall(&args[1..]),
         Some("reconfigure") => reconfigure(&args[1..]),
         Some("help") | Some("-h") | Some("--help") => {

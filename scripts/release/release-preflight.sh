@@ -214,7 +214,8 @@ for artifact in manifest["artifacts"]:
 
 release_images = []
 for env_name, artifact in (("QUASAR_CONTROL_IMAGE", "quasar-control"),
-                           ("QUASAR_AGENT_IMAGE", "quasar-agent")):
+                           ("QUASAR_AGENT_IMAGE", "quasar-agent"),
+                           ("QUASAR_RECOVERY_IMAGE", "quasar-recovery")):
     image = os.environ.get(env_name)
     item = {"artifact": artifact, "environment": env_name, "image": image}
     if image:
