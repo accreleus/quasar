@@ -1798,8 +1798,10 @@ automatically (ADR 0004 amendment):
 - If the new control plane does not verify, the old one stays kept and disabled. On Quasar's
   own database the new one is left as it is (it matches the migrated schema, and serves the
   console if it can; the restore stops it). On the operator's own database it is stopped with
-  its restart disabled (removed if it never started): left running, its next boot would
-  migrate the backup the operator restores. The attempt ends `failed`, names its dump
+  its restart disabled: left running, its next boot would migrate the backup the operator
+  restores. On either, one that never started is removed, since the actor's next start would
+  otherwise start it and run its migration outside the update. A finished attempt's journal
+  keeps only the request fields an older actor reads. The attempt ends `failed`, names its dump
   (`pre_update_dump`), and its output and the actor's log
   (`token="actor-migrating-control-plane-failed"`, field `restore`) end with the one command to
   go back, run on that machine:

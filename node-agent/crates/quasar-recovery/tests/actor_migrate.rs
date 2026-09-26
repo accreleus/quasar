@@ -1202,3 +1202,95 @@ fn only_the_operator_socket_takes_a_restore() {
     assert_eq!(code, 400, "{answer}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The request fields #364 added, as a finished journal stores its request: none, so an
+/// older actor, whose `Request` denies unknown fields, reads it.
+fn stored_request_keys(m: &Machine, id: &str) -> Vec<String> {
+    let raw = std::fs::read(m.dir.path().join("journal").join(format!("{id}.json"))).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    v["request"].as_object().unwrap().keys().cloned().collect()
+}
+
+#[test]
+fn a_finished_journal_stores_only_the_request_an_older_actor_reads() {
+    let m = Machine::install(combined_env(), false);
+    let failed = apply(&m.actor(), update(ID, 81));
+    assert_eq!(failed.state, State::Failed);
+    // The restore command it fed is in the output all the same.
+    assert!(
+        last_line(&failed.output).ends_with("--to 0.80.0"),
+        "{}",
+        failed.output
+    );
+    let keys = stored_request_keys(&m, ID);
+    assert!(!keys.iter().any(|k| k == "from_version"), "{keys:?}");
+
+    let dump = failed.dump.unwrap();
+    assert_eq!(
+        run_restore(&m.actor(), restore_request(&nth_id(2), Some(&dump), None)).state,
+        State::Succeeded
+    );
+    let again = run_restore(
+        &m.actor(),
+        restore::request_again(nth_id(3), Some(dump), None, true),
+    );
+    assert_eq!(again.state, State::Succeeded, "{again:?}");
+    let keys = stored_request_keys(&m, &nth_id(3));
+    assert!(!keys.iter().any(|k| k == "force_again"), "{keys:?}");
+    assert_eq!(journal_format(&m, &nth_id(3)), 1);
+}
+
+#[test]
+fn a_migrating_control_plane_that_never_started_is_removed_on_quasars_own_database() {
+    let m = Machine::install(combined_env(), false);
+    m.engine.with_state(|s| {
+        s.behaviour.insert(
+            control_image(81),
+            Behaviour {
+                refuse_start: Some("the engine refused the start".into()),
+                ..Default::default()
+            },
+        );
+    });
+    let result = apply(&m.actor(), update(ID, 81));
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert_eq!(result.reason, Some(Reason::NeverStarted), "{result:?}");
+    assert!(
+        result.output.contains("It was removed"),
+        "{}",
+        result.output
+    );
+    let dump = result.dump.clone().expect("the dump was taken first");
+    assert!(
+        last_line(&result.output)
+            .starts_with("docker exec quasar-recovery quasar-recovery restore --dump"),
+        "{}",
+        result.output
+    );
+    let leftover = |m: &Machine| {
+        m.engine
+            .state()
+            .containers
+            .values()
+            .any(|c| c.spec.image == control_image(81))
+    };
+    assert!(
+        !leftover(&m),
+        "the created control plane is left for a resume to start"
+    );
+    // A restart starts nothing that would migrate the database outside the attempt.
+    m.engine.restart_daemon();
+    let _ = m.actor().resume();
+    assert!(!leftover(&m));
+    assert_eq!(m.db().schema_version, OLD_SCHEMA, "no migration ran");
+    m.never_an_older_control_plane("after the restart");
+
+    // The printed restore is the way back.
+    let back = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(2), Some(&dump), Some("0.80.0")),
+    );
+    assert_eq!(back.state, State::Succeeded, "{back:?}");
+    assert_eq!(m.control_plane().spec.image, control_image(OLD_SCHEMA));
+    assert_eq!(m.control_plane().status, "running");
+}

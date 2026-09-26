@@ -9,7 +9,7 @@
 
 import type { PlatformApplyAttempt, PlatformRelease, PlatformReleaseView } from "../../../api/types";
 import { Card } from "../../../components/Card";
-import { dumpTakenAt, machineName, type FailedMigration } from "./migratingUpdate";
+import { machineName, type FailedMigration } from "./migratingUpdate";
 import { prefixed, releaseLabel, shortDigest, stamp } from "./releasesCopy";
 import { Snippet } from "./Snippet";
 
@@ -81,6 +81,13 @@ export function RefusedBanner({
   );
 }
 
+/** An instant beside the card's own date line: its time alone on the same UTC day
+ *  ("14:02", as the mock writes it), else the full stamp. */
+function besideCardTime(iso: string, card: string): string {
+  const [date, time] = stamp(iso).split(", ");
+  return time != null && date === stamp(card).split(", ")[0] ? time : stamp(iso);
+}
+
 export function RestoreCard({ view, failed }: { view: PlatformReleaseView; failed: FailedMigration }) {
   const { attempt, variant, command, release, previous } = failed;
   const machine = machineName(view);
@@ -94,7 +101,10 @@ export function RestoreCard({ view, failed }: { view: PlatformReleaseView; faile
 
   let body;
   if (variant === "own") {
-    const taken = dumpTakenAt(attempt.pre_update_dump);
+    // The dump is taken within the attempt, before the old control plane stops, so the
+    // attempt's start is when it was taken, to the minute. `pre_update_dump` itself is
+    // displayed and never parsed (amendment 14).
+    const taken = attempt.started_at ? besideCardTime(attempt.started_at, attempt.finished_at ?? attempt.created_at) : null;
     body = (
       <>
         <p className="rel-alert-body">
@@ -103,14 +113,14 @@ export function RestoreCard({ view, failed }: { view: PlatformReleaseView; faile
           the control plane, loads the dump{" "}
           {taken ? (
             <>
-              taken at {stamp(taken)} &mdash; before the migration, under {back} &mdash;
+              taken at {taken} &mdash; before the migration, under {back} &mdash;
             </>
           ) : (
             "taken before the migration"
           )}{" "}
           into Quasar&rsquo;s database, and starts {back} again.{" "}
           {taken
-            ? `Anything written after ${stamp(taken)} is lost.`
+            ? `Anything written after ${taken} is lost.`
             : "Anything written since that dump was taken is lost."}
         </p>
         <Snippet

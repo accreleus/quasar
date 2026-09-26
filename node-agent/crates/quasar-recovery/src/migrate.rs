@@ -403,9 +403,11 @@ impl Actor {
         // restart policy it would migrate their restored backup again on its next boot.
         // It never verified, so nothing is lost. Quasar's own database is stopped by the
         // restore itself, so the new control plane stays up there (and serves the console).
-        // One that never started is removed instead: an install's resume starts a container
-        // it finds only created.
-        let stopped = match (&new, external) {
+        // One that never started is removed, whichever the database: an install's resume
+        // starts a container it finds only created, which would run its migration outside
+        // this attempt with the fleet uncordoned. The dump (or the operator's backup) and
+        // the floor make the printed restore the way back.
+        let stopped = match (&new, external || !started) {
             (Some(id), true) => match self.stop_failed(id, started) {
                 Err(EngineError::Crashed) => return Err(()),
                 other => Some(other),
@@ -421,9 +423,13 @@ impl Actor {
             None if started => output.push_str(" The new one is left as it is."),
             None => {}
             Some(Ok(())) if started => output.push_str(" The new one is stopped with its restart disabled, so it does not migrate your database again."),
-            Some(Ok(())) => output.push_str(" It was removed, so nothing starts it against your database."),
-            Some(Err(e)) => output.push_str(&format!(
+            Some(Ok(())) => output.push_str(" It was removed, so nothing starts it outside this update."),
+            Some(Err(e)) if started => output.push_str(&format!(
                 " The new one could not be stopped ({e}): stop it yourself (docker stop {}) before you restore your backup, or its next start migrates the database again.",
+                names::CONTROL_PLANE
+            )),
+            Some(Err(e)) => output.push_str(&format!(
+                " The new one could not be removed ({e}): remove it yourself (docker rm {}), or the recovery actor's next start runs its migration.",
                 names::CONTROL_PLANE
             )),
         }

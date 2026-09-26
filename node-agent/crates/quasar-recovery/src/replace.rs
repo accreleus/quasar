@@ -179,6 +179,12 @@ impl Actor {
                 step.phase = Phase::Done;
             }
         }
+        // A finished journal is read by whatever actor runs next, an older one included,
+        // whose `Request` denies unknown fields: the request fields #364 added are dropped
+        // here, once nothing reads them. The restore command they fed is already in the
+        // output, and the restore point holds what a restore needs.
+        j.request.from_version = None;
+        j.request.force_again = false;
         let now = self.now();
         j.result.state = state;
         j.result.reason = reason;

@@ -21,7 +21,6 @@ import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { FleetApplyButton } from "./FleetApply";
 import { ReleasesTab } from "./ReleasesTab";
-import { dumpTakenAt } from "./migratingUpdate";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
@@ -324,10 +323,10 @@ describe("Releases after a migrating control-plane update went wrong", () => {
     expect(card).toHaveTextContent("Update failed");
     expect(card).toHaveTextContent("v0.6.0 failed after changing the database");
     expect(card).toHaveTextContent("To go back to v0.5.2, run this on living-room-pc.");
-    // The dump's time, read from its name, as the mock says it.
-    // The month's short form is the ICU data's ("Sep" or "Sept").
-    expect(card).toHaveTextContent(/loads the dump taken at 25 Sept? 2026, 14:02 — before the migration, under v0\.5\.2 —/);
-    expect(card).toHaveTextContent(/Anything written after 25 Sept? 2026, 14:02 is lost\./);
+    // When the dump was taken is the attempt's start, never parsed from the dump's name.
+    // On the card's own day, the time alone, as the mock writes it.
+    expect(card).toHaveTextContent("loads the dump taken at 14:01 — before the migration, under v0.5.2 —");
+    expect(card).toHaveTextContent("Anything written after 14:01 is lost.");
     expect(within(card).getByTestId("restore-command")).toHaveTextContent(OWN_CMD);
     expect(card).toHaveTextContent("Run on living-room-pc as root");
     expect(within(card).getByRole("button", { name: "Copy restore command" })).toBeInTheDocument();
@@ -436,11 +435,3 @@ describe("Developer apply of a control-plane digest (#364 Database section)", ()
   });
 });
 
-describe("dumpTakenAt", () => {
-  it("reads the time from the recovery actor's dump names only", () => {
-    expect(dumpTakenAt("20260925T140200Z-schema-88")).toBe("2026-09-25T14:02:00Z");
-    expect(dumpTakenAt("20260925T140200Z-schema-88-7a1f6f1e")).toBe("2026-09-25T14:02:00Z");
-    expect(dumpTakenAt("2026-09-25T1402Z-schema-88")).toBeNull();
-    expect(dumpTakenAt(null)).toBeNull();
-  });
-});

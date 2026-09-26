@@ -160,15 +160,6 @@ export function failedMigration(
   return { attempt, variant, command, release, previous };
 }
 
-/** When a pre-update dump was taken, from its name (`20260925T140200Z-schema-88`, the
- *  recovery actor's `dump_dir.rs` format), as an ISO instant; null for any other name. */
-export function dumpTakenAt(name: string | null | undefined): string | null {
-  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-schema-\d+(-[0-9a-f]{8})?$/.exec(name ?? "");
-  if (!m) return null;
-  const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
-  return Number.isNaN(new Date(iso).getTime()) ? null : iso;
-}
-
 /** The attempts list is newest first; the most recent control-plane attempt, if any. */
 export function latestControlPlaneAttempt(
   attempts: PlatformApplyAttempt[],
