@@ -1921,7 +1921,7 @@ command, with the image, to run next.
   installation it finds, from its containers, its labelled volumes or machine state, with the
   seed's image when the installed recovery actor predates `uninstall`.
 
-### Changing machine inputs: `reconfigure` (#366)
+### Changing machine inputs: `reconfigure` (#366, #386)
 
 Run inside the recovery actor, which holds the machine's lease:
 
@@ -1930,32 +1930,86 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --dry-run QUASAR_HOM
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
 ```
 
-It takes the seed's variable names: `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`, the release
-trust (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
+It takes the seed's variable names. On every machine, the release trust
+(`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
 `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`,
-`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
-`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`. An empty value unsets an
-optional one. The role, node name, database and images are fixed at install (images move by an
-update).
+`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`). On a machine with
+a node agent (a GPU host or a combined host), the agent's inputs: `QUASAR_HOME_ROOT`,
+`QUASAR_TEMPLATE_ROOT`, `QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`;
+a control-only machine runs no agent, so it refuses them. On a combined or
+control-only machine also the control plane's inputs: `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_HOSTS`,
+`QUASAR_TRUSTED_PROXIES`, `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT`, `QUASAR_ENROLL_SEED_IMAGE`
+and `QUASAR_ENROLL_AGENT_IMAGE`. An empty value unsets an optional one.
 
 A change is checked as an install would check it, then applied as a replacement with the
 same digests: each service whose container the change moves is replaced, verified, and
-restored if it does not verify, and the new inputs stay only if it succeeded. Re-creating the
-node agent ends that host's sessions, so a change that does needs `--yes`. A change no
-container renders (the signature mode, say) is only recorded. This release re-creates only
-the node agent this way, so it is for GPU hosts: a change that moves the control plane's
-container (anything the control plane renders, including the home root or trust on a combined
-host, and every control-plane-only variable) is refused: control-plane replacement (RH06-11,
-#363) serves updates, and a reconfigure does not drive it yet. `reconfigure.json` records a
-reconfigure in flight; one that cannot be read is never overwritten: reconfigure is refused,
-and the actor's next start sets it aside as `reconfigure.json.unreadable`
-(`token="reconfigure-record-set-aside"`). Machine state then keeps that reconfigure's **new**
-inputs, which the node agent runs only if its replacement succeeded, and the actor logs a
-node agent whose container differs from what it would render. Compare the agent's container
-(`docker inspect quasar-node-agent`) with machine state. A reconfigure changes only values
-that differ from machine state, so to keep the old values reconfigure to them; to keep the new
-ones, reconfigure to the old values and then to the new. Delete
-`reconfigure.json.unreadable` once you are done with it.
+restored if it does not verify. The control plane goes first, then the node agent, because a
+combined host's agent dials the control plane at the loopback of `QUASAR_HTTP_PORT`: a
+combined host's home root or HTTP port moves both. A control plane is verified by its own
+health check, and one that never becomes healthy (a port another process holds, say) is put
+back with its old inputs, as a failed control-plane update is (#363). A change no container
+renders (the signature mode, say) is only recorded. A reconfigure keeps every image, so it is
+never a migration; it is refused while a restore holds the database, and when a service runs
+another image than machine state records for it. Postgres and the recovery actor are never
+replaced by a reconfigure.
+
+The plan says what the change costs before anything moves, and a change that re-creates a
+service needs `--yes`. Re-creating the node agent ends that host's sessions. Re-creating the
+control plane restarts the console and every agent's connection; sessions keep streaming.
+GPU hosts added with Add host dial the HTTPS port their enrollment string names, so after a
+`QUASAR_TLS_PORT` change they stop connecting until they are added again. The control plane
+keeps its certificate (agents pin it), so new `QUASAR_PUBLIC_HOST` and `QUASAR_TLS_HOSTS`
+names reach the certificate only once it is re-issued ("Adding a name to the certificate"
+below).
+
+**Not reconfigurable: the database and the node name.** Changing the database mode (a
+Quasar-owned Postgres or your own database) or the database itself moves data, and a
+reconfigure never moves data: it refuses every `QUASAR_DATABASE_*` variable. To change it,
+reinstall: back the database up, run `quasar-recovery uninstall`, install again with the seed
+and the new database inputs, and load your data into the new database. The node name is the
+machine's identity, which the control plane knows its host by; to change it, reinstall the
+same way (a GPU host is then added again from Add host). The role is fixed the same way, and
+images move by an update.
+
+**How it settles.** `reconfigure.json` in machine state records the inputs before and after,
+and, once settled, its `outcome` (`quasar-recovery reconfigure` prints it; `GET
+/v1/reconfigure` on the operator socket serves it):
+
+| The attempt | Machine state keeps | `outcome.settled` |
+|---|---|---|
+| succeeded | the new inputs | `applied` |
+| failed, interrupted, or never journalled; nothing verified | the old inputs, put back | `put_back` |
+| failed after the control plane verified (the agent did not) | the new inputs, which the control plane runs | `partial`, with `behind: ["node-agent"]` |
+
+`outcome.behind` names every service not on the inputs machine state keeps (a `partial` always
+has one, and a rerun that fails again keeps it). Running the same command again finishes it:
+the values are already in force, and it re-creates only the services left behind. A kill of the recovery actor, or a
+restart of the engine or the machine, at any phase settles on the actor's next start to one of
+these, with one control plane running. A `reconfigure.json` that cannot be read is never
+overwritten: reconfigure is refused, and the actor's next start sets it aside as
+`reconfigure.json.unreadable` (`token="reconfigure-record-set-aside"`). Machine state then
+keeps that reconfigure's **new** inputs, which its services run only if its replacement
+succeeded, and the actor logs a service whose container differs from what it would render.
+Compare the containers (`docker inspect quasar-node-agent quasar-control-plane`) with machine
+state. A reconfigure changes only values that differ from machine state, so to keep the old
+values reconfigure to them; to keep the new ones, reconfigure to the old values and then to
+the new. Delete `reconfigure.json.unreadable` once you are done with it.
+
+#### Adding a name to the certificate
+
+On an owned install the control plane's self-signed pair lives in the `quasar-control-data`
+volume, generated once (`QUASAR_TLS_DIR` above). After reconfiguring `QUASAR_PUBLIC_HOST` or
+`QUASAR_TLS_HOSTS`, re-issue it to put the new names on it:
+
+```sh
+docker exec quasar-control-plane rm -f /var/lib/quasar-control/tls/cert.pem /var/lib/quasar-control/tls/key.pem
+docker restart quasar-control-plane
+```
+
+The new certificate has a new fingerprint: every browser that trusted the old one asks again,
+and every GPU host pinned to the old one stops connecting (`token="cp-tls-pin-mismatch"`)
+until it is added again from Add host. A combined host's own agent dials the loopback and is
+not affected.
 
 ---
 

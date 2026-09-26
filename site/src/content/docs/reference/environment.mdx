@@ -92,10 +92,13 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER
 ```
 
 `reconfigure` also takes `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`,
-`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`. In this
-release it replaces only the node agent, so on the first machine a change that
-moves the control plane (the allowlist, the plain-HTTP registries, and every
-first-machine input above) is refused.
+`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`, and on the
+first machine every control-plane input above: `QUASAR_PUBLIC_HOST`,
+`QUASAR_TLS_HOSTS`, `QUASAR_TRUSTED_PROXIES`, `QUASAR_HTTP_PORT`,
+`QUASAR_TLS_PORT` and the Add host images. Each change replaces the services it
+moves, on the same images, and puts them back if they do not verify. The
+database inputs and the node name are refused: changing them means reinstalling
+(`docs/configuration.md` "Changing machine inputs").
 
 ## Required on a legacy Compose install
 

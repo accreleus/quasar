@@ -314,7 +314,7 @@ on a legacy Compose install, set in the host's `deploy/.env`.
 You see this after repointing an instance at a fork's registry without widening
 the allowlist, or after narrowing it deliberately. On a legacy Compose install,
 set it to the namespace the images actually live in. On an owned machine the
-list is a seed input, recorded at the first install. A GPU host changes it with
+list is a seed input, recorded at the first install. Change it with
 `reconfigure`:
 
 ```bash
@@ -323,7 +323,7 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
 ```
 
 On the first machine the control plane carries the same list, so `reconfigure`
-refuses the change in this release: it is fixed at install. It is matched on path
+replaces the control plane with the new one. It is matched on path
 segment boundaries, so a namespace never admits a lookalike that merely starts
 with the same characters.
 

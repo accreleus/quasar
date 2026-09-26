@@ -200,9 +200,9 @@ never becomes healthy is put back automatically.
   does.
 - The allowlist and the plain-HTTP registries are seed inputs of each machine
   (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
-  recorded at its first install. Decide them before you install a machine you
-  will test on: on the first machine `reconfigure` cannot change them in this
-  release.
+  recorded at its first install, and changed later with `reconfigure` inside
+  that machine's recovery actor. On the first machine that replaces the control
+  plane, which restarts the console for a moment.
 
 <Aside type="caution" title="Multiple hosts must stay version-aligned">
 Upgrade the control plane and every agent host as one planned operation. Brief

@@ -31,9 +31,9 @@ interfaces are Docker bridge addresses, never your host's LAN address. It has to
 be told.
 
 On an owned install the names are the seed's `QUASAR_PUBLIC_HOST` and
-`QUASAR_TLS_HOSTS`, read at the first install and fixed after it in this release:
-browse to a name the certificate has, or put a reverse proxy in front for the
-new one. On a legacy Compose install, add every address you use to
+`QUASAR_TLS_HOSTS`, read at the first install. Browse to a name the certificate
+has, put a reverse proxy in front for the new one, or change them with
+`reconfigure` and re-issue the certificate. On a legacy Compose install, add every address you use to
 `QUASAR_TLS_HOSTS` in `deploy/.env`; if the certificate already exists, delete it
 and let it regenerate. See [HTTPS and certificates](/quasar/network/https/).
 

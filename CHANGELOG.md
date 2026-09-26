@@ -59,6 +59,7 @@ own; the two do not move together, and that is deliberate.
   GPU host is added back with Add host under the same node name. The agent re-registers when
   its recovery actor's reported identity changes, so the console sees a seed go missing or
   come back without an agent restart.
+- **`reconfigure` changes the control plane's inputs (#386).** On a combined or control-only machine, `quasar-recovery reconfigure` changes the public host, TLS names, ports, trusted proxies, release trust and a combined host's home root by replacing the control plane on the same digest (then the node agent where it moves too), restoring it with the old inputs if it never becomes healthy; `reconfigure.json` records how it settled, and the database and node name are refused, naming the reinstall.
 - **Add host carries the control plane's release trust (#366).** The one-line command and the
   Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
   `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane

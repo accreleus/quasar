@@ -71,8 +71,8 @@ install. Install a product-lane machine with the test registry already in them:
 ```
 
 The engine that pulls the images also needs a plain-HTTP registry in its own
-`insecure-registries`. A GPU host can widen its list later with `reconfigure`;
-the first machine cannot in this release. The rules are under [Developer
+`insecure-registries`. Any machine can widen its list later with `reconfigure`;
+on the first machine that replaces the control plane. The rules are under [Developer
 apply](/quasar/operations/upgrading/#developer-apply).
 
 A machine is in one lane at a time. Move a shared test host between lanes
