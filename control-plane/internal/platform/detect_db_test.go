@@ -69,22 +69,28 @@ func (f *fakeSource) CompareURL(from, to string) string {
 	return "https://github.com/accreleus/quasar/compare/" + from + "..." + to
 }
 
+// A format-2 manifest: the only one detection reads (amendment 14's contract step).
 func manifestFor(version, commit string, schema int, built string) string {
 	return fmt.Sprintf(`{
-	  "format_version": 1, "version": %q, "prerelease": false,
+	  "format_version": 2, "version": %q, "prerelease": false,
 	  "source_commit": %q, "built_at": %q, "schema_version": %d,
 	  "components": [
-	    { "name": "control-plane", "image": "ghcr.io/accreleus/quasar/quasar-control-plane", "digest": "sha256:%s" },
-	    { "name": "node-agent",    "image": "ghcr.io/accreleus/quasar/quasar-node-agent",    "digest": "sha256:%s" }
+	    { "name": "control-plane",  "image": "ghcr.io/accreleus/quasar/quasar-control-plane", "digest": "sha256:%s" },
+	    { "name": "node-agent",     "image": "ghcr.io/accreleus/quasar/quasar-node-agent",    "digest": "sha256:%s" },
+	    { "name": "recovery-actor", "image": "ghcr.io/accreleus/quasar/quasar-recovery",      "digest": "sha256:%s" }
+	  ],
+	  "floor": [
+	    { "name": "node-agent",     "version": "0.0.0" },
+	    { "name": "recovery-actor", "version": "0.0.0" }
 	  ]
-	}`, version, commit, built, schema, hex64, hex64)
+	}`, version, commit, built, schema, hex64, hex64, hex64)
 }
 
 func twoReleaseSource() *fakeSource {
 	return &fakeSource{
 		listings: []Listing{
-			{Tag: "v0.2.0", Version: "0.2.0", Body: "notes for 0.2.0", ManifestURL: "u/0.2.0", ManifestFormat: ManifestFormat1},
-			{Tag: "v0.3.0", Version: "0.3.0", Body: "notes for 0.3.0", ManifestURL: "u/0.3.0", ManifestFormat: ManifestFormat1},
+			{Tag: "v0.2.0", Version: "0.2.0", Body: "notes for 0.2.0", ManifestURL: "u/0.2.0", ManifestFormat: ManifestFormat2},
+			{Tag: "v0.3.0", Version: "0.3.0", Body: "notes for 0.3.0", ManifestURL: "u/0.3.0", ManifestFormat: ManifestFormat2},
 		},
 		manifests: map[string]string{
 			"u/0.2.0": manifestFor("0.2.0", commitA, 73, "2026-09-01T12:00:00Z"),
