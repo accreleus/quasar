@@ -6,7 +6,6 @@ description: One command on the new machine, created from the admin console. Wha
 import { Aside } from '@astrojs/starlight/components';
 
 {/* Keep this page's slug: the console's Add host dialog links to /install/second-host/ (web/src/pages/admin/fleet/AddHostModal.tsx). */}
-{/* TODO(#361, #365): on an owned control plane, where QUASAR_ENROLL_SEED_IMAGE and QUASAR_ENROLL_AGENT_IMAGE come from (a machine input, or the release). Today they are control-plane environment. */}
 
 Each host runs one node agent. It reports its GPUs, capacity and readiness to the
 control plane and receives sessions from it. The control plane holds no GPU state, so
@@ -29,8 +28,10 @@ On the new machine you need:
   host's readiness check reports on afterwards.
 
 The control plane has to know which images a new host installs: the seed and the node
-agent, both by digest (`QUASAR_ENROLL_SEED_IMAGE` and `QUASAR_ENROLL_AGENT_IMAGE`). If
-it does not, the dialog says so and creates nothing.
+agent, both by digest. It offers the installed release's images, and otherwise the
+recovery and agent images its own machine was installed with. To pin others, give
+the first machine's seed `QUASAR_ENROLL_SEED_IMAGE` and `QUASAR_ENROLL_AGENT_IMAGE`
+at its install. If it knows neither, the dialog says so and creates nothing.
 
 ## 1. Create the command
 

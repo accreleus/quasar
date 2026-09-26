@@ -29,8 +29,9 @@ needed. A stack manager is optional: the seed can be one `docker run` line.
 
 One Quasar installation per container engine.
 
-{/* TODO(#361): the quick-start script still checks for Compose 2.30 until the generator is rewritten. */}
-{/* TODO(#361): confirm the Engine API floor holds for the control-plane and Postgres recipes (per-service secret volumes are designed for API 1.40). */}
+On Docker older than 20.10, `/var/lib/docker` is traversable, so a host user
+whose uid is 1000 can read the control plane's secret files in its volume. Use a
+current Docker Engine on the first machine.
 
 **About 20 GB of disk** for the images on a machine that runs the agent, plus
 room for game containers and save data. A control-only machine needs far less.
@@ -113,9 +114,8 @@ the one-line command, set it yourself: that command checks and fixes the render
 node, `uinput` (loading it and persisting the module), user namespaces and the
 app-container AppArmor profile, but not this sysctl. When you start the seed
 yourself, or from Dockge or Arcane, all host preparation is yours, and the host's
-readiness card lists what is still missing.
-
-{/* TODO(open, raise on #359): the one-line command does not set or check net.core.wmem_default, which every streaming machine needs. */}
+readiness card lists what is still missing. Readiness does not check this
+sysctl, so check it yourself: `sysctl net.core.wmem_default`.
 
 The media path sends
 through libnice, which never calls `setsockopt(SO_SNDBUF)`, so its UDP sockets

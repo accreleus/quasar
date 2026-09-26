@@ -41,10 +41,13 @@ drained before its agent is replaced.
 1. **Read what the release changes.** Open Admin, Fleet, Releases and read the
    notes. The confirmation says whether this release migrates the database.
 
-2. **Have a backup of the database.** Migrations only go forward. Follow
-   [Backup and restore](/quasar/operations/backup/).
-
-   {/* TODO(#364): on an owned database the recovery actor takes a pg_dump before a migrating control-plane update, keeps the last three, and refuses to proceed if it cannot; an operator's own database needs the recorded backup confirmation (external_backup_confirmed). Replace this step with that once built. */}
+2. **Know how the database is covered.** Migrations only go forward. With
+   Quasar's own database, the recovery actor takes a dump before a release that
+   migrates it, checks it reads back, and keeps the last three; if it cannot
+   take one, or there is not room, the update is refused (`backup_failed`) and
+   nothing is touched. With your own database, the confirmation asks you to tick
+   that you have a current backup of it; without the tick the update is refused
+   (`backup_unconfirmed`). See [Backup and restore](/quasar/operations/backup/).
 
 3. **Press Update Quasar**, or Apply on a single host. The confirmation names how
    many live sessions are involved.
@@ -67,13 +70,18 @@ cannot replace itself. A GPU host's recovery actor is instructed through that
 host's own agent; the control plane's machine is instructed over a local socket.
 The console never offers an update to a control plane or host built from source.
 
-{/* TODO(#363): the control plane's own replacement by the recovery actor on its machine, and the automatic restore of a new control plane that never became healthy. */}
-{/* TODO(#362): the recovery actor updating itself (hand-over), which moves first inside each attempt. */}
+- **The recovery actor moves first** inside each attempt. It replaces itself by
+  handing over to a successor, which must verify itself before the old one is
+  discarded.
+- **The control plane** is replaced by the recovery actor on its own machine. The
+  console goes away for the length of the replacement. A new control plane that
+  never becomes healthy is put back automatically, unless the release migrates
+  the database (below).
 
 There is no by-hand upgrade for an owned install: no file to edit, no image to
 pin. A [legacy Compose install](/quasar/install/legacy-compose/#upgrade-by-hand)
 keeps its own by-hand recipe and its updater, but is not offered releases that
-ship Quasar-owned installs.
+ship owned installs.
 
 ## Release signatures
 
@@ -86,12 +94,24 @@ anything, with the same `verify` and `require` modes as the legacy updater.
 unsigned one. `require` also refuses an unsigned release, an edge build and a
 developer apply.
 
-On a Quasar-owned machine the mode and the trusted keys are first-install inputs
-of the seed, recorded in the machine's own state: decide them before the first
-install. A legacy Compose install sets them on its updater; see [Legacy Compose
-installs](/quasar/install/legacy-compose/#verify-release-signatures).
+On an owned machine the mode and the trusted keys are seed inputs,
+`QUASAR_UPDATER_SIGNATURE_MODE` (`off`, `verify` or `require`) and
+`QUASAR_UPDATER_TRUSTED_KEYS` (`<key-id>:<base64 public key>`, comma-separated),
+recorded in the machine's own state at the first install. Change them later, on
+each machine, with `reconfigure` inside its recovery actor:
 
-{/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
+  QUASAR_UPDATER_SIGNATURE_MODE=verify QUASAR_UPDATER_TRUSTED_KEYS=<key-id>:<base64 public key>
+```
+
+Enabling either mode with no trusted keys refuses every update, on purpose. The
+recovery actor fetches the signature from GitHub over HTTPS with its own
+certificate roots and no proxy: on a machine that reaches the internet only
+through a proxy, or that must trust a private CA, leave the mode `off`, since
+`verify` and `require` would refuse every release there. A legacy Compose
+install sets these on its updater; see [Legacy Compose
+installs](/quasar/install/legacy-compose/#verify-release-signatures).
 
 Publishing signed releases from your own fork, and rotating a key without a flag
 day, are in the repository's `docs/upgrading.md`.
@@ -103,11 +123,24 @@ in the database. If you must return to the older release, restore the pre-upgrad
 database backup as well. Do not hand-edit migration bookkeeping or run down
 migrations against production state.
 
-{/* TODO(#364): on an owned install a failed migrating update prints one `restore` command naming the dump and the version it returns to; it is never restored automatically. Describe that here. */}
+On an owned install Quasar enforces the rule: once a control plane has migrated
+the database, no control plane below that schema is created, started or put back
+on that machine again. A migrating update is never restored automatically. If
+the new control plane does not verify, it is left running (it matches the
+migrated schema), and the failed attempt ends with the one command that goes
+back, run on that machine:
 
-Check the current migration version with:
+```bash
+docker exec quasar-recovery quasar-recovery restore --dump <name> --to <version>
+```
 
-{/* TODO(#361): confirm the owned Postgres container's user and database names. */}
+`--to` is the version the control plane was on, and `<name>` is the dump the
+recovery actor took before the update. On your own database, restore your backup
+first with the control plane stopped, then run `restore --to <version>` alone.
+`restore --list` shows the dumps kept on the machine. See
+[Restoring](/quasar/operations/backup/#restoring).
+
+Check the current migration version on Quasar's own database with:
 
 ```bash
 docker exec quasar-postgres \
@@ -158,13 +191,18 @@ never becomes healthy is put back automatically.
   production.
 - A host under signature mode `require` refuses a developer apply, which names no
   signed release.
-- In this build a developer apply moves the node agent of an owned GPU host. The
-  control plane's own machine answers `target_not_owned` until it is itself
-  owned.
-
-{/* TODO(#362): the recovery-actor slot of a developer apply (withheld in the console until the actor can replace itself). */}
-{/* TODO(#363, #364): developer apply to the control plane's own machine, with the dump or backup confirmation of a migrating digest. */}
-{/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
+- A developer apply to a GPU host names its node agent, its recovery actor, or
+  both. One to the first machine names its control plane, with or without the
+  recovery actor beside it (never the actor alone). The node agent of a combined
+  host is applied on its own: that machine's recovery actor moves with its
+  control plane. A control-plane digest that migrates the database takes
+  the pre-update dump, or needs the backup confirmation, exactly as a release
+  does.
+- The allowlist and the plain-HTTP registries are seed inputs of each machine
+  (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
+  recorded at its first install. Decide them before you install a machine you
+  will test on: on the first machine `reconfigure` cannot change them in this
+  release.
 
 <Aside type="caution" title="Multiple hosts must stay version-aligned">
 Upgrade the control plane and every agent host as one planned operation. Brief
@@ -175,6 +213,7 @@ the right order.
 
 ## Coming from a Compose install
 
-A legacy Compose install is not converted in place. See [Move an existing
-install](/quasar/install/move-existing/) to reinstall with your data, or [Legacy
-Compose installs](/quasar/install/legacy-compose/) to stay where you are.
+A legacy Compose install is not converted in place, and replacing it is a fresh
+install with no data carried across. See [Replace a Compose
+install](/quasar/install/move-existing/), or [Legacy Compose
+installs](/quasar/install/legacy-compose/) to stay where you are.

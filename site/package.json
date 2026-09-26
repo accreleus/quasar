@@ -5,11 +5,10 @@
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
-    "build": "node scripts/compose-template.mjs --check && astro build",
+    "build": "astro build",
     "preview": "astro preview",
     "astro": "astro",
-    "test": "node scripts/compose-template.mjs --check && node --test \"src/data/*.test.js\"",
-    "compose:sync": "node scripts/compose-template.mjs"
+    "test": "node --test \"src/data/*.test.js\""
   },
   "dependencies": {
     "@astrojs/starlight": "^0.41.10",

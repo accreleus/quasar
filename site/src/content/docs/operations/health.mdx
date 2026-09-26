@@ -16,16 +16,15 @@ import { Aside } from '@astrojs/starlight/components';
 | `quasar-node-agent` | The Rust agent. Runs with host networking, drives the compositor and encoder, launches app containers. |
 
 Which of them run depends on the machine: a GPU host has the seed, the recovery
-actor and the agent. During a session you will also see the app container itself
+actor and the agent; a combined host has all of them; a control-only host has
+no agent; and with your own database there is no `quasar-postgres`. During a session you will also see the app container itself
 and a PulseAudio sidecar, both launched by the agent as siblings. During an
 update you may briefly see a stopped `quasar-node-agent.kept`, the old agent held
 until the new one is verified.
 
-{/* TODO(#361): confirm the combined and control-only containers against the owned recipes. */}
-
 A [legacy Compose install](/quasar/install/legacy-compose/#health-and-logs) runs
-Postgres, the control plane and the agent as Compose services, plus
-`quasar-updater`, which applies a platform release from the console. Use
+Postgres, the control plane and the agent as Compose services, and on a release
+that shipped it, `quasar-updater`. Use
 `docker compose -f deploy/docker-compose.yml` in place of the `docker` commands
 below.
 

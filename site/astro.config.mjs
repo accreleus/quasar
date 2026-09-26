@@ -121,7 +121,7 @@ export default defineConfig({
 						{ label: 'First-run setup', slug: 'install/first-run' },
 						{ label: 'Check your install', slug: 'install/verify' },
 						{ label: 'Add a second GPU host', slug: 'install/second-host' },
-						{ label: 'Move an existing install', slug: 'install/move-existing' },
+						{ label: 'Replace a Compose install', slug: 'install/move-existing' },
 						{ label: 'Legacy Compose installs', slug: 'install/legacy-compose' },
 					],
 				},

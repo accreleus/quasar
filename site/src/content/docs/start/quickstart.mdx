@@ -1,42 +1,32 @@
 ---
 title: Quick start
-description: Answer five questions and get one command that installs Quasar.
+description: Answer a few questions and get one command, or one stack, that installs Quasar.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 import QuickStart from '../../../components/QuickStart.astro';
 
-{/* TODO(#361, #359, #365): the QuickStart generator below still writes the four-service Compose stack and .env, and the prose on this page describes exactly that. Rewrite the generator around the seed (a role question, the seed `docker run` or one-service stack, the format-2 manifest), then this prose and the note, before the first release that ships Quasar-owned installs is published. */}
-
-Five questions, then one command to run on the machine with the GPU. You need
-Linux, Docker and about 20 GB of disk; the
+A few questions, then one command to run on the machine, or one stack to paste
+into Dockge or Arcane. You need Linux, Docker and about 20 GB of disk; the
 [requirements](/quasar/start/requirements/) have the detail.
 
-<Aside type="note" title="This quick start writes a Compose install">
-The command below writes a Compose stack and an `.env` file, as described on
-this page and on [Legacy Compose installs](/quasar/install/legacy-compose/).
-Releases that ship Quasar-owned installs start from one container, the seed,
-instead: see [Install Quasar](/quasar/install/install/). This generator has not
-been updated for them yet.
+Either way the machine runs one container you declare, the **seed**. It creates
+Quasar's **recovery actor**, which generates every secret on the machine and
+creates Postgres, the control plane and, on a machine with a GPU, the node
+agent. Nothing sensitive is on this page to leak, and nothing here writes an
+`.env` of secrets. [Install Quasar](/quasar/install/install/) says the same in
+prose, with every input.
+
+<Aside type="caution" title="Edge builds only">
+Installs owned by Quasar ship on the **edge** channel, which follows the
+`develop` branch. There is no stable release of them yet. The script pins the
+edge channel's current images by digest, so the install never moves on its own:
+it updates when you apply an update from the admin console.
 </Aside>
 
-Everything here runs in your browser. The script makes its own secrets on the
-target machine, so nothing sensitive exists on this page to leak.
-
-The stack it writes has four services: Postgres, the control plane, the node
-agent, and `quasar-updater`, which is what lets Quasar update itself from the
-admin console later. The updater holds the Docker socket, so it is worth saying
-what it cannot do: it pulls only digests inside the allow-listed registry
-namespace and recreates only the two Quasar services in this stack. The script
-fills in `QUASAR_STACK_DIR` (this directory's absolute path on the machine),
-which the updater needs to find those compose files. On Podman, also set
-`QUASAR_DOCKER_SOCKET` to your own socket path.
-
-The installer selects a stable release, pins its control-plane and agent image
-digests, and checks the matching updater image before starting anything. If the
-stable release predates this installer configuration, it stops with instructions
-to use that release’s installation guide or wait for a compatible release.
-Development changes described here are not available merely because they have
-merged into `develop`.
+<Aside type="note" title="Already running Quasar from the Compose files?">
+Nothing converts that install. The script stops if it finds one. See [Replace a
+Compose install](/quasar/install/move-existing/).
+</Aside>
 
 <QuickStart />

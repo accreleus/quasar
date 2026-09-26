@@ -293,7 +293,11 @@ stack or manager definition that re-creates it.
 - **Install-time settings** (home root, template root, release trust, app-container defaults) are
   recorded in machine state at the first install and change with `quasar-recovery reconfigure`, a
   verified replacement with the same images and new inputs. The role, node name, database and
-  images are fixed at install. `docs/configuration.md` "Changing machine inputs: `reconfigure`".
+  images are fixed at install. This release re-creates only the node agent for a reconfigure, so
+  on a combined or control-only machine a change that moves the control plane's container (the
+  public host, TLS names, trusted proxies, ports, the allowlist, and the home root on a combined
+  host) is refused; the signature settings, which no container renders, still change.
+  `docs/configuration.md` "Changing machine inputs: `reconfigure`".
 - **A GPU host** is removed from the console: the host → **Remove host** drains it, then removes
   its agent and recovery actor. Any machine can be taken apart on the machine with the recovery
   image's `uninstall`, which keeps the database, machine state and homes unless `--purge`.

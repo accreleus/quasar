@@ -196,14 +196,22 @@ On a Quasar-owned machine the recovery actor creates the volumes by fixed name:
 | `quasar-agent-data` | The agent's node secret and saved identity. |
 | `quasar-node-agent-secrets` | The agent's secrets, such as the enrollment string, written by the recovery actor and mounted read-only. |
 | `quasar-nvidia-driver` | NVIDIA hosts only. Driver userspace provisioned from the running kernel module. |
+| `quasar-postgres-data` | The first machine, with Quasar's own database: the database. |
+| `quasar-postgres-secrets` | The database password, as a file for Postgres. |
+| `quasar-control-data` | The first machine: the control plane's TLS certificate and artwork cache. It outlives every replacement of the container. |
+| `quasar-control-plane-secrets` | The control plane's database password, secret key and, on a combined host, local enrollment token, as files. |
+| `quasar-final-dump` | Only after `uninstall --purge` on a machine with Quasar's own database: the final dump. A purge never deletes it. |
 | The managed home root | A host bind mount, not a volume. User saves and installed content. |
 
-{/* TODO(#361): add the control plane's and Postgres's volumes (TLS state and artwork, the database, their secret volumes) once #361 names them. */}
-{/* TODO(#366): what `uninstall` keeps (the database volume, machine state, homes) and what `--purge` removes. */}
+The first machine also has a `quasar-platform` bridge network, on which the
+control plane reaches Postgres by name.
 
 Removing the seed never removes a volume, and neither does removing a
-container. Uninstalling a machine keeps the database, machine state and homes
-unless you ask for a purge. See [Uninstalling](/quasar/operations/uninstall/).
+container. Uninstalling a machine keeps the database, machine state, the agent's
+identity and the homes. `uninstall --purge` removes this installation's volumes
+and network and empties machine state, after a final dump of Quasar's own
+database; it never touches the homes, or a database you run yourself. See
+[Uninstalling](/quasar/operations/uninstall/).
 
 On a [legacy Compose install](/quasar/install/legacy-compose/):
 

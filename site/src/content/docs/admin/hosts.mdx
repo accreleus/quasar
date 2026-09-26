@@ -63,7 +63,7 @@ reported itself.
 | Commit | The commit the agent was built from. |
 | Built | When that build was made. |
 | Install | **Owned by Quasar** (the host's services are created and replaced by its recovery actor), **Registry** (published images on a legacy Compose stack) or **Built from source** (images compiled on the machine). A source-built host can be told about a release but never given one. |
-| Updater | On an owned host, **Recovery actor** when its recovery actor answered the agent, or **Not answering**, when a release cannot be applied there. On a legacy Compose host, **Present** or **None**: whether a `quasar-updater` service sits beside the host's stack. |
+| Updater | On an owned host, **Recovery actor** when its recovery actor answered the agent, or **Not answering**, when a release cannot be applied there. On any other host, **None**: it has no recovery actor, so a release cannot be applied there. A legacy Compose host on a release from before owned installs may still read **Present**, for the `quasar-updater` service in its stack. |
 
 Any of these can read **Unknown**, and on an agent from before the self-update
 feature they all will: it has no way to say what it is running. Such a host keeps
@@ -87,9 +87,27 @@ recovery actor and the node agent, each with its version and owner:
 If the recovery actor did not answer the agent, the card says so; sessions are
 unaffected. For an offline host it shows the last report, with its time.
 
-{/* TODO(#361): the combined and control-only inventory (Postgres and the control plane, database mode own or external); a control-only machine has no host row and appears only under Releases, Installed. */}
-{/* TODO(#366): the seed-missing and owner-conflict warnings above the card, and Remove host in its footer. */}
-{/* TODO(#365): the "must update before it can be managed" state for a host below the floor. */}
+On a **combined host** the card also lists the database (*Quasar's own* or *Your
+own*) and the control plane. A **control-only** machine runs no agent, so it has no host
+row: its services appear under Admin, Fleet, Releases, Installed, as **This
+machine**.
+
+Two warnings can appear above the card:
+
+- **No seed found.** Quasar is running normally, but if this machine's recovery
+  actor is ever deleted, nothing will re-create it. Start the seed again.
+- **Another owner's container is in the way.** A container that looks like a
+  Quasar service but was not created by this installation, such as a leftover
+  Compose stack. The recovery actor never touches it, and updates to this
+  machine are blocked until you remove it, and whatever re-creates it.
+
+A GPU host's card has **Remove host** in its footer (see [Draining and
+removing](#draining-and-removing)).
+
+A host whose node agent or recovery actor is below the control plane's floor
+reads **Must update before it can be managed**. It keeps running, but the console
+offers it only the update that lifts it; see [Updating
+Quasar](/quasar/admin/releases/).
 
 An agent **newer than the control plane** turns up as *Agent ahead of the control
 plane* under Needs attention. Nothing is broken, but it is the wrong way round —
@@ -182,18 +200,20 @@ Otherwise a user's saves are on whichever host happened to run the session.
 Drain stops a host accepting new sessions while letting existing ones finish.
 Do this before maintenance.
 
-Once it is empty, stop the agent on that machine and forget the host here.
-
-{/* TODO(#366): console Remove host drains the host, then removes its agent and recovery actor (POST /v1/admin/platform/hosts/{id}/remove); forget it once offline. */}
+To take a host out of the fleet, press **Remove host** on its page. It drains
+the host, waits for its sessions to end, then has the host's recovery actor
+remove the node agent and itself. Forget the host here once it is offline. The
+homes and the host's seed stay on the machine; see
+[Uninstalling](/quasar/operations/uninstall/). A host that is not connected is
+removed with `uninstall` on the machine instead.
 
 ## The console
 
 Each host has a console page for local-display mode, where the host renders to a
-physically attached screen, not to a browser. It needs additional
-privileges and a separate compose overlay, and it is not part of the default
-deployment.
-
-{/* TODO(open, no ticket): an owned machine has no compose overlay; RH-06 does not say how console mode is enabled on one. */}
+physically attached screen, not to a browser. It needs additional privileges and
+a separate compose overlay, and it is not part of the default deployment. An
+owned install has no way to enable it in this release: the recovery actor
+creates the agent without those privileges, and there is no input for them.
 
 ## Storage
 

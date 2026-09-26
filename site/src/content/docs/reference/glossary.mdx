@@ -59,11 +59,7 @@ let one agent enroll: single use, expiring after an hour by default (an admin ma
 choose up to 30 days), optionally bound to one node name, and stored only as a
 hash. After a successful enrollment the agent uses its
 own stored node secret instead. On a combined host the agent uses a single-use
-local token that its recovery actor generates at install. The older static,
-deployment-wide `ENROLLMENT_TOKEN` is an optional fallback on a legacy Compose
-install, and is not used by a Quasar-owned one.
-
-{/* TODO(#367): the static ENROLLMENT_TOKEN is retired; drop the fallback sentence then. */}
+local token that its recovery actor generates at install.
 
 **FEC.** Forward error correction. Adds redundancy so lost packets can be
 reconstructed. Off by default and not recommended for browser clients.
@@ -143,9 +139,9 @@ on it and says so.
 **Platform release.** A matched set of Quasar's own images (the control plane, the
 node agent and the recovery actor) built from one commit and published together.
 This is Quasar updating Quasar; app catalog images have their own versions
-entirely. The seed and Postgres are not part of a release.
-
-{/* TODO(#365): the recovery actor joins the release with manifest format 2; until a release ships it, releases carry two components. */}
+entirely. The seed and Postgres are not part of a release. A release also
+publishes a floor: the oldest agent and recovery actor its control plane still
+manages.
 
 **Playout buffer.** The client-side jitter buffer. Adapts to how evenly frames
 arrive. Uneven arrival forces a bigger buffer, and the buffer is latency.

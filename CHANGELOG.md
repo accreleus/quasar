@@ -337,6 +337,21 @@ own; the two do not move together, and that is deliberate.
 - RH-02 acceptance evidence (#265): fresh installs on the AMD test host, the NVIDIA test host and natively on an Unraid host, each with a captured readiness card, one real session, and the #264 harness rerun; the acceptance report is `docs/reports/2026-09-19-rh02-acceptance.md`. No product code changed.
 
 ### Removed
+- **The Compose updater, and with it the Compose install (#367). An existing install is
+  replaced, not migrated.** The Go updater (`internal/updater`, `cmd/quasar-updater`, the
+  `quasar-updater` image and Compose service and its shared volume), the Compose preflight
+  checks `updater_stack_dir` and `updater_overlays` (retired and reserved in the contract),
+  the node agent's Compose-label install discovery and the static `ENROLLMENT_TOKEN` are
+  gone: a control plane accepts only a token minted by Add host or its machine's local
+  token, and every update is made by the machine's recovery actor. The release reader reads
+  only the format-2 manifest. **An install made from the Compose files is not converted and
+  its data is not carried across:** it keeps running on its release, which is never offered
+  one that ships owned installs, and it is replaced by a fresh install from the seed (the
+  site's "Replace a Compose install"). Restoring a pre-RH-06 dump into a new install is
+  planned as #380. Every release until RH-07 is an edge build. The Compose files in
+  `deploy/` remain contributor tooling for building from source; `make config-check` warns
+  on a retired key left in `deploy/.env`. Amendment 14's contract step is in force
+  (protocol pin `e98088b`).
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every
   runtime operation it performs — discovery, image presence/pull/build/removal,
   application launch/observe/stop/cleanup, the audio sidecar, diagnostic and driver
@@ -348,6 +363,14 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The quick start and the site describe owned installs (#367).** The Quick Start writes
+  the seed for a combined, control-only or GPU host: a host script that pins the edge
+  channel's images by digest, refuses a host still running a Compose stack, and starts one
+  container, or the same seed as a one-service stack for Dockge or Arcane, with a `.env`
+  only for your own database's password. It generates no secret. The install, upgrade,
+  backup, restore, uninstall, HTTPS, proxy and reference pages cover owned installs, and the
+  site's draft markers are resolved. The release notes' footer lists the manifest's
+  components instead of the Compose recipe.
 - **Owned installs in the console and Add host (#366, from #361's live run).** Owned host rows
   name the machine's shape (GPU host, combined host); setup shows the owned install's
   setup-token command (`docker exec quasar-control-plane cat /run/quasar/setup-token`), and
@@ -490,6 +513,10 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The release preflight inventory matches the image build again (#383).**
+  `scripts/release/release-manifest.json` lists the three vendored patches
+  `deploy/Dockerfile.vulkan` applies and the gst-wayland-display pin in `deploy/pins.env`,
+  so `scripts/release/test-release-preflight.sh` passes.
 - **Owned installs: two #366 details from its live run.** A container that looks like a Quasar
   service and is defined in the same Compose project as the machine's seed is reported as that
   stack manager's (take it out of the stack), not as a leftover install. `quasar-recovery status`

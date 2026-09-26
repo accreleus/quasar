@@ -5,8 +5,6 @@ description: Certificate warnings, name mismatches, signaling failures, and sess
 
 import { Aside } from '@astrojs/starlight/components';
 
-{/* TODO(open, raise on #361): where an owned machine's TLS names (QUASAR_TLS_HOSTS) are set; this page still says deploy/.env. */}
-
 On a [legacy Compose install](/quasar/install/legacy-compose/), put `docker compose -f deploy/docker-compose.yml exec` or `logs` in place of `docker exec` or `docker logs` in the commands on this page.
 
 ## The browser warns about the certificate
@@ -32,11 +30,12 @@ The control plane runs in a container, so the addresses it can see on its own
 interfaces are Docker bridge addresses, never your host's LAN address. It has to
 be told.
 
-Add every address you use to `QUASAR_TLS_HOSTS` in `deploy/.env`.
-
-If the certificate already exists, adding the name is not enough on its own. You
-have to delete it and let it regenerate. See
-[HTTPS and certificates](/quasar/network/https/).
+On an owned install the names are the seed's `QUASAR_PUBLIC_HOST` and
+`QUASAR_TLS_HOSTS`, read at the first install and fixed after it in this release:
+browse to a name the certificate has, or put a reverse proxy in front for the
+new one. On a legacy Compose install, add every address you use to
+`QUASAR_TLS_HOSTS` in `deploy/.env`; if the certificate already exists, delete it
+and let it regenerate. See [HTTPS and certificates](/quasar/network/https/).
 
 ## Gamepad, Escape or microphone not working
 

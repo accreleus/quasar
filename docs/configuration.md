@@ -2390,30 +2390,32 @@ See `protocol/agent-api.md` §session_display_update and
 
 ### First-install generated configuration
 
-The public installer derives its service definitions from `deploy/docker-compose.yml`
-and its NVIDIA overlay. NVIDIA installations receive one complete Compose file.
-The site build/test gate checks the generated snapshot against both source files.
-After changing either source, run `cd site && npm run compose:sync` and commit the
-snapshot. Installation-specific transformations are in `site/src/data/stack-template.js`.
+The site's quick start (`site/src/data/stack-template.js`, tested by its
+`stack-template.test.js`) writes the seed for one machine, combined, control-only
+or GPU host, as a host script and as the same seed in a one-service stack for Dockge or
+Arcane. It writes no Compose stack of Quasar services, no `.env` of secrets and no
+`openssl rand`: the recovery actor generates every secret on the machine ("Seed"
+above). The only `.env` it writes is the operator's own database password, interpolated
+into the stack as `${QUASAR_DATABASE_PASSWORD}`; the script takes that from its own
+environment and passes `-e QUASAR_DATABASE_PASSWORD` without a value.
 
-Copied `.env` files deliberately have **blank credentials**. Run each documented
-OpenSSL command in a terminal and paste its output after the matching `=`; `.env`
-does not execute shell commands. The installer script generates credentials on the
-host only when creating a new `.env`, and preserves an existing file on reruns.
-It resolves stable release manifests and pulls all images before starting services.
+Images: the script resolves the edge channel's `o2-develop` tags of `quasar-recovery`,
+`quasar-control-plane` and `quasar-node-agent` to their registry digests on the host
+and starts the seed with those; the stack carries `@sha256:<digest>` placeholders and a
+one-line command that prints the three pins. Owned installs ship on the edge channel
+only. The script checks for Docker, curl and, on a machine with an agent, `/dev/dri`,
+refuses a host that still runs Compose-labelled Quasar services or an existing seed or
+recovery actor, sets the UDP send-buffer sysctl and loads `uinput` (persisted in
+`/boot/config/go` on Unraid), then waits for `quasar-recovery status` and, on a control
+plane, `/health`. It does not restart Docker or reconfigure the host's NVIDIA runtime.
+A GPU host gets no script: Admin → Fleet → Add host's one-line command prepares and
+installs it.
 
-Generated files retain process and application defaults, including 1 GiB of app
-shared memory (`QUASAR_APP_SHM_SIZE`, a Docker launch setting). Shared memory is a
-per-container tmpfs used by Chromium/Steam; it is not a general filesystem cache.
-The agent entrypoint establishes NVIDIA loader paths before exec; these cannot
-be set effectively after the dynamic loader has initialized.
-
-For settings omitted from the compact generated Compose, place agent variables
-in `deploy/agent.env` and control-plane variables in `deploy/control.env`. These
-files are optional. Variables explicitly present under a service's `environment`
-retain Compose precedence and use `deploy/.env` where shown. Do not put database
-credentials in `agent.env`. The repository Compose continues to support its full
-set of `.env` passthroughs.
+Owned app containers keep 1 GiB of shared memory (`QUASAR_APP_SHM_SIZE`, a Docker launch
+setting; not an input of an owned install). Shared memory is a per-container tmpfs used
+by Chromium/Steam; it is not a general filesystem cache. The agent entrypoint
+establishes NVIDIA loader paths before exec; these cannot be set effectively after the
+dynamic loader has initialized.
 
 The control plane also accepts separate database fields when `DATABASE_URL` is
 unset: `QUASAR_DATABASE_HOST` and `QUASAR_DATABASE_PASSWORD` are required;
@@ -2421,31 +2423,23 @@ unset: `QUASAR_DATABASE_HOST` and `QUASAR_DATABASE_PASSWORD` are required;
 `QUASAR_DATABASE_PORT` to `5432`, and `QUASAR_DATABASE_SSLMODE` to `disable`.
 It constructs the connection URL with proper credential escaping. An explicit
 `DATABASE_URL` remains authoritative. Password-bearing parser errors are withheld
-from startup error strings.
+from startup error strings. An owned control plane is always given these fields, the
+password as `QUASAR_DATABASE_PASSWORD_FILE`.
 
 Control-plane state defaults to a Docker-managed volume. For an operator-supplied
-bind mount, the control entrypoint can prepare ownership when the service starts
-with `user: "0:0"`; it then drops privileges and execs Go as PID 1. It adopts the
-state directory's non-root owner, or uses 1000:1000 for a new root-owned directory.
-`QUASAR_CONTROL_UID` and `QUASAR_CONTROL_GID` override that choice. Only the state
-and private runtime directories are prepared; symlink roots are refused and
-ownership traversal does not cross filesystem boundaries. The image itself still
-defaults to its non-root user. A non-root start with inaccessible storage fails
+bind mount on a source or Compose stack, the control entrypoint can prepare ownership
+when the service starts with `user: "0:0"`; it then drops privileges and execs Go as
+PID 1. It adopts the state directory's non-root owner, or uses 1000:1000 for a new
+root-owned directory. `QUASAR_CONTROL_UID` and `QUASAR_CONTROL_GID` override that
+choice. Only the state and private runtime directories are prepared; symlink roots are
+refused and ownership traversal does not cross filesystem boundaries. The image itself
+still defaults to its non-root user. A non-root start with inaccessible storage fails
 immediately with an ownership error.
 
-The generated installer requires Docker Compose 2.30 or newer: its NVIDIA file
-uses [`gpus`](https://docs.docker.com/reference/compose-file/services/#gpus), and
-its optional service environment files use
-[`required: false`](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/).
-Preflight reports missing tools, Docker access, graphics devices, and NVIDIA
-runtime registration together before changing host settings. It does not restart
-Docker or reconfigure the host's NVIDIA runtime.
-
-The basic generated file omits optional kernel-log access. To opt into NVIDIA
-Xid diagnostics, add `/dev/kmsg:/dev/kmsg:r` to the agent's `devices` and `SYSLOG`
-to `cap_add`, after checking that the host exposes `/dev/kmsg`. The generator's
-`kernelLogs` option emits both. Missing kernel-log visibility is reported by the
-existing readiness check; it is not a prerequisite for streaming.
+Kernel-log access is optional and outside an owned install: on a source or Compose
+stack, add `/dev/kmsg:/dev/kmsg:r` to the agent's `devices` and `SYSLOG` to `cap_add`
+for NVIDIA Xid diagnostics. Missing kernel-log visibility is reported by the existing
+readiness check; it is not a prerequisite for streaming.
 
 Connected agents refresh readiness every 15 seconds with one background probe
 at a time; the setup page polls every five seconds. The container engine is
