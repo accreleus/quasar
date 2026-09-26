@@ -56,6 +56,8 @@ export interface HostServices {
   /** When the rows were reported: the agent's last `register`. */
   reportedAt: string | null;
   shape: MachineShape;
+  /** It shares the control plane's machine (`isControlPlaneMachine`). */
+  controlPlaneHere: boolean;
   rows: ServiceRow[];
 }
 
@@ -194,7 +196,13 @@ export function hostServices(
     },
   ];
 
-  return { report, reportedAt, shape: combined ? "Combined host" : "GPU host", rows };
+  return {
+    report,
+    reportedAt,
+    shape: combined ? "Combined host" : "GPU host",
+    controlPlaneHere: combined,
+    rows,
+  };
 }
 
 function noDatabase(): ServiceRow {

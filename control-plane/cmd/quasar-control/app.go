@@ -1085,6 +1085,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
 	pDeps.ControlPlanePreflight = selfApplier.PreflightFacts
 	if ownMachine != nil {
+		ownMachine.Log = log
 		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts
 		pDeps.ControlPlaneMachine = ownMachine.Identity
 	}

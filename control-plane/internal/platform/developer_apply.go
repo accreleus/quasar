@@ -233,16 +233,15 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 	}
 	ctx := r.Context()
 
-	// A failed read of the own machine is null, and null refuses (control-api.md
-	// §"The control plane's own machine").
-	var own OwnMachine
-	ownOK := false
-	if h.ownMachine != nil {
-		h.ownMachine.Invalidate()
-		own, ownOK = h.ownMachine.Read(ctx)
-	}
-
 	if req.Target == TargetControlPlane {
+		// A failed read of the own machine is null, and null refuses (control-api.md
+		// §"The control plane's own machine").
+		var own OwnMachine
+		ownOK := false
+		if h.ownMachine != nil {
+			h.ownMachine.Invalidate()
+			own, ownOK = h.ownMachine.Read(ctx)
+		}
 		if !ownOK || own.Identity.InstallMode == nil || *own.Identity.InstallMode != InstallOwned {
 			httpx.WriteError(w, http.StatusConflict, CodeTargetNotOwned,
 				"this control plane does not report an owned install, so it takes no developer apply")

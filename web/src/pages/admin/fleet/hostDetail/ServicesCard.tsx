@@ -71,7 +71,7 @@ export function ServicesCard({ nodeName, services, connectedSince, now }: Servic
           </tbody>
         </table>
       </div>
-      {services.shape === "Combined host" && (
+      {services.controlPlaneHere && (
         <div className="card-pad host-services-foot">
           <p className="hint">
             This machine runs the control plane, so it is not removed from here. To uninstall it,

@@ -166,8 +166,7 @@ impl Bootstrap {
             Some(raw) => Some(ImageRef::parse(raw).map_err(|e| format!("{AGENT_IMAGE}: {e}"))?),
             None if agent_here => {
                 return Err(format!(
-                    "{AGENT_IMAGE}: {}",
-                    ImageRef::parse("").unwrap_err()
+                    "{AGENT_IMAGE} is required, pinned by digest (repository@sha256:…)"
                 ))
             }
             None => None,
@@ -200,6 +199,7 @@ impl Bootstrap {
         } else {
             None
         };
+        let app = self.check_app()?;
         let probe = Inputs {
             installation_id: "check".into(),
             node_name: node_name.clone(),
@@ -212,7 +212,7 @@ impl Bootstrap {
             socket_dir: control_here.then(|| "/check".to_string()),
             trust: op.trust.clone(),
             enroll: Default::default(),
-            app: self.check_app()?,
+            app: app.clone(),
         };
         recipe::validate(&probe).map_err(|e| e.to_string())?;
         trust_config(&op.trust)?;
@@ -226,7 +226,7 @@ impl Bootstrap {
             control,
             trust: op.trust.clone(),
             enroll_agent_image: named_agent,
-            app: self.check_app()?,
+            app,
         })
     }
 

@@ -20,11 +20,7 @@ use crate::socket::MachineRole;
 /// The postgres image's entrypoint reads `POSTGRES_PASSWORD_FILE` as root, before it drops
 /// to the postgres user, so root-only suffices; never widen it (the volume's host path may
 /// be traversable by host users). Guarded by `postgres_starts_healthy_with_a_root_only_password_file`.
-const POSTGRES_FILES: FileOwner = FileOwner {
-    uid: 0,
-    gid: 0,
-    mode: 0o400,
-};
+const POSTGRES_FILES: FileOwner = FileOwner::ROOT;
 
 const CONTROL_PLANE_FILES: FileOwner = FileOwner {
     uid: CONTROL_PLANE_UID,
@@ -32,28 +28,30 @@ const CONTROL_PLANE_FILES: FileOwner = FileOwner {
     mode: 0o400,
 };
 
-fn random_bytes() -> [u8; 32] {
+fn random_bytes() -> Result<[u8; 32], ResumeError> {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut b = [0u8; 32];
-    SystemRandom::new()
-        .fill(&mut b)
-        .expect("the system random source");
-    b
+    SystemRandom::new().fill(&mut b).map_err(|_| {
+        ResumeError::State(std::io::Error::other(
+            "the system random source failed; no secret was generated",
+        ))
+    })?;
+    Ok(b)
 }
 
 /// 64 hex characters: safe unquoted in a URL, a shell and `pg_hba`.
-fn generate_password() -> String {
-    random_bytes().iter().map(|b| format!("{b:02x}")).collect()
+fn generate_password() -> Result<String, ResumeError> {
+    Ok(random_bytes()?.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `QUASAR_SECRET_KEY`'s form: base64 of exactly 32 bytes.
-fn generate_secret_key() -> String {
-    base64::engine::general_purpose::STANDARD.encode(random_bytes())
+fn generate_secret_key() -> Result<String, ResumeError> {
+    Ok(base64::engine::general_purpose::STANDARD.encode(random_bytes()?))
 }
 
 /// The form of an admin-minted enrollment token (base64url of 32 bytes).
-fn generate_token() -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes())
+fn generate_token() -> Result<String, ResumeError> {
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes()?))
 }
 
 impl Actor {
@@ -79,9 +77,13 @@ impl Actor {
         Ok(())
     }
 
-    fn ensure_generated(&self, name: &str, generate: fn() -> String) -> Result<(), ResumeError> {
+    fn ensure_generated(
+        &self,
+        name: &str,
+        generate: fn() -> Result<String, ResumeError>,
+    ) -> Result<(), ResumeError> {
         if self.dir.load_secret(name)?.is_none() {
-            self.dir.store_secret(name, &generate())?;
+            self.dir.store_secret(name, &generate()?)?;
             info!(secret = name, "generated");
         }
         Ok(())
@@ -109,20 +111,28 @@ impl Actor {
     }
 
     pub(crate) fn ensure_control_machine(&self, machine: &Machine) -> Result<(), ResumeError> {
-        let control = machine.inputs.control.as_ref().ok_or_else(|| {
-            ResumeError::Inputs("machine state names no control-plane inputs".into())
-        })?;
+        let mut machine = machine.clone();
+        let machine = &mut machine;
+        let owned_db = machine
+            .inputs
+            .control
+            .as_ref()
+            .ok_or_else(|| {
+                ResumeError::Inputs("machine state names no control-plane inputs".into())
+            })?
+            .database
+            == DatabaseInputs::Owned;
         self.ensure_network(machine)?;
-        if control.database == DatabaseInputs::Owned {
+        if owned_db {
             self.ensure_volume(machine, names::POSTGRES_DATA_VOLUME, Role::Postgres)?;
             self.ensure_volume(machine, names::POSTGRES_SECRETS_VOLUME, Role::Postgres)?;
             let secrets = SecretMounts {
                 volume: Some(names::POSTGRES_SECRETS_VOLUME.into()),
                 files: [secrets::DATABASE_PASSWORD.to_string()].into(),
             };
-            self.ensure_service(machine, Role::Postgres, &secrets, POSTGRES_FILES)?;
-            // Not yet ready delays the control plane rather than failing it.
-            self.await_healthy(names::POSTGRES);
+            self.ensure_service(machine, Role::Postgres, &secrets, POSTGRES_FILES, |_, _| {
+                Ok(())
+            })?;
         }
         self.ensure_volume(machine, names::CONTROL_DATA_VOLUME, Role::ControlPlane)?;
         self.ensure_volume(
@@ -130,16 +140,21 @@ impl Actor {
             names::CONTROL_PLANE_SECRETS_VOLUME,
             Role::ControlPlane,
         )?;
+        let secrets = self.control_plane_secrets()?;
         self.ensure_service(
             machine,
             Role::ControlPlane,
-            &self.control_plane_secrets()?,
+            &secrets,
             CONTROL_PLANE_FILES,
+            |_, _| {
+                // Only before a create: a restart never holds the actor busy on Postgres.
+                if owned_db {
+                    self.await_healthy(names::POSTGRES);
+                }
+                Ok(())
+            },
         )?;
         if machine.role == MachineRole::Combined {
-            // Its agent enrolls with the local token, which the control plane inserts
-            // when it boots.
-            self.await_healthy(names::CONTROL_PLANE);
             self.ensure_node_agent(machine)?;
         }
         Ok(())
@@ -192,12 +207,15 @@ impl Actor {
     /// Create and start `role`'s container if it does not exist; start one an interrupted
     /// install created; leave any other alone. One whose specification differs from what
     /// this actor renders is reported and left as it is: replacing is not an install.
-    fn ensure_service(
+    /// `before_create` runs only when the container is about to be created, before it is
+    /// rendered, and may change the machine's inputs.
+    pub(crate) fn ensure_service(
         &self,
-        machine: &Machine,
+        machine: &mut Machine,
         role: Role,
         secrets: &SecretMounts,
         owner: FileOwner,
+        before_create: impl FnOnce(&mut Machine, &ImageRef) -> Result<(), ResumeError>,
     ) -> Result<(), ResumeError> {
         let image = self.service_image(machine, role)?;
         if let Some(existing) = self.engine.inspect_container(role.container_name())? {
@@ -234,6 +252,7 @@ impl Actor {
             Role::Postgres => control::POSTGRES_REVISION,
             _ => image_revision(&found, &image)?,
         };
+        before_create(machine, &image)?;
         let spec = recipe::render(role, revision, &machine.inputs, &image, secrets)?;
         if let Some(volume) = &secrets.volume {
             self.deliver_secrets_as(&image, volume, &secrets.files, owner)?;
@@ -247,7 +266,7 @@ impl Actor {
     /// Waits, bounded by `healthy_wait`, for `name` to run and report healthy (or run, with
     /// no healthcheck). Never fails: what depends on it is created either way, and retries
     /// or restarts on its own.
-    fn await_healthy(&self, name: &str) {
+    pub(crate) fn await_healthy(&self, name: &str) {
         let deadline = Instant::now() + self.config.healthy_wait;
         let mut last;
         loop {
