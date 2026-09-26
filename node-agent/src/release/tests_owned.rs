@@ -101,9 +101,22 @@ fn host(new: Behaviour) -> FakeState {
 
 struct Machine {
     engine: Arc<FakeEngine>,
+    actor: Arc<RecoveryActor>,
     _machine_dir: tempfile::TempDir,
-    _socket_dir: tempfile::TempDir,
+    socket_dir: tempfile::TempDir,
     socket: PathBuf,
+}
+
+/// The actor serves `path` from now on, as a restarted actor does.
+fn serve_at(actor: &Arc<RecoveryActor>, path: &Path) {
+    let listener = server::bind(path).unwrap();
+    let (actor, stop) = (
+        actor.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    std::thread::spawn(move || {
+        server::serve(listener, actor, quasar_recovery::trust::Caller::Agent, stop)
+    });
 }
 
 /// An installed owned GPU host whose recovery actor serves its agent socket.
@@ -139,15 +152,12 @@ fn machine(new: Behaviour) -> Machine {
     actor.resume().expect("install");
     let socket_dir = tempfile::tempdir().unwrap();
     let socket = socket_dir.path().join("agent.sock");
-    let listener = server::bind(&socket).unwrap();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::spawn(move || {
-        server::serve(listener, actor, quasar_recovery::trust::Caller::Agent, stop)
-    });
+    serve_at(&actor, &socket);
     Machine {
         engine,
+        actor,
         _machine_dir: machine_dir,
-        _socket_dir: socket_dir,
+        socket_dir,
         socket,
     }
 }
@@ -392,4 +402,44 @@ async fn an_apply_naming_the_actor_redials_only_when_another_actor_answers() {
         );
         assert!(!mgr.take_redial(), "consumed");
     }
+}
+
+/// A daemon restart can start the agent before its recovery actor serves again: the agent
+/// finds the socket dark at connect, keeps asking, and reports the actor's attempt once it
+/// answers (the contact a successor verifying a hand-over waits for).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_that_connects_before_its_actor_serves_reports_the_attempt_once_it_does() {
+    let m = machine(Behaviour {
+        health: Some("unhealthy".into()),
+        ..Default::default()
+    });
+    let mgr = ReleaseManager::owned(&m.socket);
+    let (tx, mut rx) = mpsc::channel(32);
+    let guard = mgr.attach_upstream(tx);
+    let (ok, _) = ack_of(&mgr.handle_apply(
+        "c1".into(),
+        REQ.into(),
+        release(),
+        components("node-agent", NEW),
+        false,
+    ));
+    assert!(ok);
+    terminal(&states_until_terminal(&mut rx, REQ).await);
+    drop(guard);
+
+    let later = m.socket_dir.path().join("restarted.sock");
+    let restarted = ReleaseManager::owned(&later);
+    let (tx, mut rx) = mpsc::channel(32);
+    let _guard = restarted.attach_upstream(tx);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing to report while the actor is dark"
+    );
+    serve_at(&m.actor, &later);
+    let (state, reason, restored, _) = terminal(&states_until_terminal(&mut rx, REQ).await);
+    assert_eq!(
+        (state.as_str(), reason.as_deref(), restored),
+        ("failed", Some("unhealthy"), true)
+    );
 }

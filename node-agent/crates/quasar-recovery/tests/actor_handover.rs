@@ -273,6 +273,9 @@ struct Proc {
     alive: Arc<AtomicBool>,
 }
 
+/// Every process that ever held the lease, by container id.
+type Holders = Mutex<Vec<String>>;
+
 impl Proc {
     fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
@@ -300,12 +303,17 @@ struct Lab {
     /// Set by the first submit: the relay polls from then on, as the agent's does
     /// throughout an attempt. Not before, so every install makes the same engine calls.
     relaying: AtomicBool,
+    /// Since when a node agent restarted by the daemon keeps asking a dark actor
+    /// (`release::ReleaseManager::adopt_when_answered`), and how often it found it dark.
+    reattach: Mutex<Option<Instant>>,
+    attach_misses: std::sync::atomic::AtomicUsize,
     /// The test removed every actor container on purpose: until the seed has looked, a
     /// seed that would create one is right, not racing.
     operator_removed: AtomicBool,
     /// A combined host (its control plane submits on the control socket) rather than a
     /// GPU host (its agent submits on the agent socket).
     combined: bool,
+    holders: Holders,
     me: Weak<Lab>,
     stop: AtomicBool,
 }
@@ -400,8 +408,11 @@ impl Lab {
             handover: Mutex::new(handover_timing()),
             agent_polls: AtomicBool::new(true),
             relaying: AtomicBool::new(false),
+            reattach: Mutex::new(None),
+            attach_misses: std::sync::atomic::AtomicUsize::new(0),
             operator_removed: AtomicBool::new(false),
             combined,
+            holders: Mutex::new(Vec::new()),
             me: me.clone(),
             stop: AtomicBool::new(false),
         });
@@ -419,8 +430,12 @@ impl Lab {
             if lab.stop.load(Ordering::SeqCst) {
                 return;
             }
-            if lab.relaying.load(Ordering::SeqCst) && lab.agent_polls.load(Ordering::SeqCst) {
-                let _ = quasar_recovery::server::fetch_status(&lab.socket());
+            if lab.agent_polls.load(Ordering::SeqCst) {
+                if lab.relaying.load(Ordering::SeqCst) {
+                    let _ = quasar_recovery::server::fetch_status(&lab.socket());
+                } else if lab.reattach.lock().unwrap().is_some() {
+                    lab.agent_attach();
+                }
             }
             drop(lab);
             std::thread::sleep(Duration::from_millis(5));
@@ -501,7 +516,12 @@ impl Lab {
                     }
                 }
             }
-            Lifecycle::Stopped(id) | Lifecycle::Removed(id) => self.end(id),
+            Lifecycle::Stopped(id) => self.end(id),
+            Lifecycle::Removed(id) => {
+                self.end(id);
+                // The moment a container goes is when a machine could be left without one.
+                self.check_seed(&format!("{id} removed"));
+            }
         }
     }
 
@@ -542,6 +562,7 @@ impl Lab {
         };
         let crashed = Arc::new(AtomicBool::new(false));
         let flag = crashed.clone();
+        let crashed_flag = crashed.clone();
         config.on_died = Box::new(move || flag.store(true, Ordering::SeqCst));
         let lab = self.me.clone();
         config.crash_after = Some(Box::new(move |component, phase| {
@@ -564,10 +585,18 @@ impl Lab {
                 alive,
             },
         );
+        let (lab, id) = (self.me.clone(), id.to_owned());
         std::thread::spawn(move || {
-            if actor.acquire_lease_waiting().is_ok() {
-                let _ = actor.serve();
-                let _ = actor.resume();
+            match actor.acquire_lease_waiting() {
+                Ok(()) => {
+                    if let Some(lab) = lab.upgrade() {
+                        lab.holders.lock().unwrap().push(id);
+                    }
+                    let _ = actor.serve();
+                    let _ = actor.resume();
+                }
+                // The binary exits (`actor-lease-unavailable`); its policy decides the rest.
+                Err(_) => crashed_flag.store(true, Ordering::SeqCst),
             }
             booted.store(true, Ordering::SeqCst);
         });
@@ -611,13 +640,40 @@ impl Lab {
         }
     }
 
+    /// The restarted node agent's attach: one look at the actor's status. An attempt in
+    /// flight is adopted and polled from then on; a dark actor is asked again until the
+    /// agent's window ends.
+    fn agent_attach(&self) {
+        let mut reattach = self.reattach.lock().unwrap();
+        let Some(since) = *reattach else { return };
+        match quasar_recovery::server::fetch_status(&self.socket()) {
+            Ok(body) => {
+                *reattach = None;
+                let status: Status = serde_json::from_str(&body).unwrap();
+                if status.result.is_some_and(|r| !r.state.is_terminal()) {
+                    self.relaying.store(true, Ordering::SeqCst);
+                }
+            }
+            Err(_) => {
+                self.attach_misses.fetch_add(1, Ordering::SeqCst);
+                if since.elapsed() > Duration::from_secs(90) {
+                    *reattach = None;
+                }
+            }
+        }
+    }
+
     /// What a Docker daemon restart does: every process ends, and the containers whose
-    /// policy restarts them come back.
+    /// policy restarts them come back. The node agent restarts too: it stops relaying and
+    /// attaches afresh, first before any actor serves again.
     fn restart_daemon(&self) {
         let all: Vec<String> = self.procs.lock().unwrap().keys().cloned().collect();
         for id in all {
             self.end(&id);
         }
+        self.relaying.store(false, Ordering::SeqCst);
+        *self.reattach.lock().unwrap() = Some(Instant::now());
+        self.agent_attach();
         self.engine.restart_daemon();
         for c in self.engine.state().containers.values() {
             if is_actor(c) && c.status == "running" {
@@ -1547,6 +1603,158 @@ fn a_successor_that_dies_before_taking_the_lease_leaves_the_old_actor_restored()
         result.output
     );
     assert!(lab.engine.state().container_named(NEXT).is_none());
+}
+
+/// A daemon restart while the successor verifies on a GPU host: the node agent comes back
+/// before the successor serves and finds its socket dark, keeps asking, and its contact
+/// verifies the successor.
+#[test]
+fn a_daemon_restart_while_the_successor_verifies_still_verifies_it() {
+    let lab = Lab::new();
+    at_phase(&lab, Who::New, Phase::Verifying, |lab| {
+        lab.restart_daemon();
+        false
+    });
+    hand_over(&lab);
+    let result = lab.outcome("daemon restart at verifying");
+    assert_succeeded(&lab, &result, "daemon restart at verifying");
+    assert!(
+        lab.attach_misses.load(Ordering::SeqCst) > 0,
+        "the agent attached before the successor served"
+    );
+}
+
+/// An actor started by hand without the installation's labels, started again by the
+/// printed fix after its successor died under the actor's name: it takes the name back
+/// before it removes the successor, so the seed never sees a machine without an actor.
+#[test]
+fn a_hand_started_actor_takes_its_name_back_before_its_successor_goes() {
+    let lab = Lab::new();
+    let old = lab.old_actor();
+    lab.engine.with_state(|s| {
+        let c = s.containers.get_mut(&old.id).unwrap();
+        c.spec.labels.remove("io.quasar.installation");
+        c.spec.labels.remove("io.quasar.platform-service");
+    });
+    let old_id = old.id.clone();
+    let mut fired = false;
+    lab.on(move |lab, who, component, phase| {
+        if fired || who != Who::New || component != "recovery-actor" || phase != Phase::Verifying {
+            return false;
+        }
+        fired = true;
+        let successor = lab
+            .engine
+            .state()
+            .container_named(names::RECOVERY_ACTOR)
+            .unwrap()
+            .id
+            .clone();
+        lab.break_container(&successor);
+        let (lab, old_id) = (lab.me.clone(), old_id.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Some(lab) = lab.upgrade() {
+                lab.engine.start_container(&old_id).unwrap();
+            }
+        });
+        false
+    });
+    hand_over(&lab);
+    lab.wait_until("the hand-started actor is back", |lab| {
+        let state = lab.engine.state();
+        state.container_named(NEXT).is_none()
+            && state
+                .container_named(names::RECOVERY_ACTOR)
+                .is_some_and(|c| c.id == old.id && c.status == "running")
+            && lab.serving().is_some_and(|a| {
+                a.status_for(Some(ID))
+                    .result
+                    .is_some_and(|r| r.state.is_terminal())
+            })
+    });
+    let result = lab.serving().unwrap().status_for(Some(ID)).result.unwrap();
+    assert_eq!(
+        (result.state, result.restored),
+        (State::Failed, true),
+        "{result:?}"
+    );
+    let races = lab.races.lock().unwrap().clone();
+    assert!(races.is_empty(), "the seed would have acted: {races:#?}");
+}
+
+/// A duplicate actor container on the machine, started before the hand-over or while the
+/// old actor lets go of the lease, never takes the lease: it exits at once, and the
+/// hand-over ends with one actor as if it had never run.
+#[test]
+fn a_stray_actor_never_takes_the_machine() {
+    const STRAY: &str = "quasar-recovery-stray";
+    for at_release in [false, true] {
+        let at = format!("stray started at the release: {at_release}");
+        let lab = Lab::new();
+        let mut spec = lab.old_actor().spec;
+        spec.name = STRAY.into();
+        let start_stray = move |lab: &Lab| {
+            let id = lab.engine.create_container(&spec).unwrap();
+            lab.engine
+                .set_restart_policy(&id, RestartPolicy::No)
+                .unwrap();
+            lab.engine.start_container(&id).unwrap();
+        };
+        if at_release {
+            let once = Arc::new(AtomicBool::new(false));
+            let lab_ref = lab.me.clone();
+            lab.on(move |_, who, component, phase| {
+                if who == Who::Old
+                    && component == "recovery-actor"
+                    && phase == Phase::HandingOver
+                    && !once.swap(true, Ordering::SeqCst)
+                {
+                    let (lab, start) = (lab_ref.clone(), start_stray.clone());
+                    std::thread::spawn(move || {
+                        let Some(lab) = lab.upgrade() else { return };
+                        // Start it the moment nobody holds the lease.
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while Instant::now() < deadline
+                            && lab
+                                .procs
+                                .lock()
+                                .unwrap()
+                                .values()
+                                .any(|p| p.actor.holds_lease())
+                        {
+                            std::hint::spin_loop();
+                        }
+                        start(&lab);
+                    });
+                }
+                false
+            });
+        } else {
+            start_stray(&lab);
+        }
+        hand_over(&lab);
+        lab.wait_until(&at, |lab| {
+            lab.engine
+                .state()
+                .container_named(STRAY)
+                .is_some_and(|c| c.status == "exited")
+        });
+        let stray = lab
+            .engine
+            .state()
+            .container_named(STRAY)
+            .unwrap()
+            .id
+            .clone();
+        assert!(
+            !lab.holders.lock().unwrap().contains(&stray),
+            "{at}: the stray actor took the lease"
+        );
+        lab.engine.remove_container(&stray).unwrap();
+        let result = lab.outcome(&at);
+        assert_succeeded(&lab, &result, &at);
+    }
 }
 
 /// ADR 0007: an actor a manager declares is refused a hand-over, changing nothing; a

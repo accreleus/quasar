@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use quasar_runtime::DurableFile;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::actor::Actor;
 use crate::engine::{Container, ContainerSpec, EngineError, RestartPolicy};
@@ -43,9 +43,14 @@ use crate::settle::{Party, RECOVERY_ACTOR};
 use crate::socket::{Reason, State};
 
 /// The one-line way back when no recovery actor runs after a hand-over: the previous actor
-/// is kept, stopped, under this name until its successor verified, and started again it
-/// takes the lease and restores itself.
-pub const FIX: &str = "docker start quasar-recovery.kept";
+/// is kept, stopped, until its successor verified, and started again it takes the lease and
+/// restores itself. Kept under `.kept`, or still under the actor's name when the successor
+/// stopped between stopping and renaming it.
+pub const FIX: &str =
+    "docker start quasar-recovery.kept 2>/dev/null || docker start quasar-recovery";
+
+/// How many `verify` periods of engine outage a verifying successor sits out.
+const ENGINE_OUTAGE_LIMIT: u32 = 10;
 
 /// The successor's name until it takes the actor's.
 pub fn successor_name() -> String {
@@ -175,6 +180,60 @@ impl Actor {
         let me = self.me()?;
         let c = self.engine.inspect_container(me).ok()??;
         c.labels.get(ATTEMPT_LABEL).cloned()
+    }
+
+    /// Whether this process is the old actor or the successor of the open attempt's
+    /// recovery-actor component: the only processes that wait for the lease.
+    pub(crate) fn is_handover_party(&self, own_attempt: Option<&str>) -> bool {
+        let Some(j) = self.journals.scan().open().cloned() else {
+            return false;
+        };
+        let Some(step) = j.steps.iter().find(|s| s.name == RECOVERY_ACTOR) else {
+            return false;
+        };
+        [step.old_container.as_deref(), step.new_container.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|c| self.is_me(c))
+            || own_attempt == Some(j.request.request_id.as_str())
+    }
+
+    /// Why a process that is no party to a hand-over must not act on this machine: a party
+    /// of the open hand-over still exists, or another container holds the actor's name.
+    /// `None` also when this process cannot tell its own container.
+    pub(crate) fn stray(&self) -> Option<String> {
+        self.me()?;
+        if let Some(j) = self.journals.scan().open().cloned() {
+            if let Some(i) = j.steps.iter().position(|s| s.name == RECOVERY_ACTOR) {
+                let step = &j.steps[i];
+                for id in [&step.old_container, &step.new_container]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Ok(Some(c)) = self.engine.inspect_container(id) {
+                        if !self.is_me(&c.id) {
+                            return Some(format!(
+                                "container {} is a party to hand-over {}",
+                                c.name, j.request.request_id
+                            ));
+                        }
+                    }
+                }
+                if let Some(c) = self.attempt_containers(&j, i).ok()?.first() {
+                    return Some(format!(
+                        "container {} is a party to hand-over {}",
+                        c.name, j.request.request_id
+                    ));
+                }
+            }
+        }
+        match self.engine.inspect_container(names::RECOVERY_ACTOR) {
+            Ok(Some(c)) if !self.is_me(&c.id) => Some(format!(
+                "container {} holds the recovery actor's name",
+                c.name
+            )),
+            _ => None,
+        }
     }
 
     /// The open attempt whose recovery-actor component is current and names this process
@@ -332,6 +391,10 @@ impl Actor {
                         step.successor_starts
                     ),
                 },
+                (Party::Stranger { .. }, Phase::Verified | Phase::OldDiscarded) => Failure {
+                    reason: Reason::RecreateFailed,
+                    detail: "the successor verified, then every recovery-actor container was removed before seed.json named it; the seed re-created the last verified actor it knew".into(),
+                },
                 (Party::Stranger { .. }, _) => Failure {
                     reason: Reason::RecreateFailed,
                     detail: "every recovery-actor container of the hand-over was removed before the successor verified; the recovery actor the seed re-created settled it".into(),
@@ -402,6 +465,8 @@ impl Actor {
                 Phase::Verified | Phase::OldDiscarded if party == Party::Old => {
                     return self.yield_or_finish(j, i, party);
                 }
+                // `settle` sends a stranger on the old image to `begin_actor_restore` first;
+                // this arm keeps it from ever recording the new image.
                 Phase::Verified | Phase::OldDiscarded if !on_new => to_restore(Failure {
                     reason: Reason::RecreateFailed,
                     detail: "the successor verified, then every recovery-actor container was removed; the seed re-created the last verified actor it knew".into(),
@@ -710,31 +775,54 @@ impl Actor {
 
     /// `verifying`: the successor answers on each of its own sockets, and its container
     /// runs.
+    /// Time the engine does not answer does not count against `verify`, up to
+    /// [`ENGINE_OUTAGE_LIMIT`] of them: with live-restore the containers keep running
+    /// through a daemon restart, and a healthy successor is not failed for it.
     fn verify_successor(&self, _j: &Journal, _i: usize) -> Result<(), Halt> {
         let timing = self.config.handover;
-        let deadline = Instant::now() + timing.verify;
+        let mut deadline = Instant::now() + timing.verify;
+        let outage_limit = timing.verify * ENGINE_OUTAGE_LIMIT;
+        let mut outage = std::time::Duration::ZERO;
         let me = self.me().unwrap_or_default().to_owned();
         loop {
             if self.killed() {
                 return Err(Halt::Died);
             }
+            let tick = Instant::now();
             let silent = match self.socket_plan() {
                 Ok(plan) => plan.into_iter().find_map(|p| {
                     crate::server::probe_self(&p.path)
                         .err()
                         .map(|e| format!("its socket {} did not answer ({e})", p.path.display()))
                 }),
-                Err(e) => Some(format!("its sockets are unknown: {e}")),
+                Err(e) => Some(format!("its sockets are unknown ({e})")),
             };
             let running = match self.engine.inspect_container(&me) {
-                Ok(Some(c)) => c.running,
+                Ok(Some(c)) => Some(c.running),
+                Ok(None) => Some(false),
                 Err(EngineError::Crashed) => return Err(Halt::Died),
-                _ => false,
+                Err(e) if outage < outage_limit => {
+                    debug!("verifying: the engine did not answer ({e}); not counted");
+                    let lost = tick.elapsed() + timing.poll;
+                    outage += lost;
+                    deadline += lost;
+                    None
+                }
+                Err(e) => {
+                    return Err(fail(
+                        Reason::Unhealthy,
+                        format!(
+                            "the successor did not verify: the container engine did not answer for {}s ({e})",
+                            outage.as_secs()
+                        ),
+                    ))
+                }
             };
             let why = match (silent, running) {
-                (None, true) => return self.await_agent_contact(),
+                (None, Some(true)) => return self.await_agent_contact(),
                 (Some(why), _) => why,
-                (None, false) => "its container is not running".to_string(),
+                (None, Some(false)) => "its container is not running".to_string(),
+                (None, None) => "the container engine did not answer".to_string(),
             };
             if Instant::now() >= deadline {
                 return Err(fail(
@@ -751,8 +839,9 @@ impl Actor {
 
     /// The second half of verifying on a GPU host (architecture §5.6): the node agent
     /// reconnects, which its relay does by polling status on the agent socket throughout
-    /// an attempt. Any request another process makes there counts; none within
-    /// `agent_contact` is not verified.
+    /// an attempt. Any request that is not this process's own probe counts, on any of its
+    /// sockets, so an operator's `docker exec … quasar-recovery status` does too; none
+    /// within `agent_contact` is not verified.
     fn await_agent_contact(&self) -> Result<(), Halt> {
         let gpu = matches!(
             self.dir.load_machine(),
@@ -998,14 +1087,66 @@ impl Actor {
                 }
             }
         }
-        for c in successors {
-            if c.running && matches!(party, Party::Stranger { .. }) {
+        let stranger = matches!(party, Party::Stranger { .. });
+        successors.retain(|c| {
+            let keep = !(c.running && stranger);
+            if !keep {
                 output.push_str(&format!(
                     "\nthe successor {} is running and was left alone",
                     c.name
                 ));
-                continue;
             }
+            keep
+        });
+        // The name first, then the removals: a labelled actor container exists throughout,
+        // so the seed never sees a machine with none (an unlabelled, hand-started actor
+        // does not count for it). A successor under the name steps aside; if it cannot,
+        // it is removed first after all.
+        let canonical = names::RECOVERY_ACTOR;
+        for c in successors.iter_mut().filter(|c| c.name == canonical) {
+            let away = successor_name();
+            match self.retrying(|| self.engine.rename_container(&c.id, &away)) {
+                Ok(()) => c.name = away,
+                Err(e) if crash(&e) => return Err(()),
+                Err(_) => match self.retrying(|| self.engine.remove_container(&c.id)) {
+                    Ok(()) => c.name.clear(),
+                    Err(e) if crash(&e) => return Err(()),
+                    Err(_) => {}
+                },
+            }
+        }
+        successors.retain(|c| !c.name.is_empty());
+
+        let policy = match party {
+            Party::Old => j.steps[i]
+                .old_restart
+                .unwrap_or(RestartPolicy::UnlessStopped),
+            _ => RestartPolicy::UnlessStopped,
+        };
+        let restored = match party {
+            Party::Old => true,
+            Party::Successor => false,
+            Party::Stranger { .. } => self.runs_digest(j.steps[i].old_digest.as_deref()),
+        };
+        let (named, name_note) = match self.keep_this_actor(policy) {
+            Ok(()) if restored => (
+                true,
+                "\nthe successor did not verify; the previous recovery actor was put back and is running".to_string(),
+            ),
+            Ok(()) => (
+                true,
+                "\nthe recovery actor running now keeps this machine".to_string(),
+            ),
+            Err(why) if why == CRASHED => return Err(()),
+            Err(why) => (
+                false,
+                format!(
+                    "\nthe recovery actor running now could not take the actor's name back ({why}), so it does not serve this machine"
+                ),
+            ),
+        };
+
+        for c in successors {
             match self.engine.logs_tail(&c.id, 40) {
                 Ok(tail) if !tail.trim_end().is_empty() => {
                     output.push_str(&format!("\n--- last lines of {} ---\n", c.name));
@@ -1054,36 +1195,38 @@ impl Actor {
             }
         }
 
-        let policy = match party {
-            Party::Old => j.steps[i]
-                .old_restart
-                .unwrap_or(RestartPolicy::UnlessStopped),
-            _ => RestartPolicy::UnlessStopped,
-        };
-        let restored = match party {
-            Party::Old => true,
-            Party::Successor => false,
-            Party::Stranger { .. } => self.runs_digest(j.steps[i].old_digest.as_deref()),
-        };
-        match self.keep_this_actor(policy) {
-            Ok(()) if restored => output.push_str(
-                "\nthe successor did not verify; the previous recovery actor was put back and is running",
-            ),
-            Ok(()) => output.push_str("\nthe recovery actor running now keeps this machine"),
-            Err(why) if why == CRASHED => return Err(()),
-            Err(why) => output.push_str(&format!(
-                "\nthe recovery actor running now could not take the actor's name back ({why})"
-            )),
-        }
-        for (socket, e) in self.serve_again() {
-            warn!(
-                token = "actor-restore-socket-rebind-failed",
-                "{}: {e}",
-                socket.display()
-            );
+        output.push_str(&name_note);
+        if named {
+            for (socket, e) in self.serve_again() {
+                warn!(
+                    token = "actor-restore-socket-rebind-failed",
+                    "{}: {e}",
+                    socket.display()
+                );
+            }
         }
         output.push_str(&moved_before(j, i));
-        self.finish(j, State::Failed, Some(failure.reason), output, restored)
+        self.finish(
+            j,
+            State::Failed,
+            Some(failure.reason),
+            output,
+            restored && named,
+        )?;
+        if !named {
+            // An actor serves only under the actor's name: exit, and a start that finds
+            // another container under it will not act either (`Actor::stray`).
+            error!(
+                token = "actor-name-not-taken",
+                request = %j.request.request_id,
+                "this recovery actor could not take the name {}; it exits without serving. Remove the container holding that name and rename this actor's container to it",
+                names::RECOVERY_ACTOR
+            );
+            self.release_lease();
+            self.died();
+            return Err(());
+        }
+        Ok(())
     }
 
     fn runs_digest(&self, digest: Option<&str>) -> bool {
