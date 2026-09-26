@@ -88,17 +88,40 @@ func TestAnOwnedHostOnEdgeIsUpToDateOnlyWithItsActor(t *testing.T) {
 	newest := rel("edge-b", "", commitB, 74, at(3), onEdge, noManifest)
 	actorBehind := host("h1", "gpu-01", commitB, ownedInstall, func(h *HostIdentity) { h.RecoveryActorSourceCommit = str(commitA) })
 	actorOn := host("h2", "gpu-02", commitB, ownedInstall, func(h *HostIdentity) { h.RecoveryActorSourceCommit = str(commitB) })
-	v := PlanRelease(PlanInputs{
-		Channel:        ChannelEdge,
-		ControlPlane:   cp(commitB, 74),
-		Hosts:          []HostIdentity{actorBehind, actorOn},
-		Releases:       []Release{newest},
-		UpdaterPresent: true,
-	})
+	plan := func(withActor bool) View {
+		resolver := NewImageResolver(edgeImages(commitB, withActor), NewEdgeApplyResolver(edgeImages(commitB, withActor), "", ""), 0)
+		return PlanRelease(PlanInputs{
+			Channel:        ChannelEdge,
+			ControlPlane:   cp(commitB, 74),
+			Hosts:          []HostIdentity{actorBehind, actorOn},
+			Releases:       []Release{newest},
+			UpdaterPresent: true,
+			ImageFor:       func(r Release) *ImageFact { return resolver.Check(context.Background(), r) },
+		})
+	}
+	v := plan(true)
 	if t1 := v.Targets[1]; !t1.Eligible {
 		t.Errorf("an owned host whose actor is behind the edge build: %+v, want eligible", t1)
 	}
 	if t2 := v.Targets[2]; t2.Reason == nil || *t2.Reason != ReasonUpToDate {
 		t.Errorf("an owned host fully on the edge build: %+v, want up_to_date", t2)
+	}
+
+	// A build that published no recovery image has only the agent to send, and the agent
+	// is already on it: offering the host would re-apply that agent again and again.
+	v = plan(false)
+	for _, tg := range v.Targets[1:] {
+		if tg.Reason == nil || *tg.Reason != ReasonUpToDate {
+			t.Errorf("%s on a build with no recovery image: %+v, want up_to_date", *tg.NodeName, tg)
+		}
+	}
+
+	// Nobody resolved the build (no registry egress): nothing but the agent is known.
+	v = PlanRelease(PlanInputs{
+		Channel: ChannelEdge, ControlPlane: cp(commitB, 74), Hosts: []HostIdentity{actorBehind},
+		Releases: []Release{newest}, UpdaterPresent: true,
+	})
+	if t1 := v.Targets[1]; t1.Reason == nil || *t1.Reason != ReasonUpToDate {
+		t.Errorf("an unresolved edge build: %+v, want up_to_date", t1)
 	}
 }

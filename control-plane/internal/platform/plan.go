@@ -348,7 +348,7 @@ func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity, o
 		h := hosts[i]
 		hostID, nodeName := h.HostID, h.NodeName
 		pre := PlanPreflight(TargetHost, HostPreflightFacts(h, image))
-		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h, open[hostID], fleet, pre), pre))
+		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, image, cp, h, open[hostID], fleet, pre), pre))
 	}
 	return out
 }
@@ -424,7 +424,8 @@ func edgeOlderThanInstalled(release Release, cp buildinfo.Identity) bool {
 // hostReason: "" means eligible. The contract fixes the precedence as the order
 // below, durable facts outranking transient ones: an offline source-built host
 // reports install_mode_source, because reconnecting would not change it.
-func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState, pre Preflight) string {
+// image is the registry check for newest (available[0]).
+func hostReason(newest *Release, image *ImageFact, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState, pre Preflight) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
@@ -434,7 +435,7 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 	// Amendment 14: an owned host is up to date only when its recovery actor is on
 	// the release too, where the release names one.
 	if commitsMatch(*h.SourceCommit, newest.SourceCommit) &&
-		!(releaseNamesActor(*newest) && actorBehindRelease(h, newest.SourceCommit)) {
+		!(releaseNamesActor(*newest, image) && actorBehindRelease(h, newest.SourceCommit)) {
 		return ReasonUpToDate
 	}
 	// Its images were never pulled, so there is nothing to re-pin.

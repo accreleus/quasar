@@ -1105,8 +1105,8 @@ jobs:
           # if a `create` call itself fails against the registry, the packages can
           # still end up unevenly tagged. In that case, as in every other, the
           # rollback step below puts every `:latest` back — `:latest` is the only tag
-          # deploy/README.md promises will resolve, and `sha-*`/branch tags are names
-          # nothing followed before this run.
+          # deploy/README.md promises will resolve. `sha-*` and `o2-<branch>` are not
+          # restored; the rollback step says why that is safe for the edge channel.
           write_tags "$CONTROL_SRC"  "$CONTROL_TAGS"
           write_tags "$AGENT_SRC"    "$AGENT_TAGS"
           write_tags "$RECOVERY_SRC" "$RECOVERY_TAGS"
@@ -1137,11 +1137,18 @@ jobs:
       # old one is a worse state than a clean no-op.
       #
       # SCOPE, stated so nobody reads more into a green rollback than is there: only
-      # `:latest` is restored. `sha-<sha>` and `o2-<branch>` are new names nothing
-      # followed before this run, so leaving them pointing at an unpromoted digest
-      # harms no consumer. The one case needing a human is a RE-dispatch on an
-      # already-published `vX.Y.Z`: `:X.Y.Z` may have moved and is not restored here.
-      # Re-dispatch the workflow on that tag once the cause is fixed.
+      # `:latest` is restored. `o2-<branch>` and `sha-<sha>` are left where the failed
+      # run put them, and an RH-06 control plane on the edge channel does follow them:
+      # detection reads all three images off `o2-<branch>` and refuses a set whose
+      # `org.quasar.source.commit` labels disagree, so a half-moved branch tag is
+      # reported, not offered (control-plane/internal/platform/edge.go
+      # ErrEdgeComponentsDisagree), and `sha-<sha>` is only resolved for a build
+      # detection accepted. The residual: if quasar-recovery had no `o2-<branch>`
+      # yet and its write failed, the build reads as one with no recovery actor and
+      # moves hosts' agents alone. Re-dispatch once the cause is fixed. The other
+      # case needing a human is a RE-dispatch on an already-published `vX.Y.Z`:
+      # `:X.Y.Z` may have moved and is not restored here. Re-dispatch the workflow on
+      # that tag once the cause is fixed.
       - name: Roll :latest back if the promotion did not complete
         if: failure() && steps.rollback.outcome == 'success'
         env:
@@ -1202,7 +1209,8 @@ jobs:
             printf '%s\n' "$PREVIOUS"
             echo '```'
             echo ""
-            echo "Not restored: \`sha-*\` and branch tags (nothing followed them), and"
+            echo "Not restored: \`sha-*\` and \`o2-<branch>\` (edge detection refuses a set"
+            echo "whose images disagree; re-dispatch to publish the build whole), and"
             echo "\`:X.Y.Z\` on a re-dispatched release tag — re-dispatch to fix that one."
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"

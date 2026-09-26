@@ -88,6 +88,9 @@ type ReadinessFact struct {
 // every component manifest resolved.
 type ImageFact struct {
 	Err string
+	// EdgeActor: for a release with no manifest, whether its build published a
+	// recovery-actor image. nil when nobody resolved it.
+	EdgeActor *bool
 }
 
 // PreflightFacts is everything the collectors found for ONE target. Every
