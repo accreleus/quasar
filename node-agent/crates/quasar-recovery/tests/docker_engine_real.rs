@@ -645,6 +645,9 @@ fn the_database_helpers_dump_check_and_load_a_real_postgres() {
     assert!(size.trim().parse::<u64>().unwrap() > 0, "{size}");
     let (code, out) = run(Some(DbOp::Dump), "", Some("pending.dump.partial"));
     assert_eq!(code, 0, "{out}");
+    // The archive holds the whole database: the helper's umask makes it the owner's only.
+    let (_, mode) = run(None, "stat -c %a /dumps/pending.dump.partial", None);
+    assert_eq!(mode.trim(), "600", "{mode}");
     let (code, out) = run(Some(DbOp::Inspect), "", Some("pending.dump.partial"));
     assert_eq!(code, 0, "{out}");
     let at_88 = Some(Schema {

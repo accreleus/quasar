@@ -46,6 +46,12 @@ pub struct DumpRecord {
     /// The version a restore of this dump returns to, as the printed command's `--to`.
     #[serde(default)]
     pub returns_to: Option<String>,
+    /// The restore that loaded this dump, and when: running the same command again is
+    /// refused without `--force-again`, since it discards everything written since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<String>,
 }
 
 impl DumpRecord {
@@ -211,11 +217,12 @@ impl DumpDir {
         Ok(())
     }
 
-    /// Keeps the newest [`KEEP`] pre-update dumps; `keep` is never removed.
-    pub fn prune(&self, keep: &str) -> io::Result<Vec<String>> {
+    /// Keeps the newest [`KEEP`] pre-update dumps; `keep`, and every name in `protect`
+    /// (the dump a restore point names), are never removed.
+    pub fn prune(&self, keep: &str, protect: &[&str]) -> io::Result<Vec<String>> {
         let mut removed = Vec::new();
         for r in self.list().into_iter().skip(KEEP) {
-            if r.name != keep {
+            if r.name != keep && !protect.contains(&r.name.as_str()) {
                 self.remove(&r.name)?;
                 removed.push(r.name);
             }
@@ -317,6 +324,46 @@ mod tests {
             assert!(!valid_name(bad), "{bad}");
         }
         assert_eq!(stamp("2026-09-25T10:00:00Z"), "20260925T100000Z");
+    }
+
+    #[test]
+    fn pruning_keeps_three_and_never_the_protected_dump() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = DumpDir::new(root.path());
+        dir.ensure().unwrap();
+        let names: Vec<String> = (1..=5)
+            .map(|i| format!("2026092{i}T100000Z-schema-8{i}"))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            std::fs::write(dir.file(name), b"PGDMP").unwrap();
+            dir.store(&DumpRecord {
+                format: FORMAT,
+                name: name.clone(),
+                schema_version: 80 + i as i64,
+                created_at: format!("2026-09-2{}T10:00:00Z", i + 1),
+                size_bytes: 5,
+                sha256: String::new(),
+                request_id: None,
+                control_plane: None,
+                recipe_revision: None,
+                returns_to: None,
+                restored_by: None,
+                restored_at: None,
+            })
+            .unwrap();
+        }
+        let removed = dir.prune(&names[4], &[names[0].as_str()]).unwrap();
+        assert_eq!(removed, vec![names[1].clone()]);
+        let left: Vec<String> = dir.list().into_iter().map(|r| r.name).collect();
+        assert_eq!(
+            left,
+            vec![
+                names[4].clone(),
+                names[3].clone(),
+                names[2].clone(),
+                names[0].clone()
+            ]
+        );
     }
 
     #[test]

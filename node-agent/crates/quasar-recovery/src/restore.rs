@@ -28,7 +28,9 @@ use crate::database::{self, DbError, DbOp, Hold, HoldReason};
 use crate::dump_dir::{self as dump, DumpDir};
 use crate::engine::EngineError;
 use crate::install_control::CONTROL_PLANE_FILES;
-use crate::journal::{tail_output, CallerTag, Failure, Journal, LOG_TAIL_LIMIT, RESTORE_FORMAT};
+use crate::journal::{
+    tail_output, CallerTag, Failure, Journal, FORMAT, LOG_TAIL_LIMIT, RESTORE_FORMAT,
+};
 use crate::machine::Machine;
 use crate::recipe::{self, names, Book, ImageRef, Role};
 use crate::replace::{fail, Halt, ATTEMPT_LABEL};
@@ -104,10 +106,36 @@ fn refuse(req: &Request, reason: Reason, message: impl Into<String>) -> Rejectio
     }
 }
 
+/// A refusal at `checking`, the only phase that has touched nothing. Never used later.
 fn nothing_changed(why: impl std::fmt::Display) -> Halt {
     fail(
         Reason::Invalid,
         format!("{why}. Nothing was changed: the database and the control plane are as they were"),
+    )
+}
+
+/// What `loading` leaves when it stops short, whatever stopped it: the helper may already
+/// have dropped and re-created the database.
+const LOAD_UNFINISHED: &str = "The database may now be empty; no control plane was started, and none starts until a restore finishes. Do not start the control plane by hand. Run the same command again: a restore can always be repeated";
+
+/// `loading` stopped short: a helper that exited non-zero, or an engine that stopped
+/// answering (a daemon restart) with the helper's work unknown.
+fn load_halt(name: &str, e: DbError) -> Halt {
+    match e {
+        DbError::Crashed => Halt::Died,
+        DbError::Failed(why) => fail(
+            Reason::RecreateFailed,
+            format!("loading dump {name} did not finish: {why}\n{LOAD_UNFINISHED}"),
+        ),
+    }
+}
+
+/// From `stopping` on, the hold is in place: a failure says so rather than that nothing
+/// changed.
+fn held(why: impl std::fmt::Display) -> Halt {
+    fail(
+        Reason::RecreateFailed,
+        format!("{why}. The control plane is stopped and none starts until a restore finishes; run the same command again"),
     )
 }
 
@@ -278,6 +306,16 @@ impl Actor {
                         .load(name)
                         .map_err(|e| format!("the record of dump {name} cannot be read ({e})"))?
                         .ok_or_else(|| format!("dump {name} has no record, so it is not known to be complete"))?;
+                    if let (Some(by), false) = (&record.restored_by, req.force_again) {
+                        return Err(format!(
+                            "dump {name} was already restored{} (restore {by}). Restoring it again discards everything written since then; add --force-again to do it anyway",
+                            record
+                                .restored_at
+                                .as_deref()
+                                .map(|t| format!(" at {t}"))
+                                .unwrap_or_default()
+                        ));
+                    }
                     if let (Some(to), Some(r)) = (&to, &record.returns_to) {
                         if to != r {
                             return Err(format!(
@@ -300,7 +338,7 @@ impl Actor {
                 )?;
                 let point = database::load_point(self.dir.root())
                     .map_err(|e| format!("restore-point.json cannot be read ({e})"))?
-                    .ok_or("no migrating update has run on this machine, so there is nothing to return to")?;
+                    .ok_or("there is no restore point on this machine: no migrating update has run here, or the restore it printed has already been run")?;
                 if point.returns_to != to {
                     return Err(format!(
                         "the last migrating update returns to {}, not {to}",
@@ -371,11 +409,11 @@ impl Actor {
     /// `checking`: the dump is whole and readable, its schema is what its record says,
     /// and the control plane to start matches it. Nothing is touched.
     fn check_restore(&self, j: &mut Journal) -> Result<(), Halt> {
-        let machine = self.restore_machine()?;
+        let machine = self.restore_machine().map_err(nothing_changed)?;
         let plan = self.restore_mut(j).clone();
         let image = self
             .image_labels(&plan.control_plane)
-            .map_err(|e| db_halt(e, "the control plane to start is not available"))?;
+            .map_err(|e| check_halt(e, "the control plane to start is not available"))?;
         let revision = match plan.recipe_revision {
             Some(r) => r,
             None => database::control_plane_revision(&image).ok_or_else(|| {
@@ -404,9 +442,12 @@ impl Actor {
         let schema = match &plan.dump {
             Some(name) => self.check_dump(&machine, name, &plan)?,
             None => {
+                // A running control plane migrates the database again on its next boot:
+                // the operator's restored backup would not stay restored (#364 review B2).
+                self.no_control_plane_running()?;
                 let (code, out) = self
                     .run_db(&machine, DbOp::Schema, None)
-                    .map_err(|e| db_halt(e, "read the database's schema"))?;
+                    .map_err(|e| check_halt(e, "read the database's schema"))?;
                 match database::parse_schema(&out) {
                     Some(s) if code == 0 => s,
                     _ => {
@@ -485,6 +526,27 @@ impl Actor {
         Ok(())
     }
 
+    /// An external database is the operator's to restore, with this machine's control
+    /// planes stopped: refused, with nothing changed, while one runs.
+    fn no_control_plane_running(&self) -> Result<(), Halt> {
+        for name in [
+            names::CONTROL_PLANE.to_string(),
+            kept_name(names::CONTROL_PLANE),
+        ] {
+            match self.engine.inspect_container(&name) {
+                Ok(Some(c)) if c.running => {
+                    return Err(nothing_changed(format!(
+                        "control plane {name} is running, and on its next start it would migrate your database again. Stop it (docker stop {name}), restore the backup you took before the update, then run the command again"
+                    )))
+                }
+                Ok(_) => {}
+                Err(EngineError::Crashed) => return Err(Halt::Died),
+                Err(e) => return Err(nothing_changed(format!("the container engine: {e}"))),
+            }
+        }
+        Ok(())
+    }
+
     fn check_dump(
         &self,
         machine: &Machine,
@@ -492,7 +554,16 @@ impl Actor {
         plan: &Restore,
     ) -> Result<database::Schema, Halt> {
         let dir = DumpDir::new(self.dir.root());
-        let record = dir.load(name).ok().flatten();
+        let record = dir
+            .load(name)
+            .map_err(|e| {
+                nothing_changed(format!("the record of dump {name} cannot be read ({e})"))
+            })?
+            .ok_or_else(|| {
+                nothing_changed(format!(
+                    "dump {name} has no record, so it is not known to be complete"
+                ))
+            })?;
         let (_, sha, magic) = dump::examine(&dir.file(name))
             .map_err(|e| nothing_changed(format!("dump {name} cannot be read: {e}")))?;
         if !magic {
@@ -500,16 +571,14 @@ impl Actor {
                 "{name} is not a pg_dump custom-format archive (make one with `pg_dump --format=custom`)"
             )));
         }
-        if let Some(r) = &record {
-            if r.sha256 != sha {
-                return Err(nothing_changed(format!(
-                    "dump {name} does not match the checksum recorded when it was taken: it is corrupt or was changed"
-                )));
-            }
+        if record.sha256 != sha {
+            return Err(nothing_changed(format!(
+                "dump {name} does not match the checksum recorded when it was taken: it is corrupt or was changed"
+            )));
         }
         let (code, out) = self
             .run_db(machine, DbOp::Inspect, Some(&format!("{name}.dump")))
-            .map_err(|e| db_halt(e, "read the dump"))?;
+            .map_err(|e| check_halt(e, "read the dump"))?;
         let schema = match database::parse_schema(&out) {
             Some(s) if code == 0 => s,
             _ if code != 0 => {
@@ -535,10 +604,10 @@ impl Actor {
         Ok(schema)
     }
 
-    fn restore_machine(&self) -> Result<Machine, Halt> {
+    fn restore_machine(&self) -> Result<Machine, &'static str> {
         match self.dir.load_machine() {
             Ok(Some(m)) => Ok(m),
-            _ => Err(nothing_changed("machine state is unreadable")),
+            _ => Err("machine state is unreadable"),
         }
     }
 
@@ -599,19 +668,21 @@ impl Actor {
 
     /// `loading`: the whole database replaced by the dump, in one transaction.
     fn load_dump(&self, j: &Journal) -> Result<(), Halt> {
-        let machine = self.restore_machine()?;
         let plan = j.restore.as_ref().expect("a restore journal");
         let name = plan.dump.as_deref().expect("loading names a dump");
+        let machine = self
+            .restore_machine()
+            .map_err(|why| load_halt(name, DbError::Failed(why.into())))?;
         let (code, out) = self
             .run_db(&machine, DbOp::Load, Some(&format!("{name}.dump")))
-            .map_err(|e| db_halt(e, "load the dump"))?;
+            .map_err(|e| load_halt(name, e))?;
         if code != 0 {
-            return Err(fail(
-                Reason::RecreateFailed,
-                format!(
-                    "loading dump {name} failed (exit {code}): {}\nThe database may now be empty; no control plane was started, and none starts until a restore finishes. Run the same command again: a restore can always be repeated",
+            return Err(load_halt(
+                name,
+                DbError::Failed(format!(
+                    "exit {code}: {}",
                     tail_output(out.trim(), LOG_TAIL_LIMIT)
-                ),
+                )),
             ));
         }
         let schema = plan.schema_version.expect("checking found the schema");
@@ -626,7 +697,7 @@ impl Actor {
     /// `starting`: the failed and kept control planes go, and the one the database matches
     /// is created from its recipe and started.
     fn start_restored(&self, j: &mut Journal) -> Result<(), Halt> {
-        let mut machine = self.restore_machine()?;
+        let mut machine = self.restore_machine().map_err(held)?;
         let plan = self.restore_mut(j).clone();
         if plan.dump.is_none() {
             if let Some(schema) = plan.schema_version {
@@ -763,6 +834,7 @@ impl Actor {
     fn finish_restore(&self, j: &mut Journal) -> Result<(), ()> {
         let plan = self.restore_mut(j).clone();
         database::clear_hold(self.dir.root()).map_err(|_| ())?;
+        self.mark_restored(&plan, &j.request.request_id);
         let schema = plan.schema_version.unwrap_or_default();
         let output = match &plan.dump {
             Some(name) => format!(
@@ -775,7 +847,39 @@ impl Actor {
                 plan.returns_to.as_deref().unwrap_or("")
             ),
         };
+        j.format = FORMAT;
         self.finish(j, State::Succeeded, None, output, false)
+    }
+
+    /// A restore that succeeded: its dump is recorded as restored (so the printed command
+    /// is not run twice by accident) and the restore point it went back to is cleared.
+    /// Best effort: the database is restored whatever these writes do.
+    fn mark_restored(&self, plan: &Restore, request_id: &str) {
+        let root = self.dir.root();
+        if let Some(name) = &plan.dump {
+            let dir = DumpDir::new(root);
+            match dir.load(name) {
+                Ok(Some(mut record)) if record.restored_by.as_deref() != Some(request_id) => {
+                    record.restored_by = Some(request_id.to_owned());
+                    record.restored_at = Some(self.now());
+                    if let Err(e) = dir.store(&record) {
+                        warn!(token = "actor-restore-mark-unwritten", dump = %name, "{e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(token = "actor-restore-mark-unwritten", dump = %name, "{e}"),
+            }
+        }
+        let point = database::load_point(root).ok().flatten();
+        let went_back = point.is_some_and(|p| match &plan.dump {
+            Some(name) => p.dump.as_deref() == Some(name.as_str()),
+            None => p.dump.is_none() && Some(&p.returns_to) == plan.returns_to.as_ref(),
+        });
+        if went_back {
+            if let Err(e) = database::clear_point(root) {
+                warn!(token = "actor-restore-point-uncleared", "{e}");
+            }
+        }
     }
 
     fn fail_restore(&self, j: &mut Journal, at: RestorePhase, f: Failure) -> Result<(), ()> {
@@ -795,12 +899,14 @@ impl Actor {
                 }
             }
         }
+        j.format = FORMAT;
         self.finish(j, State::Failed, Some(f.reason), output, false)
     }
 
     /// Settle: a restore interrupted before it stopped anything changed nothing.
     pub(crate) fn interrupt_restore(&self, mut j: Journal) -> Result<(), ()> {
         let output = "The recovery actor, the container engine or the machine restarted before the restore stopped anything: nothing was changed. Run the command again.".to_string();
+        j.format = FORMAT;
         self.finish(
             &mut j,
             State::Failed,
@@ -811,7 +917,7 @@ impl Actor {
     }
 }
 
-fn db_halt(e: DbError, what: &str) -> Halt {
+fn check_halt(e: DbError, what: &str) -> Halt {
     match e {
         DbError::Crashed => Halt::Died,
         DbError::Failed(why) => nothing_changed(format!("{what}: {why}")),
@@ -836,6 +942,16 @@ pub fn crash_point(p: RestorePhase) -> crate::journal::Phase {
 
 /// The request the CLI sends.
 pub fn request(request_id: String, dump: Option<String>, to: Option<String>) -> Request {
+    request_again(request_id, dump, to, false)
+}
+
+/// [`request`], with `--force-again`: a dump already restored is restored again.
+pub fn request_again(
+    request_id: String,
+    dump: Option<String>,
+    to: Option<String>,
+    force_again: bool,
+) -> Request {
     Request {
         request_id,
         kind: RequestKind::Restore,
@@ -852,5 +968,6 @@ pub fn request(request_id: String, dump: Option<String>, to: Option<String>) -> 
         purge: false,
         wait_timeout_s: 0,
         from_version: None,
+        force_again,
     }
 }

@@ -70,10 +70,18 @@ pub struct Request {
     /// Zero means the actor's default; omitted when zero, as the Go updater's request is.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub wait_timeout_s: i64,
+    /// `restore` only (`--force-again`): restore a dump that was already restored.
+    /// Omitted when false, so every other request reads exactly as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub force_again: bool,
 }
 
 fn is_zero(n: &i64) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A Go nil slice encodes as `null`; read it as empty. The field is still required.

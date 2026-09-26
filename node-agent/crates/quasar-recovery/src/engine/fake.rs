@@ -96,6 +96,10 @@ pub struct FakeState {
     /// A database helper's forced outcome, by its helper label (`db-dump`, ...): its exit
     /// code and output, with no other effect.
     pub db_failures: BTreeMap<String, (i64, String)>,
+    /// Database helpers, by label, whose engine goes away while they run (a daemon
+    /// restart): the start fails `Unavailable` after the helper did part of its work. A
+    /// `db-load` has dropped and re-created the database, which is left empty.
+    pub db_interrupted: BTreeSet<String>,
     /// Every control-plane image started against a database whose schema is above the one
     /// the image declares: what must never happen.
     pub older_control_planes_started: Vec<String>,
@@ -593,6 +597,15 @@ impl PlatformEngine for FakeEngine {
             // A helper runs to completion at once; the GPU probe prints its report and a
             // database helper acts on the simulated database.
             if let Some(helper) = c.spec.labels.get(HELPER_LABEL).cloned() {
+                if s.db_interrupted.contains(&helper) {
+                    if helper == "db-load" {
+                        s.database = Some(FakeDatabase::default());
+                    }
+                    let c = s.containers.get_mut(&id).unwrap();
+                    c.status = "exited".into();
+                    c.exit_code = Some(137);
+                    return Err(EngineError::Runtime(ErrorKind::Unavailable));
+                }
                 let spec = c.spec.clone();
                 let (code, logs) = if helper.starts_with("db-") {
                     db_helper(s, &spec, &helper)

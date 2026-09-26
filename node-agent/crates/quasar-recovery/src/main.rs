@@ -40,8 +40,12 @@ commands:
                                                     database and start the control plane
                                                     it was taken under
               restore --to <version>                on your own database, once you have
-                                                    restored your backup: start that
-                                                    control plane if the schema matches
+                                                    stopped the control plane and restored
+                                                    your backup: start that control plane
+                                                    if the schema matches
+              --force-again                         restore a dump that was already
+                                                    restored (discards what was written
+                                                    since then)
   version   print this build's version and commit";
 
 /// In the seed's own container only: what its last look came to, for the health check.
@@ -129,12 +133,14 @@ fn restore(args: &[String]) -> ExitCode {
     let mut dump = None;
     let mut to = None;
     let mut list = false;
+    let mut again = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dump" => dump = it.next().cloned(),
             "--to" => to = it.next().cloned(),
             "--list" => list = true,
+            "--force-again" => again = true,
             other => {
                 eprintln!("quasar-recovery restore: unknown argument {other:?}\n\n{USAGE}");
                 return ExitCode::from(2);
@@ -154,7 +160,7 @@ fn restore(args: &[String]) -> ExitCode {
         return list_dumps(&socket);
     }
     let id = quasar_recovery::actor::random_request_id();
-    let req = quasar_recovery::restore::request(id.clone(), dump, to);
+    let req = quasar_recovery::restore::request_again(id.clone(), dump, to, again);
     let body = serde_json::to_string(&req).expect("a request encodes");
     let followed = match operator::call(&socket, "POST", "/v1/restore", Some(&body)) {
         Ok((202, _)) => id,

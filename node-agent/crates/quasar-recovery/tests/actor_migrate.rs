@@ -305,6 +305,7 @@ fn update(id: &str, schema: i64) -> Request {
         purge: false,
         wait_timeout_s: 0,
         from_version: Some(format!("0.{}.0", schema - 1)),
+        force_again: false,
     }
 }
 
@@ -328,6 +329,13 @@ fn run_restore(actor: &Arc<Actor>, req: Request) -> AttemptResult {
         .unwrap_or_else(|r| panic!("refused: {r:?}"));
     actor.wait_attempt();
     actor.status_operator(Some(&id)).result.expect("a result")
+}
+
+/// The `format` a journal is stored in, as an older actor reads it.
+fn journal_format(m: &Machine, id: &str) -> u64 {
+    let raw = std::fs::read(m.dir.path().join("journal").join(format!("{id}.json"))).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    v["format"].as_u64().unwrap()
 }
 
 fn last_line(output: &str) -> &str {
@@ -729,6 +737,28 @@ fn a_restore_whose_load_fails_keeps_every_control_plane_off_the_database_until_i
         "{}",
         refused.message
     );
+    // The hold is the control plane's only: a combined machine's node agent that went is
+    // still re-created.
+    m.engine.with_state(|s| {
+        let id = s.container_named(names::NODE_AGENT).unwrap().id.clone();
+        s.containers.remove(&id);
+    });
+    m.actor().resume().unwrap();
+    assert_eq!(
+        m.engine
+            .state()
+            .container_named(names::NODE_AGENT)
+            .map(|c| c.status.clone()),
+        Some("running".to_string()),
+        "the node agent is re-created while the control plane is held"
+    );
+    assert!(m
+        .engine
+        .state()
+        .containers
+        .values()
+        .filter(|c| c.spec.name.starts_with(names::CONTROL_PLANE))
+        .all(|c| c.status != "running"));
 
     m.engine.with_state(|s| s.db_failures.clear());
     let again = run_restore(&m.actor(), restore_request(&nth_id(4), Some(&dump), None));
@@ -856,6 +886,28 @@ fn an_external_database_is_restored_by_the_operator_then_started_only_on_a_match
         last_line(&failed.output),
         "docker exec quasar-recovery quasar-recovery restore --to 0.80.0"
     );
+    // The failed control plane is stopped, its restart disabled: left running it would
+    // migrate the operator's restored backup again on its next boot.
+    assert!(
+        failed.output.contains("stopped with its restart disabled"),
+        "{}",
+        failed.output
+    );
+    assert!(
+        failed.output.contains("docker stop quasar-control-plane"),
+        "{}",
+        failed.output
+    );
+    assert_eq!(m.control_plane().spec.image, control_image(81));
+    assert_eq!(m.control_plane().status, "exited");
+    assert_eq!(m.control_plane().restart, RestartPolicy::No);
+    m.engine.restart_daemon();
+    m.actor().resume().unwrap();
+    assert_eq!(
+        m.control_plane().status,
+        "exited",
+        "nothing starts it again"
+    );
     let actor = m.actor();
     let refused = actor
         .submit_restore(restore_request(
@@ -884,6 +936,206 @@ fn an_external_database_is_restored_by_the_operator_then_started_only_on_a_match
     assert_eq!(m.control_plane().spec.image, control_image(OLD_SCHEMA));
     assert_eq!(m.control_plane().status, "running");
     m.never_an_older_control_plane("after the external restore");
+    assert!(!m.dir.path().join("restore-point.json").exists());
+    let refused = actor
+        .submit_restore(restore_request(&nth_id(5), None, Some("0.80.0")))
+        .unwrap_err();
+    assert!(
+        refused.message.contains("already been run"),
+        "{}",
+        refused.message
+    );
+}
+
+#[test]
+fn an_external_restore_is_refused_while_a_control_plane_runs() {
+    let m = Machine::install(external_env(), false);
+    let mut req = update(ID, 81);
+    req.external_backup_confirmed = true;
+    assert_eq!(apply(&m.actor(), req).state, State::Failed);
+    // The operator starts the failed control plane by hand, then restores their backup.
+    let id = m.control_plane().id;
+    m.engine
+        .with_state(|s| s.containers.get_mut(&id).unwrap().status = "running".into());
+    m.engine
+        .with_state(|s| s.database.as_mut().unwrap().schema_version = OLD_SCHEMA);
+    let before = m.engine.state().by_name();
+    let result = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(2), None, Some("0.80.0")),
+    );
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert!(
+        result.output.contains("docker stop quasar-control-plane"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.contains("Nothing was changed"),
+        "{}",
+        result.output
+    );
+    assert_eq!(m.engine.state().by_name(), before);
+
+    // Stopped, the same command restores.
+    m.engine
+        .with_state(|s| s.containers.get_mut(&id).unwrap().status = "exited".into());
+    let result = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(3), None, Some("0.80.0")),
+    );
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    assert_eq!(m.control_plane().spec.image, control_image(OLD_SCHEMA));
+    m.never_an_older_control_plane("after the external restore");
+}
+
+#[test]
+fn a_restore_whose_engine_goes_away_mid_load_says_the_database_may_be_empty_and_holds() {
+    let m = Machine::install(combined_env(), false);
+    let dump = apply(&m.actor(), update(ID, 81)).dump.unwrap();
+    m.engine.with_state(|s| {
+        s.db_interrupted.insert("db-load".into());
+    });
+    let result = run_restore(&m.actor(), restore_request(&nth_id(2), Some(&dump), None));
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert!(
+        result.output.contains("The database may now be empty"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.contains("Run the same command again"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("Nothing was changed"),
+        "{}",
+        result.output
+    );
+    assert_eq!(m.db().rows, "", "the load dropped the database");
+    assert!(m.dir.path().join("database-hold.json").exists());
+    m.engine.restart_daemon();
+    m.actor().resume().unwrap();
+    assert!(
+        m.engine
+            .state()
+            .containers
+            .values()
+            .filter(|c| c.spec.name.starts_with(names::CONTROL_PLANE))
+            .all(|c| c.status != "running"),
+        "a control plane runs against an emptied database"
+    );
+
+    m.engine.with_state(|s| s.db_interrupted.clear());
+    let again = run_restore(&m.actor(), restore_request(&nth_id(3), Some(&dump), None));
+    assert_eq!(again.state, State::Succeeded, "{again:?}");
+    assert_eq!(m.db().schema_version, OLD_SCHEMA);
+    assert!(!m.dir.path().join("database-hold.json").exists());
+}
+
+#[test]
+fn a_restored_dump_is_not_restored_again_without_force_again() {
+    let m = Machine::install(combined_env(), false);
+    let dump = apply(&m.actor(), update(ID, 81)).dump.unwrap();
+    let done = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(2), Some(&dump), Some("0.80.0")),
+    );
+    assert_eq!(done.state, State::Succeeded, "{done:?}");
+    assert!(
+        !m.dir.path().join("restore-point.json").exists(),
+        "the point is cleared once its restore succeeded"
+    );
+    // A pre-#364 actor reads the finished restore as a closed attempt.
+    assert_eq!(journal_format(&m, &nth_id(2)), 1);
+
+    let refused = m
+        .actor()
+        .submit_restore(restore_request(&nth_id(3), Some(&dump), Some("0.80.0")))
+        .unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid);
+    assert!(
+        refused.message.contains("already restored") && refused.message.contains("--force-again"),
+        "{}",
+        refused.message
+    );
+    let again = run_restore(
+        &m.actor(),
+        restore::request_again(nth_id(4), Some(dump.clone()), Some("0.80.0".into()), true),
+    );
+    assert_eq!(again.state, State::Succeeded, "{again:?}");
+    assert_eq!(m.db().schema_version, OLD_SCHEMA);
+}
+
+#[test]
+fn a_failed_restore_is_stored_as_a_journal_an_older_actor_reads() {
+    let m = Machine::install(combined_env(), false);
+    let dump = apply(&m.actor(), update(ID, 81)).dump.unwrap();
+    let file = m.dir.path().join("dumps").join(format!("{dump}.dump"));
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes.extend_from_slice(b"garbage");
+    std::fs::write(&file, &bytes).unwrap();
+    let result = run_restore(&m.actor(), restore_request(&nth_id(2), Some(&dump), None));
+    assert_eq!(result.state, State::Failed);
+    assert_eq!(journal_format(&m, &nth_id(2)), 1);
+}
+
+#[test]
+fn an_update_whose_running_schema_cannot_be_read_is_refused() {
+    let m = Machine::install(combined_env(), true);
+    // The running control plane's image is gone from the engine: its schema is unknown.
+    m.engine.with_state(|s| {
+        s.images
+            .retain(|reference, _| *reference != control_image(OLD_SCHEMA))
+    });
+    let mut req = update(ID, 81);
+    req.migrates = false;
+    let result = apply(&m.actor(), req);
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert_eq!(result.reason, Some(Reason::Invalid));
+    assert!(
+        result.output.contains("cannot be read"),
+        "{}",
+        result.output
+    );
+    assert_eq!(m.control_plane().spec.image, control_image(OLD_SCHEMA));
+    assert_eq!(m.control_plane().status, "running");
+    assert_eq!(m.db().schema_version, OLD_SCHEMA);
+}
+
+#[test]
+fn a_migrating_update_after_an_unrestored_failure_takes_no_dump_it_could_not_restore() {
+    let m = Machine::install(combined_env(), false);
+    let first = apply(&m.actor(), update(ID, 81));
+    assert_eq!(first.state, State::Failed);
+    let dumps = m.dump_files();
+    let result = apply(&m.actor(), update(&nth_id(2), 82));
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert_eq!(result.reason, Some(Reason::BackupFailed));
+    assert!(
+        result.output.contains("restore the dump"),
+        "{}",
+        result.output
+    );
+    assert_eq!(
+        m.dump_files(),
+        dumps,
+        "the first update's dump is kept, no other taken"
+    );
+    assert_eq!(
+        last_line(&first.output),
+        format!(
+            "docker exec quasar-recovery quasar-recovery restore --dump {} --to 0.80.0",
+            first.dump.clone().unwrap()
+        )
+    );
+    // The first update's way back still works.
+    let restored = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(3), first.dump.as_deref(), Some("0.80.0")),
+    );
+    assert_eq!(restored.state, State::Succeeded, "{restored:?}");
 }
 
 #[test]

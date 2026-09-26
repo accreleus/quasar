@@ -119,6 +119,7 @@ fn request(id: &str, name: &str, image: &str, digest: &str) -> Request {
         purge: false,
         wait_timeout_s: 0,
         from_version: None,
+        force_again: false,
     }
 }
 

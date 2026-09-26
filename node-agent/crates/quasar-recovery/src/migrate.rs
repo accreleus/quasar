@@ -18,10 +18,10 @@ use tracing::{info, warn};
 use crate::actor::Actor;
 use crate::database::{self, DbError, DbOp, RestorePoint};
 use crate::dump_dir::{self as dump, DumpDir, DumpRecord};
-use crate::engine::{EngineError, Image};
+use crate::engine::{Container, EngineError, Image, RestartPolicy};
 use crate::journal::{tail_output, Failure, Journal, LOG_TAIL_LIMIT};
 use crate::machine::Machine;
-use crate::recipe::ImageRef;
+use crate::recipe::{names, ImageRef};
 use crate::replace::{fail, moved_before, Halt};
 use crate::socket::{Reason, State};
 
@@ -43,13 +43,15 @@ fn db(e: DbError, what: &str) -> Halt {
 
 impl Actor {
     /// Whether step `i`, a control plane of `found`, migrates; refused here when it would
-    /// run against a newer schema, or migrate an external database nobody backed up.
+    /// run against a newer schema, or migrate an external database nobody backed up, or
+    /// when whether it migrates cannot be told. `running` is the control plane it replaces.
     pub(crate) fn control_plane_migrates(
         &self,
         j: &Journal,
         machine: &Machine,
         found: &Image,
         reference: &str,
+        running: Option<&Container>,
     ) -> Result<bool, Halt> {
         self.schema_allows(found, reference).map_err(|why| {
             fail(
@@ -65,11 +67,39 @@ impl Actor {
                 format!("read the running control plane's image: {e}"),
             ),
         };
-        let old = match self.recorded_control_plane(machine).map_err(read)? {
-            Some((image, _)) => self.local_image_schema(&image).map_err(read)?,
-            None => None,
+        // The schema of the control plane that runs, from its container's own image; the
+        // machine's record only when none runs.
+        let old = match running {
+            Some(c) => self
+                .engine
+                .inspect_image(&c.image_id)
+                .map_err(read)?
+                .as_ref()
+                .and_then(database::image_schema),
+            None => match self.recorded_control_plane(machine).map_err(read)? {
+                Some((image, _)) => self.local_image_schema(&image).map_err(read)?,
+                None => None,
+            },
         };
+        if !j.request.migrates && new.is_some() && old.is_none() {
+            return Err(fail(
+                Reason::Invalid,
+                format!(
+                    "{reference} is a control plane of schema {}, and the schema of the control plane it replaces cannot be read, so whether it migrates the database cannot be told. Nothing was changed",
+                    new.unwrap_or_default()
+                ),
+            ));
+        }
         let migrating = j.request.migrates || matches!((new, old), (Some(n), Some(o)) if n > o);
+        if migrating && new.is_none() && j.request.schema_version.is_none() {
+            return Err(fail(
+                Reason::Invalid,
+                format!(
+                    "this update migrates the database, but {reference} declares no {} label and the request names no schema, so no schema floor could keep an older control plane off the migrated database. Nothing was changed",
+                    database::IMAGE_SCHEMA
+                ),
+            ));
+        }
         if migrating && !Self::is_owned_database(machine) && !j.request.external_backup_confirmed {
             return Err(fail(
                 Reason::BackupUnconfirmed,
@@ -116,6 +146,10 @@ impl Actor {
             old_found.as_ref(),
             &old_image,
         );
+        let before = database::load_point(self.dir.root())
+            .ok()
+            .flatten()
+            .filter(|p| p.request_id != request_id);
         let mut point = RestorePoint {
             format: 1,
             request_id: request_id.clone(),
@@ -125,11 +159,23 @@ impl Actor {
             schema_version: old_found.as_ref().and_then(database::image_schema),
             dump: None,
             created_at: self.now(),
+            previous: before.clone().map(|mut p| {
+                p.previous = None;
+                Box::new(p)
+            }),
         };
         if Self::is_owned_database(&machine) {
             let record = match DumpDir::new(self.dir.root()).taken_by(&request_id) {
                 Some(done) => done,
-                None => self.dump_now(&machine, j, &old_image, old_revision, &returns_to)?,
+                None => self.dump_now(
+                    &machine,
+                    j,
+                    &old_image,
+                    old_found.as_ref(),
+                    old_revision,
+                    &returns_to,
+                    before.as_ref().and_then(|p| p.dump.as_deref()),
+                )?,
             };
             point.schema_version = Some(record.schema_version);
             point.dump = Some(record.name.clone());
@@ -145,13 +191,16 @@ impl Actor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dump_now(
         &self,
         machine: &Machine,
         j: &Journal,
         old_image: &ImageRef,
+        old_found: Option<&Image>,
         old_revision: u32,
         returns_to: &str,
+        protect: Option<&str>,
     ) -> Result<DumpRecord, Halt> {
         let dir = DumpDir::new(self.dir.root());
         dir.ensure()
@@ -236,6 +285,19 @@ impl Actor {
                 schema.version
             )));
         }
+        // A restore of the dump starts the control plane this machine last verified, and
+        // only when their schemas are equal: a database already ahead of it (a failed
+        // migrating update nobody restored) gives a dump no restore could use.
+        if let Some(declared) = old_found.and_then(database::image_schema) {
+            if declared != schema.version {
+                return Err(cleanup(format!(
+                    "the database is at schema {} but the control plane this machine last verified ({}) is of schema {declared}, so a dump of it could not be restored; restore the dump of the earlier update first (`docker exec {} quasar-recovery restore --list`)",
+                    schema.version,
+                    returns_to,
+                    names::RECOVERY_ACTOR
+                )));
+            }
+        }
         let now = self.now();
         let mut name = format!("{}-schema-{}", dump::stamp(&now), schema.version);
         if dir.load(&name).ok().flatten().is_some() {
@@ -257,6 +319,8 @@ impl Actor {
             control_plane: Some(old_image.clone()),
             recipe_revision: Some(old_revision),
             returns_to: Some(returns_to.to_owned()),
+            restored_by: None,
+            restored_at: None,
         };
         if let Err(e) = dir.store(&record) {
             let _ = dir.remove(&name);
@@ -265,7 +329,7 @@ impl Actor {
                 format!("the dump's record could not be written ({e}); the control plane was not replaced and the database was not touched"),
             ));
         }
-        match dir.prune(&name) {
+        match dir.prune(&name, protect.as_slice()) {
             Ok(gone) if !gone.is_empty() => {
                 info!(removed = ?gone, "older pre-update dumps removed; the last three are kept")
             }
@@ -279,13 +343,26 @@ impl Actor {
         Ok(record)
     }
 
-    /// An attempt that ends before its control plane moved leaves no dump of its own.
+    /// An attempt that ends before its control plane moved leaves no dump of its own, and
+    /// puts back the restore point it replaced.
     pub(crate) fn discard_dump(&self, request_id: &str) {
-        let dir = DumpDir::new(self.dir.root());
+        let root = self.dir.root();
+        let dir = DumpDir::new(root);
         let _ = dir.remove_partials();
         if let Some(record) = dir.taken_by(request_id) {
             if let Err(e) = dir.remove(&record.name) {
                 warn!(token = "actor-dump-discard-failed", dump = %record.name, "{e}");
+            }
+        }
+        if let Ok(Some(point)) = database::load_point(root) {
+            if point.request_id == request_id {
+                let back = match point.previous {
+                    Some(p) => database::store_point(root, &p),
+                    None => database::clear_point(root),
+                };
+                if let Err(e) = back {
+                    warn!(token = "actor-restore-point-unreverted", "{e}");
+                }
             }
         }
     }
@@ -321,11 +398,35 @@ impl Actor {
         output.push_str(&moved_before(j, i));
         let point = database::load_point(self.dir.root()).ok().flatten();
         let point = point.filter(|p| p.request_id == j.request.request_id);
+        let external = point.as_ref().is_some_and(|p| p.dump.is_none());
+        // On the operator's own database the failed control plane is stopped: left to its
+        // restart policy it would migrate their restored backup again on its next boot.
+        // It never verified, so nothing is lost. Quasar's own database is stopped by the
+        // restore itself, so the new control plane stays up there (and serves the console).
+        // One that never started is removed instead: an install's resume starts a container
+        // it finds only created.
+        let stopped = match (&new, external) {
+            (Some(id), true) => match self.stop_failed(id, started) {
+                Err(EngineError::Crashed) => return Err(()),
+                other => Some(other),
+            },
+            _ => None,
+        };
         output.push_str(if started {
-            "\nThis release migrates the database, and its migration may have run, so the previous control plane was not put back: an older control plane never runs against a newer schema. The new one is left as it is."
+            "\nThis release migrates the database, and its migration may have run, so the previous control plane was not put back: an older control plane never runs against a newer schema."
         } else {
             "\nThis release migrates the database, so the previous control plane was not put back automatically. The new control plane never started, so its migration did not run."
         });
+        match &stopped {
+            None if started => output.push_str(" The new one is left as it is."),
+            None => {}
+            Some(Ok(())) if started => output.push_str(" The new one is stopped with its restart disabled, so it does not migrate your database again."),
+            Some(Ok(())) => output.push_str(" It was removed, so nothing starts it against your database."),
+            Some(Err(e)) => output.push_str(&format!(
+                " The new one could not be stopped ({e}): stop it yourself (docker stop {}) before you restore your backup, or its next start migrates the database again.",
+                names::CONTROL_PLANE
+            )),
+        }
         match &point {
             Some(p) => match &p.dump {
                 Some(dump) => output.push_str(&format!(
@@ -335,8 +436,9 @@ impl Actor {
                     database::restore_command(Some(dump), &p.returns_to)
                 )),
                 None => output.push_str(&format!(
-                    "\nQuasar holds no dump of an operator's own database. To go back to {}, restore the backup you confirmed with your own tools, then run this on this machine; it starts {} only if the database's schema matches it:\n{}",
+                    "\nQuasar holds no dump of an operator's own database. To go back to {}: make sure the control plane is stopped (docker stop {}), restore the backup you confirmed with your own tools, then run this on this machine; it starts {} only if the database's schema matches it:\n{}",
                     p.returns_to,
+                    names::CONTROL_PLANE,
                     p.returns_to,
                     database::restore_command(None, &p.returns_to)
                 )),
@@ -359,5 +461,16 @@ impl Actor {
             "a migrating control plane did not verify; it is not restored automatically"
         );
         self.finish(j, State::Failed, Some(failure.reason), output, false)
+    }
+
+    /// Stops a failed control plane that ran and disables its restart, so neither a daemon
+    /// restart nor its policy starts it again; removes one that never ran.
+    fn stop_failed(&self, id: &str, started: bool) -> Result<(), EngineError> {
+        if !started {
+            return self.retrying(|| self.engine.remove_container(id));
+        }
+        let grace = self.config.timing.stop_grace;
+        self.retrying(|| self.engine.stop_container(id, grace))?;
+        self.retrying(|| self.engine.set_restart_policy(id, RestartPolicy::No))
     }
 }

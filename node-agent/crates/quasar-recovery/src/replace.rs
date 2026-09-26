@@ -509,7 +509,7 @@ impl Actor {
             crate::handover::carry_forward(&mut spec, old, trust_recorded);
         }
         let migrating = if role == Role::ControlPlane {
-            self.control_plane_migrates(j, &machine, &found, &reference)?
+            self.control_plane_migrates(j, &machine, &found, &reference, old.as_ref())?
         } else {
             false
         };
@@ -656,13 +656,18 @@ impl Actor {
                 EngineError::Crashed => Halt::Died,
                 e => fail(Reason::RecreateFailed, format!("read the new image: {e}")),
             })?;
-            if let Some(schema) = target {
-                self.raise_floor(schema, &j.request.request_id)
-                    .map_err(|e| {
-                        error!(token = "actor-schema-floor-unwritten", "{e}");
-                        Halt::Died
-                    })?;
-            }
+            // `checked` refused a migrating step with no target; never start one unfloored.
+            let schema = target.ok_or_else(|| {
+                fail(
+                    Reason::Invalid,
+                    "the new control plane declares no schema and the request names none, so the schema floor cannot be raised; it was not started",
+                )
+            })?;
+            self.raise_floor(schema, &j.request.request_id)
+                .map_err(|e| {
+                    error!(token = "actor-schema-floor-unwritten", "{e}");
+                    Halt::Died
+                })?;
         }
         match self.retrying(|| self.engine.start_container(&c.id)) {
             Ok(()) => Ok(()),

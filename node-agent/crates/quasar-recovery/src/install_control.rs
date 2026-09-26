@@ -135,9 +135,10 @@ impl Actor {
             })?;
         }
         // A restore owns the database until it finishes: no control plane is created or
-        // started meanwhile (`crate::restore`).
-        match crate::database::load_hold(self.dir.root()) {
-            Ok(None) => {}
+        // started meanwhile (`crate::restore`). Only the control plane is held: a combined
+        // machine's node agent is still ensured.
+        let held = match crate::database::load_hold(self.dir.root()) {
+            Ok(None) => false,
             Ok(Some(hold)) => {
                 let why = match hold.reason {
                     crate::database::HoldReason::RestoreIncomplete => format!(
@@ -146,7 +147,7 @@ impl Actor {
                     ),
                 };
                 warn!(token = "actor-control-plane-held", "{why}");
-                return Ok(());
+                true
             }
             Err(e) => {
                 return Err(ResumeError::State(std::io::Error::new(
@@ -154,27 +155,29 @@ impl Actor {
                     format!("database-hold.json cannot be read ({e}); no control plane is started until it can"),
                 )))
             }
+        };
+        if !held {
+            self.ensure_volume(machine, names::CONTROL_DATA_VOLUME, Role::ControlPlane)?;
+            self.ensure_volume(
+                machine,
+                names::CONTROL_PLANE_SECRETS_VOLUME,
+                Role::ControlPlane,
+            )?;
+            let secrets = self.control_plane_secrets()?;
+            self.ensure_service(
+                machine,
+                Role::ControlPlane,
+                &secrets,
+                CONTROL_PLANE_FILES,
+                |_, _| {
+                    // Only before a create: a restart never holds the actor busy on Postgres.
+                    if owned_db {
+                        self.await_healthy(names::POSTGRES);
+                    }
+                    Ok(())
+                },
+            )?;
         }
-        self.ensure_volume(machine, names::CONTROL_DATA_VOLUME, Role::ControlPlane)?;
-        self.ensure_volume(
-            machine,
-            names::CONTROL_PLANE_SECRETS_VOLUME,
-            Role::ControlPlane,
-        )?;
-        let secrets = self.control_plane_secrets()?;
-        self.ensure_service(
-            machine,
-            Role::ControlPlane,
-            &secrets,
-            CONTROL_PLANE_FILES,
-            |_, _| {
-                // Only before a create: a restart never holds the actor busy on Postgres.
-                if owned_db {
-                    self.await_healthy(names::POSTGRES);
-                }
-                Ok(())
-            },
-        )?;
         if machine.role == MachineRole::Combined {
             self.ensure_node_agent(machine)?;
         }

@@ -541,6 +541,7 @@ impl Actor {
             purge: false,
             wait_timeout_s: 0,
             from_version: None,
+            force_again: false,
         };
         Ok(Journal {
             format: FORMAT,

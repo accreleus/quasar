@@ -902,6 +902,7 @@ fn request(components: Vec<Component>) -> Request {
         purge: false,
         wait_timeout_s: 0,
         from_version: None,
+        force_again: false,
     }
 }
 

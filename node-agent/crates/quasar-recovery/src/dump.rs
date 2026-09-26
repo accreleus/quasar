@@ -109,6 +109,7 @@ pub fn take(
 
 /// The script reads its inputs from the environment, so nothing is interpolated into it.
 const SCRIPT: &str = r#"set -eu
+umask 077
 as_pg() { if command -v su-exec >/dev/null 2>&1; then su-exec postgres "$@"; else gosu postgres "$@"; fi; }
 as_pg pg_ctl -D "$PGDATA" -w -t 300 -o "-c listen_addresses=''" start
 rc=0

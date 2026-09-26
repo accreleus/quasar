@@ -79,8 +79,9 @@ impl DbOp {
     /// in the secrets mount and `$QUASAR_DUMP_FILE`.
     pub fn script(self) -> String {
         let password = format!("{}/{}", paths::SECRETS_DIR, secrets::DATABASE_PASSWORD);
+        // umask first: a dump archive holds the whole database, so it is the owner's only.
         let prelude = format!(
-            "set -eu; set -o pipefail; PGPASSWORD=\"$(cat {password})\"; export PGPASSWORD; "
+            "umask 077; set -eu; set -o pipefail; PGPASSWORD=\"$(cat {password})\"; export PGPASSWORD; "
         );
         // Each prints `schema=<version> dirty=<t|f>` where it reads a schema: the one line
         // the actor parses (`parse_schema`). The file is always `$QUASAR_DUMP_FILE`.
@@ -185,6 +186,10 @@ pub struct RestorePoint {
     #[serde(default)]
     pub dump: Option<String>,
     pub created_at: String,
+    /// The point this one replaced, while its attempt has not moved a control plane: an
+    /// attempt that ends before that puts it back (`Actor::discard_dump`). One level only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<Box<RestorePoint>>,
 }
 
 fn floor_file(root: &Path) -> DurableFile<SchemaFloor> {
@@ -224,6 +229,14 @@ pub fn load_point(root: &Path) -> std::io::Result<Option<RestorePoint>> {
 
 pub fn store_point(root: &Path, point: &RestorePoint) -> std::io::Result<()> {
     point_file(root).store(point)
+}
+
+/// No restore point: its restore has been run.
+pub fn clear_point(root: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(point_file(root).path()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => std::fs::File::open(root)?.sync_all(),
+    }
 }
 
 /// The value a `restore --to` names: the control plane's version, else its image's commit
