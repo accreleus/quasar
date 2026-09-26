@@ -25,10 +25,13 @@
 //!    and only on a machine that runs a control plane. A request naming `recovery-actor`
 //!    needs this actor to be the container under the actor's name: it is what hands over.
 //!    What a caller may name but this build cannot yet do is refused `invalid`, saying
-//!    which ticket brings it: a migrating control-plane replacement, which needs the
-//!    pre-update dump (RH06-12, #364), and the control socket's `restore`. The control
-//!    socket's `remove` is refused: a control-plane machine is taken apart by `uninstall`
-//!    on the machine.
+//!    which ticket brings it; the control socket's `restore` is refused, because a restore
+//!    is the operator's command (`crate::restore`), and its `remove` too: a control-plane
+//!    machine is taken apart by `uninstall` on the machine.
+//!
+//!    A migrating control plane on an operator-supplied database needs the operator's
+//!    confirmation of a backup (`backup_unconfirmed` otherwise), and no control plane is
+//!    replaced while a restore holds the database (`crate::database`).
 //! 5. Every image a registry host plus well-formed path components, then
 //!    [`trust::admit`]: single flight, the component table and the confused-deputy guard,
 //!    image and digest shape, the namespace allowlist, then ADR 0003 signatures.
@@ -109,7 +112,7 @@ fn kind_and_caller_rules(
             return Err(refuse(
                 req,
                 Reason::Invalid,
-                "restoring a pre-update dump is the operator's restore command, which arrives with RH06-12 (#364); nothing was changed",
+                "restoring a pre-update dump is the operator's command on this machine (`docker exec quasar-recovery quasar-recovery restore`), never a control-socket request; nothing was changed",
             ))
         }
         (Caller::ControlPlane, RequestKind::Remove) => {
@@ -160,15 +163,6 @@ fn kind_and_caller_rules(
             req,
             Reason::Invalid,
             "this is a GPU host: it runs no control plane to replace; nothing was changed",
-        ));
-    }
-    // A migrating control plane is never restored automatically (ADR 0004 amendment): its
-    // way back is the pre-update dump, which this build does not take.
-    if names_control_plane && req.migrates {
-        return Err(refuse(
-            req,
-            Reason::Invalid,
-            "this control plane migrates the database; replacing it across a migration, with the pre-update dump, arrives with RH06-12 (#364). Nothing was changed",
         ));
     }
     if caller == Caller::Agent && names_actor && role != MachineRole::Gpu {
@@ -333,6 +327,34 @@ impl Actor {
                 ))
             }
         };
+        // 4, the database rules.
+        if req.components.iter().any(|c| c.name == "control-plane") {
+            if req.migrates && !Actor::is_owned_database(&machine) && !req.external_backup_confirmed
+            {
+                return Err(refuse(
+                    &req,
+                    Reason::BackupUnconfirmed,
+                    "this release migrates the operator's own database, and no current backup of it was confirmed; Quasar never dumps an operator's database. Nothing was changed",
+                ));
+            }
+            match crate::database::load_hold(self.dir.root()) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(refuse(
+                        &req,
+                        Reason::Invalid,
+                        "a restore holds this machine's database (it has not finished); run the restore command again first. Nothing was changed",
+                    ))
+                }
+                Err(e) => {
+                    return Err(refuse(
+                        &req,
+                        Reason::Busy,
+                        format!("database-hold.json cannot be read ({e}); nothing was admitted"),
+                    ))
+                }
+            }
+        }
         match self.engine.list_containers() {
             Ok(all) => {
                 let conflicts = crate::race_guard::conflicts(
@@ -485,6 +507,8 @@ impl Actor {
                 new_container: None,
                 failure: None,
                 successor_starts: 0,
+                migrating: false,
+                dump: None,
             });
         }
 
@@ -507,7 +531,9 @@ impl Actor {
                 finished_at: None,
                 restored: false,
                 release: req.release.clone(),
+                dump: None,
             },
+            restore: None,
         };
         // Committed before `Accepted` is returned: an attempt the caller was told about
         // exists on disk whatever happens next.

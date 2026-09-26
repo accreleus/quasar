@@ -36,6 +36,7 @@
     "conflicts": [],
     "in_flight": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
     "dumps": [],
+    "dump_free_bytes": null,
     "result": {
       "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
       "state": "pulling",
@@ -62,7 +63,8 @@
         "id": "rel-0.3.0",
         "version": "0.3.0",
         "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
-      }
+      },
+      "dump": null
     },
     "stale": false
   }

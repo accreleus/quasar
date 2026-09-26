@@ -130,11 +130,21 @@ pub struct ActorConfig {
     /// write, an injected crash): the binary exits, so the restart policy starts it again
     /// and `resume` settles the attempt (D8).
     pub on_died: Box<dyn Fn() + Send + Sync>,
+    /// The daemon-host path of `machine_dir`, when self-inspection cannot tell (a test, or
+    /// `QUASAR_MACHINE_DIR_HOST_PATH`): the pre-update dump helper binds its `dumps/`.
+    pub machine_dir_host: Option<String>,
+    /// Free bytes on the filesystem of a path: where the pre-update dumps are written.
+    pub free_space: FreeSpace,
+    /// How long one database operation (a dump, a load) may run.
+    pub database_timeout: std::time::Duration,
     /// Fault injection: called after every committed phase with the component's name and
     /// the phase; `true` makes the process die right there.
     #[cfg(any(test, feature = "test-support"))]
     pub crash_after: Option<CrashAfter>,
 }
+
+/// See [`ActorConfig::free_space`].
+pub type FreeSpace = Box<dyn Fn(&std::path::Path) -> io::Result<u64> + Send + Sync>;
 
 /// See [`ActorConfig::crash_after`].
 #[cfg(any(test, feature = "test-support"))]
@@ -244,6 +254,9 @@ impl ActorConfig {
             handover: HandoverTiming::default(),
             socket_dir: paths::AGENT_SOCKET_DIR.into(),
             on_died: Box::new(|| {}),
+            machine_dir_host: None,
+            free_space: Box::new(crate::dump_dir::free_bytes),
+            database_timeout: crate::database::DEFAULT_TIMEOUT,
             #[cfg(any(test, feature = "test-support"))]
             crash_after: None,
         }
@@ -266,6 +279,8 @@ pub enum ResumeError {
     RecipeUnsupported(String),
     /// Something this build does not do yet.
     Unsupported(String),
+    /// A control plane older than the database's schema would be created or started.
+    OlderControlPlane(String),
     /// This process is gone (a test's stand-in for the process dying).
     Stopped,
     /// This process is no party to a hand-over and the machine has another actor.
@@ -284,6 +299,7 @@ impl std::fmt::Display for ResumeError {
             ResumeError::OwnerConflict(why) => write!(f, "owner_conflict: {why}"),
             ResumeError::RecipeUnsupported(why) => write!(f, "recipe_unsupported: {why}"),
             ResumeError::Unsupported(why) => write!(f, "not supported by this build: {why}"),
+            ResumeError::OlderControlPlane(why) => write!(f, "control plane not started: {why}"),
             ResumeError::Stopped => f.write_str("this process was stopped"),
             ResumeError::Stray(why) => {
                 write!(f, "this recovery actor is not this machine's ({why}); it will not act")
@@ -674,10 +690,18 @@ impl Actor {
     /// attempts, nor the control socket the agent's. `in_flight` stays machine-wide: it is
     /// what makes a second submit `busy`, whoever sent the first.
     pub fn status_as(&self, caller: crate::trust::Caller, request_id: Option<&str>) -> Status {
+        self.status_tagged(crate::submit::caller_tag(caller), request_id)
+    }
+
+    /// [`Actor::status_as`] for the operator socket: only the operator's own restores.
+    pub fn status_operator(&self, request_id: Option<&str>) -> Status {
+        self.status_tagged(crate::journal::CallerTag::Operator, request_id)
+    }
+
+    fn status_tagged(&self, mine: crate::journal::CallerTag, request_id: Option<&str>) -> Status {
         let mut status = self.inventory_status();
         let scan = self.journals.scan();
         status.in_flight = scan.open_id();
-        let mine = crate::submit::caller_tag(caller);
         status.result = match request_id {
             Some(id) if crate::submit::is_uuid(id) => self
                 .journals
@@ -725,6 +749,21 @@ impl Actor {
             None if role == MachineRole::Gpu => DatabaseMode::None,
             None => DatabaseMode::Owned,
         };
+        let (dumps, dump_free_bytes) = if database == DatabaseMode::Owned && machine.is_some() {
+            let dir = crate::dump_dir::DumpDir::new(self.dir.root());
+            let dumps = dir.list().into_iter().map(|d| d.wire()).collect();
+            let at = if dir.path().is_dir() {
+                dir.path()
+            } else {
+                self.dir.root()
+            };
+            let free = (self.config.free_space)(at)
+                .ok()
+                .and_then(|b| i64::try_from(b).ok());
+            (dumps, free)
+        } else {
+            (Vec::new(), None)
+        };
         Status {
             actor: self.identity(),
             seed: inventory.seed,
@@ -734,7 +773,8 @@ impl Actor {
             services: inventory.services,
             conflicts: inventory.conflicts,
             in_flight: None,
-            dumps: Vec::new(),
+            dumps,
+            dump_free_bytes,
             result: None,
             stale,
         }
@@ -812,7 +852,7 @@ impl Actor {
 
     /// A probe or secrets writer left by a crash is removed; nothing else is touched.
     fn sweep_helpers(&self) -> Result<(), ResumeError> {
-        for name in [names::GPU_PROBE, names::SECRETS_WRITER] {
+        for name in names::HELPERS {
             if let Some(c) = self.engine.inspect_container(name)? {
                 if c.labels.contains_key(labels::HELPER) {
                     info!(container = %c.name, "removing a helper left by an interrupted start");
@@ -1257,6 +1297,13 @@ impl Actor {
             ports: Vec::new(),
             healthcheck: None,
         };
+        // One an interrupted delivery left: a restore settling on the next start delivers
+        // before `resume` sweeps helpers.
+        if let Some(stale) = self.engine.inspect_container(names::SECRETS_WRITER)? {
+            if stale.labels.get(labels::HELPER).map(String::as_str) == Some(SECRETS_HELPER) {
+                self.engine.remove_container(&stale.id)?;
+            }
+        }
         let id = self.engine.create_container(&writer)?;
         let uploaded = self.engine.upload_archive(&id, "/secrets", archive);
         let removed = self.engine.remove_container(&id);
@@ -1497,6 +1544,11 @@ fn tar_of(entries: &[(String, String)], owner: FileOwner) -> Result<Vec<u8>, Res
         builder.append_data(&mut header, name, value.as_bytes())?;
     }
     Ok(builder.into_inner()?)
+}
+
+/// A fresh request id (a v4 uuid), for the operator's `restore`.
+pub fn random_request_id() -> String {
+    random_uuid()
 }
 
 pub(crate) fn random_uuid() -> String {

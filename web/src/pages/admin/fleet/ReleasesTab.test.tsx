@@ -517,7 +517,7 @@ describe("ReleasesTab", () => {
     renderTab();
 
     // "Apply · Updated", the row's own state line, over its digest step.
-    expect(await screen.findByText("Apply")).toBeInTheDocument();
+    expect(await screen.findByText("Apply", { selector: "span" })).toBeInTheDocument();
     expect(screen.getByText(/Updated/)).toBeInTheDocument();
     expect(screen.getByText(/111111111111/)).toBeInTheDocument();
   });
@@ -817,12 +817,26 @@ describe("Releases on an owned control plane (#363)", () => {
     expect(screen.queryByText("Changes the database")).not.toBeInTheDocument();
   });
 
-  it("names a migrating release, which an owned control plane cannot take yet", async () => {
-    mocked.getPlatformReleases.mockResolvedValue(ownedView(true));
+  it("says a migrating release dumps Quasar's own database before the control plane moves", async () => {
+    const v = ownedView(true);
+    Object.assign(v.installed.control_plane, { database_mode: "owned" });
+    mocked.getPlatformReleases.mockResolvedValue(v);
     renderTab();
     expect(await screen.findByText("Changes the database")).toBeInTheDocument();
-    expect(screen.getByText(/never applied unattended/)).toBeInTheDocument();
-    expect(screen.getByText(/not available in this version yet/)).toBeInTheDocument();
+    expect(screen.getByText(/never applied unattended/)).toHaveTextContent(
+      "Quasar dumps its database before the control plane moves",
+    );
+    expect(screen.queryByText(/not available in this version/)).not.toBeInTheDocument();
+  });
+
+  it("says a migrating release on the operator's own database needs their confirmed backup", async () => {
+    const v = ownedView(true);
+    Object.assign(v.installed.control_plane, { database_mode: "external" });
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+    expect(await screen.findByText(/never applied unattended/)).toHaveTextContent(
+      "needs your confirmation that you have a current backup of your own database",
+    );
   });
 
   it("keeps the per-host detail to three columns, so Revert stays inside the rail", async () => {

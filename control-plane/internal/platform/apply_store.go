@@ -35,7 +35,7 @@ var (
 const attemptColumns = `a.id::text, a.run_id::text, a.kind, a.target, a.host_id::text,
 	h.node_name, a.release_id::text, a.requested_digests, a.previous_digests,
 	a.state, a.reason, a.sessions_remaining, a.force, a.output,
-	a.requested_by::text, a.created_at, a.started_at, a.finished_at`
+	a.requested_by::text, a.created_at, a.started_at, a.finished_at, a.pre_update_dump`
 
 const attemptFrom = ` FROM platform_apply_attempts a LEFT JOIN hosts h ON h.id = a.host_id`
 
@@ -77,7 +77,8 @@ func scanAttempt(row pgx.Row) (Attempt, error) {
 	var requested, previous []byte
 	if err := row.Scan(&a.ID, &a.RunID, &a.Kind, &a.Target, &a.HostID, &a.NodeName,
 		&a.ReleaseID, &requested, &previous, &a.State, &a.Reason, &a.SessionsRemaining,
-		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt); err != nil {
+		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt,
+		&a.PreUpdateDump); err != nil {
 		return Attempt{}, err
 	}
 	a.RequestedDigests = make([]ComponentDigest, 0)
@@ -410,7 +411,8 @@ func (s *Store) OpenHostAttempt(ctx context.Context, hostID string) (Attempt, st
 		 ORDER BY a.created_at DESC LIMIT 1
 	`, hostID).Scan(&a.ID, &a.RunID, &a.Kind, &a.Target, &a.HostID, &a.NodeName,
 		&a.ReleaseID, &requested, &previous, &a.State, &a.Reason, &a.SessionsRemaining,
-		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt, &commit)
+		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt,
+		&a.PreUpdateDump, &commit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Attempt{}, "", ErrAttemptNotFound
 	}

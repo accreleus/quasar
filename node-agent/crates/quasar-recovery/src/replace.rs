@@ -179,6 +179,12 @@ impl Actor {
                 step.phase = Phase::Done;
             }
         }
+        // A finished journal is read by whatever actor runs next, an older one included,
+        // whose `Request` denies unknown fields: the request fields #364 added are dropped
+        // here, once nothing reads them. The restore command they fed is already in the
+        // output, and the restore point holds what a restore needs.
+        j.request.from_version = None;
+        j.request.force_again = false;
         let now = self.now();
         j.result.state = state;
         j.result.reason = reason;
@@ -232,6 +238,9 @@ impl Actor {
     /// Drive `j` to its terminal outcome. `Err` is [`Halt::Died`]: the journal is left for
     /// the next start.
     pub(crate) fn run(&self, mut j: Journal) -> Result<(), ()> {
+        if j.restore.is_some() {
+            return self.run_restore(j);
+        }
         loop {
             if !j.is_open() {
                 return Ok(());
@@ -251,7 +260,10 @@ impl Actor {
                     continue;
                 }
                 Phase::Pulling => self.pull_and_check(&mut j, i).map(|()| Phase::Checked),
+                // A migrating control plane's way back is taken while the old one still runs.
+                Phase::Checked if j.steps[i].migrating => Ok(Phase::Dumping),
                 Phase::Checked => Ok(Phase::OldKept),
+                Phase::Dumping => self.take_dump(&mut j, i).map(|()| Phase::OldKept),
                 Phase::OldKept => self.keep_old(&j, i).map(|()| Phase::Created),
                 Phase::Created => self.create_new(&mut j, i).map(|()| Phase::Started),
                 Phase::Started => self.start_new(&j, i).map(|()| Phase::Verifying),
@@ -289,6 +301,9 @@ impl Actor {
                     let output = format!("{}{}", failure.detail, moved_before(&j, i));
                     return self.finish(&mut j, State::Failed, Some(failure.reason), output, false);
                 }
+                Err(Halt::Fail(failure)) if j.steps[i].migrating => {
+                    return self.fail_migrating(&mut j, i, failure);
+                }
                 Err(Halt::Fail(failure)) => {
                     warn!(
                         token = "actor-verification-failed",
@@ -306,7 +321,14 @@ impl Actor {
     /// Settle an attempt interrupted before the old container was touched: remove anything
     /// it created, and end it `failed`/`interrupted`.
     fn interrupt(&self, mut j: Journal) -> Result<(), ()> {
+        if j.restore.is_some() {
+            return self.interrupt_restore(j);
+        }
         let current = j.current().unwrap_or(0);
+        // A dump the interrupted attempt started, or finished, is no way back for anything.
+        if j.steps.get(current).is_some_and(|s| s.migrating) {
+            self.discard_dump(&j.request.request_id);
+        }
         let created = match self.attempt_containers(&j, current) {
             Ok(created) => created,
             Err(EngineError::Crashed) => return Err(()),
@@ -492,7 +514,13 @@ impl Actor {
             );
             crate::handover::carry_forward(&mut spec, old, trust_recorded);
         }
+        let migrating = if role == Role::ControlPlane {
+            self.control_plane_migrates(j, &machine, &found, &reference, old.as_ref())?
+        } else {
+            false
+        };
         let step = &mut j.steps[i];
+        step.migrating = migrating;
         step.revision = Some(revision);
         step.spec = Some(spec);
         step.old_container = old.as_ref().map(|c| c.id.clone());
@@ -627,6 +655,26 @@ impl Actor {
         if c.running {
             return Ok(());
         }
+        // From this start on the database may be at the new schema: nothing may bring an
+        // older control plane back against it, whatever happens to this attempt.
+        if j.steps[i].migrating {
+            let target = self.migration_target(j, i).map_err(|e| match e {
+                EngineError::Crashed => Halt::Died,
+                e => fail(Reason::RecreateFailed, format!("read the new image: {e}")),
+            })?;
+            // `checked` refused a migrating step with no target; never start one unfloored.
+            let schema = target.ok_or_else(|| {
+                fail(
+                    Reason::Invalid,
+                    "the new control plane declares no schema and the request names none, so the schema floor cannot be raised; it was not started",
+                )
+            })?;
+            self.raise_floor(schema, &j.request.request_id)
+                .map_err(|e| {
+                    error!(token = "actor-schema-floor-unwritten", "{e}");
+                    Halt::Died
+                })?;
+        }
         match self.retrying(|| self.engine.start_container(&c.id)) {
             Ok(()) => Ok(()),
             Err(EngineError::Crashed) => Err(Halt::Died),
@@ -673,7 +721,9 @@ impl Actor {
                                 return Ok(());
                             }
                         }
-                        (_, Some("unhealthy")) => {
+                        // A migration may hold a control plane unhealthy until it is done, and a
+                        // migrating one is never restored: it gets the whole wait.
+                        (_, Some("unhealthy")) if !j.steps[i].migrating => {
                             return Err(fail(
                                 Reason::Unhealthy,
                                 format!("the new container reported unhealthy ({last})"),
@@ -751,6 +801,9 @@ impl Actor {
             reason: Reason::Unhealthy,
             detail: String::new(),
         });
+        if j.steps[i].migrating {
+            return self.fail_migrating(j, i, failure);
+        }
         let mut output = failure.detail.clone();
         let canonical = self.role(j, i).container_name();
         let mut restored = false;
@@ -813,6 +866,13 @@ impl Actor {
             .retrying(|| self.engine.inspect_container(old_id))
             .map_err(crashed)?
             .ok_or_else(|| "the previous container is gone".to_string())?;
+        if canonical == Role::ControlPlane.container_name() {
+            let image = self
+                .retrying(|| self.engine.inspect_image(&old.image_id))
+                .map_err(crashed)?
+                .ok_or_else(|| "the previous control plane's image is gone".to_string())?;
+            self.schema_allows(&image, &old.image)?;
+        }
         if old.name != canonical {
             if let Some(other) = self
                 .retrying(|| self.engine.inspect_container(canonical))

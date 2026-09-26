@@ -61,13 +61,26 @@ pub struct Request {
     /// `remove` only: also delete the data.
     #[serde(default)]
     pub purge: bool,
+    /// A migrating control-plane replacement: the requesting control plane's own version,
+    /// which the restore command of a failure returns to. Omitted when absent, so a
+    /// request that names none reads exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
     /// Zero means the actor's default; omitted when zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub wait_timeout_s: i64,
+    /// `restore` only (`--force-again`): restore a dump that was already restored.
+    /// Omitted when false, so every other request reads exactly as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub force_again: bool,
 }
 
 fn is_zero(n: &i64) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A Go nil slice encodes as `null`; read it as empty. The field is still required.
@@ -134,6 +147,10 @@ pub struct AttemptResult {
     pub finished_at: Option<String>,
     pub restored: bool,
     pub release: Release,
+    /// The pre-update dump this attempt took (control-api.md `pre_update_dump`): what the
+    /// printed `restore` command names. `null` on every other attempt.
+    #[serde(default)]
+    pub dump: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +243,11 @@ pub struct Status {
     pub in_flight: Option<String>,
     #[serde(deserialize_with = "null_as_empty")]
     pub dumps: Vec<Dump>,
+    /// Free bytes where the pre-update dumps are written, on a machine whose database is
+    /// Quasar's own; `null` elsewhere and when it could not be read. The control plane
+    /// judges preflight `backup_space` from it.
+    #[serde(default)]
+    pub dump_free_bytes: Option<i64>,
     pub result: Option<AttemptResult>,
     /// True when the inventory is the last one because the engine was slow to answer.
     pub stale: bool,

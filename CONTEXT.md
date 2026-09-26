@@ -658,6 +658,11 @@ three are kept on the machine. An operator's own database gets no dump: its back
 is the operator's, confirmed before the update. _Avoid_: "backup" unqualified,
 "recovery bundle" (withdrawn with RH06's review).
 
+**Schema floor** — the lowest schema a machine's database may be at, recorded in machine state
+by the recovery actor before a migrating control plane starts and lowered only by a `restore`.
+No control plane whose image declares a lower schema is created, started or put back on that
+machine. _Avoid_: "floor" unqualified (that is the release floor above).
+
 **Owner conflict** — a container on an owned machine that looks like a Quasar
 platform service but lacks the installation's labels: a leftover Compose stack, a
 definition a manager still holds. The recovery actor never acts on it and says so.

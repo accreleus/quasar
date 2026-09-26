@@ -2,7 +2,8 @@
 //! anything (#352 R1-Q2: "D7's dump, not a bundle").
 //!
 //! A plain `pg_dump`, nothing more: this is not the pre-update dump of a migrating update
-//! (#364 owns that, with its retention and `restore`). The database is dumped **offline**,
+//! (`crate::dump_dir`, #364, with its retention and `restore`); the two share one helper
+//! runner (`crate::database::run_helper`). The database is dumped **offline**,
 //! from its data volume, by a one-shot helper on the machine's own Postgres image that
 //! starts a private postmaster with no TCP listener, runs `pg_dump` over its local socket,
 //! and stops it. So the dump does not depend on the Postgres service still running (an
@@ -15,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::engine::{ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
+use crate::engine::{ContainerSpec, PlatformEngine, RestartPolicy};
 use crate::recipe::{self, control, labels, names, paths, Bind, ImageRef};
 
 /// What the helper container is, on its `io.quasar.helper` label.
@@ -88,67 +89,27 @@ pub fn take(
             dir.clone()
         }
     };
-    // A helper an interrupted run left behind.
-    if let Some(stale) = engine
-        .inspect_container(names::FINAL_DUMP)
-        .map_err(|e| format!("inspect {}: {e}", names::FINAL_DUMP))?
-    {
-        if stale.labels.get(labels::HELPER).map(String::as_str) != Some(HELPER) {
-            return Err(format!(
-                "a container this uninstall did not create holds the name {}; remove it and run again",
-                names::FINAL_DUMP
-            ));
-        }
-        engine
-            .remove_container(&stale.id)
-            .map_err(|e| format!("remove a leftover dump helper: {e}"))?;
-    }
     let spec = helper_spec(postgres_image, &dump_mount, name);
-    let id = engine
-        .create_container(&spec)
-        .map_err(|e| format!("create the dump helper: {e}"))?;
-    let outcome = run(engine, &id);
-    let removed = engine.remove_container(&id);
-    let code = outcome?;
-    if let Err(e) = removed {
-        tracing::warn!(
-            token = "uninstall-dump-helper-left",
-            "the dump helper could not be removed: {e}"
-        );
-    }
+    // The runner `crate::database` shares: a stale helper swept, this one always removed.
+    let (code, logs) =
+        crate::database::run_helper(engine, &spec, DUMP_TIMEOUT).map_err(|e| match e {
+            crate::database::DbError::Crashed => "the recovery actor stopped".to_string(),
+            crate::database::DbError::Failed(why) => format!("the dump helper: {why}"),
+        })?;
     if code != 0 {
-        return Err(format!("pg_dump exited {code}"));
+        let tail = logs.trim_end();
+        return Err(if tail.is_empty() {
+            format!("pg_dump exited {code}")
+        } else {
+            format!("the dump helper exited {code}:\n{tail}")
+        });
     }
     Ok(name.to_string())
 }
 
-fn run(engine: &dyn PlatformEngine, id: &str) -> Result<i64, String> {
-    engine
-        .start_container(id)
-        .map_err(|e| format!("start the dump helper: {e}"))?;
-    match engine.wait_container(id, DUMP_TIMEOUT) {
-        Ok(0) => Ok(0),
-        Ok(code) => {
-            let tail = engine.logs_tail(id, 20).unwrap_or_default();
-            Err(format!(
-                "the dump helper exited {code}{}",
-                if tail.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(":\n{}", tail.trim_end())
-                }
-            ))
-        }
-        Err(EngineError::Runtime(crate::engine::ErrorKind::Timeout)) => Err(format!(
-            "the dump did not finish within {} minutes",
-            DUMP_TIMEOUT.as_secs() / 60
-        )),
-        Err(e) => Err(format!("wait for the dump helper: {e}")),
-    }
-}
-
 /// The script reads its inputs from the environment, so nothing is interpolated into it.
 const SCRIPT: &str = r#"set -eu
+umask 077
 as_pg() { if command -v su-exec >/dev/null 2>&1; then su-exec postgres "$@"; else gosu postgres "$@"; fi; }
 as_pg pg_ctl -D "$PGDATA" -w -t 300 -o "-c listen_addresses=''" start
 rc=0

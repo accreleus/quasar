@@ -63,14 +63,27 @@ own; the two do not move together, and that is deliberate.
   Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
   `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane
   admits the developer applies that control plane accepts.
+- **A migrating update of an owned control plane dumps the database first (#364).** Before it
+  replaces the control plane with a release that migrates the database, the recovery actor
+  dumps a Quasar-owned database (refusing the update if the dump fails or does not fit) and
+  keeps the last three dumps; an operator's own database needs the operator's confirmation of
+  a current backup instead. A failed migrating update is never restored automatically: Fleet ▸
+  Releases and the actor's output print one `restore` command, which loads the dump into a
+  stopped database and starts the control plane it was taken under. An older control plane is
+  never started against a newer schema. On an operator's own database a failed migrating control
+  plane is stopped, and `restore --to` starts the old one once they have restored their backup.
+  The Update dialog shows the dump's space or the backup confirmation, and a refused or failed
+  migrating update its banner or restore card. A developer apply's Apply button stays enabled
+  on an operator's own database, with a hint, because the console cannot know a digest
+  migrates before the server reads the image; the server fails a migrating one
+  `backup_unconfirmed` unless the backup was confirmed.
 - **An owned control plane is updated by its recovery actor (#363).** On a combined or
   control-only install the fleet run's control-plane step, and a developer apply to the
   control plane, go over the machine's control socket: the recovery actor moves itself first
   when it is behind, then keeps the old control plane stopped until the new one passes its
   health check, and puts it back automatically when it never does. Live sessions keep
   streaming through it, and the booted control plane counts as the evidence only once the
-  actor has verified it. A release that migrates the database is refused before anything
-  moves until the pre-update dump arrives (#364). A session ended by an agent restart now
+  actor has verified it. A session ended by an agent restart now
   says so, and Fleet ▸ Releases keeps its per-host detail inside the rail.
 - **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
   machine to a successor: it starts beside the running actor, takes the machine's lease only

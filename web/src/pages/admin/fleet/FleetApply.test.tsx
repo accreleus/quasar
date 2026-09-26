@@ -175,9 +175,9 @@ describe("FleetApplyButton", () => {
     expect(screen.queryByRole("button", { name: "Update Quasar" })).not.toBeInTheDocument();
   });
 
-  // #363: an owned control plane takes no migration until its pre-update dump
-  // exists (#364), so the run would stop before anything moved.
-  it("is disabled for a migrating release on an owned control plane, and only then", () => {
+  // #364: an owned control plane takes a migration behind its pre-update dump, so
+  // the #363 refusal is gone; preflight backup_space is what can block it now.
+  it("is offered for a migrating release on an owned control plane", () => {
     const owned = (migrates: boolean) => {
       const v = view({ available: [release({ migrates, schema_version: migrates ? 75 : 74 })] });
       Object.assign(v.installed.control_plane, { install_mode: "owned", machine_role: "combined", machine_node_name: "gpu-01" });
@@ -185,8 +185,8 @@ describe("FleetApplyButton", () => {
     };
     const { unmount } = renderButton(owned(true));
     const button = screen.getByRole("button", { name: "Update Quasar" });
-    expect(button).toBeDisabled();
-    expect(button).toHaveAttribute("title", expect.stringContaining("cannot take in this version yet"));
+    expect(button).toBeEnabled();
+    expect(button).not.toHaveAttribute("title");
     unmount();
     renderButton(owned(false));
     expect(screen.getByRole("button", { name: "Update Quasar" })).toBeEnabled();
@@ -203,7 +203,8 @@ describe("FleetApplyButton", () => {
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/then 3 eligible hosts, to/)).toBeInTheDocument();
-    expect(within(dialog).getByText("0.3.0")).toBeInTheDocument();
+    // With its version prefix, as the restore card names releases.
+    expect(within(dialog).getByText("v0.3.0")).toBeInTheDocument();
     expect(within(dialog).getByText(/ends every live session on 3 hosts/)).toBeInTheDocument();
     expect(within(dialog).getByText(/lose contact for about 20 seconds/)).toBeInTheDocument();
   });

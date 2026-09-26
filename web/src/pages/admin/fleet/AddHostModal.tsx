@@ -15,7 +15,7 @@
 import { useState, type ReactNode } from "react";
 import { Button } from "../../../components/Button";
 import { Modal } from "../../../components/Modal";
-import { IconCopy } from "../../../components/icons";
+import { Snippet } from "./Snippet";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
 import type { AccessCheck } from "../../../api/types";
@@ -428,54 +428,5 @@ function AddHostDialog({
       {tabs}
       {body}
     </Modal>
-  );
-}
-
-/** A copyable value. The text stays selectable, so a failed clipboard write costs
- *  nothing; "Copied" only follows a write that resolved. */
-function Snippet({
-  caption,
-  sub,
-  text,
-  testId,
-  label,
-}: {
-  caption?: string;
-  sub?: string;
-  text: string;
-  testId: string;
-  label: string;
-}) {
-  const [copied, setCopied] = useState(false);
-
-  const copy = async () => {
-    if (!navigator.clipboard) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      /* the value is still selectable */
-    }
-  };
-
-  return (
-    <div className="addhost-snippet">
-      {caption && (
-        <div>
-          <div className="eyebrow">{caption}</div>
-          {sub && <div className="hint addhost-sub">{sub}</div>}
-        </div>
-      )}
-      <div className="enroll-snippet">
-        <pre className="mono" data-testid={testId}>
-          {text}
-        </pre>
-        <Button variant="ghost" size="sm" onClick={() => void copy()} aria-label={label}>
-          <IconCopy />
-          {copied ? "Copied" : "Copy"}
-        </Button>
-      </div>
-    </div>
   );
 }

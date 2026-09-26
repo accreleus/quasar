@@ -1672,6 +1672,7 @@ registers as `seed_version`.
 | `QUASAR_DATABASE_PASSWORD` | — (**required** with `QUASAR_DATABASE_HOST`) | The operator's database password: copied into machine state's secrets at first boot and given to the control plane only as a file (`QUASAR_DATABASE_PASSWORD_FILE`). Not read again once installed, so it can then be removed from the stack. Refused without `QUASAR_DATABASE_HOST` (a Quasar-owned database generates its own). |
 | `QUASAR_DOCKER_SOCKET_HOST_PATH` | `/var/run/docker.sock` | Only when the actor cannot inspect its own container: the daemon-host path of the engine socket it binds into the agent. Normally learned from the actor's own mount. |
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
+| `QUASAR_MACHINE_DIR_HOST_PATH` | learned from the actor's own mount | Only when the actor cannot inspect its own container: the daemon-host path of the machine-state directory, whose `dumps/` the pre-update dump helper binds (#364). Normally the `quasar-machine` volume's mount point, which needs the engine's `local` volume driver. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
 | `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from ("Release trust" below). **A seed input** (#361): read from the seed's container at first install like the other inputs, checked, and recorded in machine state (`machine.json` `inputs.trust`), which the actor uses from then on; the seed-created actor's own environment holds none (ADR 0007's frozen profile). A developer apply from a test registry needs that registry's namespace here, set on the seed before the first install; `reconfigure` (#366) changes it later. On a control-plane machine the control plane is given the same list (its developer-apply check). A machine installed before these were recorded uses the actor's own environment, as before. |
 | `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `off`, none, the org's GitHub Releases, `15` | ADR 0003 release signatures, verified by the actor ("Release trust" below). Seed inputs recorded at first install, exactly as the allowlist above (machine state wins over the actor's own environment once recorded). A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value refuses the install before anything is created (`token="seed-inputs-invalid"`), or stops a hand-started actor (`token="actor-trust-config-invalid"`). |
@@ -1763,6 +1764,70 @@ declared by an external manager, which only the seed may be (ADR 0007), and a re
 replace it is refused `owner_conflict` with nothing changed.
 
 **One socket, one name.** On a GPU host the actor listens at `/run/quasar-recovery/agent.sock`, inside the `quasar-recovery-agent` volume it mounts read-write; that path is fixed, not an actor input. On a combined or control-only machine the same volume holds one subdirectory per socket: the agent socket at `agent/agent.sock` and the **control socket** at `control/control.sock` (owned by the control plane's uid, 1000). Each container is given only its own subdirectory, bound read-only by the volume's daemon-host path (Engine API 1.40 has no volume sub-paths; the seed's frozen profile mounts one socket volume): the agent sees `/run/quasar-recovery/agent.sock` as on a GPU host, the control plane `/run/quasar-recovery/control.sock` (`QUASAR_RECOVERY_CONTROL_SOCKET`). A request on the control socket is the control plane's, one on the agent socket the agent's. This needs the engine's `local` volume driver, which reports a host path for the volume. The agent it creates mounts the same volume read-only at the same path and is told where through `QUASAR_RECOVERY_SOCKET` (see "Node agent — connection & identity"), which the actor's recipe sets. Both names come from one constant module (`quasar_runtime::owned_install`), so the two sides cannot drift.
+
+**A migrating control-plane update, and `restore` (#364).** On a combined or control-only
+machine a control-plane step that migrates the database (the request says so, or the new
+image's `org.quasar.schema.version` is above the running one's) is never restored
+automatically (ADR 0004 amendment):
+- **Quasar's own database.** After the pull and before the old control plane stops, the actor
+  measures the database, refuses `backup_failed` unless the machine has its size plus a tenth
+  (at least 64 MiB) free, and dumps it (`pg_dump --format=custom`, in a disposable
+  `quasar-db-helper` container from the machine's own Postgres image, on the platform network)
+  into `dumps/` in machine state, checking the dump reads back before it counts. A dump that
+  fails, does not fit or does not read back refuses the step `backup_failed`: the control plane
+  was not replaced and the database was not touched. The last three dumps are kept, each
+  `dumps/<name>.dump` beside `dumps/<name>.json` (its schema version, sha256, and the control
+  plane and recipe revision it was taken under); status lists them and reports
+  `dump_free_bytes`, which the control plane's `backup_space` preflight reads.
+- **The operator's own database.** The request must carry `external_backup_confirmed`, else it
+  is refused `backup_unconfirmed` before anything stops. Quasar never dumps it.
+- Before the new control plane starts, `schema-floor.json` in machine state records the schema
+  it may migrate to. No control plane whose image declares a lower schema is ever created,
+  started or put back on this machine after that (`token="actor-resume-failed"`, "an older
+  control plane never runs against a newer schema"), until a restore lowers it. So once the
+  floor is raised, going back to the older control plane always takes a full `restore`, even
+  when the new one never got to migrate (its start was refused, or its container was
+  removed): nothing else lowers the floor. A later migrating update is refused
+  `backup_failed` while the database is ahead of the control plane this machine last
+  verified (a failed migrating update nobody restored): a dump of it could not be restored.
+- If the new control plane does not verify, the old one stays kept and disabled. On Quasar's
+  own database the new one is left as it is (it matches the migrated schema, and serves the
+  console if it can; the restore stops it). On the operator's own database it is stopped with
+  its restart disabled: left running, its next boot would migrate the backup the operator
+  restores. On either, one that never started is removed, since the actor's next start would
+  otherwise start it and run its migration outside the update. A finished attempt's journal
+  keeps only the request fields an older actor reads. The attempt ends `failed`, names its dump
+  (`pre_update_dump`), and its output and the actor's log
+  (`token="actor-migrating-control-plane-failed"`, field `restore`) end with the one command to
+  go back, run on that machine:
+
+  ```
+  docker exec quasar-recovery quasar-recovery restore --dump <name> --to <version>
+  docker exec quasar-recovery quasar-recovery restore --to <version>      # your own database: stop the control plane, restore your backup, then this
+  docker exec quasar-recovery quasar-recovery restore --list              # the dumps kept here
+  ```
+
+  `--to` is the version the control plane was on (the dump records it); a dump that returns to
+  another version is refused. The command talks to the actor over an operator socket in the
+  actor's own container (`/run/quasar-operator/operator.sock`, the one `reconfigure` uses; in
+  no volume, so only `docker exec` reaches it) and
+  follows the restore to its end. Before anything is touched the restore checks the dump's
+  checksum, that `pg_restore` reads it, that it is not marked dirty, and that its schema is the
+  one the control plane it returns to declares; a corrupt or mismatched dump is refused with
+  nothing changed. Then it writes `database-hold.json` (no control plane is created or started
+  while it exists, `token="actor-control-plane-held"`), stops this machine's control planes,
+  drops and re-creates the database and loads the dump in one transaction, creates that
+  control plane afresh from its recipe, and waits for it to report healthy. A restart part-way
+  continues it; a load that stops short (a helper error, or an engine restart mid-load) keeps
+  the hold and says the database may now be empty (do not start the control plane by hand);
+  the same command can always be run again. Once a restore has succeeded its dump is marked
+  restored and the restore point is cleared, so running the printed command again is refused;
+  `--force-again` restores the same dump anyway, discarding everything written since. On the
+  operator's own database there is no dump: the command refuses while a control plane runs
+  (`docker stop quasar-control-plane` first, or its next boot migrates the restored backup
+  again), checks the live schema matches the version named, then starts that control plane.
+  Dumps and the final `uninstall --purge` dump are written `0600`. Only dumps this machine's
+  actor took are restored; a pre-RH-06 install is not migrated (redeploy it).
 
 On start the actor takes the machine's lease (`actor.lease`; a second actor on the same
 volume exits, `token="actor-lease-unavailable"`, unless it is one of a hand-over's two

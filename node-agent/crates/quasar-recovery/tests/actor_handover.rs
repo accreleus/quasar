@@ -901,6 +901,8 @@ fn request(components: Vec<Component>) -> Request {
         dump: None,
         purge: false,
         wait_timeout_s: 0,
+        from_version: None,
+        force_again: false,
     }
 }
 
@@ -2060,7 +2062,7 @@ fn a_daemon_restart_mid_control_plane_replacement_settles_with_a_running_control
 }
 
 #[test]
-fn only_the_control_socket_moves_the_control_plane_and_never_across_a_migration() {
+fn only_the_control_socket_moves_the_control_plane_and_a_restore_is_the_operators() {
     let lab = Lab::combined();
     let actor = lab.serving().unwrap();
     let refused = actor
@@ -2072,13 +2074,6 @@ fn only_the_control_socket_moves_the_control_plane_and_never_across_a_migration(
         "{}",
         refused.message
     );
-
-    let mut migrating = request(vec![actor_component(), control_component()]);
-    migrating.migrates = true;
-    migrating.schema_version = Some(97);
-    let refused = lab.submit(migrating).unwrap_err();
-    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
-    assert!(refused.message.contains("#364"), "{}", refused.message);
 
     let mut restore = request(vec![]);
     restore.kind = RequestKind::Restore;

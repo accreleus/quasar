@@ -98,6 +98,10 @@ func PlanRelease(in PlanInputs) View {
 	}
 	cpFacts := in.ControlPlanePreflight
 	cpFacts.Image = image
+	if len(available) > 0 {
+		migrates := ReleaseRunsAMigration(available[0], in.ControlPlane.SchemaVersion)
+		cpFacts.Migrates = &migrates
+	}
 
 	v := View{
 		Channel:    channel,

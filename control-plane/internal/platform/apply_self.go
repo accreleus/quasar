@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
@@ -30,6 +31,9 @@ type SelfRequest struct {
 	Migrates                bool
 	SchemaVersion           int
 	ExternalBackupConfirmed bool
+	// FromVersion is this control plane's own version: what a migrating
+	// failure's restore command returns to.
+	FromVersion string
 }
 
 // SelfAccepted is the actor's 202 for a control-plane step.
@@ -53,6 +57,8 @@ type SelfResult struct {
 	// Restored: the actor put the previous control plane back.
 	Restored bool
 	Release  ReleaseRef
+	// PreUpdateDump is the dump a migrating attempt took, when it took one.
+	PreUpdateDump *string
 }
 
 // UpdaterAPI is the sliver of the control socket this package uses, as an
@@ -120,6 +126,21 @@ type SelfApplier struct {
 	// VerdictSilence is how long, from the apply deadline on, the actor may give
 	// no answer for a request before the attempt times out.
 	VerdictSilence time.Duration
+
+	// DeveloperSchema reads the schema a developer apply's control-plane image
+	// declares, which decides whether it migrates. Nil sends it as not
+	// migrating, and the recovery actor still reads the image's own label.
+	DeveloperSchema func(ctx context.Context, components []ComponentDigest) (int, error)
+
+	// confirmed holds the attempts whose operator confirmed a current backup of
+	// an external database. In memory only: control-api.md stores it on no row,
+	// so a control plane restarted before the send fails the step
+	// backup_unconfirmed and the operator applies again.
+	confirmed sync.Map
+	// schemas holds a developer apply's control-plane schema as its admission
+	// read it (NoteDeveloperSchema), so the send reads no registry after the
+	// drain. In memory only: a restarted control plane reads the image again.
+	schemas sync.Map
 }
 
 // NewSelfApplier builds the control-plane applier with the contract's timings.
@@ -197,7 +218,9 @@ func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 }
 
 func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) bool {
-	req := SelfRequest{RequestID: requestID, Components: a.RequestedDigests}
+	id := s.Identity()
+	req := SelfRequest{RequestID: requestID, Components: a.RequestedDigests, FromVersion: id.Version}
+	_, req.ExternalBackupConfirmed = s.confirmed.Load(a.ID)
 	if a.ReleaseID != nil {
 		rel, err := s.store.Release(ctx, *a.ReleaseID)
 		if err != nil {
@@ -207,11 +230,10 @@ func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) boo
 		}
 		req.Release = ReleaseRef{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
 		req.SchemaVersion = rel.SchemaVersion
-		req.Migrates = rel.SchemaVersion > s.Identity().SchemaVersion
+		req.Migrates = rel.SchemaVersion > id.SchemaVersion
 	} else {
 		// A developer apply: its provenance is the commit its images carry
-		// (control-api.md §"Developer apply"). The endpoint refuses a migrating
-		// one, so what reaches here never migrates.
+		// (control-api.md §"Developer apply").
 		commit, err := s.developerCommit(ctx, a)
 		if err != nil {
 			s.log.Error("self-apply: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
@@ -219,6 +241,19 @@ func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) boo
 			return false
 		}
 		req.Release = ReleaseRef{SourceCommit: commit}
+		if noted, ok := s.schemas.Load(a.ID); ok {
+			req.SchemaVersion = noted.(int)
+			req.Migrates = req.SchemaVersion > id.SchemaVersion
+		} else if s.DeveloperSchema != nil {
+			schema, err := s.DeveloperSchema(ctx, a.RequestedDigests)
+			if err != nil {
+				s.log.Error("self-apply: could not read the developer apply's schema", "attempt_id", a.ID, "err", err)
+				s.fail(a.ID, ReasonInvalid, "the control-plane image's schema could not be read: "+err.Error())
+				return false
+			}
+			req.SchemaVersion = schema
+			req.Migrates = schema > id.SchemaVersion
+		}
 	}
 	accepted, err := s.updater.Apply(ctx, req)
 	if err != nil {
@@ -321,6 +356,14 @@ func (s *SelfApplier) followVerdict(ctx context.Context, a Attempt, requestID st
 
 // record writes one result onto the attempt and reports whether it resolved it.
 func (s *SelfApplier) record(ctx context.Context, attemptID string, res SelfResult) bool {
+	// Before the terminal write: a restore command in the output names this dump.
+	if res.PreUpdateDump != nil {
+		if d, ok := s.store.(dumpRecorder); ok {
+			if err := d.SetPreUpdateDump(ctx, attemptID, *res.PreUpdateDump); err != nil {
+				s.log.Warn("self-apply: could not record the pre-update dump", "attempt_id", attemptID, "err", err)
+			}
+		}
+	}
 	switch res.State {
 	case AttemptSucceeded:
 		if _, err := s.store.SucceedAttempt(ctx, attemptID); err != nil {
@@ -395,6 +438,24 @@ func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) b
 		"attempt_id", a.ID, "state", a.State)
 	s.poll(ctx, a, requestID)
 	return true
+}
+
+// dumpRecorder is a selfStore that keeps an attempt's pre_update_dump (*Store).
+type dumpRecorder interface {
+	SetPreUpdateDump(ctx context.Context, attemptID, dump string) error
+}
+
+// ConfirmExternalBackup carries the operator's confirmation of a current backup
+// of an external database to this attempt's request (control-api.md
+// external_backup_confirmed). Call it before Apply.
+func (s *SelfApplier) ConfirmExternalBackup(attemptID string) {
+	s.confirmed.Store(attemptID, true)
+}
+
+// NoteDeveloperSchema keeps the schema a developer apply's admission read from
+// its control-plane image, for the send. Call it before Apply.
+func (s *SelfApplier) NoteDeveloperSchema(attemptID string, schema int) {
+	s.schemas.Store(attemptID, schema)
 }
 
 // developerCommit is the commit a developer apply's images carry.

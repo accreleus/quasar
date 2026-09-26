@@ -7,7 +7,7 @@ import (
 )
 
 // The fleet run's control-plane step on an owned machine (#363): the actor
-// moves first, and a migrating release is refused before anything moves.
+// moves first. A migrating step is migrating_step_test.go's (#364).
 
 func TestOrderControlPlaneComponents(t *testing.T) {
 	cp := ComponentDigest{Name: ComponentControlPlane, Image: "r/quasar-control-plane", Digest: "sha256:c"}
@@ -99,28 +99,5 @@ func TestAnUnattendedRunUpdatesAnOwnedControlPlane(t *testing.T) {
 	}
 	if steps := d.steps(); len(steps) == 0 || steps[0] != TargetControlPlane {
 		t.Fatalf("steps = %v, want the control plane first", steps)
-	}
-}
-
-// A migrating step needs the pre-update dump (RH06-12, #364): refused before
-// the fleet is cordoned, drained or sent anything, so refusing changes nothing.
-func TestAMigratingControlPlaneStepOnAnOwnedMachineIsRefusedBeforeAnythingMoves(t *testing.T) {
-	store := newFakeFleetStore(true)
-	d := &fakeDrivers{store: store, outcome: map[string]string{}}
-	f := ownedFleet(t, store, d, &fakeOwnMachine{})
-	// testFleet's default: the fixture release migrates.
-
-	run := runToEnd(t, f, store)
-	if run.State != RunFailed || run.Error == nil || !strings.Contains(*run.Error, "#364") {
-		t.Fatalf("run = %q (%v), want failed naming #364", run.State, run.Error)
-	}
-	if steps := d.steps(); len(steps) != 0 {
-		t.Fatalf("steps = %v, want none", steps)
-	}
-	if attempts, _ := store.RunAttempts(context.Background(), testRunID); len(attempts) != 0 {
-		t.Fatalf("attempts = %+v, want none", attempts)
-	}
-	if cordons, _ := store.CordonedHosts(context.Background(), testRunID); len(cordons) != 0 {
-		t.Fatalf("cordons = %+v, want none: nothing was cordoned", cordons)
 	}
 }
