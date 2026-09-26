@@ -1577,6 +1577,45 @@ fn a_hand_started_actor_takes_its_name_back_before_its_successor_goes() {
     assert!(races.is_empty(), "the seed would have acted: {races:#?}");
 }
 
+/// A successor that did not verify hands back, but the engine will not start the old
+/// actor: the successor keeps the machine under the actor's name, and the stopped old
+/// actor goes. A later hand-over is still possible.
+#[test]
+fn a_successor_that_cannot_start_the_old_actor_keeps_the_machine_under_the_name() {
+    let lab = Lab::new();
+    let old = lab.old_actor();
+    lab.engine.with_state(|s| {
+        s.behaviour.insert(
+            ACTOR_IMAGE.into(),
+            Behaviour {
+                refuse_start: Some("OCI runtime create failed".into()),
+                ..Default::default()
+            },
+        );
+    });
+    lab.agent_polls.store(false, Ordering::SeqCst);
+    hand_over(&lab);
+    let result = lab.outcome("the old actor cannot start");
+    assert_eq!(
+        (result.state, result.restored),
+        (State::Failed, false),
+        "{result:?}"
+    );
+    let actors = lab.actors();
+    assert_eq!(actors.len(), 1, "{actors:#?}");
+    let now = &actors[0];
+    assert_eq!(now.spec.name, names::RECOVERY_ACTOR);
+    assert_eq!(now.spec.image, NEW_ACTOR);
+    assert_eq!(now.status, "running");
+    assert_eq!(now.restart, RestartPolicy::UnlessStopped);
+    assert!(!lab.engine.state().containers.contains_key(&old.id));
+    // Not verified, so seed.json still names the last verified actor.
+    assert_eq!(
+        lab.seed_file().recovery_actor_image.reference(),
+        ACTOR_IMAGE
+    );
+}
+
 /// A duplicate actor container on the machine, started before the hand-over or while the
 /// old actor lets go of the lease, never takes the lease: it exits at once, and the
 /// hand-over ends with one actor as if it had never run.

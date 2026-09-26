@@ -200,30 +200,36 @@ impl Actor {
 
     /// Why a process that is no party to a hand-over must not act on this machine: a party
     /// of the open hand-over still exists, or another container holds the actor's name.
-    /// `None` also when this process cannot tell its own container.
+    /// `None` also when this process cannot tell its own container. Fails closed while a
+    /// hand-over is open (an engine that does not answer may hide a party), open otherwise,
+    /// so a lone actor still starts and serves stale status through an engine outage.
     pub(crate) fn stray(&self) -> Option<String> {
         self.me()?;
         if let Some(j) = self.journals.scan().open().cloned() {
             if let Some(i) = j.steps.iter().position(|s| s.name == RECOVERY_ACTOR) {
+                let id = &j.request.request_id;
+                let party = |name: &str| format!("container {name} is a party to hand-over {id}");
+                let blind = |e: EngineError| {
+                    format!("the engine did not answer ({e}), so a party to hand-over {id} may still exist")
+                };
                 let step = &j.steps[i];
-                for id in [&step.old_container, &step.new_container]
+                for c in [&step.old_container, &step.new_container]
                     .into_iter()
                     .flatten()
                 {
-                    if let Ok(Some(c)) = self.engine.inspect_container(id) {
-                        if !self.is_me(&c.id) {
-                            return Some(format!(
-                                "container {} is a party to hand-over {}",
-                                c.name, j.request.request_id
-                            ));
-                        }
+                    match self.engine.inspect_container(c) {
+                        Ok(Some(c)) if !self.is_me(&c.id) => return Some(party(&c.name)),
+                        Ok(_) => {}
+                        Err(e) => return Some(blind(e)),
                     }
                 }
-                if let Some(c) = self.attempt_containers(&j, i).ok()?.first() {
-                    return Some(format!(
-                        "container {} is a party to hand-over {}",
-                        c.name, j.request.request_id
-                    ));
+                match self.attempt_containers(&j, i) {
+                    Ok(found) => {
+                        if let Some(c) = found.first() {
+                            return Some(party(&c.name));
+                        }
+                    }
+                    Err(e) => return Some(blind(e)),
                 }
             }
         }
@@ -1117,6 +1123,37 @@ impl Actor {
         }
         successors.retain(|c| !c.name.is_empty());
 
+        // A stranger removes the previous actor only when it is really left over: stopped.
+        // A running one is another actor process, never removed by elimination. Before the
+        // name, which a stopped previous actor may still hold (a hand-back that could not
+        // start it); this process is a labelled actor container throughout.
+        let leftover_old = match j.steps[i].old_container.clone().filter(|o| !self.is_me(o)) {
+            Some(old) if matches!(party, Party::Stranger { .. }) => {
+                match self.engine.inspect_container(&old) {
+                    Ok(Some(c)) if !c.running => Some(old),
+                    Ok(Some(c)) => {
+                        output.push_str(&format!(
+                            "\nthe previous actor {} is running and was left alone",
+                            c.name
+                        ));
+                        None
+                    }
+                    Err(e) if crash(&e) => return Err(()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(old) = leftover_old {
+            match self.retrying(|| self.engine.remove_container(&old)) {
+                Ok(()) => {}
+                Err(e) if crash(&e) => return Err(()),
+                Err(e) => {
+                    output.push_str(&format!("\nthe previous actor could not be removed: {e}"))
+                }
+            }
+        }
+
         let policy = match party {
             Party::Old => j.steps[i]
                 .old_restart
@@ -1164,37 +1201,6 @@ impl Actor {
                 )),
             }
         }
-        // A stranger removes the previous actor only when it is really left over: stopped.
-        // A running one is another actor process, never removed by elimination.
-        let leftover_old = match j.steps[i].old_container.clone().filter(|o| !self.is_me(o)) {
-            Some(old) if matches!(party, Party::Stranger { .. }) => {
-                match self.engine.inspect_container(&old) {
-                    Ok(Some(c)) if !c.running => Some(old),
-                    Ok(Some(c)) => {
-                        output.push_str(&format!(
-                            "\nthe previous actor {} is running and was left alone",
-                            c.name
-                        ));
-                        None
-                    }
-                    Err(e) if crash(&e) => return Err(()),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        if let Some(old) = leftover_old {
-            {
-                match self.retrying(|| self.engine.remove_container(&old)) {
-                    Ok(()) => {}
-                    Err(e) if crash(&e) => return Err(()),
-                    Err(e) => {
-                        output.push_str(&format!("\nthe previous actor could not be removed: {e}"))
-                    }
-                }
-            }
-        }
-
         output.push_str(&name_note);
         if named {
             for (socket, e) in self.serve_again() {
