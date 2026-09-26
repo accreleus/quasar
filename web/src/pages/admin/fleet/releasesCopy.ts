@@ -34,6 +34,7 @@ const PREFLIGHT_CHECK_TEXT: Record<string, string> = {
   image_resolvable: "release images resolve at the registry",
   agent_connected: "agent connected",
   health_addr_bindable: "agent health port free",
+  backup_space: "room for the database dump",
 };
 
 export function preflightCheckText(id: string): string {
@@ -228,6 +229,33 @@ export function faultText(kind: string): string {
  *  which publishes no version by design. */
 export function releaseLabel(release: PlatformRelease): string {
   return release.version || shortCommit(release.source_commit);
+}
+
+/** A version reads as "v0.2.0"; a bare commit (edge) does not take the v. */
+export function prefixed(label: string): string {
+  return /^\d/.test(label) ? `v${label}` : label;
+}
+
+/** An instant as the console prints a release's publication: "5 Sep 2026,
+ *  14:59". UTC, because every timestamp on this page is a UTC instant and the
+ *  next-check line beside it is a UTC cron. */
+export function stamp(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const date = new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(d);
+  const time = new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZone: "UTC",
+  }).format(d);
+  return `${date}, ${time}`;
 }
 
 export function shortCommit(commit: string | null | undefined): string {

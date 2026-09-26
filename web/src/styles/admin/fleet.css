@@ -564,6 +564,26 @@
 }
 .devapply-detail { margin: var(--s2) 0 0; white-space: pre-wrap; }
 
+/* A migrating update gone wrong (#364): rh06 update-refused / restore-*.png, `rhRefusedBanner`
+   and `rhRestore` in assets/pages-rh06.js, whose inline styles these carry. */
+.rel-alert-eyebrow.warning { color: var(--warning-text); }
+.rel-alert-eyebrow.danger { color: var(--danger-text); }
+.rel-refused-body {
+  margin: 6px 0 0;
+  font-size: var(--t-sm);
+  line-height: 1.55;
+  max-width: 80ch;
+}
+.rel-alert-body {
+  margin: var(--s4) 0;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.6;
+  max-width: 84ch;
+}
+.rel-restore-hint { margin: var(--s3) 0 0; line-height: 1.55; }
+.rel-history-failed { color: var(--danger-text); }
+
 /* The control plane's own machine in Releases > Installed (#361): `rhInstalled` in
    design_handoff_v3/screens/assets/pages-rh06.js, screenshots rh06/inv-control-only*. */
 .rel-machine { margin-top: var(--s5); }
