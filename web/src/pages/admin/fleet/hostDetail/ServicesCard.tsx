@@ -185,6 +185,8 @@ function StateCell({ state }: { state: ServiceState }) {
           reachable
         </Chip>
       );
+    case "must_update":
+      return <Chip variant="warning">must update</Chip>;
     case "in_the_way":
       return <Chip variant="warning">in the way</Chip>;
     default:

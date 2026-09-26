@@ -81,6 +81,11 @@ type HostIdentity struct {
 	InstallMode    *string `json:"install_mode"`
 	UpdaterPresent *bool   `json:"updater_present"`
 	IdentityKnown  bool    `json:"identity_known"`
+	// BelowFloor is amendment 14's read signal: the agent or the recovery actor
+	// orders below the installed control plane's floor (floor.go). Derived and
+	// served, never left to a client to re-derive, like IdentityKnown; it changes
+	// no eligibility.
+	BelowFloor bool `json:"below_floor"`
 	// AgentConnected is whether this host's agent has a live socket to THIS
 	// control-plane process, as the agent registry sees it right now.
 	//
@@ -109,6 +114,10 @@ type HostIdentity struct {
 	// a host attempt actor first. Unserialized: the host body carries it, the
 	// release view's frozen identity shape does not.
 	RecoveryActorSourceCommit *string `json:"-"`
+	// RecoveryActorVersion is hosts.recovery_actor_version (amendment 14): with
+	// AgentVersion, what the floor is judged against. Unserialized for the same
+	// reason.
+	RecoveryActorVersion *string `json:"-"`
 }
 
 // Known is `identity_known`: all four fields present. A host with any of them
@@ -158,6 +167,10 @@ const (
 	// state this build has no table for; #116 evaluates them.
 	ReasonAttemptInFlight = "attempt_in_flight"
 	ReasonRunActive       = "run_active"
+
+	// Amendment 14. Never a `targets` reason: only the revert and developer-apply
+	// refusals carry it (floor.go).
+	ReasonBelowFloor = "below_floor"
 )
 
 // Target is one target's eligibility, evaluated against available[0] only.

@@ -34,7 +34,7 @@ def validate(dependencies):
             visit(prerequisite)
     visit('release')
     required = {'release-gate', 'preflight', 'promote',
-                'validate-control-plane', 'validate-node-agent'}
+                'validate-control-plane', 'validate-node-agent', 'validate-recovery-actor'}
     assert required <= seen, f'publication bypasses required gates: {sorted(required - seen)}'
     for job in required | {'release'}:
         assert not re.search(r'^    (?:if:.*(?:always\(|failure\(|cancelled\()|continue-on-error:\s*true)', blocks[job], re.M), f'{job} bypasses successful prerequisites'
@@ -42,7 +42,8 @@ def validate(dependencies):
 validate(graph)
 # Prove the guard catches the actual pre-fix publication race and its validation
 # equivalent, rather than merely reading a keyword somewhere in the workflow.
-for job, edge in [('release', 'promote'), ('promote', 'validate-node-agent')]:
+for job, edge in [('release', 'promote'), ('promote', 'validate-node-agent'),
+                  ('promote', 'validate-recovery-actor')]:
     changed = copy.deepcopy(graph)
     changed[job].discard(edge)
     try:

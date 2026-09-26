@@ -73,19 +73,22 @@ func (r *ImageResolver) Check(ctx context.Context, rel Release) *ImageFact {
 	}
 	r.mu.Unlock()
 
-	fact := ImageFact{Err: r.resolve(ctx, rel)}
+	errText, edgeActor := r.resolve(ctx, rel)
+	fact := ImageFact{Err: errText, EdgeActor: edgeActor}
 	r.mu.Lock()
 	r.cache[rel.ID] = imageCheckEntry{fact: fact, at: time.Now()}
 	r.mu.Unlock()
 	return &fact
 }
 
-func (r *ImageResolver) resolve(ctx context.Context, rel Release) string {
+// resolve is the fact's error text ("" when every component resolved) and, for an
+// edge release, whether its build published a recovery actor.
+func (r *ImageResolver) resolve(ctx context.Context, rel Release) (string, *bool) {
 	var components []ComponentDigest
 	if len(rel.Manifest) > 0 {
 		m, err := ParseManifest(rel.Manifest)
 		if err != nil {
-			return "the release manifest does not parse: " + err.Error()
+			return "the release manifest does not parse: " + err.Error(), nil
 		}
 		for _, c := range m.Components {
 			components = append(components, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
@@ -94,14 +97,20 @@ func (r *ImageResolver) resolve(ctx context.Context, rel Release) string {
 	if len(components) == 0 {
 		// Edge: no manifest, so the commit tag is what the apply would resolve.
 		if r.edge == nil {
-			return "this release carries no manifest and this control plane cannot reach the registry to resolve one"
+			return "this release carries no manifest and this control plane cannot reach the registry to resolve one", nil
 		}
-		for _, f := range []func(context.Context, Release) (ComponentDigest, error){r.edge.ControlPlaneComponent, r.edge.NodeAgentComponent} {
-			if _, err := f(ctx, rel); err != nil {
-				return err.Error()
-			}
+		if _, err := EdgeControlPlaneComponents(ctx, r.edge, rel); err != nil {
+			return err.Error(), nil
 		}
-		return ""
+		host, err := EdgeHostComponents(ctx, r.edge, rel)
+		if err != nil {
+			return err.Error(), nil
+		}
+		actor := false
+		for _, c := range host {
+			actor = actor || c.Name == ComponentRecovery
+		}
+		return "", &actor
 	}
 	for _, c := range components {
 		ref := c.Image + "@" + c.Digest
@@ -109,8 +118,8 @@ func (r *ImageResolver) resolve(ctx context.Context, rel Release) string {
 		_, err := r.inspect.InspectConfig(cctx, ref)
 		cancel()
 		if err != nil {
-			return fmt.Sprintf("%s: %s does not resolve at the registry: %v", c.Name, ref, err)
+			return fmt.Sprintf("%s: %s does not resolve at the registry: %v", c.Name, ref, err), nil
 		}
 	}
-	return ""
+	return "", nil
 }

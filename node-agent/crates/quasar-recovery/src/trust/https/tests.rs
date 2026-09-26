@@ -14,8 +14,8 @@ use crate::trust::golang::proxy::ProxyEnv;
 use crate::trust::source::parse_manifest_base_url;
 use crate::trust::SignatureEvidence;
 
-const SIG: &str = "platform-release-manifest.json.sig";
-const MANIFEST: &str = "platform-release-manifest.json";
+const SIG: &str = "platform-release-manifest.v2.json.sig";
+const MANIFEST: &str = "platform-release-manifest.v2.json";
 const LIMIT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]

@@ -5,4 +5,4 @@ package buildinfo
 // the image label org.quasar.recipe by reading the line below, so keep its exact shape.
 // Bump it only when the control plane starts needing a new mount, environment input,
 // port, device or capability, together with the actor's recipe book.
-const RecipeRevision = 1
+const RecipeRevision = 2

@@ -23,6 +23,10 @@ pub const TLS_HOSTS: &str = "QUASAR_TLS_HOSTS";
 pub const TRUSTED_PROXIES: &str = "QUASAR_TRUSTED_PROXIES";
 pub const HTTP_PORT: &str = "QUASAR_HTTP_PORT";
 pub const TLS_PORT: &str = "QUASAR_TLS_PORT";
+/// Optional overrides of the images Add host installs; unset, the control plane offers the
+/// installed release's, then this machine's install-time images (#365).
+pub const ENROLL_SEED_IMAGE: &str = "QUASAR_ENROLL_SEED_IMAGE";
+pub const ENROLL_AGENT_IMAGE: &str = "QUASAR_ENROLL_AGENT_IMAGE";
 /// Setting this makes the database the operator's own (#352 R1-Q1); the other
 /// `QUASAR_DATABASE_*` inputs complete it, under the control plane's own names.
 pub const DATABASE_HOST: &str = "QUASAR_DATABASE_HOST";
@@ -109,6 +113,8 @@ impl Bootstrap {
                 app_puid: get(APP_PUID),
                 app_pgid: get(APP_PGID),
                 container_network: get(CONTAINER_NETWORK),
+                enroll_seed_override: get(ENROLL_SEED_IMAGE),
+                enroll_agent_override: get(ENROLL_AGENT_IMAGE),
                 trust: TrustInputs {
                     unknown: Default::default(),
                     allowed_namespaces: get(ALLOWED_NAMESPACES),
@@ -201,6 +207,15 @@ impl Bootstrap {
             None
         };
         let app = self.check_app()?;
+        let override_of = |name: &str, raw: &Option<String>| -> Result<Option<ImageRef>, String> {
+            raw.as_deref()
+                .map(|v| ImageRef::parse(v.trim()).map_err(|e| format!("{name}: {e}")))
+                .transpose()
+        };
+        let enroll_overrides = (
+            override_of(ENROLL_SEED_IMAGE, &op.enroll_seed_override)?,
+            override_of(ENROLL_AGENT_IMAGE, &op.enroll_agent_override)?,
+        );
         let probe = Inputs {
             unknown: Default::default(),
             installation_id: "check".into(),
@@ -228,6 +243,7 @@ impl Bootstrap {
             control,
             trust: op.trust.clone(),
             enroll_agent_image: named_agent,
+            enroll_overrides,
             app,
         })
     }
@@ -346,6 +362,8 @@ pub struct Checked {
     /// The agent image a control-plane machine's Add host installs on new GPU hosts: its
     /// own agent's on a combined host, `QUASAR_AGENT_IMAGE` if named on a control-only one.
     pub enroll_agent_image: Option<ImageRef>,
+    /// The operator's `QUASAR_ENROLL_SEED_IMAGE` / `QUASAR_ENROLL_AGENT_IMAGE`, if given.
+    pub enroll_overrides: (Option<ImageRef>, Option<ImageRef>),
     pub app: AppInputs,
 }
 

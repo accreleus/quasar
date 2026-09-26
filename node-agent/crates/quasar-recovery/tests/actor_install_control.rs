@@ -759,6 +759,65 @@ fn the_control_plane_serves_add_host_this_machines_seed_and_agent_images() {
     assert_eq!(cp.spec.env["QUASAR_ENROLL_AGENT_IMAGE"], AGENT_IMAGE);
 }
 
+/// A revision-2 control plane (#365) is given the install-time images only as fallbacks,
+/// below the installed release's, and the operator's `QUASAR_ENROLL_*` seed inputs as
+/// overrides.
+#[test]
+fn a_revision_2_control_plane_gets_add_host_overrides_and_install_time_fallbacks() {
+    const OVERRIDE: &str = "registry.example.invalid/dev/quasar-node-agent@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let mut env = combined_env();
+    env.insert("QUASAR_ENROLL_AGENT_IMAGE".into(), OVERRIDE.into());
+    let mut state = control_host(env);
+    state.registry.insert(
+        CONTROL_IMAGE.into(),
+        image(
+            "sha256:c0c0000000000000000000000000000000000000000000000000000000000000",
+            CONTROL_IMAGE,
+            Some("2"),
+        ),
+    );
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    let created = seed(&engine, dir.path(), SEED_ID).step();
+    assert!(matches!(created, Outcome::Created { .. }), "{created:?}");
+    let id = engine
+        .state()
+        .container_named(names::RECOVERY_ACTOR)
+        .unwrap()
+        .id
+        .clone();
+    start(&engine, dir.path(), &id).resume().unwrap();
+
+    let state = engine.state();
+    let cp = state.container_named(names::CONTROL_PLANE).unwrap();
+    assert_eq!(cp.spec.env["QUASAR_ENROLL_SEED_IMAGE"], "");
+    assert_eq!(cp.spec.env["QUASAR_ENROLL_AGENT_IMAGE"], OVERRIDE);
+    assert_eq!(
+        cp.spec.env["QUASAR_ENROLL_FALLBACK_SEED_IMAGE"],
+        ACTOR_IMAGE
+    );
+    assert_eq!(
+        cp.spec.env["QUASAR_ENROLL_FALLBACK_AGENT_IMAGE"],
+        AGENT_IMAGE
+    );
+}
+
+#[test]
+fn a_malformed_add_host_override_is_refused_before_anything_is_installed() {
+    let mut env = combined_env();
+    env.insert(
+        "QUASAR_ENROLL_SEED_IMAGE".into(),
+        "registry.example.invalid/quasar/quasar-recovery:latest".into(),
+    );
+    let engine = Arc::new(FakeEngine::new(seeded_host(env)));
+    let dir = tempfile::tempdir().unwrap();
+    let refused = seed(&engine, dir.path(), SEED_ID).step();
+    assert!(
+        matches!(&refused, Outcome::Idle { why, .. } if why.contains("QUASAR_ENROLL_SEED_IMAGE")),
+        "{refused:?}"
+    );
+}
+
 /// The control plane knows its machine's shape from its own configuration, and takes
 /// trusted proxies from the seed under its own rules.
 #[test]

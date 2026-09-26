@@ -1,9 +1,13 @@
-# `platform-release-manifest.json.sig` — the detached release signature
+# `platform-release-manifest.v2.json.sig` — the detached release signature
 
 The optional second asset of a platform release: a detached signature over the
-exact bytes of `platform-release-manifest.json`. A host configured to verify
-signatures fetches both from the release and refuses to apply a release whose
-signature does not check out.
+exact bytes of the manifest asset beside it. The release job signs
+`platform-release-manifest.v2.json` into `platform-release-manifest.v2.json.sig`;
+a release published before format 2 carries `platform-release-manifest.json.sig`
+over `platform-release-manifest.json`. The format below is the same for both. A
+host configured to verify signatures fetches the pair from the release and
+refuses to apply a release whose signature does not check out: a recovery actor
+fetches the v2 pair (a pre-RH06 Compose updater fetched the format-1 pair).
 
 Signing what it covers: **the manifest, not each image.** The manifest already
 names every component digest (`scripts/release/platform-release-manifest.md`),

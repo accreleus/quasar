@@ -10,7 +10,7 @@ use std::time::Duration;
 use quasar_recovery::actor::{Actor, ActorConfig, TrustConfig};
 use quasar_recovery::bootstrap::Bootstrap;
 use quasar_recovery::engine::DockerEngine;
-use quasar_recovery::recipe::paths;
+use quasar_recovery::recipe::{paths, Book};
 use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
 use quasar_recovery::socket::Request;
 use quasar_recovery::trust::{self, SignatureEvidence};
@@ -34,6 +34,8 @@ commands:
             a verified replacement; run it inside the recovery actor (docker exec). A change
             that moves the control plane's container is refused in this build
   version   print this build's version and commit
+  recipes   print the recipe revisions this build renders, per role, as one JSON line
+            (read by scripts/release/check-release-compatibility.sh)
 
 restore is not in this build.";
 
@@ -61,6 +63,11 @@ fn main() -> ExitCode {
                 identity::version(),
                 identity::source_commit()
             );
+            ExitCode::SUCCESS
+        }
+        // No machine state, socket or engine: the release job runs it with `--network none`.
+        Some("recipes") => {
+            println!("{}", Book::windows_json());
             ExitCode::SUCCESS
         }
         Some("uninstall") => uninstall(&args[1..]),

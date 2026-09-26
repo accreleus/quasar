@@ -3575,6 +3575,9 @@ rc_of 0 "release:publication-dependencies" -- bash "$ROOT/scripts/release/test-r
 # shell verifier accepts, and refuse a tampered manifest or a wrong key.
 rc_of 0 "release:signature-contract" -- bash "$ROOT/scripts/release/test-platform-release-signature.sh"
 
+# ADR 0008's release-time check: refuse a release its own recovery actor cannot manage.
+rc_of 0 "release:compatibility-check" -- bash "$ROOT/scripts/release/test-release-compatibility.sh"
+
 printf '\n== test-db runner selection (#125) ==\n'
 # make test-db must work on a host with no Go toolchain outside containers --
 # every fleet host. The Postgres side was already ephemeral and per-worktree;

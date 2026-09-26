@@ -94,7 +94,8 @@ func (s *Store) Hosts(ctx context.Context) ([]HostIdentity, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id::text, node_name, status, agent_version,
 		       source_commit, built_at, install_mode, updater_present,
-		       readiness, readiness_reported_at, recovery_actor_source_commit
+		       readiness, readiness_reported_at, recovery_actor_source_commit,
+		       recovery_actor_version
 		FROM hosts
 		ORDER BY created_at DESC
 	`)
@@ -110,7 +111,8 @@ func (s *Store) Hosts(ctx context.Context) ([]HostIdentity, error) {
 		var readiness []byte
 		if err := rows.Scan(&h.HostID, &h.NodeName, &h.Status, &h.AgentVersion,
 			&h.SourceCommit, &builtAt, &h.InstallMode, &h.UpdaterPresent,
-			&readiness, &h.ReadinessReportedAt, &h.RecoveryActorSourceCommit); err != nil {
+			&readiness, &h.ReadinessReportedAt, &h.RecoveryActorSourceCommit,
+			&h.RecoveryActorVersion); err != nil {
 			return nil, fmt.Errorf("scan host identity: %w", err)
 		}
 		if len(readiness) > 0 {

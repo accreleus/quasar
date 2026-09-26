@@ -901,6 +901,9 @@ function TargetsCard({
   const ready = hostTargets.filter((t) => t.eligible).length;
   const holdouts = hostTargets.filter((t) => !t.eligible).slice(0, 3);
   const moreHoldouts = hostTargets.length - ready - holdouts.length;
+  // Offered only the update (amendment 14 below_floor): never a revert.
+  const belowFloor = new Set(view.installed.hosts.filter((h) => h.below_floor).map((h) => h.host_id));
+  const mustUpdate = hostTargets.filter((t) => t.eligible && t.host_id && belowFloor.has(t.host_id));
 
   const columns: TableColumn<PlatformReleaseTarget>[] = [
     {
@@ -941,7 +944,7 @@ function TargetsCard({
                 Apply
               </Button>
             )}
-            {back?.digest && (
+            {back?.digest && !belowFloor.has(t.host_id) && (
               <Button variant="ghost" size="sm" onClick={() => setReverting(t)}>
                 Revert
               </Button>
@@ -977,8 +980,14 @@ function TargetsCard({
           </span>
         </Fact>
       </div>
-      {holdouts.length > 0 && (
+      {holdouts.length + mustUpdate.length > 0 && (
         <div className="mt2">
+          {mustUpdate.map((t) => (
+            <div className="rel-holdout" key={`floor-${t.host_id}`}>
+              <span>{t.node_name}</span>
+              <span className="hint">must update first · included</span>
+            </div>
+          ))}
           {holdouts.map((t) => (
             <div className="rel-holdout" key={t.host_id ?? "cp"}>
               <span>{t.node_name}</span>

@@ -967,12 +967,15 @@ git tag v0.2.0            # the version must already have a CHANGELOG section
 git push origin v0.2.0
 ```
 
-That tag push runs `.github/workflows/images.yml`, which builds both images,
-validates them against `deploy/image-contract.json`, runs the release preflight,
-promotes the tag set (`:0.2.0`, and `:latest` for a stable version), then creates
-the GitHub Release with that version's `CHANGELOG.md` section as the body and
-attaches `platform-release-manifest.json` — the machine-readable list of the two
-component images by digest ([schema](../scripts/release/platform-release-manifest.md)).
+That tag push runs `.github/workflows/images.yml`, which builds the control-plane,
+node-agent and recovery-actor images, validates them against
+`deploy/image-contract.json`, runs the release preflight, promotes the tag set
+(`:0.2.0`, and `:latest` for a stable version), then creates the GitHub Release with
+that version's `CHANGELOG.md` section as the body and attaches
+`platform-release-manifest.v2.json` — the machine-readable list of the three
+component images by digest and the floor
+([schema](../scripts/release/platform-release-manifest.md)). Releases before #365
+attached the two-component `platform-release-manifest.json` instead.
 
 A **prerelease** tag (`v0.2.0-rc.1`) publishes a GitHub *prerelease*, which the
 `stable` channel ignores. It needs its own changelog section, under its
@@ -989,8 +992,8 @@ mistake costs seconds rather than the ~85-minute node-agent build:
 
 Everything else stays manual: a merge to `develop` or `main` publishes nothing.
 To publish from a branch, dispatch the workflow from the Actions tab with the ref
-selector on that branch — it produces `sha-<sha>` and branch tags, never a
-version tag and never a Release.
+selector on that branch — it produces `sha-<sha>` and `o2-<branch>` tags (the edge
+tag family, #365), never a version tag and never a Release.
 
 If a run fails *after* the promote job, the images are published but the Release
 is not. Re-run the failed job (Actions → the run → "Re-run failed jobs"); the

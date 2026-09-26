@@ -909,6 +909,21 @@ func TestLoadEnrollPinsTakeOnlyADigest(t *testing.T) {
 		t.Fatalf("EnrollPins = %+v", c.EnrollPins)
 	}
 
+	t.Setenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE", seed)
+	t.Setenv("QUASAR_ENROLL_FALLBACK_AGENT_IMAGE", agent)
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.EnrollFallback.SeedImage != seed || c.EnrollFallback.AgentImage != agent {
+		t.Fatalf("EnrollFallback = %+v", c.EnrollFallback)
+	}
+	t.Setenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE", "registry.example.invalid/quasar/quasar-recovery:0.6.0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QUASAR_ENROLL_FALLBACK_SEED_IMAGE") {
+		t.Fatalf("a tagged fallback must fail startup naming the variable, got %v", err)
+	}
+	t.Setenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE", seed)
+
 	t.Setenv("QUASAR_ENROLL_AGENT_IMAGE", "registry.example.invalid/quasar/quasar-node-agent:0.6.0")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QUASAR_ENROLL_AGENT_IMAGE") {
 		t.Fatalf("a tag must fail startup naming the variable, got %v", err)

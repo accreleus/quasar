@@ -49,8 +49,11 @@ PY
 
 valid_base="ghcr.io/accreleus/quasar-base@sha256:$digest"
 
+valid_recovery="registry.example/quasar-recovery@sha256:$digest"
+
 preflight() {
-  QUASAR_CONTROL_IMAGE="$1" QUASAR_AGENT_IMAGE="$2" QUASAR_BASE_IMAGE="$valid_base" \
+  QUASAR_CONTROL_IMAGE="$1" QUASAR_AGENT_IMAGE="$2" QUASAR_RECOVERY_IMAGE="$valid_recovery" \
+    QUASAR_BASE_IMAGE="$valid_base" \
     "$worktree/scripts/release/release-preflight.sh" --require-artifact-images --output "$3"
 }
 
@@ -76,6 +79,7 @@ PY
 # Strict preflight without the base identity must fail: the artifacts' FROM
 # lineage would be unrecorded and the committed :latest default is mutable.
 if QUASAR_CONTROL_IMAGE="$valid_control" QUASAR_AGENT_IMAGE="$valid_vulkan" \
+    QUASAR_RECOVERY_IMAGE="$valid_recovery" \
     "$worktree/scripts/release/release-preflight.sh" --require-artifact-images \
     --output "$evidence_dir/nobase.json" >/dev/null 2>&1; then
   fail "unexpected strict success without QUASAR_BASE_IMAGE"
@@ -84,7 +88,7 @@ python3 -c 'import json,sys; report=json.load(open(sys.argv[1])); assert report[
 
 # A tag-form base is mutable metadata, exactly like a tagged artifact image.
 if QUASAR_CONTROL_IMAGE="$valid_control" QUASAR_AGENT_IMAGE="$valid_vulkan" \
-    QUASAR_BASE_IMAGE="ghcr.io/accreleus/quasar-base:latest" \
+    QUASAR_RECOVERY_IMAGE="$valid_recovery" QUASAR_BASE_IMAGE="ghcr.io/accreleus/quasar-base:latest" \
     "$worktree/scripts/release/release-preflight.sh" --require-artifact-images \
     --output "$evidence_dir/tagbase.json" >/dev/null 2>&1; then
   fail "unexpected strict success with tag-form QUASAR_BASE_IMAGE"
@@ -106,6 +110,15 @@ reject "registry.example/quasar-control:1@sha256:$digest" "$valid_vulkan" \
   "$evidence_dir/tagged.json" "QUASAR_CONTROL_IMAGE must be exact"
 reject "registry.example/quasar-control@sha256:abcd" "$valid_vulkan" \
   "$evidence_dir/malformed.json" "QUASAR_CONTROL_IMAGE must be exact"
+
+# The recovery actor is a release artifact like the other two.
+if QUASAR_CONTROL_IMAGE="$valid_control" QUASAR_AGENT_IMAGE="$valid_vulkan" \
+    QUASAR_BASE_IMAGE="$valid_base" \
+    "$worktree/scripts/release/release-preflight.sh" --require-artifact-images \
+    --output "$evidence_dir/norecovery.json" >/dev/null 2>&1; then
+  fail "unexpected strict success without QUASAR_RECOVERY_IMAGE"
+fi
+python3 -c 'import json,sys; report=json.load(open(sys.argv[1])); assert report["result"] == "FAIL" and "missing required release artifact image: QUASAR_RECOVERY_IMAGE" in report["errors"], report["errors"]' "$evidence_dir/norecovery.json"
 
 # Every strict output under candidate repository is rejected and must not write.
 inside="$worktree/strict-preflight-inside.json"

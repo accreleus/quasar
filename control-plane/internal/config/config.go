@@ -66,6 +66,8 @@ type Config struct {
 
 	// The images /enroll-host.sh and the Add host stack install, by digest.
 	EnrollPins enrollscript.Pins // QUASAR_ENROLL_SEED_IMAGE, QUASAR_ENROLL_AGENT_IMAGE
+	// Below the installed release's images: the machine's install-time images.
+	EnrollFallback enrollscript.Pins // QUASAR_ENROLL_FALLBACK_SEED_IMAGE, QUASAR_ENROLL_FALLBACK_AGENT_IMAGE
 
 	// Empty / "spread" / "least-loaded" all select least-loaded (P3-02).
 	PlacementPolicy string // QUASAR_PLACEMENT_POLICY
@@ -339,9 +341,15 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("%s %q: carries a quote or a control character", trust[0], trust[1])
 		}
 	}
+	c.EnrollFallback = enrollscript.Pins{
+		SeedImage:  strings.TrimSpace(os.Getenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE")),
+		AgentImage: strings.TrimSpace(os.Getenv("QUASAR_ENROLL_FALLBACK_AGENT_IMAGE")),
+	}
 	for _, pin := range [][2]string{
 		{"QUASAR_ENROLL_SEED_IMAGE", c.EnrollPins.SeedImage},
 		{"QUASAR_ENROLL_AGENT_IMAGE", c.EnrollPins.AgentImage},
+		{"QUASAR_ENROLL_FALLBACK_SEED_IMAGE", c.EnrollFallback.SeedImage},
+		{"QUASAR_ENROLL_FALLBACK_AGENT_IMAGE", c.EnrollFallback.AgentImage},
 	} {
 		if pin[1] != "" && !enrollscript.ValidImage(pin[1]) {
 			return nil, fmt.Errorf("%s %q: must be repository@sha256:<64 lowercase hex>, never a tag", pin[0], pin[1])

@@ -14,7 +14,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::signature::verify_manifest_signature;
-use super::source::{probe, redirect_allowed, AssetResponse};
+use super::source::{
+    probe_assets, redirect_allowed, AssetResponse, ReleaseAssets, FORMAT_1_ASSETS, FORMAT_2_ASSETS,
+};
 use super::{
     admit, parse_allowed_namespaces, parse_manifest_base_url, parse_signature_mode,
     parse_trusted_keys, wants_signature_evidence, Caller, Config, SignatureEvidence,
@@ -142,6 +144,19 @@ impl EvidenceSpec {
 struct FetchSpec {
     base_url: String,
     responses: BTreeMap<String, AssetSpec>,
+    /// 2 for a vector about the format-2 pair the actor fetches; absent is the Go
+    /// updater's format-1 pair.
+    asset_format: Option<u8>,
+}
+
+impl FetchSpec {
+    fn assets(&self) -> ReleaseAssets {
+        match self.asset_format {
+            None | Some(1) => FORMAT_1_ASSETS,
+            Some(2) => FORMAT_2_ASSETS,
+            Some(other) => panic!("unknown asset_format {other}"),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -183,7 +198,8 @@ fn gather(spec: &FetchSpec, version: Option<&str>) -> (SignatureEvidence, Vec<St
     );
     let base = parse_manifest_base_url(&spec.base_url).expect("vector base url");
     let mut fetched = Vec::new();
-    let evidence = probe(&base, version).run(|url| fake_fetch(spec, &mut fetched, url));
+    let evidence =
+        probe_assets(&base, version, spec.assets()).run(|url| fake_fetch(spec, &mut fetched, url));
     (evidence, fetched)
 }
 

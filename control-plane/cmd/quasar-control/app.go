@@ -16,6 +16,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/artwork"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/config"
 	"github.com/accreleus/quasar/control-plane/internal/console"
 	"github.com/accreleus/quasar/control-plane/internal/crud"
@@ -104,6 +105,9 @@ type Services struct {
 	// claim list.
 	jobsAgentHandler *jobs.AgentHandler
 	pool             *pgxpool.Pool
+	// What /enroll-host.sh installs: the configured pins over the installed
+	// release's images. Nil serves the configured pins alone.
+	enrollPins enrollscript.PinSource
 
 	// authSvc: main.go wires the dev-only agent-auth endpoint (#399) to this same
 	// service so there is one hashing and token-issuance path. Unused by RegisterRoutes.
@@ -1373,6 +1377,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		jobsAgentHandler: jobsAgentHandler,
 
 		pool:           pool,
+		enrollPins:     installedEnrollPins(cfg.EnrollPins, cfg.EnrollFallback, platformStore, buildinfo.Get().SourceCommit, log),
 		authSvc:        authSvc,
 		janitorStop:    janitorStop,
 		jobsDispatcher: jobsDispatcher,
@@ -1434,10 +1439,42 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	if s.cfg.WebRoot != "" {
 		s.log.Info("serving SPA", "root", s.cfg.WebRoot)
 		mux.Handle("/", httpx.SPAHandler(s.cfg.WebRoot))
-		mux.Handle("/enroll-host.sh", enrollscript.Handler(s.cfg.WebRoot, s.cfg.EnrollPins, s.log))
-		if s.cfg.EnrollPins.SeedImage == "" || s.cfg.EnrollPins.AgentImage == "" {
-			s.log.Warn("Add host has no images to install: set QUASAR_ENROLL_SEED_IMAGE and QUASAR_ENROLL_AGENT_IMAGE")
+		pins := s.enrollPins
+		if pins == nil {
+			static := s.cfg.EnrollPins.Or(s.cfg.EnrollFallback)
+			pins = func(context.Context) enrollscript.Pins { return static }
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if p := pins(ctx); p.SeedImage == "" || p.AgentImage == "" {
+			s.log.Warn("Add host has no images to install: the installed release names none, and " +
+				"QUASAR_ENROLL_SEED_IMAGE / QUASAR_ENROLL_AGENT_IMAGE are unset")
+		}
+		cancel()
+		mux.Handle("/enroll-host.sh", enrollscript.HandlerFrom(s.cfg.WebRoot, pins, s.log))
+	}
+}
+
+// installedEnrollPins answers Add host's images per request, field by field: the
+// operator's QUASAR_ENROLL_* override, else the installed release's recovery-actor and
+// node-agent images, else the machine's install-time QUASAR_ENROLL_FALLBACK_* images.
+// Read per request because detection can learn the installed release after boot.
+// commit is this build's (nil when unstamped: no release can be installed).
+func installedEnrollPins(configured, fallback enrollscript.Pins, store *platform.Store, commit *string, log *slog.Logger) enrollscript.PinSource {
+	return func(ctx context.Context) enrollscript.Pins {
+		if configured.SeedImage != "" && configured.AgentImage != "" {
+			return configured
+		}
+		release := enrollscript.Pins{}
+		if commit != nil && store != nil {
+			seed, agent, ok, err := store.InstalledEnrollImages(ctx, *commit)
+			if err != nil {
+				log.Warn("Add host: could not read the installed release's images", "err", err)
+			}
+			if ok {
+				release = enrollscript.Pins{SeedImage: seed, AgentImage: agent}
+			}
+		}
+		return configured.Or(release).Or(fallback)
 	}
 }
 

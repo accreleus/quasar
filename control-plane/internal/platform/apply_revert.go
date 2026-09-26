@@ -41,6 +41,10 @@ type RevertInputs struct {
 	// ordered (beta compares semver precedence, not build time). "" is the
 	// non-beta ordering, which is what every other channel uses.
 	Channel string
+	// The host's served below_floor, and the floor a restored release is judged
+	// against: a revert is refused below_floor from or to either (amendment 14).
+	HostBelowFloor bool
+	Floor          buildinfo.Floor
 }
 
 // RevertDecision is the attempt to create, or the refusal to write.
@@ -67,6 +71,10 @@ type RevertDecision struct {
 // on THIS host under this or an older control plane, and the control plane only
 // moves forward, so its schema cannot be above the current one.
 func PlanRevert(in RevertInputs) RevertDecision {
+	// A below-floor host is offered only an update.
+	if in.HostBelowFloor {
+		return RevertDecision{Code: CodeHostNotEligible, Reason: ReasonBelowFloor}
+	}
 	if in.LastSucceeded == nil {
 		return RevertDecision{Code: CodeNothingToRevert}
 	}
@@ -96,6 +104,9 @@ func PlanRevert(in RevertInputs) RevertDecision {
 	if in.PreviousRelease != nil && ordersAbove(*in.PreviousRelease, in.ControlPlaneRelease, in.ControlPlane, in.Channel) {
 		return RevertDecision{Code: CodeHostNotEligible, Reason: ReasonReleaseAboveControlPlane}
 	}
+	if in.PreviousRelease != nil && releaseBelowFloor(*in.PreviousRelease, componentNames(requested), in.Floor) {
+		return RevertDecision{Code: CodeHostNotEligible, Reason: ReasonBelowFloor}
+	}
 
 	d := RevertDecision{
 		OK:        true,
@@ -107,6 +118,14 @@ func PlanRevert(in RevertInputs) RevertDecision {
 		d.ReleaseID = &id
 	}
 	return d
+}
+
+func componentNames(cs []ComponentDigest) []string {
+	out := make([]string, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, c.Name)
+	}
+	return out
 }
 
 // nodeAgentPrevious is the node-agent entry: what names the build a revert returns to.
@@ -284,7 +303,12 @@ func (h *ApplyHandler) handleHostRevert(w http.ResponseWriter, r *http.Request) 
 
 // revertInputs is every read the decision needs.
 func (h *ApplyHandler) revertInputs(ctx context.Context, view View, hostID string) (RevertInputs, error) {
-	in := RevertInputs{ControlPlane: view.Installed.ControlPlane, Channel: view.Channel}
+	in := RevertInputs{
+		ControlPlane:   view.Installed.ControlPlane,
+		Channel:        view.Channel,
+		HostBelowFloor: hostIdentity(view, hostID).BelowFloor,
+		Floor:          buildinfo.DeclaredFloor(),
+	}
 	if cpCommit := view.Installed.ControlPlane.SourceCommit; cpCommit != nil {
 		// With no row for the control plane, ordersAbove falls back to
 		// schema_version, the key that always exists.

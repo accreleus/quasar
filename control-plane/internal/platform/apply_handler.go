@@ -204,14 +204,14 @@ func (h *ApplyHandler) handleHostApply(w http.ResponseWriter, r *http.Request) {
 				"this release carries no manifest and this control plane cannot reach the registry to resolve one")
 			return
 		}
-		c, err := h.edge.NodeAgentComponent(ctx, release)
+		resolved, err := EdgeHostComponents(ctx, h.edge, release)
 		if err != nil {
-			h.log.Warn("platform apply: could not resolve the edge node-agent digest", "err", err)
+			h.log.Warn("platform apply: could not resolve the edge build's digests", "err", err)
 			httpx.WriteError(w, http.StatusConflict, CodeReleaseNotOffered,
-				"this release's node-agent image could not be resolved: "+err.Error())
+				"this release's images could not be resolved: "+err.Error())
 			return
 		}
-		components = []ComponentDigest{c}
+		components = resolved
 	}
 	switch reason := hostTargetReason(view, hostID); reason {
 	case "":
