@@ -408,6 +408,10 @@ func (s *SelfApplier) record(ctx context.Context, attemptID string, res SelfResu
 // Returns false when the attempt is still open: it was never sent, and the
 // caller re-drives it. A cancelled ctx (this process shutting down) returns
 // true with nothing written; the caller must not re-drive then either.
+//
+// A restart caused by an operator's `quasar-recovery reconfigure` has no row to
+// adopt, and the control socket never answers with that attempt, so no row
+// takes it for its verdict (guarded by reconfigure_boot_test.go).
 func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) bool {
 	requestID, err := s.store.AttemptRequestID(ctx, a.ID)
 	if ctx.Err() != nil {
