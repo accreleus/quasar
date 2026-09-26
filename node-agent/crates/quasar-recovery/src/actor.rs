@@ -877,6 +877,7 @@ impl Actor {
             None => None,
         };
         let mut inputs = Inputs {
+            unknown: Default::default(),
             installation_id,
             node_name: checked.node_name.clone(),
             home_root: checked.home_root.clone(),
@@ -893,6 +894,7 @@ impl Actor {
         if checked.control.is_some() {
             // The seed a new GPU host runs is this machine's recovery image.
             inputs.enroll = recipe::EnrollImages {
+                unknown: Default::default(),
                 seed: self
                     .own_container()?
                     .and_then(|me| own_image(self.engine.as_ref(), &me))
@@ -954,6 +956,7 @@ impl Actor {
         }
 
         let machine = Machine {
+            unknown: Default::default(),
             format: FORMAT,
             installation_id: inputs.installation_id.clone(),
             role: checked.role,

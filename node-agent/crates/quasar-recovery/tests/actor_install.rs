@@ -299,6 +299,33 @@ fn a_gpus_probe_that_never_gets_an_answer_fails_the_start_and_the_next_one_asks_
     );
 }
 
+/// An actor put back by a revert rewrites machine state a newer actor wrote (here, to
+/// record the `--gpus` answer) without erasing what it does not know.
+#[test]
+fn recording_the_gpus_answer_keeps_what_a_newer_actor_wrote() {
+    let mut state = nvidia_host(&[], true);
+    state.gpus_create_failures = vec![transient_500(), transient_500(), transient_500()];
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    assert!(actor(&engine, dir.path(), operator()).resume().is_err());
+
+    let mut newer = machine_json(&dir);
+    newer["later"] = serde_json::json!({"a": 1});
+    newer["inputs"]["later"] = 2.into();
+    newer["inputs"]["gpu"]["later"] = "x".into();
+    newer["inputs"]["devices"]["later"] = true.into();
+    std::fs::write(
+        dir.path().join("machine.json"),
+        serde_json::to_vec(&newer).unwrap(),
+    )
+    .unwrap();
+
+    actor(&engine, dir.path(), operator()).resume().unwrap();
+    let mut want = newer;
+    want["inputs"]["gpu"]["gpus_served"] = true.into();
+    assert_eq!(machine_json(&dir), want);
+}
+
 /// Docker 28+ with CDI enabled refuses `--gpus all` on an engine that has no NVIDIA
 /// device with its own words (measured on Docker 29.8, HTTP 500 at start); that is the
 /// same definite no as the older "could not select device driver".

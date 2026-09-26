@@ -285,7 +285,9 @@ impl Actor {
   inputs, database mode), `seed.json` (frozen format 1), `actor.lease` (flock, never unlinked),
   `journal/<request-id>.json` (tmp + fsync + rename per phase), `services/<role>.json` (last
   verified rendered spec — the cache that lets the actor act with the control plane down),
-  `dumps/` (last three pre-update dumps, each with its schema version), `secrets/`.
+  `dumps/` (last three pre-update dumps, each with its schema version), `secrets/`. An actor
+  keeps every `machine.json` field it does not know and writes it back on a rewrite, so an
+  actor put back by a revert does not erase what a newer one recorded.
 - **Secrets as files (D5).** Generated lazily at first render (database password, secret key,
   the local enrollment secret). Each consumer gets a small **per-service secrets volume** written
   by the actor and mounted read-only into that one container (works on Engine API 1.40; no

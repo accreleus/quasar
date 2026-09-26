@@ -1599,7 +1599,8 @@ manager's stack can carry them; they are read **only on a clean machine**, from 
 container when the seed created the actor (`QUASAR_SEED_CONTAINER`, set by the seed), else
 from its own environment. Once machine state exists (`machine.json` in the `quasar-machine`
 volume) it wins, and a later start's inputs are ignored (a differing home root is logged
-`token="actor-input-ignored"`). A seed-created actor takes the installation id from its
+`token="actor-input-ignored"`). An actor keeps the fields of `machine.json` it does not know and
+writes them back, so an older actor put back by a revert leaves a newer one's state intact. A seed-created actor takes the installation id from its
 own container's label, so the seed, machine state and `seed.json` name one installation.
 A machine installed before `seed.json` existed (an actor started by hand, then replaced by a
 seed) is labelled with a new installation while machine state keeps the old one; the actor
