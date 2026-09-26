@@ -45,6 +45,20 @@ func ConfiguredUpdaterSocket() string {
 	return UpdaterSocketPath
 }
 
+// SelfRequest is one control-plane apply as the self-applier hands it to the
+// actor beside it: the Compose updater, or on an owned machine the recovery
+// actor (actor_client.go). Components are in replacement order.
+type SelfRequest struct {
+	RequestID  string
+	Components []ComponentDigest
+	Release    ReleaseRef
+	// Migrates is the release's schema above this binary's; SchemaVersion is the
+	// schema it moves to, 0 when unknown.
+	Migrates                bool
+	SchemaVersion           int
+	ExternalBackupConfirmed bool
+}
+
 // UpdaterAPI is the sliver of the local socket this package uses, as an
 // interface so the self-apply is testable over a temp socket or a fake.
 type UpdaterAPI interface {
@@ -56,9 +70,18 @@ type UpdaterAPI interface {
 	SocketState() SocketState
 	// Self is what the updater discovered about the stack it sits beside.
 	Self(ctx context.Context) (UpdaterSelf, error)
-	Apply(ctx context.Context, req updater.ApplyRequest) (updater.Accepted, error)
+	Apply(ctx context.Context, req SelfRequest) (updater.Accepted, error)
 	Result(ctx context.Context, requestID string) (updater.Result, error)
+	// SocketPath names the socket in an operator-facing failure.
+	SocketPath() string
 }
+
+// verdictExecutor is an actor whose result is the verdict: the recovery actor
+// keeps the old control plane until the new one passes its health check and
+// restores it when it does not (ADR 0004 amendment), so the booted binary is
+// the evidence only once that result is terminal. The Compose updater's result
+// file lags its own recreate (#113 finding 2) and is not one.
+type verdictExecutor interface{ ResultIsVerdict() bool }
 
 // UpdaterSelf is the sliver of `GET /v1/self` this package reads. Declared here
 // rather than imported so an older updater, whose answer carries no `images`,
@@ -159,7 +182,23 @@ func (e *updaterError) Error() string {
 	return e.Reason + ": " + e.Message
 }
 
-func (c *UpdaterClient) Apply(ctx context.Context, req updater.ApplyRequest) (updater.Accepted, error) {
+// SocketPath is where this client dials.
+func (c *UpdaterClient) SocketPath() string {
+	if c == nil {
+		return ""
+	}
+	return c.socket
+}
+
+// Apply sends the request in the updater's own shape, which has no notion of
+// a migration: the Compose updater recreates whatever it is given.
+func (c *UpdaterClient) Apply(ctx context.Context, sr SelfRequest) (updater.Accepted, error) {
+	req := updater.ApplyRequest{RequestID: sr.RequestID, Release: updater.Release{
+		ID: sr.Release.ID, Version: sr.Release.Version, SourceCommit: sr.Release.SourceCommit,
+	}}
+	for _, c := range sr.Components {
+		req.Components = append(req.Components, updater.Component{Name: c.Name, Image: c.Image, Digest: c.Digest})
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return updater.Accepted{}, err
@@ -267,6 +306,10 @@ type SelfApplier struct {
 	// plane, and a report read once at start would then be a lie for its whole
 	// life.
 	InstallModeTTL time.Duration
+	// DeveloperCommit reads the commit a developer apply's images carry: its
+	// release_apply provenance and its success evidence, since the row names no
+	// release. Nil fails such an attempt before the send.
+	DeveloperCommit func(ctx context.Context, components []ComponentDigest) (string, error)
 
 	mu      sync.Mutex
 	self    UpdaterSelf
@@ -386,7 +429,7 @@ func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 	if !s.UpdaterPresent() {
 		// Refused rather than attempted: an apply with nothing to carry it out
 		// is a failure with a name, not a timeout fifteen minutes later.
-		s.fail(a.ID, ReasonUpdaterAbsentFailure, "no updater socket at "+ConfiguredUpdaterSocket())
+		s.fail(a.ID, ReasonUpdaterAbsentFailure, "no socket to apply the control plane over at "+s.socketPath())
 		return
 	}
 
@@ -425,7 +468,7 @@ func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 }
 
 func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) bool {
-	var ref updater.Release
+	req := SelfRequest{RequestID: requestID, Components: a.RequestedDigests}
 	if a.ReleaseID != nil {
 		rel, err := s.store.Release(ctx, *a.ReleaseID)
 		if err != nil {
@@ -433,15 +476,22 @@ func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) boo
 			s.fail(a.ID, ReasonInvalid, "")
 			return false
 		}
-		ref = updater.Release{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
+		req.Release = ReleaseRef{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
+		req.SchemaVersion = rel.SchemaVersion
+		req.Migrates = rel.SchemaVersion > s.Identity().SchemaVersion
+	} else {
+		// A developer apply: its provenance is the commit its images carry
+		// (control-api.md §"Developer apply"). The endpoint refuses a migrating
+		// one, so what reaches here never migrates.
+		commit, err := s.developerCommit(ctx, a)
+		if err != nil {
+			s.log.Error("self-apply: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			s.fail(a.ID, ReasonInvalid, "the images' build identity could not be read: "+err.Error())
+			return false
+		}
+		req.Release = ReleaseRef{SourceCommit: commit}
 	}
-	components := make([]updater.Component, 0, len(a.RequestedDigests))
-	for _, c := range a.RequestedDigests {
-		components = append(components, updater.Component{Name: c.Name, Image: c.Image, Digest: c.Digest})
-	}
-	accepted, err := s.updater.Apply(ctx, updater.ApplyRequest{
-		RequestID: requestID, Components: components, Release: ref,
-	})
+	accepted, err := s.updater.Apply(ctx, req)
 	if err != nil {
 		var rej *updaterError
 		if errors.As(err, &rej) {
@@ -546,6 +596,11 @@ func (s *SelfApplier) record(ctx context.Context, attemptID string, res updater.
 func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) bool {
 	id := s.Identity()
 	if wantCommit != "" && id.SourceCommit != nil && commitsMatch(*id.SourceCommit, wantCommit) {
+		// On an owned machine this build may yet be put back: it is the evidence
+		// only once the recovery actor has verified it, or stopped answering.
+		if s.awaitVerdict(ctx, a) {
+			return true
+		}
 		if done, err := s.store.SucceedAttempt(ctx, a.ID); err != nil {
 			s.log.Warn("self-apply: could not resolve the adopted attempt", "attempt_id", a.ID, "err", err)
 			return false
@@ -573,6 +628,58 @@ func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) b
 	defer cancel()
 	s.poll(dctx, a.ID, requestID)
 	return true
+}
+
+// awaitVerdict relays a verdict executor's result for a sent attempt until it is
+// terminal, and reports whether the attempt is resolved. False when the executor
+// is not one, the attempt was never sent, or the apply deadline passed with no
+// verdict: the caller then falls back to the booted-binary evidence.
+func (s *SelfApplier) awaitVerdict(ctx context.Context, a Attempt) bool {
+	if v, ok := s.updater.(verdictExecutor); !ok || !v.ResultIsVerdict() {
+		return false
+	}
+	requestID, err := s.store.AttemptRequestID(ctx, a.ID)
+	if err != nil || requestID == "" {
+		return false
+	}
+	started := a.CreatedAt
+	if a.StartedAt != nil {
+		started = *a.StartedAt
+	}
+	dctx, cancel := context.WithDeadline(ctx, started.Add(s.Deadline))
+	defer cancel()
+	for {
+		if cur, err := s.store.Attempt(dctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+			return true
+		}
+		if res, err := s.updater.Result(dctx, requestID); err == nil && s.record(dctx, a.ID, res) {
+			return true
+		}
+		select {
+		case <-dctx.Done():
+			if errors.Is(dctx.Err(), context.DeadlineExceeded) {
+				s.log.Warn("self-apply: no verdict from the recovery actor by the deadline; this build is serving on the commit, so it is the evidence",
+					"attempt_id", a.ID)
+			}
+			return false
+		case <-time.After(s.PollInterval):
+		}
+	}
+}
+
+// developerCommit is the commit a developer apply's images carry.
+func (s *SelfApplier) developerCommit(ctx context.Context, a Attempt) (string, error) {
+	if s.DeveloperCommit == nil {
+		return "", errors.New("no registry reader is wired to read the images' commit")
+	}
+	return s.DeveloperCommit(ctx, a.RequestedDigests)
+}
+
+func (s *SelfApplier) socketPath() string {
+	if s.updater == nil {
+		return ConfiguredUpdaterSocket()
+	}
+	return s.updater.SocketPath()
 }
 
 func (s *SelfApplier) fail(attemptID, reason, output string) {

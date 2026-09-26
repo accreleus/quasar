@@ -331,9 +331,11 @@ func (u *fakeUpdater) Self(context.Context) (UpdaterSelf, error) {
 	return *u.self, nil
 }
 
-func (u *fakeUpdater) Apply(context.Context, updater.ApplyRequest) (updater.Accepted, error) {
+func (u *fakeUpdater) Apply(context.Context, SelfRequest) (updater.Accepted, error) {
 	return updater.Accepted{}, nil
 }
+
+func (u *fakeUpdater) SocketPath() string { return "" }
 
 func (u *fakeUpdater) Result(_ context.Context, _ string) (updater.Result, error) {
 	u.mu.Lock()
