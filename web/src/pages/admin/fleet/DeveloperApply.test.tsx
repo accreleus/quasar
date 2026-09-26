@@ -330,3 +330,80 @@ describe("Developer apply", () => {
     expect(screen.getByText("Recovery actor · gpu-host-2")).toBeInTheDocument();
   });
 });
+
+describe("Developer apply to the control plane's own machine (#363)", () => {
+  const CP_DIGEST = "sha256:" + "e71f".repeat(16);
+  const CP = `registry.example.invalid:5000/quasar-dev/quasar-control-plane@${CP_DIGEST}`;
+
+  function ownedView(role: "combined" | "control_only"): PlatformReleaseView {
+    const v = view([
+      host({ host_id: "h0", node_name: "living-room-pc" }),
+      host({ host_id: "h1", node_name: "gpu-host-2" }),
+    ]);
+    Object.assign(v.installed.control_plane, {
+      install_mode: "owned",
+      machine_role: role,
+      machine_node_name: role === "combined" ? "living-room-pc" : "attic-server",
+    });
+    return v;
+  }
+
+  it("offers a combined host once, as the control plane's machine", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView("combined"));
+    renderTab();
+    const drawer = await openDrawer();
+    const options = within(within(drawer).getByLabelText("Machine")).getAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual([
+      "living-room-pc · Combined host",
+      "gpu-host-2 · GPU host",
+    ]);
+    expect(within(drawer).getByLabelText("Control plane")).toBeEnabled();
+    expect(within(drawer).getByLabelText("Node agent")).toBeEnabled();
+  });
+
+  it("sends a control-plane image as the control-plane target, with its actor", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView("control_only"));
+    mocked.developerApply.mockResolvedValue({ attempt: {} as PlatformApplyAttempt });
+    renderTab();
+    const drawer = await openDrawer();
+    expect(within(drawer).getByLabelText("Node agent")).toBeDisabled();
+    fireEvent.change(within(drawer).getByLabelText("Recovery actor"), { target: { value: RA } });
+    fireEvent.change(within(drawer).getByLabelText("Control plane"), { target: { value: CP } });
+    fireEvent.click(applyButton(drawer));
+
+    await waitFor(() => expect(mocked.developerApply).toHaveBeenCalledTimes(1));
+    expect(mocked.developerApply).toHaveBeenCalledWith("tok", {
+      target: "control_plane",
+      components: [
+        { name: "recovery-actor", image: "registry.example.invalid:5000/quasar-dev/quasar-recovery", digest: RA_DIGEST },
+        { name: "control-plane", image: "registry.example.invalid:5000/quasar-dev/quasar-control-plane", digest: CP_DIGEST },
+      ],
+      force: false,
+    });
+  });
+
+  it("sends the combined host's node agent alone as that host's request", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView("combined"));
+    mocked.developerApply.mockResolvedValue({ attempt: {} as PlatformApplyAttempt });
+    renderTab();
+    const drawer = await openDrawer();
+    fireEvent.change(within(drawer).getByLabelText("Node agent"), { target: { value: NA } });
+    fireEvent.click(applyButton(drawer));
+    await waitFor(() => expect(mocked.developerApply).toHaveBeenCalledTimes(1));
+    expect(mocked.developerApply.mock.calls[0][1]).toMatchObject({ target: "host", host_id: "h0" });
+  });
+
+  it("refuses combinations the control plane's machine cannot take in one request", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView("combined"));
+    renderTab();
+    const drawer = await openDrawer();
+    fireEvent.change(within(drawer).getByLabelText("Recovery actor"), { target: { value: RA } });
+    expect(applyButton(drawer)).toBeDisabled();
+    expect(drawer).toHaveTextContent("the recovery actor moves only with the control plane");
+
+    fireEvent.change(within(drawer).getByLabelText("Control plane"), { target: { value: CP } });
+    fireEvent.change(within(drawer).getByLabelText("Node agent"), { target: { value: NA } });
+    expect(applyButton(drawer)).toBeDisabled();
+    expect(drawer).toHaveTextContent("Apply the control plane first, then its node agent on its own.");
+  });
+});

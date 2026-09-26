@@ -395,6 +395,20 @@ suffices, runs `pg_dump` in a one-shot Postgres helper container into `dumps/`, 
 external database → the request must carry `ExternalBackupConfirmed` (console checkbox; the
 unattended path never migrates) or it is rejected `backup_unconfirmed`.
 
+*Implementation note (#363):* `ActorClient` (`control-plane/internal/platform/actor_client.go`)
+is the `UpdaterAPI` adapter; the request it sends is pinned by
+`testdata/recovery/socket/request-replace-control-plane-actor-first.json`. On an owned machine
+`Adopt` waits for the actor's terminal result before it accepts the booted binary on the
+release's commit as success, because the actor may still restore the old control plane (a new
+one that boots but never passes its healthcheck); only an actor that stays silent until the
+apply deadline falls back to the booted binary. A control plane must pass its image's own
+healthcheck: one with none never passes and is restored. Each socket's `status` answers only for
+attempts submitted on it. A developer apply to the control-plane target is a standalone
+control-plane attempt that holds every host with an admission restriction owned by the attempt,
+released once it is terminal (on a later boot too). Until #364 a migrating release, or a
+migrating developer-apply digest, is refused before anything is cordoned, and the actor refuses a
+`migrates: true` control-plane request as a backstop.
+
 **Agent update, revert.** Unchanged control-plane side (`release_apply` over the agent
 WebSocket); the agent relays to the agent socket; the actor replaces
 `[recovery-actor?, node-agent]` and applies ADR 0004 restore; the agent relays `release_state`

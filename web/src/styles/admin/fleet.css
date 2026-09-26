@@ -564,6 +564,9 @@
 .rel-machine-rows .rel-fact { align-items: flex-start; }
 .rel-machine-rows .rel-fact > span:last-child { text-align: right; }
 .rel-machine-hint { margin-top: 2px; }
+/* A rail value with a line under it ("6 hosts" over "4 on v0.5.2 · 2 older"), as
+   `rhInstalled`'s Node agents fact draws it (#363). */
+.rel-fact-sub { display: block; text-align: right; }
 .rel-machine-none { color: var(--text-4); }
 .rel-machine-foot { margin: 10px 0 0; line-height: 1.5; }
 

@@ -133,7 +133,7 @@ func TestDeveloperApplyRecordsAnAttemptAndSendsTheDigestsActorFirst(t *testing.T
 
 	var action, details string
 	if err := h.pool.QueryRow(context.Background(),
-		`SELECT action, details::text FROM admin_activity WHERE action = 'platform.apply.developer'`).Scan(&action, &details); err != nil {
+		`SELECT action, details::text FROM admin_activity WHERE action = 'platform.apply.developer' AND details->>'attempt_id' = $1`, a.ID).Scan(&action, &details); err != nil {
 		t.Fatalf("audit row: %v", err)
 	}
 	for _, want := range []string{a.ID, devAgentDigest, devActorDigest, `"force": false`, `"external_backup_confirmed": false`} {
