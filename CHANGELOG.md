@@ -552,6 +552,18 @@ own; the two do not move together, and that is deliberate.
   stack manager's (take it out of the stack), not as a leftover install. `quasar-recovery status`
   inside the recovery actor answers from the operator's socket, so it shows the machine's
   latest attempt, an operator's `reconfigure` included, rather than only the node agent's.
+- **Remove host tells a disconnected owned host by its heartbeats (#366).** An owned host
+  whose agent is gone keeps an admission hold and reads `draining`, never `offline`, so the
+  console offered the removal to a host nobody could tell, reported the refusal as the
+  recovery actor's, and would have called a finished removal stuck. It now reads six missed
+  heartbeats as not connected, and says so when a host went away before it was asked.
+- **Adding a removed host back lifts its removal's drain (#366).** A console removal cordons the
+  host with the operator's drain when none was held; adding the machine back onto the same host
+  row left it `draining`, so nothing could be placed on it until an admin undrained it. The new
+  enrollment now releases that drain, and only that one: an operator's own drain, and every
+  platform hold, stay. The remove route's refusal for a host that is not connected now speaks of
+  the removal, not a release, and `enroll-host.sh` shows what the recovery actor's `uninstall`
+  said when it fails, rather than only that it did not finish.
 - **A recovery actor successor is verified only by the node agent (#362).** On a GPU host the
   successor's own image healthcheck counted as the node agent reaching it, so a successor
   verified with no agent running. Only the agent relay's poll of the attempt's status counts

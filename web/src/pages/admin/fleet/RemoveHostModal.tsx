@@ -9,6 +9,7 @@ import { Button } from "../../../components/Button";
 import { Modal } from "../../../components/Modal";
 import { IconTrash } from "../../../components/icons";
 import { elapsedWords } from "../../../lib/format/relativeTime";
+import { notConnected } from "./removeHost";
 
 export interface RemoveHostModalProps {
   host: Host;
@@ -28,7 +29,7 @@ export function RemoveHostModal({
   now,
 }: RemoveHostModalProps) {
   const node = host.node_name;
-  const offline = host.status === "offline";
+  const offline = notConnected(host, now);
   return (
     <Modal
       open

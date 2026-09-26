@@ -1862,14 +1862,21 @@ A GPU host is removed from the console: Admin → Fleet → the host → Remove 
 plane drains it, waits for its sessions to end, and sends `host_remove`; the host's recovery
 actor records the removal, removes the node agent, then itself. Homes and volumes stay, and
 so does the seed, which from then on stays idle (`token="seed-uninstalled"`). Forget the host
-once it is offline. A host that is not connected cannot be removed this way. A removal that
-stops part-way leaves the host visibly there: Retry removal on its page, the recovery actor's
-next start, or `uninstall` on the machine finishes it.
+once the console reads it removed. A host whose agent is not connected cannot be removed this
+way: the route answers 409 `host_offline` ("this host's agent is not connected, so its
+recovery actor could not be asked; nothing was removed"). An owned host whose agent is gone
+keeps an admission hold and so reads `draining`, never `offline`; the console tells it is not
+connected by six missed heartbeats (about a minute). A removal that stops part-way leaves the
+host visibly there: Retry removal on its page, the recovery actor's next start, or `uninstall`
+on the machine finishes it.
 
 **Bringing a removed GPU host back** is Add host: create a command with the same node name and
 run it on the machine. The one-line command finds the removed install, clears it (its volumes
 and the agent's old identity; never the homes, which are host directories) and installs
-afresh, and the control plane keeps the host's history under its node name. The same holds
+afresh, and the control plane keeps the host's history under its node name. The new
+enrollment lifts the drain the removal took, and only that one: a drain an admin set before
+the removal, and every platform hold, stay. If clearing the removed install fails, the
+command prints what the recovery actor's `uninstall` said. The same holds
 after a GPU host's `uninstall` that kept its data. A kept-data `uninstall` is otherwise for
 decommissioning or moving a machine: there is no command that reinstates the old install on
 its kept data.

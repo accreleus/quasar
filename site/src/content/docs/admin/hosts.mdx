@@ -202,10 +202,14 @@ Do this before maintenance.
 
 To take a host out of the fleet, press **Remove host** on its page. It drains
 the host, waits for its sessions to end, then has the host's recovery actor
-remove the node agent and itself. Forget the host here once it is offline. The
+remove the node agent and itself. Forget the host here once the page says it was
+removed. Adding the machine back under the same node name keeps its history and
+lifts the drain the removal took, but not one you set yourself. The
 homes and the host's seed stay on the machine; see
 [Uninstalling](/quasar/operations/uninstall/). A host that is not connected is
-removed with `uninstall` on the machine instead.
+removed with `uninstall` on the machine instead: the console counts a host as
+not connected after about a minute without a heartbeat, even while it reads
+*draining*, and refuses the removal then with "nothing was removed".
 
 ## The console
 

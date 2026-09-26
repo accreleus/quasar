@@ -41,16 +41,22 @@ For a GPU host, open it under Admin, Fleet, Hosts and press **Remove host**. The
 control plane drains it, waits for its sessions to end, then tells the host's
 recovery actor, which removes the node agent and then itself. The homes, the
 volumes and the seed stay; the seed from then on stays idle. **Forget** the host
-once it is offline.
+once the console says it was removed.
 
-A host that is not connected cannot be removed this way: use `uninstall` on the
-machine (below). A removal that stops part-way leaves the host visibly there;
+A host whose agent is not connected cannot be removed this way: the console says
+it "is not connected, so its recovery actor could not be asked; nothing was
+removed". Use `uninstall` on the machine instead (below). The console counts a
+host as not connected after about a minute without a heartbeat, even while it
+still reads *draining*. A removal that stops part-way leaves the host visibly there;
 **Retry removal** on its page, the recovery actor's next start, or `uninstall` on
 the machine finishes it.
 
 To bring a removed host back, create a command in Add host with the same node
 name and run it on the machine. It clears the removed install and installs
-afresh, and the host keeps its history.
+afresh, and the host keeps its history. The drain the removal took is lifted when
+the host enrolls again; a drain you set yourself before the removal stays. If
+clearing the removed install fails, the command prints what `uninstall` said;
+run it again to continue.
 
 ## Uninstall a machine
 
@@ -203,12 +209,13 @@ Do not tear down the whole deployment for this.
 
 1. Open the host in Admin, Fleet, Hosts and press **Remove host**. It drains the
    host, waits for its sessions to end, then removes its agent and recovery actor.
-2. Forget the host once it is offline.
+2. Forget the host once the console says it was removed.
 3. Remove its seed from the machine when you are ready. It stays idle until you
    do.
 
 </Steps>
 
-A host that is offline is removed with `uninstall` on that machine instead.
+A host whose agent is not connected is removed with `uninstall` on that machine
+instead.
 
 Its home directories stay where they are. Move or delete them when you are ready.

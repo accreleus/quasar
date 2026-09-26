@@ -74,22 +74,40 @@ export function removable(host: Host, machine: PlatformIdentity | null | undefin
   return isOwned(host) && !isControlPlaneMachine(host, machine);
 }
 
+/** Six missed heartbeats (agent-api.md `heartbeat_interval_ms`, 5 s), with room for skew
+ *  between this browser's clock and the control plane's. */
+export const NOT_CONNECTED_AFTER_MS = 60_000;
+
+/**
+ * Whether the host's agent is gone. `offline` alone is not enough: an owned host whose agent
+ * disconnects keeps an admission hold (the journal reconciliation, or the removal's own
+ * drain) and so reads `draining`, never `offline`. Its heartbeats stop either way.
+ */
+export function notConnected(
+  host: Pick<Host, "status" | "last_heartbeat_at">,
+  now: number,
+): boolean {
+  if (host.status === "offline") return true;
+  const seen = host.last_heartbeat_at ? Date.parse(host.last_heartbeat_at) : NaN;
+  return Number.isFinite(seen) && now - seen > NOT_CONNECTED_AFTER_MS;
+}
+
 export type NextStep = "send" | "removed" | "stalled" | "disconnected" | null;
 
 /** What a removal in flight does next, given the host as it now stands. */
 export function nextStep(
   r: Removal,
-  host: Pick<Host, "status">,
+  host: Pick<Host, "status" | "last_heartbeat_at">,
   liveSessions: number,
   now: number,
 ): NextStep {
   if (r.phase === "waiting") {
-    if (host.status === "offline") return "disconnected";
+    if (notConnected(host, now)) return "disconnected";
     if (r.notBefore != null && now < r.notBefore) return null;
     return liveSessions === 0 ? "send" : null;
   }
   if (r.phase === "sent") {
-    if (host.status === "offline") return "removed";
+    if (notConnected(host, now)) return "removed";
     if (r.sentAt != null && now - r.sentAt > REMOVAL_STALL_MS) return "stalled";
   }
   return null;
@@ -144,9 +162,16 @@ export function useHostRemoval(host: Host | undefined, liveSessions: number, now
       onFailure: (e, hostId) => {
         const r = getRemoval(hostId);
         if (r) {
+          const gone = e instanceof ApiError && e.reason === "host_offline";
           setRemoval(
             hostId,
-            failed(r, "Its recovery actor did not take the removal; nothing was removed.", failureDetail(e)),
+            failed(
+              r,
+              gone
+                ? "It is not connected, so its recovery actor could not be asked; nothing was removed."
+                : "Its recovery actor did not take the removal; nothing was removed.",
+              failureDetail(e),
+            ),
           );
         }
       },

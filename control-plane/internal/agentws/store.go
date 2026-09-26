@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
@@ -139,6 +140,9 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		if dbLive || (s.isAgentConnected != nil && s.isAgentConnected(existingID)) {
 			return registerResult{}, ErrHostAgentConnected
 		}
+		if err := releaseRemovalDrain(ctx, tx, existingID); err != nil {
+			return registerResult{}, err
+		}
 	case errors.Is(err, pgx.ErrNoRows):
 		// A new node_name: nothing to take over, and nothing locked either — zero rows
 		// lock nothing. Concurrent first-enrollments of the same name serialize on the
@@ -188,6 +192,38 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		return registerResult{}, fmt.Errorf("commit enrollment: %w", err)
 	}
 	return registerResult{HostID: hostID, NodeSecret: secretHex}, nil
+}
+
+// removalDrainWindow bounds how long after taking its cordon the remove route records
+// `platform.remove.host`: the host_remove ack timeout (10 s) and a forced session stop.
+const removalDrainWindow = "60 seconds"
+
+// releaseRemovalDrain lifts, on a re-enrollment onto the row, only the drain a console
+// removal took for itself. The route takes the operator-drain owner only when none was held,
+// then audits, so its drain is the one created within removalDrainWindow before a
+// `platform.remove.host` record; an operator's older drain must stay (no distinct owner id is
+// possible: schema.md pins the manual owner). Guarded by
+// TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain.
+func releaseRemovalDrain(ctx context.Context, tx pgx.Tx, hostID string) error {
+	tag, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions r
+		WHERE r.host_id = $1::uuid AND r.owner_kind = 'manual'
+		  AND r.owner_id = '`+admission.ManualOwner.ID+`'::uuid
+		  AND EXISTS (SELECT 1 FROM admin_activity a
+		      WHERE a.action = 'platform.remove.host' AND a.target_type = 'host' AND lower(a.target_id) = r.host_id::text
+		        AND a.created_at >= r.created_at
+		        AND a.created_at < r.created_at + interval '`+removalDrainWindow+`')`, hostID)
+	if err != nil {
+		return fmt.Errorf("release the removal's drain: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET status = 'offline'
+		WHERE id = $1::uuid AND status = 'draining'
+		  AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions WHERE host_id = $1::uuid)`, hostID); err != nil {
+		return fmt.Errorf("project the host after its removal's drain: %w", err)
+	}
+	return nil
 }
 
 // hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees

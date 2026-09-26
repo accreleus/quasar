@@ -171,9 +171,9 @@ case "$cmd" in
       *" --entrypoint cat "*)
         cat "$S/v/quasar-machine/files/${last##*/}" 2>/dev/null; exit ;;
       *" uninstall "*)
-        [ "${MOCK_UNINSTALL_OK:-1}" = 1 ] || exit 1
         # An actor image from before uninstall existed refuses the command.
-        case " $* " in *" mock.example/quasar/quasar-recovery@"*) [ "${MOCK_ACTOR_NO_UNINSTALL:-0}" = 1 ] && exit 2 ;; esac
+        case " $* " in *" mock.example/quasar/quasar-recovery@"*) [ "${MOCK_ACTOR_NO_UNINSTALL:-0}" = 1 ] && { echo "error: unrecognized subcommand 'uninstall'" >&2; exit 2; } ;; esac
+        [ "${MOCK_UNINSTALL_OK:-1}" = 1 ] || { echo "ERROR uninstall: could not remove container quasar-node-agent: conflict" >&2; exit 1; }
         id=""; prev=""
         for a in "$@"; do [ "$prev" = --confirm ] && id="$a"; prev="$a"; done
         for d in "$S"/c/* "$S"/v/*; do
@@ -611,6 +611,15 @@ if [ "$RC" -eq 0 ] && grep -q "mock.example/quasar/quasar-recovery@.* uninstall 
   pass "reset where the actor predates uninstall: the seed's image runs it instead"
 else
   fail "reset old actor" "rc=$RC docker=[$(grep -E ' uninstall ' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
+run_installer reset-uninstall-fails "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1 MOCK_ACTOR_NO_UNINSTALL=1 MOCK_UNINSTALL_OK=0
+if [ "$RC" -eq 1 ] && grep -q 'uninstall of installation inst-0 did not finish' <<<"$OUT" \
+   && grep -q "unrecognized subcommand 'uninstall'; ERROR uninstall: could not remove container quasar-node-agent: conflict" <<<"$OUT" \
+   && ! grep -q '^run -d --name quasar-seed' <<<"$DOCKER_LOG"; then
+  pass "a failed uninstall shows what each attempt said, and installs nothing"
+else
+  fail "uninstall fails" "rc=$RC out=$(tail -3 <<<"$OUT")"
 fi
 installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
 run_installer reset-reconnect-verdict "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1 \
