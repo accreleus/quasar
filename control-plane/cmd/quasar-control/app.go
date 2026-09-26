@@ -41,7 +41,6 @@ import (
 	signalpkg "github.com/accreleus/quasar/control-plane/internal/signal"
 	"github.com/accreleus/quasar/control-plane/internal/storage"
 	"github.com/accreleus/quasar/control-plane/internal/telemetry"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -1014,7 +1013,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// Developer apply (amendment 14): the namespaces checked up front, and where
 	// the images' build identity is read — the allowed namespaces' registries over
 	// the hardened client, plus any plain-HTTP test registry the operator names.
-	developerNamespaces := updater.ParseNamespaces(os.Getenv("QUASAR_UPDATER_ALLOWED_NAMESPACES"))
+	developerNamespaces := platform.ParseNamespaces(os.Getenv("QUASAR_UPDATER_ALLOWED_NAMESPACES"))
 	insecureRegistries := platform.ConfiguredInsecureRegistries()
 	developerImages := platform.NewRegistryDeveloperImages(platform.RoutedInspector{
 		Plain:      images.NewPlainHTTPRegistryResolver(insecureRegistries, 30*time.Second),
@@ -1067,11 +1066,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// Preflight's one network collector: do the release's digests resolve at
 	// the registry (amendment 9). Invalidated on "Check now" and before an apply.
 	imageResolver := platform.NewImageResolver(platformRegistryResolver, edgeApply, 0)
-	// The control plane applies ITSELF over the updater socket beside it, never
-	// over an agent connection (agent-api.md §release_apply).
-	// On an owned install the recovery actor beside it over the control socket
-	// instead (#363); the Compose updater keeps serving every other install.
-	var selfExecutor platform.UpdaterAPI = platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
+	// The control plane applies ITSELF through the recovery actor on its own
+	// machine, over the control socket, never over an agent connection
+	// (agent-api.md §release_apply). Without one, nothing can replace it.
+	var selfExecutor platform.UpdaterAPI
 	if cfg.RecoveryControlSocket != "" {
 		selfExecutor = platform.NewActorClient(cfg.RecoveryControlSocket)
 	}
@@ -1091,14 +1089,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// decision and by "Check now".
 	refreshPreflight := func() {
 		imageResolver.Invalidate()
-		selfApplier.InvalidateSelf()
 		ownMachine.Invalidate()
 	}
 
 	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
-	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
-	pDeps.ControlPlanePreflight = selfApplier.PreflightFacts
 	if ownMachine != nil {
 		ownMachine.Log = log
 		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts

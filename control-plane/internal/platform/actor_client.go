@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
 // ActorClient is the self-apply seam (UpdaterAPI) over an owned machine's
@@ -46,10 +44,6 @@ func NewActorClient(socketPath string) *ActorClient {
 	}
 }
 
-// ResultIsVerdict: the actor verifies the new control plane and restores the
-// old one itself, so its result decides the attempt (apply_self.go).
-func (c *ActorClient) ResultIsVerdict() bool { return true }
-
 func (c *ActorClient) SocketPath() string { return c.socket }
 
 func (c *ActorClient) Present() bool { return c.SocketState().SocketExists }
@@ -66,12 +60,6 @@ func (c *ActorClient) SocketState() SocketState {
 		st.SocketExists = true
 	}
 	return st
-}
-
-// Self is the Compose updater's stack report, which an owned machine has none
-// of: its identity and preflight facts come from OwnMachineReader.
-func (c *ActorClient) Self(context.Context) (UpdaterSelf, error) {
-	return UpdaterSelf{}, errors.New("an owned machine has no Compose stack to report")
 }
 
 // ActorRequest is the control-socket submit for one control-plane step. It
@@ -99,66 +87,66 @@ func ActorRequest(req SelfRequest) actorsocket.Request {
 	return out
 }
 
-func (c *ActorClient) Apply(ctx context.Context, req SelfRequest) (updater.Accepted, error) {
+func (c *ActorClient) Apply(ctx context.Context, req SelfRequest) (SelfAccepted, error) {
 	body, err := json.Marshal(ActorRequest(req))
 	if err != nil {
-		return updater.Accepted{}, err
+		return SelfAccepted{}, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://recovery/v1/submit", bytes.NewReader(body))
 	if err != nil {
-		return updater.Accepted{}, err
+		return SelfAccepted{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return updater.Accepted{}, err
+		return SelfAccepted{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, ownMachineMaxBody))
 	if resp.StatusCode != http.StatusAccepted {
 		var rej actorsocket.Rejection
 		if json.Unmarshal(raw, &rej) == nil && rej.Reason != "" {
-			return updater.Accepted{}, &updaterError{Reason: string(rej.Reason), Message: rej.Message}
+			return SelfAccepted{}, &actorRefusal{Reason: string(rej.Reason), Message: rej.Message}
 		}
-		return updater.Accepted{}, fmt.Errorf("the recovery actor answered %d: %s", resp.StatusCode, string(raw))
+		return SelfAccepted{}, fmt.Errorf("the recovery actor answered %d: %s", resp.StatusCode, string(raw))
 	}
 	var acc actorsocket.Accepted
 	if err := json.Unmarshal(raw, &acc); err != nil {
-		return updater.Accepted{}, fmt.Errorf("decode the recovery actor's 202: %w", err)
+		return SelfAccepted{}, fmt.Errorf("decode the recovery actor's 202: %w", err)
 	}
-	return updater.Accepted{RequestID: acc.RequestID, Previous: previousOfActor(acc.Previous)}, nil
+	return SelfAccepted{RequestID: acc.RequestID, Previous: previousOfActor(acc.Previous)}, nil
 }
 
 // Result is the attempt's result from `GET /v1/status?request_id=`; the
 // control socket answers only for attempts submitted on it.
-func (c *ActorClient) Result(ctx context.Context, requestID string) (updater.Result, error) {
+func (c *ActorClient) Result(ctx context.Context, requestID string) (SelfResult, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		"http://recovery/v1/status?request_id="+url.QueryEscape(requestID), nil)
 	if err != nil {
-		return updater.Result{}, err
+		return SelfResult{}, err
 	}
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return updater.Result{}, err
+		return SelfResult{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return updater.Result{}, fmt.Errorf("the recovery actor answered %d", resp.StatusCode)
+		return SelfResult{}, fmt.Errorf("the recovery actor answered %d", resp.StatusCode)
 	}
 	var st actorsocket.Status
 	if err := json.NewDecoder(io.LimitReader(resp.Body, ownMachineMaxBody)).Decode(&st); err != nil {
-		return updater.Result{}, fmt.Errorf("decode the recovery actor's status: %w", err)
+		return SelfResult{}, fmt.Errorf("decode the recovery actor's status: %w", err)
 	}
 	if st.Result == nil || st.Result.RequestID != requestID {
-		return updater.Result{}, ErrNoResult
+		return SelfResult{}, ErrNoResult
 	}
 	return resultOfActor(*st.Result), nil
 }
 
-// resultOfActor re-frames the actor's result in the updater's spellings, which
+// resultOfActor re-frames the actor's result in `release_state`'s spellings, which
 // it keeps by design.
-func resultOfActor(r actorsocket.Result) updater.Result {
-	out := updater.Result{
+func resultOfActor(r actorsocket.Result) SelfResult {
+	out := SelfResult{
 		RequestID:  r.RequestID,
 		State:      string(r.State),
 		Previous:   previousOfActor(r.Previous),
@@ -167,7 +155,7 @@ func resultOfActor(r actorsocket.Result) updater.Result {
 		UpdatedAt:  r.UpdatedAt,
 		FinishedAt: r.FinishedAt,
 		Restored:   r.Restored,
-		Release: updater.Release{
+		Release: ReleaseRef{
 			ID: r.Release.ID, Version: r.Release.Version, SourceCommit: r.Release.SourceCommit,
 		},
 	}
@@ -176,15 +164,15 @@ func resultOfActor(r actorsocket.Result) updater.Result {
 		out.Reason = &reason
 	}
 	for _, c := range r.Components {
-		out.Components = append(out.Components, updater.Component{Name: c.Name, Image: c.Image, Digest: c.Digest})
+		out.Components = append(out.Components, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
 	}
 	return out
 }
 
-func previousOfActor(in []actorsocket.Previous) []updater.PreviousComponent {
-	out := make([]updater.PreviousComponent, 0, len(in))
+func previousOfActor(in []actorsocket.Previous) []PreviousDigest {
+	out := make([]PreviousDigest, 0, len(in))
 	for _, p := range in {
-		out = append(out, updater.PreviousComponent{Name: p.Name, Digest: p.Digest})
+		out = append(out, PreviousDigest{Name: p.Name, Digest: p.Digest})
 	}
 	return out
 }

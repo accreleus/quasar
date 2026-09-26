@@ -9,7 +9,6 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
 // The control-plane target of a developer apply on an owned machine.
@@ -63,7 +62,7 @@ func (h *ApplyHandler) developerApplyControlPlane(w http.ResponseWriter, r *http
 	}
 	// ADR 0001, up front: no registry outside the allowlist is ever contacted.
 	for _, c := range components {
-		if !updater.NamespaceAllowed(c.Image, h.allowedNamespaces) {
+		if !NamespaceAllowed(c.Image, h.allowedNamespaces) {
 			httpx.WriteError(w, http.StatusConflict, CodeNamespaceRejected,
 				fmt.Sprintf("component %s: image %s is outside the allowed platform-image namespaces (%s)",
 					c.Name, c.Image, strings.Join(h.allowedNamespaces, ",")))

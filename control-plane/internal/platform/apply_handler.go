@@ -11,7 +11,6 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
 // The two apply endpoints. Every refusal is evaluated against the same view the
@@ -74,7 +73,7 @@ type logger interface {
 // page reads, so eligibility is evaluated once and in one place.
 func NewApplyHandler(store *Store, runner *Runner, view func(ctx context.Context) (View, error), auditor audit.Recorder, log logger) *ApplyHandler {
 	return &ApplyHandler{store: store, runner: runner, view: view, auditor: auditor, log: log,
-		allowedNamespaces: updater.DefaultAllowedNamespaces}
+		allowedNamespaces: DefaultAllowedNamespaces}
 }
 
 // WithEdgeResolver wires registry resolution for manifest-less releases.
