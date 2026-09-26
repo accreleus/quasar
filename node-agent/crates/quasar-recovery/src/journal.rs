@@ -398,3 +398,59 @@ pub fn tail_output(text: &str, limit: usize) -> String {
 
 pub const OUTPUT_LIMIT: usize = 8192;
 pub const LOG_TAIL_LIMIT: usize = 3072;
+
+/// A container's log tail as an attempt's output embeds it: without terminal escape
+/// sequences (a service logging in colour to a pipe), cut to [`LOG_TAIL_LIMIT`].
+pub fn embedded_log_tail(tail: &str) -> String {
+    tail_output(strip_ansi(tail).trim_end(), LOG_TAIL_LIMIT)
+}
+
+/// `text` without ANSI escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL|ESC \`)
+/// and two-byte escapes.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use super::*;
+
+    #[test]
+    fn a_coloured_log_line_is_embedded_as_plain_text() {
+        let line = "\u{1b}[2m2026-09-26T04:41:52Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m \u{1b}[2mquasar_recovery\u{1b}[0m\u{1b}[2m:\u{1b}[0m lease held \u{1b}[3mtoken\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"x\"\n";
+        assert_eq!(
+            embedded_log_tail(line),
+            "2026-09-26T04:41:52Z ERROR quasar_recovery: lease held token=\"x\""
+        );
+        assert_eq!(
+            strip_ansi("a\u{1b}]0;title\u{7}b\u{1b}]8;;u\u{1b}\\c\u{1b}7d"),
+            "abcd"
+        );
+        assert_eq!(strip_ansi("plain: ünïcode"), "plain: ünïcode");
+    }
+}

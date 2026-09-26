@@ -431,7 +431,7 @@ impl Lab {
             }
             if lab.agent_polls.load(Ordering::SeqCst) {
                 if lab.relaying.load(Ordering::SeqCst) {
-                    let _ = quasar_recovery::server::fetch_status(&lab.socket());
+                    let _ = quasar_recovery::server::poll_attempt_as_agent(&lab.socket(), ID);
                 } else if lab.reattach.lock().unwrap().is_some() {
                     lab.agent_attach();
                 }
@@ -1575,7 +1575,44 @@ fn a_successor_the_agent_never_reaches_hands_the_machine_back() {
     assert!(
         result
             .output
-            .contains("no node agent reached its agent socket"),
+            .contains("the node agent did not poll this attempt"),
+        "{}",
+        result.output
+    );
+}
+
+/// Bug found live on #362: the actor image's healthcheck (`quasar-recovery status`) and any
+/// other request that is not the agent's poll of this attempt must not verify a successor.
+/// With no agent, a healthcheck-style status and a raw unmarked `GET /v1/status` every
+/// 20 ms leave the successor unverified: failed, restored, the old actor back.
+#[test]
+fn a_healthcheck_or_an_operators_status_does_not_verify_a_successor() {
+    use std::io::{Read, Write};
+    let lab = Lab::new();
+    let old = lab.old_actor();
+    lab.agent_polls.store(false, Ordering::SeqCst);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (flag, socket) = (stop.clone(), lab.socket());
+    let prober = std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            let _ = quasar_recovery::server::fetch_status(&socket);
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&socket) {
+                let _ = s.write_all(b"GET /v1/status HTTP/1.0\r\nHost: recovery\r\n\r\n");
+                let _ = s.read_to_end(&mut Vec::new());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    hand_over(&lab);
+    let result = lab.outcome("healthcheck only");
+    stop.store(true, Ordering::SeqCst);
+    prober.join().unwrap();
+    assert_restored(&lab, &result, &old, "healthcheck only");
+    assert_eq!(result.reason, Some(Reason::Unhealthy), "{result:?}");
+    assert!(
+        result
+            .output
+            .contains("the node agent did not poll this attempt"),
         "{}",
         result.output
     );
