@@ -138,7 +138,9 @@ sudo rm /etc/modules-load.d/uinput.conf
 
 The app-container AppArmor profile the one-line command loads on an AppArmor
 host. Loaded, it lasts until the next boot. The command also installs it to load
-at every boot when it applies fixes or when asked to persist it:
+at every boot when run with `QUASAR_ENROLL_FIX=1`, `--fix` or
+`QUASAR_ENROLL_APPARMOR_PERSIST=1`. Answering `y` at a fix prompt does not persist
+it. If the file exists, remove it:
 
 ```bash
 sudo rm /etc/apparmor.d/quasar-app

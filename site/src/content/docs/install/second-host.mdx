@@ -101,16 +101,20 @@ The script's own inputs, set in front of `sh` like the string:
 | `QUASAR_HOME_ROOT` | `/var/lib/quasar/homes` | The home root on this machine. |
 | `QUASAR_TEMPLATE_ROOT` | beside the home root | The template root. |
 | `QUASAR_NODE_NAME` | the machine's host name | The node name, when the command was not bound to one. |
-| `QUASAR_ENROLL_APPARMOR_PERSIST` | off | `1` also installs the AppArmor profile so it loads at every boot. |
+| `QUASAR_ENROLL_APPARMOR_PERSIST` | off | `1` also installs the AppArmor profile so it loads at every boot. `QUASAR_ENROLL_FIX=1` and `--fix` do the same; answering `y` at a prompt does not. |
 | `QUASAR_ENROLL_DRY_RUN` | off | `1` checks the host and prints what it would start, and starts nothing. |
 
 The script lists every input, including `QUASAR_RESET_IDENTITY` (below), when run
-with `--help`. Use the command from the dialog with `sh -s -- --help` in place of
-the final `sh`:
+with `--help`. It reads that text from its own file, so download it first, with the
+same `curl` flags as the command from the dialog, then run it:
 
 ```bash
 curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
-  | sh -s -- --help
+  -o enroll-host.sh
+```
+
+```bash
+sh enroll-host.sh --help
 ```
 
 ## The recovery actor comes with it

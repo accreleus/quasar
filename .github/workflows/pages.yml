@@ -34,12 +34,24 @@ jobs:
       # nothing, so a green build would publish a draft. Refuse to deploy while
       # any remain. Only this workflow checks: drafts may land on branches.
       - name: Refuse to publish unfinished drafts
+        # grep exits 0 when it finds a marker, 1 when it finds none, and 2 on any
+        # error (a missing directory, an unreadable file). Only 1 is clean: the
+        # guard must fail closed, never read an error as "no markers".
         run: |
-          if hits="$(grep -rnE 'TODO\((#|open)' site/src/content site/src/components)"; then
-            printf '%s\n' "$hits"
-            echo "::error title=Unpublished drafts::The site still carries TODO(#N) / TODO(open …) draft markers (listed above). They mark RH-06 pages that must not publish before the first release that ships Quasar-owned installs, and a Quick Start generator not yet rewritten. Finish or remove every marker, then dispatch pages again. See site/README.md, Before publishing."
-            exit 1
-          fi
+          set +e
+          hits="$(grep -rnE 'TODO\((#|open)' site/src/content site/src/components)"
+          status=$?
+          set -e
+          case "$status" in
+            1) echo "No draft markers: the site may publish." ;;
+            0)
+              printf '%s\n' "$hits"
+              echo "::error title=Unpublished drafts::The site still carries TODO(#N) / TODO(open …) draft markers (listed above). They mark RH-06 pages that must not publish before the first release that ships Quasar-owned installs, and a Quick Start generator not yet rewritten. Finish or remove every marker, then dispatch pages again. See site/README.md, Before publishing."
+              exit 1 ;;
+            *)
+              echo "::error title=Publication guard could not scan::grep exited $status while scanning site/src/content and site/src/components for draft markers, so the guard could not scan and refuses to publish. Fix the checkout, then dispatch pages again."
+              exit 1 ;;
+          esac
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
