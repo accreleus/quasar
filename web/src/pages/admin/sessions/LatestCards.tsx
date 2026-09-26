@@ -20,7 +20,7 @@ function LatestCard({ title, at, now, rows }: { title: string; at: number | null
     <div className="card">
       <div className="panel-head">
         <span className="panel-title">{title}</span>
-        <span className="hint" style={{ marginLeft: "auto" }}>
+        <span className="hint ml-auto">
           {at === null ? "no sample yet" : `${relativeTimeCompact(at, now)} ago`}
         </span>
       </div>
@@ -29,7 +29,7 @@ function LatestCard({ title, at, now, rows }: { title: string; at: number | null
           <tbody>
             {rows.map(([label, value]) => (
               <tr key={label}>
-                <td style={{ color: "var(--text-3)" }}>{label}</td>
+                <td className="td-muted">{label}</td>
                 <td className="right num primary">{value}</td>
               </tr>
             ))}

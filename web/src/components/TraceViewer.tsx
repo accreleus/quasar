@@ -15,6 +15,7 @@
  */
 
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { getDiagnosticBundle } from "../api/admin";
 import { ApiError } from "../api/client";
 import type { DiagnosticBundle, Falsifier, TraceSeriesPoint, TraceEvent } from "../api/types";
@@ -358,7 +359,7 @@ const LaneChart = memo(function LaneChart({
       <div className="trace-lane-caption">
         {rendered.map((r) => (
           <span key={r.key} data-scale-for={r.key} className="trace-lane-scale-item">
-            <i className="trace-lane-swatch" style={{ background: r.color }} aria-hidden="true" />
+            <i className="trace-lane-swatch" style={{ "--swatch": r.color } as CSSProperties} aria-hidden="true" />
             <span className="num">
               {r.label} · max {fmtScale(r.max)}
             </span>
@@ -508,7 +509,7 @@ const EventTrack = memo(function EventTrack({
           title={`${m.type}${m.n > 1 ? ` ×${m.n}` : ""} · ${Math.round(
             (xMax - m.ts) / 1000,
           )}s before the end of the window`}
-          style={{ left: `${m.pct.toFixed(2)}%`, background: eventColor(m.type) }}
+          style={{ left: `${m.pct.toFixed(2)}%`, "--swatch": eventColor(m.type) } as CSSProperties}
         />
       ))}
     </div>
@@ -592,7 +593,7 @@ function Tooltip({ tooltip }: { tooltip: TooltipState }) {
       <div className="trace-tooltip-lane">{tooltip.laneLabel}</div>
       {tooltip.values.map((v) => (
         <div key={v.label} className="trace-tooltip-row" title={v.title || undefined}>
-          <span style={{ color: v.color }}>
+          <span className="trace-tooltip-series" style={{ "--swatch": v.color } as CSSProperties}>
             {v.label}
             {v.qual && <span className="trace-tooltip-qual"> · {v.qual}</span>}
           </span>
@@ -600,7 +601,7 @@ function Tooltip({ tooltip }: { tooltip: TooltipState }) {
         </div>
       ))}
       {tooltip.nearEvents.map((ev, i) => (
-        <div key={i} className="trace-tooltip-event" style={{ color: eventColor(ev.type) }}>
+        <div key={i} className="trace-tooltip-event" style={{ "--swatch": eventColor(ev.type) } as CSSProperties}>
           {ev.type}
         </div>
       ))}
@@ -782,7 +783,7 @@ function TraceLegend({ events }: { events: TraceEvent[] }) {
     <div className="trace-legend">
       {types.map((t) => (
         <span key={t} className="trace-legend-item">
-          <i className="trace-legend-swatch" style={{ background: eventColor(t) }} aria-hidden="true" />
+          <i className="trace-legend-swatch" style={{ "--swatch": eventColor(t) } as CSSProperties} aria-hidden="true" />
           <span className="num">{t}</span>
         </span>
       ))}
@@ -793,7 +794,7 @@ function TraceLegend({ events }: { events: TraceEvent[] }) {
         >
           <i
             className="trace-legend-swatch"
-            style={{ background: OTHER_EVENT_COLOR }}
+            style={{ "--swatch": OTHER_EVENT_COLOR } as CSSProperties}
             aria-hidden="true"
           />
           <span className="num">other event</span>

@@ -308,22 +308,20 @@ export function RuntimePresetDrawer({
                 <div key={i}>
                   <div className="kv-row">
                     <input
-                      className={["input", "mono", hasError(`env_key_${i}`) ? "input-error" : ""]
+                      className={["input", "mono", "grow", hasError(`env_key_${i}`) ? "input-error" : ""]
                         .filter(Boolean)
                         .join(" ")}
                       value={k}
                       onChange={(e) => updateEnvKey(i, e.target.value)}
                       placeholder="KEY"
                       aria-label={`Env key ${i + 1}`}
-                      style={{ flex: 1 }}
                     />
                     <input
-                      className="input mono"
+                      className="input mono lib-env-val"
                       value={v}
                       onChange={(e) => updateEnvVal(i, e.target.value)}
                       placeholder="value"
                       aria-label={`Env value ${i + 1}`}
-                      style={{ flex: 1.4 }}
                     />
                     <button
                       className="kv-del"
@@ -426,8 +424,7 @@ export function RuntimePresetDrawer({
                 <button
                   key={a.id}
                   type="button"
-                  className="chip chip-accent"
-                  style={{ cursor: "pointer", border: 0 }}
+                  className="chip chip-accent lib-chip-link"
                   onClick={() => {
                     onClose();
                     navigate(`/admin/library/apps/${a.id}`);
@@ -442,7 +439,7 @@ export function RuntimePresetDrawer({
         </div>
       </div>
 
-      {error && <p className="form-error" style={{ marginTop: "var(--s4)" }}>{error}</p>}
+      {error && <p className="form-error mt4">{error}</p>}
     </Drawer>
   );
 }

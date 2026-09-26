@@ -70,16 +70,16 @@ function PolicyCard({
   const updates = images.filter((i) => i.update_available).length;
 
   return (
-    <div className="card card-pad" style={{ display: "flex", gap: "var(--s7)", alignItems: "center", flexWrap: "wrap" }}>
+    <div className="card card-pad row wrap gap7">
       <div>
         <div className="eyebrow">Update policy</div>
         {loadError ? (
-          <div className="col gap2" style={{ marginTop: 8, alignItems: "flex-start" }}>
-            <p className="form-error" role="alert" style={{ margin: 0 }}>{loadError}</p>
+          <div className="col gap2 mt2 img-policy-error">
+            <p className="form-error m0" role="alert">{loadError}</p>
             <Button variant="secondary" size="sm" onClick={onRetry}>Retry</Button>
           </div>
         ) : policy ? (
-          <div style={{ marginTop: 8 }}>
+          <div className="mt2">
             <SegmentedControl<ImageUpdatePolicy>
               aria-label="Image update policy"
               value={policy}
@@ -94,18 +94,18 @@ function PolicyCard({
         ) : null}
       </div>
       {policy && <p className="hint" style={{ maxWidth: 430 }}>{POLICY_COPY[policy].desc}</p>}
-      <div className="right" style={{ marginLeft: "auto", textAlign: "right" }}>
+      <div className="right ml-auto">
         <div className="eyebrow">Catalog</div>
-        <div style={{ fontSize: "var(--t-sm)", color: "var(--text-2)", marginTop: 6 }}>
+        <div className="sec mt2 img-catalog-count">
           {images.length} image{images.length === 1 ? "" : "s"} · {installed} installed
           {updates > 0 && (
-            <> · <span style={{ color: "var(--warning-text)" }}>{updates} update{updates === 1 ? "" : "s"} available</span></>
+            <> · <span className="tone-warning">{updates} update{updates === 1 ? "" : "s"} available</span></>
           )}
         </div>
         <p className="hint">Last synced {fmtDate(fetchedAt)}, {fmtClockTime(fetchedAt)}</p>
         {provenance && (
           <>
-            <p className="hint" style={{ marginTop: 2 }}>
+            <p className="hint mt1">
               Manifest <Digest sha={provenance.sha256} /> at ref <span className="mono">{provenance.ref}</span>
               {provenance.commit_sha ? (
                 <> · commit <Digest sha={provenance.commit_sha} /></>
@@ -113,7 +113,7 @@ function PolicyCard({
                 <span className="muted"> · commit unresolved</span>
               )}
             </p>
-            <p className="hint" style={{ fontSize: "var(--t-xs)", wordBreak: "break-all", maxWidth: 360, marginTop: 2 }}>
+            <p className="hint mt1 img-manifest-url" style={{ maxWidth: 360 }}>
               {provenance.url}
             </p>
           </>
@@ -343,7 +343,7 @@ export function ImagesTab() {
       render: (img) => (
         <div>
           <div className="primary">{img.display_name}</div>
-          <div className="sub mono" style={{ marginTop: 2 }}>{img.registry_ref ?? "—"}</div>
+          <div className="sub mono mt1">{img.registry_ref ?? "—"}</div>
         </div>
       ),
     },
@@ -355,7 +355,7 @@ export function ImagesTab() {
         return (
           <div>
             <div className="num">{v.version}</div>
-            <div className="sub" style={{ color: v.tone === "warning" ? "var(--warning-text)" : v.tone === "info" ? "var(--info-text)" : undefined }}>
+            <div className={v.tone === "warning" ? "sub tone-warning" : v.tone === "info" ? "sub tone-info" : "sub"}>
               {v.sub}
             </div>
           </div>
@@ -371,7 +371,7 @@ export function ImagesTab() {
         return (
           <div style={{ maxWidth: 132 }}>
             <Bar percent={roll.total > 0 ? (roll.ready / roll.total) * 100 : 0} label={`${roll.ready}/${roll.total}`} variant={roll.tone} />
-            <div className="sub" style={{ marginTop: 4 }}>{roll.note}</div>
+            <div className="sub mt1">{roll.note}</div>
           </div>
         );
       },
@@ -475,7 +475,7 @@ export function ImagesTab() {
       {!catalog.loading && catalog.data && (
         <>
           {catalog.data.sync_error && (
-            <p className="note warn" role="alert" style={{ marginBottom: "var(--s4)" }}>
+            <p className="note warn mb4" role="alert">
               <strong>Last sync failed.</strong> {catalog.data.sync_error} The catalog below is the last
               successfully cached version, not necessarily current.
             </p>
@@ -486,7 +486,7 @@ export function ImagesTab() {
               was ruled out (operator decision 2026-08-28); this alert is the whole
               mitigation, so a changed digest must be impossible to miss. */}
           {catalog.data.provenance?.changed && (
-            <p className="note warn" role="alert" style={{ marginBottom: "var(--s4)" }}>
+            <p className="note warn mb4" role="alert">
               <strong>The manifest changed at the last sync.</strong>{" "}
               {catalog.data.provenance.previous_sha256 ? (
                 <Digest sha={catalog.data.provenance.previous_sha256} />
@@ -575,7 +575,7 @@ export function ImagesTab() {
             the removal keeps the image on disk. Any app relying on this image will fail to launch
             until it is reinstalled.
           </p>
-          <p className="sec muted" style={{ fontSize: "var(--t-xs)" }}>
+          <p className="sec muted img-fineprint">
             Reinstalling later re-fetches whatever digest the catalog currently has pinned for this
             image. It is not a fresh build. If you're uninstalling to force a corrected image to be
             pulled again, sync the catalog first so a newer digest is what gets re-adopted.

@@ -208,6 +208,11 @@ own; the two do not move together, and that is deliberate.
   signal, a developer-apply route and the control plane's own machine identity. The contract
   step retiring the Compose wording and the static token is not in force until RH06-15
   (#367). ADRs 0007 and 0008 are new and ADR 0004 is amended. No behaviour changes yet.
+- **Design lint for the web client (#370).** `npm run lint:design` checks every
+  stylesheet and component for off-scale spacing, raw colours and inline styles, and
+  each failure names the token or utility class to use instead. A per-file baseline
+  records the existing debt and only ratchets down. CSS spacing now snaps to the 4px
+  token scale, so gaps and padding shift by a few pixels across the UI.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
@@ -401,6 +406,28 @@ own; the two do not move together, and that is deliberate.
   tests without GStreamer, glib or CUDA, so the RH-06 recovery actor can link it. Pure
   refactor: agent behaviour, log tokens and wire messages are unchanged. `node-agent/` is
   now a Cargo workspace; the Rust gates run with `--workspace`.
+- **Design-lint batch A: shared components and utilities (#372).** Every inline style in
+  `web/src/components/` has moved to token-backed classes, and `components.css` gains the
+  `.t-xs` `.t-sm` `.t-lg` `.t-h3` `.text-1` `.text-2` `.mb1` utilities (the block's top
+  comment lists every utility and its token). Off-scale spacing snapped to the 4px scale.
+  The one other visible change: bare `label.check` checkboxes (the Users table) now show the
+  pointer cursor like every other checkbox.
+- **Web design lint, batch B: raw colours into named tokens (#373).** Every hex, `oklch()`,
+  `rgb()` and named colour in the web stylesheets and components now lives in `tokens.css`
+  under a role name and is read through `var(--…)`; each token holds the value it replaced, so
+  nothing renders differently. The `raw-colour-css` and `raw-colour-tsx` baselines are zero,
+  apart from reasoned allows for the brand mark and the artwork-sampled detail scrim.
+- **Design-lint batch C1: admin fleet, sessions, streaming, overview, settings and audit (#374).**
+  Every inline style in those admin pages has moved to the batch A utilities or to classes in
+  `admin.css` and `admin/fleet.css`; only runtime widths and opacities stay inline. Off-scale
+  spacing snapped to the 4px scale; nothing else looks different.
+- **Design-lint batch C2: admin library, people, app editor and top-level admin pages (#375).**
+  Their inline styles have moved to utilities and token-backed classes in `admin.css` and
+  `admin/editor.css`. Off-scale spacing snapped to the 4px scale; nothing else looks different.
+- **Design-lint batch D: setup wizard, styleguide, user-side leftovers (#376).** The setup
+  wizard steps, the /admin resume banner, /styleguide, the auth card, the home detail band and
+  the stream HUD carry no inline styling beyond runtime sizes and custom properties. The 6px
+  gaps under the wizard's headings snapped to 8px; nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API
@@ -607,6 +634,10 @@ own; the two do not move together, and that is deliberate.
   the NVIDIA driver volume; the static `ENROLLMENT_TOKEN` is optional; each host may have its own
   home root; the Debian note asks for Compose 2.30; `make diagnose` is marked as needing a
   checkout. The site's compose snapshot is regenerated, so `npm run build` passes again.
+- **Session charts with a small range drew duplicate y-axis ticks (#372).** A metric like
+  `ladder_res_rung` (0–1) got ticks `0, 0, 1, 1, 1`: overlapping gridlines and a React
+  duplicate-key warning. Ticks now take the fewest decimals that keep them distinct
+  (`0, 0.3, 0.6, 0.8, 1.1`); a normal range keeps its integer ticks.
 - **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
   before any host reports it ready. After the launch is accepted, the control
   plane prepares the image on the selected host with the adopted, frozen

@@ -55,8 +55,8 @@ interface TableProps<T> {
   sortDir?: SortDir;
   /** Called with the clicked column's key when a sortable header is activated. */
   onSort?: (key: string) => void;
-  /** Optional per-row inline style, e.g. dimming ended/failed rows. */
-  rowStyle?: (row: T) => CSSProperties | undefined;
+  /** Optional per-row dimming, e.g. for ended/failed rows. */
+  rowStyle?: (row: T) => Pick<CSSProperties, "opacity"> | undefined;
   /**
    * Opt-in expandable rows: when provided, a leading chevron column toggles a
    * full-width detail row rendered by `renderExpanded`. `isExpanded`/`onToggleExpand`
@@ -127,11 +127,8 @@ export function Table<T>({
         </thead>
         <tbody>
           {rows.length === 0 && empty ? (
-            <tr>
-              <td
-                colSpan={columns.length + (expandable ? 1 : 0)}
-                style={{ textAlign: "center", color: "var(--text-3)", padding: "var(--s8)" }}
-              >
+            <tr className="qtable-empty-row">
+              <td colSpan={columns.length + (expandable ? 1 : 0)}>
                 {empty}
               </td>
             </tr>
@@ -143,7 +140,7 @@ export function Table<T>({
                   <tr
                     className={onRowClick ? "clickable" : undefined}
                     onClick={onRowClick ? () => onRowClick(row) : undefined}
-                    style={rowStyle?.(row)}
+                    style={{ opacity: rowStyle?.(row)?.opacity }}
                   >
                     {expandable && (
                       <td className="qtable-expand-cell">

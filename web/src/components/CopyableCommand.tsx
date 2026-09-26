@@ -39,20 +39,12 @@ export function CopyableCommand({ text, label }: CopyableCommandProps) {
   return (
     <>
       {label && (
-        <div className="hint" style={{ marginTop: 6 }}>
+        <div className="hint mt2">
           {label}
         </div>
       )}
-      <div className="row gap2" style={{ marginTop: 4, alignItems: "center" }}>
-        <code
-          className="mono"
-          style={{
-            flex: 1,
-            overflowWrap: "anywhere",
-            whiteSpace: "pre-wrap",
-            fontSize: "var(--t-xs)",
-          }}
-        >
+      <div className="row gap2 mt1">
+        <code className="mono grow t-xs copyable-cmd">
           {text}
         </code>
         <Button type="button" variant="ghost" size="sm" onClick={() => void copy()}>

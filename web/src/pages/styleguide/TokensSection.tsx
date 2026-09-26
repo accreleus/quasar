@@ -2,6 +2,8 @@
 // actual computed value of each custom property off :root at render time, so
 // this section can never drift from tokens.css: change a value there and the
 // label here changes with it. No hex literals — every swatch is `var(--x)`.
+import type { CSSProperties } from "react";
+
 interface TokenEntry {
   name: string;
   label: string;
@@ -19,7 +21,7 @@ function TokenRow({ token }: { token: TokenEntry }) {
   const value = readVar(token.name);
   return (
     <div className="sg-sw">
-      <div className="sg-chip-color" style={{ background: `var(${token.name})` }} />
+      <div className="sg-chip-color" style={{ "--sg-swatch": `var(${token.name})` } as CSSProperties} />
       <div className="sg-meta">
         <div className="sg-nm">{token.label}</div>
         <div className="sg-tok">{token.name}</div>
@@ -114,7 +116,7 @@ export function TokensSection() {
 
       <div className="sg-comp-label">Spacing</div>
       <div className="sg-comp-block">
-        <div className="sg-specimen-row" style={{ alignItems: "flex-end" }}>
+        <div className="sg-specimen-row sg-align-end">
           {SPACING.map((token) => (
             <div key={token} className="sg-scale-cell">
               <div className="sg-scale-box" style={{ width: `var(${token})`, height: `var(${token})` }} />
@@ -130,13 +132,8 @@ export function TokensSection() {
           {RADII.map((r) => (
             <div key={r.name} className="sg-scale-cell">
               <div
-                style={{
-                  width: 74,
-                  height: 54,
-                  background: "var(--surf-raised)",
-                  border: "1px solid var(--line-2)",
-                  borderRadius: `var(${r.name})`,
-                }}
+                className="sg-radius-box"
+                style={{ width: 74, height: 54, "--sg-radius": `var(${r.name})` } as CSSProperties}
               />
               <div className="sg-lbl-sm">{r.label}</div>
             </div>

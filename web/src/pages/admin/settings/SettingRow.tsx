@@ -11,20 +11,12 @@ interface SettingRowProps {
 
 export function SettingRow({ label, hint, children }: SettingRowProps) {
   return (
-    <div
-      className="rowflex"
-      style={{
-        justifyContent: "space-between",
-        gap: "var(--s6)",
-        padding: "11px 0",
-        borderBottom: "1px solid var(--line)",
-      }}
-    >
+    <div className="rowflex between gap6 setting-row">
       <div>
         <div className="label">{label}</div>
         {hint && <div className="hint">{hint}</div>}
       </div>
-      <div style={{ flex: "none" }}>{children}</div>
+      <div className="setting-row-control">{children}</div>
     </div>
   );
 }

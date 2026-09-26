@@ -445,7 +445,7 @@ export function FleetRunPanel({
 
   return (
     <>
-      <div className="rowflex" style={{ alignItems: "center" }}>
+      <div className="rowflex center">
         <Chip variant={RUN_STATE_CHIP[run.state] ?? "neutral"}>{run.state}</Chip>
         <span>{runStateText(run.state)}</span>
         {/* #122: an admin finding a fleet run they did not start is owed the

@@ -55,10 +55,10 @@ export interface HostRowProps {
   now: number;
 }
 
-const TONE_TEXT: Record<string, string> = {
-  success: "var(--success-text)",
-  warning: "var(--warning-text)",
-  danger: "var(--danger-text)",
+const TONE_CELL: Record<string, string> = {
+  success: "td-success",
+  warning: "td-warning",
+  danger: "td-danger",
 };
 
 export function HostRow(props: HostRowProps) {
@@ -188,7 +188,7 @@ export function HostRow(props: HostRowProps) {
 
         <td className="right num">{live}</td>
 
-        <td className="right num" style={{ color: TONE_TEXT[heartbeatTone(host)] }}>
+        <td className={`right num ${TONE_CELL[heartbeatTone(host)] ?? ""}`}>
           {host.last_heartbeat_at ? relativeTimeCompact(host.last_heartbeat_at, now) : "Never"}
         </td>
 
