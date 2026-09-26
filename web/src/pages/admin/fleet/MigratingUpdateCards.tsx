@@ -9,7 +9,7 @@
 
 import type { PlatformApplyAttempt, PlatformRelease, PlatformReleaseView } from "../../../api/types";
 import { Card } from "../../../components/Card";
-import { machineName, type FailedMigration } from "./migratingUpdate";
+import { dumpTakenAt, machineName, type FailedMigration } from "./migratingUpdate";
 import { prefixed, releaseLabel, shortDigest, stamp } from "./releasesCopy";
 import { Snippet } from "./Snippet";
 
@@ -94,13 +94,24 @@ export function RestoreCard({ view, failed }: { view: PlatformReleaseView; faile
 
   let body;
   if (variant === "own") {
+    const taken = dumpTakenAt(attempt.pre_update_dump);
     body = (
       <>
         <p className="rel-alert-body">
           Quasar does not undo a migrating update on its own, because the new control plane may
           already have written data. To go back to <b>{back}</b>, run this on {machine}. It stops
-          the control plane, loads the dump taken before the migration into Quasar&rsquo;s
-          database, and starts {back} again. Anything written since that dump was taken is lost.
+          the control plane, loads the dump{" "}
+          {taken ? (
+            <>
+              taken at {stamp(taken)} &mdash; before the migration, under {back} &mdash;
+            </>
+          ) : (
+            "taken before the migration"
+          )}{" "}
+          into Quasar&rsquo;s database, and starts {back} again.{" "}
+          {taken
+            ? `Anything written after ${stamp(taken)} is lost.`
+            : "Anything written since that dump was taken is lost."}
         </p>
         <Snippet
           caption={`Run on ${machine} as root`}
@@ -139,13 +150,15 @@ export function RestoreCard({ view, failed }: { view: PlatformReleaseView; faile
       <>
         <p className="rel-alert-body">
           Quasar holds no dump of your database, and does not undo a migrating update on its own.
-          To go back to <b>{back}</b>: restore the backup you confirmed into your database with
+          To go back to <b>{back}</b>: make sure the control plane on {machine} is stopped (the
+          recovery actor stops it when the update fails; if it runs, <code>docker stop
+          quasar-control-plane</code>), restore the backup you confirmed into your database with
           your own tools, then run this on {machine}. It starts {back} only if the
           database&rsquo;s schema matches that release, and refuses otherwise.
         </p>
         {command ? (
           <Snippet
-            caption={`Run on ${machine} as root, after restoring your backup`}
+            caption={`Run on ${machine} as root, after stopping the control plane and restoring your backup`}
             text={command}
             testId="restore-command"
             label="Copy restore command"

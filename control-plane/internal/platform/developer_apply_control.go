@@ -24,6 +24,12 @@ type developerSchema interface {
 // controlPlaneDeveloper drives the attempt (SelfDeveloperRunner).
 type controlPlaneDeveloper interface{ Start(a Attempt) }
 
+// admittedSchemaNoter keeps what admission read of the control-plane image
+// (SelfDeveloperRunner.NoteDeveloperSchema).
+type admittedSchemaNoter interface {
+	NoteDeveloperSchema(attemptID string, schema int, migrates bool)
+}
+
 // WithSelfDeveloper wires the driver of control-plane developer applies.
 func (h *ApplyHandler) WithSelfDeveloper(d controlPlaneDeveloper) *ApplyHandler {
 	h.selfDev = d
@@ -158,6 +164,10 @@ func (h *ApplyHandler) developerApplyControlPlane(w http.ResponseWriter, r *http
 	}
 	if c, ok := h.selfDev.(backupConfirmer); ok && migrates && req.ExternalBackupConfirmed {
 		c.ConfirmExternalBackup(attempt.ID)
+	}
+	// The schema is read once, here: the drain and the send use this answer.
+	if n, ok := h.selfDev.(admittedSchemaNoter); ok {
+		n.NoteDeveloperSchema(attempt.ID, schema, migrates)
 	}
 	h.selfDev.Start(attempt)
 	httpx.WriteJSON(w, http.StatusAccepted, AttemptEnvelope{Attempt: attempt})

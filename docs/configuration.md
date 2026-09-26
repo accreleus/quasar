@@ -1778,16 +1778,24 @@ automatically (ADR 0004 amendment):
 - Before the new control plane starts, `schema-floor.json` in machine state records the schema
   it may migrate to. No control plane whose image declares a lower schema is ever created,
   started or put back on this machine after that (`token="actor-resume-failed"`, "an older
-  control plane never runs against a newer schema"), until a restore lowers it.
-- If the new control plane does not verify, it is left as it is (it matches the migrated
-  schema, and serves the console if it can) and the old one stays kept and disabled. The
-  attempt ends `failed`, names its dump (`pre_update_dump`), and its output and the actor's log
+  control plane never runs against a newer schema"), until a restore lowers it. So once the
+  floor is raised, going back to the older control plane always takes a full `restore`, even
+  when the new one never got to migrate (its start was refused, or its container was
+  removed): nothing else lowers the floor. A later migrating update is refused
+  `backup_failed` while the database is ahead of the control plane this machine last
+  verified (a failed migrating update nobody restored): a dump of it could not be restored.
+- If the new control plane does not verify, the old one stays kept and disabled. On Quasar's
+  own database the new one is left as it is (it matches the migrated schema, and serves the
+  console if it can; the restore stops it). On the operator's own database it is stopped with
+  its restart disabled (removed if it never started): left running, its next boot would
+  migrate the backup the operator restores. The attempt ends `failed`, names its dump
+  (`pre_update_dump`), and its output and the actor's log
   (`token="actor-migrating-control-plane-failed"`, field `restore`) end with the one command to
   go back, run on that machine:
 
   ```
   docker exec quasar-recovery quasar-recovery restore --dump <name> --to <version>
-  docker exec quasar-recovery quasar-recovery restore --to <version>      # your own database, once you restored your backup
+  docker exec quasar-recovery quasar-recovery restore --to <version>      # your own database: stop the control plane, restore your backup, then this
   docker exec quasar-recovery quasar-recovery restore --list              # the dumps kept here
   ```
 
@@ -1802,10 +1810,16 @@ automatically (ADR 0004 amendment):
   while it exists, `token="actor-control-plane-held"`), stops this machine's control planes,
   drops and re-creates the database and loads the dump in one transaction, creates that
   control plane afresh from its recipe, and waits for it to report healthy. A restart part-way
-  continues it; a failed load keeps the hold; the same command can always be run again. On the
-  operator's own database there is no dump: the command checks the live schema matches the
-  version named, then starts that control plane. Only dumps this machine's actor took are
-  restored; a pre-RH-06 install is not migrated (redeploy it).
+  continues it; a load that stops short (a helper error, or an engine restart mid-load) keeps
+  the hold and says the database may now be empty (do not start the control plane by hand);
+  the same command can always be run again. Once a restore has succeeded its dump is marked
+  restored and the restore point is cleared, so running the printed command again is refused;
+  `--force-again` restores the same dump anyway, discarding everything written since. On the
+  operator's own database there is no dump: the command refuses while a control plane runs
+  (`docker stop quasar-control-plane` first, or its next boot migrates the restored backup
+  again), checks the live schema matches the version named, then starts that control plane.
+  Dumps and the final `uninstall --purge` dump are written `0600`. Only dumps this machine's
+  actor took are restored; a pre-RH-06 install is not migrated (redeploy it).
 
 On start the actor takes the machine's lease (`actor.lease`; a second actor on the same
 volume exits, `token="actor-lease-unavailable"`, unless it is one of a hand-over's two

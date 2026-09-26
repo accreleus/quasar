@@ -29,7 +29,7 @@ import { IconRefresh } from "../../../components/icons";
 import { AttemptProgress } from "./ApplyControls";
 import { BACKUP_SPACE, databasePlan, machineName, ownedControlPlane, type DatabasePlan } from "./migratingUpdate";
 import { blockingChecks, partialSummary, willBeSkipped } from "./preflight";
-import { eligibilityText, hasUpdate, preflightCheckText, releaseLabel, runStateText } from "./releasesCopy";
+import { eligibilityText, hasUpdate, prefixed, preflightCheckText, releaseLabel, runStateText } from "./releasesCopy";
 
 function eligibleHosts(targets: PlatformReleaseTarget[]): PlatformReleaseTarget[] {
   return targets.filter((t) => t.kind === "host" && t.eligible);
@@ -196,7 +196,7 @@ function FleetApplyModal({
     >
       <p>
         Update the control plane, then {hosts} eligible host{hosts === 1 ? "" : "s"}, to{" "}
-        <b>{releaseLabel(newest)}</b>.
+        <b>{prefixed(releaseLabel(newest))}</b>.
       </p>
       {migrates && ownedControlPlane(view) ? (
         <p>

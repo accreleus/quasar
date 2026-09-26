@@ -3,11 +3,14 @@ package platform
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
+	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
 // A migrating control-plane step on an owned machine (#364, #352 decision 14):
@@ -222,5 +225,62 @@ func TestBackupSpaceIsJudgedAgainstTheDumpTheDatabaseNeeds(t *testing.T) {
 	}
 	if dumpSpaceNeeded(0) != 64<<20 || dumpSpaceNeeded(10_000_000_000) != 11_000_000_000 {
 		t.Fatal("the space rule differs from the recovery actor's (quasar_recovery::dump::space_needed)")
+	}
+}
+
+// capturingUpdater takes every request and accepts it.
+type capturingUpdater struct {
+	UpdaterAPI
+	reqs []SelfRequest
+}
+
+func (c *capturingUpdater) Apply(_ context.Context, req SelfRequest) (updater.Accepted, error) {
+	c.reqs = append(c.reqs, req)
+	return updater.Accepted{RequestID: req.RequestID}, nil
+}
+
+// A developer apply's schema is read once, at admission: the send after the
+// drain uses that answer, so a registry that stops answering meanwhile cannot
+// fail the attempt invalid (#364 review). Without the note it is still read.
+func TestADeveloperApplySendsTheSchemaItsAdmissionRead(t *testing.T) {
+	up := &capturingUpdater{}
+	store := &dumpStore{}
+	s := &SelfApplier{store: store, updater: up, log: testLogger()}
+	s.Identity = func() buildinfo.Identity { return buildinfo.Identity{Version: "0.3.0", SchemaVersion: 96} }
+	s.DeveloperCommit = func(context.Context, []ComponentDigest) (string, error) { return commitB, nil }
+	s.DeveloperSchema = func(context.Context, []ComponentDigest) (int, error) {
+		return 0, errors.New("the registry did not answer")
+	}
+	a := Attempt{ID: "dev-1", Kind: KindDeveloperApply, Target: TargetControlPlane,
+		RequestedDigests: []ComponentDigest{cpComponent()}}
+	s.NoteDeveloperSchema(a.ID, 97)
+	if !s.send(context.Background(), a, "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22") {
+		t.Fatalf("send failed: %q", store.reason)
+	}
+	if len(up.reqs) != 1 || up.reqs[0].SchemaVersion != 97 || !up.reqs[0].Migrates {
+		t.Fatalf("requests = %+v, want schema 97, migrating", up.reqs)
+	}
+
+	a.ID = "dev-2"
+	if s.send(context.Background(), a, "8b2f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22") {
+		t.Fatal("an unnoted attempt with an unreadable schema was sent")
+	}
+	if store.reason != ReasonInvalid {
+		t.Fatalf("reason = %q, want invalid", store.reason)
+	}
+}
+
+// The runner's drain decision uses the admission's answer too.
+func TestTheDeveloperRunnerKeepsWhatAdmissionRead(t *testing.T) {
+	r := &SelfDeveloperRunner{self: &SelfApplier{}}
+	r.Migrates = func(context.Context, []ComponentDigest) (bool, error) {
+		return true, errors.New("the registry did not answer")
+	}
+	r.NoteDeveloperSchema("dev-1", 96, false)
+	if m, ok := r.migrates.Load("dev-1"); !ok || m.(bool) {
+		t.Fatalf("noted migrates = %v %v", m, ok)
+	}
+	if n, ok := r.self.(*SelfApplier).schemas.Load("dev-1"); !ok || n.(int) != 96 {
+		t.Fatalf("the self-applier was not handed the schema: %v %v", n, ok)
 	}
 }

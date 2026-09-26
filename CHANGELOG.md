@@ -51,8 +51,13 @@ own; the two do not move together, and that is deliberate.
   a current backup instead. A failed migrating update is never restored automatically: Fleet ▸
   Releases and the actor's output print one `restore` command, which loads the dump into a
   stopped database and starts the control plane it was taken under. An older control plane is
-  never started against a newer schema. The Update dialog shows the dump's space or the backup
-  confirmation, and a refused or failed migrating update its banner or restore card.
+  never started against a newer schema. On an operator's own database a failed migrating control
+  plane is stopped, and `restore --to` starts the old one once they have restored their backup.
+  The Update dialog shows the dump's space or the backup confirmation, and a refused or failed
+  migrating update its banner or restore card. A developer apply's Apply button stays enabled
+  on an operator's own database, with a hint, because the console cannot know a digest
+  migrates before the server reads the image; the server fails a migrating one
+  `backup_unconfirmed` unless the backup was confirmed.
 - **An owned control plane is updated by its recovery actor (#363).** On a combined or
   control-only install the fleet run's control-plane step, and a developer apply to the
   control plane, go over the machine's control socket: the recovery actor moves itself first

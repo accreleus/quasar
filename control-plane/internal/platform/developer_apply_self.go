@@ -53,6 +53,10 @@ type SelfDeveloperRunner struct {
 	// under live sessions.
 	Migrates func(ctx context.Context, components []ComponentDigest) (bool, error)
 
+	// migrates holds what admission decided per attempt (NoteDeveloperSchema),
+	// so prepare reads no registry. In memory only, like the self-applier's.
+	migrates sync.Map
+
 	mu      sync.Mutex
 	running map[string]bool
 	baseCtx context.Context
@@ -185,6 +189,22 @@ func (r *SelfDeveloperRunner) drive(ctx context.Context, a Attempt, adopted bool
 	}
 }
 
+// developerSchemaNoter is a self driver that keeps the schema admission read.
+type developerSchemaNoter interface {
+	NoteDeveloperSchema(attemptID string, schema int)
+}
+
+// NoteDeveloperSchema keeps what the admission read of the attempt's
+// control-plane image: whether it migrates, for the drain, and its schema, for
+// the send. Call it before Start: a registry that stops answering after the
+// drain then cannot fail the attempt.
+func (r *SelfDeveloperRunner) NoteDeveloperSchema(attemptID string, schema int, migrates bool) {
+	r.migrates.Store(attemptID, migrates)
+	if n, ok := r.self.(developerSchemaNoter); ok {
+		n.NoteDeveloperSchema(attemptID, schema)
+	}
+}
+
 // ConfirmExternalBackup hands the operator's confirmation of their own
 // database's backup to the self-applier that sends the attempt.
 func (r *SelfDeveloperRunner) ConfirmExternalBackup(attemptID string) {
@@ -200,7 +220,9 @@ func (r *SelfDeveloperRunner) ConfirmExternalBackup(attemptID string) {
 // stopping.
 func (r *SelfDeveloperRunner) prepare(ctx context.Context, a Attempt) bool {
 	migrates := true
-	if r.Migrates != nil {
+	if noted, ok := r.migrates.Load(a.ID); ok {
+		migrates = noted.(bool)
+	} else if r.Migrates != nil {
 		if m, err := r.Migrates(ctx, a.RequestedDigests); err == nil {
 			migrates = m
 		} else {

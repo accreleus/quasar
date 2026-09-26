@@ -21,6 +21,7 @@ import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { FleetApplyButton } from "./FleetApply";
 import { ReleasesTab } from "./ReleasesTab";
+import { dumpTakenAt } from "./migratingUpdate";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
@@ -39,7 +40,7 @@ const FAIL =
   "The pre-update dump needs about 1.4 GB and 0.6 GB is free on this machine. Free some space there, then check again.";
 
 const OWN_CMD =
-  "docker exec quasar-recovery quasar-recovery restore --dump 2026-09-25T1402Z-schema-88 --to 0.5.2";
+  "docker exec quasar-recovery quasar-recovery restore --dump 20260925T140200Z-schema-88 --to 0.5.2";
 const EXT_CMD = "docker exec quasar-recovery quasar-recovery restore --to 0.5.2";
 
 function release(over: Partial<PlatformRelease> = {}): PlatformRelease {
@@ -141,7 +142,7 @@ function cpAttempt(over: Partial<PlatformApplyAttempt> = {}): PlatformApplyAttem
     sessions_remaining: null,
     force: false,
     output: `pulled\nhealth check failed at 14:07\n${OWN_CMD}\n`,
-    pre_update_dump: "2026-09-25T1402Z-schema-88",
+    pre_update_dump: "20260925T140200Z-schema-88",
     requested_by: "u1",
     created_at: "2026-09-25T14:01:00Z",
     started_at: "2026-09-25T14:01:00Z",
@@ -323,12 +324,15 @@ describe("Releases after a migrating control-plane update went wrong", () => {
     expect(card).toHaveTextContent("Update failed");
     expect(card).toHaveTextContent("v0.6.0 failed after changing the database");
     expect(card).toHaveTextContent("To go back to v0.5.2, run this on living-room-pc.");
+    // The dump's time, read from its name, as the mock says it.
+    expect(card).toHaveTextContent("loads the dump taken at 25 Sep 2026, 14:02 — before the migration, under v0.5.2 —");
+    expect(card).toHaveTextContent("Anything written after 25 Sep 2026, 14:02 is lost.");
     expect(within(card).getByTestId("restore-command")).toHaveTextContent(OWN_CMD);
     expect(card).toHaveTextContent("Run on living-room-pc as root");
     expect(within(card).getByRole("button", { name: "Copy restore command" })).toBeInTheDocument();
     const details = within(card).getByText("Attempt details").closest("details")!;
     expect(details.open).toBe(false);
-    expect(details).toHaveTextContent("dump: 2026-09-25T1402Z-schema-88");
+    expect(details).toHaveTextContent("dump: 20260925T140200Z-schema-88");
     expect(details).toHaveTextContent("schema: 88 → 91");
     // It replaces the update banner, which would otherwise say "Up to date".
     expect(screen.queryByText("Up to date.")).not.toBeInTheDocument();
@@ -366,7 +370,11 @@ describe("Releases after a migrating control-plane update went wrong", () => {
     const card = await screen.findByTestId("restore-external");
     expect(card).toHaveTextContent("Quasar holds no dump of your database");
     expect(card).toHaveTextContent("restore the backup you confirmed into your database with your own tools");
-    expect(card).toHaveTextContent("Run on living-room-pc as root, after restoring your backup");
+    // The control plane must be stopped first, or its next boot migrates the backup again.
+    expect(card).toHaveTextContent("docker stop quasar-control-plane");
+    expect(card).toHaveTextContent(
+      "Run on living-room-pc as root, after stopping the control plane and restoring your backup",
+    );
     expect(within(card).getByTestId("restore-command")).toHaveTextContent(EXT_CMD);
     expect(await screen.findByText("Failed · not restored · your own database")).toBeInTheDocument();
   });
@@ -424,5 +432,14 @@ describe("Developer apply of a control-plane digest (#364 Database section)", ()
     fireEvent.click(within(drawer).getByRole("button", { name: "Apply digests" }));
     await waitFor(() => expect(mocked.developerApply).toHaveBeenCalledTimes(1));
     expect(mocked.developerApply.mock.calls[0][1]).toMatchObject({ external_backup_confirmed: true });
+  });
+});
+
+describe("dumpTakenAt", () => {
+  it("reads the time from the recovery actor's dump names only", () => {
+    expect(dumpTakenAt("20260925T140200Z-schema-88")).toBe("2026-09-25T14:02:00Z");
+    expect(dumpTakenAt("20260925T140200Z-schema-88-7a1f6f1e")).toBe("2026-09-25T14:02:00Z");
+    expect(dumpTakenAt("2026-09-25T1402Z-schema-88")).toBeNull();
+    expect(dumpTakenAt(null)).toBeNull();
   });
 });

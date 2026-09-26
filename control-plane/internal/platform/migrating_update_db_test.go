@@ -218,15 +218,23 @@ func TestADeveloperApplyAcrossAMigrationFollowsTheDatabaseRule(t *testing.T) {
 		if tc.confirmed != (len(conf.confirmed) == 1) {
 			t.Fatalf("%s: confirmed %v", tc.name, conf.confirmed)
 		}
+		if tc.wantStart && (len(conf.noted) != 1 || conf.noted[0] != tc.schema) {
+			t.Fatalf("%s: noted schemas %v, want [%d] read once at admission", tc.name, conf.noted, tc.schema)
+		}
 	}
 }
 
 type confirmingSelfDev struct {
 	*recordingSelfDev
 	confirmed []string
+	noted     []int
 }
 
 func (c *confirmingSelfDev) ConfirmExternalBackup(id string) { c.confirmed = append(c.confirmed, id) }
+
+func (c *confirmingSelfDev) NoteDeveloperSchema(_ string, schema int, _ bool) {
+	c.noted = append(c.noted, schema)
+}
 
 // newControlDevHarnessWith is newControlDevHarness with the machine's own
 // recovery actor and the control-plane driver chosen by the test.

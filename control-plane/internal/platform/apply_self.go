@@ -327,6 +327,10 @@ type SelfApplier struct {
 	// so a control plane restarted before the send fails the step
 	// backup_unconfirmed and the operator applies again.
 	confirmed sync.Map
+	// schemas holds a developer apply's control-plane schema as its admission
+	// read it (NoteDeveloperSchema), so the send reads no registry after the
+	// drain. In memory only: a restarted control plane reads the image again.
+	schemas sync.Map
 
 	mu      sync.Mutex
 	self    UpdaterSelf
@@ -519,7 +523,10 @@ func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) boo
 			return false
 		}
 		req.Release = ReleaseRef{SourceCommit: commit}
-		if s.DeveloperSchema != nil {
+		if noted, ok := s.schemas.Load(a.ID); ok {
+			req.SchemaVersion = noted.(int)
+			req.Migrates = req.SchemaVersion > id.SchemaVersion
+		} else if s.DeveloperSchema != nil {
 			schema, err := s.DeveloperSchema(ctx, a.RequestedDigests)
 			if err != nil {
 				s.log.Error("self-apply: could not read the developer apply's schema", "attempt_id", a.ID, "err", err)
@@ -779,6 +786,12 @@ type dumpRecorder interface {
 // external_backup_confirmed). Call it before Apply.
 func (s *SelfApplier) ConfirmExternalBackup(attemptID string) {
 	s.confirmed.Store(attemptID, true)
+}
+
+// NoteDeveloperSchema keeps the schema a developer apply's admission read from
+// its control-plane image, for the send. Call it before Apply.
+func (s *SelfApplier) NoteDeveloperSchema(attemptID string, schema int) {
+	s.schemas.Store(attemptID, schema)
 }
 
 // developerCommit is the commit a developer apply's images carry.
