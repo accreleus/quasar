@@ -280,7 +280,19 @@ pub fn seed(engine: &Arc<FakeEngine>, dir: &Path, self_id: &str) -> Seed {
     let mut config = SeedConfig::new(dir);
     config.self_container = Some(self_id.into());
     config.new_installation_id = Box::new(|| INSTALLATION.to_string());
+    config.clock = looks_an_interval_apart();
     Seed::new(engine.clone(), config)
+}
+
+/// A seed clock that moves one interval per look, as `Seed::run` spaces them.
+pub fn looks_an_interval_apart() -> Box<dyn Fn() -> std::time::Instant + Send + Sync> {
+    let start = std::time::Instant::now();
+    let looks = std::sync::atomic::AtomicU32::new(0);
+    Box::new(move || {
+        start
+            + quasar_recovery::seed::INTERVAL
+                * looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    })
 }
 
 /// The recovery actor a seed created, running as that container: no inputs of its own.

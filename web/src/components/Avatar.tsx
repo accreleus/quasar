@@ -2,6 +2,7 @@
  * Avatar / MonoTile — user avatar or app icon tile.
  * Matches the `.mono-tile` pattern from the design system.
  */
+import type { CSSProperties } from "react";
 
 interface AvatarProps {
   /** Display name — used to derive initials */
@@ -25,13 +26,13 @@ export function Avatar({ name, src, size = "md" }: AvatarProps) {
   const px = SIZE_PX[size] ?? 36;
   return (
     <div
-      className="mono-tile"
+      className="mono-tile avatar"
       title={name}
       aria-label={name}
-      style={{ width: px, height: px, fontSize: px * 0.36 }}
+      style={{ width: px, height: px, "--avatar-fs": `${px * 0.36}px` } as CSSProperties}
     >
       {src ? (
-        <img src={src} alt={name} style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "inherit" }} />
+        <img src={src} alt={name} />
       ) : (
         initials(name)
       )}

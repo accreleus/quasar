@@ -18,6 +18,9 @@ same way. These fixtures are that promise, checked by
   seed can see, reduced to name, labels, state, command and, where it matters, id and
   environment; the seed deciding is the container running `quasar-recovery seed`) and
   `expected.json` (what the seed decides; keys it leaves out are not part of the interface).
+  A case may add `previous.json`, the seed's previous look (`{"age_s", "actors": [{"id",
+  "status"}]}`), and record a container's `restart` (`unless-stopped` or `no`); without
+  `previous.json` the case is a seed's first look.
 
 ## `seed.json`, format 1
 
@@ -47,3 +50,8 @@ does not parse, an unknown `state` or an image that is not a `sha256:` digest.
   the states around it the interface covers (a first install, a stopped or deleted actor, a
   hand-over's kept and successor containers, a name held by something else, an uninstall,
   and the seed's own unstarted create, which it starts, against look-alikes it must not).
+- `actors/rh06-381/` pins ADR 0007's "An actor stopped from outside" (#381): the one actor
+  exited with `unless-stopped`, seen so on a previous look at least 30 s old, is started;
+  a first look, a younger or different previous look, a disabled restart policy, a `dead`
+  actor, two actors, an uninstalled machine and one with no `seed.json` are left alone.
+  Its cases are hand-made, like the rest of `rh06-06`.

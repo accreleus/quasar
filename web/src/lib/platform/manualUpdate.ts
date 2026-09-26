@@ -225,7 +225,7 @@ export function manualUpdatePath(inputs: ManualUpdateInputs): ManualUpdatePath |
       if (inputs.installMode === "owned") {
         return {
           summary:
-            "This machine's recovery actor did not answer, so nothing can replace its containers until it does. Check it on the machine: the seed re-creates it if it was removed, but one stopped with docker stop or docker kill stays stopped until it is started.",
+            "This machine's recovery actor did not answer, so nothing can replace its containers until it does. Check it on the machine: the seed re-creates it if it was removed, and starts it again within about a minute if it was stopped with docker stop or docker kill while the seed runs; if the seed is stopped too, start the actor yourself.",
           commands: [
             {
               label: "Find the recovery actor and read its last lines",
