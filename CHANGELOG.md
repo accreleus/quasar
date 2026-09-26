@@ -35,7 +35,10 @@ own; the two do not move together, and that is deliberate.
   failure restores only the agent, the agent re-registers so the console shows the new actor
   version, and Developer apply now accepts a recovery-actor digest. The control plane's own
   combined host moves its actor only with the control plane. An actor rewriting machine state
-  keeps the fields it does not know, so a revert erases nothing a newer actor recorded.
+  keeps the fields it does not know, so a revert erases nothing a newer actor recorded. Only
+  a hand-over's two actors wait for the machine's lease: any other actor process exits, so a
+  duplicate never takes the machine mid-hand-over. A node agent that connects before its
+  recovery actor serves again keeps asking for up to 90 s.
 - **Combined and control-only installs from one seed (#361).** `QUASAR_ROLE=combined` or
   `control-only` on the seed installs Postgres (or uses your own database, named by
   `QUASAR_DATABASE_*`), the control plane and, on a combined host, its own node agent, which

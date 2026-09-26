@@ -348,8 +348,12 @@ digest if none exists.
 *Implementation note (#362):* the hand-over is the recovery-actor component of an ordinary
 attempt journal (`quasar-recovery` `handover.rs`); its settle table is per party (old actor,
 successor, or an actor the seed re-created after every actor container was removed) in
-`settle.rs`. A successor restarted three times without verifying hands the machine back. An
-actor that cannot take the lease waits for it. A hand-over may replace an actor that was
+`settle.rs`. A successor started three times without verifying hands the machine back. Only
+the old actor and the successor of an open hand-over wait for the lease; any other actor
+process exits while the lease is held, a party to the hand-over exists, or another container
+holds the actor's name, and an actor serves only under that name. A verifying successor does
+not count time the engine does not answer (up to ten `verify` periods), and on a GPU host
+the agent keeps asking a dark socket for up to 90 s after it connects. A hand-over may replace an actor that was
 started by hand without the installation's labels (it is the actor handing over), but an
 actor carrying Compose labels is declared by an external manager (ADR 0007) and is refused
 `owner_conflict`. The successor keeps the running actor's `QUASAR_UPDATER_*` only where machine

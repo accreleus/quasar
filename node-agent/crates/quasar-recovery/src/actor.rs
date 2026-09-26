@@ -262,6 +262,8 @@ pub enum ResumeError {
     Unsupported(String),
     /// This process is gone (a test's stand-in for the process dying).
     Stopped,
+    /// This process is no party to a hand-over and the machine has another actor.
+    Stray(String),
 }
 
 impl std::fmt::Display for ResumeError {
@@ -277,6 +279,9 @@ impl std::fmt::Display for ResumeError {
             ResumeError::RecipeUnsupported(why) => write!(f, "recipe_unsupported: {why}"),
             ResumeError::Unsupported(why) => write!(f, "not supported by this build: {why}"),
             ResumeError::Stopped => f.write_str("this process was stopped"),
+            ResumeError::Stray(why) => {
+                write!(f, "this recovery actor is not this machine's ({why}); it will not act")
+            }
         }
     }
 }
@@ -411,11 +416,12 @@ impl Actor {
         self.take_lease()
     }
 
-    /// Take the machine's lease, waiting while another recovery actor holds it: during a
+    /// Take the machine's lease. Only a party to an open hand-over waits for it: during a
     /// hand-over two actors run and the lease decides which one acts (architecture §5.6).
     /// While it waits, a successor does its part of the hand-over (`crate::handover`):
     /// it self-checks and says it is ready, and it takes the lease only once the old actor
-    /// has handed it over, or the old actor's container is gone.
+    /// has handed it over, or the old actor's container is gone. Any other process is
+    /// refused at once when the lease is held or the machine has another actor.
     pub fn acquire_lease_waiting(&self) -> Result<(), ResumeError> {
         use std::sync::atomic::Ordering;
         self.resuming.store(true, Ordering::SeqCst);
@@ -425,6 +431,15 @@ impl Actor {
         loop {
             if self.killed() {
                 return Err(ResumeError::Stopped);
+            }
+            // Anyone else acts only on a free lease, as before a hand-over existed, and never
+            // beside a party to one: taking the lease in the gap of a hand-over would be a
+            // stranger's restore beside two running actors.
+            if !self.is_handover_party(own_attempt.as_deref()) {
+                if let Some(why) = self.stray() {
+                    return Err(ResumeError::Stray(why));
+                }
+                return self.take_lease();
             }
             if self.may_take_lease(own_attempt.as_deref(), &mut last_orphan_check) {
                 match self.take_lease() {
