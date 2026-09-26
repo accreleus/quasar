@@ -6,7 +6,8 @@
 
 import type { Host } from "../../../../api/types";
 import { Button } from "../../../../components/Button";
-import { IconChevronRight, IconDownload, IconRefresh } from "../../../../components/icons";
+import { IconDownload, IconRefresh } from "../../../../components/icons";
+import { Diag } from "../Diag";
 import { floorPhrase, type FloorState } from "../hostFloor";
 import { versionLabel } from "../hostServices";
 import { eligibilityText, failureText, releaseLabel } from "../releasesCopy";
@@ -64,26 +65,20 @@ export function FloorNote({ host, state, liveSessions, onUpdate }: FloorNoteProp
     const actorMoved =
       a.requested_digests.some((c) => c.name === "recovery-actor") && !state.movesActor;
     return (
-      <div className="note warn host-note host-floor">
-        <div className="host-floor-text">
+      <div className="note warn host-note rh-note-row">
+        <div className="rh-note-body">
           <b>The update did not finish; {host.node_name} still must update.</b>{" "}
           {actorMoved &&
             `As every update does, it replaced the recovery actor first, which is now ${vOf(host.recovery_actor_version)}. `}
           {failureText(a.reason)}
           {blocked && <span className="hint host-floor-why">{blocked}</span>}
-          <details className="diag">
-            <summary>
-              <IconChevronRight />
-              Details
-            </summary>
-            <pre>
-              {[
-                `attempt: ${a.id} · outcome: ${a.state}`,
-                `reason: ${a.reason ?? "none"}`,
-                `components: ${a.requested_digests.map((c) => c.name).join(", ")}`,
-              ].join("\n")}
-            </pre>
-          </details>
+          <Diag
+            lines={[
+              `attempt: ${a.id} · outcome: ${a.state}`,
+              `reason: ${a.reason ?? "none"}`,
+              `components: ${a.requested_digests.map((c) => c.name).join(", ")}`,
+            ]}
+          />
         </div>
         <Button variant="primary" disabled={!canUpdate} onClick={onUpdate}>
           <IconRefresh />
@@ -94,8 +89,8 @@ export function FloorNote({ host, state, liveSessions, onUpdate }: FloorNoteProp
   }
 
   return (
-    <div className="note warn host-note host-floor">
-      <div className="host-floor-text">
+    <div className="note warn host-note rh-note-row">
+      <div className="rh-note-body">
         <b>{host.node_name} must update before it can be managed.</b>{" "}
         {versionsSentence(host, state)}
         {managed

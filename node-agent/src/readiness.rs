@@ -10,6 +10,8 @@
 //! host-side read is `/etc/os-release` (via `/host`), used purely to pick remediation wording;
 //! its absence degrades to generic wording, never a failed check.
 
+/// `owner_conflict` on an owned install.
+pub mod owner_conflict;
 /// The update-path checks (preflight ids), with their collectors.
 pub mod platform_update;
 pub mod report;
@@ -189,6 +191,9 @@ pub struct ProbeEnv {
     pub health: platform_update::HealthOwner,
     /// This agent's own `/health` identity, to compare against who answers.
     pub self_identity: platform_update::HealthIdentity,
+    /// On an owned install, the owner conflicts its recovery actor reported this refresh
+    /// (the inner `None`: it did not answer); `None` on any other install.
+    pub owner_conflicts: Option<owner_conflict::Observed>,
     /// The storage roots and their free space (#253), read once per probe.
     pub storage: storage::StorageView,
     /// The container engine as one inspection saw it (#254), read once per probe.
@@ -309,6 +314,12 @@ impl ProbeEnv {
                 node: crate::logging::host_name().to_string(),
                 pid: std::process::id(),
             },
+            // The same read tells whether the actor's identity moved since `register`.
+            owner_conflicts: crate::buildinfo::owned_socket().map(|socket| {
+                let (facts, conflicts) = crate::buildinfo::observe_owned(&socket);
+                crate::buildinfo::note_observed(&facts);
+                conflicts
+            }),
             storage: storage::StorageView::live(engine_answered),
             runtime,
         }
@@ -516,6 +527,15 @@ fn validate_sibling_mounts(mounts: &[crate::runtime::Mount], paths: &[String]) -
 /// Run the full check set. Pure w.r.t. `env` (no global state, network, or container launches)
 /// so it is cheap to re-run on every capacity report.
 pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
+    let mut checks = probe_all(env);
+    checks.extend(owner_conflict::check(
+        env.owner_conflicts.is_some(),
+        env.owner_conflicts.as_ref().unwrap_or(&None),
+    ));
+    checks
+}
+
+fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
     let distro = detect_distro(env);
     vec![
         runtime_facts::check_runtime_endpoint(&env.runtime),
@@ -2677,6 +2697,7 @@ mod tests {
                     node: "test".to_string(),
                     pid: 1,
                 },
+                owner_conflicts: None,
                 storage: storage::StorageView::default(),
                 runtime: runtime_facts::RuntimeView::NotObserved,
             }

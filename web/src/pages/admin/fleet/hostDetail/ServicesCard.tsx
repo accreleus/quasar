@@ -4,9 +4,11 @@
  * The rows come from hostServices.ts; this file only draws them.
  */
 
+import type { ReactNode } from "react";
 import type { HostServices, ServiceRow, ServiceState } from "../hostServices";
 import { Chip } from "../../../../components/Chip";
 import { clockTime } from "../../../../lib/format/clockTime";
+import { Diag } from "../Diag";
 
 /** "13:48", as the mock's "as of" chips and "Last report from" read. */
 const reportClock = (at: string): string => clockTime(at, { seconds: false });
@@ -18,9 +20,20 @@ export interface ServicesCardProps {
   /** When the agent connected, for the "not reported yet" note. */
   connectedSince: string | null;
   now: number;
+  /** A GPU host's footer: Remove host, or a removal in flight (`rhRemoveFoot`). */
+  foot?: ReactNode;
+  /** The host's short id, for the Details of a recovery actor that stopped answering. */
+  hostId?: string;
 }
 
-export function ServicesCard({ nodeName, services, connectedSince, now }: ServicesCardProps) {
+export function ServicesCard({
+  nodeName,
+  services,
+  connectedSince,
+  now,
+  foot,
+  hostId,
+}: ServicesCardProps) {
   const { report, rows } = services;
   const since = connectedSince ? elapsedWords(connectedSince, now) : null;
 
@@ -44,7 +57,23 @@ export function ServicesCard({ nodeName, services, connectedSince, now }: Servic
           </p>
         </div>
       )}
-      {report === "not_answering" && (
+      {report === "not_answering" && services.lastReportAt != null && (
+        <div className="host-services-note">
+          <div className="note warn">
+            <b>Could not read this machine’s services.</b> Its recovery actor has not answered for{" "}
+            {elapsedWords(new Date(services.lastReportAt).toISOString(), now)}, so the list below
+            is its last report. The node agent is connected; sessions are unaffected.
+            <Diag
+              lines={[
+                "recovery actor answered: no (the node agent's last register)",
+                `last status: ${new Date(services.lastReportAt).toISOString()}`,
+                ...(hostId ? [`host: ${hostId}`] : []),
+              ]}
+            />
+          </div>
+        </div>
+      )}
+      {report === "not_answering" && services.lastReportAt == null && (
         <div className="host-services-note">
           <p className="note warn">
             <b>Could not read this machine’s services.</b> Its recovery actor did not answer when
@@ -71,7 +100,7 @@ export function ServicesCard({ nodeName, services, connectedSince, now }: Servic
           </tbody>
         </table>
       </div>
-      {services.controlPlaneHere && (
+      {services.controlPlaneHere ? (
         <div className="card-pad host-services-foot">
           <p className="hint">
             This machine runs the control plane, so it is not removed from here. To uninstall it,
@@ -79,13 +108,17 @@ export function ServicesCard({ nodeName, services, connectedSince, now }: Servic
             homes unless you ask it to purge.
           </p>
         </div>
+      ) : (
+        foot && <div className="card-pad host-services-foot host-services-foot-row">{foot}</div>
       )}
     </div>
   );
 }
 
-function headHint({ report, reportedAt }: HostServices): string {
+function headHint({ report, reportedAt, lastReportAt }: HostServices): string {
   if (report === "offline" && reportedAt) return `Last report from ${reportClock(reportedAt)}.`;
+  if (report === "not_answering" && lastReportAt != null)
+    return `Last report from ${reportClock(new Date(lastReportAt).toISOString())}. Nothing here is acted on until the recovery actor answers again.`;
   if (report === "reported")
     return "Each Quasar service has one owner. On this machine every service but the seed is owned by its recovery actor.";
   return "Versions and owners appear once this machine’s recovery actor reports.";
@@ -98,7 +131,9 @@ function Row({ row }: { row: ServiceRow }) {
     <tr>
       <td>
         <div className="stack">
-          <span className="primary">{row.name}</span>
+          <span className={row.warning ? "primary host-services-warning" : "primary"}>
+            {row.name}
+          </span>
           <span className="sub host-services-desc">{row.description}</span>
         </div>
       </td>
@@ -152,6 +187,8 @@ function StateCell({ state }: { state: ServiceState }) {
       );
     case "must_update":
       return <Chip variant="warning">must update</Chip>;
+    case "in_the_way":
+      return <Chip variant="warning">in the way</Chip>;
     default:
       return <Chip>unknown</Chip>;
   }

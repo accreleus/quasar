@@ -345,6 +345,18 @@ func Load() (*Config, error) {
 	c.EnrollPins = enrollscript.Pins{
 		SeedImage:  strings.TrimSpace(os.Getenv("QUASAR_ENROLL_SEED_IMAGE")),
 		AgentImage: strings.TrimSpace(os.Getenv("QUASAR_ENROLL_AGENT_IMAGE")),
+		// A host added from here trusts what this control plane trusts: its developer
+		// applies are checked against the same allowlist on both sides.
+		AllowedNamespaces:  strings.TrimSpace(os.Getenv("QUASAR_UPDATER_ALLOWED_NAMESPACES")),
+		InsecureRegistries: strings.TrimSpace(os.Getenv("QUASAR_PLATFORM_INSECURE_REGISTRIES")),
+	}
+	for _, trust := range [][2]string{
+		{"QUASAR_UPDATER_ALLOWED_NAMESPACES", c.EnrollPins.AllowedNamespaces},
+		{"QUASAR_PLATFORM_INSECURE_REGISTRIES", c.EnrollPins.InsecureRegistries},
+	} {
+		if !enrollscript.ValidTrustValue(trust[1]) {
+			return nil, fmt.Errorf("%s %q: carries a quote or a control character", trust[0], trust[1])
+		}
 	}
 	c.EnrollFallback = enrollscript.Pins{
 		SeedImage:  strings.TrimSpace(os.Getenv("QUASAR_ENROLL_FALLBACK_SEED_IMAGE")),

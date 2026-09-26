@@ -1,6 +1,6 @@
 // Package enrollscript serves /enroll-host.sh: the web root's copy of
 // deploy/enroll-host.sh with the two images this control plane's Add host command
-// installs written into it. The console reads the same two lines back from the
+// installs, and its release trust, written into it. The console reads the same two lines back from the
 // served script for its stack snippet, so the one-liner and the snippet cannot name
 // different seeds. Rendered lines are pinned by testdata/enroll-host/pins.json,
 // which the web tests read too.
@@ -20,15 +20,33 @@ import (
 
 // The placeholder lines in deploy/enroll-host.sh, replaced whole.
 const (
-	seedVar  = "PINNED_SEED_IMAGE"
-	agentVar = "PINNED_AGENT_IMAGE"
+	seedVar       = "PINNED_SEED_IMAGE"
+	agentVar      = "PINNED_AGENT_IMAGE"
+	namespacesVar = "PINNED_ALLOWED_NAMESPACES"
+	insecureVar   = "PINNED_INSECURE_REGISTRIES"
 )
 
-// Pins are the images an Add host command installs, both repository@sha256:<digest>.
-// Empty means unset: the script then refuses to install and says which variable.
+// Pins are what an Add host command installs: the two images, both
+// repository@sha256:<digest> (empty means unset: the script then refuses to install
+// and says which variable), and this control plane's release trust, which the seed
+// records as the new machine's (the seed's QUASAR_UPDATER_ALLOWED_NAMESPACES and
+// QUASAR_PLATFORM_INSECURE_REGISTRIES). Empty trust means the seed's defaults.
 type Pins struct {
-	SeedImage  string // QUASAR_ENROLL_SEED_IMAGE
-	AgentImage string // QUASAR_ENROLL_AGENT_IMAGE
+	SeedImage          string // QUASAR_ENROLL_SEED_IMAGE
+	AgentImage         string // QUASAR_ENROLL_AGENT_IMAGE
+	AllowedNamespaces  string // QUASAR_UPDATER_ALLOWED_NAMESPACES
+	InsecureRegistries string // QUASAR_PLATFORM_INSECURE_REGISTRIES
+}
+
+// ValidTrustValue reports whether a trust value can be written inside the script's
+// single quotes as it is.
+func ValidTrustValue(v string) bool {
+	for _, r := range v {
+		if r == '\'' || r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // Or is p with each unset pin taken from d: the configured values are overrides of
@@ -63,9 +81,20 @@ func ValidImage(ref string) bool {
 // whole line, so a script that lost one is refused instead of served without a pin.
 func Render(script []byte, pins Pins) ([]byte, error) {
 	lines := bytes.Split(script, []byte("\n"))
-	for _, p := range []struct{ name, value string }{{seedVar, pins.SeedImage}, {agentVar, pins.AgentImage}} {
-		if p.value != "" && !ValidImage(p.value) {
+	for _, p := range []struct {
+		name, value string
+		image       bool
+	}{
+		{seedVar, pins.SeedImage, true},
+		{agentVar, pins.AgentImage, true},
+		{namespacesVar, pins.AllowedNamespaces, false},
+		{insecureVar, pins.InsecureRegistries, false},
+	} {
+		if p.image && p.value != "" && !ValidImage(p.value) {
 			return nil, fmt.Errorf("%s: %q is not repository@sha256:<digest>", p.name, p.value)
+		}
+		if !p.image && !ValidTrustValue(p.value) {
+			return nil, fmt.Errorf("%s: %q cannot be written into the script", p.name, p.value)
 		}
 		placeholder := []byte(p.name + "=''")
 		at := -1

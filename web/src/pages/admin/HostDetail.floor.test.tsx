@@ -226,6 +226,43 @@ describe("HostDetail below the floor", () => {
     expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
   });
 
+  it("stacks the floor note above a missing seed, and still offers Remove host", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ seed_version: null }) } as never);
+    renderPage();
+
+    const floorNote = (await screen.findByText("gpu-host-3 must update before it can be managed."))
+      .closest(".note") as HTMLElement;
+    const seedNote = screen.getByText("No seed found on gpu-host-3.").closest(".note") as HTMLElement;
+    expect(floorNote.compareDocumentPosition(seedNote) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    const card = screen.getByText("Services on this machine").closest(".card") as HTMLElement;
+    expect(within(card).getAllByText("must update")).toHaveLength(2);
+    expect(within(card).getByText("not found")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: /Remove host/ })).toBeTruthy();
+  });
+
+  it("stacks the floor note above another owner's container", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [{ id: "owner_conflict", status: "fail", summary: "x", remediation: "" }] as never,
+      }),
+    } as never);
+    renderPage();
+
+    const floorNote = (await screen.findByText("gpu-host-3 must update before it can be managed."))
+      .closest(".note") as HTMLElement;
+    const conflictNote = screen
+      .getByText("Another owner’s container is in the way on gpu-host-3.")
+      .closest(".note") as HTMLElement;
+    expect(floorNote.compareDocumentPosition(conflictNote) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    const card = screen.getByText("Services on this machine").closest(".card") as HTMLElement;
+    expect(within(card).getAllByText("must update")).toHaveLength(2);
+    expect(within(card).getByText("in the way")).toBeTruthy();
+    // As rh06/conflict draws it: no removal while another owner's container is in the way.
+    expect(within(card).queryByRole("button", { name: /Remove host/ })).toBeNull();
+  });
+
   it("a managed host shows no floor note and keeps its settings", async () => {
     mocked.getPlatformReleases.mockResolvedValue(view({ belowFloor: false }));
     renderPage();

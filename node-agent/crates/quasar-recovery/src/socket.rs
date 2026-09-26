@@ -182,11 +182,22 @@ pub struct Service {
 }
 
 /// A container that looks like a platform service but lacks this installation's labels
-/// (the race guard): reported, never acted on.
+/// (the race guard, [`crate::race_guard`]): reported, never acted on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
+    /// Its name, as `docker ps` shows it.
     pub container: String,
+    /// Its id, the engine's first 12 characters. Empty from an actor that predates it.
+    #[serde(default)]
+    pub id: String,
+    /// Its configured image reference, tag or digest included.
     pub image: String,
+    /// The role it looks like: `control-plane`, `node-agent`, `postgres`,
+    /// `recovery-actor`, or `updater` (the Go updater of a Compose install). Empty from an
+    /// actor that predates it.
+    #[serde(default)]
+    pub role: String,
+    /// What gave it away, for the operator.
     pub why: String,
 }
 

@@ -190,8 +190,12 @@ func TestOwnedControlPlanePreflight(t *testing.T) {
 	}
 	path, _ := serveStatus(t, fixtureBody(t, "status-combined-idle.json"))
 	p := PlanPreflight(TargetControlPlane, NewOwnMachineReader(path).PreflightFacts(context.Background()))
-	if got := strings.Join(ids(p), ","); got != CheckUpdaterSocket+","+CheckImageResolvable {
-		t.Fatalf("checks = %s, want updater_socket,image_resolvable", got)
+	if got := strings.Join(ids(p), ","); got != CheckUpdaterSocket+","+CheckOwnerConflict+","+CheckImageResolvable {
+		t.Fatalf("checks = %s, want updater_socket,owner_conflict,image_resolvable", got)
+	}
+	// The fixture's leftover Compose control plane (#366).
+	if p.Checks[1].Status != CheckFail || !strings.Contains(p.Checks[1].Detail, "deploy-quasar-control-plane-1") {
+		t.Errorf("owner_conflict = %+v, want a fail naming the fixture's conflict", p.Checks[1])
 	}
 	if p.Checks[0].Status != CheckPass || !strings.Contains(p.Checks[0].Detail, "0.4.0") {
 		t.Errorf("answered socket = %+v, want a pass naming the actor", p.Checks[0])

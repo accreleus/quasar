@@ -114,6 +114,7 @@ docker run -d --name quasar-seed --restart unless-stopped \
 ```yaml
 services:
   quasar-seed:
+    container_name: quasar-seed
     image: <registry>/quasar-recovery@sha256:<digest>
     command: seed
     restart: unless-stopped
@@ -197,6 +198,7 @@ docker run -d --name quasar-seed --restart unless-stopped \
 ```yaml
 services:
   quasar-seed:
+    container_name: quasar-seed
     image: "<registry>/quasar-recovery@sha256:<digest>"
     command: seed
     restart: unless-stopped

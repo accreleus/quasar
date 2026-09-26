@@ -8,6 +8,8 @@
 //!   <name>.json           0600, one secret each
 //! services/<role>.json    the last specification the actor applied for that role
 //! seed.json               ADR 0007 format 1, read by the seed (`crate::seed::file`)
+//! uninstalled.json        this machine's services were taken away (`crate::uninstall`)
+//! reconfigure.json        a reconfigure in progress (`crate::reconfigure`)
 //! ```
 //!
 //! The attempt journal is written by a later slice. Every file is committed through
@@ -109,6 +111,23 @@ impl MachineDir {
 
     pub fn store_seed_file(&self, file: &SeedFile) -> io::Result<()> {
         self.seed_file().store(file)
+    }
+
+    fn uninstall_file(&self) -> DurableFile<crate::uninstall::Marker> {
+        DurableFile::new(self.root.join(crate::uninstall::MARKER_FILE), "json.tmp")
+    }
+
+    /// `Ok(None)`: this machine was never uninstalled.
+    pub fn load_uninstall(&self) -> io::Result<Option<crate::uninstall::Marker>> {
+        self.uninstall_file().load()
+    }
+
+    pub fn store_uninstall(&self, marker: &crate::uninstall::Marker) -> io::Result<()> {
+        self.uninstall_file().store(marker)
+    }
+
+    pub(crate) fn reconfigure_file(&self) -> DurableFile<crate::reconfigure::Record> {
+        DurableFile::new(self.root.join(crate::reconfigure::RECORD_FILE), "json.tmp")
     }
 
     fn ensure_dir(&self, name: &str, mode: u32) -> io::Result<PathBuf> {

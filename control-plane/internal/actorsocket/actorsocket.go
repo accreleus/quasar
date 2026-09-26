@@ -159,8 +159,14 @@ type Service struct {
 // reported, never acted on.
 type Conflict struct {
 	Container string `json:"container"`
-	Image     string `json:"image"`
-	Why       string `json:"why"`
+	// ID is the engine's first 12 characters.
+	ID string `json:"id"`
+	// Image is the configured reference, tag or digest included.
+	Image string `json:"image"`
+	// Role is the role it looks like: control-plane | node-agent | postgres |
+	// recovery-actor | updater (the Go updater of a Compose install).
+	Role string `json:"role"`
+	Why  string `json:"why"`
 }
 
 type Dump struct {

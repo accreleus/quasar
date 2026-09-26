@@ -69,9 +69,22 @@ func TestAddHostOnAnOwnedInstallPrefersTheInstalledReleaseOverItsInstallTimeImag
 		AgentImage: "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:" + strings.Repeat("2", 64),
 	}
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// This control plane's release trust rides every answer, whichever images win.
+	trust := enrollscript.Pins{
+		AllowedNamespaces:  "registry.example.invalid/quasar",
+		InsecureRegistries: "registry.example.invalid:5000",
+	}
+	trusted := func(body string) {
+		t.Helper()
+		if !strings.Contains(body, "\nPINNED_ALLOWED_NAMESPACES='"+trust.AllowedNamespaces+"'\n") ||
+			!strings.Contains(body, "\nPINNED_INSECURE_REGISTRIES='"+trust.InsecureRegistries+"'\n") {
+			t.Fatalf("the release trust was dropped:\n%s", body)
+		}
+	}
 
 	before := strings.Repeat("0", 40)
-	body := servedPins(t, installedEnrollPins(enrollscript.Pins{}, installTime, store, &before, quiet))
+	body := servedPins(t, installedEnrollPins(trust, installTime, store, &before, quiet))
+	trusted(body)
 	if !strings.Contains(body, "\nPINNED_SEED_IMAGE='"+installTime.SeedImage+"'\n") ||
 		!strings.Contains(body, "\nPINNED_AGENT_IMAGE='"+installTime.AgentImage+"'\n") {
 		t.Fatal("before any release is installed, the install-time images must be served")
@@ -79,15 +92,18 @@ func TestAddHostOnAnOwnedInstallPrefersTheInstalledReleaseOverItsInstallTimeImag
 
 	// The control plane now runs the detected release: its images win.
 	after := m.SourceCommit
-	body = servedPins(t, installedEnrollPins(enrollscript.Pins{}, installTime, store, &after, quiet))
+	body = servedPins(t, installedEnrollPins(trust, installTime, store, &after, quiet))
+	trusted(body)
 	if !strings.Contains(body, "\nPINNED_SEED_IMAGE='"+releaseSeed+"'\n") ||
 		!strings.Contains(body, "\nPINNED_AGENT_IMAGE='"+releaseAgent+"'\n") {
 		t.Fatalf("after the update the installed release's images must win:\n%s", body)
 	}
 
 	// An operator override still wins over the release, one field at a time.
-	override := enrollscript.Pins{AgentImage: "registry.example.invalid/dev/quasar-node-agent@sha256:" + strings.Repeat("e", 64)}
+	override := trust
+	override.AgentImage = "registry.example.invalid/dev/quasar-node-agent@sha256:" + strings.Repeat("e", 64)
 	body = servedPins(t, installedEnrollPins(override, installTime, store, &after, quiet))
+	trusted(body)
 	if !strings.Contains(body, "\nPINNED_AGENT_IMAGE='"+override.AgentImage+"'\n") ||
 		!strings.Contains(body, "\nPINNED_SEED_IMAGE='"+releaseSeed+"'\n") {
 		t.Fatalf("the override must win for its field only:\n%s", body)

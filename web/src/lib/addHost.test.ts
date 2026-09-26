@@ -22,17 +22,37 @@ function repoFile(rel: string): string {
 const pins = JSON.parse(repoFile("testdata/enroll-host/pins.json")) as {
   seed_image: string;
   agent_image: string;
+  allowed_namespaces: string;
+  insecure_registries: string;
   lines: [string, string];
+  trust_lines: [string, string];
 };
 const script = repoFile("deploy/enroll-host.sh");
 const served = script
   .replace(/^PINNED_SEED_IMAGE=''$/m, pins.lines[0])
   .replace(/^PINNED_AGENT_IMAGE=''$/m, pins.lines[1]);
+const servedWithTrust = served
+  .replace(/^PINNED_ALLOWED_NAMESPACES=''$/m, pins.trust_lines[0])
+  .replace(/^PINNED_INSECURE_REGISTRIES=''$/m, pins.trust_lines[1]);
 
 describe("the served script and the stack name one seed (testdata/enroll-host/pins.json)", () => {
   it("reads back the images the control plane writes into /enroll-host.sh", () => {
     expect(served).not.toBe(script);
     expect(readServedImages(served)).toEqual({ seedImage: pins.seed_image, agentImage: pins.agent_image });
+  });
+
+  it("carries the control plane's release trust into the stack, as the one-line command does", () => {
+    expect(servedWithTrust).not.toBe(served);
+    const images = readServedImages(servedWithTrust)!;
+    expect(images).toEqual({
+      seedImage: pins.seed_image,
+      agentImage: pins.agent_image,
+      allowedNamespaces: pins.allowed_namespaces,
+      insecureRegistries: pins.insecure_registries,
+    });
+    const stack = composeSeedStack({ ...images, enrollment: "qenr1..abc.tok" });
+    expect(stack).toContain(`      QUASAR_UPDATER_ALLOWED_NAMESPACES: "${pins.allowed_namespaces}"\n`);
+    expect(stack).toContain(`      QUASAR_PLATFORM_INSECURE_REGISTRIES: "${pins.insecure_registries}"\n`);
   });
 
   it("writes exactly those images into the stack", () => {

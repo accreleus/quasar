@@ -78,8 +78,11 @@ export function StepClaim({ onClaimed }: StepClaimProps) {
         />
         <span className="field-hint">
           Not printed to a log. Written to{" "}
-          <code>/run/quasar/setup-token</code> on the host when the instance
-          boots with no admin. Retrieve it with{" "}
+          <code>/run/quasar/setup-token</code> in the control plane’s container
+          when the instance boots with no admin. Retrieve it on that machine: an
+          install made with the seed,{" "}
+          <code>docker exec quasar-control-plane cat /run/quasar/setup-token</code>
+          ; a Compose install,{" "}
           <code>
             docker compose -f deploy/docker-compose.yml exec
             quasar-control-plane cat /run/quasar/setup-token

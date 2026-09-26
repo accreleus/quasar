@@ -120,6 +120,8 @@ struct ActorStatus {
     actor: ActorSelf,
     #[serde(default)]
     seed: Option<SeedSelf>,
+    #[serde(default)]
+    conflicts: Vec<crate::readiness::owner_conflict::Conflict>,
 }
 
 #[derive(serde::Deserialize)]
@@ -156,6 +158,15 @@ pub fn discover(runtime: &ContainerRuntime) -> InstallFacts {
 /// An owned install asks its recovery actor over the agent socket. `updater_present` is
 /// whether the actor answered (amendment 14); the actor's fields go absent when it did not.
 pub fn discover_owned(socket: &std::path::Path) -> InstallFacts {
+    observe_owned(socket).0
+}
+
+/// [`discover_owned`], plus the owner conflicts the actor reports (`None` when it did not
+/// answer), from the same one status read.
+pub fn observe_owned(
+    socket: &std::path::Path,
+) -> (InstallFacts, crate::readiness::owner_conflict::Observed) {
+    let mut conflicts = None;
     let mut out = InstallFacts {
         install_mode: Some(InstallMode::Owned),
         updater_present: Some(false),
@@ -176,6 +187,7 @@ pub fn discover_owned(socket: &std::path::Path) -> InstallFacts {
                     .seed
                     .map(|s| s.version)
                     .filter(|v| !v.trim().is_empty());
+                conflicts = Some(status.conflicts);
             }
             Err(e) => warn!(
                 token = "install-actor-status-unreadable",
@@ -195,7 +207,47 @@ pub fn discover_owned(socket: &std::path::Path) -> InstallFacts {
             socket.display()
         ),
     }
-    out
+    (out, conflicts)
+}
+
+/// The owned install's socket, when this agent's container has one.
+pub fn owned_socket() -> Option<std::path::PathBuf> {
+    std::env::var(RECOVERY_SOCKET_ENV)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The last owned-install facts a readiness refresh read, and how many refreshes in a row
+/// read them.
+static OBSERVED: std::sync::Mutex<Option<(InstallFacts, u32)>> = std::sync::Mutex::new(None);
+
+/// Records what a refresh read from the recovery actor.
+pub fn note_observed(facts: &InstallFacts) {
+    if let Ok(mut slot) = OBSERVED.lock() {
+        *slot = match slot.take() {
+            Some((last, n)) if last == *facts => Some((last, n + 1)),
+            _ => Some((facts.clone(), 1)),
+        };
+    }
+}
+
+/// The actor's reported identity (its version, commit, the seed it sees, whether it
+/// answers) has differed from what this connection registered for two refreshes in a row.
+/// `register` is the only way those fields reach the control plane (agent-api.md
+/// §register, "Owned installs"), so the agent re-dials to report them; two in a row keeps
+/// one slow answer from costing a reconnect.
+pub fn owned_identity_changed() -> bool {
+    let registered = install_facts();
+    if registered.install_mode != Some(InstallMode::Owned) {
+        return false;
+    }
+    OBSERVED
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .is_some_and(|(seen, n)| n >= 2 && seen != registered)
 }
 
 /// The compose label naming a service within a project. The updater is found by
