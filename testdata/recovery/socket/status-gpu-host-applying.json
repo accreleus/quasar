@@ -13,6 +13,7 @@
       "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
     },
     "role": "gpu",
+    "node_name": "gpu-host-4",
     "database": "none",
     "services": [
       {

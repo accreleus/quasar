@@ -72,8 +72,17 @@ impl MachineDir {
     }
 
     pub fn load_machine(&self) -> io::Result<Option<Machine>> {
-        let machine = self.machine().load()?;
-        if let Some(m) = &machine {
+        let mut machine = self.machine().load()?;
+        if let Some(m) = &mut machine {
+            // The machine's role is authoritative; state an earlier build wrote has no
+            // `machine_role` in its control inputs.
+            if let Some(control) = m.inputs.control.as_mut() {
+                if m.role == MachineRole::ControlOnly {
+                    control.machine_role = crate::recipe::ControlRole::ControlOnly;
+                } else if m.role == MachineRole::Combined {
+                    control.machine_role = crate::recipe::ControlRole::Combined;
+                }
+            }
             if m.format != FORMAT {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

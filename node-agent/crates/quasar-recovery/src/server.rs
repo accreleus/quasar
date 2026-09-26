@@ -1,7 +1,9 @@
-//! The agent socket (D6(a), #352 decision 8): a unix HTTP socket the actor creates in the
-//! `quasar-recovery-agent` volume, which it mounts only into the agent container it
-//! creates. Not a frozen interface. It serves `GET /v1/status[?request_id=<uuid>]` and
-//! `POST /v1/submit` (a `socket::Request`; the caller is the agent).
+//! The agent socket and the control socket (D6(a), #352 decision 8): unix HTTP sockets the
+//! actor creates in the `quasar-recovery-agent` volume. Each is given only to the one
+//! container it is for (the agent socket to the node agent, the control socket to the
+//! control plane), so the socket a request arrives on is its caller. Not a frozen
+//! interface. Both serve `GET /v1/status[?request_id=<uuid>]` and `POST /v1/submit` (a
+//! `socket::Request`).
 //!
 //! Answers are `HTTP/1.1` with `Content-Length` and `Connection: close`, and the
 //! connection is closed after one response, so an HTTP/1.0 client reading to EOF (the
@@ -29,6 +31,15 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bind the socket, replacing a stale one. Only the lease holder may call this: the lease
 /// is what makes a leftover socket file certainly stale.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
+    bind_owned(path, None)
+}
+
+/// [`bind`], the socket owned by `owner` (uid, gid) so a container running as that user can
+/// connect: the control plane does not run as root. Its directory is created if need be.
+pub fn bind_owned(path: &Path, owner: Option<(u32, u32)>) -> io::Result<UnixListener> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -36,17 +47,25 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+    }
     Ok(listener)
 }
 
 /// How often a serving loop looks at its stop flag between connections.
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
-/// Serve until `stop` is set (`Ok`) or the listener fails. One thread per connection, at
-/// most [`MAX_CONNECTIONS`] at once; a connection over the limit is closed unanswered.
-/// A hand-over stops the old actor's loop before it releases the lease, so the successor
-/// binds a path nobody else serves.
-pub fn serve(listener: UnixListener, actor: Arc<Actor>, stop: Arc<AtomicBool>) -> io::Result<()> {
+/// Serve `caller`'s socket until `stop` is set (`Ok`) or the listener fails. One thread per
+/// connection, at most [`MAX_CONNECTIONS`] at once; a connection over the limit is closed
+/// unanswered. A hand-over stops the old actor's loops before it releases the lease, so the
+/// successor binds paths nobody else serves.
+pub fn serve(
+    listener: UnixListener,
+    actor: Arc<Actor>,
+    caller: Caller,
+    stop: Arc<AtomicBool>,
+) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let open = Arc::new(AtomicUsize::new(0));
     loop {
@@ -67,22 +86,30 @@ pub fn serve(listener: UnixListener, actor: Arc<Actor>, stop: Arc<AtomicBool>) -
             open.fetch_sub(1, Ordering::SeqCst);
             warn!(
                 token = "actor-socket-busy",
-                "agent socket: too many connections; one closed unanswered"
+                socket = socket_name(caller),
+                "too many connections; one closed unanswered"
             );
             continue;
         }
         let actor = actor.clone();
         let open = open.clone();
         std::thread::spawn(move || {
-            if let Err(e) = answer(stream, &actor) {
-                debug!("agent socket: {e}");
+            if let Err(e) = answer(stream, &actor, caller) {
+                debug!(socket = socket_name(caller), "{e}");
             }
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
+fn socket_name(caller: Caller) -> &'static str {
+    match caller {
+        Caller::Agent => "agent",
+        Caller::ControlPlane => "control",
+    }
+}
+
+fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut head = Vec::new();
@@ -118,7 +145,7 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
                 serde_json::to_string(&actor.status_for(request_id)).map_err(io::Error::other)?;
             respond(&mut stream, 200, &body)
         }
-        ("POST", "/v1/submit") => submit(&mut stream, &head, actor),
+        ("POST", "/v1/submit") => submit(&mut stream, &head, actor, caller),
         (_, "/v1/status") | (_, "/v1/submit") => {
             respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
         }
@@ -126,10 +153,14 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
     }
 }
 
-/// `POST /v1/submit` on the agent socket: the caller is always [`Caller::Agent`], because
-/// authority follows the mount (this socket is mounted only into the node agent).
+/// `POST /v1/submit`: the caller is the socket's, because authority follows the mount.
 /// `202` with the `Accepted`, `409` (`busy`) or `400` with the `Rejection`.
-fn submit(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result<()> {
+fn submit(
+    stream: &mut UnixStream,
+    head: &str,
+    actor: &Arc<Actor>,
+    caller: Caller,
+) -> io::Result<()> {
     let length = head
         .lines()
         .find_map(|l| {
@@ -156,7 +187,7 @@ fn submit(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result
             return respond(stream, 400, &body);
         }
     };
-    match actor.submit(Caller::Agent, request) {
+    match actor.submit(caller, request) {
         Ok(accepted) => {
             let body = serde_json::to_string(&accepted).map_err(io::Error::other)?;
             respond(stream, 202, &body)
@@ -165,7 +196,8 @@ fn submit(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result
             warn!(
                 token = "actor-submit-refused",
                 reason = %rejection.reason,
-                "a submit on the agent socket was refused: {}", rejection.message
+                socket = socket_name(caller),
+                "a submit was refused: {}", rejection.message
             );
             let status = if rejection.reason == Reason::Busy {
                 409

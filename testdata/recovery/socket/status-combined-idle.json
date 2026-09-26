@@ -13,6 +13,7 @@
       "digest": null
     },
     "role": "combined",
+    "node_name": "living-room-pc",
     "database": "owned",
     "services": [
       {

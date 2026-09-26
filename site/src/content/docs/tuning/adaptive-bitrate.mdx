@@ -5,6 +5,8 @@ description: What ABR does, the two modes, when to change mode, and how to turn 
 
 import { Aside } from '@astrojs/starlight/components';
 
+{/* TODO(#361): on an owned machine a global agent setting is per-host policy (RH-05), not deploy/.env; check this sentence. */}
+
 Adaptive bitrate measures the connection continuously and moves the encoder's
 target bitrate to match. It is on by default in `smooth` mode, and for most
 deployments that is the end of the story.

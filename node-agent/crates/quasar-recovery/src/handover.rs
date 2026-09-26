@@ -635,8 +635,12 @@ impl Actor {
             if self.take_lease_now().is_err() {
                 continue;
             }
-            if let Err(e) = self.serve_again() {
-                warn!(token = "actor-reclaim-socket-rebind-failed", "{e}");
+            for (socket, e) in self.serve_again() {
+                warn!(
+                    token = "actor-reclaim-socket-rebind-failed",
+                    "{}: {e}",
+                    socket.display()
+                );
             }
             let Ok(Some(j)) = self.journals.load(request_id) else {
                 return Ok(Flow::Ended);
@@ -701,28 +705,30 @@ impl Actor {
             .map_err(|e| engine(e, Reason::RecreateFailed, "rename the successor"))
     }
 
-    /// `verifying`: the successor answers on its own agent socket, and its container runs.
+    /// `verifying`: the successor answers on each of its own sockets, and its container
+    /// runs.
     fn verify_successor(&self, _j: &Journal, _i: usize) -> Result<(), Halt> {
         let timing = self.config.handover;
         let deadline = Instant::now() + timing.verify;
-        let socket = self.config.agent_socket.clone();
         let me = self.me().unwrap_or_default().to_owned();
         loop {
             if self.killed() {
                 return Err(Halt::Died);
             }
-            let answered = crate::server::probe_self(&socket);
+            let silent = self.socket_plan().into_iter().find_map(|p| {
+                crate::server::probe_self(&p.path)
+                    .err()
+                    .map(|e| format!("its socket {} did not answer ({e})", p.path.display()))
+            });
             let running = match self.engine.inspect_container(&me) {
                 Ok(Some(c)) => c.running,
                 Err(EngineError::Crashed) => return Err(Halt::Died),
                 _ => false,
             };
-            let why = match (&answered, running) {
-                (Ok(_), true) => return self.await_agent_contact(),
-                (Err(e), _) => {
-                    format!("its agent socket {} did not answer ({e})", socket.display())
-                }
-                (Ok(_), false) => "its container is not running".to_string(),
+            let why = match (silent, running) {
+                (None, true) => return self.await_agent_contact(),
+                (Some(why), _) => why,
+                (None, false) => "its container is not running".to_string(),
             };
             if Instant::now() >= deadline {
                 return Err(fail(
@@ -1063,8 +1069,12 @@ impl Actor {
                 "\nthe recovery actor running now could not take the actor's name back ({why})"
             )),
         }
-        if let Err(e) = self.serve_again() {
-            warn!(token = "actor-restore-socket-rebind-failed", "{e}");
+        for (socket, e) in self.serve_again() {
+            warn!(
+                token = "actor-restore-socket-rebind-failed",
+                "{}: {e}",
+                socket.display()
+            );
         }
         output.push_str(&moved_before(j, i));
         self.finish(j, State::Failed, Some(failure.reason), output, restored)

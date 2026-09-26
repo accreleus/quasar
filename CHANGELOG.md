@@ -34,6 +34,23 @@ own; the two do not move together, and that is deliberate.
   attempts move the actor first and the agent second (a revert the other way round), a later
   failure restores only the agent, the agent re-registers so the console shows the new actor
   version, and Developer apply now accepts a recovery-actor digest.
+- **Combined and control-only installs from one seed (#361).** `QUASAR_ROLE=combined` or
+  `control-only` on the seed installs Postgres (or uses your own database, named by
+  `QUASAR_DATABASE_*`), the control plane and, on a combined host, its own node agent, which
+  enrolls once with a single-use local token instead of the static `ENROLLMENT_TOKEN`. The
+  database password, secret key and local token are generated into machine state and reach
+  each container only as files (`QUASAR_DATABASE_PASSWORD_FILE`, `QUASAR_SECRET_KEY_FILE`);
+  re-running the seed changes nothing, and an interrupted install completes on the next
+  start. Fleet ▸ Releases ▸ Installed shows "This machine": its name and shape, seed,
+  recovery actor, database (Quasar's own or yours), control plane and node agent, even
+  before its recovery actor has reported; a combined host's own page shows the control plane
+  and database running there, and is not removed from the console. The platform identity
+  gains `machine_role` and `machine_node_name` (amendment 14), served from the control
+  plane's own configuration. `QUASAR_TRUSTED_PROXIES` is an optional seed input. Release trust
+  (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, the signature settings, and for the control plane
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES`) is now a seed input recorded in machine state at
+  first install, so a seed-created actor admits a test registry's images; the Compose
+  control-plane service passes the two developer-apply variables through.
 - **Add host: one line, or a seed-only stack for Dockge or Arcane (#359).** Admin → Fleet's
   Enroll host becomes Add host: it mints one single-use token (optionally bound to a node name,
   one hour to 30 days) and prints the pinned-key one-liner or, on a second tab, the seed stack.
@@ -414,6 +431,14 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The documentation site no longer states facts that stopped being true.** A control-plane
+  update without a migration does not end sessions, and a fleet run with no control-plane step
+  cordons each host only when it reaches it; a host whose new agent never came up is
+  restored automatically (ADR 0004); the `beta` channel, unattended updates and release
+  notifications are documented; the stack's container and volume lists include the updater and
+  the NVIDIA driver volume; the static `ENROLLMENT_TOKEN` is optional; each host may have its own
+  home root; the Debian note asks for Compose 2.30; `make diagnose` is marked as needing a
+  checkout. The site's compose snapshot is regenerated, so `npm run build` passes again.
 - **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
   before any host reports it ready. After the launch is accepted, the control
   plane prepares the image on the selected host with the adopted, frozen

@@ -32,7 +32,14 @@ fn the_agent_socket_serves_status_and_nothing_else() {
     let listener = server::bind(&path).unwrap();
     let serving = actor.clone();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::spawn(move || server::serve(listener, serving, stop));
+    std::thread::spawn(move || {
+        server::serve(
+            listener,
+            serving,
+            quasar_recovery::trust::Caller::Agent,
+            stop,
+        )
+    });
 
     let body = server::fetch_status(&path).unwrap();
     let served: Status = serde_json::from_str(&body).unwrap();

@@ -26,7 +26,8 @@ use crate::journal::{JournalDir, Phase};
 use crate::machine::{Machine, MachineDir, ServiceRecord, FORMAT};
 use crate::probe;
 use crate::recipe::{
-    self, labels, names, paths, secrets, Bind, ImageRef, Inputs, RenderError, Role, SecretMounts,
+    self, labels, names, paths, secrets, Bind, DatabaseInputs, ImageRef, Inputs, RenderError, Role,
+    SecretMounts, TrustInputs,
 };
 use crate::seed;
 use crate::socket::{
@@ -35,15 +36,61 @@ use crate::socket::{
 };
 use crate::trust::{SignatureEvidence, SignaturePolicy};
 
+/// One socket the actor serves (see [`Actor::socket_plan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketPlan {
+    pub path: PathBuf,
+    pub caller: crate::trust::Caller,
+    /// `(uid, gid)` the socket is owned by, when its container does not run as root.
+    pub owner: Option<(u32, u32)>,
+}
+
 /// What the operator gave this start. Read only on a clean machine: once machine state
-/// exists it wins and these are ignored (`CONTEXT.md` "Machine inputs").
-#[derive(Debug, Clone, Default)]
+/// exists it wins and these are ignored (`CONTEXT.md` "Machine inputs"). The variables are
+/// `crate::bootstrap`'s. Its `Debug` never shows the enrollment string or the password.
+#[derive(Clone, Default)]
 pub struct OperatorInputs {
     pub enrollment: Option<String>,
     pub home_root: Option<String>,
     pub template_root: Option<String>,
     pub node_name: Option<String>,
     pub agent_image: Option<String>,
+    pub control_plane_image: Option<String>,
+    pub postgres_image: Option<String>,
+    pub public_host: Option<String>,
+    pub tls_hosts: Option<String>,
+    pub trusted_proxies: Option<String>,
+    pub http_port: Option<String>,
+    pub tls_port: Option<String>,
+    pub database_host: Option<String>,
+    pub database_port: Option<String>,
+    pub database_user: Option<String>,
+    pub database_name: Option<String>,
+    pub database_sslmode: Option<String>,
+    pub database_password: Option<String>,
+    pub app_puid: Option<String>,
+    pub app_pgid: Option<String>,
+    pub container_network: Option<String>,
+    pub trust: TrustInputs,
+}
+
+impl std::fmt::Debug for OperatorInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = |v: &Option<String>| v.as_ref().map(|_| "<set>");
+        f.debug_struct("OperatorInputs")
+            .field("enrollment", &set(&self.enrollment))
+            .field("home_root", &self.home_root)
+            .field("template_root", &self.template_root)
+            .field("node_name", &self.node_name)
+            .field("agent_image", &self.agent_image)
+            .field("control_plane_image", &self.control_plane_image)
+            .field("postgres_image", &self.postgres_image)
+            .field("public_host", &self.public_host)
+            .field("database_host", &self.database_host)
+            .field("database_password", &set(&self.database_password))
+            .field("trust", &self.trust)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct ActorConfig {
@@ -67,10 +114,13 @@ pub struct ActorConfig {
     /// Gathers ADR 0003 signature evidence for a request; called only when signing is on.
     pub evidence: Box<dyn Fn(&Request) -> SignatureEvidence + Send + Sync>,
     pub timing: ReplaceTiming,
+    /// How long an install waits for Postgres, then the control plane, to report healthy
+    /// before it creates what depends on it (and creates it anyway, logged).
+    pub healthy_wait: std::time::Duration,
     pub handover: HandoverTiming,
-    /// Where this actor serves the agent socket. Fixed in the binary: the agent's recipe
-    /// names the same path.
-    pub agent_socket: PathBuf,
+    /// The directory [`Actor::socket_plan`]'s sockets are served under. Fixed in the
+    /// binary: the recipes name the same paths.
+    pub socket_dir: PathBuf,
     /// Called when this process can no longer drive its attempt (a journal it cannot
     /// write, an injected crash): the binary exits, so the restart policy starts it again
     /// and `resume` settles the attempt (D8).
@@ -184,8 +234,9 @@ impl ActorConfig {
                 error: "this recovery actor has no release-asset fetcher configured".into(),
             }),
             timing: ReplaceTiming::default(),
+            healthy_wait: std::time::Duration::from_secs(180),
             handover: HandoverTiming::default(),
-            agent_socket: paths::AGENT_SOCKET.into(),
+            socket_dir: paths::AGENT_SOCKET_DIR.into(),
             on_died: Box::new(|| {}),
             #[cfg(any(test, feature = "test-support"))]
             crash_after: None,
@@ -279,7 +330,7 @@ pub struct Actor {
     /// Seed identities by image id: an image's labels never change.
     seed_images: Mutex<BTreeMap<String, SeedIdentity>>,
     /// The agent socket's serving loop, while this process serves it.
-    server: Mutex<Option<ServerHandle>>,
+    server: Mutex<Vec<ServerHandle>>,
     /// Itself, for the serving loop, once `serve` was called on the `Arc`.
     me: std::sync::OnceLock<std::sync::Weak<Actor>>,
     /// This process handed the machine to another actor and must exit.
@@ -291,6 +342,7 @@ pub struct Actor {
 }
 
 struct ServerHandle {
+    path: PathBuf,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: std::thread::JoinHandle<io::Result<()>>,
 }
@@ -320,7 +372,7 @@ impl Actor {
             worker: Mutex::new(None),
             resuming: std::sync::atomic::AtomicBool::new(false),
             seed_images: Mutex::new(BTreeMap::new()),
-            server: Mutex::new(None),
+            server: Mutex::new(Vec::new()),
             me: std::sync::OnceLock::new(),
             retired: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
@@ -393,57 +445,87 @@ impl Actor {
         }
     }
 
-    /// Serve the agent socket on a thread of its own. Only the lease holder may: the lease
-    /// is what makes a leftover socket file certainly stale.
-    pub fn serve(self: &Arc<Self>) -> io::Result<()> {
+    /// Serve every socket of [`Actor::socket_plan`], each on a thread of its own. Only the
+    /// lease holder may: the lease is what makes a leftover socket file certainly stale.
+    /// A socket already served is left alone, so the binary calls it again once a first
+    /// install has learnt its role. Returns the sockets that could not be bound.
+    pub fn serve(self: &Arc<Self>) -> Vec<(PathBuf, io::Error)> {
         let _ = self.me.set(Arc::downgrade(self));
         self.serve_again()
     }
 
     /// [`Actor::serve`] from `&self`, once `serve` has been called on the `Arc`.
-    pub(crate) fn serve_again(&self) -> io::Result<()> {
-        let mut server = self.server.lock().unwrap();
-        if server.is_some() {
-            return Ok(());
+    pub(crate) fn serve_again(&self) -> Vec<(PathBuf, io::Error)> {
+        let mut servers = self.server.lock().unwrap();
+        let plan = self.socket_plan();
+        let actor = match self.me.get().and_then(std::sync::Weak::upgrade) {
+            Some(actor) if !self.killed() => actor,
+            found => {
+                let why = if found.is_some() {
+                    "this process was stopped"
+                } else {
+                    "this actor never served its sockets"
+                };
+                return plan
+                    .into_iter()
+                    .map(|p| (p.path, io::Error::other(why)))
+                    .collect();
+            }
+        };
+        let mut failed = Vec::new();
+        for p in plan {
+            if servers.iter().any(|h| h.path == p.path) {
+                continue;
+            }
+            let listener = match crate::server::bind_owned(&p.path, p.owner) {
+                Ok(listener) => listener,
+                Err(e) => {
+                    failed.push((p.path, e));
+                    continue;
+                }
+            };
+            info!(socket = %p.path.display(), caller = ?p.caller, "serving");
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (flag, actor, caller) = (stop.clone(), actor.clone(), p.caller);
+            let thread =
+                std::thread::spawn(move || crate::server::serve(listener, actor, caller, flag));
+            servers.push(ServerHandle {
+                path: p.path,
+                stop,
+                thread,
+            });
         }
-        if self.killed() {
-            return Err(io::Error::other("this process was stopped"));
-        }
-        let actor = self
-            .me
-            .get()
-            .and_then(std::sync::Weak::upgrade)
-            .ok_or_else(|| io::Error::other("this actor never served its socket"))?;
-        let listener = crate::server::bind(&self.config.agent_socket)?;
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let thread = std::thread::spawn(move || crate::server::serve(listener, actor, flag));
-        *server = Some(ServerHandle { stop, thread });
-        Ok(())
+        failed
     }
 
-    /// Stop serving, before the lease is released: the next holder binds the path afresh.
+    /// Whether any socket is being served.
+    pub fn serving(&self) -> bool {
+        !self.server.lock().unwrap().is_empty()
+    }
+
+    /// Stop serving, before the lease is released: the next holder binds the paths afresh.
     pub(crate) fn stop_serving(&self) {
-        let handle = self.server.lock().unwrap().take();
-        if let Some(handle) = handle {
+        let handles = std::mem::take(&mut *self.server.lock().unwrap());
+        for handle in &handles {
             handle.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        for handle in handles {
             let _ = handle.thread.join();
         }
     }
 
-    /// The serving loop ended on its own, with why; `None` while it serves, and after a
-    /// deliberate stop.
-    pub fn serving_failed(&self) -> Option<io::Error> {
-        let mut server = self.server.lock().unwrap();
-        if !server.as_ref().is_some_and(|h| h.thread.is_finished()) {
-            return None;
-        }
-        let handle = server.take()?;
-        Some(match handle.thread.join() {
+    /// A serving loop that ended on its own, with its socket and why; `None` while every
+    /// socket serves, and after a deliberate stop.
+    pub fn serving_failed(&self) -> Option<(PathBuf, io::Error)> {
+        let mut servers = self.server.lock().unwrap();
+        let at = servers.iter().position(|h| h.thread.is_finished())?;
+        let handle = servers.remove(at);
+        let why = match handle.thread.join() {
             Ok(Err(e)) => e,
-            Ok(Ok(())) => io::Error::other("the agent socket stopped"),
+            Ok(Ok(())) => io::Error::other("the socket stopped"),
             Err(_) => io::Error::other("the socket thread panicked"),
-        })
+        };
+        Some((handle.path, why))
     }
 
     pub(crate) fn release_lease(&self) {
@@ -513,9 +595,9 @@ impl Actor {
         self.ensure_seed_file(&machine)?;
         match machine.role {
             MachineRole::Gpu => self.ensure_node_agent(&machine),
-            other => Err(ResumeError::Unsupported(format!(
-                "machine role {other:?}; only `gpu` installs in this build (combined and control-only arrive with #361)"
-            ))),
+            MachineRole::Combined | MachineRole::ControlOnly => {
+                self.ensure_control_machine(&machine)
+            }
         }
     }
 
@@ -553,21 +635,22 @@ impl Actor {
             }
             Err(_) => (self.last.lock().unwrap().clone().unwrap_or_default(), true),
         };
-        let role = self
-            .dir
-            .load_machine()
-            .ok()
-            .flatten()
-            .map(|m| m.role)
-            .unwrap_or(self.config.role);
+        let machine = self.dir.load_machine().ok().flatten();
+        let role = machine.as_ref().map_or(self.config.role, |m| m.role);
+        let database = match machine.as_ref().and_then(|m| m.inputs.control.as_ref()) {
+            Some(c) if matches!(c.database, DatabaseInputs::External { .. }) => {
+                DatabaseMode::External
+            }
+            Some(_) => DatabaseMode::Owned,
+            None if role == MachineRole::Gpu => DatabaseMode::None,
+            None => DatabaseMode::Owned,
+        };
         Status {
             actor: self.identity(),
             seed: inventory.seed,
             role,
-            database: match role {
-                MachineRole::Gpu => DatabaseMode::None,
-                _ => DatabaseMode::Owned,
-            },
+            node_name: machine.map(|m| m.inputs.node_name),
+            database,
             services: inventory.services,
             conflicts: inventory.conflicts,
             in_flight: None,
@@ -709,6 +792,53 @@ impl Actor {
         }
     }
 
+    /// The release trust `submit` admits under: the settings machine state recorded at
+    /// install (the seed's), else this start's own (`ActorConfig::trust`), for a machine
+    /// installed before they were recorded.
+    pub fn trust(&self) -> Result<TrustConfig, String> {
+        match self.dir.load_machine() {
+            Ok(Some(m)) if !m.inputs.trust.is_empty() => {
+                crate::bootstrap::trust_config(&m.inputs.trust)
+            }
+            Ok(_) => Ok(self.config.trust.clone()),
+            Err(e) => Err(format!("machine state is unreadable: {e}")),
+        }
+    }
+
+    /// The sockets this machine's role serves, as `(path in this container, caller, owner)`.
+    /// The role is machine state's, else a first install's inputs, else this start's own.
+    pub fn socket_plan(&self) -> Vec<SocketPlan> {
+        let role = match self.dir.load_machine() {
+            Ok(Some(m)) => m.role,
+            _ => self
+                .install_inputs()
+                .map(|b| b.role)
+                .unwrap_or(self.config.role),
+        };
+        // The constants are the binary's paths; a test serves the same layout elsewhere.
+        let at = |path: &str| {
+            let rel = std::path::Path::new(path)
+                .strip_prefix(paths::AGENT_SOCKET_DIR)
+                .expect("every socket lives in the socket directory");
+            self.config.socket_dir.join(rel)
+        };
+        let agent = |path: &str| SocketPlan {
+            path: at(path),
+            caller: crate::trust::Caller::Agent,
+            owner: None,
+        };
+        let control = SocketPlan {
+            path: at(paths::CONTROL_SOCKET),
+            caller: crate::trust::Caller::ControlPlane,
+            owner: Some((recipe::CONTROL_PLANE_UID, recipe::CONTROL_PLANE_UID)),
+        };
+        match role {
+            MachineRole::Gpu => vec![agent(paths::AGENT_SOCKET)],
+            MachineRole::Combined => vec![agent(paths::SPLIT_AGENT_SOCKET), control],
+            MachineRole::ControlOnly => vec![control],
+        }
+    }
+
     /// The inputs of a first install: the seed's, read from the container that created this
     /// actor, or, for an actor started by hand, this process's own.
     fn install_inputs(&self) -> Result<Bootstrap, ResumeError> {
@@ -731,18 +861,10 @@ impl Actor {
 
     fn first_install(&self) -> Result<Machine, ResumeError> {
         let boot = self.install_inputs()?;
-        if boot.role != MachineRole::Gpu {
-            return Err(ResumeError::Unsupported(format!(
-                "machine role {:?}; only `gpu` installs in this build (combined and control-only arrive with #361)",
-                boot.role
-            )));
-        }
         let host = self.engine.host()?;
         let checked = boot
             .check(host.name.as_deref())
             .map_err(ResumeError::Inputs)?;
-        let enrollment = checked.enrollment.as_str();
-        let image = checked.agent_image.clone();
         // A seed-created actor carries the installation id the seed chose; adopting it keeps
         // the seed's labels, machine state and seed.json naming one installation.
         let installation_id = self
@@ -750,6 +872,10 @@ impl Actor {
             .and_then(|me| me.labels.get(labels::INSTALLATION).cloned())
             .filter(|id| !id.trim().is_empty())
             .unwrap_or_else(|| (self.config.new_installation_id)());
+        let socket_dir = match &checked.control {
+            Some(_) => Some(self.socket_volume_host_path()?),
+            None => None,
+        };
         let mut inputs = Inputs {
             installation_id,
             node_name: checked.node_name.clone(),
@@ -758,50 +884,85 @@ impl Actor {
             docker_socket: self.docker_socket_host_path()?,
             gpu: Default::default(),
             devices: Default::default(),
+            control: checked.control.as_ref().map(|c| c.inputs.clone()),
+            socket_dir,
+            trust: checked.trust.clone(),
+            enroll: Default::default(),
+            app: checked.app.clone(),
         };
+        if checked.control.is_some() {
+            // The seed a new GPU host runs is this machine's recovery image.
+            inputs.enroll = recipe::EnrollImages {
+                seed: self
+                    .own_container()?
+                    .and_then(|me| own_image(self.engine.as_ref(), &me))
+                    .and_then(|i| ImageRef::parse(&i.reference()).ok()),
+                agent: checked.enroll_agent_image.clone(),
+            };
+        }
         recipe::validate(&inputs)?;
 
         // Refused here, before anything durable: once machine state exists it wins over
         // corrected inputs.
-        let found = self.ensure_image(&image)?;
-        node_agent_revision(&found, &image)?;
-        self.dir.store_secret(secrets::ENROLLMENT, enrollment)?;
-        let report = match probe::run(self.engine.as_ref(), &image) {
-            Ok(report) => report,
-            Err(probe::ProbeError::Engine(e)) => return Err(e.into()),
-            Err(e @ probe::ProbeError::Unreadable(_)) => {
-                warn!(
-                    token = "actor-gpu-probe-unreadable",
-                    "GPU detection failed ({e}); installing the agent without GPU devices, and its readiness will report the gap"
-                );
-                probe::ProbeReport::default()
-            }
-        };
-        let (gpu, devices) = probe::select(&report);
-        match &gpu.vendor {
-            Some(vendor) => info!(
-                vendor = ?vendor,
-                render_node = gpu.render_node.as_deref().unwrap_or(""),
-                "GPU detected"
-            ),
-            None => warn!(
-                token = "actor-no-gpu",
-                "no usable GPU render node on this machine; installing the agent anyway, and its readiness will report the gap"
-            ),
+        let mut install_images = BTreeMap::new();
+        if let Some(image) = &checked.agent_image {
+            let found = self.ensure_image(image)?;
+            agent_revision_for(&found, image, checked.role)?;
+            install_images.insert(Role::NodeAgent, image.clone());
         }
-        inputs.gpu = gpu;
-        inputs.devices = devices;
+        if let Some(control) = &checked.control {
+            let found = self.ensure_image(&control.image)?;
+            supported_revision(Role::ControlPlane, &found, &control.image)?;
+            install_images.insert(Role::ControlPlane, control.image.clone());
+            if let Some(postgres) = &control.postgres_image {
+                self.ensure_image(postgres)?;
+                install_images.insert(Role::Postgres, postgres.clone());
+            }
+        }
+        if let Some(enrollment) = &checked.enrollment {
+            self.dir.store_secret(secrets::ENROLLMENT, enrollment)?;
+        }
+        if let Some(control) = &checked.control {
+            self.store_control_secrets(checked.role, control)?;
+        }
+        if let Some(image) = &checked.agent_image {
+            let report = match probe::run(self.engine.as_ref(), image) {
+                Ok(report) => report,
+                Err(probe::ProbeError::Engine(e)) => return Err(e.into()),
+                Err(e @ probe::ProbeError::Unreadable(_)) => {
+                    warn!(
+                        token = "actor-gpu-probe-unreadable",
+                        "GPU detection failed ({e}); installing the agent without GPU devices, and its readiness will report the gap"
+                    );
+                    probe::ProbeReport::default()
+                }
+            };
+            let (gpu, devices) = probe::select(&report);
+            match &gpu.vendor {
+                Some(vendor) => info!(
+                    vendor = ?vendor,
+                    render_node = gpu.render_node.as_deref().unwrap_or(""),
+                    "GPU detected"
+                ),
+                None => warn!(
+                    token = "actor-no-gpu",
+                    "no usable GPU render node on this machine; installing the agent anyway, and its readiness will report the gap"
+                ),
+            }
+            inputs.gpu = gpu;
+            inputs.devices = devices;
+        }
 
         let machine = Machine {
             format: FORMAT,
             installation_id: inputs.installation_id.clone(),
-            role: MachineRole::Gpu,
+            role: checked.role,
             created_at: (self.config.now)(),
             inputs,
-            install_images: BTreeMap::from([(Role::NodeAgent, image)]),
+            install_images,
         };
         self.dir.machine().store(&machine)?;
-        info!(installation = %machine.installation_id, node = %machine.inputs.node_name, "machine state created");
+        info!(installation = %machine.installation_id, node = %machine.inputs.node_name, role = ?machine.role, "machine state created");
         Ok(machine)
     }
 
@@ -852,7 +1013,12 @@ impl Actor {
         ])
     }
 
-    fn ensure_volume(&self, machine: &Machine, name: &str, role: Role) -> Result<(), ResumeError> {
+    pub(crate) fn ensure_volume(
+        &self,
+        machine: &Machine,
+        name: &str,
+        role: Role,
+    ) -> Result<(), ResumeError> {
         match self.engine.inspect_volume(name)? {
             Some(v) => match v.labels.get(labels::INSTALLATION) {
                 Some(id) if *id != machine.installation_id => Err(ResumeError::OwnerConflict(
@@ -875,8 +1041,11 @@ impl Actor {
 
     pub(crate) fn node_agent_secrets(&self) -> Result<SecretMounts, ResumeError> {
         let mut files = BTreeSet::new();
-        if self.dir.load_secret(secrets::ENROLLMENT)?.is_some() {
-            files.insert(secrets::ENROLLMENT.to_string());
+        // A GPU host stores only the first, a combined host only the second.
+        for name in [secrets::ENROLLMENT, secrets::LOCAL_ENROLLMENT] {
+            if self.dir.load_secret(name)?.is_some() {
+                files.insert(name.to_string());
+            }
         }
         Ok(SecretMounts {
             volume: Some(names::NODE_AGENT_SECRETS_VOLUME.into()),
@@ -884,7 +1053,7 @@ impl Actor {
         })
     }
 
-    fn ensure_node_agent(&self, machine: &Machine) -> Result<(), ResumeError> {
+    pub(crate) fn ensure_node_agent(&self, machine: &Machine) -> Result<(), ResumeError> {
         let mut machine = machine.clone();
         let machine = &mut machine;
         let role = Role::NodeAgent;
@@ -949,7 +1118,11 @@ impl Actor {
     /// is created. Only a yes is recorded; a definite no installs the agent without the
     /// NVIDIA shape (readiness reports the gap) and is asked again the next time the agent
     /// is created; no answer stops this start.
-    fn decide_gpus(&self, machine: &mut Machine, image: &ImageRef) -> Result<(), ResumeError> {
+    pub(crate) fn decide_gpus(
+        &self,
+        machine: &mut Machine,
+        image: &ImageRef,
+    ) -> Result<(), ResumeError> {
         let gpu = &machine.inputs.gpu;
         if gpu.vendor != Some(recipe::GpuVendor::Nvidia) || gpu.gpus_served {
             return Ok(());
@@ -997,13 +1170,24 @@ impl Actor {
         volume: &str,
         files: &BTreeSet<String>,
     ) -> Result<(), ResumeError> {
+        self.deliver_secrets_as(image, volume, files, FileOwner::ROOT)
+    }
+
+    /// [`Actor::deliver_secrets`], the files owned as the consuming container needs them.
+    pub(crate) fn deliver_secrets_as(
+        &self,
+        image: &ImageRef,
+        volume: &str,
+        files: &BTreeSet<String>,
+        owner: FileOwner,
+    ) -> Result<(), ResumeError> {
         let mut entries = Vec::new();
         for name in files {
             if let Some(value) = self.dir.load_secret(name)? {
                 entries.push((name.clone(), value));
             }
         }
-        let archive = tar_of(&entries)?;
+        let archive = tar_of(&entries, owner)?;
         let writer = ContainerSpec {
             name: names::SECRETS_WRITER.into(),
             image: image.reference(),
@@ -1024,6 +1208,8 @@ impl Actor {
             security_opt: Vec::new(),
             init: false,
             restart: RestartPolicy::No,
+            ports: Vec::new(),
+            healthcheck: None,
         };
         let id = self.engine.create_container(&writer)?;
         let uploaded = self.engine.upload_archive(&id, "/secrets", archive);
@@ -1201,18 +1387,43 @@ pub(crate) fn node_agent_revision(
     image: &crate::engine::Image,
     reference: &ImageRef,
 ) -> Result<u32, ResumeError> {
-    let revision = image_revision(image, reference)?;
-    if !recipe::Book::supports(Role::NodeAgent, revision) {
-        return Err(RenderError::Unsupported {
-            role: Role::NodeAgent,
-            revision,
-        }
-        .into());
+    supported_revision(Role::NodeAgent, image, reference)
+}
+
+/// [`node_agent_revision`], and on a combined host a revision whose agent reads the local
+/// enrollment token's file (2 or later).
+pub(crate) fn agent_revision_for(
+    image: &crate::engine::Image,
+    reference: &ImageRef,
+    role: MachineRole,
+) -> Result<u32, ResumeError> {
+    let revision = node_agent_revision(image, reference)?;
+    if role == MachineRole::Combined && revision < 2 {
+        return Err(ResumeError::RecipeUnsupported(format!(
+            "{} declares node-agent recipe revision {revision}; a combined host's agent needs revision 2 or later, which reads the local enrollment token",
+            reference.reference()
+        )));
     }
     Ok(revision)
 }
 
-fn image_revision(image: &crate::engine::Image, reference: &ImageRef) -> Result<u32, ResumeError> {
+/// The recipe revision `image` declares for `role`, refused unless this actor carries it.
+pub(crate) fn supported_revision(
+    role: Role,
+    image: &crate::engine::Image,
+    reference: &ImageRef,
+) -> Result<u32, ResumeError> {
+    let revision = image_revision(image, reference)?;
+    if !recipe::Book::supports(role, revision) {
+        return Err(RenderError::Unsupported { role, revision }.into());
+    }
+    Ok(revision)
+}
+
+pub(crate) fn image_revision(
+    image: &crate::engine::Image,
+    reference: &ImageRef,
+) -> Result<u32, ResumeError> {
     let label = image.labels.get(labels::IMAGE_RECIPE).ok_or_else(|| {
         ResumeError::RecipeUnsupported(format!(
             "{} carries no {} label, so it cannot be installed by a recovery actor",
@@ -1229,14 +1440,30 @@ fn image_revision(image: &crate::engine::Image, reference: &ImageRef) -> Result<
     })
 }
 
-fn tar_of(entries: &[(String, String)]) -> Result<Vec<u8>, ResumeError> {
+/// Who a delivered secret file belongs to, and its mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileOwner {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+impl FileOwner {
+    pub const ROOT: FileOwner = FileOwner {
+        uid: 0,
+        gid: 0,
+        mode: 0o400,
+    };
+}
+
+fn tar_of(entries: &[(String, String)], owner: FileOwner) -> Result<Vec<u8>, ResumeError> {
     let mut builder = tar::Builder::new(Vec::new());
     for (name, value) in entries {
         let mut header = tar::Header::new_gnu();
         header.set_size(value.len() as u64);
-        header.set_mode(0o400);
-        header.set_uid(0);
-        header.set_gid(0);
+        header.set_mode(owner.mode);
+        header.set_uid(u64::from(owner.uid));
+        header.set_gid(u64::from(owner.gid));
         header.set_mtime(0);
         header.set_entry_type(tar::EntryType::Regular);
         builder.append_data(&mut header, name, value.as_bytes())?;

@@ -3,6 +3,7 @@ package agentws
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -297,5 +298,34 @@ func TestEnrollmentWithoutMintedTokenSupport(t *testing.T) {
 	}
 	if _, err := st.enrollHost(ctx, "no-minting", "0.1.0", "static-token", "static-token"); err != nil {
 		t.Fatalf("static token with no redeemer wired: %v", err)
+	}
+}
+
+// A combined machine's own agent enrolls with its local token and no static
+// ENROLLMENT_TOKEN configured (control-api.md amendment 14 §"Enrollment").
+func TestLocalEnrollmentTokenEnrollsItsOwnNodeOnly(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	st := storeWithMintedTokens(pool, func(string) bool { return false })
+	local := fmt.Sprintf("local-token-%d", time.Now().UnixNano())
+
+	if _, err := hostenroll.EnsureLocal(ctx, pool, local, "combined-own"); err != nil {
+		t.Fatalf("ensure local: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "combined-other", "0.1.0", local, ""); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("local token on another node: got %v, want ErrInvalidEnrollmentToken", err)
+	}
+	res, err := st.enrollHost(ctx, "combined-own", "0.1.0", local, "")
+	if err != nil {
+		t.Fatalf("local token on its own node: %v", err)
+	}
+	if res.NodeSecret == "" {
+		t.Fatal("enrollment returned no node secret")
+	}
+	if err := st.markOffline(ctx, res.HostID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "combined-own", "0.1.0", local, ""); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("replay of the spent local token: got %v, want ErrInvalidEnrollmentToken", err)
 	}
 }

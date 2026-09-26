@@ -270,10 +270,13 @@ impl Actor {
                 ));
             }
         }
+        let settings = self
+            .trust()
+            .map_err(|why| refuse(&req, Reason::Invalid, format!("release trust: {why}")))?;
         let cfg = trust::Config {
-            allowed_namespaces: self.config.trust.allowed_namespaces.clone(),
+            allowed_namespaces: settings.allowed_namespaces,
             in_flight_request_id: scan.open().map(|j| j.request.request_id.clone()),
-            signature: self.config.trust.signature.clone(),
+            signature: settings.signature,
         };
         let evidence = trust::wants_signature_evidence(&cfg, &req.request_id)
             .then(|| (self.config.evidence)(&req));

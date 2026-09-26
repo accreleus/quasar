@@ -1,0 +1,81 @@
+{
+  "name": "quasar-control-plane",
+  "image": "registry.example.invalid/quasar/quasar-control-plane@sha256:aa11000000000000000000000000000000000000000000000000000000000000",
+  "entrypoint": null,
+  "cmd": null,
+  "env": {
+    "AUTH_TOKEN_TTL": "24h",
+    "GOMEMLIMIT": "1GiB",
+    "LISTEN_ADDR": ":8080",
+    "LOG_LEVEL": "info",
+    "QUASAR_DATABASE_HOST": "quasar-postgres",
+    "QUASAR_DATABASE_NAME": "quasar",
+    "QUASAR_DATABASE_PASSWORD_FILE": "/run/quasar-secrets/database-password",
+    "QUASAR_DATABASE_PORT": "5432",
+    "QUASAR_DATABASE_SSLMODE": "disable",
+    "QUASAR_DATABASE_USER": "quasar",
+    "QUASAR_ENROLL_AGENT_IMAGE": "",
+    "QUASAR_ENROLL_SEED_IMAGE": "",
+    "QUASAR_ENV": "production",
+    "QUASAR_HOME_ROOT": "/srv/quasar/homes",
+    "QUASAR_HTTP_REDIRECT": "auto",
+    "QUASAR_LOCAL_ENROLLMENT_FILE": "/run/quasar-secrets/local-enrollment",
+    "QUASAR_LOCAL_ENROLLMENT_NODE_NAME": "living-room-pc",
+    "QUASAR_MACHINE_NODE_NAME": "living-room-pc",
+    "QUASAR_MACHINE_ROLE": "combined",
+    "QUASAR_PLATFORM_INSECURE_REGISTRIES": "",
+    "QUASAR_PPROF_ADDR": "127.0.0.1:6060",
+    "QUASAR_PUBLIC_HOST": "quasar.example.invalid",
+    "QUASAR_RECOVERY_CONTROL_SOCKET": "/run/quasar-recovery/control.sock",
+    "QUASAR_SECRET_KEY_FILE": "/run/quasar-secrets/secret-key",
+    "QUASAR_TLS": "auto",
+    "QUASAR_TLS_ADDR": ":8443",
+    "QUASAR_TLS_HOSTS": "",
+    "QUASAR_TLS_REDIRECT_PORT": "8443",
+    "QUASAR_TRUSTED_PROXIES": "",
+    "QUASAR_UPDATER_ALLOWED_NAMESPACES": ""
+  },
+  "labels": {
+    "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+    "io.quasar.platform-service": "control-plane",
+    "io.quasar.recipe": "1",
+    "io.quasar.spec": "sha256:a4301c9437ed2edb213afafb31b38488c12414c1923baa4430552f9ae92c61a9"
+  },
+  "network_mode": "quasar-platform",
+  "binds": [
+    {
+      "source": "/var/lib/docker/volumes/quasar-recovery-agent/_data/control",
+      "target": "/run/quasar-recovery",
+      "read_only": true
+    },
+    {
+      "source": "quasar-control-plane-secrets",
+      "target": "/run/quasar-secrets",
+      "read_only": true
+    },
+    {
+      "source": "quasar-control-data",
+      "target": "/var/lib/quasar-control",
+      "read_only": false
+    }
+  ],
+  "devices": [],
+  "device_cgroup_rules": [],
+  "gpus": [],
+  "cap_add": [],
+  "security_opt": [],
+  "init": false,
+  "restart": "unless-stopped",
+  "ports": [
+    {
+      "container_port": 8080,
+      "host_port": 8080,
+      "host_ip": null
+    },
+    {
+      "container_port": 8443,
+      "host_port": 8443,
+      "host_ip": null
+    }
+  ]
+}

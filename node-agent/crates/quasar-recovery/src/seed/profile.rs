@@ -62,5 +62,7 @@ pub fn actor(
         security_opt: vec!["label=disable".into()],
         init: false,
         restart: RestartPolicy::UnlessStopped,
+        ports: Vec::new(),
+        healthcheck: None,
     }
 }

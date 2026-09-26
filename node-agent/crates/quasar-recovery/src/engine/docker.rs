@@ -6,7 +6,8 @@ use std::time::Duration;
 use quasar_runtime::{RuntimeClient, RuntimeConfig};
 
 use super::{
-    Container, ContainerSpec, EngineError, EngineHost, Image, PlatformEngine, RestartPolicy, Volume,
+    Container, ContainerSpec, EngineError, EngineHost, Image, Network, PlatformEngine,
+    RestartPolicy, Volume,
 };
 
 fn refused(r: quasar_runtime::platform::Refused) -> EngineError {
@@ -98,5 +99,18 @@ impl PlatformEngine for DockerEngine {
     }
     fn remove_volume(&self, name: &str) -> Result<(), EngineError> {
         Ok(self.client.remove_volume(name).wait()?)
+    }
+    fn inspect_network(&self, name: &str) -> Result<Option<Network>, EngineError> {
+        Ok(self.client.inspect_network(name).wait()?)
+    }
+    fn create_network(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Network, EngineError> {
+        Ok(self.client.create_network(name, labels.clone()).wait()?)
+    }
+    fn remove_network(&self, name: &str) -> Result<(), EngineError> {
+        Ok(self.client.remove_network(name).wait()?)
     }
 }

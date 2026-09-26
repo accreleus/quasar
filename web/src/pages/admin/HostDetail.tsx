@@ -8,7 +8,12 @@ import { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import * as adminApi from "../../api/admin";
 import { ApiError } from "../../api/client";
-import type { GPUAvailability, Host, PlatformReleaseFault } from "../../api/types";
+import type {
+  GPUAvailability,
+  Host,
+  PlatformIdentity,
+  PlatformReleaseFault,
+} from "../../api/types";
 import { useAuth } from "../../auth/context";
 import { Breadcrumbs } from "../../components/Breadcrumbs";
 import { shortId } from "../../lib/format/shortId";
@@ -44,6 +49,8 @@ interface HostDetailData {
   faults: PlatformReleaseFault[];
   /** The installed control plane's commit, from the same read; null when unknown. */
   controlPlaneCommit: string | null;
+  /** The control plane's own identity, machine fields included; null when unread. */
+  controlPlane: PlatformIdentity | null;
 }
 
 export function HostDetail() {
@@ -70,8 +77,9 @@ export function HostDetail() {
             (v) => ({
               faults: v.faults.filter((f) => f.host_id === id),
               controlPlaneCommit: v.installed?.control_plane.source_commit ?? null,
+              controlPlane: v.installed?.control_plane ?? null,
             }),
-            () => ({ faults: [], controlPlaneCommit: null }),
+            () => ({ faults: [], controlPlaneCommit: null, controlPlane: null }),
           ),
         ]);
         return { host, gpus, ...release };
@@ -164,6 +172,7 @@ export function HostDetail() {
 
   const state = hostStateLabel(host);
   const services = hostServices(host, {
+    machine: res.data?.controlPlane ?? null,
     agentOlder: agentOlderThanControlPlane(host, controlPlaneCommit, faults),
   });
 
@@ -174,7 +183,7 @@ export function HostDetail() {
       <PageHeader
         title={host.node_name}
         sub={[
-          services ? "GPU host" : null,
+          services ? services.shape : null,
           host.cpu_model,
           host.mem_mb != null ? bytesFromMb(host.mem_mb) : null,
         ]

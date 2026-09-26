@@ -55,6 +55,10 @@ type ApplyHandler struct {
 	// (developer_apply.go); a nil reader refuses image_unresolvable.
 	dev               DeveloperImages
 	allowedNamespaces []string
+	// This control plane's own machine; nil is not owned.
+	ownMachine OwnMachineSource
+	// machineShape is this control plane's own machine shape, from its configuration.
+	machineShape MachineShape
 }
 
 // logger is the sliver of *slog.Logger this file uses.

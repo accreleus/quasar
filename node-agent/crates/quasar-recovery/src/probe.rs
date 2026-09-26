@@ -180,6 +180,8 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
         security_opt: Vec::new(),
         init: false,
         restart: RestartPolicy::No,
+        ports: Vec::new(),
+        healthcheck: None,
     }
 }
 
@@ -208,6 +210,8 @@ pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
         security_opt: Vec::new(),
         init: false,
         restart: RestartPolicy::No,
+        ports: Vec::new(),
+        healthcheck: None,
     }
 }
 

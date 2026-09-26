@@ -536,6 +536,14 @@ if [ "$(scalar '.image_config.must_not_run_as_root')" = "true" ]; then
   else hemit FAIL "image.user" "runs as root (User='${U:-<empty>}')"; fi
 fi
 
+UID_WANT="$(scalar '.image_config.run_as_uid')"
+if [ -n "$UID_WANT" ]; then
+  # The numeric uid the image's USER resolves to, which Config.User (a name) does not say.
+  UID_GOT="$(docker run --rm --network none --entrypoint id "$IMAGE" -u 2>/dev/null || true)"
+  if [ "$UID_GOT" = "$UID_WANT" ]; then hemit PASS "image.uid" "runs as uid $UID_GOT"
+  else hemit FAIL "image.uid" "runs as uid '${UID_GOT:-<unknown>}', want $UID_WANT"; fi
+fi
+
 if [ "$(scalar '._deployment_ban')" = "not_a_runtime_role" ]; then
   hemit PASS "role.deployment-ban" "declared build/test-only — build-images.sh will refuse runtime tags"
 fi

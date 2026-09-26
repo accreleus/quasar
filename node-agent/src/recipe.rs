@@ -11,4 +11,6 @@
 //! bumps it. The actor's test `every_revision_the_tree_declares_is_carried_by_the_book`
 //! reads this file and fails if the book does not carry it.
 
-pub const RECIPE_REVISION: u32 = 1;
+/// 2: reads `ENROLLMENT_TOKEN_FILE`, the local enrollment token a combined host's agent is
+/// given.
+pub const RECIPE_REVISION: u32 = 2;

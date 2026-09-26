@@ -1,6 +1,6 @@
 /**
- * "Services on this machine" for an owned GPU host (design_handoff_v3
- * fleet-rh06-v3.html, `rhServices`; screenshots rh06/inv-gpu, inv-unknown).
+ * "Services on this machine" for an owned host (design_handoff_v3
+ * fleet-rh06-v3.html, `rhServices`; screenshots rh06/inv-gpu, inv-unknown, inv-combined).
  * The rows come from hostServices.ts; this file only draws them.
  */
 
@@ -32,7 +32,7 @@ export function ServicesCard({ nodeName, services, connectedSince, now }: Servic
           <div className="hint host-services-hint">{headHint(services)}</div>
         </div>
         <div className="acts">
-          <Chip>GPU host</Chip>
+          <Chip>{services.shape}</Chip>
         </div>
       </div>
 
@@ -71,6 +71,15 @@ export function ServicesCard({ nodeName, services, connectedSince, now }: Servic
           </tbody>
         </table>
       </div>
+      {services.shape === "Combined host" && (
+        <div className="card-pad host-services-foot">
+          <p className="hint">
+            This machine runs the control plane, so it is not removed from here. To uninstall it,
+            run the uninstall command on the machine; it keeps the database, machine state and
+            homes unless you ask it to purge.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -96,7 +105,17 @@ function Row({ row }: { row: ServiceRow }) {
       <td>
         {row.version || row.versionNote ? (
           <div className="stack">
-            {row.version ? <span className="num host-services-version">{row.version}</span> : DASH}
+            {row.version ? (
+              <span
+                className={
+                  row.versionPlain ? "host-services-version" : "num host-services-version"
+                }
+              >
+                {row.version}
+              </span>
+            ) : (
+              DASH
+            )}
             {row.versionNote && <span className="sub">{row.versionNote}</span>}
           </div>
         ) : (
@@ -125,6 +144,12 @@ function StateCell({ state }: { state: ServiceState }) {
       return <span className="hint">{state.text}</span>;
     case "not_found":
       return <Chip variant="warning">not found</Chip>;
+    case "reachable":
+      return (
+        <Chip variant="success" dot>
+          reachable
+        </Chip>
+      );
     default:
       return <Chip>unknown</Chip>;
   }

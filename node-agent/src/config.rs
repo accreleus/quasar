@@ -1,7 +1,7 @@
 use std::env;
 
 use crate::enrollment::{self, TransportPolicy};
-use quasar_runtime::owned_install::ENROLLMENT_FILE_ENV;
+use quasar_runtime::owned_install::{ENROLLMENT_FILE_ENV, ENROLLMENT_TOKEN_FILE_ENV};
 
 pub struct Config {
     /// WebSocket base URL of the control plane; `/agent/ws` is appended automatically.
@@ -50,7 +50,13 @@ impl Config {
         )?;
         let url = env::var("CONTROL_PLANE_URL").ok();
         let fingerprint = env::var("CONTROL_PLANE_FINGERPRINT").ok();
-        let token = normalize_enrollment_token(env::var("ENROLLMENT_TOKEN").ok());
+        let token = normalize_enrollment_token(value_or_file(
+            "ENROLLMENT_TOKEN",
+            ENROLLMENT_TOKEN_FILE_ENV,
+            env::var("ENROLLMENT_TOKEN").ok(),
+            env::var(ENROLLMENT_TOKEN_FILE_ENV).ok(),
+            |path| std::fs::read_to_string(path),
+        )?);
         let allow_plaintext =
             enrollment::is_truthy(env::var("QUASAR_ALLOW_PLAINTEXT_AGENT").ok().as_deref());
         let persisted_pin = std::fs::read_to_string(enrollment::pin_path(&node_secret_path)).ok();
@@ -109,15 +115,28 @@ fn enrollment_blob(
     file: Option<String>,
     read: impl Fn(&str) -> std::io::Result<String>,
 ) -> Result<Option<String>, String> {
+    value_or_file("QUASAR_ENROLLMENT", ENROLLMENT_FILE_ENV, value, file, read)
+}
+
+/// `value_name`'s value, or the contents of the file `file_name` names (its file twin, which
+/// a recovery actor delivers as a read-only secret). An unset file leaves the value exactly as
+/// it was; setting both is refused. An error never quotes the file's contents.
+fn value_or_file(
+    value_name: &str,
+    file_name: &str,
+    value: Option<String>,
+    file: Option<String>,
+    read: impl Fn(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, String> {
     let Some(path) = file.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()) else {
         return Ok(value);
     };
     if value.as_deref().is_some_and(|v| !v.trim().is_empty()) {
         return Err(format!(
-            "set QUASAR_ENROLLMENT or {ENROLLMENT_FILE_ENV}, not both: they name the same input"
+            "set {value_name} or {file_name}, not both: they name the same input"
         ));
     }
-    let contents = read(&path).map_err(|e| format!("{ENROLLMENT_FILE_ENV}={path}: {e}"))?;
+    let contents = read(&path).map_err(|e| format!("{file_name}={path}: {e}"))?;
     let contents = contents.trim().to_string();
     Ok((!contents.is_empty()).then_some(contents))
 }
@@ -160,7 +179,32 @@ pub(crate) fn detect_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{enrollment_blob, http_base_from_ws, normalize_enrollment_token};
+    use super::{enrollment_blob, http_base_from_ws, normalize_enrollment_token, value_or_file};
+
+    #[test]
+    fn the_enrollment_token_file_is_its_twin_and_never_both() {
+        let read = |p: &str| {
+            assert_eq!(p, "/run/quasar-secrets/local-enrollment");
+            Ok("tok-local\n".to_string())
+        };
+        let token = value_or_file(
+            "ENROLLMENT_TOKEN",
+            "ENROLLMENT_TOKEN_FILE",
+            None,
+            Some("/run/quasar-secrets/local-enrollment".into()),
+            read,
+        );
+        assert_eq!(token, Ok(Some("tok-local".into())));
+        let both = value_or_file(
+            "ENROLLMENT_TOKEN",
+            "ENROLLMENT_TOKEN_FILE",
+            Some("tok".into()),
+            Some("/f".into()),
+            |_| Ok("secret-in-file".into()),
+        )
+        .unwrap_err();
+        assert!(both.contains("ENROLLMENT_TOKEN_FILE") && !both.contains("secret-in-file"));
+    }
 
     const BLOB: &str = "qenr1..d3NzOi8vY3AuZXhhbXBsZS5pbnZhbGlkOjg0NDM.tok";
 

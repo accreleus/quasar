@@ -20,7 +20,7 @@ pub use fake::{
 };
 pub use quasar_runtime::platform::{
     ContainerSpec, EngineHost, PlatformContainer as Container, PlatformImage as Image,
-    PlatformVolume as Volume, RestartPolicy,
+    PlatformNetwork as Network, PlatformVolume as Volume, RestartPolicy,
 };
 pub use quasar_runtime::ErrorKind;
 
@@ -141,4 +141,14 @@ pub trait PlatformEngine: Send + Sync {
     ) -> Result<Volume, EngineError>;
     /// A missing volume is not an error.
     fn remove_volume(&self, name: &str) -> Result<(), EngineError>;
+    /// `Ok(None)`: no such network.
+    fn inspect_network(&self, name: &str) -> Result<Option<Network>, EngineError>;
+    /// A bridge network.
+    fn create_network(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Network, EngineError>;
+    /// A missing network is not an error.
+    fn remove_network(&self, name: &str) -> Result<(), EngineError>;
 }

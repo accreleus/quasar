@@ -135,6 +135,8 @@ struct Shape {
     device_cgroup_rules: BTreeSet<String>,
     restart: String,
     gpus_all: bool,
+    /// `host:container` published ports.
+    ports: BTreeSet<String>,
     keys: BTreeSet<String>,
 }
 
@@ -166,10 +168,14 @@ fn device_of(short: &str) -> String {
 
 /// Merge the service definitions as Compose does for `-f base -f overlay`.
 fn compose_shape(files: &[Value], env: &BTreeMap<&str, String>) -> Shape {
+    compose_service_shape(files, SERVICE, env)
+}
+
+fn compose_service_shape(files: &[Value], service: &str, env: &BTreeMap<&str, String>) -> Shape {
     let mut shape = Shape::default();
     let mut binds: BTreeMap<String, String> = BTreeMap::new();
     for doc in files {
-        let svc = &doc["services"][SERVICE];
+        let svc = &doc["services"][service];
         for (key, value) in svc.as_mapping().unwrap() {
             let key = key.as_str().unwrap();
             shape.keys.insert(key.to_owned());
@@ -207,7 +213,12 @@ fn compose_shape(files: &[Value], env: &BTreeMap<&str, String>) -> Shape {
                         }
                     }
                 }
-                "depends_on" => {}
+                "depends_on" | "healthcheck" => {}
+                "ports" => {
+                    for p in strings(value, env) {
+                        shape.ports.insert(p);
+                    }
+                }
                 other => panic!("the parity test does not understand Compose key {other:?}: teach it, or allowlist it"),
             }
         }
@@ -239,6 +250,11 @@ fn spec_shape(spec: &ContainerSpec) -> Shape {
         gpus_all: spec.gpus.len() == 1
             && spec.gpus[0].count == -1
             && spec.gpus[0].capabilities == vec![vec!["gpu".to_string()]],
+        ports: spec
+            .ports
+            .iter()
+            .map(|p| format!("{}:{}", p.host_port, p.container_port))
+            .collect(),
         keys: BTreeSet::new(),
     }
 }
@@ -266,6 +282,11 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             uinput: true,
             kmsg: true,
         },
+        control: None,
+        socket_dir: None,
+        trust: Default::default(),
+        enroll: Default::default(),
+        app: Default::default(),
     }
 }
 
@@ -349,10 +370,144 @@ fn differences(compose: &Shape, rendered: &Shape) -> BTreeSet<(String, String)> 
     for d in rendered.devices.difference(&compose.devices) {
         out.insert(("+device".into(), d.clone()));
     }
-    if compose.keys.contains("depends_on") {
-        out.insert(("-key".into(), "depends_on".into()));
+    for p in compose.ports.difference(&rendered.ports) {
+        out.insert(("-port".into(), p.clone()));
+    }
+    for p in rendered.ports.difference(&compose.ports) {
+        out.insert(("+port".into(), p.clone()));
+    }
+    for key in ["depends_on", "healthcheck"] {
+        if compose.keys.contains(key) {
+            out.insert(("-key".into(), key.into()));
+        }
     }
     out
+}
+
+const CONTROL_IMAGE: &str = "registry.example.invalid/quasar/quasar-control-plane@sha256:aa11000000000000000000000000000000000000000000000000000000000000";
+const NOT_ON_OWNED: &str = "empty unless an operator sets it in deploy/.env; an owned install takes no such input in this release, so the control plane's own default applies (docs/configuration.md \"Seed\")";
+
+/// `(kind, item, reason)` for the control plane, as `ALLOWED` for the agent.
+const ALLOWED_CONTROL_PLANE: &[(&str, &str, &str)] = &[
+    ("-env", "DATABASE_URL", "the database is named by its parts and the password is a file (D5): QUASAR_DATABASE_*"),
+    ("+env", "QUASAR_DATABASE_HOST", "the database by its parts, so the password can be a file"),
+    ("+env", "QUASAR_DATABASE_PORT", "the database by its parts"),
+    ("+env", "QUASAR_DATABASE_USER", "the database by its parts"),
+    ("+env", "QUASAR_DATABASE_NAME", "the database by its parts"),
+    ("+env", "QUASAR_DATABASE_SSLMODE", "the database by its parts"),
+    ("+env", "QUASAR_DATABASE_PASSWORD_FILE", "secrets reach containers only as read-only files (D5)"),
+    ("-env", "QUASAR_SECRET_KEY", "generated at install and delivered as a file (D5)"),
+    ("+env", "QUASAR_SECRET_KEY_FILE", "secrets reach containers only as read-only files (D5)"),
+    ("-env", "ENROLLMENT_TOKEN", "the static token retires (D10); the machine's own agent enrolls with the local token"),
+    ("+env", "QUASAR_LOCAL_ENROLLMENT_FILE", "the combined host's single-use local enrollment token, as a file"),
+    ("+env", "QUASAR_LOCAL_ENROLLMENT_NODE_NAME", "the node name the local token is bound to"),
+    ("+env", "QUASAR_MACHINE_ROLE", "the machine's shape, which the control plane serves as machine_role"),
+    ("+env", "QUASAR_MACHINE_NODE_NAME", "the machine's node name, served as machine_node_name"),
+    ("~env", "QUASAR_ENV: compose \"\", recipe \"production\"", "an owned control plane refuses the dev-only agent-auth mint at boot"),
+    ("+env", "QUASAR_RECOVERY_CONTROL_SOCKET", "the control socket: how the control plane reaches its machine's recovery actor (D6(a))"),
+    ("-bind", "quasar-updater-run:/run/quasar-updater", "the Go updater has no place on an owned machine: the recovery actor replaces it"),
+    ("+bind", "/var/lib/docker/volumes/quasar-recovery-agent/_data/control:/run/quasar-recovery:ro", "the control socket's directory, and nothing else of the socket volume"),
+    ("-bind", "quasar-control-tls:/var/lib/quasar-control", "the same state under the owned install's volume name"),
+    ("+bind", "quasar-control-data:/var/lib/quasar-control", "the control plane's TLS pair and artwork cache, a named volume that outlives every replacement"),
+    ("+bind", "quasar-control-plane-secrets:/run/quasar-secrets:ro", "the control plane's per-service secrets volume, read-only (D5)"),
+    ("-env", "QUASAR_WEB_ROOT", "the published control-plane image sets it (Dockerfile.control.prod)"),
+    ("-key", "depends_on", "Compose-only start ordering; the recovery actor waits for Postgres to be healthy instead"),
+    ("-key", "healthcheck", "the published control-plane image carries the same healthcheck (Dockerfile.control.prod)"),
+    ("-env", "BOOTSTRAP_ADMIN_EMAIL", "the first admin claims the instance with the per-boot setup token instead"),
+    ("-env", "BOOTSTRAP_ADMIN_USERNAME", "the first admin claims the instance with the per-boot setup token instead"),
+    ("-env", "BOOTSTRAP_ADMIN_PASSWORD", "the first admin claims the instance with the per-boot setup token instead"),
+];
+
+/// Compose knobs that are empty by default and that an owned install does not take
+/// (`NOT_ON_OWNED`).
+const COMPOSE_ONLY_KNOBS: &[&str] = &[
+    "QUASAR_TLS_CERT",
+    "QUASAR_TLS_KEY",
+    "QUASAR_STORAGE_PROVIDER",
+    "QUASAR_LIBRARY_PROVIDERS",
+    "QUASAR_PLACEMENT_POLICY",
+    "QUASAR_ICE_SERVERS",
+    "QUASAR_DEV_AGENT_AUTH",
+    "PUBLIC_BASE_URL",
+    "QUASAR_SECRET_KEY_PREVIOUS",
+    "QUASAR_STEAMGRIDDB_API_KEY",
+    "QUASAR_ARTWORK_PROVIDER",
+    "QUASAR_ARTWORK_DIR",
+    "QUASAR_ARTWORK_MAX_BYTES",
+    "QUASAR_ARTWORK_SWEEP_INTERVAL",
+    "QUASAR_PLATFORM_RELEASE_REPO",
+    "QUASAR_PLATFORM_RELEASE_API",
+    "QUASAR_PLATFORM_RELEASE_ASSET_HOSTS",
+    "QUASAR_PLATFORM_RELEASE_TOKEN",
+    "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL",
+    "QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET",
+    "QUASAR_PLATFORM_WEBHOOK_HOSTS",
+    "QUASAR_PLATFORM_REGISTRY",
+    "QUASAR_IMAGE_REGISTRY_HOSTS",
+];
+
+#[test]
+fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_differences() {
+    use quasar_recovery::recipe::{ControlInputs, DatabaseInputs};
+    let base = deploy("docker-compose.yml");
+    let mut inputs = inputs(Some(GpuVendor::Amd));
+    inputs.control = Some(ControlInputs {
+        machine_role: quasar_recovery::recipe::ControlRole::Combined,
+        trusted_proxies: None,
+        http_port: 8080,
+        tls_port: 8443,
+        public_host: Some("quasar.example.invalid".into()),
+        tls_hosts: None,
+        database: DatabaseInputs::Owned,
+    });
+    inputs.socket_dir = Some("/var/lib/docker/volumes/quasar-recovery-agent/_data".into());
+    let secrets = SecretMounts {
+        volume: Some(names::CONTROL_PLANE_SECRETS_VOLUME.into()),
+        files: BTreeSet::from([
+            secrets::DATABASE_PASSWORD.to_string(),
+            secrets::SECRET_KEY.to_string(),
+            secrets::LOCAL_ENROLLMENT.to_string(),
+        ]),
+    };
+    let dotenv = BTreeMap::from([
+        ("QUASAR_CONTROL_IMAGE", CONTROL_IMAGE.to_string()),
+        ("POSTGRES_PASSWORD", "from-the-env-file".to_string()),
+        ("ENROLLMENT_TOKEN", "static".to_string()),
+        ("QUASAR_PUBLIC_HOST", "quasar.example.invalid".to_string()),
+        ("QUASAR_HOME_ROOT", inputs.home_root.clone()),
+    ]);
+    let mut compose = compose_service_shape(&[base], "quasar-control-plane", &dotenv);
+    // Compose puts the service on its project network; the recipe's is quasar-platform.
+    compose.network_mode = compose
+        .network_mode
+        .or(Some(names::PLATFORM_NETWORK.into()));
+    let spec = render(
+        Role::ControlPlane,
+        1,
+        &inputs,
+        &ImageRef::parse(CONTROL_IMAGE).unwrap(),
+        &secrets,
+    )
+    .unwrap();
+    let rendered = spec_shape(&spec);
+    let found = differences(&compose, &rendered);
+    let mut allowed: BTreeSet<(String, String)> = ALLOWED_CONTROL_PLANE
+        .iter()
+        .map(|(k, i, _)| (k.to_string(), i.to_string()))
+        .collect();
+    for knob in COMPOSE_ONLY_KNOBS {
+        allowed.insert(("-env".into(), knob.to_string()));
+    }
+    let unexplained: Vec<_> = found.difference(&allowed).collect();
+    assert!(
+        unexplained.is_empty(),
+        "control-plane differences from Compose with no reason: {unexplained:#?} ({NOT_ON_OWNED})"
+    );
+    let stale: Vec<_> = allowed.iter().filter(|a| !found.contains(*a)).collect();
+    assert!(
+        stale.is_empty(),
+        "listed control-plane differences that no longer occur: {stale:?}"
+    );
 }
 
 #[test]

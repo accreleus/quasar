@@ -20,7 +20,7 @@ use quasar_recovery::actor::{
 };
 use quasar_recovery::engine::{
     Behaviour, Container, ContainerSpec, EngineError, EngineHost, FakeContainer, FakeEngine, Fault,
-    Image, Lifecycle, PlatformEngine, RestartPolicy, Volume, When,
+    Image, Lifecycle, Network, PlatformEngine, RestartPolicy, Volume, When,
 };
 use quasar_recovery::journal::Phase;
 use quasar_recovery::recipe::names;
@@ -184,6 +184,22 @@ impl PlatformEngine for ProcEngine {
     fn remove_volume(&self, name: &str) -> Result<(), EngineError> {
         self.gate()?;
         self.engine.remove_volume(name)
+    }
+    fn inspect_network(&self, name: &str) -> Result<Option<Network>, EngineError> {
+        self.gate()?;
+        self.engine.inspect_network(name)
+    }
+    fn create_network(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Network, EngineError> {
+        self.gate()?;
+        self.engine.create_network(name, labels)
+    }
+    fn remove_network(&self, name: &str) -> Result<(), EngineError> {
+        self.gate()?;
+        self.engine.remove_network(name)
     }
 }
 
@@ -407,10 +423,13 @@ impl Lab {
         };
         config.timing = fast();
         config.handover = *self.handover.lock().unwrap();
-        config.agent_socket = if self.no_socket.lock().unwrap().iter().any(|i| *i == image) {
-            self.sockets.path().join("missing").join("agent.sock")
+        config.socket_dir = if self.no_socket.lock().unwrap().iter().any(|i| *i == image) {
+            // A directory under a regular file: nothing can be bound there.
+            let file = self.sockets.path().join("not-a-directory");
+            std::fs::write(&file, b"").unwrap();
+            file
         } else {
-            self.socket()
+            self.sockets.path().to_owned()
         };
         let crashed = Arc::new(AtomicBool::new(false));
         let flag = crashed.clone();

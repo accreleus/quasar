@@ -7,7 +7,7 @@ import { Fragment, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { GPUAvailability, Host } from "../../../api/types";
+import type { GPUAvailability, Host, PlatformIdentity } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
 import { Modal } from "../../../components/Modal";
@@ -54,6 +54,16 @@ export function HostsTab() {
   const hosts = fleet.hosts;
   const hostIds = hosts.map((h) => h.id);
   const gpuKey = hostIds.join(",");
+  // Which row shares the control plane's machine; a failed read names none.
+  const identityRes = useResource<PlatformIdentity | null>({
+    label: "control-plane identity",
+    fetch: ({ token, signal }) =>
+      adminApi.getPlatformIdentity(token, signal).then(
+        (r) => r.identity,
+        () => null,
+      ),
+  });
+  const controlPlane = identityRes.data ?? null;
   const gpuRes = useResource<GpuMap>(
     {
       label: "host-gpus",
@@ -285,6 +295,7 @@ export function HostsTab() {
                       }}
                       actionPending={actionPendingId === host.id}
                       actionError={actionErrors[host.id]}
+                      controlPlane={controlPlane}
                       now={now}
                     />
                   ))}

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::{
-    Container, ContainerSpec, EngineError, EngineHost, ErrorKind, Image, PlatformEngine,
+    Container, ContainerSpec, EngineError, EngineHost, ErrorKind, Image, Network, PlatformEngine,
     RestartPolicy, Volume,
 };
 
@@ -58,6 +58,8 @@ pub struct FakeVolume {
     pub labels: BTreeMap<String, String>,
     /// Path inside the volume → (content, mode).
     pub files: BTreeMap<String, (Vec<u8>, u32)>,
+    /// `None` is the `local` driver.
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -69,6 +71,8 @@ pub struct FakeState {
     /// By id.
     pub containers: BTreeMap<String, FakeContainer>,
     pub volumes: BTreeMap<String, FakeVolume>,
+    /// User-defined networks and their labels.
+    pub networks: BTreeMap<String, BTreeMap<String, String>>,
     pub host: EngineHost,
     /// Device nodes the host has; creating a container naming another fails.
     pub host_devices: BTreeSet<String>,
@@ -244,6 +248,11 @@ impl FakeEngine {
     }
 }
 
+/// Where the `local` driver keeps a volume's data on the engine host.
+pub fn mountpoint(volume: &str) -> String {
+    format!("/var/lib/docker/volumes/{volume}/_data")
+}
+
 fn engine(kind: ErrorKind) -> EngineError {
     EngineError::Runtime(kind)
 }
@@ -373,6 +382,13 @@ impl PlatformEngine for FakeEngine {
                     500,
                     &format!("error gathering device information while adding custom device \"{}\": no such file or directory", d.host),
                 ));
+            }
+            if let Some(network) = spec.network_mode.as_deref() {
+                let builtin = matches!(network, "host" | "none" | "bridge" | "default")
+                    || network.starts_with("container:");
+                if !builtin && !s.networks.contains_key(network) {
+                    return Err(refused(404, &format!("network {network} not found")));
+                }
             }
             // The engine creates a named volume a bind names but nobody created.
             for bind in spec.binds.iter().filter(|b| b.is_volume()) {
@@ -545,6 +561,8 @@ impl PlatformEngine for FakeEngine {
             Ok(s.volumes.get(name).map(|v| Volume {
                 name: name.into(),
                 labels: v.labels.clone(),
+                mountpoint: Some(mountpoint(name)),
+                driver: v.driver.clone().unwrap_or_else(|| "local".into()),
             }))
         })
     }
@@ -558,11 +576,57 @@ impl PlatformEngine for FakeEngine {
             let v = s.volumes.entry(name.into()).or_insert_with(|| FakeVolume {
                 labels: labels.clone(),
                 files: BTreeMap::new(),
+                driver: None,
             });
             Ok(Volume {
                 name: name.into(),
                 labels: v.labels.clone(),
+                mountpoint: Some(mountpoint(name)),
+                driver: v.driver.clone().unwrap_or_else(|| "local".into()),
             })
+        })
+    }
+
+    fn inspect_network(&self, name: &str) -> Result<Option<Network>, EngineError> {
+        self.call(|s, _ev| {
+            Ok(s.networks.get(name).map(|labels| Network {
+                name: name.into(),
+                labels: labels.clone(),
+            }))
+        })
+    }
+
+    fn create_network(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Network, EngineError> {
+        self.call(|s, _ev| {
+            if s.networks.contains_key(name) {
+                return Err(refused(
+                    409,
+                    &format!("network with name {name} already exists"),
+                ));
+            }
+            s.networks.insert(name.into(), labels.clone());
+            Ok(Network {
+                name: name.into(),
+                labels: labels.clone(),
+            })
+        })
+    }
+
+    fn remove_network(&self, name: &str) -> Result<(), EngineError> {
+        self.call(|s, _ev| {
+            let in_use = s
+                .containers
+                .values()
+                .any(|c| c.spec.network_mode.as_deref() == Some(name));
+            if in_use {
+                return Err(engine(ErrorKind::Busy));
+            }
+            s.networks.remove(name);
+            Ok(())
         })
     }
 

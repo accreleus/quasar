@@ -5,10 +5,16 @@ description: The settings a self-hoster is likely to touch, grouped by what they
 
 import { Aside } from '@astrojs/starlight/components';
 
-Deployment and process settings are supplied through environment variables in
-`deploy/.env`. Instance settings and many host settings are persisted and
-editable through the admin UI; where both exist, the table notes whether the
-environment is a seed, fallback, or authoritative override.
+On a Quasar-owned machine you write only the **seed inputs** below, in the seed's
+`docker run` line or stack. The recovery actor renders every service's settings
+from them and keeps the result in the machine's own state. On a [legacy Compose
+install](/quasar/install/legacy-compose/) or a source checkout, deployment and
+process settings are environment variables in `deploy/.env`. Instance settings
+and many host settings are persisted and editable through the admin UI; where
+both exist, the table notes whether the environment is a seed, fallback, or
+authoritative override.
+
+{/* TODO(open, raise on #361): most control-plane variables on this page (TLS names or own certificate, trusted proxies, the allowed-origins override, placement policy, release repository and token, bootstrap admin, registration mode) have no place on an owned machine in the RH-06 design. Say for each where it is set once #361 decides. */}
 
 Many node agent settings can also be overridden per host from Admin, Fleet, Hosts,
 Settings, which is easier than editing a file on every machine.
@@ -20,12 +26,44 @@ The full catalogue including debug and development settings lives in
 internal or something you should not change without a measurement.
 </Aside>
 
-## Required
+## Seed inputs
+
+What the seed and the recovery actor read, **once**, on a clean machine. After
+the first install the machine's own state wins and later values are ignored, so
+the enrollment string can be removed from the stack. See [Install
+Quasar](/quasar/install/install/).
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_ROLE` | `gpu` | The machine's role: `gpu`, `combined` or `control-only`. |
+| `QUASAR_ENROLLMENT` | required on a GPU host | The single-use `qenr1.…` string from Admin, Fleet, Hosts, Add host. Stored as a secret file and handed to the agent as a file, never as an environment variable. |
+| `QUASAR_HOME_ROOT` | required | Host path of the home root, bound into the agent at the same path. |
+| `QUASAR_TEMPLATE_ROOT` | `/var/lib/quasar/templates` | Host path of the template root. Set it explicitly, as the home root's sibling. |
+| `QUASAR_NODE_NAME` | the machine's host name | The agent's node name. A node name bound into the enrollment string must match. |
+| `QUASAR_AGENT_IMAGE` | required on a machine with an agent | The node-agent image as `repository@sha256:<digest>`. A tag is refused, and so is an image whose container shape this recovery actor does not carry. |
+
+{/* TODO(#361): combined and control-only are refused by the current build; add the inputs #361 fixes (public host, control-plane and Postgres image selection, ports, external-database settings) and whether a control-only machine takes QUASAR_HOME_ROOT and QUASAR_AGENT_IMAGE. */}
+
+The seed itself also needs two mounts, not variables: the engine socket, and the
+`quasar-machine` volume read-only at `/var/lib/quasar-machine`.
+
+### The recovery actor's trust settings
+
+The recovery actor pulls platform images only from the allowed registry
+namespaces (by default `ghcr.io/accreleus/quasar`), and can check release
+signatures in `verify` or `require` mode against trusted keys, with the same
+rules as the legacy updater below. On a seed install these are first-install
+inputs, like the rest of this table: set them on the seed before the first
+install. Afterwards the machine's own state wins.
+
+{/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
+{/* TODO(#366): how reconfigure changes them later. */}
+
+## Required on a legacy Compose install
 
 | Variable | Notes |
 | --- | --- |
 | `DATABASE_URL` | Postgres connection string. |
-| `ENROLLMENT_TOKEN` | Shared secret agents present on first contact. Must match on control plane and every agent. |
 | `CONTROL_PLANE_URL` | Agent side. WebSocket URL of the control plane. |
 | `POSTGRES_PASSWORD` | Compose. Generated on a fresh install. |
 
@@ -33,9 +71,12 @@ The release install has you generate these values before first boot. The
 source-build `redeploy.sh` path generates missing secrets and never overwrites
 existing ones.
 
-`CONTROL_PLANE_URL` and `ENROLLMENT_TOKEN` can also be supplied together as
-one paste: mint `QUASAR_ENROLLMENT` from Admin, Fleet, Enroll host on an
-existing host and set only that on the new one. See below.
+`ENROLLMENT_TOKEN` is **optional**. It is the older static, deployment-wide
+enrollment secret, and if you set it, it must match on the control plane and
+every agent that uses it. The console path does not need it: mint a
+single-use `QUASAR_ENROLLMENT` string from Admin, Fleet, Hosts, Add host and set only
+that on the new host. The string carries the control-plane address too. See
+below.
 
 ## Setup and identity
 
@@ -47,7 +88,7 @@ existing host and set only that on the new one. See below.
 | `REGISTRATION_MODE` | `closed` | Seeds the registration mode on first boot of a fresh database only. The admin UI is authoritative afterwards. |
 | `PUBLIC_BASE_URL` | unset | Canonical public URL for invite links and proxied signaling. Set it when a proxy rewrites `Host`; otherwise the public host can be derived from forwarded or request headers. |
 | `NODE_NAME` | hostname | Agent side. A stable identity for this host. |
-| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Enroll host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use hour-long token, together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it. |
+| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Hosts, Add host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use token that expires after an hour by default (up to 30 days if the admin chose longer), together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it. |
 
 ## Secrets
 
@@ -158,7 +199,10 @@ value that used to be hardcoded. Do not change them without a measurement.
 
 ## Updates and releases
 
-The updater service, on every host that has one:
+On a [legacy Compose install](/quasar/install/legacy-compose/), the updater
+service, on every host that has one:
+
+{/* TODO(#367): the updater and these rows retire with #367. */}
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
