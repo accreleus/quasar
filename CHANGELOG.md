@@ -25,6 +25,25 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Format-2 releases with a floor, and hosts that must update first (#365).** Releases now
+  publish `platform-release-manifest.v2.json` (control plane, node agent and recovery actor
+  by digest, plus the oldest agent and recovery actor this release still manages) and no
+  longer the format-1 asset, so a control plane from before owned installs never offers
+  one; the images workflow builds and promotes the recovery image with the other two, and
+  branch builds are tagged `o2-<branch>` so old edge installs are not offered them either.
+  A release is refused at publication when its recovery actor cannot render its images'
+  recipes, does not reach back to the floor, or when the floor lies above the previous
+  release. A host whose agent or recovery actor is below the floor reads "must update
+  before it can be managed" on its page, in Fleet ▸ Hosts and in Releases' targets, and is
+  offered only the update: revert and developer apply of a release below the floor are
+  refused. Add host now installs the installed release's own seed and agent images, with
+  `QUASAR_ENROLL_SEED_IMAGE` / `QUASAR_ENROLL_AGENT_IMAGE` as overrides and an owned
+  machine's install-time images as the last resort (`QUASAR_ENROLL_FALLBACK_*`,
+  control-plane recipe revision 2). The recovery actor verifies release signatures
+  against the format-2 asset pair, the release-time check also refuses a release the
+  previous release's recovery actor could not hand over to, and an edge build moves an
+  owned host's recovery actor too. Nothing is published until the Compose updater
+  retires (#367).
 - **Race guard, remove host, `uninstall` and `reconfigure` (#366).** A container that looks
   like a Quasar platform service but was not created by the machine's installation (a
   leftover Compose stack, a definition a manager still holds) is never acted on: the recovery

@@ -50,6 +50,8 @@ type ReleaseAssetSource struct {
 	BaseURL string
 	Client  *http.Client
 	Timeout time.Duration
+	// Assets is the pair to fetch; the zero value is the updater's FormatOneAssets.
+	Assets ReleaseAssets
 }
 
 // Evidence answers "is this release signed, and with what". It never returns an
@@ -77,29 +79,34 @@ func (s ReleaseAssetSource) Evidence(ctx context.Context, version *string) Signa
 	defer cancel()
 
 	base := strings.ReplaceAll(s.BaseURL, "{version}", v)
+	assets := s.Assets
+	if assets == (ReleaseAssets{}) {
+		assets = FormatOneAssets
+	}
+	sigName, manifestName := assets.Signature, assets.Manifest
 
 	// The signature decides absence and so is fetched first: a release with no
 	// signature asset is unsigned, whatever its manifest says.
-	sig, status, err := s.get(ctx, base+SignatureAssetName)
+	sig, status, err := s.get(ctx, base+sigName)
 	switch {
 	case err != nil:
-		return SignatureEvidence{FetchError: fmt.Sprintf("fetching %s: %v", base+SignatureAssetName, err)}
+		return SignatureEvidence{FetchError: fmt.Sprintf("fetching %s: %v", base+sigName, err)}
 	case status == http.StatusNotFound:
 		return SignatureEvidence{Absent: true,
-			Why: fmt.Sprintf("release %s publishes no %s asset", v, SignatureAssetName)}
+			Why: fmt.Sprintf("release %s publishes no %s asset", v, sigName)}
 	case status != http.StatusOK:
-		return SignatureEvidence{FetchError: fmt.Sprintf("%s answered HTTP %d", base+SignatureAssetName, status)}
+		return SignatureEvidence{FetchError: fmt.Sprintf("%s answered HTTP %d", base+sigName, status)}
 	}
 
-	manifest, status, err := s.get(ctx, base+ManifestAssetName)
+	manifest, status, err := s.get(ctx, base+manifestName)
 	switch {
 	case err != nil:
-		return SignatureEvidence{FetchError: fmt.Sprintf("fetching %s: %v", base+ManifestAssetName, err)}
+		return SignatureEvidence{FetchError: fmt.Sprintf("fetching %s: %v", base+manifestName, err)}
 	case status != http.StatusOK:
 		// A signature with no manifest beside it is a broken publish, never an
 		// unsigned release: absence was ruled out above.
 		return SignatureEvidence{FetchError: fmt.Sprintf(
-			"release %s publishes a signature but %s answered HTTP %d", v, base+ManifestAssetName, status)}
+			"release %s publishes a signature but %s answered HTTP %d", v, base+manifestName, status)}
 	}
 
 	return SignatureEvidence{Manifest: manifest, Signature: sig}

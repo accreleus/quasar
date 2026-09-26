@@ -171,6 +171,15 @@ func evidenceFromGo(ev SignatureEvidence) evidenceSpec {
 type fetchSpec struct {
 	BaseURL   string                   `json:"base_url"`
 	Responses map[string]assetResponse `json:"responses"`
+	// AssetFormat 2 is the recovery actor's format-2 pair; absent is the updater's.
+	AssetFormat int `json:"asset_format,omitempty"`
+}
+
+func (f fetchSpec) assets() ReleaseAssets {
+	if f.AssetFormat == 2 {
+		return FormatTwoAssets
+	}
+	return FormatOneAssets
 }
 
 type assetResponse struct {
@@ -359,7 +368,7 @@ func vectorSource(t *testing.T, f fetchSpec) (ReleaseAssetSource, func() []strin
 	srv.Config.SetKeepAlivesEnabled(false)
 	srv.Start()
 	t.Cleanup(srv.Close)
-	src := ReleaseAssetSource{BaseURL: srv.URL + strings.TrimPrefix(f.BaseURL, vectorOrigin)}
+	src := ReleaseAssetSource{BaseURL: srv.URL + strings.TrimPrefix(f.BaseURL, vectorOrigin), Assets: f.assets()}
 	urls := func() []string {
 		mu.Lock()
 		defer mu.Unlock()

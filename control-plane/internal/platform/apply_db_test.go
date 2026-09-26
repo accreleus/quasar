@@ -128,6 +128,7 @@ func newApplyHarness(t *testing.T, opts ...func(*applyHarness, *ApplyHandler)) *
 			Channel:      h.channel,
 			EdgeBranch:   "develop",
 			ControlPlane: cp(commitB, buildinfo.Get().SchemaVersion),
+			Floor:        buildinfo.DeclaredFloor(),
 			Hosts:        hosts,
 			Releases:     releases,
 			OpenAttempts: open,

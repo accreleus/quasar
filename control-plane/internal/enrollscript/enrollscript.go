@@ -8,6 +8,7 @@ package enrollscript
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -47,6 +48,21 @@ func ValidTrustValue(v string) bool {
 	}
 	return true
 }
+
+// Or is p with each unset pin taken from d: the configured values are overrides of
+// the installed release's images, field by field.
+func (p Pins) Or(d Pins) Pins {
+	if p.SeedImage == "" {
+		p.SeedImage = d.SeedImage
+	}
+	if p.AgentImage == "" {
+		p.AgentImage = d.AgentImage
+	}
+	return p
+}
+
+// PinSource answers the pins for one request.
+type PinSource func(ctx context.Context) Pins
 
 // The same rule as the recovery actor's ImageRef::parse, restricted to characters that
 // are safe inside single quotes in a shell script.
@@ -98,9 +114,15 @@ func Render(script []byte, pins Pins) ([]byte, error) {
 	return bytes.Join(lines, []byte("\n")), nil
 }
 
-// Handler serves webRoot/enroll-host.sh rendered with pins. The file is read on every
-// request: the web root may be rebuilt under a running control plane.
+// Handler serves webRoot/enroll-host.sh rendered with fixed pins.
 func Handler(webRoot string, pins Pins, log *slog.Logger) http.Handler {
+	return HandlerFrom(webRoot, func(context.Context) Pins { return pins }, log)
+}
+
+// HandlerFrom serves webRoot/enroll-host.sh rendered with the pins pinsFor answers
+// for each request. The file is read on every request: the web root may be rebuilt under
+// a running control plane.
+func HandlerFrom(webRoot string, pinsFor PinSource, log *slog.Logger) http.Handler {
 	path := filepath.Join(webRoot, "enroll-host.sh")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -113,7 +135,7 @@ func Handler(webRoot string, pins Pins, log *slog.Logger) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		body, err := Render(src, pins)
+		body, err := Render(src, pinsFor(r.Context()))
 		if err != nil {
 			log.Error("enroll-host.sh cannot be served", "error", err)
 			http.Error(w, "enroll-host.sh in the web root cannot be rendered: "+err.Error(), http.StatusInternalServerError)

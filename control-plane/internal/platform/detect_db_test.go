@@ -83,8 +83,8 @@ func manifestFor(version, commit string, schema int, built string) string {
 func twoReleaseSource() *fakeSource {
 	return &fakeSource{
 		listings: []Listing{
-			{Tag: "v0.2.0", Version: "0.2.0", Body: "notes for 0.2.0", ManifestURL: "u/0.2.0"},
-			{Tag: "v0.3.0", Version: "0.3.0", Body: "notes for 0.3.0", ManifestURL: "u/0.3.0"},
+			{Tag: "v0.2.0", Version: "0.2.0", Body: "notes for 0.2.0", ManifestURL: "u/0.2.0", ManifestFormat: ManifestFormat1},
+			{Tag: "v0.3.0", Version: "0.3.0", Body: "notes for 0.3.0", ManifestURL: "u/0.3.0", ManifestFormat: ManifestFormat1},
 		},
 		manifests: map[string]string{
 			"u/0.2.0": manifestFor("0.2.0", commitA, 73, "2026-09-01T12:00:00Z"),
