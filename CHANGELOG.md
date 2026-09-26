@@ -459,6 +459,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A recovery actor successor is verified only by the node agent (#362).** On a GPU host the
+  successor's own image healthcheck counted as the node agent reaching it, so a successor
+  verified with no agent running. Only the agent relay's poll of the attempt's status counts
+  now, and the actor's own `status` requests say they are its own. A failed attempt's output
+  also embeds the failed container's log lines without terminal colour codes.
 - **The one-line Add host command, after its first live run (#359).** A spent-token reset
   also removes the unlabelled `quasar-recovery-agent` volume unless a container still mounts
   it, and then says what it left instead of "nothing was left". `--fix-only` prepares a host

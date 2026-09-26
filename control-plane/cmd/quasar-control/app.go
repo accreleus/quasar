@@ -1078,6 +1078,13 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	if cfg.RecoveryControlSocket != "" {
 		selfExecutor = platform.NewActorClient(cfg.RecoveryControlSocket)
 	}
+	// Two facts say "owned": the socket picks the executor, the machine shape
+	// the fleet run's owned rules. The recovery actor's recipe sets both; one
+	// without the other is a hand-edited configuration.
+	if owned, shaped := cfg.RecoveryControlSocket != "", applyMachineShape(cfg).Role != ""; owned != shaped {
+		log.Warn("owned-install configuration is half set: the control socket and the machine shape disagree",
+			"token", "owned-install-config-mismatch", "control_socket_set", owned, "machine_shape_set", shaped)
+	}
 	selfApplier := platform.NewSelfApplier(platformStore, selfExecutor, log)
 	selfApplier.DeveloperCommit = developerImages.Commit
 	// The control plane's own machine on an owned install; nil otherwise, and
@@ -1178,6 +1185,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// into scheduling mid-update. Here, nothing is active in the database, no run
 	// has been started by this process, and the API is not serving yet.
 	fleetRunner.ResumeCordonRestores(context.Background())
+	// The three adopters partition the open attempts: applyRunner every host
+	// attempt, fleetRunner a run's control-plane attempt (run_id set), and
+	// selfDeveloper a standalone control-plane attempt (run_id NULL).
 	fleetRunner.Adopt(context.Background())
 	selfDeveloper.Adopt(context.Background())
 

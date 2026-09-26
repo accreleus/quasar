@@ -122,7 +122,8 @@ func ValidateDeveloperApply(req DeveloperApplyRequest) ([]ComponentDigest, error
 		}
 	}
 	// A1: the actor may lead the control plane only while a control-plane
-	// replacement is in flight, so never on its own against that machine.
+	// replacement is in flight, so never on its own against that machine. To move
+	// only the actor, name the control plane's current digest beside it.
 	if req.Target == TargetControlPlane && seen[ComponentRecovery] && !seen[ComponentControlPlane] {
 		return nil, errors.New("a control_plane target names recovery-actor only together with control-plane")
 	}

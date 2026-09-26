@@ -68,15 +68,21 @@ export function FleetApplyButton({
   const blocked = controlPlaneBlocker(view.targets);
   const cp = view.targets.find((t) => t.kind === "control_plane");
   const blockingCheck = cp && blocked === "preflight_blocked" ? blockingChecks(cp)[0] : undefined;
+  // An owned control plane cannot take a migration yet (its pre-update dump is
+  // #364's): the run would stop before anything moved (apply_fleet.go).
+  const ownedMigrating =
+    cp?.eligible === true && view.installed.control_plane.machine_role != null && newest.migrates === true;
   const title = blockingCheck
     ? `${preflightCheckText(blockingCheck.id)}: ${blockingCheck.detail}`
     : blocked
       ? eligibilityText(blocked)
-      : undefined;
+      : ownedMigrating
+        ? "This release changes the database, which a Quasar-owned control plane cannot take in this version yet."
+        : undefined;
 
   return (
     <>
-      <Button onClick={() => setConfirming(true)} disabled={blocked != null} title={title}>
+      <Button onClick={() => setConfirming(true)} disabled={blocked != null || ownedMigrating} title={title}>
         {children ?? "Update Quasar"}
       </Button>
       {confirming && (

@@ -439,7 +439,9 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 		if !f.adoptCordons(ctx, run.ID) {
 			return false
 		}
-		if !f.self.Adopt(ctx, *cp, f.releaseCommit(ctx, run.ReleaseID)) {
+		// Never re-driven while shutting down: that would fail a row whose
+		// verdict the next boot reads.
+		if !f.self.Adopt(ctx, *cp, f.releaseCommit(ctx, run.ReleaseID)) && ctx.Err() == nil {
 			if f.prepareFleet(ctx, run, *cp) {
 				f.self.Apply(ctx, *cp) // never sent; re-drive it
 			}
