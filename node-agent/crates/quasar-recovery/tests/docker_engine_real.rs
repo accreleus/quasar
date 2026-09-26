@@ -364,6 +364,142 @@ fn the_gpus_probe_gets_a_definite_answer_from_a_real_engine() {
         .is_none());
 }
 
+/// Quasar's own Postgres, as its recipe renders it, becomes healthy with its password file
+/// root:root 0400, as the actor delivers it: the image's entrypoint reads the file as root.
+/// The image defaults to `recipe::control::DEFAULT_POSTGRES_IMAGE`, pulled if absent.
+#[test]
+#[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET; pulls the default Postgres image unless QUASAR_TEST_POSTGRES_IMAGE names a local one; creates and removes only uniquely named assets"]
+fn postgres_starts_healthy_with_a_root_only_password_file() {
+    use quasar_recovery::recipe::{
+        control, names, paths, render, secrets, ControlInputs, ControlRole, DatabaseInputs,
+        GpuFacts, HostDevices, Inputs, Role, SecretMounts,
+    };
+    let engine = engine();
+    let image = std::env::var("QUASAR_TEST_POSTGRES_IMAGE")
+        .unwrap_or_else(|_| control::DEFAULT_POSTGRES_IMAGE.to_string());
+    if engine.inspect_image(&image).unwrap().is_none() {
+        engine.pull(&image).unwrap();
+    }
+    let pinned = match ImageRef::parse(&image) {
+        Ok(r) => r,
+        Err(_) => ImageRef::parse(&engine.inspect_image(&image).unwrap().unwrap().repo_digests[0])
+            .unwrap(),
+    };
+    let (network, secrets_vol, data_vol) = (unique("pgnet"), unique("pgsecrets"), unique("pgdata"));
+    let (writer, pg) = (unique("pgwriter"), unique("postgres"));
+    let _cleanup = Cleanup {
+        engine: engine.clone(),
+        containers: vec![writer.clone(), pg.clone()],
+        volumes: vec![secrets_vol.clone(), data_vol.clone()],
+    };
+    struct NetworkCleanup(Arc<DockerEngine>, String);
+    impl Drop for NetworkCleanup {
+        fn drop(&mut self) {
+            let _ = self.0.remove_network(&self.1);
+        }
+    }
+    engine.create_network(&network, &BTreeMap::new()).unwrap();
+    let _net = NetworkCleanup(engine.clone(), network.clone());
+    engine
+        .create_volume(&secrets_vol, &BTreeMap::new())
+        .unwrap();
+    engine.create_volume(&data_vol, &BTreeMap::new()).unwrap();
+
+    // Delivered as the actor does: a never-started container, an archive, root:root 0400.
+    let w = engine
+        .create_container(&spec(
+            &writer,
+            &pinned.reference(),
+            "true",
+            vec![Bind {
+                source: secrets_vol.clone(),
+                target: paths::SECRETS_DIR.into(),
+                read_only: false,
+            }],
+        ))
+        .unwrap();
+    let password = "a-root-only-password";
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(password.len() as u64);
+    header.set_mode(0o400);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_entry_type(tar::EntryType::Regular);
+    tar.append_data(&mut header, secrets::DATABASE_PASSWORD, password.as_bytes())
+        .unwrap();
+    engine
+        .upload_archive(&w, paths::SECRETS_DIR, tar.into_inner().unwrap())
+        .unwrap();
+    engine.remove_container(&w).unwrap();
+
+    let inputs = Inputs {
+        installation_id: "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89".into(),
+        node_name: "control-host".into(),
+        home_root: String::new(),
+        template_root: "/var/lib/quasar/templates".into(),
+        docker_socket: "/var/run/docker.sock".into(),
+        gpu: GpuFacts {
+            vendor: None,
+            render_node: None,
+            gpus_served: false,
+            fallback: None,
+        },
+        devices: HostDevices {
+            dri: false,
+            uinput: false,
+            kmsg: false,
+        },
+        control: Some(ControlInputs {
+            machine_role: ControlRole::ControlOnly,
+            trusted_proxies: None,
+            http_port: 8080,
+            tls_port: 8443,
+            public_host: None,
+            tls_hosts: None,
+            database: DatabaseInputs::Owned,
+        }),
+        socket_dir: Some("/var/lib/docker/volumes/quasar-recovery-agent/_data".into()),
+        trust: Default::default(),
+        enroll: Default::default(),
+        app: Default::default(),
+    };
+    let mounts = SecretMounts {
+        volume: Some(secrets_vol.clone()),
+        files: std::collections::BTreeSet::from([secrets::DATABASE_PASSWORD.to_string()]),
+    };
+    let mut s = render(Role::Postgres, 1, &inputs, &pinned, &mounts).unwrap();
+    s.name = pg.clone();
+    s.network_mode = Some(network.clone());
+    s.restart = RestartPolicy::No;
+    for b in &mut s.binds {
+        if b.source == names::POSTGRES_DATA_VOLUME {
+            b.source = data_vol.clone();
+        }
+    }
+    assert!(s
+        .binds
+        .iter()
+        .any(|b| b.source == secrets_vol && b.read_only));
+    let id = engine.create_container(&s).unwrap();
+    engine.start_container(&id).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let c = engine.inspect_container(&id).unwrap().unwrap();
+        if c.health.as_deref() == Some("healthy") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline && c.status == "running",
+            "Postgres never became healthy ({c:?}):\n{}",
+            engine.logs_tail(&id, 50).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let logs = engine.logs_tail(&id, 200).unwrap();
+    assert!(!logs.contains("Permission denied"), "{logs}");
+}
+
 #[test]
 #[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET and QUASAR_TEST_RECOVERY_PULL (a digest reference the engine can pull)"]
 fn a_pull_by_digest_makes_the_image_inspectable() {

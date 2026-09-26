@@ -1138,7 +1138,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	if ownMachine != nil {
 		platformApply.WithOwnMachine(ownMachine)
 	}
-	platformApply.WithMachineShape(machineShape(cfg))
+	platformApply.WithMachineShape(applyMachineShape(cfg))
 	// Closed after construction: the view reports the active run, and the run's
 	// skips live on the sequencer the apply handler owns.
 	pDeps.ActiveRun = platformApply.ActiveRun
@@ -1391,15 +1391,19 @@ func (s *Services) Stop() {
 	s.coordinator.Close()
 }
 
-// machineShape is this control plane's own machine shape. A combined host's
-// agent is also known by the local enrollment token's node name, which only a
-// combined host's recovery actor sets.
+// machineShape is this control plane's own machine shape, as served in the
+// platform identity: only what the recipe configured (null otherwise, per
+// control-api.md "The control plane's own machine").
 func machineShape(cfg *config.Config) platform.MachineShape {
-	if cfg.MachineRole != "" {
-		return platform.MachineShape{Role: cfg.MachineRole, NodeName: cfg.MachineNodeName}
-	}
-	if cfg.LocalEnrollmentNodeName != "" {
+	return platform.MachineShape{Role: cfg.MachineRole, NodeName: cfg.MachineNodeName}
+}
+
+// applyMachineShape is the shape the developer-apply check fails closed on. It
+// also takes the local enrollment token's node name as a combined host's, so a
+// control plane given that token without the shape variables still refuses.
+func applyMachineShape(cfg *config.Config) platform.MachineShape {
+	if cfg.MachineRole == "" && cfg.LocalEnrollmentNodeName != "" {
 		return platform.MachineShape{Role: platform.MachineRoleCombined, NodeName: cfg.LocalEnrollmentNodeName}
 	}
-	return platform.MachineShape{}
+	return machineShape(cfg)
 }

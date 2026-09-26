@@ -17,13 +17,13 @@ use crate::recipe::{
 };
 use crate::socket::MachineRole;
 
-/// Postgres reads its password file as its own user (uid 70 in the alpine image, 999 in
-/// the Debian one) after the entrypoint drops root, so the file must be readable by any
-/// uid. The volume is mounted into that one container only.
+/// The postgres image's entrypoint reads `POSTGRES_PASSWORD_FILE` as root, before it drops
+/// to the postgres user, so root-only suffices; never widen it (the volume's host path may
+/// be traversable by host users). Guarded by `postgres_starts_healthy_with_a_root_only_password_file`.
 const POSTGRES_FILES: FileOwner = FileOwner {
     uid: 0,
     gid: 0,
-    mode: 0o444,
+    mode: 0o400,
 };
 
 const CONTROL_PLANE_FILES: FileOwner = FileOwner {

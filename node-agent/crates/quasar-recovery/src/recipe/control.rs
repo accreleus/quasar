@@ -137,9 +137,10 @@ pub fn trusted_proxies(raw: &str) -> Result<(), RenderError> {
         })?;
         if let Some(p) = prefix {
             let bits = if ip.is_ipv4() { 32 } else { 128 };
-            let n: u32 = p
-                .parse()
-                .ok()
+            // Digits only, as Go's net.ParseCIDR: u32's parser also takes a leading '+'.
+            let n: u32 = Some(p)
+                .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse().ok())
                 .filter(|n| *n <= bits)
                 .ok_or_else(|| bad("the prefix length is not valid for this address"))?;
             if n == 0 {

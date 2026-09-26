@@ -1389,13 +1389,21 @@ lies between. Use `require` (encrypted), or `verify-full` when the server's cert
 signed by a CA the control plane's image trusts; keep `disable` only for a database on the
 same host or a network you trust.
 
+Once the machine is installed, machine state holds the password and wins over the stack, so
+`QUASAR_DATABASE_PASSWORD` can be removed from the stack and its `.env` (changing it there
+changes nothing; `reconfigure`, #366, changes it).
+
 What the recovery actor then does, in order, each step decided by what already exists (a
 second start changes nothing; an interrupted install completes on the next start):
 
 1. Machine state: the inputs in `machine.json`; the database password (generated, 64 hex,
    or yours), `QUASAR_SECRET_KEY` (32 random bytes) and, on a combined host, a single-use
    **local enrollment token**, each a 0600 file under `secrets/`. Nothing here is ever an
-   environment value of any container.
+   environment value of any container. Each reaches its container as a file owned by the
+   uid that reads it, mode 0400 (root for Postgres, 1000 for the control plane), and the
+   control plane trims trailing whitespace (spaces, tabs, line ends) from what it reads.
+   Known limit: on Docker older than 20.10, `/var/lib/docker` is traversable, so a host
+   user whose uid is 1000 can read the control plane's secret files in its volume.
 2. The `quasar-platform` bridge network, on which the control plane reaches Postgres by name.
 3. With a Quasar-owned database: `quasar-postgres` (`quasar-postgres-data` volume, its
    password from `quasar-postgres-secrets`), then a wait of up to 180 s for it to report
@@ -1621,7 +1629,7 @@ registers as `seed_version`.
 | `QUASAR_TRUSTED_PROXIES` | unset (empty) | The reverse proxies in front of the console, with the control plane's own meaning and rules (a `/0` or a malformed entry refuses the install). Recorded at first install and passed to the control plane. |
 | `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT` | `8080`, `8443` | The host ports of the control plane's HTTP (agents, `/health`) and HTTPS (console) listeners. |
 | `QUASAR_DATABASE_HOST` | unset | Makes the database **the operator's own** (#352 R1-Q1): no Postgres is created, the console shows "Your own", and Quasar never dumps, restores or upgrades it. With `QUASAR_DATABASE_PORT` (5432), `QUASAR_DATABASE_USER` (`quasar`), `QUASAR_DATABASE_NAME` (`quasar`), `QUASAR_DATABASE_SSLMODE` (`disable`) they are copied into machine state at first boot and passed to the control plane under the same names. |
-| `QUASAR_DATABASE_PASSWORD` | — (**required** with `QUASAR_DATABASE_HOST`) | The operator's database password: copied into machine state's secrets at first boot and given to the control plane only as a file (`QUASAR_DATABASE_PASSWORD_FILE`). Refused without `QUASAR_DATABASE_HOST` (a Quasar-owned database generates its own). |
+| `QUASAR_DATABASE_PASSWORD` | — (**required** with `QUASAR_DATABASE_HOST`) | The operator's database password: copied into machine state's secrets at first boot and given to the control plane only as a file (`QUASAR_DATABASE_PASSWORD_FILE`). Not read again once installed, so it can then be removed from the stack. Refused without `QUASAR_DATABASE_HOST` (a Quasar-owned database generates its own). |
 | `QUASAR_DOCKER_SOCKET_HOST_PATH` | `/var/run/docker.sock` | Only when the actor cannot inspect its own container: the daemon-host path of the engine socket it binds into the agent. Normally learned from the actor's own mount. |
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |

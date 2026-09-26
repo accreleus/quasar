@@ -367,7 +367,9 @@ impl TrustInputs {
 /// What a combined or control-only machine's control plane is run with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlInputs {
-    /// `combined` or `control_only`: the control plane serves it as `machine_role`.
+    /// `combined` or `control_only`: the control plane serves it as `machine_role`. Absent
+    /// in state an earlier build wrote; `load_machine` sets it from the machine's role.
+    #[serde(default)]
     pub machine_role: ControlRole,
     /// The host port of the control plane's HTTP listener (agents and `/health`).
     pub http_port: u16,
@@ -386,9 +388,10 @@ pub struct ControlInputs {
     pub database: DatabaseInputs,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlRole {
+    #[default]
     Combined,
     ControlOnly,
 }

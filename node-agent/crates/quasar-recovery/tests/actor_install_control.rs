@@ -171,7 +171,7 @@ fn a_combined_install_brings_up_postgres_then_the_control_plane_then_its_agent()
     assert_eq!(password.len(), 64);
     assert_eq!(
         volume_file(&state, names::POSTGRES_SECRETS_VOLUME, "database-password"),
-        (password.clone().into_bytes(), 0o444)
+        (password.clone().into_bytes(), 0o400)
     );
     for (file, value) in [
         ("database-password", &password),
@@ -735,7 +735,17 @@ fn the_control_plane_is_told_its_machine_shape_and_trusted_proxies() {
     assert_eq!(cp.spec.env["QUASAR_MACHINE_ROLE"], "control_only");
     assert_eq!(cp.spec.env["QUASAR_TRUSTED_PROXIES"], "");
 
-    for bad in ["0.0.0.0/0", "::/0", "not-an-address", "10.0.0.0/33"] {
+    // Each is also refused by the control plane's net.ParseCIDR, so none passes the seed only
+    // to fail its boot.
+    for bad in [
+        "0.0.0.0/0",
+        "::/0",
+        "not-an-address",
+        "10.0.0.0/33",
+        "10.0.0.0/+16",
+        "10.0.0.0/",
+        "10.0.0.0/ 8",
+    ] {
         let mut env = combined_env();
         env.insert("QUASAR_TRUSTED_PROXIES".into(), bad.into());
         let engine = Arc::new(FakeEngine::new(control_host(env)));
@@ -764,6 +774,32 @@ fn machine_state_with_inputs_this_actor_does_not_know_still_loads() {
         .resume()
         .expect("unknown machine inputs are ignored");
     assert_eq!(engine.state().by_name(), before);
+}
+
+/// State an earlier build wrote has no `machine_role`; the machine's own role supplies it.
+#[test]
+fn control_inputs_without_a_machine_role_take_the_machines_role() {
+    for (env, want) in [
+        (control_only_external_env(), "control_only"),
+        (combined_env(), "combined"),
+    ] {
+        let (engine, dir, id) = seeded(env);
+        start(&engine, dir.path(), &id).resume().unwrap();
+        let path = dir.path().join("machine.json");
+        let mut machine: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        machine["inputs"]["control"]
+            .as_object_mut()
+            .unwrap()
+            .remove("machine_role")
+            .expect("machine_role is recorded");
+        std::fs::write(&path, serde_json::to_vec(&machine).unwrap()).unwrap();
+        let loaded = quasar_recovery::machine::MachineDir::new(dir.path())
+            .load_machine()
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.inputs.control.unwrap().machine_role.as_str(), want);
+    }
 }
 
 #[test]
