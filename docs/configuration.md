@@ -1715,12 +1715,14 @@ releases `actor.lease`; the successor takes it (`token="actor-handover-taking-ov
 stops the old actor, disables its restart policy, renames it `quasar-recovery.kept`, takes
 the name `quasar-recovery`, and verifies: it answers on each of its own sockets within 60 s
 (time the container engine does not answer is not counted, up to ten minutes, so a
-live-restore daemon restart does not fail a healthy successor), and on a GPU host another
-process reaches one of its sockets within a further 60 s. That is normally the node agent,
-whose relay polls status throughout an attempt and, when it connects to a socket that is
-still dark (a daemon restart can start it first), keeps asking for up to 90 s
-(`token="release-actor-dark"` if it never answers); an operator's `quasar-recovery status`
-counts too. An agent that is down leaves the successor unverified. Only then is `.kept` removed and `seed.json` rewritten to name the new image
+live-restore daemon restart does not fail a healthy successor), and on a GPU host the node
+agent polls this attempt's status on the agent socket (`GET /v1/status?request_id=<id>`)
+within a further 60 s. Its relay makes that call throughout an attempt and, when it connects
+to a socket that is still dark (a daemon restart can start it first), keeps asking for up to
+90 s and then adopts the attempt (`token="release-actor-dark"` if it never answers). Nothing
+else counts: the image's healthcheck and an operator's `quasar-recovery status` mark their
+requests as the actor's own and name no attempt. An agent that is down leaves the successor
+unverified. Only then is `.kept` removed and `seed.json` rewritten to name the new image
 (`token="actor-seed-file-updated"`). A successor that never becomes ready, never takes the
 lease, fails to verify, or is started three times without verifying is removed and the
 previous actor runs again: `failed`, `restored: true`. Every restart point settles to a

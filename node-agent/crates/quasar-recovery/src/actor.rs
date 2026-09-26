@@ -349,7 +349,8 @@ pub struct Actor {
     /// This process is gone: a test stands it in for the process dying.
     killed: std::sync::atomic::AtomicBool,
     /// Requests another process made on this actor's agent socket.
-    external_requests: std::sync::atomic::AtomicU64,
+    /// Attempts whose status another process polled on one of this process's sockets.
+    polled_attempts: Mutex<BTreeSet<String>>,
 }
 
 struct ServerHandle {
@@ -380,18 +381,24 @@ impl Actor {
             me: std::sync::OnceLock::new(),
             retired: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
-            external_requests: std::sync::atomic::AtomicU64::new(0),
+            polled_attempts: Mutex::new(BTreeSet::new()),
         }
     }
 
-    pub(crate) fn note_external_request(&self) {
-        self.external_requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    /// A poll of `request_id`'s status that was not this binary's own (`crate::server`).
+    pub(crate) fn note_attempt_poll(&self, request_id: &str) {
+        if !crate::submit::is_uuid(request_id) {
+            return;
+        }
+        let mut polled = self.polled_attempts.lock().unwrap();
+        if polled.len() >= 16 {
+            polled.clear();
+        }
+        polled.insert(request_id.to_owned());
     }
 
-    pub(crate) fn external_requests(&self) -> u64 {
-        self.external_requests
-            .load(std::sync::atomic::Ordering::SeqCst)
+    pub(crate) fn attempt_polled(&self, request_id: &str) -> bool {
+        self.polled_attempts.lock().unwrap().contains(request_id)
     }
 
     /// Serve `status` through a separate engine client, typically one with a short
