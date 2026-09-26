@@ -238,88 +238,84 @@ fn actor() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // A journal this process cannot write, or an attempt it can no longer drive, is
+    // settled by the next start (D8): exit so the restart policy provides one.
+    config.on_died = Box::new(|| {
+        error!(
+            token = "actor-exiting-to-settle",
+            "this recovery actor can no longer drive its attempt; exiting so the next start settles it"
+        );
+        std::process::exit(1);
+    });
     let actor =
         Arc::new(Actor::new(Arc::new(engine), config).with_status_engine(Arc::new(status_engine)));
 
     // The lease first, then the sockets, then `resume`: settling an interrupted attempt can
     // take a whole verification, and the agent must be able to read its status meanwhile.
-    if let Err(e) = actor.acquire_lease() {
+    // During a hand-over the lease is held by the other actor, and this one waits.
+    if let Err(e) = actor.acquire_lease_waiting() {
         error!(token = "actor-lease-unavailable", "{e}");
         return ExitCode::FAILURE;
     }
-    let (stopped, servers) = std::sync::mpsc::channel::<std::io::Error>();
-    let mut serving: Vec<PathBuf> = Vec::new();
-    serve_planned(&actor, &mut serving, &stopped);
+    unbound(actor.serve());
 
-    // The lease is already held, so `resume` cannot answer `LeaseHeld`.
     match actor.resume() {
+        Ok(()) if actor.retired() => {}
         Ok(()) => info!("this machine's services are installed and running"),
         Err(e) => error!(
             token = "actor-resume-failed",
             "{e}; the install is retried on the next start, and status keeps being served"
         ),
     }
-    // A first install learns its role from the seed's inputs; bind what it needs.
-    serve_planned(&actor, &mut serving, &stopped);
-    match actor.trust() {
-        Ok(t) => info!(
-            namespaces = ?t.allowed_namespaces,
-            signature_mode = t.signature.mode.as_str(),
-            "release trust in force"
-        ),
-        Err(why) => error!(token = "actor-trust-recorded-invalid", "{why}"),
+    if !actor.retired() {
+        // A first install learns its role from the seed's inputs; bind what it needs.
+        unbound(actor.serve());
+        match actor.trust() {
+            Ok(t) => info!(
+                namespaces = ?t.allowed_namespaces,
+                signature_mode = t.signature.mode.as_str(),
+                "release trust in force"
+            ),
+            Err(why) => error!(token = "actor-trust-recorded-invalid", "{why}"),
+        }
+        if !actor.serving() {
+            return ExitCode::FAILURE;
+        }
     }
 
-    if serving.is_empty() {
-        return ExitCode::FAILURE;
+    // A hand-over stops this process's sockets on purpose while it waits to be stopped or
+    // to take the machine back; only a socket that stopped on its own ends the process.
+    loop {
+        if actor.retired() {
+            info!(
+                token = "actor-retired",
+                "this recovery actor handed the machine over and exits"
+            );
+            return ExitCode::SUCCESS;
+        }
+        if let Some((socket, e)) = actor.serving_failed() {
+            error!(
+                token = "actor-socket-failed",
+                "the socket {} stopped: {e}",
+                socket.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
-    drop(stopped);
-    let e = servers
-        .recv()
-        .unwrap_or_else(|_| std::io::Error::other("every socket thread ended"));
-    error!(token = "actor-socket-failed", "a socket stopped: {e}");
-    ExitCode::FAILURE
 }
 
-/// Binds and serves every socket of [`Actor::socket_plan`] not already served.
-fn serve_planned(
-    actor: &Arc<Actor>,
-    serving: &mut Vec<PathBuf>,
-    stopped: &std::sync::mpsc::Sender<std::io::Error>,
-) {
-    let plan = match actor.socket_plan() {
-        Ok(plan) => plan,
-        Err(e) => {
-            error!(
-                token = "actor-socket-plan-unreadable",
-                "no socket is served: {e}"
-            );
-            return;
-        }
-    };
-    for plan in plan {
-        if serving.contains(&plan.path) {
-            continue;
-        }
-        match server::bind_owned(&plan.path, plan.owner) {
-            Ok(listener) => {
-                info!(socket = %plan.path.display(), caller = ?plan.caller, "serving");
-                let (actor, stopped, caller) = (actor.clone(), stopped.clone(), plan.caller);
-                std::thread::spawn(move || {
-                    let _ = stopped.send(server::serve(listener, actor, caller));
-                });
-                serving.push(plan.path);
-            }
-            // `resume` still runs: an interrupted attempt settles and an install completes
-            // whether or not anyone can ask about it.
-            Err(e) => error!(
-                token = "actor-socket-bind-failed",
-                "cannot create the socket {}: {e} (is the {} volume mounted at {}?)",
-                plan.path.display(),
-                quasar_recovery::recipe::names::AGENT_SOCKET_VOLUME,
-                paths::AGENT_SOCKET_DIR
-            ),
-        }
+/// `resume` still runs whatever this says: an interrupted attempt settles and an install
+/// completes whether or not anyone can ask about it.
+fn unbound(failed: Vec<(PathBuf, std::io::Error)>) {
+    for (socket, e) in failed {
+        error!(
+            token = "actor-socket-bind-failed",
+            "cannot create the socket {}: {e} (is the {} volume mounted at {}?)",
+            socket.display(),
+            quasar_recovery::recipe::names::AGENT_SOCKET_VOLUME,
+            paths::AGENT_SOCKET_DIR
+        );
     }
 }
 

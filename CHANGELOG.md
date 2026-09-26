@@ -25,6 +25,17 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
+  machine to a successor: it starts beside the running actor, takes the machine's lease only
+  when it is handed over, keeps the old actor stopped and disabled until it has verified
+  itself, and only then becomes the actor `seed.json` names. A successor that never verifies
+  is removed and the previous actor runs again (`failed`, restored); every crash, engine
+  restart or deletion part-way settles to a stated outcome with one actor running. Host
+  attempts move the actor first and the agent second (a revert the other way round), a later
+  failure restores only the agent, the agent re-registers so the console shows the new actor
+  version, and Developer apply now accepts a recovery-actor digest. The control plane's own
+  combined host moves its actor only with the control plane. An actor rewriting machine state
+  keeps the fields it does not know, so a revert erases nothing a newer actor recorded.
 - **Combined and control-only installs from one seed (#361).** `QUASAR_ROLE=combined` or
   `control-only` on the seed installs Postgres (or uses your own database, named by
   `QUASAR_DATABASE_*`), the control plane and, on a combined host, its own node agent, which

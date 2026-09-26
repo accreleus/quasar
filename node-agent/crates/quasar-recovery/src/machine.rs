@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use quasar_runtime::{DurableFile, LeaseError, StateLease};
 use serde::{Deserialize, Serialize};
 
-use crate::recipe::{ContainerSpec, ImageRef, Inputs, Role};
+use crate::recipe::{ContainerSpec, ImageRef, Inputs, Role, Unknown};
 use crate::seed::{self, file::SeedFile};
 use crate::socket::MachineRole;
 
@@ -36,6 +36,8 @@ pub struct Machine {
     pub inputs: Inputs,
     /// The image each role was first installed from.
     pub install_images: BTreeMap<Role, ImageRef>,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 /// What the actor last applied for one role: the specification's three parts and the
@@ -170,5 +172,49 @@ impl MachineDir {
             }
         }
         self.service_file(record.role)?.store(record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A combined machine's state as a newer actor might write it: a field this build does
+    /// not know at every level.
+    const NEWER: &str = r#"{
+      "format": 1, "installation_id": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89", "role": "combined",
+      "created_at": "2026-09-26T00:00:00Z", "install_images": {}, "later": {"a": [1, 2]},
+      "inputs": {
+        "installation_id": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89", "node_name": "gpu-host-01",
+        "home_root": "/srv/quasar/homes", "template_root": "/srv/quasar/templates",
+        "docker_socket": "/var/run/docker.sock", "later": 1,
+        "gpu": {"vendor": "nvidia", "render_node": "/dev/dri/renderD128", "later": "x",
+                "fallback": {"vendor": "amd", "render_node": "/dev/dri/renderD129", "later": true}},
+        "devices": {"dri": true, "uinput": true, "kmsg": false, "later": null},
+        "control": {"machine_role": "combined", "http_port": 8080, "tls_port": 8443,
+                    "public_host": null, "tls_hosts": null, "trusted_proxies": null, "later": 2,
+                    "database": {"mode": "external", "host": "db", "port": 5432, "user": "q",
+                                 "name": "q", "sslmode": "require", "later": "y"}},
+        "trust": {"allowed_namespaces": "ghcr.io/accreleus", "later": "z"},
+        "enroll": {"later": {}},
+        "app": {"puid": 1000, "later": 3}
+      }
+    }"#;
+
+    /// `decide_gpus` is such a rewrite: it records one answer into loaded state.
+    #[test]
+    fn a_rewrite_keeps_every_field_a_newer_actor_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("machine.json"), NEWER).unwrap();
+        let machines = MachineDir::new(dir.path());
+        let mut m = machines.load_machine().unwrap().unwrap();
+        m.inputs.gpu.gpus_served = true;
+        machines.machine().store(&m).unwrap();
+
+        let read = |raw: &[u8]| serde_json::from_slice::<serde_json::Value>(raw).unwrap();
+        let mut want = read(NEWER.as_bytes());
+        want["inputs"]["gpu"]["gpus_served"] = true.into();
+        let got = read(&std::fs::read(dir.path().join("machine.json")).unwrap());
+        assert_eq!(got, want);
     }
 }

@@ -62,13 +62,40 @@ pub enum Phase {
     Restoring,
     /// This component is finished (replaced, or the attempt ended on it).
     Done,
+    // The recovery actor's own replacement, its hand-over (`crate::handover`). Two
+    // processes share it: the old actor drives it to `handing_over`, the successor from
+    // `successor_active` on. Appended, so a journal an older actor wrote still reads.
+    /// Creating the successor, `quasar-recovery.next`, beside the running actor.
+    CreatingSuccessor,
+    /// Starting it. It self-checks and writes its ready marker.
+    StartingSuccessor,
+    /// Waiting for the ready marker; the old actor still holds the lease and serves.
+    AwaitingSuccessor,
+    /// The old actor stopped serving and released the lease; the successor takes it.
+    HandingOver,
+    /// The successor holds the lease and owns the attempt: taking the old actor out of
+    /// service (stop, disable its restart, rename it `.kept`).
+    SuccessorActive,
+    /// The successor renaming itself to the actor's name.
+    SuccessorRenaming,
+    /// The successor has put the old actor back under its name and is starting it; the
+    /// old actor finishes the restore once it holds the lease.
+    HandingBack,
 }
 
 impl Phase {
     /// Whether the old container has been (or is being) taken out of service. Before
     /// this, an interruption is settled as "nothing changed" (D8).
     pub fn touched_old(self) -> bool {
-        !matches!(self, Phase::Admitted | Phase::Pulling | Phase::Checked)
+        !matches!(
+            self,
+            Phase::Admitted
+                | Phase::Pulling
+                | Phase::Checked
+                | Phase::CreatingSuccessor
+                | Phase::StartingSuccessor
+                | Phase::AwaitingSuccessor
+        )
     }
 
     /// agent-api.md `release_state.state` while this phase is current: `pulling` until
@@ -77,12 +104,23 @@ impl Phase {
     pub fn wire_state(self) -> State {
         match self {
             Phase::Admitted => State::Pending,
-            Phase::Pulling | Phase::Checked => State::Pulling,
-            Phase::OldKept | Phase::Created | Phase::Started => State::Recreating,
+            // A successor running beside the old actor has taken nothing out of service.
+            Phase::Pulling
+            | Phase::Checked
+            | Phase::CreatingSuccessor
+            | Phase::StartingSuccessor
+            | Phase::AwaitingSuccessor => State::Pulling,
+            Phase::OldKept
+            | Phase::Created
+            | Phase::Started
+            | Phase::HandingOver
+            | Phase::SuccessorActive
+            | Phase::SuccessorRenaming => State::Recreating,
             Phase::Verifying
             | Phase::Verified
             | Phase::OldDiscarded
             | Phase::Restoring
+            | Phase::HandingBack
             | Phase::Done => State::Verifying,
         }
     }
@@ -108,6 +146,14 @@ pub struct Step {
     pub new_container: Option<String>,
     /// Why verification failed, carried into `restoring` so the outcome keeps it.
     pub failure: Option<Failure>,
+    /// A hand-over only: how many times a successor process has taken the lease for this
+    /// step. Bounds a successor that crash-loops once the old actor is stopped.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub successor_starts: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

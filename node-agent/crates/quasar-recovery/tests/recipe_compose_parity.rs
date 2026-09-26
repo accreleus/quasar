@@ -266,18 +266,21 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         None => None,
     };
     Inputs {
+        unknown: Default::default(),
         installation_id: "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89".into(),
         node_name: "gpu-host-01".into(),
         home_root: "/srv/quasar/homes".into(),
         template_root: "/srv/quasar/templates".into(),
         docker_socket: "/var/run/docker.sock".into(),
         gpu: GpuFacts {
+            unknown: Default::default(),
             vendor,
             render_node: render_node.map(str::to_owned),
             gpus_served: vendor == Some(GpuVendor::Nvidia),
             fallback: None,
         },
         devices: HostDevices {
+            unknown: Default::default(),
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,
@@ -452,6 +455,7 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
     let base = deploy("docker-compose.yml");
     let mut inputs = inputs(Some(GpuVendor::Amd));
     inputs.control = Some(ControlInputs {
+        unknown: Default::default(),
         machine_role: quasar_recovery::recipe::ControlRole::Combined,
         trusted_proxies: None,
         http_port: 8080,

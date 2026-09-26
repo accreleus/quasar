@@ -81,6 +81,14 @@ func (s MachineShape) CombinedNodeName() (string, bool) {
 	return s.NodeName, true
 }
 
+// SharesMachineWith is whether the host named nodeName is the agent on this
+// control plane's own machine, whose recovery actor moves in the control-plane
+// step (A1, ADR 0008), never in a host step.
+func (s MachineShape) SharesMachineWith(nodeName string) bool {
+	own, ok := s.CombinedNodeName()
+	return ok && own == nodeName
+}
+
 // PlatformIdentity is the wire `PlatformIdentity`: the binary's own stamps,
 // plus the machine it runs on.
 type PlatformIdentity struct {

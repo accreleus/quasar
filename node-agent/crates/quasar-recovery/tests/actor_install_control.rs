@@ -558,7 +558,8 @@ fn the_control_socket_serves_the_machine_and_names_the_control_plane_as_its_call
     let path = sockets.path().join("control").join("control.sock");
     let listener = server::bind_owned(&path, None).unwrap();
     let serving = actor.clone();
-    std::thread::spawn(move || server::serve(listener, serving, Caller::ControlPlane));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::spawn(move || server::serve(listener, serving, Caller::ControlPlane, stop));
 
     let status: quasar_recovery::socket::Status =
         serde_json::from_str(&server::fetch_status(&path).unwrap()).unwrap();

@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,15 +53,35 @@ pub fn bind_owned(path: &Path, owner: Option<(u32, u32)>) -> io::Result<UnixList
     Ok(listener)
 }
 
-/// Serve until the listener fails. One thread per connection, at most
-/// [`MAX_CONNECTIONS`] at once; a connection over the limit is closed unanswered.
-pub fn serve(listener: UnixListener, actor: Arc<Actor>, caller: Caller) -> io::Error {
+/// How often a serving loop looks at its stop flag between connections.
+const ACCEPT_POLL: Duration = Duration::from_millis(20);
+
+/// Serve `caller`'s socket until `stop` is set (`Ok`) or the listener fails. One thread per
+/// connection, at most [`MAX_CONNECTIONS`] at once; a connection over the limit is closed
+/// unanswered. A hand-over stops the old actor's loops before it releases the lease, so the
+/// successor binds paths nobody else serves.
+pub fn serve(
+    listener: UnixListener,
+    actor: Arc<Actor>,
+    caller: Caller,
+    stop: Arc<AtomicBool>,
+) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
     let open = Arc::new(AtomicUsize::new(0));
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
-            Err(e) => return e,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         };
+        stream.set_nonblocking(false)?;
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             open.fetch_sub(1, Ordering::SeqCst);
             warn!(
@@ -104,6 +124,13 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
         }
     }
     let head = String::from_utf8_lossy(&head);
+    let own_probe = head.lines().any(|l| {
+        l.split_once(':')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(SELF_PROBE_HEADER))
+    });
+    if !own_probe {
+        actor.note_external_request();
+    }
     let mut first = head.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -204,9 +231,23 @@ fn respond(stream: &mut UnixStream, status: u16, body: &str) -> io::Result<()> {
 
 /// The operator's `quasar-recovery status`: one `GET /v1/status`, the body as served.
 pub fn fetch_status(path: &Path) -> io::Result<String> {
+    status_request(path, "")
+}
+
+/// Marks a request the serving actor makes to itself: not another process reaching it,
+/// which is what a successor's verification waits for (`crate::handover`).
+const SELF_PROBE_HEADER: &str = "X-Quasar-Self-Probe";
+
+/// [`fetch_status`] from the serving actor itself.
+pub(crate) fn probe_self(path: &Path) -> io::Result<String> {
+    status_request(path, &format!("{SELF_PROBE_HEADER}: 1\r\n"))
+}
+
+fn status_request(path: &Path, extra_header: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.write_all(b"GET /v1/status HTTP/1.0\r\nHost: recovery\r\n\r\n")?;
+    let request = format!("GET /v1/status HTTP/1.0\r\nHost: recovery\r\n{extra_header}\r\n");
+    stream.write_all(request.as_bytes())?;
     let mut raw = String::new();
     stream.take(4 * 1024 * 1024).read_to_string(&mut raw)?;
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));

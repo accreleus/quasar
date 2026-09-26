@@ -180,18 +180,45 @@ export function ApplyHistory({ refreshKey }: { refreshKey: number }) {
   );
 }
 
+/** How the history names an attempt's components. */
+const COMPONENT_NAMES: Record<string, string> = {
+  "recovery-actor": "Recovery actor",
+  "node-agent": "Node agent",
+  "control-plane": "Control plane",
+};
+
 function ApplyHistoryRow({ attempt: a }: { attempt: PlatformApplyAttempt }) {
-  const from = a.previous_digests.map((p) => shortDigest(p.digest)).join(", ") || "unknown";
-  const to = a.requested_digests.map((c) => shortDigest(c.digest)).join(", ");
+  const machine = a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone");
+  // An attempt that moves the recovery actor (it moves first, ADR 0008) says so per
+  // component, as the RH-06 mock's history does.
+  const movesActor = a.requested_digests.some((c) => c.name === "recovery-actor");
+  const lines = movesActor
+    ? a.requested_digests.map((c) => ({
+        label: COMPONENT_NAMES[c.name] ?? c.name,
+        from: shortDigest(a.previous_digests.find((p) => p.name === c.name)?.digest ?? null),
+        to: shortDigest(c.digest),
+      }))
+    : [
+        {
+          label: null,
+          from: a.previous_digests.map((p) => shortDigest(p.digest)).join(", ") || "unknown",
+          to: a.requested_digests.map((c) => shortDigest(c.digest)).join(", "),
+        },
+      ];
   return (
     <div className="rel-fact stack">
       <div className="rowflex" style={{ justifyContent: "space-between", width: "100%" }}>
-        <span>{a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone")}</span>
+        <span>
+          {movesActor && a.requested_digests.length === 1 ? `Recovery actor · ${machine}` : machine}
+        </span>
         <span className="hint">{when(a.created_at)}</span>
       </div>
-      <span className="mono hint">
-        {from} → {to}
-      </span>
+      {lines.map((l) => (
+        <span key={l.label ?? "all"} className="mono hint">
+          {l.label && movesActor && a.requested_digests.length > 1 && `${l.label} `}
+          {l.from} → {l.to}
+        </span>
+      ))}
       <span className="hint">
         <span>{attemptKindText(a.kind)}</span> · {attemptStateText(a.state)}
         {a.reason && ` · ${failureText(a.reason)}`}
