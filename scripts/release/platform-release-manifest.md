@@ -185,13 +185,18 @@ refuses the release, printing every reason, when:
   `control-plane` window, so a pre-update control plane could not be restored
   (ADR 0008 Rule B);
 - **(c)** a floor orders above the previous release, so a component the previous
-  release left fully current would be below the floor after a one-step update.
+  release left fully current would be below the floor after a one-step update;
+- **(d)** the previous release's recovery actor does not carry the candidate
+  actor image's `recovery-actor` revision. In the hand-over the running actor
+  renders its successor, so a machine on the previous release could never take
+  this one. Its windows come from that actor's own `quasar-recovery recipes`
+  (`--previous-actor-windows`, required whenever a previous release exists).
 
 "Known releases" are the published releases carrying
 `platform-release-manifest.v2.json`; format-1 releases are ignored, because no
 owned install exists before the first format-2 release. "The previous release" is
 the known release ordering highest strictly below the candidate. With no known
-format-2 release, (b) checks nothing beyond (a) and (c) passes. A known manifest
+format-2 release, (b) checks nothing beyond (a), and (c) and (d) pass. A known manifest
 with the candidate's own version is refused.
 
 In CI, `scripts/release/collect-release-compatibility-inputs.sh` gathers the

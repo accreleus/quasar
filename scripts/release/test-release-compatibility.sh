@@ -4,7 +4,8 @@
 #
 # The fixtures: candidate 0.5.0 (floor 0.4.0) whose actor renders control-plane
 # 1..1, node-agent 1..2, recovery-actor 1..1; known releases 0.4.0 and 0.4.1
-# (format 2) and 0.3.0 (format 1, ignored).
+# (format 2) and 0.3.0 (format 1, ignored). The previous release's actor renders
+# recovery-actor 1..1 unless a case names another previous-actor windows file.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -18,8 +19,9 @@ mkdir -p "$work/none"
 
 fail() { echo "release compatibility test: $*" >&2; exit 1; }
 
-run() { # run <manifest> <known dir> <recipes> <windows>
-  "$check" --manifest "$fx/$1" --known "$2" --recipes "$fx/$3" --actor-windows "$fx/$4"
+run() { # run <manifest> <known dir> <recipes> <windows> [previous windows]
+  "$check" --manifest "$fx/$1" --known "$2" --recipes "$fx/$3" --actor-windows "$fx/$4" \
+    --previous-actor-windows "$fx/${5:-previous-actor-windows.json}"
 }
 
 pass() { # pass <expected fragment> <run args...>
@@ -79,6 +81,20 @@ pass "PASS" candidate.json "$work/none" recipes-candidate-control-2.json actor-w
 refuse "(c) the node-agent floor 0.5.0-0 orders above the previous release 0.4.1" \
   candidate-floor-above-previous.json "$fx/known" recipes.json actor-windows.json
 pass "PASS" candidate-floor-above-previous.json "$work/none" recipes.json actor-windows.json
+
+# (d) the previous release's actor cannot render the candidate actor it hands over to.
+refuse "(d) 0.5.0 recovery-actor image $ns/quasar-recovery@sha256:cccc" \
+  candidate.json "$fx/known" recipes-candidate-actor-2.json actor-windows-actor-2.json
+refuse "revision 2 is outside the previous release 0.4.1's recovery actor's recovery-actor window 1..1" \
+  candidate.json "$fx/known" recipes-candidate-actor-2.json actor-windows-actor-2.json
+pass "PASS" candidate.json "$fx/known" recipes-candidate-actor-2.json actor-windows-actor-2.json \
+  actor-windows-actor-2.json
+# With no earlier format-2 release there is no hand-over to check.
+pass "PASS" candidate.json "$work/none" recipes-candidate-actor-2.json actor-windows-actor-2.json
+# A previous release makes its actor's windows a required input.
+out=$("$check" --manifest "$fx/candidate.json" --known "$fx/known" --recipes "$fx/recipes.json" \
+  --actor-windows "$fx/actor-windows.json" 2>&1) && fail "a missing previous-actor windows file passed: $out"
+[[ "$out" == *"(d) --previous-actor-windows is required"* ]] || fail "$out"
 
 # Inputs.
 refuse "no recipe revision for $ns/quasar-node-agent@sha256:5555" \

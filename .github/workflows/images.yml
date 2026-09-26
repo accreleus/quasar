@@ -1501,11 +1501,17 @@ jobs:
           inputs="$RUNNER_TEMP/release-compatibility"
           bash scripts/release/collect-release-compatibility-inputs.sh \
             --manifest "$MANIFEST" --repo "$REPO" --out "$inputs"
+          # Written only when a format-2 release precedes this one (check (d)).
+          previous=()
+          if [ -f "$inputs/previous-actor-windows.json" ]; then
+            previous=(--previous-actor-windows "$inputs/previous-actor-windows.json")
+          fi
           bash scripts/release/check-release-compatibility.sh \
             --manifest "$MANIFEST" \
             --known "$inputs/known" \
             --recipes "$inputs/recipes.json" \
-            --actor-windows "$inputs/actor-windows.json"
+            --actor-windows "$inputs/actor-windows.json" \
+            "${previous[@]+"${previous[@]}"}"
 
       - name: Assert the promoted :X.Y.Z tags carry the manifest's digests
         env:

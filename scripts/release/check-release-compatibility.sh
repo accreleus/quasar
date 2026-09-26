@@ -14,7 +14,10 @@
 #       control-plane revision is outside its control-plane window (restoring a
 #       pre-update control plane, ADR 0008 Rule B);
 #   (c) a floor orders above the previous release, so a machine that release left
-#       current would be below the floor after the update.
+#       current would be below the floor after the update;
+#   (d) the previous release's recovery actor, which renders its successor in the
+#       hand-over, does not carry the candidate actor image's recovery-actor revision
+#       (a machine on the previous release could never take this one).
 # Known releases are the previously published format-2 manifests; format-1 ones
 # are ignored, because no owned install predates the first format-2 release. The
 # previous release is the known one ordering highest strictly below the
@@ -30,6 +33,7 @@ manifest=""
 known=""
 recipes=""
 windows=""
+previous_windows=""
 
 usage() {
   cat <<'EOF'
@@ -37,7 +41,8 @@ usage: scripts/release/check-release-compatibility.sh \
          --manifest platform-release-manifest.v2.json \
          --known DIR \
          --recipes recipes.json \
-         --actor-windows actor-windows.json
+         --actor-windows actor-windows.json \
+         [--previous-actor-windows previous-actor-windows.json]
 
   --manifest       the candidate format-2 manifest
   --known          previously published manifests (*.json); files whose
@@ -46,6 +51,9 @@ usage: scripts/release/check-release-compatibility.sh \
                    the candidate and the known format-2 manifests name
   --actor-windows  the candidate recovery actor's `quasar-recovery recipes` output,
                    {"format_version":1,"windows":{"<role>":{"from":N,"to":M},...}}
+  --previous-actor-windows
+                   the same, from the previous format-2 release's recovery actor;
+                   required when --known holds a release below the candidate
 
 Prints every refusal on stderr and exits 1; prints PASS and exits 0.
 EOF
@@ -57,6 +65,7 @@ while (($#)); do
     --known) known=${2:?--known needs a directory}; shift 2 ;;
     --recipes) recipes=${2:?--recipes needs a path}; shift 2 ;;
     --actor-windows) windows=${2:?--actor-windows needs a path}; shift 2 ;;
+    --previous-actor-windows) previous_windows=${2:?--previous-actor-windows needs a path}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -75,14 +84,14 @@ if ! "$validator" "$manifest" --expect-format 2 >/dev/null; then
   exit 1
 fi
 
-python3 - "$validator" "$manifest" "$known" "$recipes" "$windows" <<'PY'
+python3 - "$validator" "$manifest" "$known" "$recipes" "$windows" "$previous_windows" <<'PY'
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-validator, manifest_path, known_dir, recipes_path, windows_path = sys.argv[1:6]
+validator, manifest_path, known_dir, recipes_path, windows_path, previous_windows_path = sys.argv[1:7]
 errors = []
 
 ROLES = ("control-plane", "node-agent", "postgres", "recovery-actor")
@@ -177,11 +186,13 @@ if recipes is not None:
                 errors.append(f"--recipes: {ref} has recipe revision {rev!r}, "
                               "not a positive integer")
 
-# The candidate actor's windows.
-windows = {}
-doc = load_json(windows_path, "--actor-windows")
-if doc is not None:
-    shape = f"--actor-windows {windows_path}"
+def parse_windows(path, flag):
+    """`quasar-recovery recipes` output as {role: (from, to)}; None when unreadable."""
+    doc = load_json(path, flag)
+    if doc is None:
+        return None
+    shape = f"{flag} {path}"
+    out = {}
     if not isinstance(doc, dict) or sorted(doc) != ["format_version", "windows"]:
         errors.append(f"{shape} must be exactly {{\"format_version\", \"windows\"}}")
     elif doc["format_version"] != 1 or not is_int(doc["format_version"]):
@@ -198,7 +209,14 @@ if doc is not None:
                 errors.append(f"{shape}: {role} must be {{\"from\": N, \"to\": M}} with "
                               f"1 <= N <= M, got {window!r}")
             else:
-                windows[role] = (window["from"], window["to"])
+                out[role] = (window["from"], window["to"])
+    return out
+
+
+# The candidate actor's windows, and the previous release's actor's.
+windows = parse_windows(windows_path, "--actor-windows") or {}
+previous_windows = (parse_windows(previous_windows_path, "--previous-actor-windows")
+                    if previous_windows_path else None)
 done()
 
 
@@ -210,17 +228,17 @@ def revision(ref):
     return rev
 
 
-def outside(role, rev):
-    """A refusal fragment when `rev` is outside the actor's `role` window, else None."""
+def outside(role, rev, book=None, whose="the candidate recovery actor"):
+    """A refusal fragment when `rev` is outside an actor's `role` window, else None."""
+    book = windows if book is None else book
     if rev is None:
         return None
-    if role not in windows:
-        return f"the candidate recovery actor carries no {role} recipe"
-    low, high = windows[role]
+    if role not in book:
+        return f"{whose} carries no {role} recipe"
+    low, high = book[role]
     if low <= rev <= high:
         return None
-    return (f"revision {rev} is outside the candidate recovery actor's {role} window "
-            f"{low}..{high}")
+    return f"revision {rev} is outside {whose}'s {role} window {low}..{high}"
 
 
 below = [doc for _, doc in known if semver_key(doc["version"]) < semver_key(version)]
@@ -259,6 +277,19 @@ if previous is not None:
             errors.append(f"(c) the {role} floor {floor[role]} orders above the previous "
                           f"release {previous['version']}: a {role} that release left "
                           "current would be below the floor after the update")
+
+# (d) The hand-over from the previous release's actor.
+if previous is not None:
+    if previous_windows is None:
+        errors.append(f"(d) --previous-actor-windows is required: the previous release "
+                      f"{previous['version']}'s recovery actor renders this release's actor "
+                      "in the hand-over")
+    else:
+        why = outside("recovery-actor", revision(own["recovery-actor"]), previous_windows,
+                      f"the previous release {previous['version']}'s recovery actor")
+        if why:
+            errors.append(f"(d) {version} recovery-actor image {own['recovery-actor']}: a "
+                          f"machine on {previous['version']} hands over to it, and {why}")
 
 done()
 print(f"PASS {version}: {len(known)} known format-2 release(s), previous "

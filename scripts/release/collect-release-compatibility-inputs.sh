@@ -6,6 +6,9 @@
 #   OUT/recipes.json       org.quasar.recipe of every image@digest the candidate and the
 #                          known manifests name, read from the registry
 #   OUT/actor-windows.json the candidate recovery actor's `quasar-recovery recipes`
+#   OUT/previous-actor-windows.json
+#                          the same from the previous format-2 release's actor (the one
+#                          ordering highest below the candidate), when there is one
 #
 # Needs gh (GH_TOKEN), docker with buildx, and registry read access, so it has no
 # offline test beyond `bash -n` and shellcheck; the check it feeds is tested by
@@ -86,6 +89,33 @@ actor="$(jq -er '.components[] | select(.name == "recovery-actor") | "\(.image)@
   "$manifest")" || fail "$manifest names no recovery-actor component"
 docker run --rm --pull always --network none "$actor" recipes > "$out/actor-windows.json" \
   || fail "$actor recipes failed"
+
+# The hand-over (check (d)): the previous release's actor renders the candidate's.
+previous="$(python3 - "$manifest" "$out/known" <<'PY'
+import json, re, sys
+from pathlib import Path
+SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?")
+def key(v):
+    m = SEMVER.fullmatch(v)
+    pre = m.group(4)
+    ids = () if pre is None else tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+    return (tuple(int(x) for x in m.groups()[:3]), (1,) if pre is None else (0, ids))
+candidate = json.loads(Path(sys.argv[1]).read_text())["version"]
+best = None
+for path in Path(sys.argv[2]).glob("*.json"):
+    doc = json.loads(path.read_text())
+    if doc.get("format_version") != 2 or key(doc["version"]) >= key(candidate):
+        continue
+    if best is None or key(doc["version"]) > key(best["version"]):
+        best = doc
+if best:
+    print(next(f'{c["image"]}@{c["digest"]}' for c in best["components"] if c["name"] == "recovery-actor"))
+PY
+)" || fail "cannot choose the previous release"
+if [[ -n "$previous" ]]; then
+  docker run --rm --pull always --network none "$previous" recipes > "$out/previous-actor-windows.json" \
+    || fail "$previous recipes failed"
+fi
 
 echo "collected: $(find "$out/known" -name '*.json' | wc -l) known manifest(s)," \
   "$(jq length "$out/recipes.json") recipe label(s), actor windows from $actor"
