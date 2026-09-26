@@ -471,6 +471,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Owned installs: two #366 details from its live run.** A container that looks like a Quasar
+  service and is defined in the same Compose project as the machine's seed is reported as that
+  stack manager's (take it out of the stack), not as a leftover install. `quasar-recovery status`
+  inside the recovery actor answers from the operator's socket, so it shows the machine's
+  latest attempt, an operator's `reconfigure` included, rather than only the node agent's.
 - **A recovery actor successor is verified only by the node agent (#362).** On a GPU host the
   successor's own image healthcheck counted as the node agent reaching it, so a successor
   verified with no agent running. Only the agent relay's poll of the attempt's status counts

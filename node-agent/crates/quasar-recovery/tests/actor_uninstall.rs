@@ -368,6 +368,62 @@ fn look_alikes_are_reported_and_never_acted_on_while_the_actors_own_are_not_conf
     actor.wait_attempt();
 }
 
+/// A stack manager's seed (Compose-labelled) and a look-alike its own stack defines: the report
+/// says the manager runs it, while a look-alike of another project still reads as a leftover.
+#[test]
+fn a_look_alike_beside_a_managers_seed_is_reported_as_that_stacks() {
+    let (engine, dir, actor_id) = seeded_gpu_host();
+    let in_stack = container(
+        "f500000000000000000000000000000000000000000000000000000000000000",
+        "quasar-seed-366-quasar-node-agent-1",
+        "ghcr.io/accreleus/quasar/quasar-node-agent:0.3.0",
+        &[
+            ("com.docker.compose.project", "quasar-seed-366"),
+            ("com.docker.compose.service", "quasar-node-agent"),
+        ],
+        &[],
+    );
+    let leftover = container(
+        "f600000000000000000000000000000000000000000000000000000000000000",
+        "quasar-quasar-node-agent-1",
+        "ghcr.io/accreleus/quasar/quasar-node-agent:0.3.0",
+        &[
+            ("com.docker.compose.project", "quasar"),
+            ("com.docker.compose.service", "quasar-node-agent"),
+        ],
+        &[],
+    );
+    engine.with_state(|s| {
+        let seed = s.containers.get_mut(SEED_ID).expect("the seed");
+        seed.spec.labels.insert(
+            "com.docker.compose.project".into(),
+            "quasar-seed-366".into(),
+        );
+        for c in [&in_stack, &leftover] {
+            s.containers.insert(c.id.clone(), c.clone());
+        }
+    });
+    let status = running_actor(&engine, dir.path(), &actor_id).status();
+    let why = |name: &str| {
+        status
+            .conflicts
+            .iter()
+            .find(|c| c.container == name)
+            .unwrap_or_else(|| panic!("{name} not reported: {:?}", status.conflicts))
+            .why
+            .clone()
+    };
+    let managed = why("quasar-seed-366-quasar-node-agent-1");
+    assert!(managed.contains("beside this machine's seed"), "{managed}");
+    assert!(!managed.contains("older Compose install"), "{managed}");
+    let old = why("quasar-quasar-node-agent-1");
+    assert!(
+        old.contains("probably left from an older Compose install"),
+        "{old}"
+    );
+    assert_eq!(status.conflicts.len(), 2, "the seed itself is no conflict");
+}
+
 // ----- the console's "remove host" -----
 
 #[test]
@@ -1150,6 +1206,40 @@ fn a_combined_host_home_root_reconfigure_is_refused_until_control_plane_replacem
     assert!(refused.message.contains("#363"), "{}", refused.message);
     assert_eq!(machine_home(dir.path()), HOME);
     assert!(!dir.path().join("reconfigure.json").exists());
+}
+
+/// The operator's door answers status with the machine's latest attempt whoever submitted it,
+/// so a reconfigure is visible there, while the agent socket's status stays its own caller's.
+#[test]
+fn the_operator_socket_shows_an_operators_reconfigure_attempt() {
+    let (engine, dir, actor_id) = seeded_gpu_host();
+    let actor = running_actor(&engine, dir.path(), &actor_id);
+    let request = actor
+        .reconfigure(changes(&[("QUASAR_HOME_ROOT", NEW_HOME)]))
+        .expect("admitted")
+        .request_id
+        .expect("journalled");
+    actor.wait_attempt();
+
+    let socket = dir.path().join("operator-test.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let served = actor.clone();
+    std::thread::spawn(move || quasar_recovery::operator::serve(listener, served));
+    let (code, body) =
+        quasar_recovery::operator::call(&socket, "GET", "/v1/status", None).expect("answered");
+    assert_eq!(code, 200, "{body}");
+    let status: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status["result"]["request_id"], request.as_str(), "{body}");
+    assert_eq!(status["result"]["state"], "succeeded", "{body}");
+
+    let agent_view = actor.status_as(Caller::Agent, None);
+    assert!(
+        agent_view
+            .result
+            .as_ref()
+            .is_none_or(|r| r.request_id != request),
+        "the agent socket shows only the agent's own attempts"
+    );
 }
 
 // ----- records a reconfigure leaves -----
