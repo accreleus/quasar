@@ -406,7 +406,8 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 - **The documentation site no longer states facts that stopped being true.** A control-plane
-  update without a migration does not end sessions; a host whose new agent never came up is
+  update without a migration does not end sessions, and a fleet run with no control-plane step
+  cordons each host only when it reaches it; a host whose new agent never came up is
   restored automatically (ADR 0004); the `beta` channel, unattended updates and release
   notifications are documented; the stack's container and volume lists include the updater and
   the NVIDIA driver volume; the static `ENROLLMENT_TOKEN` is optional; each host may have its own
