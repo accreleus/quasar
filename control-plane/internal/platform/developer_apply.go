@@ -266,7 +266,7 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 	// On a combined host the actor moves in the control-plane step. Decided from
 	// this control plane's own configuration, so it holds (fail closed) whether or
 	// not the recovery actor answers.
-	if ownNode, ok := h.machineShape.CombinedNodeName(); ok && ownNode == nodeName {
+	if h.machineShape.SharesMachineWith(nodeName) {
 		for _, c := range components {
 			if c.Name != ComponentNodeAgent {
 				httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,

@@ -247,7 +247,8 @@ func (h *ApplyHandler) handleHostApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ADR 0008: the host's recovery actor first, when it is not on the release.
-	components = OrderHostComponents(components, release.SourceCommit, hostIdentity(view, hostID), controlPlaneMachineUnknown)
+	host := hostIdentity(view, hostID)
+	components = OrderHostComponents(components, release.SourceCommit, host, h.machineShape.SharesMachineWith(host.NodeName))
 	if len(components) == 0 {
 		writeNotEligible(w, ReasonUpToDate)
 		return
@@ -396,12 +397,6 @@ func hostIdentity(v View, hostID string) HostIdentity {
 	}
 	return HostIdentity{HostID: hostID}
 }
-
-// The control plane cannot yet tell which registered host shares its machine (its
-// own machine's recovery actor reports that over the control socket, RH06-11 #363),
-// so every host step is ordered as a GPU host's. The actor refuses the agent socket's
-// `recovery-actor` on a combined machine, so that case fails `invalid`, never ahead.
-const controlPlaneMachineUnknown = false
 
 func actorID(r *http.Request) string {
 	if u, ok := auth.UserFromContext(r.Context()); ok {

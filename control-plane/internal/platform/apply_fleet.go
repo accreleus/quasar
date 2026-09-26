@@ -191,6 +191,8 @@ type FleetRunner struct {
 	// buildinfo call at the point of use, so a test can put a release on either
 	// side of it.
 	SchemaVersion int
+	// machineShape is this control plane's own machine shape, from its configuration.
+	machineShape MachineShape
 
 	mu sync.Mutex
 	// run id → cancel, bounded at one by the active-run index.
@@ -224,6 +226,12 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 		baseCtx:         ctx,
 		stop:            cancel,
 	}
+}
+
+// WithMachineShape wires the control plane's own machine shape (its configuration).
+func (f *FleetRunner) WithMachineShape(shape MachineShape) *FleetRunner {
+	f.machineShape = shape
+	return f
 }
 
 // Start drives one run. Idempotent per run: a second Start for a run already
@@ -1305,7 +1313,8 @@ func (f *FleetRunner) createHostAttempt(ctx context.Context, run ApplyRun, hostI
 		return Attempt{}, err
 	}
 	// ADR 0008: the host's recovery actor first, when it is not on the release.
-	components = OrderHostComponents(components, release.SourceCommit, hostIdentity(view, hostID), controlPlaneMachineUnknown)
+	host := hostIdentity(view, hostID)
+	components = OrderHostComponents(components, release.SourceCommit, host, f.machineShape.SharesMachineWith(host.NodeName))
 	if len(components) == 0 {
 		return Attempt{}, fmt.Errorf("release %s names no node-agent image", releaseLabel(release))
 	}
