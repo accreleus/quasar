@@ -75,14 +75,14 @@ name: Images
 #
 # Consumption story (issue #449 — self-hosters previously had to compile
 # GStreamer + the Rust agent from source, ~25 min / ~25 GB per install):
-# this workflow is the ONLY thing that publishes the two runtime images a
+# this workflow is the ONLY thing that publishes the runtime images a
 # self-hoster (or a deploy host) actually pulls:
 #   ghcr.io/accreleus/quasar/quasar-control-plane (control plane, prod target)
 #   ghcr.io/accreleus/quasar/quasar-node-agent    (the universal node agent —
 #                                                     AMD/Intel VA, Vulkan AND NVIDIA)
 # plus the recovery actor an owned machine runs (and seeds from):
 #   ghcr.io/accreleus/quasar/quasar-recovery
-# There were three until #545 retired the separate NVIDIA image (quasar-nv). An NVIDIA
+# A separate NVIDIA image (quasar-nv) existed until #545 retired it. An NVIDIA
 # host pulls quasar-node-agent like everyone else and the agent fetches the CUDA
 # userspace it needs at run time; the difference is the compose overlay, not the image.
 # `deploy/` compose consumes these via QUASAR_NODE_IMAGE (the base/nvidia
@@ -181,8 +181,8 @@ concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: true
 
-# Read-only floor. `packages: write` is granted PER JOB, and now only to the three
-# that put bytes or tags in the registry — the jobs that JUDGE an artifact
+# Read-only floor. `packages: write` is granted PER JOB, and only to the jobs that
+# put bytes or tags in the registry (the toolchain, build-* and promote*) — the jobs that JUDGE an artifact
 # (validate-*, preflight) run without it, so a gate cannot publish what it just
 # approved. Every third-party action below is pinned to a full commit sha (the
 # trailing comment is the version that sha was) — a tag is mutable, and these run

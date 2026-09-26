@@ -1337,7 +1337,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		jobsAgentHandler: jobsAgentHandler,
 
 		pool:           pool,
-		enrollPins:     installedEnrollPins(cfg.EnrollPins, platformStore, log),
+		enrollPins:     installedEnrollPins(cfg.EnrollPins, cfg.EnrollFallback, platformStore, buildinfo.Get().SourceCommit, log),
 		authSvc:        authSvc,
 		janitorStop:    janitorStop,
 		jobsDispatcher: jobsDispatcher,
@@ -1400,34 +1400,40 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 		mux.Handle("/", httpx.SPAHandler(s.cfg.WebRoot))
 		pins := s.enrollPins
 		if pins == nil {
-			static := s.cfg.EnrollPins
+			static := s.cfg.EnrollPins.Or(s.cfg.EnrollFallback)
 			pins = func(context.Context) enrollscript.Pins { return static }
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if p := pins(ctx); p.SeedImage == "" || p.AgentImage == "" {
+			s.log.Warn("Add host has no images to install: the installed release names none, and " +
+				"QUASAR_ENROLL_SEED_IMAGE / QUASAR_ENROLL_AGENT_IMAGE are unset")
+		}
+		cancel()
 		mux.Handle("/enroll-host.sh", enrollscript.HandlerFrom(s.cfg.WebRoot, pins, s.log))
 	}
 }
 
-// installedEnrollPins answers Add host's images per request: each configured
-// QUASAR_ENROLL_SEED_IMAGE / QUASAR_ENROLL_AGENT_IMAGE, else the installed release's
-// recovery-actor and node-agent images. Read per request because detection can learn
-// the installed release after boot.
-func installedEnrollPins(configured enrollscript.Pins, store *platform.Store, log *slog.Logger) enrollscript.PinSource {
+// installedEnrollPins answers Add host's images per request, field by field: the
+// operator's QUASAR_ENROLL_* override, else the installed release's recovery-actor and
+// node-agent images, else the machine's install-time QUASAR_ENROLL_FALLBACK_* images.
+// Read per request because detection can learn the installed release after boot.
+// commit is this build's (nil when unstamped: no release can be installed).
+func installedEnrollPins(configured, fallback enrollscript.Pins, store *platform.Store, commit *string, log *slog.Logger) enrollscript.PinSource {
 	return func(ctx context.Context) enrollscript.Pins {
 		if configured.SeedImage != "" && configured.AgentImage != "" {
 			return configured
 		}
-		commit := buildinfo.Get().SourceCommit
-		if commit == nil || store == nil {
-			return configured
+		release := enrollscript.Pins{}
+		if commit != nil && store != nil {
+			seed, agent, ok, err := store.InstalledEnrollImages(ctx, *commit)
+			if err != nil {
+				log.Warn("Add host: could not read the installed release's images", "err", err)
+			}
+			if ok {
+				release = enrollscript.Pins{SeedImage: seed, AgentImage: agent}
+			}
 		}
-		seed, agent, ok, err := store.InstalledEnrollImages(ctx, *commit)
-		if err != nil {
-			log.Warn("Add host: could not read the installed release's images", "err", err)
-		}
-		if !ok {
-			return configured
-		}
-		return configured.Or(enrollscript.Pins{SeedImage: seed, AgentImage: agent})
+		return configured.Or(release).Or(fallback)
 	}
 }
 

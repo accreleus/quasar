@@ -19,8 +19,27 @@ use super::signature::SignatureEvidence;
 /// The org's own releases. `{version}` is the only substitution.
 pub(crate) const DEFAULT_MANIFEST_BASE_URL: &str =
     "https://github.com/accreleus/quasar/releases/download/v{version}/";
-pub(crate) const MANIFEST_ASSET_NAME: &str = "platform-release-manifest.json";
-pub(crate) const SIGNATURE_ASSET_NAME: &str = "platform-release-manifest.json.sig";
+/// The asset pair a release's signature is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReleaseAssets {
+    pub(crate) manifest: &'static str,
+    pub(crate) signature: &'static str,
+}
+
+/// What an actor verifies (control-api.md amendment 14, "Release manifest format 2"):
+/// RH06-era releases publish only the format-2 pair.
+pub(crate) const FORMAT_2_ASSETS: ReleaseAssets = ReleaseAssets {
+    manifest: "platform-release-manifest.v2.json",
+    signature: "platform-release-manifest.v2.json.sig",
+};
+
+/// The Go updater's pair, which the shared trust vectors describe unless one names
+/// `asset_format: 2`.
+#[cfg(test)]
+pub(crate) const FORMAT_1_ASSETS: ReleaseAssets = ReleaseAssets {
+    manifest: "platform-release-manifest.json",
+    signature: "platform-release-manifest.json.sig",
+};
 
 /// Larger than any real asset by three orders of magnitude.
 pub(crate) const MAX_ASSET_BYTES: usize = 1 << 20;
@@ -108,12 +127,22 @@ pub(crate) enum Probe {
 pub(crate) struct PendingFetch {
     version: String,
     base: String,
+    assets: ReleaseAssets,
     /// Set once the signature asset has been read; the manifest is fetched next.
     signature: Option<Vec<u8>>,
 }
 
-/// Starts gathering evidence for `version` (the request's `release.version`).
+/// Starts gathering evidence for `version` (the request's `release.version`) from the
+/// format-2 asset pair.
 pub(crate) fn probe(base: &ManifestBaseUrl, version: Option<&str>) -> Probe {
+    probe_assets(base, version, FORMAT_2_ASSETS)
+}
+
+pub(crate) fn probe_assets(
+    base: &ManifestBaseUrl,
+    version: Option<&str>,
+    assets: ReleaseAssets,
+) -> Probe {
     let v = trim_space(version.unwrap_or(""));
     if v.is_empty() {
         // An edge build or a revert to an unnamed build: nothing could have signed it.
@@ -132,6 +161,7 @@ pub(crate) fn probe(base: &ManifestBaseUrl, version: Option<&str>) -> Probe {
     Probe::Fetch(PendingFetch {
         version: v.to_owned(),
         base: base.0.replace("{version}", v),
+        assets,
         signature: None,
     })
 }
@@ -160,9 +190,9 @@ impl PendingFetch {
     /// The asset to fetch: the signature first, since it alone decides absence.
     pub(crate) fn url(&self) -> String {
         let asset = if self.signature.is_none() {
-            SIGNATURE_ASSET_NAME
+            self.assets.signature
         } else {
-            MANIFEST_ASSET_NAME
+            self.assets.manifest
         };
         format!("{}{asset}", self.base)
     }
@@ -181,13 +211,14 @@ impl PendingFetch {
             (_, Err(e)) => fetch_error(format!("fetching {url}: {e}")),
             (None, Ok(r)) if r.status == 404 => Probe::Done(SignatureEvidence::Absent {
                 why: format!(
-                    "release {} publishes no {SIGNATURE_ASSET_NAME} asset",
-                    self.version
+                    "release {} publishes no {} asset",
+                    self.version, self.assets.signature
                 ),
             }),
             (None, Ok(r)) if r.status == 200 => Probe::Fetch(PendingFetch {
                 version: self.version,
                 base: self.base,
+                assets: self.assets,
                 signature: Some(r.body),
             }),
             (None, Ok(r)) => fetch_error(format!("{url} answered HTTP {}", r.status)),

@@ -322,13 +322,19 @@ pub const APP_NETWORKS: &[&str] = &["none", "bridge", "host"];
 
 /// The images a control plane's Add host (#359) installs on a new GPU host, by digest
 /// (`repository@sha256:…`): the seed (this machine's recovery image) and the node agent.
-/// Recorded at install; `None` serves none.
+/// Recorded at install; `None` serves none. `seed`/`agent` are the install-time images, the
+/// control plane's last resort; `*_override` are the operator's `QUASAR_ENROLL_*` seed
+/// inputs, which win over the installed release's images (#365).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EnrollImages {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<ImageRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<ImageRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_override: Option<ImageRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_override: Option<ImageRef>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -551,7 +557,9 @@ impl Book {
             // agent is given. A GPU host's agent has the same shape at both.
             Role::NodeAgent => Some(1..=2),
             Role::RecoveryActor => Some(1..=revision::RECIPE_REVISION),
-            Role::ControlPlane => Some(1..=1),
+            // Revision 2: Add host's images arrive as operator overrides plus install-time
+            // fallbacks, so the installed release's images can come between (#365).
+            Role::ControlPlane => Some(1..=2),
             // The Postgres image carries no recipe label: its revision is this actor's own
             // (`control::POSTGRES_REVISION`).
             Role::Postgres => Some(1..=1),
@@ -612,7 +620,7 @@ pub fn render(
             spec
         }
         Role::RecoveryActor => recovery_actor_r1(inputs, image),
-        Role::ControlPlane => control::control_plane_r1(inputs, image, secrets)?,
+        Role::ControlPlane => control::control_plane(revision, inputs, image, secrets)?,
         Role::Postgres => control::postgres_r1(inputs, image, secrets)?,
     };
     spec.labels.extend([

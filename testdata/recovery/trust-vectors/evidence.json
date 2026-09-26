@@ -770,6 +770,146 @@
       }
     },
     {
+      "name": "format 2: both assets present",
+      "source": "added: the recovery actor fetches the v2 pair (control-api.md amendment 14)",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        },
+        "asset_format": 2
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": "{\"format_version\":1,\"signatures\":[]}"
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json"
+        ]
+      }
+    },
+    {
+      "name": "format 2: no v2 signature is an absence even beside a format-1 pair",
+      "source": "added: the recovery actor fetches the v2 pair",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          }
+        },
+        "asset_format": 2
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "release 0.3.0 publishes no platform-release-manifest.v2.json.sig asset"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "format 2: a v2 signature with no v2 manifest is a failure",
+      "source": "added: the recovery actor fetches the v2 pair",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        },
+        "asset_format": 2
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release 0.3.0 publishes a signature but https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json answered HTTP 404"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json"
+        ]
+      }
+    },
+    {
+      "name": "format 1: a v2-only release reads as unsigned to the updater",
+      "source": "added: the updater keeps the format-1 pair until it retires (#367)",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "release 0.3.0 publishes no platform-release-manifest.json.sig asset"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
       "name": "refused version ../../etc/passwd",
       "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
       "version": "../../etc/passwd",
