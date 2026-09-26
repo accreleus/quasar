@@ -247,8 +247,7 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 				"this control plane does not report an owned install, so it takes no developer apply")
 			return
 		}
-		httpx.WriteError(w, http.StatusNotImplemented, CodeApplyUnsupported,
-			"replacing the control plane on an owned machine arrives with RH06-11 (#363); nothing was attempted")
+		h.developerApplyControlPlane(w, r, req, components)
 		return
 	}
 

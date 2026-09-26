@@ -184,6 +184,13 @@ func (r *OwnMachineReader) Identity(ctx context.Context) MachineIdentity {
 	return m.Identity
 }
 
+// InstallMode is this control plane's own install mode on an owned machine:
+// `owned` while its recovery actor answers, else nil ("nobody could say"),
+// which the plan never treats as eligible.
+func (r *OwnMachineReader) InstallMode() *string {
+	return r.Identity(context.Background()).InstallMode
+}
+
 // Invalidate drops the cached answer: the apply endpoints call it before deciding.
 func (r *OwnMachineReader) Invalidate() {
 	if r == nil {

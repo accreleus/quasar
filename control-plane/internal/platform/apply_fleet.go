@@ -193,6 +193,9 @@ type FleetRunner struct {
 	SchemaVersion int
 	// machineShape is this control plane's own machine shape, from its configuration.
 	machineShape MachineShape
+	// ownMachine is what this control plane's own recovery actor reports; nil
+	// is not an owned machine.
+	ownMachine OwnMachineSource
 
 	mu sync.Mutex
 	// run id → cancel, bounded at one by the active-run index.
@@ -232,6 +235,19 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 func (f *FleetRunner) WithMachineShape(shape MachineShape) *FleetRunner {
 	f.machineShape = shape
 	return f
+}
+
+// WithOwnMachine wires this control plane's own recovery actor, whose commit
+// decides whether the control-plane step moves the actor first (ADR 0008).
+func (f *FleetRunner) WithOwnMachine(src OwnMachineSource) *FleetRunner {
+	f.ownMachine = src
+	return f
+}
+
+// ownedControlPlane: a recovery actor created this control plane, known from
+// its own configuration whether or not the actor is answering.
+func (f *FleetRunner) ownedControlPlane() bool {
+	return f.machineShape.Role != ""
 }
 
 // Start drives one run. Idempotent per run: a second Start for a run already
@@ -389,6 +405,15 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 			f.finish(run.ID, RunFailed,
 				"unattended update refused: this release would migrate the database (or its row could not be read), "+
 					"which drains every session on the instance — apply it yourself when you are watching")
+			return false
+		}
+		// A migrating step on an owned machine needs the pre-update dump, which
+		// this build does not take. Refused before the fleet is cordoned or
+		// drained, so refusing changes nothing.
+		if f.ownedControlPlane() && f.releaseRunsAMigration(ctx, run) {
+			f.log.Warn("fleet apply: refusing a migrating control-plane step on an owned machine",
+				"run_id", run.ID, "release_id", run.ReleaseID, "token", "owned-migrating-refused")
+			f.finish(run.ID, RunFailed, ownedMigratingRefusal)
 			return false
 		}
 		a, err := f.createControlPlaneAttempt(ctx, run)
@@ -1287,6 +1312,15 @@ func (f *FleetRunner) createControlPlaneAttempt(ctx context.Context, run ApplyRu
 	if err != nil {
 		return Attempt{}, err
 	}
+	// ADR 0008: on an owned machine its recovery actor first, when it is not on
+	// the release.
+	var actorCommit *string
+	if f.ownMachine != nil {
+		if own, ok := f.ownMachine.Read(ctx); ok {
+			actorCommit = own.Identity.RecoveryActorSourceCommit
+		}
+	}
+	components = OrderControlPlaneComponents(components, release.SourceCommit, f.ownedControlPlane(), actorCommit)
 	if len(components) == 0 {
 		return Attempt{}, fmt.Errorf("release %s names no control-plane image", releaseLabel(release))
 	}
