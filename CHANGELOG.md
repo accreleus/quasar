@@ -213,6 +213,10 @@ own; the two do not move together, and that is deliberate.
   each failure names the token or utility class to use instead. A per-file baseline
   records the existing debt and only ratchets down. CSS spacing now snaps to the 4px
   token scale, so gaps and padding shift by a few pixels across the UI.
+- **`DESIGN.md`, the UI spec.** Colour roles, the spacing scale, density, where styles
+  live and when inline styles are allowed, plus a table of the places Quasar overrides
+  the v3 mocks. It takes precedence over `design_handoff_v3/`, which stays the
+  reference for composition.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds

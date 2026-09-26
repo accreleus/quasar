@@ -180,21 +180,24 @@ Load-bearing gotchas now live in `.claude/rules/` and auto-load when working wit
 - `.claude/rules/webrtc-testing.md` — WebRTC / browser testing gotchas (loads for `node-agent/**`, `web/**`, `deploy/**`)
 If you are doing pipeline, encoder, WebRTC, or browser-testing work purely over ssh without touching those paths locally, read the relevant rule file explicitly first.
 
-## UI work — the design handoff is the spec
+## UI work — DESIGN.md is the spec
 Any change touching `web/` rendering or a user-visible surface MUST start by
-reading **`design_handoff_v3/`** (README + `screens/assets/console-v3.css` — the
-token contract — + the matching `screens/*.html` mock: `login-v3`, `home`,
-`loading-v3`, `loading-to-stream-v3`, `session-overlay-v3`, `admin-console-v3`
-with its `assets/pages-*.js` section renderers), and MUST be visually verified
-against it (designer agent / `visual-verdict` skill) before being presented as
-done. v3 supersedes the earlier `design_handoff_quasar` / `design_handoff_v2`
-packages (removed 2026-08-28; git history has them) — where they differ, v3 wins.
+reading **`DESIGN.md`** (the rules, and where Quasar overrides the mocks), then the
+matching mock in **`design_handoff_v3/`** for composition (README +
+`screens/*.html`: `login-v3`, `home`, `loading-v3`, `loading-to-stream-v3`,
+`session-overlay-v3`, `admin-console-v3` with its `assets/pages-*.js` section
+renderers, `releases-v3`). Values live in `web/src/styles/tokens.css`. Where
+`DESIGN.md` and a mock disagree, `DESIGN.md` wins; the mocks carry flaws baked in by
+the design tool, and each known one is listed in its override table. A newly found
+flaw is added there in the same change that fixes it. The change MUST be visually
+verified (designer agent / `visual-verdict` skill) before being presented as done.
+v3 supersedes the earlier `design_handoff_quasar` / `design_handoff_v2` packages
+(removed 2026-08-28; git history has them).
 
-The rule that outlives either reference: **do not invent a style guide or
-restyle from taste.** One exists. If no mockup covers the surface being changed,
-say so explicitly and ask before styling. If you cannot reach the handoff at
-all, stop and ask rather than improvising. (History: a milestone run that
-skipped the handoff produced a full UI that had to be redone.)
+The rule that outlives any reference: **do not invent a style guide or restyle from
+taste.** If neither `DESIGN.md` nor a mock covers the surface being changed, say so
+explicitly and ask before styling. (History: a milestone run that skipped the handoff
+produced a full UI that had to be redone.)
 
 ## Model tiering (per-ticket tiers ride on each issue's `needs:*` label / kickoff doc)
 - Opus 4.8: architecture, interface/schema design, WebRTC negotiation, the latency path, security/concurrency, integration debugging, writing tickets, reviewing seams.
