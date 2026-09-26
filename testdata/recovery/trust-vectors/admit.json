@@ -2354,6 +2354,185 @@
       }
     },
     {
+      "name": "the control socket may name the recovery actor with the control plane",
+      "source": "added: control-api.md amendment 14 (the control-plane target names recovery-actor first)",
+      "caller": "control_plane",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          },
+          {
+            "name": "control-plane",
+            "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": true,
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "the control socket names the recovery actor only with the control plane",
+      "source": "added: A1 (the actor leads the control plane only while its replacement is in flight)",
+      "caller": "control_plane",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "the control plane's recovery actor is held to the allowlist",
+      "source": "added: amendment 14 (the actor's image is subject to the same namespace rules)",
+      "caller": "control_plane",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/someone-else/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          },
+          {
+            "name": "control-plane",
+            "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": false,
+        "reason": "namespace_rejected",
+        "message": "component \"recovery-actor\": image \"ghcr.io/someone-else/quasar/quasar-recovery\" is outside this host's platform-image namespaces (ghcr.io/accreleus/quasar)",
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "a signed release binds the control plane's recovery actor",
+      "source": "added: ADR 0003 binding covers every component a request names",
+      "caller": "control_plane",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "require",
+        "trusted_keys": [
+          {
+            "id": "release-2026",
+            "public_key_of": "release-2026"
+          }
+        ]
+      },
+      "request": {
+        "request_id": "11111111-2222-3333-4444-555555555555",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "name": "control-plane",
+            "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+            "digest": "sha256:aa11000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "release": {
+          "id": "rel",
+          "version": "0.3.0",
+          "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "evidence": {
+        "state": "signed",
+        "manifest": {
+          "text": "{\"version\":\"0.3.0\",\"components\":[{\"name\":\"control-plane\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\"},{\"name\":\"recovery-actor\",\"image\":\"ghcr.io/accreleus/quasar/quasar-recovery\",\"digest\":\"sha256:cc33000000000000000000000000000000000000000000000000000000000000\"}]}"
+        },
+        "signature": {
+          "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"ySOKnHt5JDB4fhMjQaU90oj21KuVr6tHnAYXbD5QuK2QwRmfSdmS4QXWwmAaUHsyxDbmA5QqfvBBrA5yanrzCQ==\"}]}"
+        }
+      },
+      "expect": {
+        "admitted": true,
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
       "name": "off ignores unverifiable evidence and no keys",
       "source": "go:control-plane/internal/updater/signature_test.go:TestCheckSignatureOffIgnoresEverything",
       "caller": "control_plane",

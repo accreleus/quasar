@@ -206,8 +206,11 @@ type admitVector struct {
 	Evidence *evidenceSpec `json:"evidence,omitempty"`
 	Fetch    *fetchSpec    `json:"fetch,omitempty"`
 	Expect   admitDecision `json:"expect"`
-	// Agent-caller vectors only: the Go updater has no notion of which socket
-	// a request came in on, so Go is held to this, and the Rust port to both.
+	// The Go updater has no notion of which socket a request came in on. On an
+	// agent-caller vector Go is held to this and the Rust port to both; on a
+	// control-plane-caller vector it is present only where the port admits what
+	// Go refuses (the control socket naming the recovery actor with the control
+	// plane), and Go is held to it, the port to Expect.
 	ExpectWithoutCallerGuard *admitDecision `json:"expect_without_caller_guard,omitempty"`
 }
 
@@ -576,10 +579,11 @@ func TestTrustVectorsPassAgainstGo(t *testing.T) {
 				got := goAdmit(t, v)
 				switch v.Caller {
 				case "control_plane":
+					want := v.Expect
 					if v.ExpectWithoutCallerGuard != nil {
-						t.Errorf("%s: expect_without_caller_guard is for agent-caller vectors only", v.Name)
+						want = *v.ExpectWithoutCallerGuard
 					}
-					matchAdmit(t, v.Name, v.Expect, got)
+					matchAdmit(t, v.Name, want, got)
 				case "agent":
 					if v.ExpectWithoutCallerGuard == nil {
 						t.Fatalf("%s: an agent-caller vector must say what the caller-less Go updater does", v.Name)

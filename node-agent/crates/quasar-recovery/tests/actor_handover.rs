@@ -19,9 +19,8 @@ use quasar_recovery::actor::{
     Actor, ActorConfig, HandoverTiming, OperatorInputs, ReplaceTiming, TrustConfig,
 };
 use quasar_recovery::engine::{
-    Behaviour, Container, ContainerSpec, EngineError, EngineHost, FakeContainer, FakeEngine, FakeState,
-    Fault,
-    Image, Lifecycle, Network, PlatformEngine, RestartPolicy, Volume, When,
+    Behaviour, Container, ContainerSpec, EngineError, EngineHost, FakeContainer, FakeEngine,
+    FakeState, Fault, Image, Lifecycle, Network, PlatformEngine, RestartPolicy, Volume, When,
 };
 use quasar_recovery::journal::Phase;
 use quasar_recovery::recipe::names;
@@ -1833,7 +1832,10 @@ fn a_control_plane_step_moves_the_actor_first_then_the_control_plane() {
     assert_one_control_plane(&lab, NEW_CONTROL, "actor then control plane");
     // Sessions ride through: the agent and the database are never touched.
     let now = lab.container(names::NODE_AGENT);
-    assert_eq!((now.id.as_str(), now.status.as_str()), (agent.id.as_str(), "running"));
+    assert_eq!(
+        (now.id.as_str(), now.status.as_str()),
+        (agent.id.as_str(), "running")
+    );
     assert_eq!(lab.container(names::POSTGRES).id, postgres.id);
     let names: Vec<&str> = result.previous.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["recovery-actor", "control-plane"]);
@@ -1930,7 +1932,12 @@ fn killing_the_actor_mid_control_plane_replacement_settles_with_a_running_contro
 /// back, and the kept control plane (restart disabled) does not.
 #[test]
 fn a_daemon_restart_mid_control_plane_replacement_settles_with_a_running_control_plane() {
-    for phase in [Phase::Checked, Phase::OldKept, Phase::Started, Phase::Verifying] {
+    for phase in [
+        Phase::Checked,
+        Phase::OldKept,
+        Phase::Started,
+        Phase::Verifying,
+    ] {
         let at = format!("daemon restart after control-plane {phase:?}");
         let lab = Lab::combined();
         let mut fired = false;

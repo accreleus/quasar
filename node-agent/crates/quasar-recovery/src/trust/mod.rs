@@ -35,8 +35,9 @@ pub(crate) const DEFAULT_ALLOWED_NAMESPACES: &[&str] = &["ghcr.io/accreleus/quas
 /// The closed component table. Anything else (`quasar-updater`, `postgres`, ...) is
 /// `invalid`, and so is `recovery-actor` except on the agent socket: unlike the Go updater,
 /// the recovery actor accepts itself there, because it hands over to a successor
-/// (agent-api.md amendment 14, ADR 0008). The agent-caller vectors pin the difference. The
-/// control socket names it only with the control plane's replacement (`crate::submit`).
+/// (agent-api.md amendment 14, ADR 0008). The control socket names it only together with
+/// `control-plane` (rule A: the actor moves first); alone it stays unknown there, as in Go.
+/// The vectors whose Go answer differs carry it as `expect_without_caller_guard`.
 const COMPONENTS: &[&str] = &["control-plane", "node-agent"];
 const RECOVERY_ACTOR: &str = "recovery-actor";
 
@@ -122,10 +123,11 @@ pub fn admit(
         return Err(reject(Reason::Invalid, "components is empty".into()));
     }
     let mut seen: Vec<&str> = Vec::with_capacity(req.components.len());
+    let names_control_plane = req.components.iter().any(|c| c.name == "control-plane");
     for c in &req.components {
         let name = quote(&c.name);
         let known = COMPONENTS.contains(&c.name.as_str())
-            || (caller == Caller::Agent && c.name == RECOVERY_ACTOR);
+            || (c.name == RECOVERY_ACTOR && (caller == Caller::Agent || names_control_plane));
         if !known {
             return Err(reject(Reason::Invalid, format!("unknown component {name}")));
         }
