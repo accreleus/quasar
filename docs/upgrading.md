@@ -18,7 +18,7 @@ do instead.
   Compose files" is about this kind. How to make one: `docs/configuration.md` "Seed" and the
   site's Install pages.
 - **An install made from the Compose files before owned installs existed**
-  (`deploy/docker-compose.yml` plus `deploy/.env`, with or without `quasar-updater`). It keeps
+  (`deploy/docker-compose.yml` plus `deploy/.env`, with or without its updater service). It keeps
   running the release it has. It is **not offered** any release that ships owned installs, or
   anything after it, and nothing converts it in place: it is replaced by a fresh seed install
   ("Replacing an install made from the Compose files" below).
