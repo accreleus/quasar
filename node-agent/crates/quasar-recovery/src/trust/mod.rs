@@ -36,7 +36,7 @@ pub(crate) const DEFAULT_ALLOWED_NAMESPACES: &[&str] = &["ghcr.io/accreleus/quas
 /// `invalid`, and so is `recovery-actor` except on the agent socket: unlike the Go updater,
 /// the recovery actor accepts itself there, because it hands over to a successor
 /// (agent-api.md amendment 14, ADR 0008). The agent-caller vectors pin the difference. The
-/// control socket names it only with the control plane's replacement (RH06-11, #363).
+/// control socket names it only with the control plane's replacement (`crate::submit`).
 const COMPONENTS: &[&str] = &["control-plane", "node-agent"];
 const RECOVERY_ACTOR: &str = "recovery-actor";
 

@@ -19,7 +19,8 @@ use quasar_recovery::actor::{
     Actor, ActorConfig, HandoverTiming, OperatorInputs, ReplaceTiming, TrustConfig,
 };
 use quasar_recovery::engine::{
-    Behaviour, Container, ContainerSpec, EngineError, EngineHost, FakeContainer, FakeEngine, Fault,
+    Behaviour, Container, ContainerSpec, EngineError, EngineHost, FakeContainer, FakeEngine, FakeState,
+    Fault,
     Image, Lifecycle, Network, PlatformEngine, RestartPolicy, Volume, When,
 };
 use quasar_recovery::journal::Phase;
@@ -46,6 +47,68 @@ const NEXT: &str = "quasar-recovery.next";
 /// The seed fixture set the current tree writes until a release ships it
 /// (`testdata/recovery/seed/README.md`).
 const UNRELEASED_SET: &str = "unreleased";
+const CONTROL_REPO: &str = "registry.example.invalid/quasar/quasar-control-plane";
+const CONTROL_IMAGE: &str = "registry.example.invalid/quasar/quasar-control-plane@sha256:aa11000000000000000000000000000000000000000000000000000000000000";
+const NEW_CONTROL_DIGEST: &str =
+    "sha256:ab12000000000000000000000000000000000000000000000000000000000000";
+const NEW_CONTROL: &str = "registry.example.invalid/quasar/quasar-control-plane@sha256:ab12000000000000000000000000000000000000000000000000000000000000";
+const POSTGRES_IMAGE: &str = "docker.io/library/postgres@sha256:dd55000000000000000000000000000000000000000000000000000000000000";
+
+fn recipe_image(id: &str, reference: &str, recipe: Option<&str>) -> Image {
+    Image {
+        id: id.into(),
+        repo_digests: vec![reference.into()],
+        labels: recipe
+            .map(|r| BTreeMap::from([("org.quasar.recipe".to_string(), r.to_string())]))
+            .unwrap_or_default(),
+    }
+}
+
+/// A clean machine with only a combined host's seed on it; Postgres, the control plane and
+/// the newer control plane are healthy once they run.
+fn combined_host() -> FakeState {
+    let env = BTreeMap::from([
+        ("QUASAR_ROLE".to_string(), "combined".to_string()),
+        ("QUASAR_HOME_ROOT".into(), HOME.into()),
+        ("QUASAR_AGENT_IMAGE".into(), AGENT_IMAGE.into()),
+        ("QUASAR_CONTROL_PLANE_IMAGE".into(), CONTROL_IMAGE.into()),
+        ("QUASAR_POSTGRES_IMAGE".into(), POSTGRES_IMAGE.into()),
+        ("QUASAR_PUBLIC_HOST".into(), "quasar.example.invalid".into()),
+    ]);
+    let mut state = seeded_host(env);
+    state
+        .registry
+        .insert(AGENT_IMAGE.into(), agent_image(Some("2")));
+    for (id, reference, recipe) in [
+        (
+            "sha256:c0c0000000000000000000000000000000000000000000000000000000000000",
+            CONTROL_IMAGE,
+            Some("1"),
+        ),
+        (
+            "sha256:c1c1000000000000000000000000000000000000000000000000000000000000",
+            NEW_CONTROL,
+            Some("1"),
+        ),
+        (
+            "sha256:9090000000000000000000000000000000000000000000000000000000000000",
+            POSTGRES_IMAGE,
+            None,
+        ),
+    ] {
+        state
+            .registry
+            .insert(reference.into(), recipe_image(id, reference, recipe));
+        state.behaviour.insert(
+            reference.into(),
+            Behaviour {
+                health: Some("healthy".into()),
+                ..Default::default()
+            },
+        );
+    }
+    state
+}
 
 /// The phases each process commits in a hand-over, in order.
 const OLD_PHASES: &[Phase] = &[
@@ -240,6 +303,9 @@ struct Lab {
     /// The test removed every actor container on purpose: until the seed has looked, a
     /// seed that would create one is right, not racing.
     operator_removed: AtomicBool,
+    /// A combined host (its control plane submits on the control socket) rather than a
+    /// GPU host (its agent submits on the agent socket).
+    combined: bool,
     me: Weak<Lab>,
     stop: AtomicBool,
 }
@@ -276,7 +342,21 @@ impl Lab {
     /// A GPU host installed the documented way: the seed started, it created the actor, and
     /// the actor installed the agent. The successor's image is in the registry.
     fn new() -> Arc<Lab> {
-        let mut state = seeded_host(seed_env());
+        Lab::build(false)
+    }
+
+    /// A combined host installed the same way: Postgres, the control plane and its agent.
+    /// A newer control-plane image is in the registry too (`NEW_CONTROL`).
+    fn combined() -> Arc<Lab> {
+        Lab::build(true)
+    }
+
+    fn build(combined: bool) -> Arc<Lab> {
+        let mut state = if combined {
+            combined_host()
+        } else {
+            seeded_host(seed_env())
+        };
         let mut labels = BTreeMap::from([
             ("org.quasar.recipe".to_string(), "1".to_string()),
             ("org.quasar.version".to_string(), "0.7.0".to_string()),
@@ -321,6 +401,7 @@ impl Lab {
             agent_polls: AtomicBool::new(true),
             relaying: AtomicBool::new(false),
             operator_removed: AtomicBool::new(false),
+            combined,
             me: me.clone(),
             stop: AtomicBool::new(false),
         });
@@ -330,7 +411,8 @@ impl Lab {
                 lab.lifecycle(event);
             }
         });
-        // The node agent's relay: it polls the attempt's status on the agent socket.
+        // The node agent's relay (on a combined host, the control plane's poll): it polls
+        // the attempt's status on the socket it submitted on.
         let weak = Arc::downgrade(&lab);
         std::thread::spawn(move || loop {
             let Some(lab) = weak.upgrade() else { return };
@@ -383,8 +465,30 @@ impl Lab {
         outcome
     }
 
+    /// The socket attempts are submitted and polled on: the agent socket of a GPU host, the
+    /// control socket of a combined host.
     fn socket(&self) -> std::path::PathBuf {
-        self.sockets.path().join("agent.sock")
+        if self.combined {
+            self.sockets.path().join("control/control.sock")
+        } else {
+            self.sockets.path().join("agent.sock")
+        }
+    }
+
+    fn caller(&self) -> Caller {
+        if self.combined {
+            Caller::ControlPlane
+        } else {
+            Caller::Agent
+        }
+    }
+
+    fn container(&self, name: &str) -> FakeContainer {
+        self.engine
+            .state()
+            .container_named(name)
+            .unwrap_or_else(|| panic!("no {name}"))
+            .clone()
     }
 
     fn lifecycle(&self, event: &Lifecycle) {
@@ -426,6 +530,7 @@ impl Lab {
             ..Default::default()
         };
         config.timing = fast();
+        config.healthy_wait = Duration::from_millis(20);
         config.handover = *self.handover.lock().unwrap();
         config.socket_dir = if self.no_socket.lock().unwrap().iter().any(|i| *i == image) {
             // A directory under a regular file: nothing can be bound there.
@@ -641,11 +746,12 @@ impl Lab {
         }
     }
 
-    /// Submit on the running actor's agent socket path, as the agent's relay does.
+    /// Submit as the running actor's caller does: the agent's relay on a GPU host, the
+    /// control plane on a combined host.
     fn submit(&self, req: Request) -> Result<(), quasar_recovery::socket::Rejection> {
         let actor = self.serving().expect("an actor serves");
         self.relaying.store(true, Ordering::SeqCst);
-        actor.submit(Caller::Agent, req).map(|_| ())
+        actor.submit(self.caller(), req).map(|_| ())
     }
 
     /// Wait until the attempt is terminal and exactly one actor runs, holds the lease and
@@ -1464,4 +1570,253 @@ fn a_manager_declared_actor_is_refused_a_hand_over() {
     );
     assert_eq!(lab.actors().len(), 1);
     assert!(lab.engine.state().container_named(NEXT).is_none());
+}
+
+// ─── the control plane's step on its own machine (#363) ──────────────────────────────
+
+fn control_component() -> Component {
+    Component {
+        name: "control-plane".into(),
+        image: CONTROL_REPO.into(),
+        digest: NEW_CONTROL_DIGEST.into(),
+    }
+}
+
+/// The machine after a control-plane step: one control plane, under its name, running and
+/// restartable, and no kept container of any service left behind.
+fn assert_one_control_plane(lab: &Lab, image: &str, at: &str) -> FakeContainer {
+    let state = lab.engine.state();
+    let cps: Vec<&FakeContainer> = state
+        .containers
+        .values()
+        .filter(|c| {
+            c.spec
+                .labels
+                .get("io.quasar.platform-service")
+                .map(String::as_str)
+                == Some("control-plane")
+        })
+        .collect();
+    assert_eq!(cps.len(), 1, "{at}: control-plane containers {cps:#?}");
+    let cp = cps[0].clone();
+    assert_eq!(cp.spec.name, names::CONTROL_PLANE, "{at}");
+    assert_eq!(cp.spec.image, image, "{at}");
+    assert_eq!(cp.status, "running", "{at}");
+    assert_eq!(cp.restart, RestartPolicy::UnlessStopped, "{at}");
+    assert!(
+        state
+            .containers
+            .values()
+            .all(|c| !c.spec.name.ends_with(".kept")),
+        "{at}: a kept container is left"
+    );
+    cp
+}
+
+#[test]
+fn a_control_plane_step_moves_the_actor_first_then_the_control_plane() {
+    let lab = Lab::combined();
+    let agent = lab.container(names::NODE_AGENT);
+    let postgres = lab.container(names::POSTGRES);
+    lab.submit(request(vec![actor_component(), control_component()]))
+        .unwrap();
+    let result = lab.outcome("actor then control plane");
+    assert_succeeded(&lab, &result, "actor then control plane");
+    assert_one_control_plane(&lab, NEW_CONTROL, "actor then control plane");
+    // Sessions ride through: the agent and the database are never touched.
+    let now = lab.container(names::NODE_AGENT);
+    assert_eq!((now.id.as_str(), now.status.as_str()), (agent.id.as_str(), "running"));
+    assert_eq!(lab.container(names::POSTGRES).id, postgres.id);
+    let names: Vec<&str> = result.previous.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["recovery-actor", "control-plane"]);
+    assert_eq!(
+        result.previous[1].digest.as_deref(),
+        CONTROL_IMAGE.split_once('@').map(|(_, d)| d)
+    );
+}
+
+/// ADR 0004 amendment and A1: a non-migrating control plane that never passes a health
+/// check is put back automatically; the actor that moved first stays on the new release.
+#[test]
+fn a_control_plane_that_never_passes_a_health_check_is_restored_and_the_actor_stays_ahead() {
+    for health in ["starting", "unhealthy"] {
+        let lab = Lab::combined();
+        let cp = lab.container(names::CONTROL_PLANE);
+        lab.engine.with_state(|s| {
+            s.behaviour.insert(
+                NEW_CONTROL.into(),
+                Behaviour {
+                    health: Some(health.into()),
+                    ..Default::default()
+                },
+            );
+        });
+        lab.submit(request(vec![actor_component(), control_component()]))
+            .unwrap();
+        let result = lab.outcome(health);
+        assert_eq!(result.state, State::Failed, "{health}: {result:?}");
+        assert_eq!(result.reason, Some(Reason::Unhealthy), "{health}");
+        assert!(result.restored, "{health}: {result:?}");
+        lab.assert_one_actor(NEW_ACTOR, health);
+        let now = assert_one_control_plane(&lab, CONTROL_IMAGE, health);
+        assert_eq!(now.id, cp.id, "{health}: not the previous control plane");
+        assert!(
+            result.output.contains("previous container was put back")
+                && result.output.contains("recovery-actor")
+                && result.output.contains("stays on the new image"),
+            "{health}: {}",
+            result.output
+        );
+    }
+}
+
+/// The actor killed at any point of the control plane's replacement settles, on its
+/// restart, to a stated outcome with one running control plane: interrupted and untouched
+/// before the old one was taken out of service, continued to verification after.
+#[test]
+fn killing_the_actor_mid_control_plane_replacement_settles_with_a_running_control_plane() {
+    let phases = [
+        (Phase::Pulling, false),
+        (Phase::Checked, false),
+        (Phase::OldKept, true),
+        (Phase::Created, true),
+        (Phase::Started, true),
+        (Phase::Verifying, true),
+        (Phase::Verified, true),
+        (Phase::OldDiscarded, true),
+    ];
+    for (phase, continues) in phases {
+        let at = format!("killed after control-plane {phase:?}");
+        let lab = Lab::combined();
+        let cp = lab.container(names::CONTROL_PLANE);
+        let mut fired = false;
+        lab.on(move |_, who, component, p| {
+            let hit = !fired && who == Who::New && component == "control-plane" && p == phase;
+            fired |= hit;
+            hit
+        });
+        lab.submit(request(vec![actor_component(), control_component()]))
+            .unwrap();
+        let result = lab.outcome(&at);
+        lab.assert_one_actor(NEW_ACTOR, &at);
+        if continues {
+            assert_eq!(result.state, State::Succeeded, "{at}: {result:?}");
+            assert_one_control_plane(&lab, NEW_CONTROL, &at);
+        } else {
+            assert_eq!(result.state, State::Failed, "{at}: {result:?}");
+            assert_eq!(result.reason, Some(Reason::Interrupted), "{at}");
+            assert!(!result.restored, "{at}");
+            let now = assert_one_control_plane(&lab, CONTROL_IMAGE, &at);
+            assert_eq!(now.id, cp.id, "{at}: the control plane was touched");
+            assert!(
+                result.output.contains("recovery-actor")
+                    && result.output.contains("stays on the new image"),
+                "{at}: {}",
+                result.output
+            );
+        }
+    }
+}
+
+/// The same with the whole engine restarting: containers whose policy restarts them come
+/// back, and the kept control plane (restart disabled) does not.
+#[test]
+fn a_daemon_restart_mid_control_plane_replacement_settles_with_a_running_control_plane() {
+    for phase in [Phase::Checked, Phase::OldKept, Phase::Started, Phase::Verifying] {
+        let at = format!("daemon restart after control-plane {phase:?}");
+        let lab = Lab::combined();
+        let mut fired = false;
+        lab.on(move |lab, who, component, p| {
+            if fired || who != Who::New || component != "control-plane" || p != phase {
+                return false;
+            }
+            fired = true;
+            lab.restart_daemon();
+            false
+        });
+        lab.submit(request(vec![actor_component(), control_component()]))
+            .unwrap();
+        let result = lab.outcome(&at);
+        lab.assert_one_actor(NEW_ACTOR, &at);
+        let image = if result.state == State::Succeeded {
+            NEW_CONTROL
+        } else {
+            assert_eq!(result.reason, Some(Reason::Interrupted), "{at}: {result:?}");
+            CONTROL_IMAGE
+        };
+        assert_one_control_plane(&lab, image, &at);
+    }
+}
+
+#[test]
+fn only_the_control_socket_moves_the_control_plane_and_never_across_a_migration() {
+    let lab = Lab::combined();
+    let actor = lab.serving().unwrap();
+    let refused = actor
+        .submit(Caller::Agent, request(vec![control_component()]))
+        .unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+    assert!(
+        refused.message.contains("confused deputy"),
+        "{}",
+        refused.message
+    );
+
+    let mut migrating = request(vec![actor_component(), control_component()]);
+    migrating.migrates = true;
+    migrating.schema_version = Some(97);
+    let refused = lab.submit(migrating).unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+    assert!(refused.message.contains("#364"), "{}", refused.message);
+
+    let mut restore = request(vec![]);
+    restore.kind = RequestKind::Restore;
+    restore.dump = Some("2026-09-25T1402Z-schema-88".into());
+    let refused = lab.submit(restore).unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+
+    // Nothing was journalled and nothing moved.
+    assert!(actor.status_for(Some(ID)).result.is_none());
+    lab.assert_one_actor(ACTOR_IMAGE, "refused");
+    assert_one_control_plane(&lab, CONTROL_IMAGE, "refused");
+}
+
+#[test]
+fn a_gpu_hosts_control_socket_request_names_no_control_plane() {
+    let lab = Lab::new();
+    let actor = lab.serving().unwrap();
+    let refused = actor
+        .submit(Caller::ControlPlane, request(vec![control_component()]))
+        .unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid, "{}", refused.message);
+    assert!(refused.message.contains("GPU host"), "{}", refused.message);
+}
+
+/// Each socket reads only its own caller's attempts: the agent on a combined host never
+/// sees the control plane's replacement as one to relay.
+#[test]
+fn each_socket_answers_status_only_for_attempts_submitted_on_it() {
+    use std::io::{Read, Write};
+    let lab = Lab::combined();
+    lab.submit(request(vec![control_component()])).unwrap();
+    let result = lab.outcome("control plane");
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    let read = |socket: &str, query: &str| -> Status {
+        let path = lab.sockets.path().join(socket);
+        let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+        write!(
+            stream,
+            "GET /v1/status{query} HTTP/1.0\r\nHost: recovery\r\n\r\n"
+        )
+        .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap()
+    };
+    let by_id = format!("?request_id={ID}");
+    let mine = |s: Status| s.result.map(|r| r.request_id);
+    assert_eq!(mine(read("control/control.sock", &by_id)), Some(ID.into()));
+    assert_eq!(mine(read("control/control.sock", "")), Some(ID.into()));
+    assert_eq!(mine(read("agent/agent.sock", &by_id)), None);
+    assert_eq!(mine(read("agent/agent.sock", "")), None);
 }

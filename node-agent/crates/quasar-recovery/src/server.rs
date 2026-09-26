@@ -2,8 +2,8 @@
 //! actor creates in the `quasar-recovery-agent` volume. Each is given only to the one
 //! container it is for (the agent socket to the node agent, the control socket to the
 //! control plane), so the socket a request arrives on is its caller. Not a frozen
-//! interface. Both serve `GET /v1/status[?request_id=<uuid>]` and `POST /v1/submit` (a
-//! `socket::Request`).
+//! interface. Both serve `GET /v1/status[?request_id=<uuid>]`, whose `result` is only ever an
+//! attempt submitted on the same socket, and `POST /v1/submit` (a `socket::Request`).
 //!
 //! Answers are `HTTP/1.1` with `Content-Length` and `Connection: close`, and the
 //! connection is closed after one response, so an HTTP/1.0 client reading to EOF (the
@@ -136,13 +136,11 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     match (method, path) {
         ("GET", "/v1/status") => {
-            // TODO(#363): scope `result` by caller once the control socket exists, so the
-            // agent socket answers only for attempts the agent submitted.
             let request_id = query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("request_id="));
-            let body =
-                serde_json::to_string(&actor.status_for(request_id)).map_err(io::Error::other)?;
+            let body = serde_json::to_string(&actor.status_as(caller, request_id))
+                .map_err(io::Error::other)?;
             respond(&mut stream, 200, &body)
         }
         ("POST", "/v1/submit") => submit(&mut stream, &head, actor, caller),
