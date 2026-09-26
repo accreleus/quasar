@@ -110,6 +110,7 @@ impl Bootstrap {
                 app_pgid: get(APP_PGID),
                 container_network: get(CONTAINER_NETWORK),
                 trust: TrustInputs {
+                    unknown: Default::default(),
                     allowed_namespaces: get(ALLOWED_NAMESPACES),
                     signature_mode: get(SIGNATURE_MODE),
                     trusted_keys: get(TRUSTED_KEYS),
@@ -201,6 +202,7 @@ impl Bootstrap {
         };
         let app = self.check_app()?;
         let probe = Inputs {
+            unknown: Default::default(),
             installation_id: "check".into(),
             node_name: node_name.clone(),
             home_root: home_root.clone(),
@@ -242,6 +244,7 @@ impl Bootstrap {
                 .transpose()
         };
         Ok(AppInputs {
+            unknown: Default::default(),
             puid: id(APP_PUID, &op.app_puid)?,
             pgid: id(APP_PGID, &op.app_pgid)?,
             container_network: op.container_network.as_ref().map(|n| n.trim().to_owned()),
@@ -279,6 +282,7 @@ impl Bootstrap {
                     })?;
                 let port = port(DATABASE_PORT, op.database_port.as_deref(), 5432)?;
                 let database = DatabaseInputs::External {
+                    unknown: Default::default(),
                     host: host.trim().to_owned(),
                     port,
                     user: op
@@ -307,6 +311,7 @@ impl Bootstrap {
             postgres_image,
             database_password,
             inputs: ControlInputs {
+                unknown: Default::default(),
                 machine_role: if self.role == MachineRole::Combined {
                     recipe::ControlRole::Combined
                 } else {

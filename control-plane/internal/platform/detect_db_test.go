@@ -252,6 +252,49 @@ func TestStoreHostsProjectsIdentityAndDerivesKnown(t *testing.T) {
 	}
 }
 
+// The recovery actor's commit, which orders a host attempt actor first (#362), is
+// read both into the view's identity and on its own for the register hook.
+func TestStoreReadsTheHostsRecoveryActorCommit(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	store := NewStore(pool)
+	var owned, legacy string
+	if err := pool.QueryRow(ctx, `INSERT INTO hosts (node_name, status, node_secret_hash, source_commit, built_at,
+		install_mode, updater_present, recovery_actor_source_commit)
+		VALUES ('gpu-owned', 'online', 'x', $1, now(), 'owned', true, $2) RETURNING id::text`, commitA, commitB).Scan(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO hosts (node_name, status, node_secret_hash)
+		VALUES ('gpu-legacy', 'online', 'y') RETURNING id::text`).Scan(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	hosts, err := store.Hosts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hosts {
+		switch h.NodeName {
+		case "gpu-owned":
+			if h.RecoveryActorSourceCommit == nil || *h.RecoveryActorSourceCommit != commitB {
+				t.Errorf("owned host: actor commit %v", h.RecoveryActorSourceCommit)
+			}
+		case "gpu-legacy":
+			if h.RecoveryActorSourceCommit != nil {
+				t.Errorf("legacy host: actor commit %v", *h.RecoveryActorSourceCommit)
+			}
+		}
+	}
+	if got, err := store.HostActorCommit(ctx, owned); err != nil || got == nil || *got != commitB {
+		t.Errorf("HostActorCommit(owned) = %v, %v", got, err)
+	}
+	if got, err := store.HostActorCommit(ctx, legacy); err != nil || got != nil {
+		t.Errorf("HostActorCommit(legacy) = %v, %v", got, err)
+	}
+	if _, err := store.HostActorCommit(ctx, "00000000-0000-4000-8000-000000000000"); err != ErrHostNotFound {
+		t.Errorf("HostActorCommit(missing) err = %v, want ErrHostNotFound", err)
+	}
+}
+
 func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), sql, args...); err != nil {

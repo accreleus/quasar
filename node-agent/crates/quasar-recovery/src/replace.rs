@@ -21,9 +21,10 @@ use tracing::{error, info, warn};
 
 use crate::actor::{Actor, ResumeError};
 use crate::engine::{Container, EngineError, RestartPolicy};
+use crate::handover::Flow;
 use crate::journal::{tail_output, Failure, Journal, Phase, LOG_TAIL_LIMIT, OUTPUT_LIMIT};
 use crate::recipe::{self, labels, Book, RenderError, Role};
-use crate::settle::{settle, Settlement};
+use crate::settle::{settle, Settlement, RECOVERY_ACTOR};
 use crate::socket::{Reason, State};
 use crate::submit::kept_name;
 
@@ -31,14 +32,14 @@ use crate::submit::kept_name;
 pub const ATTEMPT_LABEL: &str = "io.quasar.attempt";
 
 /// How a step stopped short.
-enum Halt {
+pub(crate) enum Halt {
     /// The process "died" here (`EngineError::Crashed`, injected by tests), or the journal
     /// could not be written: stop driving and leave the journal as it is.
     Died,
     Fail(Failure),
 }
 
-fn fail(reason: Reason, detail: impl Into<String>) -> Halt {
+pub(crate) fn fail(reason: Reason, detail: impl Into<String>) -> Halt {
     Halt::Fail(Failure {
         reason,
         detail: detail.into(),
@@ -46,7 +47,7 @@ fn fail(reason: Reason, detail: impl Into<String>) -> Halt {
 }
 
 /// An engine error inside a step: a crash stops everything; anything else fails the step.
-fn engine(e: EngineError, reason: Reason, what: &str) -> Halt {
+pub(crate) fn engine(e: EngineError, reason: Reason, what: &str) -> Halt {
     match e {
         EngineError::Crashed => Halt::Died,
         e => fail(reason, format!("{what}: {e}")),
@@ -70,6 +71,7 @@ impl Actor {
                 request = %request_id,
                 "this attempt stopped being driven; the next start settles it"
             );
+            self.died();
         }
     }
 
@@ -90,27 +92,51 @@ impl Actor {
         let Some(journal) = scan.open().cloned() else {
             return Ok(());
         };
+        self.settle_journal(journal).map_err(|()| {
+            self.died();
+            stopped()
+        })
+    }
+
+    /// Drive an open journal this process just took the lease for to its outcome, by the
+    /// settle table for this process's party.
+    pub(crate) fn settle_journal(&self, mut journal: Journal) -> Result<(), ()> {
         let id = journal.request.request_id.clone();
-        match settle(&journal) {
+        let party = self.party(&journal);
+        self.count_successor_start(&mut journal, party)?;
+        match settle(&journal, party) {
             Settlement::Terminal => Ok(()),
             Settlement::Interrupted => {
-                info!(request = %id, "settling an attempt interrupted before anything changed");
-                self.interrupt(journal).map_err(|()| stopped())
+                info!(request = %id, "settling an attempt interrupted before its current component was touched");
+                self.interrupt(journal)
             }
             Settlement::Continue => {
-                info!(request = %id, "continuing an attempt a restart interrupted after the old container was taken out of service");
-                self.run(journal).map_err(|()| stopped())
+                info!(request = %id, ?party, "continuing an attempt a restart interrupted");
+                self.run(journal)
+            }
+            Settlement::Restore => {
+                info!(request = %id, ?party, "the recovery actor's hand-over did not finish; putting the previous actor back");
+                self.begin_actor_restore(&mut journal, party)?;
+                self.run(journal)
+            }
+            Settlement::Yield => {
+                info!(request = %id, ?party, "another recovery actor finishes this attempt; handing the machine to it");
+                self.yield_attempt(journal, party)
             }
         }
     }
 
-    fn now(&self) -> String {
+    pub(crate) fn now(&self) -> String {
         (self.config.now)()
     }
 
     /// Commit the journal. A journal that cannot be written stops the attempt: acting on
     /// a phase that is not on disk is the one thing D8 forbids.
-    fn commit(&self, j: &mut Journal) -> Result<(), ()> {
+    pub(crate) fn commit(&self, j: &mut Journal) -> Result<(), ()> {
+        // A process that is gone writes nothing: another actor may own the attempt now.
+        if self.killed() {
+            return Err(());
+        }
         j.project();
         j.result.updated_at = self.now();
         self.journals.store(j).map_err(|e| {
@@ -122,12 +148,19 @@ impl Actor {
         })
     }
 
-    fn advance(&self, j: &mut Journal, i: usize, phase: Phase) -> Result<(), ()> {
+    pub(crate) fn advance(&self, j: &mut Journal, i: usize, phase: Phase) -> Result<(), ()> {
         j.steps[i].phase = phase;
-        self.commit(j)
+        self.commit(j)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(crash) = &self.config.crash_after {
+            if crash(&j.steps[i].name, phase) {
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &self,
         j: &mut Journal,
         state: State,
@@ -135,6 +168,9 @@ impl Actor {
         output: String,
         restored: bool,
     ) -> Result<(), ()> {
+        if self.killed() {
+            return Err(());
+        }
         for step in j.steps.iter_mut() {
             if state == State::Failed && step.phase != Phase::Done {
                 step.phase = Phase::Done;
@@ -155,6 +191,7 @@ impl Actor {
             );
         })?;
         self.journals.prune();
+        crate::handover::forget_ready(self.dir.root(), &j.request.request_id);
         match state {
             State::Succeeded => info!(request = %j.request.request_id, "attempt succeeded"),
             _ => warn!(
@@ -168,7 +205,7 @@ impl Actor {
         Ok(())
     }
 
-    fn retrying<T>(
+    pub(crate) fn retrying<T>(
         &self,
         mut op: impl FnMut() -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
@@ -199,6 +236,12 @@ impl Actor {
             let Some(i) = j.current() else {
                 return self.finish(&mut j, State::Succeeded, None, String::new(), false);
             };
+            if j.steps[i].name == RECOVERY_ACTOR {
+                match self.drive_handover(&mut j, i)? {
+                    Flow::StepDone => continue,
+                    Flow::Ended => return Ok(()),
+                }
+            }
             let outcome = match j.steps[i].phase {
                 Phase::Admitted => {
                     self.advance(&mut j, i, Phase::Pulling)?;
@@ -214,19 +257,34 @@ impl Actor {
                 Phase::OldDiscarded => self.discard_old(&j, i).map(|()| Phase::Done),
                 Phase::Restoring => return self.restore(&mut j, i),
                 Phase::Done => unreachable!("current() skips finished steps"),
+                // Only the recovery actor's own component hands over (`drive_handover`).
+                Phase::CreatingSuccessor
+                | Phase::StartingSuccessor
+                | Phase::AwaitingSuccessor
+                | Phase::HandingOver
+                | Phase::SuccessorActive
+                | Phase::SuccessorRenaming
+                | Phase::HandingBack => {
+                    let detail = format!(
+                        "component {} is journalled in a hand-over phase, which only the recovery actor's own component has",
+                        j.steps[i].name
+                    );
+                    return self.finish(
+                        &mut j,
+                        State::Failed,
+                        Some(Reason::Invalid),
+                        detail,
+                        false,
+                    );
+                }
             };
             match outcome {
                 Ok(next) => self.advance(&mut j, i, next)?,
                 Err(Halt::Died) => return Err(()),
                 Err(Halt::Fail(failure)) if !j.steps[i].phase.touched_old() => {
-                    // Before the old container was touched: nothing changed.
-                    return self.finish(
-                        &mut j,
-                        State::Failed,
-                        Some(failure.reason),
-                        failure.detail,
-                        false,
-                    );
+                    // Before the old container was touched: this component changed nothing.
+                    let output = format!("{}{}", failure.detail, moved_before(&j, i));
+                    return self.finish(&mut j, State::Failed, Some(failure.reason), output, false);
                 }
                 Err(Halt::Fail(failure)) => {
                     warn!(
@@ -245,7 +303,8 @@ impl Actor {
     /// Settle an attempt interrupted before the old container was touched: remove anything
     /// it created, and end it `failed`/`interrupted`.
     fn interrupt(&self, mut j: Journal) -> Result<(), ()> {
-        let created = match self.attempt_containers(&j) {
+        let current = j.current().unwrap_or(0);
+        let created = match self.attempt_containers(&j, current) {
             Ok(created) => created,
             Err(EngineError::Crashed) => return Err(()),
             Err(e) => {
@@ -265,53 +324,64 @@ impl Actor {
                 }
             }
         }
-        let phase = j
-            .current()
-            .map(|i| format!("{:?}", j.steps[i].phase).to_lowercase())
-            .unwrap_or_default();
+        let step = &j.steps[current];
+        let phase = snake(step.phase);
+        let output = format!(
+            "the recovery actor, the container engine or the machine restarted while {} was at `{phase}`, before the running {} was touched; it was not changed.{} It is not retried: apply again to try again.",
+            step.name,
+            step.name,
+            moved_before(&j, current)
+        );
         self.finish(
             &mut j,
             State::Failed,
             Some(Reason::Interrupted),
-            format!(
-                "the recovery actor, the container engine or the machine restarted while this attempt was at `{phase}`, before the running service was touched; nothing was changed. It is not retried: apply again to try again."
-            ),
+            output,
             false,
         )
     }
 
-    /// The containers this attempt created: this installation's, labelled with the
-    /// attempt, and never a container the attempt recorded as the one it replaces
-    /// (architecture §5.4). A label alone proves nothing: it survives on the running
-    /// service an earlier attempt of the same id created.
-    fn attempt_containers(&self, j: &Journal) -> Result<Vec<Container>, EngineError> {
+    /// The containers this attempt created for component `i`: this installation's, of
+    /// the component's role, labelled with the attempt, and never a container the attempt
+    /// recorded as one it replaces, nor this process's own (architecture §5.4). A label
+    /// alone proves nothing: it survives on the running service an earlier attempt of the
+    /// same id created, and on a successor that became the actor.
+    pub(crate) fn attempt_containers(
+        &self,
+        j: &Journal,
+        i: usize,
+    ) -> Result<Vec<Container>, EngineError> {
         let Ok(Some(machine)) = self.dir.load_machine() else {
             return Ok(Vec::new());
         };
         let id = j.request.request_id.as_str();
+        let role = self.role(j, i).as_str();
         let old: Vec<&String> = j
             .steps
             .iter()
             .filter_map(|s| s.old_container.as_ref())
             .collect();
+        let me = self.config.self_container.as_deref();
         Ok(self
             .retrying(|| self.engine.list_containers())?
             .into_iter()
             .filter(|c| {
                 c.labels.get(ATTEMPT_LABEL).map(String::as_str) == Some(id)
                     && c.labels.get(labels::INSTALLATION) == Some(&machine.installation_id)
+                    && c.labels.get(labels::PLATFORM_SERVICE).map(String::as_str) == Some(role)
                     && !old.contains(&&c.id)
+                    && !me.is_some_and(|me| same_container(me, &c.id))
             })
             .collect())
     }
 
-    fn role(&self, j: &Journal, i: usize) -> Role {
+    pub(crate) fn role(&self, j: &Journal, i: usize) -> Role {
         Role::parse(&j.steps[i].name).unwrap_or(Role::NodeAgent)
     }
 
     /// `pulling`: the image by digest, its recipe revision (Rule C: refused before
     /// anything stops), the rendered specification, and the old container recorded.
-    fn pull_and_check(&self, j: &mut Journal, i: usize) -> Result<(), Halt> {
+    pub(crate) fn pull_and_check(&self, j: &mut Journal, i: usize) -> Result<(), Halt> {
         let role = self.role(j, i);
         let image = j.steps[i].image.clone();
         let reference = image.reference();
@@ -336,7 +406,7 @@ impl Actor {
             fail(
                 Reason::RecipeUnsupported,
                 format!(
-                    "{reference} carries no {} label, so this recovery actor cannot tell how to create it; nothing was changed",
+                    "{reference} carries no {} label, so this recovery actor cannot tell how to create it; the running service was not touched",
                     labels::IMAGE_RECIPE
                 ),
             )
@@ -354,7 +424,7 @@ impl Actor {
             return Err(fail(
                 Reason::RecipeUnsupported,
                 format!(
-                    "{reference} needs {} recipe revision {revision}, which this recovery actor does not carry (it renders {:?}); apply the recovery actor that does first. Nothing was changed",
+                    "{reference} needs {} recipe revision {revision}, which this recovery actor does not carry (it renders {:?}); apply the recovery actor that does first. The running service was not touched",
                     role.as_str(),
                     Book::window(role)
                 ),
@@ -365,10 +435,13 @@ impl Actor {
             Ok(None) => return Err(fail(Reason::RecreateFailed, "machine state is missing")),
             Err(e) => return Err(fail(Reason::RecreateFailed, format!("machine state: {e}"))),
         };
-        let secrets = self
-            .node_agent_secrets()
-            .map_err(|e| fail(Reason::RecreateFailed, format!("machine state: {e}")))?;
-        let spec = recipe::render(role, revision, &machine.inputs, &image, &secrets).map_err(
+        let secrets = match role {
+            Role::NodeAgent => self
+                .node_agent_secrets()
+                .map_err(|e| fail(Reason::RecreateFailed, format!("machine state: {e}")))?,
+            _ => Default::default(),
+        };
+        let mut spec = recipe::render(role, revision, &machine.inputs, &image, &secrets).map_err(
             |e| match e {
                 RenderError::Unsupported { .. } => fail(Reason::RecipeUnsupported, e.to_string()),
                 RenderError::Invalid(_) => fail(Reason::RecreateFailed, e.to_string()),
@@ -377,16 +450,44 @@ impl Actor {
         let old = self
             .retrying(|| self.engine.inspect_container(role.container_name()))
             .map_err(|e| engine(e, Reason::RecreateFailed, "inspect the running container"))?;
+        let itself = |c: &Container| {
+            role == Role::RecoveryActor
+                && self
+                    .config
+                    .self_container
+                    .as_deref()
+                    .is_some_and(|me| same_container(me, &c.id))
+        };
         if let Some(old) = &old {
-            if !self.is_ours(&machine, old, role) {
+            if !itself(old) && !self.is_ours(&machine, old, role) {
                 return Err(fail(
                     Reason::OwnerConflict,
                     format!(
-                        "container {} ({}) is not this installation's; it is never acted on. Nothing was changed",
+                        "container {} ({}) is not this installation's; it is never acted on, and the running service was not touched",
                         old.name, old.image
                     ),
                 ));
             }
+        }
+        if role == Role::RecoveryActor {
+            let me = self.config.self_container.as_deref();
+            let Some(old) = old
+                .as_ref()
+                .filter(|c| me.is_some_and(|me| same_container(me, &c.id)))
+            else {
+                return Err(fail(
+                    Reason::RecreateFailed,
+                    format!(
+                        "the container named {} is not the recovery actor running this attempt, so it cannot hand over to a successor; the running actor was not touched",
+                        role.container_name()
+                    ),
+                ));
+            };
+            let trust_recorded = matches!(
+                self.dir.load_machine(),
+                Ok(Some(m)) if !m.inputs.trust.is_empty()
+            );
+            crate::handover::carry_forward(&mut spec, old, trust_recorded);
         }
         let step = &mut j.steps[i];
         step.revision = Some(revision);
@@ -397,7 +498,7 @@ impl Actor {
     }
 
     /// `old_kept`: stop, disable the restart policy, rename `.kept`. Idempotent.
-    fn keep_old(&self, j: &Journal, i: usize) -> Result<(), Halt> {
+    pub(crate) fn keep_old(&self, j: &Journal, i: usize) -> Result<(), Halt> {
         let Some(old_id) = j.steps[i].old_container.clone() else {
             return Ok(()); // nothing ran before: nothing to keep
         };
@@ -466,7 +567,7 @@ impl Actor {
     fn create_new(&self, j: &mut Journal, i: usize) -> Result<(), Halt> {
         let id = j.request.request_id.clone();
         let mine = self
-            .attempt_containers(j)
+            .attempt_containers(j, i)
             .map_err(|e| engine(e, Reason::RecreateFailed, "list containers"))?;
         if let Some(c) = mine.into_iter().next() {
             j.steps[i].new_container = Some(c.id);
@@ -509,7 +610,7 @@ impl Actor {
             }
         }
         Ok(self
-            .attempt_containers(j)
+            .attempt_containers(j, i)
             .map_err(|e| engine(e, Reason::RecreateFailed, "list containers"))?
             .into_iter()
             .next())
@@ -605,7 +706,7 @@ impl Actor {
     }
 
     /// `verified`: the new specification becomes this machine's record of the service.
-    fn record_new(&self, j: &Journal, i: usize) -> Result<(), Halt> {
+    pub(crate) fn record_new(&self, j: &Journal, i: usize) -> Result<(), Halt> {
         let step = &j.steps[i];
         let (Some(revision), Some(spec)) = (step.revision, step.spec.clone()) else {
             return Err(fail(
@@ -621,7 +722,7 @@ impl Actor {
     }
 
     /// `old_discarded`: the kept container goes.
-    fn discard_old(&self, j: &Journal, i: usize) -> Result<(), Halt> {
+    pub(crate) fn discard_old(&self, j: &Journal, i: usize) -> Result<(), Halt> {
         if let Some(old) = j.steps[i].old_container.clone() {
             match self.retrying(|| self.engine.remove_container(&old)) {
                 Ok(()) => {}
@@ -688,10 +789,11 @@ impl Actor {
                 "\nthe new container did not verify and the automatic restore ALSO failed ({why}); apply the digests in `previous` by hand"
             )),
         }
+        output.push_str(&moved_before(j, i));
         self.finish(j, State::Failed, Some(failure.reason), output, restored)
     }
 
-    fn bring_back(
+    pub(crate) fn bring_back(
         &self,
         old_id: &str,
         canonical: &str,
@@ -739,7 +841,42 @@ impl Actor {
     }
 }
 
-const CRASHED: &str = "\u{0}crashed";
+pub(crate) const CRASHED: &str = "\u{0}crashed";
+
+/// What components before `i` already changed, for an outcome that would otherwise read
+/// as "nothing changed": a multi-component attempt keeps what it verified (ADR 0004
+/// amendment, "one service per failure"). Empty when nothing did.
+pub(crate) fn moved_before(j: &Journal, i: usize) -> String {
+    let moved: Vec<String> = j.steps[..i]
+        .iter()
+        .filter(|s| s.phase == Phase::Done)
+        .map(|s| format!("{} {}", s.name, s.image.reference()))
+        .collect();
+    if moved.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Earlier in this attempt {} {} replaced and verified, and {} on the new image.",
+        moved.join(" and "),
+        if moved.len() == 1 { "was" } else { "were" },
+        if moved.len() == 1 { "stays" } else { "stay" },
+    )
+}
+
+/// A phase as the journal spells it.
+pub(crate) fn snake(phase: Phase) -> String {
+    serde_json::to_value(phase)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Two references to one container: equal, or one a unique prefix of the other (a
+/// container knows itself by `$HOSTNAME`, the id's first 12 characters, when its mounts
+/// do not tell).
+pub(crate) fn same_container(a: &str, b: &str) -> bool {
+    a == b || (a.len().min(b.len()) >= 12 && (a.starts_with(b) || b.starts_with(a)))
+}
 
 fn stopped() -> ResumeError {
     ResumeError::State(std::io::Error::other(

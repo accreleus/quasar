@@ -19,9 +19,12 @@
 //!    (`host_remove`) is admitted by [`crate::remove`] before any of them, and on a machine
 //!    being uninstalled nothing else is. The agent socket may send `replace` (agent-api.md
 //!    `release_apply`) and `remove`; never `restore`, which loads a pre-update dump on the
-//!    control plane's machine. It may name only `node-agent` and `recovery-actor`; the
-//!    control socket only `control-plane` and `recovery-actor`. What a caller may name but
-//!    this build cannot yet do is refused `invalid`, saying which ticket brings it.
+//!    control plane's machine. It may name only `node-agent` and `recovery-actor`, and the
+//!    actor only on a GPU host; the control socket only `control-plane` and
+//!    `recovery-actor`, the actor only together with the control plane (A1, ADR 0008).
+//!    A request naming `recovery-actor` needs this actor to be the container under the
+//!    actor's name: it is what hands over. What a caller may name but this build cannot
+//!    yet do is refused `invalid`, saying which ticket brings it.
 //! 5. Every image a registry host plus well-formed path components, then
 //!    [`trust::admit`]: single flight, the component table and the confused-deputy guard,
 //!    image and digest shape, the namespace allowlist, then ADR 0003 signatures.
@@ -39,11 +42,14 @@ use tracing::{info, warn};
 use crate::actor::Actor;
 use crate::journal::{CallerTag, Journal, Phase, Step, FORMAT};
 use crate::recipe::{labels, ImageRef, Role};
-use crate::replace::ATTEMPT_LABEL;
+use crate::replace::{same_container, ATTEMPT_LABEL};
 use crate::socket::{
-    Accepted, AttemptResult, Previous, Reason, Rejection, Request, RequestKind, State,
+    Accepted, AttemptResult, MachineRole, Previous, Reason, Rejection, Request, RequestKind, State,
 };
 use crate::trust::{self, Caller};
+
+/// The labels Compose stamps on the containers it manages.
+const COMPOSE_LABEL_PREFIX: &str = "com.docker.compose.";
 
 /// The components each socket may name at all (architecture §5.2).
 fn may_name(caller: Caller, name: &str) -> bool {
@@ -78,8 +84,12 @@ fn refuse(req: &Request, reason: Reason, message: impl Into<String>) -> Rejectio
     }
 }
 
-/// Step 4: what `admit` does not decide.
-fn kind_and_caller_rules(caller: Caller, req: &Request) -> Result<(), Rejection> {
+/// Step 4: what `admit` does not decide. `role` is this machine's.
+fn kind_and_caller_rules(
+    caller: Caller,
+    req: &Request,
+    role: MachineRole,
+) -> Result<(), Rejection> {
     match (caller, req.kind) {
         (_, RequestKind::Replace) => {}
         (Caller::Agent, RequestKind::Restore) => {
@@ -118,18 +128,32 @@ fn kind_and_caller_rules(caller: Caller, req: &Request) -> Result<(), Rejection>
                 format!("component \"{}\" may not be named on {socket}", c.name),
             ));
         }
-        let not_yet = match c.name.as_str() {
-            "recovery-actor" => Some("replacing the recovery actor (its hand-over to a successor) arrives with RH06-10 (#362)"),
-            "control-plane" => Some("replacing the control plane arrives with RH06-11 (#363)"),
-            _ => None,
-        };
-        if let Some(why) = not_yet {
+        if c.name == "control-plane" {
             return Err(refuse(
                 req,
                 Reason::Invalid,
-                format!("component \"{}\": {why}; nothing was changed", c.name),
+                "component \"control-plane\": replacing the control plane arrives with RH06-11 (#363); nothing was changed",
             ));
         }
+    }
+    // A1 (ADR 0008): on the control plane's own machine the actor may lead the control
+    // plane only while a control-plane replacement is in flight, so it moves only in the
+    // control-plane step, never alone (control-api.md §"Developer apply").
+    let names_actor = req.components.iter().any(|c| c.name == "recovery-actor");
+    let names_control_plane = req.components.iter().any(|c| c.name == "control-plane");
+    if caller == Caller::ControlPlane && names_actor && !names_control_plane {
+        return Err(refuse(
+            req,
+            Reason::Invalid,
+            "the control socket names recovery-actor only together with control-plane: the actor may lead the control plane only while its replacement is in flight; nothing was changed",
+        ));
+    }
+    if caller == Caller::Agent && names_actor && role != MachineRole::Gpu {
+        return Err(refuse(
+            req,
+            Reason::Invalid,
+            "on the control plane's own machine the recovery actor moves in the control-plane step, never on the agent socket; nothing was changed",
+        ));
     }
     Ok(())
 }
@@ -223,7 +247,14 @@ impl Actor {
 
         // 4.
         if is_uuid(&req.request_id) {
-            kind_and_caller_rules(caller, &req)?;
+            let role = self
+                .dir
+                .load_machine()
+                .ok()
+                .flatten()
+                .map(|m| m.role)
+                .unwrap_or(self.config.role);
+            kind_and_caller_rules(caller, &req, role)?;
         }
 
         // 5. An unreadable journal fails closed: it may be the open attempt.
@@ -326,11 +357,59 @@ impl Actor {
             })?;
             let canonical = role.container_name();
             let mut old_digest = None;
-            for name in [canonical.to_string(), kept_name(canonical)] {
+            let mut names = vec![canonical.to_string(), kept_name(canonical)];
+            if role == Role::RecoveryActor {
+                names.push(crate::handover::successor_name());
+            }
+            for name in names {
                 match self.engine.inspect_container(&name) {
                     Ok(Some(existing)) => {
-                        if existing.labels.get(labels::INSTALLATION)
-                            != Some(&machine.installation_id)
+                        // A hand-over is driven by the actor that runs under the actor's
+                        // name: an actor started under another name has nothing to hand
+                        // over from.
+                        if role == Role::RecoveryActor
+                            && name == canonical
+                            && !self
+                                .config
+                                .self_container
+                                .as_deref()
+                                .is_some_and(|me| same_container(me, &existing.id))
+                        {
+                            return Err(refuse(
+                                &req,
+                                Reason::Invalid,
+                                format!(
+                                    "this recovery actor is not the container named {canonical}, so it cannot hand over to a successor; nothing was changed"
+                                ),
+                            ));
+                        }
+                        // This actor's own container, started by hand without the
+                        // labels, is not a conflict: it is what hands over.
+                        let itself = self
+                            .config
+                            .self_container
+                            .as_deref()
+                            .is_some_and(|me| same_container(me, &existing.id));
+                        // An actor a manager declares (ADR 0007 rejected it) is the
+                        // manager's to replace: a hand-over would race its redeploy.
+                        if itself
+                            && existing
+                                .labels
+                                .keys()
+                                .any(|k| k.starts_with(COMPOSE_LABEL_PREFIX))
+                        {
+                            return Err(refuse(
+                                &req,
+                                Reason::OwnerConflict,
+                                format!(
+                                    "this recovery actor ({}) is declared by an external manager (it carries Compose labels), so it is not Quasar's to replace; declare only the seed in the manager. Nothing was changed",
+                                    existing.name
+                                ),
+                            ));
+                        }
+                        if !itself
+                            && existing.labels.get(labels::INSTALLATION)
+                                != Some(&machine.installation_id)
                         {
                             return Err(refuse(
                                 &req,
@@ -357,6 +436,13 @@ impl Actor {
                     }
                 }
             }
+            if role == Role::RecoveryActor && self.config.self_container.is_none() {
+                return Err(refuse(
+                    &req,
+                    Reason::Invalid,
+                    "this recovery actor cannot tell its own container, so it cannot hand over to a successor; nothing was changed",
+                ));
+            }
             previous.push(Previous {
                 name: c.name.clone(),
                 digest: old_digest.clone(),
@@ -375,6 +461,7 @@ impl Actor {
                 spec: None,
                 new_container: None,
                 failure: None,
+                successor_starts: 0,
             });
         }
 

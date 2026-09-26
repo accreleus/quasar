@@ -32,14 +32,17 @@ use golang::text::quote;
 /// The only namespace a platform release comes from unless an operator says otherwise.
 pub(crate) const DEFAULT_ALLOWED_NAMESPACES: &[&str] = &["ghcr.io/accreleus/quasar"];
 
-/// The closed component table. The actor never accepts a request naming itself or
-/// anything else (`quasar-updater`, `postgres`, ...): those are `invalid`.
+/// The closed component table. Anything else (`quasar-updater`, `postgres`, ...) is
+/// `invalid`, and so is `recovery-actor` except on the agent socket: unlike the Go updater,
+/// the recovery actor accepts itself there, because it hands over to a successor
+/// (agent-api.md amendment 14, ADR 0008). The agent-caller vectors pin the difference. The
+/// control socket names it only with the control plane's replacement (RH06-11, #363).
 const COMPONENTS: &[&str] = &["control-plane", "node-agent"];
+const RECOVERY_ACTOR: &str = "recovery-actor";
 
 /// What a request on the agent socket may name. A node agent asking to replace the
-/// control plane is a confused deputy (agent-api.md `release_apply`). `recovery-actor` joins
-/// both tables only with the RH06-01 contract amendment.
-const AGENT_SOCKET_COMPONENTS: &[&str] = &["node-agent"];
+/// control plane is a confused deputy (agent-api.md `release_apply`).
+const AGENT_SOCKET_COMPONENTS: &[&str] = &["node-agent", "recovery-actor"];
 
 /// Which socket a request arrived on (architecture §5.2). Authority follows the mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +124,9 @@ pub fn admit(
     let mut seen: Vec<&str> = Vec::with_capacity(req.components.len());
     for c in &req.components {
         let name = quote(&c.name);
-        if !COMPONENTS.contains(&c.name.as_str()) {
+        let known = COMPONENTS.contains(&c.name.as_str())
+            || (caller == Caller::Agent && c.name == RECOVERY_ACTOR);
+        if !known {
             return Err(reject(Reason::Invalid, format!("unknown component {name}")));
         }
         if caller == Caller::Agent && !AGENT_SOCKET_COMPONENTS.contains(&c.name.as_str()) {

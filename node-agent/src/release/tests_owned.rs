@@ -101,9 +101,22 @@ fn host(new: Behaviour) -> FakeState {
 
 struct Machine {
     engine: Arc<FakeEngine>,
+    actor: Arc<RecoveryActor>,
     _machine_dir: tempfile::TempDir,
-    _socket_dir: tempfile::TempDir,
+    socket_dir: tempfile::TempDir,
     socket: PathBuf,
+}
+
+/// The actor serves `path` from now on, as a restarted actor does.
+fn serve_at(actor: &Arc<RecoveryActor>, path: &Path) {
+    let listener = server::bind(path).unwrap();
+    let (actor, stop) = (
+        actor.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    std::thread::spawn(move || {
+        server::serve(listener, actor, quasar_recovery::trust::Caller::Agent, stop)
+    });
 }
 
 /// An installed owned GPU host whose recovery actor serves its agent socket.
@@ -139,14 +152,12 @@ fn machine(new: Behaviour) -> Machine {
     actor.resume().expect("install");
     let socket_dir = tempfile::tempdir().unwrap();
     let socket = socket_dir.path().join("agent.sock");
-    let listener = server::bind(&socket).unwrap();
-    std::thread::spawn(move || {
-        server::serve(listener, actor, quasar_recovery::trust::Caller::Agent)
-    });
+    serve_at(&actor, &socket);
     Machine {
         engine,
+        actor,
         _machine_dir: machine_dir,
-        _socket_dir: socket_dir,
+        socket_dir,
         socket,
     }
 }
@@ -301,16 +312,8 @@ async fn the_relay_forwards_the_agent_and_actor_components_and_relays_the_actors
         ));
         assert_eq!((ok, err.as_deref()), (false, Some("invalid")), "{name}");
     }
-    // Forwarded; this build's actor refuses the actor's own replacement.
-    let (ok, err) = ack_of(&mgr.handle_apply(
-        "c".into(),
-        REQ.into(),
-        release(),
-        components("recovery-actor", NEW),
-        false,
-    ));
-    assert_eq!((ok, err.as_deref()), (false, Some("invalid")));
-    // The actor's allowlist is the enforcement.
+    // `recovery-actor` is forwarded (below: the redial test). The actor's allowlist is the
+    // enforcement.
     let outside = vec![ReleaseComponent {
         name: "node-agent".into(),
         image: "elsewhere.example.invalid/x/quasar-node-agent".into(),
@@ -362,4 +365,81 @@ fn an_owned_manager_with_no_actor_socket_is_absent() {
         false,
     ));
     assert_eq!((ok, err.as_deref()), (false, Some("updater_absent")));
+}
+
+/// Amendment 14 §register: after an apply that named the recovery actor, the agent
+/// re-dials only when the actor answering now is not the one it registered.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_apply_naming_the_actor_redials_only_when_another_actor_answers() {
+    for (registered_as_now, want) in [(true, false), (false, true)] {
+        let m = machine(Behaviour::default());
+        let mgr = ReleaseManager::owned(&m.socket);
+        let mut registered = crate::buildinfo::discover_owned(&m.socket);
+        if !registered_as_now {
+            registered.recovery_actor_version = Some("0.0.1".into());
+        }
+        crate::buildinfo::set_install_facts(registered);
+        let (tx, mut rx) = mpsc::channel(32);
+        let _guard = mgr.attach_upstream(tx);
+        // The successor's image is not in the registry: the attempt fails at the pull.
+        let (ok, err) = ack_of(&mgr.handle_apply(
+            "c".into(),
+            REQ.into(),
+            release(),
+            components("recovery-actor", NEW),
+            false,
+        ));
+        assert!(ok, "{err:?}");
+        let (state, reason, _, _) = terminal(&states_until_terminal(&mut rx, REQ).await);
+        assert_eq!(
+            (state.as_str(), reason.as_deref()),
+            ("failed", Some("pull_failed"))
+        );
+        assert_eq!(
+            mgr.take_redial(),
+            want,
+            "registered as now: {registered_as_now}"
+        );
+        assert!(!mgr.take_redial(), "consumed");
+    }
+}
+
+/// A daemon restart can start the agent before its recovery actor serves again: the agent
+/// finds the socket dark at connect, keeps asking, and reports the actor's attempt once it
+/// answers (the contact a successor verifying a hand-over waits for).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_that_connects_before_its_actor_serves_reports_the_attempt_once_it_does() {
+    let m = machine(Behaviour {
+        health: Some("unhealthy".into()),
+        ..Default::default()
+    });
+    let mgr = ReleaseManager::owned(&m.socket);
+    let (tx, mut rx) = mpsc::channel(32);
+    let guard = mgr.attach_upstream(tx);
+    let (ok, _) = ack_of(&mgr.handle_apply(
+        "c1".into(),
+        REQ.into(),
+        release(),
+        components("node-agent", NEW),
+        false,
+    ));
+    assert!(ok);
+    terminal(&states_until_terminal(&mut rx, REQ).await);
+    drop(guard);
+
+    let later = m.socket_dir.path().join("restarted.sock");
+    let restarted = ReleaseManager::owned(&later);
+    let (tx, mut rx) = mpsc::channel(32);
+    let _guard = restarted.attach_upstream(tx);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing to report while the actor is dark"
+    );
+    serve_at(&m.actor, &later);
+    let (state, reason, restored, _) = terminal(&states_until_terminal(&mut rx, REQ).await);
+    assert_eq!(
+        (state.as_str(), reason.as_deref(), restored),
+        ("failed", Some("unhealthy"), true)
+    );
 }

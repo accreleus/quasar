@@ -25,18 +25,21 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         None => (None, false),
     };
     Inputs {
+        unknown: Default::default(),
         installation_id: "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89".into(),
         node_name: "gpu-host-01".into(),
         home_root: "/srv/quasar/homes".into(),
         template_root: "/var/lib/quasar/templates".into(),
         docker_socket: "/var/run/docker.sock".into(),
         gpu: GpuFacts {
+            unknown: Default::default(),
             vendor,
             render_node: render_node.map(str::to_owned),
             gpus_served,
             fallback: None,
         },
         devices: HostDevices {
+            unknown: Default::default(),
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,
@@ -252,6 +255,7 @@ pub fn combined(database: DatabaseInputs) -> Inputs {
     let mut i = inputs(Some(GpuVendor::Amd));
     i.node_name = "living-room-pc".into();
     i.control = Some(ControlInputs {
+        unknown: Default::default(),
         machine_role: quasar_recovery::recipe::ControlRole::Combined,
         trusted_proxies: None,
         http_port: 8080,
@@ -266,6 +270,7 @@ pub fn combined(database: DatabaseInputs) -> Inputs {
 
 fn external() -> DatabaseInputs {
     DatabaseInputs::External {
+        unknown: Default::default(),
         host: "db.example.invalid".into(),
         port: 5433,
         user: "quasar_app".into(),
@@ -481,6 +486,7 @@ fn control_inputs_that_could_inject_are_refused() {
         let mut i = combined(external());
         if let Some(c) = i.control.as_mut() {
             c.database = DatabaseInputs::External {
+                unknown: Default::default(),
                 host: host.into(),
                 port: 5432,
                 user: "quasar".into(),

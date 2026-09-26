@@ -43,15 +43,10 @@ const SLOTS: ImageSlot[] = [
   { name: "control-plane", label: "Control plane", placeholder: "namespace/quasar-control-plane@sha256:…" },
 ];
 
-/** What a GPU host's recovery actor can replace in this build; `control-plane` is never
- *  sent to a host. */
-const HOST_COMPONENTS: ReadonlySet<ComponentName> = new Set(["node-agent"]);
-
-/** Offered to a host by the contract, but the actor refuses it `invalid` until it can
- *  replace itself; withheld rather than sent to a drained host for a certain refusal. */
-const WITHHELD: Partial<Record<ComponentName, string>> = {
-  "recovery-actor": "arrives with #362",
-};
+/** What a host target may name (control-api.md §"Developer apply"): its agent and its
+ *  recovery actor, which the server orders first. `control-plane` is never sent to a
+ *  host. */
+const HOST_COMPONENTS: ReadonlySet<ComponentName> = new Set(["recovery-actor", "node-agent"]);
 
 /** Owned GPU hosts, the only machines this build offers. */
 export function developerApplyMachines(view: PlatformReleaseView): PlatformHostIdentity[] {
@@ -261,12 +256,7 @@ export function DeveloperApplyDrawer({
                 onChange={(v) => edit(slot.name, v)}
               />
             ) : (
-              <ImageField
-                key={slot.name}
-                slot={slot}
-                value=""
-                absent={WITHHELD[slot.name] ?? "not on this machine"}
-              />
+              <ImageField key={slot.name} slot={slot} value="" absent="not on this machine" />
             ),
           )}
         </div>

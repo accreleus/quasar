@@ -285,7 +285,9 @@ impl Actor {
   inputs, database mode), `seed.json` (frozen format 1), `actor.lease` (flock, never unlinked),
   `journal/<request-id>.json` (tmp + fsync + rename per phase), `services/<role>.json` (last
   verified rendered spec — the cache that lets the actor act with the control plane down),
-  `dumps/` (last three pre-update dumps, each with its schema version), `secrets/`.
+  `dumps/` (last three pre-update dumps, each with its schema version), `secrets/`. An actor
+  keeps every `machine.json` field it does not know and writes it back on a rewrite, so an
+  actor put back by a revert does not erase what a newer one recorded.
 - **Secrets as files (D5).** Generated lazily at first render (database password, secret key,
   the local enrollment secret). Each consumer gets a small **per-service secrets volume** written
   by the actor and mounted read-only into that one container (works on Engine API 1.40; no
@@ -342,6 +344,21 @@ that never verifies is stopped and the old actor re-enabled — **failed, restor
 needing a human (successor cannot start at all after the old one was stopped) is covered by a
 printed one-line fix and by the seed, which re-creates an actor from `seed.json`'s verified
 digest if none exists.
+
+*Implementation note (#362):* the hand-over is the recovery-actor component of an ordinary
+attempt journal (`quasar-recovery` `handover.rs`); its settle table is per party (old actor,
+successor, or an actor the seed re-created after every actor container was removed) in
+`settle.rs`. A successor started three times without verifying hands the machine back. Only
+the old actor and the successor of an open hand-over wait for the lease; any other actor
+process exits while the lease is held, a party to the hand-over exists, or another container
+holds the actor's name, and an actor serves only under that name. A verifying successor does
+not count time the engine does not answer (up to ten `verify` periods), and on a GPU host
+the agent keeps asking a dark socket for up to 90 s after it connects. A hand-over may replace an actor that was
+started by hand without the installation's labels (it is the actor handing over), but an
+actor carrying Compose labels is declared by an external manager (ADR 0007) and is refused
+`owner_conflict`. The successor keeps the running actor's `QUASAR_UPDATER_*` only where machine
+state records no release trust, since recorded trust wins. The machine states of each committed phase of a successful hand-over are
+seed fixtures (`testdata/recovery/seed/actors/unreleased`).
 
 ### 5.7 The seed
 

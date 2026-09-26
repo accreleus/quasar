@@ -434,23 +434,27 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
     engine.remove_container(&w).unwrap();
 
     let inputs = Inputs {
+        unknown: Default::default(),
         installation_id: "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89".into(),
         node_name: "control-host".into(),
         home_root: String::new(),
         template_root: "/var/lib/quasar/templates".into(),
         docker_socket: "/var/run/docker.sock".into(),
         gpu: GpuFacts {
+            unknown: Default::default(),
             vendor: None,
             render_node: None,
             gpus_served: false,
             fallback: None,
         },
         devices: HostDevices {
+            unknown: Default::default(),
             dri: false,
             uinput: false,
             kmsg: false,
         },
         control: Some(ControlInputs {
+            unknown: Default::default(),
             machine_role: ControlRole::ControlOnly,
             trusted_proxies: None,
             http_port: 8080,

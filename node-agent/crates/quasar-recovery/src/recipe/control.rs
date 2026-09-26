@@ -100,6 +100,7 @@ pub(super) fn validate(control: &ControlInputs) -> Result<(), RenderError> {
         user,
         name,
         sslmode,
+        ..
     } = &control.database
     {
         host_like("the database host", host)?;
@@ -269,6 +270,7 @@ pub(super) fn control_plane_r1(
             user,
             name,
             sslmode,
+            ..
         } => (
             host.clone(),
             *port,

@@ -2032,6 +2032,328 @@
       }
     },
     {
+      "name": "the agent socket may name the recovery actor",
+      "source": "added: agent-api.md amendment 14 release_apply names recovery-actor",
+      "caller": "agent",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": true,
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "the recovery actor first, then the node agent",
+      "source": "added: amendment 14 component order",
+      "caller": "agent",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          },
+          {
+            "name": "node-agent",
+            "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": true,
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "the recovery actor's image is held to the allowlist",
+      "source": "added: amendment 14 (the actor's image is subject to the same namespace rules)",
+      "caller": "agent",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/someone-else/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": false,
+        "reason": "namespace_rejected",
+        "message": "component \"recovery-actor\": image \"ghcr.io/someone-else/quasar/quasar-recovery\" is outside this host's platform-image namespaces (ghcr.io/accreleus/quasar)",
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "the recovery actor's digest must be well formed",
+      "source": "added: amendment 14 (the same digest rules)",
+      "caller": "agent",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:nothex"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": false,
+        "reason": "digest_malformed",
+        "message": "component \"recovery-actor\": digest \"sha256:nothex\" is not sha256: + 64 lowercase hex",
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "the recovery actor named twice",
+      "source": "added: agent-api.md release_apply, each name at most once",
+      "caller": "agent",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "off",
+        "trusted_keys": []
+      },
+      "request": {
+        "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          },
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:9f2c000000000000000000000000000000000000000000000000000000000abc"
+          }
+        ],
+        "release": {
+          "id": "r1",
+          "version": null,
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "component \"recovery-actor\" named twice",
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "a signed release binds the recovery actor's digest",
+      "source": "added: ADR 0003 binding covers every component a request names",
+      "caller": "agent",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "require",
+        "trusted_keys": [
+          {
+            "id": "release-2026",
+            "public_key_of": "release-2026"
+          }
+        ]
+      },
+      "request": {
+        "request_id": "11111111-2222-3333-4444-555555555555",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "name": "node-agent",
+            "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+            "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "release": {
+          "id": "rel",
+          "version": "0.3.0",
+          "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "evidence": {
+        "state": "signed",
+        "manifest": {
+          "text": "{\"version\":\"0.3.0\",\"components\":[{\"name\":\"recovery-actor\",\"image\":\"ghcr.io/accreleus/quasar/quasar-recovery\",\"digest\":\"sha256:cc33000000000000000000000000000000000000000000000000000000000000\"},{\"name\":\"node-agent\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\"}]}"
+        },
+        "signature": {
+          "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"CYwP5UE70kP+jHjPW5BOdV5P6Mr1ldZ4JX3r366nlRl0FEFM8NmUf1WmW2O8GkzHhakIfqOlxkM1bXyuoJ9iAw==\"}]}"
+        }
+      },
+      "expect": {
+        "admitted": true,
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
+      "name": "a signed release that does not name the recovery actor refuses it",
+      "source": "added: ADR 0003 binding; a format-1 manifest carries no recovery-actor",
+      "caller": "agent",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "verify",
+        "trusted_keys": [
+          {
+            "id": "release-2026",
+            "public_key_of": "release-2026"
+          }
+        ]
+      },
+      "request": {
+        "request_id": "11111111-2222-3333-4444-555555555555",
+        "components": [
+          {
+            "name": "recovery-actor",
+            "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+            "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "name": "node-agent",
+            "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+            "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "release": {
+          "id": "rel",
+          "version": "0.3.0",
+          "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "evidence": {
+        "state": "signed",
+        "manifest": {
+          "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+        },
+        "signature": {
+          "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+        }
+      },
+      "expect": {
+        "admitted": false,
+        "reason": "signature_invalid",
+        "message": "the signed release manifest (key release-2026) does not describe this request: component \"recovery-actor\" is not in the manifest",
+        "warnings": []
+      },
+      "expect_without_caller_guard": {
+        "admitted": false,
+        "reason": "invalid",
+        "message": "unknown component \"recovery-actor\"",
+        "warnings": []
+      }
+    },
+    {
       "name": "off ignores unverifiable evidence and no keys",
       "source": "go:control-plane/internal/updater/signature_test.go:TestCheckSignatureOffIgnoresEverything",
       "caller": "control_plane",

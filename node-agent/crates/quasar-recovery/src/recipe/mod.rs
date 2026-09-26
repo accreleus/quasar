@@ -171,6 +171,11 @@ pub enum GpuVendor {
     Intel,
 }
 
+/// The fields of one level of machine state that this build does not know: written by a
+/// newer actor, kept, and written back on every rewrite, so an actor put back by a revert
+/// does not erase them.
+pub type Unknown = BTreeMap<String, serde_json::Value>;
+
 /// What the disposable probe learned about the machine's GPU (architecture §5.3 "GPU facts
 /// detected by a disposable probe").
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -190,6 +195,8 @@ pub struct GpuFacts {
     /// when the engine does not serve `--gpus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<GpuNode>,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -200,6 +207,8 @@ fn is_false(b: &bool) -> bool {
 pub struct GpuNode {
     pub vendor: GpuVendor,
     pub render_node: String,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl GpuFacts {
@@ -221,11 +230,13 @@ impl GpuFacts {
 
 /// Optional host device nodes. The engine refuses to create a container that names a
 /// device the host lacks, and system containers often lack some of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostDevices {
     pub dri: bool,
     pub uinput: bool,
     pub kmsg: bool,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl Default for HostDevices {
@@ -234,16 +245,17 @@ impl Default for HostDevices {
             dri: true,
             uinput: true,
             kmsg: true,
+            unknown: Unknown::new(),
         }
     }
 }
 
 /// The machine inputs a recipe is rendered with. Only ever grows, each with a default.
 ///
-/// Unknown fields are ignored, here and in every nested input, so an actor put back by a
-/// revert reads machine state a newer actor wrote. It renders only the inputs its own
-/// recipes know, which is what it rendered before; `ImageRef` and `ContainerSpec` stay
-/// strict.
+/// Unknown fields, here and in every nested input, are kept ([`Unknown`]), so an actor put
+/// back by a revert reads machine state a newer actor wrote and does not erase it on a
+/// rewrite. It renders only the inputs its own recipes know, which is what it rendered
+/// before; `ImageRef` and `ContainerSpec` stay strict.
 ///
 /// On a GPU host the agent takes the control plane's URL and pin from the enrollment
 /// string, so there is no control URL. A combined host's agent reaches the control plane
@@ -283,6 +295,8 @@ pub struct Inputs {
     /// Host defaults for the agent's app containers, from the seed at first install.
     #[serde(default, skip_serializing_if = "AppInputs::is_empty")]
     pub app: AppInputs,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 /// Host defaults the agent gives its app containers (`QUASAR_APP_PUID`, `QUASAR_APP_PGID`,
@@ -297,6 +311,8 @@ pub struct AppInputs {
     /// `none`, `bridge` or `host`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_network: Option<String>,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl AppInputs {
@@ -317,6 +333,8 @@ pub struct EnrollImages {
     pub seed: Option<ImageRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<ImageRef>,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl EnrollImages {
@@ -349,6 +367,8 @@ pub struct TrustInputs {
     /// `QUASAR_PLATFORM_INSECURE_REGISTRIES`: the control plane's plain-HTTP registries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insecure_registries: Option<String>,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl TrustInputs {
@@ -390,6 +410,8 @@ pub struct ControlInputs {
     #[serde(default)]
     pub trusted_proxies: Option<String>,
     pub database: DatabaseInputs,
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +445,8 @@ pub enum DatabaseInputs {
         user: String,
         name: String,
         sslmode: String,
+        #[serde(flatten)]
+        unknown: Unknown,
     },
 }
 

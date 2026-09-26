@@ -501,6 +501,7 @@ impl Actor {
                 spec: None,
                 new_container: None,
                 failure: None,
+                successor_starts: 0,
             });
         }
         let _ = machine;

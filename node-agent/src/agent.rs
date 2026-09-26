@@ -474,8 +474,7 @@ pub async fn run(cfg: Config) {
                     sleep(Duration::from_millis(250)).await;
                     continue;
                 }
-                // Not an enrollment, and it ends no session (#128 holds them across it).
-                if e.downcast_ref::<OwnedIdentityReconnect>().is_some() {
+                if e.downcast_ref::<ActorIdentityReconnect>().is_some() {
                     sessions.registered_this_connection = false;
                     sleep(Duration::from_millis(250)).await;
                     continue;
@@ -1513,19 +1512,20 @@ impl std::fmt::Display for PolicySeedReconnect {
 
 impl std::error::Error for PolicySeedReconnect {}
 
-/// The recovery actor's reported identity changed under this connection (the seed went
-/// missing or came back, the actor stopped or started answering): reconnect so `register`
-/// carries it (agent-api.md §register, "Owned installs").
+/// The recovery actor was replaced, or its reported identity changed (the seed went
+/// missing or came back, the actor stopped or started answering), under this connection
+/// (agent-api.md §register, owned installs): reconnect once so `register` reports it. Not
+/// an enrollment, and it ends no session.
 #[derive(Debug)]
-struct OwnedIdentityReconnect;
+struct ActorIdentityReconnect;
 
-impl std::fmt::Display for OwnedIdentityReconnect {
+impl std::fmt::Display for ActorIdentityReconnect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("the recovery actor's identity changed")
     }
 }
 
-impl std::error::Error for OwnedIdentityReconnect {}
+impl std::error::Error for ActorIdentityReconnect {}
 
 /// Open the control-plane socket and split it.
 ///
@@ -2331,7 +2331,7 @@ async fn connect_and_run(
                         mgr.readiness.refreshed(checks, SystemTime::now());
                         if crate::buildinfo::owned_identity_changed() {
                             info!(token = "owned-identity-redial", "the recovery actor now reports a different identity (actor, seed or whether it answers); reconnecting so register carries it");
-                            return Err(OwnedIdentityReconnect.into());
+                            return Err(ActorIdentityReconnect.into());
                         }
                     }
                     ReadinessRefresh::Done(Err(error)) => {
@@ -2815,6 +2815,11 @@ async fn connect_and_run(
                     continue;
                 };
                 send(&mut tx, &msg).await?;
+                let terminal = matches!(&msg, AgentMsg::ReleaseState { state, .. } if state == "succeeded" || state == "failed");
+                if terminal && release_mgr.take_redial() {
+                    info!(token = "release-actor-redial", "this host's recovery actor was replaced; reconnecting so register carries its identity");
+                    return Err(ActorIdentityReconnect.into());
+                }
             }
             // A host probe concluded, was deferred, or its check went not-applicable /
             // forgotten. Applying is pure in-memory work; the result reaches the

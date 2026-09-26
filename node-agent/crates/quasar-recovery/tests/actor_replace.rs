@@ -618,16 +618,7 @@ fn the_agent_socket_may_ask_only_to_replace_the_agent_or_the_actor() {
         "control plane",
     );
     assert!(deputy.contains("confused deputy"), "{deputy}");
-    let actor_itself = invalid(
-        request(
-            ID,
-            "recovery-actor",
-            "registry.example.invalid/quasar/quasar-recovery",
-            NEW_DIGEST,
-        ),
-        "recovery actor",
-    );
-    assert!(actor_itself.contains("#362"), "{actor_itself}");
+    // The actor itself is accepted (its hand-over: tests/actor_handover.rs).
     invalid(
         request(
             ID,

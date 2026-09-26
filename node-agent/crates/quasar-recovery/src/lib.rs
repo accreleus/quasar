@@ -24,6 +24,7 @@ pub mod bootstrap;
 pub mod dump;
 pub mod engine;
 pub mod explain;
+pub mod handover;
 pub mod identity;
 mod install_control;
 pub mod journal;

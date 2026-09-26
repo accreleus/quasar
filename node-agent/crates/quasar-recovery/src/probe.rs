@@ -143,15 +143,18 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
     let other = renders.iter().find(|(_, _, v)| *v != GpuVendor::Nvidia);
     let chosen = nvidia.or(other);
     let gpu = GpuFacts {
+        unknown: Default::default(),
         vendor: chosen.map(|(_, _, v)| *v),
         render_node: chosen.map(|(_, n, _)| (*n).to_owned()),
         gpus_served: false,
         fallback: nvidia.and(other).map(|(_, n, v)| GpuNode {
+            unknown: Default::default(),
             vendor: *v,
             render_node: (*n).to_owned(),
         }),
     };
     let devices = HostDevices {
+        unknown: Default::default(),
         dri: !report.nodes.is_empty(),
         uinput: report.uinput,
         kmsg: report.kmsg,
