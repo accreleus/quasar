@@ -128,9 +128,6 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
         l.split_once(':')
             .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(SELF_PROBE_HEADER))
     });
-    if !own_probe {
-        actor.note_external_request();
-    }
     let mut first = head.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -141,6 +138,9 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
             let request_id = query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("request_id="));
+            if let Some(id) = request_id.filter(|_| !own_probe) {
+                actor.note_attempt_poll(id);
+            }
             let body =
                 serde_json::to_string(&actor.status_for(request_id)).map_err(io::Error::other)?;
             respond(&mut stream, 200, &body)
@@ -229,24 +229,27 @@ fn respond(stream: &mut UnixStream, status: u16, body: &str) -> io::Result<()> {
     stream.flush()
 }
 
-/// The operator's `quasar-recovery status`: one `GET /v1/status`, the body as served.
+/// One `GET /v1/status`, the body as served: the operator's `quasar-recovery status`, the
+/// image's healthcheck, and an actor probing its own sockets. Always marked, so it is never
+/// taken for the node agent (`crate::handover`, agent contact).
 pub fn fetch_status(path: &Path) -> io::Result<String> {
-    status_request(path, "")
+    status_request(path, "/v1/status", &format!("{SELF_PROBE_HEADER}: 1\r\n"))
 }
 
-/// Marks a request the serving actor makes to itself: not another process reaching it,
-/// which is what a successor's verification waits for (`crate::handover`).
+/// Marks a request made by this binary rather than by the node agent.
 const SELF_PROBE_HEADER: &str = "X-Quasar-Self-Probe";
 
-/// [`fetch_status`] from the serving actor itself.
-pub(crate) fn probe_self(path: &Path) -> io::Result<String> {
-    status_request(path, &format!("{SELF_PROBE_HEADER}: 1\r\n"))
+/// The node agent relay's poll of one attempt, as its own client sends it (unmarked). For
+/// tests standing in for the agent.
+#[cfg(any(test, feature = "test-support"))]
+pub fn poll_attempt_as_agent(path: &Path, request_id: &str) -> io::Result<String> {
+    status_request(path, &format!("/v1/status?request_id={request_id}"), "")
 }
 
-fn status_request(path: &Path, extra_header: &str) -> io::Result<String> {
+fn status_request(path: &Path, target: &str, extra_header: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    let request = format!("GET /v1/status HTTP/1.0\r\nHost: recovery\r\n{extra_header}\r\n");
+    let request = format!("GET {target} HTTP/1.0\r\nHost: recovery\r\n{extra_header}\r\n");
     stream.write_all(request.as_bytes())?;
     let mut raw = String::new();
     stream.take(4 * 1024 * 1024).read_to_string(&mut raw)?;

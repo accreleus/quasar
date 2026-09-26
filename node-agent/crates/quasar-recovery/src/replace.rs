@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 use crate::actor::{Actor, ResumeError};
 use crate::engine::{Container, EngineError, RestartPolicy};
 use crate::handover::Flow;
-use crate::journal::{tail_output, Failure, Journal, Phase, LOG_TAIL_LIMIT, OUTPUT_LIMIT};
+use crate::journal::{embedded_log_tail, tail_output, Failure, Journal, Phase, OUTPUT_LIMIT};
 use crate::recipe::{self, labels, Book, RenderError, Role};
 use crate::settle::{settle, Settlement, RECOVERY_ACTOR};
 use crate::socket::{Reason, State};
@@ -761,7 +761,7 @@ impl Actor {
             match self.engine.logs_tail(&new.id, 40) {
                 Ok(tail) if !tail.trim_end().is_empty() => {
                     output.push_str("\n--- last lines of the failed container ---\n");
-                    output.push_str(&tail_output(tail.trim_end(), LOG_TAIL_LIMIT));
+                    output.push_str(&embedded_log_tail(&tail));
                 }
                 Err(EngineError::Crashed) => return Err(()),
                 _ => {}
