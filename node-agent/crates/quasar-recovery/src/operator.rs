@@ -10,7 +10,9 @@
 //! nothing needed re-creating (or for a dry run), `202` with one naming the attempt,
 //! `409`/`400` with a `Rejection`. `POST /v1/restore` (a `socket::Request` of kind
 //! `restore`, `crate::restore`) answers `202` with an `Accepted`, `409`/`400` with a
-//! `Rejection`. `GET /v1/status?request_id=` is the actor's status.
+//! `Rejection`. `GET /v1/status?request_id=` is the actor's status. `GET /v1/reconfigure`
+//! is `reconfigure.json` (`null` when there is none), whose `outcome` says how the last
+//! reconfigure settled.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -21,7 +23,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::actor::Actor;
-use crate::reconfigure::{Planned, ReconfigureRequest};
+use crate::reconfigure::{Planned, ReconfigureRequest, Record};
 use crate::socket::{Reason, Rejection, Request};
 
 pub const SOCKET: &str = "/run/quasar-operator/operator.sock";
@@ -71,6 +73,16 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
                 serde_json::to_string(&actor.status_for(request_id)).map_err(io::Error::other)?;
             respond(&mut stream, 200, &body)
         }
+        ("GET", "/v1/reconfigure") => match actor.reconfigure_record() {
+            Ok(record) => {
+                let body = serde_json::to_string(&record).map_err(io::Error::other)?;
+                respond(&mut stream, 200, &body)
+            }
+            Err(e) => {
+                let body = serde_json::json!({ "error": e.to_string() }).to_string();
+                respond(&mut stream, 409, &body)
+            }
+        },
         ("POST", "/v1/restore") => {
             let Some(body) = read_body(&mut stream, &head)? else {
                 return respond(&mut stream, 413, r#"{"error":"request_too_large"}"#);
@@ -213,6 +225,17 @@ pub fn call(
 pub enum Answer {
     Planned(Planned),
     Refused(Rejection),
+}
+
+/// `reconfigure.json` as the running actor reads it.
+pub fn reconfigure_record(socket: &Path) -> io::Result<Option<Record>> {
+    let (status, body) = call(socket, "GET", "/v1/reconfigure", None)?;
+    if status != 200 {
+        return Err(io::Error::other(format!(
+            "the actor answered {status}: {body}"
+        )));
+    }
+    serde_json::from_str(&body).map_err(io::Error::other)
 }
 
 pub fn reconfigure(socket: &Path, req: &ReconfigureRequest) -> io::Result<Answer> {
