@@ -1977,8 +1977,9 @@ and, once settled, its `outcome` (`quasar-recovery reconfigure` prints it; `GET
 | failed, interrupted, or never journalled; nothing verified | the old inputs, put back | `put_back` |
 | failed after the control plane verified (the agent did not) | the new inputs, which the control plane runs | `partial`, with `behind: ["node-agent"]` |
 
-A `partial` reconfigure is finished by running the same command again: the values are already
-in force, and it re-creates only the services left behind. A kill of the recovery actor, or a
+`outcome.behind` names every service not on the inputs machine state keeps (a `partial` always
+has one, and a rerun that fails again keeps it). Running the same command again finishes it:
+the values are already in force, and it re-creates only the services left behind. A kill of the recovery actor, or a
 restart of the engine or the machine, at any phase settles on the actor's next start to one of
 these, with one control plane running. A `reconfigure.json` that cannot be read is never
 overwritten: reconfigure is refused, and the actor's next start sets it aside as

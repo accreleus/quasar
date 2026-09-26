@@ -70,7 +70,8 @@ pub struct Outcome {
     pub reason: Option<Reason>,
     /// The attempt put a kept container back.
     pub restored: bool,
-    /// On `partial`: the services still on their previous specification.
+    /// The services not on the inputs machine state keeps (always on `partial`): the same
+    /// reconfigure run again re-creates them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behind: Vec<Role>,
     pub settled_at: String,
@@ -403,7 +404,7 @@ impl Actor {
         match self.dir.reconfigure_file().load() {
             Ok(Some(Record {
                 outcome: Some(o), ..
-            })) if o.settled == Settled::Partial => o.behind,
+            })) => o.behind,
             _ => Vec::new(),
         }
     }
@@ -820,27 +821,33 @@ impl Actor {
             ),
             None => (None, None, false),
         };
-        let behind: Vec<Role> = record
+        let not_moved = record
             .replaced
             .iter()
-            .copied()
-            .filter(|role| !self.runs(*role, &record.after))
-            .collect();
+            .filter(|role| !self.runs(**role, &record.after))
+            .count();
         let settled = if state == Some(State::Succeeded) {
             Settled::Applied
-        } else if journal.is_none() || behind.len() == record.replaced.len() {
+        } else if journal.is_none() || not_moved == record.replaced.len() {
             Settled::PutBack
-        } else if behind.is_empty() {
+        } else if not_moved == 0 {
             Settled::Applied
         } else {
             Settled::Partial
         };
+        let in_force = match settled {
+            Settled::PutBack => &record.before,
+            Settled::Applied | Settled::Partial => &record.after,
+        };
+        // Whatever the outcome: a failed catch-up of a partial reconfigure is put back to
+        // inputs its service still does not run.
+        let behind = [Role::ControlPlane, Role::NodeAgent]
+            .into_iter()
+            .filter(|role| matches!(self.dir.load_service(*role), Ok(Some(_))))
+            .filter(|role| !self.runs(*role, in_force))
+            .collect();
         Outcome {
-            behind: if settled == Settled::Partial {
-                behind
-            } else {
-                Vec::new()
-            },
+            behind,
             settled,
             state,
             reason,

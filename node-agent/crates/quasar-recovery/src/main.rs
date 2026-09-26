@@ -727,6 +727,20 @@ fn report_reconfigure(
         .as_ref()
         .map(|r| r.to_string())
         .unwrap_or_default();
+    let behind: Vec<String> = outcome
+        .as_ref()
+        .map(|o| o.behind.iter().map(|r| r.as_str().to_owned()).collect())
+        .unwrap_or_default();
+    if !behind.is_empty()
+        && outcome
+            .as_ref()
+            .is_some_and(|o| o.settled != Settled::Partial)
+    {
+        eprintln!(
+            "{} still runs other inputs than machine state holds: run the same reconfigure again to re-create it.",
+            behind.join(" and ")
+        );
+    }
     match outcome.map(|o| (o.settled, o.behind)) {
         Some((Settled::Applied, _)) => {
             println!("Reconfigured: the new inputs are in force.");

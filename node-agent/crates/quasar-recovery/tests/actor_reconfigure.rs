@@ -678,6 +678,18 @@ fn an_agent_that_does_not_verify_after_the_control_plane_did_is_partial_and_a_re
         serde_json::json!(["node-agent"])
     );
 
+    // A catch-up that fails again is put back to inputs its agent still does not run, and
+    // stays behind for the next.
+    let (_, result) = run(&actor, changes(&[("QUASAR_HTTP_PORT", "18080")]));
+    assert_eq!(result.state, State::Failed);
+    let record = m.record().unwrap();
+    assert_eq!(record["outcome"]["settled"], "put_back");
+    assert_eq!(
+        record["outcome"]["behind"],
+        serde_json::json!(["node-agent"])
+    );
+    assert_eq!(m.inputs()["control"]["http_port"], NEW_HTTP);
+
     m.engine.with_state(|s| {
         s.behaviour.remove(AGENT_IMAGE);
     });
