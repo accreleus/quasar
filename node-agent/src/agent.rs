@@ -474,6 +474,12 @@ pub async fn run(cfg: Config) {
                     sleep(Duration::from_millis(250)).await;
                     continue;
                 }
+                // Not an enrollment, and it ends no session (#128 holds them across it).
+                if e.downcast_ref::<OwnedIdentityReconnect>().is_some() {
+                    sessions.registered_this_connection = false;
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 // #128: hold the running sessions instead of stopping them. The
                 // media path is agent-to-browser and needs nothing from the
                 // control plane while it is away, and on reconnect the control
@@ -1507,6 +1513,20 @@ impl std::fmt::Display for PolicySeedReconnect {
 
 impl std::error::Error for PolicySeedReconnect {}
 
+/// The recovery actor's reported identity changed under this connection (the seed went
+/// missing or came back, the actor stopped or started answering): reconnect so `register`
+/// carries it (agent-api.md §register, "Owned installs").
+#[derive(Debug)]
+struct OwnedIdentityReconnect;
+
+impl std::fmt::Display for OwnedIdentityReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the recovery actor's identity changed")
+    }
+}
+
+impl std::error::Error for OwnedIdentityReconnect {}
+
 /// Open the control-plane socket and split it.
 ///
 /// #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
@@ -2309,6 +2329,10 @@ async fn connect_and_run(
                     ReadinessRefresh::Done(Ok(checks)) => {
                         readiness_busy = false;
                         mgr.readiness.refreshed(checks, SystemTime::now());
+                        if crate::buildinfo::owned_identity_changed() {
+                            info!(token = "owned-identity-redial", "the recovery actor now reports a different identity (actor, seed or whether it answers); reconnecting so register carries it");
+                            return Err(OwnedIdentityReconnect.into());
+                        }
                     }
                     ReadinessRefresh::Done(Err(error)) => {
                         readiness_busy = false;
@@ -4393,6 +4417,9 @@ impl SessionManager {
                 self.release_mgr
                     .handle_apply(id, request_id, release, components, force),
             ),
+            ControlMsg::HostRemove { id, request_id } => {
+                Some(crate::host_remove::handle(id, &request_id))
+            }
             ControlMsg::Registered { .. } => {
                 warn!(
                     token = "duplicate-registered",

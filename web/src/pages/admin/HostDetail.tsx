@@ -4,8 +4,8 @@
  * session poll filtered to this host.
  */
 
-import { useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import * as adminApi from "../../api/admin";
 import { ApiError } from "../../api/client";
 import type {
@@ -32,7 +32,14 @@ import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { ServicesCard } from "./fleet/hostDetail/ServicesCard";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
-import { agentOlderThanControlPlane, hostServices } from "./fleet/hostServices";
+import { HostWarnings } from "./fleet/hostDetail/HostWarnings";
+import { RemovalNote } from "./fleet/hostDetail/RemovalNote";
+import { RemoveHostModal } from "./fleet/RemoveHostModal";
+import { agentOlderThanControlPlane, hostServices, type LastReport } from "./fleet/hostServices";
+import { ownerConflict } from "./fleet/hostWarnings";
+import { removable, setRemoval, useHostRemoval } from "./fleet/removeHost";
+import { IconTrash } from "../../components/icons";
+import { clockTime } from "../../lib/format/clockTime";
 import { AdmissionReasons, admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./fleet/AdmissionReasons";
 import { hostStateChip, hostStateLabel } from "./fleet/hostDerived";
 import { faultText } from "./fleet/releasesCopy";
@@ -151,6 +158,45 @@ export function HostDetail() {
   // Awaiting confirmation in the Modal below; null when no "Launch anyway" is pending.
   const [confirmOverrideCheckId, setConfirmOverrideCheckId] = useState<string | null>(null);
   const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [removeOpen, setRemoveOpen] = useState(false);
+  // The Hosts tab's row menu opens the confirmation here, where the removal is shown.
+  const [params, setParams] = useSearchParams();
+  useEffect(() => {
+    if (host && params.get("remove") === "1") {
+      setRemoveOpen(true);
+      setParams({}, { replace: true });
+    }
+  }, [host, params, setParams]);
+
+  // The last report in which the recovery actor answered, kept for when it stops
+  // answering (mock rh06/inv-error): the contract keeps no last report of its own.
+  const lastReport = useRef<LastReport | null>(null);
+  useEffect(() => {
+    if (host?.updater_present === true) lastReport.current = { host, at: Date.now() };
+  }, [host]);
+  if (lastReport.current && lastReport.current.host.id !== id) lastReport.current = null;
+
+  // "Check again" on an owner conflict: when it was pressed, until the conflict clears.
+  const [checkedAt, setCheckedAt] = useState<number | null>(null);
+  const conflict = host ? ownerConflict(host) : null;
+  useEffect(() => {
+    if (!conflict) setCheckedAt(null);
+  }, [conflict]);
+
+  const removal = useHostRemoval(host, sessions.length, now);
+  const forget = useAdminAction(
+    async (target: Host) => {
+      if (!token) return;
+      await adminApi.deleteHost(token, target.id);
+      setRemoval(target.id, null);
+      await fleet.reload();
+      navigate("/admin/fleet/hosts");
+    },
+    {
+      success: (_r, target) => `Host "${target.node_name}" forgotten`,
+      failure: "could not forget host",
+    },
+  );
 
   const crumbs = (
     <Breadcrumbs
@@ -171,10 +217,42 @@ export function HostDetail() {
   }
 
   const state = hostStateLabel(host);
+  const machine = res.data?.controlPlane ?? null;
   const services = hostServices(host, {
-    machine: res.data?.controlPlane ?? null,
+    machine,
     agentOlder: agentOlderThanControlPlane(host, controlPlaneCommit, faults),
+    last: lastReport.current,
+    conflict: conflict != null,
   });
+  const inFlight = removal.removal;
+  const canRemove =
+    removable(host, machine) &&
+    !conflict &&
+    services != null &&
+    (services.report === "reported" || services.report === "offline");
+  const servicesFoot =
+    inFlight?.phase === "waiting" ? (
+      <>
+        <p className="hint">
+          Removal started by {inFlight.by ?? "an admin"} at{" "}
+          {clockTime(new Date(inFlight.startedAt).toISOString(), { seconds: false })}.
+        </p>
+        <Button size="sm" disabled={removal.pending} onClick={() => removal.cancel(host)}>
+          Cancel removal
+        </Button>
+      </>
+    ) : !inFlight && canRemove ? (
+      <>
+        <p className="hint">
+          Removing drains the host, then stops and removes its node agent and recovery actor.
+          Homes and data stay on the machine.
+        </p>
+        <Button variant="danger" size="sm" onClick={() => setRemoveOpen(true)}>
+          <IconTrash />
+          Remove host
+        </Button>
+      </>
+    ) : null;
 
   return (
     <section className="page host-detail-page">
@@ -194,6 +272,9 @@ export function HostDetail() {
             <Chip variant={hostStateChip(host)} dot={state === "online"}>
               {state}
             </Chip>
+            {(inFlight?.phase === "waiting" || inFlight?.phase === "sent") && (
+              <Chip variant="info">removing</Chip>
+            )}
             <Button
               variant="ghost"
               onClick={() => navigate(`/admin/fleet/hosts/${host.id}/console`)}
@@ -248,12 +329,50 @@ export function HostDetail() {
         </p>
       )}
 
+      <HostWarnings
+        host={host}
+        checkedAt={checkedAt}
+        now={now}
+        onCheckAgain={() => {
+          setCheckedAt(Date.now());
+          void res.refresh({ silent: true });
+        }}
+      />
+
+      {inFlight && (
+        <RemovalNote
+          host={host}
+          removal={inFlight}
+          sessions={sessions}
+          now={now}
+          pending={removal.pending}
+          onRetry={() => removal.start(host, sessions.length)}
+          onForget={() => void forget.run(host)}
+        />
+      )}
+
       {services && (
         <ServicesCard
           nodeName={host.node_name}
           services={services}
           connectedSince={host.agent_connected_since}
           now={now}
+          foot={servicesFoot}
+          hostId={shortId(host.id)}
+        />
+      )}
+
+      {removeOpen && (
+        <RemoveHostModal
+          host={host}
+          liveSessions={sessions.length}
+          now={now}
+          pending={removal.pending}
+          onClose={() => setRemoveOpen(false)}
+          onConfirm={() => {
+            setRemoveOpen(false);
+            removal.start(host, sessions.length);
+          }}
         />
       )}
 

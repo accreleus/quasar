@@ -30,6 +30,8 @@ pub const KEEP_FINISHED: usize = 16;
 pub enum CallerTag {
     ControlPlane,
     Agent,
+    /// The operator's `reconfigure` on the operator socket (`crate::operator`).
+    Operator,
 }
 
 /// One component's progress. The phase names the step that is **about to be, or being,

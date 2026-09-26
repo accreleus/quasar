@@ -619,26 +619,37 @@ fi
 
 volumes_of() { dk volume ls -q "$@" 2>/dev/null || true; }
 
-# remove_install: this machine's GPU-host install, containers before volumes (a
-# volume a container still holds cannot be removed). Homes are host paths and stay.
-# Never on a machine holding a control plane or Quasar's Postgres, or their data.
+# remove_install: this machine's GPU-host install, by the recovery actor's own
+# `uninstall --purge` (#366): it removes only what the installation created, and its
+# volumes. Homes are host paths and stay. Never on a machine holding a control plane
+# or Quasar's Postgres, or their data.
 remove_install() {
   for role in control-plane postgres; do
     if [ -n "$(names_of --filter "label=io.quasar.platform-service=$role")$(volumes_of --filter "label=io.quasar.platform-service=$role")" ]; then
       host_error "this machine holds a Quasar $role (a container or its volume); removing its install is not this script's job."
     fi
   done
-  seed_c=""
-  [ -z "$(state_of "$SEED")" ] || seed_c="$SEED"
-  # The seed first: it would re-create a removed recovery actor.
-  for c in $seed_c $(names_of --filter label=io.quasar.installation); do
-    dk rm -f "$c" >/dev/null 2>&1 || host_error "could not remove container $c; remove it by hand and re-run."
+  # The installation, and the image to uninstall it with: the actor's, else the seed's.
+  inst=""; uninstall_image="$seed_image"
+  for c in $(names_of --filter label=io.quasar.platform-service=recovery-actor) $(names_of --filter label=io.quasar.installation); do
+    inst="$(dk inspect -f '{{index .Config.Labels "io.quasar.installation"}}' "$c" 2>/dev/null || true)"
+    [ -z "$inst" ] || { uninstall_image="$(dk inspect -f '{{.Config.Image}}' "$c" 2>/dev/null || echo "$seed_image")"; break; }
   done
-  for v in $(volumes_of --filter label=io.quasar.installation) $MACHINE_VOLUME; do
-    if dk volume inspect "$v" >/dev/null 2>&1; then
-      dk volume rm "$v" >/dev/null 2>&1 || host_error "could not remove volume $v; something still holds it."
-    fi
-  done
+  # The seed first: it is this script's own, and it would re-create a removed actor.
+  if [ -n "$(state_of "$SEED")" ]; then
+    dk rm -f "$SEED" >/dev/null 2>&1 || host_error "could not remove the seed $SEED; remove it by hand and re-run."
+  fi
+  if [ -n "$inst" ]; then
+    dk run --rm --security-opt label=disable \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v "$MACHINE_VOLUME:/var/lib/quasar-machine" \
+      "$uninstall_image" uninstall --purge --confirm "$inst" >/dev/null ||
+      host_error "the recovery actor's uninstall of installation $inst did not finish; run this command again, which continues it."
+  fi
+  # uninstall empties the machine-state volume it has mounted; the volume goes here.
+  if dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then
+    dk volume rm "$MACHINE_VOLUME" >/dev/null 2>&1 || host_error "could not remove volume $MACHINE_VOLUME; something still holds it."
+  fi
 }
 
 actors=""; fresh=1

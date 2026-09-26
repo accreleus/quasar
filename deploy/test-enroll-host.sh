@@ -121,7 +121,14 @@ case "$cmd" in
       printf '%s\n' "$out"
     done
     exit 0 ;;
-  inspect) [ -d "$S/c/$last" ] || { echo "Error: No such object: $last" >&2; exit 1; }; cat "$S/c/$last/state"; echo; exit 0 ;;
+  inspect)
+    [ -d "$S/c/$last" ] || { echo "Error: No such object: $last" >&2; exit 1; }
+    case "${1:-}|${2:-}" in
+      *'io.quasar.installation'*) label_value "$S/c/$last" io.quasar.installation ;;
+      *'.Config.Image'*) echo "mock.example/quasar/quasar-recovery@sha256:$(printf 'a%.0s' $(seq 64))" ;;
+      *) cat "$S/c/$last/state"; echo ;;
+    esac
+    exit 0 ;;
   image) [ "${MOCK_IMAGES_PRESENT:-0}" = 1 ]; exit ;;
   pull) [ "${MOCK_PULL_OK:-1}" = 1 ] || { echo "mock: pull refused: $last" >&2; exit 1; }; exit 0 ;;
   volume)
@@ -144,6 +151,18 @@ case "$cmd" in
     [ -d "$S/c/$last" ] && cat "$S/c/$last/logs"; exit 0 ;;
   exec) printf '%s\n' "${MOCK_SEED_STATUS:-}"; exit 0 ;;
   run)
+    # The recovery actor's `uninstall --purge --confirm <id>`: what carries the id goes;
+    # it empties the machine-state volume it mounts but cannot remove it.
+    case " $* " in
+      *" uninstall "*)
+        [ "${MOCK_UNINSTALL_OK:-1}" = 1 ] || exit 1
+        id=""; prev=""
+        for a in "$@"; do [ "$prev" = --confirm ] && id="$a"; prev="$a"; done
+        for d in "$S"/c/* "$S"/v/*; do
+          [ -d "$d" ] && [ -n "$id" ] && has_label "$d" "io.quasar.installation=$id" && rm -rf "$d"
+        done
+        exit 0 ;;
+    esac
     envf=""; name=""; args=("$@"); i=0
     while [ "$i" -lt "${#args[@]}" ]; do
       case "${args[$i]}" in --env-file) envf="${args[$((i + 1))]}" ;; --name) name="${args[$((i + 1))]}" ;; esac
@@ -461,8 +480,9 @@ reset_engine
 run_installer spent "${OK_ENV[@]}" MOCK_AGENT_LOG='ERROR quasar_node_agent::agent: control plane rejected register: auth_failed: authentication failed'
 if [ "$RC" -eq 1 ] && grep -q 'expired, was already used' <<<"$OUT" && grep -q 'Add host' <<<"$OUT" \
    && grep -q 'Nothing was left on this machine' <<<"$OUT" && engine_empty \
-   && [ "$(grep -n '^rm -f quasar-seed' <<<"$DOCKER_LOG" | cut -d: -f1)" -lt "$(grep -n '^rm -f quasar-recovery' <<<"$DOCKER_LOG" | cut -d: -f1)" ]; then
-  pass "spent or expired token on a fresh machine: clear message, create-a-new-command hint, nothing left (seed removed first)"
+   && grep -q '^run --rm .* uninstall --purge --confirm inst-1$' <<<"$DOCKER_LOG" \
+   && [ "$(grep -n '^rm -f quasar-seed' <<<"$DOCKER_LOG" | cut -d: -f1)" -lt "$(grep -n ' uninstall --purge ' <<<"$DOCKER_LOG" | cut -d: -f1)" ]; then
+  pass "spent or expired token on a fresh machine: clear message, create-a-new-command hint, nothing left (seed removed first, then the actor's uninstall --purge)"
 else
   fail "spent token" "rc=$RC left=[$(ls "$state/c" "$state/v")] out=$(tail -3 <<<"$OUT")"
 fi
@@ -481,10 +501,12 @@ else
   fail "spent installed" "rc=$RC docker=[$DOCKER_LOG] out=$(tail -3 <<<"$OUT")"
 fi
 run_installer reset "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
-if [ "$RC" -eq 0 ] && grep -q '^rm -f quasar-seed' <<<"$DOCKER_LOG" && grep -q '^volume rm quasar-agent-data' <<<"$DOCKER_LOG" \
-   && grep -q '^volume rm quasar-machine' <<<"$DOCKER_LOG" && started && grep -q 'enrolled' <<<"$OUT" \
-   && [ "$(grep -n '^rm -f quasar-node-agent' <<<"$DOCKER_LOG" | cut -d: -f1)" -lt "$(grep -n '^volume rm quasar-agent-data' <<<"$DOCKER_LOG" | cut -d: -f1)" ]; then
-  pass "QUASAR_RESET_IDENTITY=1: seed, actor and agent removed before their volumes, then a fresh install"
+uninstall_at="$(grep -n ' uninstall --purge --confirm inst-0$' <<<"$DOCKER_LOG" | cut -d: -f1)"
+if [ "$RC" -eq 0 ] && [ -n "$uninstall_at" ] && grep -q '^volume rm quasar-machine' <<<"$DOCKER_LOG" && started && grep -q 'enrolled' <<<"$OUT" \
+   && [ "$(grep -n '^rm -f quasar-seed' <<<"$DOCKER_LOG" | cut -d: -f1)" -lt "$uninstall_at" ] \
+   && [ "$uninstall_at" -lt "$(grep -n '^run -d --name quasar-seed' <<<"$DOCKER_LOG" | cut -d: -f1)" ] \
+   && grep -q 'io.quasar.installation=inst-1' "$state/v/quasar-agent-data/labels"; then
+  pass "QUASAR_RESET_IDENTITY=1: the seed, then the actor's own uninstall --purge (agent, actor, volumes), then a fresh install"
 else
   fail "reset identity" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
 fi

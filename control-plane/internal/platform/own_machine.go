@@ -95,6 +95,8 @@ type OwnMachine struct {
 	Identity MachineIdentity
 	// ActorVersion is as reported, for operator prose only.
 	ActorVersion string
+	// Conflicts are the race guard's owner conflicts, for the preflight.
+	Conflicts []actorsocket.Conflict
 }
 
 // CombinedNodeName is the node name of the agent sharing this control plane's
@@ -110,7 +112,7 @@ func (m OwnMachine) CombinedNodeName() (string, bool) {
 // the contract cannot use is null, never passed through.
 func OwnMachineFromStatus(st actorsocket.Status) OwnMachine {
 	owned := InstallOwned
-	m := OwnMachine{Role: st.Role, NodeName: st.NodeName, ActorVersion: st.Actor.Version}
+	m := OwnMachine{Role: st.Role, NodeName: st.NodeName, ActorVersion: st.Actor.Version, Conflicts: st.Conflicts}
 	m.Identity.InstallMode = &owned
 	if agentws.ValidRecoveryActorVersion(st.Actor.Version) {
 		v := st.Actor.Version
@@ -209,7 +211,7 @@ func (r *OwnMachineReader) PreflightFacts(ctx context.Context) PreflightFacts {
 		return PreflightFacts{}
 	}
 	m, ok, at, err := r.read(ctx)
-	fact := &OwnedActorFact{Socket: r.socket, Answered: ok, Version: m.ActorVersion}
+	fact := &OwnedActorFact{Socket: r.socket, Answered: ok, Version: m.ActorVersion, Conflicts: m.Conflicts}
 	if err != nil {
 		fact.Err = err.Error()
 	}

@@ -642,10 +642,10 @@ fn the_agent_socket_may_ask_only_to_replace_the_agent_or_the_actor() {
     let mut restore = agent_request(ID);
     restore.kind = RequestKind::Restore;
     assert!(invalid(restore, "restore").contains("restore"));
+    // A removal (#366, tests/actor_uninstall.rs) names no components.
     let mut remove = agent_request(ID);
     remove.kind = RequestKind::Remove;
-    remove.components.clear();
-    assert!(invalid(remove, "remove").contains("#366"));
+    assert!(invalid(remove, "remove").contains("no components"));
 
     let refused = actor
         .submit(

@@ -21,6 +21,7 @@ import { useResource } from "../../../lib/resource/react";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { AddHostModal } from "./AddHostModal";
 import { HostRow } from "./HostRow";
+import { removable } from "./removeHost";
 import "../../../styles/admin/fleet.css";
 
 // `Host.capacity` carries the roll-up but no GPU model names, so one resource
@@ -290,6 +291,11 @@ export function HostsTab() {
                         )
                       }
                       onForget={() => {
+                        // An owned GPU host is removed by its recovery actor, on its page.
+                        if (removable(host, controlPlane)) {
+                          navigate(`/admin/fleet/hosts/${host.id}?remove=1`);
+                          return;
+                        }
                         setForgetError(null);
                         setForgetTarget(host);
                       }}
