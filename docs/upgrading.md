@@ -431,7 +431,10 @@ starts a check.
   it is published, with its notes and its pinned digests, applied through exactly
   the same path a stable release takes. Nothing else about an apply changes.
 - **`edge`** — whatever was last published from `release_edge_branch` (default
-  `develop`). No version, no notes, a compare link instead.
+  `develop`). No version, no notes, a compare link instead. RH06-era branch builds
+  are published under the `o2-<branch>` image tag and no longer move `<branch>`, so a
+  control plane from before RH06 on `edge` stays on the last build it could run and
+  is never offered one it cannot: moving to an owned install is a reinstall.
 
 Beta stores nothing of its own: a prerelease is already detected and cached
 alongside the stable releases, and beta is the channel that lists it. So
@@ -857,10 +860,16 @@ its place, commits that (`chore(release): x.y.z`), tags the commit `vX.Y.Z`
 (annotated), and pushes both. Pushing the tag is what triggers the tag-push
 release lane (`.github/workflows/images.yml`, #108): it builds and validates
 the images, then publishes them, a GitHub Release whose body is that
-version's changelog section, and a `platform-release-manifest.json` asset.
-Publication waits for the separately versioned updater image too, because the
-release notes link its tag. The manifest itself contains control-plane and
-node-agent only. Publish the public documentation from the released tree after
+version's changelog section, and a `platform-release-manifest.v2.json` asset
+naming the control plane, node agent and recovery actor by digest, and the floor
+(#365; [schema](../scripts/release/platform-release-manifest.md)). Before it
+publishes, `scripts/release/check-release-compatibility.sh` refuses a release whose
+recovery actor cannot render its images' recipes or reach back to the floor, or
+whose floor lies above the previous release. The format-1
+`platform-release-manifest.json` is no longer published, so no release may be cut
+from this tree until the Compose updater, which reads only that asset, has retired
+(#367). Publication waits for the separately versioned updater image too, because the
+release notes link its tag. Publish the public documentation from the released tree after
 this workflow succeeds (`pages.yml` is manually dispatched).
 
 It refuses — with a one-line reason, before touching anything — unless:
@@ -931,16 +940,17 @@ Done once, by the maintainer who publishes releases.
 3. **Cut a release as usual.** The `release` job signs the manifest right after
    it validates it, verifies its own signature with the public half of the key
    before uploading anything, and attaches
-   `platform-release-manifest.json.sig` beside the manifest. With no secret
+   `platform-release-manifest.v2.json.sig` beside the manifest (a release cut before
+   #365 carries `platform-release-manifest.json.sig`). With no secret
    configured the step prints one line and does nothing.
 
 4. **Check the release.** The asset should be there, and:
 
    ```bash
-   gh release download vX.Y.Z --pattern 'platform-release-manifest.json*'
+   gh release download vX.Y.Z --pattern 'platform-release-manifest.v2.json*'
    scripts/release/verify-platform-release-manifest.sh \
-     --manifest  platform-release-manifest.json \
-     --signature platform-release-manifest.json.sig \
+     --manifest  platform-release-manifest.v2.json \
+     --signature platform-release-manifest.v2.json.sig \
      --public-key quasar-release-2026:<base64>
    ```
 
@@ -1023,7 +1033,8 @@ Never a same-day swap.
    that has not been updated yet is not stranded. Signing an existing release's
    manifest by hand does the same thing —
    `sign-platform-release-manifest.sh … --append <the existing .sig>` — followed
-   by `gh release upload <tag> platform-release-manifest.json.sig --clobber`.
+   by `gh release upload <tag> platform-release-manifest.v2.json.sig --clobber` (the
+   `.json.sig` pair for a release cut before #365).
 
 3. **Drop the old key** from `QUASAR_UPDATER_TRUSTED_KEYS` on every host, once
    every host carries the new one and every release you might still want to

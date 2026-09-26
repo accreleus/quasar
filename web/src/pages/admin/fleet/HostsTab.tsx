@@ -7,7 +7,12 @@ import { Fragment, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { GPUAvailability, Host, PlatformIdentity } from "../../../api/types";
+import type {
+  GPUAvailability,
+  Host,
+  PlatformIdentity,
+  PlatformReleaseView,
+} from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
 import { Modal } from "../../../components/Modal";
@@ -20,6 +25,8 @@ import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { AddHostModal } from "./AddHostModal";
+import { ApplyConfirmModal } from "./ApplyControls";
+import { hostFloorState } from "./hostFloor";
 import { HostRow } from "./HostRow";
 import { hostFlag } from "./hostWarnings";
 import { removable } from "./removeHost";
@@ -72,6 +79,20 @@ export function HostsTab() {
       ),
   });
   const controlPlane = identityRes.data ?? null;
+  // below_floor and the update a below-floor host is offered. A failed read marks no row.
+  const releaseRes = useResource<PlatformReleaseView | null>({
+    label: "platform releases",
+    pollMs: GPU_POLL_MS,
+    fetch: async ({ token, signal }) => {
+      try {
+        return await adminApi.getPlatformReleases(token, signal);
+      } catch {
+        return null;
+      }
+    },
+  });
+  const [updateTarget, setUpdateTarget] = useState<Host | null>(null);
+  const updateFloor = updateTarget ? hostFloorState(updateTarget, releaseRes.data) : null;
   const gpuRes = useResource<GpuMap>(
     {
       label: "host-gpus",
@@ -96,19 +117,26 @@ export function HostsTab() {
 
   const now = fleet.lastFetchedAt ?? Date.now();
   const online = hosts.filter((h) => h.status === "online").length;
-  const attention = hosts.filter(attends).length;
+  // A host below the floor needs its update (amendment 14 below_floor).
+  const belowFloorKey = (releaseRes.data?.installed?.hosts ?? [])
+    .filter((h) => h.below_floor)
+    .map((h) => h.host_id)
+    .join(",");
+  const belowFloor = useMemo(() => new Set(belowFloorKey.split(",")), [belowFloorKey]);
+  const needsCare = (host: Host) => attends(host) || belowFloor.has(host.id);
+  const attention = hosts.filter(needsCare).length;
 
   const visible = useMemo(() => {
     const text = query.trim().toLowerCase();
     return hosts.filter((host) => {
       if (segment === "online" && host.status !== "online") return false;
-      if (segment === "attention" && !attends(host)) return false;
+      if (segment === "attention" && !(attends(host) || belowFloor.has(host.id))) return false;
       if (!text) return true;
       return (
         host.node_name.toLowerCase().includes(text) || host.id.toLowerCase().includes(text)
       );
     });
-  }, [hosts, segment, query]);
+  }, [hosts, segment, query, belowFloor]);
 
   const groups = useMemo(
     () => (groupByVendor ? groupByGpuVendor(visible, gpus) : [{ label: null, hosts: visible }]),
@@ -309,6 +337,8 @@ export function HostsTab() {
                       actionPending={actionPendingId === host.id}
                       actionError={actionErrors[host.id]}
                       controlPlane={controlPlane}
+                      floor={hostFloorState(host, releaseRes.data)}
+                      onUpdate={() => setUpdateTarget(host)}
                       now={now}
                     />
                   ))}
@@ -318,6 +348,19 @@ export function HostsTab() {
           </table>
         )}
       </div>
+
+      {updateTarget && updateFloor?.release && updateFloor.target && (
+        <ApplyConfirmModal
+          release={updateFloor.release}
+          target={updateFloor.target}
+          liveSessions={updateTarget.capacity?.active_sessions ?? null}
+          onClose={() => setUpdateTarget(null)}
+          onApplied={() => {
+            void fleet.reload();
+            void releaseRes.refresh({ silent: true });
+          }}
+        />
+      )}
 
       <AddHostModal
         open={enrollOpen}

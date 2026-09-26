@@ -241,6 +241,21 @@ describe("hostAfterFailureText", () => {
 });
 
 describe("Revert on the Releases page", () => {
+  // Amendment 14 below_floor: such a host is offered only an update, and the server
+  // refuses the revert anyway.
+  it("offers a host below the floor the update and no Revert", async () => {
+    mocked.listPlatformAttempts.mockResolvedValue({ attempts: [attempt()] });
+    const v = view();
+    v.installed.hosts[0].below_floor = true;
+    v.targets[1] = { ...v.targets[1], eligible: true, reason: null };
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+
+    expect(await screen.findByText("must update first · included")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Revert$/ })).not.toBeInTheDocument();
+  });
+
   it("offers no Revert when the host has nothing to go back to", async () => {
     renderTab();
     // The host is named by the targets rollup and by the table behind it.

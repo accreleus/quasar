@@ -218,7 +218,9 @@ func (d *Detector) resolve(ctx context.Context, l Listing) (Release, error) {
 	if err != nil {
 		return Release{}, err
 	}
-	m, err := ParseManifest(raw)
+	// The asset name promises its format; a listing that named neither asset has
+	// already failed the fetch above.
+	m, err := ParseManifestAsset(raw, l.ManifestFormat)
 	if err != nil {
 		return Release{}, err
 	}

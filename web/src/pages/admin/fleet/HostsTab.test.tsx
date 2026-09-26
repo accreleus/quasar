@@ -475,6 +475,62 @@ describe("HostsTab — add host", () => {
   });
 });
 
+describe("HostsTab — a host below the floor", () => {
+  const CP = "3f9a2c1e0c5a9d1b7a2f3e4d5c6b7a8901234567";
+  const releaseView = (belowFloor: boolean) =>
+    ({
+      faults: [],
+      available: [{ id: "rel", version: "0.5.2", source_commit: CP, manifest: null }],
+      installed: {
+        control_plane: { version: "0.5.2", source_commit: CP, built_at: null, schema_version: 88 },
+        hosts: [{ host_id: "c2059601", node_name: "quasar-node-1", identity_known: true, below_floor: belowFloor }],
+      },
+      targets: [{ kind: "host", host_id: "c2059601", node_name: "quasar-node-1", eligible: true, reason: null }],
+    }) as never;
+
+  it("chips the row and offers only the update, drain and removal", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(releaseView(true));
+    renderTab();
+    expect(await screen.findByText("must update")).toBeTruthy();
+    // It needs attention: its update.
+    expect(screen.getByRole("tab", { name: "Needs attention, 1" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    const items = screen.getAllByRole("menuitem").map((el) => el.textContent);
+    expect(items).toEqual(["Open host", "Update to v0.5.2", "Drain", "Remove host"]);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Update to v0.5.2" }));
+    expect(await screen.findByText("Update quasar-node-1")).toBeTruthy();
+    expect(screen.getByText("Update now — ends 2 live sessions")).toBeTruthy();
+  });
+
+  it("leaves a managed host's row and menu as they were", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(releaseView(false));
+    renderTab();
+    await waitFor(() => expect(mocked.getPlatformReleases).toHaveBeenCalled());
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for quasar-node-1" }));
+    expect(screen.queryByText("must update")).toBeNull();
+    expect(screen.getAllByRole("menuitem").map((el) => el.textContent)).toContain("Host settings");
+  });
+
+  it("stacks the floor before an owner's own warning, and still offers Remove host", async () => {
+    setFleet([
+      host({ install_mode: "owned", updater_present: true, seed_version: null } as Partial<Host>),
+    ]);
+    mocked.getPlatformReleases.mockResolvedValue(releaseView(true));
+    renderTab();
+    const row = (await screen.findByText("must update")).closest("tr") as HTMLElement;
+    const chips = [...row.querySelectorAll(".chip-sm")].map((el) => el.textContent);
+    expect(chips).toEqual(["must update", "no seed"]);
+    // One host, one attention count, whatever stacks on it.
+    expect(screen.getByRole("tab", { name: "Needs attention, 1" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    const items = screen.getAllByRole("menuitem").map((el) => el.textContent);
+    expect(items).toEqual(["Open host", "Update to v0.5.2", "Drain", "Remove host"]);
+  });
+});
+
 describe("HostsTab — owned hosts (#366)", () => {
   const owned = { install_mode: "owned", updater_present: true, seed_version: "0.5.0" } as Partial<Host>;
 

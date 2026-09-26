@@ -16,8 +16,10 @@ import { shortId } from "../../../lib/format/shortId";
 import { primaryGpuLabel } from "../../../lib/gpu";
 import { admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./AdmissionReasons";
 import { HostExpansion } from "./HostExpansion";
+import type { FloorState } from "./hostFloor";
 import { hostFlag } from "./hostWarnings";
-import { isControlPlaneMachine, isOwned } from "./hostServices";
+import { isControlPlaneMachine, isOwned, versionLabel } from "./hostServices";
+import { releaseLabel } from "./releasesCopy";
 import {
   distinctGpuVendors,
   groupGpusByModel,
@@ -47,6 +49,9 @@ export interface HostRowProps {
   actionError?: string;
   /** The control plane's own identity: which host shares its machine. */
   controlPlane?: PlatformIdentity | null;
+  /** Below the floor, the row offers only an update (hostFloor.ts). */
+  floor?: FloorState | null;
+  onUpdate?: () => void;
   now: number;
 }
 
@@ -98,6 +103,12 @@ export function HostRow(props: HostRowProps) {
           <div className="rowflex">
             <i className={`sdot ${hostStateDot(host)}`} title={state} />
             <span className="primary">{host.node_name}</span>
+            {/* Stacked states: the floor governs what the row offers, so it reads first. */}
+            {props.floor?.kind === "below" && (
+              <Chip variant="warning" className="chip-sm" title="Must update before it can be managed">
+                must update
+              </Chip>
+            )}
             {flag && (
               <Chip variant="warning" className="chip-sm" title={flag.title}>
                 {flag.label}
@@ -195,6 +206,7 @@ export function HostRow(props: HostRowProps) {
               gpuError={props.gpuError}
               actionError={props.actionError}
               controlPlane={props.controlPlane}
+              belowFloor={props.floor?.kind === "below"}
               now={now}
             />
           </td>
@@ -231,13 +243,28 @@ function GpuCell({ gpus }: { gpus: GPUAvailability[] | null | undefined }) {
 }
 
 function menuItems(props: HostRowProps): ActionsMenuEntry[] {
-  const { host, actionPending } = props;
-  const items: ActionsMenuEntry[] = [
-    { key: "open", label: "Open host", onClick: props.onOpen },
-    { key: "console", label: "Local console", onClick: props.onConsole },
-    { key: "settings", label: "Host settings", onClick: props.onSettings },
-    { key: "sep", separator: true },
-  ];
+  const { host, actionPending, floor } = props;
+  // Below the floor the only thing offered is an update (rh06 floor mock's row menu).
+  const items: ActionsMenuEntry[] =
+    floor?.kind === "below"
+      ? [
+          { key: "open", label: "Open host", onClick: props.onOpen },
+          {
+            key: "update",
+            label: floor.release
+              ? `Update to ${versionLabel(releaseLabel(floor.release))}`
+              : "Update",
+            disabled: !floor.release || !floor.target?.eligible || !props.onUpdate,
+            onClick: () => props.onUpdate?.(),
+          },
+          { key: "sep", separator: true },
+        ]
+      : [
+          { key: "open", label: "Open host", onClick: props.onOpen },
+          { key: "console", label: "Local console", onClick: props.onConsole },
+          { key: "settings", label: "Host settings", onClick: props.onSettings },
+          { key: "sep", separator: true },
+        ];
 
   if (hasOperatorDrain(host)) {
     items.push({

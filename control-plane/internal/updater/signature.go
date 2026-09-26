@@ -51,10 +51,23 @@ const SignatureDocumentFormatVersion = 1
 // and host are host-local config, never anything the request supplies.
 const DefaultManifestBaseURL = "https://github.com/accreleus/quasar/releases/download/v{version}/"
 
-// The two asset names, fixed: the manifest and its detached signature.
+// The two asset names the updater reads, fixed: the format-1 manifest and its detached
+// signature. The recovery actor reads the format-2 pair (control-api.md amendment 14);
+// the shared trust vectors cover both through ReleaseAssetSource.Assets.
 const (
 	ManifestAssetName  = "platform-release-manifest.json"
 	SignatureAssetName = "platform-release-manifest.json.sig"
+
+	ManifestAssetNameV2  = "platform-release-manifest.v2.json"
+	SignatureAssetNameV2 = "platform-release-manifest.v2.json.sig"
+)
+
+// ReleaseAssets names the manifest and signature a source fetches.
+type ReleaseAssets struct{ Manifest, Signature string }
+
+var (
+	FormatOneAssets = ReleaseAssets{Manifest: ManifestAssetName, Signature: SignatureAssetName}
+	FormatTwoAssets = ReleaseAssets{Manifest: ManifestAssetNameV2, Signature: SignatureAssetNameV2}
 )
 
 // TrustedKey is one public key this host trusts. ID is a label and is never

@@ -138,6 +138,7 @@ beforeEach(() => {
   mocked.getHost.mockResolvedValue({ host: host() } as never);
   mocked.getHostGPUs.mockResolvedValue({ items: [gpu()] } as never);
   mocked.getPlatformReleases.mockResolvedValue({ faults: [] } as never);
+  mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] } as never);
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
   mocked.setReadinessOverride.mockResolvedValue({} as never);

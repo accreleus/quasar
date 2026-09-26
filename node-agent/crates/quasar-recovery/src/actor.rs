@@ -71,6 +71,8 @@ pub struct OperatorInputs {
     pub app_puid: Option<String>,
     pub app_pgid: Option<String>,
     pub container_network: Option<String>,
+    pub enroll_seed_override: Option<String>,
+    pub enroll_agent_override: Option<String>,
     pub trust: TrustInputs,
 }
 
@@ -979,6 +981,8 @@ impl Actor {
                     .and_then(|me| own_image(self.engine.as_ref(), &me))
                     .and_then(|i| ImageRef::parse(&i.reference()).ok()),
                 agent: checked.enroll_agent_image.clone(),
+                seed_override: checked.enroll_overrides.0.clone(),
+                agent_override: checked.enroll_overrides.1.clone(),
             };
         }
         recipe::validate(&inputs)?;

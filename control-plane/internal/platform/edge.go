@@ -40,6 +40,11 @@ var edgeComponents = [2]edgeComponent{
 	{Name: "node-agent", Image: "quasar-node-agent"},
 }
 
+// edgeRecovery is the third component of an RH06-era edge build (amendment 14: an edge
+// build names a recovery actor whenever one was published for its commit). Optional,
+// because the registry answering 404 for it is "not published", not a broken build.
+var edgeRecovery = edgeComponent{Name: ComponentRecovery, Image: "quasar-recovery"}
+
 // EdgeBuild is one resolved edge build: what the branch tag pointed at, at the
 // moment it was read.
 type EdgeBuild struct {
@@ -163,6 +168,26 @@ func (e *RegistryEdgeSource) Resolve(ctx context.Context, branch string) (EdgeBu
 			Digest: cfg.ManifestDigest,
 		})
 	}
+
+	ref := e.ImageRef(edgeRecovery.Image, tag)
+	cfg, err := e.inspect.InspectConfig(ctx, ref)
+	switch {
+	case errors.Is(err, images.ErrRegistryNotFound):
+		return build, nil
+	case err != nil:
+		return EdgeBuild{}, fmt.Errorf("edge image %s: %w", ref, err)
+	}
+	if commit := strings.ToLower(cfg.Label(LabelSourceCommit)); commit != build.SourceCommit {
+		return EdgeBuild{}, fmt.Errorf("%w: %s is %s while %s is %q (tag %q)",
+			ErrEdgeComponentsDisagree, edgeComponents[0].Name, shortCommit(build.SourceCommit),
+			edgeRecovery.Name, cfg.Label(LabelSourceCommit), tag)
+	}
+	if cfg.ManifestDigest == "" {
+		return EdgeBuild{}, fmt.Errorf("edge image %s resolved to no digest", ref)
+	}
+	build.Components = append(build.Components, ManifestComponent{
+		Name: edgeRecovery.Name, Image: e.ImageName(edgeRecovery.Image), Digest: cfg.ManifestDigest,
+	})
 	return build, nil
 }
 
@@ -178,11 +203,28 @@ func parseSchemaLabel(raw string) (int, error) {
 	return n, nil
 }
 
-// BranchTag maps a branch to the tag it is published under: twin of
-// docker/metadata-action's `type=ref,event=branch` in
+// EdgeTagPrefix is the RH06 edge tag family (control-api.md amendment 14, "Release
+// manifest format 2": the edge tag family is release tooling). A control plane that
+// predates RH06 resolves a branch build as `<image>:<branch>`, so RH06-era branch builds
+// are published only as `<image>:o2-<branch>` and the images workflow no longer moves
+// the bare branch tag: an old edge install is never offered a build it could not run.
+const EdgeTagPrefix = "o2-"
+
+// BranchTag maps a branch to the tag its build is published under: twin of
+// docker/metadata-action's `type=ref,event=branch,prefix=o2-` in
 // .github/workflows/images.yml, which replaces every character outside
-// [A-Za-z0-9._-] with "-" (so `feature/x` is `feature-x`).
+// [A-Za-z0-9._-] with "-" (so `feature/x` is `o2-feature-x`). "" for a branch that
+// maps to no usable tag.
 func BranchTag(branch string) string {
+	name := branchTagName(branch)
+	if name == "" {
+		return ""
+	}
+	return EdgeTagPrefix + name
+}
+
+// branchTagName is the sanitised branch name, before the family prefix.
+func branchTagName(branch string) string {
 	branch = strings.TrimSpace(branch)
 	var b strings.Builder
 	for _, c := range branch {

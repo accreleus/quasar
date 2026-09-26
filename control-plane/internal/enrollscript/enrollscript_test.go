@@ -1,6 +1,7 @@
 package enrollscript_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -149,6 +150,33 @@ func TestAScriptWithoutItsPlaceholdersIsRefusedNotServedUnpinned(t *testing.T) {
 		if strings.Contains(rr.Body.String(), "#!/bin/sh") {
 			t.Errorf("%s: served the script anyway", name)
 		}
+	}
+}
+
+// The configured pins override the installed release's images one field at a time,
+// and the source is asked on every request.
+func TestConfiguredPinsOverrideTheInstalledReleaseFieldByField(t *testing.T) {
+	f := loadFixture(t)
+	installed := enrollscript.Pins{SeedImage: f.SeedImage, AgentImage: f.AgentImage}
+	override := "registry.example.invalid/dev/quasar-node-agent@sha256:" + strings.Repeat("e", 64)
+	calls := 0
+	h := enrollscript.HandlerFrom(webRoot(t, realScript(t)), func(context.Context) enrollscript.Pins {
+		calls++
+		return enrollscript.Pins{AgentImage: override}.Or(installed)
+	}, quiet)
+	body := get(t, h).Body.String()
+	if !strings.Contains(body, "\nPINNED_SEED_IMAGE='"+f.SeedImage+"'\n") {
+		t.Error("an unset override did not fall back to the installed release's seed")
+	}
+	if !strings.Contains(body, "\nPINNED_AGENT_IMAGE='"+override+"'\n") {
+		t.Error("the configured agent image did not win")
+	}
+	get(t, h)
+	if calls != 2 {
+		t.Errorf("pins read %d times for two requests", calls)
+	}
+	if got := (enrollscript.Pins{}).Or(enrollscript.Pins{}); got != (enrollscript.Pins{}) {
+		t.Errorf("nothing configured and nothing installed = %+v", got)
 	}
 }
 

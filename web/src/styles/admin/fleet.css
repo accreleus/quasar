@@ -351,6 +351,13 @@
   margin-bottom: 12px;
 }
 
+/* Why the one action of "Must update before it can be managed" (#365, `pageRhFloor`) is
+   not available right now, under the note's text. */
+.host-detail-page .host-floor-why {
+  display: block;
+  margin-top: 4px;
+}
+
 /* ── Add host modal ────────────────────────────────────────────────── */
 
 /* A value block wraps rather than scrolling out of the dialog: an operator

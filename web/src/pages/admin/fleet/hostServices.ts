@@ -9,6 +9,7 @@
  */
 
 import type { Host, PlatformIdentity, PlatformReleaseFault } from "../../../api/types";
+import { floorLabel, type FloorState } from "./hostFloor";
 import { shortCommit } from "./hostIdentity";
 import { commitsMatch } from "./releasesCopy";
 
@@ -32,6 +33,8 @@ export type ServiceState =
   | { kind: "not_found" }
   /** The operator's own database, which this page's own load just used. */
   | { kind: "reachable" }
+  /** The host is below the floor and its update replaces this service. */
+  | { kind: "must_update" }
   /** Another owner's container that Quasar never acts on. */
   | { kind: "in_the_way" };
 
@@ -135,6 +138,7 @@ export function hostServices(
     machine?: PlatformIdentity | null;
     last?: LastReport | null;
     conflict?: boolean;
+    floor?: FloorState | null;
   },
 ): HostServices | null {
   if (!isOwned(host)) return null;
@@ -178,6 +182,7 @@ export function hostServices(
   const actorCommit = host.recovery_actor_source_commit
     ? ` · commit ${shortCommit(host.recovery_actor_source_commit)}`
     : "";
+  const floor = floorRows(host, opts.floor);
 
   const rows: ServiceRow[] = [
     {
@@ -197,9 +202,15 @@ export function hostServices(
       name: "Recovery actor",
       description: "Creates, updates and recovers the services on this machine, and itself.",
       version: answered ? actorVersion : null,
-      versionNote: answered && !actorVersion ? `version not reported${actorCommit}` : null,
+      versionNote: !answered
+        ? null
+        : floor.actor
+          ? floor.note
+          : !actorVersion
+            ? `version not reported${actorCommit}`
+            : null,
       owner: answered ? "Quasar" : null,
-      state: answered ? liveOrLast() : { kind: "unknown" },
+      state: !answered ? { kind: "unknown" } : floor.actor ? { kind: "must_update" } : liveOrLast(),
     },
     machine ? databaseRow(machine, answered, liveOrLast) : noDatabase(),
     machine
@@ -234,10 +245,15 @@ export function hostServices(
       // The inventory is the recovery actor's report: until it answers, the
       // agent's row waits with the rest, as the mock's "not reported yet" draws it.
       version: answered ? versionLabel(host.agent_version) : null,
-      versionNote:
-        answered && opts.agentOlder ? "older than the control plane · update from Releases" : null,
+      versionNote: !answered
+        ? null
+        : floor.agent
+          ? floor.note
+          : opts.agentOlder
+            ? "older than the control plane · update from Releases"
+            : null,
       owner: answered ? "Quasar" : null,
-      state: answered ? liveOrLast() : { kind: "unknown" },
+      state: !answered ? { kind: "unknown" } : floor.agent ? { kind: "must_update" } : liveOrLast(),
     },
   ];
   if (opts.conflict) {
@@ -261,6 +277,24 @@ export function hostServices(
     controlPlaneHere: combined,
     rows,
   };
+}
+
+/**
+ * Which rows read "must update", and their note. The server says only that the host is
+ * below the floor, so a row says "below v…" only where that follows without comparing
+ * versions here: the update moves this service alone (the other is on the release), or
+ * both report one version.
+ */
+function floorRows(
+  host: Host,
+  floor: FloorState | null | undefined,
+): { agent: boolean; actor: boolean; note: string | null } {
+  if (floor?.kind !== "below") return { agent: false, actor: false, note: null };
+  const both = floor.movesAgent && floor.movesActor;
+  const version = floor.movesAgent ? floor.floor.agent : floor.floor.actor;
+  const sameVersion = !!host.agent_version && host.agent_version === host.recovery_actor_version;
+  const note = version && (!both || sameVersion) ? `below ${floorLabel(version)}` : null;
+  return { agent: floor.movesAgent, actor: floor.movesActor, note };
 }
 
 function noDatabase(): ServiceRow {
