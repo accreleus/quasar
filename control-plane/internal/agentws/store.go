@@ -40,7 +40,7 @@ type agentStore struct {
 	isAgentConnected func(hostID string) bool
 	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
 	// so agentws does not import hostenroll (and so tests can supply a stub). Nil means
-	// minted tokens are unavailable: only the static token can enroll.
+	// minted tokens are unavailable, and then nothing enrolls.
 	redeemEnrollment func(ctx context.Context, db hostenroll.DBTX, plaintext, nodeName string) error
 }
 
@@ -89,23 +89,14 @@ type registerResult struct {
 // plane's own downtime to the agent.
 var agentRestartMinGap = 15 * time.Second
 
-// enrollHost creates or re-enrolls a host using the enrollment token.
-// If the host row already exists, the node_secret is rotated (idempotent re-enrollment).
-func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, token, configToken string) (registerResult, error) {
-	// Two credentials are accepted, minted first (#12/#96).
-	//
-	// A minted token is per-host, hashed, single-use and expiring; the static configToken
-	// is the fleet-wide value every deployment has today and must keep working across the
-	// upgrade. Redemption is deferred into the transaction below so that consuming a
-	// single-use token is atomic with the host row it creates: if the upsert fails, the
-	// use is given back with the rollback.
-	//
-	// Constant-time on the static compare: the enrollment token gates rogue-node
-	// enrollment, and /agent/ws is reachable pre-auth — don't leak a byte-by-byte timing
-	// oracle. A minted token needs no such care: it is looked up by hash, not compared.
-	staticOK := configToken != "" &&
-		subtle.ConstantTimeCompare([]byte(token), []byte(configToken)) == 1
-
+// enrollHost creates or re-enrolls a host using the enrollment token: a minted
+// token or a machine's single-use local one, and nothing else (control-api.md
+// §Host enrollment tokens; the static ENROLLMENT_TOKEN is retired). Redemption is
+// deferred into the transaction below so that consuming a single-use token is
+// atomic with the host row it creates: if the upsert fails, the use is given
+// back with the rollback. A minted token is looked up by hash, so it needs no
+// constant-time compare.
+func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, token string) (registerResult, error) {
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
 		return registerResult{}, fmt.Errorf("generate node secret: %w", err)
@@ -123,18 +114,16 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// Consume the credential inside the transaction (see the note above), and BEFORE the
 	// takeover guard below: /agent/ws is reachable pre-auth, and running the guard first
 	// told an unauthenticated caller whether a node_name exists with a live agent.
-	if !staticOK {
-		if s.redeemEnrollment == nil {
-			return registerResult{}, ErrInvalidEnrollmentToken // minted tokens unavailable
+	if s.redeemEnrollment == nil {
+		return registerResult{}, ErrInvalidEnrollmentToken // minted tokens unavailable
+	}
+	if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
+		// Only a genuinely unusable token is an auth failure. A DB outage reported as
+		// "authentication failed" sends the operator to rotate a token that was fine.
+		if errors.Is(err, hostenroll.ErrInvalidToken) {
+			return registerResult{}, ErrInvalidEnrollmentToken
 		}
-		if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
-			// Only a genuinely unusable token is an auth failure. A DB outage reported as
-			// "authentication failed" sends the operator to rotate a token that was fine.
-			if errors.Is(err, hostenroll.ErrInvalidToken) {
-				return registerResult{}, ErrInvalidEnrollmentToken
-			}
-			return registerResult{}, fmt.Errorf("redeem enrollment token: %w", err)
-		}
+		return registerResult{}, fmt.Errorf("redeem enrollment token: %w", err)
 	}
 
 	// #96: enrollment onto an EXISTING node_name replaces its node_secret. That is correct

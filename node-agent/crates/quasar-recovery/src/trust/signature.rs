@@ -1,4 +1,4 @@
-//! ADR 0003 release signatures: port of `control-plane/internal/updater/signature.go`.
+//! ADR 0003 release signatures.
 //!
 //! What is signed is the release manifest's exact bytes; a detached document
 //! (`scripts/release/platform-release-signature.md`) carries ed25519 signatures over them.

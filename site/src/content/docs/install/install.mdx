@@ -5,20 +5,15 @@ description: One container per machine, the seed, started with docker run or as 
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-{/* TODO(#361): the combined and control-only install is a draft. Fill in the inputs #361 fixes (public host, how the control-plane and Postgres images are chosen, ports, TLS names, external-database names), confirm QUASAR_AGENT_IMAGE on a combined machine, and confirm the health check below. */}
-{/* TODO(#365): where the operator gets the seed and agent digests (the format-2 release manifest), and the published repository name of the recovery image. Until then `<registry>/quasar-recovery` and `<digest>` are placeholders. */}
-
 Read [Requirements](/quasar/start/requirements/) first, particularly the sysctl
 and, on NVIDIA, the container toolkit. Nothing here compiles Quasar. It pulls
-published images, which is about 20 GB on a machine that runs the agent.
+published images, which is about 20 GB on a machine that runs the agent. The
+[quick start](/quasar/start/quickstart/) writes everything on this page for you.
 
-<Aside type="note" title="Use a release that ships Quasar-owned installs">
-This page describes the install that starts with the seed. Use a release
-that publishes the recovery image, or follow the instructions shipped with
-your chosen release. A merge into `develop` does not publish compatible stable
-images. For a release that does not publish it, the supported install is the
-Compose stack: see [Install with
-Compose](/quasar/install/legacy-compose/#install-with-compose).
+<Aside type="caution" title="Edge builds only">
+Installs owned by Quasar ship on the **edge** channel, which follows the
+`develop` branch. There is no stable release of them yet. Each image is
+published with the edge tag `o2-develop`; an install names it by digest.
 </Aside>
 
 ## How an install is put together
@@ -36,11 +31,12 @@ Engine API, and later replaces them when you update from the console.
 | GPU host | The node agent |
 
 Every machine also runs the recovery actor itself. There is no compose file for
-the services and no `.env`: the recovery actor generates the machine's secrets
-and keeps them in its own volume. Your manager shows one container, the seed.
-Quasar's services appear beside it as `quasar-recovery`, `quasar-postgres`,
+the services and no `.env` of secrets: the recovery actor generates the machine's
+secrets and keeps them in its own volume. Your manager shows one container, the
+seed. Quasar's services appear beside it as `quasar-recovery`, `quasar-postgres`,
 `quasar-control-plane` and `quasar-node-agent`, and a stack redeploy only ever
-touches the seed.
+touches the seed. With Dockge or Arcane the stack file lives in the manager's own
+storage, like any other stack.
 
 One installation per container engine. Two on one engine are not supported.
 
@@ -49,46 +45,57 @@ One installation per container engine. Two on one engine are not supported.
 It holds the Docker socket, so it is worth knowing its limits.
 
 - It pulls platform images **only by digest**, and only from the allowed registry
-  namespaces: the project's own by default. The list is an install-time input,
-  set with the seed's other inputs on the first install.
-  {/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
+  namespaces: the project's own by default. The list is the seed input
+  `QUASAR_UPDATER_ALLOWED_NAMESPACES`, recorded at the first install with the
+  release-signature settings (see [Release
+  signatures](/quasar/operations/upgrading/#release-signatures)).
 - It acts only on containers it created, which carry this installation's labels.
   A container that looks like a Quasar service but is not its own, such as a
-  leftover Compose stack, is an **owner conflict**: it is never touched, and the
-  recovery actor's status names it.
-  {/* TODO(#366): the race guard raises owner_conflict in readiness, eligibility and the console; say so here. */}
+  leftover Compose stack, is an **owner conflict**: it is never touched. The
+  recovery actor's status names it, the host's readiness reports it, an update
+  to that machine is blocked, and the console shows it above the host's
+  **Services on this machine** card.
 - It never touches your game containers or anything else on the machine.
 - It keeps the old container of a service stopped until the new one is
   verified, so a failed update can be put back without a pull.
 
-An install without the recovery actor is not supported. If you want full manual
-control, keep a [legacy Compose install](/quasar/install/legacy-compose/).
+An install without the recovery actor is not supported.
 
 ## Before you start
 
-**Make the home and template roots**, on storage that survives a reboot:
+**Choose the home root** on a machine that runs games, on storage that survives a
+reboot. It holds every user's saves and installed games. The template root sits
+beside it. On a systemd host:
 
 ```bash
 sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes /var/lib/quasar/templates
 ```
 
-Choose the owner for your host (Unraid commonly uses 99:100). The home root holds
-every user's saves and installed games. The template root sits beside it.
+Choose the owner for your host (Unraid commonly uses 99:100, and then sets
+`QUASAR_APP_PUID=99` and `QUASAR_APP_PGID=100` below).
 
 <Aside type="caution" title="On Unraid, use appdata">
 The root shell starts in `/root`, which is a ramdisk. Put both roots under
 `/mnt/user/appdata/`, for example `/mnt/user/appdata/quasar/homes` and
-`/mnt/user/appdata/quasar/templates`, and use those paths in the seed below. A
-`docker run` seed on Unraid is a plain Docker install.
+`/mnt/user/appdata/quasar/templates`, and keep Dockge's stacks directory there
+too. A `docker run` seed on Unraid is a plain Docker install.
 </Aside>
 
-**Pick the images.** The seed runs the recovery image, by digest. A GPU-capable
-machine also names the node-agent image, by digest. A tag is refused for both.
-Take both digests from the release you are installing.
+**Pin the images.** The seed runs the recovery image, and names the control-plane
+and node-agent images, each **by digest**: the seed refuses a tag for the images
+it installs, and resolves its own. This prints all three for the edge channel:
+
+```bash
+for i in quasar-recovery quasar-control-plane quasar-node-agent; do
+  docker pull -q ghcr.io/accreleus/quasar/$i:o2-develop >/dev/null &&
+  docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+    ghcr.io/accreleus/quasar/$i:o2-develop | grep -m1 "^ghcr.io/accreleus/quasar/$i@"
+done
+```
+
+Use its three lines where the examples below say `@sha256:<digest>`.
 
 ## Install the first machine
-
-{/* TODO(#361): this section is a draft. `combined` and `control-only` are refused by the current build (`token="seed-inputs-invalid"`). Nothing below may be relied on until #361 lands. */}
 
 The first machine runs the control plane. On a combined host it also runs a node
 agent, so one machine with a GPU is a complete install.
@@ -102,10 +109,12 @@ docker run -d --name quasar-seed --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v quasar-machine:/var/lib/quasar-machine:ro \
   -e QUASAR_ROLE=combined \
+  -e QUASAR_PUBLIC_HOST=192.168.1.50 \
   -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
   -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
+  -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest> \
   -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
-  <registry>/quasar-recovery@sha256:<digest> seed
+  ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
 ```
 
 </TabItem>
@@ -115,18 +124,20 @@ docker run -d --name quasar-seed --restart unless-stopped \
 services:
   quasar-seed:
     container_name: quasar-seed
-    image: <registry>/quasar-recovery@sha256:<digest>
+    image: "ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest>"
     command: seed
     restart: unless-stopped
     security_opt: [label=disable]
+    environment:
+      QUASAR_ROLE: "combined"
+      QUASAR_PUBLIC_HOST: "192.168.1.50"
+      QUASAR_HOME_ROOT: "/var/lib/quasar/homes"
+      QUASAR_TEMPLATE_ROOT: "/var/lib/quasar/templates"
+      QUASAR_CONTROL_PLANE_IMAGE: "ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest>"
+      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - quasar-machine:/var/lib/quasar-machine:ro
-    environment:
-      QUASAR_ROLE: combined
-      QUASAR_HOME_ROOT: /var/lib/quasar/homes
-      QUASAR_TEMPLATE_ROOT: /var/lib/quasar/templates
-      QUASAR_AGENT_IMAGE: ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>
 volumes:
   quasar-machine:
     name: quasar-machine                  # required: not <project>_quasar-machine
@@ -135,34 +146,70 @@ volumes:
 </TabItem>
 </Tabs>
 
+- **`QUASAR_PUBLIC_HOST`** is the name or LAN address you will type into the
+  browser. The control plane's self-signed certificate names it, and a container
+  cannot see the machine's LAN address by itself, so set it. More names go in
+  `QUASAR_TLS_HOSTS`, comma-separated.
+- **Ports** default to 8443 (the console) and 8080 (agents and `/health`).
+  `QUASAR_TLS_PORT` and `QUASAR_HTTP_PORT` move them.
+- **Behind a reverse proxy**, add `QUASAR_TRUSTED_PROXIES`. See [Behind a reverse
+  proxy](/quasar/network/reverse-proxy/).
+- **Postgres** is created from the `postgres:16-alpine` digest this release of
+  the recovery actor carries. `QUASAR_POSTGRES_IMAGE` pins another, by digest.
+  Quasar never updates it after it is created.
+
 What is **not** there, by design:
 
 - **No database password and no secret key.** The recovery actor generates them
   into its own volume and hands them to Postgres and the control plane as
   mounted files, never as environment variables.
 - **No enrollment string.** The recovery actor gives its own agent a single-use
-  local token. The static, deployment-wide `ENROLLMENT_TOKEN` is not used.
+  local token.
+- **No admin account.** You claim the instance in the browser with a one-time
+  setup token: see [First-run setup](/quasar/install/first-run/).
 
-A **control-only** machine is the same with `QUASAR_ROLE=control-only`. It runs no
-agent, so it needs no GPU and none of the GPU preparation in the requirements.
-Add GPU hosts to it afterwards.
-
-{/* TODO(#361): whether a control-only machine still takes QUASAR_HOME_ROOT, QUASAR_TEMPLATE_ROOT and QUASAR_AGENT_IMAGE. */}
+A **control-only** machine sets `QUASAR_ROLE=control-only`. It runs no agent, so
+it needs no GPU, no home root and none of the GPU preparation in the
+requirements. `QUASAR_AGENT_IMAGE` is optional there: named, it is the agent
+Add host installs on new GPU hosts when no release names one; left out, Add host
+offers the installed release's images. `QUASAR_HOME_ROOT` is optional too; set it
+only if every GPU host will use that same path.
 
 ### Your own Postgres
 
-Bringing your own database is a supported option. Its connection settings,
-password included, are seed inputs: write them in the stack's `.env` and let the
-manager interpolate them into the seed's environment, the way it does for any
-stack. This is the one case where a secret also lives in your manager's
-configuration, because you chose the database. The recovery actor copies the
-values into its own volume at first boot.
+Bringing your own database is supported. Add its settings to the seed's
+environment, and keep the password in the stack's `.env`, where the manager
+interpolates it:
 
-Quasar then never creates, dumps, restores, resets or upgrades that database.
-Before an update that migrates it, the console asks you to confirm you have a
-current backup of your own. The console shows the database mode as `external`.
+```yaml
+      QUASAR_DATABASE_HOST: "db.example.internal"
+      QUASAR_DATABASE_PORT: "5432"          # default 5432
+      QUASAR_DATABASE_USER: "quasar"        # default quasar
+      QUASAR_DATABASE_NAME: "quasar"        # default quasar
+      QUASAR_DATABASE_SSLMODE: "require"
+      QUASAR_DATABASE_PASSWORD: "${QUASAR_DATABASE_PASSWORD}"
+```
 
-{/* TODO(#361): the external-database input names and a worked stack with its .env. The control plane's existing split fields are QUASAR_DATABASE_HOST/PORT/USER/NAME/SSLMODE/PASSWORD; #361 has not adopted them as seed inputs. */}
+```bash
+# the stack's .env
+QUASAR_DATABASE_PASSWORD=<your database password>
+```
+
+For `docker run`, export `QUASAR_DATABASE_PASSWORD` in your shell and pass
+`-e QUASAR_DATABASE_PASSWORD` without a value, so the password is not on the
+command line.
+
+- **Set `QUASAR_DATABASE_SSLMODE`** for a database on another machine: `require`,
+  or `verify-full` when the server's certificate is signed by a CA the
+  control-plane image trusts. The default, `disable`, sends the password in clear
+  text, and is right only for a database on the same host or a network you trust.
+- This is the one secret that lives in your manager's configuration, because you
+  chose the database. The recovery actor copies it into its own volume at the
+  first install; after that it is not read again and can be removed from the
+  stack.
+- Quasar never creates, dumps, restores or upgrades your database. Before an
+  update that migrates it, the console asks you to confirm you have a current
+  backup of your own. The console shows the database as *Your own*.
 
 ## Add a GPU host
 
@@ -189,7 +236,7 @@ docker run -d --name quasar-seed --restart unless-stopped \
   -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
   -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
   -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
-  <registry>/quasar-recovery@sha256:<digest> seed
+  ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
 ```
 
 </TabItem>
@@ -199,7 +246,7 @@ docker run -d --name quasar-seed --restart unless-stopped \
 services:
   quasar-seed:
     container_name: quasar-seed
-    image: "<registry>/quasar-recovery@sha256:<digest>"
+    image: "ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest>"
     command: seed
     restart: unless-stopped
     security_opt: [label=disable]
@@ -220,10 +267,10 @@ volumes:
 </TabItem>
 </Tabs>
 
-What matters in both:
+What matters on every machine:
 
-- **Both images by digest.** A seed image with no registry digest, or an agent
-  image named by tag, is refused before anything is created.
+- **Images by digest.** A seed image with no registry digest, or an agent or
+  control-plane image named by tag, is refused before anything is created.
 - **The two mounts.** The engine socket, and the `quasar-machine` volume at
   `/var/lib/quasar-machine`, read-only. In a stack the volume needs its
   `name: quasar-machine` line: without it the manager names the volume
@@ -233,17 +280,16 @@ What matters in both:
 - **`QUASAR_ROLE`** defaults to `gpu`. **`QUASAR_NODE_NAME`** is optional and
   defaults to the machine's host name; a node name bound into the enrollment
   string must match it.
-- **Set the template root explicitly**, as the sibling of the home root. The
-  recovery actor's default is the fixed `/var/lib/quasar/templates`, which is not
-  beside a home root somewhere else.
+- **Set the template root** beside the home root, as above. It defaults to that,
+  and writing it out keeps it obvious.
 - **Inputs are read once**, on a clean machine. After that the machine's own
   state wins, and the enrollment string can be deleted from the stack. A
   `docker run` container's environment cannot be edited, so the spent string
   stays visible in `docker inspect` until the container is recreated without it.
   It enrolls nothing after its first use.
-- **Host preparation is yours** on this path: the sysctl, `uinput` and, on
-  NVIDIA, the container toolkit from the requirements. The host's readiness card
-  lists anything still missing.
+- **Host preparation is yours** when you start the seed yourself: the sysctl,
+  `uinput` and, on NVIDIA, the container toolkit from the requirements. The
+  host's readiness card lists anything still missing.
 
 The full list of inputs is in the [environment
 reference](/quasar/reference/environment/#seed-inputs).
@@ -269,30 +315,29 @@ docker ps --filter label=io.quasar.installation
 
 The seed is not in that list. It is yours, not Quasar's.
 
-On the first machine, the control plane answers on plain HTTP:
-
-{/* TODO(#361): confirm the published health port on an owned control plane. */}
+On the first machine, the control plane answers on plain HTTP on its HTTP port:
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-You want `{"status":"ok","db":"ok"}`. Then open `https://<host-ip>:8443` in
-Chrome. It will warn about the self-signed certificate once. Accept it and
+You want `{"status":"ok","db":"ok"}`. Then open `https://<QUASAR_PUBLIC_HOST>:8443`
+in Chrome. It will warn about the self-signed certificate once. Accept it and
 continue with [First-run setup](/quasar/install/first-run/).
 
 On a GPU host, the host appears under Admin, Fleet, Hosts within a few seconds.
 Its **Services on this machine** card shows the seed, the recovery actor and the
-agent, with their versions.
+agent, with their versions. The first machine appears under Admin, Fleet,
+Releases, Installed, as **This machine**.
 
 ### An install that did not complete
 
-An install writes nothing durable until its inputs and the agent image have
-passed, so a refused install is fixed by correcting the stack or the
-`docker run` line and starting the seed again. The seed's log names the variable
-at fault. If the recovery actor had already been created and its install then
-failed (for instance the agent image disappeared from the registry in between),
-correct the seed's inputs, then:
+An install writes nothing durable until its inputs and images have passed, so a
+refused install is fixed by correcting the stack or the `docker run` line and
+starting the seed again. The seed's log names the variable at fault. If the
+recovery actor had already been created and its install then failed (for
+instance an image disappeared from the registry in between), correct the seed's
+inputs, then:
 
 ```bash
 docker restart quasar-recovery
@@ -306,25 +351,24 @@ problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor).
 
 It is the one volume that must never be deleted. It holds the machine's
 generated secrets, the record of every update the recovery actor carried out,
-what each service was last verified as, and the seed's state file. The recovery
-actor needs it to act while the control plane is down.
+what each service was last verified as, the seed's state file and, on a machine
+with Quasar's own database, the dumps taken before updates. The recovery actor
+needs it to act while the control plane is down.
 
-`QUASAR_SECRET_KEY` is in it. That key cannot be recovered, but it protects only
-values you can enter again: the SteamGridDB key and the release-notification
-signing secret.
-
-{/* TODO(open, raise on #361): whether and how an operator copies machine-state secrets off the machine. R1 cut downloadable bundles and backup directories. */}
+Quasar provides no way to copy machine state off the machine in this release, and
+nothing here needs you to. What it holds that cannot be regenerated is small:
+`QUASAR_SECRET_KEY` protects only values you can enter again (the SteamGridDB key
+and the release-notification signing secret), and a lost database is what
+[backups](/quasar/operations/backup/) are for.
 
 ## Removing or redeploying the seed
 
 **Removing the seed, or redeploying its stack, never stops or removes Quasar.**
 The seed only re-creates the recovery actor if that is ever missing, so with no
 seed the machine keeps running. What you lose is the safety net: a recovery actor
-deleted while there is no seed cannot be re-created. The host's **Services on
-this machine** card shows the seed as *not found*. Start the seed again to clear
-it. A stopped seed counts as none.
-
-{/* TODO(#366): the seed-missing warning above the services card (mockup seed-missing.png). */}
+deleted while there is no seed cannot be re-created. The console warns about it
+above the host's **Services on this machine** card, which shows the seed as *not
+found*. Start the seed again to clear it. A stopped seed counts as none.
 
 To stop Quasar on a machine without removing anything, stop its containers.
 The agent first, then the control plane and Postgres on the first machine:
@@ -335,42 +379,52 @@ docker stop quasar-node-agent
 
 `docker start` brings each back as it was.
 
-{/* TODO(#366): the `uninstall` command (the seed image run with `uninstall`), what it keeps, `--purge`, and console Remove host. Link Uninstalling once it describes them. */}
-
 Removing Quasar from a machine is its own command, not a side effect of managing
-the stack. See [Uninstalling](/quasar/operations/uninstall/).
+the stack: **Remove host** in the console for a GPU host, or the recovery image's
+`uninstall` on any machine. See [Uninstalling](/quasar/operations/uninstall/).
 
-## Updating
+## Updating and changing settings
 
 Updates come only from the console: **Admin, Fleet, Releases**, for the whole
 fleet or one host, or unattended. There is no file to edit and no image to pin
-by hand. See [Updating Quasar](/quasar/admin/releases/).
+by hand. The recovery actor on the first machine replaces the control plane too,
+and puts the old one back if the new one never becomes healthy. See [Updating
+Quasar](/quasar/admin/releases/).
 
-{/* TODO(#363): the control plane's own update through the recovery actor on its machine. */}
-{/* TODO(#366): install-time settings (home root, ports, public host) change with `quasar-recovery reconfigure`; document it once built. */}
+Install-time settings change with `reconfigure`, run inside the recovery actor:
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --dry-run QUASAR_HOME_ROOT=/mnt/homes
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
+```
+
+It replaces the services the change moves with the same images and the new
+settings, verifies them, and puts them back if they do not verify. In this
+release it re-creates only the node agent, so it is for GPU hosts: on the first
+machine a change that moves the control plane (its public host, TLS names,
+trusted proxies, ports, the registry allowlist, and a combined host's home root)
+is refused, and those are fixed at install. The signature settings change
+anywhere, since no container carries them. The role, node name, database and
+images never change this way; images move by an update.
 
 ## Application memory and ownership
 
-Application containers retain **1 GiB of shared memory** by default
-(`QUASAR_APP_SHM_SIZE=1g`). This supports applications such as Steam; it is a
-Docker container setting, not a value baked into an image. Change it only when an
-application needs a different allocation.
+Application containers get **1 GiB of shared memory** (`QUASAR_APP_SHM_SIZE`),
+which applications such as Steam need. An owned install takes no input for it in
+this release.
 
-`QUASAR_APP_PUID` and `QUASAR_APP_PGID` control game and save-data ownership.
-They do not change the control-plane user.
-
-{/* TODO(#361): where QUASAR_APP_SHM_SIZE and QUASAR_APP_PUID/PGID are set on an owned machine (RH-05 host policy or a machine input). Unraid-owned data needs 99/100. */}
+`QUASAR_APP_PUID` and `QUASAR_APP_PGID` decide who owns game and save data. They
+are seed inputs on a machine that runs games, and `reconfigure` changes them on a
+GPU host. They do not change what Quasar's own services run as.
 
 ## Ports
 
-| Port | Purpose |
-| --- | --- |
-| 8443 | HTTPS web app and API. |
-| 8080 | Agent enrollment and `/health`. Browser routes redirect to HTTPS. |
+| Port | Input | Purpose |
+| --- | --- | --- |
+| 8443 | `QUASAR_TLS_PORT` | HTTPS web app and API. |
+| 8080 | `QUASAR_HTTP_PORT` | Agent enrollment and `/health`. Browser routes redirect to HTTPS. |
 
-{/* TODO(#361): ports are a machine input; name the input once #361 fixes it. */}
-
-There is no reverse proxy in the default deployment. For Caddy or an existing
+There is no reverse proxy in the default install. For Caddy or an existing
 ingress, see [Behind a reverse proxy](/quasar/network/reverse-proxy/).
 
 ## Building from source
@@ -381,12 +435,13 @@ minutes and 25 GB of build storage on 8 vCPU. Start at
 rather than adapting anything above.
 
 The Compose files in the repository are contributor tooling for that path, not a
-supported install. A machine built from source is never acted on by a recovery
-actor.
+supported install. A machine built from source has no recovery actor, and the
+console never offers it an update.
 
 ## Coming from a Compose install
 
 A stack started from `deploy/docker-compose.yml` and `deploy/.env` keeps running,
-but it is not offered this release. To move it over with its data, see [Move an
-existing install](/quasar/install/move-existing/). To stay where you are, see
-[Legacy Compose installs](/quasar/install/legacy-compose/).
+but it is not offered a release that ships owned installs, and nothing converts
+it. Replacing it is a fresh install: see [Replace a Compose
+install](/quasar/install/move-existing/). To stay where you are, see [Legacy
+Compose installs](/quasar/install/legacy-compose/).

@@ -5,8 +5,6 @@ description: What ABR does, the two modes, when to change mode, and how to turn 
 
 import { Aside } from '@astrojs/starlight/components';
 
-{/* TODO(#361): on an owned machine a global agent setting is per-host policy (RH-05), not deploy/.env; check this sentence. */}
-
 Adaptive bitrate measures the connection continuously and moves the encoder's
 target bitrate to match. It is on by default in `smooth` mode, and for most
 deployments that is the end of the story.
@@ -22,8 +20,9 @@ bandwidth estimate, and moves the target as conditions change.
 
 ## The two modes
 
-Set with `QUASAR_ABR_MODE`, globally in `deploy/.env` or per host under Admin,
-Hosts, Settings.
+Set per host under Admin, Fleet, Hosts, Settings. On a legacy Compose install or a
+source checkout, `QUASAR_ABR_MODE` in `deploy/.env` sets it for the whole host
+too; an owned install takes no agent environment of its own.
 
 ### `smooth`, the default
 

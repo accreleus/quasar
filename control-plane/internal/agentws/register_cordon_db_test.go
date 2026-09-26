@@ -24,7 +24,7 @@ func hostStatus(t *testing.T, pool *pgxpool.Pool, hostID string) string {
 
 func TestReconnectPreservesOwnedRestrictionAfterOfflineProjection(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHostWithSecret(t, pool, "owned-reconnect-host", "secret-rh05")
 	holds := admission.NewStore(pool)
 	ctx := context.Background()
@@ -59,7 +59,7 @@ func setHostStatus(t *testing.T, pool *pgxpool.Pool, hostID, status string) {
 // cordon, and it already handles a connected draining host.
 func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHostWithSecret(t, pool, "cordoned-reconnect-host", "secret-140")
 
 	setHostStatus(t, pool, hostID, "draining")
@@ -102,13 +102,12 @@ func setDrainCreatedAt(t *testing.T, pool *pgxpool.Pool, hostID string, ago stri
 // that one: an operator's own drain, older than the removal, stays.
 func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	holds := admission.NewStore(pool)
 	ctx := context.Background()
-	const token = "shared-enrollment-token-366"
 
 	// The removal's own drain: taken seconds before the removal was audited.
-	res, err := s.enrollHost(ctx, "removed-host", "0.3.0", token, token)
+	res, err := s.enrollHost(ctx, "removed-host", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +119,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	if err := s.markOffline(ctx, res.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enrollHost(ctx, "removed-host", "0.3.1", token, token); err != nil {
+	if _, err := s.enrollHost(ctx, "removed-host", "0.3.1", testEnrollmentToken); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "online" {
@@ -131,7 +130,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	}
 
 	// An operator drain held before the removal: the route took none of its own.
-	res2, err := s.enrollHost(ctx, "drained-then-removed", "0.3.0", token, token)
+	res2, err := s.enrollHost(ctx, "drained-then-removed", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +142,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	if err := s.markOffline(ctx, res2.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enrollHost(ctx, "drained-then-removed", "0.3.1", token, token); err != nil {
+	if _, err := s.enrollHost(ctx, "drained-then-removed", "0.3.1", testEnrollmentToken); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 	if got := hostStatus(t, pool, res2.HostID); got != "draining" {
@@ -151,7 +150,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	}
 
 	// A platform owner's hold is never touched, even beside a removal's drain.
-	res3, err := s.enrollHost(ctx, "removed-mid-run", "0.3.0", token, token)
+	res3, err := s.enrollHost(ctx, "removed-mid-run", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +165,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	if err := s.markOffline(ctx, res3.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enrollHost(ctx, "removed-mid-run", "0.3.1", token, token); err != nil {
+	if _, err := s.enrollHost(ctx, "removed-mid-run", "0.3.1", testEnrollmentToken); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 	r, _ := holds.List(ctx, res3.HostID)
@@ -182,16 +181,15 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 // path: re-enrolling a known node_name is not an uncordon either.
 func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
-	const token = "shared-enrollment-token-140"
-	res, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.0", token, token)
+	res, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatalf("initial enroll: %v", err)
 	}
 	setHostStatus(t, pool, res.HostID, "draining")
 
-	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", token, token); err != nil {
+	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", testEnrollmentToken); err != nil {
 		t.Fatalf("re-enroll: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "draining" {
@@ -199,7 +197,7 @@ func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 	}
 
 	setHostStatus(t, pool, res.HostID, "offline")
-	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.2", token, token); err != nil {
+	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.2", testEnrollmentToken); err != nil {
 		t.Fatalf("third enroll: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "online" {

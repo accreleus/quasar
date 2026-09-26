@@ -2,13 +2,12 @@
 //!
 //! Two halves, because they are learned differently. The **build stamps**
 //! (`SOURCE_COMMIT`, `BUILT_AT`) come from `build.rs` at compile time; the
-//! **install mode** and **updater presence** are discovered at run time from
-//! the agent's own container through the Quasar runtime API. All four
+//! **install mode** and **updater presence** are discovered at run time: from
+//! the recovery actor on an owned install, else from the agent's own container
+//! image through the Quasar runtime API. All four
 //! ride the optional identity fields on `register` (agent-api.md), and the
 //! control plane stores them wholesale — an absent field is stored NULL, so
 //! reporting nothing is always safe and never a lie.
-
-use std::collections::BTreeMap;
 
 use tracing::{debug, info, warn};
 
@@ -106,7 +105,7 @@ pub struct InstallFacts {
 }
 
 /// Set by the recovery actor's recipe: the agent socket, whose presence in the
-/// environment is what makes this an owned install. Unset, discovery is the Compose one.
+/// environment is what makes this an owned install. Unset, this host has no recovery actor.
 pub use quasar_runtime::owned_install::AGENT_SOCKET_ENV as RECOVERY_SOCKET_ENV;
 
 /// Well inside the actor's own status deadline plus one engine round trip.
@@ -142,8 +141,8 @@ fn source_commit_shape(c: &str) -> bool {
 }
 
 /// This host's install facts: the recovery actor's answer on an owned install (the
-/// actor put [`RECOVERY_SOCKET_ENV`] in this container's environment), else Compose
-/// discovery exactly as before.
+/// actor put [`RECOVERY_SOCKET_ENV`] in this container's environment), else what the
+/// agent's own container image says, with no recovery actor.
 pub fn discover(runtime: &ContainerRuntime) -> InstallFacts {
     match std::env::var(RECOVERY_SOCKET_ENV)
         .ok()
@@ -250,24 +249,13 @@ pub fn owned_identity_changed() -> bool {
         .is_some_and(|(seen, n)| n >= 2 && seen != registered)
 }
 
-/// The compose label naming a service within a project. The updater is found by
-/// service name, not by container name, which an operator may rename freely.
-const LABEL_SERVICE: &str = "com.docker.compose.service";
-const LABEL_PROJECT: &str = "com.docker.compose.project";
-/// The service name the updater is deployed under (`CONTEXT.md` "Updater").
-const UPDATER_SERVICE: &str = "quasar-updater";
-
-/// Read-only facts needed by installation discovery. Production uses the shared
-/// Quasar runtime interface; the trait keeps classification independent of a daemon.
+/// Read-only facts installation discovery needs. Production uses the shared Quasar
+/// runtime interface; the trait keeps classification independent of a daemon.
 pub trait ContainerFacts {
     /// This container's own id, as docker would accept it.
     fn self_reference(&self) -> Option<String>;
     /// The configured image reference of one container, distinct from its image ID.
     fn image_reference(&self, container: &str) -> Option<String>;
-    /// The compose labels on one container.
-    fn labels(&self, container: &str) -> Option<BTreeMap<String, String>>;
-    /// Compose service names of the RUNNING containers in one compose project.
-    fn services_in_project(&self, project: &str) -> Option<Vec<String>>;
 }
 
 /// Installation facts from the configured Quasar runtime API.
@@ -299,42 +287,6 @@ impl ContainerFacts for DockerFacts {
                 .configured_image,
         )
     }
-
-    fn labels(&self, container: &str) -> Option<BTreeMap<String, String>> {
-        Some(
-            crate::runtime::configured()
-                .ok()?
-                .inspect_container(container)
-                .wait()
-                .ok()??
-                .labels,
-        )
-    }
-
-    fn services_in_project(&self, project: &str) -> Option<Vec<String>> {
-        Some(
-            crate::runtime::configured()
-                .ok()?
-                .live_containers()
-                .wait()
-                .ok()?
-                .into_iter()
-                .filter(|container| {
-                    container
-                        .labels
-                        .get(LABEL_PROJECT)
-                        .is_some_and(|value| value == project)
-                })
-                .filter_map(|container| {
-                    container
-                        .labels
-                        .get(LABEL_SERVICE)
-                        .filter(|value| !value.is_empty())
-                        .cloned()
-                })
-                .collect(),
-        )
-    }
 }
 
 /// Classify an image reference. Registry when it names a registry host
@@ -364,14 +316,16 @@ pub fn classify_image_reference(reference: &str) -> Option<InstallMode> {
     })
 }
 
-/// Learn this host's install mode and updater presence from its own container.
+/// Learn the install mode of a host with no recovery actor from its own container.
 ///
-/// Every step is independently optional: an unreadable image reference leaves
-/// `install_mode` absent without costing the updater answer, and a container
-/// with no compose project leaves `updater_present` absent (nothing can be said
-/// about a stack that is not a stack). Nothing here can fail a registration.
+/// Such a host has nothing that can replace its containers (the Compose updater is
+/// retired), so `updater_present` is a definite `false`. An unreadable image
+/// reference leaves `install_mode` absent. Nothing here can fail a registration.
 pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
-    let mut out = InstallFacts::default();
+    let mut out = InstallFacts {
+        updater_present: Some(false),
+        ..Default::default()
+    };
 
     // Every failure below is INFO, not debug: identity-unknown is a state a host
     // operator has to be able to explain, and the reason is only ever visible here.
@@ -379,7 +333,7 @@ pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
         info!(
             "install discovery: could not determine this process's own container id \
              (/proc/self/mountinfo carries none and $HOSTNAME is not a container id); \
-             install mode and updater presence stay unknown"
+             install mode stays unknown"
         );
         return out;
     };
@@ -398,31 +352,12 @@ pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
         ),
     }
 
-    match facts
-        .labels(&me)
-        .and_then(|l| l.get(LABEL_PROJECT).cloned())
-    {
-        Some(project) if !project.is_empty() => match facts.services_in_project(&project) {
-            Some(services) => {
-                out.updater_present = Some(services.iter().any(|s| s == UPDATER_SERVICE));
-            }
-            None => info!(
-                "install discovery: could not list compose project {project}; \
-                 updater presence stays unknown"
-            ),
-        },
-        _ => info!(
-            "install discovery: container {me} carries no {LABEL_PROJECT} label, \
-             so it is not part of a compose stack; updater presence stays unknown"
-        ),
-    }
-
     out
 }
 
 /// Re-discovered before every `register`, not once at boot: a boot-time
-/// snapshot pinned `updater_present=false` on a host whose updater started
-/// after the agent, and the host then read as ineligible forever. Unset reads
+/// snapshot would pin an owned host's `updater_present=false` when its recovery
+/// actor answered after the agent started. Unset reads
 /// as "nothing discovered", the correct answer for the standalone session
 /// subcommands that never register.
 static INSTALL_FACTS: std::sync::RwLock<Option<InstallFacts>> = std::sync::RwLock::new(None);
@@ -487,8 +422,6 @@ mod tests {
     struct FakeFacts {
         self_ref: Option<String>,
         image: Option<String>,
-        labels: Option<BTreeMap<String, String>>,
-        services: Option<Vec<String>>,
     }
 
     impl ContainerFacts for FakeFacts {
@@ -498,16 +431,6 @@ mod tests {
         fn image_reference(&self, _c: &str) -> Option<String> {
             self.image.clone()
         }
-        fn labels(&self, _c: &str) -> Option<BTreeMap<String, String>> {
-            self.labels.clone()
-        }
-        fn services_in_project(&self, _p: &str) -> Option<Vec<String>> {
-            self.services.clone()
-        }
-    }
-
-    fn compose_labels(project: &str) -> BTreeMap<String, String> {
-        BTreeMap::from([(LABEL_PROJECT.to_string(), project.to_string())])
     }
 
     #[test]
@@ -547,60 +470,30 @@ mod tests {
         assert_eq!(classify_image_reference("   "), None);
     }
 
+    // A host with no recovery actor has nothing to replace its containers:
+    // `updater_present` is a definite false, never absent.
     #[test]
-    fn discovery_reports_both_facts_when_docker_answers() {
-        let facts = FakeFacts {
-            self_ref: Some("abc123".into()),
-            image: Some("ghcr.io/accreleus/quasar/quasar-node-agent:latest".into()),
-            labels: Some(compose_labels("quasar")),
-            services: Some(vec!["quasar-node-agent".into(), UPDATER_SERVICE.into()]),
-        };
-        assert_eq!(
-            discover_install(&facts),
-            InstallFacts {
-                install_mode: Some(InstallMode::Registry),
-                updater_present: Some(true),
-                ..Default::default()
-            }
-        );
-    }
-
-    // `false` is a real answer ("I looked, there is none") and must not be
-    // collapsed into absent, which means "nobody has said".
-    #[test]
-    fn a_stack_without_an_updater_reports_false_not_absent() {
-        let facts = FakeFacts {
-            self_ref: Some("abc123".into()),
-            image: Some("quasar-node-agent:latest".into()),
-            labels: Some(compose_labels("quasar")),
-            services: Some(vec!["quasar-node-agent".into()]),
-        };
-        assert_eq!(
-            discover_install(&facts),
-            InstallFacts {
-                install_mode: Some(InstallMode::Source),
-                updater_present: Some(false),
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn no_compose_project_leaves_updater_unknown_without_costing_install_mode() {
-        let facts = FakeFacts {
-            self_ref: Some("abc123".into()),
-            image: Some("quasar-node-agent:latest".into()),
-            labels: Some(BTreeMap::new()),
-            services: None,
-        };
-        assert_eq!(
-            discover_install(&facts),
-            InstallFacts {
-                install_mode: Some(InstallMode::Source),
-                updater_present: None,
-                ..Default::default()
-            }
-        );
+    fn a_host_with_no_recovery_actor_reports_its_image_and_no_updater() {
+        for (image, mode) in [
+            (
+                "ghcr.io/accreleus/quasar/quasar-node-agent:latest",
+                InstallMode::Registry,
+            ),
+            ("quasar-node-agent:latest", InstallMode::Source),
+        ] {
+            let facts = FakeFacts {
+                self_ref: Some("abc123".into()),
+                image: Some(image.into()),
+            };
+            assert_eq!(
+                discover_install(&facts),
+                InstallFacts {
+                    install_mode: Some(mode),
+                    updater_present: Some(false),
+                    ..Default::default()
+                }
+            );
+        }
     }
 
     /// A compose stack that sets `hostname:` gives the agent container a DNS
@@ -637,10 +530,13 @@ mod tests {
     }
 
     #[test]
-    fn no_self_reference_reports_nothing_at_all() {
+    fn no_self_reference_leaves_the_install_mode_unknown() {
         assert_eq!(
             discover_install(&FakeFacts::default()),
-            InstallFacts::default()
+            InstallFacts {
+                updater_present: Some(false),
+                ..Default::default()
+            }
         );
     }
 

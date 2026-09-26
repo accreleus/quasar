@@ -22,6 +22,10 @@ import (
 // its shapes are internal/actorsocket, pinned by testdata/recovery/socket.
 // semantics: control-api.md §"The control plane's own machine" (amendment 14).
 
+// DefaultInstallModeTTL bounds how stale this control plane's own install mode
+// and preflight facts may be: seconds, not a boot-time read.
+const DefaultInstallModeTTL = 30 * time.Second
+
 const (
 	ownMachineReadTimeout = 3 * time.Second
 	// A status body is a few KiB; the cap only stops a runaway peer.
@@ -138,8 +142,7 @@ func OwnMachineFromStatus(st actorsocket.Status) OwnMachine {
 }
 
 // OwnMachineReader asks the recovery actor for `GET /v1/status` and reuses the
-// answer, or the failure, for TTL: the cadence of the control plane's other
-// preflight facts (DefaultInstallModeTTL).
+// answer, or the failure, for TTL (DefaultInstallModeTTL).
 type OwnMachineReader struct {
 	socket string
 	http   *http.Client

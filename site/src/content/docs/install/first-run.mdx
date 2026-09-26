@@ -27,8 +27,6 @@ administrator of your machine.
 On first boot, if no admin exists, the control plane writes a random token to a
 file inside the container. It is never logged and never printed. Read it with:
 
-{/* TODO(#361): confirm against the owned control-plane recipe; the container name is fixed as quasar-control-plane. */}
-
 ```bash
 docker exec quasar-control-plane cat /run/quasar/setup-token
 ```
@@ -54,12 +52,11 @@ restarts before you claim. Read it again; do not reuse an old one.
 
 ### Or skip the wizard entirely
 
-{/* TODO(open, raise on #361): no seed input or machine input carries BOOTSTRAP_ADMIN_*; either add one or say this is not available on an owned install. Until then this section is written for a Compose stack only. */}
-
-If you would rather provision the admin from configuration, the control plane
-reads three settings at its first boot. On a [legacy Compose
-install](/quasar/install/legacy-compose/) or a source checkout, set all three in
-`deploy/.env` before the first boot:
+Not on an owned install: the seed takes no admin account, so the setup token is
+the way in. On a [legacy Compose install](/quasar/install/legacy-compose/) or a
+source checkout, the control plane can instead provision the admin from three
+settings at its first boot. Set all three in `deploy/.env` before the first
+boot:
 
 ```bash
 BOOTSTRAP_ADMIN_EMAIL=you@example.com
@@ -115,9 +112,16 @@ not writable, input device rules absent.
 Nothing here blocks you. A failing check warns and links you to Admin, Fleet,
 Hosts. For storage, the wizard can keep the agent-reported root or select one of
 its subdirectories. Moving to an entirely different root means changing the
-machine's home root, so the bind mount moves too.
+machine's home root, so the bind mount moves too. On an owned GPU host that is
+`reconfigure`, run inside its recovery actor, which replaces the agent with the
+new root and puts it back if it does not verify:
 
-{/* TODO(#366): changing the home root on an owned machine is `quasar-recovery reconfigure` (a verified Replacement with the same image and new inputs). Describe it once built. */}
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
+```
+
+On a combined host the home root is fixed at install in this release. Changing
+the root does not move existing homes; see [Storage](/quasar/admin/hosts/#storage).
 
 <Shot
 	label="Setup wizard, hosts step"
@@ -157,9 +161,8 @@ Admin, Settings:
 - Start the first Steam library scan when discovery is enabled.
 - A reminder that `QUASAR_SECRET_KEY` cannot be recovered. On an owned install it
   lives in the `quasar-machine` volume, the one volume on each machine that must
-  never be deleted. On a legacy Compose install it is in `deploy/.env`.
-
-{/* TODO(open, raise on #367): the wizard itself (web/src/pages/setup/StepFinishing.tsx) still says "Back up deploy/.env now"; no ticket changes it for owned installs. */}
+  never be deleted, and the wizard says so. On a legacy Compose install it is in
+  `deploy/.env`, and the wizard tells you to back that file up.
 
 The scan is best-effort. A failed or slow scan does not trap you in the wizard;
 you can run it later from the administration area.

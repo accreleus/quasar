@@ -3,9 +3,6 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
-	"path/filepath"
-	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -18,12 +15,12 @@ import (
 // readiness report) gather facts, this decides. `unknown` never blocks — a fleet
 // of agents that predate the checks must keep updating.
 
-// The closed PreflightCheckId vocabulary. The three an agent answers about
-// itself are also its readiness check ids (node-agent readiness/platform_update.rs).
+// The closed PreflightCheckId vocabulary. The ones an agent answers about itself
+// are also its readiness check ids (node-agent readiness/platform_update.rs).
+// updater_stack_dir and updater_overlays retired with the Compose updater and
+// stay reserved: never reuse them (control-api.md "RH06 contract step").
 const (
 	CheckUpdaterSocket      = "updater_socket"
-	CheckUpdaterStackDir    = "updater_stack_dir"
-	CheckUpdaterOverlays    = "updater_overlays"
 	CheckImageResolvable    = "image_resolvable"
 	CheckAgentConnected     = "agent_connected"
 	CheckHealthAddrBindable = "health_addr_bindable"
@@ -61,23 +58,11 @@ type Preflight struct {
 	Checks    []PreflightCheck `json:"checks"`
 }
 
-// SocketState is the three-way #184 diagnosis of the control plane's own
-// updater socket: the mount directory, then the socket inside it.
+// SocketState is the #184 diagnosis of the recovery actor's control socket: the
+// mount directory, then the socket inside it.
 type SocketState struct {
 	DirExists    bool
 	SocketExists bool
-}
-
-// UpdaterSelfFacts is what `GET /v1/self` over the socket reported. Err is
-// non-empty when the socket existed but the call failed.
-type UpdaterSelfFacts struct {
-	Err         string
-	Version     string
-	StackDir    string
-	ConfigFiles []string
-	// Per compose service, the compose-file set its running container was
-	// started with (its own labels, read by the updater). nil = not inspected.
-	ServiceConfigFiles map[string][]string
 }
 
 // ReadinessFact is one of the agent's readiness checks, by id.
@@ -100,21 +85,21 @@ type ImageFact struct {
 // pointer is a tri-state: nil means nobody could look.
 type PreflightFacts struct {
 	CheckedAt *time.Time
-	// Control plane only.
-	Socket *SocketState
-	Self   *UpdaterSelfFacts
 	// Host only.
 	AgentConnected *bool
 	Readiness      map[string]ReadinessFact
 	// Both; copied from the instance-wide check.
 	Image *ImageFact
-	// Control plane on an owned machine only; non-nil replaces Socket/Self.
+	// Control plane on an owned machine only.
 	OwnedActor *OwnedActorFact
+	// Control plane only: this control plane has no recovery actor at all (it was
+	// not installed with the seed). False with a nil OwnedActor is "not looked".
+	NoRecoveryActor bool
 	// Control plane only: whether available[0] migrates (nil: nothing listed),
 	// and the size of this control plane's database (nil: not read).
 	Migrates      *bool
 	DatabaseBytes *int64
-	// Host only: an owned host carries owner_conflict and no Compose checks.
+	// Host only: an owned host carries owner_conflict.
 	OwnedHost bool
 }
 
@@ -137,7 +122,6 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 	var checks []PreflightCheck
 	switch {
 	case kind == TargetControlPlane && f.OwnedActor != nil:
-		// An owned target carries no Compose checks (amendment 14 §"Preflight").
 		checks = []PreflightCheck{
 			ownedActorSocketCheck(f.OwnedActor),
 			ownedConflictCheck(f.OwnedActor),
@@ -148,11 +132,14 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 		if db := f.OwnedActor.DatabaseMode; !f.OwnedActor.Answered || (db != nil && *db == DatabaseModeOwned) {
 			checks = append(checks, backupSpaceCheck(f))
 		}
+	case kind == TargetControlPlane && f.NoRecoveryActor:
+		checks = []PreflightCheck{
+			noActorCheck(),
+			imageCheck(f.Image),
+		}
 	case kind == TargetControlPlane:
 		checks = []PreflightCheck{
-			cpSocketCheck(f.Socket, f.Self),
-			cpStackDirCheck(f.Self),
-			cpOverlaysCheck(f.Self),
+			unknown(CheckUpdaterSocket, "the recovery actor was not asked"),
 			imageCheck(f.Image),
 		}
 	case f.OwnedHost:
@@ -167,8 +154,6 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 		checks = []PreflightCheck{
 			agentConnectedCheck(f.AgentConnected),
 			readinessCheck(CheckUpdaterSocket, f.Readiness),
-			readinessCheck(CheckUpdaterStackDir, f.Readiness),
-			readinessCheck(CheckUpdaterOverlays, f.Readiness),
 			readinessCheck(CheckHealthAddrBindable, f.Readiness),
 			imageCheck(f.Image),
 		}
@@ -194,30 +179,13 @@ func foldPreflight(checks []PreflightCheck) string {
 // Blocked reports whether this preflight produces the preflight_blocked reason.
 func (p Preflight) Blocked() bool { return p.State == PreflightBlocked }
 
-func cpSocketCheck(s *SocketState, self *UpdaterSelfFacts) PreflightCheck {
-	switch {
-	case s == nil:
-		return unknown(CheckUpdaterSocket, "the updater socket was not looked for")
-	case !s.DirExists:
-		return fail(CheckUpdaterSocket,
-			"the updater's socket volume is not mounted in this container (no "+updaterSocketDir()+
-				"): the control plane was created before the volume existed. Recreate it: "+
-				"docker compose up -d --force-recreate --no-deps quasar-control-plane")
-	case !s.SocketExists:
-		return fail(CheckUpdaterSocket,
-			"the volume is mounted but the updater is not running (no socket at "+ConfiguredUpdaterSocket()+
-				"). Start it: docker compose up -d quasar-updater")
-	case self == nil:
-		return unknown(CheckUpdaterSocket, "the socket exists but the updater was not asked")
-	case self.Err != "":
-		return fail(CheckUpdaterSocket, "the updater did not answer on "+ConfiguredUpdaterSocket()+": "+self.Err+
-			". Check its logs: docker compose logs quasar-updater")
-	}
-	v := self.Version
-	if v == "" {
-		v = "of unknown version"
-	}
-	return pass(CheckUpdaterSocket, "updater "+v+" answered on "+ConfiguredUpdaterSocket())
+// noActorCheck is a control plane with no recovery actor on its machine: one not
+// installed with the seed, which nothing can replace from the console.
+func noActorCheck() PreflightCheck {
+	return fail(CheckUpdaterSocket,
+		"this control plane has no recovery actor on its machine, so the console cannot update it: "+
+			"it was not installed with the seed. A source build is updated with deploy/redeploy.sh; "+
+			"any other install is replaced by a fresh seed install (docs/upgrading.md)")
 }
 
 // ownedActorSocketCheck keeps the updater_socket id; its detail names no
@@ -260,49 +228,6 @@ func ownedConflictCheck(a *OwnedActorFact) PreflightCheck {
 	}
 	return fail(CheckOwnerConflict, "the recovery actor never acts on a container it did not create, and these look like Quasar services: "+
 		strings.Join(each, "; ")+". Remove them and the stack or manager definition that recreates them: docker rm -f "+strings.Join(names, " "))
-}
-
-func cpStackDirCheck(self *UpdaterSelfFacts) PreflightCheck {
-	if self == nil || self.Err != "" {
-		return unknown(CheckUpdaterStackDir, "not evaluated: the updater did not answer")
-	}
-	if self.StackDir == "" || len(self.ConfigFiles) == 0 {
-		return fail(CheckUpdaterStackDir,
-			"the updater has not discovered the stack it sits beside. Set QUASAR_STACK_DIR in deploy/.env "+
-				"to the stack directory's absolute host path and recreate quasar-updater")
-	}
-	return pass(CheckUpdaterStackDir, fmt.Sprintf("%s, %d compose file(s)", self.StackDir, len(self.ConfigFiles)))
-}
-
-// cpOverlaysCheck compares the compose-file set each running service was
-// started with against the updater's own. A mismatch means the next recreate
-// drops (or adds) an overlay the operator did not expect.
-func cpOverlaysCheck(self *UpdaterSelfFacts) PreflightCheck {
-	if self == nil || self.Err != "" {
-		return unknown(CheckUpdaterOverlays, "not evaluated: the updater did not answer")
-	}
-	if self.ServiceConfigFiles == nil {
-		return unknown(CheckUpdaterOverlays, "the updater predates the overlay check")
-	}
-	want := strings.Join(self.ConfigFiles, ", ")
-	services := make([]string, 0, len(self.ServiceConfigFiles))
-	for svc := range self.ServiceConfigFiles {
-		services = append(services, svc)
-	}
-	sort.Strings(services)
-	for _, svc := range services {
-		got := self.ServiceConfigFiles[svc]
-		if got == nil {
-			continue // no container for this service: nothing to compare
-		}
-		if !slices.Equal(got, self.ConfigFiles) {
-			return fail(CheckUpdaterOverlays, fmt.Sprintf(
-				"%s was started with [%s] but the updater with [%s]; an apply would recreate it with the updater's set. "+
-					"Bring both up with the same -f list, or recreate quasar-updater with the service's",
-				svc, strings.Join(got, ", "), want))
-		}
-	}
-	return pass(CheckUpdaterOverlays, "every running service was started with the updater's compose files")
 }
 
 func agentConnectedCheck(c *bool) PreflightCheck {
@@ -357,8 +282,6 @@ func fail(id, detail string) PreflightCheck {
 func unknown(id, detail string) PreflightCheck {
 	return PreflightCheck{ID: id, Status: CheckUnknown, Detail: detail}
 }
-
-func updaterSocketDir() string { return filepath.Dir(ConfiguredUpdaterSocket()) }
 
 // backupSpaceCheck: room for the pre-update dump when available[0] migrates.
 // The recovery actor measures again before it dumps and is the enforcement.

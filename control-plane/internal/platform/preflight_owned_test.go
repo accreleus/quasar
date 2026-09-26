@@ -61,11 +61,12 @@ func TestAnOwnedHostTargetCarriesOwnerConflictAndNoComposeChecks(t *testing.T) {
 		t.Fatalf("an unreported owner_conflict = %+v (state %s), want unknown and not blocked", check(p, CheckOwnerConflict), p.State)
 	}
 
-	// A registry host keeps its Compose checks and carries no owner_conflict.
+	// A registry host carries no owner_conflict, and no host carries the
+	// retired Compose checks.
 	registry := InstallRegistry
 	h.InstallMode = &registry
 	p = PlanPreflight(TargetHost, HostPreflightFacts(h, &ImageFact{}))
-	if check(p, CheckOwnerConflict).ID != "" || check(p, CheckUpdaterStackDir).ID == "" {
+	if check(p, CheckOwnerConflict).ID != "" || check(p, "updater_stack_dir").ID != "" || check(p, "updater_overlays").ID != "" {
 		t.Fatalf("registry checks = %v", checkIDs(p))
 	}
 }

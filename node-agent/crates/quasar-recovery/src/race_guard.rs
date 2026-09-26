@@ -23,8 +23,8 @@ pub const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 pub const COMPOSE_PROJECT: &str = "com.docker.compose.project";
 /// The node agent's ownership label on the containers it creates (sessions, probes).
 const AGENT_OWNER: &str = quasar_runtime::ownership::LABEL;
-/// The Go updater of a Compose install: it recreates containers on its own, so a leftover
-/// one is in the way as much as a leftover service.
+/// A pre-RH06 Compose install's `quasar-updater`: it recreates containers on its own, so a
+/// leftover one is in the way as much as a leftover service.
 pub const UPDATER: &str = "updater";
 const UPDATER_SERVICE: &str = "quasar-updater";
 /// The node agent's probe containers, named before they are labelled.

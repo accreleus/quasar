@@ -8,23 +8,23 @@ import (
 
 // What a host apply that ended on its deadline tells the operator (#201).
 //
-// The updater writes the verdict and it travels home over the agent's socket.
-// When the new agent fails its health wait and the ADR 0004 restore fails too,
-// no agent comes back to carry it, so the attempt can only expire — and a bare
-// `timeout` hides a diagnosis the host already holds. These strings say where
-// it is. Not a second relay path: the updater is host-local by design.
+// The recovery actor journals the verdict and it travels home over the agent's
+// socket. When the new agent fails its health wait and the ADR 0004 restore
+// fails too, no agent comes back to carry it, so the attempt can only expire,
+// and a bare `timeout` hides a diagnosis the host already holds. These strings
+// say where it is. Not a second relay path: the actor is host-local by design.
 
 // applyReach is how far a release got, as far as the attempt row can say.
 // `pending` is ambiguous in both directions: MintRequestID writes it before the
-// send, and the updater's own first result state is `pending` too, relayed and
+// send, and the actor's own first result state is `pending` too, relayed and
 // written straight back. No column records the ack, so that row must claim
 // neither history.
 type applyReach int
 
 const (
 	reachNotSent applyReach = iota // no request id was minted, or none sent yet
-	reachUnknown                   // a request id exists; `pending` cannot say if an updater has it
-	reachSent                      // a state past `pending` was relayed, so an updater has a result
+	reachUnknown                   // a request id exists; `pending` cannot say if the actor has it
+	reachSent                      // a state past `pending` was relayed, so the actor has a result
 )
 
 func attemptReach(state, requestID string) applyReach {
@@ -40,67 +40,68 @@ func attemptReach(state, requestID string) applyReach {
 	return reachSent
 }
 
-// applyNotSentOutput is the timeout with no agent and no request id: no updater
-// has a result for this attempt, so naming the read command would send an
-// operator after a 404.
+// applyNotSentOutput is the timeout with no agent and no request id: the actor
+// has no journal for this attempt, so naming the read command would send an
+// operator after a missing file.
 const applyNotSentOutput = "This apply expired without ever being sent: the host's agent was not connected to " +
-	"the control plane. Nothing on this host was pulled, recreated or changed, and its updater has no " +
-	"result for this attempt.\n\n" +
-	"Bring the agent back — Fleet ▸ Hosts shows when it was last seen — and apply again."
+	"the control plane. Nothing on this host was pulled, replaced or changed, and its recovery actor has no " +
+	"record of this attempt.\n\n" +
+	"Bring the agent back (Fleet ▸ Hosts shows when it was last seen) and apply again."
 
-// readResultCommand reads the updater's own result, on the host. The updater
-// container, never the node agent: every shape that reaches here has the node
-// agent down.
-func readResultCommand(requestID, socket string) string {
-	return "  docker compose exec quasar-updater curl -s --unix-socket " + socket +
-		" http://u/v1/results/" + requestID + "\n\n"
+// actorJournalDir is where the recovery actor keeps one journal per request id,
+// inside its own container (quasar-recovery journal.rs, machine state).
+const actorJournalDir = "/var/lib/quasar-machine/journal/"
+
+// readResultCommand reads the recovery actor's journal for the request, on the
+// host. The actor's container, never the node agent: every shape that reaches
+// here has the node agent down.
+func readResultCommand(requestID string) string {
+	return "  docker exec quasar-recovery cat " + actorJournalDir + requestID + ".json\n\n"
 }
 
 // applyTimeoutOutput composes the `output` of a host attempt failed as
 // ReasonTimeout. "" means say nothing new: the agent is on the wire, so the
 // missing verdict is not a relay failure.
-func applyTimeoutOutput(agentConnected bool, reach applyReach, requestID, socket string) string {
+func applyTimeoutOutput(agentConnected bool, reach applyReach, requestID string) string {
 	if agentConnected {
 		return ""
 	}
 	if reach == reachNotSent || requestID == "" {
 		return applyNotSentOutput
 	}
-	if socket == "" {
-		socket = UpdaterSocketPath
-	}
 	var b strings.Builder
 	if reach == reachUnknown {
-		// One read on the host resolves both halves, so the 404 case is spelt out.
+		// One read on the host resolves both halves, so the missing-file case is spelt out.
 		b.WriteString("This apply expired without a verdict and the host's agent has not come back.\n\n")
-		b.WriteString("The last this host reported was its updater holding the request, unstarted — but an ")
-		b.WriteString("apply no updater ever received looks exactly the same from here, and nothing recorded ")
-		b.WriteString("which this was. So whether anything on this host was pulled or recreated cannot be ")
+		b.WriteString("The last this host reported was its recovery actor holding the request, unstarted, but an ")
+		b.WriteString("apply the actor never received looks exactly the same from here, and nothing recorded ")
+		b.WriteString("which this was. So whether anything on this host was pulled or replaced cannot be ")
 		b.WriteString("settled from the control plane.\n\n")
-		b.WriteString("It can be settled on the host. Ask the updater container, not the node agent: the ")
+		b.WriteString("It can be settled on the host. Ask the recovery actor, not the node agent: the ")
 		b.WriteString("node agent is the one that is down.\n\n")
-		b.WriteString(readResultCommand(requestID, socket))
-		b.WriteString("A result there is the verdict — the real reason, the failed container's last log ")
-		b.WriteString("lines, and the `previous` digests to put back by hand. A 404 means this updater never ")
-		b.WriteString("received the request and nothing on this host was changed.\n\n")
-		b.WriteString("`docker compose logs quasar-updater` carries the same verdict.")
+		b.WriteString(readResultCommand(requestID))
+		b.WriteString("A journal there is the verdict: the real reason, the failed container's last log ")
+		b.WriteString("lines, and the `previous` digests to put back by hand. No such file means the actor never ")
+		b.WriteString("admitted the request and nothing on this host was changed.\n\n")
+		b.WriteString("`docker exec quasar-recovery quasar-recovery status` shows the actor's last attempt, and ")
+		b.WriteString("`docker logs quasar-recovery` carries the same verdict.")
 		return b.String()
 	}
 	b.WriteString("This apply expired without a verdict and the host's agent has not come back, so the ")
-	b.WriteString("updater's own result could not be relayed to the control plane.\n\n")
-	b.WriteString("That most often means the new container failed its health wait and the updater's ")
+	b.WriteString("recovery actor's own result could not be relayed to the control plane.\n\n")
+	b.WriteString("That most often means the new container failed its health wait and the actor's ")
 	b.WriteString("automatic restore of the previous one (ADR 0004) failed too. It is not proof: a ")
 	b.WriteString("restore still running when the deadline fell, a pull slower than the deadline, a host ")
 	b.WriteString("that lost power part-way through, an agent stopped by hand and a host off the network ")
-	b.WriteString("all look the same from here. If this host is back in Fleet ▸ Hosts, the updater ")
-	b.WriteString("finished after the apply gave up — the version shown there says which build it came ")
+	b.WriteString("all look the same from here. If this host is back in Fleet ▸ Hosts, the actor ")
+	b.WriteString("finished after the apply gave up; the version shown there says which build it came ")
 	b.WriteString("back on.\n\n")
-	b.WriteString("The verdict is on that host — the real reason, the failed container's last log lines, ")
-	b.WriteString("and the `previous` digests to put back by hand. Read it in the stack directory there. ")
-	b.WriteString("Ask the updater container, not the node agent: the node agent is the one that is down.\n\n")
-	b.WriteString(readResultCommand(requestID, socket))
-	b.WriteString("`docker compose logs quasar-updater` carries the same verdict, and says whether the ")
-	b.WriteString("restore finished.")
+	b.WriteString("The verdict is on that host: the real reason, the failed container's last log lines, ")
+	b.WriteString("and the `previous` digests to put back by hand. Ask the recovery actor, not the node ")
+	b.WriteString("agent: the node agent is the one that is down.\n\n")
+	b.WriteString(readResultCommand(requestID))
+	b.WriteString("`docker exec quasar-recovery quasar-recovery status` shows the actor's last attempt, and ")
+	b.WriteString("`docker logs quasar-recovery` says whether the restore finished.")
 	return b.String()
 }
 
@@ -130,10 +131,7 @@ func (r *Runner) timeoutOutput(attemptID string) string {
 			"attempt_id", attemptID, "err", err)
 		return ""
 	}
-	// NOT ConfiguredUpdaterSocket: that is THIS container's override, and the
-	// command runs in a different host's updater container, which compose
-	// passes no QUASAR_UPDATER_SOCKET.
-	hint := applyTimeoutOutput(false, attemptReach(a.State, requestID), requestID, UpdaterSocketPath)
+	hint := applyTimeoutOutput(false, attemptReach(a.State, requestID), requestID)
 	return joinApplyOutput(a.Output, hint)
 }
 

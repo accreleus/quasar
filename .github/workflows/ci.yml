@@ -124,8 +124,9 @@ jobs:
           cache-dependency-path: site/package-lock.json
       - name: Install
         run: npm ci
-      # Includes the compose-template drift check and the stack-template
-      # contract tests (quoting, credential handling, absolute stack path).
+      # The stack-template contract tests: the one-service seed stack, digest
+      # pins, no generated secrets, and every generated script parsing and
+      # refusing a leftover Compose stack.
       - name: Unit tests
         run: npm test
       - name: Build

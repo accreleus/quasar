@@ -589,14 +589,14 @@ describe("ReleasesTab › manual update paths", () => {
     expect(screen.queryByRole("button", { name: /^apply/i })).not.toBeInTheDocument();
   });
 
-  it("a host with no updater shows the one-time updater addition and the registry recipe", async () => {
+  it("a host with no recovery actor shows the registry recipe and no updater to add", async () => {
     mocked.getPlatformReleases.mockResolvedValue(
       ineligible("updater_absent", { updater_present: false }),
     );
     renderTab();
 
     const block = await screen.findByTestId("manual-h1");
-    expect(block).toHaveTextContent("up -d --no-deps quasar-updater");
+    expect(block).not.toHaveTextContent("quasar-updater");
     expect(block).toHaveTextContent("pull quasar-control-plane quasar-node-agent");
     expect(block).toHaveTextContent("QUASAR_CONTROL_IMAGE=");
   });
@@ -785,7 +785,7 @@ describe("preflight on the targets card (#187)", () => {
         preflight: {
           state: "unknown",
           checked_at: null,
-          checks: [{ id: "updater_overlays", status: "unknown", detail: "the agent has not reported this check" }],
+          checks: [{ id: "health_addr_bindable", status: "unknown", detail: "the agent has not reported this check" }],
         },
       },
     ] as PlatformReleaseView["targets"];

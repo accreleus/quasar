@@ -224,24 +224,16 @@ func reasonBlock(t *testing.T, file, ident string) []string {
 	return nil
 }
 
-// The actor's reasons must include every reason the Go updater emits and every
-// failure reason the platform package records, apart from the four the
-// platform observes about an updater rather than receives from one. Guards
-// drift until the ActorClient adapter unifies the vocabularies.
-func TestReasonsIncludeTheUpdaterAndPlatformVocabularies(t *testing.T) {
+// The actor's reasons must include every failure reason the platform package
+// records, apart from the four the platform observes about an actor rather than
+// receives from one.
+func TestReasonsIncludeThePlatformVocabulary(t *testing.T) {
 	known := map[string]bool{}
 	for _, r := range KnownReasons {
 		known[string(r)] = true
 	}
 	observedByOthers := map[string]bool{"updater_absent": true, "updater_unreachable": true, "timeout": true, "unsupported": true}
 
-	updater := append(reasonBlock(t, "../updater/plan.go", "ReasonInvalid"),
-		reasonBlock(t, "../updater/signature.go", "ReasonSignatureMissing")...)
-	for _, r := range updater {
-		if !known[r] {
-			t.Errorf("updater reason %q is missing from actorsocket.KnownReasons", r)
-		}
-	}
 	platform := reasonBlock(t, "../platform/apply.go", "ReasonUpdaterAbsentFailure")
 	inPlatform := map[string]bool{}
 	for _, r := range platform {
@@ -255,7 +247,7 @@ func TestReasonsIncludeTheUpdaterAndPlatformVocabularies(t *testing.T) {
 			t.Errorf("%q must be a platform reason the actor never emits", r)
 		}
 	}
-	if len(updater) < 10 || len(platform) < 14 {
-		t.Fatalf("parsed %d updater and %d platform reasons: the const blocks moved", len(updater), len(platform))
+	if len(platform) < 14 {
+		t.Fatalf("parsed %d platform reasons: the const block moved", len(platform))
 	}
 }

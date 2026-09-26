@@ -6,7 +6,7 @@ The tag-push release lane (`.github/workflows/images.yml`) also lives here: `cha
 
 `check-release-compatibility.sh` is ADR 0008's release-time check (refuse a release its own recovery actor could not manage after a one-step update); `collect-release-compatibility-inputs.sh` gathers its inputs in the release job.
 
-`new-release-signing-key.sh` / `sign-platform-release-manifest.sh` / `verify-platform-release-manifest.sh` are the optional detached release signature — schema in `platform-release-signature.md`, operator procedure in `docs/upgrading.md`. The release job signs only when the `QUASAR_RELEASE_SIGNING_KEY` secret exists; the normative verifier is the updater's, in `control-plane/internal/updater/signature.go`. **No key, public or private, belongs in this repository** — the keygen refuses to write inside the tree, and the contract test generates every key it uses at run time.
+`new-release-signing-key.sh` / `sign-platform-release-manifest.sh` / `verify-platform-release-manifest.sh` are the optional detached release signature — schema in `platform-release-signature.md`, operator procedure in `docs/upgrading.md`. The release job signs only when the `QUASAR_RELEASE_SIGNING_KEY` secret exists; the normative verifier is the recovery actor's, in `node-agent/crates/quasar-recovery/src/trust/signature.rs`. **No key, public or private, belongs in this repository** — the keygen refuses to write inside the tree, and the contract test generates every key it uses at run time.
 
 `release-cut.sh` (`make release VERSION=x.y.z`, #109) is what pushes the tag that triggers that lane: it moves `CHANGELOG.md`'s `## Unreleased` section into a dated section, commits and tags on `main`, and pushes both, refusing on a dirty/behind tree, a non-semver or not-strictly-newer version, or an empty `## Unreleased`. Its changelog rewrite is exposed as a pure `--transform` mode (stdin in, stdout out, no git) for fixture testing, and doc: `docs/upgrading.md` "Cutting a release".
 
@@ -17,6 +17,6 @@ for test in scripts/release/test-*.sh; do bash "$test"; done
 ```
 
 `test-release-publication-gate.sh` (also run by `make verify` and the image workflow release gate) verifies that GitHub Release publication waits
-for the control-plane, node-agent and recovery-actor images and the separately
-promoted updater. The manifest names the first three; the release notes also
-advertise the updater. `test-release-compatibility.sh` also runs under `make verify`.
+for the control-plane, node-agent and recovery-actor images to be validated and promoted,
+and that no Compose-updater lane comes back. `test-release-compatibility.sh` also runs
+under `make verify`.

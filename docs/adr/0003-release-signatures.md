@@ -4,6 +4,11 @@ date: 2026-09-08
 ---
 # A platform release may carry a detached ed25519 signature, verified by the updater
 
+> *RH06-15 (#367):* the verifier is now the recovery actor's port of this one
+> (`node-agent/crates/quasar-recovery/src/trust`, held to the frozen answers in
+> `testdata/recovery/trust-vectors`); the Go updater that implemented it is retired. The
+> decision below is unchanged.
+
 ADR 0001 chose digest pinning alone and filed signatures as a follow-up, noting
 that "the manifest already carries the digests a signature would cover" and that
 adding them later "changes the verifier, not the shape". This is that follow-up.

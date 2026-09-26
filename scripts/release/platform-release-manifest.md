@@ -23,12 +23,10 @@ There are two formats, under two asset names:
 writes format 1. `validate-platform-release-manifest.sh` reads both, dispatching on
 `format_version`, because releases already published carry format 1.
 
-> **Publishing is blocked on #367.** The contract's ordering constraint
-> (`protocol/control-api.md` "RH06 contract step", item 4) says no release may be
-> published without the format-1 pair until the Go updater has retired (RH06-15,
-> #367): a `registry` host's updater fetches only `platform-release-manifest.json`
-> and its `.sig`. The release job publishes only the v2 pair, so no release is cut
-> from this tooling before #367 lands. The block is on #367, not on this tooling.
+> **No format-1 asset is published** (`protocol/control-api.md` "RH06 contract step",
+> item 4, in force since RH06-15, #367): its last reader, the Compose updater, is
+> retired, and a control plane implementing amendment 14 reads only the v2 asset, so a
+> release that carries only the format-1 one is not listed.
 
 > **Not `scripts/release/release-manifest.json`.** That file is the release
 > preflight's *inputs* declaration — supported targets, upstream pins, vendored
@@ -209,15 +207,15 @@ covered by `scripts/release/test-release-compatibility.sh` over
 ## How it is consumed
 
 The control plane's release detection reads the newest GitHub Releases for the
-repository and, for each, fetches the v2 asset when the release publishes one and
-the format-1 asset otherwise. A release whose asset is missing or unparseable is a
-release it does not offer. From the manifest it takes:
+repository and, for each, fetches the v2 asset. A release that carries only the
+format-1 asset predates owned installs and is not listed, with no fault; one whose v2
+asset is missing or unparseable is a release it does not offer. From the manifest it takes:
 
 - `version` + `prerelease` — what to show, and whether the instance's channel
   wants it at all (`stable` skips prereleases).
 - `schema_version` — the no-downgrade comparison of ADR 0002.
 - `components[].image` + `.digest` — composed into `image@digest` and handed to
-  the target, so a host pulls exactly the bytes the control plane resolved and
+  the recovery actor of the target's machine, so a host pulls exactly the bytes the control plane resolved and
   never a floating tag (ADR 0001).
 
 A control plane that predates format 2 fetches only `platform-release-manifest.json`,

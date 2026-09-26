@@ -1,10 +1,10 @@
 // Package hostenroll owns per-host enrollment tokens (#12/#96): admin-minted, hashed at
 // rest, single-use by default, expiring, and optionally bound to one node_name.
 //
-// Why this exists rather than the single static ENROLLMENT_TOKEN: that value is shared by
-// the whole fleet, cannot be rotated without a control-plane restart, and — because
-// enrollment upserts on node_name — carries the authority to BECOME an already-enrolled
-// host, not merely to add a new one. A token minted for one machine, good once, expiring,
+// These and a machine's single-use local token are the only enrollment credentials (the
+// fleet-wide static ENROLLMENT_TOKEN is retired, control-api.md "RH06 contract step"):
+// because enrollment upserts on node_name, a shared value would carry the authority to
+// BECOME an already-enrolled host. A token minted for one machine, good once, expiring,
 // is the credential the operator thinks they are handing out.
 //
 // The redemption model is deliberately the same one `invites` uses (single

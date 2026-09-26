@@ -379,13 +379,13 @@ describe("FleetRunPanel", () => {
         state: "failed",
         current_target: null,
         current_host_id: null,
-        error: "the updater could not be reached",
+        error: "the recovery actor could not be reached",
         attempts: [attempt({ state: "failed", reason: "recreate_failed" })],
       }),
     );
 
     expect(screen.getByText("Stopped at the first target that failed.")).toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("the updater could not be reached");
+    expect(screen.getByRole("alert")).toHaveTextContent("the recovery actor could not be reached");
     expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
   });
 

@@ -1,10 +1,7 @@
-//! Release trust (#356): a behaviour-for-behaviour port of the Go updater's request gates
-//! (`control-plane/internal/updater/plan.go` `Plan`, lines 158-256) and ADR 0003 signature
-//! verification (`signature.go`, `signature_source.go`, and `server.go` `signatureEvidence`).
-//!
-//! "The same" is defined by `testdata/recovery/trust-vectors/`, which the Go package also
-//! runs. A divergence from a vector is a bug here; a Go behaviour that looks wrong is
-//! reported, not changed. [`admit`] is pure apart from the WARN it emits for an unverified
+//! Release trust (#356): the request gates and ADR 0003 signature verification, ported
+//! behaviour-for-behaviour from the Go updater (retired with #367, which froze its answers
+//! as the vectors in `testdata/recovery/trust-vectors/`). A divergence from a vector is a
+//! bug here; a vector that looks wrong is reported, not changed. [`admit`] is pure apart from the WARN it emits for an unverified
 //! apply; the network is [`HttpsFetcher`]'s, which gathers the [`SignatureEvidence`].
 
 mod golang;
@@ -33,10 +30,10 @@ use golang::text::quote;
 pub(crate) const DEFAULT_ALLOWED_NAMESPACES: &[&str] = &["ghcr.io/accreleus/quasar"];
 
 /// The closed component table. Anything else (`quasar-updater`, `postgres`, ...) is
-/// `invalid`, and so is `recovery-actor` except on the agent socket: unlike the Go updater,
-/// the recovery actor accepts itself there, because it hands over to a successor
+/// `invalid`, and so is `recovery-actor` except on the agent socket: the recovery actor
+/// accepts itself there, because it hands over to a successor
 /// (agent-api.md amendment 14, ADR 0008). The control socket names it only together with
-/// `control-plane` (rule A: the actor moves first); alone it stays unknown there, as in Go.
+/// `control-plane` (rule A: the actor moves first); alone it stays unknown there.
 /// The vectors whose Go answer differs carry it as `expect_without_caller_guard`.
 const COMPONENTS: &[&str] = &["control-plane", "node-agent"];
 const RECOVERY_ACTOR: &str = "recovery-actor";

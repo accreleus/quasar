@@ -10,7 +10,6 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
 // A migrating control-plane step on an owned machine (#364, #352 decision 14):
@@ -234,9 +233,9 @@ type capturingUpdater struct {
 	reqs []SelfRequest
 }
 
-func (c *capturingUpdater) Apply(_ context.Context, req SelfRequest) (updater.Accepted, error) {
+func (c *capturingUpdater) Apply(_ context.Context, req SelfRequest) (SelfAccepted, error) {
 	c.reqs = append(c.reqs, req)
-	return updater.Accepted{RequestID: req.RequestID}, nil
+	return SelfAccepted{RequestID: req.RequestID}, nil
 }
 
 // A developer apply's schema is read once, at admission: the send after the

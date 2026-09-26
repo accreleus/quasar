@@ -1,6 +1,14 @@
 # Deploying Quasar
 
-Getting Quasar running on a Linux GPU box, and the reference material for the
+> **Installing Quasar for real? Use the seed, not this file.** An operator installs with one
+> small container per machine, the seed (the one-line command, a `docker run` line, or a
+> one-service stack in Dockge or Arcane), and Quasar's recovery actor creates, updates and
+> recovers the rest: `docs/configuration.md` "Seed" and the site's Install pages. The Compose
+> files this page documents are **contributor tooling** (the source lane: `deploy/redeploy.sh`,
+> `make redeploy-cp`, `make rebuild`), **not a supported install**. A stack started from them
+> has no recovery actor and is never updated from the console.
+
+Getting a source-built Quasar running on a Linux GPU box, and the reference material for the
 things you may have to configure afterwards.
 
 - **[Part 1 — Quick start](#part-1-quick-start)**: from nothing to streaming.
@@ -34,164 +42,25 @@ Contributor tooling (the dev container, the harnesses, image builds) is not here
 
 Full detail on every one of these: [Prerequisites in detail](#prerequisites-in-detail).
 
-Two ways in. Pick one:
+Two ways in:
 
-- **[A — Install a release](#a-install-a-release-recommended)**: pull the
-  published images. Nothing compiles. This is what you want.
-- **[B — Build from source](#b-build-from-source)**: build everything from a
-  git branch. For contributors, and for hosts that track `develop`.
+- **[A — Install a release](#a-install-a-release-recommended)**: with the seed. This is what
+  you want.
+- **[B — Build from source](#b-build-from-source)**: build everything from a git branch
+  with the Compose files. For contributors, and for hosts that track `develop`.
 
 ## A. Install a release (recommended)
 
-### 1. Get the tagged tree
+An operator install is the seed. It keeps no `.env` and no stack directory, needs no Compose
+file, and takes a handful of inputs (role, home root, the images by digest, and for a GPU host
+a single-use enrollment string from Admin → Fleet → Add host). The recipes, for a combined,
+control-only or GPU host, as a `docker run` line or a one-service Dockge/Arcane stack, and with
+your own Postgres: `docs/configuration.md` "Seed" and "Combined and control-only machines". How
+it is updated, recovered, reconfigured and removed: `docs/upgrading.md`.
 
-You need the repo only for its compose files. A shallow clone of the tag is
-enough, and no submodule has to be initialized.
-
-```bash
-git clone --depth 1 --branch vX.Y.Z https://github.com/accreleus/quasar.git
-cd quasar
-```
-
-Replace `vX.Y.Z` with the newest tag from the
-[releases page](https://github.com/accreleus/quasar/releases).
-
-> You should see `Cloning into 'quasar'...` and end up in a directory
-> containing `deploy/`.
-
-### 2. Write `deploy/.env`
-
-Three values matter. `POSTGRES_PASSWORD` and `ENROLLMENT_TOKEN` are required —
-Compose refuses to start without them. `QUASAR_SECRET_KEY` is optional but set
-it now: without it, credentials saved through the admin UI cannot be stored.
-
-The two image lines pin the stack to the release. Take the digests from the
-release body, or from the release's `platform-release-manifest.json` asset, which
-carries the same two digests in machine-readable form.
-
-The compose file also starts `quasar-updater`, the per-host actor that applies
-future releases. Its default is a bare local tag no registry serves, so a
-release install has to name the published image; and it needs
-`QUASAR_STACK_DIR`, this directory's absolute host path, to find the compose
-project it is sitting beside (see [The updater](../docs/upgrading.md#the-updater)).
-
-The secrets below are read from `/dev/urandom` with `od` and `base64`
-(coreutils, always present) rather than `openssl`, which a minimal host may
-not have.
-
-```bash
-umask 077
-cp deploy/.env.example deploy/.env
-cat >> deploy/.env <<EOF
-
-POSTGRES_PASSWORD=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-ENROLLMENT_TOKEN=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-QUASAR_SECRET_KEY=$(head -c 32 /dev/urandom | base64)
-QUASAR_HOME_ROOT=/var/lib/quasar/homes
-
-QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:...
-QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:...
-
-QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest
-QUASAR_STACK_DIR=$(cd deploy && pwd)
-EOF
-chmod 600 deploy/.env
-```
-
-> No output. `grep -c = deploy/.env` should now be non-zero, and
-> `ls -l deploy/.env` should show `-rw-------`.
-
-`QUASAR_HOME_ROOT` can be any persistent path; `/var/lib/quasar/homes` suits a
-generic Linux host, but on unraid-style appliance OSes where `/var/lib` is
-RAM-backed and lost on reboot, use the persistent data share instead (e.g.
-`/mnt/user/appdata/quasar/homes`, or `/mnt/cache/appdata/quasar/homes` to skip
-the FUSE overlay) — here and in the `install -d` commands in step 3.
-
-**Back up `deploy/.env` somewhere safe.** `QUASAR_SECRET_KEY` seals every
-credential stored through the admin UI; losing it makes them unrecoverable.
-
-### 3. Name this host in the certificate, and create the home directory root
-
-Quasar serves its own self-signed certificate, generated on first boot. It can
-only see its own container addresses, so it has to be told the name or address
-you will actually type — otherwise the browser rejects it on every visit, and
-accepting the warning never clears that (it is a name mismatch, not a trust
-failure).
-
-**Reaching it by IP?** Nothing to decide — this fills in your LAN address:
-
-```bash
-bash deploy/seed-tls-hosts.sh deploy/.env
-sudo install -d -m 0755 /var/lib/quasar/homes
-```
-
-> You should see the line it wrote, e.g.
-> `QUASAR_TLS_HOSTS=192.168.1.50,myhost` added to `deploy/.env`.
-
-**Have a DNS name for this host?** Put it in `deploy/.env` *before* you bring
-the stack up, and the certificate carries it:
-
-```bash
-echo 'QUASAR_TLS_HOSTS=play.example.com' >> deploy/.env
-sudo install -d -m 0755 /var/lib/quasar/homes
-```
-
-Either way you open the stack at that name or address in step 5. (Both work
-together: `QUASAR_TLS_HOSTS=play.example.com,192.168.1.50`. `seed-tls-hosts.sh`
-never overwrites a value you set yourself, so setting it by hand first is
-always safe.)
-
-Adding a name *after* the stack is already running needs the certificate
-re-issued — see [Adding a name later](#adding-a-name-later).
-
-### 4. Pull and start
-
-The two image lines you set in step 2 are what make this a pinned release
-install — there is no extra overlay to add. AMD/Intel hosts use the base file
-alone; NVIDIA hosts add the one hardware overlay.
-
-```bash
-# AMD / Intel host
-docker compose -f deploy/docker-compose.yml pull
-docker compose -f deploy/docker-compose.yml up -d
-
-# NVIDIA host
-docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml pull
-docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml up -d
-```
-
-> The pull is the long part — the node-agent image is large. `up -d` then
-> prints `Container deploy-quasar-postgres-1  Started` and the same for
-> `quasar-control-plane` and `quasar-node-agent`.
-
-**On a kernel view with no `/dev/kmsg`** (some system containers), `up -d` fails after the control
-plane is already healthy with:
-
-> Error response from daemon: error gathering device information while adding
-> custom device "/dev/kmsg": no such file or directory
-
-See the `/dev/kmsg` row of [Prerequisites in detail](#prerequisites-in-detail)
-for the fix.
-
-### 5. Check it came up
-
-```bash
-docker compose -f deploy/docker-compose.yml ps
-curl http://localhost:8080/health
-```
-
-> `ps` should show all three services `healthy`. `curl` should print
-> `{"status":"ok","db":"ok"}`. (That one URL stays plaintext deliberately; every
-> other HTTP path redirects to HTTPS.)
-
-If you changed `CONTROL_PORT` or `QUASAR_TLS_PORT` in `deploy/.env`, substitute
-your values for `:8080` and `:8443` in this and every later command.
-
-Now go to [Claim your admin account](#claim-your-admin-account).
-
-> **Installing `v0.1.0` specifically?** That tag predates three fixes to this
-> path and needs two extra steps. See
-> [Installing v0.1.0](#installing-v010-extra-steps) at the end of Part 3.
+A stack made from these Compose files before the seed existed keeps running its release and is
+not offered any release after it; it is replaced by a fresh seed install
+(`docs/upgrading.md` "Replacing an install made from the Compose files").
 
 ## B. Build from source
 
@@ -230,11 +99,24 @@ bash deploy/redeploy.sh va develop         # AMD / Intel host
 > the TLS host names. The last line is the verdict:
 >
 > ```
-> REDEPLOY env=nvidia scope=all ref=develop sha=<short> bundle=index-<hash>.js health=ok catalog=401 agent=registered updater=ok result=OK
+> REDEPLOY env=nvidia scope=all ref=develop sha=<short> bundle=index-<hash>.js health=ok catalog=401 agent=registered result=OK
 > ```
 >
 > `result=OK` means every post-deploy check passed. A non-zero exit or
 > `result=FAIL` means it did not — read the failing check above that line.
+
+**On a fresh stack the agent cannot enroll yet**, so the first run ends with
+`agent=MISSING`: there is no fleet-wide static enrollment token, and the control plane redeems
+only tokens it minted. Claim the admin account (below), mint a token in Admin → Fleet → Add
+host (bind it to this host's `NODE_NAME`, default `quasar-node-1`), put the token part of the
+string (after its last `.`) in `deploy/.env` as `ENROLLMENT_TOKEN=`, and recreate the agent:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps quasar-node-agent
+```
+
+Once it has enrolled, its saved node secret reconnects on every later deploy and the token is
+spent.
 
 **Back up `deploy/.env`** — `redeploy.sh` generated `QUASAR_SECRET_KEY` into it,
 and losing that key makes stored credentials unrecoverable.
@@ -1014,24 +896,6 @@ Runs the node-agent binary with all GStreamer plugins, using host networking
 over `localhost:8080`, and launches game containers and audio sidecars as
 sibling containers through the mounted Docker socket.
 
-### `quasar-updater`
-
-The per-host actor that applies a platform release: it pulls the pinned digests
-and recreates the containers they replace, because a container cannot recreate
-itself. It acts only when told to, over a unix socket in a volume shared with
-the other two services, and only on the stack it sits beside — it discovers that
-stack from its own compose labels, so it picks up whatever overlays you used
-without being told about them.
-
-Two things it will not do: apply an image from outside
-`QUASAR_UPDATER_ALLOWED_NAMESPACES`, and update itself. Its own image is named
-by tag rather than digest for that reason; see
-[`docs/upgrading.md`](../docs/upgrading.md) for the one-line update and for
-adding the service to an existing install.
-
-It needs `QUASAR_STACK_DIR` set to this directory's absolute host path.
-`deploy/redeploy.sh` seeds it.
-
 ## A second install on the same host
 
 A second, isolated Quasar beside an existing one on the same Docker engine
@@ -1050,7 +914,7 @@ works, but every value below has to differ from the first install's
   its health port is a host-wide bind, not a per-container one. Two agents
   both left at the default `127.0.0.1:9091` fight over the same address; give
   the second one its own loopback port (e.g. `127.0.0.1:9191`).
-- **Its own `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`, and `QUASAR_STACK_DIR`**,
+- **Its own `QUASAR_HOME_ROOT` and `QUASAR_TEMPLATE_ROOT`**,
   each a path distinct from the first install's, in one path form (e.g. on an
   unraid-style host, both installs under the same persistent share:
   `/mnt/user/appdata/quasar-a/homes` and `/mnt/user/appdata/quasar-b/homes`).
@@ -1068,10 +932,9 @@ Before pulling a new version onto a running stack, back up Postgres and read
 upgrade steps, and the fix for the crash loop you get if you roll a control-plane
 binary back *below* the database's applied migration version.
 
-Which recipe you use depends on how this host was installed. A registry install
-(path A) re-pins the two digest lines in `deploy/.env` and recreates those two
-services — [Upgrading a registry install](../docs/upgrading.md#upgrading-a-registry-install);
-a source install (path B) runs `deploy/redeploy.sh <va|nvidia> <ref>`.
+A source install (path B) runs `deploy/redeploy.sh <va|nvidia> <ref>`. A stack pinned to
+published images before the seed existed moves by hand among the releases published before it
+([Upgrading a registry install](../docs/upgrading.md#upgrading-a-registry-install)).
 
 ### Narrow redeploys (source path)
 
@@ -1146,53 +1009,6 @@ docker compose -f deploy/docker-compose.yml down
 # so you will re-enroll and re-claim the admin account
 docker compose -f deploy/docker-compose.yml down -v
 ```
-
-## Installing v0.1.0 (extra steps)
-
-`v0.1.0` predates three fixes to the release path and needs two extra steps,
-both applied **before** step 4's `up -d`. Its images also carry the old names:
-`quasar-control`, and `quasar-vulkan` (AMD/Intel) or `quasar-nv` (NVIDIA).
-
-Note that you install a release from *that release's own tree*, so the compose
-files in play here are `v0.1.0`'s, not the ones described above — `v0.1.0` still
-has a `docker-compose.release.yml`, and step 4 for it is the older
-`COMPOSE="-f deploy/docker-compose.yml … -f deploy/docker-compose.release.yml"`
-form that tag's own README documents.
-
-```bash
-# a) The release control image runs as a non-root user, and a fresh Docker
-#    named volume is created root-owned, so the control plane cannot create
-#    its TLS directory and exits at boot. Pre-create the volume and give it
-#    to uid 1000.
-docker volume create deploy_quasar-control-tls
-docker run --rm -v deploy_quasar-control-tls:/v alpine chown 1000:1000 /v
-
-# b) v0.1.0's release overlay empties the control-plane's volume list (to drop
-#    a development bind mount) and takes the TLS volume with it, and the base
-#    healthcheck calls wget, which that image does not ship — so the container
-#    would stay unhealthy and the node agent would never start. Restore both.
-cat > deploy/docker-compose.release-fixups.yml <<'YAML'
-services:
-  quasar-control-plane:
-    volumes:
-      - quasar-control-tls:/var/lib/quasar-control
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
-YAML
-```
-
-Then append `-f deploy/docker-compose.release-fixups.yml` to that tag's own
-compose chain. Releases after `v0.1.0` need none of this.
-
-**Image names changed after v0.1.0.** The rename to `quasar-control-plane` /
-`quasar-node-agent` lands in the next release, and both names are published for
-one transition window, so a pin to either resolves to the same digests. The
-third, `quasar-nv`, has no successor: the separate NVIDIA lineage is retired and
-an NVIDIA host runs `quasar-node-agent` like every other host.
-
-A release carries an immutable `:X.Y.Z` tag on both runtime images alongside the
-digests. Prefer the digest — a tag is a pointer, and the release overlay is
-explicitly a pin.
 
 ---
 

@@ -32,7 +32,7 @@ func readIdentity(t *testing.T, pool *pgxpool.Pool, hostID string) storedIdentit
 
 func TestReplaceHostIdentityStoresAllFourFields(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	// A fresh host is identity-unknown: nothing has said anything yet.
@@ -75,7 +75,7 @@ func TestReplaceHostIdentityStoresAllFourFields(t *testing.T) {
 // storage/codecs/readiness, which are keep-if-absent.
 func TestReplaceHostIdentityNullsEveryAbsentFieldOnTheNextRegister(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	known, _ := identityFromRegister(RegisterMsg{
@@ -107,7 +107,7 @@ func TestReplaceHostIdentityNullsEveryAbsentFieldOnTheNextRegister(t *testing.T)
 // would refuse the write and take the whole registration down with it.
 func TestReplaceHostIdentityDropsAnUnknownInstallModeRatherThanFailingTheWrite(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	id, dropped := identityFromRegister(RegisterMsg{

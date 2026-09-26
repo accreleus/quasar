@@ -12,8 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 render() {
-  ENROLLMENT_TOKEN=test \
-    POSTGRES_PASSWORD=test \
+  POSTGRES_PASSWORD=test \
     JWT_SECRET=test \
     docker compose "$@" config --format json
 }
@@ -166,7 +165,7 @@ import json,sys; print(json.load(sys.stdin)['volumes']['quasar-postgres-data']['
 # fall back to defaults or adopt only some volumes — `:?` gives an actionable
 # per-var error rather than a silent partial adoption.
 ADOPT=("${BASE[@]}" -f deploy/overlays/docker-compose.adopt-volumes.yml)
-if ENROLLMENT_TOKEN=test POSTGRES_PASSWORD=test JWT_SECRET=test \
+if POSTGRES_PASSWORD=test JWT_SECRET=test \
     docker compose "${ADOPT[@]}" config --format json >/dev/null 2>&1; then
   fail "adopt-volumes overlay rendered with no QUASAR_*_VOLUME vars set — should have failed on the ':?' required vars"
 fi
@@ -175,7 +174,7 @@ fi
 # stack that was previously on a forked compose file keep its existing data
 # volumes instead of silently starting against an empty database.
 adopt_render() {
-  ENROLLMENT_TOKEN=test POSTGRES_PASSWORD=test JWT_SECRET=test \
+  POSTGRES_PASSWORD=test JWT_SECRET=test \
     QUASAR_POSTGRES_VOLUME=legacy_pg_volume \
     QUASAR_AGENT_VOLUME=legacy_agent_volume \
     QUASAR_CONTROL_VOLUME=legacy_tls_volume \
@@ -346,11 +345,11 @@ if docker compose version --short 2>/dev/null | awk -F. '{exit !($1>2 || ($1==2 
   # networks, containers — not "can we reach a registry"). A missing local
   # image is irrelevant to what #448 was; forcing a pull attempt here would
   # make the test depend on registry access it doesn't need.
-  ENROLLMENT_TOKEN=test POSTGRES_PASSWORD=test JWT_SECRET=test \
+  POSTGRES_PASSWORD=test JWT_SECRET=test \
     docker compose "${BASE[@]}" up --no-start --dry-run --pull never >/dev/null \
     || fail "BASE chain failed 'up --no-start --dry-run' (would have caught #448)"
 
-  ENROLLMENT_TOKEN=test POSTGRES_PASSWORD=test JWT_SECRET=test \
+  POSTGRES_PASSWORD=test JWT_SECRET=test \
     QUASAR_POSTGRES_VOLUME=legacy_pg_volume \
     QUASAR_AGENT_VOLUME=legacy_agent_volume \
     QUASAR_CONTROL_VOLUME=legacy_tls_volume \

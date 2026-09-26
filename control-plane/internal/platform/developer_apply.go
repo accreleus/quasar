@@ -15,7 +15,6 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/images"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
 // Developer apply: an admin's arbitrary digest set on one owned target, as a
@@ -111,7 +110,7 @@ func ValidateDeveloperApply(req DeveloperApplyRequest) ([]ComponentDigest, error
 			return nil, fmt.Errorf("component %q is named twice", c.Name)
 		}
 		seen[c.Name] = true
-		if c.Image == "" || strings.ContainsAny(c.Image, " \t\n") || updater.ImageHasTagOrDigest(c.Image) {
+		if c.Image == "" || strings.ContainsAny(c.Image, " \t\n") || ImageHasTagOrDigest(c.Image) {
 			return nil, fmt.Errorf("component %q: image %q must be a repository reference with no tag and no digest", c.Name, c.Image)
 		}
 		if !RepositoryWellFormed(c.Image) {
@@ -293,7 +292,7 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 
 	// ADR 0001, up front: no registry outside the allowlist is ever contacted.
 	for _, c := range components {
-		if !updater.NamespaceAllowed(c.Image, h.allowedNamespaces) {
+		if !NamespaceAllowed(c.Image, h.allowedNamespaces) {
 			httpx.WriteError(w, http.StatusConflict, CodeNamespaceRejected,
 				fmt.Sprintf("component %s: image %s is outside the allowed platform-image namespaces (%s)",
 					c.Name, c.Image, strings.Join(h.allowedNamespaces, ",")))

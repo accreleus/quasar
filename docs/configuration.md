@@ -40,8 +40,7 @@ then arrive as files.
 | `QUASAR_SECRET_KEY_FILE` | unset | A file holding the `QUASAR_SECRET_KEY` value (same format): its file twin. Trailing whitespace is trimmed. Startup fails if the file is unreadable or empty, or if `QUASAR_SECRET_KEY` is also set. An owned install generates the key at install. |
 | `QUASAR_LOCAL_ENROLLMENT_FILE` | unset | A combined host: the single-use **local enrollment token** its recovery actor generated for this machine's own node agent. At boot the control plane stores it hashed in `host_enrollments` (single use, no expiry, no minting admin, bound to `QUASAR_LOCAL_ENROLLMENT_NODE_NAME`); a token already present is left as it is, so a restart never re-arms a spent one. Set together with `QUASAR_LOCAL_ENROLLMENT_NODE_NAME`; an empty file fails startup. |
 | `QUASAR_LOCAL_ENROLLMENT_NODE_NAME` | unset | The node name the local enrollment token is bound to; no other node can redeem it. Set together with `QUASAR_LOCAL_ENROLLMENT_FILE`. |
-| `QUASAR_RECOVERY_CONTROL_SOCKET` | unset | An owned machine only (the recipe sets `/run/quasar-recovery/control.sock`): its recovery actor's control socket. When set, the control plane reads its own machine's identity from it (`install_mode`, `recovery_actor_version`, `recovery_actor_source_commit`, `seed_version`, `database_mode` on `GET /v1/admin/platform/identity` and the release view), at most every 30 s; the control-plane target's `updater_socket` preflight check checks this socket, and `updater_stack_dir` / `updater_overlays` are not evaluated. The control plane also applies itself over this socket instead of the Compose updater's (`QUASAR_UPDATER_SOCKET` is then ignored): the fleet run's control-plane step and a developer apply to the control plane are submitted to the recovery actor. Unset: not an owned machine, and no socket is read. |
-| `ENROLLMENT_TOKEN` | unset (optional since #12; **deprecated**, amendment 14) | **Deprecated:** retires with the RH06 contract step (RH06-15, #367); a control plane logs one WARN at boot while it is set, and nothing when it is unset (the recommended state). Owned installs never use it. The fleet-wide static enrollment token. **Since #12 this is the fallback, not the primary path**: an admin mints per-host tokens in Admin → Fleet → Add host (`POST /v1/admin/hosts/enrollments` — hashed at rest, single-use, one-hour expiry, optionally bound to one `node_name`) and the agent presents either. Unset, only minted per-host tokens (and a combined host's local token) can enroll — the right end state once every host has joined. Existing agents that enrolled with it keep reconnecting with their node secret regardless. Keep it set on a single-host install (the local agent dials `ws://localhost` and enrolls with it on first boot). Treat it as a break-glass credential — it can enroll *any* node name, and (#96) it is refused only while the host it names has a live agent. |
+| `QUASAR_RECOVERY_CONTROL_SOCKET` | unset | An owned machine only (the recipe sets `/run/quasar-recovery/control.sock`): its recovery actor's control socket. When set, the control plane reads its own machine's identity from it (`install_mode`, `recovery_actor_version`, `recovery_actor_source_commit`, `seed_version`, `database_mode` on `GET /v1/admin/platform/identity` and the release view), at most every 30 s; the control-plane target's `updater_socket` preflight check checks this socket. The control plane applies itself over this socket: the fleet run's control-plane step and a developer apply to the control plane are submitted to the recovery actor. Unset: not an owned machine, no socket is read, and nothing can replace this control plane (its target reads `updater_absent`, and its `updater_socket` check fails naming that it was not installed with the seed). |
 | `QUASAR_IMAGE_REGISTRY_HOSTS` | `ghcr.io` | Comma-separated registry-host allowlist for the image-management digest resolver (P3): manifest HEADs and token-realm fetches are refused for any other host, which is the SSRF containment on catalog-supplied registry refs (enforced by the shared `internal/outbound` client since #105). The allowlist names the hosts actually contacted, so a Docker Hub ref needs `docker.io,registry-1.docker.io,auth.docker.io` — the ref's registry, its API endpoint, and its token realm. **Also gates catalog-supplied artwork URLs (#456):** a provider app's `cover_url` is accepted only when it is an `https` URL on one of these hosts; anything else (relative path, plain http, off-allowlist host) falls back to the shipped gradient tile. **The edge release channel reuses this list** for the platform component images, with `QUASAR_PLATFORM_REGISTRY` added to it automatically. **A registry that serves blobs by redirect needs its blob host on this list too:** reading an image's labels fetches a config blob, and GHCR answers that with a `307` to `pkg-containers.githubusercontent.com`, which is followed only if allowed. `ghcr.io` implies that host automatically; any other redirecting registry must have its blob host added here by hand, or edge detection fails with a refused redirect. |
 | `QUASAR_LIBRARY_PROVIDERS` | `steam` | Comma-separated allowlist of `library_provider` names the P5 auto-ensure may install on a discovery enable. The local trust boundary on catalog-declared providers: a catalog image marking itself a provider outside this list is never auto-installed. Passed through the base compose file. |
 | `LISTEN_ADDR` | `:8080` | HTTP listen address; must contain a port. Agent-facing surface (`/agent/ws` enrollment, `/v1/agent/*`, `/health`) always serves here in plain HTTP. When the HTTPS listener is on (default), **browser-facing routes on this listener redirect to HTTPS** instead of being served — see `QUASAR_HTTP_REDIRECT`. |
@@ -108,7 +107,7 @@ then arrive as files.
 | `QUASAR_PLATFORM_RELEASE_REPO` | `accreleus/quasar` | **Platform-release detection (#104/#110).** The `owner/name` repository whose GitHub Releases the `platform.release_detect` job reads. Point it at a fork to follow that fork's releases. Set it to **`off`** (or `none` / `disabled`) to turn detection off entirely: the job still exists in the Jobs page but every run is `skipped` with a reason, no outbound request is made, and the admin Releases page simply reports nothing available. **Empty means the default, not off** — compose forwards every knob as `${VAR:-}`, so a stock install hands the process an empty string and reading that as "off" would disable self-update everywhere. |
 | `QUASAR_PLATFORM_RELEASE_API` | `https://api.github.com` | API base for the same job, for a GitHub Enterprise host or a test double. Its host is added to the release client's egress allowlist automatically, so pointing at a different API needs no second knob. Must be `https` — the shared outbound client refuses anything else. |
 | `QUASAR_PLATFORM_RELEASE_ASSET_HOSTS` | `github.com,objects.githubusercontent.com,release-assets.githubusercontent.com` | Comma-separated egress allowlist for **release asset downloads**, and the only hosts the download's single redirect may point at. The asset URL and its `Location` are both remote-supplied, so a host outside this list is refused **by name** — the job summary names it and this variable, which is the whole remedy. Separate from the API host because GitHub serves assets from a CDN, and **that CDN moves**: the 302 target was `objects.githubusercontent.com` and is now `release-assets.githubusercontent.com`. Both stay listed; an entry GitHub has stopped using costs nothing, while a missing one stops detection dead (seen live on `v0.2.0-rc.1`). If a future move breaks detection again, the fix is to add the host the summary names. |
-| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | **Developer apply (#360).** Read by the control plane too: `POST /v1/admin/platform/developer-apply` refuses an image outside these namespaces (`409 namespace_rejected`) before any registry is contacted, with the updater's matching rules. Each machine's own recovery actor still enforces its own list. The namespaces' registry hosts are added to the developer apply's registry egress automatically. |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | **Developer apply (#360).** Read by the control plane too: `POST /v1/admin/platform/developer-apply` refuses an image outside these namespaces (`409 namespace_rejected`) before any registry is contacted, with the recovery actor's matching rules ("Release trust" below). Each machine's own recovery actor still enforces its own list. The namespaces' registry hosts are added to the developer apply's registry egress automatically. |
 | `QUASAR_PLATFORM_INSECURE_REGISTRIES` | — (off) | **Developer apply only (#360), for a test or private registry.** Comma-separated `host[:port]` the control plane reads a developer apply's image labels (`org.quasar.source.commit`) from over **plain HTTP, private addresses allowed**. Only the named hosts; every other registry keeps the hardened client (HTTPS, public addresses only). The images must also be under `QUASAR_UPDATER_ALLOWED_NAMESPACES`. **Digest-bound:** the manifest must hash to the requested digest, an index's chosen child manifest to its descriptor's digest, and the config blob to the manifest's config digest; any mismatch refuses the apply `409 image_unresolvable`, so neither the registry nor the unencrypted link can substitute labels. Plain HTTP still exposes what is read to the network. Leave unset in production. |
 | `QUASAR_PLATFORM_REGISTRY` | `ghcr.io` | **Edge channel (#111).** The registry the platform's three component images (`<registry>/<QUASAR_PLATFORM_RELEASE_REPO>/quasar-control-plane`, `.../quasar-node-agent` and `.../quasar-recovery`) are published to. Used only while `release_channel` is `edge`, where detection resolves the branch's tag (`o2-<branch>`, the RH06 edge tag family; a control plane that predates RH06 resolves the bare `<branch>` tag, which RH06-era builds no longer move) to a digest and reads the build's identity from the image labels — the stable channel reads a release manifest instead and never touches a registry. This host is added to the `QUASAR_IMAGE_REGISTRY_HOSTS` egress allowlist **automatically**, so repointing the platform images at another registry is one knob, not two. A registry that needs credentials is not supported here: resolution is anonymous-pull only. |
 | `QUASAR_PLATFORM_RELEASE_TOKEN` | unset | Optional bearer token for the releases listing and asset download. A public repository needs none; set it for a private fork or to lift GitHub's unauthenticated rate limit. Never logged. |
@@ -342,11 +341,11 @@ Read in `node-agent/src/config.rs`. `CONTROL_PLANE_URL` is **required**.
 |---|---|---|
 | `QUASAR_ENROLLMENT` | unset | **The one-paste way to join a second host (#12).** Admin → Fleet → Add host also prints a one-line installer (`deploy/enroll-host.sh`, served by the control plane itself at `/enroll-host.sh`; a self-signed control plane is fetched with `curl --pinnedpubkey`) that hands this string to the seed on the new machine, whose recovery actor gives it to the agent as `QUASAR_ENROLLMENT_FILE` — see "Add host" below. The enrollment string itself: `qenr1.<FINGERPRINT>.<base64url(wss-url)>.<token>`. It supplies the control-plane URL, the certificate fingerprint to pin, and a minted single-use enrollment token in one value — the fingerprint is first and verbatim (uppercase colon-separated SHA-256, exactly as the control plane logs it) so you can compare it by eye before pasting. The agent refuses a string carrying a `ws://` URL. Precedence when other variables are also set: `CONTROL_PLANE_URL` overrides the URL inside it (logged at WARN — split-horizon deployments) **but only with another `wss://` address — a `ws://` override is fatal even with `QUASAR_ALLOW_PLAINTEXT_AGENT=1`**, because it would send the string's own token in cleartext (unset `QUASAR_ENROLLMENT` and use `ENROLLMENT_TOKEN` if cleartext is really intended); `CONTROL_PLANE_FINGERPRINT` overrides the fingerprint inside it (WARN — the certificate-rotation path); an `ENROLLMENT_TOKEN` that *differs* from the token inside it is fatal; a saved pin that differs from the configured one is superseded with a WARN. An empty fingerprint segment (`qenr1..`) means the control plane is behind a real-CA certificate and is logged as such at connect, so a mispasted string is visible. Once enrolled, the pin is saved beside the node secret (`NODE_SECRET_PATH` + `.tls`) and this variable can be removed. |
 | `QUASAR_ENROLLMENT_FILE` | unset | The file twin of `QUASAR_ENROLLMENT` (#357): a path whose contents (trimmed) are the enrollment string, with exactly the same meaning. On an owned install the recovery actor sets it to `/run/quasar-secrets/enrollment`, a read-only file in the agent's secrets volume, so the string never enters the container environment. Setting both variables is a startup error; an unreadable file is a startup error naming the path, never the contents; an empty file is the same as no enrollment string. Unset, `QUASAR_ENROLLMENT` behaves exactly as before. |
-| `QUASAR_RECOVERY_SOCKET` | unset | Set only by the recovery actor's recipe (#357): the agent socket, `/run/quasar-recovery/agent.sock`. Its presence makes this an **owned** install: before every `register` the agent reads the actor's `GET /v1/status` there and registers `install_mode: "owned"`, `updater_present` = whether the actor answered, and the actor's `recovery_actor_version`, `recovery_actor_source_commit` and `seed_version` (agent-api.md amendment 14). No answer logs `token="install-actor-unreachable"` and registers `updater_present: false`. Unset (Compose and source installs), install discovery is the Compose one, unchanged. Do not set it by hand. |
+| `QUASAR_RECOVERY_SOCKET` | unset | Set only by the recovery actor's recipe (#357): the agent socket, `/run/quasar-recovery/agent.sock`. Its presence makes this an **owned** install: before every `register` the agent reads the actor's `GET /v1/status` there and registers `install_mode: "owned"`, `updater_present` = whether the actor answered, and the actor's `recovery_actor_version`, `recovery_actor_source_commit` and `seed_version` (agent-api.md amendment 14). No answer logs `token="install-actor-unreachable"` and registers `updater_present: false`. Unset (a Compose or source install), the host has no recovery actor: the agent registers `updater_present: false` and its `install_mode` from its own image reference (a registry host or a bare local tag), and its `updater_socket` readiness check reads not applicable. Do not set it by hand. |
 | `CONTROL_PLANE_URL` | — (**required** unless `QUASAR_ENROLLMENT` supplies it) | Control-plane WebSocket, e.g. `ws://localhost:8080` or `wss://cp.example:8443` (HTTP base for the agent pull channels is derived from it: `ws→http`, `wss→https`, strips `/agent/ws`). **`wss://` works (#12)** and both agent clients — the websocket and the node-secret HTTP polls — verify the same way: **pinned** to the control plane's leaf certificate when a fingerprint is known (from `QUASAR_ENROLLMENT`, `CONTROL_PLANE_FINGERPRINT`, or the saved pin), else against the bundled WebPKI roots (a real certificate, e.g. the Caddy overlay). Under a pin, SAN and expiry are not checked — the pin is the identity, and the self-signed default routinely lacks the LAN name or IP you dial. **`ws://` is cleartext**: the enrollment token and the node secret cross it as plain JSON. It is allowed without ceremony only to loopback (`localhost` / `127.0.0.0/8` / `::1`, the single-host compose default); to any other host the agent refuses to start unless `QUASAR_ALLOW_PLAINTEXT_AGENT=1`. |
 | `CONTROL_PLANE_FINGERPRINT` | unset | Manual certificate pin: the SHA-256 the control plane logs at startup (`fingerprint=…`, also on the admin Access panel and `GET /v1/admin/access-check`). Accepts `AB:CD:…`, lowercase, bare hex, or a `sha256:` prefix. Use it to **rotate**: after a control-plane certificate is re-issued every pinned agent stops connecting (it logs `token="cp-tls-pin-mismatch"` with the expected and observed values) until this is updated — one value per host, no re-enrollment, the node secret and host row survive. Overrides the fingerprint inside `QUASAR_ENROLLMENT` and the saved pin. Does nothing on a `ws://` URL (logged at WARN). |
 | `QUASAR_ALLOW_PLAINTEXT_AGENT` | unset (off) | `1`/`true` permits a `ws://` control-plane URL to a **non-loopback** host. Only for a network you own end to end (a VPN or private link) and only as a transition: the credentials are on the wire. Every connect logs the policy. Existing single-host installs dial loopback and never need this. |
-| `ENROLLMENT_TOKEN` | unset | Presented on first enrollment; must match the control-plane's. Optional once the node secret is persisted (`NODE_SECRET_PATH`). An empty/whitespace-only value is treated as unset. **#519: if there is no persisted node secret AND this is unset/empty, the agent cannot ever register — it logs `token="boot-enrollment-unconfigured"` naming this variable and the admin Hosts page, then exits non-zero** (after a short delay, so a `restart: unless-stopped` compose policy crash-loops visibly rather than hot-spinning) instead of idling forever in the reconnect loop while `docker compose ps` shows it healthy. Get a token from Admin → Fleet → Add host (a minted per-host token, or the whole enrollment string via `QUASAR_ENROLLMENT`), or copy the static `ENROLLMENT_TOKEN` from the control plane's `deploy/.env`. |
+| `ENROLLMENT_TOKEN` | unset | Presented on first enrollment: a token this control plane minted (Admin → Fleet → Add host; the token part of the enrollment string, after its last `.`), or a combined host's local token. There is no fleet-wide static token: the control plane redeems nothing else. Optional once the node secret is persisted (`NODE_SECRET_PATH`). An empty/whitespace-only value is treated as unset. **#519: if there is no persisted node secret AND this is unset/empty, the agent cannot ever register — it logs `token="boot-enrollment-unconfigured"` naming this variable and the admin Hosts page, then exits non-zero** (after a short delay, so a `restart: unless-stopped` compose policy crash-loops visibly rather than hot-spinning) instead of idling forever in the reconnect loop while the engine shows it healthy. Get a token from Admin → Fleet → Add host (a minted per-host token, or the whole enrollment string via `QUASAR_ENROLLMENT`). |
 | `ENROLLMENT_TOKEN_FILE` | unset | The file twin of `ENROLLMENT_TOKEN` (#361): a path whose contents (trimmed) are the token, with the same meaning. A combined host's recovery actor gives its own agent the machine's single-use local enrollment token this way, from the agent's secrets volume. Setting both is refused at start; an unreadable file names the variable, never its contents. Read by agents of recipe revision 2 or later. |
 | `NODE_NAME` | system hostname | Stable identity for the host; also scopes the default secret path. |
 | `NODE_SECRET_PATH` | `/tmp/quasar-{NODE_NAME}-secret` | Where the per-node secret (issued at enrollment) is persisted. In compose this is a named volume so it survives restarts. The certificate pin learned at the first verified `wss://` connection is saved next to it as `<path>.tls` (0600, created atomically, never following a symlink). On a **reconnect** it is refreshed only when `CONTROL_PLANE_FINGERPRINT` supplies a different pin — the operator-driven rotation path; a pin arriving via the enrollment string never overwrites an existing file. A register that **mints a node secret** (a first enrollment, or the #199 re-enrollment below) does refresh it whatever named the pin: that register replaces the identity the saved pin belonged to, and the pin being written is the one that just verified the handshake — otherwise a host re-enrolled onto a second control plane keeps the first one's fingerprint and cannot connect at all once `QUASAR_ENROLLMENT` is removed. The managed-image state is `<path>.images.json`. **#199 — this file outlives the control plane that minted it.** The agent presents the saved secret in preference to `ENROLLMENT_TOKEN`/`QUASAR_ENROLLMENT`, so a machine re-enrolled against a *different* control plane arrives holding a credential that one has never issued and is refused `host_not_found`. The agent recovers on its own: it re-registers **once per reject** with the configured enrollment token, which mints a fresh identity and overwrites this file (logged `token="cp-register-stale-identity"`). Once per reject, not latched — a control plane that is merely mid-restore still gets the saved secret offered on the next attempt. With no token configured there is nothing to fall back on: the agent logs `token="cp-register-stale-identity-unresolvable"` naming this path and the reset route, and `deploy/enroll-host.sh --reset-identity` (or `QUASAR_RESET_IDENTITY=1`) does the clearing. Container ownership is persisted in `<path>.container-owner` (0600), locked for the agent process lifetime. Keep it with the node state: a concurrent agent sharing this state or a malformed owner file fails startup with `boot-container-ownership-unavailable`. Startup cleanup removes only matching-owner session/audio containers; foreign and legacy unlabelled containers are preserved for manual review. Never delete or replace the owner file while an agent runs. |
@@ -878,9 +877,8 @@ removal target cannot authorize deleting its replacement. Those cases fail with
 `image operation outcome unknown` instead of repeating the mutation.
 
 Installation metadata, image environment, engine storage information and live
-container mounts are read through the same runtime API. Missing Compose labels leave
-the corresponding Compose facts unknown; Quasar does not infer a project or updater
-from container names. The configured image reference and the running image ID remain
+container mounts are read through the same runtime API. Quasar does not infer a Compose
+project from labels or container names. The configured image reference and the running image ID remain
 separate facts.
 
 Docker mount sources and its storage root are **daemon-host paths**. A containerized
@@ -991,8 +989,7 @@ they are terminal evidence with nothing left to reconcile. Leave every non-termi
 record in place.
 Runtime journals under `<node-secret>.runtime-images/` are read by every RH-01 agent
 build (unknown fields are ignored); a pre-RH-01 agent does not read them and retires
-owner-labelled containers by name prefix at boot as it always did. The updater is unchanged by #239: its separate
-image retains its own Docker CLI and Compose workflow.
+owner-labelled containers by name prefix at boot as it always did.
 
 For a future rootless configuration, the API endpoint is the socket visible inside
 the agent, while bind-mount source paths belong to the daemon host. Socket access,
@@ -1232,7 +1229,8 @@ a specific readiness check answerable rather than `skip`.
 ## Deploy / compose-interpolation only
 
 Consumed by `deploy/docker-compose*.yml` interpolation — **not** read by the app
-code directly. Set in `deploy/.env`.
+code directly. Set in `deploy/.env`. The Compose files are **contributor tooling**, not a
+supported install: an operator installs with the seed ("Seed" below), which keeps no `.env`.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -1247,9 +1245,6 @@ code directly. Set in `deploy/.env`.
 | `QUASAR_CORE_DIR` | — (**required** by `docker-compose.cores.yml`) | Host directory for core dumps. Must be a real filesystem: **the kernel cannot write a core to FUSE**, and a share path silently produces zero cores. |
 | `QUASAR_CONTROL_IMAGE` / `QUASAR_AGENT_IMAGE` | the `:latest` local tags | Digest-pinned release artifacts. Setting both is what makes `deploy/docker-compose.yml` a pinned release install; unset, the stack runs the locally-built `:latest` images. `release-preflight.sh` rejects anything that is not `name@sha256:<64 hex>`. |
 | `QUASAR_POSTGRES_VOLUME` / `QUASAR_AGENT_VOLUME` / `QUASAR_CONTROL_VOLUME` | unset | **Upgrades only, AND only take effect with `-f deploy/overlays/docker-compose.adopt-volumes.yml` in the compose chain** (#448: Compose v5 rejects an empty `name:` default on the base file at `up`, so the override moved to this opt-in overlay). `deploy/redeploy.sh` adds the overlay automatically when all three are set (and refuses a partial set); manual compose invocations must pass it explicitly. Unset, or the overlay omitted = Compose's normal `<project>_<key>` naming. Set (with the overlay) to adopt volumes that already exist under other names, so a stack that used to run a forked compose file keeps its data instead of starting against an empty database. `scripts/dev/migrate-compose-volumes.sh` prints the exact values and the invocation. |
-| `QUASAR_UPDATER_IMAGE` | `quasar-updater:latest` | The updater's image. A **tag, not a digest**, on purpose: the updater is what applies a release, so it is not one of the images a release moves, and it is not in the release manifest. Registry installs set `ghcr.io/accreleus/quasar/quasar-updater:latest`; updating it is a separate manual step (`docs/upgrading.md`). |
-| `QUASAR_STACK_DIR` | `/var/lib/quasar/stack-dir-unset` (a sentinel) | The stack directory's absolute **host** path, bind-mounted into the updater at that same path. Required for the updater to function: it rebuilds its compose invocation from its own container's compose labels, which record host paths, so the same absolute path must resolve inside the container. `deploy/redeploy.sh` seeds it and warns when a moved checkout makes it stale. Left at the sentinel, the updater refuses to serve and logs which label it could not resolve. |
-| `QUASAR_DOCKER_SOCKET` | `/var/run/docker.sock` | Host path of the container-runtime socket mounted into the updater. Rootless Podman: `/run/user/<uid>/podman/podman.sock`. |
 | `QUASAR_APP_IMAGE` | `quasar-agent-dev:latest` | Override for `scripts/dev/seed-benchmark-apps.sh` so seeded apps use the host's runtime image. |
 
 ---
@@ -1431,7 +1426,7 @@ second start changes nothing; an interrupted install completes on the next start
 5. On a combined host, after a wait of up to 180 s for the control plane to report healthy:
    `quasar-node-agent`, which reaches the control plane at `ws://127.0.0.1:<http port>`
    (loopback only) and enrolls once with the local token (`ENROLLMENT_TOKEN_FILE`). The
-   static `ENROLLMENT_TOKEN` is not used.
+   static `ENROLLMENT_TOKEN` is retired.
 
 **The console.** Browse to `https://<QUASAR_PUBLIC_HOST>:<QUASAR_TLS_PORT>`. The certificate
 is self-signed and names `QUASAR_PUBLIC_HOST` (and `QUASAR_TLS_HOSTS`, if given): accept it
@@ -1679,8 +1674,8 @@ registers as `seed_version`.
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
 | `QUASAR_MACHINE_DIR_HOST_PATH` | learned from the actor's own mount | Only when the actor cannot inspect its own container: the daemon-host path of the machine-state directory, whose `dumps/` the pre-update dump helper binds (#364). Normally the `quasar-machine` volume's mount point, which needs the engine's `local` volume driver. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
-| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from, with exactly the updater's rules (see "Updater" below). **A seed input** (#361): read from the seed's container at first install like the other inputs, checked, and recorded in machine state (`machine.json` `inputs.trust`), which the actor uses from then on; the seed-created actor's own environment holds none (ADR 0007's frozen profile). A developer apply from a test registry needs that registry's namespace here, set on the seed before the first install; `reconfigure` (#366) changes it later. On a control-plane machine the control plane is given the same list (its developer-apply check). A machine installed before these were recorded uses the actor's own environment, as before. |
-| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | as the updater's | ADR 0003 release signatures, verified by the actor exactly as the updater does. Seed inputs recorded at first install, exactly as the allowlist above (machine state wins over the actor's own environment once recorded). A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value refuses the install before anything is created (`token="seed-inputs-invalid"`), or stops a hand-started actor (`token="actor-trust-config-invalid"`). |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from ("Release trust" below). **A seed input** (#361): read from the seed's container at first install like the other inputs, checked, and recorded in machine state (`machine.json` `inputs.trust`), which the actor uses from then on; the seed-created actor's own environment holds none (ADR 0007's frozen profile). A developer apply from a test registry needs that registry's namespace here, set on the seed before the first install; `reconfigure` (#366) changes it later. On a control-plane machine the control plane is given the same list (its developer-apply check). A machine installed before these were recorded uses the actor's own environment, as before. |
+| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `off`, none, the org's GitHub Releases, `15` | ADR 0003 release signatures, verified by the actor ("Release trust" below). Seed inputs recorded at first install, exactly as the allowlist above (machine state wins over the actor's own environment once recorded). A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value refuses the install before anything is created (`token="seed-inputs-invalid"`), or stops a hand-started actor (`token="actor-trust-config-invalid"`). |
 | `QUASAR_PLATFORM_INSECURE_REGISTRIES` | unset | A combined or control-only machine: the plain-HTTP registries (`host[:port]`, comma-separated) its control plane may read a developer apply's image identity from, for a test registry. A seed input, recorded like the allowlist and passed to the control plane. The engine pulling from such a registry needs it in its own `insecure-registries`. |
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
@@ -1867,14 +1862,21 @@ A GPU host is removed from the console: Admin → Fleet → the host → Remove 
 plane drains it, waits for its sessions to end, and sends `host_remove`; the host's recovery
 actor records the removal, removes the node agent, then itself. Homes and volumes stay, and
 so does the seed, which from then on stays idle (`token="seed-uninstalled"`). Forget the host
-once it is offline. A host that is not connected cannot be removed this way. A removal that
-stops part-way leaves the host visibly there: Retry removal on its page, the recovery actor's
-next start, or `uninstall` on the machine finishes it.
+once the console reads it removed. A host whose agent is not connected cannot be removed this
+way: the route answers 409 `host_offline` ("this host's agent is not connected, so its
+recovery actor could not be asked; nothing was removed"). An owned host whose agent is gone
+keeps an admission hold and so reads `draining`, never `offline`; the console tells it is not
+connected by six missed heartbeats (about a minute). A removal that stops part-way leaves the
+host visibly there: Retry removal on its page, the recovery actor's next start, or `uninstall`
+on the machine finishes it.
 
 **Bringing a removed GPU host back** is Add host: create a command with the same node name and
 run it on the machine. The one-line command finds the removed install, clears it (its volumes
 and the agent's old identity; never the homes, which are host directories) and installs
-afresh, and the control plane keeps the host's history under its node name. The same holds
+afresh, and the control plane keeps the host's history under its node name. The new
+enrollment lifts the drain the removal took, and only that one: a drain an admin set before
+the removal, and every platform hold, stay. If clearing the removed install fails, the
+command prints what the recovery actor's `uninstall` said. The same holds
 after a GPU host's `uninstall` that kept its data. A kept-data `uninstall` is otherwise for
 decommissioning or moving a machine: there is no command that reinstates the old install on
 its kept data.
@@ -1954,47 +1956,31 @@ ones, reconfigure to the old values and then to the new. Delete
 
 ---
 
-## Updater (`quasar-updater`)
+### Release trust
 
-Read by the updater process (`control-plane/cmd/quasar-updater`); the control
-plane also reads `QUASAR_UPDATER_SOCKET`, because it applies **itself** over
-that socket rather than through any agent. Set in
-`deploy/.env`; the compose service passes them through. The socket path and the
-result-file layout are **not** a frozen interface (`protocol/schema.md` §"Not
-frozen: the updater's local socket").
+What a machine's recovery actor admits a replacement under: the namespace allowlist and,
+optionally, ADR 0003 release signatures. The four `QUASAR_UPDATER_*` names are kept from the
+retired Compose updater, whose rules the actor ported (`testdata/recovery/trust-vectors`); they
+are seed inputs recorded in machine state at first install ("Recovery actor" table above) and
+changed later with `reconfigure`.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this host will pull platform images from. Matched on `host/path/` segment boundaries, so `ghcr.io/accreleus/quasar` does not admit `ghcr.io/accreleus/quasar-evil/x`. Anything outside is refused `namespace_rejected` before a byte is pulled. **Unset or blank is the org default, never "allow nothing" and never "allow everything"** — the compose default is `${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}`, so the program is handed an empty string on every stack that does not set it (guarded by `TestUnsetNamespaceKnobIsTheOrgDefault`). To lock a host down, name a namespace nothing matches. |
-| `QUASAR_UPDATER_WAIT_TIMEOUT_S` | `300` | `docker compose up --wait --wait-timeout`. A request may name its own value. |
-| `QUASAR_UPDATER_PULL_TIMEOUT_S` | `3600` | Wall-clock bound on the `pull` step. |
-| `QUASAR_UPDATER_RECREATE_TIMEOUT_S` | `900` | Wall-clock bound on the `up` step, independent of compose's health wait. |
-| `QUASAR_UPDATER_SOCKET` | `/run/quasar-updater/updater.sock` | Where the socket is created, mode 0666, in the volume shared with the control plane and the agent. Read by all three: an absent socket makes the control-plane target of an update `updater_absent` rather than an apply that fails halfway. |
-| `QUASAR_UPDATER_RESULTS_DIR` | `/run/quasar-updater/results` | One result file per request id, written tmp+rename. Directory is root-owned 0755: the other containers read, only the updater writes. |
-| `QUASAR_UPDATER_DOCKER_BIN` | `docker` | The CLI the updater drives. |
-| `QUASAR_UPDATER_SIGNATURE_MODE` | `off` | `off` · `verify` · `require`. See "Release signature verification" below. An unrecognised value is **fatal at startup**, never a silent fall back to `off`. **`verify` is a migration rung, not an enforcement boundary**: it catches a signed release that has been tampered with, but the apply request chooses which version's signature is looked for, so a request naming no version — or one never published — reads as "unsigned" and is applied. Only `require` refuses that. Each such apply logs a WARN naming the version. |
-| `QUASAR_UPDATER_TRUSTED_KEYS` | *(none)* | Comma-separated `key-id:base64`, each the raw 32 bytes of an ed25519 **public** key; a bare `base64` with no label is accepted. Several at once is how a key rotation avoids a flag day. A malformed entry is fatal at startup. |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this machine will pull platform images from. Matched on `host/path/` segment boundaries, so `ghcr.io/accreleus/quasar` does not admit `ghcr.io/accreleus/quasar-evil/x`. Anything outside is refused `namespace_rejected` before a byte is pulled. **Unset or blank is the org default, never "allow nothing" and never "allow everything".** To lock a machine down, name a namespace nothing matches. |
+| `QUASAR_UPDATER_SIGNATURE_MODE` | `off` | `off` · `verify` · `require`. An unrecognised value refuses the install (`token="seed-inputs-invalid"`), never a silent fall back to `off`. **`verify` is a migration rung, not an enforcement boundary**: it catches a signed release that has been tampered with, but the apply request chooses which version's signature is looked for, so a request naming no version — or one never published — reads as "unsigned" and is applied. Only `require` refuses that. Each such apply logs a WARN naming the version. |
+| `QUASAR_UPDATER_TRUSTED_KEYS` | *(none)* | Comma-separated `key-id:base64`, each the raw 32 bytes of an ed25519 **public** key; a bare `base64` with no label is accepted. Several at once is how a key rotation avoids a flag day. A malformed entry refuses the install. |
 | `QUASAR_UPDATER_MANIFEST_BASE_URL` | `https://github.com/accreleus/quasar/releases/download/v{version}/` | Where the release manifest and its signature are fetched from. Must be **https** and must contain `{version}`; a trailing `/` is added if absent. A fork or an internal mirror points this at its own. |
-| `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | Wall-clock bound on **both** asset fetches together. It has to stay well under the agent's 30 s socket call, or a slow mirror reads as `updater_absent`. |
-
-The node agent reads the socket and results paths too, under the same names, to
-find the socket it POSTs to and the result files it relays
-(`agent-api.md` `release_state`).
-
-### Release signature verification
+| `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | Wall-clock bound on **both** asset fetches together, well under the agent's 30 s socket call. |
 
 A platform release may publish a detached signature over its manifest
-(`scripts/release/platform-release-signature.md`). When verification is on, the
-updater fetches the manifest and the signature from
-`QUASAR_UPDATER_MANIFEST_BASE_URL` for the release's version, checks the
-signature against `QUASAR_UPDATER_TRUSTED_KEYS`, and checks that the signed
-manifest names the very images and digests the apply is asking for. It is a
-second gate beside the namespace allowlist, and it refuses in the same way.
-
-**Off by default.** Nothing is fetched and nothing is checked, which is ADR 0001
-trust: the pinned digest plus the namespace allowlist. Turning it on is an
-operator decision that also needs a signing key in the release pipeline —
-`docs/upgrading.md` "Signing platform releases".
+(`scripts/release/platform-release-signature.md`). When verification is on, the actor fetches
+the manifest and the signature from `QUASAR_UPDATER_MANIFEST_BASE_URL` for the release's
+version, checks the signature against `QUASAR_UPDATER_TRUSTED_KEYS`, and checks that the signed
+manifest names the very images and digests the apply is asking for. It is a second gate beside
+the namespace allowlist, and it refuses in the same way. **Off by default**: nothing is fetched
+and nothing is checked, which is ADR 0001 trust (the pinned digest plus the namespace
+allowlist). Turning it on also needs a signing key in the release pipeline (`docs/upgrading.md`
+"Signing platform releases").
 
 | Mode | What the release publishes | Outcome |
 |---|---|---|
@@ -2007,23 +1993,25 @@ operator decision that also needs a signing key in the release pipeline —
 | `require` | otherwise | As `verify`. |
 | `verify` or `require` | — with no `QUASAR_UPDATER_TRUSTED_KEYS` | Every apply refused, `signature_invalid`. Fail closed: a gate that is on but checking nothing is worse than one that is off. |
 
-Two consequences worth knowing before setting `require`:
+Before setting `require`:
 
-- **A release with no version is refused.** An edge-channel build, or a revert to
-  a build the instance can no longer name by release, carries no version, so
-  there is no published manifest to have signed it. Under `require` those are
-  refused; use the manual `redeploy.sh` recipe or drop the host to `verify`.
-- **The updater needs outbound HTTPS** to the manifest base URL. It does not,
-  when the mode is `off`.
+- **A request with no release version is refused**: a developer apply, an edge-channel build,
+  or a revert to a build the instance can no longer name by release carries no version, so no
+  published manifest signed it. Drop the machine to `verify` for those.
+- **The actor needs outbound HTTPS** to the manifest base URL (not with `off`).
+- **No proxy.** The fetch has no proxy client: a request that `HTTPS_PROXY` (honouring
+  `NO_PROXY`) would route through a proxy is refused, so a machine that reaches the release host
+  only through a proxy cannot run `verify` or `require`; it runs `off`.
+- **Public trust roots only.** The fetch trusts the public web roots (Mozilla's set) and ignores
+  `SSL_CERT_FILE` / `SSL_CERT_DIR`, so a mirror behind a private certificate authority is
+  refused. Point `QUASAR_UPDATER_MANIFEST_BASE_URL` at a host with a publicly trusted
+  certificate.
 
-One hole `verify` cannot close: the fetch is unauthenticated, so on a **private**
-release repository every asset answers 404 and a host reads a signed release as
-an unsigned one. A fork publishing privately should run `require`, which refuses
-that case, or point `QUASAR_UPDATER_MANIFEST_BASE_URL` at a mirror its hosts can
-actually read.
-
-`curl --unix-socket /run/quasar-updater/updater.sock http://u/v1/self` reports
-`signature_mode`, `trusted_key_ids` and `manifest_source` — key labels, never key
+One hole `verify` cannot close: the fetch is unauthenticated, so on a **private** release
+repository every asset answers 404 and a machine reads a signed release as an unsigned one. A
+fork publishing privately should run `require`, which refuses that case, or point
+`QUASAR_UPDATER_MANIFEST_BASE_URL` at a mirror its machines can read. What a machine records is
+in machine state (`machine.json`, `inputs.trust`): key labels and public keys, never private key
 material.
 
 ---
@@ -2474,30 +2462,32 @@ See `protocol/agent-api.md` §session_display_update and
 
 ### First-install generated configuration
 
-The public installer derives its service definitions from `deploy/docker-compose.yml`
-and its NVIDIA overlay. NVIDIA installations receive one complete Compose file.
-The site build/test gate checks the generated snapshot against both source files.
-After changing either source, run `cd site && npm run compose:sync` and commit the
-snapshot. Installation-specific transformations are in `site/src/data/stack-template.js`.
+The site's quick start (`site/src/data/stack-template.js`, tested by its
+`stack-template.test.js`) writes the seed for one machine, combined, control-only
+or GPU host, as a host script and as the same seed in a one-service stack for Dockge or
+Arcane. It writes no Compose stack of Quasar services, no `.env` of secrets and no
+`openssl rand`: the recovery actor generates every secret on the machine ("Seed"
+above). The only `.env` it writes is the operator's own database password, interpolated
+into the stack as `${QUASAR_DATABASE_PASSWORD}`; the script takes that from its own
+environment and passes `-e QUASAR_DATABASE_PASSWORD` without a value.
 
-Copied `.env` files deliberately have **blank credentials**. Run each documented
-OpenSSL command in a terminal and paste its output after the matching `=`; `.env`
-does not execute shell commands. The installer script generates credentials on the
-host only when creating a new `.env`, and preserves an existing file on reruns.
-It resolves stable release manifests and pulls all images before starting services.
+Images: the script resolves the edge channel's `o2-develop` tags of `quasar-recovery`,
+`quasar-control-plane` and `quasar-node-agent` to their registry digests on the host
+and starts the seed with those; the stack carries `@sha256:<digest>` placeholders and a
+one-line command that prints the three pins. Owned installs ship on the edge channel
+only. The script checks for Docker, curl and, on a machine with an agent, `/dev/dri`,
+refuses a host that still runs Compose-labelled Quasar services or an existing seed or
+recovery actor, sets the UDP send-buffer sysctl and loads `uinput` (persisted in
+`/boot/config/go` on Unraid), then waits for `quasar-recovery status` and, on a control
+plane, `/health`. It does not restart Docker or reconfigure the host's NVIDIA runtime.
+A GPU host gets no script: Admin → Fleet → Add host's one-line command prepares and
+installs it.
 
-Generated files retain process and application defaults, including 1 GiB of app
-shared memory (`QUASAR_APP_SHM_SIZE`, a Docker launch setting). Shared memory is a
-per-container tmpfs used by Chromium/Steam; it is not a general filesystem cache.
-The agent entrypoint establishes NVIDIA loader paths before exec; these cannot
-be set effectively after the dynamic loader has initialized.
-
-For settings omitted from the compact generated Compose, place agent variables
-in `deploy/agent.env` and control-plane variables in `deploy/control.env`. These
-files are optional. Variables explicitly present under a service's `environment`
-retain Compose precedence and use `deploy/.env` where shown. Do not put database
-credentials in `agent.env`. The repository Compose continues to support its full
-set of `.env` passthroughs.
+Owned app containers keep 1 GiB of shared memory (`QUASAR_APP_SHM_SIZE`, a Docker launch
+setting; not an input of an owned install). Shared memory is a per-container tmpfs used
+by Chromium/Steam; it is not a general filesystem cache. The agent entrypoint
+establishes NVIDIA loader paths before exec; these cannot be set effectively after the
+dynamic loader has initialized.
 
 The control plane also accepts separate database fields when `DATABASE_URL` is
 unset: `QUASAR_DATABASE_HOST` and `QUASAR_DATABASE_PASSWORD` are required;
@@ -2505,31 +2495,23 @@ unset: `QUASAR_DATABASE_HOST` and `QUASAR_DATABASE_PASSWORD` are required;
 `QUASAR_DATABASE_PORT` to `5432`, and `QUASAR_DATABASE_SSLMODE` to `disable`.
 It constructs the connection URL with proper credential escaping. An explicit
 `DATABASE_URL` remains authoritative. Password-bearing parser errors are withheld
-from startup error strings.
+from startup error strings. An owned control plane is always given these fields, the
+password as `QUASAR_DATABASE_PASSWORD_FILE`.
 
 Control-plane state defaults to a Docker-managed volume. For an operator-supplied
-bind mount, the control entrypoint can prepare ownership when the service starts
-with `user: "0:0"`; it then drops privileges and execs Go as PID 1. It adopts the
-state directory's non-root owner, or uses 1000:1000 for a new root-owned directory.
-`QUASAR_CONTROL_UID` and `QUASAR_CONTROL_GID` override that choice. Only the state
-and private runtime directories are prepared; symlink roots are refused and
-ownership traversal does not cross filesystem boundaries. The image itself still
-defaults to its non-root user. A non-root start with inaccessible storage fails
+bind mount on a source or Compose stack, the control entrypoint can prepare ownership
+when the service starts with `user: "0:0"`; it then drops privileges and execs Go as
+PID 1. It adopts the state directory's non-root owner, or uses 1000:1000 for a new
+root-owned directory. `QUASAR_CONTROL_UID` and `QUASAR_CONTROL_GID` override that
+choice. Only the state and private runtime directories are prepared; symlink roots are
+refused and ownership traversal does not cross filesystem boundaries. The image itself
+still defaults to its non-root user. A non-root start with inaccessible storage fails
 immediately with an ownership error.
 
-The generated installer requires Docker Compose 2.30 or newer: its NVIDIA file
-uses [`gpus`](https://docs.docker.com/reference/compose-file/services/#gpus), and
-its optional service environment files use
-[`required: false`](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/).
-Preflight reports missing tools, Docker access, graphics devices, and NVIDIA
-runtime registration together before changing host settings. It does not restart
-Docker or reconfigure the host's NVIDIA runtime.
-
-The basic generated file omits optional kernel-log access. To opt into NVIDIA
-Xid diagnostics, add `/dev/kmsg:/dev/kmsg:r` to the agent's `devices` and `SYSLOG`
-to `cap_add`, after checking that the host exposes `/dev/kmsg`. The generator's
-`kernelLogs` option emits both. Missing kernel-log visibility is reported by the
-existing readiness check; it is not a prerequisite for streaming.
+Kernel-log access is optional and outside an owned install: on a source or Compose
+stack, add `/dev/kmsg:/dev/kmsg:r` to the agent's `devices` and `SYSLOG` to `cap_add`
+for NVIDIA Xid diagnostics. Missing kernel-log visibility is reported by the existing
+readiness check; it is not a prerequisite for streaming.
 
 Connected agents refresh readiness every 15 seconds with one background probe
 at a time; the setup page polls every five seconds. The container engine is

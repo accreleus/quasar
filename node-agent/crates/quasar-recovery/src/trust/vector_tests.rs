@@ -1,9 +1,8 @@
 //! The shared release-trust golden vectors (#356), run against the Rust port. In the crate
 //! rather than under `tests/` so the probe and the redirect rule stay crate-private.
 //!
-//! `control-plane/internal/updater/trustvectors_test.go` runs the same files against the
-//! Go updater, and its case table generates them. Both runners know every kind, run
-//! every vector, and fail on a file or kind they do not know.
+//! The files are the Go updater's answers, frozen when it retired (#367). The runner
+//! knows every kind, runs every vector, and fails on a file or kind it does not know.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,7 +28,7 @@ fn vector_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../testdata/recovery/trust-vectors")
 }
 
-/// Must equal `vectorKeySeedPrefix` in the Go runner: keys are derived from labels, so
+/// The vectors' key derivation (it was the Go runner's too): keys are derived from labels, so
 /// no key material is ever committed.
 const KEY_SEED_PREFIX: &str =
     "quasar release-trust golden vector test key; public by construction, never trust it: ";
@@ -215,7 +214,7 @@ struct AdmitConfig {
     trusted_keys: Vec<VectorKey>,
 }
 
-/// The Go updater's ApplyRequest, which is the trust-relevant part of a Request.
+/// The vectors' request shape: the trust-relevant part of a Request.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 struct VectorRequest {

@@ -134,7 +134,7 @@ init: ## Make a fresh clone/worktree workable (submodule, .env, devtools image, 
 doctor: ## Check this machine can do Quasar work (remote reachability is advisory)
 	@bash $(DX)/doctor.sh
 
-config-check: ## Validate every compose file set; advise on deploy/.env drift
+config-check: ## Validate every compose file set; advise on deploy/.env drift and retired updater keys
 	@bash $(DX)/config_check.sh
 
 ## ── Verify & test ───────────────────────────────────────────────────────────

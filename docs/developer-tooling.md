@@ -33,7 +33,7 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `make help` | Lists all targets (default target) | Greppable; shows knobs + this worktree's instance/ports |
 | `make init` | First-time setup: protocol submodule, devtools image, doctor | Idempotent; **never overwrites `.env`** |
 | `make doctor` | Environment check: docker, go, node, submodule, disk, remote reachability | Remote check is ADVISORY → `degraded`, not failure |
-| `make config-check` | Parses every compose file set; diffs `.env` keys vs `docs/configuration.md` | Key diff is advisory WARN |
+| `make config-check` | Parses every compose file set (the contributor lane's); diffs `.env` keys vs `docs/configuration.md`; flags keys the retired Compose updater read | Key diff and retired keys are advisory WARN |
 | `make verify` | fmt + lint + build across components + shellcheck + DX self-tests | No DB, no network; the baseline for ANY change |
 | `make test` | All unit suites | = test-go + test-rust + test-web |
 | `make test-go` | Go build/vet/test | DB integration tests SKIP without a database — green here ≠ DB-tested |

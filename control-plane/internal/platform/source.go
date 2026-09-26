@@ -32,10 +32,10 @@ type Listing struct {
 	Prerelease  bool
 	Body        string
 	PublishedAt time.Time
-	ManifestURL string // "" when the release published no manifest asset
-	// ManifestFormat is the format the asset at ManifestURL must carry: 2 for
-	// ManifestAssetNameV2, 1 for ManifestAssetName, 0 when there is none. A
-	// release that publishes both is read from the v2 asset (control-api.md
-	// amendment 14, "Release manifest format 2").
+	ManifestURL string // "" when the release published no format-2 manifest asset
+	// ManifestFormat is 2 for a release carrying ManifestAssetNameV2 (the asset at
+	// ManifestURL), 1 for one carrying only the format-1 asset, which is never
+	// fetched and not listed (control-api.md "RH06 contract step", item 4), and 0
+	// for one carrying neither.
 	ManifestFormat int
 }

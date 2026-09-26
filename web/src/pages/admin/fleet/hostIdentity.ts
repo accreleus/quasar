@@ -69,10 +69,10 @@ export function updaterHint(
     return "This host's recovery actor answered the agent.";
   if (mode === "owned" && present === false)
     return "This host's recovery actor did not answer the agent — a release cannot be applied here.";
-  if (present === true) return "An updater sits beside this host's agent.";
+  if (present === true) return "This host's recovery actor answered the agent.";
   if (present === false)
-    return "The agent looked and found no updater on this stack — a release cannot be applied here.";
-  return "No agent has reported whether an updater is present.";
+    return "This host has no recovery actor: it was not installed with the seed, so a release cannot be applied here.";
+  return "No agent has reported whether a recovery actor is present.";
 }
 
 /** True only when all four identity fields are known. The eligibility model

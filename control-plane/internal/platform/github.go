@@ -167,9 +167,9 @@ type ghRelease struct {
 }
 
 // The assets a stable release carries. Distinct from
-// scripts/release/release-manifest.json, which is a different file. An RH06-era
-// release publishes the format-2 asset; a control plane implementing amendment 14
-// reads it when a release publishes one and the format-1 asset otherwise.
+// scripts/release/release-manifest.json, which is a different file. Only the
+// format-2 asset is read: a release carrying only the format-1 one predates owned
+// installs and is not listed (control-api.md "RH06 contract step", item 4).
 const (
 	ManifestAssetName   = "platform-release-manifest.json"
 	ManifestAssetNameV2 = "platform-release-manifest.v2.json"
@@ -212,7 +212,7 @@ func (g *GitHubSource) List(ctx context.Context) ([]Listing, error) {
 			case a.Name == ManifestAssetNameV2:
 				l.ManifestURL, l.ManifestFormat = a.BrowserDownloadURL, ManifestFormat2
 			case a.Name == ManifestAssetName && l.ManifestFormat != ManifestFormat2:
-				l.ManifestURL, l.ManifestFormat = a.BrowserDownloadURL, ManifestFormat1
+				l.ManifestFormat = ManifestFormat1 // marked, never fetched
 			}
 		}
 		out = append(out, l)
@@ -222,7 +222,7 @@ func (g *GitHubSource) List(ctx context.Context) ([]Listing, error) {
 
 func (g *GitHubSource) FetchManifest(ctx context.Context, rawURL string) ([]byte, error) {
 	if strings.TrimSpace(rawURL) == "" {
-		return nil, fmt.Errorf("release carries neither a %s nor a %s asset", ManifestAssetNameV2, ManifestAssetName)
+		return nil, fmt.Errorf("release carries no %s asset", ManifestAssetNameV2)
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {

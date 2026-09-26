@@ -25,8 +25,8 @@ Rules the fixtures pin:
   recent attempt submitted on the asking socket when no id is given; the
   agent's relay reads the second on connect to replay or adopt it. `POST /v1/submit`
   answers `202` with an `accepted`, `409` with a `busy` `rejection`, `400` with any other.
-- `result` keeps the Go updater's result-file spellings (`internal/updater/result.go`,
-  without `commands`, which named Compose invocations), so the agent's
+- `result` keeps `release_state`'s spellings (as the retired Go updater's result file
+  did, without its `commands`), so the agent's
   `release_state` relay stays a re-frame. `reason` is set exactly when `state` is
   `failed`; `finished_at` exactly when the state is terminal.
 - An interrupted attempt is `state: failed`, `reason: interrupted`, `restored: false`.

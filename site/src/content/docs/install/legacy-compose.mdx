@@ -4,14 +4,6 @@ description: For an install started from the Compose files and an .env file. Wha
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
-import { Code } from 'astro-expressive-code/components';
-import { DEFAULTS, generate } from '../../../data/stack-template.js';
-
-export const files = generate({ ...DEFAULTS, tlsHosts: '192.0.2.50,quasar.lan' });
-export const nvidiaFiles = generate({ ...DEFAULTS, gpu: 'nvidia', tlsHosts: '192.0.2.50,quasar.lan' });
-
-{/* TODO(#365): name the first release that ships Quasar-owned installs wherever this page says "that release". */}
-{/* TODO(#367): this page receives the Compose and updater material #367 retires from the other pages; re-check it against the retirement once #367 lands. */}
 
 A **legacy Compose install** is one started from `deploy/docker-compose.yml` and
 `deploy/.env`: the quick start before Quasar owned its own services, or the same
@@ -19,118 +11,25 @@ files copied by hand. Postgres, the control plane, the node agent and
 `quasar-updater` are services in your stack, and the `.env` file holds the
 secrets.
 
-Releases that ship Quasar-owned installs install differently: one container per
-machine, the seed, and Quasar creates and updates the rest. See [Install
-Quasar](/quasar/install/install/). Until you install one of those releases, the
-Compose install is the supported install, and [Install with
-Compose](#install-with-compose) below is how to make one from scratch.
-
-{/* TODO(#367): once the first release that ships Quasar-owned installs is out, remove "Install with Compose" (no new Compose installs are made) and the "Until you install" sentence above. */}
+Installs owned by Quasar are a different shape: one container per machine, the
+seed, and Quasar creates and updates the rest. See [Install
+Quasar](/quasar/install/install/). No new Compose install is made; the Compose
+files in the repository are contributor tooling for building from source.
 
 ## What happens to a legacy install
 
 - **It keeps running** on the release it has, and everything on this page keeps
   working.
-- **It is not offered the first release that ships Quasar-owned installs, or any
-  release after it.** A legacy control plane reads a release manifest format that
-  those releases no longer publish. The console shows no new release rather than
+- **It is not offered a release that ships owned installs, or any release after
+  it.** A legacy control plane reads a release manifest format that those
+  releases no longer publish. The console shows no new release rather than
   an error. An install on the `edge` channel likewise stops seeing new builds.
 - **Nothing converts it in place.** The Compose updater and the `.env`-driven
   install end with the last Compose release.
 
-To move over and keep your data, follow [Move an existing
-install](/quasar/install/move-existing/). Until you do, the rest of this page is
-what the stack still needs.
-
-## Install with Compose
-
-The [quick start](/quasar/start/quickstart/) writes these same files and runs the
-commands for you. This is the by-hand version. Read
-[Requirements](/quasar/start/requirements/) first, particularly the sysctl and,
-on NVIDIA, the container toolkit. It pulls published images, about 20 GB, and
-needs Docker Compose v2.30 or newer.
-
-<Steps>
-
-1. **Make a stack directory and a home root.**
-
-   ```bash
-   mkdir -p quasar/deploy && cd quasar
-   ```
-
-   ```bash
-   sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes
-   ```
-
-   Choose the home owner for your host (Unraid commonly uses 99:100).
-   Control-plane certificates and artwork use a Docker-managed volume with the
-   image's ownership, so no control-state directory needs manual preparation.
-
-   The `deploy/` subdirectory is not cosmetic. Every command on this page uses
-   `deploy/docker-compose.yml` and `deploy/.env`, so matching that layout keeps
-   them correct as written. Run this somewhere that survives a reboot: on Unraid
-   the root shell starts in `/root`, a ramdisk, so use a path under
-   `/mnt/user/appdata/` instead.
-
-2. **Save this as `deploy/docker-compose.yml`.**
-
-   <Code code={files.compose} lang="yaml" />
-
-3. **Save this as `deploy/.env`**, beside it, with your own secrets.
-
-   <Code code={files.env} lang="bash" />
-
-   Run the three OpenSSL commands in a terminal and paste their outputs into the
-   blank credential values. Set the stack-directory path and the published image
-   references as instructed. Keep `deploy/.env` private (`chmod 600 deploy/.env`).
-   For Unraid-owned application data, set `QUASAR_APP_PUID=99` and
-   `QUASAR_APP_PGID=100`.
-
-4. **On NVIDIA, use this complete file instead of the file in step 2.**
-
-   <Code code={nvidiaFiles.compose} lang="yaml" />
-
-   GPU access and driver provisioning are already included. There is only one
-   Compose file to use for the commands that follow.
-
-5. **Select published images and start it.** Set `QUASAR_CONTROL_IMAGE` and
-   `QUASAR_AGENT_IMAGE` to the digest references in your chosen [GitHub
-   release](https://github.com/accreleus/quasar/releases)'s
-   `platform-release-manifest.json`, and `QUASAR_UPDATER_IMAGE` to the updater
-   image published for that release. Do not assume that a `latest` tag exists.
-   A prerelease is for testing, not the default install.
-
-   ```bash
-   docker compose -f deploy/docker-compose.yml config --quiet
-   ```
-
-   ```bash
-   docker compose -f deploy/docker-compose.yml pull
-   ```
-
-   ```bash
-   docker compose -f deploy/docker-compose.yml up -d
-   ```
-
-6. **Check it came up.**
-
-   ```bash
-   curl http://localhost:8080/health
-   ```
-
-   You want `{"status":"ok","db":"ok"}`, and four services in
-   `docker compose -f deploy/docker-compose.yml ps`.
-
-7. **Open Quasar** at `https://<host-ip>:8443` in Chrome. It will warn about the
-   self-signed certificate once. Accept it and continue with [First-run
-   setup](/quasar/install/first-run/), reading the setup token with the Compose
-   command given there.
-
-</Steps>
-
-The ports are 8443 (the web app and API, `QUASAR_TLS_PORT`) and 8080 (agent
-enrollment and `/health`, `CONTROL_PORT`). There is no reverse proxy in this
-deployment; see [Behind a reverse proxy](/quasar/network/reverse-proxy/).
+Replacing it is a fresh install, with no data carried across: see [Replace a
+Compose install](/quasar/install/move-existing/). Until you do, the rest of this
+page is what the stack still needs.
 
 ## The stack directory and `.env`
 
@@ -173,53 +72,9 @@ already ships `security_opt: ["label=disable"]`, without which an
 SELinux-enforcing host refuses every call to the mounted socket.
 </Aside>
 
-Deleting the service from the file is a supported choice on a legacy stack:
-everything else works, the host reports that it has no updater, and you upgrade
-it by hand (below).
-
-### Add the updater to an existing install
-
-An install from before the updater existed shows *No updater is installed beside
-this host's stack* on the Releases tab. Once, on each host:
-
-<Steps>
-
-1. **Get the compose file that declares the service**: pull the checkout, or
-   download `deploy/docker-compose.yml` from your release's tag.
-
-2. **Tell it where the stack lives**, in `deploy/.env`. This must be the stack
-   directory's absolute **host** path: the updater rebuilds its Compose
-   invocation from its own container labels, and those record host paths.
-
-   ```bash
-   echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
-   # Set QUASAR_UPDATER_IMAGE in deploy/.env to the updater image for your release.
-   ```
-
-3. **Bring it up**, touching nothing else.
-
-   ```bash
-   docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
-   ```
-
-4. **Confirm the host sees it.** In Admin, Fleet, Hosts, the host drawer's
-   **Updater** row should read *Present*. Restart the agent if it does not: it
-   reads updater presence once, at boot.
-
-</Steps>
-
-### The updater updates itself by hand
-
-It is what applies a release, so it is not one of the images a release moves and
-it is not in the release manifest. Its image is named by tag for that reason.
-Use the updater version published for your release; do not assume a `latest` tag
-exists. Pull and recreate it whenever you like. It holds no state, and an apply
-already in flight finishes regardless.
-
-```bash
-docker compose -f deploy/docker-compose.yml pull quasar-updater
-docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
-```
+A legacy stack without the service works too: the host reports that it has no
+updater, and you upgrade it by hand (below). Nothing ships the updater any more,
+so a stack that lacks it keeps lacking it.
 
 ### Verify release signatures
 
@@ -326,8 +181,8 @@ docker compose -f deploy/docker-compose.yml exec -T quasar-postgres \
   pg_dump -U quasar -Fc quasar > quasar-$(date +%Y%m%d-%H%M).dump
 ```
 
-This is also the dump that [Move an existing
-install](/quasar/install/move-existing/) carries into a new install.
+A new owned install cannot load this dump yet; that is planned
+([#380](https://github.com/accreleus/quasar/issues/380)).
 
 To restore into this same stack:
 

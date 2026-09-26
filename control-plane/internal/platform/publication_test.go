@@ -92,7 +92,7 @@ func TestThisControlPlaneReadsTheFormat2Asset(t *testing.T) {
 	}
 }
 
-// While both assets are published (the expand step), the v2 one is read.
+// The v2 asset is read; the format-1 asset is never fetched (the contract step).
 func TestTheFormat2AssetWinsOverTheFormat1Asset(t *testing.T) {
 	assets := rh06Assets(t)
 	assets[ManifestAssetName] = goodManifest
@@ -111,8 +111,8 @@ func TestTheFormat2AssetWinsOverTheFormat1Asset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if listings[0].ManifestFormat != ManifestFormat1 {
-		t.Fatalf("a release with only the format-1 asset: %+v", listings[0])
+	if listings[0].ManifestFormat != ManifestFormat1 || listings[0].ManifestURL != "" {
+		t.Fatalf("a release with only the format-1 asset must be marked and never fetched: %+v", listings[0])
 	}
 }
 

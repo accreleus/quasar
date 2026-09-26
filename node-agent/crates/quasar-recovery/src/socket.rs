@@ -3,8 +3,7 @@
 //! Not a frozen interface. The Go twin is `control-plane/internal/actorsocket`; both sides
 //! decode and re-encode every fixture in `testdata/recovery/socket/` to the same JSON, so a
 //! field added on one side and not the other fails a test on both. Field spellings of
-//! [`AttemptResult`] are the Go updater's result file's (`updater/result.go`), so the
-//! agent's `release_state` relay stays a re-frame.
+//! [`AttemptResult`] are `release_state`'s, so the agent's relay stays a re-frame.
 //!
 //! What the actor reads ([`Request`] and its parts) refuses unknown fields; what it writes
 //! does not, because the actor moves first and an older reader must accept a newer one.
@@ -67,7 +66,7 @@ pub struct Request {
     /// request that names none reads exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_version: Option<String>,
-    /// Zero means the actor's default; omitted when zero, as the Go updater's request is.
+    /// Zero means the actor's default; omitted when zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub wait_timeout_s: i64,
     /// `restore` only (`--force-again`): restore a dump that was already restored.
@@ -210,7 +209,7 @@ pub struct Conflict {
     /// Its configured image reference, tag or digest included.
     pub image: String,
     /// The role it looks like: `control-plane`, `node-agent`, `postgres`,
-    /// `recovery-actor`, or `updater` (the Go updater of a Compose install). Empty from an
+    /// `recovery-actor`, or `updater` (a leftover Compose `quasar-updater`). Empty from an
     /// actor that predates it.
     #[serde(default)]
     pub role: String,

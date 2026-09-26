@@ -111,8 +111,9 @@ fn docker_inspection_and_foreign_mounts() {
         Some(quasar_node_agent::buildinfo::InstallMode::Source)
     );
     assert_eq!(
-        installation.updater_present, None,
-        "missing Compose labels remain unknown"
+        installation.updater_present,
+        Some(false),
+        "a container with no recovery actor has nothing to replace it"
     );
     assert_eq!(legacy_runtime.own_image().unwrap(), metadata.id);
     assert_eq!(

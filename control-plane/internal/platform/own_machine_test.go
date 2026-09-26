@@ -214,9 +214,9 @@ func TestOwnedControlPlanePreflight(t *testing.T) {
 		t.Errorf("detail = %q, want no Compose command and the recovery actor's log named", c.Detail)
 	}
 
-	// Not an owned machine: today's four checks.
-	if got := ids(PlanPreflight(TargetControlPlane, NewOwnMachineReader("").PreflightFacts(context.Background()))); len(got) != 4 {
-		t.Fatalf("unowned checks = %v, want today's four", got)
+	// Not an owned machine: no reader, and none of the retired Compose checks.
+	if got := ids(PlanPreflight(TargetControlPlane, NewOwnMachineReader("").PreflightFacts(context.Background()))); len(got) != 2 {
+		t.Fatalf("unowned checks = %v, want updater_socket and image_resolvable", got)
 	}
 }
 

@@ -5,7 +5,8 @@ import {
   CONTROL_IMAGE_VAR,
   REGISTRY_PULL_COMMAND,
   REGISTRY_RECREATE_COMMAND,
-  UPDATER_UP_COMMAND,
+  ACTOR_CHECK_COMMAND,
+  ACTOR_LOG_COMMAND,
   manualUpdatePath,
   redeployProfile,
   redeployRef,
@@ -116,11 +117,18 @@ describe("manualUpdatePath", () => {
     ).toBe(`deploy/redeploy.sh <va|nvidia> ${commit}`);
   });
 
-  it("updater_absent adds the updater once, then the registry recipe", () => {
+  it("updater_absent on a Compose install is the registry recipe, with no updater to add", () => {
     const commands = commandsOf("updater_absent") ?? "";
-    expect(commands).toContain(UPDATER_UP_COMMAND);
     expect(commands).toContain(REGISTRY_PULL_COMMAND);
     expect(commands).toContain(REGISTRY_RECREATE_COMMAND);
+    expect(commands).not.toContain("quasar-updater");
+  });
+
+  it("updater_absent on an owned machine checks the recovery actor instead", () => {
+    const commands = commandsOf("updater_absent", { installMode: "owned" }) ?? "";
+    expect(commands).toContain(ACTOR_CHECK_COMMAND);
+    expect(commands).toContain(ACTOR_LOG_COMMAND);
+    expect(commands).not.toContain("docker compose");
   });
 
   it("fills the two .env lines with the release manifest's digests, in its normative order", () => {
@@ -138,6 +146,56 @@ describe("manualUpdatePath", () => {
       commandsOf("updater_absent", { release: release({ manifest: null }) }) ?? "";
     expect(commands).toContain("<control-plane digest>");
     expect(commands).toContain("<node-agent digest>");
+  });
+
+  it("reads the two pins from a format-2 manifest, which also names the recovery actor", () => {
+    const v2 = {
+      ...manifest,
+      format_version: 2,
+      components: [
+        ...manifest.components,
+        { name: "recovery-actor", image: "ghcr.io/accreleus/quasar/quasar-recovery", digest: "sha256:ddd" },
+      ],
+      floor: [
+        { name: "node-agent", version: "0.3.0" },
+        { name: "recovery-actor", version: "0.3.0" },
+      ],
+    } as unknown as PlatformRelease["manifest"];
+    const commands = commandsOf("updater_absent", { release: release({ manifest: v2 }) }) ?? "";
+    expect(commands).toContain(
+      `${CONTROL_IMAGE_VAR}=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:aaa`,
+    );
+    expect(commands).toContain(`${AGENT_IMAGE_VAR}=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:bbb`);
+    expect(commands).not.toContain("sha256:ddd");
+  });
+
+  it("components out of their normative order are no manifest", () => {
+    const swapped = {
+      ...manifest,
+      components: [manifest.components[1], manifest.components[0]],
+    } as unknown as PlatformRelease["manifest"];
+    const commands =
+      commandsOf("updater_absent", { release: release({ manifest: swapped }) }) ?? "";
+    expect(commands).toContain("<control-plane digest>");
+    expect(commands).not.toContain("sha256:bbb");
+  });
+
+  it("a control plane with no recovery actor gets the redeploy recipe, not a pin", () => {
+    const path = manualUpdatePath({
+      reason: "updater_absent",
+      kind: "control_plane",
+      gpuVendor: "AMD",
+      release: release(),
+    });
+    expect(path?.summary).toMatch(/redeploy script/i);
+    expect(path?.commands.map((c) => c.command)).toEqual(["deploy/redeploy.sh va v0.3.0"]);
+    const owned = manualUpdatePath({
+      reason: "updater_absent",
+      kind: "control_plane",
+      installMode: "owned",
+      release: release(),
+    });
+    expect(owned?.commands.map((c) => c.command).join("\n")).toContain(ACTOR_CHECK_COMMAND);
   });
 
   it("a half-understood manifest is no manifest: one bad component means placeholders", () => {

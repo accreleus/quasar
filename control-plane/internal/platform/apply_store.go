@@ -45,7 +45,7 @@ const terminalStatesSQL = `('succeeded','failed','cancelled')`
 
 // applyOutputLimit is `platform_apply_attempts.output`'s CHECK (migration
 // 0075). Pinned against the migration by TestApplyOutputLimitMatchesSQL; the
-// same number is agentws.maxReleaseOutputLen and updater.OutputTailBytes.
+// same number is agentws.maxReleaseOutputLen and the recovery actor's OUTPUT_LIMIT.
 const applyOutputLimit = 8192
 
 // boundApplyOutput makes an output writable. Postgres REFUSES a value the CHECK
@@ -55,7 +55,7 @@ const applyOutputLimit = 8192
 // own upstream: the relay cuts a byte tail that can start mid-rune, the JSON
 // hop can substitute a 3-byte U+FFFD per bad byte and push a bounded output
 // past the cap, and the control plane's own apply (apply_self.go) reads its
-// result straight off the updater's socket with no bound at all.
+// result straight off the recovery actor's socket with no bound at all.
 //
 // The cut is from the FRONT, like the wire hop's: the error is at the end.
 func boundApplyOutput(s string) string {
@@ -64,7 +64,7 @@ func boundApplyOutput(s string) string {
 	}
 	// NUL is valid UTF-8 and Postgres still refuses it in a `text` value
 	// (SQLSTATE 22021), which is the same lost-terminal-write this function
-	// exists to prevent. Nothing upstream strips it: the updater tails bytes,
+	// exists to prevent. Nothing upstream strips it: the actor tails bytes,
 	// JSON carries \u0000 end to end, and the wire hop only cuts for length. A
 	// container that dies with binary in its last log lines is all it takes.
 	s = strings.ReplaceAll(s, "\x00", "")

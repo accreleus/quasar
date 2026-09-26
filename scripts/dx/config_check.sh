@@ -29,7 +29,6 @@ fi
 # values for the `${VAR:?}` required ones so validation reports STRUCTURE
 # problems rather than "you have no .env yet".
 export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-config-check-placeholder}"
-export ENROLLMENT_TOKEN="${ENROLLMENT_TOKEN:-config-check-placeholder}"
 # The adopt-volumes overlay declares all three volume names `${VAR:?}`. Supplying
 # throwaway names here validates its STRUCTURE on every machine; the base file
 # deliberately ignores these vars (asserted by scripts/dev/test-compose-overlays.sh),
@@ -113,6 +112,26 @@ else
     dx_warn env-drift "deploy/.env sets keys not mentioned in docs/configuration.md:${undocumented}"
   else
     dx_pass env-drift "every deploy/.env key appears in docs/configuration.md"
+  fi
+
+  # Keys the Compose stack no longer reads since the Compose updater retired
+  # (#367). The trust keys live on as recovery-actor seed inputs, which this
+  # stack has no actor to read.
+  retired=""
+  for key in QUASAR_UPDATER_IMAGE QUASAR_STACK_DIR QUASAR_DOCKER_SOCKET \
+             QUASAR_UPDATER_WAIT_TIMEOUT_S QUASAR_UPDATER_PULL_TIMEOUT_S \
+             QUASAR_UPDATER_RECREATE_TIMEOUT_S QUASAR_UPDATER_SOCKET \
+             QUASAR_UPDATER_RESULTS_DIR QUASAR_UPDATER_DOCKER_BIN \
+             QUASAR_UPDATER_SIGNATURE_MODE QUASAR_UPDATER_TRUSTED_KEYS \
+             QUASAR_UPDATER_MANIFEST_BASE_URL QUASAR_UPDATER_MANIFEST_TIMEOUT_S; do
+    if grep -qE "^[[:space:]]*${key}=" "$ENV_FILE"; then
+      retired="$retired $key"
+    fi
+  done
+  if [ -n "$retired" ]; then
+    dx_warn env-retired "deploy/.env sets keys nothing in this stack reads since the Compose updater retired (#367); remove them:${retired}"
+  else
+    dx_pass env-retired "no Compose-updater keys in deploy/.env"
   fi
 fi
 

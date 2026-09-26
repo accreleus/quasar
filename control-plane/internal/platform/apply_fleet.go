@@ -412,7 +412,7 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 		}
 		cp = &a
 		if f.backupAllowsTheStep(ctx, run, a) && f.prepareFleet(ctx, run, a) {
-			// Normally never returns: the updater recreates this container
+			// Normally never returns: the recovery actor replaces this container
 			// partway through, and the next boot's Adopt resolves the row.
 			f.self.Apply(ctx, a)
 		}

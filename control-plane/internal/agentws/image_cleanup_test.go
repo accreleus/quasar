@@ -150,7 +150,7 @@ func TestRegisterKeepsAuthenticationWhenCleanupInventoryIsMalformed(t *testing.T
 
 func TestImageCleanupMalformedReferenceWireRevokesInventory(t *testing.T) {
 	pool := testPool(t)
-	h := NewHandler(pool, "test-token", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil)
+	h := NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

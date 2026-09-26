@@ -31,8 +31,6 @@ production.
 ```
 site/
   astro.config.mjs          site + base URL, sidebar, theme, expressive-code
-  scripts/
-    compose-template.mjs    snapshots deploy/docker-compose*.yml for the quick start
   src/
     content/docs/           every documentation page, as .mdx
     components/
@@ -42,36 +40,31 @@ site/
       Placeholder.astro     the screenshot placeholder panel
       Shot.astro            figure wrapper used in docs pages
     data/
-      stack-template.js     what the quick start generates: files and script
+      stack-template.js     what the quick start generates: the seed stack and script
       stack-template.test.js  its tests (npm test)
       platforms.js          per-platform host preparation for the script
       proxy-configs.js      the reverse-proxy snippets
       write-fixtures.mjs    writes every generated script out for shellcheck
-      compose-template.generated.js  the snapshot; never edit by hand
     route-data.ts           corrects the titles starlight-openapi generates
     styles/theme.css        Starlight variable overrides, product tokens
     assets/                 the brand mark and the screenshots
   SCREENSHOTS.md            checklist of screenshots still to capture
 ```
 
-`npm run build` and `npm test` both refuse a stale snapshot. After a change to
-`deploy/docker-compose.yml` or `deploy/docker-compose.nvidia.yml`, run
-`npm run compose:sync` and commit the regenerated file with it.
+The quick start writes the seed for one machine (combined, control-only or GPU
+host): a `docker run` script and the same seed as a one-service stack for Dockge
+or Arcane. It holds the seed's input names and the edge channel's tag, so a change
+to the seed's inputs (`docs/configuration.md` "Seed") or to the published image
+names needs the matching change in `stack-template.js` and its tests.
 
 ## Before publishing
 
-The pages describing Quasar-owned installs (RH-06: the seed, the recovery actor,
-Move an existing install) are drafts. They describe work that ships only with
-the **first release that ships Quasar-owned installs**, and parts of them depend
-on tickets still open. So:
+The site describes installs owned by Quasar (RH-06: the seed and the recovery
+actor), which ship on the **edge** channel only; the pages say so and promise no
+stable release. Publish it with the `pages` workflow once that work is on the
+branch you publish from, and not before: the published site must never describe
+an install the published images cannot make.
 
-- **Do not publish the RH-06 drafts before that release.** They go live in the
-  same step as the release: merged to `main` with it, then published with the
-  `pages` workflow. Until then the published site must keep describing today's
-  supported install, the Compose stack, correctly.
-- **The Quick Start generator must be rewritten first.** `QuickStart.astro`,
-  `src/data/stack-template.js` and `scripts/compose-template.mjs` still write the
-  four-service Compose stack. Around the seed, they need #361, #359 and #365.
 - **Every unfinished part carries a hidden marker**, an MDX comment such as
   `{/* TODO(#361): … */}`, or `TODO(open, …)` for a question no ticket owns yet.
   They render nothing, so the build cannot tell a draft from a finished page.

@@ -23,10 +23,9 @@ const SERVICE: &str = "quasar-node-agent";
 /// key). `vendor` scopes a difference to one GPU vendor's machine (`none`: no GPU), or `*`.
 const ALLOWED: &[(&str, &str, &str, &str)] = &[
     ("-env", "CONTROL_PLANE_URL", "*", "the enrollment string carries the control-plane URL, as in enroll-host.sh's agent-only stack"),
-    ("-env", "ENROLLMENT_TOKEN", "*", "secrets reach containers only as read-only files (D5) and the static token retires (D10)"),
+    ("-env", "ENROLLMENT_TOKEN", "*", "secrets reach containers only as read-only files (D5): the string arrives as QUASAR_ENROLLMENT_FILE"),
     ("+env", "QUASAR_ENROLLMENT_FILE", "*", "the enrollment string, delivered as a file in the agent's secrets volume (D5)"),
     ("+env", "QUASAR_RECOVERY_SOCKET", "*", "the agent socket: how an owned agent reaches its recovery actor (D6(a))"),
-    ("-bind", "quasar-updater-run:/run/quasar-updater", "*", "the Go updater has no place on an owned machine: the recovery actor replaces it"),
     ("+bind", "quasar-node-agent-secrets:/run/quasar-secrets:ro", "*", "the agent's per-service secrets volume, read-only (D5)"),
     ("+bind", "quasar-recovery-agent:/run/quasar-recovery:ro", "*", "the agent-socket volume, read-only in the agent (D6(a))"),
     ("-key", "depends_on", "*", "Compose-only start ordering; a GPU host has no local control plane"),
@@ -401,14 +400,12 @@ const ALLOWED_CONTROL_PLANE: &[(&str, &str, &str)] = &[
     ("+env", "QUASAR_DATABASE_PASSWORD_FILE", "secrets reach containers only as read-only files (D5)"),
     ("-env", "QUASAR_SECRET_KEY", "generated at install and delivered as a file (D5)"),
     ("+env", "QUASAR_SECRET_KEY_FILE", "secrets reach containers only as read-only files (D5)"),
-    ("-env", "ENROLLMENT_TOKEN", "the static token retires (D10); the machine's own agent enrolls with the local token"),
     ("+env", "QUASAR_LOCAL_ENROLLMENT_FILE", "the combined host's single-use local enrollment token, as a file"),
     ("+env", "QUASAR_LOCAL_ENROLLMENT_NODE_NAME", "the node name the local token is bound to"),
     ("+env", "QUASAR_MACHINE_ROLE", "the machine's shape, which the control plane serves as machine_role"),
     ("+env", "QUASAR_MACHINE_NODE_NAME", "the machine's node name, served as machine_node_name"),
     ("~env", "QUASAR_ENV: compose \"\", recipe \"production\"", "an owned control plane refuses the dev-only agent-auth mint at boot"),
     ("+env", "QUASAR_RECOVERY_CONTROL_SOCKET", "the control socket: how the control plane reaches its machine's recovery actor (D6(a))"),
-    ("-bind", "quasar-updater-run:/run/quasar-updater", "the Go updater has no place on an owned machine: the recovery actor replaces it"),
     ("+bind", "/var/lib/docker/volumes/quasar-recovery-agent/_data/control:/run/quasar-recovery:ro", "the control socket's directory, and nothing else of the socket volume"),
     ("-bind", "quasar-control-tls:/var/lib/quasar-control", "the same state under the owned install's volume name"),
     ("+bind", "quasar-control-data:/var/lib/quasar-control", "the control plane's TLS pair and artwork cache, a named volume that outlives every replacement"),
@@ -476,7 +473,6 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
     let dotenv = BTreeMap::from([
         ("QUASAR_CONTROL_IMAGE", CONTROL_IMAGE.to_string()),
         ("POSTGRES_PASSWORD", "from-the-env-file".to_string()),
-        ("ENROLLMENT_TOKEN", "static".to_string()),
         ("QUASAR_PUBLIC_HOST", "quasar.example.invalid".to_string()),
         ("QUASAR_HOME_ROOT", inputs.home_root.clone()),
     ]);

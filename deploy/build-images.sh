@@ -51,12 +51,11 @@
 #
 # ROLES
 #   runtime   quasar-node-agent    Dockerfile.vulkan --target runtime   AMD/Intel + Vulkan
-#   updater   quasar-updater       Dockerfile.updater --target runtime  per-host updater
 #   recovery  quasar-recovery      Dockerfile.recovery --target runtime the RH-06 recovery actor
 #   dev       quasar-agent-dev     Dockerfile.vulkan --target dev       build/test env only
 #   control   quasar-control-plane Dockerfile.control.prod              control plane
 #   profiling quasar-profiling     Dockerfile.vulkan --target profiling PROF-02 capture image
-#   all                       runtime dev control updater recovery (NOT profiling)
+#   all                       runtime dev control recovery (NOT profiling)
 #   (default when no role is given: runtime control)
 #
 #   THERE IS NO NVIDIA ROLE (#545, 2026-08-26). `runtime` is the universal agent image:
@@ -239,13 +238,15 @@ add_arg() { EXTRA_ARGS+=("$1"); }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    toolchain|runtime|dev|control|profiling|updater|recovery) ROLES+=("$1"); shift ;;
+    toolchain|runtime|dev|control|profiling|recovery) ROLES+=("$1"); shift ;;
+    # The Go updater retired with #367: the recovery actor replaces it.
+    updater) die "the 'updater' role was retired by #367: the recovery actor (role 'recovery') replaces the Compose updater. Build 'recovery'." ;;
     # `nv` was the NVIDIA lineage, retired by #545. Named explicitly so an old
     # command line or CI job fails with a sentence instead of "unknown argument".
     nv) die "the 'nv' role was retired by #545: quasar-node-agent (role 'runtime') is the universal agent image, and the CUDA userspace it needs is fetched at run time. Build 'runtime'." ;;
     # `profiling` is deliberately NOT in `all`: it is an on-demand diagnostic variant,
     # and a routine `all` build must not silently spend a full extra Rust compile on it.
-    all) ROLES+=(runtime dev control updater recovery); shift ;;
+    all) ROLES+=(runtime dev control recovery); shift ;;
 
     --base-image)       add_arg "QUASAR_BASE_IMAGE=${2:?}"; BASE_IMAGE_SET=1; shift 2 ;;
     --gst-version)      add_arg "GST_VERSION=${2:?}";              shift 2 ;;
@@ -317,7 +318,7 @@ done
 [ "$BASE_IMAGE_SET" = 1 ] || add_arg "QUASAR_BASE_IMAGE=$BASE_IMAGE_DEFAULT"
 
 # De-duplicate, then order so a base image is built before anything that layers on it.
-order_of() { case "$1" in toolchain) echo 0 ;; runtime) echo 1 ;; dev) echo 3 ;; profiling) echo 4 ;; control) echo 5 ;; updater) echo 6 ;; recovery) echo 7 ;; esac; }
+order_of() { case "$1" in toolchain) echo 0 ;; runtime) echo 1 ;; dev) echo 3 ;; profiling) echo 4 ;; control) echo 5 ;; recovery) echo 7 ;; esac; }
 # Plain while-read rather than `mapfile`: mapfile is bash 4+, and this script should
 # stay parseable/runnable on any bash the operator happens to have.
 _ordered=()
@@ -444,7 +445,6 @@ fi
 role_dockerfile() { case "$1" in
   toolchain|runtime|dev|profiling) echo "deploy/Dockerfile.vulkan" ;;
   control)                  echo "deploy/Dockerfile.control.prod" ;;
-  updater)                  echo "deploy/Dockerfile.updater" ;;
   recovery)                 echo "deploy/Dockerfile.recovery" ;;
 esac; }
 role_target() { case "$1" in
@@ -452,7 +452,6 @@ role_target() { case "$1" in
   runtime) echo runtime ;; dev) echo dev ;; profiling) echo profiling ;;
   # Dockerfile.control.prod has a single unnamed final stage — no --target applies.
   control) echo "" ;;
-  updater) echo runtime ;;
   recovery) echo runtime ;;
 esac; }
 # Images are named for the ROLE they play, not for the technology that happens to
@@ -463,7 +462,6 @@ role_image() { case "$1" in
   runtime) echo quasar-node-agent ;;
   dev) echo quasar-agent-dev ;; control) echo quasar-control-plane ;;
   profiling) echo quasar-profiling ;;
-  updater) echo quasar-updater ;;
   recovery) echo quasar-recovery ;;
 esac; }
 # The org.quasar.recipe value of a platform image (ADR 0008), or nothing for a role that is
@@ -812,11 +810,11 @@ for role in "${ROLES[@]}"; do
   fi
 
   ROLE_ARGS=("${EXTRA_ARGS[@]:-}")
-  # The updater is the one role not built on the quasar-base family (its base is
-  # the upstream docker CLI image), so it declares no QUASAR_BASE_IMAGE ARG and
-  # the shared default must not be handed to it. An EXPLICIT --base-image is a
-  # misunderstanding worth saying out loud rather than dropping quietly.
-  if [ "$role" = updater ] || [ "$role" = recovery ]; then
+  # The recovery actor is not built on the quasar-base family (its base is
+  # alpine), so it declares no QUASAR_BASE_IMAGE ARG and the shared default must
+  # not be handed to it. An EXPLICIT --base-image is a misunderstanding worth
+  # saying out loud rather than dropping quietly.
+  if [ "$role" = recovery ]; then
     [ "$BASE_IMAGE_SET" = 1 ] && warn "role '$role' is not built on quasar-base; --base-image does not apply to it and is ignored for this role."
     _filtered=()
     for kv in "${ROLE_ARGS[@]:-}"; do
@@ -825,7 +823,6 @@ for role in "${ROLES[@]}"; do
     ROLE_ARGS=("${_filtered[@]:-}")
   fi
   [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
-  [ "$DF_REL" = "deploy/Dockerfile.updater" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
   [ "$DF_REL" = "deploy/Dockerfile.recovery" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
   if [ "$DF_REL" = "deploy/Dockerfile.control.prod" ]; then
     ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")

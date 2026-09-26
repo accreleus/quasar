@@ -15,7 +15,7 @@ const REASON_TEXT: Record<string, string> = {
   identity_unknown: "This target has not reported what it is running.",
   up_to_date: "Already on the newest release.",
   install_mode_source: "Built from source on the host — update it with git, not from here.",
-  updater_absent: "No updater is installed beside this host's stack.",
+  updater_absent: "No recovery actor answers on this machine: it was not installed with the seed, or its actor is down.",
   host_offline: "The host's agent is not connected.",
   release_above_control_plane: "Waiting on the control plane: this release carries a newer schema.",
   control_plane_not_first: "Waiting on the control plane, which moves first.",
@@ -28,9 +28,7 @@ const REASON_TEXT: Record<string, string> = {
 /** The closed preflight check vocabulary (amendment 9), as short labels. An
  *  unknown id renders verbatim. */
 const PREFLIGHT_CHECK_TEXT: Record<string, string> = {
-  updater_socket: "updater reachable",
-  updater_stack_dir: "updater sees the stack directory",
-  updater_overlays: "compose files match the updater's",
+  updater_socket: "recovery actor reachable",
   image_resolvable: "release images resolve at the registry",
   agent_connected: "agent connected",
   health_addr_bindable: "agent health port free",
@@ -57,7 +55,7 @@ const SKIP_PHRASE: Record<string, string> = {
   host_offline: "offline",
   preflight_blocked: "a preflight check failed",
   install_mode_source: "built from source",
-  updater_absent: "no updater",
+  updater_absent: "no recovery actor",
   attempt_in_flight: "another update in flight",
 };
 
@@ -92,7 +90,7 @@ const FAULT_TEXT: Record<string, string> = {
 const ATTEMPT_STATE_TEXT: Record<string, string> = {
   queued: "Queued",
   waiting_sessions: "Waiting for sessions to end",
-  pending: "Handed to the updater",
+  pending: "Handed to the recovery actor",
   pulling: "Pulling the image",
   recreating: "Recreating the agent",
   verifying: "Verifying",
@@ -125,7 +123,7 @@ export function runStateText(state: string): string {
  *  mapping serves progress, history and an ack rejection. An identifier this
  *  build does not know renders verbatim. */
 const FAILURE_TEXT: Record<string, string> = {
-  updater_absent: "No updater is installed beside this host's stack.",
+  updater_absent: "No recovery actor answers on this machine: it was not installed with the seed, or its actor is down.",
   busy: "An update was already in flight on this host.",
   invalid: "The update request was rejected as un-actionable.",
   namespace_rejected: "The image is outside this host's platform-image namespace.",
@@ -134,7 +132,7 @@ const FAILURE_TEXT: Record<string, string> = {
   recreate_failed: "The container could not be recreated — this host's agent is stopped.",
   never_started: "The new container never started.",
   unhealthy: "The new container started but never became healthy.",
-  updater_unreachable: "The updater could not be reached.",
+  updater_unreachable: "The recovery actor could not be reached.",
   timeout: "The update did not finish in time.",
   unsupported: "This host's agent predates the update feature; update it another way.",
   signature_missing: "This host requires a signed release and this one is not signed.",
@@ -156,23 +154,23 @@ export function failureText(reason: string | null | undefined): string {
 }
 
 /** What a failure left running on the host. Keyed on the same closed
- *  vocabulary: a failure past the health wait IS restored by the updater
+ *  vocabulary: a failure past the health wait IS restored by the recovery actor
  *  itself (ADR 0004), so one fixed "nothing was rolled back" line was false for
  *  half of them (#201). "" for a reason this build does not know — no sentence
  *  beats a guess about what a host is running. */
 const UNTOUCHED = "Nothing was applied: this host is still running the build it had.";
 
 const RESTORE_ATTEMPTED =
-  "The new container did not come up. The updater puts the previous build back itself when " +
+  "The new container did not come up. The recovery actor puts the previous build back itself when " +
   "that happens; the apply history shows an automatic revert when it worked.";
 
-/** The same restore, told for a failed REVERT (#202). The updater still
+/** The same restore, told for a failed REVERT (#202). The recovery actor still
  *  performs it — `restoreWorthy` keys on the reason and the components, not on
  *  which button was pressed — but the build it puts back is the one the revert
  *  was leaving, not "the previous build", and no history row records it:
  *  recordAutoRevert writes an `auto_revert` only for an apply. */
 const RESTORE_ATTEMPTED_REVERT =
-  "The new container did not come up. The updater puts the build this revert was leaving back " +
+  "The new container did not come up. The recovery actor puts the build this revert was leaving back " +
   "itself when that happens, and records nothing for it: the history shows only this failure.";
 
 const AFTER_FAILURE_TEXT: Record<string, string> = {
@@ -191,11 +189,11 @@ const AFTER_FAILURE_TEXT: Record<string, string> = {
   never_started: RESTORE_ATTEMPTED,
   unhealthy: RESTORE_ATTEMPTED,
   // One identifier, two histories: the control plane writes it for an apply it
-  // never handed over, and the agent emits it for one the updater had already
+  // never handed over, and the agent emits it for one the actor had already
   // accepted and then stopped answering for — by which point the old container
   // can be gone (agent-api.md). Neither may be claimed.
   updater_unreachable:
-    "The updater stopped answering, so how far this apply got cannot be read from here — " +
+    "The recovery actor stopped answering, so how far this apply got cannot be read from here — " +
     "check the host itself.",
   // Both builds are unaccounted for: the apply expired with no verdict, which
   // is what the attempt's own output explains.
