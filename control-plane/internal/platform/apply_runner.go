@@ -695,13 +695,16 @@ func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep Relea
 	if len(restored) > 1 && failed.HostID != nil {
 		// The restored agent registered before relaying this, so the host's
 		// recorded actor is the one serving now.
-		onWant := false
-		if want := r.attemptCommit(ctx, failed); want != "" {
-			if actor, err := r.store.HostActorCommit(ctx, *failed.HostID); err == nil && actor != nil {
-				onWant = commitsMatch(want, *actor)
-			}
+		// Neither commit known: which component was restored cannot be told, and a
+		// guessed row would offer the wrong revert.
+		want := r.attemptCommit(ctx, failed)
+		actor, err := r.store.HostActorCommit(ctx, *failed.HostID)
+		if want == "" || err != nil || actor == nil {
+			r.log.Warn("release_state says restored, but which component was put back cannot be told; no auto_revert recorded",
+				"attempt_id", failed.ID, "host_id", *failed.HostID, "token", "apply-auto-revert-component-unknown")
+			return
 		}
-		restored = restoredComponents(restored, onWant)
+		restored = restoredComponents(restored, commitsMatch(want, *actor))
 	}
 	requested := restoredDigests(restored, rep.Previous)
 	if len(requested) == 0 {

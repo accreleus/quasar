@@ -1496,8 +1496,10 @@ hand-over (`docs/rh06/2026-09-24-architecture.md` §5.6): the running actor crea
 marker (`handover/<request-id>.ready` in machine state). It then stops serving and
 releases `actor.lease`; the successor takes it (`token="actor-handover-taking-over"`),
 stops the old actor, disables its restart policy, renames it `quasar-recovery.kept`, takes
-the name `quasar-recovery`, and verifies by answering on its own agent socket within 60 s.
-Only then is `.kept` removed and `seed.json` rewritten to name the new image
+the name `quasar-recovery`, and verifies: it answers on its own agent socket within 60 s,
+and on a GPU host the node agent reaches that socket within a further 60 s (the agent's
+relay polls it throughout an attempt; an agent that is down leaves the successor
+unverified). Only then is `.kept` removed and `seed.json` rewritten to name the new image
 (`token="actor-seed-file-updated"`). A successor that never becomes ready, never takes the
 lease, fails to verify, or restarts three times without verifying is removed and the
 previous actor runs again: `failed`, `restored: true`. Every restart point settles to a
@@ -1511,6 +1513,10 @@ seed re-create the last verified actor. An attempt naming the actor and the agen
 the actor first; a later failure restores only the agent, and the actor stays on the new
 image (the output says so). After an attempt that replaced the actor, the agent
 reconnects once (`token="release-actor-redial"`) so its `register` reports the new actor.
+A hand-over may replace an actor started by hand without the installation's labels: it is
+the actor handing over. An actor whose container carries `com.docker.compose.*` labels is
+declared by an external manager, which only the seed may be (ADR 0007), and a request to
+replace it is refused `owner_conflict` with nothing changed.
 
 **One socket, one name.** The actor always listens at `/run/quasar-recovery/agent.sock`, inside the `quasar-recovery-agent` volume it mounts read-write; that path is fixed, not an actor input. The agent it creates mounts the same volume read-only at the same path and is told where through `QUASAR_RECOVERY_SOCKET` (see "Node agent — connection & identity"), which the actor's recipe sets. Both names come from one constant module (`quasar_runtime::owned_install`), so the two sides cannot drift.
 

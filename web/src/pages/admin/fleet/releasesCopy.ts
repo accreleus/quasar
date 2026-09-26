@@ -136,7 +136,7 @@ const FAILURE_TEXT: Record<string, string> = {
   backup_unconfirmed:
     "This update changes the database and no backup of your own database was confirmed, so the control plane was not replaced.",
   interrupted:
-    "The recovery actor restarted before it had touched the running service; nothing changed and nothing was retried.",
+    "The recovery actor restarted before it had touched the service it was replacing, so that service was not changed and nothing was retried. Anything this update had already replaced stays updated; the details say what.",
 };
 
 export function failureText(reason: string | null | undefined): string {

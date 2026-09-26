@@ -43,6 +43,9 @@ const ID: &str = "0b9f5d3a-6c1e-4f2a-8d7b-1e2f3a4b5c6d";
 const COMMIT: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const KEPT: &str = "quasar-recovery.kept";
 const NEXT: &str = "quasar-recovery.next";
+/// The seed fixture set the current tree writes until a release ships it
+/// (`testdata/recovery/seed/README.md`).
+const UNRELEASED_SET: &str = "unreleased";
 
 /// The phases each process commits in a hand-over, in order.
 const OLD_PHASES: &[Phase] = &[
@@ -77,6 +80,7 @@ fn handover_timing() -> HandoverTiming {
         ready: Duration::from_secs(3),
         takeover: Duration::from_secs(3),
         verify: Duration::from_secs(3),
+        agent_contact: Duration::from_secs(3),
         poll: Duration::from_millis(2),
         orphan_check: Duration::from_secs(3600),
     }
@@ -210,7 +214,10 @@ struct Lab {
     inert: Mutex<Vec<&'static str>>,
     /// Images whose process is given an agent socket it cannot bind.
     no_socket: Mutex<Vec<&'static str>>,
-    orphan_check: Mutex<Duration>,
+    /// The clocks a process is started with.
+    handover: Mutex<HandoverTiming>,
+    /// Whether the simulated node agent polls the agent socket, as its relay does.
+    agent_polls: AtomicBool,
     /// The test removed every actor container on purpose: until the seed has looked, a
     /// seed that would create one is right, not racing.
     operator_removed: AtomicBool,
@@ -291,7 +298,8 @@ impl Lab {
             races: Mutex::new(Vec::new()),
             inert: Mutex::new(Vec::new()),
             no_socket: Mutex::new(Vec::new()),
-            orphan_check: Mutex::new(Duration::from_secs(3600)),
+            handover: Mutex::new(handover_timing()),
+            agent_polls: AtomicBool::new(true),
             operator_removed: AtomicBool::new(false),
             me: me.clone(),
             stop: AtomicBool::new(false),
@@ -301,6 +309,19 @@ impl Lab {
             if let Some(lab) = weak.upgrade() {
                 lab.lifecycle(event);
             }
+        });
+        // The node agent's relay: it polls the attempt's status on the agent socket.
+        let weak = Arc::downgrade(&lab);
+        std::thread::spawn(move || loop {
+            let Some(lab) = weak.upgrade() else { return };
+            if lab.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            if lab.agent_polls.load(Ordering::SeqCst) {
+                let _ = quasar_recovery::server::fetch_status(&lab.socket());
+            }
+            drop(lab);
+            std::thread::sleep(Duration::from_millis(5));
         });
         let weak = Arc::downgrade(&lab);
         std::thread::spawn(move || loop {
@@ -385,10 +406,7 @@ impl Lab {
             ..Default::default()
         };
         config.timing = fast();
-        config.handover = HandoverTiming {
-            orphan_check: *self.orphan_check.lock().unwrap(),
-            ..handover_timing()
-        };
+        config.handover = *self.handover.lock().unwrap();
         config.agent_socket = if self.no_socket.lock().unwrap().iter().any(|i| *i == image) {
             self.sockets.path().join("missing").join("agent.sock")
         } else {
@@ -1100,7 +1118,7 @@ fn with_every_actor_container_removed_the_seed_recreates_the_verified_actor() {
 #[test]
 fn a_successor_whose_old_actor_vanished_takes_the_machine_over() {
     let lab = Lab::new();
-    *lab.orphan_check.lock().unwrap() = Duration::from_millis(5);
+    lab.handover.lock().unwrap().orphan_check = Duration::from_millis(5);
     at_phase(&lab, Who::Old, Phase::AwaitingSuccessor, |lab| {
         let old = lab
             .engine
@@ -1232,11 +1250,11 @@ fn only_a_gpu_hosts_agent_socket_may_move_the_actor() {
     assert_eq!(lab.actors().len(), 1);
 }
 
-/// The machine states this actor's hand-over leaves, one per committed phase, as seed
-/// contract fixtures (`testdata/recovery/seed/actors/rh06-10/`, read by
-/// `tests/seed_contract.rs` with every other released actor's): a seed of any age must
-/// see a recovery actor in each and do nothing. Regenerate with
-/// `QUASAR_WRITE_SEED_FIXTURES=1`; an existing case is never edited to make a test pass.
+/// The machine states a successful hand-over leaves, one per committed phase, as seed
+/// contract fixtures in the unreleased set (`testdata/recovery/seed/actors/`
+/// [`UNRELEASED_SET`], read by `tests/seed_contract.rs` with every released actor's): a seed
+/// of any age must see a recovery actor in each and do nothing. Regenerate with
+/// `QUASAR_WRITE_SEED_FIXTURES=1`; a release copies the set to its version and freezes it.
 #[test]
 fn the_hand_over_states_this_actor_writes_are_seed_fixtures() {
     type Snapshot = (String, Vec<serde_json::Value>, Vec<u8>);
@@ -1288,7 +1306,8 @@ fn the_hand_over_states_this_actor_writes_are_seed_fixtures() {
     assert_eq!(lab.outcome("fixtures").state, State::Succeeded);
 
     let set = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../testdata/recovery/seed/actors/rh06-10");
+        .join("../../../testdata/recovery/seed/actors")
+        .join(UNRELEASED_SET);
     let write = std::env::var_os("QUASAR_WRITE_SEED_FIXTURES").is_some();
     let snapshots = snapshots.lock().unwrap().clone();
     assert_eq!(snapshots.len(), OLD_PHASES.len() + NEW_PHASES.len());
@@ -1320,4 +1339,70 @@ fn the_hand_over_states_this_actor_writes_are_seed_fixtures() {
             "{case}"
         );
     }
+}
+
+/// Architecture §5.6: on a GPU host the successor verifies only once the node agent
+/// reaches it. An agent that never does leaves it unverified, and it hands back.
+#[test]
+fn a_successor_the_agent_never_reaches_hands_the_machine_back() {
+    let lab = Lab::new();
+    let old = lab.old_actor();
+    lab.agent_polls.store(false, Ordering::SeqCst);
+    hand_over(&lab);
+    let result = lab.outcome("no agent contact");
+    assert_restored(&lab, &result, &old, "no agent contact");
+    assert_eq!(result.reason, Some(Reason::Unhealthy), "{result:?}");
+    assert!(
+        result
+            .output
+            .contains("no node agent reached its agent socket"),
+        "{}",
+        result.output
+    );
+}
+
+/// Crash-table row 3: the old actor released the lease, the successor died before taking
+/// it and does not come back; the old actor's watchdog takes the machine back.
+#[test]
+fn a_successor_that_dies_before_taking_the_lease_leaves_the_old_actor_restored() {
+    let lab = Lab::new();
+    lab.handover.lock().unwrap().takeover = Duration::from_millis(300);
+    let old = lab.old_actor();
+    at_phase(&lab, Who::Old, Phase::HandingOver, |lab| {
+        let next = lab.engine.state().container_named(NEXT).unwrap().id.clone();
+        lab.break_container(&next);
+        false
+    });
+    hand_over(&lab);
+    let result = lab.outcome("row 3");
+    assert_restored(&lab, &result, &old, "row 3");
+    assert!(
+        result.output.contains("did not take the machine's lease"),
+        "{}",
+        result.output
+    );
+    assert!(lab.engine.state().container_named(NEXT).is_none());
+}
+
+/// ADR 0007: an actor a manager declares is refused a hand-over, changing nothing; a
+/// hand-started actor without labels may hand over (the self-exception).
+#[test]
+fn a_manager_declared_actor_is_refused_a_hand_over() {
+    let lab = Lab::new();
+    let old = lab.old_actor();
+    lab.engine.with_state(|s| {
+        let c = s.containers.get_mut(&old.id).unwrap();
+        c.spec
+            .labels
+            .insert("com.docker.compose.project".into(), "quasar".into());
+    });
+    let refused = lab.submit(request(vec![actor_component()])).unwrap_err();
+    assert_eq!(refused.reason, Reason::OwnerConflict, "{}", refused.message);
+    assert!(
+        refused.message.contains("external manager"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(lab.actors().len(), 1);
+    assert!(lab.engine.state().container_named(NEXT).is_none());
 }

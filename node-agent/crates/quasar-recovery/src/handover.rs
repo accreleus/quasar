@@ -12,7 +12,8 @@
 //!                      the lease, watch        successor_active   stop the old actor, disable
 //!                                                                 it, rename it .kept
 //!                                              successor_renaming take the actor's name
-//!                                              verifying          answer on its own socket
+//!                                              verifying          answer on its own socket;
+//!                                                                 on a GPU host, reached by the agent
 //!                                              verified           record its specification
 //!                                              old_discarded      remove .kept, then seed.json
 //! ```
@@ -309,12 +310,12 @@ impl Actor {
             return Ok(());
         }
         if step.failure.is_none() {
-            let takeover = self.config.handover.takeover.as_secs();
+            let takeover = self.config.handover.takeover;
             step.failure = Some(match (party, step.phase) {
                 (Party::Old, Phase::HandingOver) => Failure {
                     reason: Reason::Unhealthy,
                     detail: format!(
-                        "the successor did not take the machine's lease within {takeover}s of the hand-over"
+                        "the successor did not take the machine's lease within {takeover:?} of the hand-over"
                     ),
                 },
                 (Party::Old, _) => Failure {
@@ -710,14 +711,14 @@ impl Actor {
             if self.killed() {
                 return Err(Halt::Died);
             }
-            let answered = crate::server::fetch_status(&socket);
+            let answered = crate::server::probe_self(&socket);
             let running = match self.engine.inspect_container(&me) {
                 Ok(Some(c)) => c.running,
                 Err(EngineError::Crashed) => return Err(Halt::Died),
                 _ => false,
             };
             let why = match (&answered, running) {
-                (Ok(_), true) => return Ok(()),
+                (Ok(_), true) => return self.await_agent_contact(),
                 (Err(e), _) => {
                     format!("its agent socket {} did not answer ({e})", socket.display())
                 }
@@ -729,6 +730,40 @@ impl Actor {
                     format!(
                         "the successor did not verify within {}s: {why}",
                         timing.verify.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(timing.poll);
+        }
+    }
+
+    /// The second half of verifying on a GPU host (architecture §5.6): the node agent
+    /// reconnects, which its relay does by polling status on the agent socket throughout
+    /// an attempt. Any request another process makes there counts; none within
+    /// `agent_contact` is not verified.
+    fn await_agent_contact(&self) -> Result<(), Halt> {
+        let gpu = matches!(
+            self.dir.load_machine(),
+            Ok(Some(m)) if m.role == crate::socket::MachineRole::Gpu
+        );
+        if !gpu {
+            return Ok(());
+        }
+        let timing = self.config.handover;
+        let deadline = Instant::now() + timing.agent_contact;
+        loop {
+            if self.killed() {
+                return Err(Halt::Died);
+            }
+            if self.external_requests() > 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(fail(
+                    Reason::Unhealthy,
+                    format!(
+                        "the successor did not verify: no node agent reached its agent socket within {}s",
+                        timing.agent_contact.as_secs()
                     ),
                 ));
             }
@@ -952,6 +987,13 @@ impl Actor {
             }
         }
         for c in successors {
+            if c.running && matches!(party, Party::Stranger { .. }) {
+                output.push_str(&format!(
+                    "\nthe successor {} is running and was left alone",
+                    c.name
+                ));
+                continue;
+            }
             match self.engine.logs_tail(&c.id, 40) {
                 Ok(tail) if !tail.trim_end().is_empty() => {
                     output.push_str(&format!("\n--- last lines of {} ---\n", c.name));
@@ -969,8 +1011,27 @@ impl Actor {
                 )),
             }
         }
-        if matches!(party, Party::Stranger { .. }) {
-            if let Some(old) = j.steps[i].old_container.clone().filter(|o| !self.is_me(o)) {
+        // A stranger removes the previous actor only when it is really left over: stopped.
+        // A running one is another actor process, never removed by elimination.
+        let leftover_old = match j.steps[i].old_container.clone().filter(|o| !self.is_me(o)) {
+            Some(old) if matches!(party, Party::Stranger { .. }) => {
+                match self.engine.inspect_container(&old) {
+                    Ok(Some(c)) if !c.running => Some(old),
+                    Ok(Some(c)) => {
+                        output.push_str(&format!(
+                            "\nthe previous actor {} is running and was left alone",
+                            c.name
+                        ));
+                        None
+                    }
+                    Err(e) if crash(&e) => return Err(()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(old) = leftover_old {
+            {
                 match self.retrying(|| self.engine.remove_container(&old)) {
                     Ok(()) => {}
                     Err(e) if crash(&e) => return Err(()),

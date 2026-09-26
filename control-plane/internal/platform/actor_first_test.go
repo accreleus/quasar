@@ -104,6 +104,7 @@ func TestAnAutoRevertNamesOnlyTheRestoredComponent(t *testing.T) {
 	}{
 		{"the actor moved, the agent was put back", strPtr(testCommit), ComponentNodeAgent},
 		{"the actor itself was put back", strPtr(strings.Repeat("0", 40)), ComponentRecovery},
+		{"the actor's commit is unknown: logged, not guessed", nil, ""},
 	} {
 		a := queuedAttempt(true)
 		a.RequestedDigests = []ComponentDigest{actorDigest('a'), agentDigest('b')}
@@ -120,6 +121,12 @@ func TestAnAutoRevertNamesOnlyTheRestoredComponent(t *testing.T) {
 		})
 		r.Close()
 		rows := store.autoReverts()
+		if tc.want == "" {
+			if len(rows) != 0 {
+				t.Fatalf("%s: a guessed auto_revert row %+v", tc.name, rows)
+			}
+			continue
+		}
 		if len(rows) != 1 || len(rows[0].RequestedDigests) != 1 || rows[0].RequestedDigests[0].Name != tc.want {
 			t.Fatalf("%s: auto_revert rows %+v, want one naming %s", tc.name, rows, tc.want)
 		}
@@ -146,6 +153,14 @@ func TestARevertPutsTheAgentBackBeforeTheActor(t *testing.T) {
 	}
 	if !reflect.DeepEqual(d.Requested, want) {
 		t.Fatalf("requested %+v, want %+v", d.Requested, want)
+	}
+	// A last attempt that moved only the actor reverts only the actor.
+	actorOnly := succeededApply(&old)
+	actorOnly.RequestedDigests = []ComponentDigest{actorDigest('a')}
+	actorOnly.PreviousDigests = []PreviousDigest{{Name: ComponentRecovery, Digest: &oldActor}}
+	if d := PlanRevert(RevertInputs{LastSucceeded: actorOnly, ControlPlane: cp(commitB, 40)}); !d.OK ||
+		!reflect.DeepEqual(d.Requested, []ComponentDigest{{Name: ComponentRecovery, Image: actorRepo, Digest: oldActor}}) {
+		t.Fatalf("actor-only revert: %+v", d)
 	}
 	// With the agent's previous digest unknown, nothing is reverted, whatever the
 	// actor's is.

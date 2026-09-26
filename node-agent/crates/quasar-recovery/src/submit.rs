@@ -46,6 +46,9 @@ use crate::socket::{
 };
 use crate::trust::{self, Caller};
 
+/// The labels Compose stamps on the containers it manages.
+const COMPOSE_LABEL_PREFIX: &str = "com.docker.compose.";
+
 /// The components each socket may name at all (architecture §5.2).
 fn may_name(caller: Caller, name: &str) -> bool {
     match caller {
@@ -364,6 +367,23 @@ impl Actor {
                             .self_container
                             .as_deref()
                             .is_some_and(|me| same_container(me, &existing.id));
+                        // An actor a manager declares (ADR 0007 rejected it) is the
+                        // manager's to replace: a hand-over would race its redeploy.
+                        if itself
+                            && existing
+                                .labels
+                                .keys()
+                                .any(|k| k.starts_with(COMPOSE_LABEL_PREFIX))
+                        {
+                            return Err(refuse(
+                                &req,
+                                Reason::OwnerConflict,
+                                format!(
+                                    "this recovery actor ({}) is declared by an external manager (it carries Compose labels), so it is not Quasar's to replace; declare only the seed in the manager. Nothing was changed",
+                                    existing.name
+                                ),
+                            ));
+                        }
                         if !itself
                             && existing.labels.get(labels::INSTALLATION)
                                 != Some(&machine.installation_id)

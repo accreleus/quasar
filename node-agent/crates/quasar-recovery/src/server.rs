@@ -97,6 +97,13 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>) -> io::Result<()> {
         }
     }
     let head = String::from_utf8_lossy(&head);
+    let own_probe = head.lines().any(|l| {
+        l.split_once(':')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(SELF_PROBE_HEADER))
+    });
+    if !own_probe {
+        actor.note_external_request();
+    }
     let mut first = head.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -192,9 +199,23 @@ fn respond(stream: &mut UnixStream, status: u16, body: &str) -> io::Result<()> {
 
 /// The operator's `quasar-recovery status`: one `GET /v1/status`, the body as served.
 pub fn fetch_status(path: &Path) -> io::Result<String> {
+    status_request(path, "")
+}
+
+/// Marks a request the serving actor makes to itself: not another process reaching it,
+/// which is what a successor's verification waits for (`crate::handover`).
+const SELF_PROBE_HEADER: &str = "X-Quasar-Self-Probe";
+
+/// [`fetch_status`] from the serving actor itself.
+pub(crate) fn probe_self(path: &Path) -> io::Result<String> {
+    status_request(path, &format!("{SELF_PROBE_HEADER}: 1\r\n"))
+}
+
+fn status_request(path: &Path, extra_header: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.write_all(b"GET /v1/status HTTP/1.0\r\nHost: recovery\r\n\r\n")?;
+    let request = format!("GET /v1/status HTTP/1.0\r\nHost: recovery\r\n{extra_header}\r\n");
+    stream.write_all(request.as_bytes())?;
     let mut raw = String::new();
     stream.take(4 * 1024 * 1024).read_to_string(&mut raw)?;
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));

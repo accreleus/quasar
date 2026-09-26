@@ -346,13 +346,12 @@ digest if none exists.
 *Implementation note (#362):* the hand-over is the recovery-actor component of an ordinary
 attempt journal (`quasar-recovery` `handover.rs`); its settle table is per party (old actor,
 successor, or an actor the seed re-created after every actor container was removed) in
-`settle.rs`. The successor's self-check covers the engine, machine state and the journal;
-its verification is answering `GET /v1/status` on its own agent socket with its container
-running (an agent `hello` is not built). A successor restarted three times without
-verifying hands the machine back. The successor keeps the running actor's
-`QUASAR_UPDATER_*`, `QUASAR_SEED_CONTAINER` and `RUST_LOG`, so a hand-over never resets a
-machine's trust configuration. An actor that cannot take the lease waits for it. Every
-machine state a hand-over leaves is a seed fixture (`testdata/recovery/seed/actors/rh06-10`).
+`settle.rs`. A successor restarted three times without verifying hands the machine back. An
+actor that cannot take the lease waits for it. A hand-over may replace an actor that was
+started by hand without the installation's labels (it is the actor handing over), but an
+actor carrying Compose labels is declared by an external manager (ADR 0007) and is refused
+`owner_conflict`. The machine states of each committed phase of a successful hand-over are
+seed fixtures (`testdata/recovery/seed/actors/unreleased`).
 
 ### 5.7 The seed
 

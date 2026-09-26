@@ -96,6 +96,9 @@ pub struct HandoverTiming {
     pub takeover: std::time::Duration,
     /// How long a successor has to answer on its own sockets once it holds the lease.
     pub verify: std::time::Duration,
+    /// On a GPU host, how long a successor then waits for the node agent to reach its
+    /// agent socket (the relay polls status throughout an attempt).
+    pub agent_contact: std::time::Duration,
     /// Between two looks at the lease, the journal or a ready marker.
     pub poll: std::time::Duration,
     /// How often a waiting successor checks that the old actor's container still exists.
@@ -108,6 +111,7 @@ impl Default for HandoverTiming {
             ready: std::time::Duration::from_secs(60),
             takeover: std::time::Duration::from_secs(60),
             verify: std::time::Duration::from_secs(60),
+            agent_contact: std::time::Duration::from_secs(60),
             poll: std::time::Duration::from_millis(500),
             orphan_check: std::time::Duration::from_secs(5),
         }
@@ -282,6 +286,8 @@ pub struct Actor {
     retired: std::sync::atomic::AtomicBool,
     /// This process is gone: a test stands it in for the process dying.
     killed: std::sync::atomic::AtomicBool,
+    /// Requests another process made on this actor's agent socket.
+    external_requests: std::sync::atomic::AtomicU64,
 }
 
 struct ServerHandle {
@@ -318,7 +324,18 @@ impl Actor {
             me: std::sync::OnceLock::new(),
             retired: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
+            external_requests: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn note_external_request(&self) {
+        self.external_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn external_requests(&self) -> u64 {
+        self.external_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Serve `status` through a separate engine client, typically one with a short
