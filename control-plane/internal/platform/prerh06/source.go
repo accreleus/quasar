@@ -1,4 +1,4 @@
-package platform
+package prerh06
 
 import (
 	"context"
@@ -33,9 +33,4 @@ type Listing struct {
 	Body        string
 	PublishedAt time.Time
 	ManifestURL string // "" when the release published no manifest asset
-	// ManifestFormat is the format the asset at ManifestURL must carry: 2 for
-	// ManifestAssetNameV2, 1 for ManifestAssetName, 0 when there is none. A
-	// release that publishes both is read from the v2 asset (control-api.md
-	// amendment 14, "Release manifest format 2").
-	ManifestFormat int
 }

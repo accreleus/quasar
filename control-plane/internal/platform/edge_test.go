@@ -58,14 +58,14 @@ func twoImages(tag, commit, schema string) *fakeInspector {
 }
 
 func TestEdgeResolveReadsBothImages(t *testing.T) {
-	inspect := twoImages("develop", commitA, "76")
+	inspect := twoImages("o2-develop", commitA, "76")
 	src := NewRegistryEdgeSource(inspect, "", "")
 
 	build, err := src.Resolve(context.Background(), "develop")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if build.SourceCommit != commitA || build.SchemaVersion != 76 || build.Tag != "develop" {
+	if build.SourceCommit != commitA || build.SchemaVersion != 76 || build.Tag != "o2-develop" {
 		t.Fatalf("build = %+v", build)
 	}
 	if build.BuiltAt.Format("2006-01-02T15:04:05Z") != "2026-09-04T12:00:00Z" {
@@ -84,10 +84,10 @@ func TestEdgeResolveReadsBothImages(t *testing.T) {
 }
 
 func TestEdgeResolveComponentsDisagree(t *testing.T) {
-	inspect := twoImages("develop", commitA, "76")
-	agent := inspect.byRef["ghcr.io/accreleus/quasar/quasar-node-agent:develop"]
+	inspect := twoImages("o2-develop", commitA, "76")
+	agent := inspect.byRef["ghcr.io/accreleus/quasar/quasar-node-agent:o2-develop"]
 	agent.Labels = labels(commitB, "2026-09-04T12:00:00Z", "")
-	inspect.byRef["ghcr.io/accreleus/quasar/quasar-node-agent:develop"] = agent
+	inspect.byRef["ghcr.io/accreleus/quasar/quasar-node-agent:o2-develop"] = agent
 
 	_, err := NewRegistryEdgeSource(inspect, "", "").Resolve(context.Background(), "develop")
 	if !errors.Is(err, ErrEdgeComponentsDisagree) {
@@ -96,24 +96,24 @@ func TestEdgeResolveComponentsDisagree(t *testing.T) {
 }
 
 func TestEdgeResolveMissingSchemaLabelIsUnknown(t *testing.T) {
-	inspect := twoImages("develop", commitA, "")
+	inspect := twoImages("o2-develop", commitA, "")
 	_, err := NewRegistryEdgeSource(inspect, "", "").Resolve(context.Background(), "develop")
 	if !errors.Is(err, ErrEdgeSchemaUnknown) {
 		t.Fatalf("err = %v, want ErrEdgeSchemaUnknown", err)
 	}
 
 	// A label that is present but not a positive integer is the same answer.
-	inspect = twoImages("develop", commitA, "not-a-number")
+	inspect = twoImages("o2-develop", commitA, "not-a-number")
 	if _, err := NewRegistryEdgeSource(inspect, "", "").Resolve(context.Background(), "develop"); !errors.Is(err, ErrEdgeSchemaUnknown) {
 		t.Fatalf("err = %v, want ErrEdgeSchemaUnknown", err)
 	}
 }
 
 func TestEdgeResolveMissingCommitLabelFails(t *testing.T) {
-	inspect := twoImages("develop", commitA, "76")
-	cfg := inspect.byRef["ghcr.io/accreleus/quasar/quasar-control-plane:develop"]
+	inspect := twoImages("o2-develop", commitA, "76")
+	cfg := inspect.byRef["ghcr.io/accreleus/quasar/quasar-control-plane:o2-develop"]
 	cfg.Labels = map[string]string{}
-	inspect.byRef["ghcr.io/accreleus/quasar/quasar-control-plane:develop"] = cfg
+	inspect.byRef["ghcr.io/accreleus/quasar/quasar-control-plane:o2-develop"] = cfg
 
 	_, err := NewRegistryEdgeSource(inspect, "", "").Resolve(context.Background(), "develop")
 	if err == nil || !strings.Contains(err.Error(), LabelSourceCommit) {
@@ -124,27 +124,27 @@ func TestEdgeResolveMissingCommitLabelFails(t *testing.T) {
 // A branch with a slash is published under a sanitized tag, so the resolver
 // must ask for that tag and not the branch name.
 func TestEdgeResolveTagMapping(t *testing.T) {
-	inspect := twoImages("feature-x", commitA, "76")
+	inspect := twoImages("o2-feature-x", commitA, "76")
 	build, err := NewRegistryEdgeSource(inspect, "", "").Resolve(context.Background(), "feature/x")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if build.Tag != "feature-x" {
-		t.Fatalf("tag = %q, want feature-x", build.Tag)
+	if build.Tag != "o2-feature-x" {
+		t.Fatalf("tag = %q, want o2-feature-x", build.Tag)
 	}
-	if len(inspect.seen) == 0 || !strings.HasSuffix(inspect.seen[0], ":feature-x") {
-		t.Fatalf("requested %v, want a :feature-x ref", inspect.seen)
+	if len(inspect.seen) == 0 || !strings.HasSuffix(inspect.seen[0], ":o2-feature-x") {
+		t.Fatalf("requested %v, want a :o2-feature-x ref", inspect.seen)
 	}
 }
 
 func TestBranchTag(t *testing.T) {
 	for _, tc := range []struct{ branch, want string }{
-		{"develop", "develop"},
-		{"feature/x", "feature-x"},
-		{"feat/111-edge-channel", "feat-111-edge-channel"},
-		{"release/v1.2", "release-v1.2"},
-		{"a b", "a-b"},
-		{"-lead", "lead"},
+		{"develop", "o2-develop"},
+		{"feature/x", "o2-feature-x"},
+		{"feat/111-edge-channel", "o2-feat-111-edge-channel"},
+		{"release/v1.2", "o2-release-v1.2"},
+		{"a b", "o2-a-b"},
+		{"-lead", "o2-lead"},
 		{"", ""},
 	} {
 		if got := BranchTag(tc.branch); got != tc.want {

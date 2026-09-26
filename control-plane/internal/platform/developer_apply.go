@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/images"
 	"github.com/accreleus/quasar/control-plane/internal/updater"
@@ -321,6 +322,11 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 	if !DeveloperCommitAllowed(commit, view, knownRelease) {
 		writeRefusal(w, CodeHostNotEligible, ReasonReleaseAboveControlPlane,
 			"the images' commit is neither this control plane's nor a release at or below it, so it cannot be shown not to be ahead of the control plane; apply the control plane first")
+		return
+	}
+	if knownRelease != nil && releaseBelowFloor(*knownRelease, componentNames(components), buildinfo.DeclaredFloor()) {
+		writeRefusal(w, CodeHostNotEligible, ReasonBelowFloor,
+			"the images belong to a release below this control plane's floor, which it no longer manages")
 		return
 	}
 	if !h.runner.Supported(hostID) {

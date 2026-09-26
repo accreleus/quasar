@@ -26,6 +26,10 @@ type PlanInputs struct {
 	SourceRepo string
 
 	ControlPlane buildinfo.Identity
+	// Floor is the control plane's declared floor (buildinfo.DeclaredFloor): what
+	// each host's served `below_floor` is judged against. The zero value judges no
+	// host below it.
+	Floor buildinfo.Floor
 	// The machine it runs on, served beside it; no decision reads it.
 	ControlPlaneMachine MachineIdentity
 
@@ -80,7 +84,7 @@ func PlanRelease(in PlanInputs) View {
 	}
 
 	available := offerable(in.Releases, channel, in.ControlPlane)
-	hosts := withDerivedIdentity(in.Hosts)
+	hosts := withDerivedIdentity(in.Hosts, in.Floor)
 	open := openTargets(in.OpenAttempts)
 	fleet := fleetState{
 		runActive:      in.ActiveRun != nil,
@@ -316,11 +320,13 @@ func belowInstalledVersion(r Release, cp buildinfo.Identity) bool {
 	return semver.ComparePrecedence(candidate, installed) < 0
 }
 
-// withDerivedIdentity fills identity_known, which is served, never re-derived.
-func withDerivedIdentity(hosts []HostIdentity) []HostIdentity {
+// withDerivedIdentity fills identity_known and below_floor, which are served, never
+// re-derived.
+func withDerivedIdentity(hosts []HostIdentity, floor buildinfo.Floor) []HostIdentity {
 	out := make([]HostIdentity, 0, len(hosts))
 	for _, h := range hosts {
 		h.IdentityKnown = h.Known()
+		h.BelowFloor = HostBelowFloor(h, floor)
 		out = append(out, h)
 	}
 	return out

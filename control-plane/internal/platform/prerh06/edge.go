@@ -1,4 +1,4 @@
-package platform
+package prerh06
 
 import (
 	"context"
@@ -178,28 +178,11 @@ func parseSchemaLabel(raw string) (int, error) {
 	return n, nil
 }
 
-// EdgeTagPrefix is the RH06 edge tag family (control-api.md amendment 14, "Release
-// manifest format 2": the edge tag family is release tooling). A control plane that
-// predates RH06 resolves a branch build as `<image>:<branch>`, so RH06-era branch builds
-// are published only as `<image>:o2-<branch>` and the images workflow no longer moves
-// the bare branch tag: an old edge install is never offered a build it could not run.
-const EdgeTagPrefix = "o2-"
-
-// BranchTag maps a branch to the tag its build is published under: twin of
-// docker/metadata-action's `type=ref,event=branch,prefix=o2-` in
+// BranchTag maps a branch to the tag it is published under: twin of
+// docker/metadata-action's `type=ref,event=branch` in
 // .github/workflows/images.yml, which replaces every character outside
-// [A-Za-z0-9._-] with "-" (so `feature/x` is `o2-feature-x`). "" for a branch that
-// maps to no usable tag.
+// [A-Za-z0-9._-] with "-" (so `feature/x` is `feature-x`).
 func BranchTag(branch string) string {
-	name := branchTagName(branch)
-	if name == "" {
-		return ""
-	}
-	return EdgeTagPrefix + name
-}
-
-// branchTagName is the sanitised branch name, before the family prefix.
-func branchTagName(branch string) string {
 	branch = strings.TrimSpace(branch)
 	var b strings.Builder
 	for _, c := range branch {

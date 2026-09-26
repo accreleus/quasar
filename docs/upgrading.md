@@ -431,7 +431,10 @@ starts a check.
   it is published, with its notes and its pinned digests, applied through exactly
   the same path a stable release takes. Nothing else about an apply changes.
 - **`edge`** — whatever was last published from `release_edge_branch` (default
-  `develop`). No version, no notes, a compare link instead.
+  `develop`). No version, no notes, a compare link instead. RH06-era branch builds
+  are published under the `o2-<branch>` image tag and no longer move `<branch>`, so a
+  control plane from before RH06 on `edge` stays on the last build it could run and
+  is never offered one it cannot: moving to an owned install is a reinstall.
 
 Beta stores nothing of its own: a prerelease is already detected and cached
 alongside the stable releases, and beta is the channel that lists it. So
