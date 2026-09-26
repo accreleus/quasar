@@ -352,7 +352,7 @@ describe("HostDetail — remove host (#366)", () => {
 
   it("says a host that went away before the removal was sent is not connected", async () => {
     mocked.removePlatformHost.mockRejectedValueOnce(
-      new ApiError(409, "host_not_eligible", "this host cannot take this release right now", undefined, undefined, undefined, "host_offline"),
+      new ApiError(409, "host_not_eligible", "this host's agent is not connected, so its recovery actor could not be asked; nothing was removed", undefined, undefined, undefined, "host_offline"),
     );
     renderDetail();
     fireEvent.click(await screen.findByRole("button", { name: /Remove host/ }));

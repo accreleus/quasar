@@ -673,12 +673,17 @@ machine_file() {
 # json_string <key>: the first "key": "value" on stdin.
 json_string() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1; }
 
-# uninstall_with <image> <installation>: the recovery actor's own purge of it.
+# uninstall_with <image> <installation>: the recovery actor's own purge of it. A failed
+# attempt's last lines are appended to UNINSTALL_SAID, for the error that reports it.
+UNINSTALL_SAID=""
 uninstall_with() {
-  dk run --rm --security-opt label=disable \
+  said="$(dk run --rm --security-opt label=disable \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$MACHINE_VOLUME:/var/lib/quasar-machine" \
-    "$1" uninstall --purge --confirm "$2" >/dev/null 2>&1
+    "$1" uninstall --purge --confirm "$2" 2>&1)" && return 0
+  said="$(printf '%s\n' "$said" | sed '/^[[:space:]]*$/d' | tail -n 3 | tr '\n' ' ' | sed 's/[. ]*$//')"
+  UNINSTALL_SAID="${UNINSTALL_SAID:+$UNINSTALL_SAID; }${said:-no output}"
+  return 1
 }
 
 # remove_install: this machine's GPU-host install, by the recovery actor's own
@@ -720,7 +725,7 @@ remove_install() {
     # An actor older than uninstall (#366) refuses the command: the seed's image has it.
     uninstall_with "$uninstall_image" "$inst" ||
       { [ "$uninstall_image" != "$seed_image" ] && uninstall_with "$seed_image" "$inst"; } ||
-      host_error "the recovery actor's uninstall of installation $inst did not finish; run this command again, which continues it."
+      host_error "the recovery actor's uninstall of installation $inst did not finish. It said: $UNINSTALL_SAID. Run this command again, which continues it."
   fi
   # uninstall empties the machine-state volume it has mounted; the volume goes here.
   if dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then

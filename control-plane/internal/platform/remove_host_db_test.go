@@ -259,6 +259,9 @@ func TestRemoveHostRefusesInTheContractsOrderChangingNothing(t *testing.T) {
 			if code != c.code || errCode(t, body) != c.errc || reasonOf(t, body) != c.reason {
 				t.Fatalf("= %d %s, want %d %s reason=%q", code, body, c.code, c.errc, c.reason)
 			}
+			if c.reason != "" && (bytes.Contains(body, []byte("release")) || !bytes.Contains(body, []byte("nothing was removed"))) {
+				t.Errorf("a removal refusal speaks of a release, or not of the removal: %s", body)
+			}
 			if h.agent.sentCount() != 0 {
 				t.Error("host_remove was sent")
 			}
@@ -310,6 +313,7 @@ func TestRemoveHostAckOutcomesRestoreTheCordon(t *testing.T) {
 	}{
 		{"the actor refused", Ack{OK: false, Error: "busy"}, nil, http.StatusConflict, CodeHostNotRemovable},
 		{"no ack", Ack{}, context.DeadlineExceeded, http.StatusNotImplemented, CodeApplyUnsupported},
+		{"undeliverable", Ack{}, io.ErrClosedPipe, http.StatusConflict, CodeHostNotEligible},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			h := newRemoveHarness(t)
@@ -320,6 +324,9 @@ func TestRemoveHostAckOutcomesRestoreTheCordon(t *testing.T) {
 			}
 			if c.ack.Error != "" && !bytes.Contains(body, []byte(c.ack.Error)) {
 				t.Errorf("the message does not name the ack's identifier: %s", body)
+			}
+			if c.errc == CodeHostNotEligible && (reasonOf(t, body) != ReasonHostOffline || bytes.Contains(body, []byte("release"))) {
+				t.Errorf("an undeliverable removal = %s, want host_offline in removal wording", body)
 			}
 			if h.status(t) != "online" {
 				t.Error("the cordon was not restored")

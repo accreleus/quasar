@@ -123,9 +123,13 @@ type notEligible struct {
 }
 
 func writeNotEligible(w http.ResponseWriter, reason string) {
+	writeNotEligibleMessage(w, reason, "this host cannot take this release right now")
+}
+
+func writeNotEligibleMessage(w http.ResponseWriter, reason, message string) {
 	var body notEligible
 	body.Error.Code = CodeHostNotEligible
-	body.Error.Message = "this host cannot take this release right now"
+	body.Error.Message = message
 	body.Reason = reason
 	httpx.WriteJSON(w, http.StatusConflict, body)
 }
