@@ -1086,6 +1086,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
 	pDeps.ControlPlanePreflight = selfApplier.PreflightFacts
 	if ownMachine != nil {
+		ownMachine.Log = log
 		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts
 		pDeps.ControlPlaneMachine = ownMachine.Identity
 	}
@@ -1145,16 +1146,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	platformRemove := platform.NewRemoveHandler(platform.RemoveDeps{
 		Store:     platformStore,
 		Connected: agentRegistry.IsConnected,
-		OwnNodeName: func(ctx context.Context) (string, bool) {
-			if name, ok := applyMachineShape(cfg).CombinedNodeName(); ok {
-				return name, true
-			}
-			if ownMachine != nil {
-				if m, ok := ownMachine.Read(ctx); ok {
-					return m.CombinedNodeName()
-				}
-			}
-			return "", false
+		// The shape the recovery actor wrote into this control plane's configuration,
+		// known whether or not the actor answers (control-api.md, machine_node_name).
+		OwnNodeName: func(context.Context) (string, bool) {
+			return applyMachineShape(cfg).CombinedNodeName()
 		},
 		Cordon: func(ctx context.Context, hostID string) (func(context.Context), error) {
 			held, err := admissionStore.List(ctx, hostID)

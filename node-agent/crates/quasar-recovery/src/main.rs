@@ -296,7 +296,17 @@ fn serve_planned(
     serving: &mut Vec<PathBuf>,
     stopped: &std::sync::mpsc::Sender<std::io::Error>,
 ) {
-    for plan in actor.socket_plan() {
+    let plan = match actor.socket_plan() {
+        Ok(plan) => plan,
+        Err(e) => {
+            error!(
+                token = "actor-socket-plan-unreadable",
+                "no socket is served: {e}"
+            );
+            return;
+        }
+    };
+    for plan in plan {
         if serving.contains(&plan.path) {
             continue;
         }
@@ -590,18 +600,34 @@ fn trust_from_env(machine_dir: String) -> Result<(TrustConfig, Evidence), String
                 }
             }
         };
-        let recorded = quasar_recovery::machine::MachineDir::new(&machine_dir)
-            .load_machine()
-            .ok()
-            .flatten()
-            .map(|m| m.inputs.trust)
-            .filter(|t| !t.is_empty());
+        // `Actor::trust`'s rule: recorded settings win, and unreadable state refuses.
+        let recorded = match quasar_recovery::machine::MachineDir::new(&machine_dir).load_machine()
+        {
+            Ok(m) => m.map(|m| m.inputs.trust).filter(|t| !t.is_empty()),
+            Err(e) => {
+                return SignatureEvidence::FetchError {
+                    error: format!("machine state is unreadable: {e}"),
+                }
+            }
+        };
         let (base, timeout) = match recorded {
-            Some(t) => (
-                trust::parse_manifest_base_url(t.manifest_base_url.as_deref().unwrap_or(""))
-                    .unwrap_or_else(|_| base.clone()),
-                trust::parse_manifest_timeout(t.manifest_timeout_s.as_deref().unwrap_or("")),
-            ),
+            Some(t) => {
+                match trust::parse_manifest_base_url(t.manifest_base_url.as_deref().unwrap_or("")) {
+                    Ok(recorded_base) => (
+                        recorded_base,
+                        trust::parse_manifest_timeout(
+                            t.manifest_timeout_s.as_deref().unwrap_or(""),
+                        ),
+                    ),
+                    Err(e) => {
+                        return SignatureEvidence::FetchError {
+                            error: format!(
+                                "QUASAR_UPDATER_MANIFEST_BASE_URL recorded in machine state: {e}"
+                            ),
+                        }
+                    }
+                }
+            }
             None => (base.clone(), timeout),
         };
         runtime.block_on(fetcher.evidence(&base, req.release.version.as_deref(), timeout))

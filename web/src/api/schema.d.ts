@@ -4588,8 +4588,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Remove an owned GPU host's node agent and recovery actor (admin). NOT YET SERVED - see x-unimplemented.
-         * @description AMENDMENT 14 (#353), authored ahead of the server: `x-unimplemented: true` until the RH06 slice that implements it registers the route and removes the marker (and its entry in the drift test's reviewed allowlist) in the same change. The console's "remove host". Validates (refusing the control plane's own machine's agent before anything changes), cordons the host exactly as a per-host apply does, then checks sessions (without force a remaining session refuses 409 conflict; with force they are stopped), then sends agent-api.md host_remove and answers 202 once the recovery actor accepts. It does NOT forget the host: once the host is offline the existing DELETE /v1/hosts/{id} does that, unchanged. A refusal after the cordon puts the host's cordon state back as it was found. Writes no platform_apply_attempts row. Audited as platform.remove.host.
+         * Remove an owned GPU host's node agent and recovery actor (admin).
+         * @description AMENDMENT 14 (#353); served since RH06-14 (#366). The console's "remove host". Validates (refusing the control plane's own machine's agent before anything changes), cordons the host exactly as a per-host apply does, then checks sessions (without force a remaining session refuses 409 conflict; with force they are stopped), then sends agent-api.md host_remove and answers 202 once the recovery actor accepts. It does NOT forget the host: once the host is offline the existing DELETE /v1/hosts/{id} does that, unchanged. A refusal after the cordon puts the host's cordon state back as it was found. Writes no platform_apply_attempts row. Audited as platform.remove.host.
          */
         post: {
             parameters: {

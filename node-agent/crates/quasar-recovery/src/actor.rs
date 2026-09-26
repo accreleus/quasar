@@ -565,10 +565,11 @@ impl Actor {
 
     /// The sockets this machine's role serves, as `(path in this container, caller, owner)`.
     /// The role is machine state's, else a first install's inputs, else this start's own.
-    pub fn socket_plan(&self) -> Vec<SocketPlan> {
-        let role = match self.dir.load_machine() {
-            Ok(Some(m)) => m.role,
-            _ => self
+    /// Unreadable machine state is an error: guessing a role could serve the wrong caller.
+    pub fn socket_plan(&self) -> Result<Vec<SocketPlan>, ResumeError> {
+        let role = match self.dir.load_machine()? {
+            Some(m) => m.role,
+            None => self
                 .install_inputs()
                 .map(|b| b.role)
                 .unwrap_or(self.config.role),
@@ -583,11 +584,11 @@ impl Actor {
             caller: crate::trust::Caller::ControlPlane,
             owner: Some((recipe::CONTROL_PLANE_UID, recipe::CONTROL_PLANE_UID)),
         };
-        match role {
+        Ok(match role {
             MachineRole::Gpu => vec![agent(paths::AGENT_SOCKET)],
             MachineRole::Combined => vec![agent(paths::SPLIT_AGENT_SOCKET), control],
             MachineRole::ControlOnly => vec![control],
-        }
+        })
     }
 
     /// The inputs of a first install: the seed's, read from the container that created this
@@ -808,61 +809,31 @@ impl Actor {
         let mut machine = machine.clone();
         let machine = &mut machine;
         let role = Role::NodeAgent;
-        let image = match self.dir.load_service(role)? {
-            Some(record) => record.image,
-            None => machine.install_images.get(&role).cloned().ok_or_else(|| {
-                ResumeError::Inputs("machine state names no node-agent image".into())
-            })?,
-        };
         self.ensure_volume(machine, names::AGENT_DATA_VOLUME, role)?;
         self.ensure_volume(machine, names::NODE_AGENT_SECRETS_VOLUME, role)?;
         self.ensure_volume(machine, names::AGENT_SOCKET_VOLUME, Role::RecoveryActor)?;
-        let secrets = self.node_agent_secrets()?;
-
-        if let Some(existing) = self.engine.inspect_container(role.container_name())? {
-            if machine.inputs.gpu.nvidia_shape() {
-                self.ensure_volume(machine, names::NVIDIA_DRIVER_VOLUME, role)?;
-            }
-            if !self.is_ours(machine, &existing, role) {
-                return Err(ResumeError::OwnerConflict(format!(
-                    "container {} ({}) is not this installation's; it is left untouched",
-                    existing.name, existing.image
-                )));
-            }
-            let revision = existing
-                .labels
-                .get(labels::RECIPE)
-                .and_then(|r| r.parse().ok())
-                .unwrap_or(0);
-            let spec = recipe::render(role, revision, &machine.inputs, &image, &secrets)?;
-            if existing.labels.get(labels::SPEC) != spec.labels.get(labels::SPEC) {
-                warn!(
-                    token = "actor-spec-differs",
-                    container = %existing.name,
-                    "the running node agent differs from what this actor renders; it is left as it is (replacing a service is not in this build)"
-                );
-                return Ok(());
-            }
-            if existing.status == "created" {
-                info!(container = %existing.name, "starting the node agent an interrupted install created");
-                self.engine.start_container(&existing.id)?;
-            }
-            self.record(role, revision, &image, spec)?;
-            return Ok(());
-        }
-
-        let found = self.ensure_image(&image)?;
-        let revision = image_revision(&found, &image)?;
-        self.decide_gpus(machine, &image)?;
         if machine.inputs.gpu.nvidia_shape() {
             self.ensure_volume(machine, names::NVIDIA_DRIVER_VOLUME, role)?;
         }
-        let spec = recipe::render(role, revision, &machine.inputs, &image, &secrets)?;
-        self.deliver_secrets(&image, names::NODE_AGENT_SECRETS_VOLUME, &secrets.files)?;
-        let id = self.engine.create_container(&spec)?;
-        self.engine.start_container(&id)?;
-        info!(container = names::NODE_AGENT, image = %image.reference(), revision, "node agent created and started");
-        self.record(role, revision, &image, spec)
+        let secrets = self.node_agent_secrets()?;
+        self.ensure_service(
+            machine,
+            role,
+            &secrets,
+            FileOwner::ROOT,
+            |machine, image| {
+                // A combined host's agent enrolls with the local token, which the control
+                // plane inserts when it boots.
+                if machine.role == MachineRole::Combined {
+                    self.await_healthy(names::CONTROL_PLANE);
+                }
+                self.decide_gpus(machine, image)?;
+                if machine.inputs.gpu.nvidia_shape() {
+                    self.ensure_volume(machine, names::NVIDIA_DRIVER_VOLUME, role)?;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// On an NVIDIA machine not yet known to serve `--gpus`, ask the engine before the agent
@@ -914,17 +885,7 @@ impl Actor {
     }
 
     /// Writes the secret files into a service's secrets volume through a helper container
-    /// that is created, never started, and removed.
-    pub(crate) fn deliver_secrets(
-        &self,
-        image: &ImageRef,
-        volume: &str,
-        files: &BTreeSet<String>,
-    ) -> Result<(), ResumeError> {
-        self.deliver_secrets_as(image, volume, files, FileOwner::ROOT)
-    }
-
-    /// [`Actor::deliver_secrets`], the files owned as the consuming container needs them.
+    /// that is created, never started, and removed, owned as the consuming container needs.
     pub(crate) fn deliver_secrets_as(
         &self,
         image: &ImageRef,

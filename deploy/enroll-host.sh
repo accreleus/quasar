@@ -1,62 +1,74 @@
 #!/bin/sh
 # deploy/enroll-host.sh — add this machine to a Quasar control plane as a GPU host.
-#
-#   curl -fsSL [-k --pinnedpubkey 'sha256//…'] https://<control-plane>/enroll-host.sh \
-#     | QUASAR_ENROLLMENT='qenr1.…' [QUASAR_NODE_NAME=<name>] sh
-#
-# Admin → Fleet → Add host prints that line filled in. The control plane serves this
-# file with the two images it installs written in below (QUASAR_ENROLL_SEED_IMAGE and
-# QUASAR_ENROLL_AGENT_IMAGE on the control plane), the same two its Dockge / Arcane
-# stack names. With a self-signed control plane, curl trusts nothing but the pinned
-# public key (`-k` alone would hand anyone on the path a root shell; `--pinnedpubkey`
-# is what makes `-k` safe). The two go TOGETHER: `--pinnedpubkey` on its own still
-# fails a self-signed certificate with `SSL certificate problem: self-signed
-# certificate (18)`, because curl validates the chain before it looks at the pin.
-# With a real-CA certificate neither appears. The agent then pins the certificate
-# fingerprint carried INSIDE the enrollment string. The string travels in an
-# environment variable, never a URL or an argv: it is single-use and expires, which
-# is what makes a shell-history exposure bounded.
-#
-# What it does, in order (it prints each step; nothing is silent):
-#   1. parses the string, refuses a ws:// (cleartext) control plane;
-#   2. checks the host the way the agent's readiness will: Docker, a DRM render node,
-#      /dev/uinput, unprivileged user namespaces (incl. the Ubuntu 24.04+ AppArmor
-#      knob), the NVIDIA container toolkit on NVIDIA, and loads the app-container
-#      AppArmor profile. A failed check stops here, before anything is started, and
-#      prints its fix; at a terminal it offers to apply it, QUASAR_ENROLL_FIX=1
-#      applies it without asking;
-#   3. pulls the seed and node-agent images, by digest;
-#   4. starts the seed (container quasar-seed): it creates the recovery actor, which
-#      creates the node agent with the enrollment string, node name and home root;
-#   5. waits until the agent has enrolled, or names the failure. A refused string
-#      leaves nothing behind on a machine this run installed.
-# It writes no compose file, no .env and no install directory. On a machine that is
-# already installed it starts nothing and changes nothing; it reports the agent. It
-# never edits the firewall.
-#
-# Inputs (environment):
-#   QUASAR_ENROLLMENT     required: the string from Admin → Fleet → Add host
-#   QUASAR_NODE_NAME      this host's fleet name (the command carries it when it is
-#                         bound to one), default: the machine's hostname
-#   QUASAR_HOME_ROOT      managed-home root, default /var/lib/quasar/homes
-#   QUASAR_TEMPLATE_ROOT  home-template root, default `templates` beside the home root
-#   QUASAR_SEED_IMAGE     the seed image, repository@sha256:… (default: served below)
-#   QUASAR_AGENT_IMAGE    the node-agent image, repository@sha256:… (default: served)
-#   QUASAR_ENROLL_FIX=1   apply a failed check's fix without asking; =0 never ask
-#   QUASAR_ENROLL_APPARMOR_PERSIST=1  also install the AppArmor profile in
-#                         /etc/apparmor.d so it survives a reboot (QUASAR_ENROLL_FIX=1
-#                         does too)
-#   QUASAR_ENROLL_DRY_RUN=1   check the host and print the plan; pull and start nothing
-#   QUASAR_RESET_IDENTITY=1   first remove this machine's GPU-host install (the seed,
-#                         the recovery actor, the node agent and their volumes, the
-#                         agent's saved identity included; homes are kept), so it
-#                         enrolls from scratch. For a machine whose install keeps an
-#                         enrollment string that no longer works.
-#
-# Sub-commands (argv): --fix, --reset-identity, --print-apparmor-profile, --help.
-#   `… | sh -s -- --fix` is QUASAR_ENROLL_FIX=1.
-# end-of-help
+# What it does and its inputs: help_text below, which `--help` prints (piped too).
 set -eu
+
+help_text() {
+cat <<'HELP'
+deploy/enroll-host.sh — add this machine to a Quasar control plane as a GPU host.
+
+  curl -fsSL [-k --pinnedpubkey 'sha256//…'] https://<control-plane>/enroll-host.sh \
+    | QUASAR_ENROLLMENT='qenr1.…' [QUASAR_NODE_NAME=<name>] sh
+
+Admin → Fleet → Add host prints that line filled in. The control plane serves this
+file with the two images it installs written in below (QUASAR_ENROLL_SEED_IMAGE and
+QUASAR_ENROLL_AGENT_IMAGE on the control plane), the same two its Dockge / Arcane
+stack names. With a self-signed control plane, curl trusts nothing but the pinned
+public key (`-k` alone would hand anyone on the path a root shell; `--pinnedpubkey`
+is what makes `-k` safe). The two go TOGETHER: `--pinnedpubkey` on its own still
+fails a self-signed certificate with `SSL certificate problem: self-signed
+certificate (18)`, because curl validates the chain before it looks at the pin.
+With a real-CA certificate neither appears. The agent then pins the certificate
+fingerprint carried INSIDE the enrollment string. The string travels in an
+environment variable, never a URL or an argv: it is single-use and expires, which
+is what makes a shell-history exposure bounded.
+
+What it does, in order (it prints each step; nothing is silent):
+  1. parses the string, refuses a ws:// (cleartext) control plane;
+  2. checks the host the way the agent's readiness will: Docker, a DRM render node,
+     /dev/uinput, unprivileged user namespaces (incl. the Ubuntu 24.04+ AppArmor
+     knob), the NVIDIA container toolkit on NVIDIA, and loads the app-container
+     AppArmor profile. A failed check stops here, before anything is started, and
+     prints its fix; at a terminal it offers to apply it, QUASAR_ENROLL_FIX=1
+     applies it without asking;
+  3. pulls the seed and node-agent images, by digest;
+  4. starts the seed (container quasar-seed): it creates the recovery actor, which
+     creates the node agent with the enrollment string, node name and home root;
+  5. waits until the agent has enrolled, or names the failure. A refused string
+     leaves nothing behind on a machine this run installed.
+It writes no compose file, no .env and no install directory. On a machine that is
+already installed it starts nothing and changes nothing; it reports the agent. It
+never edits the firewall.
+
+Inputs (environment):
+  QUASAR_ENROLLMENT     required: the string from Admin → Fleet → Add host
+  QUASAR_NODE_NAME      this host's fleet name (the command carries it when it is
+                        bound to one), default: the machine's hostname
+  QUASAR_HOME_ROOT      managed-home root, default /var/lib/quasar/homes
+  QUASAR_TEMPLATE_ROOT  home-template root, default `templates` beside the home root
+  QUASAR_SEED_IMAGE     the seed image, repository@sha256:… (default: served below)
+  QUASAR_AGENT_IMAGE    the node-agent image, repository@sha256:… (default: served)
+  QUASAR_ENROLL_FIX=1   apply a failed check's fix without asking; =0 never ask
+  QUASAR_ENROLL_APPARMOR_PERSIST=1  also install the AppArmor profile in
+                        /etc/apparmor.d so it survives a reboot (QUASAR_ENROLL_FIX=1
+                        does too)
+  QUASAR_ENROLL_DRY_RUN=1   check the host and print the plan and each fix; apply,
+                        pull and start nothing
+  QUASAR_RESET_IDENTITY=1   first remove this machine's GPU-host install (the seed,
+                        the recovery actor, the node agent and their volumes, the
+                        agent's saved identity included; homes are kept), so it
+                        enrolls from scratch. For a machine whose install keeps an
+                        enrollment string that no longer works.
+
+Sub-commands (argv): --fix, --fix-only, --reset-identity, --print-apparmor-profile,
+--help.
+  `… | sh -s -- --fix` is QUASAR_ENROLL_FIX=1.
+  --fix-only (or QUASAR_ENROLL_FIX_ONLY=1) prepares the host and stops: every check,
+  each failed one's fix applied, the AppArmor profile loaded and persisted. It needs no
+  enrollment string and pulls and starts nothing: for a host that takes the Dockge /
+  Arcane stack instead of this command.
+HELP
+}
 
 # Written by the control plane that serves this script (internal/enrollscript), each
 # line replaced whole; empty in the repository. testdata/enroll-host/pins.json pins it.
@@ -68,6 +80,7 @@ TAIL_SECS="${QUASAR_ENROLL_TAIL_SECS:-180}"
 DRY="${QUASAR_ENROLL_DRY_RUN:-0}"
 FIX="${QUASAR_ENROLL_FIX:-}"
 RESET_IDENTITY="${QUASAR_RESET_IDENTITY:-0}"
+FIX_ONLY="${QUASAR_ENROLL_FIX_ONLY:-0}"
 PERSIST_AA="${QUASAR_ENROLL_APPARMOR_PERSIST:-0}"
 
 # Fixed by the recovery actor's profile and recipes (quasar_runtime::owned_install,
@@ -76,6 +89,9 @@ SEED=quasar-seed
 ACTOR=quasar-recovery
 AGENT=quasar-node-agent
 MACHINE_VOLUME=quasar-machine
+# The agent socket's volume. The seed's actor profile mounts it, so the engine creates
+# it unlabelled before the actor can label anything.
+SOCKET_VOLUME=quasar-recovery-agent
 AGENT_HEALTH=http://127.0.0.1:9091/health
 
 # ── rendering ────────────────────────────────────────────────────────────────
@@ -322,21 +338,21 @@ profile quasar-app flags=(attach_disconnected,mediate_deleted) {
 PROFILE
 }
 
-usage() {
-  sed -n '2,/^# end-of-help$/p' "$0" 2>/dev/null | sed '$d' | sed 's/^# \{0,1\}//' || true
-}
 
 # ── sub-commands ─────────────────────────────────────────────────────────────
 for arg in "$@"; do
   case "$arg" in
     --print-apparmor-profile) apparmor_profile; exit 0 ;;
-    --help|-h)                usage; exit 0 ;;
+    --help|-h)                help_text; exit 0 ;;
     --reset-identity)         RESET_IDENTITY=1 ;;
     --fix)                    FIX=1 ;;
+    --fix-only)               FIX_ONLY=1 ;;
     *) usage_error "unknown argument '$arg' (try --help)" ;;
   esac
 done
 
+# read_install_inputs: the string, name, roots and images an install needs.
+read_install_inputs() {
 # ── 1. the enrollment string ─────────────────────────────────────────────────
 blob="${QUASAR_ENROLLMENT:-}"
 [ -n "$blob" ] || usage_error "QUASAR_ENROLLMENT is not set. Create a command in Admin → Fleet → Add host and run it as printed:
@@ -412,6 +428,14 @@ else
   say "  certificate: public CA — verified normally, nothing pinned"
 fi
 say "  token:       read from QUASAR_ENROLLMENT (not shown)"
+}
+
+if [ "$FIX_ONLY" = 1 ]; then
+  [ "$DRY" != 1 ] || usage_error "--fix-only applies fixes and QUASAR_ENROLL_DRY_RUN=1 applies none: use one"
+  FIX=1
+else
+  read_install_inputs
+fi
 
 # ── privileges ───────────────────────────────────────────────────────────────
 # Never prompt from inside a pipe: every privileged command runs `sudo -n`, and a
@@ -595,6 +619,12 @@ if knob_is "$knob" Y; then
   fi
 fi
 
+if [ "$FIX_ONLY" = 1 ]; then
+  say ""
+  ok "host prepared: every check passes. Nothing was pulled or started; add the host with the Dockge or Arcane stack."
+  exit 0
+fi
+
 # ── this machine as it is now ────────────────────────────────────────────────
 # names_of <docker ps filter>…: container names, one per line
 names_of() { dk ps -a --format '{{.Names}}' "$@" 2>/dev/null || true; }
@@ -650,6 +680,16 @@ remove_install() {
   if dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then
     dk volume rm "$MACHINE_VOLUME" >/dev/null 2>&1 || host_error "could not remove volume $MACHINE_VOLUME; something still holds it."
   fi
+  # Only when no container mounts it: kept otherwise, and said so.
+  LEFT=""
+  if dk volume inspect "$SOCKET_VOLUME" >/dev/null 2>&1; then
+    users="$(names_of --filter "volume=$SOCKET_VOLUME" | tr '\n' ' ' | sed 's/ $//')"
+    if [ -n "$users" ]; then
+      LEFT="the volume $SOCKET_VOLUME, which $users still mounts"
+    else
+      dk volume rm "$SOCKET_VOLUME" >/dev/null 2>&1 || LEFT="the volume $SOCKET_VOLUME, which could not be removed"
+    fi
+  fi
 }
 
 actors=""; fresh=1
@@ -657,12 +697,13 @@ if [ "$DRY" != 1 ]; then
   if [ "$RESET_IDENTITY" = 1 ]; then
     remove_install
     ok "removed this machine's GPU-host install (QUASAR_RESET_IDENTITY): it enrolls from scratch"
+    [ -z "$LEFT" ] || warn "left in place: $LEFT"
   fi
   actors="$(names_of --filter label=io.quasar.platform-service=recovery-actor)"
   # Anything of an installation already here makes this run not the installer:
   # a refused string then removes nothing.
   if [ -n "$actors$(names_of --filter label=io.quasar.installation)$(volumes_of --filter label=io.quasar.installation)" ] ||
-     dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then
+     dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1 || dk volume inspect "$SOCKET_VOLUME" >/dev/null 2>&1; then
     fresh=0
   fi
 fi
@@ -734,7 +775,10 @@ fi
 fail_install() {
   if [ "$fresh" = 1 ]; then
     remove_install
-    host_error "$1 Nothing was left on this machine: create a new command in Admin → Fleet → Add host and run it."
+    if [ -z "$LEFT" ]; then
+      host_error "$1 Nothing was left on this machine: create a new command in Admin → Fleet → Add host and run it."
+    fi
+    host_error "$1 What this run installed was removed except $LEFT; remove that, then create a new command in Admin → Fleet → Add host and run it."
   fi
   host_error "$1"
 }

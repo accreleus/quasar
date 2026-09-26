@@ -70,6 +70,8 @@ export interface HostServices {
    *  the rows are that last report, and this is when it was read (ms). */
   lastReportAt: number | null;
   shape: MachineShape;
+  /** It shares the control plane's machine (`isControlPlaneMachine`). */
+  controlPlaneHere: boolean;
   rows: ServiceRow[];
 }
 
@@ -256,6 +258,7 @@ export function hostServices(
     reportedAt,
     lastReportAt: null,
     shape: combined ? "Combined host" : "GPU host",
+    controlPlaneHere: combined,
     rows,
   };
 }

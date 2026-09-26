@@ -49,7 +49,7 @@ services, any container in the way, and the result of the last update.
 | `seed-actor-created` | It created and started `quasar-recovery`. The install proceeds there. |
 | `a recovery actor exists; nothing to do` | The normal state after the first install. |
 | `seed-inputs-invalid` | An input is missing or invalid, or the agent image declares no container shape this recovery actor carries. The line names the variable. Nothing was created. Correct the stack or `docker run` line and start the seed again. |
-| `seed-agent-image-unavailable` | The agent image cannot be pulled. Nothing was created; it tries again at the next look. |
+| `seed-agent-image-unavailable` | An image the install names cannot be pulled: the agent's, or on a combined or control-only machine the control plane's or Postgres's. The line names the variable. Nothing was created; it tries again at the next look. |
 | `seed-self-invalid` | A mount is missing, the volume is not the machine's `quasar-machine` volume (a stack without `name: quasar-machine`), or the seed's image has no registry digest. Start it by digest with both mounts. |
 | `seed-uninstalled` | The machine was uninstalled. The seed stays idle. |
 | `seed-file-unknown-format`, `seed-file-unreadable` | The seed's state file is of a format it does not know, or invalid. The seed stays idle rather than guess. |

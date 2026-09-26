@@ -658,10 +658,14 @@ impl Uninstall {
                 ));
                 continue;
             }
-            self.engine
-                .remove_volume(name)
-                .map_err(|e| stopped(format!("delete the {name} volume: {e}")))?;
-            report.say(format!("Deleted the {name} volume."));
+            match self.engine.remove_volume(name) {
+                Ok(()) => report.say(format!("Deleted the {name} volume.")),
+                // It holds only sockets: one a container still mounts is kept, and said so.
+                Err(e) if *name == names::AGENT_SOCKET_VOLUME => report.say(format!(
+                    "Kept the {name} volume: it could not be deleted ({e})."
+                )),
+                Err(e) => return Err(stopped(format!("delete the {name} volume: {e}"))),
+            }
         }
         if let Ok(Some(n)) = self.engine.inspect_network(names::PLATFORM_NETWORK) {
             if n.labels.get(labels::INSTALLATION) == Some(&machine.installation_id) {
