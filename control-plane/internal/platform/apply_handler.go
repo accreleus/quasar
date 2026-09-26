@@ -246,6 +246,13 @@ func (h *ApplyHandler) handleHostApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ADR 0008: the host's recovery actor first, when it is not on the release.
+	host := hostIdentity(view, hostID)
+	components = OrderHostComponents(components, release.SourceCommit, host, h.machineShape.SharesMachineWith(host.NodeName))
+	if len(components) == 0 {
+		writeNotEligible(w, ReasonUpToDate)
+		return
+	}
 	previous, err := h.previousDigests(ctx, hostID, components)
 	if err != nil {
 		h.internal(w, "read previous digests", err)
@@ -368,8 +375,8 @@ func hostTargetReason(v View, hostID string) string {
 	return ReasonIdentityUnknown
 }
 
-// releaseComponents is the node-agent component of a release's manifest, and
-// only that: the control-plane component is never sent to a host.
+// releaseComponents is what a release's manifest may send a host (the node agent,
+// and the recovery actor when the manifest names one), never the control plane.
 func releaseComponents(r Release) []ComponentDigest {
 	if len(r.Manifest) == 0 {
 		return nil
@@ -378,7 +385,17 @@ func releaseComponents(r Release) []ComponentDigest {
 	if err != nil {
 		return nil
 	}
-	return NodeAgentComponents(m)
+	return HostComponentsOf(m)
+}
+
+// hostIdentity is the view's identity of one host (zero when it lists none).
+func hostIdentity(v View, hostID string) HostIdentity {
+	for _, h := range v.Installed.Hosts {
+		if h.HostID == hostID {
+			return h
+		}
+	}
+	return HostIdentity{HostID: hostID}
 }
 
 func actorID(r *http.Request) string {

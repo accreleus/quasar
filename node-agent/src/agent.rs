@@ -474,6 +474,11 @@ pub async fn run(cfg: Config) {
                     sleep(Duration::from_millis(250)).await;
                     continue;
                 }
+                if e.downcast_ref::<ActorIdentityReconnect>().is_some() {
+                    sessions.registered_this_connection = false;
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 // #128: hold the running sessions instead of stopping them. The
                 // media path is agent-to-browser and needs nothing from the
                 // control plane while it is away, and on reconnect the control
@@ -1506,6 +1511,20 @@ impl std::fmt::Display for PolicySeedReconnect {
 }
 
 impl std::error::Error for PolicySeedReconnect {}
+
+/// The recovery actor was replaced under this connection (agent-api.md §register, owned
+/// installs): reconnect once so `register` reports the actor now serving. Not an
+/// enrollment, and it ends no session.
+#[derive(Debug)]
+struct ActorIdentityReconnect;
+
+impl std::fmt::Display for ActorIdentityReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("recovery actor replaced")
+    }
+}
+
+impl std::error::Error for ActorIdentityReconnect {}
 
 /// Open the control-plane socket and split it.
 ///
@@ -2791,6 +2810,11 @@ async fn connect_and_run(
                     continue;
                 };
                 send(&mut tx, &msg).await?;
+                let terminal = matches!(&msg, AgentMsg::ReleaseState { state, .. } if state == "succeeded" || state == "failed");
+                if terminal && release_mgr.take_redial() {
+                    info!(token = "release-actor-redial", "this host's recovery actor was replaced; reconnecting so register carries its identity");
+                    return Err(ActorIdentityReconnect.into());
+                }
             }
             // A host probe concluded, was deferred, or its check went not-applicable /
             // forgotten. Applying is pure in-memory work; the result reaches the

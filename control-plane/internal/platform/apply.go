@@ -317,6 +317,67 @@ func NodeAgentComponents(m Manifest) []ComponentDigest {
 	return out
 }
 
+// HostComponentsOf extracts what a release may send a host: its node-agent entry
+// and, from a manifest that names one, its recovery-actor entry, in manifest order.
+// OrderHostComponents decides which of them a given host is sent.
+func HostComponentsOf(m Manifest) []ComponentDigest {
+	out := make([]ComponentDigest, 0, 2)
+	for _, c := range m.Components {
+		if c.Name != ComponentNodeAgent && c.Name != ComponentRecovery {
+			continue
+		}
+		out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
+	}
+	return out
+}
+
+// OrderHostComponents is one host target's list, in replacement order
+// (control-api.md amendment 14, "Components of an apply on an owned machine"):
+// `[recovery-actor, node-agent]` when the host's actor is not on the release,
+// `[node-agent]` when it is, `[recovery-actor]` when only the actor is behind.
+// The actor is sent only to an owned host, and never in the host step of the
+// control plane's own machine, whose actor moves in the control-plane step.
+func OrderHostComponents(release []ComponentDigest, releaseCommit string, h HostIdentity, controlPlaneMachine bool) []ComponentDigest {
+	var agent, actor *ComponentDigest
+	for i := range release {
+		switch release[i].Name {
+		case ComponentNodeAgent:
+			agent = &release[i]
+		case ComponentRecovery:
+			actor = &release[i]
+		}
+	}
+	actorBehind := actor != nil && !controlPlaneMachine && actorBehindRelease(h, releaseCommit)
+	agentBehind := h.SourceCommit == nil || !commitsMatch(*h.SourceCommit, releaseCommit)
+	out := make([]ComponentDigest, 0, 2)
+	if actorBehind {
+		out = append(out, *actor)
+	}
+	if agent != nil && (agentBehind || !actorBehind) {
+		out = append(out, *agent)
+	}
+	return out
+}
+
+// releaseNamesActor: the release's manifest carries a recovery-actor component.
+func releaseNamesActor(r Release) bool {
+	for _, c := range releaseComponents(r) {
+		if c.Name == ComponentRecovery {
+			return true
+		}
+	}
+	return false
+}
+
+// actorBehindRelease: an owned host whose recovery actor does not report the
+// release's commit (a null commit is not on it).
+func actorBehindRelease(h HostIdentity, releaseCommit string) bool {
+	if h.InstallMode == nil || *h.InstallMode != InstallOwned {
+		return false
+	}
+	return h.RecoveryActorSourceCommit == nil || !commitsMatch(*h.RecoveryActorSourceCommit, releaseCommit)
+}
+
 // ControlPlaneComponents extracts the components the control plane may apply to
 // itself: today exactly the `control-plane` entry. Empty means the release
 // cannot move this control plane, which is a refusal and never an empty apply.

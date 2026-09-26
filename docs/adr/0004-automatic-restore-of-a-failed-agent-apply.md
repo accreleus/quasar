@@ -104,6 +104,15 @@ no `.env.prev` and no pull. The decision above is extended, and nothing in it is
   restored.** That applies to an attempt interrupted before the old container was taken out of
   service; one interrupted after that continues to verification on the next start and is restored
   under the rules above if verification fails. Nothing is ever retried on its own.
+  *(Clarification, #362.)* In a request naming several components, `interrupted` describes the
+  component being replaced when the restart came: that component was not changed and later ones
+  were never touched, while components earlier in the list that were already replaced and
+  verified stay on their new digests (the bullet above), and `output` names them. For the
+  recovery actor's own component, its old container counts as taken out of service once the
+  running actor has released the machine's lease to its successor. This clarification is
+  recorded in `protocol/agent-api.md` §`release_state` and `protocol/control-api.md` §"Failure
+  reasons"; it was made under the RH06-01 process with the coordinator's authorisation and is
+  flagged for the owner.
 - A `registry` machine keeps the updater's behaviour described above until the Go updater retires
   with RH06-15 (#367).
 

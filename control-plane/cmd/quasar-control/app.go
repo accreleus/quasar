@@ -1130,7 +1130,8 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		platformHandler.ReleaseView, webhookConfig, nil, auditStore, log)
 
 	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
-		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
+		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log).
+		WithMachineShape(applyMachineShape(cfg))
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
 		WithPreflightRefresh(refreshPreflight).
 		WithEdgeResolver(edgeApply).
@@ -1399,9 +1400,10 @@ func machineShape(cfg *config.Config) platform.MachineShape {
 	return platform.MachineShape{Role: cfg.MachineRole, NodeName: cfg.MachineNodeName}
 }
 
-// applyMachineShape is the shape the developer-apply check fails closed on. It
-// also takes the local enrollment token's node name as a combined host's, so a
-// control plane given that token without the shape variables still refuses.
+// applyMachineShape is the shape every apply decides the combined host by: its
+// recovery actor moves only with the control plane. Fails closed: it also takes
+// the local enrollment token's node name as a combined host's, so a control
+// plane given that token without the shape variables still leaves it out.
 func applyMachineShape(cfg *config.Config) platform.MachineShape {
 	if cfg.MachineRole == "" && cfg.LocalEnrollmentNodeName != "" {
 		return platform.MachineShape{Role: platform.MachineRoleCombined, NodeName: cfg.LocalEnrollmentNodeName}

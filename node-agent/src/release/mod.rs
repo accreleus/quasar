@@ -17,7 +17,7 @@ pub(crate) mod unix_http;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -121,7 +121,19 @@ pub struct ReleaseManager {
     /// [`UNREACHABLE_AFTER`] in millis, overridable so tests do not sleep for
     /// three minutes to observe a timeout.
     unreachable_after_ms: AtomicU64,
+    /// Set just before the terminal state of an apply that replaced the recovery actor
+    /// under this still-connected agent (amendment 14, §register): the connection closes
+    /// once it has forwarded that state and re-dials, so `register` carries the new actor.
+    redial: AtomicBool,
+    /// An attach found the recovery actor dark and keeps asking (`ADOPT_WINDOW`).
+    adopting: AtomicBool,
 }
+
+/// How long an attach keeps asking a recovery actor that did not answer. A daemon restart
+/// can start this agent before its actor serves again, and a successor verifying a
+/// hand-over waits for exactly this contact (`quasar_recovery::handover`, 60 s).
+const ADOPT_WINDOW: Duration = Duration::from_secs(90);
+const ADOPT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Detaches the upstream sender on every connection-end path, so a poller
 /// outliving the connection emits into nothing rather than a dead channel.
@@ -157,7 +169,30 @@ impl ReleaseManager {
             upstream: RwLock::new(None),
             inflight: Mutex::new(None),
             unreachable_after_ms: AtomicU64::new(UNREACHABLE_AFTER.as_millis() as u64),
+            redial: AtomicBool::new(false),
+            adopting: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the connection should re-dial now that it forwarded a terminal
+    /// `release_state` (see `redial`). Consumed by the call.
+    pub fn take_redial(&self) -> bool {
+        self.redial.swap(false, Ordering::SeqCst)
+    }
+
+    /// The recovery actor answering now is not the one this agent registered: an apply
+    /// named `recovery-actor` and the actor moved.
+    fn actor_replaced(&self, res: &UpdaterResult) -> bool {
+        if !matches!(self.actor, Actor::Recovery)
+            || !res.components.iter().any(|c| c.name == "recovery-actor")
+        {
+            return false;
+        }
+        let now = crate::buildinfo::discover_owned(&self.socket);
+        let registered = crate::buildinfo::install_facts();
+        now.updater_present == Some(true)
+            && (now.recovery_actor_source_commit != registered.recovery_actor_source_commit
+                || now.recovery_actor_version != registered.recovery_actor_version)
     }
 
     fn appliable(&self) -> &'static [&'static str] {
@@ -213,40 +248,83 @@ impl ReleaseManager {
     /// the attempt would sit `verifying` on the control plane for ever.
     pub fn attach_upstream(self: &Arc<Self>, tx: mpsc::Sender<AgentMsg>) -> UpstreamGuard {
         *self.upstream.write().unwrap() = Some(tx);
-        for res in self.replayable_results() {
-            info!(
-                "release apply {}: re-emitting state {} after connect",
-                res.request_id, res.state
-            );
-            if is_terminal(&res.state) {
-                self.send(res.into_msg());
-                continue;
-            }
-            let adopt = {
-                let mut inflight = self.inflight.lock().unwrap();
-                match inflight.as_deref() {
-                    // This process's own poller is already relaying it (a
-                    // reconnect, not a restart); a second watcher would only
-                    // duplicate frames.
-                    Some(cur) if cur == res.request_id => false,
-                    Some(_) => false,
-                    None => {
-                        *inflight = Some(res.request_id.clone());
-                        true
-                    }
+        match self.replayable_results() {
+            Some(results) => {
+                for res in results {
+                    self.replay(res);
                 }
-            };
-            if adopt {
-                info!(
-                    "release apply {}: adopting the in-flight apply of the agent this one replaced",
-                    res.request_id
-                );
-                self.spawn_poller(res.request_id);
-            } else {
-                self.send(res.into_msg());
             }
+            None => self.adopt_when_answered(),
         }
         UpstreamGuard { mgr: self.clone() }
+    }
+
+    /// The recovery actor did not answer at attach: ask again, backing off, until it does
+    /// or [`ADOPT_WINDOW`] ends, then replay what it reports.
+    fn adopt_when_answered(self: &Arc<Self>) {
+        if self.adopting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mgr = self.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut backoff = Duration::from_millis(250);
+            loop {
+                std::thread::sleep(backoff);
+                if let Some(results) = mgr.replayable_results() {
+                    for res in results {
+                        mgr.replay(res);
+                    }
+                    break;
+                }
+                if started.elapsed() > ADOPT_WINDOW {
+                    warn!(
+                        token = "release-actor-dark",
+                        "the recovery actor did not answer on {} within {}s of connecting; an apply it was running is reported when it next answers",
+                        mgr.socket.display(),
+                        ADOPT_WINDOW.as_secs()
+                    );
+                    break;
+                }
+                backoff = (backoff * 2).min(ADOPT_BACKOFF_MAX);
+            }
+            mgr.adopting.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Re-emit one result after a connect, adopting it when it is still in flight.
+    fn replay(self: &Arc<Self>, res: UpdaterResult) {
+        info!(
+            "release apply {}: re-emitting state {} after connect",
+            res.request_id, res.state
+        );
+        if is_terminal(&res.state) {
+            self.send(res.into_msg());
+            return;
+        }
+        let adopt = {
+            let mut inflight = self.inflight.lock().unwrap();
+            match inflight.as_deref() {
+                // This process's own poller is already relaying it (a
+                // reconnect, not a restart); a second watcher would only
+                // duplicate frames.
+                Some(cur) if cur == res.request_id => false,
+                Some(_) => false,
+                None => {
+                    *inflight = Some(res.request_id.clone());
+                    true
+                }
+            }
+        };
+        if adopt {
+            info!(
+                "release apply {}: adopting the in-flight apply of the agent this one replaced",
+                res.request_id
+            );
+            self.spawn_poller(res.request_id);
+        } else {
+            self.send(res.into_msg());
+        }
     }
 
     #[cfg(test)]
@@ -404,6 +482,9 @@ impl ReleaseManager {
                         if last.as_deref() != Some(res.state.as_str()) {
                             last = Some(res.state.clone());
                             info!("release apply {request_id}: {}", res.state);
+                            if terminal && mgr.actor_replaced(&res) {
+                                mgr.redial.store(true, Ordering::SeqCst);
+                            }
                             mgr.send_blocking(res.into_msg());
                         }
                         if terminal {
@@ -468,6 +549,11 @@ impl ReleaseManager {
     /// One attempt's result from the recovery actor's status (the most recent attempt's
     /// when `request_id` is `None`); `None` when the actor has none or did not answer.
     fn actor_result(&self, request_id: Option<&str>) -> Option<UpdaterResult> {
+        self.actor_answer(request_id).flatten()
+    }
+
+    /// [`Self::actor_result`], `None` when the actor did not answer at all.
+    fn actor_answer(&self, request_id: Option<&str>) -> Option<Option<UpdaterResult>> {
         let path = match request_id {
             Some(id) => format!("/v1/status?request_id={id}"),
             None => "/v1/status".to_string(),
@@ -477,7 +563,7 @@ impl ReleaseManager {
         if reply.status != 200 {
             return None;
         }
-        match serde_json::from_str::<ActorStatus>(&reply.body) {
+        Some(match serde_json::from_str::<ActorStatus>(&reply.body) {
             Ok(status) => status
                 .result
                 .filter(|r| request_id.is_none_or(|id| r.request_id == id)),
@@ -485,7 +571,7 @@ impl ReleaseManager {
                 debug!("recovery actor status unparsable: {e}");
                 None
             }
-        }
+        })
     }
 
     fn read_result_file(&self, path: &Path) -> Option<UpdaterResult> {
@@ -502,22 +588,26 @@ impl ReleaseManager {
     /// Every result file present that [`replay_worthy`] keeps, one per request
     /// id, ordered so the re-emit is deterministic. Age is the file's mtime: the
     /// updater rewrites the file on every state change, so it tracks
-    /// `updated_at` without parsing a timestamp.
-    fn replayable_results(&self) -> Vec<UpdaterResult> {
+    /// `updated_at` without parsing a timestamp. `None`: the recovery actor did not
+    /// answer.
+    fn replayable_results(&self) -> Option<Vec<UpdaterResult>> {
         let results_dir = match &self.actor {
             Actor::Updater { results_dir } => results_dir,
             // The actor keeps the journal: its most recent attempt is the only one an
             // agent can still speak for (single flight). Age is its `updated_at`.
             Actor::Recovery => {
-                return self
-                    .actor_result(None)
-                    .filter(|r| replay_worthy_for(r, rfc3339_age(&r.updated_at), self.appliable()))
-                    .into_iter()
-                    .collect()
+                return Some(
+                    self.actor_answer(None)?
+                        .filter(|r| {
+                            replay_worthy_for(r, rfc3339_age(&r.updated_at), self.appliable())
+                        })
+                        .into_iter()
+                        .collect(),
+                )
             }
         };
         let Ok(entries) = std::fs::read_dir(results_dir) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         let mut by_id: BTreeMap<String, UpdaterResult> = BTreeMap::new();
         for entry in entries.flatten() {
@@ -544,7 +634,7 @@ impl ReleaseManager {
             }
             by_id.insert(res.request_id.clone(), res);
         }
-        by_id.into_values().collect()
+        Some(by_id.into_values().collect())
     }
 
     /// Lossy: the connect path must never block.

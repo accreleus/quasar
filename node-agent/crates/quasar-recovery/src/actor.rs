@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 use crate::bootstrap::Bootstrap;
 use crate::engine::{Container, ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
-use crate::journal::JournalDir;
+use crate::journal::{JournalDir, Phase};
 use crate::machine::{Machine, MachineDir, ServiceRecord, FORMAT};
 use crate::probe;
 use crate::recipe::{
@@ -117,6 +117,55 @@ pub struct ActorConfig {
     /// How long an install waits for Postgres, then the control plane, to report healthy
     /// before it creates what depends on it (and creates it anyway, logged).
     pub healthy_wait: std::time::Duration,
+    pub handover: HandoverTiming,
+    /// The directory [`Actor::socket_plan`]'s sockets are served under. Fixed in the
+    /// binary: the recipes name the same paths.
+    pub socket_dir: PathBuf,
+    /// Called when this process can no longer drive its attempt (a journal it cannot
+    /// write, an injected crash): the binary exits, so the restart policy starts it again
+    /// and `resume` settles the attempt (D8).
+    pub on_died: Box<dyn Fn() + Send + Sync>,
+    /// Fault injection: called after every committed phase with the component's name and
+    /// the phase; `true` makes the process die right there.
+    #[cfg(any(test, feature = "test-support"))]
+    pub crash_after: Option<CrashAfter>,
+}
+
+/// See [`ActorConfig::crash_after`].
+#[cfg(any(test, feature = "test-support"))]
+pub type CrashAfter = Box<dyn Fn(&str, Phase) -> bool + Send + Sync>;
+
+/// A hand-over's clocks (architecture §5.6). Fields, not constants, so a test can compress
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoverTiming {
+    /// How long a started successor has to self-check and write its ready marker.
+    pub ready: std::time::Duration,
+    /// How long the old actor waits, once it released the lease, for the successor to
+    /// take it before it takes it back.
+    pub takeover: std::time::Duration,
+    /// How long a successor has to answer on its own sockets once it holds the lease.
+    pub verify: std::time::Duration,
+    /// On a GPU host, how long a successor then waits for the node agent to reach its
+    /// agent socket (the relay polls status throughout an attempt).
+    pub agent_contact: std::time::Duration,
+    /// Between two looks at the lease, the journal or a ready marker.
+    pub poll: std::time::Duration,
+    /// How often a waiting successor checks that the old actor's container still exists.
+    pub orphan_check: std::time::Duration,
+}
+
+impl Default for HandoverTiming {
+    fn default() -> Self {
+        HandoverTiming {
+            ready: std::time::Duration::from_secs(60),
+            takeover: std::time::Duration::from_secs(60),
+            verify: std::time::Duration::from_secs(60),
+            agent_contact: std::time::Duration::from_secs(60),
+            poll: std::time::Duration::from_millis(500),
+            orphan_check: std::time::Duration::from_secs(5),
+        }
+    }
 }
 
 /// This machine's trust knobs: `QUASAR_UPDATER_ALLOWED_NAMESPACES`,
@@ -186,6 +235,11 @@ impl ActorConfig {
             }),
             timing: ReplaceTiming::default(),
             healthy_wait: std::time::Duration::from_secs(180),
+            handover: HandoverTiming::default(),
+            socket_dir: paths::AGENT_SOCKET_DIR.into(),
+            on_died: Box::new(|| {}),
+            #[cfg(any(test, feature = "test-support"))]
+            crash_after: None,
         }
     }
 }
@@ -206,6 +260,10 @@ pub enum ResumeError {
     RecipeUnsupported(String),
     /// Something this build does not do yet.
     Unsupported(String),
+    /// This process is gone (a test's stand-in for the process dying).
+    Stopped,
+    /// This process is no party to a hand-over and the machine has another actor.
+    Stray(String),
 }
 
 impl std::fmt::Display for ResumeError {
@@ -220,6 +278,10 @@ impl std::fmt::Display for ResumeError {
             ResumeError::OwnerConflict(why) => write!(f, "owner_conflict: {why}"),
             ResumeError::RecipeUnsupported(why) => write!(f, "recipe_unsupported: {why}"),
             ResumeError::Unsupported(why) => write!(f, "not supported by this build: {why}"),
+            ResumeError::Stopped => f.write_str("this process was stopped"),
+            ResumeError::Stray(why) => {
+                write!(f, "this recovery actor is not this machine's ({why}); it will not act")
+            }
         }
     }
 }
@@ -272,6 +334,22 @@ pub struct Actor {
     pub(crate) resuming: std::sync::atomic::AtomicBool,
     /// Seed identities by image id: an image's labels never change.
     seed_images: Mutex<BTreeMap<String, SeedIdentity>>,
+    /// The agent socket's serving loop, while this process serves it.
+    server: Mutex<Vec<ServerHandle>>,
+    /// Itself, for the serving loop, once `serve` was called on the `Arc`.
+    me: std::sync::OnceLock<std::sync::Weak<Actor>>,
+    /// This process handed the machine to another actor and must exit.
+    retired: std::sync::atomic::AtomicBool,
+    /// This process is gone: a test stands it in for the process dying.
+    killed: std::sync::atomic::AtomicBool,
+    /// Requests another process made on this actor's agent socket.
+    external_requests: std::sync::atomic::AtomicU64,
+}
+
+struct ServerHandle {
+    path: PathBuf,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<io::Result<()>>,
 }
 
 const PLATFORM_NAMES: &[&str] = &[
@@ -299,7 +377,22 @@ impl Actor {
             worker: Mutex::new(None),
             resuming: std::sync::atomic::AtomicBool::new(false),
             seed_images: Mutex::new(BTreeMap::new()),
+            server: Mutex::new(Vec::new()),
+            me: std::sync::OnceLock::new(),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            killed: std::sync::atomic::AtomicBool::new(false),
+            external_requests: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn note_external_request(&self) {
+        self.external_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn external_requests(&self) -> u64 {
+        self.external_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Serve `status` through a separate engine client, typically one with a short
@@ -323,8 +416,179 @@ impl Actor {
         self.take_lease()
     }
 
+    /// Take the machine's lease. Only a party to an open hand-over waits for it: during a
+    /// hand-over two actors run and the lease decides which one acts (architecture §5.6).
+    /// While it waits, a successor does its part of the hand-over (`crate::handover`):
+    /// it self-checks and says it is ready, and it takes the lease only once the old actor
+    /// has handed it over, or the old actor's container is gone. Any other process is
+    /// refused at once when the lease is held or the machine has another actor.
+    pub fn acquire_lease_waiting(&self) -> Result<(), ResumeError> {
+        use std::sync::atomic::Ordering;
+        self.resuming.store(true, Ordering::SeqCst);
+        let mut logged = false;
+        let mut last_orphan_check = None;
+        let own_attempt = self.own_attempt_label();
+        loop {
+            if self.killed() {
+                return Err(ResumeError::Stopped);
+            }
+            // Anyone else acts only on a free lease, as before a hand-over existed, and never
+            // beside a party to one: taking the lease in the gap of a hand-over would be a
+            // stranger's restore beside two running actors.
+            if !self.is_handover_party(own_attempt.as_deref()) {
+                if let Some(why) = self.stray() {
+                    return Err(ResumeError::Stray(why));
+                }
+                return self.take_lease();
+            }
+            if self.may_take_lease(own_attempt.as_deref(), &mut last_orphan_check) {
+                match self.take_lease() {
+                    Ok(()) => return Ok(()),
+                    Err(ResumeError::LeaseHeld) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if !logged {
+                info!(
+                    token = "actor-lease-waiting",
+                    "another recovery actor holds this machine's lease; waiting for it"
+                );
+                logged = true;
+            }
+            self.while_waiting(own_attempt.as_deref());
+            std::thread::sleep(self.config.handover.poll);
+        }
+    }
+
+    /// Serve every socket of [`Actor::socket_plan`], each on a thread of its own. Only the
+    /// lease holder may: the lease is what makes a leftover socket file certainly stale.
+    /// A socket already served is left alone, so the binary calls it again once a first
+    /// install has learnt its role. Returns the sockets that could not be bound.
+    pub fn serve(self: &Arc<Self>) -> Vec<(PathBuf, io::Error)> {
+        let _ = self.me.set(Arc::downgrade(self));
+        self.serve_again()
+    }
+
+    /// [`Actor::serve`] from `&self`, once `serve` has been called on the `Arc`.
+    pub(crate) fn serve_again(&self) -> Vec<(PathBuf, io::Error)> {
+        let mut servers = self.server.lock().unwrap();
+        let plan = match self.socket_plan() {
+            Ok(plan) => plan,
+            Err(e) => {
+                let why = format!("this machine's sockets are unknown: {e}");
+                return vec![(self.config.socket_dir.clone(), io::Error::other(why))];
+            }
+        };
+        let actor = match self.me.get().and_then(std::sync::Weak::upgrade) {
+            Some(actor) if !self.killed() => actor,
+            found => {
+                let why = if found.is_some() {
+                    "this process was stopped"
+                } else {
+                    "this actor never served its sockets"
+                };
+                return plan
+                    .into_iter()
+                    .map(|p| (p.path, io::Error::other(why)))
+                    .collect();
+            }
+        };
+        let mut failed = Vec::new();
+        for p in plan {
+            if servers.iter().any(|h| h.path == p.path) {
+                continue;
+            }
+            let listener = match crate::server::bind_owned(&p.path, p.owner) {
+                Ok(listener) => listener,
+                Err(e) => {
+                    failed.push((p.path, e));
+                    continue;
+                }
+            };
+            info!(socket = %p.path.display(), caller = ?p.caller, "serving");
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (flag, actor, caller) = (stop.clone(), actor.clone(), p.caller);
+            let thread =
+                std::thread::spawn(move || crate::server::serve(listener, actor, caller, flag));
+            servers.push(ServerHandle {
+                path: p.path,
+                stop,
+                thread,
+            });
+        }
+        failed
+    }
+
+    /// Whether any socket is being served.
+    pub fn serving(&self) -> bool {
+        !self.server.lock().unwrap().is_empty()
+    }
+
+    /// Stop serving, before the lease is released: the next holder binds the paths afresh.
+    pub(crate) fn stop_serving(&self) {
+        let handles = std::mem::take(&mut *self.server.lock().unwrap());
+        for handle in &handles {
+            handle.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        for handle in handles {
+            let _ = handle.thread.join();
+        }
+    }
+
+    /// A serving loop that ended on its own, with its socket and why; `None` while every
+    /// socket serves, and after a deliberate stop.
+    pub fn serving_failed(&self) -> Option<(PathBuf, io::Error)> {
+        let mut servers = self.server.lock().unwrap();
+        let at = servers.iter().position(|h| h.thread.is_finished())?;
+        let handle = servers.remove(at);
+        let why = match handle.thread.join() {
+            Ok(Err(e)) => e,
+            Ok(Ok(())) => io::Error::other("the socket stopped"),
+            Err(_) => io::Error::other("the socket thread panicked"),
+        };
+        Some((handle.path, why))
+    }
+
+    pub(crate) fn release_lease(&self) {
+        *self.lease.lock().unwrap() = None;
+    }
+
+    /// This process handed the machine to another recovery actor: the binary exits, and
+    /// its disabled restart policy keeps it down.
+    pub fn retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn retire(&self) {
+        self.stop_serving();
+        self.release_lease();
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A test's stand-in for this process dying: it stops serving, drops the lease and
+    /// acts on nothing more.
+    pub fn kill(&self) {
+        self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_serving();
+        self.release_lease();
+    }
+
+    pub(crate) fn killed(&self) -> bool {
+        self.killed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn died(&self) {
+        if !self.killed() {
+            (self.config.on_died)();
+        }
+    }
+
     pub fn resume(&self) -> Result<(), ResumeError> {
         use std::sync::atomic::Ordering;
+        if self.killed() {
+            return Err(ResumeError::Stopped);
+        }
         self.resuming.store(true, Ordering::SeqCst);
         let result = self.resume_inner();
         self.resuming.store(false, Ordering::SeqCst);
@@ -333,10 +597,14 @@ impl Actor {
 
     fn resume_inner(&self) -> Result<(), ResumeError> {
         self.take_lease()?;
-        self.sweep_helpers()?;
         // D8: an attempt a restart left open reaches its outcome before anything else
-        // looks at the machine's services, and no new attempt is started here.
+        // looks at the machine's services, and no new attempt is started here. First, so
+        // nothing else a start does can leave a hand-over waiting on this process.
         self.settle_open()?;
+        if self.retired() {
+            return Ok(());
+        }
+        self.sweep_helpers()?;
         let machine = match self.dir.load_machine()? {
             Some(machine) => {
                 self.note_ignored_inputs(&machine);
@@ -413,7 +681,7 @@ impl Actor {
         }
     }
 
-    fn take_lease(&self) -> Result<(), ResumeError> {
+    pub(crate) fn take_lease(&self) -> Result<(), ResumeError> {
         let mut lease = self.lease.lock().unwrap();
         if lease.is_some() {
             return Ok(());
@@ -429,6 +697,8 @@ impl Actor {
             )));
         }
         match self.dir.lease() {
+            // A process that is gone never holds the lease, even one it had just taken.
+            Ok(_) if self.killed() => Err(ResumeError::Stopped),
             Ok(held) => {
                 *lease = Some(held);
                 Ok(())
@@ -567,13 +837,20 @@ impl Actor {
                 .map(|b| b.role)
                 .unwrap_or(self.config.role),
         };
+        // The constants are the binary's paths; a test serves the same layout elsewhere.
+        let at = |path: &str| {
+            let rel = std::path::Path::new(path)
+                .strip_prefix(paths::AGENT_SOCKET_DIR)
+                .expect("every socket lives in the socket directory");
+            self.config.socket_dir.join(rel)
+        };
         let agent = |path: &str| SocketPlan {
-            path: path.into(),
+            path: at(path),
             caller: crate::trust::Caller::Agent,
             owner: None,
         };
         let control = SocketPlan {
-            path: paths::CONTROL_SOCKET.into(),
+            path: at(paths::CONTROL_SOCKET),
             caller: crate::trust::Caller::ControlPlane,
             owner: Some((recipe::CONTROL_PLANE_UID, recipe::CONTROL_PLANE_UID)),
         };
@@ -622,6 +899,7 @@ impl Actor {
             None => None,
         };
         let mut inputs = Inputs {
+            unknown: Default::default(),
             installation_id,
             node_name: checked.node_name.clone(),
             home_root: checked.home_root.clone(),
@@ -638,6 +916,7 @@ impl Actor {
         if checked.control.is_some() {
             // The seed a new GPU host runs is this machine's recovery image.
             inputs.enroll = recipe::EnrollImages {
+                unknown: Default::default(),
                 seed: self
                     .own_container()?
                     .and_then(|me| own_image(self.engine.as_ref(), &me))
@@ -699,6 +978,7 @@ impl Actor {
         }
 
         let machine = Machine {
+            unknown: Default::default(),
             format: FORMAT,
             installation_id: inputs.installation_id.clone(),
             role: checked.role,

@@ -107,16 +107,32 @@ impl FakeState {
     }
 }
 
+/// A container lifecycle change an engine call made, for a test that runs a process per
+/// container (the recovery actor's hand-over has two).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// A container started running (not a helper, which runs to completion at once).
+    Started(String),
+    /// A running container was stopped.
+    Stopped(String),
+    /// A container was removed.
+    Removed(String),
+}
+
+type Hook = std::sync::Arc<dyn Fn(&Lifecycle) + Send + Sync>;
+
 #[derive(Default)]
 struct Inner {
     state: FakeState,
     calls: usize,
     faults: Vec<Fault>,
+    events: Vec<Lifecycle>,
 }
 
 #[derive(Default)]
 pub struct FakeEngine {
     inner: Mutex<Inner>,
+    hook: Mutex<Option<Hook>>,
 }
 
 const HELPER_LABEL: &str = "io.quasar.helper";
@@ -129,8 +145,16 @@ impl FakeEngine {
                 state,
                 calls: 0,
                 faults: Vec::new(),
+                events: Vec::new(),
             }),
+            hook: Mutex::new(None),
         }
+    }
+
+    /// Called, outside the engine's lock, after every call that started, stopped or
+    /// removed a container.
+    pub fn on_lifecycle(&self, hook: impl Fn(&Lifecycle) + Send + Sync + 'static) {
+        *self.hook.lock().unwrap() = Some(std::sync::Arc::new(hook));
     }
 
     pub fn state(&self) -> FakeState {
@@ -176,8 +200,24 @@ impl FakeEngine {
     /// `After` fault.
     fn call<T>(
         &self,
-        op: impl FnOnce(&mut FakeState) -> Result<T, EngineError>,
+        op: impl FnOnce(&mut FakeState, &mut Vec<Lifecycle>) -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
+        let (result, events) = self.call_locked(op);
+        if !events.is_empty() {
+            let hook = self.hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                for event in &events {
+                    hook(event);
+                }
+            }
+        }
+        result
+    }
+
+    fn call_locked<T>(
+        &self,
+        op: impl FnOnce(&mut FakeState, &mut Vec<Lifecycle>) -> Result<T, EngineError>,
+    ) -> (Result<T, EngineError>, Vec<Lifecycle>) {
         let mut inner = self.inner.lock().unwrap();
         let index = inner.calls;
         inner.calls += 1;
@@ -189,16 +229,21 @@ impl FakeEngine {
                 .map(|f| f.error.clone())
         };
         if let Some(error) = fault(When::Before) {
-            return Err(error);
+            return (Err(error), Vec::new());
         }
         let after = fault(When::After);
         if inner.state.unreachable {
-            return Err(EngineError::Runtime(ErrorKind::Unavailable));
+            return (
+                Err(EngineError::Runtime(ErrorKind::Unavailable)),
+                Vec::new(),
+            );
         }
-        let result = op(&mut inner.state);
+        let inner = &mut *inner;
+        let result = op(&mut inner.state, &mut inner.events);
+        let events = std::mem::take(&mut inner.events);
         match after {
-            Some(error) => Err(error),
-            None => result,
+            Some(error) => (Err(error), events),
+            None => (result, events),
         }
     }
 }
@@ -278,11 +323,11 @@ fn view(s: &FakeState, c: &FakeContainer) -> Container {
 
 impl PlatformEngine for FakeEngine {
     fn host(&self) -> Result<EngineHost, EngineError> {
-        self.call(|s| Ok(s.host.clone()))
+        self.call(|s, _ev| Ok(s.host.clone()))
     }
 
     fn inspect_image(&self, reference: &str) -> Result<Option<Image>, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             Ok(s.images
                 .get(reference)
                 .or_else(|| s.images.values().find(|i| i.id == reference))
@@ -291,7 +336,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn pull(&self, reference: &str) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let image = s
                 .registry
                 .get(reference)
@@ -303,11 +348,11 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn inspect_container(&self, name_or_id: &str) -> Result<Option<Container>, EngineError> {
-        self.call(|s| Ok(find(s, name_or_id).map(|c| view(s, c))))
+        self.call(|s, _ev| Ok(find(s, name_or_id).map(|c| view(s, c))))
     }
 
     fn list_containers(&self) -> Result<Vec<Container>, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let mut all: Vec<Container> = s.containers.values().map(|c| view(s, c)).collect();
             all.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(all)
@@ -315,7 +360,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn create_container(&self, spec: &ContainerSpec) -> Result<String, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             if !spec.gpus.is_empty() && !s.gpus_create_failures.is_empty() {
                 return Err(s.gpus_create_failures.remove(0));
             }
@@ -369,7 +414,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn start_container(&self, id: &str) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, ev| {
             let id = find_id(s, id)?;
             let output = s.probe_output.clone();
             let gpus_supported = s.gpus_supported;
@@ -407,25 +452,27 @@ impl PlatformEngine for FakeEngine {
                     c.health = b.health;
                     c.logs = b.logs;
                 }
+                ev.push(Lifecycle::Started(id.clone()));
             }
             Ok(())
         })
     }
 
     fn stop_container(&self, id: &str, _grace: Duration) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, ev| {
             let id = find_id(s, id)?;
             let c = s.containers.get_mut(&id).unwrap();
             if c.status == "running" {
                 c.status = "exited".into();
                 c.exit_code = Some(0);
+                ev.push(Lifecycle::Stopped(id.clone()));
             }
             Ok(())
         })
     }
 
     fn set_restart_policy(&self, id: &str, policy: RestartPolicy) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let id = find_id(s, id)?;
             s.containers.get_mut(&id).unwrap().restart = policy;
             Ok(())
@@ -433,7 +480,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn rename_container(&self, id: &str, name: &str) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             if s.container_named(name).is_some() {
                 return Err(engine(ErrorKind::Engine));
             }
@@ -444,16 +491,17 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn remove_container(&self, id: &str) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, ev| {
             if let Ok(id) = find_id(s, id) {
                 s.containers.remove(&id);
+                ev.push(Lifecycle::Removed(id));
             }
             Ok(())
         })
     }
 
     fn wait_container(&self, id: &str, _timeout: Duration) -> Result<i64, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let c = find(s, id).ok_or(engine(ErrorKind::Missing))?;
             match (c.status.as_str(), c.exit_code) {
                 ("running", _) => Err(engine(ErrorKind::Timeout)),
@@ -464,7 +512,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn logs_tail(&self, id: &str, _lines: usize) -> Result<String, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             find(s, id)
                 .map(|c| c.logs.clone())
                 .ok_or(engine(ErrorKind::Missing))
@@ -472,7 +520,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn upload_archive(&self, id: &str, path: &str, tar: Vec<u8>) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let c = find(s, id).ok_or(engine(ErrorKind::Missing))?;
             let volume = c
                 .spec
@@ -509,7 +557,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn inspect_volume(&self, name: &str) -> Result<Option<Volume>, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             Ok(s.volumes.get(name).map(|v| Volume {
                 name: name.into(),
                 labels: v.labels.clone(),
@@ -524,7 +572,7 @@ impl PlatformEngine for FakeEngine {
         name: &str,
         labels: &BTreeMap<String, String>,
     ) -> Result<Volume, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let v = s.volumes.entry(name.into()).or_insert_with(|| FakeVolume {
                 labels: labels.clone(),
                 files: BTreeMap::new(),
@@ -540,7 +588,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn inspect_network(&self, name: &str) -> Result<Option<Network>, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             Ok(s.networks.get(name).map(|labels| Network {
                 name: name.into(),
                 labels: labels.clone(),
@@ -553,7 +601,7 @@ impl PlatformEngine for FakeEngine {
         name: &str,
         labels: &BTreeMap<String, String>,
     ) -> Result<Network, EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             if s.networks.contains_key(name) {
                 return Err(refused(
                     409,
@@ -569,7 +617,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn remove_network(&self, name: &str) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let in_use = s
                 .containers
                 .values()
@@ -583,7 +631,7 @@ impl PlatformEngine for FakeEngine {
     }
 
     fn remove_volume(&self, name: &str) -> Result<(), EngineError> {
-        self.call(|s| {
+        self.call(|s, _ev| {
             let in_use = s
                 .containers
                 .values()

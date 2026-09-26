@@ -1611,7 +1611,8 @@ manager's stack can carry them; they are read **only on a clean machine**, from 
 container when the seed created the actor (`QUASAR_SEED_CONTAINER`, set by the seed), else
 from its own environment. Once machine state exists (`machine.json` in the `quasar-machine`
 volume) it wins, and a later start's inputs are ignored (a differing home root is logged
-`token="actor-input-ignored"`). A seed-created actor takes the installation id from its
+`token="actor-input-ignored"`). An actor keeps the fields of `machine.json` it does not know and
+writes them back, so an older actor put back by a revert leaves a newer one's state intact. A seed-created actor takes the installation id from its
 own container's label, so the seed, machine state and `seed.json` name one installation.
 A machine installed before `seed.json` existed (an actor started by hand, then replaced by a
 seed) is labelled with a new installation while machine state keeps the old one; the actor
@@ -1671,7 +1672,8 @@ or only the container toolkit's hook).
 
 **Replacing the node agent (#360).** The agent relays a `release_apply` to its actor over
 the agent socket (`POST /v1/submit`), which may name only `node-agent` and
-`recovery-actor` (replacing the actor itself arrives with RH06-10). The actor journals
+`recovery-actor` (the actor only on a GPU host; see "Replacing the recovery actor"
+below). Components are replaced in the order sent. The actor journals
 every phase to `journal/<request-id>.json` in machine state before acting on it, pulls,
 stops the old agent, disables its restart policy and renames it
 `quasar-node-agent.kept`, creates and starts the new one, and waits up to 300 s (or the
@@ -1690,10 +1692,52 @@ answer `busy`, status reports it in flight, and a start settles nothing
 `actor-journal-write-failed`. `docker exec quasar-recovery quasar-recovery status`
 shows the last attempt's result.
 
+**Replacing the recovery actor (#362).** A request naming `recovery-actor` is a
+hand-over (`docs/rh06/2026-09-24-architecture.md` §5.6): the running actor creates
+`quasar-recovery.next` from its recipe, keeping its own `QUASAR_SEED_CONTAINER` and
+`RUST_LOG` (and its `QUASAR_UPDATER_*` only on a machine whose state records no release
+trust: recorded trust wins over the variables), starts it, and waits up to 60 s for its
+ready marker (`handover/<request-id>.ready` in machine state). It then stops serving and
+releases `actor.lease`; the successor takes it (`token="actor-handover-taking-over"`),
+stops the old actor, disables its restart policy, renames it `quasar-recovery.kept`, takes
+the name `quasar-recovery`, and verifies: it answers on each of its own sockets within 60 s
+(time the container engine does not answer is not counted, up to ten minutes, so a
+live-restore daemon restart does not fail a healthy successor), and on a GPU host another
+process reaches one of its sockets within a further 60 s. That is normally the node agent,
+whose relay polls status throughout an attempt and, when it connects to a socket that is
+still dark (a daemon restart can start it first), keeps asking for up to 90 s
+(`token="release-actor-dark"` if it never answers); an operator's `quasar-recovery status`
+counts too. An agent that is down leaves the successor unverified. Only then is `.kept` removed and `seed.json` rewritten to name the new image
+(`token="actor-seed-file-updated"`). A successor that never becomes ready, never takes the
+lease, fails to verify, or is started three times without verifying is removed and the
+previous actor runs again: `failed`, `restored: true`. Every restart point settles to a
+stated outcome, and throughout at least one container carries the actor's two seed
+labels, or an unlabelled one holds the actor's name, so the seed never creates an actor
+beside a hand-over. Only the two actors of a hand-over wait for the lease
+(`token="actor-lease-waiting"`); any other actor process exits
+(`token="actor-lease-unavailable"`) when the lease is held, when a party to an open
+hand-over still exists, or when another container holds the name `quasar-recovery`, so a
+duplicate actor never takes the machine in the moment the lease changes hands. An actor
+that cannot take the name back after a failed hand-over serves nothing and exits
+(`token="actor-name-not-taken"`). The one case needing a person, a successor that cannot
+start at all after the old actor was stopped, is fixed by
+`docker start quasar-recovery.kept 2>/dev/null || docker start quasar-recovery` (the old
+actor is under the first name, or under the second when the successor stopped between
+stopping and renaming it; it then takes the lease and restores itself); removing every `quasar-recovery*` container instead lets the
+seed re-create the last verified actor. An attempt naming the actor and the agent moves
+the actor first; a later failure restores only the agent, and the actor stays on the new
+image (the output says so). After an attempt that replaced the actor, the agent
+reconnects once (`token="release-actor-redial"`) so its `register` reports the new actor.
+A hand-over may replace an actor started by hand without the installation's labels: it is
+the actor handing over. An actor whose container carries `com.docker.compose.*` labels is
+declared by an external manager, which only the seed may be (ADR 0007), and a request to
+replace it is refused `owner_conflict` with nothing changed.
+
 **One socket, one name.** On a GPU host the actor listens at `/run/quasar-recovery/agent.sock`, inside the `quasar-recovery-agent` volume it mounts read-write; that path is fixed, not an actor input. On a combined or control-only machine the same volume holds one subdirectory per socket: the agent socket at `agent/agent.sock` and the **control socket** at `control/control.sock` (owned by the control plane's uid, 1000). Each container is given only its own subdirectory, bound read-only by the volume's daemon-host path (Engine API 1.40 has no volume sub-paths; the seed's frozen profile mounts one socket volume): the agent sees `/run/quasar-recovery/agent.sock` as on a GPU host, the control plane `/run/quasar-recovery/control.sock` (`QUASAR_RECOVERY_CONTROL_SOCKET`). A request on the control socket is the control plane's, one on the agent socket the agent's. This needs the engine's `local` volume driver, which reports a host path for the volume. The agent it creates mounts the same volume read-only at the same path and is told where through `QUASAR_RECOVERY_SOCKET` (see "Node agent — connection & identity"), which the actor's recipe sets. Both names come from one constant module (`quasar_runtime::owned_install`), so the two sides cannot drift.
 
 On start the actor takes the machine's lease (`actor.lease`; a second actor on the same
-volume exits `token="actor-lease-unavailable"`), creates machine state, detects the GPU
+volume exits, `token="actor-lease-unavailable"`, unless it is one of a hand-over's two
+actors, which waits), creates machine state, detects the GPU
 with a disposable probe container, and creates `quasar-node-agent` from its recipe with its
 volumes (`quasar-agent-data`, `quasar-node-agent-secrets`, and `quasar-nvidia-driver` on an
 NVIDIA host whose engine serves `--gpus`). A second start on an installed machine changes

@@ -154,6 +154,7 @@ fn the_current_fixture_set_is_what_the_current_actor_writes() {
 fn every_actor_container_a_recovery_actor_renders_carries_more_than_the_seed_labels() {
     use quasar_recovery::recipe::{self, Book, Role, SecretMounts};
     let inputs = quasar_recovery::recipe::Inputs {
+        unknown: Default::default(),
         installation_id: INSTALLATION.into(),
         node_name: "gpu-host-01".into(),
         home_root: HOME.into(),
