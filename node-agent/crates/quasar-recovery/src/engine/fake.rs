@@ -90,6 +90,157 @@ pub struct FakeState {
     pub behaviour: BTreeMap<String, Behaviour>,
     pub unreachable: bool,
     pub next_id: u64,
+    /// The control plane's database, as the database helpers (`crate::database`) and a
+    /// starting control plane see it. `None`: nothing simulates one.
+    pub database: Option<FakeDatabase>,
+    /// A database helper's forced outcome, by its helper label (`db-dump`, ...): its exit
+    /// code and output, with no other effect.
+    pub db_failures: BTreeMap<String, (i64, String)>,
+    /// Every control-plane image started against a database whose schema is above the one
+    /// the image declares: what must never happen.
+    pub older_control_planes_started: Vec<String>,
+}
+
+/// A database: its `schema_migrations` row and a token standing for its rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FakeDatabase {
+    pub schema_version: i64,
+    pub dirty: bool,
+    pub rows: String,
+    pub size_bytes: u64,
+}
+
+/// What the in-memory engine's `pg_dump` writes: a custom-format archive's magic, then the
+/// database it holds.
+pub fn dump_bytes(db: &FakeDatabase) -> Vec<u8> {
+    format!(
+        "PGDMP fake archive\nschema={}\ndirty={}\nrows={}\nsize={}\n",
+        db.schema_version,
+        if db.dirty { "t" } else { "f" },
+        db.rows,
+        db.size_bytes
+    )
+    .into_bytes()
+}
+
+fn parse_dump(bytes: &[u8]) -> Option<FakeDatabase> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if !lines.next()?.starts_with("PGDMP") {
+        return None;
+    }
+    let mut db = FakeDatabase::default();
+    for line in lines {
+        let (k, v) = line.split_once('=')?;
+        match k {
+            "schema" => db.schema_version = v.parse().ok()?,
+            "dirty" => db.dirty = v == "t",
+            "rows" => db.rows = v.into(),
+            "size" => db.size_bytes = v.parse().ok()?,
+            _ => {}
+        }
+    }
+    Some(db)
+}
+
+/// One database helper run: `(exit code, output)`. Files are real, under the host path the
+/// helper's `/dumps` bind names (a test's temporary machine-state directory).
+fn db_helper(s: &mut FakeState, spec: &ContainerSpec, op: &str) -> (i64, String) {
+    if let Some(forced) = s.db_failures.get(op) {
+        return forced.clone();
+    }
+    let file = spec.env.get("QUASAR_DUMP_FILE").and_then(|f| {
+        let (dir, name) = f.rsplit_once('/')?;
+        let bind = spec.binds.iter().find(|b| b.target == dir)?;
+        Some((
+            std::path::Path::new(&bind.source).join(name),
+            bind.read_only,
+        ))
+    });
+    let owned = spec.env.get("PGHOST").map(String::as_str) == Some("quasar-postgres");
+    let reachable = !owned
+        || s.containers
+            .values()
+            .any(|c| c.spec.name == "quasar-postgres" && c.status == "running");
+    let unreachable = (2, "psql: error: connection to server failed\n".to_string());
+    let schema_line = |db: &FakeDatabase| {
+        format!(
+            "schema={} dirty={}\n",
+            db.schema_version,
+            if db.dirty { "t" } else { "f" }
+        )
+    };
+    match op {
+        "db-size" => match (&s.database, reachable) {
+            (Some(db), true) => (0, format!("{}\n", db.size_bytes)),
+            _ => unreachable,
+        },
+        "db-schema" => match (&s.database, reachable) {
+            (Some(db), true) => (0, schema_line(db)),
+            _ => unreachable,
+        },
+        "db-dump" => {
+            let (Some(db), true) = (&s.database, reachable) else {
+                return unreachable;
+            };
+            match file {
+                Some((path, false)) => match std::fs::write(&path, dump_bytes(db)) {
+                    Ok(()) => (0, String::new()),
+                    Err(e) => (
+                        1,
+                        format!("pg_dump: error: could not open output file: {e}\n"),
+                    ),
+                },
+                _ => (1, "pg_dump: error: no writable output file\n".into()),
+            }
+        }
+        "db-inspect" | "db-load" => {
+            let Some((path, _)) = file else {
+                return (1, "pg_restore: error: no input file\n".into());
+            };
+            let Some(archived) = std::fs::read(&path).ok().and_then(|b| parse_dump(&b)) else {
+                return (
+                    1,
+                    "pg_restore: error: input file does not appear to be a valid archive\n".into(),
+                );
+            };
+            if op == "db-inspect" {
+                return (0, schema_line(&archived));
+            }
+            if !reachable {
+                return unreachable;
+            }
+            s.database = Some(archived);
+            (0, String::new())
+        }
+        _ => (0, String::new()),
+    }
+}
+
+/// A control plane starting against the database: it migrates it up to the schema its
+/// image declares, or, older than the database, is recorded as what must never happen.
+fn control_plane_boot(s: &mut FakeState, spec: &ContainerSpec) {
+    if spec
+        .labels
+        .get("io.quasar.platform-service")
+        .map(String::as_str)
+        != Some("control-plane")
+    {
+        return;
+    }
+    let declared = s
+        .images
+        .get(&spec.image)
+        .and_then(|i| i.labels.get("org.quasar.schema.version"))
+        .and_then(|v| v.parse::<i64>().ok());
+    let (Some(db), Some(declared)) = (s.database.as_mut(), declared) else {
+        return;
+    };
+    if declared < db.schema_version {
+        s.older_control_planes_started.push(spec.image.clone());
+    } else {
+        db.schema_version = declared;
+    }
 }
 
 impl FakeState {
@@ -439,19 +590,29 @@ impl PlatformEngine for FakeEngine {
                 return Err(refused(500, &message));
             }
             c.starts += 1;
-            // A helper runs to completion at once; only the GPU probe prints anything.
-            if let Some(helper) = c.spec.labels.get(HELPER_LABEL) {
+            // A helper runs to completion at once; the GPU probe prints its report and a
+            // database helper acts on the simulated database.
+            if let Some(helper) = c.spec.labels.get(HELPER_LABEL).cloned() {
+                let spec = c.spec.clone();
+                let (code, logs) = if helper.starts_with("db-") {
+                    db_helper(s, &spec, &helper)
+                } else if helper == PROBE_HELPER {
+                    (0, output)
+                } else {
+                    (0, String::new())
+                };
+                let c = s.containers.get_mut(&id).unwrap();
                 c.status = "exited".into();
-                c.exit_code = Some(0);
-                if helper == PROBE_HELPER {
-                    c.logs = output;
-                }
+                c.exit_code = Some(code);
+                c.logs = logs;
             } else {
                 c.status = "running".into();
                 if let Some(b) = behaviour {
                     c.health = b.health;
                     c.logs = b.logs;
                 }
+                let spec = c.spec.clone();
+                control_plane_boot(s, &spec);
                 ev.push(Lifecycle::Started(id.clone()));
             }
             Ok(())

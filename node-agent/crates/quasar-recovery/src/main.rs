@@ -12,7 +12,7 @@ use quasar_recovery::bootstrap::Bootstrap;
 use quasar_recovery::engine::DockerEngine;
 use quasar_recovery::recipe::paths;
 use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
-use quasar_recovery::socket::Request;
+use quasar_recovery::socket::{Request, State};
 use quasar_recovery::trust::{self, SignatureEvidence};
 use quasar_recovery::{identity, server, shutdown};
 use tracing::{error, info};
@@ -26,9 +26,23 @@ commands:
             serve its sockets (docs/configuration.md \"Recovery actor\")
   status    print this machine's inventory, as the running actor serves it (in the seed's
             container: what the seed last did)
+  restore   on a control-plane machine, inside the running actor
+            (docker exec quasar-recovery quasar-recovery restore ...):
+              restore --list                        the pre-update dumps kept here
+              restore --dump <name> --to <version>  load a pre-update dump into Quasar's
+                                                    database and start the control plane
+                                                    it was taken under
+              restore --to <version>                on your own database, once you have
+                                                    restored your backup: start that
+                                                    control plane if the schema matches
+              restore --dump -                      a fresh install (seed started with
+                                                    QUASAR_AWAIT_RESTORE=1): load a
+                                                    pg_dump --format=custom file from stdin
+                                                    (docker exec -i ... < file) before the
+                                                    control plane's first boot
   version   print this build's version and commit
 
-restore, uninstall and reconfigure are not in this build.";
+uninstall and reconfigure are not in this build.";
 
 /// In the seed's own container only: what its last look came to, for the health check.
 const SEED_STATUS_FILE: &str = "/tmp/quasar-seed.status";
@@ -56,7 +70,8 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Some("restore") | Some("uninstall") | Some("reconfigure") => {
+        Some("restore") => restore(&args[1..]),
+        Some("uninstall") | Some("reconfigure") => {
             eprintln!(
                 "quasar-recovery: `{}` is not in this build\n\n{USAGE}",
                 args[0]
@@ -107,6 +122,155 @@ fn status() -> ExitCode {
         last.unwrap_or_else(|| "no recovery-actor socket in this container".into())
     );
     ExitCode::FAILURE
+}
+
+/// The operator's `restore`: a client of the operator socket, which only a process in the
+/// actor's own container reaches. It submits, then follows the restore to its outcome.
+fn restore(args: &[String]) -> ExitCode {
+    let mut dump = None;
+    let mut to = None;
+    let mut list = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dump" => dump = it.next().cloned(),
+            "--to" => to = it.next().cloned(),
+            "--list" => list = true,
+            other => {
+                eprintln!("quasar-recovery restore: unknown argument {other:?}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let socket = std::path::PathBuf::from(
+        env("QUASAR_OPERATOR_SOCKET")
+            .unwrap_or_else(|| quasar_recovery::restore::OPERATOR_SOCKET.into()),
+    );
+    if !socket.exists() {
+        eprintln!(
+            "quasar-recovery restore: no operator socket at {}: run this inside the recovery actor, `docker exec {} quasar-recovery restore ...`, on the machine that runs the control plane",
+            socket.display(),
+            quasar_recovery::recipe::names::RECOVERY_ACTOR
+        );
+        return ExitCode::FAILURE;
+    }
+    if list || (dump.is_none() && to.is_none()) {
+        return list_dumps(&socket);
+    }
+    if dump.as_deref() == Some("-") {
+        let machine_dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
+        let dir = quasar_recovery::dump::DumpDir::new(std::path::Path::new(&machine_dir));
+        let name = format!(
+            "import-{}",
+            quasar_recovery::dump::stamp(&quasar_recovery::actor::rfc3339_now())
+        );
+        let written = dir
+            .ensure()
+            .and_then(|()| {
+                quasar_recovery::dump::write_import(std::io::stdin().lock(), &dir.partial(&name))
+            })
+            .and_then(|n| dir.complete(&name).map(|()| n));
+        match written {
+            Ok(n) => eprintln!("read {n} bytes from stdin as {name}"),
+            Err(e) => {
+                let _ = std::fs::remove_file(dir.partial(&name));
+                eprintln!("quasar-recovery restore: the dump could not be read from stdin: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        dump = Some(name);
+    }
+    let id = quasar_recovery::actor::random_request_id();
+    let req = quasar_recovery::restore::request(id.clone(), dump, to);
+    let body = serde_json::to_string(&req).expect("a request encodes");
+    let followed = match server::call(&socket, "POST", "/v1/submit", &body) {
+        Ok((202, _)) => id,
+        Ok((status, body)) => {
+            let rejection = serde_json::from_str::<quasar_recovery::socket::Rejection>(&body);
+            match rejection {
+                Ok(r) => eprintln!(
+                    "quasar-recovery restore: refused ({}): {}",
+                    r.reason, r.message
+                ),
+                Err(_) => eprintln!("quasar-recovery restore: the actor answered {status}: {body}"),
+            }
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("quasar-recovery restore: the recovery actor did not answer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("restore {followed} admitted; following it (it continues if this command stops)");
+    let mut said = None;
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let status = server::call(
+            &socket,
+            "GET",
+            &format!("/v1/status?request_id={followed}"),
+            "",
+        )
+        .ok()
+        .filter(|(code, _)| *code == 200)
+        .and_then(|(_, body)| serde_json::from_str::<quasar_recovery::socket::Status>(&body).ok());
+        let Some(result) = status.and_then(|s| s.result) else {
+            continue;
+        };
+        if said != Some(result.state) {
+            said = Some(result.state);
+            eprintln!(
+                "{}",
+                match result.state {
+                    State::Pending => "admitted",
+                    State::Pulling => "checking the dump and the control plane it belongs to",
+                    State::Recreating => "stopping the control plane and loading the database",
+                    State::Verifying => "waiting for the control plane to report healthy",
+                    State::Succeeded => "done",
+                    State::Failed => "failed",
+                }
+            );
+        }
+        if result.state.is_terminal() {
+            println!("{}", result.output);
+            return if result.state == State::Succeeded {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
+        }
+    }
+}
+
+fn list_dumps(socket: &std::path::Path) -> ExitCode {
+    let status = match server::call(socket, "GET", "/v1/status", "") {
+        Ok((200, body)) => serde_json::from_str::<quasar_recovery::socket::Status>(&body),
+        Ok((code, body)) => {
+            eprintln!("quasar-recovery restore: the actor answered {code}: {body}");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("quasar-recovery restore: the recovery actor did not answer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(status) = status else {
+        eprintln!("quasar-recovery restore: the status did not decode");
+        return ExitCode::FAILURE;
+    };
+    if status.dumps.is_empty() {
+        println!("no pre-update dumps are kept on this machine");
+    }
+    for d in &status.dumps {
+        println!(
+            "{}  schema {}  taken {}  {}",
+            d.name,
+            d.schema_version,
+            d.created_at,
+            quasar_recovery::dump::human(d.size_bytes.max(0) as u64)
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn explain(body: &str) {
@@ -211,6 +375,7 @@ fn actor() -> ExitCode {
     if let Some(fallback) = env("QUASAR_DOCKER_SOCKET_HOST_PATH") {
         config.docker_socket_fallback = fallback;
     }
+    config.machine_dir_host = env("QUASAR_MACHINE_DIR_HOST_PATH");
 
     let engines = DockerEngine::from_environment().and_then(|engine| {
         let mut short = quasar_runtime::RuntimeConfig::from_environment()?;

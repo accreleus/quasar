@@ -53,6 +53,20 @@ pub fn bind_owned(path: &Path, owner: Option<(u32, u32)>) -> io::Result<UnixList
     Ok(listener)
 }
 
+/// Who a socket serves: the caller its mount makes it (the agent or the control plane), or
+/// the operator, whose socket sits in the actor's own container and takes `restore` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Door {
+    Socket(Caller),
+    Operator,
+}
+
+impl From<Caller> for Door {
+    fn from(caller: Caller) -> Self {
+        Door::Socket(caller)
+    }
+}
+
 /// How often a serving loop looks at its stop flag between connections.
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
@@ -63,9 +77,10 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 pub fn serve(
     listener: UnixListener,
     actor: Arc<Actor>,
-    caller: Caller,
+    door: impl Into<Door>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let door = door.into();
     listener.set_nonblocking(true)?;
     let open = Arc::new(AtomicUsize::new(0));
     loop {
@@ -86,7 +101,7 @@ pub fn serve(
             open.fetch_sub(1, Ordering::SeqCst);
             warn!(
                 token = "actor-socket-busy",
-                socket = socket_name(caller),
+                socket = socket_name(door),
                 "too many connections; one closed unanswered"
             );
             continue;
@@ -94,22 +109,23 @@ pub fn serve(
         let actor = actor.clone();
         let open = open.clone();
         std::thread::spawn(move || {
-            if let Err(e) = answer(stream, &actor, caller) {
-                debug!(socket = socket_name(caller), "{e}");
+            if let Err(e) = answer(stream, &actor, door) {
+                debug!(socket = socket_name(door), "{e}");
             }
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn socket_name(caller: Caller) -> &'static str {
-    match caller {
-        Caller::Agent => "agent",
-        Caller::ControlPlane => "control",
+fn socket_name(door: Door) -> &'static str {
+    match door {
+        Door::Socket(Caller::Agent) => "agent",
+        Door::Socket(Caller::ControlPlane) => "control",
+        Door::Operator => "operator",
     }
 }
 
-fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Result<()> {
+fn answer(mut stream: UnixStream, actor: &Arc<Actor>, door: Door) -> io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut head = Vec::new();
@@ -139,11 +155,14 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
             let request_id = query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("request_id="));
-            let body = serde_json::to_string(&actor.status_as(caller, request_id))
-                .map_err(io::Error::other)?;
+            let status = match door {
+                Door::Socket(caller) => actor.status_as(caller, request_id),
+                Door::Operator => actor.status_operator(request_id),
+            };
+            let body = serde_json::to_string(&status).map_err(io::Error::other)?;
             respond(&mut stream, 200, &body)
         }
-        ("POST", "/v1/submit") => submit(&mut stream, &head, actor, caller),
+        ("POST", "/v1/submit") => submit(&mut stream, &head, actor, door),
         (_, "/v1/status") | (_, "/v1/submit") => {
             respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
         }
@@ -153,12 +172,7 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
 
 /// `POST /v1/submit`: the caller is the socket's, because authority follows the mount.
 /// `202` with the `Accepted`, `409` (`busy`) or `400` with the `Rejection`.
-fn submit(
-    stream: &mut UnixStream,
-    head: &str,
-    actor: &Arc<Actor>,
-    caller: Caller,
-) -> io::Result<()> {
+fn submit(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>, door: Door) -> io::Result<()> {
     let length = head
         .lines()
         .find_map(|l| {
@@ -185,7 +199,11 @@ fn submit(
             return respond(stream, 400, &body);
         }
     };
-    match actor.submit(caller, request) {
+    let answered = match door {
+        Door::Socket(caller) => actor.submit(caller, request),
+        Door::Operator => actor.submit_restore(request),
+    };
+    match answered {
         Ok(accepted) => {
             let body = serde_json::to_string(&accepted).map_err(io::Error::other)?;
             respond(stream, 202, &body)
@@ -194,7 +212,7 @@ fn submit(
             warn!(
                 token = "actor-submit-refused",
                 reason = %rejection.reason,
-                socket = socket_name(caller),
+                socket = socket_name(door),
                 "a submit was refused: {}", rejection.message
             );
             let status = if rejection.reason == Reason::Busy {
@@ -225,6 +243,26 @@ fn respond(stream: &mut UnixStream, status: u16, body: &str) -> io::Result<()> {
         body.len()
     )?;
     stream.flush()
+}
+
+/// One request on a socket: the status code and the body.
+pub fn call(path: &Path, method: &str, target: &str, body: &str) -> io::Result<(u16, String)> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    let request = format!(
+        "{method} {target} HTTP/1.0\r\nHost: recovery\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut raw = String::new();
+    stream.take(4 * 1024 * 1024).read_to_string(&mut raw)?;
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| io::Error::other(format!("the actor answered {head:?}")))?;
+    Ok((code, body.to_owned()))
 }
 
 /// The operator's `quasar-recovery status`: one `GET /v1/status`, the body as served.

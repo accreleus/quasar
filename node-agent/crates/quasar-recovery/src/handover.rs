@@ -488,7 +488,7 @@ impl Actor {
                 Phase::Restoring | Phase::HandingBack => {
                     return self.restore_actor(j, i, party).map(|()| Flow::Ended);
                 }
-                Phase::OldKept | Phase::Created | Phase::Started => {
+                Phase::OldKept | Phase::Created | Phase::Started | Phase::Dumping => {
                     let detail = format!(
                         "the recovery actor's component is journalled in the node agent's phase {phase:?}"
                     );

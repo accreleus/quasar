@@ -30,6 +30,7 @@ use crate::recipe::{
     SecretMounts, TrustInputs,
 };
 use crate::seed;
+use crate::server::Door;
 use crate::socket::{
     ActorIdentity, AttemptResult, Conflict, DatabaseMode, MachineRole, Request, SeedIdentity,
     Service, Status,
@@ -68,6 +69,7 @@ pub struct OperatorInputs {
     pub database_name: Option<String>,
     pub database_sslmode: Option<String>,
     pub database_password: Option<String>,
+    pub await_restore: Option<String>,
     pub app_puid: Option<String>,
     pub app_pgid: Option<String>,
     pub container_network: Option<String>,
@@ -125,11 +127,25 @@ pub struct ActorConfig {
     /// write, an injected crash): the binary exits, so the restart policy starts it again
     /// and `resume` settles the attempt (D8).
     pub on_died: Box<dyn Fn() + Send + Sync>,
+    /// The daemon-host path of `machine_dir`, when self-inspection cannot tell (a test, or
+    /// `QUASAR_MACHINE_DIR_HOST_PATH`): the pre-update dump helper binds its `dumps/`.
+    pub machine_dir_host: Option<String>,
+    /// Free bytes on the filesystem of a path: where the pre-update dumps are written.
+    pub free_space: FreeSpace,
+    /// How long one database operation (a dump, a load) may run.
+    pub database_timeout: std::time::Duration,
+    /// The operator socket (`crate::restore`), in this container's own filesystem and no
+    /// volume, so only a process started in this container (`docker exec`) reaches it.
+    /// `None`: `operator.sock` in `<socket_dir>-operator`, beside the socket volume.
+    pub operator_socket: Option<PathBuf>,
     /// Fault injection: called after every committed phase with the component's name and
     /// the phase; `true` makes the process die right there.
     #[cfg(any(test, feature = "test-support"))]
     pub crash_after: Option<CrashAfter>,
 }
+
+/// See [`ActorConfig::free_space`].
+pub type FreeSpace = Box<dyn Fn(&std::path::Path) -> io::Result<u64> + Send + Sync>;
 
 /// See [`ActorConfig::crash_after`].
 #[cfg(any(test, feature = "test-support"))]
@@ -238,6 +254,10 @@ impl ActorConfig {
             handover: HandoverTiming::default(),
             socket_dir: paths::AGENT_SOCKET_DIR.into(),
             on_died: Box::new(|| {}),
+            machine_dir_host: None,
+            free_space: Box::new(crate::dump::free_bytes),
+            database_timeout: crate::database::DEFAULT_TIMEOUT,
+            operator_socket: None,
             #[cfg(any(test, feature = "test-support"))]
             crash_after: None,
         }
@@ -260,6 +280,8 @@ pub enum ResumeError {
     RecipeUnsupported(String),
     /// Something this build does not do yet.
     Unsupported(String),
+    /// A control plane older than the database's schema would be created or started.
+    OlderControlPlane(String),
     /// This process is gone (a test's stand-in for the process dying).
     Stopped,
     /// This process is no party to a hand-over and the machine has another actor.
@@ -278,6 +300,7 @@ impl std::fmt::Display for ResumeError {
             ResumeError::OwnerConflict(why) => write!(f, "owner_conflict: {why}"),
             ResumeError::RecipeUnsupported(why) => write!(f, "recipe_unsupported: {why}"),
             ResumeError::Unsupported(why) => write!(f, "not supported by this build: {why}"),
+            ResumeError::OlderControlPlane(why) => write!(f, "control plane not started: {why}"),
             ResumeError::Stopped => f.write_str("this process was stopped"),
             ResumeError::Stray(why) => {
                 write!(f, "this recovery actor is not this machine's ({why}); it will not act")
@@ -358,7 +381,11 @@ const PLATFORM_NAMES: &[&str] = &[
     names::CONTROL_PLANE,
     names::POSTGRES,
 ];
-const HELPER_NAMES: &[&str] = &[names::GPU_PROBE, names::SECRETS_WRITER];
+const HELPER_NAMES: &[&str] = &[
+    names::GPU_PROBE,
+    names::SECRETS_WRITER,
+    crate::database::HELPER,
+];
 const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 const SECRETS_HELPER: &str = "secrets-writer";
 
@@ -494,29 +521,48 @@ impl Actor {
             }
         };
         let mut failed = Vec::new();
-        for p in plan {
-            if servers.iter().any(|h| h.path == p.path) {
+        // The operator's socket is served wherever a control plane is; a GPU host has no
+        // database to restore.
+        let operator = plan
+            .iter()
+            .any(|p| p.caller == crate::trust::Caller::ControlPlane)
+            .then(|| (self.operator_socket(), Door::Operator, None));
+        let doors = plan
+            .into_iter()
+            .map(|p| (p.path, Door::Socket(p.caller), p.owner))
+            .chain(operator);
+        for (path, door, owner) in doors {
+            if servers.iter().any(|h| h.path == path) {
                 continue;
             }
-            let listener = match crate::server::bind_owned(&p.path, p.owner) {
+            let listener = match crate::server::bind_owned(&path, owner) {
                 Ok(listener) => listener,
                 Err(e) => {
-                    failed.push((p.path, e));
+                    failed.push((path, e));
                     continue;
                 }
             };
-            info!(socket = %p.path.display(), caller = ?p.caller, "serving");
+            info!(socket = %path.display(), door = ?door, "serving");
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (flag, actor, caller) = (stop.clone(), actor.clone(), p.caller);
+            let (flag, actor) = (stop.clone(), actor.clone());
             let thread =
-                std::thread::spawn(move || crate::server::serve(listener, actor, caller, flag));
-            servers.push(ServerHandle {
-                path: p.path,
-                stop,
-                thread,
-            });
+                std::thread::spawn(move || crate::server::serve(listener, actor, door, flag));
+            servers.push(ServerHandle { path, stop, thread });
         }
         failed
+    }
+
+    /// Where the operator socket is served (`ActorConfig::operator_socket`).
+    pub fn operator_socket(&self) -> PathBuf {
+        self.config.operator_socket.clone().unwrap_or_else(|| {
+            let dir = &self.config.socket_dir;
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            dir.with_file_name(format!("{name}-operator"))
+                .join("operator.sock")
+        })
     }
 
     /// Whether any socket is being served.
@@ -643,10 +689,18 @@ impl Actor {
     /// attempts, nor the control socket the agent's. `in_flight` stays machine-wide: it is
     /// what makes a second submit `busy`, whoever sent the first.
     pub fn status_as(&self, caller: crate::trust::Caller, request_id: Option<&str>) -> Status {
+        self.status_tagged(crate::submit::caller_tag(caller), request_id)
+    }
+
+    /// [`Actor::status_as`] for the operator socket: only the operator's own restores.
+    pub fn status_operator(&self, request_id: Option<&str>) -> Status {
+        self.status_tagged(crate::journal::CallerTag::Operator, request_id)
+    }
+
+    fn status_tagged(&self, mine: crate::journal::CallerTag, request_id: Option<&str>) -> Status {
         let mut status = self.inventory_status();
         let scan = self.journals.scan();
         status.in_flight = scan.open_id();
-        let mine = crate::submit::caller_tag(caller);
         status.result = match request_id {
             Some(id) if crate::submit::is_uuid(id) => self
                 .journals
@@ -694,6 +748,26 @@ impl Actor {
             None if role == MachineRole::Gpu => DatabaseMode::None,
             None => DatabaseMode::Owned,
         };
+        let (dumps, dump_free_bytes) = if database == DatabaseMode::Owned && machine.is_some() {
+            let dir = crate::dump::DumpDir::new(self.dir.root());
+            let dumps = dir
+                .list()
+                .into_iter()
+                .filter(|d| !d.imported)
+                .map(|d| d.wire())
+                .collect();
+            let at = if dir.path().is_dir() {
+                dir.path()
+            } else {
+                self.dir.root()
+            };
+            let free = (self.config.free_space)(at)
+                .ok()
+                .and_then(|b| i64::try_from(b).ok());
+            (dumps, free)
+        } else {
+            (Vec::new(), None)
+        };
         Status {
             actor: self.identity(),
             seed: inventory.seed,
@@ -703,7 +777,8 @@ impl Actor {
             services: inventory.services,
             conflicts: inventory.conflicts,
             in_flight: None,
-            dumps: Vec::new(),
+            dumps,
+            dump_free_bytes,
             result: None,
             stale,
         }
@@ -781,7 +856,7 @@ impl Actor {
 
     /// A probe or secrets writer left by a crash is removed; nothing else is touched.
     fn sweep_helpers(&self) -> Result<(), ResumeError> {
-        for name in [names::GPU_PROBE, names::SECRETS_WRITER] {
+        for name in HELPER_NAMES {
             if let Some(c) = self.engine.inspect_container(name)? {
                 if c.labels.contains_key(labels::HELPER) {
                     info!(container = %c.name, "removing a helper left by an interrupted start");
@@ -1014,6 +1089,24 @@ impl Actor {
             inputs,
             install_images,
         };
+        // Before machine state: once machine.json exists nothing re-reads the inputs, so a
+        // hold written after it could be lost to a crash and the control plane would boot.
+        if checked.control.as_ref().is_some_and(|c| c.await_restore) {
+            crate::database::store_hold(
+                self.dir.root(),
+                &crate::database::Hold {
+                    format: 1,
+                    reason: crate::database::HoldReason::AwaitRestore,
+                    since: (self.config.now)(),
+                    request_id: None,
+                },
+            )?;
+            info!(
+                token = "actor-awaiting-restore",
+                "this install holds its control plane until a restore: run `docker exec -i {} quasar-recovery restore --dump - < <your pg_dump file>`",
+                names::RECOVERY_ACTOR
+            );
+        }
         self.dir.machine().store(&machine)?;
         info!(installation = %machine.installation_id, node = %machine.inputs.node_name, role = ?machine.role, "machine state created");
         Ok(machine)
@@ -1224,6 +1317,13 @@ impl Actor {
             ports: Vec::new(),
             healthcheck: None,
         };
+        // One an interrupted delivery left: a restore settling on the next start delivers
+        // before `resume` sweeps helpers.
+        if let Some(stale) = self.engine.inspect_container(names::SECRETS_WRITER)? {
+            if stale.labels.get(labels::HELPER).map(String::as_str) == Some(SECRETS_HELPER) {
+                self.engine.remove_container(&stale.id)?;
+            }
+        }
         let id = self.engine.create_container(&writer)?;
         let uploaded = self.engine.upload_archive(&id, "/secrets", archive);
         let removed = self.engine.remove_container(&id);
@@ -1482,6 +1582,11 @@ fn tar_of(entries: &[(String, String)], owner: FileOwner) -> Result<Vec<u8>, Res
         builder.append_data(&mut header, name, value.as_bytes())?;
     }
     Ok(builder.into_inner()?)
+}
+
+/// A fresh request id (a v4 uuid), for the operator's `restore`.
+pub fn random_request_id() -> String {
+    random_uuid()
 }
 
 pub(crate) fn random_uuid() -> String {

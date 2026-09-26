@@ -21,6 +21,8 @@
 
 pub mod actor;
 pub mod bootstrap;
+pub mod database;
+pub mod dump;
 pub mod engine;
 pub mod explain;
 pub mod handover;
@@ -28,9 +30,11 @@ pub mod identity;
 mod install_control;
 pub mod journal;
 pub mod machine;
+mod migrate;
 pub mod probe;
 pub mod recipe;
 pub mod replace;
+pub mod restore;
 pub mod seed;
 pub mod server;
 pub mod settle;

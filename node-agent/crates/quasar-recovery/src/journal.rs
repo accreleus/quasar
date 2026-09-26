@@ -30,6 +30,9 @@ pub const KEEP_FINISHED: usize = 16;
 pub enum CallerTag {
     ControlPlane,
     Agent,
+    /// The operator's `restore` command, on the operator socket inside the actor's own
+    /// container. An older actor cannot read the tag, so it never settles such a journal.
+    Operator,
 }
 
 /// One component's progress. The phase names the step that is **about to be, or being,
@@ -81,6 +84,10 @@ pub enum Phase {
     /// The successor has put the old actor back under its name and is starting it; the
     /// old actor finishes the restore once it holds the lease.
     HandingBack,
+    /// A migrating control plane only, between `checked` and `old_kept`: taking the
+    /// pre-update dump of a Quasar-owned database, or recording the restore point of an
+    /// external one. The old control plane still runs.
+    Dumping,
 }
 
 impl Phase {
@@ -92,6 +99,7 @@ impl Phase {
             Phase::Admitted
                 | Phase::Pulling
                 | Phase::Checked
+                | Phase::Dumping
                 | Phase::CreatingSuccessor
                 | Phase::StartingSuccessor
                 | Phase::AwaitingSuccessor
@@ -107,6 +115,7 @@ impl Phase {
             // A successor running beside the old actor has taken nothing out of service.
             Phase::Pulling
             | Phase::Checked
+            | Phase::Dumping
             | Phase::CreatingSuccessor
             | Phase::StartingSuccessor
             | Phase::AwaitingSuccessor => State::Pulling,
@@ -150,6 +159,14 @@ pub struct Step {
     /// step. Bounds a successor that crash-loops once the old actor is stopped.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub successor_starts: u32,
+    /// A control plane only: whether this replacement moves the database's schema forward,
+    /// by the request or by the images' own schema labels, whichever says so. Decided at
+    /// `checked`. A migrating control plane is never restored automatically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub migrating: bool,
+    /// The pre-update dump this step took, once it is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dump: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -174,6 +191,9 @@ pub struct Journal {
     /// The attempt as `status` serves it: kept current with every phase, so the wire
     /// projection is never recomputed from a half-read journal.
     pub result: AttemptResult,
+    /// A `restore` request's progress (`crate::restore`); such a journal has no steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<crate::restore::Restore>,
 }
 
 impl Journal {
@@ -193,6 +213,9 @@ impl Journal {
             return;
         }
         let mut state = State::Pending;
+        if let Some(restore) = &self.restore {
+            state = restore.phase.wire_state();
+        }
         for step in &self.steps {
             let s = step.phase.wire_state();
             if rank(s) > rank(state) {

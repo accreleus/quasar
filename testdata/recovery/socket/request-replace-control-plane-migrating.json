@@ -21,6 +21,7 @@
     "external_backup_confirmed": true,
     "dump": null,
     "purge": false,
-    "wait_timeout_s": 600
+    "wait_timeout_s": 600,
+    "from_version": "0.3.0"
   }
 }
