@@ -333,6 +333,52 @@ describe("HostDetail — remove host (#366)", () => {
     expect((within(dialog).getByRole("button", { name: /Remove host/ }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("reads a disconnected owned host that an admission hold keeps 'draining' as not connected", async () => {
+    // Live on the owned fleet: the journal reconciliation hold keeps a gone agent's host
+    // `draining`; only its stopped heartbeat says it is gone.
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        status: "draining",
+        admission_restrictions: [{ owner_kind: "reconciliation", reason: "journal_reconciliation" }] as never,
+        last_heartbeat_at: new Date(NOW - 10 * 60_000).toISOString(),
+      }),
+    } as never);
+    renderDetail();
+    fireEvent.click(await screen.findByRole("button", { name: /Remove host/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("gpu-host-4 is not connected")).toBeTruthy();
+    expect((within(dialog).getByRole("button", { name: /Remove host/ }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("says a host that went away before the removal was sent is not connected", async () => {
+    mocked.removePlatformHost.mockRejectedValueOnce(
+      new ApiError(409, "host_not_eligible", "this host's agent is not connected, so its recovery actor could not be asked; nothing was removed", undefined, undefined, undefined, "host_offline"),
+    );
+    renderDetail();
+    fireEvent.click(await screen.findByRole("button", { name: /Remove host/ }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: /Remove host/ }));
+    const note = (await screen.findByText("Removing gpu-host-4 did not finish.")).closest(".note") as HTMLElement;
+    expect(note.textContent).toContain("It is not connected, so its recovery actor could not be asked");
+  });
+
+  it("counts a removal done when the host's heartbeats stop, though its drain keeps it 'draining'", async () => {
+    renderDetail();
+    fireEvent.click(await screen.findByRole("button", { name: /Remove host/ }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: /Remove host/ }));
+    expect(await screen.findByText(/removing the node agent, then\s+itself/)).toBeTruthy();
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        status: "draining",
+        admission_restrictions: [{ owner_kind: "manual", reason: "manual_drain" }] as never,
+        last_heartbeat_at: new Date(NOW - 3000).toISOString(),
+      }),
+    } as never);
+    await act(async () => {
+      vi.advanceTimersByTime(70_000);
+    });
+    expect(await screen.findByText("gpu-host-4 was removed.")).toBeTruthy();
+  });
+
   it("opens the confirmation when the Hosts tab sends the admin here to remove", async () => {
     renderDetail(`/admin/fleet/hosts/${ID}?remove=1`);
     expect(await screen.findByText("Remove gpu-host-4?")).toBeTruthy();

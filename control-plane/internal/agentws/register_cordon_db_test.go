@@ -80,6 +80,104 @@ func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 	}
 }
 
+// recordRemoval writes the remove route's audit record for a host, `ago` in the past.
+func recordRemoval(t *testing.T, pool *pgxpool.Pool, hostID string, ago string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `INSERT INTO admin_activity (action, target_type, target_id, details, created_at)
+		VALUES ('platform.remove.host', 'host', $1, '{"node_name":"n","force":false}', now() - $2::interval)`, hostID, ago); err != nil {
+		t.Fatalf("record removal: %v", err)
+	}
+}
+
+func setDrainCreatedAt(t *testing.T, pool *pgxpool.Pool, hostID string, ago string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `UPDATE host_admission_restrictions SET created_at = now() - $2::interval
+		WHERE host_id = $1::uuid AND owner_kind = 'manual'`, hostID, ago); err != nil {
+		t.Fatalf("set drain created_at: %v", err)
+	}
+}
+
+// #366: a console removal cordons the host with the operator-drain owner when no drain is
+// held. Adding the host back onto its row (a new enrollment) lifts that drain, and only
+// that one: an operator's own drain, older than the removal, stays.
+func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T) {
+	pool := testPool(t)
+	s := &agentStore{pool: pool}
+	holds := admission.NewStore(pool)
+	ctx := context.Background()
+	const token = "shared-enrollment-token-366"
+
+	// The removal's own drain: taken seconds before the removal was audited.
+	res, err := s.enrollHost(ctx, "removed-host", "0.3.0", token, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holds.Acquire(ctx, res.HostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
+	setDrainCreatedAt(t, pool, res.HostID, "2 hours")
+	recordRemoval(t, pool, res.HostID, "7196 seconds")
+	if err := s.markOffline(ctx, res.HostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.enrollHost(ctx, "removed-host", "0.3.1", token, token); err != nil {
+		t.Fatalf("re-add: %v", err)
+	}
+	if got := hostStatus(t, pool, res.HostID); got != "online" {
+		t.Fatalf("status after the re-add = %q, want online (the removal's drain lifted)", got)
+	}
+	if r, _ := holds.List(ctx, res.HostID); len(r) != 0 {
+		t.Fatalf("holds after the re-add = %+v, want none", r)
+	}
+
+	// An operator drain held before the removal: the route took none of its own.
+	res2, err := s.enrollHost(ctx, "drained-then-removed", "0.3.0", token, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holds.Acquire(ctx, res2.HostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
+	setDrainCreatedAt(t, pool, res2.HostID, "3 hours")
+	recordRemoval(t, pool, res2.HostID, "1 hour")
+	if err := s.markOffline(ctx, res2.HostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.enrollHost(ctx, "drained-then-removed", "0.3.1", token, token); err != nil {
+		t.Fatalf("re-add: %v", err)
+	}
+	if got := hostStatus(t, pool, res2.HostID); got != "draining" {
+		t.Fatalf("status = %q, want draining: the operator's own drain stays", got)
+	}
+
+	// A platform owner's hold is never touched, even beside a removal's drain.
+	res3, err := s.enrollHost(ctx, "removed-mid-run", "0.3.0", token, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := admission.Owner{Kind: admission.Platform, ID: "00000000-0000-0000-0000-000000000366"}
+	if _, err := holds.Acquire(ctx, res3.HostID, run, admission.ReasonPlatformApply); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holds.Acquire(ctx, res3.HostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
+	recordRemoval(t, pool, res3.HostID, "0 seconds")
+	if err := s.markOffline(ctx, res3.HostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.enrollHost(ctx, "removed-mid-run", "0.3.1", token, token); err != nil {
+		t.Fatalf("re-add: %v", err)
+	}
+	r, _ := holds.List(ctx, res3.HostID)
+	if len(r) != 1 || r[0].OwnerKind != admission.Platform {
+		t.Fatalf("holds = %+v, want only the platform owner's", r)
+	}
+	if got := hostStatus(t, pool, res3.HostID); got != "draining" {
+		t.Fatalf("status = %q, want draining while the platform owner holds", got)
+	}
+}
+
 // TestEnrollHostKeepsADrainingHostDraining is the same rule on the enrol/upsert
 // path: re-enrolling a known node_name is not an uncordon either.
 func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {

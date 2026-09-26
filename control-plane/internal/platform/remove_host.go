@@ -132,11 +132,11 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.deps.Connected != nil && !h.deps.Connected(hostID) {
-		writeNotEligible(w, ReasonHostOffline)
+		writeRemovalNotEligible(w, ReasonHostOffline)
 		return
 	}
 	if host.UpdaterPresent != nil && !*host.UpdaterPresent {
-		writeNotEligible(w, ReasonUpdaterAbsent)
+		writeRemovalNotEligible(w, ReasonUpdaterAbsent)
 		return
 	}
 	if host.InstallMode == nil || *host.InstallMode != InstallOwned {
@@ -192,7 +192,7 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 		// before an ack). The contract's word for "nobody to tell" is host_offline; a
 		// removal the actor did accept shows as the host staying offline.
 		restore(ctx)
-		writeNotEligible(w, ReasonHostOffline)
+		writeRemovalNotEligible(w, ReasonHostOffline)
 		return
 	case !ack.OK:
 		restore(ctx)
@@ -217,4 +217,13 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 func (h *RemoveHandler) internal(w http.ResponseWriter, what string, err error) {
 	h.log.Error("host removal: "+what+" failed", "err", err)
 	httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not remove the host")
+}
+
+// writeRemovalNotEligible keeps the apply route's code and reason with removal wording.
+func writeRemovalNotEligible(w http.ResponseWriter, reason string) {
+	msg := "this host's agent is not connected, so its recovery actor could not be asked; nothing was removed"
+	if reason == ReasonUpdaterAbsent {
+		msg = "this host's recovery actor has not answered, so it could not be asked; nothing was removed"
+	}
+	writeNotEligibleMessage(w, reason, msg)
 }
