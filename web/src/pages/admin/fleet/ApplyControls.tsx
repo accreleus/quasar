@@ -218,7 +218,7 @@ function ApplyHistoryRow({
       ];
   return (
     <div className="rel-fact stack">
-      <div className="rowflex" style={{ justifyContent: "space-between", width: "100%" }}>
+      <div className="rowflex between" style={{ width: "100%" }}>
         <span>
           {movesActor && a.requested_digests.length === 1 ? `Recovery actor · ${machine}` : machine}
         </span>

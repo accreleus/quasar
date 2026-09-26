@@ -67,6 +67,8 @@ renumbered to their public issues.
   `npx tsc -b --noEmit` in a tree with no `node_modules` (every agent worktree) reports success for
   a tsc it never ran. `make test-web` runs it in the devtools container and has caught a real type
   error both of those passed.
+  **The design lint (`npm run lint:design`) checks spacing, colours and inline styles, and its
+  baseline (`web/src/styles/design-lint.baseline.json`) only ever goes down.**
 - `deploy/`       compose now, k8s manifests later. **Build images with `deploy/build-images.sh`, never a hand-typed `docker build`** — it forces an explicit `--target` (a bare build takes the LAST stage regardless of `-t`), rejects a `--build-arg` for an undeclared ARG (Docker ignores those silently), and validates every artifact against `deploy/image-contract.json` before promoting `:latest`. The contract is the durable form of every image defect that reached production; **never relax an assertion to make a build green.** **`deploy/` is the OPERATOR front door: it holds only what someone installing Quasar needs.** Contributor tooling lives under `scripts/` — `dev/` (the dev container wrapper and dev seeders), `verify/` (verify stages + the devtools image), `harness/` (acceptance harnesses, `lib/`, `checks/`, the `apitest` module, `peer-driver.mjs`), `release/` (release-evidence gates), `dx/` (the Makefile's orchestration) — and non-operator compose overlays live in `deploy/overlays/`. Don't add a new development script to `deploy/`.
 - `third_party/`  vendored forks — **currently only a README**; gst-wayland-display/inputtino are built from upstream pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime/nv targets on the `quasar-base` family), vendored only when modification is needed. Don't go looking for source here. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `0b691b4` (upstream base `43d4c25`, upstream `stable` `016b4fc` merged), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.4` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
 - `CONTEXT.md`    the domain glossary (chain, rung, cert cap, stream plan, device probe, envelope, host probe, readiness check, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
@@ -178,21 +180,24 @@ Load-bearing gotchas now live in `.claude/rules/` and auto-load when working wit
 - `.claude/rules/webrtc-testing.md` — WebRTC / browser testing gotchas (loads for `node-agent/**`, `web/**`, `deploy/**`)
 If you are doing pipeline, encoder, WebRTC, or browser-testing work purely over ssh without touching those paths locally, read the relevant rule file explicitly first.
 
-## UI work — the design handoff is the spec
+## UI work — DESIGN.md is the spec
 Any change touching `web/` rendering or a user-visible surface MUST start by
-reading **`design_handoff_v3/`** (README + `screens/assets/console-v3.css` — the
-token contract — + the matching `screens/*.html` mock: `login-v3`, `home`,
-`loading-v3`, `loading-to-stream-v3`, `session-overlay-v3`, `admin-console-v3`
-with its `assets/pages-*.js` section renderers), and MUST be visually verified
-against it (designer agent / `visual-verdict` skill) before being presented as
-done. v3 supersedes the earlier `design_handoff_quasar` / `design_handoff_v2`
-packages (removed 2026-08-28; git history has them) — where they differ, v3 wins.
+reading **`DESIGN.md`** (the rules, and where Quasar overrides the mocks), then the
+matching mock in **`design_handoff_v3/`** for composition (README +
+`screens/*.html`: `login-v3`, `home`, `loading-v3`, `loading-to-stream-v3`,
+`session-overlay-v3`, `admin-console-v3` with its `assets/pages-*.js` section
+renderers, `releases-v3`). Values live in `web/src/styles/tokens.css`. Where
+`DESIGN.md` and a mock disagree, `DESIGN.md` wins; the mocks carry flaws baked in by
+the design tool, and each known one is listed in its override table. A newly found
+flaw is added there in the same change that fixes it. The change MUST be visually
+verified (designer agent / `visual-verdict` skill) before being presented as done.
+v3 supersedes the earlier `design_handoff_quasar` / `design_handoff_v2` packages
+(removed 2026-08-28; git history has them).
 
-The rule that outlives either reference: **do not invent a style guide or
-restyle from taste.** One exists. If no mockup covers the surface being changed,
-say so explicitly and ask before styling. If you cannot reach the handoff at
-all, stop and ask rather than improvising. (History: a milestone run that
-skipped the handoff produced a full UI that had to be redone.)
+The rule that outlives any reference: **do not invent a style guide or restyle from
+taste.** If neither `DESIGN.md` nor a mock covers the surface being changed, say so
+explicitly and ask before styling. (History: a milestone run that skipped the handoff
+produced a full UI that had to be redone.)
 
 ## Model tiering (per-ticket tiers ride on each issue's `needs:*` label / kickoff doc)
 - Opus 4.8: architecture, interface/schema design, WebRTC negotiation, the latency path, security/concurrency, integration debugging, writing tickets, reviewing seams.

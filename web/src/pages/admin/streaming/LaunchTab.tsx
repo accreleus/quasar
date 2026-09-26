@@ -48,12 +48,11 @@ function DefaultsCard({
   // instance-wide default.
   const userVisible = launchProfiles.filter((p) => p.visibility === "user");
   return (
-    <div className="card card-pad" style={{ display: "flex", gap: "var(--s7)", alignItems: "center", flexWrap: "wrap" }}>
+    <div className="card card-pad row gap7 wrap">
       <div>
         <div className="eyebrow">Default profile</div>
         <select
-          className="select"
-          style={{ marginTop: 7 }}
+          className="select mt2"
           value={policy.global_default_profile_id ?? ""}
           disabled={busy}
           aria-label="Default profile"
@@ -66,7 +65,7 @@ function DefaultsCard({
         </select>
       </div>
       <div style={{ maxWidth: 420 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "var(--s5)" }}>
+        <div className="row between gap5">
           <div>
             <div className="label">Let users choose a profile</div>
             <div className="hint">Otherwise every session uses the default</div>
@@ -232,8 +231,8 @@ function LaunchProfileCard({
           <ActionsMenu label={`Actions for ${profile.display_name}`} items={menuItems} />
         </div>
       </div>
-      <div style={{ padding: "var(--s3) var(--card-pad) var(--card-pad)" }}>
-        {profile.description && <p className="hint" style={{ marginTop: -4, marginBottom: "var(--s3)" }}>{profile.description}</p>}
+      <div className="lp-body">
+        {profile.description && <p className="hint lp-desc">{profile.description}</p>}
         <RungEditor
           rungs={rungs}
           availableToAdd={availableToAdd}

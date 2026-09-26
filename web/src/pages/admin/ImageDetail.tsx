@@ -203,8 +203,8 @@ export function ImageDetail() {
           header: "State",
           render: (h) => {
             const st = hostImageState(img, h.id);
-            const color = st === "stale" ? "var(--warning-text)" : st === "absent" ? "var(--text-4)" : undefined;
-            return <span style={{ color }}>{HOST_STATE_LABEL[st]}</span>;
+            const tone = st === "stale" ? "tone-warning" : st === "absent" ? "img-faint" : undefined;
+            return <span className={tone}>{HOST_STATE_LABEL[st]}</span>;
           },
         },
         {
@@ -312,16 +312,16 @@ export function ImageDetail() {
           />
 
           <div className="editor">
-            <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)", minWidth: 0 }}>
+            <div className="col gap4" style={{ minWidth: 0 }}>
               <div className="card card-pad">
-                <p style={{ fontSize: "var(--t-sm)", color: "var(--text-2)", lineHeight: 1.55, margin: "0 0 var(--s4)", maxWidth: "70ch" }}>
+                <p className="img-desc">
                   {img.description}
                 </p>
                 <div className="ae-facts">
                   <div className="ae-fact"><span>Reference</span><span className="mono">{img.registry_ref ?? "—"}</span></div>
                   <div className="ae-fact"><span>Digest</span><span className="mono">{img.registry_digest ?? "—"}</span></div>
                   <div className="ae-fact"><span>Catalog version</span><span className="num">{img.version}</span></div>
-                  <div className="ae-fact"><span>Installed version</span><span>{img.installed_version ? <span className="num">{img.installed_version}</span> : <span style={{ color: "var(--text-4)" }}>not installed</span>}</span></div>
+                  <div className="ae-fact"><span>Installed version</span><span>{img.installed_version ? <span className="num">{img.installed_version}</span> : <span className="img-faint">not installed</span>}</span></div>
                   <div className="ae-fact"><span>Install mode</span><span>{img.installed ? (img.lazy ? "on first launch" : "eager") : "—"}</span></div>
                   <div className="ae-fact"><span>Last pulled</span><span>not tracked</span></div>
                 </div>
@@ -346,9 +346,9 @@ export function ImageDetail() {
                   <div className="acts hint">{usedByPresets.length} presets · {usedByApps.length} apps</div>
                 </div>
                 {usedByPresets.length || usedByApps.length ? (
-                  <div className="card-pad" style={{ display: "flex", gap: "var(--s7)", flexWrap: "wrap" }}>
-                    <div style={{ flex: "1 1 220px" }}>
-                      <div className="eyebrow" style={{ marginBottom: 9 }}>Runtime presets</div>
+                  <div className="card-pad img-used-by">
+                    <div className="img-used-col">
+                      <div className="eyebrow img-used-head">Runtime presets</div>
                       {usedByPresets.length ? (
                         usedByPresets.map((p) => (
                           <div className="ae-fact" key={p.id}>
@@ -360,8 +360,8 @@ export function ImageDetail() {
                         <div className="sub">None</div>
                       )}
                     </div>
-                    <div style={{ flex: "1 1 220px" }}>
-                      <div className="eyebrow" style={{ marginBottom: 9 }}>Apps</div>
+                    <div className="img-used-col">
+                      <div className="eyebrow img-used-head">Apps</div>
                       {usedByApps.length ? (
                         usedByApps.map((a) => (
                           <div className="ae-fact" key={a.id}>
@@ -387,13 +387,13 @@ export function ImageDetail() {
             <div className="ae-rail">
               <div className="card card-pad">
                 <div className="eyebrow">Rollout</div>
-                <div style={{ marginTop: 10 }}>
+                <div className="mt3">
                   <Bar percent={roll.total > 0 ? (roll.ready / roll.total) * 100 : 0} label={`${roll.ready}/${roll.total}`} variant={roll.tone} />
                 </div>
-                <div className="ae-facts" style={{ marginTop: "var(--s4)" }}>
+                <div className="ae-facts mt4">
                   <div className="ae-fact">
                     <span>State</span>
-                    <span style={{ color: inFlight ? "var(--info-text)" : img.update_available ? "var(--warning-text)" : undefined }}>
+                    <span className={inFlight ? "tone-info" : img.update_available ? "tone-warning" : undefined}>
                       {inFlight
                         ? HOST_STATE_COPY[inFlight].label
                         : img.update_available
@@ -412,7 +412,7 @@ export function ImageDetail() {
               </div>
               {(img.installed || inFlight !== null) && (
                 <>
-                  <Button variant="danger" style={{ width: "100%", justifyContent: "center" }} onClick={() => setUninstallOpen(true)}>
+                  <Button variant="danger" className="btn-block" onClick={() => setUninstallOpen(true)}>
                     <IconTrash />
                     Uninstall image
                   </Button>
@@ -445,7 +445,7 @@ export function ImageDetail() {
             on hosts. Review each host's cached versions and protection reasons before requesting
             explicit removal. Apps relying on this image will fail to launch until it is reinstalled.
           </p>
-          <p className="sec muted" style={{ fontSize: "var(--t-xs)" }}>
+          <p className="sec muted t-xs">
             Reinstalling later re-fetches whatever digest the catalog currently has pinned for this
             image. It is not a fresh build. If you're uninstalling to force a corrected image to be
             pulled again, sync the catalog first so a newer digest is what gets re-adopted.

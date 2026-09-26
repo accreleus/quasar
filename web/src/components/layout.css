@@ -37,7 +37,71 @@
   background: var(--danger-bg);
   border: 1px solid var(--danger-line);
   border-radius: var(--r-sm);
-  padding: 10px 14px;
+  padding: var(--s3) var(--s4);
+}
+
+/* Danger is the default tone; the steps also box a note and a warning. */
+.login-error.is-info {
+  color: var(--info-text);
+  background: var(--info-bg);
+  border-color: var(--info-line);
+}
+
+.login-error.is-warning {
+  color: var(--warning-text);
+  background: var(--warning-bg);
+  border-color: var(--warning-line);
+}
+
+/* One bordered block per host (StepHosts) or library provider (StepLibraries). */
+.setup-host {
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  padding: var(--s4);
+}
+
+/* StepLibraries: a submitted provider's install-status row. */
+.setup-install-row {
+  padding: var(--s3) var(--s4);
+}
+
+/* Name + description beside the switch; the switch stays top-aligned. */
+.setup-provider-head {
+  align-items: flex-start;
+}
+
+.setup-subhead {
+  margin: 0 0 var(--s2);
+}
+
+.setup-claim-lede {
+  text-align: center;
+}
+
+.setup-steps {
+  justify-content: center;
+}
+
+/* The /admin resume banner: the buttons keep their width, the message wraps. */
+.setup-resume-actions {
+  flex-shrink: 0;
+}
+
+.setup-gpu-list {
+  margin: 0;
+  padding-left: var(--s5);
+}
+
+/* A text-styled toggle ("Advanced: set a different path"). */
+.setup-link-btn {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 /* The wizard's submit reads a step larger than an app-wide `.btn` (t-sm). */

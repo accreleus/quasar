@@ -125,7 +125,7 @@ function HostRow({ host, now, onOpen }: { host: Host; now: number; onOpen: () =>
       </td>
       <td className="right num">{capacity ? capacity.active_sessions : "—"}</td>
       <td className="right">
-        <span className="num" style={{ color: online ? "var(--success-text)" : "var(--text-3)" }}>
+        <span className={online ? "num ov-hb-online" : "num muted"}>
           {host.last_heartbeat_at ? relativeTimeCompact(host.last_heartbeat_at, now) : "Never"}
         </span>
       </td>

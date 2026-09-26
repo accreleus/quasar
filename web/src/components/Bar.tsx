@@ -3,7 +3,7 @@
  * Bar: horizontal capacity bar.
  * Gauge: conic-gradient circular gauge.
  */
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 
 // ── Bar ────────────────────────────────────────────────────
 
@@ -62,10 +62,8 @@ export function Gauge({ percent, label, color }: GaugeProps) {
   const arcColor = color ?? "var(--accent)";
   return (
     <div
-      className="gauge"
-      style={{
-        background: `conic-gradient(from -90deg, ${arcColor} ${pct * 3.6}deg, var(--ink-5) 0)`,
-      }}
+      className="gauge gauge-meter"
+      style={{ "--p": pct, "--gc": arcColor } as CSSProperties}
       role="meter"
       aria-valuenow={pct}
       aria-valuemin={0}

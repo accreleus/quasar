@@ -43,34 +43,24 @@ export function SourceRow({
   last,
 }: SourceRowProps) {
   return (
-    <div
-      className="row"
-      style={{
-        display: "flex",
-        flexWrap: "wrap",
-        gap: "var(--s5)",
-        alignItems: "flex-start",
-        padding: "var(--card-pad)",
-        borderBottom: last ? undefined : "1px solid var(--line)",
-      }}
-    >
-      <div style={{ flex: 1, minWidth: 0 }}>
+    <div className={last ? "row lib-source-row" : "row lib-source-row lib-source-sep"}>
+      <div className="grow" style={{ minWidth: 0 }}>
         <div className="rowflex">
           <span className="panel-title">{name}</span>
           {badge}
         </div>
-        <div className="hint" style={{ marginTop: 5, maxWidth: "60ch" }}>
+        <div className="hint mt1" style={{ maxWidth: "60ch" }}>
           {description}
         </div>
         {meta && (
-          <div className="muted" style={{ marginTop: 10, fontSize: "var(--t-sm)" }}>
+          <div className="muted mt3 t-sm">
             {meta}
           </div>
         )}
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: "var(--s2)", flex: "none" }}>
+      <div className="rowflex lib-source-actions">
         {actions}
-        <span title={switchTitle} style={{ marginLeft: "var(--s3)" }}>
+        <span title={switchTitle} className="lib-source-switch">
           <Switch
             aria-label={switchLabel}
             checked={switchChecked}
@@ -79,7 +69,7 @@ export function SourceRow({
           />
         </span>
       </div>
-      {children && <div style={{ flexBasis: "100%", minWidth: 0 }}>{children}</div>}
+      {children && <div className="lib-source-children" style={{ minWidth: 0 }}>{children}</div>}
     </div>
   );
 }

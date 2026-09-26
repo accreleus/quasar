@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest",
-    "gen:api": "openapi-typescript ../protocol/openapi.yaml -o src/api/schema.d.ts"
+    "gen:api": "openapi-typescript ../protocol/openapi.yaml -o src/api/schema.d.ts",
+    "lint:design": "vitest run src/styles/design-lint"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.3.0",

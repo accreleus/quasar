@@ -18,7 +18,8 @@
 
 /* The mock indents the id under the status dot rather than under the cell. */
 .hosts-page .host-row-id {
-  margin-top: 2px;
+  margin-top: var(--s1);
+  /* design-lint-allow spacing-scale: indents the id under the name, past the status dot */
   padding-left: 17px;
 }
 
@@ -27,7 +28,7 @@
    but its table never groups. Shared by both tabs, so it is not page-scoped. */
 .qtable tbody tr.group-row > td {
   background: color-mix(in oklch, var(--surf-inset) 60%, transparent);
-  padding: 7px var(--s5);
+  padding: var(--s2) var(--s5);
   height: auto;
   display: table-cell;
 }
@@ -42,15 +43,16 @@
 .exp-row .note,
 .exp-row .form-error,
 .exp-row .exp-note {
+  /* design-lint-allow spacing-scale: aligns with .exp-in's 44px text column */
   margin: var(--s4) var(--s5) var(--s4) 44px;
 }
 
 .exp-actions {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--s2);
   align-items: flex-start;
-  margin-top: 2px;
+  margin-top: var(--s1);
 }
 
 /* `.qtable tbody td` is nowrap so a collapsed row stays on one line, and
@@ -60,6 +62,7 @@
    the container: one declaration covers the card, and a descendant that wants
    nowrap back still says so itself. */
 .hosts-page .exp-readiness {
+  /* design-lint-allow spacing-scale: aligns with .exp-in's 44px text column */
   padding: 0 var(--s5) var(--s5) 44px;
   white-space: normal;
 }
@@ -91,7 +94,27 @@
 
 /* The drawer's storage bars sit above the facts and need the same rhythm. */
 .hosts-page .exp-in .bar-row {
-  padding: 5px 0;
+  padding: var(--s1) 0;
+}
+
+/* A GPU's slots line over its codec chips, right-aligned in the fact. */
+.gpu-slots {
+  align-items: flex-end;
+}
+
+/* GPU codec chips: the hosts drawer and host detail's capacity card. */
+.gpu-codecs {
+  display: flex;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.gpu-codecs-end {
+  justify-content: flex-end;
+}
+
+.disk-danger {
+  color: var(--danger-text);
 }
 
 /* ── Jobs ─────────────────────────────────────────────────────────── */
@@ -152,7 +175,7 @@
   flex-direction: row;
   flex-wrap: wrap;
   align-items: center;
-  margin-top: 9px;
+  margin-top: var(--s2);
 }
 
 /* A failed run's message, on its own full-width row under the run. `.exp-row`
@@ -160,7 +183,7 @@
    so it aligns with the cells rather than with a chevron. */
 .jobs-page .exp-row .run-error {
   margin: 0;
-  padding: var(--s3) 14px;
+  padding: var(--s3) var(--s4);
 }
 
 /* ── Host detail ──────────────────────────────────────────────────── */
@@ -183,7 +206,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--s2);
 }
 
 .host-detail-page .cap-name {
@@ -214,9 +237,15 @@
   width: 30%;
 }
 
+/* Two classes: outranks `.bar-row`'s gap. */
+.bar-row.cap-codecs {
+  flex-wrap: wrap;
+  row-gap: var(--s1);
+}
+
 /* "Services on this machine" (fleet-rh06-v3.html `rhServices`; its inline styles). */
 .host-detail-page .host-services-hint {
-  margin-top: 3px;
+  margin-top: var(--s1);
 }
 
 .host-detail-page .host-services-note {
@@ -270,13 +299,13 @@
 
 /* `.diag`: the closed "Details" disclosure, the one place identifiers appear. */
 .rh-diag {
-  margin-top: 10px;
+  margin-top: var(--s2);
 }
 
 .rh-diag > summary {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--s1);
   cursor: pointer;
   list-style: none;
   font-size: var(--t-xs);
@@ -302,7 +331,7 @@
 }
 
 .rh-diag pre {
-  margin: 8px 0 0;
+  margin: var(--s2) 0 0;
   font-family: var(--font-mono);
   font-size: var(--t-xs);
   line-height: 1.7;
@@ -312,14 +341,14 @@
   background: color-mix(in oklch, var(--surf-inset) 82%, transparent);
   border: 1px solid var(--line);
   border-radius: var(--r-control);
-  padding: 9px 11px;
+  padding: var(--s2) var(--s3);
 }
 
 /* A warning's own actions (`pageRhWarning`: Check again). */
 .rh-note-actions {
   display: flex;
-  gap: 8px;
-  margin-top: 10px;
+  gap: var(--s2);
+  margin-top: var(--s2);
 }
 
 /* A note with its action beside it (`rhRemove`, failed). */
@@ -337,7 +366,7 @@
 
 /* The remove-host dialog's copy (`rhRemove`). */
 .rm-host-copy {
-  margin: 0 0 12px;
+  margin: 0 0 var(--s3);
   font-size: var(--t-sm);
   color: var(--text-2);
   line-height: 1.6;
@@ -348,14 +377,14 @@
 }
 
 .rm-host-note {
-  margin-bottom: 12px;
+  margin-bottom: var(--s3);
 }
 
 /* Why the one action of "Must update before it can be managed" (#365, `pageRhFloor`) is
    not available right now, under the note's text. */
 .host-detail-page .host-floor-why {
   display: block;
-  margin-top: 4px;
+  margin-top: var(--s1);
 }
 
 /* ── Add host modal ────────────────────────────────────────────────── */
@@ -369,7 +398,7 @@
   background: var(--surf-inset);
   border: 1px solid var(--line);
   border-radius: var(--r-control);
-  padding: 9px 11px;
+  padding: var(--s2) var(--s3);
 }
 
 .enroll-snippet pre {
@@ -406,7 +435,7 @@
 }
 .addhost-lead {
   font-size: var(--t-base);
-  margin: 0 0 6px;
+  margin: 0 0 var(--s2);
 }
 .addhost-intro {
   margin: 0 0 var(--s4);
@@ -434,10 +463,10 @@
 .addhost-snippet {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--s2);
 }
 .addhost-sub {
-  margin-top: 3px;
+  margin-top: var(--s1);
 }
 .addhost-explain {
   margin: var(--s4) 0 0;
@@ -447,7 +476,7 @@
   white-space: nowrap;
 }
 .addhost-more {
-  margin-top: 10px;
+  margin-top: var(--s2);
 }
 .addhost-more > .addhost-snippet {
   margin-top: var(--s2);
@@ -536,6 +565,18 @@
   color: var(--text);
 }
 
+.panel-head.rel-card-head {
+  align-items: flex-start;
+}
+
+.rowflex.rel-baseline {
+  align-items: baseline;
+}
+
+.rel-notes-src {
+  padding: var(--s1);
+}
+
 /* One changelog bullet: a tag gutter, a one-line title, its issue chips, and
    the detail behind a disclosure. */
 .rel-e {
@@ -543,9 +584,9 @@
 }
 .rel-e > summary {
   display: flex;
-  gap: 11px;
+  gap: var(--s3);
   align-items: baseline;
-  padding: 9px var(--card-pad);
+  padding: var(--s2) var(--card-pad);
   cursor: pointer;
   list-style: none;
 }
@@ -588,7 +629,8 @@
   transform: rotate(180deg);
 }
 .rel-b {
-  padding: 2px var(--card-pad) 13px calc(var(--card-pad) + 47px);
+  /* design-lint-allow spacing-scale: aligns under the summary text, past chevron and version */
+  padding: var(--s1) var(--card-pad) var(--s3) calc(var(--card-pad) + 47px);
   font-size: var(--t-sm);
   color: var(--text-3);
   line-height: 1.6;
@@ -610,7 +652,7 @@
   font-size: 0.85em;
   color: var(--text-2);
   background: var(--ink-5);
-  padding: 1px 4px;
+  padding: 1px var(--s1);
   border-radius: 3px;
 }
 
@@ -620,7 +662,7 @@
   justify-content: space-between;
   align-items: center;
   gap: var(--s3);
-  padding: 7px 0;
+  padding: var(--s2) 0;
   border-top: 1px solid var(--line);
   font-size: var(--t-sm);
 }
@@ -633,13 +675,13 @@
 .rel-fact.stack {
   flex-direction: column;
   align-items: stretch;
-  gap: 3px;
+  gap: var(--s1);
 }
 .rel-holdout {
   display: flex;
   justify-content: space-between;
   gap: var(--s2);
-  padding: 4px 0;
+  padding: var(--s1) 0;
   font-size: var(--t-xs);
 }
 /* The per-host detail: today's targets table, its manual recipes and its
@@ -658,8 +700,8 @@
    last column (Apply, Revert) stays inside the card at 1440 px (#363). */
 .rel-detail .qtable thead th,
 .rel-detail .qtable tbody td {
-  padding-left: 6px;
-  padding-right: 6px;
+  /* design-lint-allow spacing-scale: the 300px rail keeps its last column inside the card only at 6px */
+  padding-inline: 6px;
   white-space: normal;
 }
 .rel-detail .qtable tbody td { height: auto; }
@@ -680,7 +722,7 @@
 .rel-alert-eyebrow.warning { color: var(--warning-text); }
 .rel-alert-eyebrow.danger { color: var(--danger-text); }
 .rel-refused-body {
-  margin: 6px 0 0;
+  margin: var(--s2) 0 0;
   font-size: var(--t-sm);
   line-height: 1.55;
   max-width: 80ch;
@@ -698,20 +740,33 @@
 /* The control plane's own machine in Releases > Installed (#361): `rhInstalled` in
    design_handoff_v3/screens/assets/pages-rh06.js, screenshots rh06/inv-control-only*. */
 .rel-machine { margin-top: var(--s5); }
-.rel-machine-title { margin-top: 4px; }
-.rel-machine-note { margin-top: 8px; font-size: var(--t-xs); }
-.rel-machine-rows { margin-top: 6px; }
+.rel-machine-title { margin-top: var(--s1); }
+.rel-machine-note { margin-top: var(--s2); font-size: var(--t-xs); }
+.rel-machine-rows { margin-top: var(--s2); }
 .rel-machine-rows .rel-fact { align-items: flex-start; }
 .rel-machine-rows .rel-fact > span:last-child { text-align: right; }
-.rel-machine-hint { margin-top: 2px; }
+.rel-machine-hint { margin-top: var(--s1); }
 /* A rail value with a line under it ("6 hosts" over "4 on v0.5.2 · 2 older"), as
    `rhInstalled`'s Node agents fact draws it (#363). */
 .rel-fact-sub { display: block; text-align: right; }
 .rel-machine-none { color: var(--text-4); }
-.rel-machine-foot { margin: 10px 0 0; line-height: 1.5; }
+.rel-machine-foot { margin: var(--s2) 0 0; line-height: 1.5; }
 
 /* Keep the scoped Releases rail from overriding the shared split breakpoint. */
 .rel-split > * { min-width: 0; }
 @media (max-width: 1240px) {
   .rel-split { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Storage tab: the ownership card's inner rows and the delete modal's facts. */
+.storage-pad {
+  padding: var(--s4);
+}
+
+.storage-facts {
+  font-size: var(--t-sm);
+}
+
+.storage-id {
+  overflow-wrap: anywhere;
 }

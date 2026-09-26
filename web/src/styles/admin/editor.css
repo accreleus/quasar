@@ -32,17 +32,28 @@
   text-decoration: underline;
 }
 
+/* Rail card: the hero frame is clipped to the card's radius. */
+.ae-rail-card {
+  overflow: hidden;
+}
+
+/* Access tab: the user picker and its button align on their bottom edge. */
+.ae-add-user {
+  align-items: flex-end;
+  max-width: 560px;
+}
+
 /* The gradient stands in for missing art, in both crops and in the rail. It is
    a design, not a broken image, so it carries the app's monogram. */
 .ae-frame {
   position: relative;
   overflow: hidden;
-  background: linear-gradient(150deg, oklch(0.5443 0.2453 284.39), oklch(0.3727 0.1878 282.05));
+  background: linear-gradient(150deg, var(--cover-violet-a), var(--cover-violet-b));
   display: grid;
   place-content: center;
   font-family: var(--font-display);
   font-weight: 600;
-  color: oklch(1 0 0 / 0.82);
+  color: var(--editor-frame-ink);
   letter-spacing: 0.03em;
   border-radius: var(--r-sm);
   border: 1px solid var(--line-2);
@@ -78,7 +89,7 @@
 }
 
 .ae-crop figcaption {
-  margin-top: 7px;
+  margin-top: var(--s2);
   font-size: var(--t-xs);
   color: var(--text-3);
 }
@@ -86,7 +97,7 @@
 .ae-cands {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
-  gap: 9px;
+  gap: var(--s2);
   list-style: none;
   margin: 0;
   padding: 0;
@@ -98,11 +109,11 @@
   border: 1px solid var(--line-2);
   background: var(--ink-3);
   border-radius: var(--r-sm);
-  padding: 6px;
+  padding: var(--s2);
   cursor: pointer;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--s2);
   text-align: left;
 }
 
@@ -117,11 +128,11 @@
   place-content: center;
   aspect-ratio: 2 / 3;
   border-radius: var(--r-xs);
-  background: linear-gradient(160deg, oklch(0.4600 0.1600 285), oklch(0.5443 0.2453 284.39));
+  background: linear-gradient(160deg, var(--editor-cand-art), var(--cover-violet-a));
   font-style: normal;
   font-family: var(--font-display);
   font-size: 15px;
-  color: oklch(1 0 0 / 0.85);
+  color: var(--editor-cand-ink);
 }
 
 .ae-cand i img {
@@ -148,7 +159,7 @@
   display: flex;
   align-items: center;
   gap: var(--s3);
-  padding: 9px 0;
+  padding: var(--s2) 0;
   border-top: 1px solid var(--line);
 }
 
@@ -169,7 +180,7 @@
 .ae-item-m {
   font-size: var(--t-xs);
   color: var(--text-3);
-  margin-top: 2px;
+  margin-top: var(--s1);
 }
 
 /* Inside a section body the fact block is a field-width column, not the rail's
@@ -184,7 +195,7 @@
   display: flex;
   align-items: baseline;
   gap: var(--s3);
-  padding: 7px 0;
+  padding: var(--s2) 0;
   border-bottom: 1px solid var(--line);
   font-size: var(--t-sm);
 }

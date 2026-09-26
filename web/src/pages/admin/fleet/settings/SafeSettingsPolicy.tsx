@@ -189,7 +189,7 @@ export function SafeSettingsPolicy({
               : <Chip variant={STATUS_CHIP[group.status] ?? "neutral"} className="chip-sm">{group.status.replaceAll("_", " ")}</Chip>}
           </h3>
           <p className="hint">{knobHelp(knob)}</p>
-          <p className="hint" style={{ marginTop: 4 }}>
+          <p className="hint">
             {`${resolved?.source === "explicit" ? "Explicit value" : resolved?.source === "automatic" ? "Automatic choice" : "Deployment setting"} ${valueLabel((resolved?.value ?? undefined) as SettingValue | undefined)} · `}
             {verified
               ? `Verified on the current connection${group.observed_at ? ` at ${new Date(group.observed_at).toLocaleString()}` : ""}`
@@ -201,7 +201,7 @@ export function SafeSettingsPolicy({
               : `Desired revision ${group.desired_revision} · applied revision ${group.applied_revision ?? "none"} · ${group.scope.replaceAll("_", " ")}`}
           </p>
           {group.scope === "restart" && group.approval_preview?.available && <p className="hint">Current hardware evidence supports {Object.entries(group.approval_preview.resolved).map(([key, value]) => `${key}: ${valueLabel(value as SettingValue)}`).join(", ")}. Review the evidence below before idle approval.</p>}
-          {group.remedy && !unsaved && <p className="hint" style={{ marginTop: 4 }}>{remedyText(group.remedy)}</p>}
+          {group.remedy && !unsaved && <p className="hint">{remedyText(group.remedy)}</p>}
           {group.next_retry_at && <p className="hint">Next retry {new Date(group.next_retry_at).toLocaleTimeString()}</p>}
         </div>
         <div>
@@ -216,7 +216,7 @@ export function SafeSettingsPolicy({
             {(knob.key === "encoder" || knob.key === "render_node") && <option value="automatic">Automatic choice</option>}
             <option value="explicit">Explicit value</option>
           </select>
-          {draft.source === "explicit" && <div style={{ marginTop: 6 }}>
+          {draft.source === "explicit" && <div className="mt2">
             <KnobControl
               knob={knob}
               value={draft.value}
@@ -225,7 +225,7 @@ export function SafeSettingsPolicy({
               ariaLabel={`${label} value`}
             />
           </div>}
-          {waitsForRetry(group) && <div style={{ marginTop: 6 }}>
+          {waitsForRetry(group) && <div className="mt2">
             <Button disabled={retrying === knob.key} onClick={() => void retry(knob.key)}>Retry</Button>
           </div>}
         </div>

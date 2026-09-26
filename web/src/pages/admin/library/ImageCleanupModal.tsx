@@ -130,11 +130,11 @@ export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }:
       {current ? <p className="hint">Only versions verified on this current host connection are listed.</p> :
         <p className="note" role="status">Inventory {view.inventory_status}. {view.remedy ?? "Reconnect the host and wait for a complete inventory before cleanup."} An empty list does not mean the cache is empty.</p>}
       {current && candidates.length === 0 && <p className="hint">No verified cached version is available for this image on this host.</p>}
-      {current && candidates.map((candidate) => <div className="ae-facts" key={`${candidate.image_id}:${candidate.version}:${candidate.runtime_image_id}`} style={{ marginTop: "var(--s4)" }}>
+      {current && candidates.map((candidate) => <div className="ae-facts mt4" key={`${candidate.image_id}:${candidate.version}:${candidate.runtime_image_id}`}>
         <div className="ae-fact"><span>Image</span><span>{candidate.image_id}</span></div>
         <div className="ae-fact"><span>Version</span><span className="num">{candidate.version}</span></div>
-        <div className="ae-fact"><span>Reference</span><span className="mono" style={{ overflowWrap: "anywhere" }}>{candidate.image_ref}</span></div>
-        <div className="ae-fact"><span>Daemon image ID</span><span className="mono" style={{ overflowWrap: "anywhere" }}>{candidate.runtime_image_id}</span></div>
+        <div className="ae-fact"><span>Reference</span><span className="mono lib-wrap-any">{candidate.image_ref}</span></div>
+        <div className="ae-fact"><span>Daemon image ID</span><span className="mono lib-wrap-any">{candidate.runtime_image_id}</span></div>
         {candidate.reasons.length > 0 && <div className="note">
           {candidate.reasons.map((reason) => <div key={reason}>{reasonCopy[reason]}</div>)}
           {candidate.remedy && <div>{candidate.remedy}</div>}

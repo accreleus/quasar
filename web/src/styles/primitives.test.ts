@@ -77,8 +77,9 @@ describe("v3 primitives", () => {
   it("card carries the depth-pass shadow stack", () => {
     const c = rule(".card");
     expect(c).toMatch(/inset 0 1px 0 var\(--glass-highlight\)/);
-    expect(c).toMatch(/0 2px 4px oklch\(0\.02 0\.01 267\/\.45\)/);
-    expect(c).toMatch(/0 18px 44px -28px oklch\(0\.02 0\.01 267\/\.85\)/);
+    // Token values are pinned in colour-tokens.test.ts.
+    expect(c).toMatch(/0 2px 4px var\(--card-shadow-near\)/);
+    expect(c).toMatch(/0 18px 44px -28px var\(--card-shadow-far\)/);
     expect(c).not.toMatch(/var\(--shadow-md\)/);
   });
 

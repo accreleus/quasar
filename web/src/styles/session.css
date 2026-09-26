@@ -35,7 +35,7 @@
   padding: 0;
   border: 1px solid var(--line-2);
   border-radius: 50%;
-  background: oklch(0.13 0.012 267 / 0.72);
+  background: var(--session-summon-bg);
   -webkit-backdrop-filter: blur(20px) saturate(150%);
   backdrop-filter: blur(20px) saturate(150%);
   box-shadow: var(--shadow-lg);
@@ -80,7 +80,7 @@
   display: grid;
   place-content: center;
   justify-items: center;
-  gap: 18px;
+  gap: var(--s5);
   opacity: 0;
   pointer-events: none;
   transition: opacity .35s ease;
