@@ -1020,6 +1020,16 @@ fn home_of(engine: &FakeEngine) -> Option<String> {
         .cloned()
 }
 
+/// `reconfigure.json`'s settled outcome.
+fn settled(dir: &std::path::Path) -> String {
+    let r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("reconfigure.json")).unwrap()).unwrap();
+    r["outcome"]["settled"]
+        .as_str()
+        .unwrap_or("unsettled")
+        .to_owned()
+}
+
 fn machine_home(dir: &std::path::Path) -> String {
     let m: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("machine.json")).unwrap()).unwrap();
@@ -1066,7 +1076,7 @@ fn reconfiguring_the_home_root_replaces_the_agent_on_the_same_image() {
     assert_eq!(home_of(&engine).as_deref(), Some(NEW_HOME));
     assert!(new.spec.binds.iter().any(|b| b.source == NEW_HOME));
     assert_eq!(machine_home(dir.path()), NEW_HOME);
-    assert!(!dir.path().join("reconfigure.json").exists());
+    assert_eq!(settled(dir.path()), "applied");
     assert!(engine
         .state()
         .container_named("quasar-node-agent.kept")
@@ -1114,7 +1124,7 @@ fn a_reconfigure_whose_agent_does_not_verify_puts_back_the_agent_and_the_inputs(
         HOME,
         "the old inputs are back in force"
     );
-    assert!(!dir.path().join("reconfigure.json").exists());
+    assert_eq!(settled(dir.path()), "put_back");
 }
 
 #[test]
@@ -1155,7 +1165,7 @@ fn a_reconfigure_interrupted_before_the_agent_was_touched_settles_as_nothing_cha
             .id,
         old.id
     );
-    assert!(!dir.path().join("reconfigure.json").exists());
+    assert_eq!(settled(dir.path()), "put_back");
 }
 
 #[test]
@@ -1197,19 +1207,6 @@ fn a_reconfigure_that_moves_no_container_is_recorded_and_one_that_cannot_be_appl
         assert!(refused.message.contains(why), "{key}: {}", refused.message);
     }
     assert_eq!(machine_home(dir.path()), HOME);
-}
-
-#[test]
-fn a_combined_host_home_root_reconfigure_is_refused_until_control_plane_replacement_exists() {
-    let (engine, dir, actor_id) = seeded_combined_host();
-    let actor = running_actor(&engine, dir.path(), &actor_id);
-    let refused = actor
-        .reconfigure(changes(&[("QUASAR_HOME_ROOT", NEW_HOME)]))
-        .expect_err("moves the control plane");
-    assert_eq!(refused.reason, Reason::Invalid);
-    assert!(refused.message.contains("#363"), "{}", refused.message);
-    assert_eq!(machine_home(dir.path()), HOME);
-    assert!(!dir.path().join("reconfigure.json").exists());
 }
 
 /// The operator's door answers status with the machine's latest attempt whoever submitted it,

@@ -1,23 +1,31 @@
 //! `quasar-recovery reconfigure` (#352 decision A2): changing a machine's inputs (its home
-//! root, release trust, app-container defaults) after install.
+//! root, public host, ports, release trust, app-container defaults) after install.
 //!
 //! A reconfigure is a **Replacement with the same digests and new machine inputs**: each
 //! service whose rendered specification the change moves is replaced through the attempt
-//! machinery ([`crate::replace`]) exactly as an update replaces it — journalled, the old
-//! container kept until the new one verifies, restored if it does not — with the image it
+//! machinery ([`crate::replace`]) exactly as an update replaces it: journalled, the old
+//! container kept until the new one verifies, restored if it does not, with the image it
 //! already runs. A change no container renders (the recovery actor's own signature policy,
-//! say) needs no replacement and is simply recorded.
+//! say) needs no replacement and is simply recorded. The control plane goes first: a
+//! combined host's agent dials it at the loopback of its HTTP port. Postgres and the
+//! recovery actor are never replaced by a reconfigure (#352 R1), and the database and the
+//! node name are not reconfigurable: they are changed by reinstalling.
 //!
 //! **Order, and why it is crash-safe.** `reconfigure.json` (the inputs before and after) is
 //! committed first, then machine state takes the new inputs, then the attempt is journalled
 //! and driven. `resume` settles the attempt first (D8), then [`Actor::settle_reconfigure`]
-//! reads the record: the attempt succeeded → the new inputs stay; it failed, was
-//! interrupted, or was never journalled → the old inputs are put back. So machine state
-//! never holds inputs a running service was not verified with.
+//! reads the record and writes its [`Outcome`] into it, from the services' own records
+//! (`services/<role>.json` is written only once a replacement verified):
 //!
-//! What this build replaces for a reconfigure is the node agent. A change that moves the
-//! control plane's container is refused: control-plane replacement (RH06-11, #363) serves
-//! updates, and a reconfigure does not drive it yet. Postgres is never replaced (#352 R1).
+//! | the attempt | services on the new inputs | machine state keeps | outcome |
+//! |---|---|---|---|
+//! | succeeded | all | the new inputs | `applied` |
+//! | failed, interrupted, or never journalled | none | the old inputs, put back | `put_back` |
+//! | failed after an earlier service verified | some | the new inputs | `partial` |
+//!
+//! A `partial` outcome names the services still on their previous specification
+//! ([`Outcome::behind`]); the same reconfigure run again re-creates them. So machine state
+//! never holds inputs no running service was verified with.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -29,8 +37,7 @@ use tracing::{error, info, warn};
 use crate::actor::Actor;
 use crate::bootstrap as var;
 use crate::journal::{CallerTag, Journal, Phase, Step, FORMAT};
-use crate::machine::Machine;
-use crate::recipe::{self, names, secrets, ImageRef, Inputs, Role, SecretMounts};
+use crate::recipe::{self, labels, names, secrets, ImageRef, Inputs, Role, SecretMounts};
 use crate::socket::{
     AttemptResult, MachineRole, Previous, Reason, Release, Request, RequestKind, State,
 };
@@ -38,7 +45,8 @@ use crate::socket::{
 pub const RECORD_FILE: &str = "reconfigure.json";
 const RECORD_FORMAT: u32 = 1;
 
-/// `reconfigure.json`. Not a frozen interface.
+/// `reconfigure.json`: the last reconfigure that replaced a service, and once settled its
+/// outcome. Not a frozen interface; an older actor reads it and ignores `outcome`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub format: u32,
@@ -48,6 +56,32 @@ pub struct Record {
     pub after: Inputs,
     pub replaced: Vec<Role>,
     pub started_at: String,
+    /// `None` while the reconfigure is in flight or not yet settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+}
+
+/// How a reconfigure ended (the module's table).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Outcome {
+    pub settled: Settled,
+    /// The attempt's terminal state and reason; `None` when it was never journalled.
+    pub state: Option<State>,
+    pub reason: Option<Reason>,
+    /// The attempt put a kept container back.
+    pub restored: bool,
+    /// On `partial`: the services still on their previous specification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behind: Vec<Role>,
+    pub settled_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Settled {
+    Applied,
+    PutBack,
+    Partial,
 }
 
 /// The operator's request on the operator socket.
@@ -66,11 +100,15 @@ pub struct ReconfigureRequest {
 pub struct Planned {
     /// The variables whose value changes.
     pub changed: Vec<String>,
-    /// The services re-created with the new inputs, in order (`node-agent`).
+    /// The services re-created with the new inputs, in order (`control-plane`, `node-agent`).
     pub replaced: Vec<String>,
     /// The replacement's attempt, once admitted: `GET /v1/status?request_id=` follows it.
     pub request_id: Option<String>,
     pub dry_run: bool,
+    /// What the operator should know before saying `--yes`: sessions it ends, hosts it
+    /// cuts off, what it does not change.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// Every variable a reconfigure takes, and where it may be given.
@@ -87,8 +125,8 @@ const EVERYWHERE: &[&str] = &[
     var::APP_PGID,
     var::CONTAINER_NETWORK,
 ];
-pub const ENROLL_SEED_IMAGE: &str = "QUASAR_ENROLL_SEED_IMAGE";
-pub const ENROLL_AGENT_IMAGE: &str = "QUASAR_ENROLL_AGENT_IMAGE";
+pub const ENROLL_SEED_IMAGE: &str = var::ENROLL_SEED_IMAGE;
+pub const ENROLL_AGENT_IMAGE: &str = var::ENROLL_AGENT_IMAGE;
 const CONTROL_ONLY: &[&str] = &[
     var::PUBLIC_HOST,
     var::TLS_HOSTS,
@@ -104,6 +142,20 @@ fn opt(v: &str) -> Option<String> {
     (!v.is_empty()).then(|| v.to_owned())
 }
 
+/// Why `key` is not reconfigurable, naming what changes it instead.
+fn not_reconfigurable(key: &str) -> &'static str {
+    match key {
+        var::NODE_NAME => "the node name is this machine's identity, which the control plane knows its host by. To change it, reinstall: `quasar-recovery uninstall`, then install again with the seed and the new QUASAR_NODE_NAME (a GPU host is then added again from Add host)",
+        var::ROLE => "a machine's role is fixed at install. To change it, reinstall: `quasar-recovery uninstall`, then install again with the seed and the new QUASAR_ROLE",
+        var::AGENT_IMAGE | var::CONTROL_PLANE_IMAGE | var::POSTGRES_IMAGE => {
+            "an image changes by an update (Fleet ▸ Releases), never by a reconfigure"
+        }
+        var::ENROLLMENT => "an installed machine keeps its identity",
+        k if k.starts_with("QUASAR_DATABASE_") => "the database is fixed at install. Changing the database mode (Quasar's own Postgres or your own database) or the database itself moves data, which a reconfigure never does. To change it, reinstall: back the database up, run `quasar-recovery uninstall`, install again with the seed and the new QUASAR_DATABASE_* inputs, and load your data into the new database",
+        _ => "unknown variable",
+    }
+}
+
 /// The inputs `changes` gives, and which variables actually change a value. Refuses a
 /// variable a reconfigure does not take, naming the ones it does, and inputs that fail the
 /// install's own checks.
@@ -112,7 +164,7 @@ pub fn apply(
     role: MachineRole,
     changes: &BTreeMap<String, String>,
 ) -> Result<(Inputs, Vec<String>), String> {
-    let (after, ()) = apply_fields(before, role, changes)?;
+    let after = apply_fields(before, role, changes)?;
     checked(before, role, changes, after)
 }
 
@@ -120,30 +172,25 @@ fn apply_fields(
     before: &Inputs,
     role: MachineRole,
     changes: &BTreeMap<String, String>,
-) -> Result<(Inputs, ()), String> {
+) -> Result<Inputs, String> {
     let mut after = before.clone();
     for (key, value) in changes {
         let control_key = CONTROL_ONLY.contains(&key.as_str());
         if !EVERYWHERE.contains(&key.as_str()) && !control_key {
-            let mut allowed: Vec<&str> = EVERYWHERE.to_vec();
-            if role != MachineRole::Gpu {
-                allowed.extend_from_slice(CONTROL_ONLY);
-            }
             return Err(format!(
-                "{key} is not changed by a reconfigure ({}). A machine's role, node name and database are fixed at install, and its images move by an update. Reconfigurable here: {}",
-                match key.as_str() {
-                    var::ROLE | var::NODE_NAME => "it is the machine's identity",
-                    var::AGENT_IMAGE | var::CONTROL_PLANE_IMAGE | var::POSTGRES_IMAGE => "an image changes by an update",
-                    var::ENROLLMENT => "an installed machine keeps its identity",
-                    k if k.starts_with("QUASAR_DATABASE_") => "the database is fixed at install",
-                    _ => "unknown variable",
-                },
-                allowed.join(", ")
+                "{key} is not changed by a reconfigure: {}. Reconfigurable here: {}",
+                not_reconfigurable(key),
+                variables(Some(role)).join(", ")
             ));
         }
         if control_key && after.control.is_none() {
             return Err(format!(
                 "{key} configures a control plane, and this machine runs none"
+            ));
+        }
+        if key == var::HOME_ROOT && role == MachineRole::ControlOnly {
+            return Err(format!(
+                "{key}: a control-only machine runs no node agent, so it has no home root"
             ));
         }
         let trust = &mut after.trust;
@@ -190,6 +237,8 @@ fn apply_fields(
                             control.tls_port = port;
                         }
                     }
+                    // The seed's `QUASAR_ENROLL_*` are the operator's overrides (#365); the
+                    // install-time images stay the fallback.
                     ENROLL_SEED_IMAGE | ENROLL_AGENT_IMAGE => {
                         let image = match opt(value) {
                             None => None,
@@ -198,9 +247,9 @@ fn apply_fields(
                             }
                         };
                         if key == ENROLL_SEED_IMAGE {
-                            after.enroll.seed = image;
+                            after.enroll.seed_override = image;
                         } else {
-                            after.enroll.agent = image;
+                            after.enroll.agent_override = image;
                         }
                     }
                     _ => unreachable!("every control key is matched"),
@@ -208,7 +257,7 @@ fn apply_fields(
             }
         }
     }
-    Ok((after, ()))
+    Ok(after)
 }
 
 fn checked(
@@ -221,36 +270,34 @@ fn checked(
     var::trust_config(&after.trust)?;
     let mut changed = Vec::new();
     for (key, value) in changes {
-        let mut alone = before.clone();
         let one = BTreeMap::from([(key.clone(), value.clone())]);
-        assign_all(&mut alone, role, &one)?;
-        if alone != *before {
+        if apply_fields(before, role, &one)? != *before {
             changed.push(key.clone());
         }
     }
     Ok((after, changed))
 }
 
-/// The field assignments of [`apply`], without its whole-input checks.
-fn assign_all(
-    inputs: &mut Inputs,
-    role: MachineRole,
-    changes: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    let (after, _) = apply_fields(inputs, role, changes)?;
-    *inputs = after;
-    Ok(())
-}
-
-/// Why a role cannot be replaced for a reconfigure in this build, if it cannot.
+/// Why a role cannot be replaced by a reconfigure, if it cannot.
 fn not_replaceable(role: Role) -> Option<&'static str> {
     match role {
-        Role::NodeAgent => None,
-        Role::ControlPlane => Some("re-create the control plane, and a reconfigure does not use control-plane replacement (#363) yet"),
-        Role::Postgres => Some("re-create Quasar's Postgres, which is created once and never replaced (#352 R1)"),
-        Role::RecoveryActor => Some("re-create the recovery actor itself, which a reconfigure does not do"),
+        Role::NodeAgent | Role::ControlPlane => None,
+        Role::Postgres => {
+            Some("re-create Quasar's Postgres, which is created once and never replaced (#352 R1)")
+        }
+        Role::RecoveryActor => {
+            Some("re-create the recovery actor itself, which a reconfigure does not do")
+        }
     }
 }
+
+/// The order a reconfigure replaces in: the control plane before the agent that dials it.
+const ORDER: [Role; 4] = [
+    Role::ControlPlane,
+    Role::NodeAgent,
+    Role::Postgres,
+    Role::RecoveryActor,
+];
 
 fn refuse(reason: Reason, message: impl Into<String>) -> crate::socket::Rejection {
     crate::socket::Rejection {
@@ -258,6 +305,37 @@ fn refuse(reason: Reason, message: impl Into<String>) -> crate::socket::Rejectio
         reason,
         message: message.into(),
     }
+}
+
+/// What the operator is told before a reconfigure of `changed` replacing `replaced`.
+fn notes(role: MachineRole, changed: &[String], replaced: &[Role]) -> Vec<String> {
+    let mut out = Vec::new();
+    let changes = |k: &str| changed.iter().any(|c| c == k);
+    if replaced.contains(&Role::ControlPlane) {
+        out.push("Re-creating the control plane restarts the console and drops every agent's connection for a moment; running sessions keep streaming and agents reconnect.".to_string());
+    }
+    if replaced.contains(&Role::NodeAgent) {
+        out.push("Re-creating the node agent ends this host's sessions.".to_string());
+    }
+    if changes(var::TLS_PORT) {
+        out.push(format!(
+            "GPU hosts added with Add host dial the HTTPS port in their enrollment string: after {} changes they stop connecting until they are added again{}.",
+            var::TLS_PORT,
+            if role == MachineRole::ControlOnly {
+                ""
+            } else {
+                " (this machine's own agent is not affected)"
+            }
+        ));
+    }
+    if changes(var::PUBLIC_HOST) || changes(var::TLS_HOSTS) {
+        out.push(format!(
+            "The control plane keeps its certificate, which agents pin, so {} and {} reach the certificate only when it is re-issued (docs/configuration.md, QUASAR_TLS_DIR).",
+            var::PUBLIC_HOST,
+            var::TLS_HOSTS
+        ));
+    }
+    out
 }
 
 impl Actor {
@@ -273,35 +351,61 @@ impl Actor {
         })
     }
 
-    /// The services whose rendered specification `after` moves, in replacement order.
-    fn moved_by(&self, before: &Inputs, after: &Inputs) -> Result<Vec<Role>, String> {
+    /// The `io.quasar.spec` of `role` rendered with `inputs` on its recorded revision and
+    /// image; `None` when machine state has no record of it.
+    fn spec_with(&self, role: Role, inputs: &Inputs) -> Result<Option<String>, String> {
+        let Some(record) = self.dir.load_service(role).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let secrets = self.secrets_for(role).map_err(|e| e.to_string())?;
+        recipe::render(
+            role,
+            record.recipe_revision,
+            inputs,
+            &record.image,
+            &secrets,
+        )
+        .map(|s| s.labels.get(labels::SPEC).cloned())
+        .map_err(|e| format!("{}: {e}", role.as_str()))
+    }
+
+    /// Whether `role`'s verified specification is the one `inputs` render.
+    fn runs(&self, role: Role, inputs: &Inputs) -> bool {
+        match (self.dir.load_service(role), self.spec_with(role, inputs)) {
+            (Ok(Some(record)), Ok(Some(spec))) => spec == record.spec_digest,
+            _ => false,
+        }
+    }
+
+    /// The services whose rendered specification `after` moves, in replacement order,
+    /// with those a partly applied reconfigure left behind that `after` still moves.
+    fn moved_by(
+        &self,
+        before: &Inputs,
+        after: &Inputs,
+        behind: &[Role],
+    ) -> Result<Vec<Role>, String> {
         let mut moved = Vec::new();
-        for role in [
-            Role::NodeAgent,
-            Role::ControlPlane,
-            Role::Postgres,
-            Role::RecoveryActor,
-        ] {
-            let Some(record) = self.dir.load_service(role).map_err(|e| e.to_string())? else {
+        for role in ORDER {
+            let Some(new) = self.spec_with(role, after)? else {
                 continue;
             };
-            let secrets = self.secrets_for(role).map_err(|e| e.to_string())?;
-            let render = |inputs: &Inputs| {
-                recipe::render(
-                    role,
-                    record.recipe_revision,
-                    inputs,
-                    &record.image,
-                    &secrets,
-                )
-                .map(|s| s.labels.get(recipe::labels::SPEC).cloned())
-                .map_err(|e| format!("{}: {e}", role.as_str()))
-            };
-            if render(before)? != render(after)? {
+            let catch_up = behind.contains(&role) && !self.runs(role, after);
+            if self.spec_with(role, before)? != Some(new) || catch_up {
                 moved.push(role);
             }
         }
         Ok(moved)
+    }
+
+    /// The services the last reconfigure left on their previous specification.
+    fn left_behind(&self) -> Vec<Role> {
+        match self.dir.reconfigure_file().load() {
+            Ok(Some(Record {
+                outcome: Some(o), ..
+            })) if o.settled == Settled::Partial => o.behind,
+            _ => Vec::new(),
+        }
     }
 
     /// The operator's reconfigure. `Ok` with no `request_id`: nothing needed re-creating
@@ -343,13 +447,13 @@ impl Actor {
         let (after, changed) = apply(&machine.inputs, machine.role, &req.changes)
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;
         let replaced = self
-            .moved_by(&machine.inputs, &after)
+            .moved_by(&machine.inputs, &after, &self.left_behind())
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;
         if let Some(why) = replaced.iter().find_map(|r| not_replaceable(*r)) {
             return Err(refuse(
                 Reason::Invalid,
                 format!(
-                    "changing {} would {why}, so this build cannot apply it; nothing was changed",
+                    "changing {} would {why}, so a reconfigure cannot apply it; nothing was changed",
                     changed.join(", ")
                 ),
             ));
@@ -359,8 +463,9 @@ impl Actor {
             replaced: replaced.iter().map(|r| r.as_str().to_string()).collect(),
             request_id,
             dry_run: req.dry_run,
+            notes: notes(machine.role, &changed, &replaced),
         };
-        if req.dry_run || changed.is_empty() {
+        if req.dry_run || (changed.is_empty() && replaced.is_empty()) {
             return Ok(planned(None));
         }
         let scan = self.journals.scan();
@@ -370,12 +475,13 @@ impl Actor {
                 format!("attempt {open} is in flight; reconfigure once it has finished"),
             ));
         }
-        // No attempt is open, so a record left here belongs to a finished attempt: settle it
-        // now rather than answer busy until the next start. One that cannot be read is
-        // never overwritten.
+        // No attempt is open, so a record left unsettled belongs to a finished attempt:
+        // settle it now rather than answer busy until the next start. One that cannot be
+        // read is never overwritten.
         self.settle_reconfigure();
         match self.dir.reconfigure_file().load() {
             Ok(None) => {}
+            Ok(Some(r)) if r.outcome.is_some() => {}
             Ok(Some(r)) => {
                 return Err(refuse(
                     Reason::Busy,
@@ -390,6 +496,23 @@ impl Actor {
                     Reason::Invalid,
                     format!("{RECORD_FILE} is unreadable ({e}); nothing was changed. The recovery actor's next start sets it aside"),
                 ))
+            }
+        }
+        if replaced.contains(&Role::ControlPlane) {
+            match crate::database::load_hold(self.dir.root()) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(refuse(
+                        Reason::Invalid,
+                        "a restore holds this machine's database (it has not finished), so no control plane is started; run the restore command again first. Nothing was changed",
+                    ))
+                }
+                Err(e) => {
+                    return Err(refuse(
+                        Reason::Busy,
+                        format!("database-hold.json cannot be read ({e}); nothing was changed"),
+                    ))
+                }
             }
         }
         let containers = self.engine.list_containers().map_err(|e| {
@@ -432,9 +555,10 @@ impl Actor {
             after: after.clone(),
             replaced: replaced.clone(),
             started_at: (self.config.now)(),
+            outcome: None,
         };
         let journal = self
-            .reconfigure_journal(&machine, &request_id, &replaced)
+            .reconfigure_journal(&request_id, &replaced)
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;
         // The record, then the inputs, then the attempt (module documentation).
         self.dir.reconfigure_file().store(&record).map_err(|e| {
@@ -453,7 +577,7 @@ impl Actor {
             ));
         }
         if let Err(e) = self.journals.store(&journal) {
-            self.put_back(&record);
+            self.undo_admission(&record);
             return Err(refuse(
                 Reason::Busy,
                 format!("the attempt could not be journalled ({e}); nothing was changed"),
@@ -475,12 +599,9 @@ impl Actor {
         Ok(planned(Some(request_id)))
     }
 
-    fn reconfigure_journal(
-        &self,
-        machine: &Machine,
-        request_id: &str,
-        roles: &[Role],
-    ) -> Result<Journal, String> {
+    /// The attempt: one step per service, each on the image machine state records for it,
+    /// which must be the image it runs, so a reconfigure can never be a migration.
+    fn reconfigure_journal(&self, request_id: &str, roles: &[Role]) -> Result<Journal, String> {
         let mut steps = Vec::new();
         let mut components = Vec::new();
         let mut previous = Vec::new();
@@ -497,6 +618,13 @@ impl Actor {
             let old_digest = running
                 .as_ref()
                 .and_then(|c| c.image.split_once('@').map(|(_, d)| d.to_owned()));
+            if let Some(digest) = old_digest.as_ref().filter(|d| **d != record.image.digest) {
+                return Err(format!(
+                    "the running {} is on {digest}, not on {}, which machine state records for it; a reconfigure keeps a service's image, so settle that first (an update, or `quasar-recovery restore`)",
+                    role.as_str(),
+                    record.image.digest
+                ));
+            }
             components.push(crate::socket::Component {
                 name: role.as_str().into(),
                 image: record.image.repository.clone(),
@@ -522,7 +650,6 @@ impl Actor {
                 dump: None,
             });
         }
-        let _ = machine;
         let now = (self.config.now)();
         let release = Release {
             id: String::new(),
@@ -567,36 +694,41 @@ impl Actor {
         })
     }
 
-    /// Machine state's inputs back to what they were before `record`.
-    fn put_back(&self, record: &Record) {
+    /// An admission that could not journal its attempt: nothing happened, so the inputs go
+    /// back and the record goes.
+    fn undo_admission(&self, record: &Record) {
+        if self.write_inputs(&record.before) {
+            let _ = remove_record(&self.dir);
+        }
+    }
+
+    /// Machine state's inputs set to `inputs`; `false` (logged) when they could not be.
+    fn write_inputs(&self, inputs: &Inputs) -> bool {
         match self.dir.load_machine() {
             Ok(Some(mut machine)) => {
-                machine.inputs = record.before.clone();
+                if machine.inputs == *inputs {
+                    return true;
+                }
+                machine.inputs = inputs.clone();
                 if let Err(e) = self.dir.machine().store(&machine) {
                     warn!(token = "reconfigure-inputs-not-restored", "the previous machine inputs could not be written back ({e}); the next start tries again");
-                    return;
+                    return false;
                 }
+                true
             }
-            Ok(None) => {}
+            Ok(None) => true,
             Err(e) => {
                 warn!(
                     token = "reconfigure-machine-unreadable",
                     "machine state is unreadable ({e}); the previous inputs are put back on the next start"
                 );
-                return;
+                false
             }
-        }
-        if let Err(e) = remove_record(&self.dir) {
-            warn!(
-                token = "reconfigure-record-left",
-                "{RECORD_FILE} could not be removed after putting the inputs back ({e})"
-            );
         }
     }
 
-    /// Settles a reconfigure whose attempt has reached its outcome, or was never journalled:
-    /// the new inputs stay only if the replacement succeeded. Idempotent; `resume` calls it
-    /// after settling the open attempt.
+    /// Settles a reconfigure whose attempt has reached its outcome, or was never journalled
+    /// (the module's table). Idempotent; `resume` calls it after settling the open attempt.
     pub(crate) fn settle_reconfigure(&self) {
         self.settle_reconfigure_record(false);
     }
@@ -609,7 +741,8 @@ impl Actor {
     }
 
     fn settle_reconfigure_record(&self, set_aside: bool) {
-        let record = match self.dir.reconfigure_file().load() {
+        let mut record = match self.dir.reconfigure_file().load() {
+            Ok(Some(r)) if r.outcome.is_some() => return,
             Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) if set_aside => {
@@ -618,7 +751,7 @@ impl Actor {
                 match std::fs::rename(&from, &to) {
                     Ok(()) => error!(
                         token = "reconfigure-record-set-aside",
-                        "{RECORD_FILE} was unreadable ({e}) and is kept as {}; machine state keeps the inputs of that reconfigure, which the node agent may not run if it did not succeed. Run reconfigure again with the values you want",
+                        "{RECORD_FILE} was unreadable ({e}) and is kept as {}; machine state keeps the inputs of that reconfigure, which its services may not run if it did not succeed. Run reconfigure again with the values you want",
                         to.display()
                     ),
                     Err(re) => error!(
@@ -636,27 +769,89 @@ impl Actor {
                 return;
             }
         };
-        match self.journals.load(&record.request_id) {
-            Ok(Some(j)) if j.is_open() => {}
-            Ok(Some(j)) if j.result.state == State::Succeeded => {
-                info!(request = %record.request_id, changed = ?record.changed, "reconfigured: the new inputs are in force");
-                if let Err(e) = remove_record(&self.dir) {
-                    warn!(
-                        token = "reconfigure-record-not-cleared",
-                        "{RECORD_FILE} could not be removed after the reconfigure succeeded ({e})"
-                    );
-                }
+        let journal = match self.journals.load(&record.request_id) {
+            Ok(Some(j)) if j.is_open() => return,
+            Ok(j) => j,
+            Err(e) => {
+                warn!(token = "reconfigure-journal-unreadable", "{e}");
+                return;
             }
-            Ok(_) => {
-                warn!(
-                    token = "reconfigure-reverted",
-                    request = %record.request_id,
-                    "the reconfigure's replacement did not succeed; the previous machine inputs are back in force"
-                );
-                self.put_back(&record);
-            }
-            Err(e) => warn!(token = "reconfigure-journal-unreadable", "{e}"),
+        };
+        let outcome = self.outcome_of(&record, journal.as_ref());
+        let inputs = match outcome.settled {
+            Settled::PutBack => &record.before,
+            Settled::Applied | Settled::Partial => &record.after,
+        };
+        if !self.write_inputs(inputs) {
+            return;
         }
+        match outcome.settled {
+            Settled::Applied => {
+                info!(request = %record.request_id, changed = ?record.changed, "reconfigured: the new inputs are in force")
+            }
+            Settled::PutBack => warn!(
+                token = "reconfigure-reverted",
+                request = %record.request_id,
+                "the reconfigure's replacement did not succeed; the previous machine inputs are back in force"
+            ),
+            Settled::Partial => warn!(
+                token = "reconfigure-partial",
+                request = %record.request_id,
+                behind = ?outcome.behind,
+                "the reconfigure was partly applied: the new inputs stay in force, and the services it could not re-create run their previous specification until the same reconfigure is run again"
+            ),
+        }
+        record.outcome = Some(outcome);
+        if let Err(e) = self.dir.reconfigure_file().store(&record) {
+            warn!(
+                token = "reconfigure-outcome-unrecorded",
+                "the reconfigure's outcome could not be written to {RECORD_FILE} ({e}); the next start settles it again"
+            );
+        }
+    }
+
+    /// The module's table, from the attempt's result and the services' verified records.
+    fn outcome_of(&self, record: &Record, journal: Option<&Journal>) -> Outcome {
+        let (state, reason, restored) = match journal {
+            Some(j) => (
+                Some(j.result.state),
+                j.result.reason.clone(),
+                j.result.restored,
+            ),
+            None => (None, None, false),
+        };
+        let behind: Vec<Role> = record
+            .replaced
+            .iter()
+            .copied()
+            .filter(|role| !self.runs(*role, &record.after))
+            .collect();
+        let settled = if state == Some(State::Succeeded) {
+            Settled::Applied
+        } else if journal.is_none() || behind.len() == record.replaced.len() {
+            Settled::PutBack
+        } else if behind.is_empty() {
+            Settled::Applied
+        } else {
+            Settled::Partial
+        };
+        Outcome {
+            behind: if settled == Settled::Partial {
+                behind
+            } else {
+                Vec::new()
+            },
+            settled,
+            state,
+            reason,
+            restored,
+            settled_at: (self.config.now)(),
+        }
+    }
+
+    /// The last reconfigure's record, for the operator socket.
+    pub fn reconfigure_record(&self) -> io::Result<Option<Record>> {
+        self.dir.reconfigure_file().load()
     }
 }
 
@@ -674,6 +869,9 @@ pub fn variables(role: Option<MachineRole>) -> Vec<&'static str> {
     let mut out: BTreeSet<&str> = EVERYWHERE.iter().copied().collect();
     if role != Some(MachineRole::Gpu) {
         out.extend(CONTROL_ONLY.iter().copied());
+    }
+    if role == Some(MachineRole::ControlOnly) {
+        out.remove(var::HOME_ROOT);
     }
     out.into_iter().collect()
 }
