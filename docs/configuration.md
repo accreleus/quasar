@@ -1681,13 +1681,14 @@ shows the last attempt's result.
 
 **Replacing the recovery actor (#362).** A request naming `recovery-actor` is a
 hand-over (`docs/rh06/2026-09-24-architecture.md` §5.6): the running actor creates
-`quasar-recovery.next` from its recipe, keeping its own `QUASAR_UPDATER_*`,
-`QUASAR_SEED_CONTAINER` and `RUST_LOG`, starts it, and waits up to 60 s for its ready
-marker (`handover/<request-id>.ready` in machine state). It then stops serving and
+`quasar-recovery.next` from its recipe, keeping its own `QUASAR_SEED_CONTAINER` and
+`RUST_LOG` (and its `QUASAR_UPDATER_*` only on a machine whose state records no release
+trust: recorded trust wins over the variables), starts it, and waits up to 60 s for its
+ready marker (`handover/<request-id>.ready` in machine state). It then stops serving and
 releases `actor.lease`; the successor takes it (`token="actor-handover-taking-over"`),
 stops the old actor, disables its restart policy, renames it `quasar-recovery.kept`, takes
-the name `quasar-recovery`, and verifies: it answers on its own agent socket within 60 s,
-and on a GPU host the node agent reaches that socket within a further 60 s (the agent's
+the name `quasar-recovery`, and verifies: it answers on each of its own sockets within 60 s,
+and on a GPU host the node agent reaches the agent socket within a further 60 s (the agent's
 relay polls it throughout an attempt; an agent that is down leaves the successor
 unverified). Only then is `.kept` removed and `seed.json` rewritten to name the new image
 (`token="actor-seed-file-updated"`). A successor that never becomes ready, never takes the

@@ -52,25 +52,28 @@ pub fn successor_name() -> String {
     format!("{}.next", names::RECOVERY_ACTOR)
 }
 
-/// The running actor's own configuration that its successor keeps: its release trust
-/// knobs (`docs/configuration.md` "Recovery actor"), which a successor rendered from the
-/// recipe alone would silently reset, the seed that created it, and its log level.
-const CARRIED_ENV: &[&str] = &[
-    "QUASAR_UPDATER_ALLOWED_NAMESPACES",
-    "QUASAR_UPDATER_SIGNATURE_MODE",
-    "QUASAR_UPDATER_TRUSTED_KEYS",
-    "QUASAR_UPDATER_MANIFEST_BASE_URL",
-    "QUASAR_UPDATER_MANIFEST_TIMEOUT_S",
-    crate::seed::profile::SEED_CONTAINER_ENV,
-    "RUST_LOG",
+/// What a successor keeps of the running actor's environment: the seed that created it
+/// and its log level, which the recipe does not render.
+const CARRIED_ENV: &[&str] = &[crate::seed::profile::SEED_CONTAINER_ENV, "RUST_LOG"];
+
+/// The running actor's release trust (`docs/configuration.md` "Recovery actor"), carried
+/// only when machine state records none: recorded trust wins over any variable
+/// (`Actor::trust`), so carrying it would keep a setting that no longer applies.
+const CARRIED_TRUST_ENV: &[&str] = &[
+    crate::bootstrap::ALLOWED_NAMESPACES,
+    crate::bootstrap::SIGNATURE_MODE,
+    crate::bootstrap::TRUSTED_KEYS,
+    crate::bootstrap::MANIFEST_BASE_URL,
+    crate::bootstrap::MANIFEST_TIMEOUT_S,
 ];
 
-/// The successor's specification: the recipe's, plus [`CARRIED_ENV`] from the running
-/// actor's container, and its `io.quasar.spec` recomputed over the result.
-pub(crate) fn carry_forward(spec: &mut ContainerSpec, running: &Container) {
+/// The successor's specification: the recipe's, plus [`CARRIED_ENV`] (and, on a machine
+/// whose state records no trust, [`CARRIED_TRUST_ENV`]) from the running actor's container,
+/// and its `io.quasar.spec` recomputed over the result.
+pub(crate) fn carry_forward(spec: &mut ContainerSpec, running: &Container, trust_recorded: bool) {
     for kv in &running.env {
         if let Some((k, v)) = kv.split_once('=') {
-            if CARRIED_ENV.contains(&k) {
+            if CARRIED_ENV.contains(&k) || (!trust_recorded && CARRIED_TRUST_ENV.contains(&k)) {
                 spec.env.insert(k.to_owned(), v.to_owned());
             }
         }

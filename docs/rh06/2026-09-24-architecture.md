@@ -350,7 +350,8 @@ successor, or an actor the seed re-created after every actor container was remov
 actor that cannot take the lease waits for it. A hand-over may replace an actor that was
 started by hand without the installation's labels (it is the actor handing over), but an
 actor carrying Compose labels is declared by an external manager (ADR 0007) and is refused
-`owner_conflict`. The machine states of each committed phase of a successful hand-over are
+`owner_conflict`. The successor keeps the running actor's `QUASAR_UPDATER_*` only where machine
+state records no release trust, since recorded trust wins. The machine states of each committed phase of a successful hand-over are
 seed fixtures (`testdata/recovery/seed/actors/unreleased`).
 
 ### 5.7 The seed

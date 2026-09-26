@@ -845,8 +845,7 @@ fn a_successor_takes_over_and_seed_json_names_it_only_once_it_verified() {
         assert_eq!(named, want, "{who:?} {phase:?}");
     }
 
-    // The successor keeps what the operator gave the actor it replaced: its trust knobs
-    // and its seed.
+    // The successor keeps the seed that created the actor it replaced.
     let now = lab.actors()[0].clone();
     assert_eq!(
         now.spec
@@ -866,6 +865,42 @@ fn a_successor_takes_over_and_seed_json_names_it_only_once_it_verified() {
         before.keys().collect::<Vec<_>>()
     );
     lab.assert_one_actor(NEW_ACTOR, "after a restart");
+}
+
+/// Recorded trust wins over the variables (`Actor::trust`), so a successor keeps the
+/// running actor's `QUASAR_UPDATER_*` only on a machine whose state records none.
+#[test]
+fn a_successor_keeps_the_trust_variables_only_where_machine_state_records_none() {
+    const VAR: &str = "QUASAR_UPDATER_ALLOWED_NAMESPACES";
+    for recorded in [false, true] {
+        let at = format!("trust recorded: {recorded}");
+        let lab = Lab::new();
+        let old = lab.old_actor();
+        lab.engine.with_state(|s| {
+            let c = s.containers.get_mut(&old.id).unwrap();
+            c.spec
+                .env
+                .insert(VAR.into(), "registry.example.invalid/quasar".into());
+        });
+        if recorded {
+            let path = lab.dir.path().join("machine.json");
+            let mut machine: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            machine["inputs"]["trust"] =
+                serde_json::json!({ "allowed_namespaces": "registry.example.invalid/quasar" });
+            std::fs::write(&path, serde_json::to_vec(&machine).unwrap()).unwrap();
+        }
+        hand_over(&lab);
+        let result = lab.outcome(&at);
+        assert_succeeded(&lab, &result, &at);
+        let env = &lab.actors()[0].spec.env;
+        assert_eq!(env.contains_key(VAR), !recorded, "{at}: {env:?}");
+        assert_eq!(
+            env.get("QUASAR_SEED_CONTAINER").map(String::as_str),
+            Some(SEED_ID),
+            "{at}"
+        );
+    }
 }
 
 #[test]

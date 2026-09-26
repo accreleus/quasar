@@ -483,7 +483,11 @@ impl Actor {
                     ),
                 ));
             };
-            crate::handover::carry_forward(&mut spec, old);
+            let trust_recorded = matches!(
+                self.dir.load_machine(),
+                Ok(Some(m)) if !m.inputs.trust.is_empty()
+            );
+            crate::handover::carry_forward(&mut spec, old, trust_recorded);
         }
         let step = &mut j.steps[i];
         step.revision = Some(revision);
