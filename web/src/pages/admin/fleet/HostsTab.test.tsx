@@ -512,6 +512,11 @@ describe("HostsTab — owned hosts (#366)", () => {
     const conflictRow = screen.getByText("study-pc").closest("tr") as HTMLElement;
     expect(within(conflictRow).getByText("owner conflict")).toBeTruthy();
     expect(within(conflictRow).queryByText("no seed")).toBeNull();
+    // Both rows need attention, and the conflicted one still reads online.
+    expect(within(conflictRow).queryByText(/degraded/)).toBeNull();
+    fireEvent.click(screen.getByRole("tab", { name: /Needs attention/ }));
+    expect(screen.getByText("gpu-host-2")).toBeTruthy();
+    expect(screen.getByText("study-pc")).toBeTruthy();
   });
 
   it("sends Remove host for an owned GPU host to its page, where its recovery actor removes it", async () => {
