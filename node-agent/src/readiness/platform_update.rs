@@ -126,7 +126,7 @@ pub fn check_updater_socket(actor: Option<&ActorView>) -> ReadinessCheck {
             "The recovery actor did not answer on {}",
             actor.socket.display()
         ),
-        "Check that it is running (docker ps --filter name=quasar-recovery) and read its log (docker logs quasar-recovery)".into(),
+        "Check it with docker ps -a --filter name=quasar-recovery. Exited means it was stopped with docker stop or docker kill, which Docker never restarts: docker start quasar-recovery finishes what it was doing. Otherwise read its log (docker logs quasar-recovery)".into(),
     )
 }
 

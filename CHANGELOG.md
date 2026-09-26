@@ -526,6 +526,20 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Add host installs the seed the control plane's machine runs after a developer apply
+  (#385).** Below an override and the installed release, Add host now offers the image of
+  the recovery actor answering on the control plane's own machine, and that machine's
+  running node agent, before the install-time `QUASAR_ENROLL_FALLBACK_*` images. A developer
+  apply is no release, so the served command used to name the seed the machine was installed
+  with, which on a host removed from the console could not clear its uninstalled state.
+- **A recovery actor stopped with `docker stop` or `docker kill` is reported, not silent
+  (#381).** Docker never restarts a container stopped that way, so a machine whose actor was
+  stopped mid-replacement stayed without a control plane until someone noticed. The seed now
+  logs `seed-actor-stopped` and turns unhealthy when no recovery actor of the installation has
+  run for two looks, naming `docker start quasar-recovery` (or the way back after an
+  interrupted hand-over); it still starts no existing actor. The `updater_socket` readiness
+  check, the control-plane preflight and the console's manual path for an owned machine say
+  the same, and the recovery runbook in `docs/upgrading.md` has the case.
 - **The release preflight inventory matches the image build again (#383).**
   `scripts/release/release-manifest.json` lists the three vendored patches
   `deploy/Dockerfile.vulkan` applies and the gst-wayland-display pin in `deploy/pins.env`,

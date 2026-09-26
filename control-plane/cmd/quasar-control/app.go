@@ -1380,7 +1380,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		jobsAgentHandler: jobsAgentHandler,
 
 		pool:           pool,
-		enrollPins:     installedEnrollPins(cfg.EnrollPins, cfg.EnrollFallback, platformStore, buildinfo.Get().SourceCommit, log),
+		enrollPins:     installedEnrollPins(cfg.EnrollPins, cfg.EnrollFallback, platformStore, buildinfo.Get().SourceCommit, ownMachineSource(ownMachine), log),
 		authSvc:        authSvc,
 		janitorStop:    janitorStop,
 		jobsDispatcher: jobsDispatcher,
@@ -1449,8 +1449,8 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if p := pins(ctx); p.SeedImage == "" || p.AgentImage == "" {
-			s.log.Warn("Add host has no images to install: the installed release names none, and " +
-				"QUASAR_ENROLL_SEED_IMAGE / QUASAR_ENROLL_AGENT_IMAGE are unset")
+			s.log.Warn("Add host has no images to install: the installed release names none, this machine's " +
+				"recovery actor reports none it runs, and QUASAR_ENROLL_SEED_IMAGE / QUASAR_ENROLL_AGENT_IMAGE are unset")
 		}
 		cancel()
 		mux.Handle("/enroll-host.sh", enrollscript.HandlerFrom(s.cfg.WebRoot, pins, s.log))
@@ -1459,10 +1459,12 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 
 // installedEnrollPins answers Add host's images per request, field by field: the
 // operator's QUASAR_ENROLL_* override, else the installed release's recovery-actor and
-// node-agent images, else the machine's install-time QUASAR_ENROLL_FALLBACK_* images.
-// Read per request because detection can learn the installed release after boot.
-// commit is this build's (nil when unstamped: no release can be installed).
-func installedEnrollPins(configured, fallback enrollscript.Pins, store *platform.Store, commit *string, log *slog.Logger) enrollscript.PinSource {
+// node-agent images, else the ones this control plane's own machine runs (#385: a
+// developer apply is no release), else the install-time QUASAR_ENROLL_FALLBACK_* images.
+// Read per request because detection or an apply can change the answer after boot.
+// commit is this build's (nil when unstamped: no release can be installed); own is nil
+// with no recovery actor.
+func installedEnrollPins(configured, fallback enrollscript.Pins, store *platform.Store, commit *string, own platform.OwnMachineSource, log *slog.Logger) enrollscript.PinSource {
 	return func(ctx context.Context) enrollscript.Pins {
 		if configured.SeedImage != "" && configured.AgentImage != "" {
 			return configured
@@ -1477,8 +1479,36 @@ func installedEnrollPins(configured, fallback enrollscript.Pins, store *platform
 				release = enrollscript.Pins{SeedImage: seed, AgentImage: agent}
 			}
 		}
-		return configured.Or(release).Or(fallback)
+		return configured.Or(release).Or(runningEnrollPins(ctx, own)).Or(fallback)
 	}
+}
+
+// runningEnrollPins is empty per field when the actor did not answer or named no
+// image Add host may serve.
+func runningEnrollPins(ctx context.Context, own platform.OwnMachineSource) enrollscript.Pins {
+	if own == nil {
+		return enrollscript.Pins{}
+	}
+	m, ok := own.Read(ctx)
+	if !ok {
+		return enrollscript.Pins{}
+	}
+	var out enrollscript.Pins
+	if enrollscript.ValidImage(m.Running.RecoveryActor) {
+		out.SeedImage = m.Running.RecoveryActor
+	}
+	if enrollscript.ValidImage(m.Running.NodeAgent) {
+		out.AgentImage = m.Running.NodeAgent
+	}
+	return out
+}
+
+// ownMachineSource never returns a typed nil.
+func ownMachineSource(reader *platform.OwnMachineReader) platform.OwnMachineSource {
+	if reader == nil {
+		return nil
+	}
+	return reader
 }
 
 // Stop cancels the background goroutines and the coordinator's lifecycle context.

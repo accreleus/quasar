@@ -110,13 +110,44 @@ type OwnMachine struct {
 	DumpFreeBytes *int64
 	// Conflicts are the race guard's owner conflicts, for the preflight.
 	Conflicts []actorsocket.Conflict
+	// Running is what this machine runs, for Add host (#385).
+	Running RunningImages
+}
+
+// RunningImages are `repository@sha256:<digest>`, "" when the status did not say.
+// The recovery-actor image is also the seed's: one binary (ADR 0007).
+type RunningImages struct {
+	RecoveryActor string
+	NodeAgent     string
+}
+
+// runningImagesOf: the actor is the one that answered; the agent is the one
+// running node-agent container, none when there is not exactly one image running.
+func runningImagesOf(st actorsocket.Status) RunningImages {
+	var out RunningImages
+	if st.Actor.Image != "" && st.Actor.Digest != nil && *st.Actor.Digest != "" {
+		out.RecoveryActor = st.Actor.Image + "@" + *st.Actor.Digest
+	}
+	for _, s := range st.Services {
+		if s.Role != ComponentNodeAgent || s.State != "running" || s.Image == "" || s.Digest == nil || *s.Digest == "" {
+			continue
+		}
+		ref := s.Image + "@" + *s.Digest
+		if out.NodeAgent != "" && out.NodeAgent != ref {
+			out.NodeAgent = ""
+			break
+		}
+		out.NodeAgent = ref
+	}
+	return out
 }
 
 // OwnMachineFromStatus derives the identity from one status answer. A value
 // the contract cannot use is null, never passed through.
 func OwnMachineFromStatus(st actorsocket.Status) OwnMachine {
 	owned := InstallOwned
-	m := OwnMachine{ActorVersion: st.Actor.Version, DumpFreeBytes: st.DumpFreeBytes, Conflicts: st.Conflicts}
+	m := OwnMachine{ActorVersion: st.Actor.Version, DumpFreeBytes: st.DumpFreeBytes, Conflicts: st.Conflicts,
+		Running: runningImagesOf(st)}
 	m.Identity.InstallMode = &owned
 	if agentws.ValidRecoveryActorVersion(st.Actor.Version) {
 		v := st.Actor.Version

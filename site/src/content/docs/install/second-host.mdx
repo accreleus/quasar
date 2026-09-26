@@ -28,8 +28,9 @@ On the new machine you need:
   host's readiness check reports on afterwards.
 
 The control plane has to know which images a new host installs: the seed and the node
-agent, both by digest. It offers the installed release's images, and otherwise the
-recovery and agent images its own machine was installed with. To pin others, give
+agent, both by digest. It offers the installed release's images, otherwise the
+recovery and agent images its own machine runs now (after a developer apply, the ones
+it was moved to), and otherwise the ones that machine was installed with. To pin others, give
 the first machine's seed `QUASAR_ENROLL_SEED_IMAGE` and `QUASAR_ENROLL_AGENT_IMAGE`
 at its install. If it knows neither, the dialog says so and creates nothing.
 
