@@ -526,6 +526,12 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Add host installs the seed the control plane's machine runs after a developer apply
+  (#385).** Below an override and the installed release, Add host now offers the image of
+  the recovery actor answering on the control plane's own machine, and that machine's
+  running node agent, before the install-time `QUASAR_ENROLL_FALLBACK_*` images. A developer
+  apply is no release, so the served command used to name the seed the machine was installed
+  with, which on a host removed from the console could not clear its uninstalled state.
 - **The release preflight inventory matches the image build again (#383).**
   `scripts/release/release-manifest.json` lists the three vendored patches
   `deploy/Dockerfile.vulkan` applies and the gst-wayland-display pin in `deploy/pins.env`,
