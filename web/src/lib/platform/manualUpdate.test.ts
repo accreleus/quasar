@@ -6,6 +6,7 @@ import {
   REGISTRY_PULL_COMMAND,
   REGISTRY_RECREATE_COMMAND,
   ACTOR_CHECK_COMMAND,
+  ACTOR_START_COMMAND,
   ACTOR_LOG_COMMAND,
   manualUpdatePath,
   redeployProfile,
@@ -128,6 +129,7 @@ describe("manualUpdatePath", () => {
     const commands = commandsOf("updater_absent", { installMode: "owned" }) ?? "";
     expect(commands).toContain(ACTOR_CHECK_COMMAND);
     expect(commands).toContain(ACTOR_LOG_COMMAND);
+    expect(commands).toContain(ACTOR_START_COMMAND);
     expect(commands).not.toContain("docker compose");
   });
 

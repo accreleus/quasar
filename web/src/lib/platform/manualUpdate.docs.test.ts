@@ -15,6 +15,7 @@ import {
   REGISTRY_RECREATE_COMMAND,
   ACTOR_CHECK_COMMAND,
   ACTOR_LOG_COMMAND,
+  ACTOR_START_COMMAND,
 } from "./manualUpdate";
 
 // `import.meta.url` is not a file URL under vitest's transform, so the guide is
@@ -40,7 +41,7 @@ describe("docs/upgrading.md and the manual-update commands", () => {
   });
 
   it("documents the recovery-actor check the UI shows", () => {
-    for (const skeleton of [ACTOR_CHECK_COMMAND, ACTOR_LOG_COMMAND]) {
+    for (const skeleton of [ACTOR_CHECK_COMMAND, ACTOR_LOG_COMMAND, ACTOR_START_COMMAND]) {
       expect(guide).toContain(skeleton);
     }
   });

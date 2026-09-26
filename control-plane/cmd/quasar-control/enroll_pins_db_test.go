@@ -83,7 +83,7 @@ func TestAddHostOnAnOwnedInstallPrefersTheInstalledReleaseOverItsInstallTimeImag
 	}
 
 	before := strings.Repeat("0", 40)
-	body := servedPins(t, installedEnrollPins(trust, installTime, store, &before, quiet))
+	body := servedPins(t, installedEnrollPins(trust, installTime, store, &before, nil, quiet))
 	trusted(body)
 	if !strings.Contains(body, "\nPINNED_SEED_IMAGE='"+installTime.SeedImage+"'\n") ||
 		!strings.Contains(body, "\nPINNED_AGENT_IMAGE='"+installTime.AgentImage+"'\n") {
@@ -92,7 +92,7 @@ func TestAddHostOnAnOwnedInstallPrefersTheInstalledReleaseOverItsInstallTimeImag
 
 	// The control plane now runs the detected release: its images win.
 	after := m.SourceCommit
-	body = servedPins(t, installedEnrollPins(trust, installTime, store, &after, quiet))
+	body = servedPins(t, installedEnrollPins(trust, installTime, store, &after, nil, quiet))
 	trusted(body)
 	if !strings.Contains(body, "\nPINNED_SEED_IMAGE='"+releaseSeed+"'\n") ||
 		!strings.Contains(body, "\nPINNED_AGENT_IMAGE='"+releaseAgent+"'\n") {
@@ -102,7 +102,7 @@ func TestAddHostOnAnOwnedInstallPrefersTheInstalledReleaseOverItsInstallTimeImag
 	// An operator override still wins over the release, one field at a time.
 	override := trust
 	override.AgentImage = "registry.example.invalid/dev/quasar-node-agent@sha256:" + strings.Repeat("e", 64)
-	body = servedPins(t, installedEnrollPins(override, installTime, store, &after, quiet))
+	body = servedPins(t, installedEnrollPins(override, installTime, store, &after, nil, quiet))
 	trusted(body)
 	if !strings.Contains(body, "\nPINNED_AGENT_IMAGE='"+override.AgentImage+"'\n") ||
 		!strings.Contains(body, "\nPINNED_SEED_IMAGE='"+releaseSeed+"'\n") {

@@ -64,6 +64,8 @@ const AGENT_IMAGE_PLACEHOLDER =
  *  §When the recovery actor does not answer). */
 export const ACTOR_CHECK_COMMAND = "docker ps -a --filter name=quasar-recovery";
 export const ACTOR_LOG_COMMAND = "docker logs --tail 50 quasar-recovery";
+/** Docker never restarts a container stopped with docker stop or docker kill (#381). */
+export const ACTOR_START_COMMAND = "docker start quasar-recovery";
 
 /** The source path (`docs/upgrading.md` §A normal upgrade). */
 export const REDEPLOY_SKELETON = "deploy/redeploy.sh <va|nvidia> <ref>";
@@ -223,11 +225,15 @@ export function manualUpdatePath(inputs: ManualUpdateInputs): ManualUpdatePath |
       if (inputs.installMode === "owned") {
         return {
           summary:
-            "This machine's recovery actor did not answer, so nothing can replace its containers until it does. Check it on the machine; the seed re-creates it if it was removed.",
+            "This machine's recovery actor did not answer, so nothing can replace its containers until it does. Check it on the machine: the seed re-creates it if it was removed, but one stopped with docker stop or docker kill stays stopped until it is started.",
           commands: [
             {
               label: "Find the recovery actor and read its last lines",
               command: `${ACTOR_CHECK_COMMAND}\n${ACTOR_LOG_COMMAND}`,
+            },
+            {
+              label: "If it shows Exited, start it; it finishes what it was doing",
+              command: ACTOR_START_COMMAND,
             },
           ],
         };
