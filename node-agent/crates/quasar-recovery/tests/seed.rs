@@ -407,6 +407,10 @@ fn no_running_actor_is_reported_only_while_the_machine_is_installed() {
         next.id = "ac10000000000000000000000000000000000000000000000000000000000000".into();
         next.spec.name = "quasar-recovery".into();
         next.status = "running".into();
+        // A successor is rendered by an actor, so it carries a recipe label (ADR 0007).
+        next.spec
+            .labels
+            .insert(quasar_recovery::recipe::labels::RECIPE.into(), "1".into());
         s.containers.insert(kept.id.clone(), kept);
         s.containers.insert(next.id.clone(), next);
     });
