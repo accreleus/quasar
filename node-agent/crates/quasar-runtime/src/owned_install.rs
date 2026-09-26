@@ -8,6 +8,10 @@ pub const AGENT_SOCKET_ENV: &str = "QUASAR_RECOVERY_SOCKET";
 /// The file twin of `QUASAR_ENROLLMENT`, which the actor points at the agent's secrets volume.
 pub const ENROLLMENT_FILE_ENV: &str = "QUASAR_ENROLLMENT_FILE";
 
+/// The file twin of `ENROLLMENT_TOKEN`: a combined host's recovery actor delivers its
+/// single-use local enrollment token to its own agent as this read-only secret file.
+pub const ENROLLMENT_TOKEN_FILE_ENV: &str = "ENROLLMENT_TOKEN_FILE";
+
 /// Where the agent-socket volume is mounted, in the actor (read-write) and the agent
 /// (read-only).
 pub const AGENT_SOCKET_DIR: &str = "/run/quasar-recovery";

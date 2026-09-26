@@ -314,7 +314,9 @@
       },
       "image_config": {
         "healthcheck_required": true,
-        "must_not_run_as_root": true
+        "must_not_run_as_root": true,
+        "run_as_uid": 1000,
+        "_uid_note": "The recovery actor delivers the control plane's secret files (database password, secret key, local enrollment token) owned by uid 1000, mode 0400 (#361, CONTROL_PLANE_UID in node-agent/crates/quasar-recovery). An image running as any other uid cannot read them and the control plane cannot start on an owned install."
       }
     }
   }

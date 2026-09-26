@@ -126,6 +126,12 @@ var actorVersion = regexp.MustCompile(
 	`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
 		`(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$`)
 
+// ValidRecoveryActorVersion and ValidSourceCommit are register's rules for the
+// owned identity fields, shared with the control plane's own machine
+// identity (internal/platform/own_machine.go) so the two read alike.
+func ValidRecoveryActorVersion(v string) bool { return actorVersionOrderable(v) }
+func ValidSourceCommit(c string) bool         { return agentCommit.MatchString(c) }
+
 // actorVersionOrderable: unlike agent_version (stored as sent), a
 // recovery_actor_version that cannot be ordered is stored NULL.
 func actorVersionOrderable(v string) bool {

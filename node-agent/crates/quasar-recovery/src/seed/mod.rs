@@ -490,9 +490,10 @@ impl Seed {
                     Ok(checked) => checked,
                     Err(why) => return inputs_invalid(why),
                 };
-                // The actor would refuse this image only after it had written machine state,
-                // which then wins over corrected inputs: refuse it here, before anything exists.
-                if let Err(outcome) = self.check_agent_image(&checked.agent_image) {
+                // The actor would refuse these images only after it had written machine
+                // state, which then wins over corrected inputs: refuse them here, before
+                // anything exists.
+                if let Err(outcome) = self.check_images(&checked) {
                     return outcome;
                 }
                 ((self.config.new_installation_id)(), me.image.clone())
@@ -521,16 +522,37 @@ impl Seed {
         self.start_own(id, image.reference(), installation_id)
     }
 
-    /// The agent image a first install names: on the engine (pulled if need be) and of a
-    /// recipe revision this build's actor carries.
-    fn check_agent_image(&self, image: &ImageRef) -> Result<(), Outcome> {
+    /// Every image a first install names: on the engine (pulled if need be) and, for the
+    /// agent and the control plane, of a recipe revision this build's actor carries.
+    fn check_images(&self, checked: &bootstrap::Checked) -> Result<(), Outcome> {
+        if let Some(image) = &checked.agent_image {
+            let found = self.pulled(image, bootstrap::AGENT_IMAGE)?;
+            crate::actor::agent_revision_for(&found, image, checked.role)
+                .map_err(|e| inputs_invalid(format!("{}: {e}", bootstrap::AGENT_IMAGE)))?;
+        }
+        if let Some(control) = &checked.control {
+            let found = self.pulled(&control.image, bootstrap::CONTROL_PLANE_IMAGE)?;
+            crate::actor::supported_revision(
+                crate::recipe::Role::ControlPlane,
+                &found,
+                &control.image,
+            )
+            .map_err(|e| inputs_invalid(format!("{}: {e}", bootstrap::CONTROL_PLANE_IMAGE)))?;
+            if let Some(postgres) = &control.postgres_image {
+                self.pulled(postgres, bootstrap::POSTGRES_IMAGE)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `image` on the engine, pulled if need be. `variable` names the input it came from.
+    fn pulled(&self, image: &ImageRef, variable: &str) -> Result<crate::engine::Image, Outcome> {
         let reference = image.reference();
         let unavailable = |e: String| {
             Outcome::Retry {
             token: "seed-agent-image-unavailable",
             why: format!(
-                "{} {reference} cannot be pulled ({e}); nothing was installed, and it is tried again at the next look",
-                bootstrap::AGENT_IMAGE
+                "{variable} {reference} cannot be pulled ({e}); nothing was installed, and it is tried again at the next look"
             ),
         }
         };
@@ -546,7 +568,7 @@ impl Seed {
                     })
                 );
                 if !retrying {
-                    info!(image = %reference, "pulling the agent image the install names");
+                    info!(image = %reference, "pulling an image the install names");
                 }
                 if let Err(e) = self.engine.pull(&reference) {
                     return Err(unavailable(e.to_string()));
@@ -559,9 +581,7 @@ impl Seed {
             }
             Err(e) => return Err(unreachable(e)),
         };
-        crate::actor::node_agent_revision(&found, image)
-            .map(|_| ())
-            .map_err(|e| inputs_invalid(format!("{}: {e}", bootstrap::AGENT_IMAGE)))
+        Ok(found)
     }
 
     fn start_own(&self, id: String, image: String, installation_id: String) -> Outcome {

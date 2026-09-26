@@ -25,6 +25,23 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Combined and control-only installs from one seed (#361).** `QUASAR_ROLE=combined` or
+  `control-only` on the seed installs Postgres (or uses your own database, named by
+  `QUASAR_DATABASE_*`), the control plane and, on a combined host, its own node agent, which
+  enrolls once with a single-use local token instead of the static `ENROLLMENT_TOKEN`. The
+  database password, secret key and local token are generated into machine state and reach
+  each container only as files (`QUASAR_DATABASE_PASSWORD_FILE`, `QUASAR_SECRET_KEY_FILE`);
+  re-running the seed changes nothing, and an interrupted install completes on the next
+  start. Fleet ▸ Releases ▸ Installed shows "This machine": its name and shape, seed,
+  recovery actor, database (Quasar's own or yours), control plane and node agent, even
+  before its recovery actor has reported; a combined host's own page shows the control plane
+  and database running there, and is not removed from the console. The platform identity
+  gains `machine_role` and `machine_node_name` (amendment 14), served from the control
+  plane's own configuration. `QUASAR_TRUSTED_PROXIES` is an optional seed input. Release trust
+  (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, the signature settings, and for the control plane
+  `QUASAR_PLATFORM_INSECURE_REGISTRIES`) is now a seed input recorded in machine state at
+  first install, so a seed-created actor admits a test registry's images; the Compose
+  control-plane service passes the two developer-apply variables through.
 - **Add host: one line, or a seed-only stack for Dockge or Arcane (#359).** Admin → Fleet's
   Enroll host becomes Add host: it mints one single-use token (optionally bound to a node name,
   one hour to 30 days) and prints the pinned-key one-liner or, on a second tab, the seed stack.

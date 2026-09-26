@@ -236,6 +236,17 @@
   color: var(--text-4);
 }
 
+/* `rhRemoveFoot` for a machine that runs the control plane. */
+.host-detail-page .host-services-foot {
+  border-top: 1px solid var(--line);
+}
+
+.host-detail-page .host-services-foot .hint {
+  margin: 0;
+  max-width: 70ch;
+  line-height: 1.55;
+}
+
 /* ── Add host modal ────────────────────────────────────────────────── */
 
 /* A value block wraps rather than scrolling out of the dialog: an operator
@@ -543,6 +554,18 @@
   color: var(--text-2);
 }
 .devapply-detail { margin: var(--s2) 0 0; white-space: pre-wrap; }
+
+/* The control plane's own machine in Releases > Installed (#361): `rhInstalled` in
+   design_handoff_v3/screens/assets/pages-rh06.js, screenshots rh06/inv-control-only*. */
+.rel-machine { margin-top: var(--s5); }
+.rel-machine-title { margin-top: 4px; }
+.rel-machine-note { margin-top: 8px; font-size: var(--t-xs); }
+.rel-machine-rows { margin-top: 6px; }
+.rel-machine-rows .rel-fact { align-items: flex-start; }
+.rel-machine-rows .rel-fact > span:last-child { text-align: right; }
+.rel-machine-hint { margin-top: 2px; }
+.rel-machine-none { color: var(--text-4); }
+.rel-machine-foot { margin: 10px 0 0; line-height: 1.5; }
 
 /* Keep the scoped Releases rail from overriding the shared split breakpoint. */
 .rel-split > * { min-width: 0; }

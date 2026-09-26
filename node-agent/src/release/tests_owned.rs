@@ -85,6 +85,8 @@ fn host(new: Behaviour) -> FakeState {
                 security_opt: Vec::new(),
                 init: false,
                 restart: RestartPolicy::UnlessStopped,
+                ports: Vec::new(),
+                healthcheck: None,
             },
             status: "running".into(),
             starts: 1,
@@ -117,6 +119,7 @@ fn machine(new: Behaviour) -> Machine {
             template_root: None,
             node_name: None,
             agent_image: Some(format!("{REPO}@{OLD}")),
+            ..Default::default()
         },
     );
     config.self_container = Some(ACTOR_ID.into());
@@ -137,7 +140,9 @@ fn machine(new: Behaviour) -> Machine {
     let socket_dir = tempfile::tempdir().unwrap();
     let socket = socket_dir.path().join("agent.sock");
     let listener = server::bind(&socket).unwrap();
-    std::thread::spawn(move || server::serve(listener, actor));
+    std::thread::spawn(move || {
+        server::serve(listener, actor, quasar_recovery::trust::Caller::Agent)
+    });
     Machine {
         engine,
         _machine_dir: machine_dir,

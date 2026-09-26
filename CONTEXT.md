@@ -629,8 +629,10 @@ digests are "the restore recipe"), which is a different thing. _Avoid_: "templat
 where the manual command block could be meant.
 
 **Machine inputs** — the few install-time facts a machine's recipes are rendered
-with: role, node name, home and template roots, public host, ports, control URL,
-detected GPU facts and database mode. They change only by a reconfigure, which is a
+with: role, node name, home and template roots, public host, TLS hosts, trusted
+proxies, ports, control URL, detected GPU facts, database mode, release trust (the
+namespace allowlist, signature settings and insecure registries), the images Add host
+installs, and app-container defaults. They change only by a reconfigure, which is a
 replacement with the same image and new inputs. _Avoid_: "settings" (agent settings
 are host policy), "config".
 

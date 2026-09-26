@@ -912,8 +912,7 @@ fn an_agent_image_that_cannot_be_pulled_is_said_once_however_many_looks() {
         );
     }
     assert_eq!(
-        log.matches("pulling the agent image the install names")
-            .count(),
+        log.matches("pulling an image the install names").count(),
         1,
         "{log}"
     );

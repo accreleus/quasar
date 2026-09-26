@@ -14,7 +14,7 @@
  * are #117/#118; developer apply is #360 (DeveloperApply.tsx).
  */
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
   JobsResponse,
@@ -38,6 +38,9 @@ import { TextField } from "../../../components/TextField";
 import { IconChevronDown, IconDownload, IconRefresh } from "../../../components/icons";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { relativeTime } from "../../../lib/format/relativeTime";
+import { clockTime } from "../../../lib/format/clockTime";
+import { ThisMachineBlock } from "./ThisMachine";
+import { isOwnedMachine, thisMachine, type MachineReport } from "./thisMachine";
 import { manualUpdatePath } from "../../../lib/platform/manualUpdate";
 import {
   parseReleaseNotes,
@@ -246,7 +249,7 @@ export function ReleasesTab() {
               <ReleaseFeed view={view} />
             </div>
             <div className="rel-rail">
-              <InstalledCard view={view} />
+              <InstalledCard view={view} updatedAt={res.updatedAt ?? null} />
               <TargetsCard
                 view={view}
                 refreshKey={applied}
@@ -503,9 +506,25 @@ function NoNotes({ release, edge }: { release: PlatformRelease; edge: boolean })
   );
 }
 
-function InstalledCard({ view }: { view: PlatformReleaseView }) {
+export function InstalledCard({
+  view,
+  updatedAt,
+}: {
+  view: PlatformReleaseView;
+  updatedAt: number | null;
+}) {
   const cp = view.installed.control_plane;
   const hosts = view.installed.hosts;
+  // The last report of this machine seen on this page, for when its recovery actor stops
+  // answering (the identity then reads null, as for a machine that is not owned).
+  const last = useRef<MachineReport | null>(null);
+  const at = updatedAt ?? Date.now();
+  const machine = thisMachine(cp, last.current, hosts, (t) =>
+    clockTime(new Date(t).toISOString(), { seconds: false }),
+  );
+  useEffect(() => {
+    if (isOwnedMachine(cp)) last.current = { identity: cp, at };
+  }, [cp, at]);
   const repo = view.source_repo ?? "";
   const commitUrl = gh(repo, `commit/${cp.source_commit}`);
   const versions = new Set(hosts.map((h) => h.agent_version).filter(Boolean));
@@ -534,6 +553,7 @@ function InstalledCard({ view }: { view: PlatformReleaseView }) {
         <span className="num">{cp.schema_version}</span>
       </Fact>
       <Fact label="Node agents">{agents}</Fact>
+      <ThisMachineBlock machine={machine} now={at} />
       {view.last_error && (
         <p className="form-error mt3" role="alert">
           Last release check failed: {view.last_error}

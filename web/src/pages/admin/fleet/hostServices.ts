@@ -1,13 +1,14 @@
 /**
- * An owned GPU host's service inventory (the RH-06 "Services on this machine"
- * mock), derived from the host body's amendment-14 fields. One module so the
- * host page's card and the host row's Services column cannot disagree.
+ * An owned host's service inventory (the RH-06 "Services on this machine" mock),
+ * derived from the host body's amendment-14 fields and, for the host that shares the
+ * control plane's machine, from PlatformIdentity. One module so the host page's card
+ * and the host row's Services column cannot disagree.
  *
  * Semantics of the fields: control-api.md "Owned hosts on the host body and the
- * release view"; agent-api.md §register, "Owned installs".
+ * release view", "The control plane's own machine"; agent-api.md §register.
  */
 
-import type { Host, PlatformReleaseFault } from "../../../api/types";
+import type { Host, PlatformIdentity, PlatformReleaseFault } from "../../../api/types";
 import { shortCommit } from "./hostIdentity";
 import { commitsMatch } from "./releasesCopy";
 
@@ -21,14 +22,18 @@ export type ServiceState =
   /** The service does not run on this machine at all. */
   | { kind: "absent"; text: string }
   /** The recovery actor answered and found no such container. */
-  | { kind: "not_found" };
+  | { kind: "not_found" }
+  /** The operator's own database, which this page's own load just used. */
+  | { kind: "reachable" };
 
 export interface ServiceRow {
   key: ServiceKey;
   name: string;
   description: string;
-  /** "v0.5.2", or null when not reported. */
+  /** "v0.5.2", "Quasar’s own", or null when not reported. */
   version: string | null;
+  /** The version is words, not a version number. */
+  versionPlain?: boolean;
   versionNote: string | null;
   owner: string | null;
   state: ServiceState;
@@ -44,15 +49,33 @@ export type InventoryReport =
   /** `updater_present: true` on an offline host; the rows are its last report. */
   | "offline";
 
+export type MachineShape = "GPU host" | "Combined host";
+
 export interface HostServices {
   report: InventoryReport;
   /** When the rows were reported: the agent's last `register`. */
   reportedAt: string | null;
+  shape: MachineShape;
   rows: ServiceRow[];
 }
 
 export function isOwned(host: Host): boolean {
   return host.install_mode === "owned";
+}
+
+/**
+ * The host is the control plane's own machine: only a combined machine, and only by
+ * its node name (control-api.md: never on control_only, where a GPU host could share it).
+ */
+export function isControlPlaneMachine(
+  host: Pick<Host, "node_name">,
+  machine: PlatformIdentity | null | undefined,
+): boolean {
+  return (
+    machine?.machine_role === "combined" &&
+    !!machine.machine_node_name &&
+    machine.machine_node_name === host.node_name
+  );
 }
 
 /**
@@ -78,8 +101,13 @@ export function versionLabel(version: string | null | undefined): string | null 
 }
 
 /** Null for a host that is not owned: its page renders as it always has. */
-export function hostServices(host: Host, opts: { agentOlder: boolean }): HostServices | null {
+export function hostServices(
+  host: Host,
+  opts: { agentOlder: boolean; machine?: PlatformIdentity | null },
+): HostServices | null {
   if (!isOwned(host)) return null;
+  const combined = isControlPlaneMachine(host, opts.machine);
+  const machine = combined ? opts.machine : null;
 
   // `updater_present` is whether the actor answered (agent-api.md §register,
   // "Owned installs"), not `recovery_actor_version`: a branch build reports
@@ -126,24 +154,32 @@ export function hostServices(host: Host, opts: { agentOlder: boolean }): HostSer
       owner: answered ? "Quasar" : null,
       state: answered ? liveOrLast() : { kind: "unknown" },
     },
-    {
-      key: "database",
-      name: "Database",
-      description: "No database runs on a GPU host.",
-      version: null,
-      versionNote: null,
-      owner: null,
-      state: { kind: "absent", text: "none on this machine" },
-    },
-    {
-      key: "control_plane",
-      name: "Control plane",
-      description: "Runs on another machine.",
-      version: null,
-      versionNote: null,
-      owner: null,
-      state: { kind: "absent", text: "not on this machine" },
-    },
+    machine ? databaseRow(machine, answered, liveOrLast) : noDatabase(),
+    machine
+      ? {
+          key: "control_plane",
+          name: "Control plane",
+          description: "Accounts, the console, scheduling and signaling.",
+          version: versionLabel(machine.version) ?? machine.version,
+          versionNote: [
+            machine.source_commit ? `commit ${shortCommit(machine.source_commit)}` : null,
+            `schema ${machine.schema_version}`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          owner: "Quasar",
+          // It is serving this page.
+          state: { kind: "running" },
+        }
+      : {
+          key: "control_plane",
+          name: "Control plane",
+          description: "Runs on another machine.",
+          version: null,
+          versionNote: null,
+          owner: null,
+          state: { kind: "absent", text: "not on this machine" },
+        },
     {
       key: "node_agent",
       name: "Node agent",
@@ -158,5 +194,59 @@ export function hostServices(host: Host, opts: { agentOlder: boolean }): HostSer
     },
   ];
 
-  return { report, reportedAt, rows };
+  return { report, reportedAt, shape: combined ? "Combined host" : "GPU host", rows };
+}
+
+function noDatabase(): ServiceRow {
+  return {
+    key: "database",
+    name: "Database",
+    description: "No database runs on a GPU host.",
+    version: null,
+    versionNote: null,
+    owner: null,
+    state: { kind: "absent", text: "none on this machine" },
+  };
+}
+
+function databaseRow(
+  machine: PlatformIdentity,
+  answered: boolean,
+  liveOrLast: () => ServiceState,
+): ServiceRow {
+  if (machine.database_mode === "external") {
+    return {
+      key: "database",
+      name: "Database",
+      description:
+        "Your own database. Quasar only uses it: it never dumps, restores, resets or upgrades it.",
+      version: "Your own",
+      versionPlain: true,
+      versionNote: null,
+      owner: "You",
+      state: { kind: "reachable" },
+    };
+  }
+  if (machine.database_mode === "owned") {
+    return {
+      key: "database",
+      name: "Database",
+      description:
+        "Quasar’s own Postgres, created at install. Quasar does not update it; it dumps it before a migrating update.",
+      version: "Quasar’s own",
+      versionPlain: true,
+      versionNote: null,
+      owner: "Quasar",
+      state: answered ? liveOrLast() : { kind: "unknown" },
+    };
+  }
+  return {
+    key: "database",
+    name: "Database",
+    description: "The control plane’s database.",
+    version: null,
+    versionNote: null,
+    owner: null,
+    state: { kind: "unknown" },
+  };
 }

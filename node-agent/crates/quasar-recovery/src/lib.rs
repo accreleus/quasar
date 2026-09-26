@@ -22,7 +22,9 @@
 pub mod actor;
 pub mod bootstrap;
 pub mod engine;
+pub mod explain;
 pub mod identity;
+mod install_control;
 pub mod journal;
 pub mod machine;
 pub mod probe;

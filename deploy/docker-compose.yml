@@ -225,6 +225,11 @@ services:
       # allowlist every registry read passes.
       QUASAR_PLATFORM_REGISTRY: ${QUASAR_PLATFORM_REGISTRY:-}
       QUASAR_IMAGE_REGISTRY_HOSTS: ${QUASAR_IMAGE_REGISTRY_HOSTS:-}
+      # Developer apply (#360): the platform-image namespaces the control plane checks a
+      # developer apply against (the updater's own list, above all its default), and the
+      # plain-HTTP registries it may read a developer apply's image identity from.
+      QUASAR_UPDATER_ALLOWED_NAMESPACES: ${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
+      QUASAR_PLATFORM_INSECURE_REGISTRIES: ${QUASAR_PLATFORM_INSECURE_REGISTRIES:-}
       # --- Debug / profiling listener (PROF-01, #388) -------------------------
       # SHIPS ENABLED, ON LOOPBACK. Diagnosing a box that has been up for three
       # weeks on somebody else's hardware is the whole point. 6060 is DELIBERATELY

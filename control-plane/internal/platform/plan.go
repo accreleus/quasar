@@ -26,6 +26,8 @@ type PlanInputs struct {
 	SourceRepo string
 
 	ControlPlane buildinfo.Identity
+	// The machine it runs on, served beside it; no decision reads it.
+	ControlPlaneMachine MachineIdentity
 
 	// In the order the host list uses: `targets` and `installed.hosts` must
 	// agree with GET /v1/hosts.
@@ -100,8 +102,9 @@ func PlanRelease(in PlanInputs) View {
 		CheckedAt:  rfc3339OrNil(in.CheckedAt),
 		LastError:  in.LastError,
 		Installed: Installed{
-			ControlPlane: in.ControlPlane,
-			Hosts:        hosts,
+			ControlPlane:        in.ControlPlane,
+			Hosts:               hosts,
+			ControlPlaneMachine: in.ControlPlaneMachine,
 		},
 		Available: available,
 		Targets:   targets(available, in.ControlPlane, hosts, open, fleet, cpFacts, image),

@@ -184,6 +184,24 @@ func (h *ApplyHandler) WithDeveloperApply(dev DeveloperImages, allowed []string)
 	return h
 }
 
+// OwnMachineSource is the control plane's own machine (OwnMachineReader).
+type OwnMachineSource interface {
+	Read(ctx context.Context) (OwnMachine, bool)
+	Invalidate()
+}
+
+// WithOwnMachine wires the control plane's own machine; unwired is not owned.
+func (h *ApplyHandler) WithOwnMachine(src OwnMachineSource) *ApplyHandler {
+	h.ownMachine = src
+	return h
+}
+
+// WithMachineShape wires the control plane's own machine shape (its configuration).
+func (h *ApplyHandler) WithMachineShape(shape MachineShape) *ApplyHandler {
+	h.machineShape = shape
+	return h
+}
+
 func writeRefusal(w http.ResponseWriter, code, reason, message string) {
 	if code == CodeHostNotEligible {
 		var body notEligible
@@ -215,23 +233,47 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 	}
 	ctx := r.Context()
 
+	// A failed read of the own machine is null, and null refuses (control-api.md
+	// §"The control plane's own machine").
+	var own OwnMachine
+	ownOK := false
+	if h.ownMachine != nil {
+		h.ownMachine.Invalidate()
+		own, ownOK = h.ownMachine.Read(ctx)
+	}
+
 	if req.Target == TargetControlPlane {
-		// The control plane's own install_mode comes from its machine's recovery
-		// actor over the control socket, which this build does not read: null is
-		// the safe answer (control-api.md §"The control plane's own machine").
-		httpx.WriteError(w, http.StatusConflict, CodeTargetNotOwned,
-			"this control plane does not report an owned install, so it takes no developer apply")
+		if !ownOK || own.Identity.InstallMode == nil || *own.Identity.InstallMode != InstallOwned {
+			httpx.WriteError(w, http.StatusConflict, CodeTargetNotOwned,
+				"this control plane does not report an owned install, so it takes no developer apply")
+			return
+		}
+		httpx.WriteError(w, http.StatusNotImplemented, CodeApplyUnsupported,
+			"replacing the control plane on an owned machine arrives with RH06-11 (#363); nothing was attempted")
 		return
 	}
 
 	hostID := *req.HostID
-	if _, err := h.store.HostStatus(ctx, hostID); err != nil {
+	nodeName, err := h.store.HostNodeName(ctx, hostID)
+	if err != nil {
 		if errors.Is(err, ErrHostNotFound) {
 			httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such host")
 			return
 		}
 		h.internal(w, "read host", err)
 		return
+	}
+	// On a combined host the actor moves in the control-plane step. Decided from
+	// this control plane's own configuration, so it holds (fail closed) whether or
+	// not the recovery actor answers.
+	if ownNode, ok := h.machineShape.CombinedNodeName(); ok && ownNode == nodeName {
+		for _, c := range components {
+			if c.Name != ComponentNodeAgent {
+				httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+					"this host shares the control plane's machine, so a developer apply to it names only node-agent; its recovery actor moves with the control plane")
+				return
+			}
+		}
 	}
 	view, err := h.freshView(ctx)
 	if err != nil {

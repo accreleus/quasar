@@ -105,6 +105,8 @@ pub fn host(
         security_opt: Vec::new(),
         init: false,
         restart: RestartPolicy::UnlessStopped,
+        ports: Vec::new(),
+        healthcheck: None,
     };
     for volume in [names::MACHINE_VOLUME, names::AGENT_SOCKET_VOLUME] {
         state.volumes.insert(volume.into(), FakeVolume::default());
@@ -150,6 +152,7 @@ pub fn operator() -> OperatorInputs {
         template_root: None,
         node_name: None,
         agent_image: Some(AGENT_IMAGE.into()),
+        ..Default::default()
     }
 }
 
@@ -244,6 +247,8 @@ pub fn seed_container(id: &str, image: &str, env: BTreeMap<String, String>) -> F
             security_opt: Vec::new(),
             init: false,
             restart: RestartPolicy::UnlessStopped,
+            ports: Vec::new(),
+            healthcheck: None,
         },
         status: "running".into(),
         starts: 1,

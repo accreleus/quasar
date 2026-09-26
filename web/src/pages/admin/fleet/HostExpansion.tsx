@@ -6,7 +6,12 @@
 
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
-import type { GPUAvailability, Host, HostStorageVolume } from "../../../api/types";
+import type {
+  GPUAvailability,
+  Host,
+  HostStorageVolume,
+  PlatformIdentity,
+} from "../../../api/types";
 import { Bar } from "../../../components/Bar";
 import { ReadinessCard } from "../../../components/ReadinessCard";
 import { LOW_STORAGE_PCT } from "../../../lib/fleet/deriveAlerts";
@@ -33,18 +38,27 @@ export interface HostExpansionProps {
   gpuError: string | null;
   /** Inline result of the last drain/uncordon on this row. */
   actionError?: string;
+  /** The control plane's own identity: whether this host shares its machine. */
+  controlPlane?: PlatformIdentity | null;
   now: number;
 }
 
 /** Free share under which the storage column turns red (mock: dp >= 90 used). */
 const DISK_DANGER_PCT = 90;
 
-export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostExpansionProps) {
+export function HostExpansion({
+  host,
+  gpus,
+  gpuError,
+  actionError,
+  controlPlane,
+  now,
+}: HostExpansionProps) {
   const util = utilisation(host, gpus);
   const storage = storageTotals(host.storage);
   const volumes = host.storage ?? [];
   // The row carries no control-plane build, so "older" is the host page's to say.
-  const services = hostServices(host, { agentOlder: false });
+  const services = hostServices(host, { agentOlder: false, machine: controlPlane });
 
   return (
     <>
