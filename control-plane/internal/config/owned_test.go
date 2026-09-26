@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +43,13 @@ func TestDatabasePasswordFileCompletesTheHostForm(t *testing.T) {
 	}
 	if db.Password != "s3cret /?#@ and %" {
 		t.Fatal("password file did not round trip with its trailing newline trimmed")
+	}
+}
+
+func TestASecretFileReadErrorIsWrapped(t *testing.T) {
+	_, err := readSecretFile("QUASAR_SECRET_KEY_FILE", filepath.Join(t.TempDir(), "missing"))
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("err = %v, want it to wrap the read error", err)
 	}
 }
 

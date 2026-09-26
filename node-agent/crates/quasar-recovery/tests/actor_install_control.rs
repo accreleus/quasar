@@ -109,12 +109,23 @@ fn seeded(env: BTreeMap<String, String>) -> (Arc<FakeEngine>, tempfile::TempDir,
 }
 
 fn start(engine: &Arc<FakeEngine>, dir: &std::path::Path, actor_id: &str) -> Actor {
+    start_with(engine, dir, actor_id, |_| {})
+}
+
+fn start_with(
+    engine: &Arc<FakeEngine>,
+    dir: &std::path::Path,
+    actor_id: &str,
+    adjust: impl FnOnce(&mut ActorConfig),
+) -> Actor {
     let mut config = ActorConfig::new(dir, MachineRole::Gpu, OperatorInputs::default());
     config.self_container = Some(actor_id.into());
     config.seed_container = Some(SEED_ID.into());
     config.now = Box::new(|| NOW.to_string());
     config.gpus_probe_backoff = std::time::Duration::ZERO;
-    Actor::new(engine.clone(), fast(config))
+    let mut config = fast(config);
+    adjust(&mut config);
+    Actor::new(engine.clone(), config)
 }
 
 fn volume_file(state: &FakeState, volume: &str, file: &str) -> (Vec<u8>, u32) {
@@ -351,6 +362,36 @@ fn postgres_not_yet_ready_delays_the_control_plane_rather_than_failing_the_insta
     assert!(state.container_named(names::NODE_AGENT).is_some());
 }
 
+/// A dependency's health is waited for only before the container that needs it is created,
+/// so a restart of an installed machine is not held busy (submit refuses while it settles).
+#[test]
+fn a_restart_does_not_wait_on_an_unhealthy_dependency() {
+    let (engine, dir, id) = seeded(combined_env());
+    engine.with_state(|s| {
+        for image in [POSTGRES_IMAGE, CONTROL_IMAGE] {
+            s.behaviour.get_mut(image).unwrap().health = Some("unhealthy".into());
+        }
+    });
+    let wait = std::time::Duration::from_millis(600);
+    let waiting =
+        |engine: &Arc<FakeEngine>| start_with(engine, dir.path(), &id, |c| c.healthy_wait = wait);
+
+    let began = std::time::Instant::now();
+    waiting(&engine).resume().unwrap();
+    // Postgres before the control plane, the control plane before the agent.
+    assert!(began.elapsed() >= wait * 2, "{:?}", began.elapsed());
+    let installed = engine.state().by_name();
+
+    let began = std::time::Instant::now();
+    waiting(&engine).resume().unwrap();
+    assert!(
+        began.elapsed() < wait,
+        "a restart waited {:?}",
+        began.elapsed()
+    );
+    assert_eq!(engine.state().by_name(), installed);
+}
+
 #[test]
 fn a_combined_hosts_agent_image_must_read_the_local_token_or_nothing_is_installed() {
     let engine = Arc::new(FakeEngine::new({
@@ -421,6 +462,18 @@ fn an_install_interrupted_anywhere_completes_on_the_next_start_with_one_set_of_s
                 password.as_bytes(),
                 "call {call} {when:?}"
             );
+            // One local enrollment token: the one the control plane inserts is the agent's.
+            let token = secret(dir.path(), secrets::LOCAL_ENROLLMENT);
+            for volume in [
+                names::CONTROL_PLANE_SECRETS_VOLUME,
+                names::NODE_AGENT_SECRETS_VOLUME,
+            ] {
+                assert_eq!(
+                    volume_file(&state, volume, "local-enrollment").0,
+                    token.as_bytes(),
+                    "call {call} {when:?}: {volume}"
+                );
+            }
         }
     }
 }
@@ -492,7 +545,7 @@ fn the_control_socket_serves_the_machine_and_names_the_control_plane_as_its_call
     let actor = Arc::new(start(&engine, dir.path(), &id));
     actor.resume().unwrap();
 
-    let plan = actor.socket_plan();
+    let plan = actor.socket_plan().unwrap();
     let callers: Vec<_> = plan.iter().map(|p| p.caller).collect();
     assert_eq!(callers, vec![Caller::Agent, Caller::ControlPlane]);
     assert_eq!(

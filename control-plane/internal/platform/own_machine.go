@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -89,28 +90,16 @@ type PlatformIdentity struct {
 
 // OwnMachine is what the recovery actor on this control plane's machine said.
 type OwnMachine struct {
-	Role actorsocket.Role
-	// The machine's node name: on a combined host, its own agent's.
-	NodeName *string
 	Identity MachineIdentity
 	// ActorVersion is as reported, for operator prose only.
 	ActorVersion string
-}
-
-// CombinedNodeName is the node name of the agent sharing this control plane's
-// machine, when the machine is a combined host.
-func (m OwnMachine) CombinedNodeName() (string, bool) {
-	if m.Role != actorsocket.RoleCombined || m.NodeName == nil || *m.NodeName == "" {
-		return "", false
-	}
-	return *m.NodeName, true
 }
 
 // OwnMachineFromStatus derives the identity from one status answer. A value
 // the contract cannot use is null, never passed through.
 func OwnMachineFromStatus(st actorsocket.Status) OwnMachine {
 	owned := InstallOwned
-	m := OwnMachine{Role: st.Role, NodeName: st.NodeName, ActorVersion: st.Actor.Version}
+	m := OwnMachine{ActorVersion: st.Actor.Version}
 	m.Identity.InstallMode = &owned
 	if agentws.ValidRecoveryActorVersion(st.Actor.Version) {
 		v := st.Actor.Version
@@ -142,6 +131,8 @@ type OwnMachineReader struct {
 	socket string
 	http   *http.Client
 	TTL    time.Duration
+	// Log records a failed read; nil is slog.Default().
+	Log *slog.Logger
 
 	mu     sync.Mutex
 	set    bool
@@ -170,14 +161,6 @@ func NewOwnMachineReader(socketPath string) *OwnMachineReader {
 			},
 		},
 	}
-}
-
-// Socket is the path read.
-func (r *OwnMachineReader) Socket() string {
-	if r == nil {
-		return ""
-	}
-	return r.socket
 }
 
 // Read is the machine as last seen; ok false when the actor did not answer or
@@ -227,10 +210,18 @@ func (r *OwnMachineReader) read(ctx context.Context) (OwnMachine, bool, time.Tim
 	}
 	r.mu.Unlock()
 
-	st, err := r.status(ctx)
+	// Detached from the request: the answer is shared for TTL, so one caller's
+	// cancellation (an admin navigating away) must not be cached for everyone.
+	st, err := r.status(context.WithoutCancel(ctx))
 	var m OwnMachine
 	if err == nil {
 		m = OwnMachineFromStatus(st)
+	} else {
+		log := r.Log
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("recovery actor status read failed", "socket", r.socket, "err", err)
 	}
 	now := time.Now()
 	r.mu.Lock()

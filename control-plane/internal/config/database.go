@@ -67,7 +67,7 @@ func envOrFile(key string) (string, error) {
 func readSecretFile(envKey, path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("%s: cannot read %s", envKey, path)
+		return "", fmt.Errorf("%s: cannot read %s: %w", envKey, path, err)
 	}
 	v := strings.TrimRight(string(raw), " \t\r\n")
 	if v == "" {

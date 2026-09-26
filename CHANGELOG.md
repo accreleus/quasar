@@ -422,6 +422,10 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A combined or control-only machine's recovery actor no longer holds every start on an
+  unhealthy dependency (#361).** It waits for Postgres, then the control plane, only before
+  creating what needs them, so a restart of an installed machine answers release requests at
+  once instead of refusing them as busy for up to six minutes.
 - **The documentation site no longer states facts that stopped being true.** A control-plane
   update without a migration does not end sessions, and a fleet run with no control-plane step
   cordons each host only when it reaches it; a host whose new agent never came up is

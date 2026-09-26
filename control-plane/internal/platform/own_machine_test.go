@@ -76,12 +76,6 @@ func TestOwnMachineReadsACombinedHost(t *testing.T) {
 		t.Fatal("the actor answered, but the read failed")
 	}
 	id := m.Identity
-	if m.Role != actorsocket.RoleCombined || m.NodeName == nil || *m.NodeName != "living-room-pc" {
-		t.Fatalf("role/node = %q/%v", m.Role, m.NodeName)
-	}
-	if node, ok := m.CombinedNodeName(); !ok || node != "living-room-pc" {
-		t.Fatalf("CombinedNodeName = %q, %v", node, ok)
-	}
 	for name, got := range map[string]*string{
 		"install_mode":                 id.InstallMode,
 		"recovery_actor_version":       id.RecoveryActorVersion,
@@ -107,9 +101,6 @@ func TestOwnMachineReadsAControlOnlyHost(t *testing.T) {
 	m, ok := NewOwnMachineReader(path).Read(context.Background())
 	if !ok {
 		t.Fatal("a stale answer is still an answer")
-	}
-	if _, combined := m.CombinedNodeName(); combined {
-		t.Fatal("a control-only machine reported a combined node")
 	}
 	id := m.Identity
 	if id.InstallMode == nil || *id.InstallMode != InstallOwned {
@@ -150,9 +141,6 @@ func TestOwnMachineFromStatusNullsWhatTheContractCannotUse(t *testing.T) {
 	if id.RecoveryActorVersion != nil || id.RecoveryActorSourceCommit != nil || id.SeedVersion != nil || id.DatabaseMode != nil {
 		t.Fatalf("identity = %+v, want the unusable values null", id)
 	}
-	if _, ok := OwnMachineFromStatus(actorsocket.Status{Role: actorsocket.RoleCombined}).CombinedNodeName(); ok {
-		t.Fatal("a combined machine with no node name named one")
-	}
 }
 
 func TestOwnMachineAnswerIsReusedUntilInvalidated(t *testing.T) {
@@ -169,6 +157,24 @@ func TestOwnMachineAnswerIsReusedUntilInvalidated(t *testing.T) {
 	r.Read(ctx)
 	if n := hits.Load(); n != 2 {
 		t.Fatalf("socket reads = %d after Invalidate, want 2", n)
+	}
+}
+
+// The answer is shared for TTL, so a caller that has already gone away must not
+// leave "not answering" cached for every reader after it.
+func TestACancelledRequestIsNotCachedAsASilentActor(t *testing.T) {
+	path, hits := serveStatus(t, fixtureBody(t, "status-combined-idle.json"))
+	r := NewOwnMachineReader(path)
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := r.Read(gone); !ok {
+		t.Fatal("a cancelled caller's read failed; its cancellation reached the actor read")
+	}
+	if _, ok := r.Read(context.Background()); !ok {
+		t.Fatal("the next reader sees a failed read")
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("actor asked %d times, want once (the answer is reused)", n)
 	}
 }
 
