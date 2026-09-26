@@ -202,9 +202,13 @@ configurable: **the control plane first, then every eligible host, one at a
 time.** There is no hosts-only button, because an agent is never moved past the
 control plane.
 
-The run cordons every host for its whole life, so no new session starts on a
-machine it is about to update. Whether it also **waits for sessions to end**
-before the control-plane step depends on the release:
+A run with a control-plane step cordons every host for its whole life, so no new
+session starts on a machine it is about to update. A run whose control plane is
+already on the release has no such step, so it cordons each host only when it
+reaches it, and the rest of the fleet keeps taking sessions. The cordons are
+released when the run finishes; a host you had already cordoned stays cordoned.
+Whether the run also **waits for sessions to end** before the control-plane step
+depends on the release:
 
 - **A release that runs no migration does not wait.** Live sessions stream
   straight through the control-plane restart. The agent holds its running
