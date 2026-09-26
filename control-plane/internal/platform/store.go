@@ -125,3 +125,30 @@ func (s *Store) Hosts(ctx context.Context) ([]HostIdentity, error) {
 	}
 	return out, rows.Err()
 }
+
+// DatabaseBytes is this control plane's database on disk: what a pre-update
+// dump of it may need (preflight backup_space).
+func (s *Store) DatabaseBytes(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.pool.QueryRow(ctx, `SELECT pg_database_size(current_database())`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("read the database size: %w", err)
+	}
+	return n, nil
+}
+
+// SetPreUpdateDump records the dump a migrating control-plane attempt took, as
+// the recovery actor names it (amendment 14). The column's CHECKs keep it to
+// control-plane rows of at most 255 bytes; a longer name is never stored, so the
+// write beside it is not refused with it.
+func (s *Store) SetPreUpdateDump(ctx context.Context, attemptID, dump string) error {
+	if dump == "" || len(dump) > 255 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE platform_apply_attempts SET pre_update_dump = $2
+		 WHERE id = $1::uuid AND target = 'control_plane'`, attemptID, dump)
+	if err != nil {
+		return fmt.Errorf("record pre_update_dump: %w", err)
+	}
+	return nil
+}

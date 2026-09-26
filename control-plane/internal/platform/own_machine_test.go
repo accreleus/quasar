@@ -179,7 +179,8 @@ func TestACancelledRequestIsNotCachedAsASilentActor(t *testing.T) {
 }
 
 // control-api.md amendment 14 §"Preflight": no Compose checks on an owned
-// target, and updater_socket names no Compose command.
+// target, updater_socket names no Compose command, and a Quasar-owned database
+// adds backup_space.
 func TestOwnedControlPlanePreflight(t *testing.T) {
 	ids := func(p Preflight) []string {
 		var out []string
@@ -190,8 +191,8 @@ func TestOwnedControlPlanePreflight(t *testing.T) {
 	}
 	path, _ := serveStatus(t, fixtureBody(t, "status-combined-idle.json"))
 	p := PlanPreflight(TargetControlPlane, NewOwnMachineReader(path).PreflightFacts(context.Background()))
-	if got := strings.Join(ids(p), ","); got != CheckUpdaterSocket+","+CheckImageResolvable {
-		t.Fatalf("checks = %s, want updater_socket,image_resolvable", got)
+	if got := strings.Join(ids(p), ","); got != CheckUpdaterSocket+","+CheckImageResolvable+","+CheckBackupSpace {
+		t.Fatalf("checks = %s, want updater_socket,image_resolvable,backup_space", got)
 	}
 	if p.Checks[0].Status != CheckPass || !strings.Contains(p.Checks[0].Detail, "0.4.0") {
 		t.Errorf("answered socket = %+v, want a pass naming the actor", p.Checks[0])

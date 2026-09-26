@@ -90,6 +90,10 @@ func ActorRequest(req SelfRequest) actorsocket.Request {
 		v := int64(req.SchemaVersion)
 		out.SchemaVersion = &v
 	}
+	if req.Migrates && req.FromVersion != "" {
+		v := req.FromVersion
+		out.FromVersion = &v
+	}
 	for _, comp := range req.Components {
 		out.Components = append(out.Components, actorsocket.Component{Name: comp.Name, Image: comp.Image, Digest: comp.Digest})
 	}
@@ -156,14 +160,15 @@ func (c *ActorClient) Result(ctx context.Context, requestID string) (updater.Res
 // it keeps by design.
 func resultOfActor(r actorsocket.Result) updater.Result {
 	out := updater.Result{
-		RequestID:  r.RequestID,
-		State:      string(r.State),
-		Previous:   previousOfActor(r.Previous),
-		Output:     r.Output,
-		StartedAt:  r.StartedAt,
-		UpdatedAt:  r.UpdatedAt,
-		FinishedAt: r.FinishedAt,
-		Restored:   r.Restored,
+		RequestID:     r.RequestID,
+		State:         string(r.State),
+		Previous:      previousOfActor(r.Previous),
+		Output:        r.Output,
+		StartedAt:     r.StartedAt,
+		UpdatedAt:     r.UpdatedAt,
+		FinishedAt:    r.FinishedAt,
+		Restored:      r.Restored,
+		PreUpdateDump: r.Dump,
 		Release: updater.Release{
 			ID: r.Release.ID, Version: r.Release.Version, SourceCommit: r.Release.SourceCommit,
 		},

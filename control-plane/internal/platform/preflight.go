@@ -25,6 +25,9 @@ const (
 	CheckImageResolvable    = "image_resolvable"
 	CheckAgentConnected     = "agent_connected"
 	CheckHealthAddrBindable = "health_addr_bindable"
+	// Amendment 14: room for the pre-update dump, on an owned control plane
+	// whose database is Quasar's own.
+	CheckBackupSpace = "backup_space"
 )
 
 // Per-check status and the folded state.
@@ -99,6 +102,10 @@ type PreflightFacts struct {
 	Image *ImageFact
 	// Control plane on an owned machine only; non-nil replaces Socket/Self.
 	OwnedActor *OwnedActorFact
+	// Control plane only: whether available[0] migrates (nil: nothing listed),
+	// and the size of this control plane's database (nil: not read).
+	Migrates      *bool
+	DatabaseBytes *int64
 }
 
 // OwnedActorFact is whether the recovery actor answered on the control socket.
@@ -107,6 +114,9 @@ type OwnedActorFact struct {
 	Answered bool
 	Version  string
 	Err      string
+	// DatabaseMode is `owned` or `external` as the actor reported it; nil unknown.
+	DatabaseMode  *string
+	DumpFreeBytes *int64
 }
 
 // PlanPreflight decides one target. Every check is evaluated (no short-circuit)
@@ -119,6 +129,9 @@ func PlanPreflight(kind string, f PreflightFacts) Preflight {
 		checks = []PreflightCheck{
 			ownedActorSocketCheck(f.OwnedActor),
 			imageCheck(f.Image),
+		}
+		if db := f.OwnedActor.DatabaseMode; db != nil && *db == DatabaseModeOwned {
+			checks = append(checks, backupSpaceCheck(f))
 		}
 	case kind == TargetControlPlane:
 		checks = []PreflightCheck{
@@ -299,6 +312,46 @@ func unknown(id, detail string) PreflightCheck {
 }
 
 func updaterSocketDir() string { return filepath.Dir(ConfiguredUpdaterSocket()) }
+
+// backupSpaceCheck: room for the pre-update dump when available[0] migrates.
+// The recovery actor measures again before it dumps and is the enforcement.
+func backupSpaceCheck(f PreflightFacts) PreflightCheck {
+	if f.Migrates == nil || !*f.Migrates {
+		return pass(CheckBackupSpace, "This release does not change the database, so no dump is taken.")
+	}
+	if f.OwnedActor == nil || f.OwnedActor.DumpFreeBytes == nil {
+		return unknown(CheckBackupSpace, "Free space on this machine has not been reported, so it is checked just before the dump.")
+	}
+	if f.DatabaseBytes == nil {
+		return unknown(CheckBackupSpace, "The database's size could not be read, so the free space is checked just before the dump.")
+	}
+	free, size := uint64(max(*f.OwnedActor.DumpFreeBytes, 0)), uint64(max(*f.DatabaseBytes, 0))
+	need := dumpSpaceNeeded(size)
+	if free < need {
+		return fail(CheckBackupSpace, fmt.Sprintf(
+			"The pre-update dump needs about %s and %s is free on this machine. Free some space there, then check again.",
+			humanBytes(need), humanBytes(free)))
+	}
+	return pass(CheckBackupSpace, fmt.Sprintf(
+		"Quasar's database is about %s; %s is free for the pre-update dump.", humanBytes(size), humanBytes(free)))
+}
+
+// dumpSpaceNeeded is the recovery actor's rule, the database's size plus a
+// tenth, at least 64 MiB. Rust twin: quasar_recovery::dump::space_needed; keep
+// the two equal.
+func dumpSpaceNeeded(databaseBytes uint64) uint64 {
+	return databaseBytes + max(databaseBytes/10, 64<<20)
+}
+
+// humanBytes reads a size as operator prose does ("1.4 GB"). Rust twin:
+// quasar_recovery::dump::human.
+func humanBytes(b uint64) string {
+	const gb, mb = 1_000_000_000.0, 1_000_000.0
+	if f := float64(b); f >= gb {
+		return fmt.Sprintf("%.1f GB", f/gb)
+	}
+	return fmt.Sprintf("%.0f MB", max(float64(b)/mb, 1))
+}
 
 // readinessCheckWire is agent-api.md `readiness[]` as stored in hosts.readiness.
 type readinessCheckWire struct {

@@ -101,13 +101,16 @@ type OwnMachine struct {
 	Identity MachineIdentity
 	// ActorVersion is as reported, for operator prose only.
 	ActorVersion string
+	// DumpFreeBytes is the free space where the pre-update dumps are written
+	// (preflight backup_space); nil when not reported.
+	DumpFreeBytes *int64
 }
 
 // OwnMachineFromStatus derives the identity from one status answer. A value
 // the contract cannot use is null, never passed through.
 func OwnMachineFromStatus(st actorsocket.Status) OwnMachine {
 	owned := InstallOwned
-	m := OwnMachine{ActorVersion: st.Actor.Version}
+	m := OwnMachine{ActorVersion: st.Actor.Version, DumpFreeBytes: st.DumpFreeBytes}
 	m.Identity.InstallMode = &owned
 	if agentws.ValidRecoveryActorVersion(st.Actor.Version) {
 		v := st.Actor.Version
@@ -207,7 +210,8 @@ func (r *OwnMachineReader) PreflightFacts(ctx context.Context) PreflightFacts {
 		return PreflightFacts{}
 	}
 	m, ok, at, err := r.read(ctx)
-	fact := &OwnedActorFact{Socket: r.socket, Answered: ok, Version: m.ActorVersion}
+	fact := &OwnedActorFact{Socket: r.socket, Answered: ok, Version: m.ActorVersion,
+		DatabaseMode: m.Identity.DatabaseMode, DumpFreeBytes: m.DumpFreeBytes}
 	if err != nil {
 		fact.Err = err.Error()
 	}

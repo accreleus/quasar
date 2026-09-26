@@ -205,6 +205,8 @@ type FleetRunner struct {
 	adopted map[string]bool
 	// run ids with a skip the store refused to record: fail towards partial.
 	unrecordedSkips map[string]bool
+	// run ids whose operator confirmed a backup of their own database.
+	confirmed map[string]bool
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -226,6 +228,7 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 		running:         make(map[string]context.CancelFunc),
 		adopted:         make(map[string]bool),
 		unrecordedSkips: make(map[string]bool),
+		confirmed:       make(map[string]bool),
 		baseCtx:         ctx,
 		stop:            cancel,
 	}
@@ -407,15 +410,6 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 					"which drains every session on the instance — apply it yourself when you are watching")
 			return false
 		}
-		// A migrating step on an owned machine needs the pre-update dump, which
-		// this build does not take. Refused before the fleet is cordoned or
-		// drained, so refusing changes nothing.
-		if f.ownedControlPlane() && f.releaseRunsAMigration(ctx, run) {
-			f.log.Warn("fleet apply: refusing a migrating control-plane step on an owned machine",
-				"run_id", run.ID, "release_id", run.ReleaseID, "token", "owned-migrating-refused")
-			f.finish(run.ID, RunFailed, ownedMigratingRefusal)
-			return false
-		}
 		a, err := f.createControlPlaneAttempt(ctx, run)
 		if err != nil {
 			f.finish(run.ID, RunFailed, "could not start the control-plane update: "+err.Error())
@@ -425,7 +419,7 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 			f.log.Warn("fleet apply: could not record the current target", "run_id", run.ID, "err", err)
 		}
 		cp = &a
-		if f.prepareFleet(ctx, run, a) {
+		if f.backupAllowsTheStep(ctx, run, a) && f.prepareFleet(ctx, run, a) {
 			// Normally never returns: the updater recreates this container
 			// partway through, and the next boot's Adopt resolves the row.
 			f.self.Apply(ctx, a)
@@ -440,8 +434,9 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 			return false
 		}
 		if !f.self.Adopt(ctx, *cp, f.releaseCommit(ctx, run.ReleaseID)) {
-			if f.prepareFleet(ctx, run, *cp) {
-				f.self.Apply(ctx, *cp) // never sent; re-drive it
+			// Never sent; re-drive it.
+			if f.backupAllowsTheStep(ctx, run, *cp) && f.prepareFleet(ctx, run, *cp) {
+				f.self.Apply(ctx, *cp)
 			}
 		}
 	}
@@ -1159,6 +1154,64 @@ func (f *FleetRunner) restoreCordons(parent context.Context, runID string) bool 
 	return restored
 }
 
+// backupConfirmer is a self driver that carries the operator's external-backup
+// confirmation to its actor (SelfApplier.ConfirmExternalBackup).
+type backupConfirmer interface{ ConfirmExternalBackup(attemptID string) }
+
+// ConfirmExternalBackup records that the operator who started runID confirmed a
+// current backup of their own database (control-api.md external_backup_confirmed).
+// In memory only, by the contract: a control plane restarted before the step is
+// sent fails it backup_unconfirmed. Call it before Start.
+func (f *FleetRunner) ConfirmExternalBackup(runID string) {
+	f.mu.Lock()
+	f.confirmed[runID] = true
+	f.mu.Unlock()
+}
+
+func (f *FleetRunner) backupConfirmed(runID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.confirmed[runID]
+}
+
+// externalDatabase: this control plane's recovery actor says its database is the
+// operator's own. Unknown reads as not: the actor refuses the step itself.
+func (f *FleetRunner) externalDatabase(ctx context.Context) bool {
+	if f.ownMachine == nil {
+		return false
+	}
+	own, ok := f.ownMachine.Read(ctx)
+	return ok && own.Identity.DatabaseMode != nil && *own.Identity.DatabaseMode == DatabaseModeExternal
+}
+
+// backupAllowsTheStep is #352 decision 14 on an owned machine, before the fleet
+// is cordoned, drained or sent anything: a migrating step on the operator's own
+// database needs their confirmation, and fails backup_unconfirmed without it. A
+// Quasar-owned database gets its pre-update dump from the recovery actor. False
+// means the attempt is resolved.
+func (f *FleetRunner) backupAllowsTheStep(ctx context.Context, run ApplyRun, a Attempt) bool {
+	if !f.ownedControlPlane() || !f.releaseRunsAMigration(ctx, run) {
+		return true
+	}
+	confirmed := f.backupConfirmed(run.ID)
+	if f.externalDatabase(ctx) && !confirmed {
+		f.log.Warn("fleet apply: a migrating step on an operator's own database without a confirmed backup",
+			"run_id", run.ID, "attempt_id", a.ID, "token", "owned-backup-unconfirmed")
+		fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := f.store.FailAttempt(fctx, a.ID, ReasonBackupUnconfirmed,
+			"this release changes the database, and no current backup of your own database was confirmed. "+
+				"Quasar never dumps an operator's database: take a backup with your own tools, then update again, confirming it. Nothing was changed"); err != nil {
+			f.log.Error("fleet apply: could not record the failure", "attempt_id", a.ID, "err", err)
+		}
+		return false
+	}
+	if c, ok := f.self.(backupConfirmer); ok && confirmed {
+		c.ConfirmExternalBackup(a.ID)
+	}
+	return true
+}
+
 func (f *FleetRunner) failAttempt(attemptID, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1388,6 +1441,9 @@ func (f *FleetRunner) finish(runID, state, errText string) {
 	// Every terminal transition comes through here, which is what makes the
 	// fleet cordon impossible to leak.
 	defer f.settleCordons(context.Background(), runID)
+	f.mu.Lock()
+	delete(f.confirmed, runID)
+	f.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := f.store.FinishRun(ctx, runID, state, errText); err != nil {

@@ -14,7 +14,6 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 	"github.com/accreleus/quasar/control-plane/internal/admission"
-	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 )
 
 type recordingSelfDev struct {
@@ -83,30 +82,7 @@ func TestADeveloperApplyToAnOwnedControlPlaneIsAControlPlaneAttemptActorFirst(t 
 	}
 }
 
-// ADR 0002 on the image's own schema: below the database is refused, above it
-// migrates, which on an owned machine arrives with the pre-update dump (#364).
-func TestADeveloperApplyToAnOwnedControlPlaneIsRefusedAcrossASchemaChange(t *testing.T) {
-	installed := buildinfo.Get().SchemaVersion
-	for _, tc := range []struct {
-		schema   int
-		wantCode int
-		wantErr  string
-	}{
-		{installed + 1, http.StatusNotImplemented, CodeApplyUnsupported},
-		{installed - 1, http.StatusUnprocessableEntity, CodeReleaseBelowSchemaVersion},
-	} {
-		h, rec := newControlDevHarness(t)
-		h.images.schema = tc.schema
-		code, out := h.post(t, devURL, h.adminToken, controlBody(cpComponent()))
-		if code != tc.wantCode || errCode(t, out) != tc.wantErr {
-			t.Fatalf("schema %d = %d %s, want %d %s", tc.schema, code, out, tc.wantCode, tc.wantErr)
-		}
-		open, err := h.store.OpenAttempts(context.Background())
-		if err != nil || len(open) != 0 || rec.count() != 0 {
-			t.Fatalf("schema %d: open=%v err=%v started=%d, want nothing created", tc.schema, open, err, rec.count())
-		}
-	}
-}
+// Across a schema change: TestADeveloperApplyAcrossAMigrationFollowsTheDatabaseRule.
 
 func TestADeveloperApplyToAnOwnedControlPlaneKeepsToTheAllowlist(t *testing.T) {
 	h, rec := newControlDevHarness(t)

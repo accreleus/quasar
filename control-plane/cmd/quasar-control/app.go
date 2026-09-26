@@ -1076,6 +1076,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	}
 	selfApplier := platform.NewSelfApplier(platformStore, selfExecutor, log)
 	selfApplier.DeveloperCommit = developerImages.Commit
+	selfApplier.DeveloperSchema = developerImages.SchemaOf
 	// The control plane's own machine on an owned install; nil otherwise, and
 	// then nothing below reads a socket.
 	ownMachine := platform.NewOwnMachineReader(cfg.RecoveryControlSocket)
@@ -1096,6 +1097,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts
 		pDeps.ControlPlaneMachine = ownMachine.Identity
 		pDeps.ControlPlaneInstallMode = ownMachine.InstallMode
+		pDeps.ControlPlaneDatabaseBytes = platformStore.DatabaseBytes
 	}
 	pDeps.MachineShape = machineShape(cfg)
 	pDeps.ImageFor = imageResolver.Check
@@ -1149,6 +1151,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// attempt; it holds every host's admission for its duration (#363).
 	selfDeveloper := platform.NewSelfDeveloperRunner(platformStore, selfApplier, fleetCordons,
 		developerImages.Commit, log)
+	selfDeveloper.Migrates = developerImages.Migrates
 	platformApply.WithSelfDeveloper(selfDeveloper)
 	if ownMachine != nil {
 		platformApply.WithOwnMachine(ownMachine)
