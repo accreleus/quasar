@@ -60,11 +60,10 @@ const CONTROL_IMAGE_PLACEHOLDER =
 const AGENT_IMAGE_PLACEHOLDER =
   "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<node-agent digest>";
 
-/** Adding the updater to an existing install (`docs/upgrading.md` §The updater). */
-export const UPDATER_STACK_DIR_COMMAND = 'echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env';
-export const UPDATER_IMAGE_COMMAND =
-  'echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env';
-export const UPDATER_UP_COMMAND = `${COMPOSE} up -d --no-deps quasar-updater`;
+/** An owned machine whose recovery actor does not answer (`docs/upgrading.md`
+ *  §When the recovery actor does not answer). */
+export const ACTOR_CHECK_COMMAND = "docker ps -a --filter name=quasar-recovery";
+export const ACTOR_LOG_COMMAND = "docker logs --tail 50 quasar-recovery";
 
 /** The source path (`docs/upgrading.md` §A normal upgrade). */
 export const REDEPLOY_SKELETON = "deploy/redeploy.sh <va|nvidia> <ref>";
@@ -197,16 +196,22 @@ export function manualUpdatePath(inputs: ManualUpdateInputs): ManualUpdatePath |
       };
 
     case "updater_absent":
+      if (inputs.installMode === "owned") {
+        return {
+          summary:
+            "This machine's recovery actor did not answer, so nothing can replace its containers until it does. Check it on the machine; the seed re-creates it if it was removed.",
+          commands: [
+            {
+              label: "Find the recovery actor and read its last lines",
+              command: `${ACTOR_CHECK_COMMAND}\n${ACTOR_LOG_COMMAND}`,
+            },
+          ],
+        };
+      }
       return {
         summary:
-          "No updater sits beside this host's stack, so nothing on it can recreate its own containers. Add one once, then update by hand or from here.",
-        commands: [
-          {
-            label: "Add the updater to this host, once",
-            command: [UPDATER_STACK_DIR_COMMAND, UPDATER_IMAGE_COMMAND, UPDATER_UP_COMMAND].join("\n"),
-          },
-          ...registryCommands(release),
-        ],
+          "This was not installed with the seed, so it has no recovery actor and is not updated from here. Pin a release by hand as below, or replace it with a fresh seed install.",
+        commands: registryCommands(release),
       };
 
     case "identity_unknown":

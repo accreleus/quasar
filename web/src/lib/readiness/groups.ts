@@ -41,7 +41,7 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   {
     key: "platform_update",
     label: "Updates",
-    ids: ["updater_socket", "updater_stack_dir", "updater_overlays", "health_addr_bindable"],
+    ids: ["updater_socket", "health_addr_bindable"],
   },
 ];
 

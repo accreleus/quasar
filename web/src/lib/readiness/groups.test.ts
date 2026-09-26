@@ -11,8 +11,6 @@ function c(id: string, status = "pass", summary = id): ReadinessCheck {
 // or renamed there must be placed here, or it lands in "Other" unnoticed.
 const AGENT_CHECK_IDS = [
   "updater_socket",
-  "updater_stack_dir",
-  "updater_overlays",
   "health_addr_bindable",
   // Host probes (host_probe.rs).
   "media_probe",

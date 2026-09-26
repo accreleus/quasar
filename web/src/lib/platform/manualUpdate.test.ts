@@ -5,7 +5,8 @@ import {
   CONTROL_IMAGE_VAR,
   REGISTRY_PULL_COMMAND,
   REGISTRY_RECREATE_COMMAND,
-  UPDATER_UP_COMMAND,
+  ACTOR_CHECK_COMMAND,
+  ACTOR_LOG_COMMAND,
   manualUpdatePath,
   redeployProfile,
   redeployRef,
@@ -116,11 +117,18 @@ describe("manualUpdatePath", () => {
     ).toBe(`deploy/redeploy.sh <va|nvidia> ${commit}`);
   });
 
-  it("updater_absent adds the updater once, then the registry recipe", () => {
+  it("updater_absent on a Compose install is the registry recipe, with no updater to add", () => {
     const commands = commandsOf("updater_absent") ?? "";
-    expect(commands).toContain(UPDATER_UP_COMMAND);
     expect(commands).toContain(REGISTRY_PULL_COMMAND);
     expect(commands).toContain(REGISTRY_RECREATE_COMMAND);
+    expect(commands).not.toContain("quasar-updater");
+  });
+
+  it("updater_absent on an owned machine checks the recovery actor instead", () => {
+    const commands = commandsOf("updater_absent", { installMode: "owned" }) ?? "";
+    expect(commands).toContain(ACTOR_CHECK_COMMAND);
+    expect(commands).toContain(ACTOR_LOG_COMMAND);
+    expect(commands).not.toContain("docker compose");
   });
 
   it("fills the two .env lines with the release manifest's digests, in its normative order", () => {

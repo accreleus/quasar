@@ -406,9 +406,7 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
           "GitHub Releases"
         )}
         {repo && ` on ${repo}`}.{" "}
-        {isOwnedMachine(view.installed.control_plane)
-          ? "Each machine’s recovery actor applies images by digest, never by tag."
-          : "The updater follows the version tag; images are applied by digest."}
+        Each machine’s recovery actor applies images by digest, never by tag.
       </p>
     </>
   );
