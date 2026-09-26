@@ -109,19 +109,26 @@ export function HostsTab() {
 
   const now = fleet.lastFetchedAt ?? Date.now();
   const online = hosts.filter((h) => h.status === "online").length;
-  const attention = hosts.filter(needsAttention).length;
+  // A host below the floor needs its update (amendment 14 below_floor).
+  const belowFloorKey = (releaseRes.data?.installed?.hosts ?? [])
+    .filter((h) => h.below_floor)
+    .map((h) => h.host_id)
+    .join(",");
+  const belowFloor = useMemo(() => new Set(belowFloorKey.split(",")), [belowFloorKey]);
+  const attends = (host: Host) => needsAttention(host) || belowFloor.has(host.id);
+  const attention = hosts.filter(attends).length;
 
   const visible = useMemo(() => {
     const text = query.trim().toLowerCase();
     return hosts.filter((host) => {
       if (segment === "online" && host.status !== "online") return false;
-      if (segment === "attention" && !needsAttention(host)) return false;
+      if (segment === "attention" && !(needsAttention(host) || belowFloor.has(host.id))) return false;
       if (!text) return true;
       return (
         host.node_name.toLowerCase().includes(text) || host.id.toLowerCase().includes(text)
       );
     });
-  }, [hosts, segment, query]);
+  }, [hosts, segment, query, belowFloor]);
 
   const groups = useMemo(
     () => (groupByVendor ? groupByGpuVendor(visible, gpus) : [{ label: null, hosts: visible }]),

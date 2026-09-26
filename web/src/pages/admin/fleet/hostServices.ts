@@ -9,7 +9,7 @@
  */
 
 import type { Host, PlatformIdentity, PlatformReleaseFault } from "../../../api/types";
-import type { FloorState } from "./hostFloor";
+import { floorLabel, type FloorState } from "./hostFloor";
 import { shortCommit } from "./hostIdentity";
 import { commitsMatch } from "./releasesCopy";
 
@@ -234,7 +234,7 @@ function floorRows(
   const both = floor.movesAgent && floor.movesActor;
   const version = floor.movesAgent ? floor.floor.agent : floor.floor.actor;
   const sameVersion = !!host.agent_version && host.agent_version === host.recovery_actor_version;
-  const note = version && (!both || sameVersion) ? `below ${versionLabel(version)}` : null;
+  const note = version && (!both || sameVersion) ? `below ${floorLabel(version)}` : null;
   return { agent: floor.movesAgent, actor: floor.movesActor, note };
 }
 

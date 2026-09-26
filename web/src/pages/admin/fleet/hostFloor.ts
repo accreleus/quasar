@@ -86,7 +86,8 @@ export function hostFloorState(
       movesAgent: agentBehind || !actorBehind,
       movesActor: actorBehind,
       floor: manifestFloor(installed),
-      failed: lastAttempt?.state === "failed" ? lastAttempt : null,
+      // Only a failed update: a failed revert or developer apply is not "the update".
+      failed: lastAttempt?.state === "failed" && lastAttempt.kind === "apply" ? lastAttempt : null,
     };
   }
   if (host.install_mode === "owned" && !identity.identity_known) {
@@ -103,9 +104,16 @@ export function hostFloorState(
   return null;
 }
 
+/** A floor for display. `X.Y.Z-0` (SemVer's lowest X.Y.Z prerelease, which admits every
+ *  release candidate) reads as vX.Y.Z; the served version is unchanged. */
+export function floorLabel(version: string): string {
+  const shown = version.replace(/-0$/, "");
+  return /^\d/.test(shown) ? `v${shown}` : shown;
+}
+
 /** "v0.5.0 and newer", naming each component when their floors differ. */
 export function floorPhrase(floor: FloorState["floor"]): string | null {
-  const v = (s: string) => (/^\d/.test(s) ? `v${s}` : s);
+  const v = floorLabel;
   if (floor.agent && floor.actor) {
     return floor.agent === floor.actor
       ? `${v(floor.agent)} and newer`

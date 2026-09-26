@@ -131,9 +131,10 @@ describe("HostDetail below the floor", () => {
     expect(note.textContent).toContain("Updating ends its 1 live session.");
     expect(within(note).getByRole("button", { name: /Update to v0\.5\.2/ })).toBeTruthy();
 
-    // Settings and the local console are not offered; drain is.
+    // Settings, the local console and cached images are not offered; drain is.
     expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Local console" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Manage cached images" })).toBeNull();
     expect(screen.getByRole("button", { name: /drain/i })).toBeTruthy();
 
     // Both services the update replaces read "must update", each below the floor.
@@ -173,6 +174,7 @@ describe("HostDetail below the floor", () => {
       attempts: [
         {
           id: "1c7e0000-0000-4000-8000-0000000000a4",
+          kind: "apply",
           state: "failed",
           reason: "unhealthy",
           requested_digests: [
@@ -190,6 +192,23 @@ describe("HostDetail below the floor", () => {
     expect(note.textContent).toContain("The new container started but never became healthy.");
     expect(within(note).getByText("Details")).toBeTruthy();
     expect(within(note).getByRole("button", { name: /Try again/ })).toBeTruthy();
+  });
+
+  it("a failed revert is not reported as a failed update", async () => {
+    mocked.listPlatformAttempts.mockResolvedValue({
+      attempts: [
+        {
+          id: "2d8f0000-0000-4000-8000-0000000000b5",
+          kind: "revert",
+          state: "failed",
+          reason: "unhealthy",
+          requested_digests: [{ name: "node-agent", image: "r/quasar-node-agent", digest: "sha256:b" }],
+        } as unknown as PlatformApplyAttempt,
+      ],
+    } as never);
+    renderPage();
+    expect(await screen.findByText("gpu-host-3 must update before it can be managed.")).toBeTruthy();
+    expect(screen.queryByText(/The update did not finish/)).toBeNull();
   });
 
   it("an update the host cannot take right now is shown, not offered", async () => {

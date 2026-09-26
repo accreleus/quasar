@@ -492,6 +492,8 @@ describe("HostsTab — a host below the floor", () => {
     mocked.getPlatformReleases.mockResolvedValue(releaseView(true));
     renderTab();
     expect(await screen.findByText("must update")).toBeTruthy();
+    // It needs attention: its update.
+    expect(screen.getByRole("tab", { name: "Needs attention, 1" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
     const items = screen.getAllByRole("menuitem").map((el) => el.textContent);

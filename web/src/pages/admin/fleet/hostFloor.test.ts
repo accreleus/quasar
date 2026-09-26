@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Host, PlatformReleaseView } from "../../../api/types";
-import { floorPhrase, hostFloorState } from "./hostFloor";
+import { floorLabel, floorPhrase, hostFloorState } from "./hostFloor";
 
 const host = { id: "h1", install_mode: "owned", source_commit: "a".repeat(40) } as Host;
 
@@ -30,5 +30,11 @@ describe("floorPhrase", () => {
       "node agents from v0.5.0 and recovery actors from v0.4.0",
     );
     expect(floorPhrase({ agent: null, actor: null })).toBeNull();
+  });
+
+  it("reads SemVer's lowest prerelease as the release it admits", () => {
+    expect(floorLabel("0.4.0-0")).toBe("v0.4.0");
+    expect(floorLabel("0.4.0-rc.1")).toBe("v0.4.0-rc.1");
+    expect(floorPhrase({ agent: "0.4.0-0", actor: "0.4.0-0" })).toBe("v0.4.0 and newer");
   });
 });

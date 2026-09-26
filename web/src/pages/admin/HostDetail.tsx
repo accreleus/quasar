@@ -221,9 +221,11 @@ export function HostDetail() {
                 Local console
               </Button>
             )}
-            <Button variant="ghost" onClick={() => setCleanupOpen(true)}>
-              Manage cached images
-            </Button>
+            {managed && (
+              <Button variant="ghost" onClick={() => setCleanupOpen(true)}>
+                Manage cached images
+              </Button>
+            )}
             <Button
               variant="ghost"
               disabled={drain.pending != null || !canChangeOperatorDrain(host)}
