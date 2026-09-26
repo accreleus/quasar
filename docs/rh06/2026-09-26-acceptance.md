@@ -24,9 +24,9 @@ verdict is quoted from its ticket, not restated here.
 - Owner, 2026-09-26 (#368, #364, #367): pre-RH-06 installs are not migrated. Operators
   redeploy from scratch with the seed. The "pre-RH-06 dump restored into a fresh install" row
   is dropped; that work is #380, wanted before the first release to `main` together with RH-07.
-- Owner, 2026-09-25 (#352): a true reboot of a test container needs the owner's go-ahead
-  each time. Without it, the reboot row is recorded as not performed, and the Docker-daemon
-  restart row stands in for it.
+- Owner, 2026-09-26: the reboot-mid-attempt row is not required and is skipped. The
+  Docker-daemon restart row, which #352's owner comment of 2026-09-25 made its stand-in,
+  covers an engine restart mid-attempt.
 
 ## Evidence index
 
@@ -52,8 +52,8 @@ verdict is quoted from its ticket, not restated here.
 ## #368's own acceptance rows
 
 Status values: **covered** (an earlier ticket's live evidence covers it, and where), **run
-here** (no earlier evidence; run live for #368), **not performed** (and why), **dropped** (by
-owner decision, and where it went).
+here** (no earlier evidence; run live for #368), **skipped** or **dropped** (by owner
+decision, and where the work went).
 
 | # | Row | Status | Evidence |
 |---|---|---|---|
@@ -69,7 +69,7 @@ owner decision, and where it went).
 | 3d | Actor killed mid-pull | **covered** | [#360][360] row 5 (agent, twice); [#363][363] §3 `d84ce147` (control plane, real pull); #364 r5 (dump and replacement phases, pending its comment) |
 | 3e | Actor killed mid-verification | **covered** | [#360][360] row 6 (agent); [#362][362] a1–a3 (successor killed at `handing_over`, `verifying`, after `done`); [#363][363] §3 `a7c36693` (after `old_kept`) |
 | 3f | Docker daemon restart mid-attempt | **covered** | [#360][360] 7a (during pulling: interrupted, nothing changed) and 7b (during verifying: continued to succeeded); [#362][362] b (successor verifying); #364 r4 (during a restore, pending its comment) |
-| 3g | Reboot mid-attempt | **not performed**: the owner's go-ahead for a true reboot of a test container was not given. The daemon-restart row 3f stands in, as #352's owner comment provides | none |
+| 3g | Reboot mid-attempt | **skipped by owner decision (not required)**, 2026-09-26. Row 3f covers an engine restart mid-attempt | none |
 | 4a | A migrating update with `restore` | **covered, pending #364's comment** | #364 r1 (migrating developer apply dumps first), r2 (injected migration failure, not restored automatically, the printed `restore` command), r3 (restore, re-run refused, forced re-run) |
 | 4b | A pre-RH-06 dump restored into a fresh install | **dropped** (owner, 2026-09-26) | moved to #380 |
 | 5 | The acceptance map covers every user story; the report requests the owner's acceptance and promotes nothing | **this document**, and the #368 closing report | below |
@@ -126,9 +126,9 @@ Go↔Rust fixtures, the real Docker adapter in the dev container).
 | 28 | A failed agent update is restored automatically | #360 | [#360][360] forced-unhealthy image on both GPU hosts: `restored=true`, same container id, `auto_revert` row | live |
 | 29 | A control-plane update that never started is restored automatically | #363 | [#363][363] §2: a control plane whose health always fails is restored after 71.9 s, reason `unhealthy` | live |
 | 30 | Revert an agent from the console | #360 | [#360][360] row 3 | live |
-| 31 | A host below the floor says "must update before it can be managed" | #365 | [#365][365]: planner, `409 host_not_eligible / below_floor`, console states and screenshots | containerized |
+| 31 | A host below the floor says "must update before it can be managed" | #365 | [#365][365]: planner, `409 host_not_eligible / below_floor`, console states and screenshots. One live observation, on a separate owned combined install (not a test host), 2026-09-26: its node agent stamped `0.3.1-dev.edge1` read "must update before it can be managed" under the `0.4.0-0` floor; a developer apply of the same commit stamped `0.4.0-dev.edge2` (control-plane step, then agent step, both succeeded) cleared it and `below_floor` went false. Lab hosts on `0.3.1-dev.*` stamps read the same after #365, as expected | containerized, one live observation |
 | 32 | Every attempt ends in a stated outcome | #360, #362, #363 | [#360][360] all four outcomes seen live; [#362][362] fault matrix; [#363][363] §3 | live |
-| 33 | An interrupted update is finished after the actor, the daemon or the machine restarts | #360, #362, #363, #364 | actor and daemon restarts: [#360][360] rows 5–7, [#362][362] a1–b, [#363][363] §3, #364 r4/r5. Machine restart: **not performed** (row 3g) | live, except the reboot |
+| 33 | An interrupted update is finished after the actor, the daemon or the machine restarts | #360, #362, #363, #364 | actor and daemon restarts: [#360][360] rows 5–7, [#362][362] a1–b, [#363][363] §3, #364 r4/r5. Machine restart: **skipped by owner decision** (row 3g) | live, except the reboot |
 | 34 | Quasar never retries a failed update on its own | #360, #363 | [#360][360] settle table; [#363][363] §3 `d84ce147`: "It is not retried: apply again to try again" | live |
 | 35 | The recovery actor replaces itself safely | #362 | [#362][362] actor-first order, the full fault matrix, `seed.json` names the new actor | live |
 | 36 | A failed recovery-actor update leaves the previous actor running | #362 | [#362][362] d, and after the follow-up: no agent, `restored: true`, the previous actor back, one actor | live |
@@ -145,7 +145,7 @@ Go↔Rust fixtures, the real Docker adapter in the dev container).
 | 47 | My GPU hosts re-enroll under their existing names | #366 (owned hosts only) | For owned hosts, [#366][366] re-adds onto the same host row. For hosts of a pre-RH-06 install: **dropped**, #380 | live (owned); pre-RH-06 dropped → #380 |
 | 48 | An older install is not offered RH-06 as an in-place update | #365, #367 | [#365][365] v0.3.0's release readers (`internal/platform/prerh06/`) find nothing in a v2-only release; [#367][367] format-1 publication stopped | containerized |
 | 49 | Edge does not offer RH-06 builds to a pre-RH-06 install | #365 | [#365][365] `o2-<branch>` edge tags are not resolved by the pre-RH-06 readers | containerized |
-| 50 | Install-time settings changed with one `reconfigure` command | #366 | [#366][366] row 6 on a GPU host: home root, trust. **Partial:** on a combined or control-only machine, `reconfigure` refuses any input the control plane renders (home root, public host, ports, database mode, trust), because it does not yet drive control-plane replacement (`docs/configuration.md`, "reconfigure"). See "Gaps" | partial |
+| 50 | Install-time settings changed with one `reconfigure` command | #366 | [#366][366] row 6 on a GPU host: home root, trust. **Partial:** on a combined or control-only machine, `reconfigure` refuses any input the control plane renders (home root, public host, ports, database mode, trust), because it does not yet drive control-plane replacement (`docs/configuration.md`, "reconfigure"). Follow-up #386 | partial → #386 |
 | 51 | Agent settings stay in the existing host policy | #361 | [#361][361] decisions: machine inputs are install-time only, console settings stay in the database; [#366][366] `reconfigure` refuses the node name and the agent image | containerized, plus live refusals |
 | 52 | Release signature and allowlist rules behave exactly as today | #356, #365, #367 | [#356][356] 282 golden vectors from Go's own output, passed by both implementations, Opus security review APPROVED; [#365][365] four new vectors for the v2 pair; [#367][367] Go originals deleted only after that. Live `namespace_rejected`: [#363][363] refusals | containerized, plus live refusals |
 | 53 | Only the control plane may ask for a control-plane replacement; the agent only its host's agent and actor | #356, #360, #363 | [#356][356] agent-socket component guard; [#360][360] "The agent can name only the agent and the recovery actor"; [#363][363] §1 status scoping by socket | live and containerized |
@@ -167,14 +167,15 @@ needed, it is filed against its slice rather than fixed in #368.
 1. **Story 50, `reconfigure` on a control-plane machine (partial, #366).** It refuses every
    input the control plane renders until `reconfigure` drives control-plane replacement
    (#363). A combined or control-only operator cannot yet change the home root, public host,
-   ports or database mode in place. No issue tracks this yet.
+   ports or database mode in place. It is a limit #366 documented, not a defect in its
+   acceptance, and is filed as #386.
 2. **Story 20 and 37, the release channel on hardware.** Every live replacement ran as a
    developer apply. The Releases-channel apply of a format-2 release, and an unattended
    update, are containerized only, because nothing has been published; publication needs
    the owner's approval.
-3. **Story 31, `below_floor`**, is containerized only: no build below the floor was
-   deployed on purpose.
-4. **Story 33, a machine reboot mid-attempt**, is not performed (row 3g).
+3. **Story 31, `below_floor`**, is containerized, plus the one live observation on a
+   separate owned install recorded in the map.
+4. **Story 33, a machine reboot mid-attempt**, is skipped by owner decision (row 3g).
 5. **Stories 45–47 and row 4b** are dropped by the owner's decision of 2026-09-26 and are
    #380.
 6. **#364's rows** (22–27, 54, and #368 rows 2c, 3d, 3f, 4a) wait for #364's closing
@@ -191,6 +192,7 @@ needed, it is filed against its slice rather than fixed in #368.
 | #382 | Small follow-ups from the control-plane replacement live run (#363) |
 | #384 | Library scan does not fetch artwork for the games it detects |
 | #385 | Add host serves the install-time seed image after the actor is moved by developer apply |
+| #386 | `reconfigure` cannot change control-plane inputs on a combined or control-only machine (story 50) |
 
 ## Checks at the acceptance commit
 
