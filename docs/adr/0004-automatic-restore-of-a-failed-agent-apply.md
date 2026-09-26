@@ -113,8 +113,8 @@ no `.env.prev` and no pull. The decision above is extended, and nothing in it is
   recorded in `protocol/agent-api.md` §`release_state` and `protocol/control-api.md` §"Failure
   reasons"; it was made under the RH06-01 process with the coordinator's authorisation and is
   flagged for the owner.
-- A `registry` machine keeps the updater's behaviour described above until the Go updater retires
-  with RH06-15 (#367).
+- A `registry` machine kept the updater's behaviour described above until the Go updater retired
+  with RH06-15 (#367); a machine with no recovery actor now has nothing that restores it.
 
 Considered and rejected for the control plane: restoring automatically after a migration (a
 schema moved forward cannot be undone by restarting an older binary, and D7's automatic

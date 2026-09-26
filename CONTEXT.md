@@ -487,12 +487,11 @@ people; any signature by any trusted key verifies. _Avoid_: "signing key" for
 the public half (the signing key is private and lives only in the release
 pipeline), "certificate" (there is no chain and no expiry).
 
-**Updater** — the per-host actor on a Compose install that pulls a platform
-release and recreates the containers it replaces, because a container cannot
-recreate itself. It acts only when told to, and only on the stack it sits beside.
-On an owned machine the recovery actor does this job instead, and the updater
-retires with RH06-15 (#367). _Avoid_: "sidecar" in prose (that is how it is
-deployed, not what it is), "agent" (the agent asks; the updater acts).
+**Updater** — the contract's word for whatever replaces a target's containers,
+kept in `updater_present`, `updater_absent` and `updater_unreachable`: since the
+Compose updater retired with RH06-15 (#367) it is the machine's **recovery actor**.
+A pre-RH06 Compose install ran a `quasar-updater` service, which nothing ships any
+more. _Avoid_: "the updater" in new prose (say "recovery actor"), "sidecar".
 
 **Install mode** — how a host got its platform images: from the registry, built
 from source on the host, or **owned** — created and replaced by the machine's
@@ -509,9 +508,8 @@ reason is `interrupted` means nothing changed. _Avoid_: "job" (an attempt is ope
 
 **Preflight** — the per-target evaluation, on the release view, of whether the
 machinery around a target is shaped so an apply can be carried out at all: the
-updater or recovery actor reachable, on a Compose install the stack directory and
-overlays it will act on the ones the target was started with, on an owned machine
-no conflicting container and room for a pre-update dump, the health port the next
+recovery actor reachable, on an owned machine no conflicting container and room for
+a pre-update dump, the health port the next
 agent start needs, the release's images resolvable. Distinct from *eligibility* (may this target take
 the release) and from a host's *readiness* (can it run sessions); a host's own
 readiness checks are inputs to its preflight. A blocked preflight is one
@@ -542,7 +540,7 @@ always did — recreating an agent does end that host's sessions.
 ## Deployment ownership (RH06, in shaping)
 
 These terms describe RH06 as specified (#352) and as the contract amendment (amendment 14,
-#353) spells it; that amendment awaits sign-off and nothing here is built yet.
+#353) spells it; its contract step is in force since RH06-15 (#367).
 
 **Platform service** — one long-running container that runs Quasar itself on a
 machine: the control plane, a node agent, Postgres, the recovery actor, and later
@@ -586,8 +584,7 @@ the first control plane).
 by default, short-lived, optionally bound to one node name, revocable, stored only
 as a hash. A combined or control-only machine's own agent uses a single-use local
 enrollment token its recovery actor generates at install. The static
-deployment-wide token is deprecated and retires with RH06; it is no exception to
-keep. _Avoid_: "join token", "API key", "break-glass token".
+deployment-wide token retired with RH06; it is no exception to keep. _Avoid_: "join token", "API key", "break-glass token".
 
 **Host identity** — the node name and node secret by which the control plane
 recognises a host across reconnects. The agent's local state beside the secret

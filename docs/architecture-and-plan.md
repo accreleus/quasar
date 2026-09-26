@@ -185,11 +185,11 @@ image set from one commit (`CONTEXT.md` "Platform releases"). The control plane 
 releases (stable = GitHub Releases + a release manifest; edge = a branch tag's digest and
 the identity labels on the image), decides what is offered with a pure function ordered
 by **schema version** — the database migration the release embeds — and applies through
-a per-host **updater** sidecar that pulls pinned digests and recreates containers, since a
-container cannot recreate itself. The shape follows the invariants above: the control
+each machine's **recovery actor** (RH-06), which pulls pinned digests and replaces
+containers through the engine API, since a container cannot replace itself. The shape follows the invariants above: the control
 plane holds the decision and the state (`platform_releases`, apply runs and attempts in
-Postgres); the agent only relays a `release_apply` to its updater and reports
-`release_state`; the updater trusts nothing but an allowlisted registry namespace and a
+Postgres); the agent only relays a `release_apply` to its recovery actor and reports
+`release_state`; the actor trusts nothing but an allowlisted registry namespace and a
 well-formed digest (ADR 0001). Order is fixed by ADR 0002: control plane first, hosts
 after, never below the database's applied migration, so the console can never offer a
 downgrade; revert exists only for agents. A source-built host is told about releases but
