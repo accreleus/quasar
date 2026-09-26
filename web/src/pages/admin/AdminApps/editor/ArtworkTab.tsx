@@ -298,7 +298,7 @@ export function ArtworkTab({ appId, appName, token, kind }: ArtworkTabProps) {
           </>
         )}
 
-        <div className="rowflex" style={{ flexWrap: "wrap" }}>
+        <div className="rowflex wrap">
           <Button disabled={busy} onClick={() => tileInput.current?.click()}>
             Upload tile image
           </Button>

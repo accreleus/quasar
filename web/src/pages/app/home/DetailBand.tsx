@@ -4,7 +4,7 @@
 // selection it edits, BandNotes carries the warnings beneath it.
 
 import { forwardRef, useCallback, useEffect, useMemo, useRef } from "react";
-import type { RefObject } from "react";
+import type { CSSProperties, RefObject } from "react";
 import type { App, ProfilesResponse } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
@@ -162,7 +162,12 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
         : "Play";
 
   return (
-    <div className="detail show" id={`lib-detail-${app.id}`} ref={ref} style={hero.style}>
+    <div
+      className="detail show"
+      id={`lib-detail-${app.id}`}
+      ref={ref}
+      style={{ "--scrim-rgb": hero.palette.scrimRgb, "--accent-rgb": hero.palette.accentRgb } as CSSProperties}
+    >
       <div className="hero-art">
         {hero.art ? (
           /* Demand-loaded by the band opening, so eager is right; async decode

@@ -28,22 +28,12 @@ export function BulkBar({ selectedCount, actions, onClear, noun = "item" }: Bulk
       <span className="bulk-count">
         <span>{selectedCount}</span> {noun}{selectedCount === 1 ? "" : "s"} selected
       </span>
-      <div style={{ width: 1, height: 20, background: "var(--line-2)", flexShrink: 0 }} />
+      <div className="bulk-sep" />
       {actions.map((action) => (
         <BulkAction key={action.label} action={action} />
       ))}
       <button
-        style={{
-          marginLeft: "var(--s2)",
-          background: "transparent",
-          border: "none",
-          cursor: "pointer",
-          color: "var(--text-3)",
-          fontSize: "var(--t-xs)",
-          fontFamily: "var(--font-ui)",
-          padding: "2px 6px",
-          borderRadius: "var(--r-sm)",
-        }}
+        className="bulk-clear muted t-xs"
         onClick={onClear}
         aria-label={`Clear ${label}`}
       >
@@ -57,18 +47,7 @@ function BulkAction({ action }: { action: BulkBarAction }) {
   const isDanger = action.variant === "danger";
   return (
     <button
-      style={{
-        padding: "6px 14px",
-        borderRadius: "var(--r-pill)",
-        border: isDanger ? "1px solid var(--danger-line)" : "1px solid var(--line-2)",
-        background: isDanger ? "var(--danger-bg)" : "var(--ink-5)",
-        color: isDanger ? "var(--danger-text)" : "var(--text)",
-        cursor: "pointer",
-        fontSize: "var(--t-sm)",
-        fontFamily: "var(--font-ui)",
-        fontWeight: 600,
-        transition: "background 0.15s",
-      }}
+      className={`bulk-action t-sm${isDanger ? " bulk-action-danger" : ""}`}
       onClick={action.onClick}
     >
       {action.label}

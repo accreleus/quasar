@@ -3,7 +3,7 @@
 // for one served from cache.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CSSProperties, RefObject } from "react";
+import type { RefObject } from "react";
 import type { App } from "../../../api/types";
 import { artFor } from "../../../lib/appArtwork";
 import { DEFAULT_HERO_PALETTE, samplePalette, type HeroPalette } from "../../../lib/heroPalette";
@@ -15,7 +15,7 @@ export interface HeroArt {
   onLoad: () => void;
   /** The band's scrim and accent. The interior ink stays pinned light in both
    *  themes (home.css); only these two follow the art. */
-  style: CSSProperties;
+  palette: HeroPalette;
 }
 
 export function useHeroPalette(app: App): HeroArt {
@@ -40,9 +40,6 @@ export function useHeroPalette(app: App): HeroArt {
     art,
     imgRef,
     onLoad,
-    style: {
-      "--scrim-rgb": palette.scrimRgb,
-      "--accent-rgb": palette.accentRgb,
-    } as CSSProperties,
+    palette,
   };
 }

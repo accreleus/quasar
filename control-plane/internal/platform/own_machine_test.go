@@ -96,6 +96,46 @@ func TestOwnMachineReadsACombinedHost(t *testing.T) {
 	}
 }
 
+// Add host's running tier (#385): the answering actor by digest, and the one running
+// node agent.
+func TestOwnMachineReadsTheImagesItRuns(t *testing.T) {
+	read := func(name string) OwnMachine {
+		t.Helper()
+		var st actorsocket.Status
+		if err := json.Unmarshal(fixtureBody(t, name), &st); err != nil {
+			t.Fatal(err)
+		}
+		return OwnMachineFromStatus(st)
+	}
+	actor := "ghcr.io/accreleus/quasar/quasar-recovery@sha256:cc33" + strings.Repeat("0", 60)
+	combined := read("status-combined-idle.json")
+	if combined.Running.RecoveryActor != actor {
+		t.Errorf("actor = %q, want %q", combined.Running.RecoveryActor, actor)
+	}
+	if combined.Running.NodeAgent != "" {
+		t.Errorf("an exited agent is not running, got %q", combined.Running.NodeAgent)
+	}
+	gpu := read("status-gpu-host-applying.json")
+	if want := "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:1b7e" + strings.Repeat("0", 57) + "def"; gpu.Running.NodeAgent != want {
+		t.Errorf("agent = %q, want %q", gpu.Running.NodeAgent, want)
+	}
+	if control := read("status-control-only-stale.json"); control.Running.NodeAgent != "" {
+		t.Errorf("control-only agent = %q, want none", control.Running.NodeAgent)
+	}
+
+	var st actorsocket.Status
+	if err := json.Unmarshal(fixtureBody(t, "status-gpu-host-applying.json"), &st); err != nil {
+		t.Fatal(err)
+	}
+	other := "sha256:" + strings.Repeat("9", 64)
+	st.Services = append(st.Services, actorsocket.Service{Role: ComponentNodeAgent, Container: "quasar-node-agent-next",
+		Image: "ghcr.io/accreleus/quasar/quasar-node-agent", Digest: &other, State: "running"})
+	st.Actor.Digest = nil
+	if m := OwnMachineFromStatus(st); m.Running != (RunningImages{}) {
+		t.Errorf("two running agents and an undigested actor = %+v, want neither", m.Running)
+	}
+}
+
 func TestOwnMachineReadsAControlOnlyHost(t *testing.T) {
 	path, _ := serveStatus(t, fixtureBody(t, "status-control-only-stale.json"))
 	m, ok := NewOwnMachineReader(path).Read(context.Background())

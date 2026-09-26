@@ -82,7 +82,7 @@ export function IgnoreAppModal({ target, pending, onConfirm, onClose }: IgnoreAp
         access grants for it. This is fleet-wide and permanent across future scans — the game
         being reinstalled or re-observed will not bring it back.
       </p>
-      <p className="muted mt3" style={{ fontSize: "var(--t-sm)" }}>
+      <p className="muted mt3 t-sm">
         The app row, its artwork and anyone&rsquo;s favourite of it are kept, not deleted —
         recoverable later from the provider app&rsquo;s Library panel (&ldquo;Seen, not
         published&rdquo;) with an un-ignore action.

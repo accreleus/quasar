@@ -37,7 +37,7 @@ export const recentScanColumns: TableColumn<LibraryRecentScan>[] = [
     key: "completed_at",
     header: "Time",
     render: (r) => (
-      <span title={r.completed_at} style={{ fontSize: "var(--t-sm)" }}>
+      <span title={r.completed_at} className="t-sm">
         {relativeTime(r.completed_at)}
       </span>
     ),
@@ -45,12 +45,12 @@ export const recentScanColumns: TableColumn<LibraryRecentScan>[] = [
   {
     key: "user",
     header: "User",
-    render: (r) => <span style={{ fontSize: "var(--t-sm)" }}>{r.user}</span>,
+    render: (r) => <span className="t-sm">{r.user}</span>,
   },
   {
     key: "host",
     header: "Host",
-    render: (r) => <span className="mono" style={{ fontSize: "var(--t-sm)" }}>{r.host}</span>,
+    render: (r) => <span className="mono t-sm">{r.host}</span>,
   },
   {
     key: "state",
@@ -65,7 +65,7 @@ export const recentScanColumns: TableColumn<LibraryRecentScan>[] = [
     key: "counts",
     header: "Observed · suppressed · created · disabled",
     render: (r) => (
-      <span className="muted mono" style={{ fontSize: "var(--t-sm)" }} title={recentScanTitle(r)}>
+      <span className="muted mono t-sm" title={recentScanTitle(r)}>
         {r.observed} · {r.suppressed} · {r.created} · {r.disabled}
       </span>
     ),
@@ -73,7 +73,7 @@ export const recentScanColumns: TableColumn<LibraryRecentScan>[] = [
   {
     key: "backfilled",
     header: "Backfilled",
-    render: (r) => <span className="mono" style={{ fontSize: "var(--t-sm)" }}>{r.backfilled}</span>,
+    render: (r) => <span className="mono t-sm">{r.backfilled}</span>,
   },
 ];
 
@@ -86,11 +86,11 @@ export interface ScanHealthProps {
 
 export function ScanHealth({ status, steamApp, preset, presetLoading }: ScanHealthProps) {
   return (
-    <div className="col gap5" style={{ marginTop: "var(--s4)" }}>
+    <div className="col gap5 mt4">
       <div className="row gap6 wrap">
         <div>
           <span className="hint">Last scan completed</span>
-          <div className="muted" style={{ fontSize: "var(--t-sm)" }}>
+          <div className="muted t-sm">
             {status.last_scan_completed_at ? (
               <span title={status.last_scan_completed_at}>
                 {elapsedWords(status.last_scan_completed_at)} ago (
@@ -103,8 +103,8 @@ export function ScanHealth({ status, steamApp, preset, presetLoading }: ScanHeal
         </div>
         {(["pending", "claimed", "reported", "failed"] as const).map((k) => (
           <div key={k}>
-            <span className="hint" style={{ textTransform: "capitalize" }}>{k}</span>
-            <div className="muted mono" style={{ fontSize: "var(--t-sm)" }}>{status.scans[k]}</div>
+            <span className="hint lib-capitalize">{k}</span>
+            <div className="muted mono t-sm">{status.scans[k]}</div>
           </div>
         ))}
       </div>
@@ -124,7 +124,7 @@ export function ScanHealth({ status, steamApp, preset, presetLoading }: ScanHeal
 
       <div>
         <span className="hint">Provider app</span>
-        <div style={{ fontSize: "var(--t-sm)", marginTop: 4 }}>
+        <div className="t-sm mt1">
           {steamApp === null ? (
             <EmptyState>
               No app is marked as the Steam library provider yet. Set{" "}

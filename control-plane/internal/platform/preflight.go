@@ -197,7 +197,7 @@ func ownedActorSocketCheck(a *OwnedActorFact) PreflightCheck {
 			detail += ": " + a.Err
 		}
 		return fail(CheckUpdaterSocket, detail+
-			". Check that it is running (docker ps --filter name=quasar-recovery) and read its log (docker logs quasar-recovery)")
+			". Check it with docker ps -a --filter name=quasar-recovery. Exited means it was stopped with docker stop or docker kill, which Docker never restarts: docker start quasar-recovery finishes what it was doing. Otherwise read its log (docker logs quasar-recovery)")
 	}
 	v := a.Version
 	if v == "" {

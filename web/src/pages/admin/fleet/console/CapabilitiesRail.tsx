@@ -19,20 +19,11 @@ export function CapabilitiesRail({
     <div className="card card-pad">
       <div className="eyebrow">Reported capabilities</div>
       {hasCapabilities ? (
-        <div className="col gap2" style={{ marginTop: 10, fontSize: "var(--t-xs)", color: "var(--text-3)" }}>
+        <div className="col gap2 mt3 t-xs muted">
           <div>Connectors: <span className="mono">{capabilities!.connectors.join(", ") || "—"}</span></div>
           {capabilities!.outputs?.map((output) => (
-            <div
-              key={output.id}
-              style={{
-                borderLeft: "2px solid var(--line-2)",
-                paddingLeft: 9,
-                display: "flex",
-                flexDirection: "column",
-                gap: 2,
-              }}
-            >
-              <span className="cell-id" style={{ alignSelf: "flex-start" }}>{output.id}</span>
+            <div key={output.id} className="col console-output">
+              <span className="cell-id console-output-id">{output.id}</span>
               <span className="mono">{output.render_node ?? "no render node"}</span>
               <span>{output.connected ? "connected" : "disconnected"}</span>
               <span>
@@ -59,7 +50,7 @@ export function CapabilitiesRail({
           </div>
         </div>
       ) : (
-        <p className="hint" style={{ marginTop: 10 }}>Host reported no capabilities (agent offline or older).</p>
+        <p className="hint mt3">Host reported no capabilities (agent offline or older).</p>
       )}
     </div>
   );

@@ -122,7 +122,7 @@ export function Drawer({ open, onClose, title, eyebrow, children, width = 400, f
         <div className="drawer-head">
           <div>
             {eyebrow && (
-              <div className="eyebrow mono" style={{ textTransform: "none", letterSpacing: 0, marginBottom: 4 }}>
+              <div className="eyebrow mono drawer-eyebrow">
                 {eyebrow}
               </div>
             )}

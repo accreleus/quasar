@@ -47,6 +47,8 @@ services, any container in the way, and the result of the last update.
 | `seed-file-unknown-format`, `seed-file-unreadable` | The seed's state file is of a format it does not know, or invalid. The seed stays idle rather than guess. |
 | `seed-name-taken` | A container named `quasar-recovery` exists without this installation's labels, such as one started by hand. It is left alone. Remove it and the seed creates the recovery actor. |
 | `seed-actor-unstarted` | A recovery actor was created and never started, by an earlier seed container. `docker start quasar-recovery` finishes it. |
+| `seed-actor-started` | `quasar-recovery` had been stopped with `docker stop` or `docker kill`, which Docker never restarts, so the seed started it again after about a minute. It finishes what it was doing. To keep it stopped, stop the seed first. |
+| `seed-actor-stopped` | No recovery actor is running and the seed will not start it: after an interrupted update, or with two of them. Nothing on the machine can be updated or recovered meanwhile. The line names the command that brings it back. The seed shows unhealthy until then. |
 | `seed-engine-unreachable`, `seed-pull-failed`, `seed-create-failed`, `seed-start-failed` | Retried at the next look. |
 | `seed-look-failed` | A look failed for a reason with no line of its own; the message says what. Retried at the next look. |
 | `seed-engine-config` | The container engine endpoint the seed was given is unusable, for instance a `DOCKER_HOST` it refuses. The seed exits. Fix the socket mount or the variable. |
@@ -312,7 +314,7 @@ on a legacy Compose install, set in the host's `deploy/.env`.
 You see this after repointing an instance at a fork's registry without widening
 the allowlist, or after narrowing it deliberately. On a legacy Compose install,
 set it to the namespace the images actually live in. On an owned machine the
-list is a seed input, recorded at the first install. A GPU host changes it with
+list is a seed input, recorded at the first install. Change it with
 `reconfigure`:
 
 ```bash
@@ -321,7 +323,7 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
 ```
 
 On the first machine the control plane carries the same list, so `reconfigure`
-refuses the change in this release: it is fixed at install. It is matched on path
+replaces the control plane with the new one. It is matched on path
 segment boundaries, so a namespace never admits a lookalike that merely starts
 with the same characters.
 

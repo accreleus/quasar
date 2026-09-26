@@ -399,13 +399,20 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_RO
 ```
 
 It replaces the services the change moves with the same images and the new
-settings, verifies them, and puts them back if they do not verify. In this
-release it re-creates only the node agent, so it is for GPU hosts: on the first
-machine a change that moves the control plane (its public host, TLS names,
-trusted proxies, ports, the registry allowlist, and a combined host's home root)
-is refused, and those are fixed at install. The signature settings change
-anywhere, since no container carries them. The role, node name, database and
-images never change this way; images move by an update.
+settings, verifies them, and puts them back if they do not verify. On the first
+machine that includes the control plane: its public host, TLS names, trusted
+proxies, ports and the registry allowlist, and a combined host's home root. The
+control plane goes first and the machine's own agent after it. A control plane
+that never becomes healthy with the new settings, on a port something else holds
+say, is put back with the old ones. The signature settings change anywhere, since
+no container carries them. `--dry-run` shows what would be re-created and what it
+costs first: re-creating the agent ends that host's sessions, and a new HTTPS
+port cuts off the GPU hosts you added until you add them again.
+
+The database and the node name never change this way. Switching between
+Quasar's own database and your own moves data, which `reconfigure` never does:
+back the database up, uninstall, install again with the new settings, and load
+your data. The node name is changed the same way. Images move by an update.
 
 ## Application memory and ownership
 

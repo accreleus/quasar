@@ -66,7 +66,7 @@ function ConsoleRow({ title, help, children }: { title: string; help: ReactNode;
 
 /** `.eyebrow` group header between `.cset` rows. */
 function Group({ title }: { title: string }) {
-  return <div className="eyebrow" style={{ padding: "var(--s5) var(--card-pad) 2px" }}>{title}</div>;
+  return <div className="eyebrow console-group">{title}</div>;
 }
 
 export function HostConsole() {
@@ -153,7 +153,7 @@ export function HostConsole() {
             <div className="panel-head">
               <div>
                 <span className="panel-title">Console mode</span>
-                <p className="hint" style={{ marginTop: 3 }}>
+                <p className="hint mt1">
                   Local display with an explicit per-session output topology.
                 </p>
               </div>
@@ -170,7 +170,7 @@ export function HostConsole() {
                 browser stream from the same VulkanImage source. Select a card-scoped output
                 and exact reported timing, or leave both automatic.</>}
             >
-              <span className="mono" style={{ fontSize: "var(--t-xs)", color: "var(--text-3)" }}>
+              <span className="mono t-xs muted">
                 Weston · Static mode · Fullscreen
               </span>
             </ConsoleRow>
@@ -322,14 +322,14 @@ export function HostConsole() {
           <div className="col gap4">
             <div className="card card-pad">
               <div className="eyebrow">Host</div>
-              <h3 style={{ fontSize: "var(--t-h3)", marginTop: 6 }}>{host?.node_name ?? "Unknown host"}</h3>
-              <div className="mono" style={{ color: "var(--text-3)", fontSize: "var(--t-xs)", marginTop: 3 }} title={host?.id}>
+              <h3 className="t-h3 mt2">{host?.node_name ?? "Unknown host"}</h3>
+              <div className="mono muted t-xs mt1" title={host?.id}>
                 {shortId(host?.id)}
               </div>
             </div>
             <div className="card card-pad">
               <div className="eyebrow">Overrides</div>
-              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.7rem", fontWeight: 600, marginTop: 6 }}>
+              <div className="rail-stat">
                 {changedCount}
               </div>
               <div className="hint">Unsaved field changes.</div>

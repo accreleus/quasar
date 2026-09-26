@@ -112,16 +112,16 @@ not writable, input device rules absent.
 Nothing here blocks you. A failing check warns and links you to Admin, Fleet,
 Hosts. For storage, the wizard can keep the agent-reported root or select one of
 its subdirectories. Moving to an entirely different root means changing the
-machine's home root, so the bind mount moves too. On an owned GPU host that is
+machine's home root, so the bind mount moves too. On an owned host that is
 `reconfigure`, run inside its recovery actor, which replaces the agent with the
-new root and puts it back if it does not verify:
+new root and puts it back if it does not verify. On a combined host it replaces
+the control plane first, then the agent:
 
 ```bash
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
 ```
 
-On a combined host the home root is fixed at install in this release. Changing
-the root does not move existing homes; see [Storage](/quasar/admin/hosts/#storage).
+Changing the root does not move existing homes; see [Storage](/quasar/admin/hosts/#storage).
 
 <Shot
 	label="Setup wizard, hosts step"

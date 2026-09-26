@@ -73,7 +73,7 @@ then arrive as files.
 | `QUASAR_WEB_ROOT` | unset | When set, serve the built SPA from this dir for non-API paths (same-origin deploy). Compose points it at `web/dist` mounted as `/app/web`. |
 | `QUASAR_ENROLL_SEED_IMAGE` | unset (the installed release's `recovery-actor` image) | Overrides the seed image Admin → Fleet → Add host installs on a new GPU host, as `repository@sha256:<digest>` (the `quasar-recovery` image; a tag fails startup). See "Add host" below. |
 | `QUASAR_ENROLL_AGENT_IMAGE` | unset (the installed release's `node-agent` image) | Overrides the node-agent image Add host installs, as `repository@sha256:<digest>` (a tag fails startup). See "Add host" below. |
-| `QUASAR_ENROLL_FALLBACK_SEED_IMAGE`, `QUASAR_ENROLL_FALLBACK_AGENT_IMAGE` | unset | The last resort for Add host's seed and node-agent images, below the installed release's: an owned machine's recovery actor sets them to the images it was installed with (control-plane recipe revision 2, #365). Same `repository@sha256:<digest>` rule. See "Add host" below. |
+| `QUASAR_ENROLL_FALLBACK_SEED_IMAGE`, `QUASAR_ENROLL_FALLBACK_AGENT_IMAGE` | unset | The last resort for Add host's seed and node-agent images, below the installed release's and those the control plane's own machine runs (#385): an owned machine's recovery actor sets them to the images it was installed with (control-plane recipe revision 2, #365). Same `repository@sha256:<digest>` rule. See "Add host" below. |
 | `QUASAR_PLACEMENT_POLICY` | spread | `""` \| `spread` \| `least-loaded` → spread (default); `locality` → prefer the host holding the user's home (P3-02/P5-07). Unknown value = startup error. |
 | `QUASAR_SESSION_GRACE_SECS` | `120` | **Control plane.** How long a host may be silent before the stale-host sweep fails its sessions and marks it offline (#128). A disconnect no longer reaps `running` sessions — the agent holds them across a control-plane restart and re-reports them on its first heartbeat — so this is the backstop for a host that never returns. Measured from `max(last_heartbeat_at, control-plane boot)`: the boot term stops a control plane that restarts after a quiet period from reaping every session before any agent can reconnect. **Must exceed the agent's own grace plus its maximum reconnect backoff (30 s)**; with the agent default of 90 s, 120 s meets that exactly. `0` disables the sweep entirely (a host that never returns then holds its sessions and their reservations indefinitely) — it is a deliberate kill switch, not a shorter window. The sweep ticks at a quarter of this (minimum 5 s), and is inert when agent connectivity is not wired — a backstop that cannot tell a live host from a dead one must reap nothing rather than everything. |
 | `QUASAR_VRAM_MIN_FREE_MB` | `1024` | Live free-VRAM admission floor (#383). A GPU accepts a new session only if its most recent agent-reported free-VRAM sample, debited for launches the sample cannot see yet, is at least this. **Advisory, not a reservation** — encode slots remain the race-safe reservation; this only refuses a GPU that is *already* out of memory. `0` disables the veto entirely (slots-only admission) and is the kill switch. Fails **open** in every unknown case: no sample, stale sample, or a card whose `vram_mb_total` is ≤ this floor (an AMD APU's UMA carve-out). A veto rejection is a retryable `503 capacity_exhausted` and logs the GPU plus every number it judged on. Note a floor above a card's total does **not** make that card unusable: the veto abstains, the card stays servable, and any rejection there is ordinary encode-slot exhaustion. |
@@ -1515,6 +1515,8 @@ Every 30 s (and at start) it looks once and logs only a change, so each conditio
 | `token="seed-uninstalled"` | `seed.json` says this machine was uninstalled; the seed stays idle. |
 | `token="seed-file-unknown-format"` / `seed-file-unreadable` | `seed.json` is of a format other than 1, or invalid; the seed stays idle rather than guess. |
 | `token="seed-name-taken"` | A container named `quasar-recovery` exists without this installation's labels (for instance an actor started by hand, below): it is left alone. Remove it and the seed creates the actor. |
+| `token="seed-actor-started"` | The one recovery actor was stopped from outside (`docker stop` or `docker kill`, which the engine never restarts): exited with its `unless-stopped` policy intact, and so on the previous look too, at least 30 s earlier. The seed started it again, and it finishes what it was doing (ADR 0007, "An actor stopped from outside", #381). To keep it stopped, stop the seed first, or run `uninstall`. |
+| `token="seed-actor-stopped"` | On an installed machine, no recovery actor of this installation has run for two looks in a row, and it is not one the seed starts: its restart policy was disabled (a hand-over's kept actor), it is `dead`, or there are two (#381). Nothing on the machine is replaced or recovered until one runs. The line names the way back, `docker start quasar-recovery.kept 2>/dev/null \|\| docker start quasar-recovery`. |
 | `seed-engine-unreachable`, `seed-pull-failed`, `seed-create-failed`, `seed-start-failed` | Retried at the next look. |
 
 **Its own unfinished create.** If the seed stops between creating the actor and starting it
@@ -1562,6 +1564,7 @@ first match wins:
 | `QUASAR_ENROLL_SEED_IMAGE` | Override of the seed, `<registry>/quasar-recovery@sha256:<digest>`. The seed's first actor is created from it. On an owned machine it is the seed input of the same name. |
 | `QUASAR_ENROLL_AGENT_IMAGE` | Override of the node agent, `<registry>/quasar-node-agent@sha256:<digest>`. On an owned machine it is the seed input of the same name. |
 | (the installed release) | Its `recovery-actor` and `node-agent` components. |
+| (what the control plane's own machine runs) | On an owned install, the image of the recovery actor that answers on the control socket, by its digest, as the seed; and the image of that machine's one running node agent, when it has exactly one (a combined host whose agent is up), as the agent. So after a developer apply, which is no release, or a release that moved the machine, Add host installs what the machine was moved to rather than what it was installed with (#385). Read with the same 30 s cache as the machine's other facts; an actor that does not answer contributes nothing. |
 | `QUASAR_ENROLL_FALLBACK_SEED_IMAGE`, `QUASAR_ENROLL_FALLBACK_AGENT_IMAGE` | The images the machine was installed with, which its recovery actor sets for a revision-2 control plane. A revision-1 control plane has no fallback variables: the actor gives it the override, else the install-time image, as `QUASAR_ENROLL_*`. |
 
 The installed release is the stable-channel release whose commit is this control plane's, as
@@ -1918,7 +1921,7 @@ command, with the image, to run next.
   installation it finds, from its containers, its labelled volumes or machine state, with the
   seed's image when the installed recovery actor predates `uninstall`.
 
-### Changing machine inputs: `reconfigure` (#366)
+### Changing machine inputs: `reconfigure` (#366, #386)
 
 Run inside the recovery actor, which holds the machine's lease:
 
@@ -1927,32 +1930,86 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --dry-run QUASAR_HOM
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
 ```
 
-It takes the seed's variable names: `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`, the release
-trust (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
+It takes the seed's variable names. On every machine, the release trust
+(`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_UPDATER_SIGNATURE_MODE`,
 `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`,
-`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
-`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`. An empty value unsets an
-optional one. The role, node name, database and images are fixed at install (images move by an
-update).
+`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`). On a machine with
+a node agent (a GPU host or a combined host), the agent's inputs: `QUASAR_HOME_ROOT`,
+`QUASAR_TEMPLATE_ROOT`, `QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`;
+a control-only machine runs no agent, so it refuses them. On a combined or
+control-only machine also the control plane's inputs: `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_HOSTS`,
+`QUASAR_TRUSTED_PROXIES`, `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT`, `QUASAR_ENROLL_SEED_IMAGE`
+and `QUASAR_ENROLL_AGENT_IMAGE`. An empty value unsets an optional one.
 
 A change is checked as an install would check it, then applied as a replacement with the
 same digests: each service whose container the change moves is replaced, verified, and
-restored if it does not verify, and the new inputs stay only if it succeeded. Re-creating the
-node agent ends that host's sessions, so a change that does needs `--yes`. A change no
-container renders (the signature mode, say) is only recorded. This release re-creates only
-the node agent this way, so it is for GPU hosts: a change that moves the control plane's
-container (anything the control plane renders, including the home root or trust on a combined
-host, and every control-plane-only variable) is refused: control-plane replacement (RH06-11,
-#363) serves updates, and a reconfigure does not drive it yet. `reconfigure.json` records a
-reconfigure in flight; one that cannot be read is never overwritten: reconfigure is refused,
-and the actor's next start sets it aside as `reconfigure.json.unreadable`
-(`token="reconfigure-record-set-aside"`). Machine state then keeps that reconfigure's **new**
-inputs, which the node agent runs only if its replacement succeeded, and the actor logs a
-node agent whose container differs from what it would render. Compare the agent's container
-(`docker inspect quasar-node-agent`) with machine state. A reconfigure changes only values
-that differ from machine state, so to keep the old values reconfigure to them; to keep the new
-ones, reconfigure to the old values and then to the new. Delete
-`reconfigure.json.unreadable` once you are done with it.
+restored if it does not verify. The control plane goes first, then the node agent, because a
+combined host's agent dials the control plane at the loopback of `QUASAR_HTTP_PORT`: a
+combined host's home root or HTTP port moves both. A control plane is verified by its own
+health check, and one that never becomes healthy (a port another process holds, say) is put
+back with its old inputs, as a failed control-plane update is (#363). A change no container
+renders (the signature mode, say) is only recorded. A reconfigure keeps every image, so it is
+never a migration; it is refused while a restore holds the database, and when a service runs
+another image than machine state records for it. Postgres and the recovery actor are never
+replaced by a reconfigure.
+
+The plan says what the change costs before anything moves, and a change that re-creates a
+service needs `--yes`. Re-creating the node agent ends that host's sessions. Re-creating the
+control plane restarts the console and every agent's connection; sessions keep streaming.
+GPU hosts added with Add host dial the HTTPS port their enrollment string names, so after a
+`QUASAR_TLS_PORT` change they stop connecting until they are added again. The control plane
+keeps its certificate (agents pin it), so new `QUASAR_PUBLIC_HOST` and `QUASAR_TLS_HOSTS`
+names reach the certificate only once it is re-issued ("Adding a name to the certificate"
+below).
+
+**Not reconfigurable: the database and the node name.** Changing the database mode (a
+Quasar-owned Postgres or your own database) or the database itself moves data, and a
+reconfigure never moves data: it refuses every `QUASAR_DATABASE_*` variable. To change it,
+reinstall: back the database up, run `quasar-recovery uninstall`, install again with the seed
+and the new database inputs, and load your data into the new database. The node name is the
+machine's identity, which the control plane knows its host by; to change it, reinstall the
+same way (a GPU host is then added again from Add host). The role is fixed the same way, and
+images move by an update.
+
+**How it settles.** `reconfigure.json` in machine state records the inputs before and after,
+and, once settled, its `outcome` (`quasar-recovery reconfigure` prints it; `GET
+/v1/reconfigure` on the operator socket serves it):
+
+| The attempt | Machine state keeps | `outcome.settled` |
+|---|---|---|
+| succeeded | the new inputs | `applied` |
+| failed, interrupted, or never journalled; nothing verified | the old inputs, put back | `put_back` |
+| failed after the control plane verified (the agent did not) | the new inputs, which the control plane runs | `partial`, with `behind: ["node-agent"]` |
+
+`outcome.behind` names every service not on the inputs machine state keeps (a `partial` always
+has one, and a rerun that fails again keeps it). Running the same command again finishes it:
+the values are already in force, and it re-creates only the services left behind. A kill of the recovery actor, or a
+restart of the engine or the machine, at any phase settles on the actor's next start to one of
+these, with one control plane running. A `reconfigure.json` that cannot be read is never
+overwritten: reconfigure is refused, and the actor's next start sets it aside as
+`reconfigure.json.unreadable` (`token="reconfigure-record-set-aside"`). Machine state then
+keeps that reconfigure's **new** inputs, which its services run only if its replacement
+succeeded, and the actor logs a service whose container differs from what it would render.
+Compare the containers (`docker inspect quasar-node-agent quasar-control-plane`) with machine
+state. A reconfigure changes only values that differ from machine state, so to keep the old
+values reconfigure to them; to keep the new ones, reconfigure to the old values and then to
+the new. Delete `reconfigure.json.unreadable` once you are done with it.
+
+#### Adding a name to the certificate
+
+On an owned install the control plane's self-signed pair lives in the `quasar-control-data`
+volume, generated once (`QUASAR_TLS_DIR` above). After reconfiguring `QUASAR_PUBLIC_HOST` or
+`QUASAR_TLS_HOSTS`, re-issue it to put the new names on it:
+
+```sh
+docker exec quasar-control-plane rm -f /var/lib/quasar-control/tls/cert.pem /var/lib/quasar-control/tls/key.pem
+docker restart quasar-control-plane
+```
+
+The new certificate has a new fingerprint: every browser that trusted the old one asks again,
+and every GPU host pinned to the old one stops connecting (`token="cp-tls-pin-mismatch"`)
+until it is added again from Add host. A combined host's own agent dials the loopback and is
+not affected.
 
 ---
 

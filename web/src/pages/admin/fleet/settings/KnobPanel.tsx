@@ -21,7 +21,7 @@ export function KnobPanel({
       <div className="panel-head">
         <div>
           <span className="panel-title">{title}</span>
-          <p className="hint" style={{ marginTop: 3 }}>{hint}</p>
+          <p className="hint mt1">{hint}</p>
         </div>
         {actions && <div className="acts">{actions}</div>}
       </div>

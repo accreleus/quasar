@@ -73,6 +73,39 @@ parse or special-case `unknown` (or any other value).
 This clarification was approved by the Opus contract review on #358, 2026-09-25, under the
 owner's standing approval recorded on #352.
 
+## Clarification: an actor stopped from outside
+
+`docker stop` or `docker kill` of a recovery actor is a manual stop: the engine never applies
+its `unless-stopped` policy again, and a replacement the actor had started stays unfinished —
+on the control plane's machine, with no control plane (#381). We clarify that **starting such
+an actor gives the compiled profile's restart policy back its effect; it is not a
+replacement**, and the seed does it. The rule is exact and is part of seed interface 1:
+
+- `seed.json` is format 1 with `state: active` (never with no `seed.json`, never
+  `uninstalled`);
+- exactly one container carries both labels for `seed.json`'s installation, under any name;
+- it is in the engine's `exited` state, and its restart policy is `unless-stopped`;
+- the seed found the same container (by full id), in the same state, on its previous look, at
+  least one interval earlier.
+
+Anything else is left alone as before: a created container other than the seed's own unstarted
+create, a `dead` one, one whose restart policy is disabled, or more than one container with
+both labels. The seed still never stops, replaces or removes anything.
+
+The converse obligation on every recovery actor and every Quasar command: an actor container
+Quasar stops and means to keep stopped (a hand-over's kept actor, the actor an `uninstall` or a
+console removal stops) has its restart policy set to `no` before it is stopped, and an
+uninstall or removal sets `seed.json` to `uninstalled` before it stops the actor. An operator
+who wants the actor to stay stopped stops the seed first, or runs `uninstall`.
+
+The rule needs two looks, and a fixture records one: every existing fixture,
+`installed-actor-stopped` included, decides as it did. `decide` gains the previous look as an
+argument (none in the existing fixtures), and new fixtures record a previous look to pin the
+start.
+
+This clarification was approved by the owner on #381, 2026-09-26, with the Opus coordinator's
+review concurring.
+
 ## The contract-test obligation
 
 A contract test runs the **current** seed code against machine-state fixtures written by **every

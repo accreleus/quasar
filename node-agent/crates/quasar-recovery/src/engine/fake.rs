@@ -103,6 +103,9 @@ pub struct FakeState {
     /// Every control-plane image started against a database whose schema is above the one
     /// the image declares: what must never happen.
     pub older_control_planes_started: Vec<String>,
+    /// Host ports something outside the engine holds: a start publishing one is refused,
+    /// as Docker refuses it, and the container stays `created`.
+    pub ports_in_use: BTreeSet<u16>,
 }
 
 /// A database: its `schema_migrations` row and a token standing for its rows.
@@ -583,6 +586,7 @@ impl PlatformEngine for FakeEngine {
                 .get(&id)
                 .and_then(|c| s.behaviour.get(&c.spec.image))
                 .cloned();
+            let ports_in_use = s.ports_in_use.clone();
             let c = s.containers.get_mut(&id).unwrap();
             if c.status == "running" {
                 return Ok(());
@@ -592,6 +596,15 @@ impl PlatformEngine for FakeEngine {
             }
             if let Some(message) = behaviour.as_ref().and_then(|b| b.refuse_start.clone()) {
                 return Err(refused(500, &message));
+            }
+            if let Some(port) = c.spec.ports.iter().find(|p| ports_in_use.contains(&p.host_port)) {
+                return Err(refused(
+                    500,
+                    &format!(
+                        "driver failed programming external connectivity: Bind for 0.0.0.0:{} failed: port is already allocated",
+                        port.host_port
+                    ),
+                ));
             }
             c.starts += 1;
             // A helper runs to completion at once; the GPU probe prints its report and a

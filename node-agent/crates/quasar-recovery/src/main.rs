@@ -30,9 +30,10 @@ commands:
             remove this machine's Quasar services, in its own container (docs/configuration.md);
             keeps the database, machine state and homes unless --purge
   reconfigure [--dry-run] [--yes] VARIABLE=value...
-            change a GPU host's inputs (home root, release trust, app defaults, ...) through
-            a verified replacement; run it inside the recovery actor (docker exec). A change
-            that moves the control plane's container is refused in this build
+            change this machine's inputs (home root, public host, ports, release trust, app
+            defaults, ...) through a verified replacement on the same images; run it inside
+            the recovery actor (docker exec). The database and the node name are changed by
+            reinstalling, never by a reconfigure
   restore   on a control-plane machine, inside the running actor
             (docker exec quasar-recovery quasar-recovery restore ...):
               restore --list                        the pre-update dumps kept here
@@ -623,31 +624,35 @@ fn reconfigure(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if plan.changed.is_empty() {
+    if plan.changed.is_empty() && plan.replaced.is_empty() {
         println!("Nothing to change: every value is already in force.");
         return ExitCode::SUCCESS;
     }
-    println!("Changes: {}", plan.changed.join(", "));
+    if !plan.changed.is_empty() {
+        println!("Changes: {}", plan.changed.join(", "));
+    }
     if plan.replaced.is_empty() {
         println!("No service needs re-creating.");
     } else {
         println!(
-            "Re-creates, on the image it already runs: {}{}",
-            plan.replaced.join(", "),
-            if plan.replaced.iter().any(|r| r == "node-agent") {
-                " (re-creating the node agent ends this host's sessions)"
-            } else {
-                ""
-            }
+            "Re-creates, in this order, on the image each already runs: {}",
+            plan.replaced.join(", ")
         );
+    }
+    for note in &plan.notes {
+        println!("  {note}");
     }
     if dry_run {
         return ExitCode::SUCCESS;
     }
     if !plan.replaced.is_empty() && !yes {
-        println!(
-            "Nothing was changed. Drain the host if it has sessions, then run again with --yes."
-        );
+        if plan.replaced.iter().any(|r| r == "node-agent") {
+            println!(
+                "Nothing was changed. Drain the host if it has sessions, then run again with --yes."
+            );
+        } else {
+            println!("Nothing was changed. Run again with --yes to apply it.");
+        }
         return ExitCode::from(3);
     }
     let done = match ask(false) {
@@ -671,7 +676,7 @@ fn reconfigure(args: &[String]) -> ExitCode {
     println!("Replacing (attempt {id})…");
     let mut last = String::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(30 * 60);
-    loop {
+    let result = loop {
         std::thread::sleep(Duration::from_secs(2));
         let status = operator::call(socket, "GET", &format!("/v1/status?request_id={id}"), None)
             .ok()
@@ -689,25 +694,91 @@ fn reconfigure(args: &[String]) -> ExitCode {
             println!("  {state}");
             last = state;
         }
-        match result.state {
-            quasar_recovery::socket::State::Succeeded => {
-                println!("Reconfigured: the new inputs are in force.");
-                return ExitCode::SUCCESS;
-            }
-            quasar_recovery::socket::State::Failed => {
-                eprintln!(
-                    "The reconfigure failed ({}){}; the previous inputs are back in force.\n{}",
-                    result.reason.map(|r| r.to_string()).unwrap_or_default(),
-                    if result.restored {
-                        " and the previous container was put back"
-                    } else {
-                        ""
-                    },
-                    result.output
-                );
-                return ExitCode::FAILURE;
-            }
-            _ => {}
+        if matches!(
+            result.state,
+            quasar_recovery::socket::State::Succeeded | quasar_recovery::socket::State::Failed
+        ) {
+            break result;
+        }
+    };
+    report_reconfigure(socket, &id, &result)
+}
+
+/// How the reconfigure settled, from `reconfigure.json`, which the actor writes just after
+/// the attempt's own outcome.
+fn report_reconfigure(
+    socket: &std::path::Path,
+    id: &str,
+    result: &quasar_recovery::socket::AttemptResult,
+) -> ExitCode {
+    use quasar_recovery::reconfigure::Settled;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let outcome = loop {
+        let record = operator::reconfigure_record(socket).ok().flatten();
+        if let Some(o) = record
+            .filter(|r| r.request_id == id)
+            .and_then(|r| r.outcome)
+        {
+            break Some(o);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let reason = result
+        .reason
+        .as_ref()
+        .map(|r| r.to_string())
+        .unwrap_or_default();
+    let behind: Vec<String> = outcome
+        .as_ref()
+        .map(|o| o.behind.iter().map(|r| r.as_str().to_owned()).collect())
+        .unwrap_or_default();
+    if !behind.is_empty()
+        && outcome
+            .as_ref()
+            .is_some_and(|o| o.settled != Settled::Partial)
+    {
+        eprintln!(
+            "{} still runs other inputs than machine state holds: run the same reconfigure again to re-create it.",
+            behind.join(" and ")
+        );
+    }
+    match outcome.map(|o| (o.settled, o.behind)) {
+        Some((Settled::Applied, _)) => {
+            println!("Reconfigured: the new inputs are in force.");
+            ExitCode::SUCCESS
+        }
+        Some((Settled::PutBack, _)) => {
+            eprintln!(
+                "The reconfigure failed ({reason}){}; the previous inputs are back in force.\n{}",
+                if result.restored {
+                    " and the previous container was put back"
+                } else {
+                    ""
+                },
+                result.output
+            );
+            ExitCode::FAILURE
+        }
+        Some((Settled::Partial, behind)) => {
+            let behind: Vec<&str> = behind.iter().map(|r| r.as_str()).collect();
+            eprintln!(
+                "The reconfigure was partly applied ({reason}): the new inputs are in force, but {} could not be re-created and runs its previous inputs. Run the same reconfigure again to re-create it.\n{}",
+                behind.join(" and "),
+                result.output
+            );
+            ExitCode::FAILURE
+        }
+        None => {
+            eprintln!(
+                "The attempt ended {:?} ({reason}), and the actor has not recorded how the reconfigure settled yet; {} in machine state (GET /v1/reconfigure on the operator socket) shows it once it has.\n{}",
+                result.state,
+                quasar_recovery::reconfigure::RECORD_FILE,
+                result.output
+            );
+            ExitCode::FAILURE
         }
     }
 }

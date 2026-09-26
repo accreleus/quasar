@@ -275,6 +275,15 @@ docker logs --tail 50 quasar-recovery
 - **It is not there at all.** The seed re-creates it from the last verified recovery-actor
   image within 30 seconds, as long as the seed is running. A seed that is stopped re-creates
   nothing: start it again.
+- **It is stopped (`Exited`), and its log ends normally.** It was stopped with `docker stop` or
+  `docker kill`, and Docker never restarts a container stopped that way: a crash comes back in
+  under a second, this does not. Nothing on the machine is replaced or recovered until it runs,
+  and a replacement it had started waits; on the control plane's own machine, stopped after the
+  old control plane, that means no control plane and no console. A running seed starts it again
+  on its second look, 30 to 60 seconds later (`seed-actor-started`, ADR 0007 "An actor stopped
+  from outside"), and it finishes the attempt where it stopped; with no seed running,
+  `docker start quasar-recovery` does the same. To keep the actor stopped, stop the seed first,
+  or run `uninstall` (#381).
 - **It exits at start.** Its last log line names the reason by token (`docs/configuration.md`
   "Recovery actor" lists them).
 - **A hand-over was interrupted and no actor starts.** The old actor is kept:

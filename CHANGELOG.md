@@ -63,6 +63,7 @@ own; the two do not move together, and that is deliberate.
   GPU host is added back with Add host under the same node name. The agent re-registers when
   its recovery actor's reported identity changes, so the console sees a seed go missing or
   come back without an agent restart.
+- **`reconfigure` changes the control plane's inputs (#386).** On a combined or control-only machine, `quasar-recovery reconfigure` changes the public host, TLS names, ports, trusted proxies, release trust and a combined host's home root by replacing the control plane on the same digest (then the node agent where it moves too), restoring it with the old inputs if it never becomes healthy; `reconfigure.json` records how it settled, and the database and node name are refused, naming the reinstall.
 - **Add host carries the control plane's release trust (#366).** The one-line command and the
   Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
   `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane
@@ -212,6 +213,15 @@ own; the two do not move together, and that is deliberate.
   signal, a developer-apply route and the control plane's own machine identity. The contract
   step retiring the Compose wording and the static token is not in force until RH06-15
   (#367). ADRs 0007 and 0008 are new and ADR 0004 is amended. No behaviour changes yet.
+- **Design lint for the web client (#370).** `npm run lint:design` checks every
+  stylesheet and component for off-scale spacing, raw colours and inline styles, and
+  each failure names the token or utility class to use instead. A per-file baseline
+  records the existing debt and only ratchets down. CSS spacing now snaps to the 4px
+  token scale, so gaps and padding shift by a few pixels across the UI.
+- **`DESIGN.md`, the UI spec.** Colour roles, the spacing scale, density, where styles
+  live and when inline styles are allowed, plus a table of the places Quasar overrides
+  the v3 mocks. It takes precedence over `design_handoff_v3/`, which stays the
+  reference for composition.
 - **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
   walks an operator through enrolled-host configuration, idle apply, placement, homes,
   preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
@@ -405,6 +415,28 @@ own; the two do not move together, and that is deliberate.
   tests without GStreamer, glib or CUDA, so the RH-06 recovery actor can link it. Pure
   refactor: agent behaviour, log tokens and wire messages are unchanged. `node-agent/` is
   now a Cargo workspace; the Rust gates run with `--workspace`.
+- **Design-lint batch A: shared components and utilities (#372).** Every inline style in
+  `web/src/components/` has moved to token-backed classes, and `components.css` gains the
+  `.t-xs` `.t-sm` `.t-lg` `.t-h3` `.text-1` `.text-2` `.mb1` utilities (the block's top
+  comment lists every utility and its token). Off-scale spacing snapped to the 4px scale.
+  The one other visible change: bare `label.check` checkboxes (the Users table) now show the
+  pointer cursor like every other checkbox.
+- **Web design lint, batch B: raw colours into named tokens (#373).** Every hex, `oklch()`,
+  `rgb()` and named colour in the web stylesheets and components now lives in `tokens.css`
+  under a role name and is read through `var(--…)`; each token holds the value it replaced, so
+  nothing renders differently. The `raw-colour-css` and `raw-colour-tsx` baselines are zero,
+  apart from reasoned allows for the brand mark and the artwork-sampled detail scrim.
+- **Design-lint batch C1: admin fleet, sessions, streaming, overview, settings and audit (#374).**
+  Every inline style in those admin pages has moved to the batch A utilities or to classes in
+  `admin.css` and `admin/fleet.css`; only runtime widths and opacities stay inline. Off-scale
+  spacing snapped to the 4px scale; nothing else looks different.
+- **Design-lint batch C2: admin library, people, app editor and top-level admin pages (#375).**
+  Their inline styles have moved to utilities and token-backed classes in `admin.css` and
+  `admin/editor.css`. Off-scale spacing snapped to the 4px scale; nothing else looks different.
+- **Design-lint batch D: setup wizard, styleguide, user-side leftovers (#376).** The setup
+  wizard steps, the /admin resume banner, /styleguide, the auth card, the home detail band and
+  the stream HUD carry no inline styling beyond runtime sizes and custom properties. The 6px
+  gaps under the wizard's headings snapped to 8px; nothing else looks different.
 - **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
   not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
   storage write test and the runtime facts — a rename only; both still warn. The engine API
@@ -530,6 +562,26 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Add host installs the seed the control plane's machine runs after a developer apply
+  (#385).** Below an override and the installed release, Add host now offers the image of
+  the recovery actor answering on the control plane's own machine, and that machine's
+  running node agent, before the install-time `QUASAR_ENROLL_FALLBACK_*` images. A developer
+  apply is no release, so the served command used to name the seed the machine was installed
+  with, which on a host removed from the console could not clear its uninstalled state.
+- **A recovery actor stopped with `docker stop` or `docker kill` is reported, not silent
+  (#381).** Docker never restarts a container stopped that way, so a machine whose actor was
+  stopped mid-replacement stayed without a control plane until someone noticed. The seed now
+  logs `seed-actor-stopped` and turns unhealthy when no recovery actor of the installation has
+  run for two looks, naming `docker start quasar-recovery` (or the way back after an
+  interrupted hand-over); it still starts no existing actor. The `updater_socket` readiness
+  check, the control-plane preflight and the console's manual path for an owned machine say
+  the same, and the recovery runbook in `docs/upgrading.md` has the case.
+- **The seed starts a recovery actor the operator stopped (#381).** Per ADR 0007's owner-
+  approved clarification "An actor stopped from outside", a seed that finds the one actor of
+  an installed machine exited with its `unless-stopped` policy intact, on two looks at least
+  30 s apart, starts it (`seed-actor-started`), and the replacement it was running completes.
+  A kept actor, a disabled policy, two actors, an uninstalled machine and one with no
+  `seed.json` are never started; those stay reported as `seed-actor-stopped`.
 - **The release preflight inventory matches the image build again (#383).**
   `scripts/release/release-manifest.json` lists the three vendored patches
   `deploy/Dockerfile.vulkan` applies and the gst-wayland-display pin in `deploy/pins.env`,
@@ -591,6 +643,10 @@ own; the two do not move together, and that is deliberate.
   the NVIDIA driver volume; the static `ENROLLMENT_TOKEN` is optional; each host may have its own
   home root; the Debian note asks for Compose 2.30; `make diagnose` is marked as needing a
   checkout. The site's compose snapshot is regenerated, so `npm run build` passes again.
+- **Session charts with a small range drew duplicate y-axis ticks (#372).** A metric like
+  `ladder_res_rung` (0–1) got ticks `0, 0, 1, 1, 1`: overlapping gridlines and a React
+  duplicate-key warning. Ticks now take the fewest decimals that keep them distinct
+  (`0, 0.3, 0.6, 0.8, 1.1`); a normal range keeps its integer ticks.
 - **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
   before any host reports it ready. After the launch is accepted, the control
   plane prepares the image on the selected host with the adopted, frozen
