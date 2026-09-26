@@ -14,7 +14,7 @@ use quasar_recovery::recipe::paths;
 use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
 use quasar_recovery::socket::Request;
 use quasar_recovery::trust::{self, SignatureEvidence};
-use quasar_recovery::{identity, server, shutdown};
+use quasar_recovery::{identity, operator, server, shutdown, uninstall};
 use tracing::{error, info};
 
 const USAGE: &str = "usage: quasar-recovery <command>
@@ -26,9 +26,16 @@ commands:
             serve its sockets (docs/configuration.md \"Recovery actor\")
   status    print this machine's inventory, as the running actor serves it (in the seed's
             container: what the seed last did)
+  uninstall [--purge [--confirm <node name>] [--dump-to <host dir>]]
+            remove this machine's Quasar services, in its own container (docs/configuration.md);
+            keeps the database, machine state and homes unless --purge
+  reconfigure [--dry-run] [--yes] VARIABLE=value...
+            change a GPU host's inputs (home root, release trust, app defaults, ...) through
+            a verified replacement; run it inside the recovery actor (docker exec). A change
+            that moves the control plane's container is refused in this build
   version   print this build's version and commit
 
-restore, uninstall and reconfigure are not in this build.";
+restore is not in this build.";
 
 /// In the seed's own container only: what its last look came to, for the health check.
 const SEED_STATUS_FILE: &str = "/tmp/quasar-seed.status";
@@ -56,7 +63,9 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Some("restore") | Some("uninstall") | Some("reconfigure") => {
+        Some("uninstall") => uninstall(&args[1..]),
+        Some("reconfigure") => reconfigure(&args[1..]),
+        Some("restore") => {
             eprintln!(
                 "quasar-recovery: `{}` is not in this build\n\n{USAGE}",
                 args[0]
@@ -258,6 +267,7 @@ fn actor() -> ExitCode {
         return ExitCode::FAILURE;
     }
     unbound(actor.serve());
+    serve_operator(&actor);
 
     match actor.resume() {
         Ok(()) if actor.retired() => {}
@@ -316,6 +326,247 @@ fn unbound(failed: Vec<(PathBuf, std::io::Error)>) {
             quasar_recovery::recipe::names::AGENT_SOCKET_VOLUME,
             paths::AGENT_SOCKET_DIR
         );
+    }
+}
+
+/// The operator socket (`quasar_recovery::operator`), inside this container only. Not
+/// fatal: without it only `reconfigure` is unavailable.
+fn serve_operator(actor: &Arc<Actor>) {
+    let path = std::path::Path::new(operator::SOCKET);
+    match server::bind(path) {
+        Ok(listener) => {
+            let actor = actor.clone();
+            std::thread::spawn(move || {
+                let e = operator::serve(listener, actor);
+                error!(token = "actor-operator-socket-failed", "the operator socket stopped: {e}");
+            });
+        }
+        Err(e) => error!(
+            token = "actor-operator-socket-unbound",
+            "cannot create the operator socket {}: {e}; reconfigure is unavailable until the actor restarts",
+            path.display()
+        ),
+    }
+}
+
+fn flag_value(args: &[String], name: &str) -> Result<Option<String>, String> {
+    match args.iter().position(|a| a == name) {
+        None => Ok(args
+            .iter()
+            .find_map(|a| a.strip_prefix(&format!("{name}=")).map(str::to_owned))),
+        Some(i) => args
+            .get(i + 1)
+            .filter(|v| !v.starts_with("--"))
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("{name} needs a value")),
+    }
+}
+
+fn uninstall(args: &[String]) -> ExitCode {
+    init_logging();
+    let known = ["--purge", "--confirm", "--dump-to"];
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].split('=').next().unwrap_or("");
+        if !known.contains(&a) {
+            eprintln!(
+                "quasar-recovery uninstall: unknown argument {:?}\n\n{USAGE}",
+                args[i]
+            );
+            return ExitCode::from(2);
+        }
+        i += if (a == "--confirm" || a == "--dump-to") && !args[i].contains('=') {
+            2
+        } else {
+            1
+        };
+    }
+    let (confirm, dump_to) = match (flag_value(args, "--confirm"), flag_value(args, "--dump-to")) {
+        (Ok(c), Ok(d)) => (c, d),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("quasar-recovery uninstall: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let purge = args.iter().any(|a| a == "--purge");
+    if !purge && (confirm.is_some() || dump_to.is_some()) {
+        eprintln!("quasar-recovery uninstall: --confirm and --dump-to belong to --purge; without it nothing is deleted or dumped\n\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let opts = uninstall::Options {
+        purge,
+        confirm,
+        dump_to,
+    };
+    let engine = match DockerEngine::from_environment() {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("quasar-recovery uninstall: the container engine endpoint is unusable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
+    let mut run = uninstall::Uninstall::new(Arc::new(engine), dir);
+    run.self_container = quasar_runtime::self_inspection::self_container_id();
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        run.prompt = Some(Box::new(|question: &str| {
+            eprint!("{question}");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok()?;
+            Some(line.trim().to_owned())
+        }));
+    }
+    match run.run(&opts) {
+        Ok(report) => {
+            for line in report.lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("quasar-recovery uninstall: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn reconfigure(args: &[String]) -> ExitCode {
+    use quasar_recovery::reconfigure::ReconfigureRequest;
+    let mut changes = std::collections::BTreeMap::new();
+    let (mut yes, mut dry_run) = (false, false);
+    for a in args {
+        match a.as_str() {
+            "--yes" => yes = true,
+            "--dry-run" => dry_run = true,
+            kv => match kv.split_once('=') {
+                Some((k, v)) if k.starts_with("QUASAR_") => {
+                    changes.insert(k.to_owned(), v.to_owned());
+                }
+                _ => {
+                    eprintln!("quasar-recovery reconfigure: expected VARIABLE=value, got {kv:?}\n\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+        }
+    }
+    let socket = std::path::Path::new(operator::SOCKET);
+    if !socket.exists() {
+        eprintln!(
+            "quasar-recovery reconfigure: no operator socket at {}; run it inside the recovery actor: docker exec -it quasar-recovery quasar-recovery reconfigure VARIABLE=value",
+            socket.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let ask = |dry_run: bool| {
+        operator::reconfigure(
+            socket,
+            &ReconfigureRequest {
+                changes: changes.clone(),
+                dry_run,
+            },
+        )
+    };
+    let plan = match ask(true) {
+        Ok(operator::Answer::Planned(p)) => p,
+        Ok(operator::Answer::Refused(r)) => {
+            eprintln!(
+                "quasar-recovery reconfigure: refused ({}): {}",
+                r.reason, r.message
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("quasar-recovery reconfigure: the recovery actor did not answer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if plan.changed.is_empty() {
+        println!("Nothing to change: every value is already in force.");
+        return ExitCode::SUCCESS;
+    }
+    println!("Changes: {}", plan.changed.join(", "));
+    if plan.replaced.is_empty() {
+        println!("No service needs re-creating.");
+    } else {
+        println!(
+            "Re-creates, on the image it already runs: {}{}",
+            plan.replaced.join(", "),
+            if plan.replaced.iter().any(|r| r == "node-agent") {
+                " (re-creating the node agent ends this host's sessions)"
+            } else {
+                ""
+            }
+        );
+    }
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    if !plan.replaced.is_empty() && !yes {
+        println!(
+            "Nothing was changed. Drain the host if it has sessions, then run again with --yes."
+        );
+        return ExitCode::from(3);
+    }
+    let done = match ask(false) {
+        Ok(operator::Answer::Planned(p)) => p,
+        Ok(operator::Answer::Refused(r)) => {
+            eprintln!(
+                "quasar-recovery reconfigure: refused ({}): {}",
+                r.reason, r.message
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("quasar-recovery reconfigure: the recovery actor did not answer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(id) = done.request_id else {
+        println!("Reconfigured: the new inputs are in force.");
+        return ExitCode::SUCCESS;
+    };
+    println!("Replacing (attempt {id})…");
+    let mut last = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30 * 60);
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let status = operator::call(socket, "GET", &format!("/v1/status?request_id={id}"), None)
+            .ok()
+            .and_then(|(code, body)| (code == 200).then_some(body))
+            .and_then(|body| serde_json::from_str::<quasar_recovery::socket::Status>(&body).ok());
+        let Some(result) = status.and_then(|s| s.result) else {
+            if std::time::Instant::now() > deadline {
+                eprintln!("quasar-recovery reconfigure: lost sight of attempt {id}; `quasar-recovery status` shows its outcome");
+                return ExitCode::FAILURE;
+            }
+            continue;
+        };
+        let state = format!("{:?}", result.state).to_lowercase();
+        if state != last {
+            println!("  {state}");
+            last = state;
+        }
+        match result.state {
+            quasar_recovery::socket::State::Succeeded => {
+                println!("Reconfigured: the new inputs are in force.");
+                return ExitCode::SUCCESS;
+            }
+            quasar_recovery::socket::State::Failed => {
+                eprintln!(
+                    "The reconfigure failed ({}){}; the previous inputs are back in force.\n{}",
+                    result.reason.map(|r| r.to_string()).unwrap_or_default(),
+                    if result.restored {
+                        " and the previous container was put back"
+                    } else {
+                        ""
+                    },
+                    result.output
+                );
+                return ExitCode::FAILURE;
+            }
+            _ => {}
+        }
     }
 }
 

@@ -42,6 +42,10 @@ pub mod names {
     pub const GPU_PROBE: &str = "quasar-gpu-probe";
     /// The never-started helper through which a secrets volume is written.
     pub const SECRETS_WRITER: &str = "quasar-secrets-writer";
+    /// The one-shot helper an `uninstall --purge` dumps a Quasar-owned database with.
+    pub const FINAL_DUMP: &str = "quasar-final-dump";
+    /// Where that dump goes unless the operator names a directory: a purge never deletes it.
+    pub const FINAL_DUMP_VOLUME: &str = "quasar-final-dump";
     /// The control plane's own state (its TLS pair, the artwork cache): a named volume, so
     /// it outlives every replacement of the container.
     pub const CONTROL_DATA_VOLUME: &str = "quasar-control-data";

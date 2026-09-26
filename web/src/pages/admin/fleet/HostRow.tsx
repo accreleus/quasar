@@ -16,6 +16,8 @@ import { shortId } from "../../../lib/format/shortId";
 import { primaryGpuLabel } from "../../../lib/gpu";
 import { admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./AdmissionReasons";
 import { HostExpansion } from "./HostExpansion";
+import { hostFlag } from "./hostWarnings";
+import { isControlPlaneMachine, isOwned } from "./hostServices";
 import {
   distinctGpuVendors,
   groupGpusByModel,
@@ -60,6 +62,14 @@ export function HostRow(props: HostRowProps) {
   const state = hostStateLabel(host);
   const offline = host.status === "offline";
   const live = host.capacity?.active_sessions ?? 0;
+  const flag = hostFlag(host);
+  // The machine's shape, for an owned host (mock rh06/hosts): the control plane's own
+  // machine is the combined host, by the contract's rule; every other one is a GPU host.
+  const shape = isOwned(host)
+    ? isControlPlaneMachine(host, props.controlPlane)
+      ? "Combined host"
+      : "GPU host"
+    : null;
 
   return (
     <>
@@ -88,6 +98,11 @@ export function HostRow(props: HostRowProps) {
           <div className="rowflex">
             <i className={`sdot ${hostStateDot(host)}`} title={state} />
             <span className="primary">{host.node_name}</span>
+            {flag && (
+              <Chip variant="warning" className="chip-sm" title={flag.title}>
+                {flag.label}
+              </Chip>
+            )}
             {/* #429: an agent that keeps restarting is worth seeing without
                 opening the drawer, where the last-restart time lives. */}
             {host.agent_restart_count > 0 && (
@@ -109,6 +124,7 @@ export function HostRow(props: HostRowProps) {
           </div>
           <div className="sub mono host-row-id" title={host.id}>
             {shortId(host.id)}
+            {shape ? ` · ${shape}` : ""}
             {state !== "online" ? ` · ${state}` : ""}
           </div>
         </td>

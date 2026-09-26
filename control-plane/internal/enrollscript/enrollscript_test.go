@@ -16,9 +16,21 @@ import (
 )
 
 type fixture struct {
-	SeedImage  string   `json:"seed_image"`
-	AgentImage string   `json:"agent_image"`
-	Lines      []string `json:"lines"`
+	SeedImage          string   `json:"seed_image"`
+	AgentImage         string   `json:"agent_image"`
+	AllowedNamespaces  string   `json:"allowed_namespaces"`
+	InsecureRegistries string   `json:"insecure_registries"`
+	Lines              []string `json:"lines"`
+	TrustLines         []string `json:"trust_lines"`
+}
+
+func (f fixture) pins() enrollscript.Pins {
+	return enrollscript.Pins{
+		SeedImage:          f.SeedImage,
+		AgentImage:         f.AgentImage,
+		AllowedNamespaces:  f.AllowedNamespaces,
+		InsecureRegistries: f.InsecureRegistries,
+	}
 }
 
 func loadFixture(t *testing.T) fixture {
@@ -65,14 +77,14 @@ var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 // served script carries, and the rendered script still parses.
 func TestServedScriptCarriesThePinnedImagesTheConsoleReads(t *testing.T) {
 	f := loadFixture(t)
-	h := enrollscript.Handler(webRoot(t, realScript(t)), enrollscript.Pins{SeedImage: f.SeedImage, AgentImage: f.AgentImage}, quiet)
+	h := enrollscript.Handler(webRoot(t, realScript(t)), f.pins(), quiet)
 	rr := get(t, h)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
 	lines := strings.Split(body, "\n")
-	for _, want := range f.Lines {
+	for _, want := range append(append([]string{}, f.Lines...), f.TrustLines...) {
 		n := 0
 		for _, l := range lines {
 			if l == want {
@@ -83,8 +95,10 @@ func TestServedScriptCarriesThePinnedImagesTheConsoleReads(t *testing.T) {
 			t.Errorf("%d lines %q, want 1", n, want)
 		}
 	}
-	if strings.Contains(body, "PINNED_SEED_IMAGE=''") || strings.Contains(body, "PINNED_AGENT_IMAGE=''") {
-		t.Error("a placeholder survived the render")
+	for _, placeholder := range []string{"PINNED_SEED_IMAGE=''", "PINNED_AGENT_IMAGE=''", "PINNED_ALLOWED_NAMESPACES=''", "PINNED_INSECURE_REGISTRIES=''"} {
+		if strings.Contains(body, placeholder) {
+			t.Errorf("%s survived the render", placeholder)
+		}
 	}
 	if cc := rr.Header().Get("Cache-Control"); cc != "no-store" {
 		t.Errorf("Cache-Control %q: the pins follow configuration and must not be cached", cc)
@@ -109,9 +123,21 @@ func TestUnsetPinsServeTheScriptWithEmptyPins(t *testing.T) {
 	}
 }
 
+func TestATrustValueTheScriptCannotQuoteIsRefused(t *testing.T) {
+	f := loadFixture(t)
+	for _, bad := range []string{"ghcr.io/x'; rm -rf /; '", "ghcr.io/x\nQUASAR_ROLE=combined"} {
+		pins := f.pins()
+		pins.AllowedNamespaces = bad
+		rr := get(t, enrollscript.Handler(webRoot(t, realScript(t)), pins, quiet))
+		if rr.Code != http.StatusInternalServerError || strings.Contains(rr.Body.String(), "#!/bin/sh") {
+			t.Errorf("%q: status %d, want 500 and no script", bad, rr.Code)
+		}
+	}
+}
+
 func TestAScriptWithoutItsPlaceholdersIsRefusedNotServedUnpinned(t *testing.T) {
 	f := loadFixture(t)
-	pins := enrollscript.Pins{SeedImage: f.SeedImage, AgentImage: f.AgentImage}
+	pins := f.pins()
 	for name, script := range map[string]string{
 		"missing":   "#!/bin/sh\necho old\n",
 		"duplicate": "#!/bin/sh\nPINNED_SEED_IMAGE=''\nPINNED_SEED_IMAGE=''\nPINNED_AGENT_IMAGE=''\n",

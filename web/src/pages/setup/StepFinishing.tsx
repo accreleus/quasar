@@ -30,6 +30,7 @@ import { Button } from "../../components/Button";
 import { SecretField } from "../../components/SecretField";
 import { Switch } from "../../components/TextField";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
+import { useResource } from "../../lib/resource/react";
 
 interface StepFinishingProps {
   onFinish: () => void;
@@ -50,6 +51,16 @@ function isAbortError(err: unknown): boolean {
 
 export function StepFinishing({ onFinish }: StepFinishingProps) {
   const { token } = useAuth();
+  // An owned install keeps its secret key in the quasar-machine volume, not deploy/.env.
+  // machine_role is known whether or not the recovery actor answers (control-api.md).
+  const machine = useResource<boolean>({
+    label: "control-plane identity",
+    fetch: async ({ token, signal }) => {
+      const { identity } = await adminApi.getPlatformIdentity(token, signal);
+      return identity.install_mode === "owned" || identity.machine_role != null;
+    },
+  });
+  const owned = machine.data === true;
 
   const [settings, setSettings] = useState<InstanceSettings | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
@@ -201,9 +212,19 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
             read as a microphone warning (operator review). */}
         <div className="note warn" role="status" style={{ marginTop: "var(--s4)" }}>
           <div>
-            <b>Back up deploy/.env now.</b> It holds <code>QUASAR_SECRET_KEY</code> — lose it and
-            every credential stored here, including any artwork key you just entered, becomes
-            permanently unreadable.
+            {owned ? (
+              <>
+                <b>Keep the quasar-machine volume.</b> It holds this machine’s{" "}
+                <code>QUASAR_SECRET_KEY</code> — delete it and every credential stored here,
+                including any artwork key you just entered, becomes permanently unreadable.
+              </>
+            ) : (
+              <>
+                <b>Back up deploy/.env now.</b> It holds <code>QUASAR_SECRET_KEY</code> — lose it
+                and every credential stored here, including any artwork key you just entered,
+                becomes permanently unreadable.
+              </>
+            )}
           </div>
         </div>
       </div>

@@ -12,7 +12,14 @@ import type { Host, PlatformIdentity, PlatformReleaseFault } from "../../../api/
 import { shortCommit } from "./hostIdentity";
 import { commitsMatch } from "./releasesCopy";
 
-export type ServiceKey = "seed" | "recovery_actor" | "database" | "control_plane" | "node_agent";
+export type ServiceKey =
+  | "seed"
+  | "recovery_actor"
+  | "database"
+  | "control_plane"
+  | "node_agent"
+  /** A container another owner holds, in the way (the race guard). */
+  | "conflict";
 
 export type ServiceState =
   | { kind: "running" }
@@ -24,10 +31,14 @@ export type ServiceState =
   /** The recovery actor answered and found no such container. */
   | { kind: "not_found" }
   /** The operator's own database, which this page's own load just used. */
-  | { kind: "reachable" };
+  | { kind: "reachable" }
+  /** Another owner's container that Quasar never acts on. */
+  | { kind: "in_the_way" };
 
 export interface ServiceRow {
   key: ServiceKey;
+  /** Drawn as a warning: another owner's container. */
+  warning?: boolean;
   name: string;
   description: string;
   /** "v0.5.2", "Quasar’s own", or null when not reported. */
@@ -55,6 +66,9 @@ export interface HostServices {
   report: InventoryReport;
   /** When the rows were reported: the agent's last `register`. */
   reportedAt: string | null;
+  /** The recovery actor stopped answering after it had answered in this page's life:
+   *  the rows are that last report, and this is when it was read (ms). */
+  lastReportAt: number | null;
   shape: MachineShape;
   /** It shares the control plane's machine (`isControlPlaneMachine`). */
   controlPlaneHere: boolean;
@@ -102,12 +116,43 @@ export function versionLabel(version: string | null | undefined): string | null 
   return /^\d/.test(version) ? `v${version}` : version;
 }
 
-/** Null for a host that is not owned: its page renders as it always has. */
+/** A report the recovery actor answered, and when this page read it (ms). */
+export interface LastReport {
+  host: Host;
+  at: number;
+}
+
+/**
+ * Null for a host that is not owned: its page renders as it always has. `last` is the
+ * most recent report in this page's life in which the recovery actor answered; when it
+ * no longer answers, its rows are shown as of then (mock rh06/inv-error). `conflict`
+ * adds the row for another owner's container in the way.
+ */
 export function hostServices(
   host: Host,
-  opts: { agentOlder: boolean; machine?: PlatformIdentity | null },
+  opts: {
+    agentOlder: boolean;
+    machine?: PlatformIdentity | null;
+    last?: LastReport | null;
+    conflict?: boolean;
+  },
 ): HostServices | null {
   if (!isOwned(host)) return null;
+  const last = opts.last;
+  if (host.updater_present === false && last && last.host.updater_present === true) {
+    const was = hostServices(last.host, { ...opts, last: null });
+    if (was) {
+      const asOf: ServiceState = { kind: "as_of", at: new Date(last.at).toISOString() };
+      return {
+        ...was,
+        report: "not_answering",
+        lastReportAt: last.at,
+        rows: was.rows.map((r) =>
+          r.state.kind === "running" && r.key !== "control_plane" ? { ...r, state: asOf } : r,
+        ),
+      };
+    }
+  }
   const combined = isControlPlaneMachine(host, opts.machine);
   const machine = combined ? opts.machine : null;
 
@@ -143,7 +188,7 @@ export function hostServices(
       // found no seed. Nothing on the wire says how the seed was started, so one owner
       // label covers a manager's stack and a `docker run` (mock open question 4).
       version: answered ? seedVersion : null,
-      versionNote: null,
+      versionNote: answered && seedVersion ? "declared in an external manager" : null,
       owner: answered && seedVersion ? "External manager" : null,
       state: !answered ? { kind: "unknown" } : seedVersion ? liveOrLast() : { kind: "not_found" },
     },
@@ -195,10 +240,23 @@ export function hostServices(
       state: answered ? liveOrLast() : { kind: "unknown" },
     },
   ];
+  if (opts.conflict) {
+    rows.push({
+      key: "conflict",
+      warning: true,
+      name: "Another owner’s container",
+      description: "Looks like a Quasar service, but this installation did not create it.",
+      version: null,
+      versionNote: null,
+      owner: "Another owner",
+      state: { kind: "in_the_way" },
+    });
+  }
 
   return {
     report,
     reportedAt,
+    lastReportAt: null,
     shape: combined ? "Combined host" : "GPU host",
     controlPlaneHere: combined,
     rows,

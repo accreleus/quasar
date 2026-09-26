@@ -15,9 +15,10 @@
 //!    container carries as its attempt label: never admitted again.
 //! 3. From `acquire_lease` until `resume` returns, every submit is `busy`; so is every
 //!    submit while any journal is unreadable (it may be the open attempt).
-//! 4. **Rules per kind and per caller**, which `admit` does not look at. The agent socket
-//!    may send `replace` (agent-api.md `release_apply`) and, once RH06-14 (#366) builds it,
-//!    `remove` (`host_remove`); never `restore`, which loads a pre-update dump on the
+//! 4. **Rules per kind and per caller**, which `admit` does not look at. A `remove`
+//!    (`host_remove`) is admitted by [`crate::remove`] before any of them, and on a machine
+//!    being uninstalled nothing else is. The agent socket may send `replace` (agent-api.md
+//!    `release_apply`) and `remove`; never `restore`, which loads a pre-update dump on the
 //!    control plane's machine. It may name only `node-agent` and `recovery-actor`, and the
 //!    actor only on a GPU host; the control socket only `control-plane` and
 //!    `recovery-actor`, the actor only together with the control plane (A1, ADR 0008),
@@ -25,12 +26,15 @@
 //!    needs this actor to be the container under the actor's name: it is what hands over.
 //!    What a caller may name but this build cannot yet do is refused `invalid`, saying
 //!    which ticket brings it: a migrating control-plane replacement, which needs the
-//!    pre-update dump (RH06-12, #364), and the control socket's `restore` and `remove`.
+//!    pre-update dump (RH06-12, #364), and the control socket's `restore`. The control
+//!    socket's `remove` is refused: a control-plane machine is taken apart by `uninstall`
+//!    on the machine.
 //! 5. Every image a registry host plus well-formed path components, then
 //!    [`trust::admit`]: single flight, the component table and the confused-deputy guard,
 //!    image and digest shape, the namespace allowlist, then ADR 0003 signatures.
-//! 6. The race guard at submission: a container holding a name this replacement needs,
-//!    without this installation's labels, is `owner_conflict`.
+//! 6. The race guard at submission ([`crate::race_guard`]): any owner conflict on the
+//!    machine, or a container holding a name this replacement needs without this
+//!    installation's labels, is `owner_conflict`.
 //!
 //! Every refusal happens before the first journal record, so a refusal changed nothing.
 
@@ -99,13 +103,8 @@ fn kind_and_caller_rules(
                 "the agent socket may not ask for a restore: a restore loads a pre-update dump on the control plane's machine and is the operator's command",
             ))
         }
-        (Caller::Agent, RequestKind::Remove) => {
-            return Err(refuse(
-                req,
-                Reason::Invalid,
-                "removing this machine's services (host_remove) is not in this build; it arrives with RH06-14 (#366). Nothing was changed",
-            ))
-        }
+        // Admitted by `submit_remove` before these rules.
+        (Caller::Agent, RequestKind::Remove) => {}
         (Caller::ControlPlane, RequestKind::Restore) => {
             return Err(refuse(
                 req,
@@ -258,6 +257,17 @@ impl Actor {
             ));
         }
 
+        if req.kind == RequestKind::Remove && is_uuid(&req.request_id) {
+            return self.submit_remove(caller, req);
+        }
+        if let Some(why) = crate::uninstall::uninstalled(&self.dir) {
+            return Err(refuse(
+                &req,
+                Reason::Invalid,
+                format!("{why}; nothing is replaced on it"),
+            ));
+        }
+
         // 4.
         if is_uuid(&req.request_id) {
             let role = self
@@ -325,6 +335,18 @@ impl Actor {
         };
         match self.engine.list_containers() {
             Ok(all) => {
+                let conflicts = crate::race_guard::conflicts(
+                    &all,
+                    Some(&machine.installation_id),
+                    self.config.self_container.as_deref(),
+                );
+                if !conflicts.is_empty() {
+                    return Err(refuse(
+                        &req,
+                        Reason::OwnerConflict,
+                        crate::race_guard::refusal(&conflicts),
+                    ));
+                }
                 if let Some(c) = all.iter().find(|c| {
                     c.labels.get(ATTEMPT_LABEL).map(String::as_str) == Some(req.request_id.as_str())
                 }) {

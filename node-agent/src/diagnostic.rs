@@ -810,6 +810,7 @@ where
         | ControlMsg::SessionDisplayUpdate { id, .. }
         | ControlMsg::SessionCapture { id, .. }
         | ControlMsg::ReleaseApply { id, .. }
+        | ControlMsg::HostRemove { id, .. }
         | ControlMsg::ImageInventoryReconcile { id, .. }
         | ControlMsg::ImageCleanup { id, .. }
         | ControlMsg::ImageCleanupJournalRequest { id, .. }

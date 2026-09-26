@@ -117,6 +117,9 @@ pub struct ActorConfig {
     /// How long an install waits for Postgres, then the control plane, to report healthy
     /// before it creates what depends on it (and creates it anyway, logged).
     pub healthy_wait: std::time::Duration,
+    /// Between accepting a host removal and removing the agent that relayed it
+    /// ([`crate::remove`]), so its ack reaches the control plane first.
+    pub remove_grace: std::time::Duration,
     pub handover: HandoverTiming,
     /// The directory [`Actor::socket_plan`]'s sockets are served under. Fixed in the
     /// binary: the recipes name the same paths.
@@ -235,6 +238,7 @@ impl ActorConfig {
             }),
             timing: ReplaceTiming::default(),
             healthy_wait: std::time::Duration::from_secs(180),
+            remove_grace: crate::remove::DEFAULT_GRACE,
             handover: HandoverTiming::default(),
             socket_dir: paths::AGENT_SOCKET_DIR.into(),
             on_died: Box::new(|| {}),
@@ -332,6 +336,8 @@ pub struct Actor {
     /// Set by `acquire_lease` and `resume`, cleared when `resume` returns: a submit then
     /// is refused `busy`, so one queued on a socket served before `resume` cannot race it.
     pub(crate) resuming: std::sync::atomic::AtomicBool,
+    /// A console removal is being driven in this process; a retry does not start another.
+    pub(crate) removing: Arc<std::sync::atomic::AtomicBool>,
     /// Seed identities by image id: an image's labels never change.
     seed_images: Mutex<BTreeMap<String, SeedIdentity>>,
     /// The agent socket's serving loop, while this process serves it.
@@ -353,14 +359,6 @@ struct ServerHandle {
     thread: std::thread::JoinHandle<io::Result<()>>,
 }
 
-const PLATFORM_NAMES: &[&str] = &[
-    names::NODE_AGENT,
-    names::RECOVERY_ACTOR,
-    names::CONTROL_PLANE,
-    names::POSTGRES,
-];
-const HELPER_NAMES: &[&str] = &[names::GPU_PROBE, names::SECRETS_WRITER];
-const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 const SECRETS_HELPER: &str = "secrets-writer";
 
 impl Actor {
@@ -377,6 +375,7 @@ impl Actor {
             gate: Mutex::new(()),
             worker: Mutex::new(None),
             resuming: std::sync::atomic::AtomicBool::new(false),
+            removing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             seed_images: Mutex::new(BTreeMap::new()),
             server: Mutex::new(Vec::new()),
             me: std::sync::OnceLock::new(),
@@ -604,6 +603,27 @@ impl Actor {
 
     fn resume_inner(&self) -> Result<(), ResumeError> {
         self.take_lease()?;
+        // An uninstall or a console removal has started here: nothing is installed,
+        // settled or re-created, whoever started this actor (ADR 0007: the seed idles too).
+        if let Some(why) = crate::uninstall::uninstalled(&self.dir) {
+            // A console removal a previous process did not finish is finished here; every
+            // step is remove-if-present. An operator's uninstall is left to the operator.
+            if let Ok(Some(marker)) = self.dir.load_uninstall() {
+                if marker.by == crate::uninstall::By::Console && marker.finished_at.is_none() {
+                    info!(
+                        token = "actor-removal-resumed",
+                        "a console removal did not finish; finishing it"
+                    );
+                    self.remove_services();
+                    return Ok(());
+                }
+            }
+            warn!(
+                token = "actor-machine-uninstalled",
+                "{why}; this recovery actor installs and replaces nothing. `quasar-recovery uninstall` finishes the removal"
+            );
+            return Ok(());
+        }
         // D8: an attempt a restart left open reaches its outcome before anything else
         // looks at the machine's services, and no new attempt is started here. First, so
         // nothing else a start does can leave a hand-over waiting on this process.
@@ -611,6 +631,8 @@ impl Actor {
         if self.retired() {
             return Ok(());
         }
+        // A reconfigure keeps its new inputs only if its attempt succeeded.
+        self.settle_reconfigure_on_start();
         self.sweep_helpers()?;
         let machine = match self.dir.load_machine()? {
             Some(machine) => {
@@ -1271,7 +1293,6 @@ impl Actor {
             .map(|m| m.installation_id);
         let me = self.config.self_container.as_deref();
         let mut services = Vec::new();
-        let mut conflicts = Vec::new();
         for c in &containers {
             if c.labels.contains_key(labels::HELPER) {
                 continue;
@@ -1286,29 +1307,9 @@ impl Actor {
                 if let Some(role) = c.labels.get(labels::PLATFORM_SERVICE) {
                     services.push(service(c, role));
                 }
-                continue;
-            }
-            let compose = c.labels.get(COMPOSE_SERVICE).map(String::as_str);
-            if HELPER_NAMES.contains(&c.name.as_str()) {
-                conflicts.push(Conflict {
-                    container: c.name.clone(),
-                    image: repository_of(&c.image),
-                    why: "holds the name of a recovery-actor helper without its label".into(),
-                });
-            } else if PLATFORM_NAMES.contains(&c.name.as_str())
-                || compose.is_some_and(|s| PLATFORM_NAMES.contains(&s))
-            {
-                conflicts.push(Conflict {
-                    container: c.name.clone(),
-                    image: repository_of(&c.image),
-                    why: if compose.is_some() {
-                        "a Compose service named like a Quasar platform service, without this installation's labels".into()
-                    } else {
-                        "a Quasar platform service name without this installation's labels".into()
-                    },
-                });
             }
         }
+        let conflicts = crate::race_guard::conflicts(&containers, installation.as_deref(), me);
         services.sort_by_key(|s| (s.role != Role::RecoveryActor.as_str(), s.role.clone()));
         let seed = seed::find_running(&containers, self.config.seed_container.as_deref())
             .map(|c| self.seed_identity(c));
@@ -1360,7 +1361,10 @@ impl Actor {
 
 /// A container's image as `repository@sha256:…`: its configured reference when that is
 /// digest-pinned, else the registry digest the engine knows for its repository.
-fn own_image(engine: &dyn PlatformEngine, me: &Container) -> Option<seed::file::ActorImage> {
+pub(crate) fn own_image(
+    engine: &dyn PlatformEngine,
+    me: &Container,
+) -> Option<seed::file::ActorImage> {
     if let Some(pinned) = seed::file::ActorImage::parse(&me.image) {
         return Some(pinned);
     }

@@ -247,6 +247,110 @@
   line-height: 1.55;
 }
 
+/* `rhRemoveFoot` for a GPU host: the hint beside its danger button. */
+.host-detail-page .host-services-foot-row {
+  display: flex;
+  gap: var(--s5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.host-detail-page .host-services-foot-row .hint {
+  flex: 1;
+  min-width: 260px;
+  max-width: none;
+}
+
+/* `rhServices`: another owner's container, in the way. */
+.host-detail-page .host-services-warning {
+  color: var(--warning-text);
+}
+
+/* ── RH-06 warnings and remove host (fleet-rh06-v3.html; its inline styles) ── */
+
+/* `.diag`: the closed "Details" disclosure, the one place identifiers appear. */
+.rh-diag {
+  margin-top: 10px;
+}
+
+.rh-diag > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.rh-diag > summary::-webkit-details-marker {
+  display: none;
+}
+
+.rh-diag > summary:hover {
+  color: var(--text);
+}
+
+.rh-diag > summary svg {
+  width: 11px;
+  height: 11px;
+  transition: transform 0.15s;
+}
+
+.rh-diag[open] > summary svg {
+  transform: rotate(90deg);
+}
+
+.rh-diag pre {
+  margin: 8px 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: color-mix(in oklch, var(--surf-inset) 82%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  padding: 9px 11px;
+}
+
+/* A warning's own actions (`pageRhWarning`: Check again). */
+.rh-note-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* A note with its action beside it (`rhRemove`, failed). */
+.rh-note-row {
+  display: flex;
+  gap: var(--s5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.rh-note-body {
+  flex: 1;
+  min-width: 280px;
+}
+
+/* The remove-host dialog's copy (`rhRemove`). */
+.rm-host-copy {
+  margin: 0 0 12px;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+.rm-host-copy b {
+  color: var(--text);
+}
+
+.rm-host-note {
+  margin-bottom: 12px;
+}
+
 /* ── Add host modal ────────────────────────────────────────────────── */
 
 /* A value block wraps rather than scrolling out of the dialog: an operator

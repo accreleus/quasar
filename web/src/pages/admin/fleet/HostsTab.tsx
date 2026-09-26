@@ -21,6 +21,8 @@ import { useResource } from "../../../lib/resource/react";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { AddHostModal } from "./AddHostModal";
 import { HostRow } from "./HostRow";
+import { hostFlag } from "./hostWarnings";
+import { removable } from "./removeHost";
 import "../../../styles/admin/fleet.css";
 
 // `Host.capacity` carries the roll-up but no GPU model names, so one resource
@@ -35,6 +37,12 @@ type GpuMap = Record<string, GPUAvailability[] | null>;
 const GPU_POLL_MS = 30_000;
 
 type Segment = "all" | "online" | "attention";
+
+/** A row's attention chip (owner conflict, no seed) counts too: the segment holds
+ *  every row an operator should look at (design_handoff_v3 screens/rh06 hosts). */
+function attends(host: Host): boolean {
+  return needsAttention(host) || hostFlag(host) != null;
+}
 
 export function HostsTab() {
   const navigate = useNavigate();
@@ -88,13 +96,13 @@ export function HostsTab() {
 
   const now = fleet.lastFetchedAt ?? Date.now();
   const online = hosts.filter((h) => h.status === "online").length;
-  const attention = hosts.filter(needsAttention).length;
+  const attention = hosts.filter(attends).length;
 
   const visible = useMemo(() => {
     const text = query.trim().toLowerCase();
     return hosts.filter((host) => {
       if (segment === "online" && host.status !== "online") return false;
-      if (segment === "attention" && !needsAttention(host)) return false;
+      if (segment === "attention" && !attends(host)) return false;
       if (!text) return true;
       return (
         host.node_name.toLowerCase().includes(text) || host.id.toLowerCase().includes(text)
@@ -290,6 +298,11 @@ export function HostsTab() {
                         )
                       }
                       onForget={() => {
+                        // An owned GPU host is removed by its recovery actor, on its page.
+                        if (removable(host, controlPlane)) {
+                          navigate(`/admin/fleet/hosts/${host.id}?remove=1`);
+                          return;
+                        }
                         setForgetError(null);
                         setForgetTarget(host);
                       }}
