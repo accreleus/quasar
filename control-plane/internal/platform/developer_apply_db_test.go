@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 )
 
 const (
@@ -27,6 +29,7 @@ var (
 type fakeDevImages struct {
 	mu     sync.Mutex
 	commit string
+	schema int
 	err    error
 	reads  int
 }
@@ -36,6 +39,17 @@ func (f *fakeDevImages) Commit(context.Context, []ComponentDigest) (string, erro
 	defer f.mu.Unlock()
 	f.reads++
 	return f.commit, f.err
+}
+
+// ControlPlaneSchema answers schema, or when unset the running binary's own.
+func (f *fakeDevImages) ControlPlaneSchema(context.Context, ComponentDigest) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads++
+	if f.schema != 0 {
+		return f.schema, f.err
+	}
+	return buildinfo.Get().SchemaVersion, f.err
 }
 
 func (f *fakeDevImages) count() int {
