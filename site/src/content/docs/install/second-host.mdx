@@ -104,7 +104,14 @@ The script's own inputs, set in front of `sh` like the string:
 | `QUASAR_ENROLL_APPARMOR_PERSIST` | off | `1` also installs the AppArmor profile so it loads at every boot. |
 | `QUASAR_ENROLL_DRY_RUN` | off | `1` checks the host and prints what it would start, and starts nothing. |
 
-`sh enroll-host.sh --help` lists every one, including `QUASAR_RESET_IDENTITY` (below).
+The script lists every input, including `QUASAR_RESET_IDENTITY` (below), when run
+with `--help`. Use the command from the dialog with `sh -s -- --help` in place of
+the final `sh`:
+
+```bash
+curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
+  | sh -s -- --help
+```
 
 ## The recovery actor comes with it
 
@@ -169,12 +176,13 @@ does nothing on its own there: for instance after its identity was lost, or to r
 it. Create a new command and run it with `QUASAR_RESET_IDENTITY=1` in front of `sh`. It
 first removes this machine's seed, recovery actor, node agent and their volumes, the
 agent's saved identity included, never the homes, and then enrolls from scratch. It
-refuses on a machine that runs a control plane.
+refuses, and removes nothing, on a machine that holds a Quasar control plane or
+Postgres: a container of either, or either one's volume.
 
 If the seed or the recovery actor refuses to install, the script quotes its log line.
 [Install and startup
-problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor) lists every
-one.
+problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor) explains the
+ones you are likely to meet.
 
 ## Using Dockge or Arcane
 

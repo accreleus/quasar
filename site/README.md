@@ -58,6 +58,32 @@ site/
 `deploy/docker-compose.yml` or `deploy/docker-compose.nvidia.yml`, run
 `npm run compose:sync` and commit the regenerated file with it.
 
+## Before publishing
+
+The pages describing Quasar-owned installs (RH-06: the seed, the recovery actor,
+Move an existing install) are drafts. They describe work that ships only with
+the **first release that ships Quasar-owned installs**, and parts of them depend
+on tickets still open. So:
+
+- **Do not publish the RH-06 drafts before that release.** They go live in the
+  same step as the release: merged to `main` with it, then published with the
+  `pages` workflow. Until then the published site must keep describing today's
+  supported install, the Compose stack, correctly.
+- **The Quick Start generator must be rewritten first.** `QuickStart.astro`,
+  `src/data/stack-template.js` and `scripts/compose-template.mjs` still write the
+  four-service Compose stack. Around the seed, they need #361, #359 and #365.
+- **Every unfinished part carries a hidden marker**, an MDX comment such as
+  `{/* TODO(#361): … */}`, or `TODO(open, …)` for a question no ticket owns yet.
+  They render nothing, so the build cannot tell a draft from a finished page.
+
+The `pages` workflow enforces this: its first step fails, listing every marker,
+while any `TODO(#` or `TODO(open` remains under `src/content` or `src/components`.
+The CI build does not check, so drafts can land on branches. To see what is left:
+
+```bash
+grep -rnE 'TODO\((#|open)' site/src/content site/src/components
+```
+
 ## Deployment
 
 `.github/workflows/pages.yml` builds `site/` and publishes `site/dist` to

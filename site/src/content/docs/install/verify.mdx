@@ -78,7 +78,7 @@ curl http://127.0.0.1:9091/health
 control plane is up. If it is false, the agent is running but cannot reach the
 control plane. On a GPU host, check the `QUASAR_ENROLLMENT` string it was
 installed with: created in Admin, Fleet, Hosts, Add host, it is single use and
-expires after an hour unless you chose longer, so a spent or stale one needs a
+expires after an hour by default, or up to 30 days if you chose longer, so a spent or stale one needs a
 fresh command. The recovery
 actor hands it to the agent as a file (`QUASAR_ENROLLMENT_FILE`), never as an
 environment variable. On a combined host the agent enrolls with a local token its
@@ -128,8 +128,8 @@ launched.
 
 ## 7. Certificates cover the address you use
 
-If you reach Quasar at `https://192.168.1.50:8443` then the certificate needs to
-name `192.168.1.50`. On a legacy Compose install that comes from
+If you reach Quasar at `https://192.0.2.50:8443` then the certificate needs to
+name `192.0.2.50`. On a legacy Compose install that comes from
 `QUASAR_TLS_HOSTS` in `deploy/.env`, set before the first boot. If you missed it,
 or added an address later, see [HTTPS and certificates](/quasar/network/https/).
 

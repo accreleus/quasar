@@ -47,15 +47,17 @@ Quasar](/quasar/install/install/).
 The seed itself also needs two mounts, not variables: the engine socket, and the
 `quasar-machine` volume read-only at `/var/lib/quasar-machine`.
 
-### The recovery actor's own settings
+### The recovery actor's trust settings
 
-The recovery actor pulls platform images only from
-`QUASAR_UPDATER_ALLOWED_NAMESPACES` (default `ghcr.io/accreleus/quasar`) and
-checks release signatures under `QUASAR_UPDATER_SIGNATURE_MODE` and
-`QUASAR_UPDATER_TRUSTED_KEYS`, with the same rules as the legacy updater below.
-Unlike the seed inputs, it reads these on every start.
+The recovery actor pulls platform images only from the allowed registry
+namespaces (by default `ghcr.io/accreleus/quasar`), and can check release
+signatures in `verify` or `require` mode against trusted keys, with the same
+rules as the legacy updater below. On a seed install these are first-install
+inputs, like the rest of this table: set them on the seed before the first
+install. Afterwards the machine's own state wins.
 
-{/* TODO(#361): a seed-created actor gets only the frozen profile's environment, so these cannot be set on it today (found in #360's live run). #361 is to read them from the seed at first install and keep them in machine state; #366's reconfigure changes them later. Document how once built. */}
+{/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
+{/* TODO(#366): how reconfigure changes them later. */}
 
 ## Required on a legacy Compose install
 
@@ -86,7 +88,7 @@ below.
 | `REGISTRATION_MODE` | `closed` | Seeds the registration mode on first boot of a fresh database only. The admin UI is authoritative afterwards. |
 | `PUBLIC_BASE_URL` | unset | Canonical public URL for invite links and proxied signaling. Set it when a proxy rewrites `Host`; otherwise the public host can be derived from forwarded or request headers. |
 | `NODE_NAME` | hostname | Agent side. A stable identity for this host. |
-| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Hosts, Add host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use hour-long token, together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it. |
+| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Hosts, Add host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use token that expires after an hour by default (up to 30 days if the admin chose longer), together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it. |
 
 ## Secrets
 

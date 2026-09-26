@@ -7,7 +7,7 @@ name: pages
 #
 # The published base is https://accreleus.github.io/quasar/ and it is not free
 # to change: the product UI ships that URL to operators
-# (web/src/pages/admin/fleet/EnrollHostModal.tsx). site/astro.config.mjs holds
+# (web/src/pages/admin/fleet/AddHostModal.tsx). site/astro.config.mjs holds
 # the matching `site` + `base`.
 
 on:
@@ -29,6 +29,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+      # Publication guard (site/README.md "Before publishing"). Unfinished pages
+      # carry hidden MDX comments such as {/* TODO(#361): ... */}; they render
+      # nothing, so a green build would publish a draft. Refuse to deploy while
+      # any remain. Only this workflow checks: drafts may land on branches.
+      - name: Refuse to publish unfinished drafts
+        run: |
+          if hits="$(grep -rnE 'TODO\((#|open)' site/src/content site/src/components)"; then
+            printf '%s\n' "$hits"
+            echo "::error title=Unpublished drafts::The site still carries TODO(#N) / TODO(open …) draft markers (listed above). They mark RH-06 pages that must not publish before the first release that ships Quasar-owned installs, and a Quick Start generator not yet rewritten. Finish or remove every marker, then dispatch pages again. See site/README.md, Before publishing."
+            exit 1
+          fi
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'

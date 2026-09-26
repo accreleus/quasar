@@ -97,8 +97,10 @@ yourself is never touched.
 
 ## Host changes to undo
 
-Quasar asks you to make changes outside Docker. None are removed by any of the
-above.
+Quasar asks you to make changes outside Docker, and the one-line command for a GPU
+host makes some of them itself when you let it apply its fixes. None are removed
+by any of the above. Check each file before removing it: another program may
+depend on the same setting.
 
 The socket buffer sysctl:
 
@@ -106,23 +108,45 @@ The socket buffer sysctl:
 sudo rm /etc/sysctl.d/99-quasar.conf
 ```
 
-The uinput module load, if you added it and nothing else needs it:
+The user-namespace sysctls the one-line command writes when it applies a fix.
+Depending on the host, the file holds `kernel.apparmor_restrict_unprivileged_userns=0`
+(the Ubuntu 24.04 and later default is `1`), `kernel.unprivileged_userns_clone=1`
+or `user.max_user_namespaces=15000`. Read it, remove it, then set each value back
+to your distribution's default, or reboot:
+
+```bash
+cat /etc/sysctl.d/99-quasar-userns.conf
+```
+
+```bash
+sudo rm /etc/sysctl.d/99-quasar-userns.conf
+```
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+```
+
+The last command is for Ubuntu 24.04 and later; use the value your distribution
+ships for any other line the file held.
+
+The uinput module load, if you added it or the one-line command did, and nothing
+else needs it:
 
 ```bash
 sudo rm /etc/modules-load.d/uinput.conf
 ```
 
-Any TLS certificate you added to your machines' trust stores.
-
-On a GPU host added with the one-line command, the app-container AppArmor
-profile it loaded. It stays loaded until the next boot, and until you remove the
-file if you asked the command to persist it:
+The app-container AppArmor profile the one-line command loads on an AppArmor
+host. Loaded, it lasts until the next boot. The command also installs it to load
+at every boot when it applies fixes or when asked to persist it:
 
 ```bash
 sudo rm /etc/apparmor.d/quasar-app
 ```
 
 {/* TODO(#366): whether `uninstall` unloads the quasar-app profile; confirm the unload command (apparmor_parser -R) against the script before documenting it. */}
+
+Any TLS certificate you added to your machines' trust stores.
 
 ## Removing one host from a fleet
 

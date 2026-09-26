@@ -54,9 +54,10 @@ reservation in admission control.
 **Entitlement.** The grant that decides whether an app appears in a user's
 library. Granted to everyone or to named users.
 
-**Enrollment token.** A secret an admin mints in Admin, Fleet, Hosts, Add host to let
-one agent enroll: single use, expiring after an hour, optionally bound to one node
-name, and stored only as a hash. After a successful enrollment the agent uses its
+**Enrollment token.** A secret an admin mints in Admin, Fleet, Hosts, Add host to
+let one agent enroll: single use, expiring after an hour by default (an admin may
+choose up to 30 days), optionally bound to one node name, and stored only as a
+hash. After a successful enrollment the agent uses its
 own stored node secret instead. On a combined host the agent uses a single-use
 local token that its recovery actor generates at install. The older static,
 deployment-wide `ENROLLMENT_TOKEN` is an optional fallback on a legacy Compose

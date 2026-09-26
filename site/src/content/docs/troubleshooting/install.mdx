@@ -56,12 +56,17 @@ services, any container in the way, and the result of the last update.
 | `seed-name-taken` | A container named `quasar-recovery` exists without this installation's labels, such as one started by hand. It is left alone. Remove it and the seed creates the recovery actor. |
 | `seed-actor-unstarted` | A recovery actor was created and never started, by an earlier seed container. `docker start quasar-recovery` finishes it. |
 | `seed-engine-unreachable`, `seed-pull-failed`, `seed-create-failed`, `seed-start-failed` | Retried at the next look. |
+| `seed-look-failed` | A look failed for a reason with no line of its own; the message says what. Retried at the next look. |
+| `seed-engine-config` | The container engine endpoint the seed was given is unusable, for instance a `DOCKER_HOST` it refuses. The seed exits. Fix the socket mount or the variable. |
 
 ### What the recovery actor says
 
 | Log | Meaning and fix |
 | --- | --- |
 | `actor-resume-failed` | The install failed, for example on an unreachable engine or an owner conflict. The actor keeps answering `status` and tries again only at its next start. |
+| `actor-role-invalid` | `QUASAR_ROLE` names a role this build does not install. The actor exits. |
+| `actor-engine-config` | The container engine endpoint is unusable, for instance a refused `DOCKER_HOST`. The actor exits. |
+| `actor-no-gpu` | The probe found no usable GPU render node. The agent is installed anyway and its readiness reports the gap. |
 | `actor-gpus-served` | The engine serves `--gpus`, so the agent gets the NVIDIA shape. |
 | `actor-gpus-refused` | The engine refused the GPU request. The agent is installed without the NVIDIA shape, and readiness reports the gap. Fix the NVIDIA Container Toolkit, then remove the agent container so the next start asks again. |
 | `actor-gpus-probe-retry` | The engine did not answer the GPU probe. It is asked up to three times. |
@@ -70,8 +75,18 @@ services, any container in the way, and the result of the last update.
 | `actor-input-ignored` | A later start carried a different input. Machine state wins after the first install. |
 | `actor-installation-label-differs` | A machine installed by a hand-started actor, then given a seed. Remove the actor once more (`docker rm -f quasar-recovery`) and the seed re-creates it. |
 | `actor-trust-config-invalid` | An invalid signature mode or trusted key. The start stops. |
+| `actor-spec-differs` | The running node agent differs from what this actor would create. It is left as it is. |
+| `actor-socket-bind-failed` | The actor cannot create the agent's socket, usually because the `quasar-recovery-agent` volume is not mounted at `/run/quasar-recovery`. The start stops. |
+| `actor-socket-busy` | Too many connections on the agent socket; one was closed unanswered. |
+| `actor-socket-failed` | The agent socket stopped. The actor exits, and its restart policy starts it again. |
+| `actor-submit-refused` | The actor refused an update request from its agent, for instance `busy` while another attempt is in flight. The line names the reason. |
 | `actor-attempt-failed`, `actor-verification-failed` | An update did not complete. If the new agent had been started and never became healthy, it was removed and the old one put back. The console's apply history has the reason. |
 | `actor-journal-unreadable` | The record of an update cannot be read (corrupt, or written by a newer actor). Every update waits, and nothing is settled, until the file is dealt with. |
+| `actor-journal-write-failed` | The record of an update could not be written. The attempt stops there, and the next start settles it. Check the free space of the volume holding `quasar-machine`. |
+| `actor-kept-not-removed` | An update was verified, but the old, stopped container could not be removed. The next update removes it. |
+
+These are the lines you are likely to meet. The repository's
+`docs/configuration.md`, under "Seed" and "Recovery actor", is the full record.
 
 {/* TODO(#361-#366): add the apply reasons as they are built: owner_conflict, recipe_unsupported, backup_failed, backup_unconfirmed, interrupted. */}
 
@@ -279,11 +294,14 @@ updater on a legacy Compose install, set in the host's `deploy/.env` and applied
 by recreating the updater.
 
 You see this after repointing an instance at a fork's registry without widening
-the allowlist, or after narrowing it deliberately. Set it to the namespace the
-images actually live in. It is matched on path segment boundaries, so a namespace
-never admits a lookalike that merely starts with the same characters.
+the allowlist, or after narrowing it deliberately. On a legacy Compose install,
+set it to the namespace the images actually live in. On a Quasar-owned machine
+the recovery actor's list is a first-install input of its seed, so it has to be
+right when the machine is installed. It is matched on path segment boundaries, so
+a namespace never admits a lookalike that merely starts with the same characters.
 
-{/* TODO(#361): how to widen a seed-created recovery actor's allowlist; it cannot be set today. */}
+{/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
+{/* TODO(#366): changing it on an installed machine (reconfigure). */}
 
 ## The control plane is unhealthy after an update
 

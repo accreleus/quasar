@@ -16,8 +16,9 @@ published images, which is about 20 GB on a machine that runs the agent.
 This page describes the install that starts with the seed. Use a release
 that publishes the recovery image, or follow the instructions shipped with
 your chosen release. A merge into `develop` does not publish compatible stable
-images. An install made from the older Compose files is described under
-[Legacy Compose installs](/quasar/install/legacy-compose/).
+images. For a release that does not publish it, the supported install is the
+Compose stack: see [Install with
+Compose](/quasar/install/legacy-compose/#install-with-compose).
 </Aside>
 
 ## How an install is put together
@@ -48,7 +49,9 @@ One installation per container engine. Two on one engine are not supported.
 It holds the Docker socket, so it is worth knowing its limits.
 
 - It pulls platform images **only by digest**, and only from the allowed registry
-  namespaces (the project's own unless you change it).
+  namespaces: the project's own by default. The list is an install-time input,
+  set with the seed's other inputs on the first install.
+  {/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
 - It acts only on containers it created, which carry this installation's labels.
   A container that looks like a Quasar service but is not its own, such as a
   leftover Compose stack, is an **owner conflict**: it is never touched, and the
@@ -169,8 +172,8 @@ host](/quasar/install/second-host/). Starting the seed yourself is the same
 install without the host preparation.
 
 For a `docker run` line, take the enrollment string from the same dialog, under
-**Show the enrollment string**. It is single use, and expires after an hour
-unless you chose longer.
+**Show the enrollment string**. It is single use, and expires after an hour by
+default, or up to 30 days if you chose longer.
 
 <Tabs>
 <TabItem label="docker run">
@@ -294,7 +297,7 @@ docker restart quasar-recovery
 ```
 
 The recovery actor installs once per start, from the seed's current inputs. The
-log lines and what each one means are in [Install and startup
+log lines you are likely to meet are explained in [Install and startup
 problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor).
 
 ## Keep the `quasar-machine` volume

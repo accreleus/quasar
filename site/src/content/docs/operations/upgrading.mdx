@@ -86,7 +86,12 @@ anything, with the same `verify` and `require` modes as the legacy updater.
 unsigned one. `require` also refuses an unsigned release, an edge build and a
 developer apply.
 
-{/* TODO(#361): where an owned machine's QUASAR_UPDATER_SIGNATURE_MODE and QUASAR_UPDATER_TRUSTED_KEYS are set. A seed-created actor cannot receive them today. The legacy updater's settings are on the Legacy Compose installs page. */}
+On a Quasar-owned machine the mode and the trusted keys are first-install inputs
+of the seed, recorded in the machine's own state: decide them before the first
+install. A legacy Compose install sets them on its updater; see [Legacy Compose
+installs](/quasar/install/legacy-compose/#verify-release-signatures).
+
+{/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
 
 Publishing signed releases from your own fork, and rotating a key without a flag
 day, are in the repository's `docs/upgrading.md`.
@@ -144,7 +149,9 @@ never becomes healthy is put back automatically.
 
 - The control plane checks the namespace first, against its own
   `QUASAR_UPDATER_ALLOWED_NAMESPACES`, and refuses anything outside it before any
-  registry is contacted. Each machine's recovery actor then enforces its own list.
+  registry is contacted. Each machine's recovery actor then enforces its own
+  list, which is a first-install input of that machine's seed. A host installed
+  with only the default namespace refuses a test registry's images.
 - For a contributor's plain-HTTP test registry, name it in the control plane's
   `QUASAR_PLATFORM_INSECURE_REGISTRIES`. The images must still be in an allowed
   namespace, and the manifest must hash to the digest you gave. Leave it unset in
@@ -157,7 +164,7 @@ never becomes healthy is put back automatically.
 
 {/* TODO(#362): the recovery-actor slot of a developer apply (withheld in the console until the actor can replace itself). */}
 {/* TODO(#363, #364): developer apply to the control plane's own machine, with the dump or backup confirmation of a migrating digest. */}
-{/* TODO(#361): a seed-created actor cannot yet have its namespace allowlist widened for a test registry. */}
+{/* TODO(#361): the allowlist, signature settings and trusted proxies become first-install seed inputs recorded in machine state. Document their names and rules from #361's docs/configuration.md "Seed" once it merges. */}
 
 <Aside type="caution" title="Multiple hosts must stay version-aligned">
 Upgrade the control plane and every agent host as one planned operation. Brief
