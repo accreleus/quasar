@@ -12,7 +12,6 @@ import { ACTIVE_SESSION_STATES } from "../../../api/sessionStates";
 import type {
   AdminSessionsResponse,
   PlatformApplyAttempt,
-  PlatformApplyAttemptsResponse,
   PlatformRelease,
   PlatformReleaseTarget,
 } from "../../../api/types";
@@ -158,23 +157,29 @@ function when(iso: string | null | undefined): string {
 /** Apply history: what this instance has done to itself, newest first. Drawn as
  *  the rail's compact list (design_handoff_v3/screens/releases-v3.html), not a
  *  table: it sits in a 300px column. */
-export function ApplyHistory({ refreshKey }: { refreshKey: number }) {
-  const res = useResource<PlatformApplyAttemptsResponse>(
-    {
-      label: "apply history",
-      fetch: ({ token, signal }) => adminApi.listPlatformAttempts(token, { limit: 50 }, signal),
-    },
-    [refreshKey],
-  );
-
+export function ApplyHistory({
+  loading,
+  error,
+  attempts,
+  statusFor,
+}: {
+  loading: boolean;
+  error: string | null | undefined;
+  attempts: PlatformApplyAttempt[] | undefined;
+  /** A row's outcome line when the caller knows more than the attempt's state
+   *  ("Failed · not restored · dump kept", #364); null keeps the default. */
+  statusFor?: (attempt: PlatformApplyAttempt) => string | null;
+}) {
   return (
     <>
-      <ResourceStates loading={res.loading} error={res.errorMessage} />
-      {res.data &&
-        (res.data.attempts.length === 0 ? (
+      <ResourceStates loading={loading} error={error ?? null} />
+      {attempts &&
+        (attempts.length === 0 ? (
           <p className="muted">Nothing has been applied on this instance yet.</p>
         ) : (
-          res.data.attempts.map((a) => <ApplyHistoryRow key={a.id} attempt={a} />)
+          attempts.map((a) => (
+            <ApplyHistoryRow key={a.id} attempt={a} status={statusFor?.(a) ?? null} />
+          ))
         ))}
     </>
   );
@@ -187,7 +192,13 @@ const COMPONENT_NAMES: Record<string, string> = {
   "control-plane": "Control plane",
 };
 
-function ApplyHistoryRow({ attempt: a }: { attempt: PlatformApplyAttempt }) {
+function ApplyHistoryRow({
+  attempt: a,
+  status,
+}: {
+  attempt: PlatformApplyAttempt;
+  status: string | null;
+}) {
   const machine = a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone");
   // An attempt that moves the recovery actor (it moves first, ADR 0008) says so per
   // component, as the RH-06 mock's history does.
@@ -219,10 +230,14 @@ function ApplyHistoryRow({ attempt: a }: { attempt: PlatformApplyAttempt }) {
           {l.from} → {l.to}
         </span>
       ))}
-      <span className="hint">
-        <span>{attemptKindText(a.kind)}</span> · {attemptStateText(a.state)}
-        {a.reason && ` · ${failureText(a.reason)}`}
-      </span>
+      {status ? (
+        <span className="hint rel-history-failed">{status}</span>
+      ) : (
+        <span className="hint">
+          <span>{attemptKindText(a.kind)}</span> · {attemptStateText(a.state)}
+          {a.reason && ` · ${failureText(a.reason)}`}
+        </span>
+      )}
     </div>
   );
 }

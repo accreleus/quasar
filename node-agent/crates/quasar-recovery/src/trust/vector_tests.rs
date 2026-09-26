@@ -281,6 +281,8 @@ fn run_admit(v: &AdmitVector, caller: Caller) -> Value {
         dump: None,
         purge: false,
         wait_timeout_s: 0,
+        from_version: None,
+        force_again: false,
     };
     let mut fetched = None;
     let evidence = match (&v.evidence, &v.fetch) {

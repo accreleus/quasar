@@ -63,14 +63,27 @@ own; the two do not move together, and that is deliberate.
   Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
   `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane
   admits the developer applies that control plane accepts.
+- **A migrating update of an owned control plane dumps the database first (#364).** Before it
+  replaces the control plane with a release that migrates the database, the recovery actor
+  dumps a Quasar-owned database (refusing the update if the dump fails or does not fit) and
+  keeps the last three dumps; an operator's own database needs the operator's confirmation of
+  a current backup instead. A failed migrating update is never restored automatically: Fleet ▸
+  Releases and the actor's output print one `restore` command, which loads the dump into a
+  stopped database and starts the control plane it was taken under. An older control plane is
+  never started against a newer schema. On an operator's own database a failed migrating control
+  plane is stopped, and `restore --to` starts the old one once they have restored their backup.
+  The Update dialog shows the dump's space or the backup confirmation, and a refused or failed
+  migrating update its banner or restore card. A developer apply's Apply button stays enabled
+  on an operator's own database, with a hint, because the console cannot know a digest
+  migrates before the server reads the image; the server fails a migrating one
+  `backup_unconfirmed` unless the backup was confirmed.
 - **An owned control plane is updated by its recovery actor (#363).** On a combined or
   control-only install the fleet run's control-plane step, and a developer apply to the
   control plane, go over the machine's control socket: the recovery actor moves itself first
   when it is behind, then keeps the old control plane stopped until the new one passes its
   health check, and puts it back automatically when it never does. Live sessions keep
   streaming through it, and the booted control plane counts as the evidence only once the
-  actor has verified it. A release that migrates the database is refused before anything
-  moves until the pre-update dump arrives (#364). A session ended by an agent restart now
+  actor has verified it. A session ended by an agent restart now
   says so, and Fleet ▸ Releases keeps its per-host detail inside the rail.
 - **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
   machine to a successor: it starts beside the running actor, takes the machine's lease only
@@ -490,6 +503,23 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Steam no longer swaps the X and Y gamepad buttons (#348).** The session's virtual
+  gamepad now presents as a wired Xbox 360 controller (045e:028e, USB) with exactly the
+  buttons, triggers and hat d-pad the kernel `xpad` driver exposes, so SDL, Steam and games
+  that read the controller directly apply their known Xbox layout instead of guessing one.
+  The device name no longer carries the session id (it moved to `phys`), so a layout saved
+  in Steam survives into the next session. In console mode a forwarded physical pad's d-pad
+  now reaches the game whether the pad reports it as a hat or as buttons.
+- **A controller your browser doesn't recognise is no longer scrambled silently (#348).**
+  When the browser reports a pad without the standard layout (seen with an 8BitDo pad
+  over Bluetooth), its buttons reach the game in the pad's own order. The session now
+  says so once per pad, and the Controller & input pane notes it under that pad, with
+  the fix: switch the pad to XInput mode, or connect it by cable or USB receiver.
+- **Mouse-wheel scrolling is no longer inverted (#350).** The host forwarded the browser's
+  scroll direction to the virtual mouse unchanged, but Linux counts the wheel the other
+  way round, so scrolling up moved content down in every app. Small wheel movements
+  (Firefox sends well under one notch's worth per event) now also add up into whole
+  notches instead of being dropped by apps and games that read only whole notches.
 - **Owned installs: two #366 details from its live run.** A container that looks like a Quasar
   service and is defined in the same Compose project as the machine's seed is reported as that
   stack manager's (take it out of the stack), not as a leftover install. `quasar-recovery status`
@@ -1114,7 +1144,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.5 — 2026-09-07
 
 ### Fixed
-
 - `deploy/redeploy.sh`'s header no longer claims that running sessions survive a
   control-plane-only deploy. They do not, and have not: recreating the control
   plane ends every session on the host (#128). Drain first if the sessions
@@ -1175,7 +1204,6 @@ own; the two do not move together, and that is deliberate.
   preparation off preserves existing homes, templates and running sessions (#145).
 
 ### Fixed
-
 - Release publication waits for the updater image to be validated and promoted,
   so its installation instructions cannot advertise a missing updater tag.
 - Agent startup cleanup only removes its own session and audio containers;
@@ -1208,7 +1236,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.3 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update no longer re-cordons each host moments after it finishes (#140,
   second half).** The per-host apply inside a fleet run found the host already draining
   — the run's own cordon — took it for an admin's, and restored it a few milliseconds
@@ -1218,7 +1245,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.2 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update from v0.2.0 no longer leaves every host `draining` when it
   finishes (#140).** The v0.2.0 control plane cordoned the fleet with nothing to record
   it in; when the new control plane picked the run up it found every host draining, took
@@ -1233,7 +1259,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.1 — 2026-09-05
 
 ### Fixed
-
 - **A fleet update no longer fails on the first host right after the control plane
   updates itself (#117).** When the new control plane came back and picked the run up,
   it moved to the first host before the agents had reconnected, recorded the miss as
@@ -1416,7 +1441,6 @@ own; the two do not move together, and that is deliberate.
   The release view also gains an additive `source_repo` field.
 
 ### Fixed
-
 - **Installing a release no longer requires building it.** The documented quick start
   told self-hosters to run `deploy/redeploy.sh <profile> vX.Y.Z`, which compiles the web
   client and both runtime images from source — roughly 25 minutes and 25 GB of Docker

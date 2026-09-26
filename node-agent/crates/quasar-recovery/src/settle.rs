@@ -7,7 +7,7 @@
 //!
 //! | Last journalled phase of the current component | Outcome |
 //! |---|---|
-//! | `admitted`, `pulling`, `checked` (the old container untouched) | **interrupted**: `failed` with reason `interrupted`; this component changed nothing, nothing is retried |
+//! | `admitted`, `pulling`, `checked`, `dumping` (the old container untouched) | **interrupted**: `failed` with reason `interrupted`; this component changed nothing (a dump it took is discarded), nothing is retried |
 //! | `old_kept` … `verifying` | continue to verification; on failure restore (ADR 0004 amendment) |
 //! | `restoring` | finish the restore; `failed`, `restored` as it turns out |
 //! | `verified`, `old_discarded` | finish discarding the old container; **succeeded** |
@@ -67,6 +67,14 @@ pub enum Settlement {
 pub fn settle(journal: &Journal, party: Party) -> Settlement {
     if !journal.is_open() {
         return Settlement::Terminal;
+    }
+    // A restore (`crate::restore`): nothing is touched before `stopping`.
+    if let Some(restore) = &journal.restore {
+        return if restore.phase.touched() {
+            Settlement::Continue
+        } else {
+            Settlement::Interrupted
+        };
     }
     let Some(i) = journal.current() else {
         // Every component finished but the terminal record was not written.
@@ -138,6 +146,8 @@ mod tests {
             new_container: None,
             failure: None,
             successor_starts: 0,
+            migrating: false,
+            dump: None,
         }
     }
 
@@ -162,6 +172,8 @@ mod tests {
                 dump: None,
                 purge: false,
                 wait_timeout_s: 0,
+                from_version: None,
+                force_again: false,
             },
             steps,
             result: AttemptResult {
@@ -176,7 +188,9 @@ mod tests {
                 finished_at: None,
                 restored: false,
                 release,
+                dump: None,
             },
+            restore: None,
         }
     }
 

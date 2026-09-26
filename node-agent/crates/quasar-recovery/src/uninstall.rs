@@ -158,8 +158,7 @@ pub(crate) fn helpers(containers: &[Container]) -> Vec<&Container> {
     containers
         .iter()
         .filter(|c| {
-            [names::GPU_PROBE, names::SECRETS_WRITER, names::FINAL_DUMP].contains(&c.name.as_str())
-                && c.labels.contains_key(labels::HELPER)
+            names::HELPERS.contains(&c.name.as_str()) && c.labels.contains_key(labels::HELPER)
         })
         .collect()
 }

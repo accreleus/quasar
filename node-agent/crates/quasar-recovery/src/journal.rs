@@ -18,6 +18,10 @@ use crate::recipe::ImageRef;
 use crate::socket::{AttemptResult, Reason, Request, State};
 
 pub const FORMAT: u32 = 1;
+/// A restore's journal (`crate::restore`). An actor that predates restores reads the tag
+/// and ignores the `restore` field, so it would settle one as an attempt with no steps:
+/// the format it does not read makes it fail closed instead.
+pub const RESTORE_FORMAT: u32 = 2;
 
 /// How many finished attempts are kept for `status` and re-posts. The open attempt is
 /// never pruned.
@@ -30,7 +34,7 @@ pub const KEEP_FINISHED: usize = 16;
 pub enum CallerTag {
     ControlPlane,
     Agent,
-    /// The operator's `reconfigure` on the operator socket (`crate::operator`).
+    /// The operator's `reconfigure` or `restore`, on the operator socket (`crate::operator`).
     Operator,
     /// A caller a later build added. The journal stays readable, so its attempt settles as
     /// usual, and a re-post of its id is refused as another caller's. No attempt is ever
@@ -88,6 +92,10 @@ pub enum Phase {
     /// The successor has put the old actor back under its name and is starting it; the
     /// old actor finishes the restore once it holds the lease.
     HandingBack,
+    /// A migrating control plane only, between `checked` and `old_kept`: taking the
+    /// pre-update dump of a Quasar-owned database, or recording the restore point of an
+    /// external one. The old control plane still runs.
+    Dumping,
 }
 
 impl Phase {
@@ -99,6 +107,7 @@ impl Phase {
             Phase::Admitted
                 | Phase::Pulling
                 | Phase::Checked
+                | Phase::Dumping
                 | Phase::CreatingSuccessor
                 | Phase::StartingSuccessor
                 | Phase::AwaitingSuccessor
@@ -114,6 +123,7 @@ impl Phase {
             // A successor running beside the old actor has taken nothing out of service.
             Phase::Pulling
             | Phase::Checked
+            | Phase::Dumping
             | Phase::CreatingSuccessor
             | Phase::StartingSuccessor
             | Phase::AwaitingSuccessor => State::Pulling,
@@ -157,6 +167,14 @@ pub struct Step {
     /// step. Bounds a successor that crash-loops once the old actor is stopped.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub successor_starts: u32,
+    /// A control plane only: whether this replacement moves the database's schema forward,
+    /// by the request or by the images' own schema labels, whichever says so. Decided at
+    /// `checked`. A migrating control plane is never restored automatically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub migrating: bool,
+    /// The pre-update dump this step took, once it is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dump: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -181,6 +199,9 @@ pub struct Journal {
     /// The attempt as `status` serves it: kept current with every phase, so the wire
     /// projection is never recomputed from a half-read journal.
     pub result: AttemptResult,
+    /// A `restore` request's progress (`crate::restore`); such a journal has no steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<crate::restore::Restore>,
 }
 
 impl Journal {
@@ -200,6 +221,9 @@ impl Journal {
             return;
         }
         let mut state = State::Pending;
+        if let Some(restore) = &self.restore {
+            state = restore.phase.wire_state();
+        }
         for step in &self.steps {
             let s = step.phase.wire_state();
             if rank(s) > rank(state) {
@@ -291,11 +315,12 @@ impl JournalDir {
         }
         let journal = self.file(request_id).load()?;
         if let Some(j) = &journal {
-            if j.format != FORMAT {
+            let known = j.format == FORMAT || (j.format == RESTORE_FORMAT && j.restore.is_some());
+            if !known {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "journal {request_id} is format {}, this actor reads {FORMAT}",
+                        "journal {request_id} is format {}, this actor reads {FORMAT} and {RESTORE_FORMAT}",
                         j.format
                     ),
                 ));

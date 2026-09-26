@@ -249,7 +249,7 @@ describe("TelemetrySnapshot shape — input fields present", () => {
       channelBufferedAmount: 1024,
       backpressureDetected: true,
       gamepadCount: 1,
-      pads: [{ index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)" }],
+      pads: [{ index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard" }],
       gamepadSendPerSec: 30,
     });
     const tm = makeTelemetry(() => metrics);
@@ -264,7 +264,7 @@ describe("TelemetrySnapshot shape — input fields present", () => {
     expect(im.backpressureDetected).toBe(true);
     expect(im.gamepadCount).toBe(1);
     expect(im.pads).toEqual([
-      { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)" },
+      { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard" },
     ]);
     expect(im.gamepadSendPerSec).toBe(30);
 

@@ -516,3 +516,176 @@ fn a_pull_by_digest_makes_the_image_inspectable() {
     let image = engine.inspect_image(&reference).unwrap().unwrap();
     assert!(image.repo_digests.contains(&reference));
 }
+
+/// The database helpers' scripts (#364) against a real Postgres: what a pre-update dump,
+/// its check, a restore's load and a schema read run. The dumps are a volume here, where
+/// the actor binds the host path of its machine state's `dumps/`; the scripts are the same.
+///
+/// ```text
+/// QUASAR_TEST_RUNTIME_SOCKET=/var/run/docker.sock \
+/// QUASAR_TEST_POSTGRES_IMAGE=postgres:16-alpine \
+///   cargo test -p quasar-recovery --test docker_engine_real database -- --ignored
+/// ```
+#[test]
+#[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET and QUASAR_TEST_POSTGRES_IMAGE; creates and removes only uniquely named assets"]
+fn the_database_helpers_dump_check_and_load_a_real_postgres() {
+    use quasar_recovery::database::{parse_schema, DbOp, Schema, DUMP_FILE_ENV};
+    let engine = engine();
+    let pg = std::env::var("QUASAR_TEST_POSTGRES_IMAGE").expect("QUASAR_TEST_POSTGRES_IMAGE");
+    let (network, secrets, dumps) = (unique("net"), unique("secrets"), unique("dumps"));
+    let server = unique("postgres");
+    let mut cleanup = Cleanup {
+        engine: engine.clone(),
+        containers: vec![server.clone()],
+        volumes: vec![secrets.clone(), dumps.clone()],
+    };
+    engine.create_network(&network, &BTreeMap::new()).unwrap();
+    let bind = |source: &str, target: &str, ro| Bind {
+        source: source.into(),
+        target: target.into(),
+        read_only: ro,
+    };
+    // The password file, as the actor delivers it.
+    let writer = unique("writer");
+    cleanup.containers.push(writer.clone());
+    let w = engine
+        .create_container(&spec(
+            &writer,
+            &pg,
+            "true",
+            vec![bind(&secrets, "/secrets", false)],
+        ))
+        .unwrap();
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(8);
+    header.set_mode(0o400);
+    header.set_entry_type(tar::EntryType::Regular);
+    tar.append_data(&mut header, "database-password", &b"pw-s3cr3"[..])
+        .unwrap();
+    engine
+        .upload_archive(&w, "/secrets", tar.into_inner().unwrap())
+        .unwrap();
+    engine.remove_container(&w).unwrap();
+
+    let mut server_spec = spec(
+        &server,
+        &pg,
+        "",
+        vec![bind(&secrets, "/run/quasar-secrets", true)],
+    );
+    server_spec.entrypoint = None;
+    server_spec.cmd = None;
+    server_spec.init = false;
+    server_spec.network_mode = Some(network.clone());
+    server_spec.env = BTreeMap::from([
+        ("POSTGRES_USER".to_string(), "quasar".to_string()),
+        ("POSTGRES_DB".into(), "quasar".into()),
+        (
+            "POSTGRES_PASSWORD_FILE".into(),
+            "/run/quasar-secrets/database-password".into(),
+        ),
+    ]);
+    let s = engine.create_container(&server_spec).unwrap();
+    engine.start_container(&s).unwrap();
+
+    let run = |op: Option<DbOp>, script: &str, file: Option<&str>| -> (i64, String) {
+        let name = unique("helper");
+        let mut env = BTreeMap::from([
+            ("PGHOST".to_string(), server.clone()),
+            ("PGPORT".into(), "5432".into()),
+            ("PGUSER".into(), "quasar".into()),
+            ("PGDATABASE".into(), "quasar".into()),
+            ("PGSSLMODE".into(), "disable".into()),
+        ]);
+        if let Some(f) = file {
+            env.insert(DUMP_FILE_ENV.into(), format!("/dumps/{f}"));
+        }
+        let script = match op {
+            Some(op) => op.script(),
+            None => format!(
+                "PGPASSWORD=\"$(cat /run/quasar-secrets/database-password)\"; export PGPASSWORD; {script}"
+            ),
+        };
+        let read_only = matches!(op, Some(DbOp::Inspect | DbOp::Load));
+        let mut helper = spec(
+            &name,
+            &pg,
+            &script,
+            vec![
+                bind(&secrets, "/run/quasar-secrets", true),
+                bind(&dumps, "/dumps", read_only),
+            ],
+        );
+        helper.network_mode = Some(network.clone());
+        helper.env = env;
+        let id = engine.create_container(&helper).unwrap();
+        engine.start_container(&id).unwrap();
+        let code = engine
+            .wait_container(&id, Duration::from_secs(120))
+            .unwrap();
+        let logs = engine.logs_tail(&id, 200).unwrap();
+        engine.remove_container(&id).unwrap();
+        (code, logs)
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while run(None, "pg_isready -q", None).0 != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "postgres never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let seed = "psql -X -v ON_ERROR_STOP=1 -c 'create table schema_migrations (version bigint not null primary key, dirty boolean not null)' -c 'insert into schema_migrations values (88, false)' -c 'create table users (name text)' -c \"insert into users values ('alice')\"";
+    assert_eq!(run(None, seed, None).0, 0);
+
+    let (code, size) = run(Some(DbOp::Size), "", None);
+    assert_eq!(code, 0, "{size}");
+    assert!(size.trim().parse::<u64>().unwrap() > 0, "{size}");
+    let (code, out) = run(Some(DbOp::Dump), "", Some("pending.dump.partial"));
+    assert_eq!(code, 0, "{out}");
+    // The archive holds the whole database: the helper's umask makes it the owner's only.
+    let (_, mode) = run(None, "stat -c %a /dumps/pending.dump.partial", None);
+    assert_eq!(mode.trim(), "600", "{mode}");
+    let (code, out) = run(Some(DbOp::Inspect), "", Some("pending.dump.partial"));
+    assert_eq!(code, 0, "{out}");
+    let at_88 = Some(Schema {
+        version: 88,
+        dirty: false,
+    });
+    assert_eq!(parse_schema(&out), at_88, "{out}");
+
+    // A migration and a write after the dump; the load puts the database back.
+    let later = "psql -X -v ON_ERROR_STOP=1 -c 'update schema_migrations set version = 91' -c 'create table later (x int)' -c \"insert into users values ('bob')\"";
+    assert_eq!(run(None, later, None).0, 0);
+    let (_, out) = run(Some(DbOp::Schema), "", None);
+    assert_eq!(parse_schema(&out).unwrap().version, 91, "{out}");
+    let (code, out) = run(Some(DbOp::Load), "", Some("pending.dump.partial"));
+    assert_eq!(code, 0, "{out}");
+    let (_, out) = run(Some(DbOp::Schema), "", None);
+    assert_eq!(parse_schema(&out), at_88, "{out}");
+    let (_, users) = run(
+        None,
+        "psql -X -tA -c \"select string_agg(name, ',') from users\"",
+        None,
+    );
+    assert_eq!(users.trim(), "alice", "{users}");
+    let (code, _) = run(None, "psql -X -tA -c 'select 1 from later'", None);
+    assert_ne!(
+        code, 0,
+        "the table the later migration created survived the load"
+    );
+    // The load can be repeated.
+    assert_eq!(run(Some(DbOp::Load), "", Some("pending.dump.partial")).0, 0);
+
+    // A file that is not an archive fails the check.
+    assert_eq!(run(None, "echo garbage > /dumps/bad.dump", None).0, 0);
+    let (code, out) = run(Some(DbOp::Inspect), "", Some("bad.dump"));
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(parse_schema(&out), None);
+
+    engine.stop_container(&s, Duration::from_secs(5)).unwrap();
+    engine.remove_container(&s).unwrap();
+    engine.remove_network(&network).unwrap();
+}

@@ -22,7 +22,7 @@ use crate::socket::MachineRole;
 /// be traversable by host users). Guarded by `postgres_starts_healthy_with_a_root_only_password_file`.
 const POSTGRES_FILES: FileOwner = FileOwner::ROOT;
 
-const CONTROL_PLANE_FILES: FileOwner = FileOwner {
+pub(crate) const CONTROL_PLANE_FILES: FileOwner = FileOwner {
     uid: CONTROL_PLANE_UID,
     gid: CONTROL_PLANE_UID,
     mode: 0o400,
@@ -134,26 +134,50 @@ impl Actor {
                 Ok(())
             })?;
         }
-        self.ensure_volume(machine, names::CONTROL_DATA_VOLUME, Role::ControlPlane)?;
-        self.ensure_volume(
-            machine,
-            names::CONTROL_PLANE_SECRETS_VOLUME,
-            Role::ControlPlane,
-        )?;
-        let secrets = self.control_plane_secrets()?;
-        self.ensure_service(
-            machine,
-            Role::ControlPlane,
-            &secrets,
-            CONTROL_PLANE_FILES,
-            |_, _| {
-                // Only before a create: a restart never holds the actor busy on Postgres.
-                if owned_db {
-                    self.await_healthy(names::POSTGRES);
-                }
-                Ok(())
-            },
-        )?;
+        // A restore owns the database until it finishes: no control plane is created or
+        // started meanwhile (`crate::restore`). Only the control plane is held: a combined
+        // machine's node agent is still ensured.
+        let held = match crate::database::load_hold(self.dir.root()) {
+            Ok(None) => false,
+            Ok(Some(hold)) => {
+                let why = match hold.reason {
+                    crate::database::HoldReason::RestoreIncomplete => format!(
+                        "a restore stopped before it finished, so the database may be partly loaded; run the same restore command again (`docker exec {} quasar-recovery restore --list` lists the dumps)",
+                        names::RECOVERY_ACTOR
+                    ),
+                };
+                warn!(token = "actor-control-plane-held", "{why}");
+                true
+            }
+            Err(e) => {
+                return Err(ResumeError::State(std::io::Error::new(
+                    e.kind(),
+                    format!("database-hold.json cannot be read ({e}); no control plane is started until it can"),
+                )))
+            }
+        };
+        if !held {
+            self.ensure_volume(machine, names::CONTROL_DATA_VOLUME, Role::ControlPlane)?;
+            self.ensure_volume(
+                machine,
+                names::CONTROL_PLANE_SECRETS_VOLUME,
+                Role::ControlPlane,
+            )?;
+            let secrets = self.control_plane_secrets()?;
+            self.ensure_service(
+                machine,
+                Role::ControlPlane,
+                &secrets,
+                CONTROL_PLANE_FILES,
+                |_, _| {
+                    // Only before a create: a restart never holds the actor busy on Postgres.
+                    if owned_db {
+                        self.await_healthy(names::POSTGRES);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
         if machine.role == MachineRole::Combined {
             self.ensure_node_agent(machine)?;
         }
@@ -242,6 +266,11 @@ impl Actor {
                 return Ok(());
             }
             if existing.status == "created" {
+                if role == Role::ControlPlane {
+                    let found = self.ensure_image(&image)?;
+                    self.schema_allows(&found, &image.reference())
+                        .map_err(ResumeError::OlderControlPlane)?;
+                }
                 info!(container = %existing.name, "starting what an interrupted install created");
                 self.engine.start_container(&existing.id)?;
             }
@@ -249,6 +278,10 @@ impl Actor {
         }
 
         let found = self.ensure_image(&image)?;
+        if role == Role::ControlPlane {
+            self.schema_allows(&found, &image.reference())
+                .map_err(ResumeError::OlderControlPlane)?;
+        }
         let revision = match role {
             Role::Postgres => control::POSTGRES_REVISION,
             _ => image_revision(&found, &image)?,

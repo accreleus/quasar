@@ -634,6 +634,7 @@ fn status_reports_the_machine_inventory_in_the_socket_shape() {
             "conflicts": [],
             "in_flight": null,
             "dumps": [],
+            "dump_free_bytes": null,
             "result": null,
             "stale": false
         })

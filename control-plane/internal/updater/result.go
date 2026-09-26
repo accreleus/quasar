@@ -44,6 +44,9 @@ type Result struct {
 	Release Release `json:"release"`
 	// Exactly what was run, so a failure's manual recipe is copy-paste.
 	Commands [][]string `json:"commands"`
+	// PreUpdateDump is set only by the recovery actor's client
+	// (platform/actor_client.go): the dump its attempt took. Never in a file.
+	PreUpdateDump *string `json:"-"`
 }
 
 // The one place a request field becomes a filesystem path, so the uuid shape is

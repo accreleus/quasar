@@ -45,6 +45,9 @@ type Request struct {
 	Purge                   bool        `json:"purge"`
 	// Zero is the actor's default.
 	WaitTimeoutS int64 `json:"wait_timeout_s,omitempty"`
+	// FromVersion is a migrating control-plane request's own version: what a
+	// failure's restore command returns to. Omitted when nil.
+	FromVersion *string `json:"from_version,omitempty"`
 }
 
 // Previous is the digest a component was on before; nil, never omitted, when
@@ -131,6 +134,9 @@ type Result struct {
 	FinishedAt *string     `json:"finished_at"`
 	Restored   bool        `json:"restored"`
 	Release    Release     `json:"release"`
+	// Dump is the pre-update dump this attempt took (control-api.md
+	// pre_update_dump); nil on every other attempt.
+	Dump *string `json:"dump"`
 }
 
 type ActorIdentity struct {
@@ -208,6 +214,9 @@ type Status struct {
 	Conflicts []Conflict `json:"conflicts"`
 	InFlight  *string    `json:"in_flight"`
 	Dumps     []Dump     `json:"dumps"`
-	Result    *Result    `json:"result"`
-	Stale     bool       `json:"stale"`
+	// DumpFreeBytes is the free space where pre-update dumps are written, on a
+	// machine whose database is Quasar's own; nil elsewhere or unreadable.
+	DumpFreeBytes *int64  `json:"dump_free_bytes"`
+	Result        *Result `json:"result"`
+	Stale         bool    `json:"stale"`
 }

@@ -177,14 +177,18 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 	}
 
 	details := map[string]any{
-		"release_id":    release.ID,
-		"source_commit": release.SourceCommit,
-		"force":         req.Force,
+		"release_id":                release.ID,
+		"source_commit":             release.SourceCommit,
+		"force":                     req.Force,
+		"external_backup_confirmed": req.ExternalBackupConfirmed,
 	}
 	if req.RetryOf != nil {
 		details["retry_of"] = *req.RetryOf
 	}
 	audit.TryRecord(ctx, h.auditor, actor, "platform.apply.run", "platform", release.ID, details)
+	if req.ExternalBackupConfirmed {
+		h.fleet.ConfirmExternalBackup(run.ID)
+	}
 	h.fleet.Start(run)
 	h.fillRun(ctx, &run)
 	httpx.WriteJSON(w, http.StatusAccepted, RunEnvelope{Run: run})

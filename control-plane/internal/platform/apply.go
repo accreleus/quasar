@@ -151,10 +151,13 @@ type Attempt struct {
 	SessionsRemaining *int              `json:"sessions_remaining"`
 	Force             bool              `json:"force"`
 	Output            string            `json:"output"`
-	RequestedBy       *string           `json:"requested_by"`
-	CreatedAt         time.Time         `json:"created_at"`
-	StartedAt         *time.Time        `json:"started_at"`
-	FinishedAt        *time.Time        `json:"finished_at"`
+	// PreUpdateDump names the dump a migrating control-plane attempt's restore
+	// command takes (amendment 14); opaque, nil everywhere else.
+	PreUpdateDump *string    `json:"pre_update_dump"`
+	RequestedBy   *string    `json:"requested_by"`
+	CreatedAt     time.Time  `json:"created_at"`
+	StartedAt     *time.Time `json:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at"`
 }
 
 // ActiveApply is the view's `active_apply`: what is in flight right now. One
@@ -250,6 +253,10 @@ type FleetApplyRequest struct {
 	Force     bool   `json:"force"`
 	// RetryOf links a "Retry skipped hosts" run to the partial run it finishes.
 	RetryOf *string `json:"retry_of"`
+	// ExternalBackupConfirmed is the operator's word that their own database is
+	// backed up (amendment 14); read only for a migrating step on an external
+	// database, and stored on no row.
+	ExternalBackupConfirmed bool `json:"external_backup_confirmed"`
 }
 
 // RunEnvelope is the body of every run response.

@@ -405,9 +405,22 @@ apply deadline falls back to the booted binary. A control plane must pass its im
 healthcheck: one with none never passes and is restored. Each socket's `status` answers only for
 attempts submitted on it. A developer apply to the control-plane target is a standalone
 control-plane attempt that holds every host with an admission restriction owned by the attempt,
-released once it is terminal (on a later boot too). Until #364 a migrating release, or a
-migrating developer-apply digest, is refused before anything is cordoned, and the actor refuses a
-`migrates: true` control-plane request as a backstop.
+released once it is terminal (on a later boot too).
+
+*Implementation note (#364):* the dump phase sits after the pull and the recipe check, before
+`old_kept` (`quasar-recovery` `migrate.rs`), so an image the actor cannot render costs no dump.
+The actor treats a step as migrating when the request says so or the images' schema labels do,
+and records a **schema floor** in machine state before the new control plane starts; no control
+plane that declares a lower schema is created, started or put back until a restore lowers it. A
+migrating failure leaves the new control plane as it is and the old one kept and disabled. The
+operator's `restore` is submitted on an operator socket inside the actor's own container (`docker
+exec quasar-recovery quasar-recovery restore --dump <name> --to <version>`), journalled with its
+own phases (`restore.rs`), and holds every control plane off the database from the moment it
+stops one until it has loaded the dump and started the matching control plane. By owner decision
+(2026-09-26) restoring a pre-RH-06 stack's dump into a fresh install (D4's data carry) is out of
+scope: existing installs redeploy. The control plane passes `external_backup_confirmed` from the
+fleet or developer apply to the step in memory only, and a migrating developer apply drains the
+instance as a migrating release does.
 
 **Agent update, revert.** Unchanged control-plane side (`release_apply` over the agent
 WebSocket); the agent relays to the agent socket; the actor replaces

@@ -6,9 +6,10 @@
  *
  * Owned GPU hosts are offered, and the control plane's own machine when it is owned.
  * There a control-plane image makes the request the control-plane target (with its
- * recovery actor first); the node agent alone is that host's own request. A digest
- * that migrates the database is refused by the server until the mock's Database
- * section (drain, dump or external-backup confirmation) exists with #364.
+ * recovery actor first); the node agent alone is that host's own request. A control-plane
+ * digest that migrates follows a migrating release's database rule (#364): the Database
+ * section is drawn for every control-plane request, worded conditionally, because the
+ * console cannot know before submitting whether a digest migrates.
  */
 
 import { useState } from "react";
@@ -53,6 +54,8 @@ export interface DeveloperMachine {
   nodeName: string;
   /** The control plane's own machine: its control plane can be applied here. */
   controlPlane: boolean;
+  /** Its database, on the control plane's machine; null when not reported. */
+  databaseMode?: "owned" | "external" | null;
 }
 
 /** Owned GPU hosts, and the control plane's own machine when it reports an owned
@@ -70,6 +73,7 @@ export function developerApplyMachines(view: PlatformReleaseView): DeveloperMach
       hostId: agent?.host_id ?? null,
       nodeName: own,
       controlPlane: true,
+      databaseMode: cp.database_mode ?? null,
     });
   }
   for (const h of view.installed.hosts) {
@@ -198,6 +202,7 @@ export function DeveloperApplyDrawer({
     "control-plane": "",
   });
   const [refusal, setRefusal] = useState<Refusal | null>(null);
+  const [backupConfirmed, setBackupConfirmed] = useState(false);
 
   const machine = machines.find((m) => m.key === machineKey);
   const offered = SLOTS.filter((s) => offers(machine, s.name));
@@ -213,13 +218,22 @@ export function DeveloperApplyDrawer({
     parsed.map((p) => p.slot.name),
   );
   const controlPlaneTarget = components.some((c) => c.name === "control-plane");
+  const namesControlPlane = parsed.some((p) => p.slot.name === "control-plane");
+  const external = machine?.databaseMode === "external";
 
   const apply = useAdminAction(
     async () =>
       adminApi.developerApply(
         token ?? "",
         controlPlaneTarget
-          ? { target: "control_plane", components, force: false }
+          ? {
+              target: "control_plane",
+              components,
+              force: false,
+              // Not a gate: a digest that migrates unconfirmed fails backup_unconfirmed
+              // before anything stops, and the console cannot know which digests migrate.
+              ...(external ? { external_backup_confirmed: backupConfirmed } : {}),
+            }
           : { target: "host", host_id: machine?.hostId ?? "", components, force: false },
       ),
     {
@@ -255,7 +269,12 @@ export function DeveloperApplyDrawer({
       width={DRAWER_WIDTH}
       footer={
         <>
-          <span className="hint">{problem ?? footerHint(parsed.length, invalid)}</span>
+          <span className="hint">
+            {problem ??
+              (external && namesControlPlane && !backupConfirmed && invalid === 0
+                ? "Without your confirmation, a build that changes the database is refused before anything stops."
+                : footerHint(parsed.length, invalid))}
+          </span>
           <span className="grow" />
           <Button variant="ghost" onClick={onClose}>
             Cancel
@@ -319,6 +338,14 @@ export function DeveloperApplyDrawer({
         </div>
       </div>
 
+      {machine?.controlPlane && namesControlPlane && (
+        <DatabaseSection
+          machine={machine}
+          confirmed={backupConfirmed}
+          onConfirm={setBackupConfirmed}
+        />
+      )}
+
       <div className="fsec">
         <div className="fs-label">
           <h4>Allowed namespaces</h4>
@@ -333,6 +360,69 @@ export function DeveloperApplyDrawer({
         </div>
       </div>
     </Drawer>
+  );
+}
+
+/** rh06 devapply-migrating(-external).png, worded for a digest that may or may not
+ *  migrate. The confirmation is sent, never required: the server decides. */
+function DatabaseSection({
+  machine,
+  confirmed,
+  onConfirm,
+}: {
+  machine: DeveloperMachine;
+  confirmed: boolean;
+  onConfirm: (confirmed: boolean) => void;
+}) {
+  const mode = machine.databaseMode ?? null;
+  return (
+    <div className="fsec">
+      <div className="fs-label">
+        <h4>Database</h4>
+        <p>If this control-plane image changes the database, it follows a migrating release&rsquo;s rule.</p>
+      </div>
+      <div className="fs-fields">
+        <p className="hint devapply-ns-note">
+          If this build changes the database, then like a migrating release this apply waits for
+          every session on the instance to end before the control plane is replaced, and is never
+          applied unattended.
+        </p>
+        {mode === "external" ? (
+          <>
+            <div className="note warn">
+              <b>Quasar does not back up your database.</b> It uses your database as it is and
+              never dumps, restores or upgrades it. If this build changes the database, take a
+              backup with your own tools first: it is the only way back if this build fails.
+            </div>
+            <label className="rowflex">
+              <input
+                type="checkbox"
+                checked={confirmed}
+                onChange={(e) => onConfirm(e.target.checked)}
+              />
+              <span>
+                I have a current backup of this database, taken after the last change I want to
+                keep.
+              </span>
+            </label>
+          </>
+        ) : mode === "owned" ? (
+          <div className="note">
+            <b>Quasar dumps its database first.</b> If this build changes the database, the
+            recovery actor on {machine.nodeName} dumps Quasar&rsquo;s database before the control
+            plane is replaced. If the dump cannot be taken, the apply stops there: the control
+            plane is not replaced and the database is not touched.
+          </div>
+        ) : (
+          <div className="note warn">
+            <b>The database has not been reported yet.</b> The recovery actor on{" "}
+            {machine.nodeName} has not said whether this is Quasar&rsquo;s own database or yours.
+            If this build changes the database, Quasar dumps its own first, or needs your
+            confirmation of a backup of yours.
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

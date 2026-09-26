@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
@@ -22,6 +23,12 @@ type developerSchema interface {
 
 // controlPlaneDeveloper drives the attempt (SelfDeveloperRunner).
 type controlPlaneDeveloper interface{ Start(a Attempt) }
+
+// admittedSchemaNoter keeps what admission read of the control-plane image
+// (SelfDeveloperRunner.NoteDeveloperSchema).
+type admittedSchemaNoter interface {
+	NoteDeveloperSchema(attemptID string, schema int, migrates bool)
+}
 
 // WithSelfDeveloper wires the driver of control-plane developer applies.
 func (h *ApplyHandler) WithSelfDeveloper(d controlPlaneDeveloper) *ApplyHandler {
@@ -99,10 +106,10 @@ func (h *ApplyHandler) developerApplyControlPlane(w http.ResponseWriter, r *http
 			fmt.Sprintf("the control-plane image is at schema %d, below the database's %d (ADR 0002)", schema, installed))
 		return
 	}
-	if schema > installed {
-		httpx.WriteError(w, http.StatusNotImplemented, CodeApplyUnsupported, ownedMigratingRefusal)
-		return
-	}
+	// A migrating digest follows #352 decision 14 exactly as a migrating release
+	// does: the runner drains the instance, then the recovery actor dumps a
+	// Quasar-owned database or requires the operator's confirmation for theirs.
+	migrates := schema > installed
 	if h.selfDev == nil {
 		httpx.WriteError(w, http.StatusNotImplemented, CodeApplyUnsupported,
 			"this control plane cannot drive a developer apply to itself")
@@ -119,6 +126,7 @@ func (h *ApplyHandler) developerApplyControlPlane(w http.ResponseWriter, r *http
 		Requested: components,
 		Previous:  previousOrUnknown(last, components),
 		Actor:     nilIfEmpty(actor),
+		Force:     req.Force,
 	})
 	if err != nil {
 		if errors.Is(err, ErrAttemptInFlight) {
@@ -140,8 +148,60 @@ func (h *ApplyHandler) developerApplyControlPlane(w http.ResponseWriter, r *http
 		"force":                     req.Force,
 		"external_backup_confirmed": req.ExternalBackupConfirmed,
 	})
+	if migrates && h.externalDatabase(ctx) && !req.ExternalBackupConfirmed {
+		// Failed before anything is held, drained or sent: nothing changed.
+		if err := h.store.FailAttempt(ctx, attempt.ID, ReasonBackupUnconfirmed,
+			"this build changes the database, and no current backup of your own database was confirmed. "+
+				"Quasar never dumps an operator's database: take a backup with your own tools, then apply again, confirming it. Nothing was changed"); err != nil {
+			h.internal(w, "fail attempt", err)
+			return
+		}
+		if failed, err := h.store.Attempt(ctx, attempt.ID); err == nil {
+			attempt = failed
+		}
+		httpx.WriteJSON(w, http.StatusAccepted, AttemptEnvelope{Attempt: attempt})
+		return
+	}
+	if c, ok := h.selfDev.(backupConfirmer); ok && migrates && req.ExternalBackupConfirmed {
+		c.ConfirmExternalBackup(attempt.ID)
+	}
+	// The schema is read once, here: the drain and the send use this answer.
+	if n, ok := h.selfDev.(admittedSchemaNoter); ok {
+		n.NoteDeveloperSchema(attempt.ID, schema, migrates)
+	}
 	h.selfDev.Start(attempt)
 	httpx.WriteJSON(w, http.StatusAccepted, AttemptEnvelope{Attempt: attempt})
+}
+
+// externalDatabase: this control plane's recovery actor says its database is the
+// operator's own. Unknown reads as not: the actor refuses such a step itself.
+func (h *ApplyHandler) externalDatabase(ctx context.Context) bool {
+	if h.ownMachine == nil {
+		return false
+	}
+	own, ok := h.ownMachine.Read(ctx)
+	return ok && own.Identity.DatabaseMode != nil && *own.Identity.DatabaseMode == DatabaseModeExternal
+}
+
+// SchemaOf is the schema version a developer apply's control-plane image
+// declares (SelfApplier.DeveloperSchema).
+func (d *RegistryDeveloperImages) SchemaOf(ctx context.Context, components []ComponentDigest) (int, error) {
+	for _, c := range components {
+		if c.Name == ComponentControlPlane {
+			return d.ControlPlaneSchema(ctx, c)
+		}
+	}
+	return 0, errors.New("the request names no control-plane image")
+}
+
+// Migrates reports whether a developer apply's control-plane image moves the
+// schema past this binary's (SelfDeveloperRunner.Migrates).
+func (d *RegistryDeveloperImages) Migrates(ctx context.Context, components []ComponentDigest) (bool, error) {
+	schema, err := d.SchemaOf(ctx, components)
+	if err != nil {
+		return false, err
+	}
+	return schema > buildinfo.SchemaVersion(), nil
 }
 
 // ControlPlaneSchema is the schema version the control-plane image at this

@@ -518,6 +518,8 @@ impl Actor {
                 new_container: None,
                 failure: None,
                 successor_starts: 0,
+                migrating: false,
+                dump: None,
             });
         }
         let _ = machine;
@@ -538,6 +540,8 @@ impl Actor {
             dump: None,
             purge: false,
             wait_timeout_s: 0,
+            from_version: None,
+            force_again: false,
         };
         Ok(Journal {
             format: FORMAT,
@@ -557,7 +561,9 @@ impl Actor {
                 finished_at: None,
                 restored: false,
                 release,
+                dump: None,
             },
+            restore: None,
         })
     }
 

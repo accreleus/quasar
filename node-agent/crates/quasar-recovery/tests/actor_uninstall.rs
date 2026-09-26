@@ -166,6 +166,8 @@ fn replace_request(id: &str) -> Request {
         dump: None,
         purge: false,
         wait_timeout_s: 0,
+        from_version: None,
+        force_again: false,
     }
 }
 
@@ -185,6 +187,8 @@ fn remove_request(id: &str) -> Request {
         dump: None,
         purge: false,
         wait_timeout_s: 0,
+        from_version: None,
+        force_again: false,
     }
 }
 
