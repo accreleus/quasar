@@ -605,8 +605,9 @@ fn every_trust_vector_passes_against_the_rust_port() {
                 "admit" => {
                     let v: AdmitVector = decode(raw);
                     match v.caller.as_str() {
+                        // `expect_without_caller_guard` here is Go's answer where the port
+                        // admits what Go refuses; the port is held to `expect`.
                         "control_plane" => {
-                            assert!(v.expect_without_caller_guard.is_none(), "{}", v.name);
                             match_decision(
                                 &v.name,
                                 &v.expect,

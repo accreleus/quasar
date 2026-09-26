@@ -378,18 +378,45 @@ func actorBehindRelease(h HostIdentity, releaseCommit string) bool {
 	return h.RecoveryActorSourceCommit == nil || !commitsMatch(*h.RecoveryActorSourceCommit, releaseCommit)
 }
 
-// ControlPlaneComponents extracts the components the control plane may apply to
-// itself: today exactly the `control-plane` entry. Empty means the release
-// cannot move this control plane, which is a refusal and never an empty apply.
+// ControlPlaneComponents extracts what a release may move on the control
+// plane's own machine: its `control-plane` entry and, from a manifest that names
+// one, its `recovery-actor` entry. OrderControlPlaneComponents decides which of
+// them the step names. No control-plane entry means the release cannot move
+// this control plane, which is a refusal and never an empty apply.
 func ControlPlaneComponents(m Manifest) []ComponentDigest {
-	out := make([]ComponentDigest, 0, 1)
+	out := make([]ComponentDigest, 0, 2)
 	for _, c := range m.Components {
-		if c.Name != ComponentControlPlane {
+		if c.Name != ComponentControlPlane && c.Name != ComponentRecovery {
 			continue
 		}
 		out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
 	}
 	return out
+}
+
+// OrderControlPlaneComponents is the control-plane step's list, in replacement
+// order (control-api.md amendment 14, "Components of an apply on an owned
+// machine"): `[recovery-actor, control-plane]` when the machine is owned and
+// its actor is not on the release, else `[control-plane]`. A Compose control
+// plane is never sent an actor. Empty when the release names no control plane.
+func OrderControlPlaneComponents(release []ComponentDigest, releaseCommit string, owned bool, actorCommit *string) []ComponentDigest {
+	var cp, actor *ComponentDigest
+	for i := range release {
+		switch release[i].Name {
+		case ComponentControlPlane:
+			cp = &release[i]
+		case ComponentRecovery:
+			actor = &release[i]
+		}
+	}
+	if cp == nil {
+		return nil
+	}
+	out := make([]ComponentDigest, 0, 2)
+	if owned && actor != nil && (actorCommit == nil || !commitsMatch(*actorCommit, releaseCommit)) {
+		out = append(out, *actor)
+	}
+	return append(out, *cp)
 }
 
 // unknownPrevious is what an attempt records for `previous_digests` before the

@@ -2115,11 +2115,7 @@ async fn connect_and_run(
     info!("capacity report sent");
     if let Some(ledger) = sessions.mgr.home_cleanup.as_mut() {
         for session_id in ledger.take_recovered() {
-            send(
-                &mut tx,
-                &qualified_home_terminal(&session_id, crate::home_cleanup::TerminalKind::Failed),
-            )
-            .await?;
+            send(&mut tx, &recovered_terminal(&session_id)).await?;
         }
     }
 
@@ -4792,6 +4788,21 @@ fn stream_to_params(s: StreamSpec) -> anyhow::Result<StreamParams> {
 
 fn ack(id: String, ok: bool, error: Option<String>) -> AgentMsg {
     AgentMsg::Ack { id, ok, error }
+}
+
+/// `session_state.error` for a session the previous agent process was still running when it
+/// ended. No `reason_code` fits (agent-api.md defines only `app_exited_early`), so the prose
+/// field carries it: an agent update ends that host's sessions (#352 decision 9).
+const RECOVERED_SESSION_ERROR: &str = "the node agent restarted while this session was running \
+     (the agent was updated, replaced or stopped), so the session ended";
+
+/// The terminal report for a session found live in the previous agent process's ledger.
+fn recovered_terminal(session_id: &str) -> AgentMsg {
+    let mut msg = qualified_home_terminal(session_id, crate::home_cleanup::TerminalKind::Failed);
+    if let AgentMsg::SessionState { error, .. } = &mut msg {
+        *error = Some(RECOVERED_SESSION_ERROR.to_string());
+    }
+    msg
 }
 
 fn qualified_home_terminal(
@@ -9396,5 +9407,22 @@ mod tests {
         );
         assert_eq!(next.app_boot_timeout, Some(Duration::from_secs(42)));
         assert_ne!(running.app_boot_timeout, next.app_boot_timeout);
+    }
+
+    /// A session live when the previous agent process ended (an agent update ends that
+    /// host's sessions) is reported failed with a stated reason, not with every field null.
+    #[test]
+    fn a_session_the_previous_agent_process_ran_ends_failed_with_a_stated_reason() {
+        let json = serde_json::to_value(recovered_terminal("0b9f5d3a-0000-4000-8000-000000000001"))
+            .unwrap();
+        assert_eq!(json["type"], "session_state");
+        assert_eq!(json["state"], "failed");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("node agent restarted")),
+            "{json}"
+        );
+        assert!(json.get("reason_code").is_none(), "{json}");
     }
 }

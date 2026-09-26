@@ -33,7 +33,8 @@ pub enum CallerTag {
     /// The operator's `reconfigure` on the operator socket (`crate::operator`).
     Operator,
     /// A caller a later build added. The journal stays readable, so its attempt settles as
-    /// usual, and a re-post of its id is refused as another caller's. Never written new.
+    /// usual, and a re-post of its id is refused as another caller's. No attempt is ever
+    /// admitted as `Other`, but settling such a journal writes it back as `other`.
     #[serde(other)]
     Other,
 }

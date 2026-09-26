@@ -121,7 +121,8 @@ func ValidateDeveloperApply(req DeveloperApplyRequest) ([]ComponentDigest, error
 		}
 	}
 	// A1: the actor may lead the control plane only while a control-plane
-	// replacement is in flight, so never on its own against that machine.
+	// replacement is in flight, so never on its own against that machine. To move
+	// only the actor, name the control plane's current digest beside it.
 	if req.Target == TargetControlPlane && seen[ComponentRecovery] && !seen[ComponentControlPlane] {
 		return nil, errors.New("a control_plane target names recovery-actor only together with control-plane")
 	}
@@ -247,8 +248,7 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 				"this control plane does not report an owned install, so it takes no developer apply")
 			return
 		}
-		httpx.WriteError(w, http.StatusNotImplemented, CodeApplyUnsupported,
-			"replacing the control plane on an owned machine arrives with RH06-11 (#363); nothing was attempted")
+		h.developerApplyControlPlane(w, r, req, components)
 		return
 	}
 

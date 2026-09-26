@@ -4,10 +4,11 @@
  * apply"). Laid out to design_handoff_v3/screens/rh06 `devapply*.png`
  * (`rhDevApply` / `rhDevCard` in assets/pages-rh06.js).
  *
- * Only owned GPU hosts are offered. The control plane's own machine is not: its
- * target can take a migrating control-plane digest, and the drawer does not yet
- * carry the mock's Database section (drain, dump or external-backup
- * confirmation) that such an apply needs.
+ * Owned GPU hosts are offered, and the control plane's own machine when it is owned.
+ * There a control-plane image makes the request the control-plane target (with its
+ * recovery actor first); the node agent alone is that host's own request. A digest
+ * that migrates the database is refused by the server until the mock's Database
+ * section (drain, dump or external-backup confirmation) exists with #364.
  */
 
 import { useState } from "react";
@@ -15,7 +16,6 @@ import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
 import type {
   ApplyComponentDigest,
-  PlatformHostIdentity,
   PlatformReleaseView,
 } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
@@ -43,14 +43,66 @@ const SLOTS: ImageSlot[] = [
   { name: "control-plane", label: "Control plane", placeholder: "namespace/quasar-control-plane@sha256:…" },
 ];
 
-/** What a host target may name (control-api.md §"Developer apply"): its agent and its
- *  recovery actor, which the server orders first. `control-plane` is never sent to a
- *  host. */
-const HOST_COMPONENTS: ReadonlySet<ComponentName> = new Set(["recovery-actor", "node-agent"]);
+/** One machine the drawer offers, and the services it can take (control-api.md
+ *  §"Developer apply"). */
+export interface DeveloperMachine {
+  key: string;
+  label: string;
+  /** The host a node-agent request names; null on a control-only machine. */
+  hostId: string | null;
+  nodeName: string;
+  /** The control plane's own machine: its control plane can be applied here. */
+  controlPlane: boolean;
+}
 
-/** Owned GPU hosts, the only machines this build offers. */
-export function developerApplyMachines(view: PlatformReleaseView): PlatformHostIdentity[] {
-  return view.installed.hosts.filter((h) => h.install_mode === "owned");
+/** Owned GPU hosts, and the control plane's own machine when it reports an owned
+ *  install. A combined host is that machine, never a GPU host of its own. */
+export function developerApplyMachines(view: PlatformReleaseView): DeveloperMachine[] {
+  const cp = view.installed.control_plane;
+  const own = cp.install_mode === "owned" ? (cp.machine_node_name ?? null) : null;
+  const combined = own != null && cp.machine_role === "combined";
+  const out: DeveloperMachine[] = [];
+  if (own != null && (combined || cp.machine_role === "control_only")) {
+    const agent = combined ? view.installed.hosts.find((h) => h.node_name === own) : undefined;
+    out.push({
+      key: "control-plane",
+      label: `${own} · ${combined ? "Combined host" : "Control-only host"}`,
+      hostId: agent?.host_id ?? null,
+      nodeName: own,
+      controlPlane: true,
+    });
+  }
+  for (const h of view.installed.hosts) {
+    if (h.install_mode !== "owned" || (combined && h.node_name === own)) continue;
+    out.push({ key: h.host_id, label: `${h.node_name} · GPU host`, hostId: h.host_id, nodeName: h.node_name, controlPlane: false });
+  }
+  return out;
+}
+
+/** The services a machine offers; any other slot reads as not on this machine. */
+function offers(m: DeveloperMachine | undefined, name: ComponentName): boolean {
+  if (!m) return false;
+  switch (name) {
+    case "control-plane":
+      return m.controlPlane;
+    case "node-agent":
+      return m.hostId != null;
+    case "recovery-actor":
+      return true;
+  }
+}
+
+/** Why the filled images cannot be one request on this machine, or null. */
+function combinationProblem(m: DeveloperMachine | undefined, names: ComponentName[]): string | null {
+  if (!m?.controlPlane) return null;
+  const cp = names.includes("control-plane");
+  if (cp && names.includes("node-agent")) {
+    return "Apply the control plane first, then its node agent on its own.";
+  }
+  if (!cp && names.includes("recovery-actor")) {
+    return "On the control plane’s machine the recovery actor moves only with the control plane.";
+  }
+  return null;
 }
 
 const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
@@ -134,12 +186,12 @@ export function DeveloperApplyDrawer({
   onClose,
   onApplied,
 }: {
-  machines: PlatformHostIdentity[];
+  machines: DeveloperMachine[];
   onClose: () => void;
   onApplied: () => void;
 }) {
   const { token } = useAuth();
-  const [hostId, setHostId] = useState(machines[0]?.host_id ?? "");
+  const [machineKey, setMachineKey] = useState(machines[0]?.key ?? "");
   const [values, setValues] = useState<Record<ComponentName, string>>({
     "recovery-actor": "",
     "node-agent": "",
@@ -147,7 +199,8 @@ export function DeveloperApplyDrawer({
   });
   const [refusal, setRefusal] = useState<Refusal | null>(null);
 
-  const offered = SLOTS.filter((s) => HOST_COMPONENTS.has(s.name));
+  const machine = machines.find((m) => m.key === machineKey);
+  const offered = SLOTS.filter((s) => offers(machine, s.name));
   const parsed = offered
     .filter((s) => values[s.name].trim() !== "")
     .map((s) => ({ slot: s, result: parseImageReference(values[s.name]) }));
@@ -155,19 +208,23 @@ export function DeveloperApplyDrawer({
   const components: ApplyComponentDigest[] = parsed.flatMap(({ slot, result }) =>
     result.ok ? [{ name: slot.name, image: result.image, digest: result.digest }] : [],
   );
-  const machine = machines.find((m) => m.host_id === hostId);
+  const problem = combinationProblem(
+    machine,
+    parsed.map((p) => p.slot.name),
+  );
+  const controlPlaneTarget = components.some((c) => c.name === "control-plane");
 
   const apply = useAdminAction(
     async () =>
-      adminApi.developerApply(token ?? "", {
-        target: "host",
-        host_id: hostId,
-        components,
-        force: false,
-      }),
+      adminApi.developerApply(
+        token ?? "",
+        controlPlaneTarget
+          ? { target: "control_plane", components, force: false }
+          : { target: "host", host_id: machine?.hostId ?? "", components, force: false },
+      ),
     {
       // Accepted is not started: the attempt may wait for the host's sessions to end.
-      success: `Developer apply queued for ${machine?.node_name ?? "the host"}.`,
+      success: `Developer apply queued for ${machine?.nodeName ?? "the machine"}.`,
       // The drawer's refusal note carries the explanation; the toast only
       // reports the event, so the server's message is not shown twice.
       failure: () => "The developer apply was not started.",
@@ -182,7 +239,7 @@ export function DeveloperApplyDrawer({
   );
 
   const busy = apply.pending != null;
-  const canApply = !busy && hostId !== "" && parsed.length > 0 && invalid === 0;
+  const canApply = !busy && machine != null && parsed.length > 0 && invalid === 0 && problem == null;
 
   const edit = (name: ComponentName, value: string) => {
     setValues((v) => ({ ...v, [name]: value }));
@@ -198,7 +255,7 @@ export function DeveloperApplyDrawer({
       width={DRAWER_WIDTH}
       footer={
         <>
-          <span className="hint">{footerHint(parsed.length, invalid)}</span>
+          <span className="hint">{problem ?? footerHint(parsed.length, invalid)}</span>
           <span className="grow" />
           <Button variant="ghost" onClick={onClose}>
             Cancel
@@ -226,15 +283,15 @@ export function DeveloperApplyDrawer({
           <SelectField
             label="Machine"
             name="developer_apply_machine"
-            value={hostId}
+            value={machineKey}
             onChange={(e) => {
-              setHostId(e.target.value);
+              setMachineKey(e.target.value);
               setRefusal(null);
             }}
           >
             {machines.map((m) => (
-              <option key={m.host_id} value={m.host_id}>
-                {m.node_name} · GPU host
+              <option key={m.key} value={m.key}>
+                {m.label}
               </option>
             ))}
           </SelectField>
@@ -248,7 +305,7 @@ export function DeveloperApplyDrawer({
         </div>
         <div className="fs-fields">
           {SLOTS.map((slot) =>
-            HOST_COMPONENTS.has(slot.name) ? (
+            offers(machine, slot.name) ? (
               <ImageField
                 key={slot.name}
                 slot={slot}

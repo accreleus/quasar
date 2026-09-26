@@ -692,14 +692,26 @@ remove_install() {
     fi
   done
   # The installation, and the image to uninstall it with: the actor's, else the seed's.
-  # A removed host has no container left, so its labelled volumes or machine state name it.
+  # A removed host has no container left: its machine state names it, and only without
+  # machine state a labelled volume does (another installation's volume must not decide).
   inst=""; uninstall_image="$seed_image"
   for c in $(names_of --filter label=io.quasar.platform-service=recovery-actor) $(names_of --filter label=io.quasar.installation); do
     inst="$(dk inspect -f '{{index .Config.Labels "io.quasar.installation"}}' "$c" 2>/dev/null || true)"
     [ -z "$inst" ] || { uninstall_image="$(dk inspect -f '{{.Config.Image}}' "$c" 2>/dev/null || echo "$seed_image")"; break; }
   done
-  [ -n "$inst" ] || inst="$(dk volume ls --filter label=io.quasar.installation --format '{{.Label "io.quasar.installation"}}' 2>/dev/null | sed '/^$/d' | head -n 1 || true)"
   [ -n "$inst" ] || inst="$(machine_file machine.json | json_string installation_id)"
+  if [ -z "$inst" ] && ! dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then
+    inst="$(dk volume ls --filter label=io.quasar.installation --format '{{.Label "io.quasar.installation"}}' 2>/dev/null | sed '/^$/d' | head -n 1 || true)"
+  fi
+  # Anything of another installation stays, and so would block the fresh install: refuse
+  # before removing anything, and name it.
+  stray="$( {
+    dk ps -a --filter label=io.quasar.installation --format '{{.Names}}|{{.Label "io.quasar.installation"}}' 2>/dev/null
+    dk volume ls --filter label=io.quasar.installation --format '{{.Name}}|{{.Label "io.quasar.installation"}}' 2>/dev/null
+  } | awk -F'|' -v id="$inst" '$2 != "" && $2 != id { print $1 " (installation " $2 ")" }' | head -n 3 | tr '\n' ',' | sed 's/,$//; s/,/, /g' || true)"
+  if [ -n "$stray" ]; then
+    host_error "this machine holds $stray, which belongs to another Quasar installation than this one${inst:+ ($inst)}. Nothing was removed. Remove what is not needed by hand (docker rm / docker volume rm), then run this again."
+  fi
   # The seed first: it is this script's own, and it would re-create a removed actor.
   if [ -n "$(state_of "$SEED")" ]; then
     dk rm -f "$SEED" >/dev/null 2>&1 || host_error "could not remove the seed $SEED; remove it by hand and re-run."

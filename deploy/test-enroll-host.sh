@@ -147,7 +147,10 @@ case "$cmd" in
         for a in "$@"; do case "$a" in label=*) want="${a#label=}" ;; *'.Label'*) fmt="$a" ;; esac; done
         for d in "$S"/v/*; do
           [ -d "$d" ] && { [ -z "$want" ] || has_label "$d" "$want"; } || continue
-          if [ -n "$fmt" ]; then label_value "$d" io.quasar.installation; else echo "${d##*/}"; fi
+          if [ -n "$fmt" ]; then
+            out="${fmt//\{\{.Name\}\}/${d##*/}}"
+            printf '%s\n' "${out//\{\{.Label \"io.quasar.installation\"\}\}/$(label_value "$d" io.quasar.installation)}"
+          else echo "${d##*/}"; fi
         done
         exit 0 ;;
       rm) [ "${MOCK_VOLUME_RM_OK:-1}" = 1 ] || { echo "mock: volume is in use" >&2; exit 1; }; rm -rf "${S:?}/v/$last"; exit 0 ;;
@@ -570,6 +573,27 @@ if [ "$RC" -eq 0 ] && [ -n "$uninstall_at" ] && grep -q 'added back' <<<"$OUT" &
   pass "after console removal, re-add: the old install is purged by its id from machine state (homes kept), then a fresh install under the same node name"
 else
   fail "re-add after removal" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+removed_machine
+volume quasar-old-data io.quasar.installation=inst-9
+before="$(find "$state" -type f | sort | xargs cat | md5sum)"
+run_installer re-add-stray "${OK_ENV[@]}"
+if [ "$RC" -eq 1 ] && grep -q 'quasar-old-data (installation inst-9)' <<<"$OUT" && grep -q 'Nothing was removed' <<<"$OUT" \
+   && nothing_started && ! grep -q ' uninstall ' <<<"$DOCKER_LOG" \
+   && [ "$(find "$state" -type f | sort | xargs cat | md5sum)" = "$before" ]; then
+  pass "re-add with a stray volume of another installation: refused, naming it; nothing removed or started"
+else
+  fail "re-add stray" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+removed_machine
+volume quasar-old-data io.quasar.installation=inst-9
+mkdir -p "$state/v/quasar-machine/files"
+printf '{"installation_id": "inst-0"}\n' > "$state/v/quasar-machine/files/machine.json"
+run_installer reset-machine-state-first "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
+if [ "$RC" -eq 1 ] && grep -q 'another Quasar installation than this one (inst-0)' <<<"$OUT" && ! grep -q ' uninstall ' <<<"$DOCKER_LOG"; then
+  pass "machine state names the installation before any labelled volume: another's volume is never taken for it"
+else
+  fail "machine state first" "rc=$RC out=$(tail -3 <<<"$OUT")"
 fi
 removed_machine
 rm -rf "$state/v/quasar-machine"

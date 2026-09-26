@@ -21,10 +21,14 @@
 //!    `release_apply`) and `remove`; never `restore`, which loads a pre-update dump on the
 //!    control plane's machine. It may name only `node-agent` and `recovery-actor`, and the
 //!    actor only on a GPU host; the control socket only `control-plane` and
-//!    `recovery-actor`, the actor only together with the control plane (A1, ADR 0008).
-//!    A request naming `recovery-actor` needs this actor to be the container under the
-//!    actor's name: it is what hands over. What a caller may name but this build cannot
-//!    yet do is refused `invalid`, saying which ticket brings it.
+//!    `recovery-actor`, the actor only together with the control plane (A1, ADR 0008),
+//!    and only on a machine that runs a control plane. A request naming `recovery-actor`
+//!    needs this actor to be the container under the actor's name: it is what hands over.
+//!    What a caller may name but this build cannot yet do is refused `invalid`, saying
+//!    which ticket brings it: a migrating control-plane replacement, which needs the
+//!    pre-update dump (RH06-12, #364), and the control socket's `restore`. The control
+//!    socket's `remove` is refused: a control-plane machine is taken apart by `uninstall`
+//!    on the machine.
 //! 5. Every image a registry host plus well-formed path components, then
 //!    [`trust::admit`]: single flight, the component table and the confused-deputy guard,
 //!    image and digest shape, the namespace allowlist, then ADR 0003 signatures.
@@ -69,7 +73,7 @@ pub(crate) fn is_uuid(s: &str) -> bool {
             .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn tag(caller: Caller) -> CallerTag {
+pub(crate) fn caller_tag(caller: Caller) -> CallerTag {
     match caller {
         Caller::ControlPlane => CallerTag::ControlPlane,
         Caller::Agent => CallerTag::Agent,
@@ -101,11 +105,18 @@ fn kind_and_caller_rules(
         }
         // Admitted by `submit_remove` before these rules.
         (Caller::Agent, RequestKind::Remove) => {}
-        (Caller::ControlPlane, kind) => {
+        (Caller::ControlPlane, RequestKind::Restore) => {
             return Err(refuse(
                 req,
                 Reason::Invalid,
-                format!("a {kind:?} request on the control socket is not in this build; nothing was changed"),
+                "restoring a pre-update dump is the operator's restore command, which arrives with RH06-12 (#364); nothing was changed",
+            ))
+        }
+        (Caller::ControlPlane, RequestKind::Remove) => {
+            return Err(refuse(
+                req,
+                Reason::Invalid,
+                "a control-plane machine is taken apart by the operator's uninstall command (RH06-14, #366), never over the control socket; nothing was changed",
             ))
         }
     }
@@ -128,17 +139,13 @@ fn kind_and_caller_rules(
                 format!("component \"{}\" may not be named on {socket}", c.name),
             ));
         }
-        if c.name == "control-plane" {
-            return Err(refuse(
-                req,
-                Reason::Invalid,
-                "component \"control-plane\": replacing the control plane arrives with RH06-11 (#363); nothing was changed",
-            ));
-        }
     }
     // A1 (ADR 0008): on the control plane's own machine the actor may lead the control
     // plane only while a control-plane replacement is in flight, so it moves only in the
-    // control-plane step, never alone (control-api.md §"Developer apply").
+    // control-plane step, never alone (control-api.md §"Developer apply"). To move only
+    // the actor there, name `[recovery-actor, control-plane]` with the control plane's
+    // current digest: the control plane is replaced by itself (a restart, sessions ride
+    // through). Guarded by a_control_plane_machines_actor_moves_with_its_current_control_plane.
     let names_actor = req.components.iter().any(|c| c.name == "recovery-actor");
     let names_control_plane = req.components.iter().any(|c| c.name == "control-plane");
     if caller == Caller::ControlPlane && names_actor && !names_control_plane {
@@ -146,6 +153,22 @@ fn kind_and_caller_rules(
             req,
             Reason::Invalid,
             "the control socket names recovery-actor only together with control-plane: the actor may lead the control plane only while its replacement is in flight; nothing was changed",
+        ));
+    }
+    if names_control_plane && role == MachineRole::Gpu {
+        return Err(refuse(
+            req,
+            Reason::Invalid,
+            "this is a GPU host: it runs no control plane to replace; nothing was changed",
+        ));
+    }
+    // A migrating control plane is never restored automatically (ADR 0004 amendment): its
+    // way back is the pre-update dump, which this build does not take.
+    if names_control_plane && req.migrates {
+        return Err(refuse(
+            req,
+            Reason::Invalid,
+            "this control plane migrates the database; replacing it across a migration, with the pre-update dump, arrives with RH06-12 (#364). Nothing was changed",
         ));
     }
     if caller == Caller::Agent && names_actor && role != MachineRole::Gpu {
@@ -168,7 +191,7 @@ impl Actor {
         // 1-2. The journal answers a re-post, before anything grades the request.
         if is_uuid(&req.request_id) {
             match self.journals.load(&req.request_id) {
-                Ok(Some(known)) if known.caller == tag(caller) => {
+                Ok(Some(known)) if known.caller == caller_tag(caller) => {
                     info!(request = %req.request_id, "a re-post of a known request; answered from the journal, nothing new is started");
                     return Ok(Accepted {
                         request_id: req.request_id.clone(),
@@ -469,7 +492,7 @@ impl Actor {
         let journal = Journal {
             format: FORMAT,
             seq: self.journals.next_seq(),
-            caller: tag(caller),
+            caller: caller_tag(caller),
             request: req.clone(),
             steps,
             result: AttemptResult {

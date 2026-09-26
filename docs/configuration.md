@@ -40,7 +40,7 @@ then arrive as files.
 | `QUASAR_SECRET_KEY_FILE` | unset | A file holding the `QUASAR_SECRET_KEY` value (same format): its file twin. Trailing whitespace is trimmed. Startup fails if the file is unreadable or empty, or if `QUASAR_SECRET_KEY` is also set. An owned install generates the key at install. |
 | `QUASAR_LOCAL_ENROLLMENT_FILE` | unset | A combined host: the single-use **local enrollment token** its recovery actor generated for this machine's own node agent. At boot the control plane stores it hashed in `host_enrollments` (single use, no expiry, no minting admin, bound to `QUASAR_LOCAL_ENROLLMENT_NODE_NAME`); a token already present is left as it is, so a restart never re-arms a spent one. Set together with `QUASAR_LOCAL_ENROLLMENT_NODE_NAME`; an empty file fails startup. |
 | `QUASAR_LOCAL_ENROLLMENT_NODE_NAME` | unset | The node name the local enrollment token is bound to; no other node can redeem it. Set together with `QUASAR_LOCAL_ENROLLMENT_FILE`. |
-| `QUASAR_RECOVERY_CONTROL_SOCKET` | unset | An owned machine only (the recipe sets `/run/quasar-recovery/control.sock`): its recovery actor's control socket. When set, the control plane reads its own machine's identity from it (`install_mode`, `recovery_actor_version`, `recovery_actor_source_commit`, `seed_version`, `database_mode` on `GET /v1/admin/platform/identity` and the release view), at most every 30 s; the control-plane target's `updater_socket` preflight check checks this socket, and `updater_stack_dir` / `updater_overlays` are not evaluated. Unset: not an owned machine, and no socket is read. |
+| `QUASAR_RECOVERY_CONTROL_SOCKET` | unset | An owned machine only (the recipe sets `/run/quasar-recovery/control.sock`): its recovery actor's control socket. When set, the control plane reads its own machine's identity from it (`install_mode`, `recovery_actor_version`, `recovery_actor_source_commit`, `seed_version`, `database_mode` on `GET /v1/admin/platform/identity` and the release view), at most every 30 s; the control-plane target's `updater_socket` preflight check checks this socket, and `updater_stack_dir` / `updater_overlays` are not evaluated. The control plane also applies itself over this socket instead of the Compose updater's (`QUASAR_UPDATER_SOCKET` is then ignored): the fleet run's control-plane step and a developer apply to the control plane are submitted to the recovery actor. Unset: not an owned machine, and no socket is read. |
 | `ENROLLMENT_TOKEN` | unset (optional since #12; **deprecated**, amendment 14) | **Deprecated:** retires with the RH06 contract step (RH06-15, #367); a control plane logs one WARN at boot while it is set, and nothing when it is unset (the recommended state). Owned installs never use it. The fleet-wide static enrollment token. **Since #12 this is the fallback, not the primary path**: an admin mints per-host tokens in Admin → Fleet → Add host (`POST /v1/admin/hosts/enrollments` — hashed at rest, single-use, one-hour expiry, optionally bound to one `node_name`) and the agent presents either. Unset, only minted per-host tokens (and a combined host's local token) can enroll — the right end state once every host has joined. Existing agents that enrolled with it keep reconnecting with their node secret regardless. Keep it set on a single-host install (the local agent dials `ws://localhost` and enrolls with it on first boot). Treat it as a break-glass credential — it can enroll *any* node name, and (#96) it is refused only while the host it names has a live agent. |
 | `QUASAR_IMAGE_REGISTRY_HOSTS` | `ghcr.io` | Comma-separated registry-host allowlist for the image-management digest resolver (P3): manifest HEADs and token-realm fetches are refused for any other host, which is the SSRF containment on catalog-supplied registry refs (enforced by the shared `internal/outbound` client since #105). The allowlist names the hosts actually contacted, so a Docker Hub ref needs `docker.io,registry-1.docker.io,auth.docker.io` — the ref's registry, its API endpoint, and its token realm. **Also gates catalog-supplied artwork URLs (#456):** a provider app's `cover_url` is accepted only when it is an `https` URL on one of these hosts; anything else (relative path, plain http, off-allowlist host) falls back to the shipped gradient tile. **The edge release channel reuses this list** for the platform component images, with `QUASAR_PLATFORM_REGISTRY` added to it automatically. **A registry that serves blobs by redirect needs its blob host on this list too:** reading an image's labels fetches a config blob, and GHCR answers that with a `307` to `pkg-containers.githubusercontent.com`, which is followed only if allowed. `ghcr.io` implies that host automatically; any other redirecting registry must have its blob host added here by hand, or edge detection fails with a refused redirect. |
 | `QUASAR_LIBRARY_PROVIDERS` | `steam` | Comma-separated allowlist of `library_provider` names the P5 auto-ensure may install on a discovery enable. The local trust boundary on catalog-declared providers: a catalog image marking itself a provider outside this list is never auto-installed. Passed through the base compose file. |
@@ -1562,8 +1562,9 @@ dialog says so and creates nothing. A tag in either fails startup: the seed refu
 
 Both paths also carry the control plane's own release trust, `QUASAR_UPDATER_ALLOWED_NAMESPACES`
 and `QUASAR_PLATFORM_INSECURE_REGISTRIES` when set, into the seed's inputs of the same names,
-so the new machine records the trust its control plane checks a developer apply against. Unset,
-the seed keeps its defaults. A value with a quote or a control character fails startup.
+so the new machine records the trust its control plane checks a developer apply against: it
+admits the same namespaces, and pulls over plain HTTP from the same registries. Unset, the
+seed keeps its defaults. A value with a quote or a control character fails startup.
 
 The command is
 
@@ -1856,10 +1857,17 @@ node agent ends that host's sessions, so a change that does needs `--yes`. A cha
 container renders (the signature mode, say) is only recorded. This release re-creates only
 the node agent this way, so it is for GPU hosts: a change that moves the control plane's
 container (anything the control plane renders, including the home root or trust on a combined
-host, and every control-plane-only variable) is refused until control-plane replacement exists
-(RH06-11, #363). `reconfigure.json` records a reconfigure in flight; one that cannot be read is
-never overwritten: reconfigure is refused, and the actor's next start sets it aside as
-`reconfigure.json.unreadable` (`token="reconfigure-record-set-aside"`).
+host, and every control-plane-only variable) is refused: control-plane replacement (RH06-11,
+#363) serves updates, and a reconfigure does not drive it yet. `reconfigure.json` records a
+reconfigure in flight; one that cannot be read is never overwritten: reconfigure is refused,
+and the actor's next start sets it aside as `reconfigure.json.unreadable`
+(`token="reconfigure-record-set-aside"`). Machine state then keeps that reconfigure's **new**
+inputs, which the node agent runs only if its replacement succeeded, and the actor logs a
+node agent whose container differs from what it would render. Compare the agent's container
+(`docker inspect quasar-node-agent`) with machine state. A reconfigure changes only values
+that differ from machine state, so to keep the old values reconfigure to them; to keep the new
+ones, reconfigure to the old values and then to the new. Delete
+`reconfigure.json.unreadable` once you are done with it.
 
 ---
 

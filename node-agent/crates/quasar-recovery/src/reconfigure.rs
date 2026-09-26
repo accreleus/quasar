@@ -16,8 +16,8 @@
 //! never holds inputs a running service was not verified with.
 //!
 //! What this build replaces for a reconfigure is the node agent. A change that moves the
-//! control plane's container is refused, naming the slice that brings control-plane
-//! replacement (RH06-11, #363); Postgres is never replaced (#352 R1).
+//! control plane's container is refused: control-plane replacement (RH06-11, #363) serves
+//! updates, and a reconfigure does not drive it yet. Postgres is never replaced (#352 R1).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -246,7 +246,7 @@ fn assign_all(
 fn not_replaceable(role: Role) -> Option<&'static str> {
     match role {
         Role::NodeAgent => None,
-        Role::ControlPlane => Some("re-create the control plane, and replacing the control plane arrives with RH06-11 (#363)"),
+        Role::ControlPlane => Some("re-create the control plane, and a reconfigure does not use control-plane replacement (#363) yet"),
         Role::Postgres => Some("re-create Quasar's Postgres, which is created once and never replaced (#352 R1)"),
         Role::RecoveryActor => Some("re-create the recovery actor itself, which a reconfigure does not do"),
     }

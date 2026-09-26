@@ -796,3 +796,49 @@ describe("preflight on the targets card (#187)", () => {
     expect(await screen.findByTestId("preflight-h1")).toHaveTextContent("not evaluated");
   });
 });
+
+describe("Releases on an owned control plane (#363)", () => {
+  function ownedView(migrates: boolean): PlatformReleaseView {
+    const v = eligibleHostView({ available: [release({ migrates, schema_version: migrates ? 75 : 74 })] });
+    Object.assign(v.installed.control_plane, {
+      install_mode: "owned",
+      machine_role: "combined",
+      machine_node_name: "gpu-host-01",
+    });
+    v.installed.hosts[0].install_mode = "owned";
+    return v;
+  }
+
+  it("says every machine's recovery actor moves first, and that sessions ride a non-migrating update", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView(false));
+    renderTab();
+    expect(await screen.findByText(/Each machine’s recovery actor is updated before its other services/)).toBeInTheDocument();
+    expect(screen.getByText(/live sessions keep streaming while the control plane restarts/)).toBeInTheDocument();
+    expect(screen.queryByText("Changes the database")).not.toBeInTheDocument();
+  });
+
+  it("names a migrating release, which an owned control plane cannot take yet", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView(true));
+    renderTab();
+    expect(await screen.findByText("Changes the database")).toBeInTheDocument();
+    expect(screen.getByText(/never applied unattended/)).toBeInTheDocument();
+    expect(screen.getByText(/not available in this version yet/)).toBeInTheDocument();
+  });
+
+  it("keeps the per-host detail to three columns, so Revert stays inside the rail", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ownedView(false));
+    renderTab();
+    await screen.findByText("Per-host detail");
+    openPerHostDetail();
+    const heads = screen.getAllByRole("columnheader").map((th) => th.textContent);
+    expect(heads).toEqual(["Target", "State", ""]);
+  });
+
+  it("counts the agents on the control plane's version under the host total", async () => {
+    const v = ownedView(false);
+    v.installed.hosts.push({ ...v.installed.hosts[0], host_id: "h2", node_name: "gpu-host-02", agent_version: "0.0.9" });
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+    expect(await screen.findByText("1 on v0.1.0 · 1 older")).toBeInTheDocument();
+  });
+});

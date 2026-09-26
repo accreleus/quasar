@@ -52,7 +52,8 @@ func cpComponent() ComponentDigest {
 	return ComponentDigest{Name: ComponentControlPlane, Image: "registry.example.invalid/dev/quasar-control-plane", Digest: devAgentDigest}
 }
 
-func TestDeveloperApplyToTheControlPlaneOnAnOwnedMachine(t *testing.T) {
+// The accepted cases are developer_apply_control_db_test.go's.
+func TestDeveloperApplyToTheControlPlaneNeedsAnAnsweringActor(t *testing.T) {
 	body := map[string]any{"target": "control_plane", "components": []ComponentDigest{cpComponent()}}
 
 	// A recovery actor that did not answer reads null: the safe refusal.
@@ -60,13 +61,7 @@ func TestDeveloperApplyToTheControlPlaneOnAnOwnedMachine(t *testing.T) {
 	if code, out := silent.post(t, devURL, silent.adminToken, body); code != http.StatusConflict || errCode(t, out) != CodeTargetNotOwned {
 		t.Errorf("silent actor = %d %s, want 409 target_not_owned", code, out)
 	}
-
-	h := newOwnMachineDevHarness(t, ownedMachine(actorsocket.RoleControlOnly, "attic-server"))
-	code, out := h.post(t, devURL, h.adminToken, body)
-	if code != http.StatusNotImplemented || errCode(t, out) != CodeApplyUnsupported {
-		t.Fatalf("owned control plane = %d %s, want 501 apply_unsupported", code, out)
-	}
-	if h.images.count() != 0 || h.agent.sentCount() != 0 {
+	if silent.images.count() != 0 || silent.agent.sentCount() != 0 {
 		t.Fatal("a refused control-plane request read the registry or sent a command")
 	}
 }

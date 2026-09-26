@@ -44,6 +44,15 @@ own; the two do not move together, and that is deliberate.
   Dockge/Arcane stack pass `QUASAR_UPDATER_ALLOWED_NAMESPACES` and
   `QUASAR_PLATFORM_INSECURE_REGISTRIES` to the seed, so a host added from a control plane
   admits the developer applies that control plane accepts.
+- **An owned control plane is updated by its recovery actor (#363).** On a combined or
+  control-only install the fleet run's control-plane step, and a developer apply to the
+  control plane, go over the machine's control socket: the recovery actor moves itself first
+  when it is behind, then keeps the old control plane stopped until the new one passes its
+  health check, and puts it back automatically when it never does. Live sessions keep
+  streaming through it, and the booted control plane counts as the evidence only once the
+  actor has verified it. A release that migrates the database is refused before anything
+  moves until the pre-update dump arrives (#364). A session ended by an agent restart now
+  says so, and Fleet ▸ Releases keeps its per-host detail inside the rail.
 - **The recovery actor replaces itself (#362).** An apply naming `recovery-actor` hands the
   machine to a successor: it starts beside the running actor, takes the machine's lease only
   when it is handed over, keeps the old actor stopped and disabled until it has verified

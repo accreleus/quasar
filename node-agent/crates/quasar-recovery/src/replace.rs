@@ -1,4 +1,5 @@
-//! One Replacement (architecture §5.5): the node agent's, driven from the journal.
+//! One Replacement (architecture §5.5): the node agent's or the control plane's, driven
+//! from the journal. The recovery actor's own is a hand-over (`crate::handover`).
 //!
 //! ```text
 //! admitted → pulling → checked → old_kept → created → started → verifying → verified
@@ -12,8 +13,10 @@
 //! policy disabled so an engine or machine restart cannot bring it back, renamed
 //! `<name>.kept` — until the new one is verified; restoring it is renaming it back and
 //! starting it, with no pull (ADR 0004 and its RH06 amendment: a node agent that fails
-//! verification is always restored). Nothing is retried as a new attempt: an engine call
-//! that fails transiently is asked again inside its step, and that is all.
+//! verification is always restored, and so is a control plane that never passed a health
+//! check, which submit admits only for a release that does not migrate). Nothing is
+//! retried as a new attempt: an engine call that fails transiently is asked again inside
+//! its step, and that is all.
 
 use std::time::{Duration, Instant};
 
@@ -436,11 +439,11 @@ impl Actor {
             Err(e) => return Err(fail(Reason::RecreateFailed, format!("machine state: {e}"))),
         };
         let secrets = match role {
-            Role::NodeAgent => self
-                .node_agent_secrets()
-                .map_err(|e| fail(Reason::RecreateFailed, format!("machine state: {e}")))?,
-            _ => Default::default(),
-        };
+            Role::NodeAgent => self.node_agent_secrets(),
+            Role::ControlPlane => self.control_plane_secrets(),
+            _ => Ok(Default::default()),
+        }
+        .map_err(|e| fail(Reason::RecreateFailed, format!("machine state: {e}")))?;
         let mut spec = recipe::render(role, revision, &machine.inputs, &image, &secrets).map_err(
             |e| match e {
                 RenderError::Unsupported { .. } => fail(Reason::RecipeUnsupported, e.to_string()),
@@ -635,8 +638,11 @@ impl Actor {
     }
 
     /// `verifying`: running and healthy (or running, twice, with no healthcheck) within
-    /// the wait timeout. A container the engine reports `unhealthy` fails at once.
+    /// the wait timeout. A container the engine reports `unhealthy` fails at once. A
+    /// control plane must pass its own healthcheck (`/health`, which reaches the database):
+    /// one with none never passed a health check (ADR 0004 amendment), so it is restored.
     fn verify(&self, j: &Journal, i: usize) -> Result<(), Halt> {
+        let needs_health = self.role(j, i) == Role::ControlPlane;
         let timing = self.config.timing;
         let timeout = match j.request.wait_timeout_s {
             n if n > 0 => Duration::from_secs(n.min(3600) as u64),
@@ -661,7 +667,7 @@ impl Actor {
                     );
                     match (c.running, c.health.as_deref()) {
                         (true, Some("healthy")) => return Ok(()),
-                        (true, None) => {
+                        (true, None) if !needs_health => {
                             steady += 1;
                             if steady >= 2 {
                                 return Ok(());

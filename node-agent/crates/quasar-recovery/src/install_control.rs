@@ -160,6 +160,7 @@ impl Actor {
         Ok(())
     }
 
+    /// The control plane's secret files, as its install and every replacement render them.
     pub(crate) fn control_plane_secrets(&self) -> Result<SecretMounts, ResumeError> {
         let mut files = std::collections::BTreeSet::new();
         for name in [

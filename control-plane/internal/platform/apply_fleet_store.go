@@ -284,6 +284,8 @@ func (s *Store) RequestCancel(ctx context.Context, runID string) (ApplyRun, erro
 // host_id is always NULL; the zero uuid in the single-flight index is what
 // makes two open control-plane attempts impossible.
 type NewControlPlaneAttempt struct {
+	// Kind is KindApply when empty; a developer apply names no release.
+	Kind      string
 	RunID     *string
 	ReleaseID *string
 	Requested []ComponentDigest
@@ -301,14 +303,18 @@ func (s *Store) CreateControlPlaneAttempt(ctx context.Context, in NewControlPlan
 	if err != nil {
 		return Attempt{}, fmt.Errorf("encode previous_digests: %w", err)
 	}
+	kind := in.Kind
+	if kind == "" {
+		kind = KindApply
+	}
 	var id string
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO platform_apply_attempts
 		    (run_id, kind, target, release_id, requested_digests, previous_digests,
 		     state, requested_by)
-		VALUES ($1::uuid, 'apply', 'control_plane', $2::uuid, $3::jsonb, $4::jsonb, 'queued', $5::uuid)
+		VALUES ($1::uuid, $6, 'control_plane', $2::uuid, $3::jsonb, $4::jsonb, 'queued', $5::uuid)
 		RETURNING id::text
-	`, in.RunID, in.ReleaseID, requested, previous, in.Actor).Scan(&id)
+	`, in.RunID, in.ReleaseID, requested, previous, in.Actor, kind).Scan(&id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
