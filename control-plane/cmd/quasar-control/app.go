@@ -91,6 +91,7 @@ type Services struct {
 	platformNotify *platform.NotifyHandler
 	applyRunner    *platform.Runner
 	fleetRunner    *platform.FleetRunner
+	selfDeveloper  *platform.SelfDeveloperRunner
 	auditHandler   *audit.Handler
 	artworkHandler *artwork.Handler
 	secretsHandler *secrets.Handler
@@ -1067,8 +1068,21 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imageResolver := platform.NewImageResolver(platformRegistryResolver, edgeApply, 0)
 	// The control plane applies ITSELF over the updater socket beside it, never
 	// over an agent connection (agent-api.md §release_apply).
-	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
-	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
+	// On an owned install the recovery actor beside it over the control socket
+	// instead (#363); the Compose updater keeps serving every other install.
+	var selfExecutor platform.UpdaterAPI = platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
+	if cfg.RecoveryControlSocket != "" {
+		selfExecutor = platform.NewActorClient(cfg.RecoveryControlSocket)
+	}
+	// Two facts say "owned": the socket picks the executor, the machine shape
+	// the fleet run's owned rules. The recovery actor's recipe sets both; one
+	// without the other is a hand-edited configuration.
+	if owned, shaped := cfg.RecoveryControlSocket != "", applyMachineShape(cfg).Role != ""; owned != shaped {
+		log.Warn("owned-install configuration is half set: the control socket and the machine shape disagree",
+			"token", "owned-install-config-mismatch", "control_socket_set", owned, "machine_shape_set", shaped)
+	}
+	selfApplier := platform.NewSelfApplier(platformStore, selfExecutor, log)
+	selfApplier.DeveloperCommit = developerImages.Commit
 	// The control plane's own machine on an owned install; nil otherwise, and
 	// then nothing below reads a socket.
 	ownMachine := platform.NewOwnMachineReader(cfg.RecoveryControlSocket)
@@ -1088,6 +1102,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		ownMachine.Log = log
 		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts
 		pDeps.ControlPlaneMachine = ownMachine.Identity
+		pDeps.ControlPlaneInstallMode = ownMachine.InstallMode
 	}
 	pDeps.MachineShape = machineShape(cfg)
 	pDeps.ImageFor = imageResolver.Check
@@ -1137,8 +1152,14 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		WithEdgeResolver(edgeApply).
 		WithFleet(fleetRunner).
 		WithDeveloperApply(developerImages, developerNamespaces)
+	// A developer apply to this control plane is a standalone control-plane
+	// attempt; it holds every host's admission for its duration (#363).
+	selfDeveloper := platform.NewSelfDeveloperRunner(platformStore, selfApplier, fleetCordons,
+		developerImages.Commit, log)
+	platformApply.WithSelfDeveloper(selfDeveloper)
 	if ownMachine != nil {
 		platformApply.WithOwnMachine(ownMachine)
+		fleetRunner.WithOwnMachine(ownMachine)
 	}
 	platformApply.WithMachineShape(applyMachineShape(cfg))
 	// Closed after construction: the view reports the active run, and the run's
@@ -1160,7 +1181,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// into scheduling mid-update. Here, nothing is active in the database, no run
 	// has been started by this process, and the API is not serving yet.
 	fleetRunner.ResumeCordonRestores(context.Background())
+	// The three adopters partition the open attempts: applyRunner every host
+	// attempt, fleetRunner a run's control-plane attempt (run_id set), and
+	// selfDeveloper a standalone control-plane attempt (run_id NULL).
 	fleetRunner.Adopt(context.Background())
+	selfDeveloper.Adopt(context.Background())
 
 	// Unattended automatic apply (#122). Constructed here because it needs the
 	// fleet runner's Start and the view that reports the active run — it is a
@@ -1295,6 +1320,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		platformApply:    platformApply,
 		applyRunner:      applyRunner,
 		fleetRunner:      fleetRunner,
+		selfDeveloper:    selfDeveloper,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
 		platformNotify:   platformNotify,
@@ -1386,6 +1412,9 @@ func (s *Services) Stop() {
 	// next boot's Adopt resumes them.
 	if s.fleetRunner != nil {
 		s.fleetRunner.Close()
+	}
+	if s.selfDeveloper != nil {
+		s.selfDeveloper.Close()
 	}
 	if s.applyRunner != nil {
 		s.applyRunner.Close()

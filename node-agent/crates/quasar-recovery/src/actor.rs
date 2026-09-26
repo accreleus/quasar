@@ -645,6 +645,34 @@ impl Actor {
         status
     }
 
+    /// [`Actor::status_for`] as one socket serves it: `result` only ever names an attempt
+    /// that socket's caller submitted, so the agent socket never reads the control plane's
+    /// attempts, nor the control socket the agent's. `in_flight` stays machine-wide: it is
+    /// what makes a second submit `busy`, whoever sent the first.
+    pub fn status_as(&self, caller: crate::trust::Caller, request_id: Option<&str>) -> Status {
+        let mut status = self.inventory_status();
+        let scan = self.journals.scan();
+        status.in_flight = scan.open_id();
+        let mine = crate::submit::caller_tag(caller);
+        status.result = match request_id {
+            Some(id) if crate::submit::is_uuid(id) => self
+                .journals
+                .load(id)
+                .ok()
+                .flatten()
+                .filter(|j| j.caller == mine)
+                .map(|j| j.result),
+            Some(_) => None,
+            None => scan
+                .journals
+                .into_iter()
+                .rev()
+                .find(|j| j.caller == mine)
+                .map(|j| j.result),
+        };
+        status
+    }
+
     fn attempt_result(&self, request_id: Option<&str>) -> Option<AttemptResult> {
         match request_id {
             Some(id) if crate::submit::is_uuid(id) => {

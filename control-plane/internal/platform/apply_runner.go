@@ -28,7 +28,9 @@ const (
 	DefaultAckTimeout = 10 * time.Second
 	// The overall apply deadline. Generous: a cold pull of a platform image on
 	// a slow link legitimately takes minutes, and this exists so a run can
-	// never wedge forever on one target.
+	// never wedge forever on one target. On an owned control plane it bounds
+	// only a silent recovery actor: one still answering is waited for, and its
+	// 300 s verify default (ActorRequest sends no wait_timeout_s) is the budget.
 	DefaultApplyDeadline = 15 * time.Minute
 	// How often the drain is re-counted, and how often a sent attempt is
 	// re-read for a terminal state written by the relay.

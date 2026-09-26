@@ -144,6 +144,10 @@ type admitCase struct {
 	// counterpart in this package (architecture §5.2, the confused-deputy
 	// guard the agent enforces today at node-agent/src/release/mod.rs).
 	agentExpect *admitDecision
+	// controlExpect is the port's answer for a control-plane-caller vector where it
+	// differs from Go's: the control socket names the recovery actor together with
+	// the control plane (amendment 14, ADR 0008 rule A); the updater never does.
+	controlExpect *admitDecision
 }
 
 // actorAdmitted and actorRefused are the recovery actor's answer where it accepts a
@@ -353,6 +357,22 @@ func admitCases(t *testing.T) []admitCase {
 		{name: "a signed release that does not name the recovery actor refuses it", source: "added: ADR 0003 binding; a format-1 manifest carries no recovery-actor",
 			agent: true, cfg: keyed(SignatureModeVerify), evidence: signedEv, req: with(signedReq, comps(ra(actorImg, testActorDigest), na(testAgentImage, testAgentDigest))), want: ReasonInvalid,
 			agentExpect: actorRefused(ReasonSignatureInvalid, `the signed release manifest (key release-2026) does not describe this request: component "recovery-actor" is not in the manifest`)},
+
+		// ── the control socket moving the actor first (Rust-only, #363): the control
+		//    plane's machine replaces [recovery-actor, control-plane] (ADR 0008 rule A),
+		//    the actor held to every rule the control plane's image is held to. Alone, the
+		//    actor stays unknown here, as in Go. ──
+		{name: "the control socket may name the recovery actor with the control plane", source: "added: control-api.md amendment 14 (the control-plane target names recovery-actor first)",
+			cfg: tvOff(), req: with(agentReq(), comps(ra(actorImg, goodDigest), cp(controlImg, goodDigest))), want: ReasonInvalid, controlExpect: actorAdmitted()},
+		{name: "the control socket names the recovery actor only with the control plane", source: "added: A1 (the actor leads the control plane only while its replacement is in flight)",
+			cfg: tvOff(), req: with(agentReq(), comps(ra(actorImg, goodDigest))), want: ReasonInvalid},
+		{name: "the control plane's recovery actor is held to the allowlist", source: "added: amendment 14 (the actor's image is subject to the same namespace rules)",
+			cfg: tvOff(), req: with(agentReq(), comps(ra("ghcr.io/someone-else/quasar/quasar-recovery", goodDigest), cp(controlImg, goodDigest))), want: ReasonInvalid,
+			controlExpect: actorRefused(ReasonNamespaceRejected, `component "recovery-actor": image "ghcr.io/someone-else/quasar/quasar-recovery" is outside this host's platform-image namespaces (ghcr.io/accreleus/quasar)`)},
+		{name: "a signed release binds the control plane's recovery actor", source: "added: ADR 0003 binding covers every component a request names",
+			cfg: keyed(SignatureModeRequire), req: with(signedReq, comps(ra(actorImg, testActorDigest), cp(testControlImage, testControlDigest))), want: ReasonInvalid,
+			evidence:      signedManifest(`{"version":"0.3.0","components":[{"name":"control-plane","image":"` + testControlImage + `","digest":"` + testControlDigest + `"},{"name":"recovery-actor","image":"` + actorImg + `","digest":"` + testActorDigest + `"}]}`),
+			controlExpect: actorAdmitted()},
 
 		// ── signature.go checkSignature, lifted from signature_test.go ──
 		{name: "off ignores unverifiable evidence and no keys", source: tvSig + "TestCheckSignatureOffIgnoresEverything",
@@ -859,6 +879,12 @@ func generateTrustVectors(t *testing.T) map[string][]byte {
 				e.Fetched = got.Fetched
 				v.Expect = e
 			}
+		} else if c.controlExpect != nil {
+			goAnswer := got
+			v.ExpectWithoutCallerGuard = &goAnswer
+			e := *c.controlExpect
+			e.Fetched = got.Fetched
+			v.Expect = e
 		} else {
 			v.Expect = got
 		}

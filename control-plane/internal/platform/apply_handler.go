@@ -59,6 +59,8 @@ type ApplyHandler struct {
 	ownMachine OwnMachineSource
 	// machineShape is this control plane's own machine shape, from its configuration.
 	machineShape MachineShape
+	// Drives a developer apply to this control plane (developer_apply_control.go).
+	selfDev controlPlaneDeveloper
 }
 
 // logger is the sliver of *slog.Logger this file uses.
