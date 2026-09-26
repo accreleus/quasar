@@ -433,6 +433,16 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The one-line Add host command, after its first live run (#359).** A spent-token reset
+  also removes the unlabelled `quasar-recovery-agent` volume unless a container still mounts
+  it, and then says what it left instead of "nothing was left". `--fix-only` prepares a host
+  for the Dockge / Arcane stack without an enrollment string (a dry run still applies no fix).
+  `curl … | sh -s -- --help` prints the help. The agent's own messages say Add host, and the
+  seed's documented time to unhealthy is corrected to about two minutes.
+- **A combined or control-only machine's recovery actor no longer holds every start on an
+  unhealthy dependency (#361).** It waits for Postgres, then the control plane, only before
+  creating what needs them, so a restart of an installed machine answers release requests at
+  once instead of refusing them as busy for up to six minutes.
 - **The documentation site no longer states facts that stopped being true.** A control-plane
   update without a migration does not end sessions, and a fleet run with no control-plane step
   cordons each host only when it reaches it; a host whose new agent never came up is

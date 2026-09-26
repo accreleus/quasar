@@ -3,7 +3,7 @@
 //! operator's wording is tested rather than read off a live machine.
 
 use crate::machine::Machine;
-use crate::recipe::{names, DatabaseInputs};
+use crate::recipe::{DatabaseInputs, Role};
 use crate::socket::{MachineRole, Service, Status};
 
 fn service<'a>(status: &'a Status, role: &str) -> Option<&'a Service> {
@@ -43,20 +43,21 @@ pub fn explain(status: &Status, machine: Option<&Machine>) -> Vec<String> {
     let mut expected = Vec::new();
     if machine.role != MachineRole::Gpu {
         if external.is_none() {
-            expected.push(("postgres", names::POSTGRES));
+            expected.push(Role::Postgres);
         }
-        expected.push(("control-plane", names::CONTROL_PLANE));
+        expected.push(Role::ControlPlane);
     }
     if machine.role != MachineRole::ControlOnly {
-        expected.push(("node-agent", names::NODE_AGENT));
+        expected.push(Role::NodeAgent);
     }
-    for (role, container) in expected {
-        match service(status, role) {
+    for role in expected {
+        let container = role.container_name();
+        match service(status, role.as_str()) {
             None => out.push(format!(
                 "{container} is not on this machine: `docker restart quasar-recovery` creates it"
             )),
             Some(s) if healthy(s) => {}
-            Some(s) if role == "control-plane" && external.is_some() => out.push(format!(
+            Some(s) if role == Role::ControlPlane && external.is_some() => out.push(format!(
                 "{container} is {}. Its database is your own, at {}: check that it is up and reachable from this machine; `docker logs {container}` says why",
                 state(s),
                 external.as_deref().unwrap_or_default()

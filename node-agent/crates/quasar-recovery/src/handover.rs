@@ -718,11 +718,14 @@ impl Actor {
             if self.killed() {
                 return Err(Halt::Died);
             }
-            let silent = self.socket_plan().into_iter().find_map(|p| {
-                crate::server::probe_self(&p.path)
-                    .err()
-                    .map(|e| format!("its socket {} did not answer ({e})", p.path.display()))
-            });
+            let silent = match self.socket_plan() {
+                Ok(plan) => plan.into_iter().find_map(|p| {
+                    crate::server::probe_self(&p.path)
+                        .err()
+                        .map(|e| format!("its socket {} did not answer ({e})", p.path.display()))
+                }),
+                Err(e) => Some(format!("its sockets are unknown ({e})")),
+            };
             let running = match self.engine.inspect_container(&me) {
                 Ok(Some(c)) => c.running,
                 Err(EngineError::Crashed) => return Err(Halt::Died),

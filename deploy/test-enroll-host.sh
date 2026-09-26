@@ -83,6 +83,9 @@ installed_machine() { # installed_machine <agent log>
   printf '%s\n' "$1" > "$state/c/quasar-node-agent/logs"
   volume quasar-machine
   volume quasar-agent-data io.quasar.installation=inst-0
+  volume quasar-recovery-agent
+  echo quasar-recovery-agent > "$state/c/quasar-recovery/volumes"
+  echo quasar-recovery-agent > "$state/c/quasar-node-agent/volumes"
 }
 
 mkdir -p "$tmp/bin"
@@ -112,7 +115,10 @@ case "$cmd" in
       [ -d "$d" ] || continue
       keep=1
       for f in ${filters[@]+"${filters[@]}"}; do
-        case "$f" in label=*) has_label "$d" "${f#label=}" || keep=0 ;; esac
+        case "$f" in
+          label=*) has_label "$d" "${f#label=}" || keep=0 ;;
+          volume=*) grep -qxF "${f#volume=}" "$d/volumes" 2>/dev/null || keep=0 ;;
+        esac
       done
       [ "$keep" = 1 ] || continue
       out="${fmt//\{\{.Names\}\}/${d##*/}}"
@@ -156,12 +162,16 @@ case "$cmd" in
     # The seed at work: it creates the recovery actor, which creates the agent.
     if [ "${MOCK_SEED_CREATES:-1}" = 1 ]; then
       mk quasar-recovery running "/usr/local/bin/quasar-recovery actor" io.quasar.installation=inst-1 io.quasar.platform-service=recovery-actor
+      echo quasar-recovery-agent > "$S/c/quasar-recovery/volumes"
+      # The actor profile's socket volume: created by the engine, so unlabelled.
+      mkdir -p "$S/v/quasar-recovery-agent"; : > "$S/v/quasar-recovery-agent/labels"
       printf '%s\n' "${MOCK_ACTOR_LOG:-}" > "$S/c/quasar-recovery/logs"
       if [ -z "${MOCK_ACTOR_LOG:-}" ]; then
         mk quasar-node-agent running "/usr/local/bin/quasar-node-agent-entrypoint" io.quasar.installation=inst-1 io.quasar.platform-service=node-agent
+        echo quasar-recovery-agent > "$S/c/quasar-node-agent/volumes"
         printf '%s\n' "${MOCK_AGENT_LOG:-}" > "$S/c/quasar-node-agent/logs"
       fi
-      for v in quasar-agent-data quasar-recovery-agent quasar-node-agent-secrets; do
+      for v in quasar-agent-data quasar-node-agent-secrets; do
         mkdir -p "$S/v/$v"; echo io.quasar.installation=inst-1 > "$S/v/$v/labels"
       done
     fi
@@ -482,9 +492,10 @@ else
 fi
 run_installer reset "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
 if [ "$RC" -eq 0 ] && grep -q '^rm -f quasar-seed' <<<"$DOCKER_LOG" && grep -q '^volume rm quasar-agent-data' <<<"$DOCKER_LOG" \
-   && grep -q '^volume rm quasar-machine' <<<"$DOCKER_LOG" && started && grep -q 'enrolled' <<<"$OUT" \
+   && grep -q '^volume rm quasar-machine' <<<"$DOCKER_LOG" && grep -q '^volume rm quasar-recovery-agent' <<<"$DOCKER_LOG" \
+   && started && grep -q 'enrolled' <<<"$OUT" && ! grep -q 'left in place' <<<"$OUT" \
    && [ "$(grep -n '^rm -f quasar-node-agent' <<<"$DOCKER_LOG" | cut -d: -f1)" -lt "$(grep -n '^volume rm quasar-agent-data' <<<"$DOCKER_LOG" | cut -d: -f1)" ]; then
-  pass "QUASAR_RESET_IDENTITY=1: seed, actor and agent removed before their volumes, then a fresh install"
+  pass "QUASAR_RESET_IDENTITY=1: seed, actor and agent removed before their volumes (the unlabelled socket volume too), then a fresh install"
 else
   fail "reset identity" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
 fi
@@ -511,6 +522,27 @@ if [ "$RC" -eq 1 ] && grep -q "dockge-quasar-seed-1" <<<"$OUT" && nothing_starte
   pass "reset with a stack-manager seed on the machine: refused before anything is removed (that seed would re-create the actor)"
 else
   fail "reset manager seed" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+
+installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
+container debug-shell running "/bin/sh"
+echo quasar-recovery-agent > "$state/c/debug-shell/volumes"
+run_installer reset-socket-in-use "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1
+if [ "$RC" -eq 0 ] && grep -q 'left in place: the volume quasar-recovery-agent, which debug-shell still mounts' <<<"$OUT" \
+   && ! grep -q '^volume rm quasar-recovery-agent' <<<"$DOCKER_LOG" && [ -d "$state/c/debug-shell" ]; then
+  pass "reset: the socket volume another container still mounts is kept, and the run says so"
+else
+  fail "reset socket in use" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(grep -i left <<<"$OUT")"
+fi
+
+reset_engine
+volume quasar-recovery-agent
+run_installer orphan-socket "${OK_ENV[@]}" MOCK_AGENT_LOG='ERROR control plane rejected register: auth_failed: authentication failed'
+if [ "$RC" -eq 1 ] && ! grep -q 'Nothing was left' <<<"$OUT" && ! grep -qE '^(rm|volume rm) ' <<<"$DOCKER_LOG" \
+   && [ -d "$state/v/quasar-recovery-agent" ]; then
+  pass "a socket volume from before the run: not this run's to remove on a refused string"
+else
+  fail "orphan socket" "rc=$RC docker=[$(grep -E '^(rm|volume rm)' <<<"$DOCKER_LOG")] out=$(tail -2 <<<"$OUT")"
 fi
 
 # Any trace of an installation already here: a refused string must not remove it.
@@ -602,6 +634,29 @@ else
 fi
 
 reset_engine
+mk_root "$tmp/root"; printf '1\n' > "$tmp/root/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+FIX=1 run_installer dry-with-fix "${OK_ENV[@]}" QUASAR_ENROLL_DRY_RUN=1
+if [ "$RC" -eq 0 ] && grep -q 'Fix: sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' <<<"$OUT" && [ -z "$FIX_LOG" ] && nothing_started; then
+  pass "dry run with a failing check: prints the fix and applies nothing, even with QUASAR_ENROLL_FIX=1"
+else
+  fail "dry run fix" "rc=$RC fix=[$FIX_LOG] out=$(tail -4 <<<"$OUT")"
+fi
+reset_engine
+EXTRA_ARGS="-s -- --fix-only" run_installer fix-only
+if [ "$RC" -eq 0 ] && grep -q 'sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' <<<"$FIX_LOG" \
+   && [ "$(cat "$tmp/root/proc/sys/kernel/apparmor_restrict_unprivileged_userns")" = 0 ] \
+   && grep -q 'host prepared' <<<"$OUT" && nothing_started && ! grep -q '^pull' <<<"$DOCKER_LOG"; then
+  pass "--fix-only: no enrollment string needed; the host's fixes are applied, nothing pulled or started"
+else
+  fail "fix only" "rc=$RC fix=[$FIX_LOG] docker=[$DOCKER_LOG] out=$(tail -4 <<<"$OUT")"
+fi
+run_installer fix-only-dry QUASAR_ENROLL_FIX_ONLY=1 QUASAR_ENROLL_DRY_RUN=1
+if [ "$RC" -eq 2 ] && grep -q 'use one' <<<"$OUT" && [ -z "$DOCKER_LOG" ]; then
+  pass "--fix-only with a dry run: refused as contradictory"
+else
+  fail "fix only dry" "rc=$RC out=$(tail -2 <<<"$OUT")"
+fi
+mk_root "$tmp/root"; reset_engine
 run_installer dry "${OK_ENV[@]}" QUASAR_ENROLL_DRY_RUN=1
 if [ "$RC" -eq 0 ] && grep -q 'dry run' <<<"$OUT" && grep -q "seed image:    $SEED_IMG" <<<"$OUT" && nothing_started; then
   pass "dry run: prints the plan, pulls and starts nothing"
@@ -687,6 +742,12 @@ else
 fi
 
 # --help carries what the script documents and stops at its marker.
+piped_help="$(sh -s -- --help < "$script")"
+if grep -q 'QUASAR_ENROLL_FIX_ONLY' <<<"$piped_help" && grep -q -- '--pinnedpubkey' <<<"$piped_help"; then
+  pass "--help prints when the script is piped into sh, as curl | sh -s -- --help does"
+else
+  fail "piped help" "$(head -3 <<<"$piped_help")"
+fi
 help_out="$(sh "$script" --help)"
 if grep -q 'QUASAR_RESET_IDENTITY' <<<"$help_out" && grep -q 'QUASAR_ENROLL_FIX' <<<"$help_out" && grep -q 'QUASAR_TEMPLATE_ROOT' <<<"$help_out" \
    && grep -q -- '--pinnedpubkey' <<<"$help_out" && ! grep -q 'end-of-help' <<<"$help_out" && ! grep -q 'set -eu' <<<"$help_out"; then

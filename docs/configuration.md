@@ -1521,6 +1521,9 @@ logging `token="seed-actor-unstarted"`; `docker start quasar-recovery` finishes 
 image's health check uses it, so a stack manager shows the seed **unhealthy** while it is
 idle on something only the operator can clear (every idle row above except
 `seed-uninstalled`) and while it has stopped looking; the reason is its one log line. The
+image checks every 30 s after a 60 s start period and marks the container unhealthy after
+three failures, so a seed idle from its first look reads unhealthy about two minutes
+(measured 121 s) after it starts. The
 agent image's pull is said once (INFO), then only the WARN above. The console shows the seed's version on the host's "Services
 on this machine" card, `unknown` for a running seed whose version the actor could not read,
 and "not found" when the recovery actor finds no running seed (a stopped seed re-creates
@@ -1568,8 +1571,15 @@ exactly as the `docker run` above (`QUASAR_TEMPLATE_ROOT` always set, beside the
 and waits until the agent has enrolled. It writes no compose file, `.env` or install
 directory. Its own inputs: `QUASAR_HOME_ROOT` (default `/var/lib/quasar/homes`),
 `QUASAR_TEMPLATE_ROOT`, `QUASAR_NODE_NAME`, `QUASAR_SEED_IMAGE` / `QUASAR_AGENT_IMAGE`
-(override the served images), `QUASAR_ENROLL_APPARMOR_PERSIST=1`, `QUASAR_ENROLL_DRY_RUN=1`;
-`sh enroll-host.sh --help` lists them.
+(override the served images), `QUASAR_ENROLL_APPARMOR_PERSIST=1`, `QUASAR_ENROLL_DRY_RUN=1`
+(checks the host and prints the plan and each fix; it applies, pulls and starts nothing, even
+with `QUASAR_ENROLL_FIX=1`); `sh enroll-host.sh --help` lists them, piped or downloaded.
+
+**Preparing a host for the stack.** `… | sh -s -- --fix-only` (or `QUASAR_ENROLL_FIX_ONLY=1`)
+runs the host checks, applies each failed one's fix, loads and persists the AppArmor profile,
+and stops: it needs no enrollment string and pulls and starts nothing. It is the one-line
+command's host preparation for a machine that then takes the Dockge or Arcane stack; with a
+dry run it is refused as contradictory.
 
 - **Run again** on an installed machine (one with a recovery actor), it starts and changes
   nothing and reports the agent. A run interrupted before the recovery actor existed is
@@ -1580,7 +1590,9 @@ directory. Its own inputs: `QUASAR_HOME_ROOT` (default `/var/lib/quasar/homes`),
   installed earlier, the install keeps the string it was installed with, so run the new
   command with `QUASAR_RESET_IDENTITY=1`: it removes this machine's seed, recovery actor, node
   agent and their volumes (the agent's saved identity included, never the homes) first. It
-  refuses on a machine that runs a control plane.
+  refuses on a machine that holds a control plane or Quasar's Postgres, or their volumes. The
+  unlabelled `quasar-recovery-agent` volume goes too unless a container still mounts it; then
+  the run names what it left in place.
 - A machine still running the pre-RH06 Compose-installed agent, or a seed a stack manager
   started, is refused with what to remove first.
 

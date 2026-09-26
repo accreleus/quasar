@@ -5039,7 +5039,7 @@ fn enrollment_reachable(cfg: &Config) -> Result<(), String> {
         _ => Err(format!(
             "no persisted node_secret at {} and neither QUASAR_ENROLLMENT nor ENROLLMENT_TOKEN \
              is set: this agent can never register as-is. Paste the enrollment string from \
-             Admin -> Fleet -> Enroll host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
+             Admin -> Fleet -> Add host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
              docs/configuration.md#enrollment_token), then restart the container.",
             cfg.node_secret_path
         )),
@@ -5218,7 +5218,7 @@ fn stale_identity_message(node_secret_path: &str, kind: StaleIdentity) -> String
         StaleIdentity::Unresolvable => format!(
             "{cause}, and no enrollment token is configured — every reconnect will be refused the \
              same way. Clear the saved identity and enroll again: the command from \
-             Admin -> Fleet -> Enroll host does the clearing with QUASAR_RESET_IDENTITY=1, or \
+             Admin -> Fleet -> Add host does the clearing with QUASAR_RESET_IDENTITY=1, or \
              stop this agent and delete {node_secret_path} yourself (in a container install that \
              file is inside the agent's data volume, so removing that volume is the same thing)."
         ),
