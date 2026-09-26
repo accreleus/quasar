@@ -31,15 +31,57 @@ production.
 ```
 site/
   astro.config.mjs          site + base URL, sidebar, theme, expressive-code
+  scripts/
+    compose-template.mjs    snapshots deploy/docker-compose*.yml for the quick start
   src/
     content/docs/           every documentation page, as .mdx
     components/
       Landing.astro         the landing page, sections and its own CSS
+      ArchDiagram.astro     the architecture diagram on "How it works"
+      QuickStart.astro      the quick-start install generator
       Placeholder.astro     the screenshot placeholder panel
       Shot.astro            figure wrapper used in docs pages
+    data/
+      stack-template.js     what the quick start generates: files and script
+      stack-template.test.js  its tests (npm test)
+      platforms.js          per-platform host preparation for the script
+      proxy-configs.js      the reverse-proxy snippets
+      write-fixtures.mjs    writes every generated script out for shellcheck
+      compose-template.generated.js  the snapshot; never edit by hand
+    route-data.ts           corrects the titles starlight-openapi generates
     styles/theme.css        Starlight variable overrides, product tokens
-    assets/quasar-mark.svg  the brand mark
+    assets/                 the brand mark and the screenshots
   SCREENSHOTS.md            checklist of screenshots still to capture
+```
+
+`npm run build` and `npm test` both refuse a stale snapshot. After a change to
+`deploy/docker-compose.yml` or `deploy/docker-compose.nvidia.yml`, run
+`npm run compose:sync` and commit the regenerated file with it.
+
+## Before publishing
+
+The pages describing Quasar-owned installs (RH-06: the seed, the recovery actor,
+Move an existing install) are drafts. They describe work that ships only with
+the **first release that ships Quasar-owned installs**, and parts of them depend
+on tickets still open. So:
+
+- **Do not publish the RH-06 drafts before that release.** They go live in the
+  same step as the release: merged to `main` with it, then published with the
+  `pages` workflow. Until then the published site must keep describing today's
+  supported install, the Compose stack, correctly.
+- **The Quick Start generator must be rewritten first.** `QuickStart.astro`,
+  `src/data/stack-template.js` and `scripts/compose-template.mjs` still write the
+  four-service Compose stack. Around the seed, they need #361, #359 and #365.
+- **Every unfinished part carries a hidden marker**, an MDX comment such as
+  `{/* TODO(#361): … */}`, or `TODO(open, …)` for a question no ticket owns yet.
+  They render nothing, so the build cannot tell a draft from a finished page.
+
+The `pages` workflow enforces this: its first step fails, listing every marker,
+while any `TODO(#` or `TODO(open` remains under `src/content` or `src/components`.
+The CI build does not check, so drafts can land on branches. To see what is left:
+
+```bash
+grep -rnE 'TODO\((#|open)' site/src/content site/src/components
 ```
 
 ## Deployment
@@ -77,10 +119,10 @@ under Maintenance below.
 **Every command a reader might run goes in a fenced code block**, tagged `bash`,
 one command per block where they are meant to be run separately.
 
-**Do not document what has not shipped.** Several design specs under
-`docs/design/plans/` describe work that is proposed rather than built. Where this
-site describes something as not yet available, that is deliberate and was checked
-against the code.
+**Do not document what has not shipped.** Design records and open tickets
+describe work that is proposed rather than built, and a merge into `develop` is
+not a release. Where this site describes something as not yet available, that is
+deliberate and was checked against the code.
 
 **Say the limit in the same breath as the feature.** The audience is
 self-hosters who will find the limit themselves within an hour. Saying it up
@@ -92,8 +134,8 @@ front is what makes the rest credible.
 ## Design
 
 The site uses the product's own design tokens. The source of truth is
-`web/src/styles/tokens.css`, which is itself generated from
-`design_handoff_quasar/screens/assets/quasar.css`. Those tokens are mirrored as
+`web/src/styles/tokens.css`, which is itself taken from
+`design_handoff_v3/screens/assets/console-v3.css`. Those tokens are mirrored as
 `--q-*` custom properties at the top of `src/styles/theme.css` and mapped onto
 Starlight's `--sl-*` variables below that.
 
@@ -101,8 +143,9 @@ Do not invent colours, radii or shadows. If a value is missing, add it to the
 product tokens first and mirror it here.
 
 The brand gradient appears at most once per viewport height: the nav wordmark,
-one line of the hero, and the media path in the architecture diagram. Buttons are
-flat violet.
+one line of the hero, and the media path in the architecture diagram. Since the v3
+re-mirror it is single-hue, because v3 retired the violet-to-cyan gradient (see
+the header of `theme.css`). Buttons are flat violet.
 
 Dark is the default. A small script in `astro.config.mjs` sets it on a first
 visit. The theme toggle still works and a stored preference always wins.

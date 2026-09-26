@@ -5,6 +5,8 @@ description: Running the control plane behind Caddy or your own proxy, and the t
 
 import { Aside } from '@astrojs/starlight/components';
 
+{/* TODO(open, raise on #361): the hardened Caddy overlay, QUASAR_PUBLIC_HOST and the allowed-origins override are Compose and deploy/.env settings; the public host is a machine input on an owned install. Rewrite once #361 fixes it. */}
+
 You might want a proxy for a real certificate on a public name, to put Quasar on
 port 443 alongside other services, or to bring it under an existing ingress.
 

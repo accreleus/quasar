@@ -9,13 +9,25 @@ import { Aside } from '@astrojs/starlight/components';
 
 | Container | What it is |
 | --- | --- |
-| `quasar-postgres` | All state. Users, apps, hosts, GPUs, sessions, entitlements. |
+| `quasar-seed` | Yours, not Quasar's: the one container your manager or `docker run` line declares. It only makes sure the recovery actor exists. |
+| `quasar-recovery` | The recovery actor. Creates and replaces this machine's other Quasar services, and answers `quasar-recovery status`. |
+| `quasar-postgres` | All state. Users, apps, hosts, GPUs, sessions, entitlements. Only on the control plane's machine, and only when the database is Quasar's own. |
 | `quasar-control-plane` | The Go service. API, signaling, scheduler, and it serves the web app. Applies database migrations at startup. |
 | `quasar-node-agent` | The Rust agent. Runs with host networking, drives the compositor and encoder, launches app containers. |
 
-During a session you will also see the app container itself and a PulseAudio
-sidecar, both launched by the agent as siblings. They are not in the Compose
-file.
+Which of them run depends on the machine: a GPU host has the seed, the recovery
+actor and the agent. During a session you will also see the app container itself
+and a PulseAudio sidecar, both launched by the agent as siblings. During an
+update you may briefly see a stopped `quasar-node-agent.kept`, the old agent held
+until the new one is verified.
+
+{/* TODO(#361): confirm the combined and control-only containers against the owned recipes. */}
+
+A [legacy Compose install](/quasar/install/legacy-compose/#health-and-logs) runs
+Postgres, the control plane and the agent as Compose services, plus
+`quasar-updater`, which applies a platform release from the console. Use
+`docker compose -f deploy/docker-compose.yml` in place of the `docker` commands
+below.
 
 ## Health checks
 
@@ -44,25 +56,39 @@ curl http://127.0.0.1:9091/health
 `connected` is whether the agent's WebSocket to the control plane is up. False
 means the agent is alive but isolated.
 
-Container states:
+Container states, and what the recovery actor knows about them:
 
 ```bash
-docker compose -f deploy/docker-compose.yml ps
+docker ps --filter label=io.quasar.installation
+```
+
+```bash
+docker exec quasar-recovery quasar-recovery status
 ```
 
 ## Logs
 
 ```bash
-docker compose -f deploy/docker-compose.yml logs -f quasar-control-plane
-docker compose -f deploy/docker-compose.yml logs -f quasar-node-agent
+docker logs -f quasar-control-plane
 ```
-
-Errors only from the node-agent service:
 
 ```bash
-docker compose -f deploy/docker-compose.yml logs --tail 2000 quasar-node-agent \
+docker logs -f quasar-node-agent
+```
+
+```bash
+docker logs -f quasar-recovery
+```
+
+Errors only from the node agent:
+
+```bash
+docker logs --tail 2000 quasar-node-agent 2>&1 \
   | grep -iE '\b(error|fatal|panic)\b'
 ```
+
+The seed's and the recovery actor's log lines each carry a `token=`, listed in
+[Install and startup problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor).
 
 ## Log lines worth recognising
 
@@ -112,7 +138,9 @@ See [Sessions and audit log](/quasar/admin/sessions/) and
 
 The repository ships a diagnostic script that collects the state of everything in
 one pass: git revision, container states, health endpoints and recent errors from
-each container, with secrets redacted.
+each container, with secrets redacted. It is repository tooling: it runs from a
+checkout and reads that checkout's `deploy/` stack, so it only helps on a machine
+that runs Quasar from a checkout. On a registry install, use the commands above.
 
 ```bash
 make diagnose
