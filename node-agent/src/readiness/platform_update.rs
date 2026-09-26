@@ -6,68 +6,31 @@
 //! Collectors do the I/O once per probe (`ProbeEnv::live`); the checks are pure
 //! over what they collected, so every branch is a unit test.
 
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::messages::ReadinessCheck;
 
+/// Also the preflight check id. The Compose updater's `updater_stack_dir` and
+/// `updater_overlays` are retired and stay reserved: never reuse them.
 pub const CHECK_UPDATER_SOCKET: &str = "updater_socket";
-pub const CHECK_UPDATER_STACK_DIR: &str = "updater_stack_dir";
-pub const CHECK_UPDATER_OVERLAYS: &str = "updater_overlays";
 pub const CHECK_HEALTH_ADDR_BINDABLE: &str = "health_addr_bindable";
 
-/// The compose service this agent runs as, for the overlay comparison.
-const AGENT_SERVICE: &str = "quasar-node-agent";
-
-/// Both peers are local (a unix socket, a loopback port). Short, because the
-/// collectors run inside the register-prep budget too (#191).
+/// The health probe's peer is a loopback port. Short, because the collectors run
+/// inside the register-prep budget too (#191).
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The sliver of the updater's `GET /v1/self` these checks read. Unknown fields
-/// are ignored; missing ones default, so an older updater still answers.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct UpdaterSelf {
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub working_dir: String,
-    #[serde(default)]
-    pub config_files: Vec<String>,
-    /// Per service, the compose files its running container was started with;
-    /// absent on an updater that predates the report.
-    #[serde(default)]
-    pub service_config_files: Option<BTreeMap<String, Option<Vec<String>>>>,
-}
-
-/// What one probe learned about the updater beside this agent.
-#[derive(Debug, Clone, Default)]
-pub struct UpdaterView {
-    pub socket_exists: bool,
-    /// `None` when there was no socket to ask; `Err` when it did not answer.
-    pub self_report: Option<Result<UpdaterSelf, String>>,
-}
-
-/// Ask the updater about itself. One local unix round trip, bounded.
-pub fn collect_updater(socket: &Path) -> UpdaterView {
-    if !socket.exists() {
-        return UpdaterView::default();
-    }
-    let reply = crate::release::unix_http::request(socket, "GET", "/v1/self", None, IO_TIMEOUT);
-    let report = match reply {
-        Err(e) => Err(e.to_string()),
-        Ok(r) if r.status != 200 => Err(format!("answered {}", r.status)),
-        Ok(r) => serde_json::from_str::<UpdaterSelf>(&r.body)
-            .map_err(|e| format!("unparsable self-report: {e}")),
-    };
-    UpdaterView {
-        socket_exists: true,
-        self_report: Some(report),
-    }
+/// What one probe learned about this owned host's recovery actor, from the status
+/// read that also reports its owner conflicts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActorView {
+    pub socket: PathBuf,
+    pub answered: bool,
+    pub version: Option<String>,
 }
 
 /// Who answers the agent's health address right now (`/health` carries `node`
@@ -138,85 +101,33 @@ pub fn parse_health(body: &str) -> Result<HealthIdentity, String> {
     }
 }
 
-/// `updater_socket`: the socket exists and the updater answers on it.
-pub fn check_updater_socket(v: &UpdaterView, updater_present: Option<bool>) -> ReadinessCheck {
-    if !v.socket_exists {
-        return match updater_present {
-            Some(true) => fail(
-                CHECK_UPDATER_SOCKET,
-                "the updater service is in this stack but its socket volume is not mounted in this container: the agent was created before the volume existed".into(),
-                "Recreate the agent so it mounts the volume: docker compose up -d --force-recreate --no-deps quasar-node-agent".into(),
-            ),
-            _ => skip(CHECK_UPDATER_SOCKET, "No updater service in this stack"),
-        };
-    }
-    match &v.self_report {
-        Some(Ok(s)) => pass(
+/// `updater_socket`: on an owned host, the recovery actor answers on its agent
+/// socket; a host with no actor has nothing that can replace its containers.
+pub fn check_updater_socket(actor: Option<&ActorView>) -> ReadinessCheck {
+    let Some(actor) = actor else {
+        return skip(
             CHECK_UPDATER_SOCKET,
-            format!("Updater {} answered on its socket", if s.version.is_empty() { "(unknown version)" } else { s.version.as_str() }),
-        ),
-        Some(Err(e)) => fail(
+            "No recovery actor on this host: it was not installed with the seed, so the console cannot update it",
+        );
+    };
+    if actor.answered {
+        return pass(
             CHECK_UPDATER_SOCKET,
-            format!("The updater's socket exists but it did not answer: {e}"),
-            "Check the updater: docker compose logs quasar-updater; restart it with docker compose up -d quasar-updater".into(),
-        ),
-        None => skip(CHECK_UPDATER_SOCKET, "The updater was not asked"),
-    }
-}
-
-/// `updater_stack_dir`: the updater discovered the stack it sits beside.
-pub fn check_updater_stack_dir(v: &UpdaterView) -> ReadinessCheck {
-    let Some(Ok(s)) = &v.self_report else {
-        return skip(
-            CHECK_UPDATER_STACK_DIR,
-            "Not evaluated: the updater did not answer",
-        );
-    };
-    if s.working_dir.is_empty() || s.config_files.is_empty() {
-        return fail(
-            CHECK_UPDATER_STACK_DIR,
-            "The updater has not discovered the stack it sits beside".into(),
-            "Set QUASAR_STACK_DIR in deploy/.env to the stack directory's absolute host path and recreate quasar-updater".into(),
-        );
-    }
-    pass(
-        CHECK_UPDATER_STACK_DIR,
-        format!(
-            "Updater acts on {} ({} compose file(s))",
-            s.working_dir,
-            s.config_files.len()
-        ),
-    )
-}
-
-/// `updater_overlays`: this agent's container was started with the same
-/// compose files the updater will recreate it with.
-pub fn check_updater_overlays(v: &UpdaterView) -> ReadinessCheck {
-    let Some(Ok(s)) = &v.self_report else {
-        return skip(
-            CHECK_UPDATER_OVERLAYS,
-            "Not evaluated: the updater did not answer",
-        );
-    };
-    let Some(services) = &s.service_config_files else {
-        return skip(
-            CHECK_UPDATER_OVERLAYS,
-            "The updater does not report per-service compose files",
-        );
-    };
-    match services.get(AGENT_SERVICE) {
-        Some(Some(mine)) if mine != &s.config_files => fail(
-            CHECK_UPDATER_OVERLAYS,
             format!(
-                "This agent was started with [{}] but the updater with [{}]; an apply would recreate it with the updater's set",
-                mine.join(", "),
-                s.config_files.join(", ")
+                "Recovery actor {} answered on {}",
+                actor.version.as_deref().unwrap_or("(unknown version)"),
+                actor.socket.display()
             ),
-            "Bring the agent and the updater up with the same -f list, or recreate quasar-updater with the agent's".into(),
-        ),
-        Some(Some(_)) => pass(CHECK_UPDATER_OVERLAYS, "This agent was started with the updater's compose files".into()),
-        _ => skip(CHECK_UPDATER_OVERLAYS, "The updater sees no running container for this agent's service"),
+        );
     }
+    fail(
+        CHECK_UPDATER_SOCKET,
+        format!(
+            "The recovery actor did not answer on {}",
+            actor.socket.display()
+        ),
+        "Check that it is running (docker ps --filter name=quasar-recovery) and read its log (docker logs quasar-recovery)".into(),
+    )
 }
 
 /// `health_addr_bindable`: the configured health address is answered by this
@@ -259,92 +170,40 @@ use super::{fail, pass, skip};
 mod tests {
     use super::*;
 
-    fn healthy_self() -> UpdaterSelf {
-        let mut services = BTreeMap::new();
-        services.insert(
-            AGENT_SERVICE.to_string(),
-            Some(vec!["/srv/deploy/docker-compose.yml".to_string()]),
-        );
-        UpdaterSelf {
-            version: "0.2.5".into(),
-            working_dir: "/srv/deploy".into(),
-            config_files: vec!["/srv/deploy/docker-compose.yml".into()],
-            service_config_files: Some(services),
-        }
-    }
-
-    fn answered(s: UpdaterSelf) -> UpdaterView {
-        UpdaterView {
-            socket_exists: true,
-            self_report: Some(Ok(s)),
+    fn actor(answered: bool) -> ActorView {
+        ActorView {
+            socket: "/run/quasar-recovery/agent.sock".into(),
+            answered,
+            version: answered.then(|| "0.5.0".to_string()),
         }
     }
 
     #[test]
-    fn socket_absent_is_skip_without_an_updater_service_and_fail_with_one() {
-        let none = UpdaterView::default();
-        assert_eq!(
-            check_updater_socket(&none, Some(false)).status,
-            super::super::SKIP
-        );
-        assert_eq!(check_updater_socket(&none, None).status, super::super::SKIP);
-        let c = check_updater_socket(&none, Some(true));
+    fn no_recovery_actor_is_not_applicable_and_names_no_compose_command() {
+        let c = check_updater_socket(None);
+        assert_eq!(c.status, super::super::SKIP);
+        assert!(c.summary.contains("seed"), "{}", c.summary);
+        assert!(!c.summary.contains("compose"), "{}", c.summary);
+    }
+
+    #[test]
+    fn an_owned_host_reports_whether_its_recovery_actor_answered() {
+        let c = check_updater_socket(Some(&actor(true)));
+        assert_eq!(c.status, super::super::PASS);
+        assert!(c.summary.contains("0.5.0"), "{}", c.summary);
+
+        let c = check_updater_socket(Some(&actor(false)));
         assert_eq!(c.status, super::super::FAIL);
         assert!(
-            c.remediation.contains("--force-recreate"),
+            c.summary.contains("/run/quasar-recovery/agent.sock"),
+            "{}",
+            c.summary
+        );
+        assert!(
+            c.remediation.contains("docker logs quasar-recovery")
+                && !c.remediation.contains("compose"),
             "{}",
             c.remediation
-        );
-    }
-
-    #[test]
-    fn socket_present_reports_the_answer() {
-        assert_eq!(
-            check_updater_socket(&answered(healthy_self()), Some(true)).status,
-            super::super::PASS
-        );
-        let dead = UpdaterView {
-            socket_exists: true,
-            self_report: Some(Err("connection refused".into())),
-        };
-        let c = check_updater_socket(&dead, Some(true));
-        assert_eq!(c.status, super::super::FAIL);
-        assert!(c.summary.contains("connection refused"));
-    }
-
-    #[test]
-    fn stack_dir_and_overlays() {
-        let v = answered(healthy_self());
-        assert_eq!(check_updater_stack_dir(&v).status, super::super::PASS);
-        assert_eq!(check_updater_overlays(&v).status, super::super::PASS);
-
-        let mut drift = healthy_self();
-        drift.service_config_files.as_mut().unwrap().insert(
-            AGENT_SERVICE.into(),
-            Some(vec![
-                "/srv/deploy/docker-compose.yml".into(),
-                "/srv/deploy/overlays/dev.yml".into(),
-            ]),
-        );
-        let c = check_updater_overlays(&answered(drift));
-        assert_eq!(c.status, super::super::FAIL);
-        assert!(c.summary.contains("overlays/dev.yml"), "{}", c.summary);
-
-        let mut undiscovered = healthy_self();
-        undiscovered.working_dir.clear();
-        let c = check_updater_stack_dir(&answered(undiscovered));
-        assert_eq!(c.status, super::super::FAIL);
-        assert!(c.remediation.contains("QUASAR_STACK_DIR"));
-
-        let mut old = healthy_self();
-        old.service_config_files = None;
-        assert_eq!(
-            check_updater_overlays(&answered(old)).status,
-            super::super::SKIP
-        );
-        assert_eq!(
-            check_updater_overlays(&UpdaterView::default()).status,
-            super::super::SKIP
         );
     }
 
@@ -408,14 +267,5 @@ mod tests {
         );
         assert!(parse_health(r#"{"status":"ok"}"#).is_err());
         assert!(parse_health("<html>").is_err());
-    }
-
-    #[test]
-    fn self_report_tolerates_an_older_updater() {
-        let s: UpdaterSelf = serde_json::from_str(
-            r#"{"version":"0.2.4","working_dir":"/x","config_files":["/x/a.yml"],"images":{}}"#,
-        )
-        .unwrap();
-        assert!(s.service_config_files.is_none());
     }
 }

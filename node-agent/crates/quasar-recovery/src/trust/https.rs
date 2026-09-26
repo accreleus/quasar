@@ -1,12 +1,12 @@
 //! The release-asset fetch: the verifier fetching the manifest and its signature itself
-//! (ADR 0003), matching the Go updater's `ReleaseAssetSource` client
-//! (`control-plane/internal/updater/signature_source.go`, which runs on `http.DefaultTransport`):
+//! (ADR 0003), with the behaviour of the Go client it was ported from (on Go's
+//! `http.DefaultTransport`):
 //!
 //! - one deadline over both fetches (`QUASAR_UPDATER_MANIFEST_TIMEOUT_S`), a 30 s dial
 //!   and a 10 s TLS handshake bound;
 //! - redirects 301/302/303/307/308 followed only as `redirect_allowed` permits, a 3xx
 //!   with no `Location` returned as a response;
-//! - `Accept: application/octet-stream`, `User-Agent: quasar-updater`, gzip requested and
+//! - `Accept: application/octet-stream`, `User-Agent: quasar-recovery`, gzip requested and
 //!   decoded, basic auth from URL userinfo, `Referer` on a redirect;
 //! - at most `MAX_ASSET_BYTES + 1` bytes of a 200 body read.
 //!
@@ -14,11 +14,11 @@
 //! completed 404 on the signature asset reads as unsigned.
 //!
 //! Where Go's transport does something this one does not, it refuses instead: a request
-//! Go would route through `HTTPS_PROXY` fails (no proxy client here), as does a non-ASCII
-//! host (no IDNA). Roots are webpki-roots (Mozilla's set) where Go uses the image's
-//! `ca-certificates`; HTTP/2 is not offered. None of these reads a failure as unsigned.
-//! The open ones are listed in `testdata/recovery/trust-vectors/README.md` and must be
-//! resolved before the Go updater retires (#367).
+//! routed through `HTTPS_PROXY` fails (no proxy client here), as does a non-ASCII host (no
+//! IDNA). Roots are webpki-roots (Mozilla's set), not the image's `ca-certificates`, and
+//! `SSL_CERT_FILE`/`SSL_CERT_DIR` are ignored; HTTP/2 is not offered. None of these reads a
+//! failure as unsigned: `verify`/`require` fail closed behind a proxy or a private CA
+//! (documented limits, `docs/configuration.md` "Release trust").
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,7 +231,7 @@ impl HttpsFetcher {
             .method(http::Method::GET)
             .uri(String::from_utf8_lossy(&target.request_uri()).into_owned())
             .header(http::header::HOST, target.host.as_slice())
-            .header(http::header::USER_AGENT, "quasar-updater")
+            .header(http::header::USER_AGENT, "quasar-recovery")
             .header(http::header::ACCEPT, "application/octet-stream")
             .header(http::header::ACCEPT_ENCODING, "gzip");
         if let Some(user) = &target.user {

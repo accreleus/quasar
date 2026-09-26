@@ -231,7 +231,7 @@ async fn both_assets_are_signed_evidence_at_the_urls_the_probe_computes() {
     );
     assert_eq!(srv.targets(), vec![path(SIG), path(MANIFEST)]);
     let first = &srv.seen()[0];
-    assert_eq!(first.header("user-agent"), Some("quasar-updater"));
+    assert_eq!(first.header("user-agent"), Some("quasar-recovery"));
     assert_eq!(first.header("accept"), Some("application/octet-stream"));
     assert_eq!(first.header("accept-encoding"), Some("gzip"));
     assert_eq!(
@@ -547,7 +547,7 @@ async fn https_redirects_are_followed_with_a_referer() {
         seen[1].header("referer"),
         Some(format!("{}{}", srv.origin(), path(SIG)).as_str())
     );
-    assert_eq!(seen[1].header("user-agent"), Some("quasar-updater"));
+    assert_eq!(seen[1].header("user-agent"), Some("quasar-recovery"));
 }
 
 #[tokio::test]

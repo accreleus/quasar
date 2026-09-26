@@ -183,11 +183,9 @@ pub struct ProbeEnv {
     /// Firewall detection's answer, computed once at [`ProbeEnv::live`] so every reader sees
     /// the same instant and the subprocess cost is paid once, not per check.
     pub firewall: FirewallPosture,
-    /// The update path's facts (platform_update.rs), collected once per probe.
-    pub updater: platform_update::UpdaterView,
-    /// Whether compose declares an updater service beside this agent (`register`'s
-    /// `updater_present`); `None` when discovery could not say.
-    pub updater_present: Option<bool>,
+    /// On an owned install, what its recovery actor answered this refresh
+    /// (platform_update.rs); `None` on a host with no recovery actor.
+    pub recovery_actor: Option<platform_update::ActorView>,
     pub health: platform_update::HealthOwner,
     /// This agent's own `/health` identity, to compare against who answers.
     pub self_identity: platform_update::HealthIdentity,
@@ -261,6 +259,18 @@ impl ProbeEnv {
             } else {
                 PathBuf::from("/")
             };
+        // One status read on an owned install: whether the actor answers, its owner
+        // conflicts, and whether its identity moved since `register`.
+        let owned = crate::buildinfo::owned_socket().map(|socket| {
+            let (facts, conflicts) = crate::buildinfo::observe_owned(&socket);
+            crate::buildinfo::note_observed(&facts);
+            let actor = platform_update::ActorView {
+                socket,
+                answered: facts.updater_present == Some(true),
+                version: facts.recovery_actor_version.clone(),
+            };
+            (actor, conflicts)
+        });
         ProbeEnv {
             root: PathBuf::from("/"),
             host_root,
@@ -299,27 +309,13 @@ impl ProbeEnv {
             },
             // Vendor/GPU-independent: a firewall problem is as real on a GPU-less box.
             firewall: detect_firewall_posture(engine_answered),
-            updater: platform_update::collect_updater(&updater_socket_path()),
-            // An owned install has a recovery actor, not an updater: its `updater_present`
-            // says the actor answered, and must not make the updater's socket check fail.
-            updater_present: {
-                let facts = crate::buildinfo::install_facts();
-                match facts.install_mode {
-                    Some(crate::buildinfo::InstallMode::Owned) => None,
-                    _ => facts.updater_present,
-                }
-            },
+            recovery_actor: owned.as_ref().map(|(actor, _)| actor.clone()),
             health: platform_update::collect_health(crate::health::addr_from_env()),
             self_identity: platform_update::HealthIdentity {
                 node: crate::logging::host_name().to_string(),
                 pid: std::process::id(),
             },
-            // The same read tells whether the actor's identity moved since `register`.
-            owner_conflicts: crate::buildinfo::owned_socket().map(|socket| {
-                let (facts, conflicts) = crate::buildinfo::observe_owned(&socket);
-                crate::buildinfo::note_observed(&facts);
-                conflicts
-            }),
+            owner_conflicts: owned.map(|(_, conflicts)| conflicts),
             storage: storage::StorageView::live(engine_answered),
             runtime,
         }
@@ -569,20 +565,9 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         storage::check_template_free_space(&env.storage),
         storage::check_image_free_space(&env.storage),
         // The update path: what preflight reads about this host.
-        platform_update::check_updater_socket(&env.updater, env.updater_present),
-        platform_update::check_updater_stack_dir(&env.updater),
-        platform_update::check_updater_overlays(&env.updater),
+        platform_update::check_updater_socket(env.recovery_actor.as_ref()),
         platform_update::check_health_addr_bindable(&env.health, &env.self_identity),
     ]
-}
-
-/// Twin of `release::ReleaseManager::from_env`'s socket resolution.
-fn updater_socket_path() -> PathBuf {
-    std::env::var("QUASAR_UPDATER_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(crate::release::DEFAULT_SOCKET))
 }
 
 fn check_vulkan_av1_compatibility(env: &ProbeEnv) -> ReadinessCheck {
@@ -2690,8 +2675,7 @@ mod tests {
                 // `Unknown` means "not probed" and must never influence a verdict on its own.
                 egl_runtime: crate::nvidia_volume::EglRuntime::Unknown,
                 firewall: FirewallPosture::Unknown,
-                updater: platform_update::UpdaterView::default(),
-                updater_present: None,
+                recovery_actor: None,
                 health: platform_update::HealthOwner::default(),
                 self_identity: platform_update::HealthIdentity {
                     node: "test".to_string(),
@@ -2799,14 +2783,12 @@ mod tests {
                 continue;
             }
             // The update-path checks read the fixture's empty collectors as not
-            // applicable (no updater service, health endpoint unprobed).
+            // applicable (no recovery actor, health endpoint unprobed).
             // Storage roots are unconfigured and the engine unobserved in the fixture
             // (#253, #254), so those are not applicable either.
             if matches!(
                 c.id.as_str(),
                 "updater_socket"
-                    | "updater_stack_dir"
-                    | "updater_overlays"
                     | "health_addr_bindable"
                     | "homes_root_writable"
                     | "homes_free_space"

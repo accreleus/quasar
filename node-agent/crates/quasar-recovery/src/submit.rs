@@ -7,8 +7,8 @@
 //!    file); [`trust::admit`] refuses it.
 //! 2. **A re-post of a known request id is answered from the journal, checked against
 //!    the caller, before [`trust::admit`] runs** (the #356 security review). `admit`
-//!    treats a re-post of the in-flight id as "not busy", as the Go updater's
-//!    `AcceptedFor` did; without this step a node agent could reuse the control plane's
+//!    treats a re-post of the in-flight id as "not busy" (the vectors pin it); without
+//!    this step a node agent could reuse the control plane's
 //!    in-flight id and have a second request admitted. The same caller gets the same
 //!    `Accepted`, and nothing new happens; another caller is refused. An id whose
 //!    journal was pruned is still spent (the used-id record), and so is one any

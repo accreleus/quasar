@@ -47,7 +47,6 @@ echo "=== [2/4] control-plane (go run) ==="
 docker run -d --name "$CP" --network "$NET" \
   -v "$REPO/control-plane":/w -w /w \
   -e DATABASE_URL="postgres://quasar:quasar@$PG:5432/quasar?sslmode=disable" \
-  -e ENROLLMENT_TOKEN=test-enroll-token \
   -e BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
   -e BOOTSTRAP_ADMIN_USERNAME=admin \
   -e BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PASS" \

@@ -46,7 +46,7 @@ needed, and a consumer that has never heard of signing keeps working.
 | `signatures[].key_id` | string | 1–64 of `[A-Za-z0-9._-]` | A **label**. It picks which trusted key is tried first and it appears in messages; it is never what makes a signature good, because whoever wrote the document chose it. |
 | `signatures[].signature` | string | standard base64 of 64 raw bytes | Ed25519 over the manifest asset's exact bytes — the whole file, including its trailing newline. |
 
-No other keys, at either level: the updater decodes with unknown fields
+No other keys, at either level: the verifier decodes with unknown fields
 disallowed, so a document carrying one is refused everywhere.
 
 ## How it is produced
@@ -64,9 +64,9 @@ before exiting 0, so an unverifiable signature is never uploaded.
 
 ## How it is verified
 
-The per-host **updater**, in `control-plane/internal/updater/signature.go`,
-alongside the registry-namespace allowlist and for the same reason: it is the
-last thing between a digest and a `docker compose pull`.
+Each machine's **recovery actor**, in `node-agent/crates/quasar-recovery/src/trust/signature.rs`, alongside the registry-namespace
+allowlist and for the same reason: it is the last thing between a digest and a
+pull.
 
 It fetches both assets **itself**, over HTTPS, from
 `QUASAR_UPDATER_MANIFEST_BASE_URL` (default the org's releases) using the
@@ -86,7 +86,7 @@ The mode ladder (`off` / `verify` / `require`), the failure semantics, and the
 rotation procedure are in `docs/configuration.md` and `docs/upgrading.md`.
 `scripts/release/verify-platform-release-manifest.sh` is the same check as a
 script, for the pipeline's self-test and for an operator checking a release by
-hand; the updater's Go verifier is the normative one.
+hand; the recovery actor's verifier is the normative one.
 
 ## Versioning rule
 

@@ -91,7 +91,7 @@ unparseable is a release it does not offer. From the manifest it takes:
   wants it at all (`stable` skips prereleases).
 - `schema_version` — the no-downgrade comparison of ADR 0002.
 - `components[].image` + `.digest` — composed into `image@digest` and handed to
-  the updater, so a host pulls exactly the bytes the control plane resolved and
+  the recovery actor, so a host pulls exactly the bytes the control plane resolved and
   never a floating tag (ADR 0001).
 
 ## The detached signature

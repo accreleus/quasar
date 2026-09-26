@@ -1,8 +1,8 @@
-//! Go standard-library behaviour the Go updater's trust gates depend on.
+//! Go standard-library behaviour the trust gates were ported with (from the Go updater,
+//! retired with #367).
 //!
 //! Outcome parity (a quirk that decides admit or refuse, signed or unsigned, direct or
-//! proxied) is pinned by the golden vectors or unit tests, and must survive the Go
-//! updater's deletion (RH06-15, #367):
+//! proxied) is pinned by the golden vectors or unit tests, and must not change:
 //! - `json`: field names folded case-insensitively (with the Kelvin sign and long s),
 //!   repeated keys merged into existing values and slice elements, `null` handling,
 //!   the 10000-level depth cap, `]`/`}` allowed after the signature document, unknown
@@ -14,8 +14,8 @@
 //! - `text`: `strings.TrimSpace` and `strings.ToLower` where they select a keyword.
 //!
 //! Text-only parity (the wording of refusal and error messages: `strconv.Quote` in
-//! `text::quote`, the `parse "...": ...` and `invalid ...` strings) may be relaxed once
-//! the Go updater is gone; outcome parity may not.
+//! `text::quote`, the `parse "...": ...` and `invalid ...` strings) may be relaxed;
+//! outcome parity may not.
 
 pub(crate) mod base64;
 pub(crate) mod json;

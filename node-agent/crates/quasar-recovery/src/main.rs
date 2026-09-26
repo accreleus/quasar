@@ -576,8 +576,7 @@ fn reconfigure(args: &[String]) -> ExitCode {
 
 type Evidence = Box<dyn Fn(&Request) -> SignatureEvidence + Send + Sync>;
 
-/// The updater's trust knobs, read the way the Go updater reads them
-/// (`docs/configuration.md` "Recovery actor").
+/// The release-trust knobs (`QUASAR_UPDATER_*`, `docs/configuration.md` "Recovery actor").
 /// This start's own settings, which apply only until machine state records the seed's at
 /// install (`Actor::trust`); the fetch's base URL and timeout follow the same rule.
 fn trust_from_env(machine_dir: String) -> Result<(TrustConfig, Evidence), String> {

@@ -546,8 +546,9 @@ pub async fn run(cfg: Config) {
                             token = "agent-registration-unhealthy",
                             "agent has failed to connect/register {failures} times in a row with no \
                              successful registration since; the health endpoint now reports \
-                             unhealthy so `docker compose ps` surfaces this — check ENROLLMENT_TOKEN \
-                             validity and control-plane reachability"
+                             unhealthy so the container engine surfaces this — check that the \
+                             enrollment token is one this control plane minted and not yet spent, \
+                             and control-plane reachability"
                         );
                     }
                 }
@@ -6938,10 +6939,10 @@ mod tests {
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
     /// touches neither disk nor a docker daemon.
-    /// A ReleaseManager pointed at paths that do not exist: `present()` is false,
-    /// so nothing in these tests can reach a socket.
+    /// A ReleaseManager with no recovery actor: `present()` is false, so nothing in
+    /// these tests can reach a socket.
     fn test_release_mgr() -> Arc<ReleaseManager> {
-        ReleaseManager::new("/nonexistent/updater.sock", "/nonexistent/results")
+        ReleaseManager::without_actor()
     }
 
     fn test_image_mgr() -> Arc<ImageManager> {

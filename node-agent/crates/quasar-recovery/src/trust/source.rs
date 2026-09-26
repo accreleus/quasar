@@ -1,5 +1,4 @@
-//! Fetching a release's manifest and signature: port of
-//! `control-plane/internal/updater/signature_source.go`.
+//! Fetching a release's manifest and signature.
 //!
 //! The verifier fetches both assets itself, from a host-local base URL, by the request's
 //! `release.version`; nothing the requester sends is trusted as evidence. [`probe`] is the
@@ -27,7 +26,7 @@ pub(crate) const MAX_ASSET_BYTES: usize = 1 << 20;
 /// Bounds both fetches together, under the agent's 30 s socket timeout.
 pub(crate) const DEFAULT_ASSET_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` as the Go updater reads it: `envInt` (blank, not a
+/// `QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, read with Go's `envInt` rules (blank, not a
 /// decimal integer, or not positive is the default), then `time.Duration(n) * time.Second`,
 /// which wraps, then `Evidence`'s "not positive is the default".
 pub fn parse_manifest_timeout(raw: &str) -> Duration {

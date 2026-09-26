@@ -61,8 +61,6 @@ services:
       # the Gamepad API work without a cert warning on every fresh worktree.
       QUASAR_TLS: ${QUASAR_TLS:-off}
       QUASAR_HTTP_REDIRECT: ${QUASAR_HTTP_REDIRECT:-off}
-      # No node-agent enrolls against this stack; the value is inert.
-      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:-local-dev-no-agent}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-24h}
       # Dev-only agent auth (#399) — same passthrough as docker-compose.yml:

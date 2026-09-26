@@ -5,7 +5,7 @@
 #
 # The manifest is what the control plane reads to learn a release exists
 # (scripts/release/platform-release-manifest.md), so a silently-drifted field is
-# a broken updater on every instance. Every rejection below is a drift the
+# a broken update path on every instance. Every rejection below is a drift the
 # validator has to catch before the asset is uploaded.
 set -euo pipefail
 

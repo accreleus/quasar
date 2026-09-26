@@ -1087,182 +1087,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
-  # ── The updater lane, which is deliberately its own end-to-end chain ───────
-  #
-  # Same four phases as the other artifacts — build by digest, validate that
-  # digest, promote tags onto it — but with its OWN promote job rather than a
-  # third arm of `promote` above. The updater applies the two-component
-  # manifest and remains independently tagged; it is not a manifest component
-  # or a digest input to strict preflight. GitHub Release publication still
-  # waits for promote-updater, because its install footer advertises that tag.
-  build-updater:
-    name: build quasar-updater (digest only)
-    needs: inputs
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: deploy/Dockerfile.updater
-          target: runtime
-          outputs: type=image,name=${{ env.REGISTRY_NS }}/quasar-updater,push-by-digest=true,name-canonical=true,push=true
-          # Same reasoning as the other two lanes: a plain image manifest keeps
-          # "the thing validated is the thing promoted" checkable by eye.
-          provenance: false
-          sbom: false
-          # No QUASAR_BASE_IMAGE: this is the one image not built on the
-          # quasar-base family. Its base is the upstream docker CLI image,
-          # which is where the compose plugin comes from.
-          build-args: |
-            SOURCE_COMMIT=${{ github.sha }}
-            BUILT_AT=${{ needs.inputs.outputs.built_at }}
-          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-updater-cache:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-updater-cache:buildcache,mode=max
-
-  validate-updater:
-    name: contract - quasar-updater
-    needs: build-updater
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Validate against deploy/image-contract.json
-        env:
-          REF: ${{ env.REGISTRY_NS }}/quasar-updater@${{ needs.build-updater.outputs.digest }}
-        run: |
-          set -euo pipefail
-          echo "validating $REF"
-          bash deploy/validate-image.sh \
-            --image "$REF" --role updater \
-            --pull --require-digest-ref --no-gpu \
-            --json "$RUNNER_TEMP/contract-updater.json"
-      - name: Record the verdict on the run
-        if: always()
-        run: |
-          set -uo pipefail
-          f="$RUNNER_TEMP/contract-updater.json"
-          [ -f "$f" ] || { echo "no contract report produced" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
-          {
-            echo "### Contract: quasar-updater"
-            echo ""
-            echo '```json'
-            cat "$f"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  promote-updater:
-    name: promote quasar-updater
-    needs: [build-updater, validate-updater]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.REGISTRY_NS }}/quasar-updater
-          tags: |
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-          flavor: |
-            latest=auto
-      - name: Record the current :latest digest (rollback point)
-        id: rollback
-        run: |
-          set -euo pipefail
-          d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
-                "$REGISTRY_NS/quasar-updater:latest" 2>/dev/null || true)"
-          echo "previous=${d}" >> "$GITHUB_OUTPUT"
-          echo "quasar-updater:latest = ${d:-<none>}"
-      - name: Promote the validated digest
-        env:
-          SRC: ${{ env.REGISTRY_NS }}/quasar-updater@${{ needs.build-updater.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          # `imagetools create` WRAPS the manifest in a fresh index, so a tag's
-          # own digest can never equal the validated one. Assert set equality of
-          # the platform manifests instead — same rule as the `promote` job.
-          target_digests() {
-            local ref="$1" raw out
-            raw="$(docker buildx imagetools inspect --raw "$ref")"
-            out="$(printf '%s' "$raw" | jq -r '
-              if has("manifests") then
-                [ .manifests[]
-                  | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
-                  | .digest ] | sort | join(",")
-              else "" end')"
-            if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
-            docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref"
-          }
-          args=()
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            args+=(--tag "$t")
-          done <<< "$TAGS"
-          [ "${#args[@]}" -gt 0 ] || { echo "::error::no tags computed"; exit 1; }
-          docker buildx imagetools create "${args[@]}" "$SRC"
-
-          want="$(target_digests "$SRC")"
-          for (( i=1; i<${#args[@]}; i+=2 )); do
-            got="$(target_digests "${args[$i]}")"
-            [ "$got" = "$want" ] || {
-              echo "::error::${args[$i]} resolves to [$got], expected [$want]"; exit 1; }
-            echo "  verified ${args[$i]} -> $want"
-          done
-          {
-            echo "### Promoted quasar-updater"
-            echo ""
-            echo '```'
-            echo "${SRC##*@}"
-            printf '%s\n' "$TAGS"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Roll :latest back if the promotion did not complete
-        if: failure() && steps.rollback.outcome == 'success' && steps.rollback.outputs.previous != ''
-        env:
-          PREVIOUS: ${{ steps.rollback.outputs.previous }}
-        run: |
-          set -uo pipefail
-          echo "restoring quasar-updater:latest to $PREVIOUS"
-          docker buildx imagetools create \
-            --tag "$REGISTRY_NS/quasar-updater:latest" \
-            "$REGISTRY_NS/quasar-updater@$PREVIOUS" || true
-
   # ── Phase 5: publish the release itself (tag pushes only) ──────────────────
   #
   # Promotion put the bytes where a puller can reach them. This job is what makes
@@ -1296,9 +1120,7 @@ jobs:
   # to it: this job cannot move a tag.
   release:
     name: publish the GitHub Release
-    # The release footer advertises the updater version too. Never publish a
-    # release until that independently built/validated image has been promoted.
-    needs: [release-gate, inputs, build-control-plane, build-node-agent, promote, promote-updater]
+    needs: [release-gate, inputs, build-control-plane, build-node-agent, promote]
     if: needs.release-gate.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -1390,7 +1212,7 @@ jobs:
 
           # WHY THIS EXISTS. The manifest is the machine-readable claim "version
           # X.Y.Z is these digests"; the `:X.Y.Z` tag is what a consumer following
-          # the version resolves. If those two ever disagreed, an updater pinning
+          # the version resolves. If those two ever disagreed, an apply pinning
           # the manifest's digest and an operator pulling the tag would install
           # different bytes under one version number. Both come from the same job
           # outputs today, so this can only fail if something outside this run
@@ -1493,22 +1315,17 @@ jobs:
           # the docs tell them to take the digests "from the release"; the manifest
           # asset carries them for machines, this footer carries the same values for
           # people. Generated from the validated manifest, never typed.
-          cp_digest="$(jq -r '.components[] | select(.name=="control-plane") | .digest' "$MANIFEST")"
-          agent_digest="$(jq -r '.components[] | select(.name=="node-agent") | .digest' "$MANIFEST")"
           {
             echo
             echo "## Install or upgrade"
             echo
-            echo "Pins for \`deploy/.env\` (the two digests are the ones \`platform-release-manifest.json\` names; the updater follows the version tag):"
+            echo "The images of this release, by digest, as \`$(basename "$MANIFEST")\` names them:"
             echo
             echo '```'
-            echo "QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@${cp_digest}"
-            echo "QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@${agent_digest}"
-            echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:${VERSION}"
-            echo "QUASAR_STACK_DIR=<absolute host path of your deploy directory>"
+            jq -r '.components[] | "\(.name)  \(.image)@\(.digest)"' "$MANIFEST"
             echo '```'
             echo
-            echo "Then, with the same \`-f\` list you installed with: \`docker compose -f deploy/docker-compose.yml pull && docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps quasar-control-plane quasar-updater quasar-node-agent\` — or, on an instance that already runs the updater, apply it from Admin ▸ Fleet ▸ Releases. New install: https://accreleus.github.io/quasar/install/install/ · Upgrading: https://accreleus.github.io/quasar/operations/upgrading/"
+            echo "An install made with the seed is updated from Admin ▸ Fleet ▸ Releases. A new install starts from the seed: https://accreleus.github.io/quasar/install/install/ · An install made from the Compose files before Quasar-owned installs is not offered this release; replace it with a fresh seed install: https://accreleus.github.io/quasar/install/move-existing/ · Upgrading: https://accreleus.github.io/quasar/operations/upgrading/"
           } >> "$notes"
           echo "path=$notes" >> "$GITHUB_OUTPUT"
           wc -c < "$notes"
