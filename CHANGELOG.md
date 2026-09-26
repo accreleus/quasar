@@ -27,8 +27,10 @@ own; the two do not move together, and that is deliberate.
 ### Added
 - **RH-06 acceptance map (#368).** `docs/rh06/2026-09-26-acceptance.md` ties every user story
   in the RH-06 specification (#352) to the ticket and the evidence that cover it, and records
-  #368's own acceptance rows as covered, run for #368, skipped by the owner (the reboot row)
-  or dropped (the pre-RH-06 dump restore, now #380). It promotes nothing.
+  #368's own acceptance rows as covered, run for #368 (a combined install and a control-only
+  install declared in Arcane, an NVIDIA GPU host added from a control-only console, and
+  #386's reconfigure recipes on hardware), skipped by the owner (the reboot row) or dropped
+  (the pre-RH-06 dump restore, now #380). It promotes nothing.
 - **Format-2 releases with a floor, and hosts that must update first (#365).** Releases now
   publish `platform-release-manifest.v2.json` (control plane, node agent and recovery actor
   by digest, plus the oldest agent and recovery actor this release still manages) and no
