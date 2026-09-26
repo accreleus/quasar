@@ -361,6 +361,12 @@ func OrderHostComponents(release []ComponentDigest, releaseCommit string, h Host
 
 // releaseNamesActor: the release's manifest carries a recovery-actor component.
 func releaseNamesActor(r Release) bool {
+	// Edge rows carry no manifest. Every build under the o2- tag family, the only one
+	// this control plane resolves, is promoted with its recovery image or not at all
+	// (.github/workflows/images.yml promote), so it names one.
+	if r.Channel == ChannelEdge && len(r.Manifest) == 0 {
+		return true
+	}
 	for _, c := range releaseComponents(r) {
 		if c.Name == ComponentRecovery {
 			return true

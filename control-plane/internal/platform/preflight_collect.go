@@ -96,8 +96,8 @@ func (r *ImageResolver) resolve(ctx context.Context, rel Release) string {
 		if r.edge == nil {
 			return "this release carries no manifest and this control plane cannot reach the registry to resolve one"
 		}
-		for _, f := range []func(context.Context, Release) (ComponentDigest, error){r.edge.ControlPlaneComponent, r.edge.NodeAgentComponent} {
-			if _, err := f(ctx, rel); err != nil {
+		for _, f := range []func(context.Context, ApplyComponentResolver, Release) ([]ComponentDigest, error){EdgeControlPlaneComponents, EdgeHostComponents} {
+			if _, err := f(ctx, r.edge, rel); err != nil {
 				return err.Error()
 			}
 		}

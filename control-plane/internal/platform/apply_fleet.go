@@ -142,11 +142,7 @@ func (m ManifestOrEdge) HostComponents(ctx context.Context, r Release) ([]Compon
 	if m.Edge == nil {
 		return nil, errors.New("this release carries no manifest and this control plane cannot reach the registry to resolve one")
 	}
-	c, err := m.Edge.NodeAgentComponent(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-	return []ComponentDigest{c}, nil
+	return EdgeHostComponents(ctx, m.Edge, r)
 }
 
 func (m ManifestOrEdge) ControlPlaneComponents(ctx context.Context, r Release) ([]ComponentDigest, error) {
@@ -162,11 +158,7 @@ func (m ManifestOrEdge) ControlPlaneComponents(ctx context.Context, r Release) (
 	if m.Edge == nil {
 		return nil, errors.New("this release carries no manifest and this control plane cannot reach the registry to resolve one")
 	}
-	c, err := m.Edge.ControlPlaneComponent(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-	return []ComponentDigest{c}, nil
+	return EdgeControlPlaneComponents(ctx, m.Edge, r)
 }
 
 // FleetRunner drives fleet runs. Its only in-process state is the goroutine set

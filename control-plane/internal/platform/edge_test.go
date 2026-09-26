@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -25,7 +26,7 @@ func (f *fakeInspector) InspectConfig(_ context.Context, ref string) (images.Ima
 	}
 	cfg, ok := f.byRef[ref]
 	if !ok {
-		return images.ImageConfig{}, errors.New("no such image")
+		return images.ImageConfig{}, fmt.Errorf("no such image: %w", images.ErrRegistryNotFound)
 	}
 	return cfg, nil
 }

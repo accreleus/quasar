@@ -37,8 +37,13 @@ own; the two do not move together, and that is deliberate.
   before it can be managed" on its page, in Fleet ▸ Hosts and in Releases' targets, and is
   offered only the update: revert and developer apply of a release below the floor are
   refused. Add host now installs the installed release's own seed and agent images, with
-  `QUASAR_ENROLL_SEED_IMAGE` / `QUASAR_ENROLL_AGENT_IMAGE` as overrides. Nothing is
-  published until the Compose updater retires (#367).
+  `QUASAR_ENROLL_SEED_IMAGE` / `QUASAR_ENROLL_AGENT_IMAGE` as overrides and an owned
+  machine's install-time images as the last resort (`QUASAR_ENROLL_FALLBACK_*`,
+  control-plane recipe revision 2). The recovery actor verifies release signatures
+  against the format-2 asset pair, the release-time check also refuses a release the
+  previous release's recovery actor could not hand over to, and an edge build moves an
+  owned host's recovery actor too. Nothing is published until the Compose updater
+  retires (#367).
 - **An owned control plane is updated by its recovery actor (#363).** On a combined or
   control-only install the fleet run's control-plane step, and a developer apply to the
   control plane, go over the machine's control socket: the recovery actor moves itself first
