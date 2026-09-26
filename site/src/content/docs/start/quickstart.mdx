@@ -3,11 +3,22 @@ title: Quick start
 description: Answer five questions and get one command that installs Quasar.
 ---
 
+import { Aside } from '@astrojs/starlight/components';
 import QuickStart from '../../../components/QuickStart.astro';
+
+{/* TODO(#361, #359, #365): the QuickStart generator below still writes the four-service Compose stack and .env, and the prose on this page describes exactly that. Rewrite the generator around the seed (a role question, the seed `docker run` or one-service stack, the format-2 manifest), then this prose and the note, before the first release that ships Quasar-owned installs is published. */}
 
 Five questions, then one command to run on the machine with the GPU. You need
 Linux, Docker and about 20 GB of disk; the
 [requirements](/quasar/start/requirements/) have the detail.
+
+<Aside type="note" title="This quick start writes a Compose install">
+The command below writes a Compose stack and an `.env` file, as described on
+this page and on [Legacy Compose installs](/quasar/install/legacy-compose/).
+Releases that ship Quasar-owned installs start from one container, the seed,
+instead: see [Install Quasar](/quasar/install/install/). This generator has not
+been updated for them yet.
+</Aside>
 
 Everything here runs in your browser. The script makes its own secrets on the
 target machine, so nothing sensitive exists on this page to leak.
@@ -17,7 +28,7 @@ agent, and `quasar-updater`, which is what lets Quasar update itself from the
 admin console later. The updater holds the Docker socket, so it is worth saying
 what it cannot do: it pulls only digests inside the allow-listed registry
 namespace and recreates only the two Quasar services in this stack. The script
-fills in `QUASAR_STACK_DIR` — this directory's absolute path on the machine —
+fills in `QUASAR_STACK_DIR` (this directory's absolute path on the machine),
 which the updater needs to find those compose files. On Podman, also set
 `QUASAR_DOCKER_SOCKET` to your own socket path.
 

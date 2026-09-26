@@ -5,6 +5,8 @@ description: Quasar generates its own certificate on first boot. How to trust it
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
+{/* TODO(open, raise on #361): QUASAR_TLS_HOSTS, adding a name later and supplying your own certificate all edit deploy/.env and recreate the container. An owned machine has no such file; say where these are set once #361 decides, and move the commands to `docker exec quasar-control-plane`. */}
+
 HTTPS is not optional here. Gamepads, Keyboard Lock and microphone capture all
 need a secure context, so an HTTP-only deployment quietly loses three features.
 
@@ -21,7 +23,7 @@ The one thing you must get right is which names it claims. Set them before you
 start the stack:
 
 ```bash
-QUASAR_TLS_HOSTS=192.168.1.50,quasar.lan
+QUASAR_TLS_HOSTS=192.0.2.50,quasar.lan
 ```
 
 List every address anyone will type into a browser. LAN IP, hostname, VPN
@@ -33,7 +35,7 @@ whatever the control plane can see on its own interfaces. That last set is the
 trap: it runs in a container, so it sees a Docker bridge address like
 `172.18.0.3` and never the host's real LAN address.
 
-Visit `https://192.168.1.50:8443` and you get `ERR_CERT_COMMON_NAME_INVALID`.
+Visit `https://192.0.2.50:8443` and you get `ERR_CERT_COMMON_NAME_INVALID`.
 Clicking through does not help, because the certificate does not claim that
 address at all. There is nothing to trust.
 </Aside>

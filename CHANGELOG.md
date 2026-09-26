@@ -422,6 +422,14 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The documentation site no longer states facts that stopped being true.** A control-plane
+  update without a migration does not end sessions, and a fleet run with no control-plane step
+  cordons each host only when it reaches it; a host whose new agent never came up is
+  restored automatically (ADR 0004); the `beta` channel, unattended updates and release
+  notifications are documented; the stack's container and volume lists include the updater and
+  the NVIDIA driver volume; the static `ENROLLMENT_TOKEN` is optional; each host may have its own
+  home root; the Debian note asks for Compose 2.30; `make diagnose` is marked as needing a
+  checkout. The site's compose snapshot is regenerated, so `npm run build` passes again.
 - **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
   before any host reports it ready. After the launch is accepted, the control
   plane prepares the image on the selected host with the adopted, frozen
