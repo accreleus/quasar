@@ -14,7 +14,12 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
+	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
+
+func updaterResult(reason string) updater.Result {
+	return updater.Result{State: updater.StateFailed, Reason: &reason, Restored: true, Output: "container exited"}
+}
 
 // The owned control plane's step, over a REAL unix socket speaking the control
 // socket's shapes (testdata/recovery/socket), to a fake recovery actor.
@@ -249,23 +254,112 @@ func TestOwnedAdoptWaitsForTheActorsVerdictBeforeTrustingTheBootedBinary(t *test
 	}
 }
 
-// An actor that never answers does not strand the row: past the deadline the
-// booted binary on the release's commit is the evidence, as on Compose.
-func TestOwnedAdoptFallsBackToTheBootedBinaryWhenTheActorIsSilent(t *testing.T) {
+// adoptingOwned is a booted control plane on the release's commit adopting an
+// owned attempt the actor is verifying, with compressed clocks.
+func adoptingOwned(t *testing.T, actor *fakeActor) (*fakeStore, *SelfApplier, Attempt, string) {
+	t.Helper()
 	open := ownedAttempt(AttemptVerifying)
+	store := newFakeStore(open)
+	id, err := store.MintRequestID(context.Background(), "cp-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := testSelfApplier(t, store, NewActorClient(serveActor(t, actor)))
+	self.Deadline = 30 * time.Millisecond
+	self.VerdictSilence = 30 * time.Millisecond
+	self.Identity = func() buildinfo.Identity {
+		return buildinfo.Identity{Version: "0.9.0", SourceCommit: strPtr(testCommit)}
+	}
+	return store, self, open, id
+}
+
+// An actor that never answers for the request does not strand the row, and
+// never makes an unverified build a success: past the deadline it times out.
+func TestOwnedAdoptTimesOutFailClosedWhenTheActorIsSilent(t *testing.T) {
+	store, self, open, _ := adoptingOwned(t, &fakeActor{silent: true})
+	if !self.Adopt(context.Background(), open, testCommit) {
+		t.Fatal("Adopt reported the attempt unresolved")
+	}
+	a := store.snapshot("cp-1")
+	if a.State != AttemptFailed || a.Reason == nil || *a.Reason != ReasonTimeout {
+		t.Fatalf("state=%q reason=%v, want failed/timeout", a.State, a.Reason)
+	}
+}
+
+// A slow link: the actor is still verifying past the apply deadline. It keeps
+// answering, so it is waited for, and its verdict decides.
+func TestOwnedAdoptWaitsPastTheDeadlineWhileTheActorIsStillVerifying(t *testing.T) {
+	actor := &fakeActor{}
+	store, self, open, id := adoptingOwned(t, actor)
+	actor.set(func(a *fakeActor) { a.result = actorResult(id, actorsocket.StateVerifying, "", false) })
+	resolved := make(chan bool, 1)
+	go func() { resolved <- self.Adopt(context.Background(), open, testCommit) }()
+
+	time.Sleep(200 * time.Millisecond) // well past Deadline + VerdictSilence
+	if got := store.snapshot("cp-1").State; got != AttemptVerifying {
+		t.Fatalf("state = %q while the actor still answers verifying, want it left open", got)
+	}
+	actor.set(func(a *fakeActor) {
+		a.result = actorResult(id, actorsocket.StateFailed, actorsocket.ReasonUnhealthy, true)
+	})
+	if !<-resolved {
+		t.Fatal("Adopt reported the attempt unresolved")
+	}
+	if a := store.snapshot("cp-1"); a.State != AttemptFailed || a.Reason == nil || *a.Reason != ReasonUnhealthy {
+		t.Fatalf("state=%q reason=%v, want the actor's failed/unhealthy", a.State, a.Reason)
+	}
+}
+
+// The actor stops this control plane to put the old one back before any
+// verdict exists: shutting down writes nothing, so the restored control plane
+// records the actor's verdict on its next boot.
+func TestOwnedAdoptShuttingDownLeavesTheRowForTheNextBoot(t *testing.T) {
+	actor := &fakeActor{}
+	store, self, open, id := adoptingOwned(t, actor)
+	self.Deadline = time.Hour
+	actor.set(func(a *fakeActor) { a.result = actorResult(id, actorsocket.StateVerifying, "", false) })
+	ctx, cancel := context.WithCancel(context.Background())
+	resolved := make(chan bool, 1)
+	go func() { resolved <- self.Adopt(ctx, open, testCommit) }()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	if !<-resolved {
+		t.Fatal("Adopt asked to be re-driven while shutting down")
+	}
+	if got := store.snapshot("cp-1").State; got != AttemptVerifying {
+		t.Fatalf("state = %q after shutdown, want verifying left for the next boot", got)
+	}
+
+	// The restored old control plane boots on the previous commit and reads it.
+	actor.set(func(a *fakeActor) {
+		a.result = actorResult(id, actorsocket.StateFailed, actorsocket.ReasonUnhealthy, true)
+	})
+	if !self.Adopt(context.Background(), open, testCommit+"-no") {
+		t.Fatal("the restored control plane's Adopt reported the attempt unresolved")
+	}
+	a := store.snapshot("cp-1")
+	if a.State != AttemptFailed || a.Reason == nil || *a.Reason != ReasonUnhealthy || a.Output == "" {
+		t.Fatalf("state=%q reason=%v output=%q, want the actor's verdict", a.State, a.Reason, a.Output)
+	}
+}
+
+// A restored control plane that boots after the apply deadline still records the
+// verdict already there, rather than timing out on its first look.
+func TestAdoptPastTheDeadlineReadsAnAlreadyTerminalResult(t *testing.T) {
+	open := controlPlaneAttempt(AttemptRecreating)
+	open.CreatedAt = time.Now().Add(-time.Hour)
 	store := newFakeStore(open)
 	if _, err := store.MintRequestID(context.Background(), "cp-1"); err != nil {
 		t.Fatal(err)
 	}
-	self := testSelfApplier(t, store, NewActorClient(serveActor(t, &fakeActor{silent: true})))
-	self.Deadline = 50 * time.Millisecond
-	self.Identity = func() buildinfo.Identity {
-		return buildinfo.Identity{Version: "0.9.0", SourceCommit: strPtr(testCommit)}
-	}
+	up := &fakeUpdater{}
+	reason := ReasonNeverStarted
+	up.setResult(updaterResult(reason))
+	self := testSelfApplier(t, store, NewUpdaterClient(serveUpdater(t, up)))
 	if !self.Adopt(context.Background(), open, testCommit) {
 		t.Fatal("Adopt reported the attempt unresolved")
 	}
-	if got := store.snapshot("cp-1").State; got != AttemptSucceeded {
-		t.Fatalf("state = %q, want succeeded", got)
+	if a := store.snapshot("cp-1"); a.State != AttemptFailed || a.Reason == nil || *a.Reason != ReasonNeverStarted {
+		t.Fatalf("state=%q reason=%v, want failed/never_started, not a timeout", a.State, a.Reason)
 	}
 }

@@ -121,19 +121,34 @@ func (r *SelfDeveloperRunner) start(a Attempt, adopted bool) {
 }
 
 func (r *SelfDeveloperRunner) drive(ctx context.Context, a Attempt, adopted bool) {
+	// Shutting down is never a failure: a sent attempt's verdict is the actor's,
+	// and the next boot reads it.
 	hosts, err := r.store.Hosts(ctx)
-	if err != nil {
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil && !adopted {
 		r.fail(a.ID, fmt.Sprintf("could not read the hosts to cordon: %v", err))
 		return
 	}
 	// Re-taken on adoption too: the restart this attempt caused is exactly
-	// when a hold's projection may have been lifted underneath it.
+	// when a hold's projection may have been lifted underneath it. An adopted
+	// attempt may already be in the actor's hands, so it is never failed here.
 	for _, h := range hosts {
-		if err := r.cordons.AcquireOwned(ctx, a.ID, h.HostID); err != nil {
-			r.fail(a.ID, fmt.Sprintf("could not cordon %s: %v", h.NodeName, err))
-			r.releaseAll(a.ID)
+		err := r.cordons.AcquireOwned(ctx, a.ID, h.HostID)
+		if err == nil {
+			continue
+		}
+		if ctx.Err() != nil {
 			return
 		}
+		if adopted {
+			r.log.Warn("developer apply: could not re-take a host hold on adoption", "attempt_id", a.ID, "host_id", h.HostID, "err", err)
+			continue
+		}
+		r.fail(a.ID, fmt.Sprintf("could not cordon %s: %v", h.NodeName, err))
+		r.releaseAll(a.ID)
+		return
 	}
 	if adopted {
 		commit := ""
@@ -145,7 +160,7 @@ func (r *SelfDeveloperRunner) drive(ctx context.Context, a Attempt, adopted bool
 					"attempt_id", a.ID, "err", err)
 			}
 		}
-		if !r.self.Adopt(ctx, a, commit) {
+		if !r.self.Adopt(ctx, a, commit) && ctx.Err() == nil {
 			r.settleInFlight(ctx)
 			r.self.Apply(ctx, a)
 		}
