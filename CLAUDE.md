@@ -238,8 +238,9 @@ session memory `current-focus.md`, not this file.**
   headings; the Releases tab parses them); (2) the develop→main promotion is a PR merged only
   with the operator's sign-off, and only THEN is the cut run. After the tag push, watch the
   Images run to success, verify `gh release view vX.Y.Z` (manifest asset, not prerelease), merge
-  `main` back into `develop` (the changelog cut), then run the live update on gpu-test from
-  Fleet ▸ Releases ("Check now" → apply) before calling the release done.
+  `main` back into `develop` (the changelog cut), then run the live update from Fleet ▸ Releases
+  ("Check now" → apply) on an owned install (made with the seed) on gpu-test before calling the
+  release done: a Compose or source stack is never offered it.
 - **ABR is ON by default, mode `smooth`** (SPT-10 #346, 2026-06-27). `smooth` is
   encoder-aware + smoothness-biased (under congestion: present σ p95 ~69→19 ms,
   freezes 14→2 vs `protective`; identical on a clean path; preserves the #68 emergency

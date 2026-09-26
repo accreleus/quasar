@@ -19,9 +19,12 @@ Quasar are a different shape, and nothing converts one into the other:
   Restoring a dump taken from a Compose install into a new one is planned
   ([#380](https://github.com/accreleus/quasar/issues/380)); until it ships,
   plan for a clean start.
-- **Old homes stay on disk, untouched.** The new install does not attach them to
-  its new accounts. Keep them until you no longer need anything in them. Copying
-  a save or a setting into a new user's home by hand is up to you.
+- **Homes stay where they are, and come back by name.** Nothing is copied. A
+  home lives at `<home root>/<user>/<app>`, so when the new install uses the same
+  home root and you re-create a user and an app under the same names, that user
+  finds their saves and installed games again. What is not carried across is the
+  database and its accounts
+  ([#380](https://github.com/accreleus/quasar/issues/380)).
 
 ## Before you start
 
@@ -59,15 +62,16 @@ Quasar are a different shape, and nothing converts one into the other:
 
 3. **Install the first machine with the seed.** Use the [quick
    start](/quasar/start/quickstart/), or follow [Install the first
-   machine](/quasar/install/install/#install-the-first-machine). Give it a
-   **different home root** from the old stack's, so the two installs' homes
-   never mix.
+   machine](/quasar/install/install/#install-the-first-machine). Give it the
+   **same home root** as the old stack's.
 
 4. **Claim the new install** as in [First-run setup](/quasar/install/first-run/),
-   then add apps and users again.
+   then add apps and users again, **under the same names** as before, so each
+   user's homes are found where they are.
 
 5. **Add each GPU host** from the new console, under Admin, Fleet, Add host, as
-   in [Add a second GPU host](/quasar/install/second-host/).
+   in [Add a second GPU host](/quasar/install/second-host/), with the same home
+   root it used before.
 
 6. **Verify** as in [Check your install](/quasar/install/verify/): hosts online
    and a real session that plays.

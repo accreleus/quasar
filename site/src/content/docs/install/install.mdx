@@ -170,9 +170,10 @@ What is **not** there, by design:
 
 A **control-only** machine sets `QUASAR_ROLE=control-only`. It runs no agent, so
 it needs no GPU, no home root and none of the GPU preparation in the
-requirements. It still names `QUASAR_AGENT_IMAGE`: that is the agent Add host
-installs on new GPU hosts. `QUASAR_HOME_ROOT` is optional there; set it only if
-every GPU host will use that same path.
+requirements. `QUASAR_AGENT_IMAGE` is optional there: named, it is the agent
+Add host installs on new GPU hosts when no release names one; left out, Add host
+offers the installed release's images. `QUASAR_HOME_ROOT` is optional too; set it
+only if every GPU host will use that same path.
 
 ### Your own Postgres
 

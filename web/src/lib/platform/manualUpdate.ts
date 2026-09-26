@@ -97,18 +97,28 @@ interface ManifestComponent {
   digest?: unknown;
 }
 
-/** The manifest's two components, in the contract's normative order:
- *  control-plane then node-agent. Anything else reads as no manifest at all —
- *  a half-understood manifest must not become a half-right command. */
+/** Each manifest format's components, in the contract's normative order. */
+const MANIFEST_COMPONENTS = [
+  ["control-plane", "node-agent"],
+  ["control-plane", "node-agent", "recovery-actor"],
+];
+
+/** The control-plane and node-agent pins of a format-1 (two components) or
+ *  format-2 (three, the recovery actor last) manifest. Anything else reads as no
+ *  manifest at all — a half-understood manifest must not become a half-right command. */
 function pinnedImages(release?: PlatformRelease | null): [string, string] | null {
   const manifest = release?.manifest as { components?: unknown } | null | undefined;
   const components = manifest?.components;
-  if (!Array.isArray(components) || components.length !== 2) return null;
-  const pins = (components as ManifestComponent[]).map((c) =>
-    typeof c?.image === "string" && typeof c?.digest === "string" ? `${c.image}@${c.digest}` : null,
+  if (!Array.isArray(components)) return null;
+  const names = MANIFEST_COMPONENTS.find((n) => n.length === components.length);
+  if (!names) return null;
+  const pins = (components as ManifestComponent[]).map((c, i) =>
+    c?.name === names[i] && typeof c?.image === "string" && typeof c?.digest === "string"
+      ? `${c.image}@${c.digest}`
+      : null,
   );
-  if (pins[0] == null || pins[1] == null) return null;
-  return [pins[0], pins[1]];
+  if (pins.some((p) => p == null)) return null;
+  return [pins[0] as string, pins[1] as string];
 }
 
 /** A digest to go BACK to, and the repository it belongs to: what an attempt
@@ -196,6 +206,20 @@ export function manualUpdatePath(inputs: ManualUpdateInputs): ManualUpdatePath |
       };
 
     case "updater_absent":
+      // A control plane running this build with no recovery actor was built from
+      // source: the published image cannot replace it, so it redeploys.
+      if (inputs.kind === "control_plane" && inputs.installMode !== "owned") {
+        return {
+          summary:
+            "This control plane has no recovery actor: it was not installed with the seed, so it is not updated from here. It updates with the redeploy script.",
+          commands: [
+            {
+              label: `Rebuild and restart this stack at ${redeployRef(release)}`,
+              command: redeployCommand(inputs),
+            },
+          ],
+        };
+      }
       if (inputs.installMode === "owned") {
         return {
           summary:

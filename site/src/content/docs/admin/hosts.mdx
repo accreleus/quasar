@@ -102,7 +102,10 @@ Two warnings can appear above the card:
   machine are blocked until you remove it, and whatever re-creates it.
 
 A GPU host's card has **Remove host** in its footer (see [Draining and
-removing](#draining-and-removing)).
+removing](#draining-and-removing)). A combined host's card says instead that the
+machine runs the control plane, so it is not removed from here: it is taken
+apart with `uninstall` on the machine (see
+[Uninstalling](/quasar/operations/uninstall/)).
 
 A host whose node agent or recovery actor is below the control plane's floor
 reads **Must update before it can be managed**. It keeps running, but the console

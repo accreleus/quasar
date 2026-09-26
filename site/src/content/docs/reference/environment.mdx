@@ -47,7 +47,7 @@ Quasar](/quasar/install/install/).
 | `QUASAR_HOME_ROOT` | required on a machine with an agent | Host path of the home root, bound into the agent at the same path. Optional on a control-only machine: set, every GPU host must use that same path. |
 | `QUASAR_TEMPLATE_ROOT` | `templates` beside the home root | Host path of the template root. |
 | `QUASAR_NODE_NAME` | the machine's host name | The agent's node name. A node name bound into the enrollment string must match. |
-| `QUASAR_AGENT_IMAGE` | required | The node-agent image as `repository@sha256:<digest>`. A tag is refused, and so is an image whose container shape this recovery actor does not carry. On a control-only machine it is the agent Add host installs on new GPU hosts. |
+| `QUASAR_AGENT_IMAGE` | required on a machine with an agent | The node-agent image as `repository@sha256:<digest>`. A tag is refused, and so is an image whose container shape this recovery actor does not carry. Optional on a control-only machine: named, it is the agent Add host installs on new GPU hosts when no release names one; left out, Add host offers the installed release's images. |
 | `QUASAR_APP_PUID`, `QUASAR_APP_PGID` | the image's user | Who owns game and save data (Unraid: `99` and `100`). |
 | `QUASAR_CONTAINER_NETWORK` | `none` | The app containers' network: `none`, `bridge` or `host`. |
 

@@ -37,9 +37,6 @@ docker ps --filter label=io.quasar.installation
 | Control-only host | `quasar-recovery`, `quasar-postgres`, `quasar-control-plane` |
 | GPU host | `quasar-recovery`, `quasar-node-agent` |
 
-With your own database there is no `quasar-postgres`. The seed is not in the
-list: it is yours, not Quasar's.
-
 Plus the seed, `quasar-seed`, which is yours rather than Quasar's and so has no
 installation label. A database you run yourself means no `quasar-postgres`. All of
 them should report healthy. The node agent runs with host networking, and its

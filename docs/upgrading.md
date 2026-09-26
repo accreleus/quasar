@@ -327,8 +327,10 @@ history, keep the old stack running until it exists.)
    no `-v`), on the control-plane machine and on every GPU host (an earlier one-line agent install:
    `docker compose --project-directory /opt/quasar-agent down`). A leftover container would be an
    owner conflict and would hold the ports.
-4. **Install with the seed**, pointing it at the same home root so saves and installed games
-   are found where they are; nothing is copied.
+4. **Install with the seed**, pointing it at the same home root. Nothing is copied: a home is
+   found again when its user and its app are re-created under the same names (homes live at
+   `<home root>/<user>/<app>`), so saves and installed games come back with them. The database
+   and its accounts are what is not carried across (#380).
 5. **Add each GPU host** from Admin › Fleet › Add host.
 6. **Keep the old volumes and `deploy/.env`** until the new install is verified. They are your way
    back: `docker compose -f deploy/docker-compose.yml up -d` restores the old stack as it was.
