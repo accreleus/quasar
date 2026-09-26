@@ -128,6 +128,13 @@ pub enum Role {
 }
 
 impl Role {
+    pub const ALL: [Role; 4] = [
+        Role::ControlPlane,
+        Role::NodeAgent,
+        Role::Postgres,
+        Role::RecoveryActor,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Role::ControlPlane => "control-plane",
@@ -138,14 +145,7 @@ impl Role {
     }
 
     pub fn parse(s: &str) -> Option<Role> {
-        [
-            Role::ControlPlane,
-            Role::NodeAgent,
-            Role::Postgres,
-            Role::RecoveryActor,
-        ]
-        .into_iter()
-        .find(|r| r.as_str() == s)
+        Role::ALL.into_iter().find(|r| r.as_str() == s)
     }
 
     /// The container name the actor gives this role.
@@ -561,6 +561,23 @@ impl Book {
     pub fn supports(role: Role, revision: u32) -> bool {
         Book::window(role).is_some_and(|w| w.contains(&revision))
     }
+
+    /// Every role's window as one JSON line, a role with none omitted. The shape
+    /// `scripts/release/check-release-compatibility.sh` reads from `quasar-recovery recipes`.
+    pub fn windows_json() -> String {
+        let windows: serde_json::Map<String, serde_json::Value> = Role::ALL
+            .into_iter()
+            .filter_map(|role| {
+                Book::window(role).map(|w| {
+                    (
+                        role.as_str().to_string(),
+                        serde_json::json!({ "from": w.start(), "to": w.end() }),
+                    )
+                })
+            })
+            .collect();
+        serde_json::json!({ "format_version": 1, "windows": windows }).to_string()
+    }
 }
 
 /// Render one role's container at one revision. Total and deterministic: the same inputs
@@ -951,5 +968,39 @@ fn recovery_actor_r1(inputs: &Inputs, image: &ImageRef) -> ContainerSpec {
         restart: RestartPolicy::UnlessStopped,
         ports: Vec::new(),
         healthcheck: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_json_is_one_line_with_every_window() {
+        let line = Book::windows_json();
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.starts_with(r#"{"format_version":1,"windows":{"control-plane":{"from":"#),
+            "{line}"
+        );
+        let doc: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(doc.as_object().unwrap().len(), 2, "{line}");
+        assert_eq!(doc["format_version"], 1);
+        let windows = doc["windows"].as_object().unwrap();
+        let mut carried = 0;
+        for role in Role::ALL {
+            match Book::window(role) {
+                Some(w) => {
+                    carried += 1;
+                    assert_eq!(
+                        windows[role.as_str()],
+                        serde_json::json!({ "from": w.start(), "to": w.end() }),
+                        "{line}"
+                    );
+                }
+                None => assert!(!windows.contains_key(role.as_str()), "{line}"),
+            }
+        }
+        assert_eq!(windows.len(), carried, "{line}");
     }
 }

@@ -1,10 +1,10 @@
 {
-  "format_version": 7,
-  "version": "0.2.0-rc.1",
+  "format_version": 2,
+  "version": "0.4.0-rc.1",
   "prerelease": true,
   "source_commit": "cccccccccccccccccccccccccccccccccccccccc",
-  "built_at": "2026-09-04T12:00:00Z",
-  "schema_version": 74,
+  "built_at": "2026-10-01T12:00:00Z",
+  "schema_version": 96,
   "components": [
     {
       "name": "control-plane",
@@ -15,6 +15,21 @@
       "name": "node-agent",
       "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
       "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "recovery-actor",
+      "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+      "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "floor": [
+    {
+      "name": "node-agent",
+      "version": "0.4.0-0"
+    },
+    {
+      "name": "recovery-actor",
+      "version": "0.4.0-rc.1.1"
     }
   ]
 }
