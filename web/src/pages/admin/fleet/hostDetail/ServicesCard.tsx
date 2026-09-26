@@ -150,6 +150,8 @@ function StateCell({ state }: { state: ServiceState }) {
           reachable
         </Chip>
       );
+    case "must_update":
+      return <Chip variant="warning">must update</Chip>;
     default:
       return <Chip>unknown</Chip>;
   }

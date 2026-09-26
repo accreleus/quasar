@@ -247,6 +247,58 @@
   line-height: 1.55;
 }
 
+/* "Must update before it can be managed" (#365): `pageRhFloor`'s note and its one
+   action, from its inline styles in design_handoff_v3/screens/assets/pages-rh06.js. */
+.host-detail-page .host-floor {
+  display: flex;
+  gap: var(--s5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.host-detail-page .host-floor-text {
+  flex: 1;
+  min-width: 280px;
+}
+.host-detail-page .host-floor-why {
+  display: block;
+  margin-top: 4px;
+}
+
+/* The closed "Details" disclosure (`.diag` in fleet-rh06-v3.html's style block). */
+.host-detail-page .diag { margin-top: 10px; }
+.host-detail-page .diag > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+.host-detail-page .diag > summary::-webkit-details-marker { display: none; }
+.host-detail-page .diag > summary:hover { color: var(--text); }
+.host-detail-page .diag > summary svg {
+  width: 11px;
+  height: 11px;
+  margin: 0;
+  color: inherit;
+  transition: transform 0.15s;
+}
+.host-detail-page .diag[open] > summary svg { transform: rotate(90deg); }
+.host-detail-page .diag pre {
+  margin: 8px 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: color-mix(in oklch, var(--surf-inset) 82%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  padding: 9px 11px;
+}
+
 /* ── Add host modal ────────────────────────────────────────────────── */
 
 /* A value block wraps rather than scrolling out of the dialog: an operator

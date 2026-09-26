@@ -11,8 +11,10 @@ import { ApiError } from "../../api/client";
 import type {
   GPUAvailability,
   Host,
+  PlatformApplyAttempt,
   PlatformIdentity,
   PlatformReleaseFault,
+  PlatformReleaseView,
 } from "../../api/types";
 import { useAuth } from "../../auth/context";
 import { Breadcrumbs } from "../../components/Breadcrumbs";
@@ -30,7 +32,10 @@ import { useAdminAction } from "../../lib/resource/action";
 import { useResource } from "../../lib/resource/react";
 import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
+import { FloorNote } from "./fleet/hostDetail/FloorNote";
 import { ServicesCard } from "./fleet/hostDetail/ServicesCard";
+import { ApplyConfirmModal } from "./fleet/ApplyControls";
+import { hostFloorState } from "./fleet/hostFloor";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
 import { agentOlderThanControlPlane, hostServices } from "./fleet/hostServices";
 import { AdmissionReasons, admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./fleet/AdmissionReasons";
@@ -51,6 +56,10 @@ interface HostDetailData {
   controlPlaneCommit: string | null;
   /** The control plane's own identity, machine fields included; null when unread. */
   controlPlane: PlatformIdentity | null;
+  /** The release view, for this host's below_floor and its offered update; null when unread. */
+  view: PlatformReleaseView | null;
+  /** This host's newest attempt; null when there is none or it could not be read. */
+  lastAttempt: PlatformApplyAttempt | null;
 }
 
 export function HostDetail() {
@@ -66,7 +75,7 @@ export function HostDetail() {
       label: "host",
       pollMs: POLL_MS,
       fetch: async (ctx): Promise<HostDetailData> => {
-        const [{ host }, gpus, release] = await Promise.all([
+        const [{ host }, gpus, release, lastAttempt] = await Promise.all([
           adminApi.getHost(ctx.token, id),
           adminApi.getHostGPUs(ctx.token, id).then(
             (r) => r.items,
@@ -78,11 +87,16 @@ export function HostDetail() {
               faults: v.faults.filter((f) => f.host_id === id),
               controlPlaneCommit: v.installed?.control_plane.source_commit ?? null,
               controlPlane: v.installed?.control_plane ?? null,
+              view: v,
             }),
-            () => ({ faults: [], controlPlaneCommit: null, controlPlane: null }),
+            () => ({ faults: [], controlPlaneCommit: null, controlPlane: null, view: null }),
+          ),
+          adminApi.listPlatformAttempts(ctx.token, { hostId: id, limit: 1 }, ctx.signal).then(
+            (r) => r.attempts[0] ?? null,
+            () => null,
           ),
         ]);
-        return { host, gpus, ...release };
+        return { host, gpus, ...release, lastAttempt };
       },
     },
     [id],
@@ -151,6 +165,7 @@ export function HostDetail() {
   // Awaiting confirmation in the Modal below; null when no "Launch anyway" is pending.
   const [confirmOverrideCheckId, setConfirmOverrideCheckId] = useState<string | null>(null);
   const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [updating, setUpdating] = useState(false);
 
   const crumbs = (
     <Breadcrumbs
@@ -171,9 +186,13 @@ export function HostDetail() {
   }
 
   const state = hostStateLabel(host);
+  const floor = hostFloorState(host, res.data?.view, res.data?.lastAttempt);
+  // Below the floor the only thing offered is an update: no settings, no local console.
+  const managed = floor?.kind !== "below";
   const services = hostServices(host, {
     machine: res.data?.controlPlane ?? null,
     agentOlder: agentOlderThanControlPlane(host, controlPlaneCommit, faults),
+    floor,
   });
 
   return (
@@ -194,12 +213,14 @@ export function HostDetail() {
             <Chip variant={hostStateChip(host)} dot={state === "online"}>
               {state}
             </Chip>
-            <Button
-              variant="ghost"
-              onClick={() => navigate(`/admin/fleet/hosts/${host.id}/console`)}
-            >
-              Local console
-            </Button>
+            {managed && (
+              <Button
+                variant="ghost"
+                onClick={() => navigate(`/admin/fleet/hosts/${host.id}/console`)}
+              >
+                Local console
+              </Button>
+            )}
             <Button variant="ghost" onClick={() => setCleanupOpen(true)}>
               Manage cached images
             </Button>
@@ -210,14 +231,25 @@ export function HostDetail() {
             >
               {admissionActionLabel(host)}
             </Button>
-            <Button onClick={() => navigate(`/admin/fleet/hosts/${host.id}/settings`)}>
-              Settings
-            </Button>
+            {managed && (
+              <Button onClick={() => navigate(`/admin/fleet/hosts/${host.id}/settings`)}>
+                Settings
+              </Button>
+            )}
           </>
         }
       />
 
       <ResourceStates loading={res.loading} error={res.errorMessage} />
+
+      {floor && (
+        <FloorNote
+          host={host}
+          state={floor}
+          liveSessions={sessions.length}
+          onUpdate={() => setUpdating(true)}
+        />
+      )}
 
       {host.status === "offline" && (
         <p className="note warn host-note">
@@ -310,6 +342,15 @@ export function HostDetail() {
             check is failing. The check stays visible, and the override ends when it next passes.
           </p>
         </Modal>
+      )}
+      {updating && floor?.release && floor.target && (
+        <ApplyConfirmModal
+          release={floor.release}
+          target={floor.target}
+          liveSessions={sessions.length}
+          onClose={() => setUpdating(false)}
+          onApplied={() => void res.refresh({ silent: true })}
+        />
       )}
       {cleanupOpen && token && (
         <ImageCleanupModal token={token} hostID={host.id} hostName={host.node_name}
