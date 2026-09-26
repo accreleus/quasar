@@ -9,7 +9,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use quasar_recovery::engine::Container;
+use quasar_recovery::engine::{Container, RestartPolicy};
 use quasar_recovery::recipe::labels;
 use quasar_recovery::seed::file::{self, ActorImage};
 use quasar_recovery::seed::{self, profile};
@@ -26,7 +26,8 @@ fn fixtures() -> PathBuf {
 
 /// A container as a fixture records it: only what the seed may look at. `id` defaults to
 /// one derived from its position; the case's own seed is the container running
-/// `quasar-recovery seed`.
+/// `quasar-recovery seed`. `restart` (`unless-stopped` or `no`) is recorded where it
+/// matters, and unknown otherwise.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Recorded {
@@ -38,6 +39,8 @@ struct Recorded {
     command: Vec<String>,
     #[serde(default)]
     env: Vec<String>,
+    #[serde(default)]
+    restart: Option<String>,
 }
 
 fn container(r: &Recorded, index: usize) -> Container {
@@ -50,7 +53,11 @@ fn container(r: &Recorded, index: usize) -> Container {
         status: r.status.clone(),
         running: r.status == "running",
         health: None,
-        restart: None,
+        restart: r.restart.as_deref().map(|p| match p {
+            "unless-stopped" => RestartPolicy::UnlessStopped,
+            "no" => RestartPolicy::No,
+            other => panic!("unknown restart policy {other}"),
+        }),
         mounts: Vec::new(),
         command: r.command.clone(),
         env: r.env.clone(),
@@ -89,7 +96,15 @@ fn the_current_seed_decides_as_it_did_for_every_released_actors_machine_state() 
                 .iter()
                 .find(|c| seed::is_seed(c))
                 .map(|c| c.id.as_str());
-            let decided = serde_json::to_value(seed::decide(&read, &containers, me)).unwrap();
+            // `previous.json`, where a case has one, is the seed's previous look (ADR 0007,
+            // "An actor stopped from outside"); every other case is a first look.
+            let previous: Option<seed::PreviousLook> = case
+                .join("previous.json")
+                .exists()
+                .then(|| read_json(&case.join("previous.json")));
+            let decided =
+                serde_json::to_value(seed::decide(&read, &containers, me, previous.as_ref()))
+                    .unwrap();
             let expected: serde_json::Value = read_json(&case.join("expected.json"));
             // The fixture names what is decided; detail it leaves out (which container was
             // seen, the wording of a reason) is not part of the interface.

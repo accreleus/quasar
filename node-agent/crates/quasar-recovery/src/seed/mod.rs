@@ -8,9 +8,11 @@
 //! - `seed.json` says `uninstalled`, has another format, or does not parse: idle;
 //! - the only actor is one this seed created and never started: start it, finishing its
 //!   own create (ADR 0007, "Finishing its own create");
+//! - the only actor was stopped from outside and the previous look saw it so: start it
+//!   (ADR 0007, "An actor stopped from outside");
 //! - otherwise a container carrying both labels exists, in any state and under any name (a
 //!   hand-over's kept and successor containers included): nothing. When none of them has
-//!   run for two looks it says so (`seed-actor-stopped`, unhealthy) and still starts nothing;
+//!   run for two looks it says so (`seed-actor-stopped`, unhealthy);
 //! - otherwise create the actor from the profile, from `seed.json`'s verified image or, on
 //!   a first install (no `seed.json`), from the seed's own image with a new installation.
 //!
@@ -21,9 +23,9 @@ pub mod profile;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::actor::repository_of;
@@ -54,6 +56,11 @@ pub enum Decision {
     },
     /// The only recovery actor is this seed's own create, never started: start it.
     StartOwn {
+        container: String,
+    },
+    /// The only recovery actor was stopped from outside, and was on the previous look too:
+    /// start it.
+    StartStopped {
         container: String,
     },
     /// A recovery actor of this installation exists.
@@ -112,8 +119,45 @@ fn unstarted_create_of(c: &Container) -> Option<&str> {
     is_own_unstarted(c, Some(seed)).then_some(seed)
 }
 
+/// One container carrying both labels, as a look saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeenActor {
+    /// The full container id.
+    pub id: String,
+    /// The engine's state word.
+    pub status: String,
+}
+
+/// The seed's previous look, for [`decide`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousLook {
+    /// How long ago it was, in seconds.
+    pub age_s: u64,
+    /// Every container carrying both labels for the installation, as it saw them.
+    pub actors: Vec<SeenActor>,
+}
+
+/// ADR 0007, "An actor stopped from outside": the one actor of an active installation is
+/// exited with the profile's restart policy intact, and the previous look, at least one
+/// interval earlier, saw the same container exited and nothing else.
+fn stopped_from_outside(only: &Container, previous: Option<&PreviousLook>) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    only.status == "exited"
+        && only.restart == Some(RestartPolicy::UnlessStopped)
+        && previous.age_s >= INTERVAL.as_secs()
+        && previous.actors
+            == [SeenActor {
+                id: only.id.clone(),
+                status: only.status.clone(),
+            }]
+}
+
 /// The actors of an active installation when none of them runs; `None` otherwise. Only
-/// reported ([`Outcome::Idle`] `seed-actor-stopped`): the seed starts no existing actor.
+/// reported ([`Outcome::Idle`] `seed-actor-stopped`) when [`decide`] starts none of them.
 fn stopped_actors<'a>(read: &SeedRead, containers: &'a [Container]) -> Option<Vec<&'a Container>> {
     let SeedRead::Found(f) = read else {
         return None;
@@ -153,8 +197,14 @@ fn stopped_why(actors: &[&Container]) -> String {
     }
 }
 
-/// `me` is the seed's own full container id, when known.
-pub fn decide(read: &SeedRead, containers: &[Container], me: Option<&str>) -> Decision {
+/// `me` is the seed's own full container id, when known; `previous` is the look before
+/// this one, `None` on a seed's first.
+pub fn decide(
+    read: &SeedRead,
+    containers: &[Container],
+    me: Option<&str>,
+    previous: Option<&PreviousLook>,
+) -> Decision {
     let (installation, image) = match read {
         SeedRead::UnknownFormat(v) => {
             return Decision::UnknownFormat {
@@ -180,6 +230,12 @@ pub fn decide(read: &SeedRead, containers: &[Container], me: Option<&str>) -> De
     match actors.as_slice() {
         [only] if is_own_unstarted(only, me) => {
             return Decision::StartOwn {
+                container: only.name.clone(),
+            }
+        }
+        // `installation` is set only by an active seed.json.
+        [only] if installation.is_some() && stopped_from_outside(only, previous) => {
+            return Decision::StartStopped {
                 container: only.name.clone(),
             }
         }
@@ -238,6 +294,11 @@ pub enum Outcome {
         image: String,
         installation_id: String,
     },
+    /// An actor stopped from outside was started again.
+    Started {
+        container: String,
+        id: String,
+    },
     /// Nothing is done until something outside the seed changes.
     Idle {
         token: &'static str,
@@ -266,6 +327,12 @@ impl Outcome {
                 image = %image,
                 installation = %installation_id,
                 "created and started the recovery actor"
+            ),
+            Outcome::Started { container, id } => info!(
+                token = "seed-actor-started",
+                container = %container,
+                id = %id,
+                "started the recovery actor again: it was stopped from outside (docker stop or docker kill), and it finishes what it was doing"
             ),
             // One literal per token: node-agent/tests/log_convention.rs reads them.
             Outcome::Idle { token, why } | Outcome::Retry { token, why } => match *token {
@@ -302,6 +369,9 @@ impl Outcome {
         match self {
             Outcome::Present { container } => format!("recovery actor present ({container})"),
             Outcome::Created { id, .. } => format!("recovery actor created ({id})"),
+            Outcome::Started { container, .. } => {
+                format!("recovery actor {container} started again after it was stopped")
+            }
             Outcome::Idle { why, .. } => format!("idle: {why}"),
             Outcome::Retry { why, .. } => format!("retrying: {why}"),
         }
@@ -345,6 +415,8 @@ pub struct SeedConfig {
     pub new_installation_id: Box<dyn Fn() -> String + Send + Sync>,
     /// Rewritten after every look, for the image's health check (`quasar-recovery status`).
     pub status_file: Option<PathBuf>,
+    /// Measures how long ago the previous look was.
+    pub clock: Box<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl SeedConfig {
@@ -354,6 +426,7 @@ impl SeedConfig {
             self_container: None,
             new_installation_id: Box::new(crate::actor::random_uuid),
             status_file: None,
+            clock: Box::new(Instant::now),
         }
     }
 }
@@ -370,9 +443,8 @@ pub struct Seed {
     engine: Arc<dyn PlatformEngine>,
     config: SeedConfig,
     last: Option<Outcome>,
-    /// The actors the previous look found none of running: reported once a second look
-    /// finds the same, so a hand-over's moment between two actors is never reported.
-    stopped: Option<Vec<String>>,
+    /// When the previous look was, and the actors it saw.
+    previous: Option<(Instant, Vec<SeenActor>)>,
 }
 
 fn invalid_self(why: String) -> Outcome {
@@ -402,7 +474,7 @@ impl Seed {
             engine,
             config,
             last: None,
-            stopped: None,
+            previous: None,
         }
     }
 
@@ -437,7 +509,11 @@ impl Seed {
 
     /// One look at the machine, and the one action it may call for.
     pub fn tick(&mut self) -> Outcome {
-        let previously_stopped = self.stopped.take();
+        let now = (self.config.clock)();
+        let previous = self.previous.take().map(|(at, actors)| PreviousLook {
+            age_s: now.saturating_duration_since(at).as_secs(),
+            actors,
+        });
         let read = file::read(&self.config.machine_dir);
         let looks = matches!(read, SeedRead::Missing)
             || matches!(&read, SeedRead::Found(f) if f.state == SeedState::Active);
@@ -457,7 +533,22 @@ impl Seed {
                 .find(|c| c.id == hint || (hint.len() >= 12 && c.id.starts_with(hint)))
                 .map(|c| c.id.as_str())
         });
-        match decide(&read, &containers, me) {
+        if looks {
+            let installation = match &read {
+                SeedRead::Found(f) => Some(f.installation_id.as_str()),
+                _ => None,
+            };
+            let seen = containers
+                .iter()
+                .filter(|c| is_actor(c, installation))
+                .map(|c| SeenActor {
+                    id: c.id.clone(),
+                    status: c.status.clone(),
+                })
+                .collect();
+            self.previous = Some((now, seen));
+        }
+        match decide(&read, &containers, me, previous.as_ref()) {
             Decision::Uninstalled { installation_id } => Outcome::Idle {
                 token: "seed-uninstalled",
                 why: format!(
@@ -481,6 +572,22 @@ impl Seed {
                 let installation = c.labels.get(INSTALLATION_LABEL).cloned();
                 self.start_own(c.id.clone(), c.image.clone(), installation.unwrap_or_default())
             }
+            Decision::StartStopped { container } => {
+                let Some(c) = containers.iter().find(|c| c.name == container) else {
+                    return Outcome::Present { container };
+                };
+                let _critical = shutdown::critical();
+                match self.engine.start_container(&c.id) {
+                    Ok(()) => Outcome::Started {
+                        container,
+                        id: c.id.clone(),
+                    },
+                    Err(e) => Outcome::Retry {
+                        token: "seed-start-failed",
+                        why: format!("starting {container} ({}) again: {e}", c.id),
+                    },
+                }
+            }
             Decision::ActorPresent { container } => {
                 let creator = containers
                     .iter()
@@ -495,9 +602,12 @@ impl Seed {
                     },
                     None => match stopped_actors(&read, &containers) {
                         Some(actors) => {
-                            let ids: Vec<String> = actors.iter().map(|c| c.id.clone()).collect();
-                            let settled = previously_stopped.as_ref() == Some(&ids);
-                            self.stopped = Some(ids);
+                            // Two looks, so a hand-over's moment between two actors is
+                            // never reported.
+                            let ids: Vec<&str> = actors.iter().map(|c| c.id.as_str()).collect();
+                            let settled = previous.as_ref().is_some_and(|p| {
+                                p.actors.iter().map(|a| a.id.as_str()).eq(ids.iter().copied())
+                            });
                             if settled {
                                 Outcome::Idle {
                                     token: "seed-actor-stopped",
