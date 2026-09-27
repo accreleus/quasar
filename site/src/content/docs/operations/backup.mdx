@@ -115,11 +115,12 @@ docker exec quasar-recovery quasar-recovery restore --to <version>
 
 It checks that the database's schema matches that version before it starts it.
 
-`restore` loads only the dumps this machine's recovery actor took. A dump you took
-yourself is your copy for disaster recovery; loading one into an owned install by
-hand is not a documented procedure in this release. A dump from a Compose install
-cannot be loaded into an owned install yet
-([#380](https://github.com/accreleus/quasar/issues/380) plans it).
+`restore` loads the dumps this machine's recovery actor took, and one more kind:
+a dump of a Compose install, loaded once into a fresh install before its first
+start (`restore --dump -`, see [Move a Compose install](/quasar/install/move-existing/)).
+A dump you took of an owned install yourself is your copy for disaster recovery;
+loading one into a running owned install by hand is not a documented procedure
+in this release.
 
 Restore the home directories separately if you are restoring those too, then
 verify: the health endpoint, hosts registered, a real session.

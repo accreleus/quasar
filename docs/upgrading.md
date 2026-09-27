@@ -323,26 +323,39 @@ releases that ship owned installs publish only the format-2 manifest, which an o
 plane cannot read, and their edge builds use the `o2-` tags it never resolves. So nothing forces
 the move, and the old stack keeps working while you prepare it.
 
-Moving over is a **fresh install**. Carrying the old database across is not supported in this
-release: the new install starts with an empty database, so accounts, apps and hosts are set up
-again. (A restore of a pre-RH-06 dump into a fresh install is planned, #380; if you want your
-history, keep the old stack running until it exists.)
+Moving over is a **fresh install that loads the old database before it first starts** (#380).
+Accounts, the app library, profiles and settings carry over, and the new control plane migrates
+the data forward on its first boot. Every host is added again, under its old node name, which
+keeps its history and its homes. The site's "Move a Compose install" is the operator guide; in
+short:
 
-1. **Note what you will set up again**: users, the app catalog, each GPU host's node name and
-   home root.
-2. **Take a database dump of the old stack** and keep it, with the old `deploy/.env`:
-   `docker compose -f deploy/docker-compose.yml exec -T quasar-postgres pg_dump -Fc -U quasar quasar > quasar-final.dump`.
-3. **Stop the old stack without deleting its volumes** (`docker compose -f deploy/docker-compose.yml down`,
-   no `-v`), on the control-plane machine and on every GPU host (an earlier one-line agent install:
-   `docker compose --project-directory /opt/quasar-agent down`). A leftover container would be an
-   owner conflict and would hold the ports.
-4. **Install with the seed**, pointing it at the same home root. Nothing is copied: a home is
-   found again when its user and its app are re-created under the same names (homes live at
-   `<home root>/<user>/<app>`), so saves and installed games come back with them. The database
-   and its accounts are what is not carried across (#380).
-5. **Add each GPU host** from Admin › Fleet › Add host.
-6. **Keep the old volumes and `deploy/.env`** until the new install is verified. They are your way
-   back: `docker compose -f deploy/docker-compose.yml up -d` restores the old stack as it was.
+1. **Write down** each host's node name and every machine's home root, and keep `deploy/.env`.
+2. **Stop the old control plane and agents, not the database**:
+   `docker compose -f deploy/docker-compose.yml stop quasar-control-plane quasar-node-agent quasar-updater`
+   on the control-plane machine, and `docker compose --project-directory /opt/quasar-agent down`
+   on every other GPU host.
+3. **Dump it, custom format**:
+   `docker compose -f deploy/docker-compose.yml exec -T quasar-postgres pg_dump -Fc -U quasar quasar > quasar-move.dump`
+   (it starts `PGDMP`), then `docker compose -f deploy/docker-compose.yml down`, **no `-v`**.
+4. **Install the first machine with the seed and `QUASAR_AWAIT_RESTORE=1`**, the same home root,
+   and on a combined machine `QUASAR_NODE_NAME` set to the old `NODE_NAME`. It installs Quasar's own
+   Postgres and holds the control plane (and a combined machine's agent) back
+   (`token="actor-awaiting-restore"`, then `actor-control-plane-held` on every start).
+5. **Load the dump**: `docker exec -i quasar-recovery quasar-recovery restore --dump - < quasar-move.dump`.
+   It refuses, with nothing changed, a file that is not a whole custom-format dump of a Quasar
+   database, a dirty one, and one whose schema is newer than the installed control plane's; then it
+   loads it, sets every host the old install recorded offline, creates the control plane and waits
+   for it to report healthy (its first boot migrates the data). A failure before the control plane
+   is created keeps nothing: run the same command again.
+6. **Sign in with the old admin account** and add each GPU host from Admin › Fleet › Add host under
+   its old node name. Stored credentials (Admin › Settings) were encrypted with the old
+   `QUASAR_SECRET_KEY`: enter each again. Sign-ins carry over with the database.
+7. **Keep the old volumes and `deploy/.env`** until the new install is verified. The move only reads
+   them: `docker compose -f deploy/docker-compose.yml up -d` (and each GPU host's
+   `docker compose --project-directory /opt/quasar-agent up -d`) brings the old stack back as it was.
+
+A database of your own (`QUASAR_DATABASE_HOST`) is restored with your own tools before the
+install's first start; `QUASAR_AWAIT_RESTORE` is refused with it.
 
 ## Legacy Compose installs
 

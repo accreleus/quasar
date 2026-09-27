@@ -1673,6 +1673,7 @@ registers as `seed_version`.
 | `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT` | `8080`, `8443` | The host ports of the control plane's HTTP (agents, `/health`) and HTTPS (console) listeners. |
 | `QUASAR_DATABASE_HOST` | unset | Makes the database **the operator's own** (#352 R1-Q1): no Postgres is created, the console shows "Your own", and Quasar never dumps, restores or upgrades it. With `QUASAR_DATABASE_PORT` (5432), `QUASAR_DATABASE_USER` (`quasar`), `QUASAR_DATABASE_NAME` (`quasar`), `QUASAR_DATABASE_SSLMODE` (`disable`) they are copied into machine state at first boot and passed to the control plane under the same names. |
 | `QUASAR_DATABASE_PASSWORD` | — (**required** with `QUASAR_DATABASE_HOST`) | The operator's database password: copied into machine state's secrets at first boot and given to the control plane only as a file (`QUASAR_DATABASE_PASSWORD_FILE`). Not read again once installed, so it can then be removed from the stack. Refused without `QUASAR_DATABASE_HOST` (a Quasar-owned database generates its own). |
+| `QUASAR_AWAIT_RESTORE` | unset | `1` (or `true`/`yes`/`on`): a fresh combined or control-only install holds its first control plane back until `restore --dump -` has loaded a pre-RH-06 install's dump (#380, "A pre-RH-06 install's dump" below). Read only at the first install. Refused with `QUASAR_DATABASE_HOST` (load your own database with your own tools) and on a GPU host; any other value refuses the install. Not a `reconfigure` input. |
 | `QUASAR_DOCKER_SOCKET_HOST_PATH` | `/var/run/docker.sock` | Only when the actor cannot inspect its own container: the daemon-host path of the engine socket it binds into the agent. Normally learned from the actor's own mount. |
 | `QUASAR_MACHINE_DIR` | `/var/lib/quasar-machine` | Where the `quasar-machine` volume is mounted. The actor refuses to start without it rather than keep state in its container layer. |
 | `QUASAR_MACHINE_DIR_HOST_PATH` | learned from the actor's own mount | Only when the actor cannot inspect its own container: the daemon-host path of the machine-state directory, whose `dumps/` the pre-update dump helper binds (#364). Normally the `quasar-machine` volume's mount point, which needs the engine's `local` volume driver. |
@@ -1829,8 +1830,38 @@ automatically (ADR 0004 amendment):
   operator's own database there is no dump: the command refuses while a control plane runs
   (`docker stop quasar-control-plane` first, or its next boot migrates the restored backup
   again), checks the live schema matches the version named, then starts that control plane.
-  Dumps and the final `uninstall --purge` dump are written `0600`. Only dumps this machine's
-  actor took are restored; a pre-RH-06 install is not migrated (redeploy it).
+  Dumps and the final `uninstall --purge` dump are written `0600`. Beside the dumps this
+  machine's actor took, one more kind is restored: a pre-RH-06 install's (below).
+- **A pre-RH-06 install's dump, into a fresh install (#380).** A combined or control-only
+  machine installed with `QUASAR_AWAIT_RESTORE=1` on its seed (Quasar's own database only)
+  writes `database-hold.json` before machine state (`token="actor-awaiting-restore"`), creates
+  its Postgres, and creates no control plane, nor a combined machine's agent, until a restore
+  (`token="actor-control-plane-held"` on every start). The operator then loads the old stack's
+  `pg_dump --format=custom` file from stdin:
+
+  ```
+  docker exec -i quasar-recovery quasar-recovery restore --dump - < quasar-move.dump
+  ```
+
+  The command copies the file into `dumps/` as `import-<stamp>.dump` (`0600`, never listed or
+  pruned as a pre-update dump) and submits it. It is accepted only while this machine has never
+  created a control plane (no record and no container), and without `--to`. Before anything is
+  touched the restore checks that `pg_restore` reads the whole archive, that its
+  `schema_migrations` row is not dirty, and that its schema is **at or below** the installed
+  control plane's (`org.quasar.schema.version`); a newer dump, a plain-SQL dump and a corrupt one
+  are refused with nothing changed. The load is the same as a restore's, followed by one
+  statement that sets every host recorded `online` to `offline`: their agents belonged to the old
+  install, and a row left online would read as a live agent and refuse the re-enrollment onto its
+  node name (control-api.md "Redemption"). Then the schema floor is raised to the installed
+  control plane's schema, the hold goes, and the install creates its control plane (and a
+  combined machine's agent, enrolled with the local token under `QUASAR_NODE_NAME`), whose first
+  boot migrates the data; the restore ends once it reports healthy. The copied file is removed
+  whenever the restore ends, so after a failure before the control plane was created the same
+  command is run again with the same file; after it was created, only a reinstall
+  (`uninstall --purge`, then the seed with `QUASAR_AWAIT_RESTORE=1`) loads another dump. GPU hosts
+  are re-added from Add host under their old node names, which lands on their old host rows: the
+  history and `user_homes` they keep stay theirs. Values the old control plane stored encrypted
+  (`/v1/admin/secrets`) were under the old `QUASAR_SECRET_KEY` and are entered again.
 
 On start the actor takes the machine's lease (`actor.lease`; a second actor on the same
 volume exits, `token="actor-lease-unavailable"`, unless it is one of a hand-over's two

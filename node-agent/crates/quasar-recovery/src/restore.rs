@@ -845,7 +845,7 @@ impl Actor {
     fn start_fresh(&self, machine: &Machine, plan: &Restore, request_id: &str) -> Result<(), Halt> {
         if let Some(target) = plan.migrates_to {
             self.raise_floor(target, request_id).map_err(|e| {
-                warn!(token = "actor-restore-floor-unwritten", "{e}");
+                warn!(token = "actor-import-floor-unwritten", "{e}");
                 Halt::Died
             })?;
         }
@@ -956,8 +956,15 @@ impl Actor {
         let schema = plan.schema_version.unwrap_or_default();
         let output = match &plan.dump {
             Some(_) if plan.imported => format!(
-                "Loaded the pre-RH-06 dump (schema {schema}) into this install's database and started its control plane, which migrated it to schema {}. Its accounts, library and settings are back. Every host the old install had is offline: add each GPU host again from Admin > Fleet > Add host, under its old node name, to keep its history and homes.",
-                plan.migrates_to.unwrap_or_default()
+                "Loaded the pre-RH-06 dump (schema {schema}) into this install's database and started its control plane, which migrated it to schema {}. Its accounts, library and settings are back. Every host the old install had is offline{}: add each GPU host again from Admin > Fleet > Add host, under its old node name, to keep its history and homes.",
+                plan.migrates_to.unwrap_or_default(),
+                match self.restore_machine() {
+                    Ok(m) if m.role == MachineRole::Combined => format!(
+                        " but this machine's own, which its agent takes back as {}",
+                        m.inputs.node_name
+                    ),
+                    _ => String::new(),
+                }
             ),
             Some(name) => format!(
                 "Restored dump {name} (schema {schema}, taken {}) into Quasar's database and started control plane {} again. Anything written after the dump was taken is gone.",

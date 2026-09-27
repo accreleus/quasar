@@ -65,6 +65,7 @@ On the first machine (`combined` or `control-only`), also:
 | `QUASAR_DATABASE_PORT`, `QUASAR_DATABASE_USER`, `QUASAR_DATABASE_NAME` | `5432`, `quasar`, `quasar` | Your database's connection. |
 | `QUASAR_DATABASE_SSLMODE` | `disable` | Set `require` or `verify-full` for a database on another machine. |
 | `QUASAR_DATABASE_PASSWORD` | required with `QUASAR_DATABASE_HOST` | Interpolate it from the stack's `.env`. Not read again once installed. |
+| `QUASAR_AWAIT_RESTORE` | unset | `1` holds a fresh install's control plane until you load a Compose install's database dump into it. See [Move a Compose install](/quasar/install/move-existing/). Quasar's own database only. |
 | `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | the installed release's | Pins the images Add host installs on new GPU hosts, by digest. |
 
 The seed itself also needs two mounts, not variables: the engine socket, and the

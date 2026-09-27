@@ -1196,7 +1196,9 @@ fn a_pre_rh06_dump_is_restored_into_a_fresh_install_before_its_first_boot() {
     let result = run_restore(&m.actor(), restore_request(&nth_id(2), Some(IMPORT), None));
     assert_eq!(result.state, State::Succeeded, "{result:?}");
     assert!(
-        result.output.contains("Add host") && result.output.contains("old node name"),
+        result.output.contains("Add host")
+            && result.output.contains("old node name")
+            && result.output.contains("its agent takes back as"),
         "{}",
         result.output
     );

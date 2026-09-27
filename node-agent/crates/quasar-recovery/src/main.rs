@@ -288,10 +288,7 @@ fn read_import() -> Result<String, ()> {
             Err(())
         }
         Ok(n) => {
-            eprintln!(
-                "read {} from stdin as {name}",
-                quasar_recovery::dump_dir::human(n)
-            );
+            eprintln!("read {n} bytes from stdin as {name}");
             Ok(name)
         }
         Err(e) => {

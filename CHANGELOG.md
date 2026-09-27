@@ -25,6 +25,18 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Move a Compose install to an owned install with its data (#380).** A fresh combined or
+  control-only install started with `QUASAR_AWAIT_RESTORE=1` on its seed holds its first
+  control plane back, and `docker exec -i quasar-recovery quasar-recovery restore --dump - <
+  quasar-move.dump` loads the old stack's `pg_dump -Fc` into Quasar's own database before that
+  control plane's first boot, which migrates it forward. Accounts, the library, profiles and
+  settings carry over. A dump that is newer than the installed control plane, dirty, plain SQL
+  or unreadable is refused with nothing changed, and a machine whose control plane has already
+  been created refuses one. The old install's hosts are set offline by the load and are added
+  again under their old node names, which keeps their history and homes; stored credentials
+  are entered again. An interrupted or failed load can be run again, and the old stack's
+  volumes are only read. The site's "Move a Compose install" (formerly "Replace a Compose
+  install") is the operator guide.
 - **RH-06 acceptance map (#368).** `docs/rh06/2026-09-26-acceptance.md` ties every user story
   in the RH-06 specification (#352) to the ticket and the evidence that cover it, and records
   #368's own acceptance rows as covered, run for #368 (a combined install and a control-only
