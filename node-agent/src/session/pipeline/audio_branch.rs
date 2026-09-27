@@ -10,12 +10,13 @@ use gstreamer::prelude::*;
 use crate::session::audio::QUASAR_MONITOR_SOURCE_NAME;
 use crate::session::SessionConfig;
 
-/// Add + link the audio encode chain into `pipeline`, returning its tail capsfilter for
-/// linking into webrtcbin. Shared by the single and split pipelines, so the audio path is
+/// Add + link the audio encode chain into `pipeline`, returning its tail (the send queue)
+/// for linking into webrtcbin. Shared by the single and split pipelines, so the audio path is
 /// identical in both.
 pub(super) fn add_audio_chain(
     pipeline: &gst::Pipeline,
     cfg: &SessionConfig,
+    session_id: &str,
 ) -> Result<gst::Element> {
     let audio_src = if cfg.use_test_audio {
         // Pulse is optional, so keep the m-line alive without it. NEVER substitute a
@@ -92,6 +93,18 @@ pub(super) fn add_audio_chain(
         .property("caps", &audio_rtp_caps)
         .build()
         .context("capsfilter not found")?;
+    // Hands packets to `webrtcbin` on its own thread, so a stall on the send side (the
+    // wait for the peer's answer at every session start, or any later block) can never
+    // stop the capture thread and overrun the capture ring buffer (#351). Leaky, and
+    // bounded in time, so a stall costs the oldest packets rather than growing latency.
+    let audio_send_queue = gst::ElementFactory::make("queue")
+        .name("audio_send_queue")
+        .property_from_str("leaky", "downstream")
+        .property("max-size-time", 200_000_000_u64)
+        .property("max-size-buffers", 0_u32)
+        .property("max-size-bytes", 0_u32)
+        .build()
+        .context("queue not found")?;
 
     pipeline.add_many([
         &audio_src,
@@ -101,6 +114,7 @@ pub(super) fn add_audio_chain(
         &opus_enc,
         &rtp_opus_pay,
         &audio_rtp_capsfilter,
+        &audio_send_queue,
     ])?;
     gst::Element::link_many([
         &audio_src,
@@ -110,9 +124,13 @@ pub(super) fn add_audio_chain(
         &opus_enc,
         &rtp_opus_pay,
         &audio_rtp_capsfilter,
+        &audio_send_queue,
     ])
     .context("failed to link audio encode chain")?;
-    Ok(audio_rtp_capsfilter)
+    if let Some(encoded) = audio_rtp_capsfilter.static_pad("src") {
+        super::audio_health::attach(&audio_src, &encoded, &audio_send_queue, session_id);
+    }
+    Ok(audio_send_queue)
 }
 
 /// Knob: `QUASAR_AUDIO_NO_CLOCK`. #304: sets `provide-clock=false` +
@@ -132,7 +150,7 @@ mod tests {
     use crate::session::StreamParams;
 
     fn test_audio_cfg() -> SessionConfig {
-        let settings = RuntimeSettings::baseline_with(&|_| None);
+        let settings = RuntimeSettings::baseline();
         let stream = StreamParams {
             width: 1280,
             height: 720,
@@ -152,7 +170,8 @@ mod tests {
     fn opus_encoder_input_is_the_wire_format() {
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
-        let tail = add_audio_chain(&pipeline, &test_audio_cfg()).expect("audio chain builds");
+        let tail =
+            add_audio_chain(&pipeline, &test_audio_cfg(), "test").expect("audio chain builds");
         let sink = gst::ElementFactory::make("fakesink")
             .property("sync", false)
             .build()
