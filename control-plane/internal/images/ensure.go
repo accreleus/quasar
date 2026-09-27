@@ -404,6 +404,7 @@ func (e *Ensurer) RunRequirementReconcile(ctx context.Context) {
 			if err := e.EnsureAll(scanCtx); err != nil {
 				e.log.Warn("image requirement reconcile deferred", "err", err)
 			}
+			e.ReconcileWarmups(scanCtx)
 			cancel()
 		}
 	}
@@ -1257,6 +1258,48 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 		e.clearFailures(key)
 	}
 	return nil
+}
+
+// ReconcileWarmups offers the Steam warm-up to every connected host that has
+// never had one (#378). The two event triggers (the image reaching `ready`, the
+// host's preparation report) can both fire before the host's row is live: an
+// image already on disk is reported ready within a second of registering, and a
+// host re-added after a removal registers `draining` until its drain is lifted
+// a moment later. Both admissions then fail and nothing asks again, so the job
+// stayed unscheduled until an admin pressed Run now.
+//
+// Only a host with no warm-up run at all qualifies. Once any run exists, the
+// jobs framework's own deferral backoff and OnTerminal reconciliation own the
+// retry, and pulling a backed-off retry forward every minute would defeat them.
+// enqueueWarmup still applies the full admission rule and its "already
+// prepared" check, so this can only start what an event trigger could have.
+func (e *Ensurer) ReconcileWarmups(ctx context.Context) {
+	if e.disp == nil {
+		return
+	}
+	connected := e.disp.ConnectedHosts()
+	if len(connected) == 0 {
+		return
+	}
+	rows, err := e.pool.Query(ctx, `SELECT h.id::text FROM hosts h
+		WHERE h.id::text = ANY($1) AND h.source_preparation IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM job_runs r WHERE r.job_id = $2 AND r.host_id = h.id)`,
+		connected, warmupJobID)
+	if err != nil {
+		e.log.Warn("Steam preparation reconcile skipped", "err", err)
+		return
+	}
+	var hosts []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			hosts = append(hosts, id)
+		}
+	}
+	rows.Close()
+	for _, id := range hosts {
+		e.enqueueWarmup(id, "steam")
+	}
 }
 
 // ReconcilePreparation retries admission after a policy acknowledgement.

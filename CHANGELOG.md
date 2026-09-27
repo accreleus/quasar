@@ -567,6 +567,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Steam preparation starts on its own on a host that already has the Steam image (#378).**
+  The image is reported ready within a second of the host registering, and a host added back
+  after a removal is still draining for a moment. Both warm-up triggers could fire before the
+  host was live, and nothing asked again until an admin pressed Run now. The image reconcile now
+  offers the warm-up, once a minute, to any connected host that has never had a warm-up run.
 - **A machine keeps its final dump and can still be added back.** Add host on a machine whose
   earlier installation was purged refused to run because of the `quasar-final-dump` volume the
   purge deliberately keeps. That volume is no longer counted as another installation in the way;
