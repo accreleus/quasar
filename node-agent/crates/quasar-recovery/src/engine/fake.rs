@@ -98,8 +98,11 @@ pub struct FakeState {
     pub db_failures: BTreeMap<String, (i64, String)>,
     /// Database helpers, by label, whose engine goes away while they run (a daemon
     /// restart): the start fails `Unavailable` after the helper did part of its work. A
-    /// `db-load` has dropped and re-created the database, which is left empty.
+    /// `db-load` or `db-import` has dropped and re-created the database, which is left
+    /// empty.
     pub db_interrupted: BTreeSet<String>,
+    /// How many `db-import`s finished, each setting the imported install's hosts offline.
+    pub imported_hosts_set_offline: usize,
     /// Every control-plane image started against a database whose schema is above the one
     /// the image declares: what must never happen.
     pub older_control_planes_started: Vec<String>,
@@ -201,7 +204,7 @@ fn db_helper(s: &mut FakeState, spec: &ContainerSpec, op: &str) -> (i64, String)
                 _ => (1, "pg_dump: error: no writable output file\n".into()),
             }
         }
-        "db-inspect" | "db-load" => {
+        "db-inspect" | "db-load" | "db-import" => {
             let Some((path, _)) = file else {
                 return (1, "pg_restore: error: no input file\n".into());
             };
@@ -218,6 +221,9 @@ fn db_helper(s: &mut FakeState, spec: &ContainerSpec, op: &str) -> (i64, String)
                 return unreachable;
             }
             s.database = Some(archived);
+            if op == "db-import" {
+                s.imported_hosts_set_offline += 1;
+            }
             (0, String::new())
         }
         _ => (0, String::new()),
@@ -611,7 +617,7 @@ impl PlatformEngine for FakeEngine {
             // database helper acts on the simulated database.
             if let Some(helper) = c.spec.labels.get(HELPER_LABEL).cloned() {
                 if s.db_interrupted.contains(&helper) {
-                    if helper == "db-load" {
+                    if helper == "db-load" || helper == "db-import" {
                         s.database = Some(FakeDatabase::default());
                     }
                     let c = s.containers.get_mut(&id).unwrap();

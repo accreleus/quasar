@@ -134,13 +134,22 @@ impl Actor {
                 Ok(())
             })?;
         }
-        // A restore owns the database until it finishes: no control plane is created or
-        // started meanwhile (`crate::restore`). Only the control plane is held: a combined
-        // machine's node agent is still ensured.
+        // A restore owns the database until it finishes, and a fresh install awaiting one
+        // has none yet: no control plane is created or started meanwhile
+        // (`crate::restore`). Only the control plane is held: a combined machine's node
+        // agent is still ensured, except on a fresh install awaiting its restore, whose agent
+        // has no control plane to enroll with yet (it would only wait for one): the restore
+        // creates both.
+        let mut awaiting = false;
         let held = match crate::database::load_hold(self.dir.root()) {
             Ok(None) => false,
             Ok(Some(hold)) => {
+                awaiting = hold.reason == crate::database::HoldReason::AwaitRestore;
                 let why = match hold.reason {
+                    crate::database::HoldReason::AwaitRestore => format!(
+                        "this install awaits a restore before its control plane's first boot (QUASAR_AWAIT_RESTORE): run `{}`",
+                        crate::database::import_command()
+                    ),
                     crate::database::HoldReason::RestoreIncomplete => format!(
                         "a restore stopped before it finished, so the database may be partly loaded; run the same restore command again (`docker exec {} quasar-recovery restore --list` lists the dumps)",
                         names::RECOVERY_ACTOR
@@ -178,7 +187,7 @@ impl Actor {
                 },
             )?;
         }
-        if machine.role == MachineRole::Combined {
+        if machine.role == MachineRole::Combined && !awaiting {
             self.ensure_node_agent(machine)?;
         }
         Ok(())

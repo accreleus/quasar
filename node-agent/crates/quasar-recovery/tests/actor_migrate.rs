@@ -1138,6 +1138,309 @@ fn a_migrating_update_after_an_unrestored_failure_takes_no_dump_it_could_not_res
     assert_eq!(restored.state, State::Succeeded, "{restored:?}");
 }
 
+/// A fresh install started with `QUASAR_AWAIT_RESTORE=1`, awaiting a pre-RH-06 dump.
+fn awaiting_restore() -> Machine {
+    let mut env = combined_env();
+    env.insert("QUASAR_AWAIT_RESTORE".into(), "1".into());
+    Machine::install(env, true)
+}
+
+const IMPORT: &str = "import-20260925T090000Z";
+
+/// An old stack's `pg_dump --format=custom`, at a schema older than this install's.
+fn old_stack() -> FakeDatabase {
+    FakeDatabase {
+        schema_version: 74,
+        dirty: false,
+        rows: "accounts, apps and saves".into(),
+        size_bytes: 900_000_000,
+    }
+}
+
+/// What `restore --dump -` leaves for the actor: the operator's file, with no record.
+fn put_import(m: &Machine, bytes: &[u8]) {
+    std::fs::create_dir_all(m.dir.path().join("dumps")).unwrap();
+    std::fs::write(
+        m.dir.path().join("dumps").join(format!("{IMPORT}.dump")),
+        bytes,
+    )
+    .unwrap();
+}
+
+fn hold_reason(m: &Machine) -> Option<String> {
+    let raw = std::fs::read(m.dir.path().join("database-hold.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    v["reason"].as_str().map(str::to_owned)
+}
+
+#[test]
+fn a_pre_rh06_dump_is_restored_into_a_fresh_install_before_its_first_boot() {
+    let m = awaiting_restore();
+    // Postgres runs; no control plane boots until the restore, so the database is
+    // untouched, and no agent either: it would have nothing to enroll with.
+    let state = m.engine.state();
+    assert!(state.container_named(names::POSTGRES).is_some());
+    assert!(state.container_named(names::CONTROL_PLANE).is_none());
+    assert!(state.container_named(names::NODE_AGENT).is_none());
+    assert_eq!(m.db().schema_version, 0, "the database never booted");
+    assert_eq!(hold_reason(&m).as_deref(), Some("await_restore"));
+    // A further start keeps holding it.
+    m.actor().resume().unwrap();
+    assert!(m
+        .engine
+        .state()
+        .container_named(names::CONTROL_PLANE)
+        .is_none());
+
+    put_import(&m, &dump_bytes(&old_stack()));
+    let result = run_restore(&m.actor(), restore_request(&nth_id(2), Some(IMPORT), None));
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    assert!(
+        result.output.contains("Add host") && result.output.contains("old node name"),
+        "{}",
+        result.output
+    );
+    // The installed control plane booted on the restored data and migrated it forward.
+    assert_eq!(m.db().rows, "accounts, apps and saves");
+    assert_eq!(m.db().schema_version, OLD_SCHEMA);
+    assert_eq!(m.control_plane().spec.image, control_image(OLD_SCHEMA));
+    assert_eq!(m.control_plane().status, "running");
+    assert!(m
+        .engine
+        .state()
+        .container_named(names::NODE_AGENT)
+        .is_some());
+    // The old install's hosts were set offline by the load, so they re-enroll.
+    assert_eq!(m.engine.state().imported_hosts_set_offline, 1);
+    assert!(!m.dir.path().join("database-hold.json").exists());
+    // The operator's copy is gone, and an import is never listed as a pre-update dump.
+    assert!(m.dump_files().is_empty(), "{:?}", m.dump_files());
+    assert!(m.actor().status_operator(None).dumps.is_empty());
+    let floor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(m.dir.path().join("schema-floor.json")).unwrap())
+            .unwrap();
+    assert_eq!(floor["schema_version"], OLD_SCHEMA);
+    m.never_an_older_control_plane("after the fresh restore");
+
+    // The machine is whole: a further start changes nothing.
+    let settled = m.engine.state().by_name();
+    m.actor().resume().unwrap();
+    assert_eq!(m.engine.state().by_name(), settled);
+
+    // Once the control plane has booted, an import is refused before anything is read.
+    put_import(&m, &dump_bytes(&old_stack()));
+    let refused = m
+        .actor()
+        .submit_restore(restore_request(&nth_id(3), Some(IMPORT), None))
+        .unwrap_err();
+    assert_eq!(refused.reason, Reason::Invalid);
+    assert!(
+        refused.message.contains("fresh install") && refused.message.contains("uninstall --purge"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(m.db().rows, "accounts, apps and saves");
+}
+
+#[test]
+fn a_dump_newer_than_the_fresh_install_or_corrupt_is_refused_before_it_is_loaded() {
+    let m = awaiting_restore();
+    for (n, bytes, why) in [
+        (
+            4,
+            dump_bytes(&FakeDatabase {
+                schema_version: 90,
+                ..Default::default()
+            }),
+            "newer than this install",
+        ),
+        (
+            5,
+            b"-- PostgreSQL database dump\nCREATE TABLE".to_vec(),
+            "custom-format",
+        ),
+        // A truncated archive: `pg_restore` cannot read it through.
+        (6, b"PGDMP truncated".to_vec(), "corrupt"),
+        (
+            7,
+            dump_bytes(&FakeDatabase {
+                schema_version: 70,
+                dirty: true,
+                ..Default::default()
+            }),
+            "dirty",
+        ),
+    ] {
+        put_import(&m, &bytes);
+        m.engine.with_state(|s| {
+            s.db_failures.clear();
+            if n == 6 {
+                s.db_failures.insert(
+                    "db-inspect".into(),
+                    (
+                        1,
+                        "pg_restore: error: could not read from input file: end of file\n".into(),
+                    ),
+                );
+            }
+        });
+        let result = run_restore(&m.actor(), restore_request(&nth_id(n), Some(IMPORT), None));
+        assert_eq!(result.state, State::Failed, "{why}");
+        assert!(result.output.contains(why), "{why}: {}", result.output);
+        assert!(
+            result.output.contains("Nothing was changed")
+                && result.output.contains("run the same command again with it"),
+            "{why}: {}",
+            result.output
+        );
+        assert_eq!(m.db().schema_version, 0, "{why}: the database was touched");
+        assert!(
+            m.engine
+                .state()
+                .container_named(names::CONTROL_PLANE)
+                .is_none(),
+            "{why}"
+        );
+        assert_eq!(hold_reason(&m).as_deref(), Some("await_restore"), "{why}");
+        assert!(m.dump_files().is_empty(), "{why}: {:?}", m.dump_files());
+    }
+    // The install still awaits its restore, and a good dump then loads.
+    m.engine.with_state(|s| s.db_failures.clear());
+    put_import(&m, &dump_bytes(&old_stack()));
+    let result = run_restore(&m.actor(), restore_request(&nth_id(8), Some(IMPORT), None));
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    assert_eq!(m.db().rows, "accounts, apps and saves");
+}
+
+#[test]
+fn an_import_is_refused_where_it_does_not_belong() {
+    // An install that did not await a restore has booted its control plane.
+    let m = Machine::install(combined_env(), true);
+    put_import(&m, &dump_bytes(&old_stack()));
+    let refused = m
+        .actor()
+        .submit_restore(restore_request(&nth_id(2), Some(IMPORT), None))
+        .unwrap_err();
+    assert!(
+        refused.message.contains("QUASAR_AWAIT_RESTORE=1"),
+        "{}",
+        refused.message
+    );
+    // An import starts the installed control plane: there is no version to name.
+    let m = awaiting_restore();
+    put_import(&m, &dump_bytes(&old_stack()));
+    let refused = m
+        .actor()
+        .submit_restore(restore_request(&nth_id(3), Some(IMPORT), Some("0.3.0")))
+        .unwrap_err();
+    assert!(
+        refused.message.contains("without --to"),
+        "{}",
+        refused.message
+    );
+    // An operator's own database is never loaded by Quasar.
+    let m = Machine::install(external_env(), true);
+    put_import(&m, &dump_bytes(&old_stack()));
+    let refused = m
+        .actor()
+        .submit_restore(restore_request(&nth_id(4), Some(IMPORT), None))
+        .unwrap_err();
+    assert!(
+        refused.message.contains("your own tools"),
+        "{}",
+        refused.message
+    );
+}
+
+#[test]
+fn an_import_interrupted_at_any_phase_is_settled_and_can_be_run_again() {
+    for phase in [
+        RestorePhase::Checking,
+        RestorePhase::Stopping,
+        RestorePhase::Loading,
+        RestorePhase::Starting,
+        RestorePhase::Verifying,
+    ] {
+        let at = format!("{phase:?}");
+        let m = awaiting_restore();
+        put_import(&m, &dump_bytes(&old_stack()));
+        let point = restore::crash_point(phase);
+        let actor = m.actor_with(|c| {
+            c.crash_after = Some(Box::new(move |component, p| {
+                component == restore::COMPONENT && p == point
+            }))
+        });
+        let id = nth_id(5);
+        actor
+            .submit_restore(restore_request(&id, Some(IMPORT), None))
+            .unwrap();
+        actor.wait_attempt();
+        drop(actor);
+        m.actor().resume().unwrap();
+        let result = m.actor().status_operator(Some(&id)).result.unwrap();
+        m.never_an_older_control_plane(&at);
+        if phase == RestorePhase::Checking {
+            assert_eq!(result.reason, Some(Reason::Interrupted), "{at}: {result:?}");
+            assert_eq!(m.db().schema_version, 0, "{at}");
+            assert!(
+                m.engine
+                    .state()
+                    .container_named(names::CONTROL_PLANE)
+                    .is_none(),
+                "{at}"
+            );
+            // The command is run again, with the file.
+            put_import(&m, &dump_bytes(&old_stack()));
+            let again = run_restore(&m.actor(), restore_request(&nth_id(6), Some(IMPORT), None));
+            assert_eq!(again.state, State::Succeeded, "{at}: {again:?}");
+        } else {
+            assert_eq!(result.state, State::Succeeded, "{at}: {result:?}");
+        }
+        assert_eq!(m.db().rows, "accounts, apps and saves", "{at}");
+        assert_eq!(m.db().schema_version, OLD_SCHEMA, "{at}");
+        assert_eq!(m.control_plane().status, "running", "{at}");
+        assert!(!m.dir.path().join("database-hold.json").exists(), "{at}");
+        assert!(m.dump_files().is_empty(), "{at}: {:?}", m.dump_files());
+    }
+}
+
+#[test]
+fn an_import_whose_load_fails_keeps_the_control_plane_off_until_it_is_run_again() {
+    let m = awaiting_restore();
+    put_import(&m, &dump_bytes(&old_stack()));
+    m.engine.with_state(|s| {
+        s.db_failures.insert(
+            "db-import".into(),
+            (
+                1,
+                "pg_restore: error: could not execute query: disk full\n".into(),
+            ),
+        );
+    });
+    let result = run_restore(&m.actor(), restore_request(&nth_id(2), Some(IMPORT), None));
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert!(
+        result.output.contains("Run the same command again"),
+        "{}",
+        result.output
+    );
+    assert!(hold_reason(&m).is_some());
+    m.engine.restart_daemon();
+    m.actor().resume().unwrap();
+    assert!(m
+        .engine
+        .state()
+        .container_named(names::CONTROL_PLANE)
+        .is_none());
+
+    m.engine.with_state(|s| s.db_failures.clear());
+    put_import(&m, &dump_bytes(&old_stack()));
+    let again = run_restore(&m.actor(), restore_request(&nth_id(3), Some(IMPORT), None));
+    assert_eq!(again.state, State::Succeeded, "{again:?}");
+    assert_eq!(m.db().rows, "accounts, apps and saves");
+    assert_eq!(m.db().schema_version, OLD_SCHEMA);
+}
+
 #[test]
 fn only_the_operator_socket_takes_a_restore() {
     let m = Machine::install(combined_env(), false);

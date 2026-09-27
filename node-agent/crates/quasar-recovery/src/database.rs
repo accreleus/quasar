@@ -9,8 +9,8 @@
 //! ```text
 //! schema-floor.json   the database may be at this schema or above: no control plane
 //!                     whose image declares less is created, started or put back
-//! database-hold.json  no control plane is created or started: a restore stopped
-//!                     part-way
+//! database-hold.json  no control plane is created or started: a fresh install awaits
+//!                     its restore (#380), or a restore stopped part-way
 //! restore-point.json  what the last migrating control-plane replacement returns to
 //! ```
 
@@ -51,6 +51,11 @@ pub enum DbOp {
     Inspect,
     /// Drop and re-create the database, then `pg_restore` the dump file into it.
     Load,
+    /// [`DbOp::Load`] of an operator's file, a pre-RH-06 stack's `pg_dump` (#380), then
+    /// every host it records set offline: their agents belonged to the old install and
+    /// are gone, and a row left `online` would read as a live agent, which refuses the
+    /// re-enrollment onto its node name (control-api.md "Redemption").
+    Import,
     /// The live database's `schema_migrations` row.
     Schema,
 }
@@ -63,6 +68,7 @@ impl DbOp {
             DbOp::Dump => "db-dump",
             DbOp::Inspect => "db-inspect",
             DbOp::Load => "db-load",
+            DbOp::Import => "db-import",
             DbOp::Schema => "db-schema",
         }
     }
@@ -72,7 +78,7 @@ impl DbOp {
     }
 
     fn reads_file(self) -> bool {
-        matches!(self, DbOp::Dump | DbOp::Inspect | DbOp::Load)
+        matches!(self, DbOp::Dump | DbOp::Inspect | DbOp::Load | DbOp::Import)
     }
 
     /// The helper's `sh -c` script. Its inputs are the `PG*` variables, the password file
@@ -85,24 +91,31 @@ impl DbOp {
         );
         // Each prints `schema=<version> dirty=<t|f>` where it reads a schema: the one line
         // the actor parses (`parse_schema`). The file is always `$QUASAR_DUMP_FILE`.
-        let body = match self {
-            DbOp::Size => r#"psql -X -tA -c 'select pg_database_size(current_database())'"#,
+        let body: String = match self {
+            DbOp::Size => r#"psql -X -tA -c 'select pg_database_size(current_database())'"#.into(),
             DbOp::Dump => {
-                r#"pg_dump --format=custom --no-owner --no-privileges -f "$QUASAR_DUMP_FILE""#
+                r#"pg_dump --format=custom --no-owner --no-privileges -f "$QUASAR_DUMP_FILE""#.into()
             }
             DbOp::Inspect => {
-                r#"pg_restore --list "$QUASAR_DUMP_FILE" >/dev/null; pg_restore --data-only --table=schema_migrations -f - "$QUASAR_DUMP_FILE" | awk '/^COPY /{c=1;next} /^\\\.$/{c=0} c && NF>=2 {print "schema="$1" dirty="$2}'"#
+                r#"pg_restore --list "$QUASAR_DUMP_FILE" >/dev/null; pg_restore --data-only --table=schema_migrations -f - "$QUASAR_DUMP_FILE" | awk '/^COPY /{c=1;next} /^\\\.$/{c=0} c && NF>=2 {print "schema="$1" dirty="$2}'"#.into()
             }
-            DbOp::Load => {
-                r#"psql -X -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE IF EXISTS \"$PGDATABASE\" WITH (FORCE)" -c "CREATE DATABASE \"$PGDATABASE\" OWNER \"$PGUSER\""; pg_restore --single-transaction --exit-on-error --no-owner --no-privileges -d "$PGDATABASE" "$QUASAR_DUMP_FILE""#
-            }
+            DbOp::Load => LOAD.into(),
+            DbOp::Import => format!("{LOAD}; {OLD_HOSTS_OFFLINE}"),
             DbOp::Schema => {
-                r#"psql -X -tA -F ' ' -c 'select version, dirty from schema_migrations' | awk 'NF>=2 {print "schema="$1" dirty="$2}'"#
+                r#"psql -X -tA -F ' ' -c 'select version, dirty from schema_migrations' | awk 'NF>=2 {print "schema="$1" dirty="$2}'"#.into()
             }
         };
         format!("{prelude}{body}")
     }
 }
+
+/// [`DbOp::Load`]'s script.
+const LOAD: &str = r#"psql -X -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE IF EXISTS \"$PGDATABASE\" WITH (FORCE)" -c "CREATE DATABASE \"$PGDATABASE\" OWNER \"$PGUSER\""; pg_restore --single-transaction --exit-on-error --no-owner --no-privileges -d "$PGDATABASE" "$QUASAR_DUMP_FILE""#;
+
+/// [`DbOp::Import`]'s second step, after [`LOAD`]: the old install's hosts offline. `status` is
+/// the one column every Quasar schema's `hosts` has had; "live" is `online` with no
+/// recorded disconnect, so `offline` alone makes a host re-enrollable.
+const OLD_HOSTS_OFFLINE: &str = r#"psql -X -v ON_ERROR_STOP=1 -tA -c "UPDATE hosts SET status = 'offline' WHERE status = 'online'""#;
 
 /// A `schema_migrations` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +170,9 @@ pub struct SchemaFloor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldReason {
+    /// A fresh install whose seed asked for a restore before the first boot
+    /// (`QUASAR_AWAIT_RESTORE`, #380).
+    AwaitRestore,
     /// A restore stopped the control plane and has not finished loading and starting it.
     RestoreIncomplete,
 }
@@ -277,6 +293,15 @@ pub fn restore_command(dump: Option<&str>, returns_to: &str) -> String {
         Some(d) => format!("{exec} --dump {d} --to {returns_to}"),
         None => format!("{exec} --to {returns_to}"),
     }
+}
+
+/// The operator's command that loads a pre-RH-06 stack's `pg_dump --format=custom` file
+/// into a fresh install awaiting it (#380). The file is read from stdin, so `-i`.
+pub fn import_command() -> String {
+    format!(
+        "docker exec -i {} quasar-recovery restore --dump - < <your pg_dump --format=custom file>",
+        names::RECOVERY_ACTOR
+    )
 }
 
 impl Actor {

@@ -1,7 +1,14 @@
-//! The operator's `restore` (#352 decision 14, R1): load a pre-update dump into a stopped
-//! database and start the control plane it was taken under; or, on an operator-supplied
-//! database the operator restored with their own tools, start the control plane whose
-//! schema it matches. Only dumps this machine's actor took are restored.
+//! The operator's `restore` (#352 decisions 14 and 20, R1): load a pre-update dump into a
+//! stopped database and start the control plane it was taken under; or, on an
+//! operator-supplied database the operator restored with their own tools, start the control
+//! plane whose schema it matches; or (#380) load a pre-RH-06 stack's `pg_dump` into a fresh
+//! install before its control plane's first boot, which then migrates it forward.
+//!
+//! The last is an **import** (`restore --dump -`, `crate::dump_dir`): accepted only on
+//! Quasar's own database and only while this machine has never created a control plane
+//! (the seed's `QUASAR_AWAIT_RESTORE=1` holds the first one back). Its dump may be at any
+//! schema up to the installed control plane's, never above; the load also sets every host
+//! the old install recorded offline, since their agents are gone and must re-enroll.
 //!
 //! Submitted only on the operator socket (`crate::operator`, `POST /v1/restore`), which lives
 //! in the actor's own container (`docker exec quasar-recovery quasar-recovery restore …`),
@@ -81,6 +88,17 @@ pub struct Restore {
     pub phase: RestorePhase,
     /// The dump loaded; `None` on an external database.
     pub dump: Option<String>,
+    /// The dump is an operator's file (#380): loaded into a fresh install, whose installed
+    /// control plane then migrates it forward on its first boot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub imported: bool,
+    /// No control plane was ever created on this machine: the install itself creates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh_install: bool,
+    /// An import's target: the installed control plane's schema, which its first boot
+    /// migrates the database to. Found at `checking`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrates_to: Option<i64>,
     pub control_plane: ImageRef,
     #[serde(default)]
     pub recipe_revision: Option<u32>,
@@ -277,6 +295,9 @@ impl Actor {
         let mut plan = Restore {
             phase: RestorePhase::Admitted,
             dump: None,
+            imported: false,
+            fresh_install: false,
+            migrates_to: None,
             control_plane: ImageRef {
                 repository: String::new(),
                 digest: String::new(),
@@ -302,6 +323,9 @@ impl Actor {
                     return Err(format!("there is no dump named {name} on this machine (`restore --list` lists them)"));
                 }
                 plan.dump = Some(name.to_owned());
+                if dump::is_import(name) {
+                    return self.plan_import(machine, plan, to.as_deref());
+                }
                     let record = dumps
                         .load(name)
                         .map_err(|e| format!("the record of dump {name} cannot be read ({e})"))?
@@ -351,6 +375,52 @@ impl Actor {
             }
         }
         Ok(plan)
+    }
+
+    /// An import's plan: only before this machine's first control plane, which it then
+    /// starts.
+    fn plan_import(
+        &self,
+        machine: &Machine,
+        mut plan: Restore,
+        to: Option<&str>,
+    ) -> Result<Restore, String> {
+        if !self.control_plane_never_created()? {
+            return Err(format!(
+                "a pre-RH-06 dump is loaded only into a fresh install, before its control plane's first boot, and this machine's control plane has already been created. To load it, reinstall: `docker exec {} quasar-recovery uninstall --purge`, then install again with the seed and {}=1, then run the restore",
+                names::RECOVERY_ACTOR,
+                crate::bootstrap::AWAIT_RESTORE
+            ));
+        }
+        if to.is_some() {
+            return Err(
+                "a pre-RH-06 dump starts this install's own control plane: run it without --to"
+                    .into(),
+            );
+        }
+        plan.imported = true;
+        plan.fresh_install = true;
+        plan.control_plane = machine
+            .install_images
+            .get(&Role::ControlPlane)
+            .cloned()
+            .ok_or("machine state names no control-plane image to start")?;
+        Ok(plan)
+    }
+
+    /// No control plane was ever created here: no record of one, and no container.
+    fn control_plane_never_created(&self) -> Result<bool, String> {
+        let recorded = self
+            .dir
+            .load_service(Role::ControlPlane)
+            .map_err(|e| format!("services/control-plane.json cannot be read ({e})"))?
+            .is_some();
+        let found = self
+            .engine
+            .inspect_container(names::CONTROL_PLANE)
+            .map_err(|e| format!("the container engine did not answer ({e})"))?
+            .is_some();
+        Ok(!recorded && !found)
     }
 
     fn restore_mut<'a>(&self, j: &'a mut Journal) -> &'a mut Restore {
@@ -470,12 +540,22 @@ impl Actor {
                 schema.version
             )));
         }
-        if schema.version != target {
+        let matches = if plan.imported {
+            schema.version <= target
+        } else {
+            schema.version == target
+        };
+        if !matches {
             let to = plan
                 .returns_to
                 .as_deref()
                 .unwrap_or("the control plane to start");
-            return Err(nothing_changed(if plan.dump.is_some() {
+            return Err(nothing_changed(if plan.imported {
+                format!(
+                    "the dump is at schema {}, newer than this install's control plane (schema {target}): it was taken from a newer release. Install that release or a newer one with the seed, then restore",
+                    schema.version
+                )
+            } else if plan.dump.is_some() {
                 format!(
                     "the dump is at schema {} but {to} is a control plane of schema {target}: they do not belong together",
                     schema.version
@@ -523,6 +603,9 @@ impl Actor {
         let r = self.restore_mut(j);
         r.recipe_revision = Some(revision);
         r.schema_version = Some(schema.version);
+        if r.imported {
+            r.migrates_to = Some(target);
+        }
         Ok(())
     }
 
@@ -554,16 +637,22 @@ impl Actor {
         plan: &Restore,
     ) -> Result<database::Schema, Halt> {
         let dir = DumpDir::new(self.dir.root());
-        let record = dir
-            .load(name)
-            .map_err(|e| {
-                nothing_changed(format!("the record of dump {name} cannot be read ({e})"))
-            })?
-            .ok_or_else(|| {
-                nothing_changed(format!(
-                    "dump {name} has no record, so it is not known to be complete"
-                ))
-            })?;
+        // An import has no record: `pg_restore` reading the whole archive is its check.
+        let record = if plan.imported {
+            None
+        } else {
+            Some(
+                dir.load(name)
+                    .map_err(|e| {
+                        nothing_changed(format!("the record of dump {name} cannot be read ({e})"))
+                    })?
+                    .ok_or_else(|| {
+                        nothing_changed(format!(
+                            "dump {name} has no record, so it is not known to be complete"
+                        ))
+                    })?,
+            )
+        };
         let (_, sha, magic) = dump::examine(&dir.file(name))
             .map_err(|e| nothing_changed(format!("dump {name} cannot be read: {e}")))?;
         if !magic {
@@ -571,7 +660,7 @@ impl Actor {
                 "{name} is not a pg_dump custom-format archive (make one with `pg_dump --format=custom`)"
             )));
         }
-        if record.sha256 != sha {
+        if record.is_some_and(|r| r.sha256 != sha) {
             return Err(nothing_changed(format!(
                 "dump {name} does not match the checksum recorded when it was taken: it is corrupt or was changed"
             )));
@@ -673,8 +762,13 @@ impl Actor {
         let machine = self
             .restore_machine()
             .map_err(|why| load_halt(name, DbError::Failed(why.into())))?;
+        let op = if plan.imported {
+            DbOp::Import
+        } else {
+            DbOp::Load
+        };
         let (code, out) = self
-            .run_db(&machine, DbOp::Load, Some(&format!("{name}.dump")))
+            .run_db(&machine, op, Some(&format!("{name}.dump")))
             .map_err(|e| load_halt(name, e))?;
         if code != 0 {
             return Err(load_halt(
@@ -704,6 +798,9 @@ impl Actor {
                 self.set_floor(schema, &j.request.request_id)
                     .map_err(|_| Halt::Died)?;
             }
+        }
+        if plan.fresh_install {
+            return self.start_fresh(&machine, &plan, &j.request.request_id);
         }
         let id = j.request.request_id.clone();
         for name in [
@@ -741,6 +838,26 @@ impl Actor {
             })?;
         self.restore_mut(j).new_container = Some(container);
         Ok(())
+    }
+
+    /// `starting` on a fresh install: the hold goes and the install itself continues,
+    /// creating its control plane, which migrates the loaded database forward as it boots.
+    fn start_fresh(&self, machine: &Machine, plan: &Restore, request_id: &str) -> Result<(), Halt> {
+        if let Some(target) = plan.migrates_to {
+            self.raise_floor(target, request_id).map_err(|e| {
+                warn!(token = "actor-restore-floor-unwritten", "{e}");
+                Halt::Died
+            })?;
+        }
+        database::clear_hold(self.dir.root()).map_err(|_| Halt::Died)?;
+        match self.ensure_control_machine(machine) {
+            Ok(()) => Ok(()),
+            Err(crate::actor::ResumeError::Engine(EngineError::Crashed)) => Err(Halt::Died),
+            Err(e) => Err(fail(
+                Reason::RecreateFailed,
+                format!("the database is loaded, but the install could not create its control plane: {e}"),
+            )),
+        }
     }
 
     fn create_restored(
@@ -835,8 +952,13 @@ impl Actor {
         let plan = self.restore_mut(j).clone();
         database::clear_hold(self.dir.root()).map_err(|_| ())?;
         self.mark_restored(&plan, &j.request.request_id);
+        self.remove_import(&plan);
         let schema = plan.schema_version.unwrap_or_default();
         let output = match &plan.dump {
+            Some(_) if plan.imported => format!(
+                "Loaded the pre-RH-06 dump (schema {schema}) into this install's database and started its control plane, which migrated it to schema {}. Its accounts, library and settings are back. Every host the old install had is offline: add each GPU host again from Admin > Fleet > Add host, under its old node name, to keep its history and homes.",
+                plan.migrates_to.unwrap_or_default()
+            ),
             Some(name) => format!(
                 "Restored dump {name} (schema {schema}, taken {}) into Quasar's database and started control plane {} again. Anything written after the dump was taken is gone.",
                 plan.created_at.as_deref().unwrap_or("before the update"),
@@ -888,7 +1010,12 @@ impl Actor {
         if matches!(at, RestorePhase::Starting | RestorePhase::Verifying) {
             let _ = database::clear_hold(self.dir.root());
         }
+        self.remove_import(self.restore_mut(j));
         let mut output = f.detail;
+        if self.restore_mut(j).imported {
+            output.push('\n');
+            output.push_str(&import_hint(at));
+        }
         if at.touched() {
             if let Some(c) = self.restore_mut(j).new_container.clone() {
                 if let Ok(tail) = self.engine.logs_tail(&c, 40) {
@@ -903,8 +1030,21 @@ impl Actor {
         self.finish(j, State::Failed, Some(f.reason), output, false)
     }
 
+    /// An import is a copy of the operator's file: gone once its restore has ended, since
+    /// running the command again copies it afresh.
+    fn remove_import(&self, plan: &Restore) {
+        if let (true, Some(name)) = (plan.imported, &plan.dump) {
+            if let Err(e) = DumpDir::new(self.dir.root()).remove(name) {
+                warn!(token = "actor-import-not-removed", dump = %name, "{e}");
+            }
+        }
+    }
+
     /// Settle: a restore interrupted before it stopped anything changed nothing.
     pub(crate) fn interrupt_restore(&self, mut j: Journal) -> Result<(), ()> {
+        if let Some(plan) = j.restore.clone() {
+            self.remove_import(&plan);
+        }
         let output = "The recovery actor, the container engine or the machine restarted before the restore stopped anything: nothing was changed. Run the command again.".to_string();
         j.format = FORMAT;
         self.finish(
@@ -913,6 +1053,27 @@ impl Actor {
             Some(Reason::Interrupted),
             output,
             false,
+        )
+    }
+}
+
+/// What an operator does after a failed import: before the control plane is created the
+/// command can be run again, with the same file (its copy is not kept); after, the install
+/// has booted on the loaded data and only a reinstall loads another dump.
+fn import_hint(at: RestorePhase) -> String {
+    let start_over = format!(
+        "`docker exec {} quasar-recovery uninstall --purge`, then install again with the seed and {}=1",
+        names::RECOVERY_ACTOR,
+        crate::bootstrap::AWAIT_RESTORE
+    );
+    if matches!(at, RestorePhase::Starting | RestorePhase::Verifying) {
+        format!(
+            "The install's control plane was created on the loaded data, and its first boot migrates it forward; `docker logs {}` says how far it got. To load the dump again instead, start over: {start_over}",
+            names::CONTROL_PLANE
+        )
+    } else {
+        format!(
+            "Your file was not kept: run the same command again with it. To start over instead: {start_over}"
         )
     }
 }

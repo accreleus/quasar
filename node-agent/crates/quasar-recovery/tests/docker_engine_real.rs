@@ -607,7 +607,7 @@ fn the_database_helpers_dump_check_and_load_a_real_postgres() {
                 "PGPASSWORD=\"$(cat /run/quasar-secrets/database-password)\"; export PGPASSWORD; {script}"
             ),
         };
-        let read_only = matches!(op, Some(DbOp::Inspect | DbOp::Load));
+        let read_only = matches!(op, Some(DbOp::Inspect | DbOp::Load | DbOp::Import));
         let mut helper = spec(
             &name,
             &pg,
@@ -637,7 +637,7 @@ fn the_database_helpers_dump_check_and_load_a_real_postgres() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
-    let seed = "psql -X -v ON_ERROR_STOP=1 -c 'create table schema_migrations (version bigint not null primary key, dirty boolean not null)' -c 'insert into schema_migrations values (88, false)' -c 'create table users (name text)' -c \"insert into users values ('alice')\"";
+    let seed = "psql -X -v ON_ERROR_STOP=1 -c 'create table schema_migrations (version bigint not null primary key, dirty boolean not null)' -c 'insert into schema_migrations values (88, false)' -c 'create table users (name text)' -c \"insert into users values ('alice')\" -c 'create table hosts (node_name text, status text)' -c \"insert into hosts values ('gpu-a', 'online'), ('gpu-b', 'draining')\"";
     assert_eq!(run(None, seed, None).0, 0);
 
     let (code, size) = run(Some(DbOp::Size), "", None);
@@ -678,6 +678,19 @@ fn the_database_helpers_dump_check_and_load_a_real_postgres() {
     );
     // The load can be repeated.
     assert_eq!(run(Some(DbOp::Load), "", Some("pending.dump.partial")).0, 0);
+
+    // An operator's import (#380) loads the same way, then sets the old install's live
+    // hosts offline; a draining one keeps its status.
+    let (code, out) = run(Some(DbOp::Import), "", Some("pending.dump.partial"));
+    assert_eq!(code, 0, "{out}");
+    let (_, out) = run(Some(DbOp::Schema), "", None);
+    assert_eq!(parse_schema(&out), at_88, "{out}");
+    let (_, hosts) = run(
+        None,
+        "psql -X -tA -c \"select string_agg(node_name || '=' || status, ',' order by node_name) from hosts\"",
+        None,
+    );
+    assert_eq!(hosts.trim(), "gpu-a=offline,gpu-b=draining", "{hosts}");
 
     // A file that is not an archive fails the check.
     assert_eq!(run(None, "echo garbage > /dumps/bad.dump", None).0, 0);

@@ -522,6 +522,44 @@ fn bootstrap_refuses_mixed_or_missing_database_inputs() {
     // The template root defaults beside the home root, as the agent's own default does.
     let checked = check(combined_env()).unwrap();
     assert_eq!(checked.template_root, "/srv/quasar/templates");
+    assert!(!checked.control.unwrap().await_restore);
+}
+
+#[test]
+fn bootstrap_takes_await_restore_only_for_quasars_own_database() {
+    use quasar_recovery::bootstrap::Bootstrap;
+    let check = |env: BTreeMap<String, String>| {
+        let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        Bootstrap::from_env(&pairs).unwrap().check(Some("host"))
+    };
+    let with = |mut env: BTreeMap<String, String>, v: &str| {
+        env.insert("QUASAR_AWAIT_RESTORE".into(), v.into());
+        env
+    };
+    for on in ["1", "true", "yes", "on"] {
+        let checked = check(with(combined_env(), on)).unwrap();
+        assert!(checked.control.unwrap().await_restore, "{on}");
+    }
+    let checked = check(with(combined_env(), "0")).unwrap();
+    assert!(!checked.control.unwrap().await_restore);
+    assert!(check(with(combined_env(), "maybe"))
+        .unwrap_err()
+        .contains("not a boolean"));
+    // An operator's own database is loaded with the operator's own tools.
+    assert!(check(with(control_only_external_env(), "1"))
+        .unwrap_err()
+        .contains("Quasar's own database"));
+    // A GPU host has no database to restore into.
+    let gpu = BTreeMap::from([
+        ("QUASAR_ROLE".to_string(), "gpu".to_string()),
+        ("QUASAR_HOME_ROOT".into(), "/srv/quasar/homes".into()),
+        ("QUASAR_AGENT_IMAGE".into(), AGENT_IMAGE.into()),
+        ("QUASAR_ENROLLMENT".into(), "qenr1.example".into()),
+    ]);
+    assert!(check(gpu.clone()).is_ok(), "{:?}", check(gpu.clone()).err());
+    assert!(check(with(gpu, "1"))
+        .unwrap_err()
+        .contains("GPU host has no database"));
 }
 
 fn post(path: &std::path::Path, body: &str) -> String {

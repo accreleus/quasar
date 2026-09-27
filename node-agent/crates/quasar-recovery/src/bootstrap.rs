@@ -35,6 +35,10 @@ pub const DATABASE_USER: &str = "QUASAR_DATABASE_USER";
 pub const DATABASE_NAME: &str = "QUASAR_DATABASE_NAME";
 pub const DATABASE_SSLMODE: &str = "QUASAR_DATABASE_SSLMODE";
 pub const DATABASE_PASSWORD: &str = "QUASAR_DATABASE_PASSWORD";
+/// A fresh install holds its control plane back until the operator's `restore` has loaded
+/// a dump into Quasar's own database (#380: a pre-RH-06 install's data, before the first
+/// boot).
+pub const AWAIT_RESTORE: &str = "QUASAR_AWAIT_RESTORE";
 
 /// Release trust, read exactly as the updater reads them (`crate::trust`).
 pub const ALLOWED_NAMESPACES: &str = "QUASAR_UPDATER_ALLOWED_NAMESPACES";
@@ -110,6 +114,7 @@ impl Bootstrap {
                 database_name: get(DATABASE_NAME),
                 database_sslmode: get(DATABASE_SSLMODE),
                 database_password: get(DATABASE_PASSWORD),
+                await_restore: get(AWAIT_RESTORE),
                 app_puid: get(APP_PUID),
                 app_pgid: get(APP_PGID),
                 container_network: get(CONTAINER_NETWORK),
@@ -204,6 +209,11 @@ impl Bootstrap {
         let control = if control_here {
             Some(self.check_control()?)
         } else {
+            if parse_await_restore(op.await_restore.as_deref())? {
+                return Err(format!(
+                    "{AWAIT_RESTORE} is for the machine that runs the control plane: a GPU host has no database. Unset it here"
+                ));
+            }
             None
         };
         let app = self.check_app()?;
@@ -322,10 +332,17 @@ impl Bootstrap {
                 "{DATABASE_PASSWORD} is set without {DATABASE_HOST}: a Quasar-owned database generates its own password"
             ));
         }
+        let await_restore = parse_await_restore(op.await_restore.as_deref())?;
+        if await_restore && op.database_host.is_some() {
+            return Err(format!(
+                "{AWAIT_RESTORE} is for Quasar's own database: load your data into your own database with your own tools before this install's first start, and unset {AWAIT_RESTORE}"
+            ));
+        }
         Ok(CheckedControl {
             image,
             postgres_image,
             database_password,
+            await_restore,
             inputs: ControlInputs {
                 unknown: Default::default(),
                 machine_role: if self.role == MachineRole::Combined {
@@ -392,7 +409,21 @@ pub struct CheckedControl {
     pub postgres_image: Option<ImageRef>,
     /// The operator's own database's password, copied into machine state at first boot.
     pub database_password: Option<String>,
+    /// Hold the control plane until a `restore` has loaded a dump ([`AWAIT_RESTORE`]).
+    pub await_restore: bool,
     pub inputs: ControlInputs,
+}
+
+/// [`AWAIT_RESTORE`]'s value: unset is false.
+fn parse_await_restore(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None => Ok(false),
+        Some("1" | "true" | "yes" | "on") => Ok(true),
+        Some("0" | "false" | "no" | "off") => Ok(false),
+        Some(other) => Err(format!(
+            "{AWAIT_RESTORE}={other:?} is not a boolean: use 1 to hold the control plane until a restore"
+        )),
+    }
 }
 
 impl std::fmt::Debug for Checked {

@@ -3,10 +3,15 @@
 //! `<name>.dump` beside `<name>.json`, its record. A dump exists once its record does;
 //! `pg_dump` writes `<name>.dump.partial` first, which is never read.
 //!
+//! Beside them an **import** (#380), `import-<stamp>.dump`, is an operator's
+//! `pg_dump --format=custom` file from a pre-RH-06 stack, copied in by `restore --dump -`
+//! for a fresh install awaiting it. It has no record, so it is never listed, kept or pruned
+//! as a pre-update dump, and its restore removes it once it has ended.
+//!
 //! Not a frozen interface: the name is opaque everywhere else (control-api.md
 //! `pre_update_dump`), and only this module and the `restore` command read the files.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use quasar_runtime::DurableFile;
@@ -19,6 +24,14 @@ pub const FORMAT: u32 = 1;
 
 /// How many pre-update dumps a machine keeps (#352 decision 14).
 pub const KEEP: usize = 3;
+
+/// What an import's name begins with.
+pub const IMPORT_PREFIX: &str = "import-";
+
+/// An operator's file copied in by `restore --dump -`, not a dump this actor took.
+pub fn is_import(name: &str) -> bool {
+    name.starts_with(IMPORT_PREFIX) && valid_name(name)
+}
 
 /// A custom-format archive begins with these bytes (`pg_dump --format=custom`).
 const MAGIC: &[u8] = b"PGDMP";
@@ -65,8 +78,8 @@ impl DumpRecord {
     }
 }
 
-/// `20260925T100000Z-schema-88`, with `-<8 hex>` when two dumps would share a second.
-/// Anything else is refused before it names a file.
+/// `20260925T100000Z-schema-88`, with `-<8 hex>` when two dumps would share a second; an
+/// import is `import-20260925T100000Z`. Anything else is refused before it names a file.
 pub fn valid_name(name: &str) -> bool {
     let stamp = |s: &str| {
         let b = s.as_bytes();
@@ -76,6 +89,9 @@ pub fn valid_name(name: &str) -> bool {
             && b[9..15].iter().all(u8::is_ascii_digit)
             && b[15] == b'Z'
     };
+    if let Some(rest) = name.strip_prefix(IMPORT_PREFIX) {
+        return stamp(rest);
+    }
     let Some((ts, rest)) = name.split_once("-schema-") else {
         return false;
     };
@@ -204,7 +220,7 @@ impl DumpDir {
         Ok(())
     }
 
-    /// Every `.partial`: a dump a crash stopped half-way.
+    /// Every `.partial`: a dump or an import a crash stopped half-way.
     pub fn remove_partials(&self) -> io::Result<()> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Ok(());
@@ -265,6 +281,20 @@ pub fn examine(path: &Path) -> io::Result<(i64, String, bool)> {
     Ok((size, hex, head == MAGIC))
 }
 
+/// Copies `input` to `partial`, `0600`, and fsyncs it: the `restore --dump -` import.
+pub fn write_import(mut input: impl Read, partial: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(partial)?;
+    let n = io::copy(&mut input, &mut out)?;
+    out.flush()?;
+    out.sync_all()?;
+    Ok(n)
+}
+
 /// What the pre-update dump of a database this size may need: the database's own size (a
 /// compressed custom-format dump is smaller, so this over-asks) plus a tenth, at least
 /// 64 MiB. The Go twin is `platform.dumpSpaceNeeded`; keep the two equal.
@@ -304,13 +334,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_two_name_forms_are_accepted() {
+    fn only_the_dump_and_import_name_forms_are_accepted() {
         for ok in [
             "20260925T100000Z-schema-88",
             "20260925T100000Z-schema-88-7a1f6f1e",
+            "import-20260925T100000Z",
         ] {
             assert!(valid_name(ok), "{ok}");
         }
+        assert!(is_import("import-20260925T100000Z"));
+        assert!(!is_import("20260925T100000Z-schema-88"));
         for bad in [
             "",
             "../x",
@@ -318,7 +351,9 @@ mod tests {
             "20260925T100000Z-schema-88.dump",
             "20260925T100000Z-schema-88-7A1F6F1E",
             "20260925T1000Z-schema-88",
-            "import-20260925T100000Z",
+            "import-2026",
+            "import-20260925T100000Z-schema-88",
+            "import-20260925T100000Z/../x",
             "20260925T100000Z-schema-88/../../secrets",
         ] {
             assert!(!valid_name(bad), "{bad}");
@@ -364,6 +399,28 @@ mod tests {
                 names[0].clone()
             ]
         );
+    }
+
+    #[test]
+    fn an_import_is_written_owner_only_and_never_over_another() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = DumpDir::new(root.path());
+        dir.ensure().unwrap();
+        let name = "import-20260925T100000Z";
+        assert_eq!(
+            write_import(&b"PGDMP..."[..], &dir.partial(name)).unwrap(),
+            8
+        );
+        let mode = std::fs::metadata(dir.partial(name))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(write_import(&b"other"[..], &dir.partial(name)).is_err());
+        dir.complete(name).unwrap();
+        assert!(dir.file(name).exists());
+        assert!(dir.list().is_empty(), "an import is not a pre-update dump");
     }
 
     #[test]

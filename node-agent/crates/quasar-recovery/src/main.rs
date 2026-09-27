@@ -44,6 +44,12 @@ commands:
                                                     stopped the control plane and restored
                                                     your backup: start that control plane
                                                     if the schema matches
+              restore --dump -                      a fresh install (seed started with
+                                                    QUASAR_AWAIT_RESTORE=1): load a
+                                                    pre-RH-06 stack's pg_dump
+                                                    --format=custom file from stdin
+                                                    (docker exec -i ... < file) before
+                                                    the control plane's first boot
               --force-again                         restore a dump that was already
                                                     restored (discards what was written
                                                     since then)
@@ -167,12 +173,30 @@ fn restore(args: &[String]) -> ExitCode {
     if list || (dump.is_none() && to.is_none()) {
         return list_dumps(&socket);
     }
+    // `--dump -`: the operator's file, copied into machine state for the actor to load. A
+    // copy the actor refuses is removed here; one it admits, by the restore when it ends.
+    let mut import = None;
+    if dump.as_deref() == Some("-") {
+        match read_import() {
+            Ok(name) => {
+                import = Some(name.clone());
+                dump = Some(name);
+            }
+            Err(()) => return ExitCode::FAILURE,
+        }
+    }
+    let forget_import = || {
+        if let Some(name) = &import {
+            let _ = import_dir().remove(name);
+        }
+    };
     let id = quasar_recovery::actor::random_request_id();
     let req = quasar_recovery::restore::request_again(id.clone(), dump, to, again);
     let body = serde_json::to_string(&req).expect("a request encodes");
     let followed = match operator::call(&socket, "POST", "/v1/restore", Some(&body)) {
         Ok((202, _)) => id,
         Ok((status, body)) => {
+            forget_import();
             let rejection = serde_json::from_str::<quasar_recovery::socket::Rejection>(&body);
             match rejection {
                 Ok(r) => eprintln!(
@@ -184,6 +208,7 @@ fn restore(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
         Err(e) => {
+            forget_import();
             eprintln!("quasar-recovery restore: the recovery actor did not answer: {e}");
             return ExitCode::FAILURE;
         }
@@ -225,6 +250,57 @@ fn restore(args: &[String]) -> ExitCode {
             } else {
                 ExitCode::FAILURE
             };
+        }
+    }
+}
+
+fn import_dir() -> quasar_recovery::dump_dir::DumpDir {
+    let machine_dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
+    quasar_recovery::dump_dir::DumpDir::new(std::path::Path::new(&machine_dir))
+}
+
+/// Copies stdin into `dumps/import-<stamp>.dump`: its name, once whole.
+fn read_import() -> Result<String, ()> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        eprintln!(
+            "quasar-recovery restore: --dump - reads the dump from stdin: `docker exec -i {} quasar-recovery restore --dump - < quasar.dump`",
+            quasar_recovery::recipe::names::RECOVERY_ACTOR
+        );
+        return Err(());
+    }
+    let dir = import_dir();
+    let name = format!(
+        "{}{}",
+        quasar_recovery::dump_dir::IMPORT_PREFIX,
+        quasar_recovery::dump_dir::stamp(&quasar_recovery::actor::rfc3339_now())
+    );
+    let written = dir
+        .ensure()
+        .and_then(|()| {
+            quasar_recovery::dump_dir::write_import(std::io::stdin().lock(), &dir.partial(&name))
+        })
+        .and_then(|n| dir.complete(&name).map(|()| n));
+    match written {
+        Ok(0) => {
+            let _ = dir.remove(&name);
+            eprintln!("quasar-recovery restore: stdin was empty: `docker exec -i` (with -i) passes the file");
+            Err(())
+        }
+        Ok(n) => {
+            eprintln!(
+                "read {} from stdin as {name}",
+                quasar_recovery::dump_dir::human(n)
+            );
+            Ok(name)
+        }
+        Err(e) => {
+            // A name already taken is another import's, never this one's to remove.
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(dir.partial(&name));
+            }
+            eprintln!("quasar-recovery restore: the dump could not be read from stdin: {e}");
+            Err(())
         }
     }
 }

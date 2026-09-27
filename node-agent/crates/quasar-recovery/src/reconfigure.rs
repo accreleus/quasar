@@ -162,6 +162,7 @@ fn not_reconfigurable(key: &str) -> &'static str {
             "an image changes by an update (Fleet ▸ Releases), never by a reconfigure"
         }
         var::ENROLLMENT => "an installed machine keeps its identity",
+        crate::bootstrap::AWAIT_RESTORE => "it holds a fresh install's first control plane until a restore, so it means something only at install. To load a pre-RH-06 install's dump, reinstall with it: `quasar-recovery uninstall --purge`, then install again with the seed and QUASAR_AWAIT_RESTORE=1",
         k if k.starts_with("QUASAR_DATABASE_") => "the database is fixed at install. Changing the database mode (Quasar's own Postgres or your own database) or the database itself moves data, which a reconfigure never does. To change it, reinstall: back the database up, run `quasar-recovery uninstall`, install again with the seed and the new QUASAR_DATABASE_* inputs, and load your data into the new database",
         _ => "unknown variable",
     }
@@ -510,7 +511,7 @@ impl Actor {
                 Ok(Some(_)) => {
                     return Err(refuse(
                         Reason::Invalid,
-                        "a restore holds this machine's database (it has not finished), so no control plane is started; run the restore command again first. Nothing was changed",
+                        "a restore holds this machine's database (it has not finished, or a fresh install awaits one), so no control plane is started; finish it with the restore command first. Nothing was changed",
                     ))
                 }
                 Err(e) => {

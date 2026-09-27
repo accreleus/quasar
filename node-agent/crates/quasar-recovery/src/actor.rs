@@ -68,6 +68,7 @@ pub struct OperatorInputs {
     pub database_name: Option<String>,
     pub database_sslmode: Option<String>,
     pub database_password: Option<String>,
+    pub await_restore: Option<String>,
     pub app_puid: Option<String>,
     pub app_pgid: Option<String>,
     pub container_network: Option<String>,
@@ -1087,6 +1088,24 @@ impl Actor {
             inputs,
             install_images,
         };
+        // Before machine state: once machine.json exists nothing re-reads the inputs, so a
+        // hold written after it could be lost to a crash and the control plane would boot.
+        if checked.control.as_ref().is_some_and(|c| c.await_restore) {
+            crate::database::store_hold(
+                self.dir.root(),
+                &crate::database::Hold {
+                    format: 1,
+                    reason: crate::database::HoldReason::AwaitRestore,
+                    since: (self.config.now)(),
+                    request_id: None,
+                },
+            )?;
+            info!(
+                token = "actor-awaiting-restore",
+                "this install holds its control plane until a restore: run `{}`",
+                crate::database::import_command()
+            );
+        }
         self.dir.machine().store(&machine)?;
         info!(installation = %machine.installation_id, node = %machine.inputs.node_name, role = ?machine.role, "machine state created");
         Ok(machine)
