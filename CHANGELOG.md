@@ -581,6 +581,14 @@ own; the two do not move together, and that is deliberate.
   claim), with a note of what they checked. The user can then launch again with a new home.
   No files are moved or deleted; a machine that returns with the same storage root picks the
   old home up again. Contract amendment 15, `POST /v1/admin/storage/home-claims/release`.
+- **A library scan fetches artwork for the games it adds (#384).** Once the scan has
+  committed, the tiles it created are resolved straight away with the artwork sweep's own
+  resolver and rules (by Steam app id, cached, a "no match" recorded, a manual or locked
+  choice never replaced), instead of waiting up to `QUASAR_ARTWORK_SWEEP_INTERVAL` for the
+  next `artwork.sweep`. It runs off the scan report, so it never slows or fails the scan; a
+  provider error or rate limit leaves the app for the sweep, which stays the backstop. With
+  no artwork provider configured nothing is requested and nothing is written. The owned-install
+  docs now say the SteamGridDB key is entered in the admin UI and again after a fresh install.
 - **Add host installs the seed the control plane's machine runs after a developer apply
   (#385).** Below an override and the installed release, Add host now offers the image of
   the recovery actor answering on the control plane's own machine, and that machine's

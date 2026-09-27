@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/artwork"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/storage"
@@ -35,6 +36,19 @@ type SettingsReader interface {
 	StorageProvider(ctx context.Context) (string, error)
 }
 
+// ArtworkResolver resolves artwork for exactly the named apps under the artwork sweep's
+// rules (#384). Interface at the consumer: *artwork.Service satisfies it, app.go wires it with
+// SetArtwork. It returns nothing the scan acts on — a provider error or rate limit leaves the
+// app for the regular artwork.sweep, and never fails the scan.
+type ArtworkResolver interface {
+	ResolveApps(ctx context.Context, appIDs []string) artwork.SweepResult
+}
+
+// artworkResolveTimeout bounds one scan's post-commit artwork pass. A scan can create up to
+// scanMaxEntries tiles and the provider throttles per call, so this is generous; an app the
+// pass does not reach has no artwork row and the sweep picks it up.
+const artworkResolveTimeout = 15 * time.Minute
+
 // Handler serves the Phase 4 surfaces: the agent pull channel (§7.2/§7.3) and
 // the admin denylist/status surfaces (§8.2).
 type Handler struct {
@@ -54,7 +68,16 @@ type Handler struct {
 	// (prod and every test fixture pass the same *storage.Manager). nil is handled
 	// explicitly in inertReason, not assumed impossible.
 	drivers DriverResolver
+	// artwork resolves the tiles a scan created, after the scan committed. nil (no artwork
+	// service, e.g. its cache dir was unusable) means the sweep alone does it, as before #384.
+	artwork ArtworkResolver
+	// spawn runs the post-commit artwork pass. `go f()` in production so the scan report is
+	// answered without waiting on a third party; tests swap in a synchronous runner.
+	spawn func(func())
 }
+
+// SetArtwork wires the artwork resolver the scan report hands newly created tiles to.
+func (h *Handler) SetArtwork(r ArtworkResolver) { h.artwork = r }
 
 // NewHandler builds the library HTTP handler.
 func NewHandler(store *Store, agents AgentAuthenticator, settings SettingsReader,
@@ -63,7 +86,8 @@ func NewHandler(store *Store, agents AgentAuthenticator, settings SettingsReader
 		Record(context.Context, string, string, string, string, map[string]any) error
 	}) *Handler {
 	h := &Handler{store: store, agents: agents, settings: settings,
-		details: details, resolver: resolver, log: log}
+		details: details, resolver: resolver, log: log,
+		spawn: func(f func()) { go f() }}
 	if dr, ok := agents.(DriverResolver); ok {
 		h.drivers = dr
 	}
@@ -231,7 +255,33 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		"created", res.Created, "disabled", res.Disabled,
 		"granted", res.Granted, "revoked", res.Revoked, "rejected", res.Rejected,
 		"backfilled", res.Backfilled)
+	h.resolveCreatedArtwork(r.Context(), req.ScanID, res.CreatedAppIDs)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"accepted": true})
+}
+
+// resolveCreatedArtwork hands the tiles a committed scan just created to the artwork resolver
+// (#384), so a detected game has its art when an admin next opens the library instead of
+// after the next artwork.sweep. Called only after Reconcile committed, and off the request:
+// the scan's answer never waits on, or depends on, a third party. Detached from the request
+// context, which ends as soon as the report is answered.
+func (h *Handler) resolveCreatedArtwork(ctx context.Context, scanID string, appIDs []string) {
+	if h.artwork == nil || len(appIDs) == 0 {
+		return
+	}
+	ids := append([]string(nil), appIDs...)
+	resolver := h.artwork
+	bg := context.WithoutCancel(ctx)
+	h.spawn(func() {
+		ctx, cancel := context.WithTimeout(bg, artworkResolveTimeout)
+		defer cancel()
+		res := resolver.ResolveApps(ctx, ids)
+		if !res.ProviderConfigured {
+			return // ship-dark: nothing was asked, nothing to say
+		}
+		h.log.Info("library: resolved artwork for new tiles",
+			"scan_id", scanID, "created", len(ids), "considered", res.AppsConsidered,
+			"artwork_resolved", res.ArtworkResolved, "no_match", res.NoMatch)
+	})
 }
 
 // mergeIDs unions a and b, deduplicated, a's order then any of b's not already in a.

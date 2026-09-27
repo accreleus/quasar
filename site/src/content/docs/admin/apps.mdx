@@ -109,6 +109,8 @@ public registry will not launch, and the failure will not be obvious.
 
 ## Artwork
 
-If you set a SteamGridDB key under Admin, Settings, Quasar fetches artwork for
-catalog entries. Without one, tiles render as gradient panels. It is entirely
-cosmetic.
+If you set a SteamGridDB key under Admin, Library, Sources, Quasar fetches
+artwork for catalog entries. Games a library scan adds get theirs as soon as the
+scan finishes; anything else, or anything that fetch missed, is picked up by the
+artwork job. Artwork you uploaded or chose yourself is never replaced. Without a
+key, tiles render as gradient panels. It is entirely cosmetic.

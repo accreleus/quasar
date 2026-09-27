@@ -414,6 +414,17 @@ Quasar's own database and your own moves data, which `reconfigure` never does:
 back the database up, uninstall, install again with the new settings, and load
 your data. The node name is changed the same way. Images move by an update.
 
+### Cover artwork
+
+An owned install has no setting for the SteamGridDB key. It comes from the admin
+UI: **Admin, Library, Sources**, the SteamGridDB row. An app's editor shows on its
+**Artwork** tab whether a key is configured. The key is stored encrypted in the
+database, so a fresh install starts without one and you enter it again. Until
+then every tile is a gradient panel and nothing is sent to SteamGridDB.
+
+With a key set, a library scan fetches artwork for the games it adds as soon as
+it finishes. Games it could not fetch are picked up by the regular artwork job.
+
 ## Application memory and ownership
 
 Application containers get **1 GiB of shared memory** (`QUASAR_APP_SHM_SIZE`),

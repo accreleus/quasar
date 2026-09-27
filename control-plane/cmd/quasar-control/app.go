@@ -741,6 +741,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	libraryJanitor := library.NewJanitor(libraryStore, settingsStore, libraryResolver, log)
 	libraryHandler := library.NewHandler(libraryStore, homeProvider, settingsStore,
 		appDetails, libraryResolver, log, auditStore)
+	if artErr == nil {
+		// A scan resolves artwork for the tiles it creates right after it commits (#384);
+		// artwork.sweep stays the backstop for anything that pass misses.
+		libraryHandler.SetArtwork(artworkSvc)
+	}
 
 	// jobs.interval_secs is seeded once from instance_settings.
 	// library_discovery_interval_minutes (design §8.2); after this boot an admin owns
