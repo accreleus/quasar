@@ -567,6 +567,9 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The artwork key links point where the key lives.** The app editor's Artwork tab and the
+  setup wizard's Libraries step sent admins to Settings, which no longer holds the SteamGridDB
+  key or the library providers; they now point at Library › Sources (found in #384).
 - **Small fixes from the RH-06 live runs (#382).**
   - On the control plane's machine, a host developer apply sent during a control-plane update is
     refused up front with `409 attempt_in_flight`, instead of being accepted and failing `busy`.

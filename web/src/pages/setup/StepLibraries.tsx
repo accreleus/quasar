@@ -284,7 +284,7 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
           Optional: automatically discover games your users already own from a
           library provider and publish them as launchable tiles. Everything
           here stays fully configurable later from{" "}
-          <strong>Admin → Settings</strong> — leaving every provider off just
+          <strong>Admin → Library → Sources</strong> — leaving every provider off just
           means nobody has turned it on yet.
         </p>
       </div>
@@ -304,7 +304,7 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
           <p className="muted">
             No library providers are in the image catalog yet. This is not a
             problem — enable one anytime later from{" "}
-            <strong>Admin → Settings</strong> once the catalog has synced.
+            <strong>Admin → Library → Sources</strong> once the catalog has synced.
           </p>
           {syncError && (
             <p className="login-error" role="alert">

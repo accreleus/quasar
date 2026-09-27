@@ -22,8 +22,8 @@ function envelope(over: Partial<AppArtworkEnvelope> = {}): AppArtworkEnvelope {
   } as AppArtworkEnvelope;
 }
 
-// The tab renders a <Link to="/admin/settings"> (the credential lives on the
-// Settings page, not here) — needs a Router in scope, hence MemoryRouter.
+// The tab renders a <Link to="/admin/library/sources"> (the credential lives
+// under Library › Sources, not here) — needs a Router in scope, hence MemoryRouter.
 function renderPanel(kind = "game") {
   return render(
     <MemoryRouter>
@@ -68,23 +68,23 @@ describe("Artwork tab — provider not configured (the shipped default)", () => 
 });
 
 describe("Artwork tab — the provider credential is read-only here", () => {
-  it("shows a 'not configured' indicator and a link to Settings, with no key-entry field", async () => {
+  it("shows a 'not configured' indicator and a link to Library › Sources, with no key-entry field", async () => {
     mocked.getAppArtwork.mockResolvedValue(envelope());
     renderPanel();
 
     await screen.findByText(/No artwork provider key is configured/i);
     // No editable credential control of any kind — that facility moved to
-    // /admin/settings, and this panel must not offer a second place to set it.
+    // Library › Sources, and this panel must not offer a second place to set it.
     expect(screen.queryByLabelText(/SteamGridDB API key/i)).toBeNull();
     expect(screen.queryByRole("button", { name: /save key/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /replace key/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /clear key/i })).toBeNull();
-    // At least one link points at the Settings page (the note above the
-    // indicator links there too, so more than one is expected and fine).
-    const settingsLinks = screen.getAllByRole("link", { name: /settings/i });
-    expect(settingsLinks.length).toBeGreaterThan(0);
-    for (const link of settingsLinks) {
-      expect(link.getAttribute("href")).toBe("/admin/settings");
+    // Every link points at Library › Sources, where the key is entered (the
+    // note above the indicator links there too, so more than one is fine).
+    const sourcesLinks = screen.getAllByRole("link", { name: /library › sources/i });
+    expect(sourcesLinks.length).toBeGreaterThan(0);
+    for (const link of screen.getAllByRole("link")) {
+      expect(link.getAttribute("href")).toBe("/admin/library/sources");
     }
   });
 

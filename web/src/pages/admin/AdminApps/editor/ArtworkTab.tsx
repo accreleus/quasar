@@ -4,7 +4,7 @@
 // "Portal Knights"), which is why both exist.
 //
 // The provider credential is read-only here: set/replace/clear lives on
-// /admin/settings, since an instance-wide credential must be reachable with
+// /admin/library/sources (where the key moved), since an instance-wide credential must be reachable with
 // zero apps. This tab keeps only the indicator and the link.
 
 import { useRef, useState } from "react";
@@ -186,7 +186,7 @@ export function ArtworkTab({ appId, appName, token, kind }: ArtworkTabProps) {
                   {env?.provider_problem ??
                     "No artwork provider is configured on this deployment, so nothing is fetched automatically and no app details leave this server."}{" "}
                   Upload artwork below, or{" "}
-                  <Link to="/admin/settings">set an API key on the Settings page</Link> after
+                  <Link to="/admin/library/sources">set an API key under Library › Sources</Link> after
                   reading the provider&rsquo;s terms.
                 </div>
               </div>
@@ -195,12 +195,12 @@ export function ArtworkTab({ appId, appName, token, kind }: ArtworkTabProps) {
               {providerOn ? (
                 <>
                   {`An artwork provider key is configured, ${PROVIDER_ORIGIN_LABEL[env?.provider_origin ?? "none"] ?? env?.provider_origin}.`}{" "}
-                  <Link to="/admin/settings">Manage provider credentials</Link>
+                  <Link to="/admin/library/sources">Manage provider credentials</Link>
                 </>
               ) : (
                 <>
                   No artwork provider key is configured.{" "}
-                  <Link to="/admin/settings">Set one on the Settings page</Link>
+                  <Link to="/admin/library/sources">Set one under Library › Sources</Link>
                 </>
               )}
             </span>
