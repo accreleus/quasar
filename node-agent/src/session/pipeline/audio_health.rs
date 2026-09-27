@@ -21,6 +21,9 @@ const BACKLOG_WARN_MS: u64 = 100;
 /// A timestamp step this much larger than the previous buffer's duration is a gap, not
 /// rounding (one 10 ms buffer is 480 samples; rounding moves it by a nanosecond).
 const GAP_TOLERANCE_NS: u64 = 1_000_000;
+/// Buffers at the start of a session whose age is not judged: the capture starts behind
+/// while the ring buffer fills (~380 ms measured on the lab).
+const WARMUP_BUFFERS: u64 = 500;
 
 /// One capture thread's scheduler counters, from `/proc/thread-self/schedstat`: time on a
 /// CPU, time runnable but waiting for one, in nanoseconds.
@@ -97,6 +100,7 @@ pub(super) struct Window {
     min_capture_late_ns: Option<u64>,
     /// Session-long: the smallest capture age seen, and the first window's smallest.
     floor_ns: Option<u64>,
+    seen: u64,
     first_min_ns: Option<u64>,
 }
 
@@ -117,6 +121,7 @@ impl Window {
             min_capture_late_ns: None,
             floor_ns: None,
             first_min_ns: None,
+            seen: 0,
         }
     }
 
@@ -133,10 +138,13 @@ impl Window {
         if discont {
             self.disconts += 1;
         }
-        self.max_capture_late_ns = self.max_capture_late_ns.max(late_ns);
-        self.min_capture_late_ns =
-            Some(self.min_capture_late_ns.map_or(late_ns, |m| m.min(late_ns)));
-        self.floor_ns = Some(self.floor_ns.map_or(late_ns, |m| m.min(late_ns)));
+        self.seen += 1;
+        if self.seen > WARMUP_BUFFERS {
+            self.max_capture_late_ns = self.max_capture_late_ns.max(late_ns);
+            self.min_capture_late_ns =
+                Some(self.min_capture_late_ns.map_or(late_ns, |m| m.min(late_ns)));
+            self.floor_ns = Some(self.floor_ns.map_or(late_ns, |m| m.min(late_ns)));
+        }
         let gap = self
             .next_pts_ns
             .and_then(|expected| pts_ns.checked_sub(expected))
@@ -151,6 +159,9 @@ impl Window {
 
     /// The same audio leaving the encoder, as an RTP packet.
     pub fn encoded(&mut self, late_ns: u64) {
+        if self.seen <= WARMUP_BUFFERS {
+            return;
+        }
         self.max_encoded_late_ns = self.max_encoded_late_ns.max(late_ns);
     }
 
@@ -194,10 +205,11 @@ impl Window {
             thread_cpu_pct: share(|s| s.cpu_ns),
             thread_wait_pct: share(|s| s.wait_ns),
         };
-        let (next_pts_ns, floor_ns) = (self.next_pts_ns, self.floor_ns);
+        let (next_pts_ns, floor_ns, seen) = (self.next_pts_ns, self.floor_ns, self.seen);
         *self = Window::new(now, sched);
         self.next_pts_ns = next_pts_ns;
         self.floor_ns = floor_ns;
+        self.seen = seen;
         self.first_min_ns = first_min;
         Some(report)
     }
@@ -398,6 +410,24 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
+    /// A window past the session's warm-up, so buffer ages are judged.
+    fn warm_window(t0: Instant, sched: Option<SchedStat>) -> Window {
+        let mut w = Window::new(t0, sched);
+        w.seen = WARMUP_BUFFERS;
+        w
+    }
+
+    #[test]
+    fn warm_up_ages_are_not_judged() {
+        let t0 = Instant::now();
+        let mut w = Window::new(t0, None);
+        w.captured(0, 10 * MS, false, 380 * MS);
+        w.encoded(390 * MS);
+        let r = w.roll(t0 + WINDOW, None).unwrap();
+        assert_eq!((r.capture_backlog_ms, r.encoded_backlog_ms), (0, 0));
+        assert!(!r.is_degraded());
+    }
+
     #[test]
     fn schedstat_parses_the_proc_format() {
         assert_eq!(
@@ -497,7 +527,7 @@ mod tests {
     #[test]
     fn an_encode_backlog_alone_is_degraded() {
         let t0 = Instant::now();
-        let mut w = Window::new(t0, None);
+        let mut w = warm_window(t0, None);
         w.captured(0, 10 * MS, false, 20 * MS);
         w.encoded(150 * MS);
         let r = w.roll(t0 + WINDOW, None).unwrap();
@@ -509,7 +539,7 @@ mod tests {
     fn a_constant_start_offset_is_neither_backlog_nor_drift() {
         // Sample-count timestamps start behind the shared base time by a fixed amount.
         let t0 = Instant::now();
-        let mut w = Window::new(t0, None);
+        let mut w = warm_window(t0, None);
         for i in 0..10 {
             w.captured(i * 10 * MS, 10 * MS, false, 1_900 * MS);
             w.encoded(1_901 * MS);
@@ -525,7 +555,7 @@ mod tests {
     #[test]
     fn drift_is_measured_against_the_first_window() {
         let t0 = Instant::now();
-        let mut w = Window::new(t0, None);
+        let mut w = warm_window(t0, None);
         w.captured(0, 10 * MS, false, 1_900 * MS);
         w.roll(t0 + WINDOW, None).unwrap();
         w.captured(10 * MS, 10 * MS, false, 1_905 * MS);
