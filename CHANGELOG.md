@@ -27,6 +27,12 @@ own; the two do not move together, and that is deliberate.
 This branch is an edge build for #351 on top of 0.3.0, not a release.
 
 ### Fixed
+- **Stream audio no longer turns robotic after about 40 minutes (#351).** The audio
+  pipeline ran on the session's shared system clock, and the game audio's sample count
+  gains on it by about 80 ppm. The timestamps crept ahead of the clock, and once they were
+  200 ms ahead the audio send path held every buffer long enough to overrun the capture:
+  the browser heard about 70 ms of every 270 ms. The audio pipeline now runs on the
+  capture's own clock, so there is no drift to accumulate.
 - **Game audio was resampled twice on its way to the browser (#351).** The session's
   output sink started at PulseAudio's default 44.1 kHz and could never switch to the game's
   48 kHz, because the stream capture holds it from session start. Game audio was converted

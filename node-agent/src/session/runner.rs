@@ -1786,17 +1786,24 @@ pub fn run_blocking(
     // neither blocks the other's state transition. Teardown is the idempotent
     // `audio_pipeline.finish()`, the one mechanism no exit path can skip.
     if let Some(audio_pipe) = audio_pipeline.as_ref() {
-        // Same clock as the encode pipeline, so RTP timestamps stay coherent.
-        audio_pipe.set_start_time(None::<gst::ClockTime>);
-        audio_pipe.use_clock(Some(&shared_clock));
-        audio_pipe.set_base_time(shared_base);
+        // Never force the session's shared clock here (#351): the pipeline must run on
+        // the capture's own clock. Slaved to the SystemClock, the monitor's sample count
+        // drifts ahead of it (~80 ppm measured), audiobasesrc's skew slaving only corrects
+        // a capture that runs slow, and webrtcbin's internal `clocksync sync=true` then
+        // holds each buffer until its timestamp. After ~40 min that wait passes the 200 ms
+        // capture ring buffer and the capture drops ~200 ms of every ~270 ms. Nothing
+        // needs the shared clock: this PC is not lip-synced to video (#304).
         if let Err(e) = audio_pipe.set_state(gst::State::Playing) {
             tracing::warn!(
                 token = "audio-pipeline-play-failed",
                 "audio pipeline set PLAYING failed: {e:#} (audio disabled)"
             );
         } else {
-            tracing::info!("audio pipeline PLAYING (separate from encode)");
+            let clock = audio_pipe
+                .clock()
+                .map(|c| c.name().to_string())
+                .unwrap_or_else(|| "none yet".into());
+            tracing::info!("audio pipeline PLAYING (separate from encode, clock {clock})");
         }
     }
     // Optional local-display fan-out (third interpipe listener into waylandsink+headless
