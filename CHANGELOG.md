@@ -1128,6 +1128,14 @@ own; the two do not move together, and that is deliberate.
   48 kHz, because the stream capture holds it from session start. Game audio was converted
   down to 44.1 kHz in 16-bit, then back up to 48 kHz for Opus. The sink is now pinned to
   48 kHz stereo, and the Opus encoder input is pinned to the same format.
+- **Stream audio that the host drops is now logged (#351).** The capture could skip audio
+  when it fell behind, and only said so with `GST_DEBUG` raised. The agent now logs a
+  minute-by-minute health line for each session's audio (`audio-capture-health`, or
+  `audio-capture-degraded` with the milliseconds lost and whether the capture thread was
+  starved of CPU), and the audio pipeline's own warnings (`audio-pipeline-message`).
+  Encoded audio now reaches the audio PeerConnection through a short leaky queue, so a
+  stall on the send side, including the wait for the browser's answer at every session
+  start, no longer stops the capture.
 - **Session charts with a small range drew duplicate y-axis ticks (#372).** A metric like
   `ladder_res_rung` (0–1) got ticks `0, 0, 1, 1, 1`: overlapping gridlines and a React
   duplicate-key warning. Ticks now take the fewest decimals that keep them distinct
