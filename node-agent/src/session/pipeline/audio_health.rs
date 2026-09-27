@@ -15,9 +15,9 @@ use gstreamer::prelude::*;
 
 /// How often a summary is logged, and the unit every rate below is measured over.
 const WINDOW: Duration = Duration::from_secs(60);
-/// A buffer whose newest sample is older than this when it leaves the encoder is late
-/// enough that the capture ring buffer (200 ms) is close to overrunning.
-const LATE_WARN: Duration = Duration::from_millis(100);
+/// A buffer this far behind the session's best capture age when it leaves the encoder
+/// has the capture ring buffer (200 ms) close to overrunning.
+const BACKLOG_WARN_MS: u64 = 100;
 /// A timestamp step this much larger than the previous buffer's duration is a gap, not
 /// rounding (one 10 ms buffer is 480 samples; rounding moves it by a nanosecond).
 const GAP_TOLERANCE_NS: u64 = 1_000_000;
@@ -56,10 +56,14 @@ pub(super) struct Report {
     pub disconts: u64,
     /// RTP packets the send queue dropped because `webrtcbin` did not take them in time.
     pub send_drops: u64,
-    /// Oldest-sample age when a buffer left the capture element, and when it left the
-    /// encoder, worst in the window.
-    pub max_capture_late_ms: u64,
-    pub max_encoded_late_ms: u64,
+    /// Worst oldest-sample age in the window, at capture and after encode, above the
+    /// session's best capture age. Absolute ages carry a constant start offset, since
+    /// the capture is timestamped by sample count.
+    pub capture_backlog_ms: u64,
+    pub encoded_backlog_ms: u64,
+    /// How far the capture's sample count has drifted behind the pipeline clock since
+    /// the session's first window (negative: ahead).
+    pub clock_drift_ms: i64,
     /// Share of the window the capture thread spent on a CPU, and runnable but waiting
     /// for one. `None` when the counters were unavailable or the thread changed.
     pub thread_cpu_pct: Option<f64>,
@@ -72,7 +76,7 @@ impl Report {
         self.gap_ms > 0
             || self.disconts > 0
             || self.send_drops > 0
-            || self.max_encoded_late_ms >= LATE_WARN.as_millis() as u64
+            || self.encoded_backlog_ms >= BACKLOG_WARN_MS
     }
 }
 
@@ -90,6 +94,10 @@ pub(super) struct Window {
     send_drops: u64,
     max_capture_late_ns: u64,
     max_encoded_late_ns: u64,
+    min_capture_late_ns: Option<u64>,
+    /// Session-long: the smallest capture age seen, and the first window's smallest.
+    floor_ns: Option<u64>,
+    first_min_ns: Option<u64>,
 }
 
 impl Window {
@@ -106,6 +114,9 @@ impl Window {
             send_drops: 0,
             max_capture_late_ns: 0,
             max_encoded_late_ns: 0,
+            min_capture_late_ns: None,
+            floor_ns: None,
+            first_min_ns: None,
         }
     }
 
@@ -123,6 +134,9 @@ impl Window {
             self.disconts += 1;
         }
         self.max_capture_late_ns = self.max_capture_late_ns.max(late_ns);
+        self.min_capture_late_ns =
+            Some(self.min_capture_late_ns.map_or(late_ns, |m| m.min(late_ns)));
+        self.floor_ns = Some(self.floor_ns.map_or(late_ns, |m| m.min(late_ns)));
         let gap = self
             .next_pts_ns
             .and_then(|expected| pts_ns.checked_sub(expected))
@@ -160,6 +174,12 @@ impl Window {
             _ => None,
         };
         let ms = |ns: u64| ns / 1_000_000;
+        let floor = self.floor_ns.unwrap_or(0);
+        let first_min = self.first_min_ns.or(self.min_capture_late_ns);
+        let clock_drift_ms = match (self.min_capture_late_ns, first_min) {
+            (Some(now_min), Some(first)) => (now_min as i64 - first as i64) / 1_000_000,
+            _ => 0,
+        };
         let report = Report {
             window_ms: elapsed.as_millis() as u64,
             buffers: self.buffers,
@@ -168,14 +188,17 @@ impl Window {
             gaps: self.gaps,
             disconts: self.disconts,
             send_drops: self.send_drops,
-            max_capture_late_ms: ms(self.max_capture_late_ns),
-            max_encoded_late_ms: ms(self.max_encoded_late_ns),
+            capture_backlog_ms: ms(self.max_capture_late_ns.saturating_sub(floor)),
+            encoded_backlog_ms: ms(self.max_encoded_late_ns.saturating_sub(floor)),
+            clock_drift_ms,
             thread_cpu_pct: share(|s| s.cpu_ns),
             thread_wait_pct: share(|s| s.wait_ns),
         };
-        let next_pts_ns = self.next_pts_ns;
+        let (next_pts_ns, floor_ns) = (self.next_pts_ns, self.floor_ns);
         *self = Window::new(now, sched);
         self.next_pts_ns = next_pts_ns;
+        self.floor_ns = floor_ns;
+        self.first_min_ns = first_min;
         Some(report)
     }
 }
@@ -187,8 +210,8 @@ fn log_report(r: &Report, session_id: &str) {
             token = "audio-capture-degraded",
             session_id = %session_id,
             "stream audio lost {} ms in {} gaps over the last {} ms ({} buffers, {} ms captured, \
-             {} capture drops, {} packets dropped waiting to send); oldest sample at capture {} ms, after encode {} ms; capture \
-             thread on CPU {}, waiting for a CPU {}",
+             {} capture drops, {} packets dropped waiting to send); backlog at capture {} ms, after \
+             encode {} ms; capture clock drift {} ms; capture thread on CPU {}, waiting for a CPU {}",
             r.gap_ms,
             r.gaps,
             r.window_ms,
@@ -196,8 +219,9 @@ fn log_report(r: &Report, session_id: &str) {
             r.captured_ms,
             r.disconts,
             r.send_drops,
-            r.max_capture_late_ms,
-            r.max_encoded_late_ms,
+            r.capture_backlog_ms,
+            r.encoded_backlog_ms,
+            r.clock_drift_ms,
             pct(r.thread_cpu_pct),
             pct(r.thread_wait_pct),
         );
@@ -205,14 +229,15 @@ fn log_report(r: &Report, session_id: &str) {
         tracing::info!(
             token = "audio-capture-health",
             session_id = %session_id,
-            "stream audio healthy over the last {} ms: {} buffers, {} ms captured; oldest \
-             sample at capture {} ms, after encode {} ms; capture thread on CPU {}, waiting \
-             for a CPU {}",
+            "stream audio healthy over the last {} ms: {} buffers, {} ms captured; backlog at \
+             capture {} ms, after encode {} ms; capture clock drift {} ms; capture thread on \
+             CPU {}, waiting for a CPU {}",
             r.window_ms,
             r.buffers,
             r.captured_ms,
-            r.max_capture_late_ms,
-            r.max_encoded_late_ms,
+            r.capture_backlog_ms,
+            r.encoded_backlog_ms,
+            r.clock_drift_ms,
             pct(r.thread_cpu_pct),
             pct(r.thread_wait_pct),
         );
@@ -470,13 +495,41 @@ mod tests {
     }
 
     #[test]
-    fn a_late_encode_alone_is_degraded() {
+    fn an_encode_backlog_alone_is_degraded() {
         let t0 = Instant::now();
         let mut w = Window::new(t0, None);
         w.captured(0, 10 * MS, false, 20 * MS);
         w.encoded(150 * MS);
         let r = w.roll(t0 + WINDOW, None).unwrap();
-        assert_eq!(r.max_encoded_late_ms, 150);
+        assert_eq!(r.encoded_backlog_ms, 130);
         assert!(r.is_degraded());
+    }
+
+    #[test]
+    fn a_constant_start_offset_is_neither_backlog_nor_drift() {
+        // Sample-count timestamps start behind the shared base time by a fixed amount.
+        let t0 = Instant::now();
+        let mut w = Window::new(t0, None);
+        for i in 0..10 {
+            w.captured(i * 10 * MS, 10 * MS, false, 1_900 * MS);
+            w.encoded(1_901 * MS);
+        }
+        let r = w.roll(t0 + WINDOW, None).unwrap();
+        assert_eq!(
+            (r.capture_backlog_ms, r.encoded_backlog_ms, r.clock_drift_ms),
+            (0, 1, 0)
+        );
+        assert!(!r.is_degraded());
+    }
+
+    #[test]
+    fn drift_is_measured_against_the_first_window() {
+        let t0 = Instant::now();
+        let mut w = Window::new(t0, None);
+        w.captured(0, 10 * MS, false, 1_900 * MS);
+        w.roll(t0 + WINDOW, None).unwrap();
+        w.captured(10 * MS, 10 * MS, false, 1_905 * MS);
+        let r = w.roll(t0 + 2 * WINDOW, None).unwrap();
+        assert_eq!((r.clock_drift_ms, r.capture_backlog_ms), (5, 5));
     }
 }

@@ -1128,6 +1128,12 @@ own; the two do not move together, and that is deliberate.
   48 kHz, because the stream capture holds it from session start. Game audio was converted
   down to 44.1 kHz in 16-bit, then back up to 48 kHz for Opus. The sink is now pinned to
   48 kHz stereo, and the Opus encoder input is pinned to the same format.
+- **Stream audio no longer turns robotic after about 40 minutes (#351).** The audio
+  pipeline ran on the session's shared system clock, and the game audio's sample count
+  gains on it by about 80 ppm. The timestamps crept ahead of the clock, and once they were
+  200 ms ahead the audio send path held every buffer long enough to overrun the capture:
+  the browser heard about 70 ms of every 270 ms. The audio pipeline now runs on the
+  capture's own clock, so there is no drift to accumulate.
 - **Stream audio that the host drops is now logged (#351).** The capture could skip audio
   when it fell behind, and only said so with `GST_DEBUG` raised. The agent now logs a
   minute-by-minute health line for each session's audio (`audio-capture-health`, or

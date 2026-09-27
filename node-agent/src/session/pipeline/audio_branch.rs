@@ -42,13 +42,6 @@ pub(super) fn add_audio_chain(
         // could move the default and silently redirect host-audio capture at the client's
         // own microphone feed.
         builder = builder.property("device", device);
-        // Never slave the capture to the pipeline clock (#351). The monitor's sample count
-        // drifts against the session's SystemClock; under the default `skew`, once the
-        // drift reaches the 200 ms ring buffer audiobasesrc starts jumping the read
-        // position 200 ms at a time and the browser hears ~70 ms of every ~270 ms. The
-        // audio PC is not lip-synced to video (#304), so sample-count timestamps are
-        // correct and the receiver's jitter buffer absorbs the drift.
-        builder = builder.property_from_str("slave-method", "none");
         if audio_no_clock() {
             tracing::info!("pulsesrc provide-clock=false, do-timestamp=false (QUASAR_AUDIO_NO_CLOCK=1 — #304 Test 2)");
             builder = builder.property("provide-clock", false);
@@ -171,28 +164,6 @@ mod tests {
         let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
         cfg.use_test_audio = true;
         cfg
-    }
-
-    #[test]
-    fn the_capture_is_never_slaved_to_the_pipeline_clock() {
-        gst::init().unwrap();
-        let mut cfg = test_audio_cfg();
-        cfg.use_test_audio = false;
-        let pipeline = gst::Pipeline::new();
-        add_audio_chain(&pipeline, &cfg, "test").expect("audio chain builds");
-        let pulsesrc = pipeline
-            .iterate_elements()
-            .into_iter()
-            .filter_map(Result::ok)
-            .find(|e| e.factory().is_some_and(|f| f.name() == "pulsesrc"))
-            .expect("pulsesrc in the chain");
-        let method = pulsesrc.property_value("slave-method");
-        assert_eq!(
-            method.serialize().unwrap().as_str(),
-            "none",
-            "slave-method=skew jumps the capture 200 ms at a time once the drift reaches \
-             the ring buffer (#351)"
-        );
     }
 
     #[test]
