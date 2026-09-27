@@ -928,6 +928,21 @@ export function tombstoneHome(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/admin/storage/homes/${id}`, { method: "DELETE", token });
 }
 
+// Amendment 15 (#379): release a conflicting claim whose host is gone. The
+// expected state and reason are the values the admin read (compare-and-swap).
+export function releaseHomeClaim(
+  token: string,
+  req: {
+    user_id: string;
+    app_id: string;
+    expected_state: string;
+    expected_conflict_reason: string;
+    attestation: string;
+  },
+): Promise<void> {
+  return apiFetch<void>(`/admin/storage/home-claims/release`, { method: "POST", body: req, token });
+}
+
 // ── Session trace (ST-06/ST-07) ───────────────────────────────────────────────
 
 export function getDiagnosticBundle(token: string, sessionId: string): Promise<DiagnosticBundle> {

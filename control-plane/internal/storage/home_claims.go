@@ -315,3 +315,128 @@ func nilIfEmpty(s string) any {
 	}
 	return s
 }
+
+// Release refusals. ErrClaimChanged is the compare-and-swap miss; the caller
+// re-reads the claim and decides again.
+var (
+	ErrClaimNotFound      = errors.New("home claim not found")
+	ErrClaimChanged       = errors.New("home claim changed since it was read")
+	ErrClaimNotReleasable = errors.New("home claim is not releasable")
+	ErrClaimInUse         = errors.New("home claim is in use")
+)
+
+// ReleaseHomeClaimReq is the admin's release request. AppID may name a derived
+// tile. ExpectedState and ExpectedConflictReason are the values the admin read.
+type ReleaseHomeClaimReq struct {
+	UserID                 string
+	AppID                  string
+	ExpectedState          string
+	ExpectedConflictReason string
+}
+
+// ReleasedHomeClaim is what the audit record needs about a release.
+type ReleasedHomeClaim struct {
+	CanonicalAppID string
+	State          string
+	ConflictReason string
+	RowsRemoved    int
+}
+
+// ReleaseHomeClaim is amendment 15's audited repair (#379): it deletes a
+// conflicting claim whose owner host is gone, together with its host-less
+// user_homes rows. Those rows index a backing store no agent can reach, so no
+// agent will ever confirm them and the claim would refuse launch forever.
+// Nothing on disk is touched. A claim with any location on a host that still
+// exists is refused: choosing between live copies is the rest of #347.
+//
+// Lock order is the GC path's: the per-user advisory lock, then the claim,
+// then its user_homes rows.
+func (m *Manager) ReleaseHomeClaim(ctx context.Context, req ReleaseHomeClaimReq) (ReleasedHomeClaim, error) {
+	if !claimUUID(req.UserID) || !claimUUID(req.AppID) {
+		return ReleasedHomeClaim{}, ErrInvalidHomeClaimFilter
+	}
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return ReleasedHomeClaim{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(1,hashtext($1::text))`, req.UserID); err != nil {
+		return ReleasedHomeClaim{}, err
+	}
+	canonical, _, err := canonicalManagedHome(ctx, tx, req.AppID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ReleasedHomeClaim{}, ErrClaimNotFound
+	}
+	if err != nil {
+		return ReleasedHomeClaim{}, fmt.Errorf("resolve home claim app: %w", err)
+	}
+	var owner, reason *string
+	var state string
+	var held bool
+	err = tx.QueryRow(ctx, `SELECT host_id::text,state,conflict_reason,pending_home_token IS NOT NULL
+		FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`,
+		req.UserID, canonical).Scan(&owner, &state, &reason, &held)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ReleasedHomeClaim{}, ErrClaimNotFound
+	}
+	if err != nil {
+		return ReleasedHomeClaim{}, fmt.Errorf("lock home claim: %w", err)
+	}
+	if state != req.ExpectedState || reason == nil || *reason != req.ExpectedConflictReason {
+		return ReleasedHomeClaim{}, ErrClaimChanged
+	}
+	if state != "conflict" || owner != nil {
+		return ReleasedHomeClaim{}, ErrClaimNotReleasable
+	}
+	var live bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sessions s JOIN apps a ON a.id=s.app_id
+		WHERE s.user_id=$1::uuid AND COALESCE(a.parent_app_id,a.id)=$2::uuid
+		  AND s.state NOT IN ('stopped','failed'))`, req.UserID, canonical).Scan(&live); err != nil {
+		return ReleasedHomeClaim{}, fmt.Errorf("check live sessions: %w", err)
+	}
+	if held || live {
+		return ReleasedHomeClaim{}, ErrClaimInUse
+	}
+	var located int
+	var hostless []string
+	rows, err := tx.Query(ctx, `SELECT uh.id::text,uh.host_id IS NOT NULL
+		FROM user_homes uh JOIN apps a ON a.id=uh.app_id
+		WHERE uh.user_id=$1::uuid AND COALESCE(a.parent_app_id,a.id)=$2::uuid
+		ORDER BY uh.id FOR UPDATE OF uh`, req.UserID, canonical)
+	if err != nil {
+		return ReleasedHomeClaim{}, fmt.Errorf("lock claim homes: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		var hasHost bool
+		if err := rows.Scan(&id, &hasHost); err != nil {
+			rows.Close()
+			return ReleasedHomeClaim{}, fmt.Errorf("scan claim home: %w", err)
+		}
+		if hasHost {
+			located++
+		} else {
+			hostless = append(hostless, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return ReleasedHomeClaim{}, fmt.Errorf("read claim homes: %w", err)
+	}
+	if located > 0 {
+		return ReleasedHomeClaim{}, ErrClaimNotReleasable
+	}
+	if len(hostless) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM user_homes WHERE id::text = ANY($1)`, hostless); err != nil {
+			return ReleasedHomeClaim{}, fmt.Errorf("remove host-less homes: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`,
+		req.UserID, canonical); err != nil {
+		return ReleasedHomeClaim{}, fmt.Errorf("release home claim: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ReleasedHomeClaim{}, err
+	}
+	return ReleasedHomeClaim{CanonicalAppID: canonical, State: state, ConflictReason: *reason, RowsRemoved: len(hostless)}, nil
+}

@@ -47,6 +47,7 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("GET /v1/admin/storage/homes", admin(http.HandlerFunc(h.handleList)))
 	mux.Handle("GET /v1/admin/storage/home-claims", admin(http.HandlerFunc(h.handleListHomeClaims)))
 	mux.Handle("DELETE /v1/admin/storage/homes/{id}", admin(http.HandlerFunc(h.handleTombstone)))
+	mux.Handle("POST /v1/admin/storage/home-claims/release", admin(http.HandlerFunc(h.handleReleaseHomeClaim)))
 	mux.Handle("GET /v1/me/storage", requireAuth(http.HandlerFunc(h.handleMyStorage)))
 
 	// Agent-authenticated backing-store reaping (#175). These are NOT behind the
@@ -85,6 +86,70 @@ func (h *Handler) handleListHomeClaims(w http.ResponseWriter, r *http.Request) {
 		nextCursor = &next
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
+}
+
+type releaseHomeClaimReq struct {
+	UserID                 string `json:"user_id"`
+	AppID                  string `json:"app_id"`
+	ExpectedState          string `json:"expected_state"`
+	ExpectedConflictReason string `json:"expected_conflict_reason"`
+	Attestation            string `json:"attestation"`
+}
+
+// POST /v1/admin/storage/home-claims/release — amendment 15 (#379): release a
+// conflicting claim whose owner host is gone. Bookkeeping only.
+func (h *Handler) handleReleaseHomeClaim(w http.ResponseWriter, r *http.Request) {
+	var req releaseHomeClaimReq
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid request body")
+		return
+	}
+	attestation := strings.TrimSpace(req.Attestation)
+	switch {
+	case !claimUUID(req.UserID) || !claimUUID(req.AppID):
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "user_id and app_id must be UUIDs")
+		return
+	case attestation == "" || len([]rune(attestation)) > 500:
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "attestation must be 1 to 500 characters")
+		return
+	case req.ExpectedState != "reserved" && req.ExpectedState != "materialized" && req.ExpectedState != "conflict":
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "expected_state is not a claim state")
+		return
+	}
+	switch req.ExpectedConflictReason {
+	case "legacy_location_uncertain", "claim_owner_missing", "location_mismatch", "gc_pending":
+	default:
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "expected_conflict_reason is not a conflict reason")
+		return
+	}
+	released, err := h.mgr.ReleaseHomeClaim(r.Context(), ReleaseHomeClaimReq{
+		UserID: req.UserID, AppID: req.AppID,
+		ExpectedState: req.ExpectedState, ExpectedConflictReason: req.ExpectedConflictReason,
+	})
+	switch {
+	case errors.Is(err, ErrClaimNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "home claim not found")
+	case errors.Is(err, ErrClaimChanged):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "the claim changed since it was read; reload it and decide again")
+	case errors.Is(err, ErrClaimInUse):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeHomeInUse, "a session or home operation is using this claim; stop it first")
+	case errors.Is(err, ErrClaimNotReleasable):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeClaimNotReleasable,
+			"only a conflicting claim whose host is gone, with no copy recorded on a host that still exists, can be released")
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not release home claim")
+	default:
+		user, _ := auth.UserFromContext(r.Context())
+		h.recordActivity(r.Context(), user.ID, "storage.home_claim.release", "home_claim",
+			req.UserID+"/"+released.CanonicalAppID, map[string]any{
+				"user_id": req.UserID, "canonical_app_id": released.CanonicalAppID,
+				"previous_state": released.State, "previous_conflict_reason": released.ConflictReason,
+				"rows_removed": released.RowsRemoved, "attestation": attestation,
+			})
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 // authAgent verifies the agent bearer (node_secret) + X-Quasar-Node header and

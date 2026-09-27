@@ -109,6 +109,10 @@ export function StorageTab() {
   const [tombstoning, setTombstoning] = useState<AdminHome | null>(null);
   const [tombstoneError, setTombstoneError] = useState<string | null>(null);
   const [tombstoneInFlight, setTombstoneInFlight] = useState(false);
+  const [releasing, setReleasing] = useState<AdminHomeClaim | null>(null);
+  const [releaseNote, setReleaseNote] = useState("");
+  const [releaseError, setReleaseError] = useState<string | null>(null);
+  const [releaseInFlight, setReleaseInFlight] = useState(false);
   const [reclaimOpen, setReclaimOpen] = useState(false);
   const [reclaiming, setReclaiming] = useState(false);
 
@@ -171,6 +175,40 @@ export function StorageTab() {
       setTombstoneInFlight(false);
     }
   };
+
+  // ── Release a claim whose host is gone (amendment 15, #379) ────────────
+  // The server decides releasability; the menu only offers it for the shape
+  // it can accept (a conflict with no owner and no recorded host).
+  const closeRelease = () => { setReleasing(null); setReleaseNote(""); setReleaseError(null); };
+  const confirmRelease = async () => {
+    if (!token || !releasing || !releasing.conflict_reason) return;
+    setReleaseInFlight(true);
+    setReleaseError(null);
+    try {
+      await claimsRes.mutate((ctx) => adminApi.releaseHomeClaim(ctx.token, {
+        user_id: releasing.user_id,
+        app_id: releasing.canonical_app_id,
+        expected_state: releasing.state,
+        expected_conflict_reason: releasing.conflict_reason!,
+        attestation: releaseNote.trim(),
+      }));
+      closeRelease();
+      await claimsRes.refresh({ silent: true });
+      await res.refresh({ silent: true });
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.code === "conflict") {
+        setReleaseError("This claim changed since the page loaded. Close this and check it again.");
+      } else if (e instanceof ApiError && e.code === "home_in_use") {
+        setReleaseError("A session or home operation is using this claim. Stop it first.");
+      } else {
+        setReleaseError(e instanceof ApiError ? e.message : "Release failed.");
+      }
+    } finally {
+      setReleaseInFlight(false);
+    }
+  };
+  const releasable = (c: AdminHomeClaim) =>
+    c.state === "conflict" && !c.host_id && c.recorded_host_ids.length === 0 && !c.pending_home_operation;
 
   // ── Reclaim pending — runs the home.gc job now, once per host that has a
   //    pending home (see the file banner for why this isn't tombstoneHome).
@@ -355,6 +393,25 @@ export function StorageTab() {
         {c.materialized_at && <span className="sub">Last mounted {relativeTime(c.materialized_at)}</span>}
       </div>
     ) },
+    {
+      key: "actions",
+      header: "",
+      mobileLabel: "",
+      render: (c) => (
+        <div className="cell-actions">
+          <ActionsMenu
+            items={[{
+              key: "release",
+              label: "Release claim",
+              variant: "danger",
+              disabled: !releasable(c),
+              onClick: () => { setReleaseNote(""); setReleaseError(null); setReleasing(c); },
+            }]}
+            label={`Actions for ${c.username ?? "this user"}'s ${c.app_name ?? "app"} claim`}
+          />
+        </div>
+      ),
+    },
   ];
 
   // The head is the Fleet section's (../Fleet.tsx); this tab fills it in.
@@ -541,6 +598,54 @@ export function StorageTab() {
             {tombstoneError && (
               <p className="form-error">
                 {tombstoneError}
+              </p>
+            )}
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={!!releasing}
+        onClose={closeRelease}
+        title="Release home claim"
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeRelease} disabled={releaseInFlight}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => void confirmRelease()}
+              disabled={releaseInFlight || releaseNote.trim() === ""}
+            >
+              {releaseInFlight ? "Releasing…" : "Release"}
+            </Button>
+          </>
+        }
+      >
+        {releasing && (
+          <div className="col gap4">
+            <p className="sec">
+              The host that held this home is gone. Releasing lets {releasing.username ?? "this user"} launch
+              {" "}{releasing.app_name ?? "this app"} again with a new home. No files are moved or deleted.
+              If the machine comes back with the same storage root, the old home is picked up again.
+            </p>
+            <label className="col gap2">
+              <span className="muted">What did you check? (kept in the activity log)</span>
+              <textarea
+                className="input"
+                aria-label="What did you check"
+                rows={3}
+                maxLength={500}
+                value={releaseNote}
+                onChange={(e) => setReleaseNote(e.target.value)}
+                disabled={releaseInFlight}
+                style={{ width: "100%" }}
+              />
+            </label>
+            {releaseError && (
+              <p className="form-error" role="alert">
+                {releaseError}
               </p>
             )}
           </div>

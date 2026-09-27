@@ -567,6 +567,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Forgetting a host no longer strands its users' homes (#379).** Admins can release a
+  home claim whose host is gone from Fleet ▸ Storage ▸ Home ownership (row menu ▸ Release
+  claim), with a note of what they checked. The user can then launch again with a new home.
+  No files are moved or deleted; a machine that returns with the same storage root picks the
+  old home up again. Contract amendment 15, `POST /v1/admin/storage/home-claims/release`.
 - **Add host installs the seed the control plane's machine runs after a developer apply
   (#385).** Below an override and the installed release, Add host now offers the image of
   the recovery actor answering on the control plane's own machine, and that machine's

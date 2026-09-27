@@ -16,6 +16,7 @@ vi.mock("../../../api/admin", () => ({
   listAdminHomeClaims: vi.fn(),
   listHosts: vi.fn(),
   tombstoneHome: vi.fn(),
+  releaseHomeClaim: vi.fn(),
   runJobNow: vi.fn(),
 }));
 
@@ -107,6 +108,44 @@ describe("StorageTab", () => {
     expect(screen.getByText("Claimed host was deleted")).toBeTruthy();
     expect(screen.getByText("Steam")).toBeTruthy();
     expect(screen.getByText(/No managed homes yet/)).toBeTruthy();
+  });
+
+  it("releases a claim whose host is gone, only after the admin says what they checked", async () => {
+    vi.mocked(adminApi.listAdminHomes).mockResolvedValue({ items: [], next_cursor: null } as never);
+    vi.mocked(adminApi.listAdminHomeClaims).mockResolvedValue({
+      items: [{ user_id: "u-alice", username: "alice", canonical_app_id: "a-steam", app_name: "Steam",
+        host_id: null, host_name: null, state: "conflict", conflict_reason: "claim_owner_missing",
+        materialized_at: null, recorded_host_ids: [], pending_home_operation: false }], next_cursor: null,
+    } as never);
+    vi.mocked(adminApi.releaseHomeClaim).mockResolvedValue(undefined as never);
+    renderPage();
+
+    fireEvent.click(await screen.findByLabelText(/Actions for alice's Steam claim/));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Release claim" }));
+    const dialog = await screen.findByRole("dialog", { name: "Release home claim" });
+    const release = within(dialog).getByRole("button", { name: "Release" }) as HTMLButtonElement;
+    expect(release.disabled).toBe(true);
+    fireEvent.change(within(dialog).getByLabelText("What did you check"), { target: { value: "machine retired" } });
+    fireEvent.click(release);
+
+    await waitFor(() => expect(adminApi.releaseHomeClaim).toHaveBeenCalledWith("token", {
+      user_id: "u-alice", app_id: "a-steam", expected_state: "conflict",
+      expected_conflict_reason: "claim_owner_missing", attestation: "machine retired",
+    }));
+  });
+
+  it("does not offer release for a claim with a recorded host", async () => {
+    vi.mocked(adminApi.listAdminHomes).mockResolvedValue({ items: [], next_cursor: null } as never);
+    vi.mocked(adminApi.listAdminHomeClaims).mockResolvedValue({
+      items: [{ user_id: "u-alice", username: "alice", canonical_app_id: "a-steam", app_name: "Steam",
+        host_id: null, host_name: null, state: "conflict", conflict_reason: "location_mismatch",
+        materialized_at: null, recorded_host_ids: ["h-2"], pending_home_operation: false }], next_cursor: null,
+    } as never);
+    renderPage();
+
+    fireEvent.click(await screen.findByLabelText(/Actions for alice's Steam claim/));
+    const item = screen.getByRole("menuitem", { name: "Release claim" }) as HTMLButtonElement;
+    expect(item.disabled || item.getAttribute("aria-disabled") === "true").toBe(true);
   });
 
   it("shows pending cleanup proof and unsupported older-agent coverage", async () => {

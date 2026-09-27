@@ -5351,6 +5351,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/storage/home-claims/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release a conflicting managed-home claim whose owner host is gone (amendment 15). Bookkeeping only. */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["AdminHomeClaimReleaseRequest"];
+                };
+            };
+            responses: {
+                /** @description Released. */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description conflict (the claim changed), home_in_use, or claim_not_releasable. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/storage/homes/{id}": {
         parameters: {
             query?: never;
@@ -10773,6 +10824,21 @@ export interface components {
             legacy_unprotected_dispatch: boolean;
             /** @description Distinct sorted host IDs from known bookkeeping rows, including tombstones; not physical inventory evidence. */
             recorded_host_ids: string[];
+        };
+        AdminHomeClaimReleaseRequest: {
+            /** Format: uuid */
+            user_id: string;
+            /**
+             * Format: uuid
+             * @description A derived tile resolves to its canonical parent app.
+             */
+            app_id: string;
+            /** @enum {string} */
+            expected_state: "reserved" | "materialized" | "conflict";
+            /** @enum {string} */
+            expected_conflict_reason: "legacy_location_uncertain" | "claim_owner_missing" | "location_mismatch" | "gc_pending";
+            /** @description What the admin checked. Stored in the audit record, never interpreted. */
+            attestation: string;
         };
         AdminHomeClaimsResponse: {
             items: components["schemas"]["AdminHomeClaim"][];
