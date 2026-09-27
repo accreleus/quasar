@@ -236,6 +236,36 @@ fn an_agent_that_never_becomes_healthy_is_restored_and_says_why() {
 }
 
 #[test]
+fn a_container_that_never_becomes_healthy_is_stopped_before_it_is_removed() {
+    let (engine, dir) = installed(unhealthy());
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = events.clone();
+    engine.on_lifecycle(move |e| seen.lock().unwrap().push(e.clone()));
+    let actor = actor_with(&engine, dir.path(), fast());
+
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+
+    // #382: the failed container gets a graceful stop, so its own shutdown line
+    // reaches the log tail, and only then is it removed.
+    let events = events.lock().unwrap().clone();
+    let removed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            quasar_recovery::engine::Lifecycle::Removed(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!removed.is_empty(), "{events:?}");
+    for id in removed {
+        let at = |want: &quasar_recovery::engine::Lifecycle| events.iter().position(|e| e == want);
+        let stopped = at(&quasar_recovery::engine::Lifecycle::Stopped(id.clone()));
+        let gone = at(&quasar_recovery::engine::Lifecycle::Removed(id.clone()));
+        assert!(stopped.is_some() && stopped < gone, "{id}: {events:?}");
+    }
+}
+
+#[test]
 fn a_start_the_engine_refuses_never_started_and_is_restored() {
     let (engine, dir) = installed(Behaviour {
         refuse_start: Some(

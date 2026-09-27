@@ -52,13 +52,9 @@ func (h *ApplyHandler) developerApplyControlPlane(w http.ResponseWriter, r *http
 		h.internal(w, "build release view", err)
 		return
 	}
-	if view.ActiveApply != nil {
-		for _, a := range view.ActiveApply.Attempts {
-			if a.HostID == nil {
-				httpx.WriteError(w, http.StatusConflict, CodeAttemptInFlight, "an update of the control plane is already in flight")
-				return
-			}
-		}
+	if controlPlaneAttemptOpen(view) {
+		httpx.WriteError(w, http.StatusConflict, CodeAttemptInFlight, "an update of the control plane is already in flight")
+		return
 	}
 	for _, t := range view.Targets {
 		if t.Kind == TargetControlPlane && t.Preflight.Blocked() {
@@ -219,4 +215,18 @@ func (d *RegistryDeveloperImages) ControlPlaneSchema(ctx context.Context, c Comp
 		return 0, fmt.Errorf("%s: %w", ref, err)
 	}
 	return schema, nil
+}
+
+// controlPlaneAttemptOpen reports whether the view carries an open attempt on
+// the control plane (the one attempt with no host).
+func controlPlaneAttemptOpen(view View) bool {
+	if view.ActiveApply == nil {
+		return false
+	}
+	for _, a := range view.ActiveApply.Attempts {
+		if a.HostID == nil {
+			return true
+		}
+	}
+	return false
 }

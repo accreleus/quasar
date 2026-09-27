@@ -817,6 +817,15 @@ impl Actor {
             }
         };
         if let Some(new) = new {
+            // A graceful stop first, so the failed container writes its own shutdown
+            // line into the tail below instead of being killed mid-sentence (#382).
+            // Best effort: the removal after it forces the matter either way.
+            let grace = self.config.timing.stop_grace;
+            if let Err(EngineError::Crashed) =
+                self.retrying(|| self.engine.stop_container(&new.id, grace))
+            {
+                return Err(());
+            }
             match self.engine.logs_tail(&new.id, 40) {
                 Ok(tail) if !tail.trim_end().is_empty() => {
                     output.push_str("\n--- last lines of the failed container ---\n");

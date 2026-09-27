@@ -289,6 +289,13 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 		writeRefusal(w, code, reason, developerRefusalMessage(code, reason))
 		return
 	}
+	// On the control plane's machine one actor serves both targets, so a host
+	// apply during a control-plane attempt would only fail `busy` there (#382).
+	if h.machineShape.SharesMachineWith(nodeName) && controlPlaneAttemptOpen(view) {
+		httpx.WriteError(w, http.StatusConflict, CodeAttemptInFlight,
+			"an update of the control plane is in flight on this machine; apply the host after it finishes")
+		return
+	}
 
 	// ADR 0001, up front: no registry outside the allowlist is ever contacted.
 	for _, c := range components {

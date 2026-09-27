@@ -15,7 +15,7 @@ use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
 use quasar_recovery::socket::{Request, State};
 use quasar_recovery::trust::{self, SignatureEvidence};
 use quasar_recovery::{identity, operator, server, shutdown, uninstall};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const USAGE: &str = "usage: quasar-recovery <command>
 
@@ -799,7 +799,13 @@ fn trust_from_env(machine_dir: String) -> Result<(TrustConfig, Evidence), String
     let base = trust::parse_manifest_base_url(&raw("QUASAR_UPDATER_MANIFEST_BASE_URL"))
         .map_err(|e| format!("QUASAR_UPDATER_MANIFEST_BASE_URL: {e}"))?;
     let timeout = trust::parse_manifest_timeout(&raw("QUASAR_UPDATER_MANIFEST_TIMEOUT_S"));
-    info!(namespaces = ?allowed_namespaces, signature_mode = mode.as_str(), "release trust");
+    // Not the trust in force: machine state's recorded settings win, and are only read
+    // after the lease. "release trust in force" (after resume) is the effective line (#382).
+    debug!(
+        namespaces = ?allowed_namespaces,
+        signature_mode = mode.as_str(),
+        "release trust from this start's environment; machine state's recorded settings win"
+    );
     let policy = trust::SignaturePolicy { mode, keys };
     let fetcher = Arc::new(trust::HttpsFetcher::from_env());
     let evidence: Evidence = Box::new(move |req: &Request| {

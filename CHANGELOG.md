@@ -567,6 +567,15 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Small fixes from the RH-06 live runs (#382).**
+  - On the control plane's machine, a host developer apply sent during a control-plane update is
+    refused up front with `409 attempt_in_flight`, instead of being accepted and failing `busy`.
+  - A replacement that never becomes healthy is stopped with a grace period before its log tail
+    is taken and it is removed, so the tail ends with its own shutdown line.
+  - The recovery actor no longer logs its environment's release trust at start as if it were in
+    force; the "release trust in force" line after start-up is the effective one.
+  - The control plane's database start-up errors name the `quasar-postgres` container on an
+    owned install, not a `postgres` compose service that does not exist there.
 - **Forgetting a host no longer strands its users' homes (#379).** Admins can release a
   home claim whose host is gone from Fleet ▸ Storage ▸ Home ownership (row menu ▸ Release
   claim), with a note of what they checked. The user can then launch again with a new home.

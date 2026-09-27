@@ -403,3 +403,30 @@ func TestDeveloperApplyKindIsStorable(t *testing.T) {
 		t.Fatal("the kind CHECK admitted an unknown kind")
 	}
 }
+
+// On the control plane's machine one actor serves both targets, so a host
+// apply during a control-plane attempt is refused up front rather than
+// accepted and then failed `busy` by the actor (#382).
+func TestDeveloperApplyToACombinedHostWaitsForTheControlPlaneAttempt(t *testing.T) {
+	images := &fakeDevImages{commit: commitB}
+	h := newApplyHarness(t, func(_ *applyHarness, handler *ApplyHandler) {
+		handler.WithDeveloperApply(images, []string{"registry.example.invalid/dev"}).
+			WithMachineShape(MachineShape{Role: MachineRoleCombined, NodeName: "gpu-01"})
+	})
+	mustExec(t, h.pool, `UPDATE hosts SET install_mode = 'owned' WHERE id = $1::uuid`, h.hostID)
+	if _, err := h.store.CreateControlPlaneAttempt(context.Background(), NewControlPlaneAttempt{
+		Kind:      KindDeveloperApply,
+		Requested: []ComponentDigest{{Name: ComponentControlPlane, Image: "x", Digest: "sha256:" + strings.Repeat("a", 64)}},
+		Previous:  []PreviousDigest{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{"target": "host", "host_id": h.hostID, "components": []ComponentDigest{agentComponent()}}
+	status, out := h.post(t, devURL, h.adminToken, body)
+	if status != http.StatusConflict || errCode(t, out) != CodeAttemptInFlight {
+		t.Fatalf("host apply during a control-plane attempt = %d %s, want 409 attempt_in_flight", status, out)
+	}
+	if h.agent.sentCount() != 0 {
+		t.Errorf("sent %d release_apply, want none", h.agent.sentCount())
+	}
+}
