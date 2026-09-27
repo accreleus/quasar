@@ -579,6 +579,13 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The first session on a new NVIDIA host no longer crashes the node agent (#388).** A fresh
+  agent restarts itself once after it sets up the driver volume or the CUDA userspace, and it
+  kept taking sessions until that exit. The exit then unloaded Vulkan and the driver libraries
+  under the new session's compositor, the agent segfaulted and the session failed. The agent
+  now refuses new sessions once such a restart is under way, the CUDA restart waits until no
+  session is running, and every deliberate agent restart ends the process without running
+  library teardown.
 - **Steam preparation starts on its own on a host that already has the Steam image (#378).**
   The image is reported ready within a second of the host registering, and a host added back
   after a removal is still draining for a moment. Both warm-up triggers could fire before the

@@ -50,6 +50,7 @@ pub mod policy_catalog;
 pub mod readiness;
 pub mod recipe;
 pub mod release;
+pub mod restart;
 pub mod session;
 pub mod vram;
 

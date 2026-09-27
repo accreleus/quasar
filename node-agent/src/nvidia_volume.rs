@@ -2491,6 +2491,9 @@ pub fn restart_for_egl(grace: Duration) {
         }
         *done = true;
     }
+    // #388: from here on this process is going away, so it takes no new session. The
+    // EGL stack it would run on is the one this restart replaces.
+    crate::restart::mark_pending();
     std::thread::spawn(move || {
         std::thread::sleep(grace);
         // #66: symmetric with the cudart path — never exit while any provision is still
@@ -2502,10 +2505,11 @@ pub fn restart_for_egl(grace: Duration) {
                 "another provision is still in flight — NOT restarting; the EGL stack will \
                  re-initialise on the next agent start instead"
             );
+            crate::restart::clear_pending();
             return;
         }
         tracing::warn!(target: T, token = "drvvol-agent-restart-now", "restarting node agent now");
-        std::process::exit(0);
+        crate::restart::exit_now(0);
     });
 }
 

@@ -130,13 +130,13 @@ pub async fn run(cfg: Config) {
     if let Err(msg) = enrollment_reachable(&cfg) {
         error!(token = "boot-enrollment-unconfigured", "{msg}");
         sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-        std::process::exit(1);
+        crate::restart::exit_now(1);
     }
 
     if let Err(message) = crate::container_ownership::initialize(&cfg.node_secret_path) {
         error!(token = "boot-container-ownership-unavailable", "{message}");
         sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-        std::process::exit(1);
+        crate::restart::exit_now(1);
     }
 
     // Consume a restart journal marker once per process, before probes or
@@ -182,7 +182,7 @@ pub async fn run(cfg: Config) {
                  value to run without the endpoint."
             );
             sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-            std::process::exit(1);
+            crate::restart::exit_now(1);
         }
     }
 
@@ -327,7 +327,7 @@ pub async fn run(cfg: Config) {
                     error!(token = "home-cleanup-proof-unavailable",
                         "persistent home cleanup state is uncertain; refusing agent admission");
                     sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-                    std::process::exit(1);
+                    crate::restart::exit_now(1);
                 }
             }
         }
@@ -335,7 +335,7 @@ pub async fn run(cfg: Config) {
             error!(token = "home-cleanup-existing-ledger-unverified",
                 "existing home cleanup ledger lacks verified persistence; refusing agent admission");
             sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-            std::process::exit(1);
+            crate::restart::exit_now(1);
         }
         None => warn!(
             token = "home-cleanup-ledger-unverified",
@@ -353,7 +353,7 @@ pub async fn run(cfg: Config) {
         Ok(crate::policy::BootOutcome::Recovery(id)) => {
             info!(token = "policy-recovery-restart", attempt_id = %id,
                 "restarting once to activate the last verified hardware configuration");
-            std::process::exit(0);
+            crate::restart::exit_now(0);
         }
         Ok(outcome) => outcome,
         Err(crate::policy::BootError::Write(error)) => {
@@ -418,7 +418,7 @@ pub async fn run(cfg: Config) {
             Ok(crate::policy::BootOutcome::Recovery(id)) => {
                 info!(token = "policy-recovery-restart", attempt_id = %id,
                     "candidate failed startup verification; restarting once to restore the last verified hardware configuration");
-                std::process::exit(0);
+                crate::restart::exit_now(0);
             }
             Ok(crate::policy::BootOutcome::Uncertain(id)) => {
                 warn!(token = "policy-recovery-uncertain", attempt_id = %id,
@@ -596,6 +596,10 @@ const NVIDIA_VOLUME_RESTART_GRACE: Duration = Duration::from_secs(10);
 /// defect itself.
 pub const PROVISION_QUIESCENCE_WAIT: Duration = Duration::from_secs(30 * 60);
 
+/// How long the CUDA-userspace restart waits for the agent to hold no sessions (#388).
+/// A host that is never idle for this long gets the `cuda*` elements on its next start.
+const CUDART_RESTART_IDLE_WAIT: Duration = Duration::from_secs(12 * 60 * 60);
+
 /// Kick off driver-volume auto-provisioning only when the readiness probe reports a
 /// real NVIDIA graphics gap.
 ///
@@ -705,11 +709,26 @@ fn spawn_cuda_runtime_provisioner(runtime: &ContainerRuntime) {
                 );
                 return;
             }
+            // #388: the elements are optional, so this restart waits for the players.
+            // Sessions keep coming until the agent is idle; then it refuses new ones.
+            if !crate::restart::wait_until_idle_then_seal(
+                CUDART_RESTART_IDLE_WAIT,
+                Duration::from_secs(15),
+            ) {
+                warn!(
+                    token = "cudart-agent-restart-never-idle",
+                    waited_s = CUDART_RESTART_IDLE_WAIT.as_secs(),
+                    live_sessions = crate::restart::live_sessions(),
+                    "the agent was never idle — NOT restarting; cudaconvert & co will register \
+                     on the next agent start instead"
+                );
+                return;
+            }
             warn!(
                 token = "cudart-agent-restart-now",
                 "restarting node agent now"
             );
-            std::process::exit(0);
+            crate::restart::exit_now(0);
         })
         .map(|_| ())
         .unwrap_or_else(|e| {
@@ -904,7 +923,7 @@ async fn boot_sanity_gate(readiness: &[crate::messages::ReadinessCheck], gpu_pre
             },
             sleep: &std::thread::sleep,
             exit: &|code: i32| {
-                std::process::exit(code);
+                crate::restart::exit_now(code);
             },
         };
         run_boot_gate(&checks, gpu_present, has_node, prior_exits, &fx);
@@ -2419,7 +2438,7 @@ async fn connect_and_run(
                             let reply = AgentMsg::Ack { id: id.clone(), ok: true, error: None };
                             let _ = send(&mut tx, &reply).await;
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                            std::process::exit(0);
+                            crate::restart::exit_now(0);
                         }
                         // A config_update changes the reported effective settings; check
                         // before handle_control consumes ctrl.
@@ -2438,17 +2457,17 @@ async fn connect_and_run(
                             if journal_uncertain {
                                 warn!(token = "policy-journal-write-uncertain", "journal write failed; restarting to reconcile durable execution before another offer");
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                std::process::exit(1);
+                                crate::restart::exit_now(1);
                             }
                             if restart_requires_reconcile {
                                 warn!(token = "policy-accepted-reconcile", "restart attempt is durably accepted without an activation marker; restarting for bounded reconciliation");
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                std::process::exit(1);
+                                crate::restart::exit_now(1);
                             }
                             if restart_accepted {
                                 info!(token = "policy-candidate-restart", "durable hardware candidate accepted; restarting for startup verification");
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                std::process::exit(0);
+                                crate::restart::exit_now(0);
                             }
                             reply_result?;
                         }
@@ -2731,7 +2750,7 @@ async fn connect_and_run(
                                         token = "gpu-fault-restart-now",
                                         "GPU-global drain window elapsed; restarting agent process now"
                                     );
-                                    std::process::exit(0);
+                                    crate::restart::exit_now(0);
                                 });
                             }
                         }
@@ -3248,6 +3267,7 @@ impl SessionManager {
     /// host-probe scheduler. Called from every site that changes `pending` or
     /// `running`, so the two views can never disagree about host busyness.
     fn note_session_count(&self) {
+        crate::restart::note_sessions(self.pending.len() + self.running.len());
         if let Some(a) = &self.warmup_activity {
             a.set_live(self.running.len(), Instant::now());
         }
@@ -3527,6 +3547,19 @@ impl SessionManager {
                         id,
                         false,
                         Some("settings delivery not yet applied".to_string()),
+                    ));
+                }
+                // #388: nor does one about to restart itself to finish host setup; the
+                // exit would take the new session with it.
+                if crate::restart::pending() {
+                    warn!(
+                        token = "session-assign-refused-restart-pending",
+                        "session {session_id} assignment rejected: agent restarting to finish host setup"
+                    );
+                    return Some(ack(
+                        id,
+                        false,
+                        Some(crate::restart::REFUSAL_REASON.to_string()),
                     ));
                 }
                 // A draining agent accepts no new sessions.

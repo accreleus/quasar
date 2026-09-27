@@ -885,7 +885,7 @@ where
             )
             .await;
             tokio::time::sleep(Duration::from_millis(250)).await;
-            std::process::exit(0);
+            crate::restart::exit_now(0);
         }
         ControlMsg::ConfigPolicyOffer {
             attempt_id,
