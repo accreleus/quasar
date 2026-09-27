@@ -392,6 +392,9 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The contract now says `/enroll-host.sh` is rendered per control plane.** `control-api.md`
+  no longer calls it a static file: each control plane serves its own copy with the images its
+  Add host command installs written in (protocol pin bump, wording only).
 - **The quick start and the site describe owned installs (#367).** The Quick Start writes
   the seed for a combined, control-only or GPU host: a host script that pins the edge
   channel's images by digest, refuses a host still running a Compose stack, and starts one
