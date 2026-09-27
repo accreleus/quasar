@@ -567,6 +567,10 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A machine keeps its final dump and can still be added back.** Add host on a machine whose
+  earlier installation was purged refused to run because of the `quasar-final-dump` volume the
+  purge deliberately keeps. That volume is no longer counted as another installation in the way;
+  it stays untouched.
 - **The artwork key links point where the key lives.** The app editor's Artwork tab and the
   setup wizard's Libraries step sent admins to Settings, which no longer holds the SteamGridDB
   key or the library providers; they now point at Library › Sources (found in #384).

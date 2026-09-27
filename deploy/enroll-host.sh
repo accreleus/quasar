@@ -709,11 +709,13 @@ remove_install() {
     inst="$(dk volume ls --filter label=io.quasar.installation --format '{{.Label "io.quasar.installation"}}' 2>/dev/null | sed '/^$/d' | head -n 1 || true)"
   fi
   # Anything of another installation stays, and so would block the fresh install: refuse
-  # before removing anything, and name it.
+  # before removing anything, and name it. The final-dump volume a purge leaves is the
+  # exception: it is a keepsake of the machine, never removed by a purge, reused by the
+  # next one, and in no install's way, so it must not stop the machine being reused.
   stray="$( {
-    dk ps -a --filter label=io.quasar.installation --format '{{.Names}}|{{.Label "io.quasar.installation"}}' 2>/dev/null
-    dk volume ls --filter label=io.quasar.installation --format '{{.Name}}|{{.Label "io.quasar.installation"}}' 2>/dev/null
-  } | awk -F'|' -v id="$inst" '$2 != "" && $2 != id { print $1 " (installation " $2 ")" }' | head -n 3 | tr '\n' ',' | sed 's/,$//; s/,/, /g' || true)"
+    dk ps -a --filter label=io.quasar.installation --format '{{.Names}}|{{.Label "io.quasar.installation"}}|' 2>/dev/null
+    dk volume ls --filter label=io.quasar.installation --format '{{.Name}}|{{.Label "io.quasar.installation"}}|{{.Label "io.quasar.helper"}}' 2>/dev/null
+  } | awk -F'|' -v id="$inst" '$2 != "" && $2 != id && $3 != "final-dump" { print $1 " (installation " $2 ")" }' | head -n 3 | tr '\n' ',' | sed 's/,$//; s/,/, /g' || true)"
   if [ -n "$stray" ]; then
     host_error "this machine holds $stray, which belongs to another Quasar installation than this one${inst:+ ($inst)}. Nothing was removed. Remove what is not needed by hand (docker rm / docker volume rm), then run this again."
   fi

@@ -149,6 +149,7 @@ case "$cmd" in
           [ -d "$d" ] && { [ -z "$want" ] || has_label "$d" "$want"; } || continue
           if [ -n "$fmt" ]; then
             out="${fmt//\{\{.Name\}\}/${d##*/}}"
+            out="${out//\{\{.Label \"io.quasar.helper\"\}\}/$(label_value "$d" io.quasar.helper)}"
             printf '%s\n' "${out//\{\{.Label \"io.quasar.installation\"\}\}/$(label_value "$d" io.quasar.installation)}"
           else echo "${d##*/}"; fi
         done
@@ -584,6 +585,15 @@ if [ "$RC" -eq 1 ] && grep -q 'quasar-old-data (installation inst-9)' <<<"$OUT" 
   pass "re-add with a stray volume of another installation: refused, naming it; nothing removed or started"
 else
   fail "re-add stray" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+removed_machine
+volume quasar-final-dump io.quasar.installation=inst-9 io.quasar.helper=final-dump
+run_installer re-add-final-dump "${OK_ENV[@]}" QUASAR_NODE_NAME=gpu-host-4
+if [ "$RC" -eq 0 ] && grep -q ' uninstall --purge --confirm inst-0$' <<<"$DOCKER_LOG" && grep -q 'enrolled' <<<"$OUT" \
+   && [ -d "$state/v/quasar-final-dump" ] && ! grep -q 'volume rm quasar-final-dump' <<<"$DOCKER_LOG"; then
+  pass "re-add with an earlier installation's final dump on the machine: the dump is kept and not in the way"
+else
+  fail "re-add final dump" "rc=$RC docker=[$(grep -E '^(rm|volume rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
 fi
 removed_machine
 volume quasar-old-data io.quasar.installation=inst-9
