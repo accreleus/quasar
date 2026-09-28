@@ -89,6 +89,7 @@ pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, Ru
         cdi_devices,
         rootless: mode == crate::EngineMode::Rootless,
         gpu_injection,
+        kind: info.kind,
     })
 }
 

@@ -56,6 +56,7 @@ pub fn host(
             rootless: false,
             // A rootful Docker without an NVIDIA CDI device: `--gpus`.
             gpu_injection: Some(quasar_runtime::GpuInjection::DeviceRequest),
+            kind: quasar_runtime::EngineKind::Docker,
         },
         host_devices: devices
             .iter()

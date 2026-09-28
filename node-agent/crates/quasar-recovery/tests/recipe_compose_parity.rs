@@ -283,6 +283,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             unknown: Default::default(),
             kernel_log: false,
             engine_rootless: false,
+            host_sysfs: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,

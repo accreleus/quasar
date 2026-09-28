@@ -175,6 +175,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         kernel_log: report.kmsg && report.kernel_log,
         fuse: report.fuse,
         engine_rootless: false,
+        host_sysfs: false,
     };
     (gpu, devices)
 }

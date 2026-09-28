@@ -725,3 +725,29 @@ fn an_agent_before_revision_3_is_probed_and_recorded_as_gpus() {
     assert_eq!(agent.spec.gpus.len(), 1, "the NVIDIA shape");
     assert!(agent.spec.gpus[0].device_ids.is_empty(), "by --gpus");
 }
+
+/// Rootless Docker gives a host-network container no sysfs: the agent is given the host's
+/// `/sys` read-only there, and only there (rootless Podman binds it itself).
+#[test]
+fn only_rootless_docker_gives_the_agent_the_hosts_sysfs() {
+    for (kind, rootless, expected) in [
+        (quasar_runtime::EngineKind::Docker, true, true),
+        (quasar_runtime::EngineKind::Podman, true, false),
+        (quasar_runtime::EngineKind::Docker, false, false),
+    ] {
+        let mut state = amd_host();
+        state.host.kind = kind;
+        state.host.rootless = rootless;
+        state
+            .registry
+            .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
+        let (engine, _dir) = installed(state);
+        let state = engine.state();
+        let agent = state.container_named(names::NODE_AGENT).unwrap();
+        let sys = agent.spec.binds.iter().find(|b| b.target == "/sys");
+        assert_eq!(sys.is_some(), expected, "{kind:?} rootless={rootless}");
+        if let Some(sys) = sys {
+            assert!(sys.read_only && sys.source == "/sys");
+        }
+    }
+}

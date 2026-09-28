@@ -21,12 +21,13 @@ pub const API_FLOOR: ApiVersion = ApiVersion {
 };
 
 /// Which container engine answers on the socket (RH-07 #396, amendment 17 `engine`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EngineKind {
     Docker,
     Podman,
     /// An engine this runtime cannot name. Never guessed to be Docker, and never
     /// reported on the wire.
+    #[default]
     Unknown,
 }
 impl EngineKind {

@@ -262,6 +262,12 @@ pub struct HostDevices {
     /// Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fuse: bool,
+    /// Rootless Docker mounts no sysfs for a host-network container (a fresh sysfs needs a
+    /// network namespace of its own), so the agent would see neither its GPUs nor its
+    /// input devices. From revision 3 it is given the host's `/sys`, read-only: what any
+    /// other container sees. Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_sysfs: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -275,6 +281,7 @@ impl Default for HostDevices {
             kernel_log: false,
             engine_rootless: false,
             fuse: false,
+            host_sysfs: false,
             unknown: Unknown::new(),
         }
     }
@@ -998,6 +1005,10 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
     // A rootless engine refuses device-cgroup rules; the Quasar user's device access is
     // the host's (the udev rule host preparation writes). Rootful keeps read/write on the
     // input nodes the agent creates after it starts, but no `m`: nothing is `mknod`ed (#401).
+    if inputs.devices.host_sysfs {
+        spec.binds.push(bind("/sys", "/sys", true));
+        spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
+    }
     if inputs.devices.engine_rootless {
         spec.device_cgroup_rules.clear();
     } else {

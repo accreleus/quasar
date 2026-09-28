@@ -1078,6 +1078,8 @@ impl Actor {
             inputs.gpu = gpu;
             inputs.devices = devices;
             inputs.devices.engine_rootless = host.rootless;
+            inputs.devices.host_sysfs =
+                host.rootless && host.kind == quasar_runtime::EngineKind::Docker;
         }
 
         let machine = Machine {

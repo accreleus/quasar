@@ -253,9 +253,10 @@ pub struct EngineHost {
     pub cdi_devices: Vec<String>,
     /// The engine runs rootless (`name=rootless` in its security options; RH-07).
     pub rootless: bool,
-    /// How an NVIDIA GPU reaches a container on this engine; `None` when it cannot
-    ///.
+    /// How an NVIDIA GPU reaches a container on this engine; `None` when it cannot.
     pub gpu_injection: Option<crate::GpuInjection>,
+    /// Which engine answered (`/version`).
+    pub kind: crate::EngineKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

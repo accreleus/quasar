@@ -42,6 +42,7 @@ fn host(new: Behaviour) -> FakeState {
             rootless: false,
             // A rootful Docker without an NVIDIA CDI device: `--gpus`.
             gpu_injection: Some(quasar_runtime::GpuInjection::DeviceRequest),
+            kind: quasar_runtime::EngineKind::Docker,
         },
         host_devices: ["/dev/dri", "/dev/uinput", "/dev/kmsg"]
             .iter()

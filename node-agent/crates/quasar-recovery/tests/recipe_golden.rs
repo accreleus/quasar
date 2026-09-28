@@ -43,6 +43,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             unknown: Default::default(),
             kernel_log: false,
             engine_rootless: false,
+            host_sysfs: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -184,6 +185,18 @@ fn node_agent_revision_3_holds_none_of_the_removed_access() {
         vec!["nvidia.com/gpu=all".to_string()]
     );
     check("node-agent-r3-nvidia-rootless-cdi.json", &spec);
+    // Rootless Docker mounts no sysfs for a host-network container: the host's, read-only.
+    let mut docker_rootless = cdi.clone();
+    docker_rootless.devices.host_sysfs = true;
+    let spec = render(
+        Role::NodeAgent,
+        3,
+        &docker_rootless,
+        &image,
+        &agent_secrets(),
+    )
+    .unwrap();
+    check("node-agent-r3-nvidia-docker-rootless.json", &spec);
     // Revisions 1 and 2 never ask by CDI.
     let r2 = render(Role::NodeAgent, 2, &cdi, &image, &agent_secrets()).unwrap();
     assert!(r2.gpus.iter().all(|g| g.device_ids.is_empty()));
