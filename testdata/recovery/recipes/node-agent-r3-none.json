@@ -50,6 +50,7 @@
     "QUASAR_HOMES_GC_DRY_RUN": "",
     "QUASAR_HOMES_GC_RETENTION_HOURS": "",
     "QUASAR_HOME_ROOT": "/srv/quasar/homes",
+    "QUASAR_HOST_FUSE": "0",
     "QUASAR_INPUT_BATCH_MS": "",
     "QUASAR_INPUT_CHANNEL_MODE": "",
     "QUASAR_INPUT_CONTROLLER_NUDGE": "",
@@ -86,7 +87,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "node-agent",
     "io.quasar.recipe": "3",
-    "io.quasar.spec": "sha256:33031e841b8ab1eec2993a16ec246918181d98ec539a047120d445275a238092"
+    "io.quasar.spec": "sha256:1ec08d17298b8c5c20071f990df4bcb5982eed632cc874cc2ebe641c60c2ea10"
   },
   "network_mode": "host",
   "binds": [

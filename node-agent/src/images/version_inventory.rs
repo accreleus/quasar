@@ -396,7 +396,7 @@ mod tests {
             refs: vec![identity.image_ref.clone(), identity.image_ref.clone()],
         };
         let (complete, entries) = inventory
-            .reconcile(&[identity.clone()], &[twice], &[])
+            .reconcile(std::slice::from_ref(&identity), &[twice], &[])
             .unwrap();
         assert!(complete);
         assert_eq!(entries[0].state, "present");

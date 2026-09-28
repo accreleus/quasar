@@ -6,18 +6,17 @@
   ],
   "cmd": null,
   "env": {
+    "CONTROL_PLANE_URL": "ws://127.0.0.1:8080",
+    "ENROLLMENT_TOKEN_FILE": "/run/quasar-secrets/local-enrollment",
     "GST_DEBUG": "",
-    "LD_LIBRARY_PATH": "/opt/quasar/nvidia-driver/lib64:/opt/quasar/nvidia-driver/cuda/lib64",
     "LIBGL_ALWAYS_SOFTWARE": "",
-    "LIBVA_MESSAGING_LEVEL": "0",
     "LIBVA_TRACE": "",
     "MALLOC_ARENA_MAX": "",
     "MALLOC_MMAP_THRESHOLD_": "",
     "MALLOC_TRIM_THRESHOLD_": "",
     "MESA_LOADER_DRIVER_OVERRIDE": "",
-    "NODE_NAME": "gpu-host-01",
+    "NODE_NAME": "living-room-pc",
     "NODE_SECRET_PATH": "/var/lib/quasar-agent/node-secret",
-    "NVIDIA_DRIVER_CAPABILITIES": "all",
     "QUASAR_ABR": "1",
     "QUASAR_ABR_CLIFF_GUARD_FRAC": "",
     "QUASAR_ABR_DEADBAND": "",
@@ -38,10 +37,7 @@
     "QUASAR_AUDIO_REQUIRED": "",
     "QUASAR_CAPTURE_H264": "",
     "QUASAR_CONTAINER_NETWORK": "none",
-    "QUASAR_CUDA_DEVICE": "0",
-    "QUASAR_CUDA_RUNTIME": "1",
     "QUASAR_ENCODER": "",
-    "QUASAR_ENROLLMENT_FILE": "/run/quasar-secrets/enrollment",
     "QUASAR_FEC_ARM_LOSS_PCT": "",
     "QUASAR_FEC_ARM_WINDOWS": "",
     "QUASAR_FEC_DISARM_WINDOWS": "",
@@ -49,7 +45,6 @@
     "QUASAR_FEC_MODE": "",
     "QUASAR_FEC_PERCENTAGE": "0",
     "QUASAR_FEC_WINDOW_S": "",
-    "QUASAR_GPU_NVIDIA": "1",
     "QUASAR_HEALTH_ADDR": "127.0.0.1:9091",
     "QUASAR_HOMES_FREE_SPACE_FLOOR_GIB": "",
     "QUASAR_HOMES_GC": "",
@@ -66,11 +61,10 @@
     "QUASAR_LATENCY_PROBE": "0",
     "QUASAR_MALLOC_TRIM": "",
     "QUASAR_NVIDIA_DRIVER_HOST_PATH": "",
-    "QUASAR_NVIDIA_DRIVER_VOLUME": "1",
     "QUASAR_PULSE_IMAGE": "registry.example.invalid/quasar/quasar-node-agent@sha256:bb22000000000000000000000000000000000000000000000000000000000000",
     "QUASAR_QUEUE_BUFFERS": "3",
     "QUASAR_RECOVERY_SOCKET": "/run/quasar-recovery/agent.sock",
-    "QUASAR_RENDER_NODE": "/dev/dri/renderD128",
+    "QUASAR_RENDER_NODE": "/dev/dri/renderD129",
     "QUASAR_SLICES": "8",
     "QUASAR_TARGET_USAGE": "6",
     "QUASAR_TEMPLATE_ALLOW_CROSSFS": "",
@@ -94,7 +88,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "node-agent",
     "io.quasar.recipe": "3",
-    "io.quasar.spec": "sha256:f518aeb061f07d700ba1005a38f0dca1d26368a36492d3e0e51b7baa2a1f5a0c"
+    "io.quasar.spec": "sha256:256904c17c2da77b7b168c95250819f2c11c1924ee447a780bc0fc8b133bc7d1"
   },
   "network_mode": "host",
   "binds": [
@@ -114,17 +108,12 @@
       "read_only": true
     },
     {
-      "source": "quasar-nvidia-driver",
-      "target": "/opt/quasar/nvidia-driver",
-      "read_only": false
-    },
-    {
       "source": "/run/quasar-agent",
       "target": "/run/quasar-agent",
       "read_only": false
     },
     {
-      "source": "quasar-recovery-agent",
+      "source": "/var/lib/docker/volumes/quasar-recovery-agent/_data/agent",
       "target": "/run/quasar-recovery",
       "read_only": true
     },
@@ -166,18 +155,10 @@
       "permissions": "rwm"
     }
   ],
-  "device_cgroup_rules": [],
-  "gpus": [
-    {
-      "driver": null,
-      "count": -1,
-      "capabilities": [
-        [
-          "gpu"
-        ]
-      ]
-    }
+  "device_cgroup_rules": [
+    "c 13:* rmw"
   ],
+  "gpus": [],
   "cap_add": [],
   "security_opt": [
     "label=disable"

@@ -475,10 +475,15 @@ fn check_engine_healthchecks_inner(view: &RuntimeView) -> ReadinessCheck {
                  timeout",
                 other.unwrap_or("unreported")
             ),
-            "Enable lingering for the Quasar user so it has a systemd user session (host \
-             preparation does this: loginctl enable-linger quasar), then restart that user's \
-             Podman service."
-                .into(),
+            match facts.mode {
+                EngineMode::Rootless => "Enable lingering for the Quasar user so it has a \
+                    systemd user session (host preparation does this: loginctl enable-linger \
+                    quasar), then restart that user's Podman service."
+                    .into(),
+                EngineMode::Rootful => "Run Podman under systemd (as init) with its cgroup \
+                    manager set to systemd in containers.conf, then restart Podman's service."
+                    .into(),
+            },
         ),
     }
 }

@@ -42,6 +42,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             unknown: Default::default(),
             kernel_log: false,
             engine_rootless: false,
+            fuse: false,
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,
@@ -100,6 +101,7 @@ fn node_agent_revision_3_renders_its_golden_specification_per_vendor() {
     for (vendor, file) in [
         (Some(GpuVendor::Nvidia), "node-agent-r3-nvidia.json"),
         (Some(GpuVendor::Amd), "node-agent-r3-amd.json"),
+        (Some(GpuVendor::Intel), "node-agent-r3-intel.json"),
         (None, "node-agent-r3-none.json"),
     ] {
         let spec = render(
@@ -461,6 +463,9 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
     check("control-plane-r1-control-only-external.json", &spec);
     let spec = render(Role::NodeAgent, 2, &owned, &agent, &local_agent_secrets()).unwrap();
     check("node-agent-r2-combined-amd.json", &spec);
+    // Revision 3 on a combined host (RH-07 #402).
+    let spec = render(Role::NodeAgent, 3, &owned, &agent, &local_agent_secrets()).unwrap();
+    check("node-agent-r3-combined-amd.json", &spec);
 
     // Revision 2 (#365): Add host's install-time images are fallbacks below the installed
     // release, and only the operator's overrides reach QUASAR_ENROLL_*.
