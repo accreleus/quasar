@@ -390,7 +390,31 @@ pub(crate) async fn update_restart(
             },
         )
         .await
-        .map_err(mutation_error)
+        .map_err(mutation_error)?;
+    // ADR 0007 (RH-07): read the policy back on every engine, and treat a mismatch as a
+    // failed step. The seed's rules and every stop Quasar means to keep depend on the
+    // policy really being what was set.
+    let realized = docker
+        .inspect_container(id, None)
+        .await
+        .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
+        .host_config
+        .and_then(|h| h.restart_policy)
+        .and_then(|p| p.name);
+    let matches = match (policy, realized) {
+        (RestartPolicy::UnlessStopped, Some(RestartPolicyNameEnum::UNLESS_STOPPED)) => true,
+        // An engine may report "no" as the empty policy.
+        (
+            RestartPolicy::No,
+            Some(RestartPolicyNameEnum::NO | RestartPolicyNameEnum::EMPTY) | None,
+        ) => true,
+        _ => false,
+    };
+    if !matches {
+        // The engine accepted the update but reports another policy: the step failed.
+        return Err(ErrorKind::Engine.into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn rename(

@@ -116,6 +116,10 @@ pub struct EngineFacts {
     pub operating_system: Option<String>,
     pub architecture: Option<String>,
     pub cgroup_version: Option<String>,
+    /// `systemd` or `cgroupfs`. Podman schedules container health checks through systemd
+    /// timers, so a rootless Podman with no systemd user session falls back to `cgroupfs`
+    /// and never runs them (RH-07 #405).
+    pub cgroup_driver: Option<String>,
     pub security_options: Vec<String>,
     /// Configured OCI runtimes by name, sorted.
     pub runtimes: Vec<String>,

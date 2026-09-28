@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Quasar containers find themselves on Podman, and Podman's health checks are checked
+  (RH-07, #405).**
+  - The agent and the recovery actor recognise Podman's container layout, so they can
+    inspect their own containers (and the NVIDIA driver volume can be located) on Podman.
+  - Every restart-policy update is read back, and a mismatch fails the step (ADR 0007).
+  - A new `engine_healthchecks` readiness check fails, with the fix, when Podman has no
+    systemd session for its user and so could never run the health checks that installs
+    and updates wait on.
 - **The runtime checks what each engine created by that engine's own reporting (RH-07,
   #397).** Session containers and helpers are still re-inspected and refused if they
   differ from the request, but Podman is now read by its own rules:

@@ -198,6 +198,10 @@ pub async fn inspect_engine(config: &RuntimeConfig) -> Result<crate::EngineFacts
         operating_system: sys.operating_system,
         architecture: sys.architecture,
         cgroup_version,
+        cgroup_driver: sys
+            .cgroup_driver
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty()),
         security_options,
         runtimes,
         default_runtime: sys.default_runtime,

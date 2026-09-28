@@ -524,6 +524,7 @@ mod tests {
             operating_system: None,
             architecture: None,
             cgroup_version: None,
+            cgroup_driver: None,
             security_options: Vec::new(),
             runtimes: Vec::new(),
             default_runtime: None,

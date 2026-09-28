@@ -304,6 +304,7 @@ fn each_engine_and_mode_is_identified_from_its_own_version_and_info() {
         assert_eq!(facts.info.kind, kind, "{label}");
         assert_eq!(facts.info.version, engine_version, "{label}");
         assert_eq!(facts.mode, mode, "{label}");
+        assert_eq!(facts.cgroup_driver.as_deref(), Some("systemd"), "{label}");
         server.join().unwrap();
     }
 }
@@ -331,4 +332,40 @@ fn the_wire_names_of_engine_kind_and_mode_are_the_contract_vocabulary() {
     assert_eq!(EngineKind::Unknown.wire(), None);
     assert_eq!(EngineMode::Rootful.wire(), "rootful");
     assert_eq!(EngineMode::Rootless.wire(), "rootless");
+}
+
+const RESTART_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn restart_readback(reported: &'static str) -> Result<(), RuntimeError> {
+    let inspect: &'static str = Box::leak(
+        format!(
+            r#"{{"Id":"{RESTART_ID}","Name":"/quasar-recovery","HostConfig":{{"RestartPolicy":{{"Name":"{reported}","MaximumRetryCount":0}}}},"State":{{"Status":"running","Running":true}}}}"#
+        )
+        .into_boxed_str(),
+    );
+    let update: &'static str =
+        Box::leak(format!("POST /v1.48/containers/{RESTART_ID}/update").into_boxed_str());
+    let get: &'static str =
+        Box::leak(format!("/v1.48/containers/{RESTART_ID}/json").into_boxed_str());
+    let (_dir, runtime, server) = fixture(vec![
+        ("/version", 200, VERSION),
+        (update, 200, r#"{"Warnings":[]}"#),
+        (get, 200, inspect),
+    ]);
+    let result = runtime
+        .set_restart_policy(RESTART_ID, crate::platform::RestartPolicy::No)
+        .wait();
+    server.join().unwrap();
+    result
+}
+
+/// ADR 0007 (RH-07 clarification): after every restart-policy update the runtime reads
+/// the policy back, on every engine, and a mismatch fails the step.
+#[test]
+fn a_restart_policy_update_is_read_back() {
+    assert!(restart_readback("no").is_ok());
+    assert_eq!(
+        restart_readback("unless-stopped").unwrap_err().kind,
+        ErrorKind::Engine
+    );
 }

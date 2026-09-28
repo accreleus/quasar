@@ -104,7 +104,8 @@ fn local_evidence_checks_carry_their_scope_whatever_their_status() {
 fn every_local_check_names_a_known_source() {
     for checks in local_check_sets("prov-source") {
         for c in &checks {
-            let want = if c.id.starts_with("runtime_") {
+            // The engine's own answers: runtime_* and, from amendment 17, engine_*.
+            let want = if c.id.starts_with("runtime_") || c.id.starts_with("engine_") {
                 "runtime"
             } else {
                 "local"

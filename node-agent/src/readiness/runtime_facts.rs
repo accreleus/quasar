@@ -15,6 +15,8 @@ pub const CAPABILITIES_ID: &str = "runtime_capabilities";
 pub const CDI_ID: &str = "runtime_cdi";
 /// Amendment 17 (RH-07 #396): the engine, its version and its engine mode, in words.
 pub const ENGINE_ID: &str = "runtime_engine";
+/// Amendment 17 (RH-07 #405): can this engine run container health checks?
+pub const HEALTHCHECKS_ID: &str = "engine_healthchecks";
 
 /// The `Unreachable` detail for [`ErrorKind::Timeout`]. A missing socket uses a
 /// different sentence, so `host_container_mounts` can tell "the client ran out of
@@ -432,5 +434,51 @@ fn engine_named(facts: &EngineFacts) -> String {
         }
         EngineKind::Unknown => format!("{} {}", facts.info.name, facts.info.version),
         kind => format!("{} {}", kind.label(), facts.info.version),
+    }
+}
+
+pub fn check_engine_healthchecks(view: &RuntimeView) -> ReadinessCheck {
+    check_engine_healthchecks_inner(view).with_source("runtime")
+}
+
+/// Podman runs container health checks through systemd timers, and installs and updates
+/// wait on them. A rootless Podman with no systemd user session for its user falls back
+/// to the `cgroupfs` driver and never runs one, so an install would wait out its whole
+/// timeout with nothing said. Docker runs its health checks itself. A proxy (the engine's
+/// cgroup driver), so it never blocks.
+fn check_engine_healthchecks_inner(view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed { outcome, .. } = view else {
+        return super::skip(HEALTHCHECKS_ID, "The container engine was not asked");
+    };
+    let Ok(facts) = outcome else {
+        return super::skip(
+            HEALTHCHECKS_ID,
+            "Unknown: the engine could not be inspected",
+        );
+    };
+    if facts.info.kind != EngineKind::Podman {
+        return super::skip(
+            HEALTHCHECKS_ID,
+            "This engine runs container health checks itself",
+        );
+    }
+    match facts.cgroup_driver.as_deref() {
+        Some("systemd") => super::pass(
+            HEALTHCHECKS_ID,
+            "Podman can run container health checks: it runs under systemd".into(),
+        ),
+        other => super::fail(
+            HEALTHCHECKS_ID,
+            format!(
+                "Podman cannot run container health checks: its cgroup driver is {} (no \
+                 systemd session for its user), so installs and updates wait out their \
+                 timeout",
+                other.unwrap_or("unreported")
+            ),
+            "Enable lingering for the Quasar user so it has a systemd user session (host \
+             preparation does this: loginctl enable-linger quasar), then restart that user's \
+             Podman service."
+                .into(),
+        ),
     }
 }

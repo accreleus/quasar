@@ -31,6 +31,7 @@ fn facts(cdi: Option<CdiFacts>) -> EngineFacts {
         operating_system: Some("Ubuntu 24.04".into()),
         architecture: Some("x86_64".into()),
         cgroup_version: Some("2".into()),
+        cgroup_driver: Some("systemd".into()),
         security_options: vec![
             "name=seccomp,profile=builtin".into(),
             "name=cgroupns".into(),
@@ -569,4 +570,35 @@ fn an_ambiguous_endpoint_is_refused_by_name_and_names_both_variables() {
         c.blocks.is_some(),
         "an unusable endpoint keeps its agent-enforced block"
     );
+}
+
+// ── RH-07 #405: can this engine run container health checks? ────────────────
+
+#[test]
+fn podman_with_systemd_runs_health_checks_and_docker_skips() {
+    let root = FakeRoot::new("runtime-healthchecks");
+    let podman = engine(EngineKind::Podman, "5.8.4", EngineMode::Rootless, "fedora");
+    let checks = probe(&observed(&root, Ok(podman)));
+    let c = get(&checks, HEALTHCHECKS_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.blocks.is_none(), "a proxy check never blocks: {c:?}");
+    let docker = engine(EngineKind::Docker, "29.7.2", EngineMode::Rootful, "fedora");
+    let checks = probe(&observed(&root, Ok(docker)));
+    assert_eq!(get(&checks, HEALTHCHECKS_ID).status, SKIP);
+}
+
+/// A rootless Podman without a systemd user session never runs health checks, and
+/// installs wait on them: named, with the fix, instead of a timeout nobody can explain.
+#[test]
+fn podman_without_systemd_fails_health_checks_naming_the_fix() {
+    let root = FakeRoot::new("runtime-healthchecks-cgroupfs");
+    let mut podman = engine(EngineKind::Podman, "5.8.4", EngineMode::Rootless, "fedora");
+    podman.cgroup_driver = Some("cgroupfs".into());
+    let checks = probe(&observed(&root, Ok(podman)));
+    let c = get(&checks, HEALTHCHECKS_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(c.summary.contains("cgroupfs"), "{c:?}");
+    assert!(c.remediation.contains("linger"), "{c:?}");
+    assert!(!c.remediation.to_lowercase().contains("as root"), "{c:?}");
+    assert!(c.blocks.is_none(), "{c:?}");
 }
