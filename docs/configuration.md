@@ -841,9 +841,17 @@ have a ten-minute budget, catalog pulls thirty minutes and removals one minute.
 The existing catalog queue still admits two simultaneous pulls/builds, serializes
 each image ID and retains only its latest pending replacement.
 
-The API uses `DOCKER_HOST`, the only endpoint knob. It must be a `unix://` absolute
-path and defaults to `unix:///var/run/docker.sock`; the compose file mounts the host
-socket at that path. Nonempty `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY` or
+The API uses `DOCKER_HOST`, or Podman's name for the same setting, `CONTAINER_HOST`
+(RH-07 #396). Each must be a `unix://` absolute path. Both set to different endpoints
+is **ambiguous** and refused by name (`runtime_endpoint` fails); the agent never picks
+one. With neither set, the endpoint is the first socket that exists of
+`/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`
+and `$XDG_RUNTIME_DIR/docker.sock` (Docker first, so a Docker host is unchanged when
+Podman is installed beside it), else `/var/run/docker.sock`. The compose file and the
+recovery actor mount the host socket at `/var/run/docker.sock` inside the agent.
+The agent reports the engine it found (Docker or Podman), its version and its engine
+mode (rootful or rootless) on `register` and in the `runtime_engine` readiness check;
+finding an engine is not a claim that any capability works on it. Nonempty `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY` or
 `DOCKER_API_VERSION` overrides are rejected instead of silently ignored. A saved
 non-default Docker CLI context is also rejected: an operator who switched context
 expects it honoured, and the agent cannot do that, so it refuses rather than silently
@@ -957,8 +965,9 @@ path preserves uncertainty across agent restarts without adding a compose settin
 ### Runtime endpoint, migration and recovery
 
 For an existing host, the socket mount remains unchanged; a host using the default
-socket needs no compose change. Podman operators may point `DOCKER_HOST` at Podman's
-Docker-compatible Unix socket, but that configuration is not certified.
+socket needs no compose change. Podman's Docker-compatible socket is found without
+configuration; Podman and rootless engines are experimental engine profiles until the
+RH-07 acceptance map proves them (`runtime_engine` says which profile a host runs).
 
 Every application, helper and audio journal records the endpoint it was written
 against. Changing `DOCKER_HOST` is safe while every record is terminal (`Completed`):
@@ -1013,7 +1022,8 @@ app's catalog `runtime_spec` (image/args/env/mounts/gpu) is used instead.
 | Variable | Default | Values / notes |
 |---|---|---|
 | `QUASAR_CONTAINER_RUNTIME` | retired (#239) | Ignored. If set, startup emits `runtime-cli-knob-retired`; select the engine only with `DOCKER_HOST`. |
-| `DOCKER_HOST` | `unix:///var/run/docker.sock` | The only endpoint knob. A `unix://` absolute path to the engine socket, mounted and accessible inside the agent; the default compose file mounts the host socket at this path. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are rejected. |
+| `DOCKER_HOST` | the first existing default socket (below) | The endpoint knob. A `unix://` absolute path to the engine socket, mounted and accessible inside the agent; the default compose file mounts the host socket at `/var/run/docker.sock`. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are rejected. |
+| `CONTAINER_HOST` | unset | Podman's name for `DOCKER_HOST`, with the same rules. Setting both to different endpoints is refused as ambiguous. With neither set the agent uses the first of `/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`, `$XDG_RUNTIME_DIR/docker.sock` that exists. |
 | `QUASAR_CONTAINER_NETWORK` | `none` | Host-wide fallback `--network` for app containers, applied only when the app itself states none. **Prefer the per-app knob below** — the network is an app requirement, so setting it here to fix one title (Steam sign-in/downloads) opens the network for every app on the host. Accepted: `none` \| `bridge` \| `host`; anything else fails the session with a named error rather than being handed to the runtime. **This is the only place `host` can be selected**, deliberately: it is set by the operator of one specific machine and travels nowhere. `--network host` removes the container's network namespace — the app then reaches every service on host loopback (control plane, Postgres, any admin-only port) and can bind host ports — so it is a host-administration decision, not an app property. |
 | *(per-app)* `runtime_spec.network` / preset `network` | inherit | Not an env var — the per-app container network (first-run experience §S2). Resolved at launch as **app `runtime_spec.network` → its runtime preset's `network` column → `QUASAR_CONTAINER_NETWORK` → `none`**. Accepted at every layer: `""` (inherit) \| `none` \| `bridge`. **`host` is refused here even though the env knob above accepts it** — these values are portable (a preset is materialized from a catalog image manifest authored elsewhere), so an app-authored `host` would dissolve container network isolation on every host that installs the image. A rejected value is a 400 from the admin preset API, a failed image install from a manifest `runtime` block, a failed launch from an app's `runtime_spec`, and a failed session at the agent. Steam's catalog image declares `bridge` because its first boot must download `steamui.so` — without it the app clean-exits and the session surfaces as "media path interrupted" (#463). |
 | `QUASAR_APP_PUID` | unset | Run-as **user** id for app containers, forwarded as `PUID` (not docker `--user`, which would bypass the images' root init). The quasar-images base entrypoint starts as root, then drops to `PUID`/`PGID`. Unset ⇒ image default (unchanged). Unraid convention: `99`. An app-catalog `PUID` in the app's `runtime_spec.env` overrides this host default. |

@@ -1,0 +1,28 @@
+{
+ "Architecture": "x86_64",
+ "CDISpecDirs": [
+  "/etc/cdi",
+  "/run/.ro0/cdi",
+  "/home/example/.config/cdi",
+  "/run/user/1000/cdi"
+ ],
+ "CgroupVersion": "2",
+ "DefaultRuntime": "runc",
+ "DockerRootDir": "/home/example/.local/share/docker",
+ "OSType": "linux",
+ "OperatingSystem": "Fedora CoreOS 44.20260829.3.1 (uCore)",
+ "Runtimes": {
+  "io.containerd.runc.v2": {
+   "path": "runc"
+  },
+  "runc": {
+   "path": "runc"
+  }
+ },
+ "SecurityOptions": [
+  "name=seccomp,profile=builtin",
+  "name=rootless",
+  "name=cgroupns"
+ ],
+ "ServerVersion": "29.8.1"
+}

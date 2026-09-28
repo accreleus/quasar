@@ -20,9 +20,84 @@ pub const API_FLOOR: ApiVersion = ApiVersion {
     minor: 40,
 };
 
+/// Which container engine answers on the socket (RH-07 #396, amendment 17 `engine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    Docker,
+    Podman,
+    /// An engine this runtime cannot name. Never guessed to be Docker, and never
+    /// reported on the wire.
+    Unknown,
+}
+impl EngineKind {
+    /// The amendment-17 `engine` token; `None` for an engine this runtime cannot name.
+    pub fn wire(self) -> Option<&'static str> {
+        match self {
+            EngineKind::Docker => Some("docker"),
+            EngineKind::Podman => Some("podman"),
+            EngineKind::Unknown => None,
+        }
+    }
+    /// How an operator reads it.
+    pub fn label(self) -> &'static str {
+        match self {
+            EngineKind::Docker => "Docker",
+            EngineKind::Podman => "Podman",
+            EngineKind::Unknown => "an unrecognised container engine",
+        }
+    }
+    /// From `/version`: Podman lists a `Podman Engine` component and Docker an `Engine`
+    /// one (rootful moby reports an empty platform name, so components come first). An
+    /// engine that lists no components is named by its platform (older Docker releases).
+    pub(crate) fn from_version(platform: Option<&str>, components: &[String]) -> Self {
+        if components.iter().any(|c| c == "Podman Engine") {
+            return EngineKind::Podman;
+        }
+        if components.iter().any(|c| c == "Engine") {
+            return EngineKind::Docker;
+        }
+        match platform {
+            _ if !components.is_empty() => EngineKind::Unknown,
+            Some(name) if name.contains("Podman") => EngineKind::Podman,
+            Some(name) if name.contains("Docker") => EngineKind::Docker,
+            _ => EngineKind::Unknown,
+        }
+    }
+}
+
+/// Whether the engine runs as root on its host (amendment 17 `engine_mode`). Describes
+/// the engine, as it reports itself, not the uid of this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineMode {
+    Rootful,
+    Rootless,
+}
+impl EngineMode {
+    pub fn wire(self) -> &'static str {
+        match self {
+            EngineMode::Rootful => "rootful",
+            EngineMode::Rootless => "rootless",
+        }
+    }
+    /// From `/info`: Docker and Podman both list `name=rootless` among their security
+    /// options when rootless.
+    pub(crate) fn from_security_options(options: &[String]) -> Self {
+        if options
+            .iter()
+            .any(|o| o.split(',').any(|part| part == "name=rootless"))
+        {
+            EngineMode::Rootless
+        } else {
+            EngineMode::Rootful
+        }
+    }
+}
+
 /// Discovery facts are not a claim that GPU/rootless capabilities were tested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineInfo {
+    /// Docker, Podman, or unknown: from the engine's `/version`.
+    pub kind: EngineKind,
     pub name: String,
     pub version: String,
     pub api_version: ApiVersion,
@@ -36,6 +111,8 @@ pub struct EngineInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineFacts {
     pub info: EngineInfo,
+    /// Rootful or rootless, as the engine states it.
+    pub mode: EngineMode,
     pub operating_system: Option<String>,
     pub architecture: Option<String>,
     pub cgroup_version: Option<String>,

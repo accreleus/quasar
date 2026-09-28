@@ -3748,6 +3748,9 @@ mod tests {
             recovery_actor_version: None,
             recovery_actor_source_commit: None,
             seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"], serde_json::json!([]));

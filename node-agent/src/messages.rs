@@ -96,6 +96,14 @@ pub enum AgentMsg {
         recovery_actor_source_commit: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         seed_version: Option<String>,
+        /// Amendment 17 (RH-07 #396): the container engine and engine mode this agent
+        /// drives, from any install; each omitted when the engine could not be inspected.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine_mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source_policy_versions: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2007,6 +2015,9 @@ mod tests {
             recovery_actor_version: None,
             recovery_actor_source_commit: None,
             seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"], serde_json::json!([]));
@@ -2038,6 +2049,9 @@ mod tests {
             recovery_actor_version: None,
             recovery_actor_source_commit: None,
             seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         for key in [
@@ -2077,6 +2091,9 @@ mod tests {
             recovery_actor_version: None,
             recovery_actor_source_commit: None,
             seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -2115,6 +2132,9 @@ mod tests {
             recovery_actor_version: None,
             recovery_actor_source_commit: None,
             seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"][0]["image_id"], "steam");

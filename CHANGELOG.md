@@ -25,6 +25,16 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Hosts report their container engine (RH-07, #396).**
+  - The agent finds Podman's sockets (rootful and rootless) and honours `CONTAINER_HOST`,
+    after Docker's default. `DOCKER_HOST` and `CONTAINER_HOST` naming different engines is
+    refused as ambiguous.
+  - It reports the engine, its version and its engine mode on `register`. The control plane
+    stores them (migration 0098) and serves them on the host body.
+  - A new `runtime_engine` readiness check names the engine profile. Profiles not yet proven
+    on hardware read as experimental and block nothing.
+  - Engine-socket remediation names Docker and Podman and no longer suggests running the
+    agent as root.
 - **Host preparation (RH-07, #400).** `deploy/prepare-host.sh` is the one step that runs as
   root. For a rootless install it creates the `quasar` account, its subordinate ID ranges and
   lingering. It writes udev rules that give the `quasar` group `/dev/uinput`, Quasar's own

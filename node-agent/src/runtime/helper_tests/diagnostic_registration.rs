@@ -81,6 +81,9 @@ fn register() -> AgentMsg {
         recovery_actor_version: None,
         recovery_actor_source_commit: None,
         seed_version: None,
+        engine: None,
+        engine_version: None,
+        engine_mode: None,
     }
 }
 

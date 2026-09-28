@@ -3,6 +3,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     InvalidConfiguration,
+    /// `DOCKER_HOST` and `CONTAINER_HOST` name two different endpoints (amendment 17).
+    AmbiguousEndpoint,
     PermissionDenied,
     Missing,
     Unavailable,

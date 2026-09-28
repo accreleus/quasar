@@ -29,9 +29,9 @@ pub use docker::ExactRemoval;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
 pub use quasar_runtime::{
     agent_path_for_daemon_path, daemon_path_for_agent_path, ApiVersion, CdiFacts,
-    ContainerInspection, DaemonHostPath, DaemonImage, EngineFacts, EngineInfo, EngineStorage,
-    ErrorKind, ImageMetadata, Mount, MountKind, Operation, RuntimeConfig, RuntimeError, API_FLOOR,
-    ENGINE_INSPECTION_BUDGET,
+    ContainerInspection, DaemonHostPath, DaemonImage, EngineFacts, EngineInfo, EngineKind,
+    EngineMode, EngineStorage, ErrorKind, ImageMetadata, Mount, MountKind, Operation,
+    RuntimeConfig, RuntimeError, API_FLOOR, ENGINE_INSPECTION_BUDGET,
 };
 
 /// How long ONE owned GPU probe may take end to end — recover, create and start, wait,

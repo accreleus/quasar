@@ -490,10 +490,14 @@ func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id 
 			updater_present              = $5,
 			recovery_actor_version       = $6,
 			recovery_actor_source_commit = $7,
-			seed_version                 = $8
+			seed_version                 = $8,
+			engine                       = $9,
+			engine_version               = $10,
+			engine_mode                  = $11
 		WHERE id = $1
 	`, hostID, id.SourceCommit, id.BuiltAt, id.InstallMode, id.UpdaterPresent,
-		id.RecoveryActorVersion, id.RecoveryActorSourceCommit, id.SeedVersion); err != nil {
+		id.RecoveryActorVersion, id.RecoveryActorSourceCommit, id.SeedVersion,
+		id.Engine, id.EngineVersion, id.EngineMode); err != nil {
 		return fmt.Errorf("update host identity: %w", err)
 	}
 	return nil

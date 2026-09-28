@@ -7,7 +7,8 @@ use super::super::runtime_facts::*;
 use super::super::*;
 use super::{get, FakeRoot};
 use crate::runtime::{
-    ApiVersion, CdiFacts, EngineFacts, EngineInfo, ErrorKind, RuntimeError, API_FLOOR,
+    ApiVersion, CdiFacts, EngineFacts, EngineInfo, EngineKind, EngineMode, ErrorKind, RuntimeError,
+    API_FLOOR,
 };
 
 const ENDPOINT: &str = "unix:///var/run/docker.sock";
@@ -19,12 +20,14 @@ fn api(major: usize, minor: usize) -> ApiVersion {
 fn facts(cdi: Option<CdiFacts>) -> EngineFacts {
     EngineFacts {
         info: EngineInfo {
+            kind: EngineKind::Docker,
             name: "Docker Engine - Community".into(),
             version: "28.0.0".into(),
             api_version: api(1, 48),
             server_min_api: api(1, 24),
             server_max_api: api(1, 48),
         },
+        mode: EngineMode::Rootful,
         operating_system: Some("Ubuntu 24.04".into()),
         architecture: Some("x86_64".into()),
         cgroup_version: Some("2".into()),
@@ -435,4 +438,135 @@ fn an_invalid_endpoint_configuration_fails_the_endpoint_naming_the_knob() {
     let endpoint = get(&checks, ENDPOINT_ID);
     assert_eq!(endpoint.status, FAIL, "{endpoint:?}");
     assert!(endpoint.remediation.contains("DOCKER_HOST"), "{endpoint:?}");
+}
+
+// ── RH-07 #396: the engine, its mode, and remediation that names them ───────
+
+fn engine(kind: EngineKind, version: &str, mode: EngineMode, os: &str) -> EngineFacts {
+    let mut f = facts(None);
+    f.info.kind = kind;
+    f.info.version = version.into();
+    f.mode = mode;
+    f.operating_system = Some(os.into());
+    f
+}
+
+#[test]
+fn the_engine_check_names_the_engine_its_version_and_mode() {
+    let root = FakeRoot::new("runtime-engine-docker");
+    let checks = probe(&observed(
+        &root,
+        Ok(engine(
+            EngineKind::Docker,
+            "29.7.2",
+            EngineMode::Rootful,
+            "Fedora Linux 43",
+        )),
+    ));
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("Docker 29.7.2, rootful"), "{c:?}");
+    assert_eq!(c.source.as_deref(), Some("runtime"));
+    assert!(c.blocks.is_none(), "{c:?}");
+}
+
+/// Until the RH-07 acceptance map proves them, the new profiles read as experimental:
+/// a combination with no evidence is never implied supported (CONTEXT.md "Engine profile").
+#[test]
+fn a_profile_without_evidence_warns_as_experimental_and_blocks_nothing() {
+    let root = FakeRoot::new("runtime-engine-podman");
+    for (kind, mode) in [
+        (EngineKind::Podman, EngineMode::Rootless),
+        (EngineKind::Docker, EngineMode::Rootless),
+        (EngineKind::Podman, EngineMode::Rootful),
+    ] {
+        let checks = probe(&observed(&root, Ok(engine(kind, "5.8.4", mode, "fedora"))));
+        let c = get(&checks, ENGINE_ID);
+        assert_eq!(c.status, WARN, "{c:?}");
+        assert!(c.summary.contains("experimental"), "{c:?}");
+        assert!(c.summary.contains(mode.wire()), "{c:?}");
+        assert!(c.blocks.is_none(), "{c:?}");
+    }
+    let checks = probe(&observed(
+        &root,
+        Ok(engine(
+            EngineKind::Podman,
+            "5.8.4",
+            EngineMode::Rootless,
+            "Debian GNU/Linux 13",
+        )),
+    ));
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.summary.contains("unsupported"), "{c:?}");
+    assert!(
+        c.remediation.contains("Docker rootful"),
+        "names the alternative: {c:?}"
+    );
+}
+
+#[test]
+fn an_engine_that_cannot_be_named_is_unsupported_not_docker() {
+    let root = FakeRoot::new("runtime-engine-unknown");
+    let checks = probe(&observed(
+        &root,
+        Ok(engine(
+            EngineKind::Unknown,
+            "1.0",
+            EngineMode::Rootful,
+            "fedora",
+        )),
+    ));
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.summary.contains("unsupported"), "{c:?}");
+    assert!(!c.summary.contains("Docker 1.0"), "{c:?}");
+}
+
+/// The endpoint checks name the socket and both engines, and never tell an operator to
+/// run Quasar as root (#396 acceptance).
+#[test]
+fn no_endpoint_remediation_names_only_docker_or_suggests_root() {
+    let root = FakeRoot::new("runtime-remediation");
+    for fault in [
+        RuntimeFault::Unreachable("connection refused".into()),
+        RuntimeFault::PermissionDenied("permission denied".into()),
+        RuntimeFault::Unconfigured("DOCKER_CONTEXT is set".into()),
+        RuntimeFault::Ambiguous("two endpoints".into()),
+    ] {
+        let checks = probe(&observed(&root, Err(fault.clone())));
+        let c = get(&checks, ENDPOINT_ID);
+        assert_eq!(c.status, FAIL, "{c:?}");
+        let text = c.remediation.to_lowercase();
+        assert!(
+            !text.contains("as root") && !text.contains("run it as root"),
+            "{c:?}"
+        );
+        assert!(text.contains("podman"), "names Podman too: {c:?}");
+    }
+    let checks = probe(&observed(
+        &root,
+        Err(RuntimeFault::Unreachable("refused".into())),
+    ));
+    assert!(get(&checks, ENDPOINT_ID)
+        .remediation
+        .contains("/var/run/docker.sock"));
+}
+
+#[test]
+fn an_ambiguous_endpoint_is_refused_by_name_and_names_both_variables() {
+    let root = FakeRoot::new("runtime-ambiguous");
+    let fault = RuntimeFault::from(RuntimeError::from(ErrorKind::AmbiguousEndpoint));
+    assert!(matches!(fault, RuntimeFault::Ambiguous(_)), "{fault:?}");
+    let checks = probe(&observed(&root, Err(fault)));
+    let c = get(&checks, ENDPOINT_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(
+        c.summary.contains("DOCKER_HOST") && c.summary.contains("CONTAINER_HOST"),
+        "{c:?}"
+    );
+    assert!(
+        c.blocks.is_some(),
+        "an unusable endpoint keeps its agent-enforced block"
+    );
 }

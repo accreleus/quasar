@@ -538,6 +538,7 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         runtime_facts::check_runtime_api_version(&env.runtime),
         runtime_facts::check_runtime_capabilities(&env.runtime),
         runtime_facts::check_runtime_cdi(&env.runtime),
+        runtime_facts::check_runtime_engine(&env.runtime),
         // Runtime veto: files present but the stack not loading must never read green.
         veto_if_egl_broken(check_nvidia_egl_vendor(env, distro), env),
         veto_if_egl_broken(check_nvidia_eglcore(env, distro), env),
@@ -2798,6 +2799,7 @@ mod tests {
                     | "runtime_api_version"
                     | "runtime_capabilities"
                     | "runtime_cdi"
+                    | "runtime_engine"
             ) {
                 assert_eq!(
                     c.status, SKIP,

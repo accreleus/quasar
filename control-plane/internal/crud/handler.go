@@ -239,6 +239,10 @@ type hostResp struct {
 	RecoveryActorVersion      *string `json:"recovery_actor_version"`
 	RecoveryActorSourceCommit *string `json:"recovery_actor_source_commit"`
 	SeedVersion               *string `json:"seed_version"`
+	// Amendment 17: always serialized, null until an amendment-aware agent reports.
+	Engine        *string `json:"engine"`
+	EngineVersion *string `json:"engine_version"`
+	EngineMode    *string `json:"engine_mode"`
 	// Capacity: always serialized, null when the host has no reported GPUs to sum.
 	Capacity *HostCapacity `json:"capacity"`
 }
@@ -410,6 +414,10 @@ func hostToResp(h Host) hostResp {
 		RecoveryActorVersion:      h.RecoveryActorVersion,
 		RecoveryActorSourceCommit: h.RecoveryActorSourceCommit,
 		SeedVersion:               h.SeedVersion,
+
+		Engine:        h.Engine,
+		EngineVersion: h.EngineVersion,
+		EngineMode:    h.EngineMode,
 	}
 }
 

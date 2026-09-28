@@ -482,6 +482,7 @@ impl RuntimeClient {
 pub fn describe(error: &RuntimeError) -> &'static str {
     match error.kind {
         ErrorKind::InvalidConfiguration => "the engine endpoint is misconfigured",
+        ErrorKind::AmbiguousEndpoint => "DOCKER_HOST and CONTAINER_HOST name different engines",
         ErrorKind::PermissionDenied => "the engine socket refused this process",
         ErrorKind::Missing => "the object does not exist",
         ErrorKind::Unavailable => "the engine is unreachable",

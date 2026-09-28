@@ -7,12 +7,14 @@ use crate::messages::{ReadinessBlocks, ReadinessCheck};
 // `API_FLOOR` is owned by the runtime module, which is the code that enforces it; the
 // checks below only render it (#266), so the wording cannot drift from what discovery
 // refuses.
-use crate::runtime::{EngineFacts, ErrorKind, RuntimeError, API_FLOOR};
+use crate::runtime::{EngineFacts, EngineKind, EngineMode, ErrorKind, RuntimeError, API_FLOOR};
 
 pub const ENDPOINT_ID: &str = "runtime_endpoint";
 pub const API_VERSION_ID: &str = "runtime_api_version";
 pub const CAPABILITIES_ID: &str = "runtime_capabilities";
 pub const CDI_ID: &str = "runtime_cdi";
+/// Amendment 17 (RH-07 #396): the engine, its version and its engine mode, in words.
+pub const ENGINE_ID: &str = "runtime_engine";
 
 /// The `Unreachable` detail for [`ErrorKind::Timeout`]. A missing socket uses a
 /// different sentence, so `host_container_mounts` can tell "the client ran out of
@@ -34,6 +36,9 @@ pub enum RuntimeFault {
     IncompatibleApi(String),
     /// The endpoint configuration itself is invalid (docs/configuration.md, DOCKER_HOST).
     Unconfigured(String),
+    /// `DOCKER_HOST` and `CONTAINER_HOST` name two different endpoints (amendment 17):
+    /// refused by name, never resolved by picking one.
+    Ambiguous(String),
     /// The runtime client could not ask this refresh (busy, cancelled) or the reply made no
     /// sense; the verdict warns and the next refresh tries again.
     Indeterminate(String),
@@ -56,6 +61,9 @@ impl From<RuntimeError> for RuntimeFault {
                 "the endpoint configuration was refused (DOCKER_HOST must be a unix:// socket; \
                  DOCKER_CONTEXT, DOCKER_TLS*, DOCKER_API_VERSION must be unset)"
                     .into(),
+            ),
+            ErrorKind::AmbiguousEndpoint => RuntimeFault::Ambiguous(
+                "DOCKER_HOST and CONTAINER_HOST are both set and name different endpoints".into(),
             ),
             ErrorKind::Busy | ErrorKind::Cancelled => {
                 RuntimeFault::Indeterminate("the runtime client was busy this refresh".into())
@@ -87,10 +95,11 @@ impl RuntimeView {
         match crate::runtime::configured() {
             Ok(client) => RuntimeView::observe(client),
             Err(error) => RuntimeView::Observed {
-                endpoint: std::env::var("DOCKER_HOST")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "unix:///var/run/docker.sock".into()),
+                endpoint: ["DOCKER_HOST", "CONTAINER_HOST"]
+                    .iter()
+                    .filter_map(|key| std::env::var(key).ok().filter(|s| !s.is_empty()))
+                    .next()
+                    .unwrap_or_else(|| format!("unix://{}", quasar_runtime::DOCKER_DEFAULT_SOCKET)),
                 outcome: Err(RuntimeFault::from(error)),
             },
         }
@@ -136,7 +145,8 @@ impl RuntimeView {
                 outcome,
                 Err(RuntimeFault::Unreachable(_)
                     | RuntimeFault::PermissionDenied(_)
-                    | RuntimeFault::Unconfigured(_))
+                    | RuntimeFault::Unconfigured(_)
+                    | RuntimeFault::Ambiguous(_))
             ),
         }
     }
@@ -164,17 +174,26 @@ fn check_runtime_endpoint_inner(view: &RuntimeView) -> ReadinessCheck {
         Err(RuntimeFault::Unreachable(reason)) => super::fail(
             ENDPOINT_ID,
             format!("the container runtime at {endpoint} is unreachable: {reason}"),
-            "Check that Docker is running on the host and that its socket \
-             (/var/run/docker.sock by default, or the DOCKER_HOST unix:// path) is mounted \
-             into the agent container; recreate the agent after changing the mount."
-                .into(),
+            format!(
+                "Check that the container engine (Docker or Podman) is running on the host and \
+                 that its socket is mounted into the agent container at {} (the DOCKER_HOST or \
+                 CONTAINER_HOST unix:// path when set; /var/run/docker.sock by default); \
+                 recreate the agent after changing the mount. On a rootless engine the socket \
+                 is the Quasar user's own and its engine runs only while lingering is enabled \
+                 (host preparation).",
+                endpoint.trim_start_matches("unix://")
+            ),
         ),
         Err(RuntimeFault::PermissionDenied(reason)) => super::fail(
             ENDPOINT_ID,
             format!("the container runtime at {endpoint} refused this agent: {reason}"),
-            "Grant the agent permission on the engine socket: run it as root or add its user \
-             to the group owning /var/run/docker.sock, then recreate the agent."
-                .into(),
+            format!(
+                "Give the agent access to the engine socket {}: on a rootful engine, the \
+                 agent's user must be in the group that owns it; on a rootless engine (Docker \
+                 or Podman) the agent must run under the Quasar user that owns the engine. \
+                 Recreate the agent afterwards. Never widen the socket's permissions.",
+                endpoint.trim_start_matches("unix://")
+            ),
         ),
         Err(RuntimeFault::IncompatibleApi(_)) => super::pass(
             ENDPOINT_ID,
@@ -186,9 +205,18 @@ fn check_runtime_endpoint_inner(view: &RuntimeView) -> ReadinessCheck {
         Err(RuntimeFault::Unconfigured(reason)) => super::fail(
             ENDPOINT_ID,
             format!("the container runtime endpoint configuration is invalid: {reason}"),
-            "Set DOCKER_HOST to a unix:// socket, or leave it unset for /var/run/docker.sock, \
-             and unset DOCKER_CONTEXT, DOCKER_TLS, DOCKER_TLS_VERIFY and DOCKER_API_VERSION; \
-             the agent speaks to one explicit Unix endpoint (docs/configuration.md)."
+            "Set DOCKER_HOST (or Podman's CONTAINER_HOST) to a unix:// socket, or leave both \
+             unset to use the engine socket found at the default paths, and unset \
+             DOCKER_CONTEXT, DOCKER_TLS, DOCKER_TLS_VERIFY and DOCKER_API_VERSION; the agent \
+             speaks to one explicit Unix endpoint (docs/configuration.md)."
+                .into(),
+        ),
+        Err(RuntimeFault::Ambiguous(reason)) => super::fail(
+            ENDPOINT_ID,
+            format!("the container runtime endpoint is ambiguous: {reason}"),
+            "Set only one of DOCKER_HOST and CONTAINER_HOST, or set both to the same unix:// \
+             socket of the engine Quasar should use (Docker or Podman); the agent never \
+             chooses between two engines itself."
                 .into(),
         ),
         Err(RuntimeFault::Indeterminate(reason)) => super::warn_check(
@@ -317,5 +345,82 @@ fn check_runtime_cdi_inner(view: &RuntimeView) -> ReadinessCheck {
             ),
         },
         Err(_) => super::skip(CDI_ID, "CDI is unknown: the engine could not be inspected"),
+    }
+}
+
+/// How far one engine profile is backed by evidence (CONTEXT.md "Engine profile").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileStatus {
+    Supported,
+    Experimental,
+    Unsupported,
+}
+
+/// RH-07 decision D5, as far as evidence goes today. Rootful Docker is the validated
+/// profile. Docker rootless, Podman rootless and Podman rootful on Fedora and Ubuntu are
+/// experimental until the RH-07 acceptance map proves them (#409 moves the Fedora rows to
+/// supported); a rootless engine elsewhere, or an engine this agent cannot name, is
+/// unsupported. Unraid's rootful Docker is covered by the first row.
+pub fn engine_profile(facts: &EngineFacts) -> ProfileStatus {
+    let os = facts
+        .operating_system
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    let known_os = os.contains("fedora") || os.contains("ubuntu");
+    match (facts.info.kind, facts.mode) {
+        (EngineKind::Unknown, _) => ProfileStatus::Unsupported,
+        (EngineKind::Docker, EngineMode::Rootful) => ProfileStatus::Supported,
+        (_, _) if known_os => ProfileStatus::Experimental,
+        (_, _) => ProfileStatus::Unsupported,
+    }
+}
+
+pub fn check_runtime_engine(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_engine_inner(view).with_source("runtime")
+}
+
+fn check_runtime_engine_inner(view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed { outcome, .. } = view else {
+        return super::skip(ENGINE_ID, "The container engine was not asked");
+    };
+    let Ok(facts) = outcome else {
+        return super::skip(
+            ENGINE_ID,
+            "The engine is unknown: it could not be inspected",
+        );
+    };
+    let os = facts
+        .operating_system
+        .as_deref()
+        .unwrap_or("an unknown system");
+    let mode = facts.mode.wire();
+    let named = match facts.info.kind {
+        EngineKind::Unknown => format!("{} {}", facts.info.name, facts.info.version),
+        kind => format!("{} {}", kind.label(), facts.info.version),
+    };
+    let alternatives = "Docker rootful is supported; Docker rootless and Podman rootless on \
+                        Fedora are the RH-07 profiles (see the engine-profile docs).";
+    match engine_profile(facts) {
+        ProfileStatus::Supported => super::pass(
+            ENGINE_ID,
+            format!("{named}, {mode}, on {os}: a supported engine profile"),
+        ),
+        ProfileStatus::Experimental => super::warn_check(
+            ENGINE_ID,
+            format!(
+                "{named}, {mode}, on {os}: an experimental engine profile, not yet proven on \
+                 hardware; nothing is blocked"
+            ),
+            alternatives.into(),
+        ),
+        ProfileStatus::Unsupported => super::warn_check(
+            ENGINE_ID,
+            format!(
+                "{named}, {mode}, on {os}: an unsupported engine profile; nothing is blocked, \
+                 but it is untested"
+            ),
+            alternatives.into(),
+        ),
     }
 }

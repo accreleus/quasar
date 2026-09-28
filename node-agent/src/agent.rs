@@ -1608,6 +1608,9 @@ fn register_message(
             .then(|| install.recovery_actor_source_commit.clone())
             .flatten(),
         seed_version: owned.then(|| install.seed_version.clone()).flatten(),
+        engine: install.engine.engine.clone(),
+        engine_version: install.engine.engine_version.clone(),
+        engine_mode: install.engine.engine_mode.clone(),
     })
 }
 
@@ -5858,6 +5861,38 @@ mod tests {
         assert!(normal.get("config_policy_groups").is_some());
     }
 
+    /// Amendment 17 (#396): any install reports the engine it runs on; a host whose engine
+    /// could not be inspected sends none of the three, which the control plane stores as
+    /// unknown.
+    #[test]
+    fn register_carries_the_engine_facts_when_known_and_omits_them_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let register = |install: &crate::buildinfo::InstallFacts| {
+            serde_json::to_value(
+                register_message(&cfg, false, Vec::new(), install, true, true, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let known = crate::buildinfo::InstallFacts {
+            engine: crate::buildinfo::EngineIdentity {
+                engine: Some("podman".into()),
+                engine_version: Some("5.8.4".into()),
+                engine_mode: Some("rootless".into()),
+            },
+            ..Default::default()
+        };
+        let json = register(&known);
+        assert_eq!(json["engine"], "podman");
+        assert_eq!(json["engine_version"], "5.8.4");
+        assert_eq!(json["engine_mode"], "rootless");
+        let json = register(&crate::buildinfo::InstallFacts::default());
+        for key in ["engine", "engine_version", "engine_mode"] {
+            assert!(json.get(key).is_none(), "{key} sent while unknown");
+        }
+    }
+
     /// Amendment 14: an owned install registers `install_mode: "owned"` with its recovery
     /// actor's identity; every other install registers exactly as before, without the
     /// three owned-only fields even if discovery somehow carried them.
@@ -5884,6 +5919,7 @@ mod tests {
             recovery_actor_version: Some("0.4.0".into()),
             recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
             seed_version: None,
+            engine: Default::default(),
         });
         assert_eq!(owned["install_mode"], "owned");
         assert_eq!(owned["updater_present"], true);
@@ -5903,6 +5939,7 @@ mod tests {
             recovery_actor_version: Some("0.4.0".into()),
             recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
             seed_version: Some("0.4.0".into()),
+            engine: Default::default(),
         });
         assert_eq!(compose["install_mode"], "registry");
         let unknown = register(&crate::buildinfo::InstallFacts::default());

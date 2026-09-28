@@ -96,12 +96,51 @@ impl InstallMode {
 /// which the wire and the schema both model as unknown.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InstallFacts {
+    /// Amendment 17: the engine this agent drives, whatever the install mode.
+    pub engine: EngineIdentity,
     pub install_mode: Option<InstallMode>,
     pub updater_present: Option<bool>,
     /// Owned installs only: what the recovery actor said about itself and the seed.
     pub recovery_actor_version: Option<String>,
     pub recovery_actor_source_commit: Option<String>,
     pub seed_version: Option<String>,
+}
+
+/// The container engine and engine mode, as the amendment-17 `register` fields carry
+/// them. Every field is `None` when the engine could not be inspected, or cannot be
+/// named: the wire then reads "engine unknown", never a guess.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineIdentity {
+    pub engine: Option<String>,
+    pub engine_version: Option<String>,
+    pub engine_mode: Option<String>,
+}
+
+impl EngineIdentity {
+    /// From one engine inspection. An engine this runtime cannot name reports nothing at
+    /// all, so a version or mode is never attributed to the wrong engine.
+    pub fn from_facts(facts: &crate::runtime::EngineFacts) -> Self {
+        let Some(engine) = facts.info.kind.wire() else {
+            return Self::default();
+        };
+        let version = &facts.info.version;
+        let version_ok = (1..=64).contains(&version.len())
+            && version.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        Self {
+            engine: Some(engine.to_string()),
+            engine_version: version_ok.then(|| version.clone()),
+            engine_mode: Some(facts.mode.wire().to_string()),
+        }
+    }
+
+    /// One bounded inspection of the configured engine; unknown on any failure.
+    pub fn observe() -> Self {
+        crate::runtime::configured()
+            .ok()
+            .and_then(|client| client.inspect_engine().wait().ok())
+            .map(|facts| Self::from_facts(&facts))
+            .unwrap_or_default()
+    }
 }
 
 /// Set by the recovery actor's recipe: the agent socket, whose presence in the
@@ -144,6 +183,12 @@ fn source_commit_shape(c: &str) -> bool {
 /// actor put [`RECOVERY_SOCKET_ENV`] in this container's environment), else what the
 /// agent's own container image says, with no recovery actor.
 pub fn discover(runtime: &ContainerRuntime) -> InstallFacts {
+    let mut facts = discover_install_mode(runtime);
+    facts.engine = EngineIdentity::observe();
+    facts
+}
+
+fn discover_install_mode(runtime: &ContainerRuntime) -> InstallFacts {
     match std::env::var(RECOVERY_SOCKET_ENV)
         .ok()
         .map(|s| s.trim().to_owned())
@@ -416,6 +461,49 @@ pub fn log_startup_identity(facts: &InstallFacts) {
 
 #[cfg(test)]
 mod tests {
+    /// Amendment 17: the wire carries only what the engine really said. An engine that
+    /// cannot be named sends nothing, and a version outside the contract's shape is
+    /// dropped rather than sent.
+    #[test]
+    fn engine_identity_carries_only_what_the_contract_accepts() {
+        use crate::runtime::{ApiVersion, EngineFacts, EngineInfo, EngineKind, EngineMode};
+        let api = ApiVersion {
+            major: 1,
+            minor: 44,
+        };
+        let facts = |kind, version: &str, mode| EngineFacts {
+            info: EngineInfo {
+                kind,
+                name: "x".into(),
+                version: version.into(),
+                api_version: api,
+                server_min_api: api,
+                server_max_api: api,
+            },
+            mode,
+            operating_system: None,
+            architecture: None,
+            cgroup_version: None,
+            security_options: Vec::new(),
+            runtimes: Vec::new(),
+            default_runtime: None,
+            cdi: None,
+        };
+        let id =
+            EngineIdentity::from_facts(&facts(EngineKind::Podman, "5.8.4", EngineMode::Rootless));
+        assert_eq!(id.engine.as_deref(), Some("podman"));
+        assert_eq!(id.engine_version.as_deref(), Some("5.8.4"));
+        assert_eq!(id.engine_mode.as_deref(), Some("rootless"));
+        assert_eq!(
+            EngineIdentity::from_facts(&facts(EngineKind::Unknown, "1", EngineMode::Rootful)),
+            EngineIdentity::default()
+        );
+        let spaced =
+            EngineIdentity::from_facts(&facts(EngineKind::Docker, "29 beta", EngineMode::Rootful));
+        assert_eq!(spaced.engine.as_deref(), Some("docker"));
+        assert_eq!(spaced.engine_version, None);
+    }
+
     use super::*;
 
     #[derive(Default)]
@@ -598,6 +686,7 @@ mod tests {
                     "cccccccccccccccccccccccccccccccccccccccc".into()
                 ),
                 seed_version: Some("0.4.0".into()),
+                engine: Default::default(),
             }
         );
     }

@@ -1,0 +1,26 @@
+{
+ "Architecture": "x86_64",
+ "CDISpecDirs": [
+  "/etc/cdi",
+  "/run/cdi"
+ ],
+ "CgroupVersion": "2",
+ "DefaultRuntime": "runc",
+ "DockerRootDir": "/var/lib/docker",
+ "OSType": "linux",
+ "OperatingSystem": "Fedora CoreOS 44.20260829.3.1 (uCore)",
+ "Runtimes": {
+  "io.containerd.runc.v2": {
+   "path": "runc"
+  },
+  "runc": {
+   "path": "runc"
+  }
+ },
+ "SecurityOptions": [
+  "name=seccomp,profile=builtin",
+  "name=selinux",
+  "name=cgroupns"
+ ],
+ "ServerVersion": "29.7.2"
+}

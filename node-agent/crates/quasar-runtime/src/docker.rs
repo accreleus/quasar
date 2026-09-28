@@ -106,7 +106,19 @@ pub async fn discover(config: &RuntimeConfig) -> Result<(Docker, EngineInfo), Ru
     if selected < floor || selected < min || selected.major != 1 {
         return Err(ErrorKind::IncompatibleApi.into());
     }
+    let components: Vec<String> = reported
+        .components
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let kind = crate::EngineKind::from_version(
+        reported.platform.as_ref().map(|p| p.name.as_str()),
+        &components,
+    );
     let info = EngineInfo {
+        kind,
         name: reported
             .platform
             .map(|p| p.name)
@@ -179,12 +191,14 @@ pub async fn inspect_engine(config: &RuntimeConfig) -> Result<crate::EngineFacts
             .collect();
         crate::CdiFacts { spec_dirs, devices }
     });
+    let security_options = sys.security_options.unwrap_or_default();
     Ok(crate::EngineFacts {
         info,
+        mode: crate::EngineMode::from_security_options(&security_options),
         operating_system: sys.operating_system,
         architecture: sys.architecture,
         cgroup_version,
-        security_options: sys.security_options.unwrap_or_default(),
+        security_options,
         runtimes,
         default_runtime: sys.default_runtime,
         cdi,

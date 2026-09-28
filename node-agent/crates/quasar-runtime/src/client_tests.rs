@@ -250,3 +250,86 @@ fn environment_rejects_persisted_cli_context_without_explicit_endpoint() {
         .unwrap();
     assert!(status.success());
 }
+
+/// RH-07 #396: each engine and mode is identified from what the real engine reports.
+/// The fixtures are captured from Docker 29 and Podman 5.8, rootful and rootless.
+#[test]
+fn each_engine_and_mode_is_identified_from_its_own_version_and_info() {
+    let cases: [(&str, &str, &str, EngineKind, &str, EngineMode); 4] = [
+        (
+            "docker-rootful",
+            include_str!("../testdata/engines/docker-rootful-version.json"),
+            include_str!("../testdata/engines/docker-rootful-info.json"),
+            EngineKind::Docker,
+            "29.7.2",
+            EngineMode::Rootful,
+        ),
+        (
+            "docker-rootless",
+            include_str!("../testdata/engines/docker-rootless-version.json"),
+            include_str!("../testdata/engines/docker-rootless-info.json"),
+            EngineKind::Docker,
+            "29.8.1",
+            EngineMode::Rootless,
+        ),
+        (
+            "podman-rootful",
+            include_str!("../testdata/engines/podman-rootful-version.json"),
+            include_str!("../testdata/engines/podman-rootful-info.json"),
+            EngineKind::Podman,
+            "5.8.4",
+            EngineMode::Rootful,
+        ),
+        (
+            "podman-rootless",
+            include_str!("../testdata/engines/podman-rootless-version.json"),
+            include_str!("../testdata/engines/podman-rootless-info.json"),
+            EngineKind::Podman,
+            "5.8.4",
+            EngineMode::Rootless,
+        ),
+    ];
+    for (label, version, info, kind, engine_version, mode) in cases {
+        let api = if label.starts_with("podman") {
+            "1.44"
+        } else {
+            "1.53"
+        };
+        let info_path: &'static str = Box::leak(format!("/v{api}/info").into_boxed_str());
+        let version: &'static str = Box::leak(version.to_string().into_boxed_str());
+        let info: &'static str = Box::leak(info.to_string().into_boxed_str());
+        let (_dir, runtime, server) =
+            fixture(vec![("/version", 200, version), (info_path, 200, info)]);
+        let facts = runtime.inspect_engine().wait().unwrap();
+        assert_eq!(facts.info.kind, kind, "{label}");
+        assert_eq!(facts.info.version, engine_version, "{label}");
+        assert_eq!(facts.mode, mode, "{label}");
+        server.join().unwrap();
+    }
+}
+
+/// An engine this runtime does not know is reported by its own name when that name is a
+/// valid token, and as unknown otherwise; discovery never guesses Docker.
+#[test]
+fn an_unrecognised_engine_is_named_by_its_component_or_unknown() {
+    let (_dir, runtime, server) = fixture(vec![(
+        "/version",
+        200,
+        r#"{"Components":[{"Name":"Moby Engine","Version":"1"}],"Version":"1.0","ApiVersion":"1.44","MinAPIVersion":"1.24"}"#,
+    )]);
+    assert_eq!(runtime.discover().wait().unwrap().kind, EngineKind::Unknown);
+    server.join().unwrap();
+    // Today's fixture (a Docker platform name and no components) is still Docker.
+    let (_dir, runtime, server) = fixture(vec![("/version", 200, VERSION)]);
+    assert_eq!(runtime.discover().wait().unwrap().kind, EngineKind::Docker);
+    server.join().unwrap();
+}
+
+#[test]
+fn the_wire_names_of_engine_kind_and_mode_are_the_contract_vocabulary() {
+    assert_eq!(EngineKind::Docker.wire(), Some("docker"));
+    assert_eq!(EngineKind::Podman.wire(), Some("podman"));
+    assert_eq!(EngineKind::Unknown.wire(), None);
+    assert_eq!(EngineMode::Rootful.wire(), "rootful");
+    assert_eq!(EngineMode::Rootless.wire(), "rootless");
+}

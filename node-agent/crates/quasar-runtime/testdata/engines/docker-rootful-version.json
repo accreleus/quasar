@@ -1,0 +1,28 @@
+{
+ "ApiVersion": "1.55",
+ "Arch": "amd64",
+ "Components": [
+  {
+   "Name": "Engine",
+   "Version": "29.7.2"
+  },
+  {
+   "Name": "containerd",
+   "Version": "2.3.4"
+  },
+  {
+   "Name": "runc",
+   "Version": "1.5.1"
+  },
+  {
+   "Name": "tini-static",
+   "Version": "0.19.0"
+  }
+ ],
+ "MinAPIVersion": "1.40",
+ "Os": "linux",
+ "Platform": {
+  "Name": ""
+ },
+ "Version": "29.7.2"
+}
