@@ -1021,7 +1021,7 @@ fn register_prep_over_budget(elapsed: Duration) -> bool {
 /// worker polling the agent's control future.
 ///
 /// Everything this wraps forks subprocesses (`docker`, `nvidia-smi`, the EGL
-/// self-test, `firewall-cmd`) and reads tens of sysfs files. Inline it produced a
+/// self-test) and reads tens of sysfs files. Inline it produced a
 /// single 1311 ms poll of the future that also owns heartbeats, the signalling relay
 /// and `session_stop` — against a 20 s stale-host deadline. Ordering is unchanged
 /// (the result is awaited immediately) and a probe panic still reaches the caller.

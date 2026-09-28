@@ -37,10 +37,10 @@ provide that device. When enabled, it passes the device read-only and grants
 `SYSLOG`, allowing GPU faults to appear in the session trace. Otherwise, read the
 host’s `dmesg` when investigating a GPU fault.
 
-A `media_reachability` warning names the scoped firewall rule the host is
-missing, or the half of the media path an existing rule leaves closed. A
-default-deny host whose rules already cover the range passes, quoting them. See
-[Ports and endpoints](/quasar/reference/ports/#firewall).
+`media_reachability` is read from real sessions. It stays unknown until a browser
+on another machine has tried one, passes once such a session connects, and fails
+when a remote browser's connection attempt never arrives. The failure names the
+scoped firewall rule to add. See [Ports and endpoints](/quasar/reference/ports/#firewall).
 
 Driver provisioning is reported as work in progress, and readiness refreshes
 while the agent remains connected. A known AV1 driver restriction leaves the host

@@ -305,17 +305,9 @@ services:
     # agent-less on 2026-07-26.
     entrypoint: ["/usr/local/bin/quasar-node-agent-entrypoint"]
     network_mode: host
-    # #483 readiness firewall-posture probe (node-agent/src/readiness.rs
-    # media_reachability check) reads `nft list ruleset` / `iptables -S INPUT`
-    # to detect a default-deny host firewall that would silently drop the
-    # agent's WebRTC ICE UDP. Reading netfilter rule state needs
-    # CAP_NET_ADMIN even for the container's root user; without it both
-    # tools fail `Operation not permitted` and the check degrades to `skip`
-    # (never a false negative, but it can never detect anything either).
-    # This grants READ of the existing ruleset only — it adds no new network
-    # reach: the container already sees the host's real netfilter state
-    # because of `network_mode: host` above (shared network namespace), this
-    # capability only lets it ask for it.
+    # NET_ADMIN: the agent no longer uses it (media_reachability reads real session
+    # traffic, not the firewall, since RH-07 #403). It stays only because this file
+    # mirrors recipe revision 2 (guarded by recipe_compose_parity); revision 3 drops it.
     # SYSLOG: read `/dev/kmsg` (the device below). `kernel.dmesg_restrict=1` is the
     # default on Fedora and Ubuntu, and the container's root user does not carry
     # CAP_SYSLOG by default, so without this the open fails EPERM and the agent

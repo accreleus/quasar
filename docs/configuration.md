@@ -1236,7 +1236,7 @@ compose). See `CLAUDE.md` for the full rationale.
 
 Host kernel/network tuning (UDP `wmem_default`, etc.) lives in `deploy/host-tuning.md`.
 The node agent's device and capability grants (`/dev/dri`, `/dev/uinput`, `/dev/kmsg`
-read-only, `NET_ADMIN` + `SYSLOG`) are compose-level, not environment variables — they
+read-only, `SYSLOG`; `NET_ADMIN` is granted but unused since #403) are compose-level, not environment variables — they
 are listed in `deploy/README.md` §"Prerequisites in detail", and each one is what makes
 a specific readiness check answerable rather than `skip`.
 
