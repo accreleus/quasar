@@ -274,11 +274,6 @@ fn handle_inbound(
                 pc_name(pc),
                 candidate.candidate
             );
-            // RH-07 #403: what the remote peer offered is half the media-path evidence.
-            super::media_evidence::note_remote_candidate(
-                target.as_ptr() as usize,
-                &candidate.candidate,
-            );
             target.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate.candidate]);
         }
         SignalMsg::RestartIce { pc } => {
