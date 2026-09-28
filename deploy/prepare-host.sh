@@ -275,6 +275,10 @@ SETFACL=""
 for p in /usr/bin/setfacl /bin/setfacl; do [ -x "$R$p" ] || [ -x "$p" ] && { SETFACL="$p"; break; }; done
 [ -n "$SETFACL" ] || die "setfacl was not found (install the acl package). The device rules add access with it rather than changing a device's owner."
 acl="ACTION!=\"remove\", ENV{DEVNAME}==\"?*\", RUN+=\"$SETFACL -m g:$QUSER:rw \$devnode\""
+# Under SELinux a confined session may not open event_device_t nodes. Quasar's own input
+# devices, and only those, get the container file type (the rest keep theirs).
+input_label=""
+podman_selinux && input_label=', SECLABEL{selinux}="system_u:object_r:container_file_t:s0"'
 {
   cat <<EOF
 # Written by Quasar's host preparation (deploy/prepare-host.sh). Re-run it to change this file.
@@ -284,7 +288,7 @@ acl="ACTION!=\"remove\", ENV{DEVNAME}==\"?*\", RUN+=\"$SETFACL -m g:$QUSER:rw \$
 # Creating virtual input devices (keyboard, mouse, gamepad, touch).
 KERNEL=="uinput", SUBSYSTEM=="misc", $acl
 # The input devices Quasar itself creates, matched by name, and no others.
-SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{name}=="Quasar Virtual *", $acl
+SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{name}=="Quasar Virtual *", $acl$input_label
 # GPU render nodes: hardware encode and rendering.
 SUBSYSTEM=="drm", KERNEL=="renderD*", $acl
 EOF

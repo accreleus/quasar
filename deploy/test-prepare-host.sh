@@ -223,6 +223,10 @@ out9b2="$(prep "$r9b" "$tmp/podman-only" --mode rootless --engine podman --homes
 r9c="$tmp/r9c"; mk_root "$r9c"; mkdir -p "$r9c/sys/fs/selinux"
 prep "$r9c" "$tmp/docker-only" --mode rootless --engine docker --homes /var/lib/quasar/homes >/dev/null 2>&1
 if grep -q semanage "$r9c/.prepare-host-commands" 2>/dev/null; then fail "no label for Docker" ""; else pass "Docker's data roots are not relabelled"; fi
+grep 'Quasar Virtual' "$r9b/etc/udev/rules.d/70-quasar.rules" | grep -q 'SECLABEL{selinux}="system_u:object_r:container_file_t:s0"' \
+  && [ "$(grep -c SECLABEL "$r9b/etc/udev/rules.d/70-quasar.rules")" = 1 ] \
+  && pass "only Quasar's own input devices get the container label" || fail "input seclabel" "$(cat "$r9b/etc/udev/rules.d/70-quasar.rules")"
+if grep -q SECLABEL "$r9c/etc/udev/rules.d/70-quasar.rules"; then fail "no input label for Docker" ""; else pass "Docker's input rule carries no label"; fi
 if prep "$tmp/none" "$tmp/podman-only" --mode rootless --templates 'relative' 2>/dev/null; then fail "--templates relative" "exit 0"; else pass "--templates must be absolute"; fi
 
 # ── argument validation ─────────────────────────────────────────────────────

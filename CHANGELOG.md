@@ -37,7 +37,10 @@ own; the two do not move together, and that is deliberate.
   `container_engine_t`, the policy's confined type for nested sandboxes, so Steam's and
   Flatpak's `bwrap` can mount; `container_t` refused them and Steam never showed a window.
   The read-back checks the process label. Rootless Docker has no per-container user
-  mapping: its homes keep subordinate IDs.
+  mapping: its homes keep subordinate IDs. Host preparation's udev rule also labels Quasar's own
+  virtual input devices `container_file_t` on SELinux Podman hosts (#401), so a confined
+  session can read its keyboard, mouse and gamepad; every other input device keeps its
+  label.
 - **NVIDIA GPUs by CDI (RH-07, #399).** Every container Quasar creates on an NVIDIA host (the
   node agent, its helpers, app sessions and the actor's GPU probe) asks for the GPU the way
   its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an
