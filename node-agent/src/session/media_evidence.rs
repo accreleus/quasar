@@ -78,6 +78,14 @@ pub fn record(stats: &IceStats, connected_before: bool, outcome: IceOutcome) {
         &LocalNet::live(),
         SystemTime::now(),
     ) else {
+        if outcome == IceOutcome::Failed && !connected_before {
+            tracing::info!(
+                token = "media-reachability-inconclusive",
+                selected = stats.selected.len(),
+                remote = ?stats.remote,
+                "ICE failed, but the stats prove nothing about the media path"
+            );
+        }
         return;
     };
     tracing::info!(token = "media-reachability-observed", evidence = ?evidence, "media path evidence");
