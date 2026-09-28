@@ -110,7 +110,7 @@ pub fn decide(
         IceOutcome::Failed => {
             let a_check_arrived = stats.remote.iter().any(|c| c.kind == "prflx");
             let offered_off_host = stats.remote.iter().any(|c| local.off_host(&c.address));
-            (!a_check_arrived && offered_off_host).then(|| Evidence::Blocked {
+            (!a_check_arrived && offered_off_host).then_some(Evidence::Blocked {
                 at: now,
                 offered: stats.remote.len(),
             })

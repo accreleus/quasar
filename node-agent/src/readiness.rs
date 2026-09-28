@@ -3348,9 +3348,6 @@ mod tests {
         );
     }
 
-    /// A missing or failing detection binary must never crash the probe, and never surface as
-    /// anything but `Unknown`.
-
     // ── RH-07 #403: media reachability from real traffic ─────────────────────────
 
     fn media_env(
