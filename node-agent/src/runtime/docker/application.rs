@@ -16,7 +16,9 @@ use bollard::{
 };
 use futures_util::StreamExt;
 
-use super::dialect::{is_nvidia_request, nvidia_device_request, Engine, Namespace};
+use super::dialect::{
+    is_nvidia_request, nvidia_device_request, recorded_injection, Engine, Namespace,
+};
 use crate::runtime::GpuInjection;
 
 use crate::runtime::application::{
@@ -935,12 +937,7 @@ async fn inspect_owned(
     if let Some((_, what)) = refusals.iter().find(|(refused, _)| *refused) {
         return Err(refuse(what, dialect));
     }
-    // The request is judged against how this engine injects the GPU (#399).
-    let injection = if intent.request.nvidia_gpu {
-        engine.gpu_injection().await?
-    } else {
-        None
-    };
+    let injection = recorded_injection(intent.request.nvidia_gpu, intent.gpu_injection);
     let nvidia_request =
         |r: &DeviceRequest| injection.is_some_and(|injection| is_nvidia_request(injection, r));
     let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &nvidia_request;
@@ -1108,6 +1105,24 @@ pub(crate) async fn start(
                 Ok(_) => return Err(ErrorKind::UnknownOutcome.into()),
                 Err(e) => return Err(super::classify(e)),
             }
+            // Decided before anything is journalled: an engine that cannot be given the GPU
+            // is refused here, never given more privilege, and leaves no intent behind.
+            let gpu_injection = if request.nvidia_gpu {
+                match docker.gpu_injection().await? {
+                    Some(injection) => Some(injection),
+                    None => {
+                        tracing::warn!(
+                            token = "runtime-gpu-injection-unavailable",
+                            "this engine cannot be given an NVIDIA GPU (no NVIDIA CDI device, and \
+                             not a rootful Docker): refusing the launch; host preparation writes \
+                             the CDI specification"
+                        );
+                        return Err(ErrorKind::InvalidConfiguration.into());
+                    }
+                }
+            } else {
+                None
+            };
             let intent = ApplicationIntent {
                 request,
                 owner,
@@ -1120,6 +1135,7 @@ pub(crate) async fn start(
                 image_volumes: image_config.volumes,
                 image_volume_identities: None,
                 nvidia_params_repair: None,
+                gpu_injection,
                 phase: ApplicationPhase::Creating,
                 result: None,
             };
@@ -1162,24 +1178,7 @@ pub(crate) async fn start(
             intent.phase = ApplicationPhase::Created;
             journal.write(&intent)?;
         } else {
-            // D10: a session that needs the NVIDIA GPU asks for it the way this engine
-            // injects it; an engine that cannot is refused here, never given more privilege.
-            let injection = if intent.request.nvidia_gpu {
-                match docker.gpu_injection().await? {
-                    Some(injection) => Some(injection),
-                    None => {
-                        tracing::warn!(
-                            token = "runtime-gpu-injection-unavailable",
-                            "this engine cannot be given an NVIDIA GPU (no NVIDIA CDI device, and \
-                             not a rootful Docker): refusing the launch; host preparation writes \
-                             the CDI specification"
-                        );
-                        return Err(ErrorKind::InvalidConfiguration.into());
-                    }
-                }
-            } else {
-                None
-            };
+            let injection = recorded_injection(intent.request.nvidia_gpu, intent.gpu_injection);
             let created = docker
                 .create_container(
                     Some(CreateContainerOptions {

@@ -533,6 +533,11 @@ fn validate_sibling_mounts(mounts: &[crate::runtime::Mount], paths: &[String]) -
     }
 }
 
+/// The agent's own container holds the NVIDIA control node: the engine injected the GPU.
+fn own_nvidia_nodes(env: &ProbeEnv) -> bool {
+    env.root.join("dev/nvidiactl").exists()
+}
+
 /// Run the full check set. Pure w.r.t. `env` (no global state, network, or container launches)
 /// so it is cheap to re-run on every capacity report.
 pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
@@ -540,6 +545,7 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
     checks.extend(runtime_facts::check_runtime_cdi_gpus(
         &env.runtime,
         &env.gpus,
+        own_nvidia_nodes(env),
     ));
     checks.extend(owner_conflict::check(
         env.owner_conflicts.is_some(),
@@ -554,7 +560,7 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         runtime_facts::check_runtime_endpoint(&env.runtime),
         runtime_facts::check_runtime_api_version(&env.runtime),
         runtime_facts::check_runtime_capabilities(&env.runtime),
-        runtime_facts::check_runtime_cdi(&env.runtime, env.nvidia, &env.gpus),
+        runtime_facts::check_runtime_cdi(&env.runtime, env.nvidia, &env.gpus, own_nvidia_nodes(env)),
         runtime_facts::check_runtime_engine(&env.runtime),
         runtime_facts::check_engine_healthchecks(&env.runtime),
         // Runtime veto: files present but the stack not loading must never read green.

@@ -30,8 +30,10 @@ own; the two do not move together, and that is deliberate.
   its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an
   NVIDIA CDI device, by `--gpus` on a rootful Docker without one. A rootless Docker with
   neither gets no GPU and readiness `runtime_cdi` fails naming host preparation, blocking the
-  host (or, on a mixed host, each NVIDIA GPU through `runtime_cdi_gpu<N>`). The agent reads
-  the request back by the same rule. The driver volume no longer carries the X.Org server
+  host (or, on a mixed host, each NVIDIA GPU through `runtime_cdi_gpu<N>`). Podman lists no
+  CDI devices, so there the evidence is the agent's own NVIDIA device node. Each container
+  records the request it was created with and is read back against it, so an engine that
+  gains a CDI specification later does not orphan existing containers. The driver volume no longer carries the X.Org server
   modules, and NVIDIA app containers disable lavapipe so a broken ICD cannot fall back to
   software rendering.
 - **One least-privilege node-agent recipe (RH-07, #402).** Recipe revision 3, applied by the

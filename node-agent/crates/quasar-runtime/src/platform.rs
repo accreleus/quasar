@@ -120,7 +120,7 @@ pub struct GpuRequest {
     pub driver: Option<String>,
     pub count: i64,
     pub capabilities: Vec<Vec<String>>,
-    /// CDI device names (`nvidia.com/gpu=all`) for a `cdi` request (RH-07 #399). Omitted when
+    /// CDI device names (`nvidia.com/gpu=all`) for a `cdi` request. Omitted when
     /// empty, so every `--gpus` request serializes exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_ids: Vec<String>,
@@ -254,7 +254,7 @@ pub struct EngineHost {
     /// The engine runs rootless (`name=rootless` in its security options; RH-07).
     pub rootless: bool,
     /// How an NVIDIA GPU reaches a container on this engine; `None` when it cannot
-    /// (RH-07 #399).
+    ///.
     pub gpu_injection: Option<crate::GpuInjection>,
 }
 

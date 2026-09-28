@@ -138,7 +138,8 @@ pub struct CdiFacts {
 
 /// How an NVIDIA GPU reaches a container on this engine (RH-07 #399, decision D10). One
 /// decision for every container Quasar creates, from what the engine reports about itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GpuInjection {
     /// A CDI device request (`nvidia.com/gpu=all`): the one mechanism in every engine mode.
     Cdi,
@@ -157,8 +158,12 @@ impl GpuInjection {
     /// this engine cannot be given an NVIDIA GPU at all, which is a readiness failure naming
     /// the host preparation, never a privileged fallback.
     pub fn for_engine(kind: EngineKind, mode: EngineMode, cdi: Option<&CdiFacts>) -> Option<Self> {
-        let nvidia_cdi =
-            cdi.is_some_and(|c| c.devices.iter().any(|d| d.starts_with("nvidia.com/gpu")));
+        // Devices may carry a ` (<source>)` suffix; the id must be exactly the one requested.
+        let nvidia_cdi = cdi.is_some_and(|c| {
+            c.devices
+                .iter()
+                .any(|d| d.split_whitespace().next() == Some(NVIDIA_CDI_DEVICE))
+        });
         match (kind, mode) {
             (EngineKind::Podman, _) => Some(GpuInjection::Cdi),
             _ if nvidia_cdi => Some(GpuInjection::Cdi),

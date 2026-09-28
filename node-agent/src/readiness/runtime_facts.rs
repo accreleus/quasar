@@ -338,9 +338,26 @@ const CDI_REMEDIATION: &str = "Run host preparation (deploy/prepare-host.sh) as 
     hand a GPU to a container. Then restart the engine so it discovers the specification. \
     Never run Quasar as root to work around it.";
 
-fn cdi_verdict(id: &str, facts: &EngineFacts, injection: Option<GpuInjection>) -> ReadinessCheck {
+/// `own_nodes`: the agent's own container has the NVIDIA device nodes. Podman's `/info`
+/// lists no CDI devices, so on Podman that is the only evidence the specification resolves.
+fn cdi_verdict(
+    id: &str,
+    facts: &EngineFacts,
+    injection: Option<GpuInjection>,
+    own_nodes: bool,
+) -> ReadinessCheck {
     let named = engine_named(facts);
     let mode = facts.mode.wire();
+    if facts.info.kind == EngineKind::Podman && !own_nodes {
+        return super::fail(
+            id,
+            format!(
+                "{named}, {mode}: this agent's own container has no NVIDIA device, so Podman \
+                 resolved no NVIDIA CDI specification and no NVIDIA GPU can reach a session"
+            ),
+            CDI_REMEDIATION.into(),
+        );
+    }
     match injection {
         Some(GpuInjection::Cdi) => super::pass(
             id,
@@ -367,7 +384,12 @@ fn cdi_verdict(id: &str, facts: &EngineFacts, injection: Option<GpuInjection>) -
 /// `runtime_cdi` (amendment 17): how NVIDIA GPUs reach containers. On a host whose GPUs are
 /// all NVIDIA the engine's answer is evidence and the check carries `blocks` (`host`); a
 /// mixed host blocks per GPU instead ([`check_runtime_cdi_gpus`]).
-pub fn check_runtime_cdi(view: &RuntimeView, nvidia: bool, gpus: &[(i32, bool)]) -> ReadinessCheck {
+pub fn check_runtime_cdi(
+    view: &RuntimeView,
+    nvidia: bool,
+    gpus: &[(i32, bool)],
+    own_nodes: bool,
+) -> ReadinessCheck {
     let check = match injection(view) {
         Err(why) => super::skip(CDI_ID, why),
         Ok((facts, _)) if !nvidia => {
@@ -382,7 +404,7 @@ pub fn check_runtime_cdi(view: &RuntimeView, nvidia: bool, gpus: &[(i32, bool)])
                 format!("No NVIDIA GPU: other GPUs reach containers as device nodes; {cdi}"),
             )
         }
-        Ok((facts, injection)) => cdi_verdict(CDI_ID, facts, injection),
+        Ok((facts, injection)) => cdi_verdict(CDI_ID, facts, injection, own_nodes),
     };
     let check = check.with_source("runtime");
     if nvidia && !mixed(gpus) && matches!(view, RuntimeView::Observed { outcome: Ok(_), .. }) {
@@ -394,7 +416,11 @@ pub fn check_runtime_cdi(view: &RuntimeView, nvidia: bool, gpus: &[(i32, bool)])
 
 /// `runtime_cdi_gpu<N>`: on a mixed host, the same verdict for each NVIDIA GPU, blocking only
 /// that GPU so the others stay schedulable. Nothing on any other host.
-pub fn check_runtime_cdi_gpus(view: &RuntimeView, gpus: &[(i32, bool)]) -> Vec<ReadinessCheck> {
+pub fn check_runtime_cdi_gpus(
+    view: &RuntimeView,
+    gpus: &[(i32, bool)],
+    own_nodes: bool,
+) -> Vec<ReadinessCheck> {
     if !mixed(gpus) {
         return Vec::new();
     }
@@ -404,7 +430,7 @@ pub fn check_runtime_cdi_gpus(view: &RuntimeView, gpus: &[(i32, bool)]) -> Vec<R
     gpus.iter()
         .filter(|(_, nvidia)| *nvidia)
         .map(|(index, _)| {
-            cdi_verdict(&format!("{CDI_ID}_gpu{index}"), facts, injection)
+            cdi_verdict(&format!("{CDI_ID}_gpu{index}"), facts, injection, own_nodes)
                 .with_source("runtime")
                 .with_blocks(ReadinessBlocks::gpu(*index, "control_plane"))
         })

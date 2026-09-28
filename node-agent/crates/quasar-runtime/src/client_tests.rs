@@ -370,7 +370,7 @@ fn a_restart_policy_update_is_read_back() {
     );
 }
 
-/// RH-07 #399 (D10): CDI everywhere it resolves; `--gpus` only on a rootful Docker without an
+/// D10: CDI everywhere it resolves; `--gpus` only on a rootful Docker without an
 /// NVIDIA CDI device; nothing on a rootless Docker without one.
 #[test]
 fn gpu_injection_is_decided_from_engine_facts() {

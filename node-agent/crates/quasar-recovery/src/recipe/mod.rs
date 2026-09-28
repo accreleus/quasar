@@ -196,7 +196,7 @@ pub struct GpuFacts {
     /// gains the NVIDIA toolkit later is not held to an old answer.
     #[serde(default, alias = "nvidia_runtime", skip_serializing_if = "is_false")]
     pub gpus_served: bool,
-    /// RH-07 #399: the engine served the GPU through CDI (`nvidia.com/gpu=all`) rather than
+    /// The engine served the GPU through CDI (`nvidia.com/gpu=all`) rather than
     /// `--gpus`. From recipe revision 3 the agent asks for it the same way. Written only
     /// when true.
     #[serde(default, skip_serializing_if = "is_false")]

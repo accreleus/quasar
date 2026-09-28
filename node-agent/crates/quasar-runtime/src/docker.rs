@@ -161,6 +161,27 @@ pub async fn discover(config: &RuntimeConfig) -> Result<(Docker, EngineInfo), Ru
     Ok((docker, info))
 }
 
+/// How the engine that answered `sys` injects an NVIDIA GPU: the one reading of `/info` the
+/// agent, its readiness and the recovery actor share.
+pub fn gpu_injection_from_info(
+    kind: crate::EngineKind,
+    sys: &bollard::models::SystemInfo,
+) -> Option<crate::GpuInjection> {
+    let mode = crate::EngineMode::from_security_options(
+        sys.security_options.as_deref().unwrap_or_default(),
+    );
+    let cdi = sys.cdi_spec_dirs.clone().map(|spec_dirs| crate::CdiFacts {
+        spec_dirs,
+        devices: sys
+            .discovered_devices
+            .iter()
+            .flatten()
+            .filter_map(|d| d.id.clone())
+            .collect(),
+    });
+    crate::GpuInjection::for_engine(kind, mode, cdi.as_ref())
+}
+
 /// One read-only `/info`, folded into [`crate::EngineFacts`]. No CDI spec dir reported by
 /// the engine (`None`) is distinct from CDI reported but disabled (empty `spec_dirs`).
 pub async fn inspect_engine(config: &RuntimeConfig) -> Result<crate::EngineFacts, RuntimeError> {

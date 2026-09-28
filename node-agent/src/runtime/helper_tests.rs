@@ -22,6 +22,8 @@ struct LogGate {
 }
 #[derive(Default)]
 struct State {
+    /// The engine's `/info`; `{}` (a rootful Docker with no CDI) when unset.
+    info: Option<Value>,
     managed_ref: Option<String>,
     managed_id: String,
     managed_present: bool,
@@ -432,7 +434,7 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
     } else if route == "/info" {
         // `inspect_engine`, which the runtime readiness checks call. Every field it
         // folds is optional, so an empty object is a complete answer.
-        response = json!({});
+        response = s.info.clone().unwrap_or_else(|| json!({}));
     } else if method == "GET" && route.starts_with("/images/json") {
         response = Value::Array(if s.managed_present {
             vec![
@@ -2547,6 +2549,7 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         image_volumes: None,
         image_volume_identities: None,
         nvidia_params_repair: None,
+        gpu_injection: None,
         phase: ApplicationPhase::Running,
         result: None,
     };
@@ -6000,5 +6003,102 @@ fn a_stalled_gpu_probe_lifecycle_is_bounded_by_one_budget() {
         "the whole lifecycle must be bounded by its {budget:?} budget, not by one client \
          deadline ({:?}) per operation: took {elapsed:?}",
         engine.config.deadline
+    );
+}
+
+fn rootless_info(cdi_devices: &[&str]) -> Value {
+    json!({
+        "SecurityOptions": ["name=seccomp,profile=builtin", "name=rootless"],
+        "CDISpecDirs": ["/etc/cdi"],
+        "DiscoveredDevices": cdi_devices.iter().map(|id| json!({"Source":"cdi","ID":id})).collect::<Vec<_>>(),
+    })
+}
+
+fn nvidia_app(operation: &str) -> ApplicationRequest {
+    ApplicationRequest {
+        operation: operation.into(),
+        name: format!("quasar-sess-{operation}"),
+        image: "quasar-app:test".into(),
+        devices: vec!["/dev/dri".into()],
+        gpu: true,
+        nvidia_gpu: true,
+        ..Default::default()
+    }
+}
+
+/// D10: an engine that cannot be given the GPU is refused before anything is journalled
+/// or created, so the same launch succeeds once host preparation has run.
+#[test]
+fn application_on_an_engine_without_gpu_injection_is_refused_before_the_journal() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().info = Some(rootless_info(&[]));
+    let refused = engine
+        .client()
+        .start_application(nvidia_app("cdi-refused"))
+        .wait()
+        .unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::InvalidConfiguration);
+    assert_eq!(engine.requests("POST /containers/create"), 0);
+    engine.state.lock().unwrap().info = Some(rootless_info(&["nvidia.com/gpu=all"]));
+    engine
+        .client()
+        .start_application(nvidia_app("cdi-refused"))
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["HostConfig"]["DeviceRequests"][0]["Driver"], "cdi");
+    assert_eq!(
+        body["HostConfig"]["DeviceRequests"][0]["DeviceIDs"],
+        json!(["nvidia.com/gpu=all"])
+    );
+}
+
+/// A refused GPU probe leaves no unfinished journal, so the next probe is not `Busy`.
+#[test]
+fn gpu_probe_on_an_engine_without_gpu_injection_does_not_wedge_later_probes() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().info = Some(rootless_info(&[]));
+    let client = engine.client();
+    let (helper, run) = nvidia_probe_request();
+    let refused = client.run_gpu_probe(helper, run).wait().unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::InvalidConfiguration);
+    let (helper, run) = dri_probe_request("dri-after-refusal");
+    client.run_gpu_probe(helper, run).wait().unwrap();
+}
+
+/// A container is judged by the request it was created with: an application made with
+/// `--gpus` still reads back after the engine starts offering CDI.
+#[test]
+fn application_reads_back_by_its_recorded_injection_after_the_engine_changes() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let id = client
+        .start_application(nvidia_app("recorded-injection"))
+        .wait()
+        .unwrap();
+    engine.state.lock().unwrap().info = Some(rootless_info(&["nvidia.com/gpu=all"]));
+    engine.finish();
+    client
+        .stop_application(id, Duration::from_secs(1))
+        .wait()
+        .unwrap();
+}
+
+#[test]
+fn a_journal_written_before_the_injection_was_recorded_reads_as_gpus() {
+    use crate::runtime::GpuInjection;
+    let intent: HelperIntent = serde_json::from_value(json!({
+        "operation": "o", "name": "n", "image": "i", "owner": "w",
+        "socket": "/run/docker.sock", "id": null
+    }))
+    .unwrap();
+    assert_eq!(intent.gpu_injection, None);
+    assert_eq!(
+        super::docker::dialect::recorded_injection(true, intent.gpu_injection),
+        Some(GpuInjection::DeviceRequest)
+    );
+    assert_eq!(
+        super::docker::dialect::recorded_injection(false, None),
+        None
     );
 }

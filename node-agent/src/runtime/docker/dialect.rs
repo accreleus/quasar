@@ -133,54 +133,14 @@ impl PodmanFacts {
     }
 }
 
-/// How each engine socket injects an NVIDIA GPU, decided once per process from its `/info`
-/// (RH-07 #399). The engine behind a socket does not change while the agent runs.
-static INJECTION: std::sync::Mutex<
-    Option<std::collections::HashMap<PathBuf, Option<GpuInjection>>>,
-> = std::sync::Mutex::new(None);
-
 impl Engine {
-    /// How this engine injects an NVIDIA GPU (decision D10): CDI wherever it resolves,
-    /// `--gpus` only on a rootful Docker with no NVIDIA CDI device, `None` when it cannot.
+    /// How this engine injects an NVIDIA GPU now (decision D10). Asked per create, never
+    /// cached: a CDI specification written after the agent started must be picked up.
     pub(crate) async fn gpu_injection(&self) -> Result<Option<GpuInjection>, RuntimeError> {
-        if let Some(known) = INJECTION
-            .lock()
-            .ok()
-            .and_then(|m| m.as_ref().and_then(|m| m.get(&self.socket).copied()))
-        {
-            return Ok(known);
-        }
-        let sys = self
-            .docker
-            .info()
-            .await
-            .map_err(|_| RuntimeError::from(ErrorKind::Unavailable))?;
-        let mode = if sys
-            .security_options
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|o| o.split(',').any(|p| p == "name=rootless"))
-        {
-            crate::runtime::EngineMode::Rootless
-        } else {
-            crate::runtime::EngineMode::Rootful
-        };
-        let cdi = sys.cdi_spec_dirs.map(|spec_dirs| crate::runtime::CdiFacts {
-            spec_dirs,
-            devices: sys
-                .discovered_devices
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|d| d.id)
-                .collect(),
-        });
-        let injection = GpuInjection::for_engine(self.kind, mode, cdi.as_ref());
-        if let Ok(mut map) = INJECTION.lock() {
-            map.get_or_insert_with(Default::default)
-                .insert(self.socket.clone(), injection);
-        }
-        Ok(injection)
+        let sys = self.docker.info().await.map_err(super::classify)?;
+        Ok(quasar_runtime::docker::gpu_injection_from_info(
+            self.kind, &sys,
+        ))
     }
 
     /// Podman's native inspect of one container; `None` on Docker. A Podman that does not
@@ -459,7 +419,7 @@ fn gpu_expansion(path: &str) -> bool {
 }
 
 /// The device request that asks for every NVIDIA GPU the way `injection` says. The
-/// `--gpus` shape is exactly today's (`driver: nvidia`, count -1, capability `gpu`).
+/// `--gpus` shape is (`driver: nvidia`, count -1, capability `gpu`).
 pub(crate) fn nvidia_device_request(injection: GpuInjection) -> DeviceRequest {
     match injection {
         GpuInjection::Cdi => DeviceRequest {
@@ -474,6 +434,15 @@ pub(crate) fn nvidia_device_request(injection: GpuInjection) -> DeviceRequest {
             ..Default::default()
         },
     }
+}
+
+/// The injection a container was created with. An NVIDIA intent journalled before it was
+/// recorded was created with `--gpus`.
+pub(crate) fn recorded_injection(
+    nvidia: bool,
+    recorded: Option<GpuInjection>,
+) -> Option<GpuInjection> {
+    nvidia.then(|| recorded.unwrap_or(GpuInjection::DeviceRequest))
 }
 
 /// Is `request` exactly the NVIDIA request for `injection`, as the engine echoes it back?

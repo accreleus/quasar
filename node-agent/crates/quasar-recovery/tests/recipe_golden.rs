@@ -173,7 +173,7 @@ fn node_agent_revision_3_holds_none_of_the_removed_access() {
         spec.device_cgroup_rules
     );
     check("node-agent-r3-nvidia-rootless.json", &spec);
-    // RH-07 #399: where the engine served the GPU through CDI, revision 3 asks by CDI.
+    // Where the engine served the GPU through CDI, revision 3 asks by CDI.
     let mut cdi = rootless.clone();
     cdi.gpu.cdi = true;
     let spec = render(Role::NodeAgent, 3, &cdi, &image, &agent_secrets()).unwrap();

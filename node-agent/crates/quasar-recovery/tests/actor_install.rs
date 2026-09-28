@@ -668,12 +668,15 @@ fn an_engine_that_refuses_a_call_fails_resume_without_a_partial_container_left_r
     );
 }
 
-/// RH-07 #399 (D10): an engine that injects NVIDIA through CDI is probed and recorded that
+/// D10: an engine that injects NVIDIA through CDI is probed and recorded that
 /// way, so recipe revision 3 asks for the GPU by CDI too.
 #[test]
 fn a_cdi_engine_is_probed_and_recorded_as_cdi() {
     let mut state = nvidia_host(&[], true);
     state.host.gpu_injection = Some(quasar_recovery::recipe::GpuInjection::Cdi);
+    state
+        .registry
+        .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
     let (engine, dir) = installed(state);
     let gpu = &machine_json(&dir)["inputs"]["gpu"];
     assert_eq!(gpu["gpus_served"], true);
@@ -686,13 +689,16 @@ fn a_cdi_engine_is_probed_and_recorded_as_cdi() {
     assert_eq!(agent.spec.gpus.len(), 1, "the NVIDIA shape");
 }
 
-/// RH-07 #399: "no GPU" is decided from the engine's own facts, never from an error's
+/// "No GPU" is decided from the engine's own facts, never from an error's
 /// wording. An engine that can inject no NVIDIA GPU is not probed at all, and the agent is
 /// installed without the NVIDIA shape; nothing is recorded, so it is asked again later.
 #[test]
 fn an_engine_that_cannot_inject_a_gpu_is_not_probed_and_gets_no_nvidia_shape() {
     let mut state = nvidia_host(&[], true);
     state.host.gpu_injection = None;
+    state
+        .registry
+        .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
     let (engine, dir) = installed(state);
     let state = engine.state();
     let agent = state.container_named(names::NODE_AGENT).unwrap();
@@ -701,4 +707,21 @@ fn an_engine_that_cannot_inject_a_gpu_is_not_probed_and_gets_no_nvidia_shape() {
         .get("gpus_served")
         .is_none());
     assert!(machine_json(&dir)["inputs"]["gpu"].get("cdi").is_none());
+}
+
+/// Review M2: the probe asks with the request the agent's revision renders. Before revision
+/// 3 that is always `--gpus`, whatever the engine prefers, so the recorded answer never
+/// claims CDI for an agent that will not use it.
+#[test]
+fn an_agent_before_revision_3_is_probed_and_recorded_as_gpus() {
+    let mut state = nvidia_host(&[], true);
+    state.host.gpu_injection = Some(quasar_recovery::recipe::GpuInjection::Cdi);
+    let (engine, dir) = installed(state);
+    let gpu = &machine_json(&dir)["inputs"]["gpu"];
+    assert_eq!(gpu["gpus_served"], true);
+    assert!(gpu.get("cdi").is_none());
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert_eq!(agent.spec.gpus.len(), 1, "the NVIDIA shape");
+    assert!(agent.spec.gpus[0].device_ids.is_empty(), "by --gpus");
 }

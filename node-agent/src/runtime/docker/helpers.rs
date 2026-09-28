@@ -974,11 +974,8 @@ async fn read_back(
                 .id
         }
     };
-    let injection = if intent_device_request(intent) {
-        engine.gpu_injection().await?
-    } else {
-        None
-    };
+    let injection =
+        super::dialect::recorded_injection(intent_device_request(intent), intent.gpu_injection);
     inspect_owned(
         info,
         intent,
@@ -1112,6 +1109,7 @@ async fn create_or_adopt_inner(
         run,
         nvidia_gpu: None,
         gpu_probe,
+        gpu_injection: None,
         profile: if is_audio {
             HelperProfile::Audio
         } else if is_gpu_probe {
@@ -1134,6 +1132,22 @@ async fn create_or_adopt_inner(
     };
     if !reserves_final_evidence(&intent)? {
         return Err(ErrorKind::InvalidConfiguration.into());
+    }
+    // Decided before anything is journalled: an engine that cannot be given the GPU is
+    // refused here, never given more privilege, and leaves no intent to wedge later probes.
+    if intent_device_request(&intent) {
+        match docker.gpu_injection().await? {
+            Some(injection) => intent.gpu_injection = Some(injection),
+            None => {
+                tracing::warn!(
+                    token = "runtime-helper-gpu-injection-unavailable",
+                    "this engine cannot be given an NVIDIA GPU (no NVIDIA CDI device, and not a \
+                     rootful Docker): refusing the GPU helper; host preparation writes the CDI \
+                     specification"
+                );
+                return Err(ErrorKind::InvalidConfiguration.into());
+            }
+        }
     }
     journal.write(&intent)?;
     if intent.profile == HelperProfile::Audio {
@@ -1179,16 +1193,8 @@ async fn create_or_adopt_inner(
                 })
             })
     });
-    // D10 (#399): an NVIDIA helper asks for the GPU the way this engine injects it; an
-    // engine that cannot is refused, never given more privilege.
-    let injection = if intent_device_request(&intent) {
-        match docker.gpu_injection().await? {
-            Some(injection) => Some(injection),
-            None => return Err(ErrorKind::InvalidConfiguration.into()),
-        }
-    } else {
-        None
-    };
+    let injection =
+        super::dialect::recorded_injection(intent_device_request(&intent), intent.gpu_injection);
     let requirements = DiagnosticRequirements::FIXED;
     let devices = match requirements.devices {
         crate::runtime::DiagnosticDevices::None => Vec::new(),

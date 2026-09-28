@@ -56,7 +56,10 @@ fn observed(root: &FakeRoot, outcome: Result<EngineFacts, RuntimeFault>) -> Prob
 fn cdi_enabled_with_gpu() -> CdiFacts {
     CdiFacts {
         spec_dirs: vec!["/etc/cdi".into(), "/var/run/cdi".into()],
-        devices: vec!["nvidia.com/gpu=0 (cdi)".into()],
+        devices: vec![
+            "nvidia.com/gpu=0 (cdi)".into(),
+            "nvidia.com/gpu=all (cdi)".into(),
+        ],
     }
 }
 
@@ -417,11 +420,37 @@ fn nvidia_on_rootful_docker_without_cdi_goes_by_device_request() {
     assert!(c.summary.contains("--gpus"), "{c:?}");
 }
 
+/// Only the device Quasar requests counts: a specification listing per-index devices alone
+/// cannot serve `nvidia.com/gpu=all`.
 #[test]
-fn podman_always_goes_by_cdi() {
+fn a_cdi_spec_without_the_all_device_is_not_used() {
+    let root = FakeRoot::new("runtime-cdi-index-only");
+    let per_index = Some(CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec!["nvidia.com/gpu=0 (cdi)".into()],
+    });
+    let checks = probe(&nvidia_env(
+        &root,
+        rootless(facts(per_index)),
+        vec![(0, true)],
+    ));
+    assert_eq!(get(&checks, CDI_ID).status, FAIL);
+}
+
+/// Podman's `/info` lists no CDI devices, so its evidence is the agent's own container:
+/// the NVIDIA nodes CDI put there, or their absence.
+#[test]
+fn podman_goes_by_cdi_with_the_agents_own_nvidia_nodes_as_evidence() {
     let root = FakeRoot::new("runtime-cdi-podman");
     let mut f = rootless(facts(None));
     f.info.kind = EngineKind::Podman;
+    let checks = probe(&nvidia_env(&root, f.clone(), vec![(0, true)]));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(c.remediation.contains("prepare-host.sh"), "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+
+    root.file("dev/nvidiactl", "");
     let checks = probe(&nvidia_env(&root, f, vec![(0, true)]));
     let c = get(&checks, CDI_ID);
     assert_eq!(c.status, PASS, "{c:?}");

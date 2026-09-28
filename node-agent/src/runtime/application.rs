@@ -217,6 +217,9 @@ pub(crate) struct ApplicationIntent {
     /// It prevents a lost exec reply from authorizing a fresh exec identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvidia_params_repair: Option<NvidiaParamsRepair>,
+    /// How the NVIDIA GPU was requested at create; the read-back judges against this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_injection: Option<crate::runtime::GpuInjection>,
     pub phase: ApplicationPhase,
     pub result: Option<ApplicationResult>,
 }

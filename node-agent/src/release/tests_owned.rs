@@ -40,7 +40,7 @@ fn host(new: Behaviour) -> FakeState {
             runtimes: vec!["runc".into()],
             cdi_devices: Vec::new(),
             rootless: false,
-            // A rootful Docker without an NVIDIA CDI device: `--gpus`, as before RH-07.
+            // A rootful Docker without an NVIDIA CDI device: `--gpus`.
             gpu_injection: Some(quasar_runtime::GpuInjection::DeviceRequest),
         },
         host_devices: ["/dev/dri", "/dev/uinput", "/dev/kmsg"]

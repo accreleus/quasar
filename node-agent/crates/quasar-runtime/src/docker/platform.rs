@@ -70,6 +70,7 @@ fn mutation_error(error: Error) -> RuntimeError {
 pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, RuntimeError> {
     let (docker, info) = discover(config).await?;
     let sys = docker.info().await.map_err(classify)?;
+    let gpu_injection = crate::docker::gpu_injection_from_info(info.kind, &sys);
     let mut runtimes: Vec<String> = sys.runtimes.unwrap_or_default().into_keys().collect();
     runtimes.sort();
     let mut cdi_devices: Vec<String> = sys
@@ -82,16 +83,12 @@ pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, Ru
     let mode = crate::EngineMode::from_security_options(
         sys.security_options.as_deref().unwrap_or_default(),
     );
-    let cdi = sys.cdi_spec_dirs.map(|spec_dirs| crate::CdiFacts {
-        spec_dirs,
-        devices: cdi_devices.clone(),
-    });
     Ok(EngineHost {
         name: sys.name.filter(|v| !v.is_empty()),
         runtimes,
         cdi_devices,
         rootless: mode == crate::EngineMode::Rootless,
-        gpu_injection: crate::GpuInjection::for_engine(info.kind, mode, cdi.as_ref()),
+        gpu_injection,
     })
 }
 
