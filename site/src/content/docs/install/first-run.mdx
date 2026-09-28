@@ -173,10 +173,11 @@ you can run it later from the administration area.
 
 You land in the admin area. The sensible order from here:
 
-1. **Switch updates to edge.** Under Admin, Fleet, Releases, set the channel to
-   `edge` and press **Check now**. A new instance follows `stable`, and there is
-   no stable release of owned installs yet, so until you switch, the page lists
-   nothing and never will. See [Channels](/quasar/admin/releases/#channels).
+1. **Check the update channel.** Admin, Fleet, Releases should read `edge`,
+   which is where every release of owned installs is published for now. A new
+   owned install starts there. One installed before that change started on
+   `stable`, which lists nothing for it: set the channel to `edge` and press
+   **Check now**. See [Channels](/quasar/admin/releases/#channels).
 2. [Check your install](/quasar/install/verify/) works end to end.
 3. [Add apps](/quasar/admin/apps/) beyond whatever library discovery gave you.
 4. [Invite people](/quasar/admin/users/), if it is not just you.

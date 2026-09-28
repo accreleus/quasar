@@ -404,6 +404,13 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **A new owned install starts on the edge release channel (amendment 16).** Every release of
+  owned installs is an edge build until a stable one ships, so on `stable` a fresh install's
+  Fleet ▸ Releases listed nothing, ever. A control plane running under a recovery actor now
+  seeds `edge` when its first boot creates the instance settings; an existing install is not
+  changed (switch it once under Fleet ▸ Releases), and a Compose or source install still
+  starts on `stable`. The seed is withdrawn when the first stable release of owned installs
+  is cut, and installs made before then will need switching to `stable` by hand.
 - **The public site describes RH-05 and RH-06 as they now behave.** A new install is told to
   switch Fleet ▸ Releases to the edge channel, since stable lists nothing for an owned install
   yet. Pages no longer say a Compose install's data cannot be moved, and the quick start's

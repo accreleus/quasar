@@ -136,7 +136,13 @@ Which platform releases the admin console offers is an **instance setting**, not
 knob in `deploy/.env`: Admin › Fleet › Releases › Channel, stored in
 `instance_settings.release_channel` and settable through
 `PATCH /v1/admin/settings`. Accepted values, **default `stable`**; anything else
-is `400 validation_failed`:
+is `400 validation_failed`. **An owned install starts on `edge`** (amendment 16):
+a control plane running under a recovery actor seeds `edge` when its first boot
+creates the settings row, because every release of owned installs is an edge
+build until a stable one ships. It is written once and never over an existing
+row, so an install made before this change stays on `stable` until an admin
+switches it. `settings.OwnedInstallReleaseChannel` is the constant to withdraw
+when the first stable release of owned installs is cut:
 
 | Value | What it offers | Source |
 |---|---|---|

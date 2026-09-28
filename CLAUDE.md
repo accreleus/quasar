@@ -219,7 +219,9 @@ session memory `current-focus.md`, not this file.**
 
 **Standing operational defaults (knobs, not history):**
 - **Self-update (2026-09-05, #104):** admins see and apply *platform releases* from Fleet ▸
-  Releases. Channel defaults to `stable` (GitHub Releases + `platform-release-manifest.v2.json`);
+  Releases. Channel defaults to `stable` (GitHub Releases + `platform-release-manifest.v2.json`),
+  except that an owned install's first boot seeds `edge` (amendment 16, until the first stable
+  owned release; `settings.OwnedInstallReleaseChannel`);
   `edge` follows a branch tag (default `develop`; RH06-era builds publish `o2-<branch>`). Detection is the `platform.release_detect`
   job, weekly, Monday 02:00 UTC (editable in the Jobs tab; run-now = "Check now"). Applying goes
   through each machine's **recovery actor** (an owned install, made with the seed), which only accepts
