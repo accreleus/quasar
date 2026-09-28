@@ -6,6 +6,7 @@
   "/home/example/.config/cdi",
   "/run/user/1000/cdi"
  ],
+ "CgroupDriver": "systemd",
  "CgroupVersion": "2",
  "DefaultRuntime": "runc",
  "DockerRootDir": "/home/example/.local/share/docker",

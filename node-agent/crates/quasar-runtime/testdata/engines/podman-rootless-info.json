@@ -1,6 +1,7 @@
 {
  "Architecture": "amd64",
  "CDISpecDirs": null,
+ "CgroupDriver": "systemd",
  "CgroupVersion": "2",
  "DefaultRuntime": "crun",
  "DockerRootDir": "/home/example/.local/share/containers/storage",

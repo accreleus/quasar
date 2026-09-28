@@ -4,6 +4,7 @@
   "/etc/cdi",
   "/run/cdi"
  ],
+ "CgroupDriver": "systemd",
  "CgroupVersion": "2",
  "DefaultRuntime": "runc",
  "DockerRootDir": "/var/lib/docker",
