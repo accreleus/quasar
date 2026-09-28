@@ -198,7 +198,7 @@ printf '%s' "$out7d2" | grep -q 'ok       SELinux container_use_xserver_devices 
 [ "$(grep -c 'semodule -i' "$r7d/.prepare-host-commands")" = 1 ] && pass "the module is installed once" || fail "module idempotent" "$(cat "$r7d/.prepare-host-commands")"
 r7e="$tmp/r7e"; mk_root "$r7e" nvidia; mkdir -p "$r7e/sys/fs/selinux/booleans"; printf '0 0' > "$r7e/sys/fs/selinux/booleans/container_use_xserver_devices"
 prep "$r7e" "$tmp/docker-only" --mode rootful >/dev/null 2>&1
-if grep -q setsebool "$r7e/.prepare-host-commands" 2>/dev/null; then fail "no boolean for Docker" ""; else pass "Docker does not get the SELinux boolean"; fi
+if grep -q setsebool "$r7e/.prepare-host-commands" 2>/dev/null; then fail "no boolean for Docker" ""; else pass "Docker without SELinux does not get the SELinux boolean"; fi
 
 # ── 8. a dry run changes nothing ────────────────────────────────────────────
 r8="$tmp/r8"; mk_root "$r8" nvidia
@@ -227,11 +227,11 @@ out9b2="$(prep "$r9b" "$tmp/podman-only" --mode rootless --engine podman --homes
   && pass "labels are added once" || fail "label idempotent" "$out9b2"
 r9c="$tmp/r9c"; mk_root "$r9c"; mkdir -p "$r9c/sys/fs/selinux"
 prep "$r9c" "$tmp/docker-only" --mode rootless --engine docker --homes /var/lib/quasar/homes >/dev/null 2>&1
-if grep -q semanage "$r9c/.prepare-host-commands" 2>/dev/null; then fail "no label for Docker" ""; else pass "Docker's data roots are not relabelled"; fi
+if grep -q semanage "$r9c/.prepare-host-commands" 2>/dev/null; then fail "no label for Docker" ""; else pass "Docker without SELinux: data roots are not relabelled"; fi
 grep 'Quasar Virtual' "$r9b/etc/udev/rules.d/70-quasar.rules" | grep -q 'SECLABEL{selinux}="system_u:object_r:container_file_t:s0"' \
   && [ "$(grep -c SECLABEL "$r9b/etc/udev/rules.d/70-quasar.rules")" = 1 ] \
   && pass "only Quasar's own input devices get the container label" || fail "input seclabel" "$(cat "$r9b/etc/udev/rules.d/70-quasar.rules")"
-if grep -q SECLABEL "$r9c/etc/udev/rules.d/70-quasar.rules"; then fail "no input label for Docker" ""; else pass "Docker's input rule carries no label"; fi
+if grep -q SECLABEL "$r9c/etc/udev/rules.d/70-quasar.rules"; then fail "no input label for Docker" ""; else pass "Docker without SELinux: the input rule carries no label"; fi
 if prep "$tmp/none" "$tmp/podman-only" --mode rootless --templates 'relative' 2>/dev/null; then fail "--templates relative" "exit 0"; else pass "--templates must be absolute"; fi
 for bad in '/srv/q|/etc' '/srv/q[a]' '/var/lib' '/home'; do
   if prep "$tmp/none" "$tmp/podman-only" --mode rootless --homes "$bad" 2>/dev/null; then fail "refuse $bad" "exit 0"; else pass "--homes $bad is refused (regex or system tree)"; fi
@@ -240,6 +240,20 @@ r9d="$tmp/r9d"; mk_root "$r9d"; mkdir -p "$r9d/sys/fs/selinux" "$r9d/data/people
 if prep "$r9d" "$tmp/podman-only" --mode rootless --engine podman --homes /data/people >/dev/null 2>&1; then fail "a root holding a user's home is not labelled" "exit 0"; else pass "a directory holding a user's home is never relabelled"; fi
 grep -qF 'container_file_t /var/lib/quasar\.d/h(/.*)?' "$(r=$tmp/r9e; mk_root "$r"; mkdir -p "$r/sys/fs/selinux"; prep "$r" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar.d/h >/dev/null 2>&1; echo "$r/.prepare-host-commands")" \
   && pass "a dot in the path is escaped in the file context" || fail "dot escaping" "$(cat "$tmp/r9e/.prepare-host-commands" 2>/dev/null)"
+
+# ── 9f. rootful Docker running --selinux-enabled confines like Podman ───────
+r9f="$tmp/r9f"; mk_root "$r9f" nvidia; mkdir -p "$r9f/sys/fs/selinux/booleans" "$r9f/usr/lib/systemd/system" "$r9f/var/lib/quasar/h" "$r9f/run/quasar-agent"
+printf '0 0' > "$r9f/sys/fs/selinux/booleans/container_use_xserver_devices"
+printf '[Service]\nExecStart=/usr/bin/dockerd \\\n    --selinux-enabled \\\n    --host=fd://\n' > "$r9f/usr/lib/systemd/system/docker.service"
+out9f="$(prep "$r9f" "$tmp/docker-only" --mode rootful --engine docker --homes /var/lib/quasar/h 2>&1)" || fail "docker selinux run" "$out9f"
+grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/h(/.*)?' "$r9f/.prepare-host-commands" \
+  && grep -qF 'semanage fcontext -a -t container_file_t /run/quasar-agent(/.*)?' "$r9f/.prepare-host-commands" \
+  && grep -q 'setsebool -P container_use_xserver_devices on' "$r9f/.prepare-host-commands" \
+  && grep -q 'semodule -i' "$r9f/.prepare-host-commands" \
+  && grep -q SECLABEL "$r9f/etc/udev/rules.d/70-quasar.rules" \
+  && grep -q 'd /run/quasar-agent 0755 root root' "$r9f/etc/tmpfiles.d/quasar.conf" \
+  && pass "rootful Docker with --selinux-enabled gets the labels, boolean, module and a boot-made runtime dir" \
+  || fail "docker selinux" "$(cat "$r9f/.prepare-host-commands" 2>/dev/null) $out9f"
 
 # ── argument validation ─────────────────────────────────────────────────────
 if prep "$tmp/none" "$tmp/podman-only" 2>/dev/null; then fail "--mode required" "exit 0"; else pass "--mode is required"; fi

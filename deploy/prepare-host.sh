@@ -184,8 +184,19 @@ label_root() { # label_root DIR
   say changed "SELinux label on $1 — sessions in confined containers can write there; labels only, nothing is re-owned"
 }
 
-# podman_selinux: Podman confines its containers here, so what they share needs the label.
-podman_selinux() { { [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; } && [ -d "$R/sys/fs/selinux" ]; }
+# containers_selinux: the engine confines its containers with SELinux here, so what they
+# share needs the label. Podman always does; Docker when its daemon runs --selinux-enabled
+# (Fedora CoreOS and uCore ship it so).
+docker_selinux() {
+  { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; } || return 1
+  grep -qs -- '--selinux-enabled' "$R/usr/lib/systemd/system/docker.service" \
+      "$R/etc/systemd/system/docker.service" "$R"/etc/systemd/system/docker.service.d/*.conf \
+    || grep -qs '"selinux-enabled"[[:space:]]*:[[:space:]]*true' "$R/etc/docker/daemon.json"
+}
+containers_selinux() {
+  [ -d "$R/sys/fs/selinux" ] || return 1
+  [ "$ENGINE" = podman ] || [ "$ENGINE" = both ] || docker_selinux
+}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -277,9 +288,16 @@ if [ "$MODE" = rootless ]; then
   # rootful install, or an engine creating a missing bind source, left behind as root's.
   run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
   stand_in && mkdir -p "$R/run/quasar-agent"
+elif containers_selinux; then
+  # Rootful: the engine would create a missing bind source itself, but unlabelled. Made
+  # at boot by systemd, it takes the container label the rule below records.
+  printf '# Written by Quasar host preparation. The node agent'"'"'s runtime directory, shared with its sessions.\nd /run/quasar-agent 0755 root root -\n' \
+    | put /etc/tmpfiles.d/quasar.conf 0644 "/run/quasar-agent, made at every boot with its SELinux label" || unchanged
+  run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
+  stand_in && mkdir -p "$R/run/quasar-agent"
 fi
 # Sessions connect to the Wayland and PulseAudio sockets the agent makes here.
-if podman_selinux && { [ -d "$R/run/quasar-agent" ] || [ "$DRY_RUN" = 1 ]; }; then
+if containers_selinux && { [ -d "$R/run/quasar-agent" ] || [ "$DRY_RUN" = 1 ]; }; then
   label_root /run/quasar-agent
 fi
 
@@ -292,7 +310,7 @@ acl="ACTION!=\"remove\", ENV{DEVNAME}==\"?*\", RUN+=\"$SETFACL -m g:$QUSER:rw \$
 # Under SELinux a confined session may not open event_device_t nodes. Quasar's own input
 # devices, and only those, get the container file type (the rest keep theirs).
 input_label=""
-podman_selinux && input_label=', SECLABEL{selinux}="system_u:object_r:container_file_t:s0"'
+containers_selinux && input_label=', SECLABEL{selinux}="system_u:object_r:container_file_t:s0"'
 {
   cat <<EOF
 # Written by Quasar's host preparation (deploy/prepare-host.sh). Re-run it to change this file.
@@ -422,7 +440,7 @@ if [ -e "$R/proc/driver/nvidia/version" ]; then
   # containers under SELinux, and the policy's own boolean for exactly that label is
   # what lets them open the GPU: narrower than disabling labels for the container.
   bool="$R/sys/fs/selinux/booleans/container_use_xserver_devices"
-  if { [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; } && [ -f "$bool" ]; then
+  if containers_selinux && [ -f "$bool" ]; then
     case "$(cat "$bool")" in
       1*) say ok "SELinux container_use_xserver_devices on" ;;
       *)
@@ -536,7 +554,7 @@ data_root() { # data_root DIR WHAT
     stand_in && mkdir -p "$R$1"
     say changed "$2 $1 — $3"
   fi
-  if podman_selinux && { [ -d "$R$1" ] || [ "$DRY_RUN" = 1 ]; }; then
+  if containers_selinux && { [ -d "$R$1" ] || [ "$DRY_RUN" = 1 ]; }; then
     label_root "$1"
   fi
 }

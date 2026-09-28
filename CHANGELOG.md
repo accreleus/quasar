@@ -32,6 +32,10 @@ own; the two do not move together, and that is deliberate.
   On rootless Docker, `homes_root_writable` warns (never blocks) that session files are
   owned on the host by a subordinate ID, since Docker cannot map a container's user onto
   the Quasar user (owner decision on #404).
+  Docker whose daemon runs `--selinux-enabled` (Fedora CoreOS and uCore ship it so) is
+  treated like Podman under SELinux: host preparation labels the data roots, the runtime
+  directory (made at boot by systemd on rootful hosts too) and Quasar's input devices, and
+  installs the NVIDIA rule; Steam-type apps run as `container_engine_t` there as well.
 - **Input without `mknod` (RH-07, #401).** The agent waits for the host's own
   `/dev/input/eventN` node (through its `/dev/input` bind) for each virtual device it
   creates, and never creates or removes device nodes. It then proves it can open the node:

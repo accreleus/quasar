@@ -150,7 +150,8 @@ impl PodmanFacts {
     }
 }
 
-/// The SELinux type for app containers on SELinux Podman: still confined, but the policy's
+/// The SELinux type for app containers on an SELinux-confining engine (Podman, or Docker
+/// run --selinux-enabled): still confined, but the policy's
 /// type for nested sandboxes, so Steam's and Flatpak's bwrap can mount. `container_t`
 /// refuses those mounts and Steam never shows a window.
 pub(crate) const NESTED_SANDBOX_LABEL: &str = "label=type:container_engine_t";

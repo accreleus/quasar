@@ -1176,12 +1176,9 @@ pub(crate) async fn start(
             // D14: rootless Podman maps the app's ids onto the Quasar user. Rootless Docker
             // has no per-container mapping; its homes keep subordinate ids (a readiness gap).
             let podman = docker.dialect == super::dialect::Dialect::Podman;
-            let (rootless, selinux) = if podman {
-                docker.confinement().await?
-            } else {
-                (false, false)
-            };
-            let keep_id = rootless.then(|| app_ids(&request.environment));
+            // Docker confines with SELinux too when its daemon runs --selinux-enabled.
+            let (rootless, selinux) = docker.confinement().await?;
+            let keep_id = (podman && rootless).then(|| app_ids(&request.environment));
             // The catalog already runs these apps unconfined by seccomp for their own
             // sandboxes (bwrap); under SELinux the same need is the nested-sandbox type.
             let nested_sandbox_label = selinux

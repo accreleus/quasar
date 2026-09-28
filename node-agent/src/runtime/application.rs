@@ -224,7 +224,7 @@ pub(crate) struct ApplicationIntent {
     /// user (`keep-id`), so home files on the host belong to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_id: Option<(u32, u32)>,
-    /// On SELinux Podman the app runs as the nested-sandbox type
+    /// On an engine that confines with SELinux the app runs as the nested-sandbox type
     /// (`dialect::NESTED_SANDBOX_LABEL`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nested_sandbox_label: bool,
