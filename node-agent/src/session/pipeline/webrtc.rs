@@ -611,6 +611,19 @@ pub(super) fn connect_state_logging(
         let state =
             webrtc.property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
         tracing::info!("ICE connection state: {state:?}");
+        // RH-07 #403: a real session's ICE outcome is the media-path evidence (the demo and
+        // test pipelines carry no trace channel and are not).
+        if ice_trace.is_some() {
+            use crate::session::media_evidence::{forget, note_ice_state, IceOutcome};
+            use gstreamer_webrtc::WebRTCICEConnectionState as S;
+            let key = webrtc.as_ptr() as usize;
+            match state {
+                S::Connected | S::Completed => note_ice_state(key, IceOutcome::Connected),
+                S::Failed => note_ice_state(key, IceOutcome::Failed),
+                S::Closed => forget(key),
+                _ => note_ice_state(key, IceOutcome::Other),
+            }
+        }
         // ICE may jump Checking → Completed, skipping `Connected`. Both mean established.
         if matches!(
             state,

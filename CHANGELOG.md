@@ -25,6 +25,15 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Media reachability is judged from real traffic (RH-07, #403).** `media_reachability` no
+  longer reads the host's firewall rules, which needed `NET_ADMIN` and which a rootless
+  engine cannot grant. It reads what real sessions showed:
+  - **pass:** a browser on another machine reached the host;
+  - **fail:** the browser offered candidates and none of its traffic arrived. The check
+    names the firewall fix for the host's media port range;
+  - **unknown:** before any session.
+
+  It never blocks, and traffic from the host to itself never counts.
 - **One least-privilege node-agent recipe (RH-07, #402).** Recipe revision 3, applied by the
   recovery actor in every engine mode (rootful included), removes from the node agent:
   - the host's `/dev` mount;

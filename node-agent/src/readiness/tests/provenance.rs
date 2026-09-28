@@ -105,7 +105,11 @@ fn every_local_check_names_a_known_source() {
     for checks in local_check_sets("prov-source") {
         for c in &checks {
             // The engine's own answers: runtime_* and, from amendment 17, engine_*.
-            let want = if c.id.starts_with("runtime_") || c.id.starts_with("engine_") {
+            // media_reachability reads real session traffic the runtime saw (amendment 17).
+            let want = if c.id.starts_with("runtime_")
+                || c.id.starts_with("engine_")
+                || c.id == "media_reachability"
+            {
                 "runtime"
             } else {
                 "local"
