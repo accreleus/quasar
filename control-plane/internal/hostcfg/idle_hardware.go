@@ -134,6 +134,14 @@ func automaticEncoder(vendor string) string {
 // GPU and readiness arrays. A previous websocket cannot refresh or clear the
 // projection after a new connection has taken the journal gate.
 func (s *Store) ObserveHardwareReport(ctx context.Context, hostID, connectionID string, gpuRaw, readinessRaw json.RawMessage) error {
+	// No GPUs is an empty array: the column holds arrays, and a host whose GPU capacity
+	// could not be read (an empty list marshals to JSON null) must not fail the whole
+	// capacity report and drop the connection. A null readiness is absent, which already
+	// means "unknown" below and clears the evidence.
+	gpuRaw = emptyArrayIfNull(gpuRaw)
+	if strings.TrimSpace(string(readinessRaw)) == "null" {
+		readinessRaw = nil
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -243,4 +251,11 @@ func hardwareEvidenceSignature(gpuRaw, readinessRaw []byte) string {
 		return ""
 	}
 	return digest
+}
+
+func emptyArrayIfNull(raw json.RawMessage) json.RawMessage {
+	if trimmed := strings.TrimSpace(string(raw)); trimmed == "" || trimmed == "null" {
+		return json.RawMessage(`[]`)
+	}
+	return raw
 }

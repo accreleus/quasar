@@ -975,3 +975,32 @@ func TestAcceptedThenRecoveredCannotReplayOldReview(t *testing.T) {
 		t.Fatalf("recovery not bound into new review: %+v", fresh)
 	}
 }
+
+// Found on the first rootless Podman install (RH-07): an agent whose GPU capacity cannot
+// be read reports no GPUs, which marshalled to JSON null. The column requires an array,
+// so every capacity report failed and the control plane closed the agent's connection
+// in a loop. No GPUs is an empty array.
+func TestAHardwareReportWithNoGPUsIsAnEmptyArrayNotAConnectionLoop(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	ctx := context.Background()
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	connection := "00000000-0000-4000-8000-000000000338" // the one completeEmptyHostJournal reconciled
+	if err := store.ObserveDeploymentSettings(ctx, hostID, connection, json.RawMessage(`{"encoder":"vulkan"}`)); err != nil {
+		t.Fatal(err)
+	}
+	readiness := json.RawMessage(`[{"id":"runtime_engine","status":"warn"}]`)
+	for _, gpus := range []json.RawMessage{json.RawMessage(`null`), nil} {
+		if err := store.ObserveHardwareReport(ctx, hostID, connection, gpus, readiness); err != nil {
+			t.Fatalf("gpus=%q: %v", gpus, err)
+		}
+	}
+	if err := store.ObserveHardwareReport(ctx, hostID, connection, json.RawMessage(`[]`), json.RawMessage(`null`)); err != nil {
+		t.Fatalf("readiness=null: %v", err)
+	}
+}

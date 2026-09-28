@@ -654,6 +654,14 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A host whose GPU capacity cannot be read no longer loses its connection in a loop.** Its
+  capacity report carried `gpus: null`, which the control plane tried to store as hardware
+  evidence and failed, closing the connection each time. No GPUs is now an empty list. Found
+  on the first rootless Podman install (RH-07).
+- **The recovery actor finds `/dev/uinput` and `/dev/kmsg` on SELinux hosts.** Its probe
+  checked them with `stat`, which SELinux denies a confined container, so they read as
+  absent and the agent was created without input devices. It now lists `/dev` instead.
+  RH-07, #402.
 - **`uninstall --purge` on a control-only machine no longer prints an empty homes path (#389).**
   It said "Homes under  are host directories"; a control-only machine keeps no homes, so the
   purge report now leaves the homes sentence out there and names the home root everywhere else.

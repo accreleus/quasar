@@ -5,6 +5,11 @@
 //! with the host's `/dev` bound read-only at `/host/dev`, reads what it printed, and
 //! removes it whatever happened.
 //!
+//! Presence is read by listing `/host/dev` (a glob, which is a directory read), never by
+//! `stat`ing a node: under SELinux a confined container may list the host's `/dev` but
+//! not `stat` most of its nodes, and a `[ -e ]` there reads "absent" (found on the first
+//! rootless Podman install, RH-07).
+//!
 //! Which evidence wins: **device nodes**. `/sys/class/drm` is not namespaced, so inside a
 //! system container (an LXC guest) it lists every GPU of the physical host, including
 //! ones whose nodes this machine does not have. The probe therefore starts from the
@@ -30,7 +35,7 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
-for d in uinput kmsg nvidiactl; do [ -e "/host/dev/$d" ] && echo "dev $d"; done
+for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl) echo "dev ${f##*/}";; esac; done
 [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
