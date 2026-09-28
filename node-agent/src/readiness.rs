@@ -1837,9 +1837,9 @@ fn check_media_reachability(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
     match &env.firewall {
         FirewallPosture::Unknown => skip(
             ID,
-            "could not determine this host's inbound firewall posture — no firewalld or nft \
-             client tool answered from inside the agent container (nft is in the image and needs \
-             CAP_NET_ADMIN, which the compose file grants)",
+            "this host's inbound firewall is not read: that needs NET_ADMIN, which a \
+             least-privilege agent (recipe revision 3, and every rootless engine) does not \
+             hold. Real session traffic will be the evidence instead (RH-07)",
         ),
         FirewallPosture::Unfiltered { detail, .. } => pass(
             ID,
@@ -4484,9 +4484,9 @@ table ip raw {
         assert_eq!(c.status, SKIP);
         assert_eq!(
             c.summary,
-            "could not determine this host's inbound firewall posture — no firewalld or nft \
-             client tool answered from inside the agent container (nft is in the image and \
-             needs CAP_NET_ADMIN, which the compose file grants)"
+            "this host's inbound firewall is not read: that needs NET_ADMIN, which a \
+             least-privilege agent (recipe revision 3, and every rootless engine) does not \
+             hold. Real session traffic will be the evidence instead (RH-07)"
         );
         assert!(c.remediation.is_empty());
     }

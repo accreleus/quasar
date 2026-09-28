@@ -15,6 +15,6 @@
 /// given.
 /// 3 (RH-07 #402): least privilege. No host `/dev` mount, no `NET_ADMIN` or `SYSLOG`,
 /// `/dev/kmsg` only when the host allows kernel-log reads, and `label=disable`. This agent
-/// reads GPU faults only through that optional grant, and media reachability from real
-/// traffic.
+/// reads GPU faults only through that optional grant; without NET_ADMIN its firewall-reading
+/// media reachability check reports that it cannot read the firewall (#403 replaces it).
 pub const RECIPE_REVISION: u32 = 3;
