@@ -201,6 +201,9 @@ pub(crate) struct HelperIntent {
     /// Absent in every journal written before #258; part of the fingerprint.
     #[serde(default)]
     pub gpu_probe: Option<GpuProbeRun>,
+    /// How the NVIDIA GPU was requested at create; the read-back judges against this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_injection: Option<crate::runtime::GpuInjection>,
     /// Kept separate from `run` so journals written by the diagnostic-only
     /// implementation continue to decode as the diagnostic profile.
     #[serde(default)]

@@ -369,3 +369,40 @@ fn a_restart_policy_update_is_read_back() {
         ErrorKind::Engine
     );
 }
+
+/// D10: CDI everywhere it resolves; `--gpus` only on a rootful Docker without an
+/// NVIDIA CDI device; nothing on a rootless Docker without one.
+#[test]
+fn gpu_injection_is_decided_from_engine_facts() {
+    let with_nvidia = CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec![
+            "nvidia.com/gpu=0 (cdi)".into(),
+            "nvidia.com/gpu=all (cdi)".into(),
+        ],
+    };
+    let empty = CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec![],
+    };
+    use EngineKind::*;
+    use EngineMode::*;
+    use GpuInjection::*;
+    for (kind, mode, cdi, want) in [
+        (Podman, Rootless, None, Some(Cdi)),
+        (Podman, Rootful, None, Some(Cdi)),
+        (Docker, Rootful, Some(&with_nvidia), Some(Cdi)),
+        (Docker, Rootless, Some(&with_nvidia), Some(Cdi)),
+        (Docker, Rootful, Some(&empty), Some(DeviceRequest)),
+        (Docker, Rootful, None, Some(DeviceRequest)),
+        (Docker, Rootless, Some(&empty), None),
+        (Docker, Rootless, None, None),
+        (Unknown, Rootful, None, Some(DeviceRequest)),
+    ] {
+        assert_eq!(
+            GpuInjection::for_engine(kind, mode, cdi),
+            want,
+            "{kind:?} {mode:?} {cdi:?}"
+        );
+    }
+}

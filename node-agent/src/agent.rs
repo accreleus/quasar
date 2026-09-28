@@ -1848,6 +1848,7 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
     let checks = crate::readiness::probe(
         &crate::readiness::ProbeEnv::live(nvidia_host, "")
             .with_gpu_present(gpu_present)
+            .with_gpus(&cap.gpus)
             .with_codec_probe(None),
     )
     .into_iter()
@@ -2077,13 +2078,16 @@ async fn connect_and_run(
     // codec probe above), so nothing here re-probes or launches a container.
     let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
     let gpu_present = !cap.gpus.is_empty();
+    let readiness_gpus = cap.gpus.clone();
     let readiness = {
         let lib32 = first_settings.nvidia_lib32_path.clone();
         let probed_codecs = host_codec_report.as_ref().map(|r| r.codecs.clone());
+        let gpus = readiness_gpus.clone();
         offload_probe(move || {
             crate::readiness::probe(
                 &crate::readiness::ProbeEnv::live(nvidia_host, &lib32)
                     .with_gpu_present(gpu_present)
+                    .with_gpus(&gpus)
                     .with_codec_probe(probed_codecs.as_deref()),
             )
         })
@@ -2333,10 +2337,12 @@ async fn connect_and_run(
                 let sender = readiness_tx.clone();
                 let lib32 = mgr.runtime_settings.nvidia_lib32_path.clone();
                 let codecs = mgr.host_codec_report.as_ref().map(|r| r.codecs.clone());
+                let gpus = readiness_gpus.clone();
                 tokio::spawn(run_readiness_refresh(
                     move || crate::readiness::probe(
                         &crate::readiness::ProbeEnv::live(nvidia_host, &lib32)
                             .with_gpu_present(gpu_present)
+                            .with_gpus(&gpus)
                             .with_codec_probe(codecs.as_deref()),
                     ),
                     READINESS_REFRESH_DEADLINE,

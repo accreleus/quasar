@@ -189,8 +189,13 @@ out7d="$(prep "$r7d" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 grep -q 'setsebool -P container_use_xserver_devices on' "$r7d/.prepare-host-commands" && printf '%s' "$out7d" | grep -q 'SELinux stays enforcing' \
   && pass "NVIDIA + SELinux + Podman turns on container_use_xserver_devices, with its reason" || fail "selinux boolean" "$out7d"
 if grep -qE 'setenforce|label=disable|container_use_devices' "$script"; then fail "never relaxes SELinux" ""; else pass "never disables SELinux, labels or all-device access"; fi
+grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r7d/.prepare-host-commands" \
+  && grep -q '(allow container_engine_t xserver_misc_device_t (chr_file' "$r7d/etc/quasar/selinux/quasar-nested-gpu.cil" \
+  && [ "$(grep -c allow "$r7d/etc/quasar/selinux/quasar-nested-gpu.cil")" = 1 ] \
+  && pass "the nested-sandbox type gets exactly one NVIDIA device rule" || fail "nested gpu module" "$(cat "$r7d/.prepare-host-commands")"
 out7d2="$(prep "$r7d" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 printf '%s' "$out7d2" | grep -q 'ok       SELinux container_use_xserver_devices on' && pass "the boolean is left alone once on" || fail "selinux idempotent" "$out7d2"
+[ "$(grep -c 'semodule -i' "$r7d/.prepare-host-commands")" = 1 ] && pass "the module is installed once" || fail "module idempotent" "$(cat "$r7d/.prepare-host-commands")"
 r7e="$tmp/r7e"; mk_root "$r7e" nvidia; mkdir -p "$r7e/sys/fs/selinux/booleans"; printf '0 0' > "$r7e/sys/fs/selinux/booleans/container_use_xserver_devices"
 prep "$r7e" "$tmp/docker-only" --mode rootful >/dev/null 2>&1
 if grep -q setsebool "$r7e/.prepare-host-commands" 2>/dev/null; then fail "no boolean for Docker" ""; else pass "Docker does not get the SELinux boolean"; fi
@@ -207,6 +212,34 @@ r9="$tmp/r9"; mk_root "$r9"; mkdir -p "$r9/data/homes"
 prep "$r9" "$tmp/podman-only" --mode rootless --engine podman --homes /data/homes >/dev/null 2>&1
 if grep -qE 'chown|install -d' "$r9/.prepare-host-commands"; then fail "existing homes untouched" "$(cat "$r9/.prepare-host-commands")"; else pass "an existing homes root is never re-owned"; fi
 if grep -rq 'chown -R\|chown --recursive' "$script"; then fail "no recursive chown in the script" ""; else pass "the script contains no recursive re-own"; fi
+
+# ── 9b. SELinux Podman: the data roots carry the container label, persistently ─
+r9b="$tmp/r9b"; mk_root "$r9b"; mkdir -p "$r9b/sys/fs/selinux"
+out9b="$(prep "$r9b" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates 2>&1)" || fail "labelled run" "$out9b"
+grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/homes(/.*)?' "$r9b/.prepare-host-commands" \
+  && grep -qF 'restorecon -R /var/lib/quasar/templates' "$r9b/.prepare-host-commands" \
+  && pass "homes and templates roots get a persistent container_file_t context" || fail "selinux labels" "$(cat "$r9b/.prepare-host-commands" 2>/dev/null) $out9b"
+[ -d "$r9b/var/lib/quasar/templates" ] && pass "--templates creates the templates root" || fail "templates root" "missing"
+grep -qF 'semanage fcontext -a -t container_file_t /run/quasar-agent(/.*)?' "$r9b/.prepare-host-commands" \
+  && pass "the agent's runtime directory (session sockets) gets the container label" || fail "runtime dir label" "$(cat "$r9b/.prepare-host-commands")"
+out9b2="$(prep "$r9b" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates 2>&1)"
+[ "$(grep -c 'semanage fcontext' "$r9b/.prepare-host-commands")" = 3 ] && printf '%s' "$out9b2" | grep -q 'ok       SELinux label on /var/lib/quasar/homes' \
+  && pass "labels are added once" || fail "label idempotent" "$out9b2"
+r9c="$tmp/r9c"; mk_root "$r9c"; mkdir -p "$r9c/sys/fs/selinux"
+prep "$r9c" "$tmp/docker-only" --mode rootless --engine docker --homes /var/lib/quasar/homes >/dev/null 2>&1
+if grep -q semanage "$r9c/.prepare-host-commands" 2>/dev/null; then fail "no label for Docker" ""; else pass "Docker's data roots are not relabelled"; fi
+grep 'Quasar Virtual' "$r9b/etc/udev/rules.d/70-quasar.rules" | grep -q 'SECLABEL{selinux}="system_u:object_r:container_file_t:s0"' \
+  && [ "$(grep -c SECLABEL "$r9b/etc/udev/rules.d/70-quasar.rules")" = 1 ] \
+  && pass "only Quasar's own input devices get the container label" || fail "input seclabel" "$(cat "$r9b/etc/udev/rules.d/70-quasar.rules")"
+if grep -q SECLABEL "$r9c/etc/udev/rules.d/70-quasar.rules"; then fail "no input label for Docker" ""; else pass "Docker's input rule carries no label"; fi
+if prep "$tmp/none" "$tmp/podman-only" --mode rootless --templates 'relative' 2>/dev/null; then fail "--templates relative" "exit 0"; else pass "--templates must be absolute"; fi
+for bad in '/srv/q|/etc' '/srv/q[a]' '/var/lib' '/home'; do
+  if prep "$tmp/none" "$tmp/podman-only" --mode rootless --homes "$bad" 2>/dev/null; then fail "refuse $bad" "exit 0"; else pass "--homes $bad is refused (regex or system tree)"; fi
+done
+r9d="$tmp/r9d"; mk_root "$r9d"; mkdir -p "$r9d/sys/fs/selinux" "$r9d/data/people/ann"; printf 'ann:x:1500:1500::/data/people/ann:/bin/sh\n' >> "$r9d/etc/passwd"
+if prep "$r9d" "$tmp/podman-only" --mode rootless --engine podman --homes /data/people >/dev/null 2>&1; then fail "a root holding a user's home is not labelled" "exit 0"; else pass "a directory holding a user's home is never relabelled"; fi
+grep -qF 'container_file_t /var/lib/quasar\.d/h(/.*)?' "$(r=$tmp/r9e; mk_root "$r"; mkdir -p "$r/sys/fs/selinux"; prep "$r" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar.d/h >/dev/null 2>&1; echo "$r/.prepare-host-commands")" \
+  && pass "a dot in the path is escaped in the file context" || fail "dot escaping" "$(cat "$tmp/r9e/.prepare-host-commands" 2>/dev/null)"
 
 # ── argument validation ─────────────────────────────────────────────────────
 if prep "$tmp/none" "$tmp/podman-only" 2>/dev/null; then fail "--mode required" "exit 0"; else pass "--mode is required"; fi

@@ -135,3 +135,40 @@ pub struct CdiFacts {
     /// `"<id> (<source>)"` per discovered device.
     pub devices: Vec<String>,
 }
+
+/// How an NVIDIA GPU reaches a container on this engine (RH-07 #399, decision D10). One
+/// decision for every container Quasar creates, from what the engine reports about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuInjection {
+    /// A CDI device request (`nvidia.com/gpu=all`): the one mechanism in every engine mode.
+    Cdi,
+    /// Docker's `--gpus` device request: only a rootful Docker whose engine resolves no
+    /// NVIDIA CDI device.
+    DeviceRequest,
+}
+
+/// The CDI device every NVIDIA consumer requests.
+pub const NVIDIA_CDI_DEVICE: &str = "nvidia.com/gpu=all";
+
+impl GpuInjection {
+    /// Podman resolves CDI whenever a specification exists (it does not list them in its
+    /// compatible `/info`), so it always asks by CDI. Docker asks by CDI when it discovered an
+    /// NVIDIA CDI device, and otherwise only a rootful Docker may fall back to `--gpus`. `None`:
+    /// this engine cannot be given an NVIDIA GPU at all, which is a readiness failure naming
+    /// the host preparation, never a privileged fallback.
+    pub fn for_engine(kind: EngineKind, mode: EngineMode, cdi: Option<&CdiFacts>) -> Option<Self> {
+        // Devices may carry a ` (<source>)` suffix; the id must be exactly the one requested.
+        let nvidia_cdi = cdi.is_some_and(|c| {
+            c.devices
+                .iter()
+                .any(|d| d.split_whitespace().next() == Some(NVIDIA_CDI_DEVICE))
+        });
+        match (kind, mode) {
+            (EngineKind::Podman, _) => Some(GpuInjection::Cdi),
+            _ if nvidia_cdi => Some(GpuInjection::Cdi),
+            (_, EngineMode::Rootful) => Some(GpuInjection::DeviceRequest),
+            (_, EngineMode::Rootless) => None,
+        }
+    }
+}

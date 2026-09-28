@@ -302,7 +302,12 @@ fn real_engine_readback_passes_a_session_shaped_container() {
         name: unique.clone(),
         image,
         pull_never: true,
-        command: vec!["sh".into(), "-c".into(), "echo readback-ok; exit 0".into()],
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "echo readback-ok; cat /proc/self/uid_map; exit 0".into(),
+        ],
+        environment: vec!["PUID=1000".into(), "PGID=1000".into()],
         typed_mounts: vec![crate::runtime::application::ApplicationMount::Volume {
             source: format!("{unique}-vol"),
             target: "/data/vol".into(),
@@ -340,6 +345,15 @@ fn real_engine_readback_passes_a_session_shaped_container() {
     let result = runtime.observe_application(id.clone()).wait().unwrap();
     assert_eq!(result.exit_code, Some(0));
     assert!(result.stdout.contains("readback-ok"));
+    // #404: on rootless Podman (QUASAR_TEST_EXPECT_KEEP_ID=1) PUID is the engine's own user.
+    if std::env::var("QUASAR_TEST_EXPECT_KEEP_ID").as_deref() == Ok("1") {
+        let lines: Vec<Vec<&str>> = result
+            .stdout
+            .lines()
+            .map(|l| l.split_whitespace().collect())
+            .collect();
+        assert!(lines.contains(&vec!["1000", "0", "1"]), "{}", result.stdout);
+    }
     runtime.cleanup_application(id).wait().unwrap();
     assets.cleaned = true;
 }
@@ -549,7 +563,9 @@ fn real_docker_gpu_probe_profile_runs_with_dri_access_and_cleans_up() {
                 }),
             )
             .await;
-        docker.inspect_container(&container, None).await.is_err()
+        quasar_runtime::docker::inspect_container_tolerant(&docker, &container)
+            .await
+            .is_err()
     });
     let result = result.unwrap();
     assert_eq!(result.exit_code, Some(23), "stderr: {}", result.stderr);

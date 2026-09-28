@@ -29,7 +29,7 @@ use std::time::Duration;
 use bollard::models::{DeviceMapping, DeviceRequest};
 
 use super::{RuntimeConfig, RuntimeError};
-use crate::runtime::{EngineKind, ErrorKind};
+use crate::runtime::{EngineKind, ErrorKind, GpuInjection};
 
 /// Which engine's reporting rules apply. An engine this agent cannot name gets Docker's,
 /// the strictest.
@@ -53,6 +53,7 @@ impl Dialect {
 pub(crate) struct Engine {
     docker: bollard::Docker,
     pub(crate) dialect: Dialect,
+    kind: EngineKind,
     socket: PathBuf,
     deadline: Duration,
 }
@@ -69,6 +70,7 @@ pub(crate) async fn open(config: &RuntimeConfig) -> Result<Engine, RuntimeError>
     Ok(Engine {
         docker,
         dialect: Dialect::of(info.kind),
+        kind: info.kind,
         socket: config.socket.clone(),
         deadline: config.deadline,
     })
@@ -86,6 +88,10 @@ pub(crate) struct PodmanFacts {
     pub oci_runtime: Option<String>,
     /// Each realized mount's propagation, which the compatible inspect does not report.
     pub mount_propagations: Vec<String>,
+    /// The user namespace's maps as `container:parent:length`; Podman reports a keep-id
+    /// container's `UsernsMode` only as `private`, so these are the proof of the mapping.
+    pub uid_map: Vec<String>,
+    pub gid_map: Vec<String>,
 }
 
 impl PodmanFacts {
@@ -122,16 +128,83 @@ impl PodmanFacts {
             .get("OCIRuntime")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let map = |key: &str| -> Vec<String> {
+            value
+                .pointer(&format!("/HostConfig/IDMappings/{key}"))
+                .and_then(|m| m.as_array())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|e| e.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         Ok(Self {
             effective_caps,
             bounding_caps,
             oci_runtime,
             mount_propagations,
+            uid_map: map("UidMap"),
+            gid_map: map("GidMap"),
         })
     }
 }
 
+/// The SELinux type for app containers on SELinux Podman: still confined, but the policy's
+/// type for nested sandboxes, so Steam's and Flatpak's bwrap can mount. `container_t`
+/// refuses those mounts and Steam never shows a window.
+pub(crate) const NESTED_SANDBOX_LABEL: &str = "label=type:container_engine_t";
+
+/// The keep-id mapping `(uid, gid)` proven by Podman's maps: the one range that maps onto
+/// the engine's own user (parent id 0) is exactly `uid` (and `gid`), one id long.
+pub(crate) fn keep_id_ok(podman: Option<&PodmanFacts>, uid: u32, gid: u32) -> bool {
+    let onto_owner = |map: &[String]| -> Vec<String> {
+        map.iter()
+            .filter(|e| {
+                let parts: Vec<&str> = e.split(':').collect();
+                parts.len() == 3 && parts[1] == "0"
+            })
+            .cloned()
+            .collect()
+    };
+    podman.is_some_and(|f| {
+        onto_owner(&f.uid_map) == [format!("{uid}:0:1")]
+            && onto_owner(&f.gid_map) == [format!("{gid}:0:1")]
+    })
+}
+
 impl Engine {
+    /// Shadows bollard's inspect (reached through `Deref`) with the one that tolerates
+    /// Podman's `stopped` health status, so every read-back here uses it.
+    pub(crate) async fn inspect_container(
+        &self,
+        name_or_id: &str,
+        _options: Option<bollard::query_parameters::InspectContainerOptions>,
+    ) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error> {
+        quasar_runtime::docker::inspect_container_tolerant(&self.docker, name_or_id).await
+    }
+
+    /// `(rootless, selinux)`, from the engine's own `/info` security options.
+    pub(crate) async fn confinement(&self) -> Result<(bool, bool), RuntimeError> {
+        let sys = self.docker.info().await.map_err(super::classify)?;
+        let has = |name: &str| {
+            sys.security_options
+                .iter()
+                .flatten()
+                .any(|o| o.split(',').any(|p| p == name))
+        };
+        Ok((has("name=rootless"), has("name=selinux")))
+    }
+
+    /// How this engine injects an NVIDIA GPU now (decision D10). Asked per create, never
+    /// cached: a CDI specification written after the agent started must be picked up.
+    pub(crate) async fn gpu_injection(&self) -> Result<Option<GpuInjection>, RuntimeError> {
+        let sys = self.docker.info().await.map_err(super::classify)?;
+        Ok(quasar_runtime::docker::gpu_injection_from_info(
+            self.kind, &sys,
+        ))
+    }
+
     /// Podman's native inspect of one container; `None` on Docker. A Podman that does not
     /// answer it is an unknown outcome: the read-back cannot be proven.
     pub(crate) async fn podman_facts(&self, id: &str) -> Result<Option<PodmanFacts>, RuntimeError> {
@@ -301,9 +374,16 @@ impl Dialect {
                     return false;
                 }
                 let permissions = actual.cgroup_permissions.as_deref().unwrap_or("");
+                // Podman expands a requested directory (`/dev/dri`) into its nodes, and a
+                // CDI GPU into the nodes its specification lists.
+                let under = |dir: &str| {
+                    Path::new(host).parent() == Some(Path::new(dir)) && gpu_expansion(host)
+                };
                 host == inside
                     && (permissions.is_empty() || permissions == "rwm")
-                    && (requested.iter().any(|wanted| wanted == host)
+                    && (requested
+                        .iter()
+                        .any(|wanted| wanted == host || under(wanted))
                         || (gpu_requested && gpu_expansion(host)))
             }),
         }
@@ -404,6 +484,57 @@ fn gpu_expansion(path: &str) -> bool {
         }
         Some("/dev/nvidia-caps") => numbered(name, "nvidia-cap"),
         _ => false,
+    }
+}
+
+/// The device request that asks for every NVIDIA GPU the way `injection` says. The
+/// `--gpus` shape is (`driver: nvidia`, count -1, capability `gpu`).
+pub(crate) fn nvidia_device_request(injection: GpuInjection) -> DeviceRequest {
+    match injection {
+        GpuInjection::Cdi => DeviceRequest {
+            driver: Some("cdi".into()),
+            device_ids: Some(vec![crate::runtime::NVIDIA_CDI_DEVICE.into()]),
+            ..Default::default()
+        },
+        GpuInjection::DeviceRequest => DeviceRequest {
+            driver: Some("nvidia".into()),
+            count: Some(-1),
+            capabilities: Some(vec![vec!["gpu".into()]]),
+            ..Default::default()
+        },
+    }
+}
+
+/// The injection a container was created with. An NVIDIA intent journalled before it was
+/// recorded was created with `--gpus`.
+pub(crate) fn recorded_injection(
+    nvidia: bool,
+    recorded: Option<GpuInjection>,
+) -> Option<GpuInjection> {
+    nvidia.then(|| recorded.unwrap_or(GpuInjection::DeviceRequest))
+}
+
+/// Is `request` exactly the NVIDIA request for `injection`, as the engine echoes it back?
+/// Docker echoes a CDI request with `Count: 0` and no capabilities; anything else, or any
+/// other device, is not what Quasar asked for.
+pub(crate) fn is_nvidia_request(injection: GpuInjection, request: &DeviceRequest) -> bool {
+    let no_options = request.options.as_ref().is_none_or(|o| o.is_empty());
+    match injection {
+        GpuInjection::Cdi => {
+            request.driver.as_deref() == Some("cdi")
+                && request.device_ids.as_deref()
+                    == Some(&[crate::runtime::NVIDIA_CDI_DEVICE.to_string()][..])
+                && request.count.is_none_or(|c| c == 0)
+                && request.capabilities.as_ref().is_none_or(|c| c.is_empty())
+                && no_options
+        }
+        GpuInjection::DeviceRequest => {
+            request.driver.as_deref() == Some("nvidia")
+                && request.count == Some(-1)
+                && request.device_ids.as_ref().is_none_or(Vec::is_empty)
+                && request.capabilities.as_deref() == Some(&[vec!["gpu".to_owned()]])
+                && no_options
+        }
     }
 }
 

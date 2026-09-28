@@ -37,6 +37,45 @@ own; the two do not move together, and that is deliberate.
 
   It never blocks. Traffic from the host itself, or from a container or VM on one of its
   bridges, never counts. The agent image no longer ships `nftables`.
+- **Home files belong to the Quasar user on rootless Podman (RH-07, #404).** Session
+  containers map the app's `PUID`/`PGID` onto the Quasar user (`keep-id`), and start as root
+  when the image names no user, so its entrypoint still initialises the home before
+  dropping privileges. The read-back proves the mapping from Podman's own ID maps. Host
+  preparation gains `--templates DIR`, and on an SELinux Podman host labels the homes and
+  templates roots `container_file_t` with a persistent file context (labels only; nothing
+  is re-owned, SELinux stays enforcing), and labels `/run/quasar-agent` too, where sessions
+  reach the agent's Wayland and PulseAudio sockets (this was also why rootless Podman's
+  audio sidecar never became ready, #411). On SELinux Podman, app containers run as
+  `container_engine_t`, the policy's confined type for nested sandboxes, when the catalog
+  already runs them `seccomp=unconfined` for their own sandboxes, so Steam's and Flatpak's
+  `bwrap` can mount; `container_t` refused them and Steam never showed a window. On
+  an NVIDIA host, host preparation installs a one-rule SELinux module
+  (`quasar-nested-gpu`) giving `container_engine_t` the NVIDIA device access the
+  `container_use_xserver_devices` boolean gives `container_t`, and nothing more. The Steam
+  template's publish check forbids files owned by the app's root as the agent sees that
+  uid (1 under keep-id, where the Quasar user is the agent's 0).
+  The read-back checks the process label. Rootless Docker has no per-container user
+  mapping: its homes keep subordinate IDs. Host preparation's udev rule also labels Quasar's own
+  virtual input devices `container_file_t` on SELinux Podman hosts (#401), so a confined
+  session can read its keyboard, mouse and gamepad; every other input device keeps its
+  label. Host preparation refuses a data root that is a system tree, holds a user's home
+  or contains regex characters, and names the package when an SELinux tool is missing. An
+  update that would take the NVIDIA GPU away from an agent that has it fails before the
+  running agent is touched.
+- **NVIDIA GPUs by CDI (RH-07, #399).** Every container Quasar creates on an NVIDIA host (the
+  node agent, its helpers, app sessions and the actor's GPU probe) asks for the GPU the way
+  its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an
+  NVIDIA CDI device, by `--gpus` on a rootful Docker without one. A rootless Docker with
+  neither gets no GPU and readiness `runtime_cdi` fails naming host preparation, blocking the
+  host (or, on a mixed host, each NVIDIA GPU through `runtime_cdi_gpu<N>`). Podman lists no
+  CDI devices, so there the evidence is the agent's own NVIDIA device node. Each container
+  records the request it was created with and is read back against it, so an engine that
+  gains a CDI specification later does not orphan existing containers. The actor's GPU probe now
+  requires the NVIDIA control node inside the probe container (rootless Podman accepted a
+  `--gpus` request and injected nothing, which read as a yes), and an update that recreates
+  the agent asks the engine again when its revision renders a different request. The driver volume no longer carries the X.Org server
+  modules, and NVIDIA app containers disable lavapipe so a broken ICD cannot fall back to
+  software rendering.
 - **One least-privilege node-agent recipe (RH-07, #402).** Recipe revision 3, applied by the
   recovery actor in every engine mode (rootful included), removes from the node agent:
   - the host's `/dev` mount;
@@ -666,6 +705,12 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Podman's `stopped` health status no longer breaks inspection (RH-07, #404 live).** An
+  exited container whose image has a healthcheck reports health `stopped` on Podman, which
+  Docker's schema lacks; one such container made every inspection unparseable, so the
+  recovery actor refused all updates and the agent could not clean up its own helpers.
+  Inspection now reads an unknown health status as `none`, and one-shot helpers and probes
+  from the agent image run without a healthcheck.
 - **Image inventory works on Podman.** Podman lists a digest-pulled image's reference twice,
   and the agent read that as two images claiming one reference and refused its whole image
   inventory. The same reference on the same image is now one fact. RH-07.

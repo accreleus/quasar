@@ -45,7 +45,8 @@ pub use client::{Operation, RuntimeClient, ENGINE_INSPECTION_BUDGET};
 pub use config::{RuntimeConfig, DOCKER_DEFAULT_SOCKET};
 pub use durable::{DurableFile, LeaseError, StateLease};
 pub use engine::{
-    ApiVersion, CdiFacts, EngineFacts, EngineInfo, EngineKind, EngineMode, API_FLOOR,
+    ApiVersion, CdiFacts, EngineFacts, EngineInfo, EngineKind, EngineMode, GpuInjection, API_FLOOR,
+    NVIDIA_CDI_DEVICE,
 };
 pub use error::{ErrorKind, RuntimeError};
 pub use inspection::{

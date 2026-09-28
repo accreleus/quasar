@@ -32,6 +32,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         template_root: "/var/lib/quasar/templates".into(),
         docker_socket: "/var/run/docker.sock".into(),
         gpu: GpuFacts {
+            cdi: false,
             unknown: Default::default(),
             vendor,
             render_node: render_node.map(str::to_owned),
@@ -172,6 +173,20 @@ fn node_agent_revision_3_holds_none_of_the_removed_access() {
         spec.device_cgroup_rules
     );
     check("node-agent-r3-nvidia-rootless.json", &spec);
+    // Where the engine served the GPU through CDI, revision 3 asks by CDI.
+    let mut cdi = rootless.clone();
+    cdi.gpu.cdi = true;
+    let spec = render(Role::NodeAgent, 3, &cdi, &image, &agent_secrets()).unwrap();
+    assert_eq!(spec.gpus.len(), 1);
+    assert_eq!(spec.gpus[0].driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        spec.gpus[0].device_ids,
+        vec!["nvidia.com/gpu=all".to_string()]
+    );
+    check("node-agent-r3-nvidia-rootless-cdi.json", &spec);
+    // Revisions 1 and 2 never ask by CDI.
+    let r2 = render(Role::NodeAgent, 2, &cdi, &image, &agent_secrets()).unwrap();
+    assert!(r2.gpus.iter().all(|g| g.device_ids.is_empty()));
     // Revisions 1 and 2 render exactly as released.
     let r1 = render(
         Role::NodeAgent,

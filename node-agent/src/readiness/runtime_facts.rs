@@ -1,13 +1,15 @@
 //! Container-runtime readiness (#254): what the engine really is, observed only. The facts
 //! come from one bounded engine inspection per probe ([`RuntimeView::live`]); the verdicts
-//! are the `check_*` functions, pure over the view. Nothing here mutates the engine, and
-//! GPU injection (device request + driver volume) is untouched: CDI is reported, not used.
+//! are the `check_*` functions, pure over the view. Nothing here mutates the engine.
 
 use crate::messages::{ReadinessBlocks, ReadinessCheck};
 // `API_FLOOR` is owned by the runtime module, which is the code that enforces it; the
 // checks below only render it (#266), so the wording cannot drift from what discovery
 // refuses.
-use crate::runtime::{EngineFacts, EngineKind, EngineMode, ErrorKind, RuntimeError, API_FLOOR};
+use crate::runtime::{
+    EngineFacts, EngineKind, EngineMode, ErrorKind, GpuInjection, RuntimeError, API_FLOOR,
+    NVIDIA_CDI_DEVICE,
+};
 
 pub const ENDPOINT_ID: &str = "runtime_endpoint";
 pub const API_VERSION_ID: &str = "runtime_api_version";
@@ -308,43 +310,131 @@ fn check_runtime_capabilities_inner(view: &RuntimeView) -> ReadinessCheck {
     }
 }
 
-pub fn check_runtime_cdi(view: &RuntimeView) -> ReadinessCheck {
-    check_runtime_cdi_inner(view).with_source("runtime")
+/// How this engine would inject an NVIDIA GPU, or `Err` with a skip reason when the engine
+/// was not seen.
+fn injection(view: &RuntimeView) -> Result<(&EngineFacts, Option<GpuInjection>), &'static str> {
+    match view {
+        RuntimeView::NotObserved => Err("The container engine was not asked"),
+        RuntimeView::Observed {
+            outcome: Err(_), ..
+        } => Err("GPU injection is unknown: the engine could not be inspected"),
+        RuntimeView::Observed {
+            outcome: Ok(facts), ..
+        } => Ok((
+            facts,
+            GpuInjection::for_engine(facts.info.kind, facts.mode, facts.cdi.as_ref()),
+        )),
+    }
 }
 
-fn check_runtime_cdi_inner(view: &RuntimeView) -> ReadinessCheck {
-    let RuntimeView::Observed { outcome, .. } = view else {
-        return super::skip(CDI_ID, "The container engine was not asked");
-    };
-    match outcome {
-        Ok(facts) => match &facts.cdi {
-            None => super::skip(CDI_ID, "This engine does not report CDI"),
-            Some(cdi) if cdi.spec_dirs.is_empty() => super::pass(
-                CDI_ID,
-                "CDI injection is disabled on this engine; Quasar injects GPUs with a device \
-                 request and the driver volume, not CDI"
-                    .into(),
+/// A mixed host: NVIDIA beside another vendor. Its NVIDIA gap blocks those GPUs only,
+/// through `runtime_cdi_gpu<N>` (amendment 17).
+fn mixed(gpus: &[(i32, bool)]) -> bool {
+    gpus.iter().any(|g| g.1) && gpus.iter().any(|g| !g.1)
+}
+
+const CDI_REMEDIATION: &str = "Run host preparation (deploy/prepare-host.sh) as root: it \
+    writes the NVIDIA CDI specification (nvidia-ctk cdi generate) that this engine needs to \
+    hand a GPU to a container. Then restart the engine so it discovers the specification. \
+    Never run Quasar as root to work around it.";
+
+/// `own_nodes`: the agent's own container has the NVIDIA device nodes. Podman's `/info`
+/// lists no CDI devices, so on Podman that is the only evidence the specification resolves.
+fn cdi_verdict(
+    id: &str,
+    facts: &EngineFacts,
+    injection: Option<GpuInjection>,
+    own_nodes: bool,
+) -> ReadinessCheck {
+    let named = engine_named(facts);
+    let mode = facts.mode.wire();
+    if facts.info.kind == EngineKind::Podman && !own_nodes {
+        return super::fail(
+            id,
+            format!(
+                "{named}, {mode}: this agent's own container has no NVIDIA device, so Podman \
+                 resolved no NVIDIA CDI specification and no NVIDIA GPU can reach a session"
             ),
-            Some(cdi) if cdi.devices.is_empty() => super::pass(
-                CDI_ID,
-                format!(
-                    "CDI is enabled (spec dirs: {}) and the engine discovered no devices; GPU \
-                     injection does not use CDI",
-                    cdi.spec_dirs.join(", ")
-                ),
-            ),
-            Some(cdi) => super::pass(
-                CDI_ID,
-                format!(
-                    "CDI is enabled (spec dirs: {}); devices discovered: {}; GPU injection does \
-                     not use CDI",
-                    cdi.spec_dirs.join(", "),
-                    cdi.devices.join(", ")
-                ),
-            ),
-        },
-        Err(_) => super::skip(CDI_ID, "CDI is unknown: the engine could not be inspected"),
+            CDI_REMEDIATION.into(),
+        );
     }
+    match injection {
+        Some(GpuInjection::Cdi) => super::pass(
+            id,
+            format!("{named}, {mode}: NVIDIA GPUs reach containers by CDI ({NVIDIA_CDI_DEVICE})"),
+        ),
+        Some(GpuInjection::DeviceRequest) => super::pass(
+            id,
+            format!(
+                "{named}, {mode}: the engine reports no NVIDIA CDI device, so NVIDIA GPUs reach \
+                 containers by a --gpus device request"
+            ),
+        ),
+        None => super::fail(
+            id,
+            format!(
+                "{named}, {mode}: the engine reports no NVIDIA CDI device, and a {mode} engine \
+                 cannot use --gpus, so no NVIDIA GPU can reach a session"
+            ),
+            CDI_REMEDIATION.into(),
+        ),
+    }
+}
+
+/// `runtime_cdi` (amendment 17): how NVIDIA GPUs reach containers. On a host whose GPUs are
+/// all NVIDIA the engine's answer is evidence and the check carries `blocks` (`host`); a
+/// mixed host blocks per GPU instead ([`check_runtime_cdi_gpus`]).
+pub fn check_runtime_cdi(
+    view: &RuntimeView,
+    nvidia: bool,
+    gpus: &[(i32, bool)],
+    own_nodes: bool,
+) -> ReadinessCheck {
+    let check = match injection(view) {
+        Err(why) => super::skip(CDI_ID, why),
+        Ok((facts, _)) if !nvidia => {
+            let cdi = match &facts.cdi {
+                Some(cdi) if !cdi.spec_dirs.is_empty() => {
+                    format!("CDI is enabled (spec dirs: {})", cdi.spec_dirs.join(", "))
+                }
+                _ => "CDI is not reported".to_string(),
+            };
+            super::pass(
+                CDI_ID,
+                format!("No NVIDIA GPU: other GPUs reach containers as device nodes; {cdi}"),
+            )
+        }
+        Ok((facts, injection)) => cdi_verdict(CDI_ID, facts, injection, own_nodes),
+    };
+    let check = check.with_source("runtime");
+    if nvidia && !mixed(gpus) && matches!(view, RuntimeView::Observed { outcome: Ok(_), .. }) {
+        check.with_blocks(ReadinessBlocks::host("control_plane"))
+    } else {
+        check
+    }
+}
+
+/// `runtime_cdi_gpu<N>`: on a mixed host, the same verdict for each NVIDIA GPU, blocking only
+/// that GPU so the others stay schedulable. Nothing on any other host.
+pub fn check_runtime_cdi_gpus(
+    view: &RuntimeView,
+    gpus: &[(i32, bool)],
+    own_nodes: bool,
+) -> Vec<ReadinessCheck> {
+    if !mixed(gpus) {
+        return Vec::new();
+    }
+    let Ok((facts, injection)) = injection(view) else {
+        return Vec::new();
+    };
+    gpus.iter()
+        .filter(|(_, nvidia)| *nvidia)
+        .map(|(index, _)| {
+            cdi_verdict(&format!("{CDI_ID}_gpu{index}"), facts, injection, own_nodes)
+                .with_source("runtime")
+                .with_blocks(ReadinessBlocks::gpu(*index, "control_plane"))
+        })
+        .collect()
 }
 
 /// How far one engine profile is backed by evidence (CONTEXT.md "Engine profile").

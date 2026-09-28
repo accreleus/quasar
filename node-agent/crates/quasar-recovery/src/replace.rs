@@ -26,7 +26,7 @@ use crate::actor::{Actor, ResumeError};
 use crate::engine::{Container, EngineError, RestartPolicy};
 use crate::handover::Flow;
 use crate::journal::{embedded_log_tail, tail_output, Failure, Journal, Phase, OUTPUT_LIMIT};
-use crate::recipe::{self, labels, Book, RenderError, Role};
+use crate::recipe::{self, labels, names, Book, RenderError, Role};
 use crate::settle::{settle, Settlement, RECOVERY_ACTOR};
 use crate::socket::{Reason, State};
 use crate::submit::kept_name;
@@ -455,11 +455,32 @@ impl Actor {
                 ),
             ));
         }
-        let machine = match self.dir.load_machine() {
+        let mut machine = match self.dir.load_machine() {
             Ok(Some(m)) => m,
             Ok(None) => return Err(fail(Reason::RecreateFailed, "machine state is missing")),
             Err(e) => return Err(fail(Reason::RecreateFailed, format!("machine state: {e}"))),
         };
+        // An update may change the revision, and with it the GPU request the agent renders:
+        // the engine is asked with that request, as on install.
+        if role == Role::NodeAgent {
+            let had_gpu = machine.inputs.gpu.nvidia_shape();
+            self.decide_gpus(&mut machine, &image, revision)
+                .map_err(|e| fail(Reason::RecreateFailed, format!("GPU decision: {e}")))?;
+            // Degrading to no GPU is the install-time answer. An update of an agent that has
+            // the GPU fails closed instead, before anything stops: the old agent keeps it.
+            if had_gpu && !machine.inputs.gpu.nvidia_shape() {
+                return Err(fail(
+                    Reason::RecreateFailed,
+                    format!(
+                        "the engine no longer gives this agent the NVIDIA GPU the way recipe revision {revision} asks for it; the running agent was not touched (see the actor's actor-gpus-refused line)"
+                    ),
+                ));
+            }
+            if machine.inputs.gpu.nvidia_shape() {
+                self.ensure_volume(&machine, names::NVIDIA_DRIVER_VOLUME, role)
+                    .map_err(|e| fail(Reason::RecreateFailed, format!("driver volume: {e}")))?;
+            }
+        }
         let secrets = match role {
             Role::NodeAgent => self.node_agent_secrets(),
             Role::ControlPlane => self.control_plane_secrets(),

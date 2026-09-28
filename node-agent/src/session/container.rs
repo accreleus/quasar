@@ -2804,6 +2804,8 @@ mod tests {
                 format!("__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS={NVIDIA_DRIVER_VOLUME_DST}/egl_external_platform.d:/usr/share/egl/egl_external_platform.d"),
                 "-e".into(),
                 format!("VK_ADD_DRIVER_FILES={NVIDIA_DRIVER_VOLUME_DST}/vulkan/icd.d/nvidia_icd.json"),
+                "-e".into(),
+                "VK_LOADER_DRIVERS_DISABLE=*lvp_icd*".into(),
                 "--device".into(),
                 DRI_DIR.into(),
                 "--group-add".into(),

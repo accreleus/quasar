@@ -54,6 +54,8 @@ pub fn host(
             runtimes: runtimes.iter().map(|r| r.to_string()).collect(),
             cdi_devices: Vec::new(),
             rootless: false,
+            // A rootful Docker without an NVIDIA CDI device: `--gpus`.
+            gpu_injection: Some(quasar_runtime::GpuInjection::DeviceRequest),
         },
         host_devices: devices
             .iter()

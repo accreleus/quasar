@@ -26,6 +26,7 @@ use crate::engine::{ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
 use crate::recipe::{
     labels, names, Bind, GpuFacts, GpuNode, GpuRequest, GpuVendor, HostDevices, ImageRef,
 };
+use quasar_runtime::GpuInjection;
 
 pub const PROBE_HELPER: &str = "gpu-probe";
 pub const GPUS_PROBE_HELPER: &str = "gpus-probe";
@@ -159,6 +160,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         vendor: chosen.map(|(_, _, v)| *v),
         render_node: chosen.map(|(_, n, _)| (*n).to_owned()),
         gpus_served: false,
+        cdi: false,
         fallback: nvidia.and(other).map(|(_, n, v)| GpuNode {
             unknown: Default::default(),
             vendor: *v,
@@ -199,37 +201,51 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
         init: false,
         restart: RestartPolicy::No,
         ports: Vec::new(),
-        healthcheck: None,
+        healthcheck: Some(no_healthcheck()),
     }
 }
 
-/// The `--gpus all` probe: a container requesting every GPU, running `true`. The engine
-/// serves `--gpus` through an `nvidia` runtime, CDI, or the container toolkit's hook, and
-/// only the last is invisible in `/info`, so the evidence is whether this starts and exits
-/// 0. Removed on every path that created it.
-pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
+/// Exits 0 only when the NVIDIA control node is inside: listing /dev, since a confined
+/// container may be denied `stat` there.
+const GPUS_PROBE_TEST: &str = "set -- /dev/nvidiactl*; [ \"$1\" = /dev/nvidiactl ]";
+
+/// Probes run the agent image; its healthcheck means nothing for a one-shot container.
+fn no_healthcheck() -> quasar_runtime::platform::Healthcheck {
+    quasar_runtime::platform::Healthcheck {
+        test: vec!["NONE".into()],
+        interval_s: 0,
+        timeout_s: 0,
+        retries: 0,
+        start_period_s: 0,
+    }
+}
+
+/// The GPU probe: a container requesting every NVIDIA GPU the way the agent will (CDI or
+/// `--gpus`), which must start and find the control node inside; an engine may accept a
+/// request and inject nothing (rootless Podman with `--gpus`). Removed on every path that
+/// created it.
+pub fn gpus_spec(image: &ImageRef, injection: GpuInjection) -> ContainerSpec {
     ContainerSpec {
         name: names::GPU_PROBE.into(),
         image: image.reference(),
+        // Served means the NVIDIA control node is inside: an engine may accept a request it
+        // ignores (rootless Podman does with `--gpus`). Matched by listing /dev, since a
+        // confined container may be denied `stat` there.
         entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
-        cmd: Some(vec!["true".into()]),
+        cmd: Some(vec![GPUS_PROBE_TEST.into()]),
         env: BTreeMap::new(),
         labels: BTreeMap::from([(labels::HELPER.to_string(), GPUS_PROBE_HELPER.to_string())]),
         network_mode: Some("none".into()),
         binds: Vec::new(),
         devices: Vec::new(),
         device_cgroup_rules: Vec::new(),
-        gpus: vec![GpuRequest {
-            driver: None,
-            count: -1,
-            capabilities: vec![vec!["gpu".into()]],
-        }],
+        gpus: vec![GpuRequest::nvidia_all(injection)],
         cap_add: Vec::new(),
         security_opt: Vec::new(),
         init: false,
         restart: RestartPolicy::No,
         ports: Vec::new(),
-        healthcheck: None,
+        healthcheck: Some(no_healthcheck()),
     }
 }
 
@@ -250,11 +266,12 @@ pub enum GpusAnswer {
 pub fn serves_gpus(
     engine: &dyn PlatformEngine,
     image: &ImageRef,
+    injection: GpuInjection,
     backoff: Duration,
 ) -> Result<GpusAnswer, EngineError> {
     let mut attempt = 1;
     loop {
-        match gpus_attempt(engine, image) {
+        match gpus_attempt(engine, image, injection) {
             Err(e) if e.is_transient() && attempt < GPUS_PROBE_ATTEMPTS => {
                 warn!(
                     token = "actor-gpus-probe-retry",
@@ -268,8 +285,12 @@ pub fn serves_gpus(
     }
 }
 
-fn gpus_attempt(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<GpusAnswer, EngineError> {
-    let id = match engine.create_container(&gpus_spec(image)) {
+fn gpus_attempt(
+    engine: &dyn PlatformEngine,
+    image: &ImageRef,
+    injection: GpuInjection,
+) -> Result<GpusAnswer, EngineError> {
+    let id = match engine.create_container(&gpus_spec(image, injection)) {
         Ok(id) => id,
         Err(e) if e.is_device_request_refusal() => return Ok(GpusAnswer::Refused(e.to_string())),
         Err(e) => return Err(e),
@@ -280,7 +301,7 @@ fn gpus_attempt(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<GpusAns
         Ok(()) => match engine.wait_container(&id, PROBE_TIMEOUT) {
             Ok(0) => Ok(GpusAnswer::Served),
             Ok(code) => Ok(GpusAnswer::Refused(format!(
-                "the probe ran with the GPUs and exited {code}"
+                "the probe started but saw no NVIDIA device inside (exit {code})"
             ))),
             Err(e) => Err(e),
         },

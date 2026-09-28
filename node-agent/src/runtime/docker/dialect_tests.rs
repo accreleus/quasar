@@ -27,6 +27,8 @@ fn podman(effective: &[&str], runtime: &str) -> PodmanFacts {
         bounding_caps: Some(set),
         oci_runtime: Some(runtime.into()),
         mount_propagations: vec!["rprivate".into()],
+        uid_map: Vec::new(),
+        gid_map: Vec::new(),
     }
 }
 
@@ -336,4 +338,70 @@ fn podman_mounts_must_be_private() {
     )
     .unwrap();
     assert!(!Dialect::Podman.mount_propagation_ok(Some(&parsed)));
+}
+
+#[test]
+fn each_injection_reads_back_only_its_own_request() {
+    use crate::runtime::GpuInjection;
+    for injection in [GpuInjection::Cdi, GpuInjection::DeviceRequest] {
+        assert!(is_nvidia_request(
+            injection,
+            &nvidia_device_request(injection)
+        ));
+    }
+    assert!(!is_nvidia_request(
+        GpuInjection::Cdi,
+        &nvidia_device_request(GpuInjection::DeviceRequest)
+    ));
+    assert!(!is_nvidia_request(
+        GpuInjection::DeviceRequest,
+        &nvidia_device_request(GpuInjection::Cdi)
+    ));
+    // Docker echoes a CDI request with Count 0; a wider device set is never ours.
+    let mut echoed = nvidia_device_request(GpuInjection::Cdi);
+    echoed.count = Some(0);
+    assert!(is_nvidia_request(GpuInjection::Cdi, &echoed));
+    echoed.device_ids = Some(vec!["nvidia.com/gpu=0".into(), "vendor.com/x=all".into()]);
+    assert!(!is_nvidia_request(GpuInjection::Cdi, &echoed));
+}
+
+/// Live on rootless Podman: a requested `/dev/dri` is reported as its nodes, and a CDI GPU
+/// as the nodes its specification lists (the DRM ones included).
+#[test]
+fn podman_reports_a_requested_directory_as_its_drm_nodes_and_nothing_else() {
+    let requested = vec!["/dev/dri".to_string()];
+    let expanded = [
+        device("/dev/dri/card1", ""),
+        device("/dev/dri/renderD128", ""),
+    ];
+    assert!(Dialect::Podman.devices_ok(&expanded, &requested, false));
+    for foreign in ["/dev/dri/by-path", "/dev/sda", "/dev/nvidia0"] {
+        assert!(
+            !Dialect::Podman.devices_ok(&[device(foreign, "")], &requested, false),
+            "{foreign}"
+        );
+    }
+    let cdi = [
+        device("/dev/nvidiactl", ""),
+        device("/dev/nvidia0", ""),
+        device("/dev/dri/card1", ""),
+    ];
+    assert!(Dialect::Podman.devices_ok(&cdi, &requested, true));
+    assert!(!Dialect::Docker.devices_ok(&expanded, &requested, false));
+}
+
+/// Captured live on rootless Podman 5.8.4 (`keep-id:uid=1000,gid=1000`).
+#[test]
+fn keep_id_is_proven_by_the_one_range_mapped_onto_the_engine_user() {
+    let body = r#"{"HostConfig":{"IDMappings":{"UidMap":["0:1:1000","1000:0:1","1001:1001:64536"],"GidMap":["0:1:1000","1000:0:1","1001:1001:64536"]}}}"#;
+    let facts = PodmanFacts::from_inspect(body).unwrap();
+    assert!(keep_id_ok(Some(&facts), 1000, 1000));
+    assert!(!keep_id_ok(Some(&facts), 1001, 1000));
+    // The rootless default maps container root onto the engine user: not keep-id.
+    let default = PodmanFacts::from_inspect(
+        r#"{"HostConfig":{"IDMappings":{"UidMap":["0:0:1","1:1:65536"],"GidMap":["0:0:1","1:1:65536"]}}}"#,
+    )
+    .unwrap();
+    assert!(!keep_id_ok(Some(&default), 1000, 1000));
+    assert!(!keep_id_ok(None, 1000, 1000));
 }

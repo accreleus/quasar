@@ -130,9 +130,13 @@ impl Actor {
                 volume: Some(names::POSTGRES_SECRETS_VOLUME.into()),
                 files: [secrets::DATABASE_PASSWORD.to_string()].into(),
             };
-            self.ensure_service(machine, Role::Postgres, &secrets, POSTGRES_FILES, |_, _| {
-                Ok(())
-            })?;
+            self.ensure_service(
+                machine,
+                Role::Postgres,
+                &secrets,
+                POSTGRES_FILES,
+                |_, _, _| Ok(()),
+            )?;
         }
         // A restore owns the database until it finishes, and a fresh install awaiting one
         // has none yet: no control plane is created or started meanwhile
@@ -178,7 +182,7 @@ impl Actor {
                 Role::ControlPlane,
                 &secrets,
                 CONTROL_PLANE_FILES,
-                |_, _| {
+                |_, _, _| {
                     // Only before a create: a restart never holds the actor busy on Postgres.
                     if owned_db {
                         self.await_healthy(names::POSTGRES);
@@ -249,7 +253,7 @@ impl Actor {
         role: Role,
         secrets: &SecretMounts,
         owner: FileOwner,
-        before_create: impl FnOnce(&mut Machine, &ImageRef) -> Result<(), ResumeError>,
+        before_create: impl FnOnce(&mut Machine, &ImageRef, u32) -> Result<(), ResumeError>,
     ) -> Result<(), ResumeError> {
         let image = self.service_image(machine, role)?;
         if let Some(existing) = self.engine.inspect_container(role.container_name())? {
@@ -295,7 +299,7 @@ impl Actor {
             Role::Postgres => control::POSTGRES_REVISION,
             _ => image_revision(&found, &image)?,
         };
-        before_create(machine, &image)?;
+        before_create(machine, &image, revision)?;
         let spec = recipe::render(role, revision, &machine.inputs, &image, secrets)?;
         if let Some(volume) = &secrets.volume {
             self.deliver_secrets_as(&image, volume, &secrets.files, owner)?;

@@ -68,8 +68,9 @@ fn mutation_error(error: Error) -> RuntimeError {
 }
 
 pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, RuntimeError> {
-    let (docker, _) = discover(config).await?;
+    let (docker, info) = discover(config).await?;
     let sys = docker.info().await.map_err(classify)?;
+    let gpu_injection = crate::docker::gpu_injection_from_info(info.kind, &sys);
     let mut runtimes: Vec<String> = sys.runtimes.unwrap_or_default().into_keys().collect();
     runtimes.sort();
     let mut cdi_devices: Vec<String> = sys
@@ -79,14 +80,15 @@ pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, Ru
         .filter_map(|d| d.id.filter(|v| !v.is_empty()))
         .collect();
     cdi_devices.sort();
-    let rootless = crate::EngineMode::from_security_options(
+    let mode = crate::EngineMode::from_security_options(
         sys.security_options.as_deref().unwrap_or_default(),
-    ) == crate::EngineMode::Rootless;
+    );
     Ok(EngineHost {
         name: sys.name.filter(|v| !v.is_empty()),
         runtimes,
         cdi_devices,
-        rootless,
+        rootless: mode == crate::EngineMode::Rootless,
+        gpu_injection,
     })
 }
 
@@ -164,7 +166,7 @@ async fn inspect_with(
     docker: &bollard::Docker,
     name_or_id: &str,
 ) -> Result<Option<PlatformContainer>, RuntimeError> {
-    let info = match docker.inspect_container(name_or_id, None).await {
+    let info = match super::inspect_container_tolerant(docker, name_or_id).await {
         Ok(info) => info,
         Err(e) if status_code(&e) == Some(404) => return Ok(None),
         Err(e) => return Err(classify(e)),
@@ -300,8 +302,9 @@ fn engine_body(spec: &ContainerSpec) -> ContainerCreateBody {
                     .map(|g| DeviceRequest {
                         driver: g.driver.clone(),
                         count: Some(g.count),
-                        device_ids: None,
-                        capabilities: Some(g.capabilities.clone()),
+                        device_ids: (!g.device_ids.is_empty()).then(|| g.device_ids.clone()),
+                        // A CDI request names devices, not capabilities.
+                        capabilities: (!g.capabilities.is_empty()).then(|| g.capabilities.clone()),
                         options: None,
                     })
                     .collect()
@@ -398,8 +401,7 @@ pub(crate) async fn update_restart(
     // ADR 0007 (RH-07): read the policy back on every engine, and treat a mismatch as a
     // failed step. The seed's rules and every stop Quasar means to keep depend on the
     // policy really being what was set.
-    let realized = docker
-        .inspect_container(id, None)
+    let realized = super::inspect_container_tolerant(&docker, id)
         .await
         .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
         .host_config

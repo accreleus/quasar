@@ -110,7 +110,7 @@ async fn inspect_container_with(
     docker: &Docker,
     id: &str,
 ) -> Result<Option<crate::ContainerInspection>, RuntimeError> {
-    match docker.inspect_container(id, None).await {
+    match super::inspect_container_tolerant(docker, id).await {
         Ok(info) => Ok(Some(container_inspection(info)?)),
         Err(Error::DockerResponseServerError {
             status_code: 404, ..
@@ -136,7 +136,7 @@ pub(crate) async fn live_containers(
             .id
             .filter(|value| !value.is_empty())
             .ok_or(ErrorKind::Protocol)?;
-        let detail = match docker.inspect_container(&id, None).await {
+        let detail = match super::inspect_container_tolerant(&docker, &id).await {
             Ok(detail) => detail,
             // A race means the snapshot cannot prove a home is safe to remove.
             Err(Error::DockerResponseServerError {
