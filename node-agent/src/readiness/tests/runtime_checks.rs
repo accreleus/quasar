@@ -702,3 +702,23 @@ fn podman_without_systemd_fails_health_checks_naming_the_fix() {
     assert!(!c.remediation.to_lowercase().contains("as root"), "{c:?}");
     assert!(c.blocks.is_none(), "{c:?}");
 }
+
+/// Live on rootless Podman: the engine injected no GPU, so capacity dropped it and reported
+/// no NVIDIA. The agent still runs NVIDIA sessions, and `runtime_cdi` must say they cannot.
+#[test]
+fn an_nvidia_agent_whose_gpu_capacity_dropped_still_fails_cdi() {
+    let root = FakeRoot::new("runtime-cdi-dropped");
+    let mut f = rootless(facts(None));
+    f.info.kind = EngineKind::Podman;
+    let checks = probe(&ProbeEnv {
+        runtime: RuntimeView::Observed {
+            endpoint: ENDPOINT.into(),
+            outcome: Ok(f),
+        },
+        nvidia_runtime: true,
+        ..root.env(false, "")
+    });
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+}

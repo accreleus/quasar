@@ -199,6 +199,9 @@ pub struct ProbeEnv {
     /// Capacity detection's GPUs, as `(index, is NVIDIA)`; empty until the caller hands
     /// them over with [`ProbeEnv::with_gpus`].
     pub gpus: Vec<(i32, bool)>,
+    /// The agent runs NVIDIA sessions (`ContainerRuntime::is_nvidia`), even when capacity
+    /// detection dropped the GPU, as it does when the engine injected none.
+    pub nvidia_runtime: bool,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -322,6 +325,7 @@ impl ProbeEnv {
             storage: storage::StorageView::live(engine_answered),
             runtime,
             gpus: Vec::new(),
+            nvidia_runtime: crate::session::container::ContainerRuntime::from_env().is_nvidia(),
         }
     }
 
@@ -560,7 +564,12 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         runtime_facts::check_runtime_endpoint(&env.runtime),
         runtime_facts::check_runtime_api_version(&env.runtime),
         runtime_facts::check_runtime_capabilities(&env.runtime),
-        runtime_facts::check_runtime_cdi(&env.runtime, env.nvidia, &env.gpus, own_nvidia_nodes(env)),
+        runtime_facts::check_runtime_cdi(
+            &env.runtime,
+            env.nvidia || env.nvidia_runtime,
+            &env.gpus,
+            own_nvidia_nodes(env),
+        ),
         runtime_facts::check_runtime_engine(&env.runtime),
         runtime_facts::check_engine_healthchecks(&env.runtime),
         // Runtime veto: files present but the stack not loading must never read green.
@@ -2704,6 +2713,7 @@ mod tests {
                 storage: storage::StorageView::default(),
                 runtime: runtime_facts::RuntimeView::NotObserved,
                 gpus: Vec::new(),
+                nvidia_runtime: false,
             }
         }
 
