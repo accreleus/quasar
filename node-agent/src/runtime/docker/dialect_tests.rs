@@ -21,9 +21,12 @@ fn caps(values: &[&str]) -> Vec<String> {
 }
 
 fn podman(effective: &[&str], runtime: &str) -> PodmanFacts {
+    let set: Vec<String> = effective.iter().map(|c| format!("CAP_{c}")).collect();
     PodmanFacts {
-        effective_caps: Some(effective.iter().map(|c| format!("CAP_{c}")).collect()),
+        effective_caps: Some(set.clone()),
+        bounding_caps: Some(set),
         oci_runtime: Some(runtime.into()),
+        mount_propagations: vec!["rprivate".into()],
     }
 }
 
@@ -250,11 +253,87 @@ fn without_drop_all_both_engines_compare_the_compatible_fields() {
 
 #[test]
 fn podmans_null_capabilities_are_none_and_a_missing_field_cannot_be_proven() {
-    let none = PodmanFacts::from_inspect(r#"{"EffectiveCaps":null,"OCIRuntime":"crun"}"#).unwrap();
+    let none = PodmanFacts::from_inspect(
+        r#"{"EffectiveCaps":null,"BoundingCaps":null,"OCIRuntime":"crun","Mounts":[]}"#,
+    )
+    .unwrap();
     assert_eq!(none.effective_caps, Some(Vec::new()));
     assert!(Dialect::Podman.capabilities_ok(None, None, Some(&none), &[], true));
     let missing = PodmanFacts::from_inspect(r#"{"OCIRuntime":"crun"}"#).unwrap();
     assert_eq!(missing.effective_caps, None);
     assert!(!Dialect::Podman.capabilities_ok(None, None, Some(&missing), &[], true));
     assert!(PodmanFacts::from_inspect("not json").is_err());
+}
+
+/// Security review of #397: a drop-all never applied could leave the bounding set wide.
+#[test]
+fn podman_capabilities_need_the_bounding_set_too() {
+    let requested = caps(&REQUESTED_CAPS);
+    let mut facts = podman(&REQUESTED_CAPS, "crun");
+    let mut wide = facts.bounding_caps.clone().unwrap();
+    wide.push("CAP_SYS_ADMIN".into());
+    facts.bounding_caps = Some(wide);
+    assert!(!Dialect::Podman.capabilities_ok(None, None, Some(&facts), &requested, true));
+    facts.bounding_caps = None;
+    assert!(!Dialect::Podman.capabilities_ok(None, None, Some(&facts), &requested, true));
+}
+
+/// Security review of #397: a GPU expands to NVIDIA and DRM nodes exactly, and a path
+/// that walks out of them is refused however it is spelled.
+#[test]
+fn gpu_expansion_is_exact_and_refuses_traversal() {
+    for ok in [
+        "/dev/nvidia0",
+        "/dev/nvidia12",
+        "/dev/nvidiactl",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+        "/dev/nvidia-modeset",
+        "/dev/nvidia-caps/nvidia-cap1",
+        "/dev/dri/card1",
+        "/dev/dri/renderD128",
+    ] {
+        assert!(
+            Dialect::Podman.devices_ok(&[device(ok, "")], &[], true),
+            "{ok}"
+        );
+    }
+    for bad in [
+        "/dev/dri/../sda",
+        "/dev/dri/./card1",
+        "/dev/dri/by-path/x",
+        "/dev/nvidia-evil",
+        "/dev/sda",
+        "/dev/kmsg",
+        "/dev/nvidia0/../sda",
+        "dev/nvidia0",
+        "/dev/dri/card",
+        "/dev/nvidiactl2",
+    ] {
+        assert!(
+            !Dialect::Podman.devices_ok(&[device(bad, "")], &[], true),
+            "{bad}"
+        );
+    }
+    // A requested device spelled with traversal is refused too.
+    assert!(!Dialect::Podman.devices_ok(
+        &[device("/dev/dri/../sda", "")],
+        &["/dev/dri/../sda".to_string()],
+        false
+    ));
+}
+
+#[test]
+fn podman_mounts_must_be_private() {
+    let mut facts = podman(&[], "crun");
+    assert!(Dialect::Podman.mount_propagation_ok(Some(&facts)));
+    facts.mount_propagations = vec!["rprivate".into(), "rshared".into()];
+    assert!(!Dialect::Podman.mount_propagation_ok(Some(&facts)));
+    assert!(!Dialect::Podman.mount_propagation_ok(None));
+    assert!(Dialect::Docker.mount_propagation_ok(None));
+    let parsed = PodmanFacts::from_inspect(
+        r#"{"EffectiveCaps":[],"BoundingCaps":[],"OCIRuntime":"crun","Mounts":[{"Propagation":"rprivate"},{"Propagation":"rslave"}]}"#,
+    )
+    .unwrap();
+    assert!(!Dialect::Podman.mount_propagation_ok(Some(&parsed)));
 }

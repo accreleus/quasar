@@ -845,7 +845,7 @@ async fn inspect_owned(
     }
     // Each check names what it guards, so a refusal says why (#397). Any one failing
     // refuses the container; nothing here ever retries with more privilege.
-    let refusals: [(bool, &str); 18] = [
+    let refusals: [(bool, &str); 19] = [
         (
             host.network_mode.as_deref() != Some(&intent.request.network),
             "network mode",
@@ -935,6 +935,10 @@ async fn inspect_owned(
                 intent.request.nvidia_gpu,
             ),
             "devices",
+        ),
+        (
+            !dialect.mount_propagation_ok(podman.as_ref()),
+            "mount propagation",
         ),
     ];
     if let Some((_, what)) = refusals.iter().find(|(refused, _)| *refused) {

@@ -707,6 +707,7 @@ fn inspect_owned(
     intent: &HelperIntent,
     dialect: Dialect,
     podman: Option<&PodmanFacts>,
+    image_id: Option<&str>,
 ) -> Result<(OwnedHelperId, bool, Option<i64>), RuntimeError> {
     let h = helper(intent);
     let id = info.id.filter(|v| valid_id(v)).ok_or(ErrorKind::Protocol)?;
@@ -718,6 +719,8 @@ fn inspect_owned(
     if labels.get(container_ownership::LABEL).map(String::as_str) != Some(intent.owner.as_str())
         || labels.get(OPERATION_LABEL).map(String::as_str) != Some(h.operation.as_str())
         || (dialect.echoes_config_image() && c.image.as_deref() != Some(&h.image))
+        || (!dialect.echoes_config_image()
+            && (image_id.is_none() || info.image.as_deref() != image_id))
         || c.user.as_deref() != Some("0:0")
     {
         return Err(ErrorKind::UnknownOutcome.into());
@@ -748,7 +751,11 @@ fn inspect_owned(
         || (!device_request && host.device_requests.as_ref().is_some_and(|v| !v.is_empty()))
         || host.volumes_from.as_ref().is_some_and(|v| !v.is_empty())
         || (dialect.echoes_mount_requests() && host.binds.as_ref().is_some_and(|v| !v.is_empty()))
-        || !dialect.default_namespace(Namespace::Pid, host.pid_mode.as_deref())
+        // Docker helpers keep today's exact rule (no pid mode at all).
+        || (dialect == Dialect::Docker && host.pid_mode.as_deref().is_some_and(|v| !v.is_empty()))
+        || (dialect == Dialect::Podman
+            && !dialect.default_namespace(Namespace::Pid, host.pid_mode.as_deref()))
+        || !dialect.mount_propagation_ok(podman)
         || !dialect.default_namespace(Namespace::Ipc, host.ipc_mode.as_deref())
         || !dialect.default_namespace(Namespace::Uts, host.uts_mode.as_deref())
         || host
@@ -960,7 +967,26 @@ async fn read_back(
         Some(id) if valid_id(id) => engine.podman_facts(id).await?,
         _ => None,
     };
-    inspect_owned(info, intent, engine.dialect, podman.as_ref())
+    // Podman's Config.Image names the image rather than echoing the reference, so the
+    // helper's identity is proven by image ID there: the reference resolved now must be
+    // the image the container was created from.
+    let image_id = match engine.dialect {
+        Dialect::Docker => None,
+        Dialect::Podman => {
+            engine
+                .inspect_image(&helper(intent).image)
+                .await
+                .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
+                .id
+        }
+    };
+    inspect_owned(
+        info,
+        intent,
+        engine.dialect,
+        podman.as_ref(),
+        image_id.as_deref(),
+    )
 }
 fn uncertain_inspection(error: Error) -> RuntimeError {
     let reconciliation = match error {

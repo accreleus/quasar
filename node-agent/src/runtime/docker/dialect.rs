@@ -80,28 +80,53 @@ pub(crate) struct PodmanFacts {
     /// `None` when the inspect does not carry the field at all (it cannot be proven);
     /// Podman writes `null` for "no capabilities", which is the empty set.
     pub effective_caps: Option<Vec<String>>,
+    /// The bounding set, under the same rule: a drop-all that was never applied could
+    /// leave the effective set narrow and the bounding set wide.
+    pub bounding_caps: Option<Vec<String>>,
     pub oci_runtime: Option<String>,
+    /// Each realized mount's propagation, which the compatible inspect does not report.
+    pub mount_propagations: Vec<String>,
 }
 
 impl PodmanFacts {
     pub(crate) fn from_inspect(body: &str) -> Result<Self, RuntimeError> {
         let value: serde_json::Value =
             serde_json::from_str(body).map_err(|_| RuntimeError::from(ErrorKind::Protocol))?;
-        let effective_caps = match value.get("EffectiveCaps") {
-            None => None,
-            Some(serde_json::Value::Null) => Some(Vec::new()),
-            Some(caps) => Some(
-                serde_json::from_value(caps.clone())
-                    .map_err(|_| RuntimeError::from(ErrorKind::Protocol))?,
-            ),
+        let caps = |key: &str| -> Result<Option<Vec<String>>, RuntimeError> {
+            match value.get(key) {
+                None => Ok(None),
+                Some(serde_json::Value::Null) => Ok(Some(Vec::new())),
+                Some(caps) => serde_json::from_value(caps.clone())
+                    .map(Some)
+                    .map_err(|_| RuntimeError::from(ErrorKind::Protocol)),
+            }
         };
+        let effective_caps = caps("EffectiveCaps")?;
+        let bounding_caps = caps("BoundingCaps")?;
+        let mount_propagations = value
+            .get("Mounts")
+            .and_then(|m| m.as_array())
+            .map(|mounts| {
+                mounts
+                    .iter()
+                    .map(|m| {
+                        m.get("Propagation")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let oci_runtime = value
             .get("OCIRuntime")
             .and_then(|v| v.as_str())
             .map(str::to_string);
         Ok(Self {
             effective_caps,
+            bounding_caps,
             oci_runtime,
+            mount_propagations,
         })
     }
 }
@@ -236,9 +261,12 @@ impl Dialect {
             // that delta says nothing exact, so its native EffectiveCaps must equal the
             // request. Without drop-all, both engines grant their defaults plus the
             // additions, and the compatible delta means exactly what Docker's does.
-            Dialect::Podman if drop_all => podman
-                .and_then(|f| f.effective_caps.as_deref())
-                .is_some_and(|effective| canonical(effective) == requested),
+            Dialect::Podman if drop_all => podman.is_some_and(|f| {
+                [&f.effective_caps, &f.bounding_caps].iter().all(|set| {
+                    set.as_deref()
+                        .is_some_and(|caps| canonical(caps) == requested)
+                })
+            }),
             Dialect::Podman => compat_echoes(),
         }
     }
@@ -269,6 +297,9 @@ impl Dialect {
                 ) else {
                     return false;
                 };
+                if !normal_absolute(host) {
+                    return false;
+                }
                 let permissions = actual.cgroup_permissions.as_deref().unwrap_or("");
                 host == inside
                     && (permissions.is_empty() || permissions == "rwm")
@@ -298,6 +329,21 @@ impl Dialect {
         }
     }
 
+    /// Is every realized mount's propagation private? Docker's is checked through the
+    /// echoed request (`HostConfig.Mounts`), so this adds nothing there. Podman does not
+    /// echo it; its native inspect states it per mount, and a shared or slave mount is a
+    /// grant Quasar never asks for.
+    pub(crate) fn mount_propagation_ok(self, podman: Option<&PodmanFacts>) -> bool {
+        match self {
+            Dialect::Docker => true,
+            Dialect::Podman => podman.is_some_and(|f| {
+                f.mount_propagations
+                    .iter()
+                    .all(|p| matches!(p.as_str(), "" | "private" | "rprivate"))
+            }),
+        }
+    }
+
     /// Whether `HostConfig.Binds` / `HostConfig.Mounts` echo the request. When they do
     /// not (Podman), the realized mount points, which every engine reports, are what is
     /// compared.
@@ -318,17 +364,47 @@ impl Dialect {
     }
 }
 
-/// The device nodes a requested NVIDIA CDI device resolves to: its control and GPU nodes
-/// and the DRM nodes of the same card.
+/// An absolute path in normal form: every component after the root is a plain name, so
+/// `..` or `.` can never walk out of the directory a pattern names.
+fn normal_absolute(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    // `components()` quietly drops `.` and repeated slashes, so the path must also be
+    // exactly its own reassembly: one spelling per node, nothing to argue about.
+    matches!(components.next(), Some(std::path::Component::RootDir))
+        && components.all(|c| matches!(c, std::path::Component::Normal(_)))
+        && Path::new(path)
+            .components()
+            .collect::<PathBuf>()
+            .as_os_str()
+            == path
+}
+
+/// The device nodes a requested NVIDIA CDI device resolves to, exactly: the NVIDIA
+/// control and GPU nodes, and DRM card and render nodes. Nothing else under `/dev`.
 fn gpu_expansion(path: &str) -> bool {
+    if !normal_absolute(path) {
+        return false;
+    }
+    let numbered = |name: &str, prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
     let path = Path::new(path);
-    let nvidia_node = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("nvidia"))
-        && (path.parent() == Some(Path::new("/dev"))
-            || path.parent() == Some(Path::new("/dev/nvidia-caps")));
-    path.starts_with("/dev/dri") || nvidia_node
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    match path.parent().and_then(|p| p.to_str()) {
+        Some("/dev/dri") => numbered(name, "card") || numbered(name, "renderD"),
+        Some("/dev") => {
+            numbered(name, "nvidia")
+                || matches!(
+                    name,
+                    "nvidiactl" | "nvidia-uvm" | "nvidia-uvm-tools" | "nvidia-modeset"
+                )
+        }
+        Some("/dev/nvidia-caps") => numbered(name, "nvidia-cap"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
