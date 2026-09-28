@@ -654,6 +654,9 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Image inventory works on Podman.** Podman lists a digest-pulled image's reference twice,
+  and the agent read that as two images claiming one reference and refused its whole image
+  inventory. The same reference on the same image is now one fact. RH-07.
 - **A host whose GPU capacity cannot be read no longer loses its connection in a loop.** Its
   capacity report carried `gpus: null`, which the control plane tried to store as hardware
   evidence and failed, closing the connection each time. No GPUs is now an empty list. Found
