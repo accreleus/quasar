@@ -711,6 +711,10 @@ own; the two do not move together, and that is deliberate.
   recovery actor refused all updates and the agent could not clean up its own helpers.
   Inspection now reads an unknown health status as `none`, and one-shot helpers and probes
   from the agent image run without a healthcheck.
+- **The audio sidecar says why it did not start (RH-07, #411).** When its socket does not
+  appear, the agent stops it and logs its exit state and last output with
+  `token="audio-pulse-socket-timeout"`. The rootless cause itself, the unlabelled
+  `/run/quasar-agent`, is fixed by host preparation (#404).
 - **Image inventory works on Podman.** Podman lists a digest-pulled image's reference twice,
   and the agent read that as two images claiming one reference and refused its whole image
   inventory. The same reference on the same image is now one fact. RH-07.

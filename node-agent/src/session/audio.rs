@@ -146,13 +146,31 @@ impl PulseSidecar {
             cleanup_attempted: false,
             budget: super::teardown::RetryBudget::new(super::teardown::STOP_RETRY_BUDGET),
         };
-        if let Err(error) = sidecar.runtime.run_audio_sidecar(helper, request).wait() {
-            sidecar.stop();
-            return Err(anyhow!(error).context("pulseaudio sidecar start failed"));
-        }
+        let id = match sidecar.runtime.run_audio_sidecar(helper, request).wait() {
+            Ok(id) => id,
+            Err(error) => {
+                sidecar.stop();
+                return Err(anyhow!(error).context("pulseaudio sidecar start failed"));
+            }
+        };
         if !wait_for_socket(&sidecar.socket_dir.join("native")) {
+            // #411: say why. The daemon's own words, once it is stopped, are the reason.
+            let why = match sidecar.runtime.stop_audio_sidecar(id.clone()).wait() {
+                Ok(()) => match sidecar.runtime.observe_audio_sidecar(id).wait() {
+                    Ok(result) => format!(
+                        "exit {:?}; output: {}",
+                        result.exit_code,
+                        output_tail(&result.stdout, &result.stderr)
+                    ),
+                    Err(error) => format!("its output could not be read ({:?})", error.kind),
+                },
+                Err(error) => format!(
+                    "it could not be stopped to read its output ({:?})",
+                    error.kind
+                ),
+            };
             tracing::warn!(token = "audio-pulse-socket-timeout",
-                "pulseaudio socket '{}' did not become ready within {}s — falling back to silent audio",
+                "pulseaudio socket '{}' did not become ready within {}s — falling back to silent audio; the sidecar: {why}",
                 sidecar.socket_dir.join("native").display(), PULSE_WAIT_TOTAL.as_secs());
             sidecar.stop();
             return Ok(None);
@@ -512,6 +530,22 @@ fn card_spec_from_device(device: &str) -> Option<String> {
     Some(format!("hw:{card}"))
 }
 
+/// The last lines a daemon wrote, bounded for one log line.
+fn output_tail(stdout: &str, stderr: &str) -> String {
+    const MAX: usize = 600;
+    let joined = format!("{stdout}{stderr}");
+    let text = joined.trim();
+    if text.is_empty() {
+        return "(none)".into();
+    }
+    let start = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| text.len() - i <= MAX)
+        .unwrap_or(0);
+    text[start..].replace('\n', " | ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::teardown::RetryBudget;
@@ -776,5 +810,19 @@ mod tests {
             "quasar_output must load first so it stays the default sink"
         );
         assert!(mic_sink_at < remap_at, "remap master must exist first");
+    }
+}
+
+#[cfg(test)]
+mod output_tail_tests {
+    #[test]
+    fn a_daemons_last_words_are_bounded_and_on_one_line() {
+        assert_eq!(super::output_tail("", "  "), "(none)");
+        assert_eq!(
+            super::output_tail("a\n", "E: bind failed\n"),
+            "a | E: bind failed"
+        );
+        let long = "x".repeat(2000);
+        assert!(super::output_tail(&long, "").len() <= 600);
     }
 }
