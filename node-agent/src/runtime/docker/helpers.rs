@@ -1265,7 +1265,9 @@ async fn create_or_adopt_inner(
                 ]
             })
         }),
-        healthcheck: intent.audio.as_ref().map(|_| HealthConfig {
+        // One-shot helpers run the agent image, whose healthcheck means nothing for them;
+        // on Podman it also leaves an exited helper reporting health `stopped`.
+        healthcheck: Some(HealthConfig {
             test: Some(vec!["NONE".into()]),
             ..Default::default()
         }),

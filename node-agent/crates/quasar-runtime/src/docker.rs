@@ -16,6 +16,40 @@ pub mod credentials;
 mod inspection;
 pub(crate) mod platform;
 pub use inspection::{all_container_image_ids, daemon_images};
+
+/// Inspect one container, tolerating Podman's health status `stopped` (an exited container
+/// whose image has a healthcheck), which Docker's API schema does not have and bollard
+/// cannot parse. Unparseable for any other reason is returned as it was.
+pub async fn inspect_container_tolerant(
+    docker: &bollard::Docker,
+    name_or_id: &str,
+) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error> {
+    match docker.inspect_container(name_or_id, None).await {
+        Err(bollard::errors::Error::JsonDataError {
+            message,
+            contents,
+            column,
+        }) => normalize_inspect(&contents).ok_or(bollard::errors::Error::JsonDataError {
+            message,
+            contents,
+            column,
+        }),
+        other => other,
+    }
+}
+
+/// The health statuses Docker's schema knows; anything else reads as `none`.
+fn normalize_inspect(contents: &str) -> Option<bollard::models::ContainerInspectResponse> {
+    let mut value: serde_json::Value = serde_json::from_str(contents).ok()?;
+    let status = value.pointer_mut("/State/Health/Status")?;
+    if !matches!(
+        status.as_str(),
+        Some("" | "none" | "starting" | "healthy" | "unhealthy")
+    ) {
+        *status = serde_json::Value::String("none".into());
+    }
+    serde_json::from_value(value).ok()
+}
 pub(crate) use inspection::{
     engine_storage, inspect_container, inspect_image_metadata, live_containers,
 };
@@ -228,4 +262,23 @@ pub async fn inspect_engine(config: &RuntimeConfig) -> Result<crate::EngineFacts
         default_runtime: sys.default_runtime,
         cdi,
     })
+}
+
+#[cfg(test)]
+mod tolerant_tests {
+    /// Captured live from rootless Podman 5.8.4: an exited container whose image has a
+    /// healthcheck reports `stopped`.
+    #[test]
+    fn podmans_stopped_health_reads_as_none_and_nothing_else_changes() {
+        let body = r#"{"Id":"abc","Name":"/x","State":{"Status":"exited","Running":false,"Health":{"Status":"stopped","FailingStreak":0,"Log":[]}},"Config":{"Image":"i"}}"#;
+        assert!(serde_json::from_str::<bollard::models::ContainerInspectResponse>(body).is_err());
+        let parsed = super::normalize_inspect(body).unwrap();
+        let state = parsed.state.unwrap();
+        assert_eq!(
+            state.health.unwrap().status,
+            Some(bollard::models::HealthStatusEnum::NONE)
+        );
+        assert_eq!(parsed.id.as_deref(), Some("abc"));
+        assert!(super::normalize_inspect("not json").is_none());
+    }
 }

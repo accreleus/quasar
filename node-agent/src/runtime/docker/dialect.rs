@@ -174,6 +174,16 @@ pub(crate) fn keep_id_ok(podman: Option<&PodmanFacts>, uid: u32, gid: u32) -> bo
 }
 
 impl Engine {
+    /// Shadows bollard's inspect (reached through `Deref`) with the one that tolerates
+    /// Podman's `stopped` health status, so every read-back here uses it.
+    pub(crate) async fn inspect_container(
+        &self,
+        name_or_id: &str,
+        _options: Option<bollard::query_parameters::InspectContainerOptions>,
+    ) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error> {
+        quasar_runtime::docker::inspect_container_tolerant(&self.docker, name_or_id).await
+    }
+
     /// `(rootless, selinux)`, from the engine's own `/info` security options.
     pub(crate) async fn confinement(&self) -> Result<(bool, bool), RuntimeError> {
         let sys = self.docker.info().await.map_err(super::classify)?;

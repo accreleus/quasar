@@ -689,6 +689,12 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Podman's `stopped` health status no longer breaks inspection (RH-07, #404 live).** An
+  exited container whose image has a healthcheck reports health `stopped` on Podman, which
+  Docker's schema lacks; one such container made every inspection unparseable, so the
+  recovery actor refused all updates and the agent could not clean up its own helpers.
+  Inspection now reads an unknown health status as `none`, and one-shot helpers and probes
+  from the agent image run without a healthcheck.
 - **Image inventory works on Podman.** Podman lists a digest-pulled image's reference twice,
   and the agent read that as two images claiming one reference and refused its whole image
   inventory. The same reference on the same image is now one fact. RH-07.

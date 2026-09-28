@@ -166,7 +166,7 @@ async fn inspect_with(
     docker: &bollard::Docker,
     name_or_id: &str,
 ) -> Result<Option<PlatformContainer>, RuntimeError> {
-    let info = match docker.inspect_container(name_or_id, None).await {
+    let info = match super::inspect_container_tolerant(docker, name_or_id).await {
         Ok(info) => info,
         Err(e) if status_code(&e) == Some(404) => return Ok(None),
         Err(e) => return Err(classify(e)),

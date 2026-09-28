@@ -201,7 +201,7 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
         init: false,
         restart: RestartPolicy::No,
         ports: Vec::new(),
-        healthcheck: None,
+        healthcheck: Some(no_healthcheck()),
     }
 }
 
@@ -210,6 +210,17 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
 /// only the last is invisible in `/info`, so the evidence is whether this starts and exits
 /// 0. Removed on every path that created it.
 const GPUS_PROBE_TEST: &str = "set -- /dev/nvidiactl*; [ \"$1\" = /dev/nvidiactl ]";
+
+/// Probes run the agent image; its healthcheck means nothing for a one-shot container.
+fn no_healthcheck() -> quasar_runtime::platform::Healthcheck {
+    quasar_runtime::platform::Healthcheck {
+        test: vec!["NONE".into()],
+        interval_s: 0,
+        timeout_s: 0,
+        retries: 0,
+        start_period_s: 0,
+    }
+}
 
 pub fn gpus_spec(image: &ImageRef, injection: GpuInjection) -> ContainerSpec {
     ContainerSpec {
@@ -232,7 +243,7 @@ pub fn gpus_spec(image: &ImageRef, injection: GpuInjection) -> ContainerSpec {
         init: false,
         restart: RestartPolicy::No,
         ports: Vec::new(),
-        healthcheck: None,
+        healthcheck: Some(no_healthcheck()),
     }
 }
 
