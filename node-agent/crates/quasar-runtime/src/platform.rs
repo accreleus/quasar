@@ -227,6 +227,8 @@ pub struct EngineHost {
     pub runtimes: Vec<String>,
     /// CDI devices the engine discovered, by id (`nvidia.com/gpu=0`, ...).
     pub cdi_devices: Vec<String>,
+    /// The engine runs rootless (`name=rootless` in its security options; RH-07).
+    pub rootless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

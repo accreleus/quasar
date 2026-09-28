@@ -76,6 +76,7 @@ expected="./etc/cdi/nvidia.yaml
 ./etc/subgid
 ./etc/subuid
 ./etc/sysctl.d/99-quasar.conf
+./etc/tmpfiles.d/quasar.conf
 ./etc/udev/rules.d/70-quasar.rules
 ./home/quasar/.config/systemd/user/default.target.wants/podman-restart.service
 ./home/quasar/.config/systemd/user/sockets.target.wants/podman.socket
@@ -96,6 +97,9 @@ grep -q '# driver 615.71.09' "$r/etc/cdi/nvidia.yaml" && pass "CDI spec generate
 for why in "runs everything under this one unprivileged account" "keep running with nobody logged in" "devices Quasar uses, and only those" "Podman has no daemon"; do
   printf '%s' "$out" | grep -q "$why" && pass "change printed with its reason: $why" || fail "reason printed: $why" "$out"
 done
+
+grep -q '^d /run/quasar-agent 0750 quasar quasar -$' "$r/etc/tmpfiles.d/quasar.conf" && grep -q 'systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf' "$r/.prepare-host-commands" \
+  && pass "rootless: /run/quasar-agent is created for the Quasar user by tmpfiles.d" || fail "runtime dir" "$(cat "$r/etc/tmpfiles.d/quasar.conf" 2>&1)"
 
 # ── 2. a second run changes nothing ─────────────────────────────────────────
 before="$(tree "$r")"
@@ -132,6 +136,7 @@ grep -q '^kernel.dmesg_restrict=0$' "$r4/etc/sysctl.d/99-quasar.conf" && grep -q
 r5="$tmp/r5"; mk_root "$r5" nvidia
 out5="$(prep "$r5" "$tmp/podman-only" --mode rootful --engine podman --homes /srv/quasar 2>&1)" || fail "rootful run" "$out5"
 if grep -q '^quasar:' "$r5/etc/passwd" || grep -q '^quasar:' "$r5/etc/subuid" || [ -e "$r5/var/lib/systemd/linger/quasar" ]; then fail "rootful creates no account" ""; else pass "rootful creates no account, subordinate range or lingering"; fi
+[ ! -e "$r5/etc/tmpfiles.d/quasar.conf" ] && pass "rootful needs no runtime-directory entry (the engine creates it)" || fail "rootful tmpfiles" ""
 grep -q 'groupadd --system quasar' "$r5/.prepare-host-commands" && pass "rootful creates only the quasar group" || fail "rootful group" ""
 [ -L "$r5/etc/systemd/system/default.target.wants/podman-restart.service" ] && pass "rootful Podman enables the system podman-restart.service" || fail "rootful restart" ""
 [ -f "$r5/etc/udev/rules.d/70-quasar.rules" ] && [ -f "$r5/etc/sysctl.d/99-quasar.conf" ] && pass "rootful writes the device and kernel parts" || fail "rootful parts" ""

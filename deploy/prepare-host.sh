@@ -222,6 +222,22 @@ else
   fi
 fi
 
+# ── the agent's runtime directory ──────────────────────────────────────────
+STEP="runtime directory"
+# The node agent shares /run/quasar-agent with the sessions it starts, at the same path
+# on the host and in every container. /run is root's, and a rootless engine will not
+# create a missing bind source, so systemd creates it for the Quasar user at every boot.
+if [ "$MODE" = rootless ]; then
+  printf '# Written by Quasar host preparation. The node agent'"'"'s runtime directory, shared with its sessions.\nd /run/quasar-agent 0750 %s %s -\n' "$QUSER" "$QUSER" \
+    | put /etc/tmpfiles.d/quasar.conf 0644 "/run/quasar-agent for $QUSER, recreated at every boot (a rootless engine cannot create it)" || unchanged
+  if [ -d "$R/run/quasar-agent" ]; then
+    say ok "/run/quasar-agent exists"
+  else
+    run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
+    stand_in && mkdir -p "$R/run/quasar-agent"
+  fi
+fi
+
 # ── device access ──────────────────────────────────────────────────────────
 STEP="device rules"
 SETFACL=""

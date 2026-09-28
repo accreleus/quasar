@@ -41,6 +41,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         devices: HostDevices {
             unknown: Default::default(),
             kernel_log: false,
+            engine_rootless: false,
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,
@@ -159,6 +160,16 @@ fn node_agent_revision_3_holds_none_of_the_removed_access() {
         spec.cap_add.is_empty(),
         "never SYSLOG: the host setting is what allows the read"
     );
+    // On a rootless engine, which refuses device-cgroup rules, revision 3 carries none.
+    let mut rootless = inputs(Some(GpuVendor::Nvidia));
+    rootless.devices.engine_rootless = true;
+    let spec = render(Role::NodeAgent, 3, &rootless, &image, &agent_secrets()).unwrap();
+    assert!(
+        spec.device_cgroup_rules.is_empty(),
+        "{:?}",
+        spec.device_cgroup_rules
+    );
+    check("node-agent-r3-nvidia-rootless.json", &spec);
     // Revisions 1 and 2 render exactly as released.
     let r1 = render(
         Role::NodeAgent,

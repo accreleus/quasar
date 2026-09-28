@@ -245,6 +245,12 @@ pub struct HostDevices {
     /// only when true, so machine state an older actor wrote reads back unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kernel_log: bool,
+    /// RH-07 #402: the engine runs rootless. It refuses device-cgroup rules (access to
+    /// device nodes is then the host's device permissions, which host preparation sets),
+    /// so from recipe revision 3 the agent is created without one there. Written only
+    /// when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub engine_rootless: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -256,6 +262,7 @@ impl Default for HostDevices {
             uinput: true,
             kmsg: true,
             kernel_log: false,
+            engine_rootless: false,
             unknown: Unknown::new(),
         }
     }
@@ -979,6 +986,12 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
     spec.cap_add.clear();
     if !inputs.devices.kernel_log {
         spec.devices.retain(|d| d.host != "/dev/kmsg");
+    }
+    // A rootless engine refuses device-cgroup rules; the Quasar user's device access is
+    // the host's (the udev rule host preparation writes). Rootful keeps the input rule
+    // until #401 passes host-created nodes instead.
+    if inputs.devices.engine_rootless {
+        spec.device_cgroup_rules.clear();
     }
     spec.security_opt = vec!["label=disable".into()];
 }

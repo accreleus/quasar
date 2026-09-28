@@ -39,6 +39,7 @@ fn host(new: Behaviour) -> FakeState {
             name: Some("gpu-host-01".into()),
             runtimes: vec!["runc".into()],
             cdi_devices: Vec::new(),
+            rootless: false,
         },
         host_devices: ["/dev/dri", "/dev/uinput", "/dev/kmsg"]
             .iter()

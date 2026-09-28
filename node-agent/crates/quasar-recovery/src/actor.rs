@@ -1077,6 +1077,7 @@ impl Actor {
             }
             inputs.gpu = gpu;
             inputs.devices = devices;
+            inputs.devices.engine_rootless = host.rootless;
         }
 
         let machine = Machine {

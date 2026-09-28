@@ -79,10 +79,14 @@ pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, Ru
         .filter_map(|d| d.id.filter(|v| !v.is_empty()))
         .collect();
     cdi_devices.sort();
+    let rootless = crate::EngineMode::from_security_options(
+        sys.security_options.as_deref().unwrap_or_default(),
+    ) == crate::EngineMode::Rootless;
     Ok(EngineHost {
         name: sys.name.filter(|v| !v.is_empty()),
         runtimes,
         cdi_devices,
+        rootless,
     })
 }
 

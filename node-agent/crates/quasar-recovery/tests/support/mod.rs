@@ -53,6 +53,7 @@ pub fn host(
             name: Some("gpu-host-01".into()),
             runtimes: runtimes.iter().map(|r| r.to_string()).collect(),
             cdi_devices: Vec::new(),
+            rootless: false,
         },
         host_devices: devices
             .iter()

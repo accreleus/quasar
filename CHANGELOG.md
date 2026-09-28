@@ -32,6 +32,9 @@ own; the two do not move together, and that is deliberate.
   - `/dev/kmsg`, unless the host allows kernel-log reads (host preparation's
     `--allow-kernel-log`).
 
+  On a rootless engine it also drops the input device-cgroup rule, which rootless engines
+  refuse; device access there comes from host preparation's udev rules. Host preparation
+  now creates `/run/quasar-agent` for the Quasar user at every boot (`tmpfiles.d`).
   It adds `label=disable`, since the agent mounts the engine socket. GPU fault messages
   become an optional diagnostic that reports "skipped" and names the setting. The agent
   image now requires revision 3; revisions 1 and 2 render exactly as released.
