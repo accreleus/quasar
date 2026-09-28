@@ -25,6 +25,12 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Engine facts in the contract (RH-07, #393).** Contract amendment 17 lets a host report its
+  container engine (Docker or Podman), the engine's version and its engine mode (rootful or
+  rootless). They are shown to operators and decide nothing. The same amendment names the
+  readiness checks RH-07 adds. It also clarifies that an optional diagnostic the host did not
+  allow reports "skipped", and says why. ADR 0007 records that the seed needs no change for
+  Podman.
 - **Move a Compose install to an owned install with its data (#380).** A fresh combined or
   control-only install started with `QUASAR_AWAIT_RESTORE=1` on its seed holds its first
   control plane back, and `docker exec -i quasar-recovery quasar-recovery restore --dump - <

@@ -106,6 +106,47 @@ start.
 This clarification was approved by the owner on #381, 2026-09-26, with the Opus coordinator's
 review concurring.
 
+## Clarification: Podman, and the engine socket's path (RH07)
+
+RH07 runs Quasar on Podman as well as Docker, rootful or rootless (#390, decision D22). We
+clarify that **seed interface 1 needs no change for Podman**, and why. Nothing below changes
+what a seed decides, any fixture or any profile field. The one addition for actors is the
+restart-policy read-back below; on Docker the policy always reads back as set, so no Docker
+outcome changes.
+
+- **The engine socket.** The profile already binds "the container-engine socket at the path
+  the seed itself was given". That is the daemon-host path of whatever socket the operator
+  mounted into the seed: Docker's `/var/run/docker.sock`, Podman's rootful
+  `/run/podman/podman.sock`, or a rootless engine's socket under the Quasar user's runtime
+  directory (`$XDG_RUNTIME_DIR/podman/podman.sock`, `$XDG_RUNTIME_DIR/docker.sock`). Inside the
+  seed and the actor it stays mounted at `/var/run/docker.sock`, the in-container path the
+  profile fixes, and both speak the Docker-compatible Engine API to it. No engine is chosen by
+  path; the seed never looks for a second socket.
+- **State names and the restart policy are read through that API.** Podman's compatible API
+  reports a created-and-never-started container as `created`, a stopped one as `exited`, and the
+  restart policy by the same name `unless-stopped` (Podman 5.8.4, rootless, tested 2026-09-28).
+  Its compatible `/containers/{id}/update` changes the restart policy, and the change takes
+  effect: a container whose policy was set to `no` is not restarted when it exits (same version
+  and date). So "finishing its own create", "an actor stopped from outside" and the converse
+  obligation to set the policy to `no` before a stop hold word for word. Every recovery actor
+  released from RH07 on (#405) reads the restart policy back after each `/update`, on every
+  engine, and treats a mismatch as a failed step. Actors released earlier are not held to it.
+- **`unless-stopped` on Podman.** Podman has no daemon, but it honours the policy the same way:
+  a container that exits by itself is restarted, and one stopped through the API (`podman stop`,
+  or Quasar's own stop after setting the policy to `no`) is not. At boot, Podman's
+  `podman-restart.service` starts every container whose policy is `always`, or `unless-stopped`
+  and not stopped by hand (`--filter should-start-on-boot=true`). A rootful Podman engine
+  needs the system `podman-restart.service` enabled; a rootless one needs that service enabled
+  for the Quasar user and lingering enabled, so it runs without a login. **Host preparation**
+  does both, and a host without them is a readiness failure, not a silent gap.
+  With them, the profile's `unless-stopped` means on Podman exactly what it means on Docker, so
+  the seed's rules stay as written. (A rootless Docker daemon is itself a user service, so it
+  needs lingering for the same reason; once it runs, it applies the policy as rootful Docker
+  does.)
+
+This clarification was approved under the owner's standing pre-approval of RH07 contract
+amendments (2026-09-28), with an independent Opus review recorded on #393.
+
 ## The contract-test obligation
 
 A contract test runs the **current** seed code against machine-state fixtures written by **every
