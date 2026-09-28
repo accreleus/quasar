@@ -312,9 +312,16 @@ impl Dialect {
                     return false;
                 }
                 let permissions = actual.cgroup_permissions.as_deref().unwrap_or("");
+                // Podman expands a requested directory (`/dev/dri`) into its nodes, and a
+                // CDI GPU into the nodes its specification lists.
+                let under = |dir: &str| {
+                    Path::new(host).parent() == Some(Path::new(dir)) && gpu_expansion(host)
+                };
                 host == inside
                     && (permissions.is_empty() || permissions == "rwm")
-                    && (requested.iter().any(|wanted| wanted == host)
+                    && (requested
+                        .iter()
+                        .any(|wanted| wanted == host || under(wanted))
                         || (gpu_requested && gpu_expansion(host)))
             }),
         }

@@ -766,7 +766,11 @@ fn inspect_owned(
         }
     }
     if let Some(run) = probe {
-        if !dialect.devices_ok(host.devices.as_deref().unwrap_or(&[]), &run.devices, false) {
+        if !dialect.devices_ok(
+            host.devices.as_deref().unwrap_or(&[]),
+            &run.devices,
+            run.nvidia_device_request,
+        ) {
             return Err(ErrorKind::Protocol.into());
         }
         let mut realized_groups = host.group_add.clone().unwrap_or_default();

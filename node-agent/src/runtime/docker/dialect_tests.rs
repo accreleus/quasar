@@ -362,3 +362,28 @@ fn each_injection_reads_back_only_its_own_request() {
     echoed.device_ids = Some(vec!["nvidia.com/gpu=0".into(), "vendor.com/x=all".into()]);
     assert!(!is_nvidia_request(GpuInjection::Cdi, &echoed));
 }
+
+/// Live on rootless Podman: a requested `/dev/dri` is reported as its nodes, and a CDI GPU
+/// as the nodes its specification lists (the DRM ones included).
+#[test]
+fn podman_reports_a_requested_directory_as_its_drm_nodes_and_nothing_else() {
+    let requested = vec!["/dev/dri".to_string()];
+    let expanded = [
+        device("/dev/dri/card1", ""),
+        device("/dev/dri/renderD128", ""),
+    ];
+    assert!(Dialect::Podman.devices_ok(&expanded, &requested, false));
+    for foreign in ["/dev/dri/by-path", "/dev/sda", "/dev/nvidia0"] {
+        assert!(
+            !Dialect::Podman.devices_ok(&[device(foreign, "")], &requested, false),
+            "{foreign}"
+        );
+    }
+    let cdi = [
+        device("/dev/nvidiactl", ""),
+        device("/dev/nvidia0", ""),
+        device("/dev/dri/card1", ""),
+    ];
+    assert!(Dialect::Podman.devices_ok(&cdi, &requested, true));
+    assert!(!Dialect::Docker.devices_ok(&expanded, &requested, false));
+}
