@@ -466,7 +466,7 @@ impl Actor {
             self.decide_gpus(&mut machine, &image, revision)
                 .map_err(|e| fail(Reason::RecreateFailed, format!("GPU decision: {e}")))?;
             if machine.inputs.gpu.nvidia_shape() {
-                self.ensure_volume(&mut machine, names::NVIDIA_DRIVER_VOLUME, role)
+                self.ensure_volume(&machine, names::NVIDIA_DRIVER_VOLUME, role)
                     .map_err(|e| fail(Reason::RecreateFailed, format!("driver volume: {e}")))?;
             }
         }

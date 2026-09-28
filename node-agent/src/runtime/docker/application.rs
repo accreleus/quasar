@@ -980,10 +980,10 @@ async fn inspect_owned(
         return Err(refuse(what, dialect));
     }
     if intent.nested_sandbox_label
-        && !info
+        && info
             .process_label
             .as_deref()
-            .is_some_and(|label| label.split(':').nth(2) == Some("container_engine_t"))
+            .is_none_or(|label| label.split(':').nth(2) != Some("container_engine_t"))
     {
         return Err(refuse("selinux process label", dialect));
     }
