@@ -5982,7 +5982,9 @@ fn a_stalled_gpu_probe_lifecycle_is_bounded_by_one_budget() {
     let client = engine.client();
     let (helper, run) = nvidia_probe_request();
 
-    let budget = Duration::from_millis(500);
+    // Room for the engine round trips before create (the GPU injection is read from
+    // `/info` since #399) on a loaded machine; the bound is still one budget.
+    let budget = Duration::from_millis(900);
     let started = std::time::Instant::now();
     let error = client
         .gpu_probe_within(helper, run, budget)
