@@ -209,12 +209,17 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
 /// serves `--gpus` through an `nvidia` runtime, CDI, or the container toolkit's hook, and
 /// only the last is invisible in `/info`, so the evidence is whether this starts and exits
 /// 0. Removed on every path that created it.
+const GPUS_PROBE_TEST: &str = "set -- /dev/nvidiactl*; [ \"$1\" = /dev/nvidiactl ]";
+
 pub fn gpus_spec(image: &ImageRef, injection: GpuInjection) -> ContainerSpec {
     ContainerSpec {
         name: names::GPU_PROBE.into(),
         image: image.reference(),
+        // Served means the NVIDIA control node is inside: an engine may accept a request it
+        // ignores (rootless Podman does with `--gpus`). Matched by listing /dev, since a
+        // confined container may be denied `stat` there.
         entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
-        cmd: Some(vec!["true".into()]),
+        cmd: Some(vec![GPUS_PROBE_TEST.into()]),
         env: BTreeMap::new(),
         labels: BTreeMap::from([(labels::HELPER.to_string(), GPUS_PROBE_HELPER.to_string())]),
         network_mode: Some("none".into()),
@@ -283,7 +288,7 @@ fn gpus_attempt(
         Ok(()) => match engine.wait_container(&id, PROBE_TIMEOUT) {
             Ok(0) => Ok(GpusAnswer::Served),
             Ok(code) => Ok(GpusAnswer::Refused(format!(
-                "the probe ran with the GPUs and exited {code}"
+                "the probe started but saw no NVIDIA device inside (exit {code})"
             ))),
             Err(e) => Err(e),
         },

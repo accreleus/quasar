@@ -1700,8 +1700,10 @@ registers as `seed_version`.
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
 **NVIDIA detection.** When the device probe finds an NVIDIA render node, the actor asks
-the engine, just before it creates the agent, with a second disposable probe that requests
-the GPU the way every Quasar container on this engine will (RH-07 #399):
+the engine, just before it creates the agent (on install and on an update alike), with a
+second disposable probe that requests the GPU the way the agent's recipe revision will
+(RH-07 #399). From revision 3 that is the way every Quasar container on this engine asks;
+before it, always `--gpus all`:
 - **by CDI** (`nvidia.com/gpu=all`) on Podman, and on a Docker that reports an NVIDIA CDI
   device;
 - **by `--gpus all`** on a rootful Docker that reports none;
@@ -1711,10 +1713,12 @@ the GPU the way every Quasar container on this engine will (RH-07 #399):
   Nothing falls back to more privilege.
 
 Then:
-- It starts and exits 0: the NVIDIA shape is installed (`token="actor-gpus-served"`) and that
-  yes is recorded in machine state.
+- It starts and finds the NVIDIA control node inside (an engine may accept a request and
+  ignore it, as rootless Podman does with `--gpus`): the NVIDIA shape is installed
+  (`token="actor-gpus-served"`) and that yes is recorded in machine state, with the request
+  it answered. A later create whose revision renders a different request asks again.
 - The engine refuses the device request ("could not select device driver", or with CDI enabled "failed to discover GPU vendor from CDI") or the probe
-  exits non-zero: the agent is installed without the NVIDIA shape, pointed at the machine's
+  finds no NVIDIA device: the agent is installed without the NVIDIA shape, pointed at the machine's
   other GPU if it has one (`token="actor-gpus-refused"`, with the reason), and RH-02
   readiness reports the gap. The no is not recorded: the next time the agent is created
   (after removing it, for instance once the toolkit is installed) the engine is asked again.

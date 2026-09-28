@@ -33,7 +33,10 @@ own; the two do not move together, and that is deliberate.
   host (or, on a mixed host, each NVIDIA GPU through `runtime_cdi_gpu<N>`). Podman lists no
   CDI devices, so there the evidence is the agent's own NVIDIA device node. Each container
   records the request it was created with and is read back against it, so an engine that
-  gains a CDI specification later does not orphan existing containers. The driver volume no longer carries the X.Org server
+  gains a CDI specification later does not orphan existing containers. The actor's GPU probe now
+  requires the NVIDIA control node inside the probe container (rootless Podman accepted a
+  `--gpus` request and injected nothing, which read as a yes), and an update that recreates
+  the agent asks the engine again when its revision renders a different request. The driver volume no longer carries the X.Org server
   modules, and NVIDIA app containers disable lavapipe so a broken ICD cannot fall back to
   software rendering.
 - **One least-privilege node-agent recipe (RH-07, #402).** Recipe revision 3, applied by the

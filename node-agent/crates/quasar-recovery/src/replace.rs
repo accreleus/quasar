@@ -26,7 +26,7 @@ use crate::actor::{Actor, ResumeError};
 use crate::engine::{Container, EngineError, RestartPolicy};
 use crate::handover::Flow;
 use crate::journal::{embedded_log_tail, tail_output, Failure, Journal, Phase, OUTPUT_LIMIT};
-use crate::recipe::{self, labels, Book, RenderError, Role};
+use crate::recipe::{self, labels, names, Book, RenderError, Role};
 use crate::settle::{settle, Settlement, RECOVERY_ACTOR};
 use crate::socket::{Reason, State};
 use crate::submit::kept_name;
@@ -455,11 +455,21 @@ impl Actor {
                 ),
             ));
         }
-        let machine = match self.dir.load_machine() {
+        let mut machine = match self.dir.load_machine() {
             Ok(Some(m)) => m,
             Ok(None) => return Err(fail(Reason::RecreateFailed, "machine state is missing")),
             Err(e) => return Err(fail(Reason::RecreateFailed, format!("machine state: {e}"))),
         };
+        // An update may change the revision, and with it the GPU request the agent renders:
+        // the engine is asked with that request, as on install.
+        if role == Role::NodeAgent {
+            self.decide_gpus(&mut machine, &image, revision)
+                .map_err(|e| fail(Reason::RecreateFailed, format!("GPU decision: {e}")))?;
+            if machine.inputs.gpu.nvidia_shape() {
+                self.ensure_volume(&mut machine, names::NVIDIA_DRIVER_VOLUME, role)
+                    .map_err(|e| fail(Reason::RecreateFailed, format!("driver volume: {e}")))?;
+            }
+        }
         let secrets = match role {
             Role::NodeAgent => self.node_agent_secrets(),
             Role::ControlPlane => self.control_plane_secrets(),

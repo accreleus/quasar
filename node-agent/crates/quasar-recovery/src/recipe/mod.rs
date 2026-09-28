@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use quasar_runtime::platform::{
     Bind, ContainerSpec, Device, GpuRequest, Healthcheck, PublishedPort, RestartPolicy,
 };
-pub use quasar_runtime::GpuInjection;
+pub use quasar_runtime::{GpuInjection, NVIDIA_CDI_DEVICE};
 
 /// Deterministic names of what the recovery actor creates (architecture §5.4).
 pub mod names {

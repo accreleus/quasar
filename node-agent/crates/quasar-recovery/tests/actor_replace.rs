@@ -915,3 +915,40 @@ fn an_unreadable_journal_fails_closed() {
         assert_eq!(engine.state(), before, "{name}: the engine changed");
     }
 }
+
+/// An update that moves the agent to recipe revision 3 asks the engine again with the
+/// request revision 3 renders: an answer recorded for `--gpus` says nothing about CDI.
+#[test]
+fn an_update_to_revision_3_asks_the_engine_by_cdi_again() {
+    let mut state = nvidia_host(&[], true);
+    state.host.gpu_injection = Some(quasar_recovery::recipe::GpuInjection::Cdi);
+    state.registry.insert(NEW_AGENT.into(), new_image("3"));
+    state.behaviour.insert(NEW_AGENT.into(), healthy());
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    actor_with(&engine, dir.path(), fast())
+        .resume()
+        .expect("a clean install");
+    let machine = |dir: &tempfile::TempDir| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join("machine.json")).unwrap()).unwrap()
+    };
+    assert!(
+        machine(&dir)["inputs"]["gpu"].get("cdi").is_none(),
+        "revision 1 asked by --gpus"
+    );
+
+    let actor = actor_with(&engine, dir.path(), fast());
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    assert_eq!(
+        result_of(&actor.status_for(Some(ID))).state,
+        State::Succeeded
+    );
+    assert_eq!(machine(&dir)["inputs"]["gpu"]["cdi"], true);
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert_eq!(
+        agent.spec.gpus[0].device_ids,
+        vec![quasar_recovery::recipe::NVIDIA_CDI_DEVICE.to_string()]
+    );
+}
