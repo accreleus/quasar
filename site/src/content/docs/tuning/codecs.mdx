@@ -6,8 +6,21 @@ description: H.264, HEVC and AV1, how the server picks one per session, and the 
 import { Aside } from '@astrojs/starlight/components';
 
 Quasar supports H.264, HEVC and AV1. One per session, chosen by the server at
-launch. You do not pick a codec; you pick a quality tier, and the server resolves
-it against what your host can encode and your browser can decode.
+launch. Normally you leave the codec on **Auto**: you pick a quality tier, and the
+server resolves it against what the host's GPUs can encode and your browser can
+decode.
+
+## Choosing one yourself
+
+The launch panel's **Launch options** has a **Codec** row. It lists only codecs
+this device can decode and some GPU that could take your launch can encode. On
+Auto, the server prefers a free GPU that can give your device its best codec.
+
+A codec you pick is a requirement, not a preference, and it is never quietly
+downgraded. Only a GPU that encodes it is considered: if one exists but is busy,
+the launch waits as for any full host; if none that is online can encode it, the
+launch is refused, and the message names the codec. The server stops you before
+sending a stream your browser cannot decode.
 
 Which codecs a host can produce is decided by its encoder. See
 [Encoders](/quasar/tuning/encoders/).
@@ -33,7 +46,10 @@ picture instead of overhead.
 A quality tier is an ordered list of encode rungs. The server walks it and takes
 the first rung that survives four checks:
 
-1. **The host can encode it**, as reported by its node agent.
+1. **The GPU the session was placed on can encode it.** Each GPU reports its own
+   codecs, and HEVC or AV1 only once a short test encode of that codec has
+   passed on it. A freshly started host offers H.264 alone for the few seconds
+   those tests take.
 2. **The client can decode it.** Measured when the user logged in and stored
    against that device. HEVC and AV1 are hard-gated on a positive result,
    because sending a codec the browser cannot decode gives a black screen rather

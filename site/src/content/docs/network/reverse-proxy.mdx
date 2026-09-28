@@ -34,7 +34,9 @@ Three things make it work:
   override for them, so the Admin list is the only list.
 - **`QUASAR_TRUSTED_PROXIES`**, a seed input, names your proxy's address or
   network, so forwarded client addresses are believed only from it. It is read at
-  the first install, like the other inputs.
+  the first install, like the other inputs. To change it later, run
+  `docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_TRUSTED_PROXIES=<address or CIDR>`
+  on the first machine; it replaces the control plane with the new value.
 
 The seed's `QUASAR_PUBLIC_HOST` still names the certificate on the control
 plane's own HTTPS port, which you keep for direct LAN access.

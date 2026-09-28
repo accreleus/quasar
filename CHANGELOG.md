@@ -404,6 +404,16 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The public site describes RH-05 and RH-06 as they now behave.** A new install is told to
+  switch Fleet ▸ Releases to the edge channel, since stable lists nothing for an owned install
+  yet. Pages no longer say a Compose install's data cannot be moved, and the quick start's
+  script points at Move a Compose install before anything is stopped. Hosts and GPUs covers
+  readiness checks that block launches, `host_not_ready` and **Launch anyway**; host settings
+  sources and **Approve idle apply** (a restart setting never ends a session); per-GPU
+  placement and codecs; home claims and releasing one. Apps gains Placement, Images gains
+  first-launch pulls and cached-version removal, Codecs documents the launch panel's codec
+  picker, and troubleshooting covers the 20-second `no_host_available` retry and a controller
+  the browser does not recognise. The glossary adds home claim and readiness check.
 - **The contract now says `/enroll-host.sh` is rendered per control plane.** `control-api.md`
   no longer calls it a static file: each control plane serves its own copy with the images its
   Add host command installs written in (protocol pin bump, wording only).

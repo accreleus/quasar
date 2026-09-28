@@ -219,3 +219,11 @@ A host whose agent is not connected is removed with `uninstall` on that machine
 instead.
 
 Its home directories stay where they are. Move or delete them when you are ready.
+
+Its users' homes are still claimed by it, so while it is gone those users cannot
+launch the apps whose homes it held. If it is not coming back, forget it, then
+release each claim under Admin, Fleet, Storage, Home ownership (see [Releasing a home
+claim](/quasar/admin/hosts/#releasing-a-home-claim)); those users then start
+with new, empty homes. If you bring the machine back under the same node name
+with the same storage root, leave the claims alone: its homes are picked up
+again.

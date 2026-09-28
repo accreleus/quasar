@@ -41,6 +41,26 @@ entitled cannot see the app and cannot launch it with a direct identifier.
 Library discovery creates an everyone grant automatically when it adds an app,
 so that discovered games are launchable without further work.
 
+## Placement
+
+An app's **Placement** tab says which hosts may start new sessions of it. It is
+saved on its own, separately from the app's other changes.
+
+- **Every eligible host** (dynamic): any host that can run the app is used,
+  including hosts added later. The default.
+- **Only these hosts** (fixed): only the hosts you tick. A host added later is
+  not used until you tick it.
+
+Each selected host prepares the app's image ahead of the first launch, and the
+tab shows every host's state: selected, prepared, and ready. A failed preparation
+can be retried from there. A game tile found by library discovery inherits its
+placement from its parent app and is edited there.
+
+Placement narrows where a session can start; it never moves an existing home. A
+user whose home for the app is on a host you untick cannot launch it until that
+host is allowed again or the [home claim is
+released](/quasar/admin/hosts/#releasing-a-home-claim).
+
 ## Runtime preset settings that matter
 
 Most defaults are fine. These four are the ones that cause problems.

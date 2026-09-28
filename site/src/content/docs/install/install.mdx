@@ -20,7 +20,7 @@ published with the edge tag `o2-develop`; an install names it by digest.
 
 You declare **one container per machine: the seed**. That is the whole of what
 `docker run`, Dockge or Arcane holds for Quasar. The seed makes sure the machine's
-**recovery actor** exists and does nothing else. The recovery actor is Quasar's
+**recovery actor** exists and is running, and does nothing else. The recovery actor is Quasar's
 own container on that machine: it creates the other services through the Docker
 Engine API, and later replaces them when you update from the console.
 
@@ -460,6 +460,6 @@ console never offers it an update.
 
 A stack started from `deploy/docker-compose.yml` and `deploy/.env` keeps running,
 but it is not offered a release that ships owned installs, and nothing converts
-it. Replacing it is a fresh install: see [Replace a Compose
-install](/quasar/install/move-existing/). To stay where you are, see [Legacy
+it. Replacing it is a fresh install, which can take your data with it: see
+[Move a Compose install](/quasar/install/move-existing/). To stay where you are, see [Legacy
 Compose installs](/quasar/install/legacy-compose/).

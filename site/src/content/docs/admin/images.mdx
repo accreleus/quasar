@@ -64,12 +64,37 @@ creating an app against it.
 
 ## Where images get placed
 
-By default every host gets every installed image, so a session can be placed
-anywhere without waiting for a pull.
+An image is prepared on the hosts that need it: the hosts each app using it may
+launch on, set on the app's [Placement](/quasar/admin/apps/#placement) tab. With
+the default placement that is every eligible host, so a session can start
+anywhere without waiting for a pull. An app limited to certain hosts has its
+image prepared only there. Having an image cached on a host does not let the
+app run on a host its placement does not select.
 
-Individual apps can opt into lazy placement instead, where the image is only
-fetched on the first launch attempt on that host. Worth it for large images you
-rarely use, at the cost of a slow first launch.
+An image can be installed with **Pull on first launch** turned on instead. It is
+then prepared on a host at
+its first launch there: once the launch is accepted, the host pulls the pinned
+image, or builds the template, and the session starts when the host reports that
+exact version ready. The player sees the loading screen meanwhile, and a first
+pull of a large image can take minutes. A failure, timeout or host reconnect
+fails only that launch; the next launch tries again. After the first launch the
+image is kept up on that host like any other. Lazy is worth it for large images
+you rarely use.
+
+## Removing cached versions
+
+Uninstalling an image removes Quasar's record of it, and presets and apps that
+point at it stop launching until it is reinstalled. It does **not** delete
+anything from the hosts: cached versions stay until you remove them.
+
+On the image's page, **Cached versions** lists each version on each host, with
+what protects it. **Remove this cached version** asks that host to delete it.
+It is refused while something still needs that version: an app that requires
+it, any container using it (even a stopped one), pending launch or preparation
+work, the previous version that was prepared successfully, or a host whose
+inventory is not yet complete. A request accepted is not a removal done: the
+page says **Removal confirmed by the host inventory** only when it is. Cleanup
+never touches a managed home.
 
 ## Updates
 

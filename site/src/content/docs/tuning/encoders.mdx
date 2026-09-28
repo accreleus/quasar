@@ -29,8 +29,9 @@ QUASAR_ENCODER=vulkan
 ```
 
 Or override one machine from Admin, Fleet, Hosts, by opening that host and using
-its Settings page. Either way the agent restarts and live sessions on that host
-drop.
+its Settings page. The encoder is a restart setting there, so it takes effect
+when you approve it and the host is idle, and it never ends a running session.
+See [Per-host settings](/quasar/admin/hosts/#per-host-settings).
 
 The four values are `vulkan`, `va`, `nvenc` and `openh264`.
 

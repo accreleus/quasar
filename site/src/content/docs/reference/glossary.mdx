@@ -89,10 +89,16 @@ in an H.264 rung.
 decodes it with operating system hardware support, so effectively macOS and
 Windows only. The catalog calls it `hevc` and the wire calls it `h265`.
 
+**Home claim.** The record of where one user's home for one app lives. Once a home
+exists, that app launches on its host for that user, whatever the placement
+policy, and Quasar never creates a second home to get round an unknown or
+conflicting location. An admin can release the claim of a host that is gone for
+good.
+
 **Home root.** The directory on a host where managed home directories live. Each
 host can have its own. For saves to follow users between machines it must be real
-shared storage, not merely the same path on each one; otherwise `locality`
-placement keeps a user on the host that holds their files.
+shared storage, not merely the same path on each one; otherwise a user's
+existing home keeps their launches on the host that holds their files.
 
 **Host.** A machine running the node agent. Owns GPUs and runs sessions.
 
@@ -133,8 +139,9 @@ Quasar service but does not carry the installation's labels: a leftover Compose
 stack, or a definition a stack manager still holds. The recovery actor never acts
 on it and says so.
 
-**Placement.** Choosing which host runs a session. Governed by
-`QUASAR_PLACEMENT_POLICY`.
+**Placement.** Choosing which host and GPU run a session. Limited by the user's
+home claim, the app's own host selection and each host's readiness, then ordered
+by `QUASAR_PLACEMENT_POLICY`.
 
 **Platform release.** A matched set of Quasar's own images (the control plane, the
 node agent and the recovery actor) built from one commit and published together.
@@ -156,6 +163,11 @@ before the update.
 **Presentation interval variation.** The standard deviation of the gap between
 displayed frames. The number that matches perceived stutter. Below 12 ms is
 healthy, above 18 ms is visible.
+
+**Readiness check.** One named verdict about a host, shown on its readiness card
+with the fix when it fails. Most are advice. One that rests on evidence and is
+failing blocks launches on the host, its homes or one GPU, until it passes or an
+admin overrides it.
 
 **Recovery actor.** The Quasar-owned container on each machine that creates and
 replaces that machine's other Quasar services, and replaces itself by a
@@ -183,7 +195,8 @@ order, the recovery actor first.
 
 **Seed.** The one container you, or a stack manager such as Dockge or Arcane,
 declare for Quasar on a machine. It only makes sure the machine's recovery actor
-exists, and it is built to stay unchanged for years. Your manager updates it, not
+exists and runs, starting it again if it was stopped from outside, and it is
+built to stay unchanged for years. Your manager updates it, not
 Quasar, and removing or redeploying it never stops Quasar.
 
 **Session.** One user, one app, one host, one connection.

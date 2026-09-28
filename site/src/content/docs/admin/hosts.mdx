@@ -47,11 +47,48 @@ while the agent remains connected. A known AV1 driver restriction leaves the hos
 usable with its other eligible codecs; see
 [AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
 
-<Aside type="note" title="Readiness and launch checks">
-The agent remains available for administration when a readiness check fails.
-Required driver, home, template or runtime mounts that cannot be resolved prevent
-an affected app launch. Warnings about optional diagnostics do not block it.
-</Aside>
+### When a check blocks launches
+
+A host always registers, however many of its checks fail, so the console can say
+why. Most checks are advice. A check blocks launches only when it rests on
+**evidence**, a host probe that exercised the real path or a definite local
+observation such as an unwritable home root, **and** it currently fails. Checks
+that only look at configuration (a file exists, a firewall rule parses) never
+block, and neither does a warning or an inconclusive probe.
+
+A blocking check names what it keeps out:
+
+| Scope | What it blocks |
+| --- | --- |
+| Host | Every launch on the host. |
+| Homes | Every launch on the host that mounts a managed home. |
+| GPU | Every launch that would be placed on that one GPU. The host's other GPUs keep serving. |
+
+The gate only reads a fresh report. A host that has not reported readiness in
+the last minute is not blocked by it, because a host that has gone quiet is
+already out of placement by being offline, and stale evidence must not strand
+the fleet.
+
+When readiness is the **only** reason nothing can take a launch, the player sees
+`host_not_ready`: the host needs its administrator's attention. The message never
+names the check; that detail is on the host's readiness card. Swapping games in a
+running session is not affected, because a swap places nothing.
+
+### Overriding a failing check
+
+If you know better than the evidence, **Launch anyway** on a blocking check lets
+the host launch despite that one check. The check stays on the card, marked
+overridden, so it is never hidden. An override:
+
+- applies to that check on that host only;
+- ends by itself the next time the check passes, so it cannot mask a later
+  failure;
+- is written to the audit log as a warning, with who set it;
+- cannot lift a check the agent enforces itself. Those launches would fail on
+  the host anyway, so the console refuses the override.
+
+**Withdraw override** removes it. An override whose check the agent no longer reports is
+listed as inert: it excludes nothing, and you can withdraw it.
 
 ## Build identity in the host drawer
 
@@ -145,28 +182,63 @@ there is no VRAM cgroup controller to enforce it with, and in practice it was an
 admin-typed guess nothing reconciled. Live telemetry replaced it.
 </Aside>
 
-### The two capacity errors
+### The three launch refusals
 
-`no_host_available` means nothing in the fleet could ever serve the request.
-Usually every host is offline. Retrying does not help.
+`no_host_available` means nothing online could serve the request, usually because
+every host is offline. The web client retries it by itself for 20 seconds, which
+covers a host that has just reconnected and not yet reported its capacity. If it
+persists past that, look at the hosts, not the launch.
 
 `capacity_exhausted` means hosts are up but currently full. Retrying does help,
 once something ends.
 
+`host_not_ready` means a host could have taken the launch, but a failing
+readiness check keeps it out. See [When a check blocks
+launches](#when-a-check-blocks-launches). It clears when you fix or override the
+check, not on a timer.
+
+An explicit codec the player picked that no candidate GPU can encode is refused
+with the first two as well, rather than started on a codec they did not ask for.
+
 ## Per-host settings
 
-Each host has a Settings page that overrides its environment configuration
-without editing `.env` and restarting anything by hand. Precedence runs: per-host
-override, then agent environment, then catalog default.
+Each host has a Settings page. Every setting there has a **source**:
+
+| Source | Where the value comes from |
+| --- | --- |
+| Deployment setting | What the agent was started with: its environment and its own device detection. The default for most settings. |
+| Automatic choice | Quasar picks from what the host has proven. Offered only for the encoder and render node, and only when exactly one GPU has passed its media probe. |
+| Explicit value | A value you type. |
+
+Saving records what you want. It does not prove anything applied: each setting
+reports its own state beside it, **Verified on the current connection** once the
+agent confirms it, or **Not yet verified** until then.
 
 Settings come in two classes.
 
-**Live** settings apply to the next session on that host. ABR mode, container
-knobs and most tuning are live.
+**Next-session** settings apply to the next session that starts on the host, once
+the agent has verified them. ABR mode, container knobs and most tuning are here.
 
-**Restart** settings need the agent to restart, which drops any live sessions on
-that host. The encoder, the render node and the CUDA device are in this class.
-Quasar tells you before it does it.
+**Restart** settings (the encoder, the render node and the CUDA device) need the
+agent to restart, so saving them never applies them. Under **Restart
+configuration**, review the values Quasar will apply and press **Approve idle
+apply**. From then on the host takes no new sessions, and the agent restarts
+once the sessions already on it have finished and its checks pass. **Approval
+never ends a running session.** An approval lasts an hour, and a restart of the
+control plane also ends one that has not started: nothing changes, and you
+review and approve again.
+
+If the approval sits waiting on preparation while nothing is being prepared,
+the usual cause is a Steam template warm-up that failed because the change you
+are approving is not applied yet. Turn off **Prepare Steam for faster first
+launch** under Admin, Library, Sources, Steam, let the apply finish, then turn it
+back on. If the new configuration
+fails, the agent puts back its last verified configuration and the card says so.
+If the settings change after you reviewed them, the approval is refused and asks
+you to review again.
+
+An agent from before host policy shows **upgrade required** on the settings it
+cannot take this way; edit those in the panels below until it is updated.
 
 ## Render node selection
 
@@ -180,10 +252,11 @@ numbered names can move between reboots. See
 For NVENC on a multi-GPU box, `QUASAR_CUDA_DEVICE` selects the CUDA device index
 as well.
 
-<Aside type="caution" title="Per-session GPU routing does not exist yet">
-Placement chooses a host, and the host's configuration chooses a GPU. You cannot
-currently route a specific session to a specific GPU on a multi-GPU host.
-</Aside>
+Left unset, every GPU that passes its probes takes sessions. Placement picks a
+GPU for each session, not just a host, so a two-GPU machine runs sessions on
+both. Each GPU also advertises its own codecs: a GPU that cannot encode HEVC or
+AV1 is simply not picked for a session that needs one. Setting a render node
+takes the other GPUs out of placement.
 
 ## Placement across hosts
 
@@ -191,12 +264,25 @@ currently route a specific session to a specific GPU on a multi-GPU host.
 
 | Value | Behaviour |
 | --- | --- |
-| `spread` | Default. Distributes sessions across hosts. |
-| `least-loaded` | Prefers the host with the most free capacity. |
-| `locality` | Prefers the host that already holds the user's home directory. |
+| `spread` | Default. Prefers the GPU with the most free encode slots, then the most free VRAM. `least-loaded` is the same policy. |
+| `locality` | Prefers the host holding the user's most recently used home for that app, and falls back to `spread` when it is full, cordoned or offline. |
 
-Use `locality` if home directories are host-local instead of on shared storage.
-Otherwise a user's saves are on whichever host happened to run the session.
+Whatever the policy, a user's **existing home stays where it is**. Once a user has
+a home for an app on a host, that app launches there for them, so their saves
+are always in the session. While that host is offline or full, the player
+cannot launch that app, rather than getting an empty home somewhere else. An app's own
+[placement](/quasar/admin/apps/#placement) narrows placement further.
+
+### Releasing a home claim
+
+If a host is gone for good, its users' homes are claimed by a machine that will
+not come back, and their launches of those apps cannot be placed. Once you have
+forgotten the host, Admin, Fleet, Storage, **Home ownership** lists those claims,
+and the row menu's **Release claim** lets that user launch again with a new,
+empty home. A claim that still records a home on a host that exists cannot be
+released. It asks for a note of what you
+checked. It moves and deletes no files: if the machine returns with the same
+storage root, the old home is picked up again.
 
 ## Draining and removing
 

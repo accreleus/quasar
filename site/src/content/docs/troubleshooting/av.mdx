@@ -105,6 +105,17 @@ read-only open succeeds even on a broken setup, which is what makes this easy to
 misdiagnose. The agent's readiness check tests for write access and reports the
 result on the host detail page.
 
+## Controller buttons are in the wrong places
+
+The game sees a wired Xbox 360 controller, whatever pad you hold, so Steam and
+games apply the Xbox layout. That works when the browser recognises your pad and
+reports it with the standard layout.
+
+Some pads, for example an 8BitDo pad over Bluetooth, are reported without it. Their
+buttons then reach the game in the pad's own order. The session says so once per
+pad, and the **Controller & input** pane notes it under that pad. The fix is on
+the pad: switch it to XInput mode, or connect it by cable or its USB receiver.
+
 ## Touch input on a tablet
 
 Touch is forwarded. The session drawer is reached with an on-screen button rather

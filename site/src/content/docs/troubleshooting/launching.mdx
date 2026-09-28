@@ -9,15 +9,27 @@ import { Aside } from '@astrojs/starlight/components';
 
 | Message | Cause | What to do |
 | --- | --- | --- |
-| No host available | Nothing in the fleet is online, or no host could ever serve the request. | Check Admin, Fleet, Hosts. Retrying will not help. |
+| No host available | Nothing in the fleet is online, or no host could ever serve the request. | The browser retries this by itself for 20 seconds, which covers a host that has just reconnected. If it still fails, check Admin, Fleet, Hosts. |
 | Capacity exhausted | Hosts are up but currently full on encode slots or GPU memory. | Retry once something ends. |
+| Host not ready | A host could take the launch, but a failing readiness check keeps it out. The player is not told which check. | Open the host in Admin, Fleet, Hosts. Its readiness card marks the check that blocks launches. Fix it, or press **Launch anyway** on it. See [When a check blocks launches](/quasar/admin/hosts/#when-a-check-blocks-launches). |
+| Home conflict | The user's saved home for this app is recorded in more than one place, or where Quasar cannot confirm it. | Admin, Fleet, Storage, Home ownership shows the claim and the reason. Quasar never creates a second home to get round it. If the claim's host is gone for good, [release the claim](/quasar/admin/hosts/#releasing-a-home-claim). |
 | Session quota exceeded | The user is at their concurrent session limit. | End one, or raise the limit in Admin, People, Users. Note that a limit of zero blocks everything. |
 | Home in use | The user already has this app running elsewhere. The response names the session. | End that session. One session per user per app, because two writers corrupt save files. |
 | Not entitled | No grant for this user and app. | Grant it in Admin, Library, Apps. |
 
 ## Capacity looks free but launches are refused
 
-Admission needs both a free encode slot and enough free GPU memory. The memory
+First, check the host's readiness card: a check marked as blocking launches keeps
+the host (or one of its GPUs) out of placement however free it looks. The
+player sees *Host not ready* only when that is the sole reason; when another
+host is merely full, they see *Capacity exhausted*.
+
+The launch may also be pinned. A user who already has a home for the app on one
+host only ever launches it there, so another host's free slots do not help them.
+The same is true of an app whose [placement](/quasar/admin/apps/#placement) is
+limited to certain hosts.
+
+Admission also needs both a free encode slot and enough free GPU memory. The memory
 check is a veto against the most recent telemetry sample, defaulting to 1024 MB
 free.
 
@@ -75,7 +87,7 @@ Set `network: bridge` on the Steam runtime preset.
 **Steam starts but no games are discovered.** Discovery scans the filesystem for
 installed games. It does not sync what you own. Install something through the
 Steam launcher app first, then wait for the next scan or trigger one from Admin,
-Steam.
+Library, Sources. See [The Steam library](/quasar/admin/steam/).
 
 Discovery needs a managed-home root on the selected host. If the host has no
 effective storage root, set one under Admin, Fleet, Hosts. A root that exists only
