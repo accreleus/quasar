@@ -117,6 +117,9 @@ run() {
 }
 
 # put PATH MODE REASON: write stdin to PATH atomically when it differs.
+# Returns 0 when it wrote (or would write), 1 when the file was already right, and
+# exits 2 when it could not write. Callers treat anything but 0 or 1 as fatal:
+# `put` runs in a pipeline subshell, where its `die` cannot end this script.
 put() {
   dest="$R$1"; mode="$2"; reason="$3"
   tmp="$(mktemp "${TMPDIR:-/tmp}/quasar-prep.XXXXXX")"
@@ -127,11 +130,12 @@ put() {
   if [ "$DRY_RUN" = 1 ]; then
     rm -f "$tmp"; say "would" "write $1 — $reason"; return 0
   fi
-  mkdir -p "$(dirname "$dest")"
   # Same directory, then rename: a reader never sees half a file.
-  cp "$tmp" "$dest.quasar-new"
-  chmod "$mode" "$dest.quasar-new"
-  mv -f "$dest.quasar-new" "$dest"
+  if ! { mkdir -p "$(dirname "$dest")" && cp "$tmp" "$dest.quasar-new" \
+      && chmod "$mode" "$dest.quasar-new" && mv -f "$dest.quasar-new" "$dest"; }; then
+    rm -f "$tmp" "$dest.quasar-new"
+    die "could not write $1"
+  fi
   rm -f "$tmp"
   say changed "$1 — $reason"
   return 0
@@ -142,7 +146,16 @@ stand_in() { ! live && [ "$DRY_RUN" = 0 ]; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-passwd_has() { grep -q "^$2:" "$R/etc/$1" 2>/dev/null; }
+# After a `put` that returned non-zero: 1 means "already right"; anything else is fatal.
+unchanged() { rc=$?; [ "$rc" -eq 1 ] || exit "$rc"; }
+unchanged_then_false() { rc=$?; [ "$rc" -eq 1 ] || exit "$rc"; return 1; }
+
+# passwd_has DB NAME: the account database has NAME (getent on the live system, so
+# LDAP/SSSD accounts count; the files under a test root).
+passwd_has() {
+  if live && { [ "$1" = passwd ] || [ "$1" = group ]; }; then getent "$1" "$2" >/dev/null 2>&1
+  else grep -q "^$2:" "$R/etc/$1" 2>/dev/null; fi
+}
 
 printf 'Quasar host preparation (%s%s)\n' "$MODE" "$([ "$DRY_RUN" = 1 ] && echo ', dry run' || true)"
 
@@ -169,9 +182,12 @@ if [ "$MODE" = rootless ]; then
   elif [ "$DRY_RUN" = 1 ]; then
     say would "create account $QUSER — a rootless install runs everything under this one unprivileged account"
   else
-    run useradd --create-home --user-group --comment "Quasar" "$QUSER"
+    # A rootful preparation made the group already: join it rather than fail.
+    if passwd_has group "$QUSER"; then group_arg="-g $QUSER"; else group_arg="--user-group"; fi
+    # shellcheck disable=SC2086 # two words on purpose
+    run useradd --create-home $group_arg --comment "Quasar" "$QUSER"
     stand_in && printf '%s:x:1100:1100:Quasar:/home/%s:/bin/bash\n' "$QUSER" "$QUSER" >> "$R/etc/passwd"
-    stand_in && printf '%s:x:1100:\n' "$QUSER" >> "$R/etc/group"
+    stand_in && [ "$group_arg" = --user-group ] && printf '%s:x:1100:\n' "$QUSER" >> "$R/etc/group"
     say changed "account $QUSER — a rootless install runs everything under this one unprivileged account"
   fi
   STEP="subordinate IDs"
@@ -184,7 +200,7 @@ if [ "$MODE" = rootless ]; then
     next="$(awk -F: 'BEGIN{m=524288} NF>=3 {e=$2+$3; if (e>m) m=e} END{print m}' "$R/etc/$f" 2>/dev/null || echo 524288)"
     [ -n "$next" ] || next=524288
     { [ -f "$R/etc/$f" ] && cat "$R/etc/$f"; printf '%s:%s:65536\n' "$QUSER" "$next"; } \
-      | put "/etc/$f" 0644 "subordinate ${f#sub} range for $QUSER: the containers' own users map into it" || true
+      | put "/etc/$f" 0644 "subordinate ${f#sub} range for $QUSER: the containers' own users map into it" || unchanged
   done
   STEP="lingering"
   if [ -e "$R/var/lib/systemd/linger/$QUSER" ]; then
@@ -211,7 +227,7 @@ STEP="device rules"
 SETFACL=""
 for p in /usr/bin/setfacl /bin/setfacl; do [ -x "$R$p" ] || [ -x "$p" ] && { SETFACL="$p"; break; }; done
 [ -n "$SETFACL" ] || die "setfacl was not found (install the acl package). The device rules add access with it rather than changing a device's owner."
-acl="RUN+=\"$SETFACL -m g:$QUSER:rw \$devnode\""
+acl="ACTION!=\"remove\", ENV{DEVNAME}==\"?*\", RUN+=\"$SETFACL -m g:$QUSER:rw \$devnode\""
 {
   cat <<EOF
 # Written by Quasar's host preparation (deploy/prepare-host.sh). Re-run it to change this file.
@@ -234,7 +250,7 @@ SUBSYSTEM=="sound", KERNEL=="pcmC*|controlC*|timer", $acl
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", $acl
 EOF
   fi
-} | if put /etc/udev/rules.d/70-quasar.rules 0644 "give the $QUSER group the devices Quasar uses, and only those"; then
+} | if put /etc/udev/rules.d/70-quasar.rules 0644 "give the $QUSER group the devices Quasar uses, and only those" || unchanged_then_false; then
   if run udevadm control --reload; then
     run udevadm trigger --subsystem-match=misc --subsystem-match=input --subsystem-match=drm --subsystem-match=sound --subsystem-match=i2c-dev
   else
@@ -250,7 +266,7 @@ MODULES="uinput"
   printf '# Written by Quasar host preparation. uinput: virtual input devices.\n'
   [ "$CONSOLE" = 1 ] && printf '# i2c-dev: monitor control (DDC) in console mode.\n'
   for m in $MODULES; do printf '%s\n' "$m"; done
-} | put /etc/modules-load.d/quasar.conf 0644 "load $MODULES at boot" || true
+} | put /etc/modules-load.d/quasar.conf 0644 "load $MODULES at boot" || unchanged
 for m in $MODULES; do
   # Already loaded, or built in: nothing to do (and a container cannot load modules).
   mod_dir="$(printf '%s' "$m" | tr - _)"
@@ -263,6 +279,7 @@ done
 
 # ── kernel settings ────────────────────────────────────────────────────────
 STEP="kernel settings"
+old_sysctl="$(cat "$R/etc/sysctl.d/99-quasar.conf" 2>/dev/null || true)"
 SYSCTLS="net.core.wmem_default=2097152"
 [ "$KERNEL_LOG" = 1 ] && SYSCTLS="$SYSCTLS kernel.dmesg_restrict=0"
 [ -n "$PORT_START" ] && SYSCTLS="$SYSCTLS net.ipv4.ip_unprivileged_port_start=$PORT_START"
@@ -278,15 +295,16 @@ SYSCTLS="net.core.wmem_default=2097152"
     printf '# Optional (--unprivileged-port-start): let unprivileged services bind ports from %s.\n' "$PORT_START"
     printf 'net.ipv4.ip_unprivileged_port_start=%s\n' "$PORT_START"
   fi
-} | put /etc/sysctl.d/99-quasar.conf 0644 "kernel settings Quasar needs, applied at every boot$([ "$KERNEL_LOG" = 1 ] && echo ', plus kernel-log access (asked for)')$([ -n "$PORT_START" ] && echo ", plus ports from $PORT_START (asked for)")" || true
+} | put /etc/sysctl.d/99-quasar.conf 0644 "kernel settings Quasar needs, applied at every boot$([ "$KERNEL_LOG" = 1 ] && echo ', plus kernel-log access (asked for)')$([ -n "$PORT_START" ] && echo ", plus ports from $PORT_START (asked for)")" || unchanged
 # The file covers the next boot; the running kernel is checked every run, so a
 # setting that failed to apply once is retried rather than taken as done.
 for kv in $SYSCTLS; do
   key="${kv%%=*}"; want="${kv#*=}"
   if live; then
     have_v="$(sysctl -n "$key" 2>/dev/null || true)"
-    if [ "$have_v" = "$want" ]; then
-      say ok "$key=$want (running kernel)"
+    # A larger send buffer than Quasar needs is the operator's choice, never lowered.
+    if [ "$have_v" = "$want" ] || { [ "$key" = net.core.wmem_default ] && [ -n "$have_v" ] && [ "$have_v" -ge "$want" ] 2>/dev/null; }; then
+      say ok "$key=${have_v} (running kernel)"
     elif [ "$DRY_RUN" = 1 ]; then
       say would "set $key=$want now (it is ${have_v:-unset})"
     elif sysctl -q -w "$key=$want" >/dev/null 2>&1; then
@@ -298,27 +316,56 @@ for kv in $SYSCTLS; do
     run sysctl -q -w "$key=$want"
   fi
 done
+for opt in kernel.dmesg_restrict net.ipv4.ip_unprivileged_port_start; do
+  case " $SYSCTLS " in *" $opt="*) continue ;; esac
+  if printf '%s\n' "$old_sysctl" | grep -q "^$opt="; then
+    say warn "$opt was granted by an earlier run and is no longer asked for: the file no longer sets it, but the running kernel keeps it until reboot (or set it back with sysctl -w)"
+  fi
+done
 if [ "$KERNEL_LOG" = 0 ]; then
   say note "GPU fault messages stay hidden from Quasar; --allow-kernel-log enables that optional diagnostic"
 fi
 
-# ── NVIDIA: the CDI specification ──────────────────────────────────────────
+# ── NVIDIA: the CDI specification and SELinux ──────────────────────────────
 STEP="NVIDIA CDI specification"
 if [ -e "$R/proc/driver/nvidia/version" ]; then
-  spec=""
-  for d in /etc/cdi /var/run/cdi /run/cdi; do
+  drv="$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' "$R/proc/driver/nvidia/version" | head -n 1)"
+  # A specification someone else keeps (the toolkit's refresh service writes
+  # /var/run/cdi) counts only while it describes the loaded driver.
+  foreign=""
+  for d in /var/run/cdi /run/cdi /etc/cdi; do
     for f in "$R$d"/nvidia*.yaml "$R$d"/nvidia*.json; do
-      [ -f "$f" ] && { spec="${f#"$R"}"; break 2; }
+      [ -f "$f" ] || continue
+      [ "${f#"$R"}" = /etc/cdi/nvidia.yaml ] && continue
+      grep -q "$drv" "$f" 2>/dev/null && { foreign="${f#"$R"}"; break 2; }
     done
   done
-  if [ -n "$spec" ]; then
-    say ok "NVIDIA CDI specification ($spec)"
+  if [ -n "$foreign" ]; then
+    say ok "NVIDIA CDI specification ($foreign, driver $drv)"
   elif have nvidia-ctk; then
-    run nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-    stand_in && { mkdir -p "$R/etc/cdi" && printf 'kind: nvidia.com/gpu\n' > "$R/etc/cdi/nvidia.yaml"; }
-    say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "/etc/cdi/nvidia.yaml — describes the NVIDIA GPU to the engine, so containers get it without extra privilege; run this again after a driver upgrade"
+    # Ours is regenerated every run, so a driver upgrade is picked up by running this
+    # again; an unchanged result writes nothing.
+    spec="$(mktemp "${TMPDIR:-/tmp}/quasar-cdi.XXXXXX")"
+    nvidia-ctk cdi generate > "$spec" 2>/dev/null || { rm -f "$spec"; die "nvidia-ctk could not generate the NVIDIA CDI specification"; }
+    put /etc/cdi/nvidia.yaml 0644 "describes the NVIDIA GPU (driver $drv) to the engine, so containers get it without extra privilege" < "$spec" || unchanged
+    rm -f "$spec"
   else
     die "this is an NVIDIA host but nvidia-ctk was not found. Install the NVIDIA Container Toolkit, then run this again."
+  fi
+  STEP="SELinux"
+  # NVIDIA's device nodes are labelled xserver_misc_device_t. Podman confines its
+  # containers under SELinux, and the policy's own boolean for exactly that label is
+  # what lets them open the GPU: narrower than disabling labels for the container.
+  bool="$R/sys/fs/selinux/booleans/container_use_xserver_devices"
+  if { [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; } && [ -f "$bool" ]; then
+    case "$(cat "$bool")" in
+      1*) say ok "SELinux container_use_xserver_devices on" ;;
+      *)
+        run setsebool -P container_use_xserver_devices on
+        stand_in && printf '1 1' > "$bool"
+        say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux container_use_xserver_devices on — lets confined containers open the NVIDIA device nodes (labelled xserver_misc_device_t), and nothing else; SELinux stays enforcing"
+        ;;
+    esac
   fi
 else
   say skipped "NVIDIA CDI specification — no NVIDIA driver loaded"

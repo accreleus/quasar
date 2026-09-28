@@ -30,7 +30,9 @@ own; the two do not move together, and that is deliberate.
   lingering. It writes udev rules that give the `quasar` group `/dev/uinput`, Quasar's own
   virtual input devices (matched by name) and the GPU render nodes. With `--console` it also
   grants the display, sound and i2c devices. It loads `uinput`, sets the UDP buffer sysctl and
-  makes sure an NVIDIA CDI specification exists. On Podman it enables restart at boot. It adds
+  makes sure an NVIDIA CDI specification for the loaded driver exists. On Podman it enables
+  restart at boot and, on an SELinux host with an NVIDIA GPU, turns on the one policy boolean
+  (`container_use_xserver_devices`) that lets confined containers open the GPU. It adds
   device access rather than changing any device's owner, never writes under `/usr`, prints
   every change with its reason, and changes nothing when run again.
 - **Engine facts in the contract (RH-07, #393).** Contract amendment 17 lets a host report its
