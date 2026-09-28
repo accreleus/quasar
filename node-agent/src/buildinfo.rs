@@ -271,7 +271,7 @@ static OBSERVED: std::sync::Mutex<Option<(InstallFacts, u32)>> = std::sync::Mute
 pub fn note_observed(facts: &InstallFacts) {
     if let Ok(mut slot) = OBSERVED.lock() {
         *slot = match slot.take() {
-            Some((last, n)) if last == *facts => Some((last, n + 1)),
+            Some((last, n)) if !actor_identity_differs(&last, facts) => Some((last, n + 1)),
             _ => Some((facts.clone(), 1)),
         };
     }
@@ -291,7 +291,19 @@ pub fn owned_identity_changed() -> bool {
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
-        .is_some_and(|(seen, n)| n >= 2 && seen != registered)
+        .is_some_and(|(seen, n)| n >= 2 && actor_identity_differs(&seen, &registered))
+}
+
+/// Whether the recovery actor's part of two install observations differs: the fields a
+/// refresh reads from the actor. The engine facts are read elsewhere (and not by the
+/// refresh), so they never count here; comparing them made every owned install whose
+/// engine answered look changed forever and reconnect in a loop (#396 review).
+pub fn actor_identity_differs(seen: &InstallFacts, registered: &InstallFacts) -> bool {
+    seen.install_mode != registered.install_mode
+        || seen.updater_present != registered.updater_present
+        || seen.recovery_actor_version != registered.recovery_actor_version
+        || seen.recovery_actor_source_commit != registered.recovery_actor_source_commit
+        || seen.seed_version != registered.seed_version
 }
 
 /// Read-only facts installation discovery needs. Production uses the shared Quasar
@@ -461,6 +473,34 @@ pub fn log_startup_identity(facts: &InstallFacts) {
 
 #[cfg(test)]
 mod tests {
+    /// #396 review: the engine facts a connection registered are not part of what the
+    /// recovery actor reports, so they never make an owned install look changed.
+    #[test]
+    fn engine_facts_never_count_as_an_actor_identity_change() {
+        let actor = InstallFacts {
+            install_mode: Some(InstallMode::Owned),
+            updater_present: Some(true),
+            recovery_actor_version: Some("0.4.0".into()),
+            recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            seed_version: Some("0.4.0".into()),
+            ..Default::default()
+        };
+        let registered = InstallFacts {
+            engine: EngineIdentity {
+                engine: Some("podman".into()),
+                engine_version: Some("5.8.4".into()),
+                engine_mode: Some("rootless".into()),
+            },
+            ..actor.clone()
+        };
+        assert!(!actor_identity_differs(&actor, &registered));
+        let moved = InstallFacts {
+            recovery_actor_version: Some("0.5.0".into()),
+            ..actor.clone()
+        };
+        assert!(actor_identity_differs(&moved, &registered));
+    }
+
     /// Amendment 17: the wire carries only what the engine really said. An engine that
     /// cannot be named sends nothing, and a version outside the contract's shape is
     /// dropped rather than sent.

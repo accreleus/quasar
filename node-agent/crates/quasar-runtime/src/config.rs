@@ -62,15 +62,7 @@ impl RuntimeConfig {
     /// The second half of [`Self::from_environment`], on the process environment and the
     /// real filesystem. See [`Self::resolve_endpoint_with`] for the rules.
     pub fn resolve_endpoint() -> Result<Self, RuntimeError> {
-        Self::resolve_endpoint_with(
-            &|key| match std::env::var(key) {
-                Ok(value) => Some(value),
-                // A non-UTF-8 value cannot be a unix:// URL; surface it as set-but-invalid.
-                Err(std::env::VarError::NotUnicode(_)) => Some("\0".into()),
-                Err(std::env::VarError::NotPresent) => None,
-            },
-            &|path| path.exists(),
-        )
+        Self::resolve_endpoint_with(&|key| std::env::var_os(key), &|path| path.exists())
     }
 
     /// Which one Unix endpoint this process talks to (RH-07 #396, amendment 17):
@@ -89,13 +81,31 @@ impl RuntimeConfig {
     /// Finding a socket says nothing about what the engine can do; each capability is
     /// reported by its own readiness check.
     pub fn resolve_endpoint_with(
-        env: &dyn Fn(&str) -> Option<String>,
+        env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
         exists: &dyn Fn(&std::path::Path) -> bool,
     ) -> Result<Self, RuntimeError> {
         let set = |key: &str| env(key).filter(|value| !value.is_empty());
-        match (set("DOCKER_HOST"), set("CONTAINER_HOST")) {
+        // An endpoint is a unix:// URL, so it must be text; paths keep their bytes.
+        let endpoint = |key: &str| -> Result<Option<String>, RuntimeError> {
+            set(key)
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| RuntimeError::from(ErrorKind::InvalidConfiguration))
+                })
+                .transpose()
+        };
+        match (endpoint("DOCKER_HOST")?, endpoint("CONTAINER_HOST")?) {
             (Some(docker), Some(container)) if docker != container => {
-                return Err(ErrorKind::AmbiguousEndpoint.into())
+                // The same socket spelled two ways is one endpoint, not two.
+                let (docker, container) = (
+                    Self::from_endpoint(&docker)?,
+                    Self::from_endpoint(&container)?,
+                );
+                if docker.socket.components().ne(container.socket.components()) {
+                    return Err(ErrorKind::AmbiguousEndpoint.into());
+                }
+                return Ok(docker);
             }
             (Some(host), _) | (None, Some(host)) => return Self::from_endpoint(&host),
             (None, None) => {}
@@ -162,9 +172,9 @@ mod tests {
     use std::path::Path;
 
     fn resolve(env: &[(&str, &str)], existing: &[&str]) -> Result<PathBuf, ErrorKind> {
-        let env: HashMap<String, String> = env
+        let env: HashMap<String, std::ffi::OsString> = env
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), std::ffi::OsString::from(v)))
             .collect();
         let existing: Vec<PathBuf> = existing.iter().map(PathBuf::from).collect();
         RuntimeConfig::resolve_endpoint_with(&|key| env.get(key).cloned(), &|path: &Path| {
@@ -194,6 +204,20 @@ mod tests {
                 &[]
             ),
             Ok(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+    }
+
+    #[test]
+    fn the_same_socket_spelled_twice_is_not_ambiguous() {
+        assert_eq!(
+            resolve(
+                &[
+                    ("DOCKER_HOST", "unix:///run/podman/podman.sock"),
+                    ("CONTAINER_HOST", "unix:///run/podman//podman.sock")
+                ],
+                &[]
+            ),
+            Ok(PathBuf::from("/run/podman/podman.sock"))
         );
     }
 

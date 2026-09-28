@@ -166,10 +166,7 @@ fn check_runtime_endpoint_inner(view: &RuntimeView) -> ReadinessCheck {
     match outcome {
         Ok(facts) => super::pass(
             ENDPOINT_ID,
-            format!(
-                "{} {} at {endpoint} answers",
-                facts.info.name, facts.info.version
-            ),
+            format!("{} at {endpoint} answers", engine_named(facts)),
         ),
         Err(RuntimeFault::Unreachable(reason)) => super::fail(
             ENDPOINT_ID,
@@ -395,12 +392,11 @@ fn check_runtime_engine_inner(view: &RuntimeView) -> ReadinessCheck {
         .as_deref()
         .unwrap_or("an unknown system");
     let mode = facts.mode.wire();
-    let named = match facts.info.kind {
-        EngineKind::Unknown => format!("{} {}", facts.info.name, facts.info.version),
-        kind => format!("{} {}", kind.label(), facts.info.version),
-    };
-    let alternatives = "Docker rootful is supported; Docker rootless and Podman rootless on \
-                        Fedora are the RH-07 profiles (see the engine-profile docs).";
+    let named = engine_named(facts);
+    let alternatives = "Docker rootful is the supported profile. Docker rootless, Podman \
+                        rootless and Podman rootful on Fedora or Ubuntu are experimental until \
+                        proven on hardware; other rootless combinations are unsupported (see \
+                        the engine-profile docs).";
     match engine_profile(facts) {
         ProfileStatus::Supported => super::pass(
             ENGINE_ID,
@@ -422,5 +418,19 @@ fn check_runtime_engine_inner(view: &RuntimeView) -> ReadinessCheck {
             ),
             alternatives.into(),
         ),
+    }
+}
+
+/// The engine as an operator reads it: Docker or Podman and its version; an engine this
+/// agent cannot name by what it calls itself, when it says anything.
+fn engine_named(facts: &EngineFacts) -> String {
+    match facts.info.kind {
+        EngineKind::Unknown
+            if facts.info.name.trim().is_empty() || facts.info.name == "unknown" =>
+        {
+            format!("an unrecognised container engine {}", facts.info.version)
+        }
+        EngineKind::Unknown => format!("{} {}", facts.info.name, facts.info.version),
+        kind => format!("{} {}", kind.label(), facts.info.version),
     }
 }

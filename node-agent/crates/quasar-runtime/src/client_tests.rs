@@ -308,8 +308,7 @@ fn each_engine_and_mode_is_identified_from_its_own_version_and_info() {
     }
 }
 
-/// An engine this runtime does not know is reported by its own name when that name is a
-/// valid token, and as unknown otherwise; discovery never guesses Docker.
+/// An engine this runtime does not know is `Unknown`, never guessed to be Docker.
 #[test]
 fn an_unrecognised_engine_is_named_by_its_component_or_unknown() {
     let (_dir, runtime, server) = fixture(vec![(
