@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Host preparation (RH-07, #400).** `deploy/prepare-host.sh` is the one step that runs as
+  root. For a rootless install it creates the `quasar` account, its subordinate ID ranges and
+  lingering. It writes udev rules that give the `quasar` group `/dev/uinput`, Quasar's own
+  virtual input devices (matched by name) and the GPU render nodes. With `--console` it also
+  grants the display, sound and i2c devices. It loads `uinput`, sets the UDP buffer sysctl and
+  makes sure an NVIDIA CDI specification exists. On Podman it enables restart at boot. It adds
+  device access rather than changing any device's owner, never writes under `/usr`, prints
+  every change with its reason, and changes nothing when run again.
 - **Engine facts in the contract (RH-07, #393).** Contract amendment 17 lets a host report its
   container engine (Docker or Podman), the engine's version and its engine mode (rootful or
   rootless). They are shown to operators and decide nothing. The same amendment names the

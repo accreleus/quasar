@@ -137,6 +137,26 @@ elif command -v shellcheck >/dev/null 2>&1; then
   fi
 fi
 
+PREP="$ROOT/deploy/prepare-host.sh"
+if ! sh -n "$PREP" 2>/dev/null; then
+  fail "sh -n" "deploy/prepare-host.sh has a syntax error"
+elif command -v shellcheck >/dev/null 2>&1; then
+  sc_out="$(shellcheck -s sh -S warning "$PREP" 2>&1)"
+  if [ -z "$sc_out" ]; then
+    pass "shellcheck (prepare-host.sh, POSIX sh)" "clean at -S warning"
+  else
+    fail "shellcheck (prepare-host.sh, POSIX sh)" "$(printf '%s' "$sc_out" | head -n 20)"
+  fi
+fi
+
+printf '\n== host preparation (RH-07 #400) ==\n'
+# Offline tests against a fake root: deploy/test-prepare-host.sh is the spec.
+if hp_out="$(bash "$ROOT/deploy/test-prepare-host.sh" 2>&1)"; then
+  pass "prepare-host:contract" "$(printf '%s' "$hp_out" | tail -n 1)"
+else
+  fail "prepare-host:contract" "$(printf '%s' "$hp_out" | grep '^FAIL' | head -n 5)"
+fi
+
 printf '\n== enroll-host installer (#100) ==\n'
 # Offline contract tests: mock docker + a fake host root. deploy/test-enroll-host.sh
 # is the spec; this only records its verdict.
