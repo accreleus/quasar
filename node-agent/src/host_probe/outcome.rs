@@ -115,8 +115,10 @@ pub fn remediation(kind: ProbeKind) -> String {
         ProbeKind::Media => "Check the render node is passed to the agent container, the \
             driver/driver volume, and the agent log for `token=\"host-probe-` lines."
             .into(),
-        ProbeKind::Input => "Check /dev/uinput is passed to the container and \
-            `device_cgroup_rules: ['c 13:* rmw']` is set."
+        ProbeKind::Input => "On a rootless engine, run host preparation \
+            (deploy/prepare-host.sh): it gives the Quasar user Quasar's own input devices. \
+            On a rootful engine, check /dev/uinput and /dev/input are passed to the agent and \
+            device_cgroup_rules allows `c 13:* rw`."
             .into(),
         ProbeKind::Audio => "Check the runtime lets the agent image start the audio sidecar as \
             a sibling container: the runtime_endpoint check, and the agent logs."
@@ -412,8 +414,9 @@ mod tests {
         );
         assert_eq!(
             remediation(ProbeKind::Input),
-            "Check /dev/uinput is passed to the container and \
-             `device_cgroup_rules: ['c 13:* rmw']` is set."
+            "On a rootless engine, run host preparation (deploy/prepare-host.sh): it gives \
+             the Quasar user Quasar's own input devices. On a rootful engine, check /dev/uinput \
+             and /dev/input are passed to the agent and device_cgroup_rules allows `c 13:* rw`."
         );
         assert_eq!(
             remediation(ProbeKind::Audio),

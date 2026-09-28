@@ -88,7 +88,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "node-agent",
     "io.quasar.recipe": "3",
-    "io.quasar.spec": "sha256:256904c17c2da77b7b168c95250819f2c11c1924ee447a780bc0fc8b133bc7d1"
+    "io.quasar.spec": "sha256:fb6e5905605ee625c4911a51d66ac0f8b9a844ddb7697f38e7e1bcfe49b4c80f"
   },
   "network_mode": "host",
   "binds": [
@@ -156,7 +156,7 @@
     }
   ],
   "device_cgroup_rules": [
-    "c 13:* rmw"
+    "c 13:* rw"
   ],
   "gpus": [],
   "cap_add": [],

@@ -16,14 +16,13 @@
 //! `waylanddisplaysrc` opens input nodes via libinput's path backend (plain
 //! `open()`, no udev/seat). A container's `/dev` is a fresh tmpfs, so a
 //! freshly-created uinput device has no node there until something makes one.
-//! [`VirtualDevices::create`] `mknod`s each device's `/dev/input/eventN` from its
-//! sysfs `dev` (major:minor) if the kernel didn't; Docker `--device` then
-//! materializes the same node inside the container.
+//! The agent sees the host's `/dev/input` through a bind, so the node the kernel creates is
+//! already there; [`VirtualDevices::create`] waits for it and never `mknod`s. The engine's
+//! `--device` then passes the same host node into the session container.
 //!
 //! Requires `/dev/uinput` (root). Wire format: `protocol/input.md`.
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -334,48 +333,48 @@ fn dev_major_minor(path: &Path) -> Result<(u32, u32)> {
         .ok_or_else(|| anyhow!("unexpected sysfs dev format '{dev}' for {name}"))
 }
 
-/// `mknod` `path` (e.g. `/dev/input/event7`) if missing. No-op when the node
-/// already exists AND is the expected char device (right major:minor) — this is
-/// what lets Docker `--device` and libinput's path backend open it in a tmpfs
-/// `/dev`.
-///
-/// #378: a prior session's `docker rm -f` can leave a bind-mount artifact (a
-/// regular file/dir, or a char device with a stale major:minor) at this exact
-/// path. A bare `path.exists()` treated any of those as "done" and every later
-/// launch failed opening it. Validate type + rdev and self-heal a stale/wrong
-/// artifact before falling through to `mknod`.
+/// How long the host's devtmpfs may take to show a node the kernel just created.
+const NODE_APPEAR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait for the host's node for a device this agent just created, through its `/dev/input`
+/// bind (RH-07 #401, D9: no `mknod`, no removal: the directory is the host's), then prove
+/// this agent can open it. On a rootless engine the agent is the Quasar user, and only the
+/// input rule host preparation writes gives it that access.
 fn ensure_dev_node(path: &Path, maj: u32, min: u32) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let expected = libc::makedev(maj, min);
-            let is_expected_char_device =
-                meta.file_type().is_char_device() && meta.rdev() == expected;
-            if is_expected_char_device {
-                return Ok(());
+    wait_for_host_node(path, maj, min, NODE_APPEAR)
+}
+
+fn wait_for_host_node(path: &Path, maj: u32, min: u32, within: std::time::Duration) -> Result<()> {
+    let expected = libc::makedev(maj, min);
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_char_device() && meta.rdev() == expected => break,
+            Ok(_) => {
+                return Err(anyhow!(
+                    "{path:?} is not the host's input node {maj}:{min}; /dev/input must be the \
+                     host's directory, bind-mounted into the agent"
+                ))
             }
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove stale artifact at {path:?}"))?;
-            tracing::info!(
-                token = "vinput-stale-artifact-removed",
-                "removed stale non-device artifact at {path:?} (expected char device {maj}:{min})"
-            );
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("stat {path:?}")),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("stat {path:?}")),
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "the host's node {path:?} ({maj}:{min}) did not appear within {within:?}; \
+                 /dev/input must be the host's directory, bind-mounted into the agent"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    match File::open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow!(
+            "this agent cannot open its own input device {path:?}: run host preparation \
+             (deploy/prepare-host.sh), which gives the Quasar user Quasar's own input devices"
+        )),
+        Err(e) => Err(e).with_context(|| format!("open {path:?}")),
     }
-    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    // Character device, rw for owner+group (root in the dev image).
-    let mode = libc::S_IFCHR | 0o660;
-    let rc = unsafe { libc::mknod(cpath.as_ptr(), mode, libc::makedev(maj, min)) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("mknod {path:?} (c {maj}:{min})"));
-    }
-    tracing::debug!("mknod {path:?} (c {maj}:{min})");
-    Ok(())
 }
 
 /// Write a minimal **fake-udev** database record at `/run/udev/data/c<maj>:<min>`.
@@ -1342,6 +1341,33 @@ fn key_from_code(code: u16) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #401: the host's node is waited for, never made or removed.
+    #[test]
+    fn a_host_node_is_waited_for_and_never_made_or_removed() {
+        let short = std::time::Duration::from_millis(60);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("event42");
+        let err = wait_for_host_node(&missing, 13, 106, short).unwrap_err();
+        assert!(err.to_string().contains("did not appear"), "{err}");
+        assert!(!missing.exists(), "nothing is created");
+
+        let artifact = dir.path().join("event43");
+        std::fs::write(&artifact, b"x").unwrap();
+        let err = wait_for_host_node(&artifact, 13, 107, short).unwrap_err();
+        assert!(
+            err.to_string().contains("not the host's input node"),
+            "{err}"
+        );
+        assert!(artifact.exists(), "nothing on the host's side is removed");
+
+        // A real character device with the right numbers: /dev/null stands in.
+        let null = Path::new("/dev/null");
+        let rdev = std::fs::metadata(null).unwrap().rdev();
+        let (maj, min) = (libc::major(rdev), libc::minor(rdev));
+        wait_for_host_node(null, maj, min, short).unwrap();
+        assert!(wait_for_host_node(null, maj, min + 1, short).is_err());
+    }
 
     #[test]
     fn device_names_are_session_tagged_and_unique() {

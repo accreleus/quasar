@@ -996,10 +996,12 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
         spec.devices.retain(|d| d.host != "/dev/kmsg");
     }
     // A rootless engine refuses device-cgroup rules; the Quasar user's device access is
-    // the host's (the udev rule host preparation writes). Rootful keeps the input rule
-    // until #401 passes host-created nodes instead.
+    // the host's (the udev rule host preparation writes). Rootful keeps read/write on the
+    // input nodes the agent creates after it starts, but no `m`: nothing is `mknod`ed (#401).
     if inputs.devices.engine_rootless {
         spec.device_cgroup_rules.clear();
+    } else {
+        spec.device_cgroup_rules = vec!["c 13:* rw".into()];
     }
     spec.security_opt = vec!["label=disable".into()];
     // CDI where the engine served it (D10); `--gpus` stays only where it did not.

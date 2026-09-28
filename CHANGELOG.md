@@ -25,6 +25,12 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Input without `mknod` (RH-07, #401).** The agent waits for the host's own
+  `/dev/input/eventN` node (through its `/dev/input` bind) for each virtual device it
+  creates, and never creates or removes device nodes. It then proves it can open the node:
+  on a rootless engine that is host preparation's input rule, and the `input_probe` fails
+  with that fix when it is missing. Recipe revision 3 on a rootful engine grants the input
+  devices `c 13:* rw`, dropping `m`.
 - **Media reachability is judged from real traffic (RH-07, #403).** `media_reachability` no
   longer reads the host's firewall rules, which needed `NET_ADMIN` and which a rootless
   engine cannot grant. It reads what real sessions showed, from the session's own WebRTC

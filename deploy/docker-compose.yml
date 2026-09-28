@@ -645,11 +645,12 @@ services:
       # reports `xid_visibility: skip`, which fails nothing.
       - /dev/kmsg:/dev/kmsg:r
     device_cgroup_rules:
-      # Allow r/w/mknod for Linux input event devices (char major 13).
-      # uinput creates /dev/input/eventN nodes on the host at session start;
-      # the fake-udev mknod mirrors them inside the container, but without this
-      # rule the container's cgroup blocks reads — libinput silently fails to
-      # open the keyboard/mouse paths and the compositor receives no events.
+      # Input event devices (char major 13): uinput creates /dev/input/eventN on
+      # the host at session start and the agent opens it through the /dev/input
+      # bind above; without this rule the cgroup blocks the open and the
+      # compositor receives no events. Nothing is mknod'ed any more (#401); the
+      # `m` stays only because this file mirrors recipe revision 2, while
+      # revision 3 grants `rw`.
       - 'c 13:* rmw'
     depends_on:
       quasar-control-plane:
