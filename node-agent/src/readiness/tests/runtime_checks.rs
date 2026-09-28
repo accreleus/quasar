@@ -722,3 +722,34 @@ fn an_nvidia_agent_whose_gpu_capacity_dropped_still_fails_cdi() {
     assert_eq!(c.status, FAIL, "{c:?}");
     assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
 }
+
+/// Owner decision on #404: rootless Docker homes carry subordinate IDs, said as a warning.
+#[test]
+fn a_writable_homes_root_warns_about_ownership_only_on_rootless_docker() {
+    let pass = super::super::pass(
+        crate::readiness::storage::HOMES_WRITABLE_ID,
+        "the agent created, wrote and removed a test home".into(),
+    );
+    let view = |kind, mode| RuntimeView::Observed {
+        endpoint: ENDPOINT.into(),
+        outcome: Ok({
+            let mut f = facts(None);
+            f.info.kind = kind;
+            f.mode = mode;
+            f
+        }),
+    };
+    let c = homes_mapping(
+        pass.clone(),
+        &view(EngineKind::Docker, EngineMode::Rootless),
+    );
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.summary.contains("subordinate ID"), "{c:?}");
+    assert!(c.blocks.is_none());
+    for (kind, mode) in [
+        (EngineKind::Podman, EngineMode::Rootless),
+        (EngineKind::Docker, EngineMode::Rootful),
+    ] {
+        assert_eq!(homes_mapping(pass.clone(), &view(kind, mode)).status, PASS);
+    }
+}

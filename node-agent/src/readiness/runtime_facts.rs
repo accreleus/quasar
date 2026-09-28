@@ -437,6 +437,39 @@ pub fn check_runtime_cdi_gpus(
         .collect()
 }
 
+/// Owner decision on #404: rootless Docker has no per-container user mapping, so files a
+/// session writes are owned on the host by a subordinate ID, not the Quasar user. A
+/// writable homes root is then a warning that says so; nothing is blocked.
+pub fn homes_mapping(check: ReadinessCheck, view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed {
+        outcome: Ok(facts), ..
+    } = view
+    else {
+        return check;
+    };
+    if check.status != super::PASS
+        || facts.info.kind != EngineKind::Docker
+        || facts.mode != EngineMode::Rootless
+    {
+        return check;
+    }
+    let mut warned = super::warn_check(
+        &check.id,
+        format!(
+            "{}. On rootless Docker, files sessions write there are owned on the host by a \
+             subordinate ID, not the Quasar user: Docker cannot map a container's user onto it",
+            check.summary.trim_end_matches('.')
+        ),
+        "Nothing to fix for sessions to work. For home files owned by the Quasar user, use \
+         rootless Podman (keep-id). Never re-own existing homes recursively."
+            .into(),
+    );
+    warned.source = check.source;
+    warned.blocks = check.blocks;
+    warned.observed_at = check.observed_at;
+    warned
+}
+
 /// How far one engine profile is backed by evidence (CONTEXT.md "Engine profile").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileStatus {

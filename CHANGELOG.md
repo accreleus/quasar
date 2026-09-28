@@ -29,6 +29,9 @@ own; the two do not move together, and that is deliberate.
   host-network container on rootless Docker gets no sysfs of its own, so the agent found
   no DRM inventory and could not resolve its input nodes. On rootless Docker only, recipe
   revision 3 gives the agent the host's `/sys` read-only, the view any other container has.
+  On rootless Docker, `homes_root_writable` warns (never blocks) that session files are
+  owned on the host by a subordinate ID, since Docker cannot map a container's user onto
+  the Quasar user (owner decision on #404).
 - **Input without `mknod` (RH-07, #401).** The agent waits for the host's own
   `/dev/input/eventN` node (through its `/dev/input` bind) for each virtual device it
   creates, and never creates or removes device nodes. It then proves it can open the node:

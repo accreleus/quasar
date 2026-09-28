@@ -539,7 +539,10 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         // Applies to every host, GPU or not — not part of the sanity family.
         check_media_reachability(env, distro),
         host_container_mounts_check(&env.container_mounts),
-        storage::check_homes_root_writable(&env.storage, storage::WriteIdentity::from_env_pair(env.app_uid, env.app_gid)),
+        runtime_facts::homes_mapping(
+            storage::check_homes_root_writable(&env.storage, storage::WriteIdentity::from_env_pair(env.app_uid, env.app_gid)),
+            &env.runtime,
+        ),
         storage::check_homes_free_space(&env.storage),
         storage::check_template_free_space(&env.storage),
         storage::check_image_free_space(&env.storage),
