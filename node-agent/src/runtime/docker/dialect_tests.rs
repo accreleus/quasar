@@ -1,0 +1,260 @@
+//! Each engine's reporting, from what real engines returned for the same requested
+//! container (Docker 29 and Podman 5.8.4, rootful and rootless; #397). The rule under
+//! test is the same for every engine: exactly what Quasar asked for passes, and anything
+//! it did not ask for is refused. Rootful Docker keeps today's exact comparison.
+
+use super::*;
+
+const REQUESTED_CAPS: [&str; 8] = [
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETUID",
+    "SETPCAP",
+    "KILL",
+    "SYS_NICE",
+];
+
+fn caps(values: &[&str]) -> Vec<String> {
+    values.iter().map(|v| v.to_string()).collect()
+}
+
+fn podman(effective: &[&str], runtime: &str) -> PodmanFacts {
+    PodmanFacts {
+        effective_caps: Some(effective.iter().map(|c| format!("CAP_{c}")).collect()),
+        oci_runtime: Some(runtime.into()),
+    }
+}
+
+fn device(path: &str, permissions: &str) -> DeviceMapping {
+    DeviceMapping {
+        path_on_host: Some(path.into()),
+        path_in_container: Some(path.into()),
+        cgroup_permissions: Some(permissions.into()),
+    }
+}
+
+#[test]
+fn an_unknown_engine_is_held_to_dockers_exact_rules() {
+    assert_eq!(Dialect::of(EngineKind::Unknown), Dialect::Docker);
+    assert_eq!(Dialect::of(EngineKind::Docker), Dialect::Docker);
+    assert_eq!(Dialect::of(EngineKind::Podman), Dialect::Podman);
+}
+
+#[test]
+fn capabilities_pass_exactly_as_requested_on_each_engine() {
+    let requested = caps(&REQUESTED_CAPS);
+    // Docker echoes the request.
+    assert!(Dialect::Docker.capabilities_ok(
+        Some(&requested),
+        Some(&caps(&["ALL"])),
+        None,
+        &requested,
+        true
+    ));
+    // Podman's compatible inspect as measured: a delta from its default set. Its native
+    // EffectiveCaps are what is compared.
+    let podman_add = caps(&["SYS_NICE"]);
+    let podman_drop = caps(&["FSETID", "NET_BIND_SERVICE", "SETFCAP", "SYS_CHROOT"]);
+    assert!(Dialect::Podman.capabilities_ok(
+        Some(&podman_add),
+        Some(&podman_drop),
+        Some(&podman(&REQUESTED_CAPS, "crun")),
+        &requested,
+        true
+    ));
+}
+
+#[test]
+fn a_capability_quasar_did_not_ask_for_is_refused_on_each_engine() {
+    let requested = caps(&REQUESTED_CAPS);
+    let mut more = requested.clone();
+    more.push("SYS_ADMIN".into());
+    assert!(!Dialect::Docker.capabilities_ok(
+        Some(&more),
+        Some(&caps(&["ALL"])),
+        None,
+        &requested,
+        true
+    ));
+    let mut effective: Vec<&str> = REQUESTED_CAPS.to_vec();
+    effective.push("SYS_ADMIN");
+    assert!(!Dialect::Podman.capabilities_ok(
+        None,
+        None,
+        Some(&podman(&effective, "crun")),
+        &requested,
+        true
+    ));
+    // Podman without its native answer cannot be proven: refused, not assumed.
+    assert!(!Dialect::Podman.capabilities_ok(None, None, None, &requested, true));
+    // Docker's rule is unchanged: the compatible fields must echo the request.
+    assert!(!Dialect::Docker.capabilities_ok(Some(&requested), None, None, &requested, true));
+}
+
+#[test]
+fn runtimes_accepted_per_engine() {
+    assert!(Dialect::Docker.runtime_ok(Some("runc"), None, false));
+    assert!(Dialect::Docker.runtime_ok(None, None, false));
+    assert!(
+        !Dialect::Docker.runtime_ok(Some("crun"), None, false),
+        "rootful Docker unchanged"
+    );
+    assert!(!Dialect::Docker.runtime_ok(Some("nvidia"), None, false));
+    assert!(Dialect::Docker.runtime_ok(Some("nvidia"), None, true));
+    assert!(Dialect::Podman.runtime_ok(Some("oci"), Some(&podman(&[], "crun")), false));
+    assert!(Dialect::Podman.runtime_ok(Some("oci"), Some(&podman(&[], "runc")), false));
+    assert!(!Dialect::Podman.runtime_ok(Some("oci"), Some(&podman(&[], "krun")), false));
+    assert!(!Dialect::Podman.runtime_ok(Some("oci"), None, false));
+    assert!(!Dialect::Podman.runtime_ok(Some("kata"), Some(&podman(&[], "crun")), false));
+}
+
+#[test]
+fn default_namespaces_per_engine_and_the_host_never() {
+    for ns in [Namespace::Pid, Namespace::Ipc, Namespace::Uts] {
+        for dialect in [Dialect::Docker, Dialect::Podman] {
+            assert!(dialect.default_namespace(ns, None));
+            assert!(
+                !dialect.default_namespace(ns, Some("host")),
+                "{dialect:?} {ns:?}"
+            );
+            assert!(
+                !dialect.default_namespace(ns, Some("container:abc")),
+                "{dialect:?} {ns:?}"
+            );
+        }
+    }
+    // As measured on Podman: pid private, ipc shareable, uts private.
+    assert!(Dialect::Podman.default_namespace(Namespace::Pid, Some("private")));
+    assert!(Dialect::Podman.default_namespace(Namespace::Ipc, Some("shareable")));
+    assert!(Dialect::Podman.default_namespace(Namespace::Uts, Some("private")));
+    // Docker's rules are today's.
+    assert!(!Dialect::Docker.default_namespace(Namespace::Ipc, Some("shareable")));
+    assert!(!Dialect::Docker.default_namespace(Namespace::Uts, Some("private")));
+}
+
+#[test]
+fn security_options_compare_as_one_set() {
+    let docker = vec![
+        "seccomp=unconfined".to_string(),
+        "no-new-privileges:true".to_string(),
+    ];
+    let podman = vec![
+        "no-new-privileges".to_string(),
+        "seccomp=unconfined".to_string(),
+    ];
+    assert_eq!(
+        Dialect::Docker.security_options(Some(&docker)),
+        Dialect::Podman.security_options(Some(&podman))
+    );
+    // Docker's own spelling is not rewritten.
+    assert_ne!(
+        Dialect::Docker.security_options(Some(&vec!["no-new-privileges".into()])),
+        Dialect::Docker.security_options(Some(&vec!["no-new-privileges:true".into()]))
+    );
+}
+
+#[test]
+fn devices_docker_exact_podman_only_what_was_asked_for() {
+    let requested = vec!["/dev/dri/renderD128".to_string()];
+    assert!(Dialect::Docker.devices_ok(&[device("/dev/dri/renderD128", "rwm")], &requested, false));
+    assert!(
+        !Dialect::Docker.devices_ok(&[], &requested, false),
+        "Docker must report it"
+    );
+    assert!(!Dialect::Docker.devices_ok(&[device("/dev/dri/renderD128", "")], &requested, false));
+    // Rootless Podman lists no plain device at all: not reported, not granted.
+    assert!(Dialect::Podman.devices_ok(&[], &requested, false));
+    // Rootful Podman lists it with empty permissions.
+    assert!(Dialect::Podman.devices_ok(&[device("/dev/dri/renderD128", "")], &requested, false));
+    // A device nobody asked for is refused on every engine.
+    for dialect in [Dialect::Docker, Dialect::Podman] {
+        assert!(
+            !dialect.devices_ok(&[device("/dev/sda", "")], &requested, false),
+            "{dialect:?}"
+        );
+        assert!(
+            !dialect.devices_ok(&[device("/dev/nvidia0", "")], &requested, false),
+            "{dialect:?}"
+        );
+    }
+    // A requested GPU expands to its NVIDIA and DRM nodes, and to nothing else.
+    let expanded = [
+        device("/dev/nvidia0", ""),
+        device("/dev/nvidiactl", ""),
+        device("/dev/nvidia-uvm", ""),
+        device("/dev/dri/card1", ""),
+        device("/dev/dri/renderD128", ""),
+    ];
+    assert!(Dialect::Podman.devices_ok(&expanded, &[], true));
+    assert!(!Dialect::Podman.devices_ok(
+        &[device("/dev/nvidia0", ""), device("/dev/kmsg", "")],
+        &[],
+        true
+    ));
+    assert!(!Dialect::Podman.devices_ok(&[device("/dev/nvidia0", "/dev/other")], &[], true));
+}
+
+#[test]
+fn device_requests_docker_echoes_podman_reports_none_and_never_an_unasked_one() {
+    let nvidia = DeviceRequest {
+        driver: Some("nvidia".into()),
+        count: Some(-1),
+        capabilities: Some(vec![vec!["gpu".into()]]),
+        ..Default::default()
+    };
+    let is_nvidia = |r: &DeviceRequest| r.driver.as_deref() == Some("nvidia");
+    assert!(Dialect::Docker.device_requests_ok(Some(&vec![nvidia.clone()]), Some(&is_nvidia)));
+    assert!(!Dialect::Docker.device_requests_ok(None, Some(&is_nvidia)));
+    assert!(Dialect::Podman.device_requests_ok(None, Some(&is_nvidia)));
+    for dialect in [Dialect::Docker, Dialect::Podman] {
+        assert!(dialect.device_requests_ok(None, None));
+        assert!(
+            !dialect.device_requests_ok(Some(&vec![nvidia.clone()]), None),
+            "{dialect:?}"
+        );
+    }
+}
+
+#[test]
+fn only_docker_is_held_to_echoed_mounts_image_and_masked_paths() {
+    assert!(Dialect::Docker.echoes_mount_requests());
+    assert!(Dialect::Docker.echoes_config_image());
+    assert!(Dialect::Docker.reports_masked_paths());
+    assert!(!Dialect::Podman.echoes_mount_requests());
+    assert!(!Dialect::Podman.echoes_config_image());
+    assert!(!Dialect::Podman.reports_masked_paths());
+}
+
+/// Without drop-all both engines grant their own defaults plus the additions, and
+/// Podman's compatible delta then reads exactly as Docker's does.
+#[test]
+fn without_drop_all_both_engines_compare_the_compatible_fields() {
+    let add = caps(&["SYS_NICE"]);
+    for dialect in [Dialect::Docker, Dialect::Podman] {
+        assert!(
+            dialect.capabilities_ok(Some(&add), None, None, &add, false),
+            "{dialect:?}"
+        );
+        assert!(
+            dialect.capabilities_ok(None, None, None, &[], false),
+            "{dialect:?}"
+        );
+        assert!(
+            !dialect.capabilities_ok(Some(&caps(&["SYS_ADMIN"])), None, None, &[], false),
+            "{dialect:?}"
+        );
+    }
+}
+
+#[test]
+fn podmans_null_capabilities_are_none_and_a_missing_field_cannot_be_proven() {
+    let none = PodmanFacts::from_inspect(r#"{"EffectiveCaps":null,"OCIRuntime":"crun"}"#).unwrap();
+    assert_eq!(none.effective_caps, Some(Vec::new()));
+    assert!(Dialect::Podman.capabilities_ok(None, None, Some(&none), &[], true));
+    let missing = PodmanFacts::from_inspect(r#"{"OCIRuntime":"crun"}"#).unwrap();
+    assert_eq!(missing.effective_caps, None);
+    assert!(!Dialect::Podman.capabilities_ok(None, None, Some(&missing), &[], true));
+    assert!(PodmanFacts::from_inspect("not json").is_err());
+}

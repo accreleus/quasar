@@ -270,6 +270,80 @@ impl Drop for ApplicationAssets {
     }
 }
 
+/// RH-07 #397: a container shaped like a real session (the session's capability set,
+/// seccomp and no-new-privileges, pids and shm limits, a named volume) passes the
+/// engine-aware read-back and runs to completion, on whichever engine the socket names.
+/// The same assertions for every engine: point QUASAR_TEST_RUNTIME_SOCKET at Docker
+/// rootful, Docker rootless or Podman.
+#[test]
+#[ignore = "requires explicit test socket, application image, and host-backed QUASAR_TEST_APPLICATION_STATE_DIR; creates one unique owned application and one volume"]
+fn real_engine_readback_passes_a_session_shaped_container() {
+    let socket =
+        std::env::var("QUASAR_TEST_RUNTIME_SOCKET").expect("set explicit local test socket");
+    let image =
+        std::env::var("QUASAR_TEST_APPLICATION_IMAGE").expect("set explicit local test image");
+    let state_dir = std::env::var("QUASAR_TEST_APPLICATION_STATE_DIR")
+        .expect("set an existing host-backed directory for durable test cleanup");
+    let unique = format!(
+        "quasar-sess-readback-{}",
+        crate::runtime::builds::build_id()
+    );
+    let dir = tempfile::Builder::new()
+        .prefix("application-readback-")
+        .tempdir_in(state_dir)
+        .unwrap();
+    let mut config = RuntimeConfig::unix(socket);
+    config.image_state_path = Some(dir.path().join("operations"));
+    config.diagnostic_owner = Some(format!("runtime-readback-{unique}"));
+    config.deadline = Duration::from_secs(20);
+    let runtime = RuntimeClient::new(config).unwrap();
+    let request = ApplicationRequest {
+        operation: format!("application-{unique}"),
+        name: unique.clone(),
+        image,
+        pull_never: true,
+        command: vec!["sh".into(), "-c".into(), "echo readback-ok; exit 0".into()],
+        typed_mounts: vec![crate::runtime::application::ApplicationMount::Volume {
+            source: format!("{unique}-vol"),
+            target: "/data/vol".into(),
+            read_only: false,
+            no_copy: true,
+        }],
+        network: "none".into(),
+        security: crate::runtime::application::ApplicationSecurity {
+            cap_drop_all: true,
+            cap_add: [
+                "CHOWN",
+                "DAC_OVERRIDE",
+                "FOWNER",
+                "SETGID",
+                "SETUID",
+                "SETPCAP",
+                "KILL",
+                "SYS_NICE",
+            ]
+            .map(String::from)
+            .to_vec(),
+            no_new_privileges: true,
+            security_opt: vec!["seccomp=unconfined".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut assets = ApplicationAssets {
+        runtime: runtime.clone(),
+        operation: request.operation.clone(),
+        journal: Some(dir),
+        cleaned: false,
+    };
+    let id = runtime.start_application(request).wait().unwrap();
+    let result = runtime.observe_application(id.clone()).wait().unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.stdout.contains("readback-ok"));
+    runtime.cleanup_application(id).wait().unwrap();
+    assets.cleaned = true;
+}
+
 #[test]
 #[ignore = "requires explicit test socket, application image, and host-backed QUASAR_TEST_APPLICATION_STATE_DIR; creates one unique owned application"]
 fn real_docker_application_runtime_lifecycle() {

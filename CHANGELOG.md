@@ -25,6 +25,17 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The runtime checks what each engine created by that engine's own reporting (RH-07,
+  #397).** Session containers and helpers are still re-inspected and refused if they
+  differ from the request, but Podman is now read by its own rules:
+  - its exact effective capabilities come from its native inspect;
+  - `crun` is accepted as the runtime;
+  - its namespace and `no-new-privileges` spellings are understood;
+  - a device or GPU request it does not report is not taken as granted.
+
+  Anything reported that Quasar did not ask for is still refused, now with the name of the
+  check that failed. Rootful Docker's checks are unchanged. Real-engine tests pass on Docker
+  rootful, Docker rootless and Podman rootless.
 - **Hosts report their container engine (RH-07, #396).**
   - The agent finds Podman's sockets (rootful and rootless) and honours `CONTAINER_HOST`,
     after Docker's default. `DOCKER_HOST` and `CONTAINER_HOST` naming different engines is

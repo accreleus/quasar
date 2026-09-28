@@ -16,6 +16,8 @@ use bollard::{
 };
 use futures_util::StreamExt;
 
+use super::dialect::{Engine, Namespace};
+
 use crate::runtime::application::{
     ApplicationIntent, ApplicationJournal, ApplicationMount, ApplicationPhase, ImageVolumeIdentity,
     NvidiaParamsRepair,
@@ -37,8 +39,8 @@ const MAX_LOG_BYTES: usize = 16 * 1024;
 const LOG_TAIL_LINES: usize = 100;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 
-async fn open(config: &RuntimeConfig) -> Result<bollard::Docker, RuntimeError> {
-    Ok(super::discover(config).await?.0)
+async fn open(config: &RuntimeConfig) -> Result<Engine, RuntimeError> {
+    super::dialect::open(config).await
 }
 
 const REPAIR_MAX_STAGE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -633,23 +635,6 @@ fn exact_nvidia_all_request(request: &DeviceRequest) -> bool {
         && request.options.as_ref().is_none_or(HashMap::is_empty)
 }
 
-fn canonical_capabilities(values: Option<&Vec<String>>) -> Vec<String> {
-    let mut values = values
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| value.trim_start_matches("CAP_").to_ascii_uppercase())
-        .collect::<Vec<_>>();
-    values.sort();
-    values
-}
-
-fn canonical_security_options(values: Option<&Vec<String>>) -> Vec<String> {
-    let mut values = values.cloned().unwrap_or_default();
-    values.sort();
-    values
-}
-
 fn explicit_mount_targets(request: &ApplicationRequest) -> Result<Vec<String>, RuntimeError> {
     let mut targets = Vec::with_capacity(request.mounts.len() + request.typed_mounts.len());
     for mount in &request.mounts {
@@ -755,15 +740,32 @@ async fn inspect_identity_state(
     }
 }
 
+/// A container that is not exactly what Quasar asked for: logged with what differed, and
+/// reported to the caller as a protocol refusal (the launch fails and the container is
+/// removed; nothing is retried with more privilege).
+fn refuse(what: &str, dialect: super::dialect::Dialect) -> RuntimeError {
+    tracing::warn!(
+        token = "runtime-readback-refused",
+        check = what,
+        engine = ?dialect,
+        "the engine created an application container that differs from the request in its \
+         {what}; refusing it"
+    );
+    ErrorKind::Protocol.into()
+}
+
 async fn inspect_owned(
-    docker: &bollard::Docker,
+    engine: &Engine,
     intent: &ApplicationIntent,
 ) -> Result<(ApplicationState, Vec<ImageVolumeIdentity>), RuntimeError> {
     let id = identity(intent)?;
-    let info = docker
+    let info = engine
         .inspect_container(id.as_str(), None)
         .await
         .map_err(uncertain)?;
+    // What each engine reports differs; the rules for each live in `dialect` (#397).
+    let dialect = engine.dialect;
+    let podman = engine.podman_facts(id.as_str()).await?;
     if info.id.as_deref() != Some(id.as_str())
         || info.name.as_deref() != Some(format!("/{}", intent.request.name).as_str())
         || intent
@@ -782,13 +784,14 @@ async fn inspect_owned(
             .and_then(|c| c.labels.as_ref())
             .and_then(|v| v.get(OPERATION_LABEL))
             != Some(&intent.request.operation)
-        || info.config.as_ref().and_then(|c| c.image.as_deref())
-            != Some(
-                intent
-                    .image_id
-                    .as_deref()
-                    .unwrap_or(intent.request.image.as_str()),
-            )
+        || (dialect.echoes_config_image()
+            && info.config.as_ref().and_then(|c| c.image.as_deref())
+                != Some(
+                    intent
+                        .image_id
+                        .as_deref()
+                        .unwrap_or(intent.request.image.as_str()),
+                ))
     {
         return Err(ErrorKind::UnknownOutcome.into());
     }
@@ -836,106 +839,132 @@ async fn inspect_owned(
     }
     let host = info.host_config.as_ref().ok_or(ErrorKind::UnknownOutcome)?;
     let normalized = |values: Option<&Vec<String>>| values.cloned().unwrap_or_default();
-    if host.network_mode.as_deref() != Some(&intent.request.network)
-        || host.auto_remove.unwrap_or(false)
-        || host.privileged.unwrap_or(false)
-        || host
-            .pid_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty() && mode != "private")
-        || host
-            .ipc_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty() && mode != "private")
-        || host
-            .uts_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty())
-        || host
-            .userns_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty())
-        || matches!(
-            host.cgroupns_mode,
-            Some(bollard::models::HostConfigCgroupnsModeEnum::HOST)
-        )
-        || host.runtime.as_deref().is_some_and(|runtime| {
-            !runtime.is_empty()
-                && runtime != "runc"
-                && !(intent.request.nvidia_gpu && runtime == "nvidia")
-        })
-        || host.readonly_rootfs.unwrap_or(false) != intent.request.security.read_only_rootfs
-        || host.pids_limit != Some(intent.request.security.pids_limit)
-        || host.shm_size != Some(intent.request.security.shm_size)
-        || normalized(host.group_add.as_ref()) != intent.request.group_add
-        || normalized(host.binds.as_ref()) != intent.request.mounts
-        || canonical_capabilities(host.cap_add.as_ref())
-            != canonical_capabilities(Some(&intent.request.security.cap_add))
-        || canonical_capabilities(host.cap_drop.as_ref())
-            != if intent.request.security.cap_drop_all {
-                vec![String::from("ALL")]
-            } else {
-                Vec::new()
-            }
-    {
-        return Err(ErrorKind::Protocol.into());
-    }
     let mut wanted_security = intent.request.security.security_opt.clone();
     if intent.request.security.no_new_privileges {
         wanted_security.push("no-new-privileges:true".into());
     }
-    if canonical_security_options(host.security_opt.as_ref())
-        != canonical_security_options(Some(&wanted_security))
-    {
-        return Err(ErrorKind::Protocol.into());
+    // Each check names what it guards, so a refusal says why (#397). Any one failing
+    // refuses the container; nothing here ever retries with more privilege.
+    let refusals: [(bool, &str); 18] = [
+        (
+            host.network_mode.as_deref() != Some(&intent.request.network),
+            "network mode",
+        ),
+        (host.auto_remove.unwrap_or(false), "auto-remove"),
+        (host.privileged.unwrap_or(false), "privileged"),
+        (
+            !dialect.default_namespace(Namespace::Pid, host.pid_mode.as_deref()),
+            "pid namespace",
+        ),
+        (
+            !dialect.default_namespace(Namespace::Ipc, host.ipc_mode.as_deref()),
+            "ipc namespace",
+        ),
+        (
+            !dialect.default_namespace(Namespace::Uts, host.uts_mode.as_deref()),
+            "uts namespace",
+        ),
+        (
+            host.userns_mode
+                .as_deref()
+                .is_some_and(|mode| !mode.is_empty()),
+            "user namespace mode",
+        ),
+        (
+            matches!(
+                host.cgroupns_mode,
+                Some(bollard::models::HostConfigCgroupnsModeEnum::HOST)
+            ),
+            "host cgroup namespace",
+        ),
+        (
+            !dialect.runtime_ok(
+                host.runtime.as_deref(),
+                podman.as_ref(),
+                intent.request.nvidia_gpu,
+            ),
+            "container runtime",
+        ),
+        (
+            host.readonly_rootfs.unwrap_or(false) != intent.request.security.read_only_rootfs,
+            "read-only root filesystem",
+        ),
+        (
+            host.pids_limit != Some(intent.request.security.pids_limit),
+            "pids limit",
+        ),
+        (
+            host.shm_size != Some(intent.request.security.shm_size),
+            "shm size",
+        ),
+        (
+            normalized(host.group_add.as_ref()) != intent.request.group_add,
+            "supplementary groups",
+        ),
+        (
+            dialect.echoes_mount_requests()
+                && normalized(host.binds.as_ref()) != intent.request.mounts,
+            "bind requests",
+        ),
+        (
+            !dialect.capabilities_ok(
+                host.cap_add.as_ref(),
+                host.cap_drop.as_ref(),
+                podman.as_ref(),
+                &intent.request.security.cap_add,
+                intent.request.security.cap_drop_all,
+            ),
+            "capabilities",
+        ),
+        (
+            dialect.security_options(host.security_opt.as_ref())
+                != dialect.security_options(Some(&wanted_security)),
+            "security options",
+        ),
+        (
+            intent.request.security.systempaths_unconfined
+                && dialect.reports_masked_paths()
+                && (host.masked_paths.as_deref() != Some(&[])
+                    || host.readonly_paths.as_deref() != Some(&[])),
+            "masked paths",
+        ),
+        (
+            !dialect.devices_ok(
+                host.devices.as_deref().unwrap_or(&[]),
+                &intent.request.devices,
+                intent.request.nvidia_gpu,
+            ),
+            "devices",
+        ),
+    ];
+    if let Some((_, what)) = refusals.iter().find(|(refused, _)| *refused) {
+        return Err(refuse(what, dialect));
     }
-    if intent.request.security.systempaths_unconfined
-        && (host.masked_paths.as_deref() != Some(&[])
-            || host.readonly_paths.as_deref() != Some(&[]))
-    {
-        return Err(ErrorKind::Protocol.into());
-    }
-    let devices = host.devices.as_deref().unwrap_or(&[]);
-    if devices.len() != intent.request.devices.len()
-        || devices
-            .iter()
-            .zip(&intent.request.devices)
-            .any(|(actual, wanted)| {
-                actual.path_on_host.as_deref() != Some(wanted)
-                    || actual.path_in_container.as_deref() != Some(wanted)
-                    || actual.cgroup_permissions.as_deref() != Some("rwm")
-            })
-    {
-        return Err(ErrorKind::Protocol.into());
-    }
-    if intent.request.nvidia_gpu {
-        if !matches!(host.device_requests.as_deref(), Some([request]) if exact_nvidia_all_request(request))
-        {
-            return Err(ErrorKind::Protocol.into());
-        }
-    } else if host
-        .device_requests
-        .as_ref()
-        .is_some_and(|requests| !requests.is_empty())
-    {
-        return Err(ErrorKind::Protocol.into());
+    let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &exact_nvidia_all_request;
+    if !dialect.device_requests_ok(
+        host.device_requests.as_ref(),
+        intent.request.nvidia_gpu.then_some(nvidia_request),
+    ) {
+        return Err(refuse("device requests", dialect));
     }
     // HostConfig.Mounts carries the requested typed details that are absent from
     // MountPoint (CreateMountpoint, NoCopy, consistency). Check it separately
     // from MountPoint, whose source/type/RW values prove what Docker realized.
-    let requested_typed = host.mounts.as_deref().unwrap_or(&[]);
-    let mut unmatched_typed = requested_typed.iter().collect::<Vec<_>>();
-    for wanted in &intent.request.typed_mounts {
-        let Some(position) = unmatched_typed
-            .iter()
-            .position(|actual| matches_typed_request(actual, wanted))
-        else {
+    if dialect.echoes_mount_requests() {
+        let requested_typed = host.mounts.as_deref().unwrap_or(&[]);
+        let mut unmatched_typed = requested_typed.iter().collect::<Vec<_>>();
+        for wanted in &intent.request.typed_mounts {
+            let Some(position) = unmatched_typed
+                .iter()
+                .position(|actual| matches_typed_request(actual, wanted))
+            else {
+                return Err(ErrorKind::Protocol.into());
+            };
+            unmatched_typed.remove(position);
+        }
+        if !unmatched_typed.is_empty() {
             return Err(ErrorKind::Protocol.into());
-        };
-        unmatched_typed.remove(position);
-    }
-    if !unmatched_typed.is_empty() {
-        return Err(ErrorKind::Protocol.into());
+        }
     }
     let legacy = intent
         .request

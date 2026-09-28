@@ -1,0 +1,336 @@
+//! How each container engine reports what it created (RH-07 #397).
+//!
+//! The runtime re-inspects every container it creates and refuses anything it did not ask
+//! for. Docker echoes a request back exactly, so its read-back is a plain comparison.
+//! Podman's Docker-compatible inspect does not (measured on Podman 5.8.4, rootful and
+//! rootless; the findings are on #397 and in `docs/rh07/2026-09-28-cdi-spike.md`):
+//!
+//! - capabilities are reported as a delta from Podman's own default set, so the exact set
+//!   comes from Podman's native inspect (`EffectiveCaps`) instead;
+//! - the runtime reads `oci` (the native inspect names it: `crun` or `runc`);
+//! - namespaces Quasar left alone read `private` (and IPC `shareable`), not empty;
+//! - `no-new-privileges` has no `:true`;
+//! - requested devices and device requests are not reported (rootless never lists a plain
+//!   device; CDI-expanded devices appear only once started, with empty permissions);
+//! - named volumes sit in `Binds` with extra options, and `HostConfig.Mounts` is empty;
+//! - `Config.Image` names the image even when it was created by ID.
+//!
+//! This module is the one place those differences live: each function answers "is what
+//! the engine reported exactly what Quasar asked for?" per engine. The rule is the same on
+//! every engine: anything reported that Quasar did not ask for is a refusal. What Podman
+//! does not report at all is "not reported", never taken as granted; whether a requested
+//! device really arrived is proven by the session's own function checks. Nothing here ever
+//! relaxes rootful Docker.
+
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use bollard::models::{DeviceMapping, DeviceRequest};
+
+use super::{RuntimeConfig, RuntimeError};
+use crate::runtime::{EngineKind, ErrorKind};
+
+/// Which engine's reporting rules apply. An engine this agent cannot name gets Docker's,
+/// the strictest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    Docker,
+    Podman,
+}
+
+impl Dialect {
+    pub(crate) fn of(kind: EngineKind) -> Self {
+        match kind {
+            EngineKind::Podman => Dialect::Podman,
+            EngineKind::Docker | EngineKind::Unknown => Dialect::Docker,
+        }
+    }
+}
+
+/// An engine connection plus what its read-back needs to know about it. Derefs to the
+/// bollard client, so every existing call keeps working.
+pub(crate) struct Engine {
+    docker: bollard::Docker,
+    pub(crate) dialect: Dialect,
+    socket: PathBuf,
+    deadline: Duration,
+}
+
+impl Deref for Engine {
+    type Target = bollard::Docker;
+    fn deref(&self) -> &bollard::Docker {
+        &self.docker
+    }
+}
+
+pub(crate) async fn open(config: &RuntimeConfig) -> Result<Engine, RuntimeError> {
+    let (docker, info) = quasar_runtime::docker::discover(config).await?;
+    Ok(Engine {
+        docker,
+        dialect: Dialect::of(info.kind),
+        socket: config.socket.clone(),
+        deadline: config.deadline,
+    })
+}
+
+/// What Podman's native inspect states exactly, where its compatible inspect does not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PodmanFacts {
+    /// `None` when the inspect does not carry the field at all (it cannot be proven);
+    /// Podman writes `null` for "no capabilities", which is the empty set.
+    pub effective_caps: Option<Vec<String>>,
+    pub oci_runtime: Option<String>,
+}
+
+impl PodmanFacts {
+    pub(crate) fn from_inspect(body: &str) -> Result<Self, RuntimeError> {
+        let value: serde_json::Value =
+            serde_json::from_str(body).map_err(|_| RuntimeError::from(ErrorKind::Protocol))?;
+        let effective_caps = match value.get("EffectiveCaps") {
+            None => None,
+            Some(serde_json::Value::Null) => Some(Vec::new()),
+            Some(caps) => Some(
+                serde_json::from_value(caps.clone())
+                    .map_err(|_| RuntimeError::from(ErrorKind::Protocol))?,
+            ),
+        };
+        let oci_runtime = value
+            .get("OCIRuntime")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Ok(Self {
+            effective_caps,
+            oci_runtime,
+        })
+    }
+}
+
+impl Engine {
+    /// Podman's native inspect of one container; `None` on Docker. A Podman that does not
+    /// answer it is an unknown outcome: the read-back cannot be proven.
+    pub(crate) async fn podman_facts(&self, id: &str) -> Result<Option<PodmanFacts>, RuntimeError> {
+        if self.dialect != Dialect::Podman {
+            return Ok(None);
+        }
+        let socket = self.socket.clone();
+        let path = format!("/v4.0.0/libpod/containers/{id}/json");
+        let deadline = self.deadline;
+        let response = tokio::task::spawn_blocking(move || {
+            crate::release::unix_http::request(&socket, "GET", &path, None, deadline)
+        })
+        .await
+        .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
+        .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?;
+        if response.status != 200 {
+            return Err(ErrorKind::UnknownOutcome.into());
+        }
+        PodmanFacts::from_inspect(&response.body).map(Some)
+    }
+}
+
+/// Namespaces Quasar never sets for an app or helper container.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Namespace {
+    Pid,
+    Ipc,
+    Uts,
+}
+
+impl Dialect {
+    /// Is `mode` what this engine reports for a namespace Quasar left at its default? The
+    /// host namespace, or sharing another container's, is never the default.
+    pub(crate) fn default_namespace(self, ns: Namespace, mode: Option<&str>) -> bool {
+        let mode = mode.unwrap_or("");
+        match (self, ns) {
+            (Dialect::Docker, Namespace::Pid | Namespace::Ipc) => {
+                mode.is_empty() || mode == "private"
+            }
+            (Dialect::Docker, Namespace::Uts) => mode.is_empty(),
+            (Dialect::Podman, Namespace::Pid | Namespace::Uts) => {
+                mode.is_empty() || mode == "private"
+            }
+            (Dialect::Podman, Namespace::Ipc) => {
+                mode.is_empty() || mode == "private" || mode == "shareable"
+            }
+        }
+    }
+
+    /// Did the container get a runtime Quasar accepts? Docker: runc, or the engine default,
+    /// or `nvidia` when a GPU was requested (today's rule). Podman: its native inspect must
+    /// name crun or runc; the compatible field only ever says `oci`.
+    pub(crate) fn runtime_ok(
+        self,
+        reported: Option<&str>,
+        podman: Option<&PodmanFacts>,
+        nvidia_requested: bool,
+    ) -> bool {
+        let reported = reported.unwrap_or("");
+        match self {
+            Dialect::Docker => {
+                reported.is_empty()
+                    || reported == "runc"
+                    || (nvidia_requested && reported == "nvidia")
+            }
+            Dialect::Podman => {
+                (reported.is_empty()
+                    || reported == "oci"
+                    || reported == "crun"
+                    || reported == "runc")
+                    && podman
+                        .and_then(|f| f.oci_runtime.as_deref())
+                        .is_some_and(|runtime| runtime == "crun" || runtime == "runc")
+            }
+        }
+    }
+
+    /// The security options as a comparable set. Podman writes `no-new-privileges` for
+    /// Docker's `no-new-privileges:true`; the two mean the same.
+    pub(crate) fn security_options(self, values: Option<&Vec<String>>) -> Vec<String> {
+        let mut values: Vec<String> = values
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| match (self, value.as_str()) {
+                (Dialect::Podman, "no-new-privileges") => "no-new-privileges:true".into(),
+                _ => value,
+            })
+            .collect();
+        values.sort();
+        values
+    }
+
+    /// Are the container's capabilities exactly what Quasar asked for? Docker echoes the
+    /// request (`CapDrop: [ALL]` plus the additions). Podman reports a delta from its own
+    /// default set, so its native `EffectiveCaps` must equal the requested set exactly.
+    pub(crate) fn capabilities_ok(
+        self,
+        reported_add: Option<&Vec<String>>,
+        reported_drop: Option<&Vec<String>>,
+        podman: Option<&PodmanFacts>,
+        requested_add: &[String],
+        drop_all: bool,
+    ) -> bool {
+        let canonical = |values: &[String]| {
+            let mut values: Vec<String> = values
+                .iter()
+                .map(|value| value.trim_start_matches("CAP_").to_ascii_uppercase())
+                .collect();
+            values.sort();
+            values.dedup();
+            values
+        };
+        let requested = canonical(requested_add);
+        let compat_echoes = || {
+            canonical(reported_add.map(Vec::as_slice).unwrap_or_default()) == requested
+                && canonical(reported_drop.map(Vec::as_slice).unwrap_or_default())
+                    == if drop_all {
+                        vec![String::from("ALL")]
+                    } else {
+                        Vec::new()
+                    }
+        };
+        match self {
+            Dialect::Docker => compat_echoes(),
+            // Podman reports capabilities as a delta from its default set. With drop-all
+            // that delta says nothing exact, so its native EffectiveCaps must equal the
+            // request. Without drop-all, both engines grant their defaults plus the
+            // additions, and the compatible delta means exactly what Docker's does.
+            Dialect::Podman if drop_all => podman
+                .and_then(|f| f.effective_caps.as_deref())
+                .is_some_and(|effective| canonical(effective) == requested),
+            Dialect::Podman => compat_echoes(),
+        }
+    }
+
+    /// Is every reported device one Quasar asked for? Docker reports each requested device
+    /// in order with `rwm`, and nothing else. Podman may leave a requested device out and
+    /// reports permissions empty; what it does list must each be requested, or be a node
+    /// a requested GPU expands to (`/dev/nvidia*`, `/dev/dri/*`).
+    pub(crate) fn devices_ok(
+        self,
+        reported: &[DeviceMapping],
+        requested: &[String],
+        gpu_requested: bool,
+    ) -> bool {
+        match self {
+            Dialect::Docker => {
+                reported.len() == requested.len()
+                    && reported.iter().zip(requested).all(|(actual, wanted)| {
+                        actual.path_on_host.as_deref() == Some(wanted.as_str())
+                            && actual.path_in_container.as_deref() == Some(wanted.as_str())
+                            && actual.cgroup_permissions.as_deref() == Some("rwm")
+                    })
+            }
+            Dialect::Podman => reported.iter().all(|actual| {
+                let (Some(host), Some(inside)) = (
+                    actual.path_on_host.as_deref(),
+                    actual.path_in_container.as_deref(),
+                ) else {
+                    return false;
+                };
+                let permissions = actual.cgroup_permissions.as_deref().unwrap_or("");
+                host == inside
+                    && (permissions.is_empty() || permissions == "rwm")
+                    && (requested.iter().any(|wanted| wanted == host)
+                        || (gpu_requested && gpu_expansion(host)))
+            }),
+        }
+    }
+
+    /// Does the reported device-request list match? `wanted` says whether one request was
+    /// made and how to recognise it. Docker echoes it exactly; Podman reports none at all,
+    /// and must never report one Quasar did not make.
+    pub(crate) fn device_requests_ok(
+        self,
+        reported: Option<&Vec<DeviceRequest>>,
+        wanted: Option<&dyn Fn(&DeviceRequest) -> bool>,
+    ) -> bool {
+        let reported = reported.map(Vec::as_slice).unwrap_or_default();
+        match (self, wanted) {
+            (_, None) => reported.is_empty(),
+            (Dialect::Docker, Some(matches)) => matches!(reported, [request] if matches(request)),
+            (Dialect::Podman, Some(matches)) => match reported {
+                [] => true,
+                [request] => matches(request),
+                _ => false,
+            },
+        }
+    }
+
+    /// Whether `HostConfig.Binds` / `HostConfig.Mounts` echo the request. When they do
+    /// not (Podman), the realized mount points, which every engine reports, are what is
+    /// compared.
+    pub(crate) fn echoes_mount_requests(self) -> bool {
+        self == Dialect::Docker
+    }
+
+    /// Whether `Config.Image` echoes the reference the container was created from. Podman
+    /// names the image instead; the image ID is still compared on every engine.
+    pub(crate) fn echoes_config_image(self) -> bool {
+        self == Dialect::Docker
+    }
+
+    /// Whether an empty `MaskedPaths`/`ReadonlyPaths` is reported for an unmasked
+    /// container. Podman reports neither; that is not a grant Quasar did not ask for.
+    pub(crate) fn reports_masked_paths(self) -> bool {
+        self == Dialect::Docker
+    }
+}
+
+/// The device nodes a requested NVIDIA CDI device resolves to: its control and GPU nodes
+/// and the DRM nodes of the same card.
+fn gpu_expansion(path: &str) -> bool {
+    let path = Path::new(path);
+    let nvidia_node = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("nvidia"))
+        && (path.parent() == Some(Path::new("/dev"))
+            || path.parent() == Some(Path::new("/dev/nvidia-caps")));
+    path.starts_with("/dev/dri") || nvidia_node
+}
+
+#[cfg(test)]
+#[path = "dialect_tests.rs"]
+mod tests;
