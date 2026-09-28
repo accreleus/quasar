@@ -532,6 +532,18 @@ if [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; then
     fi
   fi
 fi
+# Rootful Docker restarts Quasar's containers itself, but only once its daemon runs: some
+# systems (Fedora CoreOS, uCore) ship it disabled.
+if [ "$MODE" = rootful ] && { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; }; then
+  link="/etc/systemd/system/multi-user.target.wants/docker.service"
+  if [ -L "$R$link" ] || [ -e "$R$link" ]; then
+    say ok "docker.service enabled"
+  elif [ -e "$R/usr/lib/systemd/system/docker.service" ]; then
+    run systemctl enable docker.service
+    stand_in && { mkdir -p "$(dirname "$R$link")" && ln -s /usr/lib/systemd/system/docker.service "$R$link"; }
+    say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "docker.service enabled — the daemon, and with it Quasar's containers, start at boot"
+  fi
+fi
 if [ "$MODE" = rootless ] && { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; }; then
   say note "rootless Docker: install it for $QUSER with dockerd-rootless-setuptool.sh and enable its docker.service; lingering (above) keeps it running"
 fi

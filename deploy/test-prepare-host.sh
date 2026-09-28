@@ -254,6 +254,10 @@ grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/h(/.*)?' "$r9
   && grep -q 'd /run/quasar-agent 0755 root root' "$r9f/etc/tmpfiles.d/quasar.conf" \
   && pass "rootful Docker with --selinux-enabled gets the labels, boolean, module and a boot-made runtime dir" \
   || fail "docker selinux" "$(cat "$r9f/.prepare-host-commands" 2>/dev/null) $out9f"
+grep -q 'systemctl enable docker.service' "$r9f/.prepare-host-commands" && [ -L "$r9f/etc/systemd/system/multi-user.target.wants/docker.service" ] \
+  && pass "rootful Docker is enabled at boot" || fail "docker at boot" "$(cat "$r9f/.prepare-host-commands")"
+prep "$r9f" "$tmp/docker-only" --mode rootful --engine docker --homes /var/lib/quasar/h >/dev/null 2>&1
+[ "$(grep -c 'systemctl enable docker.service' "$r9f/.prepare-host-commands")" = 1 ] && pass "docker.service is enabled once" || fail "docker enable idempotent" ""
 
 # ── argument validation ─────────────────────────────────────────────────────
 if prep "$tmp/none" "$tmp/podman-only" 2>/dev/null; then fail "--mode required" "exit 0"; else pass "--mode is required"; fi
