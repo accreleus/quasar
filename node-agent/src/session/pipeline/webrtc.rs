@@ -611,9 +611,15 @@ fn record_media_evidence(
     } else {
         connected_once.load(Ordering::SeqCst)
     };
+    // A failed ICE agent's stats list no candidates: what signaling delivered stands in.
+    let offered = crate::session::media_evidence::offered(webrtc);
     let promise = gst::Promise::with_change_func(move |reply| {
         if let Ok(Some(reply)) = reply {
-            record(&ice_stats(reply), before, outcome);
+            let mut stats = ice_stats(reply);
+            if stats.remote.is_empty() {
+                stats.remote = offered;
+            }
+            record(&stats, before, outcome);
         }
     });
     webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);

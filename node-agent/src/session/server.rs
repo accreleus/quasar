@@ -274,6 +274,7 @@ fn handle_inbound(
                 pc_name(pc),
                 candidate.candidate
             );
+            super::media_evidence::note_offered(target, &candidate.candidate);
             target.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate.candidate]);
         }
         SignalMsg::RestartIce { pc } => {

@@ -10,7 +10,9 @@
 //!   own, so this says the peer reached the host, never that the port range is open.
 //! - **Blocked**: ICE failed before ever connecting, the peer offered at least one off-host
 //!   candidate, and no peer-reflexive remote candidate exists (one would mean a check from
-//!   the peer did arrive).
+//!   the peer did arrive). A failed ICE agent's stats list no candidates at all, so the
+//!   offer comes from signaling, kept on the webrtcbin ([`note_offered`]); a check that
+//!   arrived without completing a pair is then not observable.
 //! - Anything else is inconclusive and changes nothing: a session that ended first, one
 //!   that connected and later dropped, a peer on this host or on one of its container
 //!   bridges, a remote address still hidden behind an mDNS name.
@@ -182,6 +184,56 @@ fn same_subnet(a: IpAddr, b: IpAddr, prefix: u8) -> bool {
         }
         _ => false,
     }
+}
+
+/// The GObject data key under which a webrtcbin carries the remote candidates signaling
+/// delivered to it. On the element, so it lives and dies with the peer connection.
+const OFFERED_KEY: &str = "quasar-offered-remote-candidates";
+
+type Offered = std::sync::Arc<Mutex<Vec<Candidate>>>;
+
+/// A remote candidate line arrived over signaling for `webrtc`. After ICE fails its stats
+/// list no candidates, so what the peer offered is kept here.
+pub fn note_offered(webrtc: &gstreamer::Element, line: &str) {
+    let Some(candidate) = candidate_from_line(line) else {
+        return;
+    };
+    // SAFETY: OFFERED_KEY is only ever set and read as `Offered`, in this module.
+    let offered = unsafe {
+        match webrtc.data::<Offered>(OFFERED_KEY) {
+            Some(ptr) => ptr.as_ref().clone(),
+            None => {
+                let fresh = Offered::default();
+                webrtc.set_data(OFFERED_KEY, fresh.clone());
+                fresh
+            }
+        }
+    };
+    if let Ok(mut list) = offered.lock() {
+        list.push(candidate);
+    };
+}
+
+/// What signaling delivered to `webrtc`, if anything.
+pub fn offered(webrtc: &gstreamer::Element) -> Vec<Candidate> {
+    // SAFETY: as in `note_offered`.
+    unsafe { webrtc.data::<Offered>(OFFERED_KEY) }
+        .and_then(|ptr| unsafe { ptr.as_ref() }.lock().ok().map(|l| l.clone()))
+        .unwrap_or_default()
+}
+
+/// `candidate:<foundation> <component> <transport> <priority> <address> <port> typ <type> ...`
+fn candidate_from_line(line: &str) -> Option<Candidate> {
+    let line = line.trim();
+    let line = line.strip_prefix("a=").unwrap_or(line);
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if !fields.first()?.starts_with("candidate:") || fields.get(6) != Some(&"typ") {
+        return None;
+    }
+    Some(Candidate {
+        address: fields.get(4)?.to_string(),
+        kind: fields.get(7)?.to_string(),
+    })
 }
 
 /// Read a webrtcbin `get-stats` reply into the remote side of its ICE.
@@ -403,6 +455,37 @@ mod tests {
             decide(&local_only, false, IceOutcome::Failed, &local(), now()),
             None
         );
+    }
+
+    #[test]
+    fn candidate_lines_yield_their_address_and_type() {
+        assert_eq!(
+            candidate_from_line(
+                "candidate:1 1 udp 2113937151 198.51.100.7 39854 typ host generation 0"
+            ),
+            Some(c("198.51.100.7", "host"))
+        );
+        assert_eq!(
+            candidate_from_line(
+                "a=candidate:9 1 UDP 1686052607 203.0.113.9 61000 typ srflx raddr 0.0.0.0 rport 0"
+            ),
+            Some(c("203.0.113.9", "srflx"))
+        );
+        assert_eq!(candidate_from_line(""), None);
+        assert_eq!(candidate_from_line("candidate:1 1 udp 1 x"), None);
+    }
+
+    #[test]
+    fn candidates_offered_over_signaling_live_on_the_element() {
+        gstreamer::init().unwrap();
+        let webrtc = gstreamer::ElementFactory::make("identity").build().unwrap();
+        assert!(offered(&webrtc).is_empty());
+        note_offered(
+            &webrtc,
+            "candidate:1 1 udp 2113937151 198.51.100.7 39854 typ host",
+        );
+        note_offered(&webrtc, "garbage");
+        assert_eq!(offered(&webrtc), vec![c("198.51.100.7", "host")]);
     }
 
     #[test]
