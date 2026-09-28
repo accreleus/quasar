@@ -25,6 +25,15 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **NVIDIA GPUs by CDI (RH-07, #399).** Every container Quasar creates on an NVIDIA host (the
+  node agent, its helpers, app sessions and the actor's GPU probe) asks for the GPU the way
+  its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an
+  NVIDIA CDI device, by `--gpus` on a rootful Docker without one. A rootless Docker with
+  neither gets no GPU and readiness `runtime_cdi` fails naming host preparation, blocking the
+  host (or, on a mixed host, each NVIDIA GPU through `runtime_cdi_gpu<N>`). The agent reads
+  the request back by the same rule. The driver volume no longer carries the X.Org server
+  modules, and NVIDIA app containers disable lavapipe so a broken ICD cannot fall back to
+  software rendering.
 - **One least-privilege node-agent recipe (RH-07, #402).** Recipe revision 3, applied by the
   recovery actor in every engine mode (rootful included), removes from the node agent:
   - the host's `/dev` mount;

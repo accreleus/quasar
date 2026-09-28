@@ -1325,6 +1325,10 @@ const VENDOR_NEUTRAL_LIB_BASES: &[&str] = &[
     "libOpenCL",
 ];
 
+/// X.Org server modules. Only an X server loads them, from its module path; a session never
+/// does, and on a CUDA-only host (no X driver installed) they are nothing the host provides.
+const X_SERVER_MODULE_BASES: &[&str] = &["nvidia_drv", "libglxserver_nvidia"];
+
 /// The base name up to the first `.so`.
 fn so_base(name: &str) -> &str {
     name.split(".so").next().unwrap_or(name)
@@ -1355,6 +1359,10 @@ fn shared_objects(dir: &Path) -> Vec<String> {
                     "skipping a vendor-neutral dispatch library — the container image supplies it, \
                      and shadowing it via LD_LIBRARY_PATH breaks EGL"
                 );
+                return false;
+            }
+            if X_SERVER_MODULE_BASES.contains(&so_base(n)) {
+                tracing::debug!(target: T, lib = %n, "skipping an X.Org server module");
                 return false;
             }
             true
@@ -2434,6 +2442,10 @@ pub fn app_container_args(
             "VK_ADD_DRIVER_FILES={}",
             dst.join(layout::VULKAN_ICD_JSON).display()
         ),
+        // With the NVIDIA ICD present, a failure to load it must surface, not fall back
+        // to lavapipe and run the game in software (the agent image sets the same).
+        "-e".into(),
+        "VK_LOADER_DRIVERS_DISABLE=*lvp_icd*".into(),
     ];
 
     // GBM_BACKENDS_PATH REPLACES Mesa's backend directory, so it is emitted only when
@@ -2865,6 +2877,15 @@ mod tests {
             pop.external_platform,
             vec!["10_nvidia_wayland.json", "15_nvidia_gbm.json"]
         );
+    }
+
+    #[test]
+    fn x_server_modules_never_enter_the_volume() {
+        let t = fake_extract("xorg");
+        t.file("nvidia_drv.so", "x");
+        t.file("libglxserver_nvidia.so.610.57.04", "x");
+        let pop = classify_extract_tree(&t.0).unwrap();
+        assert_eq!(pop.lib64.len(), 10, "{:?}", pop.lib64);
     }
 
     /// The volume must carry vendor libraries only: the installer's glvnd dispatch

@@ -6,6 +6,7 @@
 use super::super::runtime_facts::*;
 use super::super::*;
 use super::{get, FakeRoot};
+use crate::messages::ReadinessBlocks;
 use crate::runtime::{
     ApiVersion, CdiFacts, EngineFacts, EngineInfo, EngineKind, EngineMode, ErrorKind, RuntimeError,
     API_FLOOR,
@@ -360,61 +361,122 @@ fn an_indeterminate_inspection_warns_and_never_fails() {
     assert!(endpoint.summary.contains("busy"), "{endpoint:?}");
 }
 
-#[test]
-fn cdi_enabled_with_devices_reports_dirs_and_devices() {
-    let root = FakeRoot::new("runtime-cdi-devices");
-    let checks = probe(&observed(&root, Ok(facts(Some(cdi_enabled_with_gpu())))));
-    let c = get(&checks, CDI_ID);
-    assert_eq!(c.status, PASS, "{c:?}");
-    assert!(c.summary.contains("enabled"), "{c:?}");
-    assert!(c.summary.contains("/etc/cdi"), "{c:?}");
-    assert!(c.summary.contains("nvidia.com/gpu=0"), "{c:?}");
-    assert!(
-        c.remediation.is_empty(),
-        "observed only, nothing to fix: {c:?}"
-    );
+fn nvidia_env(root: &FakeRoot, facts: EngineFacts, gpus: Vec<(i32, bool)>) -> ProbeEnv {
+    ProbeEnv {
+        runtime: RuntimeView::Observed {
+            endpoint: ENDPOINT.into(),
+            outcome: Ok(facts),
+        },
+        gpus,
+        ..root.env(true, "")
+    }
+}
+
+fn rootless(mut f: EngineFacts) -> EngineFacts {
+    f.mode = EngineMode::Rootless;
+    f
+}
+
+fn no_cdi() -> Option<CdiFacts> {
+    Some(CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec![],
+    })
 }
 
 #[test]
-fn cdi_enabled_with_no_devices_says_so_without_a_verdict() {
+fn a_host_without_nvidia_passes_and_blocks_nothing() {
+    let root = FakeRoot::new("runtime-cdi-amd");
+    let checks = probe(&observed(&root, Ok(facts(no_cdi()))));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("No NVIDIA GPU"), "{c:?}");
+    assert!(c.blocks.is_none(), "{c:?}");
+}
+
+#[test]
+fn nvidia_on_an_engine_with_an_nvidia_cdi_device_goes_by_cdi_and_blocks_the_host() {
+    let root = FakeRoot::new("runtime-cdi-nvidia");
+    let checks = probe(&nvidia_env(
+        &root,
+        rootless(facts(Some(cdi_enabled_with_gpu()))),
+        vec![(0, true)],
+    ));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("by CDI (nvidia.com/gpu=all)"), "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+}
+
+#[test]
+fn nvidia_on_rootful_docker_without_cdi_goes_by_device_request() {
+    let root = FakeRoot::new("runtime-cdi-gpus");
+    let checks = probe(&nvidia_env(&root, facts(no_cdi()), vec![(0, true)]));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("--gpus"), "{c:?}");
+}
+
+#[test]
+fn podman_always_goes_by_cdi() {
+    let root = FakeRoot::new("runtime-cdi-podman");
+    let mut f = rootless(facts(None));
+    f.info.kind = EngineKind::Podman;
+    let checks = probe(&nvidia_env(&root, f, vec![(0, true)]));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("by CDI"), "{c:?}");
+}
+
+/// Amendment 17: an NVIDIA host whose engine can inject the GPU by neither CDI nor
+/// `--gpus` fails, names host preparation, and never suggests running as root.
+#[test]
+fn nvidia_on_rootless_docker_without_cdi_fails_naming_host_preparation() {
     let root = FakeRoot::new("runtime-cdi-none");
-    let checks = probe(&observed(
+    let checks = probe(&nvidia_env(
         &root,
-        Ok(facts(Some(CdiFacts {
-            spec_dirs: vec!["/etc/cdi".into()],
-            devices: vec![],
-        }))),
+        rootless(facts(no_cdi())),
+        vec![(0, true)],
     ));
     let c = get(&checks, CDI_ID);
-    assert_eq!(c.status, PASS, "{c:?}");
-    assert!(c.summary.contains("enabled"), "{c:?}");
-    assert!(c.summary.contains("no devices"), "{c:?}");
-    assert!(c.remediation.is_empty(), "{c:?}");
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(c.remediation.contains("prepare-host.sh"), "{c:?}");
+    assert!(c.remediation.contains("Never run Quasar as root"), "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+    assert!(!checks.iter().any(|c| c.id.starts_with("runtime_cdi_gpu")));
 }
 
 #[test]
-fn cdi_disabled_is_reported_and_names_how_gpus_are_really_injected() {
-    let root = FakeRoot::new("runtime-cdi-disabled");
-    let checks = probe(&observed(
+fn a_mixed_host_blocks_each_nvidia_gpu_not_the_host() {
+    let root = FakeRoot::new("runtime-cdi-mixed");
+    let checks = probe(&nvidia_env(
         &root,
-        Ok(facts(Some(CdiFacts {
-            spec_dirs: vec![],
-            devices: vec![],
-        }))),
+        rootless(facts(no_cdi())),
+        vec![(0, false), (1, true)],
     ));
-    let c = get(&checks, CDI_ID);
-    assert_eq!(c.status, PASS, "{c:?}");
-    assert!(c.summary.contains("disabled"), "{c:?}");
-    assert!(c.summary.contains("device request"), "{c:?}");
-    assert!(c.remediation.is_empty(), "{c:?}");
+    let host = get(&checks, CDI_ID);
+    assert_eq!(host.status, FAIL, "{host:?}");
+    assert!(host.blocks.is_none(), "{host:?}");
+    let gpu = get(&checks, "runtime_cdi_gpu1");
+    assert_eq!(gpu.status, FAIL, "{gpu:?}");
+    assert_eq!(gpu.blocks, Some(ReadinessBlocks::gpu(1, "control_plane")));
+    assert!(!checks.iter().any(|c| c.id == "runtime_cdi_gpu0"));
 }
 
 #[test]
-fn cdi_not_reported_by_the_engine_skips() {
-    let root = FakeRoot::new("runtime-cdi-unreported");
-    let checks = probe(&observed(&root, Ok(facts(None))));
+fn an_engine_that_could_not_be_inspected_skips_cdi_without_blocking() {
+    let root = FakeRoot::new("runtime-cdi-unknown");
+    let checks = probe(&ProbeEnv {
+        runtime: RuntimeView::Observed {
+            endpoint: ENDPOINT.into(),
+            outcome: Err(RuntimeFault::Indeterminate("busy".into())),
+        },
+        gpus: vec![(0, true)],
+        ..root.env(true, "")
+    });
     let c = get(&checks, CDI_ID);
     assert_eq!(c.status, SKIP, "{c:?}");
+    assert!(c.blocks.is_none(), "{c:?}");
 }
 
 #[test]
