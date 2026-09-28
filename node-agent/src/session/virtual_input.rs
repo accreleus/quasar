@@ -367,13 +367,26 @@ fn wait_for_host_node(path: &Path, maj: u32, min: u32, within: std::time::Durati
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    match File::open(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow!(
-            "this agent cannot open its own input device {path:?}: run host preparation \
-             (deploy/prepare-host.sh), which gives the Quasar user Quasar's own input devices"
-        )),
-        Err(e) => Err(e).with_context(|| format!("open {path:?}")),
+    // The node appears before udev has applied host preparation's rule (the ACL and label
+    // land milliseconds later), so a refusal is retried until the same deadline.
+    loop {
+        match File::open(path) {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(anyhow!(
+                    "this agent cannot open its own input device {path:?}: run host \
+                     preparation (deploy/prepare-host.sh), which gives the Quasar user \
+                     Quasar's own input devices"
+                ))
+            }
+            Err(e) => return Err(e).with_context(|| format!("open {path:?}")),
+        }
     }
 }
 
