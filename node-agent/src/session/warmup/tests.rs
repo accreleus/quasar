@@ -253,7 +253,7 @@ fn test_cfg() -> WarmupConfig {
             max_bytes: 1 << 30,
             min_files: 1,
             marker: ".local/share/Steam/steam.sh",
-            reject_root_owned: false,
+            reject_owner: None,
         },
     }
 }

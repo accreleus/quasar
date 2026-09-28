@@ -35,7 +35,12 @@ own; the two do not move together, and that is deliberate.
   reach the agent's Wayland and PulseAudio sockets (this was also why rootless Podman's
   audio sidecar never became ready, #411). On SELinux Podman, app containers run as
   `container_engine_t`, the policy's confined type for nested sandboxes, so Steam's and
-  Flatpak's `bwrap` can mount; `container_t` refused them and Steam never showed a window.
+  Flatpak's `bwrap` can mount; `container_t` refused them and Steam never showed a window. On
+  an NVIDIA host, host preparation installs a one-rule SELinux module
+  (`quasar-nested-gpu`) giving `container_engine_t` the NVIDIA device access the
+  `container_use_xserver_devices` boolean gives `container_t`, and nothing more. The Steam
+  template's publish check forbids files owned by the app's root as the agent sees that
+  uid (1 under keep-id, where the Quasar user is the agent's 0).
   The read-back checks the process label. Rootless Docker has no per-container user
   mapping: its homes keep subordinate IDs. Host preparation's udev rule also labels Quasar's own
   virtual input devices `container_file_t` on SELinux Podman hosts (#401), so a confined

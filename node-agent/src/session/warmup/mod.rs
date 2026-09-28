@@ -614,7 +614,13 @@ impl WarmupJob<'_> {
             );
         }
 
-        let stats = verify_template(&dest, &self.cfg.verify).map_err(|violations| {
+        let mut policy = self.cfg.verify.clone();
+        if policy.reject_owner.is_some() {
+            policy.reject_owner = Some(verify::app_root_uid(
+                &crate::buildinfo::EngineIdentity::observe(),
+            ));
+        }
+        let stats = verify_template(&dest, &policy).map_err(|violations| {
             error!(
                 token = "template-verification-refused",
                 "template: verification REFUSED to publish {} v{}: {}",

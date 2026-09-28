@@ -189,8 +189,13 @@ out7d="$(prep "$r7d" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 grep -q 'setsebool -P container_use_xserver_devices on' "$r7d/.prepare-host-commands" && printf '%s' "$out7d" | grep -q 'SELinux stays enforcing' \
   && pass "NVIDIA + SELinux + Podman turns on container_use_xserver_devices, with its reason" || fail "selinux boolean" "$out7d"
 if grep -qE 'setenforce|label=disable|container_use_devices' "$script"; then fail "never relaxes SELinux" ""; else pass "never disables SELinux, labels or all-device access"; fi
+grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r7d/.prepare-host-commands" \
+  && grep -q '(allow container_engine_t xserver_misc_device_t (chr_file' "$r7d/etc/quasar/selinux/quasar-nested-gpu.cil" \
+  && [ "$(grep -c allow "$r7d/etc/quasar/selinux/quasar-nested-gpu.cil")" = 1 ] \
+  && pass "the nested-sandbox type gets exactly one NVIDIA device rule" || fail "nested gpu module" "$(cat "$r7d/.prepare-host-commands")"
 out7d2="$(prep "$r7d" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 printf '%s' "$out7d2" | grep -q 'ok       SELinux container_use_xserver_devices on' && pass "the boolean is left alone once on" || fail "selinux idempotent" "$out7d2"
+[ "$(grep -c 'semodule -i' "$r7d/.prepare-host-commands")" = 1 ] && pass "the module is installed once" || fail "module idempotent" "$(cat "$r7d/.prepare-host-commands")"
 r7e="$tmp/r7e"; mk_root "$r7e" nvidia; mkdir -p "$r7e/sys/fs/selinux/booleans"; printf '0 0' > "$r7e/sys/fs/selinux/booleans/container_use_xserver_devices"
 prep "$r7e" "$tmp/docker-only" --mode rootful >/dev/null 2>&1
 if grep -q setsebool "$r7e/.prepare-host-commands" 2>/dev/null; then fail "no boolean for Docker" ""; else pass "Docker does not get the SELinux boolean"; fi

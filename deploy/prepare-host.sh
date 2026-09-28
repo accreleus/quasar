@@ -417,6 +417,21 @@ if [ -e "$R/proc/driver/nvidia/version" ]; then
         say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux container_use_xserver_devices on — lets confined containers open the NVIDIA device nodes (labelled xserver_misc_device_t), and nothing else; SELinux stays enforcing"
         ;;
     esac
+    # Sessions run as container_engine_t, the policy's confined type for nested sandboxes
+    # (Steam's bwrap). The boolean above covers container_t only; this one rule gives
+    # container_engine_t the same NVIDIA device access, and nothing more.
+    printf '%s\n' '; Written by Quasar host preparation (deploy/prepare-host.sh).' \
+      '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' \
+      | put /etc/quasar/selinux/quasar-nested-gpu.cil 0644 "the NVIDIA device rule for sessions' nested-sandbox SELinux type" || unchanged
+    if live && semodule -l 2>/dev/null | grep -qx quasar-nested-gpu; then
+      say ok "SELinux module quasar-nested-gpu"
+    elif ! live && grep -qx quasar-nested-gpu "$R/.selinux-modules" 2>/dev/null; then
+      say ok "SELinux module quasar-nested-gpu"
+    else
+      run semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil
+      stand_in && echo quasar-nested-gpu >> "$R/.selinux-modules"
+      say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module quasar-nested-gpu — lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
+    fi
   fi
 else
   say skipped "NVIDIA CDI specification — no NVIDIA driver loaded"
