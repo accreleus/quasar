@@ -352,11 +352,7 @@ fn real_engine_readback_passes_a_session_shaped_container() {
             .lines()
             .map(|l| l.split_whitespace().collect())
             .collect();
-        assert!(
-            lines.contains(&vec!["1000", "0", "1"]),
-            "{}",
-            result.stdout
-        );
+        assert!(lines.contains(&vec!["1000", "0", "1"]), "{}", result.stdout);
     }
     runtime.cleanup_application(id).wait().unwrap();
     assets.cleaned = true;

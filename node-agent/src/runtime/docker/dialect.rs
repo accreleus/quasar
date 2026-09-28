@@ -150,6 +150,11 @@ impl PodmanFacts {
     }
 }
 
+/// The SELinux type for app containers on SELinux Podman: still confined, but the policy's
+/// type for nested sandboxes, so Steam's and Flatpak's bwrap can mount. `container_t`
+/// refuses those mounts and Steam never shows a window.
+pub(crate) const NESTED_SANDBOX_LABEL: &str = "label=type:container_engine_t";
+
 /// The keep-id mapping `(uid, gid)` proven by Podman's maps: the one range that maps onto
 /// the engine's own user (parent id 0) is exactly `uid` (and `gid`), one id long.
 pub(crate) fn keep_id_ok(podman: Option<&PodmanFacts>, uid: u32, gid: u32) -> bool {
@@ -169,14 +174,16 @@ pub(crate) fn keep_id_ok(podman: Option<&PodmanFacts>, uid: u32, gid: u32) -> bo
 }
 
 impl Engine {
-    /// Whether this engine runs rootless, from its own `/info`.
-    pub(crate) async fn rootless(&self) -> Result<bool, RuntimeError> {
+    /// `(rootless, selinux)`, from the engine's own `/info` security options.
+    pub(crate) async fn confinement(&self) -> Result<(bool, bool), RuntimeError> {
         let sys = self.docker.info().await.map_err(super::classify)?;
-        Ok(sys
-            .security_options
-            .iter()
-            .flatten()
-            .any(|o| o.split(',').any(|p| p == "name=rootless")))
+        let has = |name: &str| {
+            sys.security_options
+                .iter()
+                .flatten()
+                .any(|o| o.split(',').any(|p| p == name))
+        };
+        Ok((has("name=rootless"), has("name=selinux")))
     }
 
     /// How this engine injects an NVIDIA GPU now (decision D10). Asked per create, never

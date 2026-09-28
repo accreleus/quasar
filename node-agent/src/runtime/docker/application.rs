@@ -382,6 +382,9 @@ fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> Containe
                 if r.security.no_new_privileges {
                     options.push("no-new-privileges:true".into());
                 }
+                if intent.nested_sandbox_label {
+                    options.push(super::dialect::NESTED_SANDBOX_LABEL.into());
+                }
                 options
             }),
             readonly_rootfs: Some(r.security.read_only_rootfs),
@@ -865,6 +868,9 @@ async fn inspect_owned(
     if intent.request.security.no_new_privileges {
         wanted_security.push("no-new-privileges:true".into());
     }
+    if intent.nested_sandbox_label {
+        wanted_security.push(super::dialect::NESTED_SANDBOX_LABEL.into());
+    }
     // Each check names what it guards, so a refusal says why (#397). Any one failing
     // refuses the container; nothing here ever retries with more privilege.
     let refusals: [(bool, &str); 19] = [
@@ -972,6 +978,14 @@ async fn inspect_owned(
     ];
     if let Some((_, what)) = refusals.iter().find(|(refused, _)| *refused) {
         return Err(refuse(what, dialect));
+    }
+    if intent.nested_sandbox_label
+        && !info
+            .process_label
+            .as_deref()
+            .is_some_and(|label| label.split(':').nth(2) == Some("container_engine_t"))
+    {
+        return Err(refuse("selinux process label", dialect));
     }
     let injection = recorded_injection(intent.request.nvidia_gpu, intent.gpu_injection);
     let nvidia_request =
@@ -1161,12 +1175,13 @@ pub(crate) async fn start(
             };
             // D14: rootless Podman maps the app's ids onto the Quasar user. Rootless Docker
             // has no per-container mapping; its homes keep subordinate ids (a readiness gap).
-            let keep_id =
-                if docker.dialect == super::dialect::Dialect::Podman && docker.rootless().await? {
-                    Some(app_ids(&request.environment))
-                } else {
-                    None
-                };
+            let podman = docker.dialect == super::dialect::Dialect::Podman;
+            let (rootless, selinux) = if podman {
+                docker.confinement().await?
+            } else {
+                (false, false)
+            };
+            let keep_id = rootless.then(|| app_ids(&request.environment));
             let intent = ApplicationIntent {
                 request,
                 owner,
@@ -1181,6 +1196,7 @@ pub(crate) async fn start(
                 nvidia_params_repair: None,
                 gpu_injection,
                 keep_id,
+                nested_sandbox_label: selinux,
                 phase: ApplicationPhase::Creating,
                 result: None,
             };

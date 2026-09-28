@@ -2551,6 +2551,7 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         nvidia_params_repair: None,
         gpu_injection: None,
         keep_id: None,
+        nested_sandbox_label: false,
         phase: ApplicationPhase::Running,
         result: None,
     };

@@ -31,8 +31,13 @@ own; the two do not move together, and that is deliberate.
   dropping privileges. The read-back proves the mapping from Podman's own ID maps. Host
   preparation gains `--templates DIR`, and on an SELinux Podman host labels the homes and
   templates roots `container_file_t` with a persistent file context (labels only; nothing
-  is re-owned, SELinux stays enforcing). Rootless Docker has no per-container user mapping:
-  its homes keep subordinate IDs.
+  is re-owned, SELinux stays enforcing), and labels `/run/quasar-agent` too, where sessions
+  reach the agent's Wayland and PulseAudio sockets (this was also why rootless Podman's
+  audio sidecar never became ready, #411). On SELinux Podman, app containers run as
+  `container_engine_t`, the policy's confined type for nested sandboxes, so Steam's and
+  Flatpak's `bwrap` can mount; `container_t` refused them and Steam never showed a window.
+  The read-back checks the process label. Rootless Docker has no per-container user
+  mapping: its homes keep subordinate IDs.
 - **NVIDIA GPUs by CDI (RH-07, #399).** Every container Quasar creates on an NVIDIA host (the
   node agent, its helpers, app sessions and the actor's GPU probe) asks for the GPU the way
   its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an

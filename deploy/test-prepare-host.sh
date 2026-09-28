@@ -215,8 +215,10 @@ grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/homes(/.*)?' 
   && grep -qF 'restorecon -R /var/lib/quasar/templates' "$r9b/.prepare-host-commands" \
   && pass "homes and templates roots get a persistent container_file_t context" || fail "selinux labels" "$(cat "$r9b/.prepare-host-commands" 2>/dev/null) $out9b"
 [ -d "$r9b/var/lib/quasar/templates" ] && pass "--templates creates the templates root" || fail "templates root" "missing"
+grep -qF 'semanage fcontext -a -t container_file_t /run/quasar-agent(/.*)?' "$r9b/.prepare-host-commands" \
+  && pass "the agent's runtime directory (session sockets) gets the container label" || fail "runtime dir label" "$(cat "$r9b/.prepare-host-commands")"
 out9b2="$(prep "$r9b" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates 2>&1)"
-[ "$(grep -c 'semanage fcontext' "$r9b/.prepare-host-commands")" = 2 ] && printf '%s' "$out9b2" | grep -q 'ok       SELinux label on /var/lib/quasar/homes' \
+[ "$(grep -c 'semanage fcontext' "$r9b/.prepare-host-commands")" = 3 ] && printf '%s' "$out9b2" | grep -q 'ok       SELinux label on /var/lib/quasar/homes' \
   && pass "labels are added once" || fail "label idempotent" "$out9b2"
 r9c="$tmp/r9c"; mk_root "$r9c"; mkdir -p "$r9c/sys/fs/selinux"
 prep "$r9c" "$tmp/docker-only" --mode rootless --engine docker --homes /var/lib/quasar/homes >/dev/null 2>&1

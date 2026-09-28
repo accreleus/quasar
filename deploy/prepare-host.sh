@@ -152,6 +152,27 @@ put() {
 # stand_in: true when a test root should record the effect of a command `run` skipped.
 stand_in() { ! live && [ "$DRY_RUN" = 0 ]; }
 
+# SELinux confines Podman's containers: a directory they write must carry the container
+# file label. A persistent file-context rule plus restorecon labels it (and anything
+# later created in it); that changes labels, never ownership, and SELinux stays enforcing.
+label_root() { # label_root DIR
+  if live; then
+    if semanage fcontext -l -C 2>/dev/null | grep -F "$1(/.*)?" | grep -q container_file_t; then
+      say ok "SELinux label on $1"; return
+    fi
+  elif grep -qxF "$1" "$R/.selinux-fcontext" 2>/dev/null; then
+    say ok "SELinux label on $1"; return
+  fi
+  if [ "$DRY_RUN" = 1 ]; then say would "label $1 for containers (container_file_t)"; return; fi
+  run semanage fcontext -a -t container_file_t "$1(/.*)?"
+  run restorecon -R "$1"
+  stand_in && printf '%s\n' "$1" >> "$R/.selinux-fcontext"
+  say changed "SELinux label on $1 — sessions in confined containers can write there; labels only, nothing is re-owned"
+}
+
+# podman_selinux: Podman confines its containers here, so what they share needs the label.
+podman_selinux() { { [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; } && [ -d "$R/sys/fs/selinux" ]; }
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # After a `put` that returned non-zero: 1 means "already right"; anything else is fatal.
@@ -242,6 +263,10 @@ if [ "$MODE" = rootless ]; then
   # rootful install, or an engine creating a missing bind source, left behind as root's.
   run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
   stand_in && mkdir -p "$R/run/quasar-agent"
+fi
+# Sessions connect to the Wayland and PulseAudio sockets the agent makes here.
+if podman_selinux && { [ -d "$R/run/quasar-agent" ] || [ "$DRY_RUN" = 1 ]; }; then
+  label_root /run/quasar-agent
 fi
 
 # ── device access ──────────────────────────────────────────────────────────
@@ -455,24 +480,6 @@ if [ "$MODE" = rootless ] && { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; }
 fi
 
 # ── the homes and templates roots ──────────────────────────────────────────
-# SELinux confines Podman's containers: a directory they write must carry the container
-# file label. A persistent file-context rule plus restorecon labels it (and anything
-# later created in it); that changes labels, never ownership, and SELinux stays enforcing.
-label_root() { # label_root DIR
-  if live; then
-    if semanage fcontext -l -C 2>/dev/null | grep -F "$1(/.*)?" | grep -q container_file_t; then
-      say ok "SELinux label on $1"; return
-    fi
-  elif grep -qxF "$1" "$R/.selinux-fcontext" 2>/dev/null; then
-    say ok "SELinux label on $1"; return
-  fi
-  if [ "$DRY_RUN" = 1 ]; then say would "label $1 for containers (container_file_t)"; return; fi
-  run semanage fcontext -a -t container_file_t "$1(/.*)?"
-  run restorecon -R "$1"
-  stand_in && printf '%s\n' "$1" >> "$R/.selinux-fcontext"
-  say changed "SELinux label on $1 — sessions in confined containers can write there; labels only, nothing is re-owned"
-}
-
 data_root() { # data_root DIR WHAT
   if [ -d "$R$1" ]; then
     owner="$(stat -c %U "$R$1" 2>/dev/null || echo unknown)"
@@ -490,8 +497,7 @@ data_root() { # data_root DIR WHAT
     stand_in && mkdir -p "$R$1"
     say changed "$2 $1 — $3"
   fi
-  if { [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; } && [ -d "$R/sys/fs/selinux" ] \
-      && { [ -d "$R$1" ] || [ "$DRY_RUN" = 1 ]; }; then
+  if podman_selinux && { [ -d "$R$1" ] || [ "$DRY_RUN" = 1 ]; }; then
     label_root "$1"
   fi
 }
