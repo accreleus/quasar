@@ -667,3 +667,38 @@ machine. _Avoid_: "floor" unqualified (that is the release floor above).
 platform service but lacks the installation's labels: a leftover Compose stack, a
 definition a manager still holds. The recovery actor never acts on it and says so.
 _Avoid_: "orphan", "foreign service".
+
+## Engines and privilege (RH07, in shaping)
+
+These terms describe RH07 as decided on 2026-09-28 (`docs/rh07/2026-09-28-decisions.md`).
+
+**Container engine** — the software whose API Quasar's recovery actor and node agent
+call to run containers: Docker Engine or Podman. Quasar speaks one API to both and
+tests each separately. _Avoid_: "runtime" for the engine (the runtime, runc or crun,
+is what the engine starts containers with), "daemon" (Podman has none).
+
+**Engine mode** — whether the container engine runs as root (**rootful**) or as an
+ordinary user (**rootless**). Rootless is the design target; rootful is the same
+recipe with fewer limits. _Avoid_: bare "rootless" in storage or setup code, where it
+already means a host with no storage root. Say "rootless engine" there.
+
+**Engine profile** — one tested combination of container engine, engine mode,
+operating system and GPU vendor, published with its evidence and limits. A
+combination with no evidence is experimental or unsupported, never implied
+supported.
+
+**Quasar user** — the dedicated, unprivileged Linux account a rootless install
+runs under. It owns the engine, the machine state and the homes on the host, and
+nothing else. _Avoid_: "service account" (sounds like the control plane's own users),
+"the operator's user".
+
+**Host preparation** — the one-time, repeatable root step that readies a machine
+for Quasar: kernel settings, device access rules, the GPU device description,
+subordinate ID ranges and, for rootless, lingering. It is the only thing that runs
+as root; Quasar itself never does. _Avoid_: "install" (the seed installs),
+"provisioning" (the agent provisions driver libraries at run time).
+
+**Least privilege** — the RH07 guiding rule: every Quasar container asks for the
+least access that does its job, in every engine mode, so that a compromised Quasar
+is not a compromised machine. A capability only some hosts can grant is optional
+and reports why it is missing; it is never obtained by escalation.
