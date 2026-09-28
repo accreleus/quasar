@@ -16,7 +16,8 @@ use bollard::{
 };
 use futures_util::StreamExt;
 
-use super::dialect::{Engine, Namespace};
+use super::dialect::{is_nvidia_request, nvidia_device_request, Engine, Namespace};
+use crate::runtime::GpuInjection;
 
 use crate::runtime::application::{
     ApplicationIntent, ApplicationJournal, ApplicationMount, ApplicationPhase, ImageVolumeIdentity,
@@ -324,7 +325,7 @@ fn owns(intent: &ApplicationIntent, config: &RuntimeConfig, owner: &str) -> bool
     intent.socket == config.socket && intent.owner == owner
 }
 
-fn body(intent: &ApplicationIntent) -> ContainerCreateBody {
+fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> ContainerCreateBody {
     let r = &intent.request;
     let environment = canonical_env(&r.environment);
     let mut labels = HashMap::new();
@@ -368,12 +369,10 @@ fn body(intent: &ApplicationIntent) -> ContainerCreateBody {
                     })
                     .collect(),
             ),
-            device_requests: r.nvidia_gpu.then_some(vec![DeviceRequest {
-                driver: Some("nvidia".into()),
-                count: Some(-1),
-                capabilities: Some(vec![vec!["gpu".into()]]),
-                ..Default::default()
-            }]),
+            device_requests: match (r.nvidia_gpu, injection) {
+                (true, Some(injection)) => Some(vec![nvidia_device_request(injection)]),
+                _ => None,
+            },
             binds: Some(r.mounts.clone()),
             mounts: Some(
                 r.typed_mounts
@@ -625,14 +624,6 @@ fn matches_realized_legacy(actual: &bollard::models::MountPoint, wanted: &Legacy
             .as_deref()
             .is_some_and(|actual| same_path(actual, wanted.target))
         && actual.rw == Some(!wanted.read_only)
-}
-
-fn exact_nvidia_all_request(request: &DeviceRequest) -> bool {
-    request.driver.as_deref() == Some("nvidia")
-        && request.count == Some(-1)
-        && request.device_ids.as_ref().is_none_or(Vec::is_empty)
-        && request.capabilities.as_deref() == Some(&[vec!["gpu".to_owned()]])
-        && request.options.as_ref().is_none_or(HashMap::is_empty)
 }
 
 fn explicit_mount_targets(request: &ApplicationRequest) -> Result<Vec<String>, RuntimeError> {
@@ -944,7 +935,15 @@ async fn inspect_owned(
     if let Some((_, what)) = refusals.iter().find(|(refused, _)| *refused) {
         return Err(refuse(what, dialect));
     }
-    let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &exact_nvidia_all_request;
+    // The request is judged against how this engine injects the GPU (#399).
+    let injection = if intent.request.nvidia_gpu {
+        engine.gpu_injection().await?
+    } else {
+        None
+    };
+    let nvidia_request =
+        |r: &DeviceRequest| injection.is_some_and(|injection| is_nvidia_request(injection, r));
+    let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &nvidia_request;
     if !dialect.device_requests_ok(
         host.device_requests.as_ref(),
         intent.request.nvidia_gpu.then_some(nvidia_request),
@@ -1163,13 +1162,31 @@ pub(crate) async fn start(
             intent.phase = ApplicationPhase::Created;
             journal.write(&intent)?;
         } else {
+            // D10: a session that needs the NVIDIA GPU asks for it the way this engine
+            // injects it; an engine that cannot is refused here, never given more privilege.
+            let injection = if intent.request.nvidia_gpu {
+                match docker.gpu_injection().await? {
+                    Some(injection) => Some(injection),
+                    None => {
+                        tracing::warn!(
+                            token = "runtime-gpu-injection-unavailable",
+                            "this engine cannot be given an NVIDIA GPU (no NVIDIA CDI device, and \
+                             not a rootful Docker): refusing the launch; host preparation writes \
+                             the CDI specification"
+                        );
+                        return Err(ErrorKind::InvalidConfiguration.into());
+                    }
+                }
+            } else {
+                None
+            };
             let created = docker
                 .create_container(
                     Some(CreateContainerOptions {
                         name: Some(intent.request.name.clone()),
                         ..Default::default()
                     }),
-                    body(&intent),
+                    body(&intent, injection),
                 )
                 .await;
             match created {

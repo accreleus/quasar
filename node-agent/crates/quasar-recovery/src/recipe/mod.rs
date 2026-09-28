@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use quasar_runtime::platform::{
     Bind, ContainerSpec, Device, GpuRequest, Healthcheck, PublishedPort, RestartPolicy,
 };
+pub use quasar_runtime::GpuInjection;
 
 /// Deterministic names of what the recovery actor creates (architecture §5.4).
 pub mod names {
@@ -195,6 +196,11 @@ pub struct GpuFacts {
     /// gains the NVIDIA toolkit later is not held to an old answer.
     #[serde(default, alias = "nvidia_runtime", skip_serializing_if = "is_false")]
     pub gpus_served: bool,
+    /// RH-07 #399: the engine served the GPU through CDI (`nvidia.com/gpu=all`) rather than
+    /// `--gpus`. From recipe revision 3 the agent asks for it the same way. Written only
+    /// when true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cdi: bool,
     /// On an NVIDIA machine, the lowest other recognised render node: what the agent uses
     /// when the engine does not serve `--gpus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -951,11 +957,7 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
             paths::NVIDIA_DRIVER_DIR,
             false,
         ));
-        gpus.push(GpuRequest {
-            driver: None,
-            count: -1,
-            capabilities: vec![vec!["gpu".into()]],
-        });
+        gpus.push(GpuRequest::nvidia_all(GpuInjection::DeviceRequest));
     }
     binds.sort_by(|a, b| a.target.cmp(&b.target));
 
@@ -1000,6 +1002,10 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
         spec.device_cgroup_rules.clear();
     }
     spec.security_opt = vec!["label=disable".into()];
+    // CDI where the engine served it (D10); `--gpus` stays only where it did not.
+    if inputs.gpu.nvidia_shape() && inputs.gpu.cdi {
+        spec.gpus = vec![GpuRequest::nvidia_all(GpuInjection::Cdi)];
+    }
     // The host's answer the agent can no longer read from /host/dev.
     spec.env.insert(
         "QUASAR_HOST_FUSE".into(),

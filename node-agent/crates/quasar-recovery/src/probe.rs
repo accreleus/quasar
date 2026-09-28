@@ -26,6 +26,7 @@ use crate::engine::{ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
 use crate::recipe::{
     labels, names, Bind, GpuFacts, GpuNode, GpuRequest, GpuVendor, HostDevices, ImageRef,
 };
+use quasar_runtime::GpuInjection;
 
 pub const PROBE_HELPER: &str = "gpu-probe";
 pub const GPUS_PROBE_HELPER: &str = "gpus-probe";
@@ -159,6 +160,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         vendor: chosen.map(|(_, _, v)| *v),
         render_node: chosen.map(|(_, n, _)| (*n).to_owned()),
         gpus_served: false,
+        cdi: false,
         fallback: nvidia.and(other).map(|(_, n, v)| GpuNode {
             unknown: Default::default(),
             vendor: *v,
@@ -207,7 +209,7 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
 /// serves `--gpus` through an `nvidia` runtime, CDI, or the container toolkit's hook, and
 /// only the last is invisible in `/info`, so the evidence is whether this starts and exits
 /// 0. Removed on every path that created it.
-pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
+pub fn gpus_spec(image: &ImageRef, injection: GpuInjection) -> ContainerSpec {
     ContainerSpec {
         name: names::GPU_PROBE.into(),
         image: image.reference(),
@@ -219,11 +221,7 @@ pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
         binds: Vec::new(),
         devices: Vec::new(),
         device_cgroup_rules: Vec::new(),
-        gpus: vec![GpuRequest {
-            driver: None,
-            count: -1,
-            capabilities: vec![vec!["gpu".into()]],
-        }],
+        gpus: vec![GpuRequest::nvidia_all(injection)],
         cap_add: Vec::new(),
         security_opt: Vec::new(),
         init: false,
@@ -250,11 +248,12 @@ pub enum GpusAnswer {
 pub fn serves_gpus(
     engine: &dyn PlatformEngine,
     image: &ImageRef,
+    injection: GpuInjection,
     backoff: Duration,
 ) -> Result<GpusAnswer, EngineError> {
     let mut attempt = 1;
     loop {
-        match gpus_attempt(engine, image) {
+        match gpus_attempt(engine, image, injection) {
             Err(e) if e.is_transient() && attempt < GPUS_PROBE_ATTEMPTS => {
                 warn!(
                     token = "actor-gpus-probe-retry",
@@ -268,8 +267,12 @@ pub fn serves_gpus(
     }
 }
 
-fn gpus_attempt(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<GpusAnswer, EngineError> {
-    let id = match engine.create_container(&gpus_spec(image)) {
+fn gpus_attempt(
+    engine: &dyn PlatformEngine,
+    image: &ImageRef,
+    injection: GpuInjection,
+) -> Result<GpusAnswer, EngineError> {
+    let id = match engine.create_container(&gpus_spec(image, injection)) {
         Ok(id) => id,
         Err(e) if e.is_device_request_refusal() => return Ok(GpusAnswer::Refused(e.to_string())),
         Err(e) => return Err(e),

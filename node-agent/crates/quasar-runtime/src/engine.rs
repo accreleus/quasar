@@ -157,7 +157,8 @@ impl GpuInjection {
     /// this engine cannot be given an NVIDIA GPU at all, which is a readiness failure naming
     /// the host preparation, never a privileged fallback.
     pub fn for_engine(kind: EngineKind, mode: EngineMode, cdi: Option<&CdiFacts>) -> Option<Self> {
-        let nvidia_cdi = cdi.is_some_and(|c| c.devices.iter().any(|d| d.starts_with("nvidia.com/gpu")));
+        let nvidia_cdi =
+            cdi.is_some_and(|c| c.devices.iter().any(|d| d.starts_with("nvidia.com/gpu")));
         match (kind, mode) {
             (EngineKind::Podman, _) => Some(GpuInjection::Cdi),
             _ if nvidia_cdi => Some(GpuInjection::Cdi),

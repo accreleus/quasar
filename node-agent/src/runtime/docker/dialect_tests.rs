@@ -337,3 +337,28 @@ fn podman_mounts_must_be_private() {
     .unwrap();
     assert!(!Dialect::Podman.mount_propagation_ok(Some(&parsed)));
 }
+
+#[test]
+fn each_injection_reads_back_only_its_own_request() {
+    use crate::runtime::GpuInjection;
+    for injection in [GpuInjection::Cdi, GpuInjection::DeviceRequest] {
+        assert!(is_nvidia_request(
+            injection,
+            &nvidia_device_request(injection)
+        ));
+    }
+    assert!(!is_nvidia_request(
+        GpuInjection::Cdi,
+        &nvidia_device_request(GpuInjection::DeviceRequest)
+    ));
+    assert!(!is_nvidia_request(
+        GpuInjection::DeviceRequest,
+        &nvidia_device_request(GpuInjection::Cdi)
+    ));
+    // Docker echoes a CDI request with Count 0; a wider device set is never ours.
+    let mut echoed = nvidia_device_request(GpuInjection::Cdi);
+    echoed.count = Some(0);
+    assert!(is_nvidia_request(GpuInjection::Cdi, &echoed));
+    echoed.device_ids = Some(vec!["nvidia.com/gpu=0".into(), "vendor.com/x=all".into()]);
+    assert!(!is_nvidia_request(GpuInjection::Cdi, &echoed));
+}

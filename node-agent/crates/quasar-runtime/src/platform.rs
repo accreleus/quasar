@@ -120,6 +120,30 @@ pub struct GpuRequest {
     pub driver: Option<String>,
     pub count: i64,
     pub capabilities: Vec<Vec<String>>,
+    /// CDI device names (`nvidia.com/gpu=all`) for a `cdi` request (RH-07 #399). Omitted when
+    /// empty, so every `--gpus` request serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_ids: Vec<String>,
+}
+
+impl GpuRequest {
+    /// Every NVIDIA GPU, the way this engine injects it (decision D10).
+    pub fn nvidia_all(injection: crate::GpuInjection) -> Self {
+        match injection {
+            crate::GpuInjection::Cdi => GpuRequest {
+                driver: Some("cdi".into()),
+                count: 0,
+                capabilities: Vec::new(),
+                device_ids: vec![crate::NVIDIA_CDI_DEVICE.into()],
+            },
+            crate::GpuInjection::DeviceRequest => GpuRequest {
+                driver: None,
+                count: -1,
+                capabilities: vec![vec!["gpu".into()]],
+                device_ids: Vec::new(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +253,9 @@ pub struct EngineHost {
     pub cdi_devices: Vec<String>,
     /// The engine runs rootless (`name=rootless` in its security options; RH-07).
     pub rootless: bool,
+    /// How an NVIDIA GPU reaches a container on this engine; `None` when it cannot
+    /// (RH-07 #399).
+    pub gpu_injection: Option<crate::GpuInjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

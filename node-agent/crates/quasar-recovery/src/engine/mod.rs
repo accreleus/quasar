@@ -42,6 +42,8 @@ pub enum EngineError {
 const DEVICE_REQUEST_REFUSALS: &[&str] = &[
     "could not select device driver",
     "failed to discover gpu vendor from cdi",
+    // A CDI request the engine cannot resolve (Docker and Podman word it alike).
+    "unresolvable cdi devices",
 ];
 
 impl EngineError {

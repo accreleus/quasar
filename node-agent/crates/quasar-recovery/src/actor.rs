@@ -1230,7 +1230,7 @@ impl Actor {
         )
     }
 
-    /// On an NVIDIA machine not yet known to serve `--gpus`, ask the engine before the agent
+    /// On an NVIDIA machine not yet known to serve a GPU, ask the engine before the agent
     /// is created. Only a yes is recorded; a definite no installs the agent without the
     /// NVIDIA shape (readiness reports the gap) and is asked again the next time the agent
     /// is created; no answer stops this start.
@@ -1243,13 +1243,29 @@ impl Actor {
         if gpu.vendor != Some(recipe::GpuVendor::Nvidia) || gpu.gpus_served {
             return Ok(());
         }
-        match probe::serves_gpus(self.engine.as_ref(), image, self.config.gpus_probe_backoff)? {
+        // D10: how this engine injects the GPU is decided from what it reports about
+        // itself, never from an error's wording. No way at all is a gap readiness names.
+        let Some(injection) = self.engine.host()?.gpu_injection else {
+            warn!(
+                token = "actor-gpu-injection-unavailable",
+                "NVIDIA device found, but this engine cannot be given an NVIDIA GPU: it reports no NVIDIA CDI device and is not a rootful Docker (run host preparation, which writes the NVIDIA CDI specification); installing without the NVIDIA shape"
+            );
+            return Ok(());
+        };
+        match probe::serves_gpus(
+            self.engine.as_ref(),
+            image,
+            injection,
+            self.config.gpus_probe_backoff,
+        )? {
             probe::GpusAnswer::Served => {
                 info!(
                     token = "actor-gpus-served",
-                    "NVIDIA: the engine started a --gpus all probe; installing the NVIDIA shape"
+                    via = ?injection,
+                    "NVIDIA: the engine started a GPU probe; installing the NVIDIA shape"
                 );
                 machine.inputs.gpu.gpus_served = true;
+                machine.inputs.gpu.cdi = injection == quasar_runtime::GpuInjection::Cdi;
                 self.dir.machine().store(machine)?;
             }
             probe::GpusAnswer::Refused(why) => warn!(

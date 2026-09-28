@@ -29,7 +29,7 @@ use std::time::Duration;
 use bollard::models::{DeviceMapping, DeviceRequest};
 
 use super::{RuntimeConfig, RuntimeError};
-use crate::runtime::{EngineKind, ErrorKind};
+use crate::runtime::{EngineKind, ErrorKind, GpuInjection};
 
 /// Which engine's reporting rules apply. An engine this agent cannot name gets Docker's,
 /// the strictest.
@@ -53,6 +53,7 @@ impl Dialect {
 pub(crate) struct Engine {
     docker: bollard::Docker,
     pub(crate) dialect: Dialect,
+    kind: EngineKind,
     socket: PathBuf,
     deadline: Duration,
 }
@@ -69,6 +70,7 @@ pub(crate) async fn open(config: &RuntimeConfig) -> Result<Engine, RuntimeError>
     Ok(Engine {
         docker,
         dialect: Dialect::of(info.kind),
+        kind: info.kind,
         socket: config.socket.clone(),
         deadline: config.deadline,
     })
@@ -131,7 +133,56 @@ impl PodmanFacts {
     }
 }
 
+/// How each engine socket injects an NVIDIA GPU, decided once per process from its `/info`
+/// (RH-07 #399). The engine behind a socket does not change while the agent runs.
+static INJECTION: std::sync::Mutex<
+    Option<std::collections::HashMap<PathBuf, Option<GpuInjection>>>,
+> = std::sync::Mutex::new(None);
+
 impl Engine {
+    /// How this engine injects an NVIDIA GPU (decision D10): CDI wherever it resolves,
+    /// `--gpus` only on a rootful Docker with no NVIDIA CDI device, `None` when it cannot.
+    pub(crate) async fn gpu_injection(&self) -> Result<Option<GpuInjection>, RuntimeError> {
+        if let Some(known) = INJECTION
+            .lock()
+            .ok()
+            .and_then(|m| m.as_ref().and_then(|m| m.get(&self.socket).copied()))
+        {
+            return Ok(known);
+        }
+        let sys = self
+            .docker
+            .info()
+            .await
+            .map_err(|_| RuntimeError::from(ErrorKind::Unavailable))?;
+        let mode = if sys
+            .security_options
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|o| o.split(',').any(|p| p == "name=rootless"))
+        {
+            crate::runtime::EngineMode::Rootless
+        } else {
+            crate::runtime::EngineMode::Rootful
+        };
+        let cdi = sys.cdi_spec_dirs.map(|spec_dirs| crate::runtime::CdiFacts {
+            spec_dirs,
+            devices: sys
+                .discovered_devices
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|d| d.id)
+                .collect(),
+        });
+        let injection = GpuInjection::for_engine(self.kind, mode, cdi.as_ref());
+        if let Ok(mut map) = INJECTION.lock() {
+            map.get_or_insert_with(Default::default)
+                .insert(self.socket.clone(), injection);
+        }
+        Ok(injection)
+    }
+
     /// Podman's native inspect of one container; `None` on Docker. A Podman that does not
     /// answer it is an unknown outcome: the read-back cannot be proven.
     pub(crate) async fn podman_facts(&self, id: &str) -> Result<Option<PodmanFacts>, RuntimeError> {
@@ -404,6 +455,48 @@ fn gpu_expansion(path: &str) -> bool {
         }
         Some("/dev/nvidia-caps") => numbered(name, "nvidia-cap"),
         _ => false,
+    }
+}
+
+/// The device request that asks for every NVIDIA GPU the way `injection` says. The
+/// `--gpus` shape is exactly today's (`driver: nvidia`, count -1, capability `gpu`).
+pub(crate) fn nvidia_device_request(injection: GpuInjection) -> DeviceRequest {
+    match injection {
+        GpuInjection::Cdi => DeviceRequest {
+            driver: Some("cdi".into()),
+            device_ids: Some(vec![crate::runtime::NVIDIA_CDI_DEVICE.into()]),
+            ..Default::default()
+        },
+        GpuInjection::DeviceRequest => DeviceRequest {
+            driver: Some("nvidia".into()),
+            count: Some(-1),
+            capabilities: Some(vec![vec!["gpu".into()]]),
+            ..Default::default()
+        },
+    }
+}
+
+/// Is `request` exactly the NVIDIA request for `injection`, as the engine echoes it back?
+/// Docker echoes a CDI request with `Count: 0` and no capabilities; anything else, or any
+/// other device, is not what Quasar asked for.
+pub(crate) fn is_nvidia_request(injection: GpuInjection, request: &DeviceRequest) -> bool {
+    let no_options = request.options.as_ref().is_none_or(|o| o.is_empty());
+    match injection {
+        GpuInjection::Cdi => {
+            request.driver.as_deref() == Some("cdi")
+                && request.device_ids.as_deref()
+                    == Some(&[crate::runtime::NVIDIA_CDI_DEVICE.to_string()][..])
+                && request.count.is_none_or(|c| c == 0)
+                && request.capabilities.as_ref().is_none_or(|c| c.is_empty())
+                && no_options
+        }
+        GpuInjection::DeviceRequest => {
+            request.driver.as_deref() == Some("nvidia")
+                && request.count == Some(-1)
+                && request.device_ids.as_ref().is_none_or(Vec::is_empty)
+                && request.capabilities.as_deref() == Some(&[vec!["gpu".to_owned()]])
+                && no_options
+        }
     }
 }
 

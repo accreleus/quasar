@@ -645,16 +645,6 @@ fn has_nvidia_env(env: &[String], access: &NvidiaDriverAccess) -> bool {
         }
     })
 }
-fn is_nvidia_all_request(request: &DeviceRequest) -> bool {
-    request.driver.as_deref() == Some("nvidia")
-        && request.count == Some(-1)
-        && request.device_ids.as_ref().is_none_or(Vec::is_empty)
-        && request.capabilities.as_deref() == Some(&[vec!["gpu".to_owned()]])
-        && request
-            .options
-            .as_ref()
-            .is_none_or(std::collections::HashMap::is_empty)
-}
 fn matches_nvidia_mount(mount: &bollard::models::MountPoint, access: &NvidiaDriverAccess) -> bool {
     let (typ, source, name, target) = match &access.driver_mount {
         NvidiaDriverMount::ReadOnlyBind(bind) => ("bind", bind.source.to_str(), None, &bind.target),
@@ -708,6 +698,7 @@ fn inspect_owned(
     dialect: Dialect,
     podman: Option<&PodmanFacts>,
     image_id: Option<&str>,
+    injection: Option<crate::runtime::GpuInjection>,
 ) -> Result<(OwnedHelperId, bool, Option<i64>), RuntimeError> {
     let h = helper(intent);
     let id = info.id.filter(|v| valid_id(v)).ok_or(ErrorKind::Protocol)?;
@@ -789,7 +780,10 @@ fn inspect_owned(
             return Err(ErrorKind::Protocol.into());
         }
     }
-    let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &is_nvidia_all_request;
+    let nvidia_request = |r: &DeviceRequest| {
+        injection.is_some_and(|injection| super::dialect::is_nvidia_request(injection, r))
+    };
+    let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &nvidia_request;
     if !dialect.device_requests_ok(
         host.device_requests.as_ref(),
         device_request.then_some(nvidia_request),
@@ -980,12 +974,18 @@ async fn read_back(
                 .id
         }
     };
+    let injection = if intent_device_request(intent) {
+        engine.gpu_injection().await?
+    } else {
+        None
+    };
     inspect_owned(
         info,
         intent,
         engine.dialect,
         podman.as_ref(),
         image_id.as_deref(),
+        injection,
     )
 }
 fn uncertain_inspection(error: Error) -> RuntimeError {
@@ -1179,6 +1179,16 @@ async fn create_or_adopt_inner(
                 })
             })
     });
+    // D10 (#399): an NVIDIA helper asks for the GPU the way this engine injects it; an
+    // engine that cannot is refused, never given more privilege.
+    let injection = if intent_device_request(&intent) {
+        match docker.gpu_injection().await? {
+            Some(injection) => Some(injection),
+            None => return Err(ErrorKind::InvalidConfiguration.into()),
+        }
+    } else {
+        None
+    };
     let requirements = DiagnosticRequirements::FIXED;
     let devices = match requirements.devices {
         crate::runtime::DiagnosticDevices::None => Vec::new(),
@@ -1262,15 +1272,12 @@ async fn create_or_adopt_inner(
             security_opt: Some(security_opt),
             devices: Some(devices),
             group_add,
-            device_requests: intent_device_request(&intent).then(|| {
-                vec![DeviceRequest {
-                    driver: Some("nvidia".into()),
-                    count: Some(-1),
-                    device_ids: None,
-                    capabilities: Some(vec![vec!["gpu".into()]]),
-                    options: None,
-                }]
-            }),
+            device_requests: match (intent_device_request(&intent), injection) {
+                (true, Some(injection)) => {
+                    Some(vec![super::dialect::nvidia_device_request(injection)])
+                }
+                _ => None,
+            },
             mounts,
             pids_limit: intent.audio.as_ref().map(|_| 512),
             ..Default::default()

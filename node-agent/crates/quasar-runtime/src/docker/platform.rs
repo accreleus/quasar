@@ -68,7 +68,7 @@ fn mutation_error(error: Error) -> RuntimeError {
 }
 
 pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, RuntimeError> {
-    let (docker, _) = discover(config).await?;
+    let (docker, info) = discover(config).await?;
     let sys = docker.info().await.map_err(classify)?;
     let mut runtimes: Vec<String> = sys.runtimes.unwrap_or_default().into_keys().collect();
     runtimes.sort();
@@ -79,14 +79,19 @@ pub(crate) async fn engine_host(config: &RuntimeConfig) -> Result<EngineHost, Ru
         .filter_map(|d| d.id.filter(|v| !v.is_empty()))
         .collect();
     cdi_devices.sort();
-    let rootless = crate::EngineMode::from_security_options(
+    let mode = crate::EngineMode::from_security_options(
         sys.security_options.as_deref().unwrap_or_default(),
-    ) == crate::EngineMode::Rootless;
+    );
+    let cdi = sys.cdi_spec_dirs.map(|spec_dirs| crate::CdiFacts {
+        spec_dirs,
+        devices: cdi_devices.clone(),
+    });
     Ok(EngineHost {
         name: sys.name.filter(|v| !v.is_empty()),
         runtimes,
         cdi_devices,
-        rootless,
+        rootless: mode == crate::EngineMode::Rootless,
+        gpu_injection: crate::GpuInjection::for_engine(info.kind, mode, cdi.as_ref()),
     })
 }
 
@@ -300,8 +305,9 @@ fn engine_body(spec: &ContainerSpec) -> ContainerCreateBody {
                     .map(|g| DeviceRequest {
                         driver: g.driver.clone(),
                         count: Some(g.count),
-                        device_ids: None,
-                        capabilities: Some(g.capabilities.clone()),
+                        device_ids: (!g.device_ids.is_empty()).then(|| g.device_ids.clone()),
+                        // A CDI request names devices, not capabilities.
+                        capabilities: (!g.capabilities.is_empty()).then(|| g.capabilities.clone()),
                         options: None,
                     })
                     .collect()

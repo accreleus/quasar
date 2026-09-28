@@ -376,7 +376,10 @@ fn a_restart_policy_update_is_read_back() {
 fn gpu_injection_is_decided_from_engine_facts() {
     let with_nvidia = CdiFacts {
         spec_dirs: vec!["/etc/cdi".into()],
-        devices: vec!["nvidia.com/gpu=0 (cdi)".into(), "nvidia.com/gpu=all (cdi)".into()],
+        devices: vec![
+            "nvidia.com/gpu=0 (cdi)".into(),
+            "nvidia.com/gpu=all (cdi)".into(),
+        ],
     };
     let empty = CdiFacts {
         spec_dirs: vec!["/etc/cdi".into()],
@@ -396,6 +399,10 @@ fn gpu_injection_is_decided_from_engine_facts() {
         (Docker, Rootless, None, None),
         (Unknown, Rootful, None, Some(DeviceRequest)),
     ] {
-        assert_eq!(GpuInjection::for_engine(kind, mode, cdi), want, "{kind:?} {mode:?} {cdi:?}");
+        assert_eq!(
+            GpuInjection::for_engine(kind, mode, cdi),
+            want,
+            "{kind:?} {mode:?} {cdi:?}"
+        );
     }
 }
