@@ -563,7 +563,9 @@ fn real_docker_gpu_probe_profile_runs_with_dri_access_and_cleans_up() {
                 }),
             )
             .await;
-        docker.inspect_container(&container, None).await.is_err()
+        quasar_runtime::docker::inspect_container_tolerant(&docker, &container)
+            .await
+            .is_err()
     });
     let result = result.unwrap();
     assert_eq!(result.exit_code, Some(23), "stderr: {}", result.stderr);

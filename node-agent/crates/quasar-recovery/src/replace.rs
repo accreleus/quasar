@@ -463,8 +463,19 @@ impl Actor {
         // An update may change the revision, and with it the GPU request the agent renders:
         // the engine is asked with that request, as on install.
         if role == Role::NodeAgent {
+            let had_gpu = machine.inputs.gpu.nvidia_shape();
             self.decide_gpus(&mut machine, &image, revision)
                 .map_err(|e| fail(Reason::RecreateFailed, format!("GPU decision: {e}")))?;
+            // Degrading to no GPU is the install-time answer. An update of an agent that has
+            // the GPU fails closed instead, before anything stops: the old agent keeps it.
+            if had_gpu && !machine.inputs.gpu.nvidia_shape() {
+                return Err(fail(
+                    Reason::RecreateFailed,
+                    format!(
+                        "the engine no longer gives this agent the NVIDIA GPU the way recipe revision {revision} asks for it; the running agent was not touched (see the actor's actor-gpus-refused line)"
+                    ),
+                ));
+            }
             if machine.inputs.gpu.nvidia_shape() {
                 self.ensure_volume(&machine, names::NVIDIA_DRIVER_VOLUME, role)
                     .map_err(|e| fail(Reason::RecreateFailed, format!("driver volume: {e}")))?;

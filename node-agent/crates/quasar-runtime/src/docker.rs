@@ -24,7 +24,11 @@ pub async fn inspect_container_tolerant(
     docker: &bollard::Docker,
     name_or_id: &str,
 ) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error> {
-    match docker.inspect_container(name_or_id, None).await {
+    // The one permitted raw call. Never log the error with `?`: with json_data_content its
+    // Debug carries the whole inspect body, container environment included.
+    #[allow(clippy::disallowed_methods)]
+    let raw = docker.inspect_container(name_or_id, None).await;
+    match raw {
         Err(bollard::errors::Error::JsonDataError {
             message,
             contents,

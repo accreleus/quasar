@@ -233,6 +233,13 @@ grep 'Quasar Virtual' "$r9b/etc/udev/rules.d/70-quasar.rules" | grep -q 'SECLABE
   && pass "only Quasar's own input devices get the container label" || fail "input seclabel" "$(cat "$r9b/etc/udev/rules.d/70-quasar.rules")"
 if grep -q SECLABEL "$r9c/etc/udev/rules.d/70-quasar.rules"; then fail "no input label for Docker" ""; else pass "Docker's input rule carries no label"; fi
 if prep "$tmp/none" "$tmp/podman-only" --mode rootless --templates 'relative' 2>/dev/null; then fail "--templates relative" "exit 0"; else pass "--templates must be absolute"; fi
+for bad in '/srv/q|/etc' '/srv/q[a]' '/var/lib' '/home'; do
+  if prep "$tmp/none" "$tmp/podman-only" --mode rootless --homes "$bad" 2>/dev/null; then fail "refuse $bad" "exit 0"; else pass "--homes $bad is refused (regex or system tree)"; fi
+done
+r9d="$tmp/r9d"; mk_root "$r9d"; mkdir -p "$r9d/sys/fs/selinux" "$r9d/data/people/ann"; printf 'ann:x:1500:1500::/data/people/ann:/bin/sh\n' >> "$r9d/etc/passwd"
+if prep "$r9d" "$tmp/podman-only" --mode rootless --engine podman --homes /data/people >/dev/null 2>&1; then fail "a root holding a user's home is not labelled" "exit 0"; else pass "a directory holding a user's home is never relabelled"; fi
+grep -qF 'container_file_t /var/lib/quasar\.d/h(/.*)?' "$(r=$tmp/r9e; mk_root "$r"; mkdir -p "$r/sys/fs/selinux"; prep "$r" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar.d/h >/dev/null 2>&1; echo "$r/.prepare-host-commands")" \
+  && pass "a dot in the path is escaped in the file context" || fail "dot escaping" "$(cat "$tmp/r9e/.prepare-host-commands" 2>/dev/null)"
 
 # ── argument validation ─────────────────────────────────────────────────────
 if prep "$tmp/none" "$tmp/podman-only" 2>/dev/null; then fail "--mode required" "exit 0"; else pass "--mode is required"; fi

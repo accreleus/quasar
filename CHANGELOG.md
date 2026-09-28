@@ -34,8 +34,9 @@ own; the two do not move together, and that is deliberate.
   is re-owned, SELinux stays enforcing), and labels `/run/quasar-agent` too, where sessions
   reach the agent's Wayland and PulseAudio sockets (this was also why rootless Podman's
   audio sidecar never became ready, #411). On SELinux Podman, app containers run as
-  `container_engine_t`, the policy's confined type for nested sandboxes, so Steam's and
-  Flatpak's `bwrap` can mount; `container_t` refused them and Steam never showed a window. On
+  `container_engine_t`, the policy's confined type for nested sandboxes, when the catalog
+  already runs them `seccomp=unconfined` for their own sandboxes, so Steam's and Flatpak's
+  `bwrap` can mount; `container_t` refused them and Steam never showed a window. On
   an NVIDIA host, host preparation installs a one-rule SELinux module
   (`quasar-nested-gpu`) giving `container_engine_t` the NVIDIA device access the
   `container_use_xserver_devices` boolean gives `container_t`, and nothing more. The Steam
@@ -45,7 +46,10 @@ own; the two do not move together, and that is deliberate.
   mapping: its homes keep subordinate IDs. Host preparation's udev rule also labels Quasar's own
   virtual input devices `container_file_t` on SELinux Podman hosts (#401), so a confined
   session can read its keyboard, mouse and gamepad; every other input device keeps its
-  label.
+  label. Host preparation refuses a data root that is a system tree, holds a user's home
+  or contains regex characters, and names the package when an SELinux tool is missing. An
+  update that would take the NVIDIA GPU away from an agent that has it fails before the
+  running agent is touched.
 - **NVIDIA GPUs by CDI (RH-07, #399).** Every container Quasar creates on an NVIDIA host (the
   node agent, its helpers, app sessions and the actor's GPU probe) asks for the GPU the way
   its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an

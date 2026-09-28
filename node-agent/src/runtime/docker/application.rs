@@ -362,7 +362,8 @@ fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> Containe
         // Resolve the mutable reference before journalling and create from the
         // immutable digest; the original reference remains caller evidence.
         image: Some(intent.image_id.clone().unwrap_or_else(|| r.image.clone())),
-        user: expected_user(intent).cloned(),
+        // Set only under keep-id: otherwise the image's own user applies, as it always did.
+        user: intent.keep_id.and(expected_user(intent)).cloned(),
         entrypoint: r.entrypoint.clone(),
         // Omission preserves the image's Cmd; an explicit empty vector does
         // not. The same distinction applies to Entrypoint above.
@@ -720,8 +721,7 @@ async fn inspect_identity_state(
     intent: &ApplicationIntent,
 ) -> Result<ApplicationState, RuntimeError> {
     let id = identity(intent)?;
-    let info = docker
-        .inspect_container(id.as_str(), None)
+    let info = quasar_runtime::docker::inspect_container_tolerant(docker, id.as_str())
         .await
         .map_err(uncertain)?;
     if info.id.as_deref() != Some(id.as_str())
@@ -1182,6 +1182,20 @@ pub(crate) async fn start(
                 (false, false)
             };
             let keep_id = rootless.then(|| app_ids(&request.environment));
+            // The catalog already runs these apps unconfined by seccomp for their own
+            // sandboxes (bwrap); under SELinux the same need is the nested-sandbox type.
+            let nested_sandbox_label = selinux
+                && request
+                    .security
+                    .security_opt
+                    .iter()
+                    .any(|o| o == "seccomp=unconfined");
+            tracing::info!(
+                token = "application-confinement",
+                keep_id = ?keep_id,
+                nested_sandbox_label,
+                "app container user mapping and SELinux type decided"
+            );
             let intent = ApplicationIntent {
                 request,
                 owner,
@@ -1196,7 +1210,7 @@ pub(crate) async fn start(
                 nvidia_params_repair: None,
                 gpu_injection,
                 keep_id,
-                nested_sandbox_label: selinux,
+                nested_sandbox_label,
                 phase: ApplicationPhase::Creating,
                 result: None,
             };

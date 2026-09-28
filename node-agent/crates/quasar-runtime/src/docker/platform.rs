@@ -401,8 +401,7 @@ pub(crate) async fn update_restart(
     // ADR 0007 (RH-07): read the policy back on every engine, and treat a mismatch as a
     // failed step. The seed's rules and every stop Quasar means to keep depend on the
     // policy really being what was set.
-    let realized = docker
-        .inspect_container(id, None)
+    let realized = super::inspect_container_tolerant(&docker, id)
         .await
         .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
         .host_config

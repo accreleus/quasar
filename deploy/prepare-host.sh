@@ -98,7 +98,13 @@ for pair in "homes:$HOMES" "templates:$TEMPLATES"; do
   [ -n "$dir" ] || continue
   case "$dir" in /*) ;; *) die "--$opt must be an absolute path" ;; esac
   case "$dir" in /|/usr|/usr/*) die "--$opt must not be / or under /usr" ;; esac
-  case "$dir" in *'('*|*')'*|*'*'*|*' '*) die "--$opt must be a plain path" ;; esac
+  # The path becomes an SELinux file-context regex: plain characters only.
+  case "$dir" in *[!A-Za-z0-9._/-]*|*//*|*/./*|*/../*|*/.|*/..) die "--$opt must be a plain path (letters, digits, . _ - /)" ;; esac
+  # Labelling a system tree for containers would break the host.
+  case "${dir%/}" in
+    /bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/var|/var/home|/var/lib|/var/log|/var/run|/var/tmp)
+      die "--$opt must be a directory of its own, not $dir" ;;
+  esac
 done
 
 live() { [ -z "$R" ]; }
@@ -156,15 +162,23 @@ stand_in() { ! live && [ "$DRY_RUN" = 0 ]; }
 # file label. A persistent file-context rule plus restorecon labels it (and anything
 # later created in it); that changes labels, never ownership, and SELinux stays enforcing.
 label_root() { # label_root DIR
+  re="$(printf '%s\n' "$1" | awk '{ gsub(/\./, "\\."); print }')"
+  # Never an existing user's home, or a directory holding one: it would be relabelled.
+  if awk -F: -v d="$1" '$6 == d || index($6, d "/") == 1 {f=1} END {exit !f}' "$R/etc/passwd" 2>/dev/null; then
+    die "$1 is, or holds, a user's home directory; choose a directory of its own for Quasar"
+  fi
   if live; then
-    if semanage fcontext -l -C 2>/dev/null | grep -F "$1(/.*)?" | grep -q container_file_t; then
+    for tool in semanage restorecon; do
+      have "$tool" || die "$tool was not found: install policycoreutils-python-utils (on an image-based system: rpm-ostree install policycoreutils-python-utils, then reboot), then run this again"
+    done
+    if semanage fcontext -l -C 2>/dev/null | awk -v r="$re(/.*)?" '$1 == r && /container_file_t/ {f=1} END {exit !f}'; then
       say ok "SELinux label on $1"; return
     fi
   elif grep -qxF "$1" "$R/.selinux-fcontext" 2>/dev/null; then
     say ok "SELinux label on $1"; return
   fi
   if [ "$DRY_RUN" = 1 ]; then say would "label $1 for containers (container_file_t)"; return; fi
-  run semanage fcontext -a -t container_file_t "$1(/.*)?"
+  run semanage fcontext -a -t container_file_t "$re(/.*)?"
   run restorecon -R "$1"
   stand_in && printf '%s\n' "$1" >> "$R/.selinux-fcontext"
   say changed "SELinux label on $1 — sessions in confined containers can write there; labels only, nothing is re-owned"
@@ -423,12 +437,18 @@ if [ -e "$R/proc/driver/nvidia/version" ]; then
     printf '%s\n' '; Written by Quasar host preparation (deploy/prepare-host.sh).' \
       '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' \
       | put /etc/quasar/selinux/quasar-nested-gpu.cil 0644 "the NVIDIA device rule for sessions' nested-sandbox SELinux type" || unchanged
-    if live && semodule -l 2>/dev/null | grep -qx quasar-nested-gpu; then
+    if live && ! have semodule; then
+      die "semodule was not found: install policycoreutils, then run this again"
+    fi
+    if live && semodule -l 2>/dev/null | grep -qx quasar-nested-gpu \
+        && cmp -s "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"; then
       say ok "SELinux module quasar-nested-gpu"
     elif ! live && grep -qx quasar-nested-gpu "$R/.selinux-modules" 2>/dev/null; then
       say ok "SELinux module quasar-nested-gpu"
     else
       run semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil
+      # What was loaded, so a changed rule is loaded again on the next run.
+      [ "$DRY_RUN" = 1 ] || cp "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"
       stand_in && echo quasar-nested-gpu >> "$R/.selinux-modules"
       say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module quasar-nested-gpu — lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
     fi

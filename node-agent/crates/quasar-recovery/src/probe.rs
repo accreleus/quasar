@@ -205,10 +205,8 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
     }
 }
 
-/// The `--gpus all` probe: a container requesting every GPU, running `true`. The engine
-/// serves `--gpus` through an `nvidia` runtime, CDI, or the container toolkit's hook, and
-/// only the last is invisible in `/info`, so the evidence is whether this starts and exits
-/// 0. Removed on every path that created it.
+/// Exits 0 only when the NVIDIA control node is inside: listing /dev, since a confined
+/// container may be denied `stat` there.
 const GPUS_PROBE_TEST: &str = "set -- /dev/nvidiactl*; [ \"$1\" = /dev/nvidiactl ]";
 
 /// Probes run the agent image; its healthcheck means nothing for a one-shot container.
@@ -222,6 +220,10 @@ fn no_healthcheck() -> quasar_runtime::platform::Healthcheck {
     }
 }
 
+/// The GPU probe: a container requesting every NVIDIA GPU the way the agent will (CDI or
+/// `--gpus`), which must start and find the control node inside; an engine may accept a
+/// request and inject nothing (rootless Podman with `--gpus`). Removed on every path that
+/// created it.
 pub fn gpus_spec(image: &ImageRef, injection: GpuInjection) -> ContainerSpec {
     ContainerSpec {
         name: names::GPU_PROBE.into(),
