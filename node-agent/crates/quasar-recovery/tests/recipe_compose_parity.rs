@@ -280,6 +280,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         },
         devices: HostDevices {
             unknown: Default::default(),
+            kernel_log: false,
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,

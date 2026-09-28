@@ -239,6 +239,12 @@ pub struct HostDevices {
     pub dri: bool,
     pub uinput: bool,
     pub kmsg: bool,
+    /// RH-07 #402: the host lets unprivileged processes read the kernel log
+    /// (`kernel.dmesg_restrict=0`, host preparation's `--allow-kernel-log`). From recipe
+    /// revision 3 the agent is given `/dev/kmsg` only then, and never `SYSLOG`. Written
+    /// only when true, so machine state an older actor wrote reads back unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kernel_log: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -249,6 +255,7 @@ impl Default for HostDevices {
             dri: true,
             uinput: true,
             kmsg: true,
+            kernel_log: false,
             unknown: Unknown::new(),
         }
     }
@@ -563,7 +570,8 @@ impl Book {
         match role {
             // Revision 2: the agent reads `ENROLLMENT_TOKEN_FILE`, which a combined host's
             // agent is given. A GPU host's agent has the same shape at both.
-            Role::NodeAgent => Some(1..=2),
+            // Revision 3 (RH-07 #402): least privilege in every engine mode.
+            Role::NodeAgent => Some(1..=3),
             Role::RecoveryActor => Some(1..=revision::RECIPE_REVISION),
             // Revision 2: Add host's images arrive as operator overrides plus install-time
             // fallbacks, so the installed release's images can come between (#365).
@@ -622,6 +630,9 @@ pub fn render(
                 ));
             }
             let mut spec = node_agent_r1(inputs, image, secrets);
+            if revision >= 3 {
+                least_privilege(&mut spec, inputs);
+            }
             if inputs.control.is_some() {
                 control::local_agent(&mut spec, inputs, secrets)?;
             }
@@ -954,6 +965,22 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
         ports: Vec::new(),
         healthcheck: None,
     }
+}
+
+/// Recipe revision 3 (RH-07 #402, decisions D1 and D11, P1 least privilege): the agent
+/// gives up the host's `/dev` mount, `NET_ADMIN`, `SYSLOG` and `/dev/kmsg`, in every
+/// engine mode, rootful included. What used them becomes optional and reports why it is
+/// skipped: GPU fault messages need `/dev/kmsg`, given only when the host allows
+/// unprivileged kernel-log reads; the media reachability check reads real traffic
+/// instead of firewall rules. It mounts the engine socket, so it carries
+/// `label=disable` like every other container that does.
+fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
+    spec.binds.retain(|b| b.target != "/host/dev");
+    spec.cap_add.clear();
+    if !inputs.devices.kernel_log {
+        spec.devices.retain(|d| d.host != "/dev/kmsg");
+    }
+    spec.security_opt = vec!["label=disable".into()];
 }
 
 /// The recovery actor's own container: the engine socket, its machine state and the agent

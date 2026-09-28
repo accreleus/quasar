@@ -449,6 +449,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
         },
         devices: HostDevices {
             unknown: Default::default(),
+            kernel_log: false,
             dri: false,
             uinput: false,
             kmsg: false,

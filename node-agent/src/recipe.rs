@@ -13,4 +13,8 @@
 
 /// 2: reads `ENROLLMENT_TOKEN_FILE`, the local enrollment token a combined host's agent is
 /// given.
-pub const RECIPE_REVISION: u32 = 2;
+/// 3 (RH-07 #402): least privilege. No host `/dev` mount, no `NET_ADMIN` or `SYSLOG`,
+/// `/dev/kmsg` only when the host allows kernel-log reads, and `label=disable`. This agent
+/// reads GPU faults only through that optional grant, and media reachability from real
+/// traffic.
+pub const RECIPE_REVISION: u32 = 3;

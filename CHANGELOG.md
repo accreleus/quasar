@@ -25,6 +25,16 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **One least-privilege node-agent recipe (RH-07, #402).** Recipe revision 3, applied by the
+  recovery actor in every engine mode (rootful included), removes from the node agent:
+  - the host's `/dev` mount;
+  - `NET_ADMIN` and `SYSLOG`;
+  - `/dev/kmsg`, unless the host allows kernel-log reads (host preparation's
+    `--allow-kernel-log`).
+
+  It adds `label=disable`, since the agent mounts the engine socket. GPU fault messages
+  become an optional diagnostic that reports "skipped" and names the setting. The agent
+  image now requires revision 3; revisions 1 and 2 render exactly as released.
 - **Quasar containers find themselves on Podman, and Podman's health checks are checked
   (RH-07, #405).**
   - The agent and the recovery actor recognise Podman's container layout, so they can

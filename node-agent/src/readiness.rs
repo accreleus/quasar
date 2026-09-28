@@ -606,26 +606,20 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
                 crate::gpu_kmsg::KMSG_PATH
             ),
         ),
+        // Amendment 17: an optional diagnostic the host was not prepared to grant. The
+        // summary names the setting; a skip asks nothing of the operator.
         Err(e) => ReadinessCheck {
             id: ID.to_string(),
             status: SKIP.to_string(),
             summary: format!(
-                "{} is not readable ({e}) — GPU faults will not appear in a session trace; \
-                 an Xid can only be found by hand in the host's dmesg",
+                "GPU fault messages are not collected: {} is not readable here ({e}). This \
+                 diagnostic is optional; a host that keeps the kernel log restricted \
+                 (kernel.dmesg_restrict=1, the usual default) does not grant it, and host \
+                 preparation's --allow-kernel-log does. Faults can still be read by hand \
+                 in the host's dmesg",
                 crate::gpu_kmsg::KMSG_PATH
             ),
-            remediation: format!(
-                "The shipped deploy/docker-compose.yml grants this, so a stack that cannot \
-                 read it predates that or has the entry removed. Under the node-agent \
-                 service add `{}:{}:r` to `devices:` — `:r` is the device-cgroup permission \
-                 set, a bind mount's `:ro` is rejected there — and `SYSLOG` to `cap_add:`, \
-                 which the device alone does not cover while kernel.dmesg_restrict=1 (the \
-                 distro default). Then recreate the agent container. Optional, and nothing \
-                 else changes — the tailer is read-only, off the media path, and reports \
-                 only NVRM Xid and amdgpu fault lines.",
-                crate::gpu_kmsg::KMSG_PATH,
-                crate::gpu_kmsg::KMSG_PATH
-            ),
+            remediation: String::new(),
             observed_at: None,
             source: Some("local".to_string()),
             blocks: None,
@@ -5081,30 +5075,27 @@ table ip raw {
         );
     }
 
-    /// The remediation has to name the entry the shipped compose actually uses. `devices:`
-    /// takes a device-cgroup permission set (`r`/`w`/`m`), not a bind mount's `:ro` — Compose
-    /// rejects `:ro` there outright, so the old text sent operators to an error (#83). And
-    /// `dmesg_restrict=1` is the distro default, so the device without the capability is EPERM.
+    /// Amendment 17 (RH-07 #402): GPU fault messages are an optional diagnostic. Without
+    /// the kernel log the check skips, names the host setting that would allow it, asks
+    /// nothing (empty remediation) and never tells an operator to add a capability.
     #[test]
-    fn xid_visibility_remediation_matches_the_shipped_compose_entry() {
+    fn xid_visibility_skip_names_the_host_setting_and_asks_nothing() {
         let root = FakeRoot::new("xid-remediation");
         let c = check_xid_visibility(&root.env(true, ""));
         assert_eq!(
             c.status, SKIP,
             "no dev/kmsg fixture, so this is the skip arm"
         );
+        assert!(c.remediation.is_empty(), "a skip asks nothing: {c:?}");
+        assert!(c.summary.contains("dmesg_restrict"), "{c:?}");
+        assert!(c.summary.contains("--allow-kernel-log"), "{c:?}");
+        assert!(c.summary.contains("optional"), "{c:?}");
+        let text = format!("{} {}", c.summary, c.remediation);
         assert!(
-            c.remediation.contains("/dev/kmsg:/dev/kmsg:r"),
-            "remediation must name the device entry verbatim: {c:?}"
+            !text.contains("SYSLOG") && !text.contains("cap_add"),
+            "{c:?}"
         );
-        assert!(
-            !c.remediation.contains("/dev/kmsg:/dev/kmsg:ro"),
-            "must never hand out the `:ro` form — Compose rejects it under `devices:`: {c:?}"
-        );
-        assert!(
-            c.remediation.contains("SYSLOG"),
-            "the device alone is EPERM under dmesg_restrict=1: {c:?}"
-        );
+        assert!(c.blocks.is_none());
     }
 
     /// Every operator-facing string is one normalised paragraph. A `format!` literal that lost

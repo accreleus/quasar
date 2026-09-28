@@ -40,6 +40,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         },
         devices: HostDevices {
             unknown: Default::default(),
+            kernel_log: false,
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,
@@ -90,6 +91,84 @@ fn node_agent_revision_1_renders_its_golden_specification_per_vendor() {
         .unwrap();
         check(file, &spec);
     }
+}
+
+#[test]
+fn node_agent_revision_3_renders_its_golden_specification_per_vendor() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    for (vendor, file) in [
+        (Some(GpuVendor::Nvidia), "node-agent-r3-nvidia.json"),
+        (Some(GpuVendor::Amd), "node-agent-r3-amd.json"),
+        (None, "node-agent-r3-none.json"),
+    ] {
+        let spec = render(
+            Role::NodeAgent,
+            3,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        check(file, &spec);
+    }
+}
+
+/// RH-07 #402 (D1, P1): revision 3 is one least-privilege recipe for every engine mode.
+/// The agent holds none of the host's /dev, NET_ADMIN, SYSLOG or /dev/kmsg, and carries
+/// label=disable because it mounts the engine socket. Kernel-log access, an optional
+/// diagnostic, comes back only when the host allows unprivileged reads of it.
+#[test]
+fn node_agent_revision_3_holds_none_of_the_removed_access() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    for vendor in [Some(GpuVendor::Nvidia), Some(GpuVendor::Amd), None] {
+        let spec = render(
+            Role::NodeAgent,
+            3,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        assert!(
+            !spec
+                .binds
+                .iter()
+                .any(|b| b.source == "/dev" || b.target == "/host/dev"),
+            "{vendor:?}: host /dev is mounted"
+        );
+        assert!(spec.cap_add.is_empty(), "{vendor:?}: {:?}", spec.cap_add);
+        assert!(
+            spec.security_opt.iter().any(|o| o == "label=disable"),
+            "{vendor:?}: the engine socket needs label=disable on SELinux hosts"
+        );
+        assert!(
+            !spec.devices.iter().any(|d| d.host == "/dev/kmsg"),
+            "{vendor:?}: /dev/kmsg without the host allowing it"
+        );
+    }
+    let mut allowed = inputs(Some(GpuVendor::Nvidia));
+    allowed.devices.kernel_log = true;
+    let spec = render(Role::NodeAgent, 3, &allowed, &image, &agent_secrets()).unwrap();
+    let kmsg = spec
+        .devices
+        .iter()
+        .find(|d| d.host == "/dev/kmsg")
+        .expect("kmsg when allowed");
+    assert_eq!(kmsg.permissions, "r");
+    assert!(
+        spec.cap_add.is_empty(),
+        "never SYSLOG: the host setting is what allows the read"
+    );
+    // Revisions 1 and 2 render exactly as released.
+    let r1 = render(
+        Role::NodeAgent,
+        1,
+        &inputs(Some(GpuVendor::Nvidia)),
+        &image,
+        &agent_secrets(),
+    )
+    .unwrap();
+    assert!(r1.cap_add.contains(&"NET_ADMIN".to_string()));
 }
 
 #[test]
@@ -151,7 +230,7 @@ fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
     let image = ImageRef::parse(AGENT_IMAGE).unwrap();
     for (role, revision) in [
         (Role::NodeAgent, 0),
-        (Role::NodeAgent, 3),
+        (Role::NodeAgent, 4),
         (Role::RecoveryActor, 2),
         (Role::ControlPlane, 0),
         (Role::ControlPlane, 3),

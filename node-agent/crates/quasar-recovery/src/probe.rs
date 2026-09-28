@@ -31,6 +31,7 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
 for d in uinput kmsg nvidiactl; do [ -e "/host/dev/$d" ] && echo "dev $d"; done
+[ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
   mm=$(stat -c '%t:%T' "$n") || continue
@@ -45,6 +46,8 @@ echo end"#;
 pub struct ProbeReport {
     pub uinput: bool,
     pub kmsg: bool,
+    /// The host lets unprivileged processes read the kernel log (`dmesg_restrict=0`).
+    pub kernel_log: bool,
     pub nvidia_nodes: bool,
     /// `(node, pci vendor id)`, render and card nodes, in the order printed.
     pub nodes: Vec<(String, Option<String>)>,
@@ -79,6 +82,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("uinput")) => report.uinput = true,
             (Some("dev"), Some("kmsg")) => report.kmsg = true,
             (Some("dev"), Some("nvidiactl")) => report.nvidia_nodes = true,
+            (Some("kernel_log"), Some("open")) => report.kernel_log = true,
             (Some("node"), Some(node)) if node.starts_with("/dev/dri/") => {
                 let _majmin = words.next();
                 let vendor = words.next().filter(|v| *v != "-").map(str::to_owned);
@@ -158,6 +162,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         dri: !report.nodes.is_empty(),
         uinput: report.uinput,
         kmsg: report.kmsg,
+        kernel_log: report.kmsg && report.kernel_log,
     };
     (gpu, devices)
 }
@@ -306,6 +311,19 @@ pub fn run(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<ProbeReport,
 
 #[cfg(test)]
 mod tests {
+    /// RH-07 #402: kernel-log access is reported only when the host allows it, and the
+    /// agent is offered it only with /dev/kmsg present.
+    #[test]
+    fn kernel_log_access_follows_the_host_setting() {
+        let open = parse("quasar-probe 1\ndev kmsg\nkernel_log open\nend").unwrap();
+        assert!(open.kernel_log);
+        assert!(select(&open).1.kernel_log);
+        let restricted = parse("quasar-probe 1\ndev kmsg\nend").unwrap();
+        assert!(!select(&restricted).1.kernel_log);
+        let no_node = parse("quasar-probe 1\nkernel_log open\nend").unwrap();
+        assert!(!select(&no_node).1.kernel_log);
+    }
+
     use super::*;
 
     const LXC_AMD: &str = "quasar-probe 1\ndev uinput\nnode /dev/dri/renderD129 226:129 0x1002\nnode /dev/dri/card1 226:1 0x1002\nend\n";
