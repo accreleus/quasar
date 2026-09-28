@@ -208,6 +208,21 @@ prep "$r9" "$tmp/podman-only" --mode rootless --engine podman --homes /data/home
 if grep -qE 'chown|install -d' "$r9/.prepare-host-commands"; then fail "existing homes untouched" "$(cat "$r9/.prepare-host-commands")"; else pass "an existing homes root is never re-owned"; fi
 if grep -rq 'chown -R\|chown --recursive' "$script"; then fail "no recursive chown in the script" ""; else pass "the script contains no recursive re-own"; fi
 
+# ── 9b. SELinux Podman: the data roots carry the container label, persistently ─
+r9b="$tmp/r9b"; mk_root "$r9b"; mkdir -p "$r9b/sys/fs/selinux"
+out9b="$(prep "$r9b" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates 2>&1)" || fail "labelled run" "$out9b"
+grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/homes(/.*)?' "$r9b/.prepare-host-commands" \
+  && grep -qF 'restorecon -R /var/lib/quasar/templates' "$r9b/.prepare-host-commands" \
+  && pass "homes and templates roots get a persistent container_file_t context" || fail "selinux labels" "$(cat "$r9b/.prepare-host-commands" 2>/dev/null) $out9b"
+[ -d "$r9b/var/lib/quasar/templates" ] && pass "--templates creates the templates root" || fail "templates root" "missing"
+out9b2="$(prep "$r9b" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates 2>&1)"
+[ "$(grep -c 'semanage fcontext' "$r9b/.prepare-host-commands")" = 2 ] && printf '%s' "$out9b2" | grep -q 'ok       SELinux label on /var/lib/quasar/homes' \
+  && pass "labels are added once" || fail "label idempotent" "$out9b2"
+r9c="$tmp/r9c"; mk_root "$r9c"; mkdir -p "$r9c/sys/fs/selinux"
+prep "$r9c" "$tmp/docker-only" --mode rootless --engine docker --homes /var/lib/quasar/homes >/dev/null 2>&1
+if grep -q semanage "$r9c/.prepare-host-commands" 2>/dev/null; then fail "no label for Docker" ""; else pass "Docker's data roots are not relabelled"; fi
+if prep "$tmp/none" "$tmp/podman-only" --mode rootless --templates 'relative' 2>/dev/null; then fail "--templates relative" "exit 0"; else pass "--templates must be absolute"; fi
+
 # ── argument validation ─────────────────────────────────────────────────────
 if prep "$tmp/none" "$tmp/podman-only" 2>/dev/null; then fail "--mode required" "exit 0"; else pass "--mode is required"; fi
 if prep "$tmp/none" "$tmp/podman-only" --mode rootless --unprivileged-port-start 8080 2>/dev/null; then fail "port range" "exit 0"; else pass "--unprivileged-port-start must be at most 1024"; fi

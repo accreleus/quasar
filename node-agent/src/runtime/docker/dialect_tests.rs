@@ -27,6 +27,8 @@ fn podman(effective: &[&str], runtime: &str) -> PodmanFacts {
         bounding_caps: Some(set),
         oci_runtime: Some(runtime.into()),
         mount_propagations: vec!["rprivate".into()],
+        uid_map: Vec::new(),
+        gid_map: Vec::new(),
     }
 }
 
@@ -386,4 +388,20 @@ fn podman_reports_a_requested_directory_as_its_drm_nodes_and_nothing_else() {
     ];
     assert!(Dialect::Podman.devices_ok(&cdi, &requested, true));
     assert!(!Dialect::Docker.devices_ok(&expanded, &requested, false));
+}
+
+/// Captured live on rootless Podman 5.8.4 (`keep-id:uid=1000,gid=1000`).
+#[test]
+fn keep_id_is_proven_by_the_one_range_mapped_onto_the_engine_user() {
+    let body = r#"{"HostConfig":{"IDMappings":{"UidMap":["0:1:1000","1000:0:1","1001:1001:64536"],"GidMap":["0:1:1000","1000:0:1","1001:1001:64536"]}}}"#;
+    let facts = PodmanFacts::from_inspect(body).unwrap();
+    assert!(keep_id_ok(Some(&facts), 1000, 1000));
+    assert!(!keep_id_ok(Some(&facts), 1001, 1000));
+    // The rootless default maps container root onto the engine user: not keep-id.
+    let default = PodmanFacts::from_inspect(
+        r#"{"HostConfig":{"IDMappings":{"UidMap":["0:0:1","1:1:65536"],"GidMap":["0:0:1","1:1:65536"]}}}"#,
+    )
+    .unwrap();
+    assert!(!keep_id_ok(Some(&default), 1000, 1000));
+    assert!(!keep_id_ok(None, 1000, 1000));
 }

@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Home files belong to the Quasar user on rootless Podman (RH-07, #404).** Session
+  containers map the app's `PUID`/`PGID` onto the Quasar user (`keep-id`), and start as root
+  when the image names no user, so its entrypoint still initialises the home before
+  dropping privileges. The read-back proves the mapping from Podman's own ID maps. Host
+  preparation gains `--templates DIR`, and on an SELinux Podman host labels the homes and
+  templates roots `container_file_t` with a persistent file context (labels only; nothing
+  is re-owned, SELinux stays enforcing). Rootless Docker has no per-container user mapping:
+  its homes keep subordinate IDs.
 - **NVIDIA GPUs by CDI (RH-07, #399).** Every container Quasar creates on an NVIDIA host (the
   node agent, its helpers, app sessions and the actor's GPU probe) asks for the GPU the way
   its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an

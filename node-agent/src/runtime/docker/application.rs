@@ -327,6 +327,31 @@ fn owns(intent: &ApplicationIntent, config: &RuntimeConfig, owner: &str) -> bool
     intent.socket == config.socket && intent.owner == owner
 }
 
+/// The container's user. Under keep-id Podman starts the process as the mapped user, so an
+/// image that names none is started as root explicitly: its entrypoint initialises the
+/// home as root, then drops to PUID.
+fn expected_user(intent: &ApplicationIntent) -> Option<&String> {
+    static ROOT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "0".to_string());
+    let image = intent.image_user.as_ref().filter(|u| !u.is_empty());
+    match (intent.keep_id, image) {
+        (Some(_), None) => Some(&ROOT),
+        (_, image) => image,
+    }
+}
+
+/// `PUID`/`PGID` from the request's environment, the ids the image drops to (1000 when
+/// unset, as the images default).
+fn app_ids(environment: &[String]) -> (u32, u32) {
+    let id = |key: &str| {
+        environment
+            .iter()
+            .rev()
+            .find_map(|e| e.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+            .unwrap_or(1000)
+    };
+    (id("PUID"), id("PGID"))
+}
+
 fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> ContainerCreateBody {
     let r = &intent.request;
     let environment = canonical_env(&r.environment);
@@ -337,6 +362,7 @@ fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> Containe
         // Resolve the mutable reference before journalling and create from the
         // immutable digest; the original reference remains caller evidence.
         image: Some(intent.image_id.clone().unwrap_or_else(|| r.image.clone())),
+        user: expected_user(intent).cloned(),
         entrypoint: r.entrypoint.clone(),
         // Omission preserves the image's Cmd; an explicit empty vector does
         // not. The same distinction applies to Entrypoint above.
@@ -345,6 +371,9 @@ fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> Containe
         labels: Some(labels),
         host_config: Some(HostConfig {
             network_mode: Some(r.network.clone()),
+            userns_mode: intent
+                .keep_id
+                .map(|(uid, gid)| format!("keep-id:uid={uid},gid={gid}")),
             auto_remove: Some(false),
             cap_drop: r.security.cap_drop_all.then_some(vec!["ALL".into()]),
             cap_add: Some(r.security.cap_add.clone()),
@@ -826,7 +855,7 @@ async fn inspect_owned(
     );
     if normalized_argv(config.entrypoint.as_ref()) != entrypoint
         || normalized_argv(config.cmd.as_ref()) != command
-        || normalized_user(config.user.as_ref()) != normalized_user(intent.image_user.as_ref())
+        || normalized_user(config.user.as_ref()) != expected_user(intent)
     {
         return Err(ErrorKind::Protocol.into());
     }
@@ -858,9 +887,16 @@ async fn inspect_owned(
             "uts namespace",
         ),
         (
-            host.userns_mode
-                .as_deref()
-                .is_some_and(|mode| !mode.is_empty()),
+            match intent.keep_id {
+                None => host
+                    .userns_mode
+                    .as_deref()
+                    .is_some_and(|mode| !mode.is_empty()),
+                Some((uid, gid)) => {
+                    !matches!(host.userns_mode.as_deref(), None | Some("" | "private"))
+                        || !super::dialect::keep_id_ok(podman.as_ref(), uid, gid)
+                }
+            },
             "user namespace mode",
         ),
         (
@@ -1123,6 +1159,14 @@ pub(crate) async fn start(
             } else {
                 None
             };
+            // D14: rootless Podman maps the app's ids onto the Quasar user. Rootless Docker
+            // has no per-container mapping; its homes keep subordinate ids (a readiness gap).
+            let keep_id =
+                if docker.dialect == super::dialect::Dialect::Podman && docker.rootless().await? {
+                    Some(app_ids(&request.environment))
+                } else {
+                    None
+                };
             let intent = ApplicationIntent {
                 request,
                 owner,
@@ -1136,6 +1180,7 @@ pub(crate) async fn start(
                 image_volume_identities: None,
                 nvidia_params_repair: None,
                 gpu_injection,
+                keep_id,
                 phase: ApplicationPhase::Creating,
                 result: None,
             };

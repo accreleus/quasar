@@ -22,7 +22,9 @@
 #     --unprivileged-port-start N add two optional ones;
 #   - on an NVIDIA host, makes sure an NVIDIA CDI specification exists;
 #   - on Podman, makes the engine start Quasar's containers again at boot;
-#   - with --homes DIR, creates the homes root owned by the Quasar user.
+#   - with --homes DIR (and --templates DIR), creates the homes root (and the templates
+#     root) owned by the Quasar user; on an SELinux Podman host, labels each for
+#     containers (container_file_t), so sessions can write their homes.
 #
 # It writes under /etc, plus the Quasar user's own home and systemd's linger
 # record under /var. It never writes under /usr, so image-based systems
@@ -38,6 +40,7 @@ MODE=""
 ENGINE="auto"
 QUSER="quasar"
 HOMES=""
+TEMPLATES=""
 CONSOLE=0
 KERNEL_LOG=0
 PORT_START=""
@@ -52,6 +55,7 @@ Usage: prepare-host.sh --mode rootless|rootful [options]
   --engine auto|docker|podman   the container engine (default: auto, detected)
   --user NAME                   the Quasar user (default: quasar)
   --homes DIR                   create the homes root DIR, owned by the Quasar user
+  --templates DIR               the same for the templates root (Steam's prepared home)
   --console                     also grant the display, sound and i2c devices
                                 console mode uses
   --allow-kernel-log            optional: let Quasar read GPU fault messages from
@@ -70,6 +74,7 @@ while [ $# -gt 0 ]; do
     --engine) [ $# -ge 2 ] || die "--engine needs a value"; ENGINE="$2"; shift 2 ;;
     --user) [ $# -ge 2 ] || die "--user needs a value"; QUSER="$2"; shift 2 ;;
     --homes) [ $# -ge 2 ] || die "--homes needs a value"; HOMES="$2"; shift 2 ;;
+    --templates) [ $# -ge 2 ] || die "--templates needs a value"; TEMPLATES="$2"; shift 2 ;;
     --console) CONSOLE=1; shift ;;
     --allow-kernel-log) KERNEL_LOG=1; shift ;;
     --unprivileged-port-start) [ $# -ge 2 ] || die "--unprivileged-port-start needs a value"; PORT_START="$2"; shift 2 ;;
@@ -88,10 +93,13 @@ if [ -n "$PORT_START" ]; then
   case "$PORT_START" in ''|*[!0-9]*) die "--unprivileged-port-start must be a port number" ;; esac
   [ "$PORT_START" -ge 1 ] && [ "$PORT_START" -le 1024 ] || die "--unprivileged-port-start must be between 1 and 1024"
 fi
-if [ -n "$HOMES" ]; then
-  case "$HOMES" in /*) ;; *) die "--homes must be an absolute path" ;; esac
-  case "$HOMES" in /|/usr|/usr/*) die "--homes must not be / or under /usr" ;; esac
-fi
+for pair in "homes:$HOMES" "templates:$TEMPLATES"; do
+  opt="${pair%%:*}"; dir="${pair#*:}"
+  [ -n "$dir" ] || continue
+  case "$dir" in /*) ;; *) die "--$opt must be an absolute path" ;; esac
+  case "$dir" in /|/usr|/usr/*) die "--$opt must not be / or under /usr" ;; esac
+  case "$dir" in *'('*|*')'*|*'*'*|*' '*) die "--$opt must be a plain path" ;; esac
+done
 
 live() { [ -z "$R" ]; }
 if live && [ "$(id -u)" != 0 ]; then
@@ -446,26 +454,52 @@ if [ "$MODE" = rootless ] && { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; }
   say note "rootless Docker: install it for $QUSER with dockerd-rootless-setuptool.sh and enable its docker.service; lingering (above) keeps it running"
 fi
 
-# ── the homes root ─────────────────────────────────────────────────────────
-STEP="homes root"
-if [ -n "$HOMES" ]; then
-  if [ -d "$R$HOMES" ]; then
-    owner="$(stat -c %U "$R$HOMES" 2>/dev/null || echo unknown)"
+# ── the homes and templates roots ──────────────────────────────────────────
+# SELinux confines Podman's containers: a directory they write must carry the container
+# file label. A persistent file-context rule plus restorecon labels it (and anything
+# later created in it); that changes labels, never ownership, and SELinux stays enforcing.
+label_root() { # label_root DIR
+  if live; then
+    if semanage fcontext -l -C 2>/dev/null | grep -F "$1(/.*)?" | grep -q container_file_t; then
+      say ok "SELinux label on $1"; return
+    fi
+  elif grep -qxF "$1" "$R/.selinux-fcontext" 2>/dev/null; then
+    say ok "SELinux label on $1"; return
+  fi
+  if [ "$DRY_RUN" = 1 ]; then say would "label $1 for containers (container_file_t)"; return; fi
+  run semanage fcontext -a -t container_file_t "$1(/.*)?"
+  run restorecon -R "$1"
+  stand_in && printf '%s\n' "$1" >> "$R/.selinux-fcontext"
+  say changed "SELinux label on $1 — sessions in confined containers can write there; labels only, nothing is re-owned"
+}
+
+data_root() { # data_root DIR WHAT
+  if [ -d "$R$1" ]; then
+    owner="$(stat -c %U "$R$1" 2>/dev/null || echo unknown)"
     if live && [ "$owner" != "$QUSER" ] && [ "$MODE" = rootless ]; then
-      say warn "$HOMES exists and is owned by $owner, not $QUSER. Quasar will not re-own it: give $QUSER write access to that one directory, or choose another --homes"
+      say warn "$1 exists and is owned by $owner, not $QUSER. Quasar will not re-own it: give $QUSER write access to that one directory, or choose another path"
     else
-      say ok "homes root $HOMES"
+      say ok "$2 $1"
     fi
   elif [ "$MODE" = rootful ]; then
-    say skipped "homes root $HOMES — a rootful install keeps today's ownership, which the installer sets"
+    say skipped "$2 $1 — a rootful install keeps today's ownership, which the installer sets"
   elif [ "$DRY_RUN" = 1 ]; then
-    say would "create $HOMES owned by $QUSER"
+    say would "create $1 owned by $QUSER"
   else
-    run install -d -m 0750 -o "$QUSER" -g "$QUSER" "$HOMES"
-    stand_in && mkdir -p "$R$HOMES"
-    say changed "homes root $HOMES — where each user's game saves and settings live"
+    run install -d -m 0750 -o "$QUSER" -g "$QUSER" "$1"
+    stand_in && mkdir -p "$R$1"
+    say changed "$2 $1 — $3"
   fi
-fi
+  if { [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; } && [ -d "$R/sys/fs/selinux" ] \
+      && { [ -d "$R$1" ] || [ "$DRY_RUN" = 1 ]; }; then
+    label_root "$1"
+  fi
+}
+
+STEP="homes root"
+[ -n "$HOMES" ] && data_root "$HOMES" "homes root" "where each user's game saves and settings live"
+STEP="templates root"
+[ -n "$TEMPLATES" ] && data_root "$TEMPLATES" "templates root" "where prepared app homes (Steam) are kept"
 
 STEP="done"
 printf 'Host preparation is complete. Run it again at any time: it changes only what is missing.\n'

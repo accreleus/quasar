@@ -88,6 +88,10 @@ pub(crate) struct PodmanFacts {
     pub oci_runtime: Option<String>,
     /// Each realized mount's propagation, which the compatible inspect does not report.
     pub mount_propagations: Vec<String>,
+    /// The user namespace's maps as `container:parent:length`; Podman reports a keep-id
+    /// container's `UsernsMode` only as `private`, so these are the proof of the mapping.
+    pub uid_map: Vec<String>,
+    pub gid_map: Vec<String>,
 }
 
 impl PodmanFacts {
@@ -124,16 +128,57 @@ impl PodmanFacts {
             .get("OCIRuntime")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let map = |key: &str| -> Vec<String> {
+            value
+                .pointer(&format!("/HostConfig/IDMappings/{key}"))
+                .and_then(|m| m.as_array())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|e| e.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         Ok(Self {
             effective_caps,
             bounding_caps,
             oci_runtime,
             mount_propagations,
+            uid_map: map("UidMap"),
+            gid_map: map("GidMap"),
         })
     }
 }
 
+/// The keep-id mapping `(uid, gid)` proven by Podman's maps: the one range that maps onto
+/// the engine's own user (parent id 0) is exactly `uid` (and `gid`), one id long.
+pub(crate) fn keep_id_ok(podman: Option<&PodmanFacts>, uid: u32, gid: u32) -> bool {
+    let onto_owner = |map: &[String]| -> Vec<String> {
+        map.iter()
+            .filter(|e| {
+                let parts: Vec<&str> = e.split(':').collect();
+                parts.len() == 3 && parts[1] == "0"
+            })
+            .cloned()
+            .collect()
+    };
+    podman.is_some_and(|f| {
+        onto_owner(&f.uid_map) == [format!("{uid}:0:1")]
+            && onto_owner(&f.gid_map) == [format!("{gid}:0:1")]
+    })
+}
+
 impl Engine {
+    /// Whether this engine runs rootless, from its own `/info`.
+    pub(crate) async fn rootless(&self) -> Result<bool, RuntimeError> {
+        let sys = self.docker.info().await.map_err(super::classify)?;
+        Ok(sys
+            .security_options
+            .iter()
+            .flatten()
+            .any(|o| o.split(',').any(|p| p == "name=rootless")))
+    }
+
     /// How this engine injects an NVIDIA GPU now (decision D10). Asked per create, never
     /// cached: a CDI specification written after the agent started must be picked up.
     pub(crate) async fn gpu_injection(&self) -> Result<Option<GpuInjection>, RuntimeError> {
