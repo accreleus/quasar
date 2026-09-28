@@ -422,16 +422,13 @@ impl Uninstall {
 
         if opts.purge {
             self.purge_data(&machine, &mut report)?;
+            let homes = homes_kept(&machine.inputs.home_root);
             report.say(match &dump_name {
                 Some(name) => format!(
-                    "Purged. The final dump of the database is {}. Homes under {} are host directories and were not deleted.",
+                    "Purged. The final dump of the database is {}.{homes}",
                     self.dest(opts).describe(name),
-                    machine.inputs.home_root
                 ),
-                None => format!(
-                    "Purged. Homes under {} are host directories and were not deleted.",
-                    if machine.inputs.home_root.is_empty() { "the home root" } else { machine.inputs.home_root.as_str() }
-                ),
+                None => format!("Purged.{homes}"),
             });
             report.say(format!(
                 "Remove the emptied machine-state volume once this command has exited: docker volume rm {}",
@@ -748,5 +745,29 @@ impl Uninstall {
                     .map(|s| s.recovery_actor_image.reference())
             })
             .unwrap_or_else(|| "<registry>/quasar-recovery@sha256:<digest>".to_owned())
+    }
+}
+
+/// The purge report's homes sentence, with its leading space. A machine with no
+/// home root (control-only) keeps no homes, so it says nothing about them (#389).
+fn homes_kept(home_root: &str) -> String {
+    if home_root.is_empty() {
+        String::new()
+    } else {
+        format!(" Homes under {home_root} are host directories and were not deleted.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::homes_kept;
+
+    #[test]
+    fn a_machine_with_no_home_root_says_nothing_about_homes() {
+        assert_eq!(homes_kept(""), "");
+        assert_eq!(
+            homes_kept("/srv/quasar/homes"),
+            " Homes under /srv/quasar/homes are host directories and were not deleted."
+        );
     }
 }

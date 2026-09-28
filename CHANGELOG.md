@@ -596,6 +596,9 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **`uninstall --purge` on a control-only machine no longer prints an empty homes path (#389).**
+  It said "Homes under  are host directories"; a control-only machine keeps no homes, so the
+  purge report now leaves the homes sentence out there and names the home root everywhere else.
 - **The first session on a new NVIDIA host no longer crashes the node agent (#388).** A fresh
   agent restarts itself once after it sets up the driver volume or the CUDA userspace, and it
   kept taking sessions until that exit. The exit then unloaded Vulkan and the driver libraries

@@ -819,13 +819,27 @@ fn purge_needs_a_typed_confirmation_and_no_seed_and_never_runs_without_them() {
 
 /// A combined host the seed installed: Postgres, the control plane and its own agent.
 fn seeded_combined_host() -> (Arc<FakeEngine>, tempfile::TempDir, String) {
-    let env = BTreeMap::from([
+    seeded_control_host(BTreeMap::from([
         ("QUASAR_ROLE".to_string(), "combined".to_string()),
         ("QUASAR_HOME_ROOT".into(), HOME.into()),
         ("QUASAR_AGENT_IMAGE".into(), AGENT_IMAGE.into()),
         ("QUASAR_CONTROL_PLANE_IMAGE".into(), CONTROL_IMAGE.into()),
         ("QUASAR_POSTGRES_IMAGE".into(), POSTGRES_IMAGE.into()),
-    ]);
+    ]))
+}
+
+/// A control-only machine: Postgres and the control plane, no agent and no home root.
+fn seeded_control_only_host() -> (Arc<FakeEngine>, tempfile::TempDir, String) {
+    seeded_control_host(BTreeMap::from([
+        ("QUASAR_ROLE".to_string(), "control-only".to_string()),
+        ("QUASAR_CONTROL_PLANE_IMAGE".into(), CONTROL_IMAGE.into()),
+        ("QUASAR_POSTGRES_IMAGE".into(), POSTGRES_IMAGE.into()),
+    ]))
+}
+
+fn seeded_control_host(
+    env: BTreeMap<String, String>,
+) -> (Arc<FakeEngine>, tempfile::TempDir, String) {
     let mut state = seeded_host(env);
     state
         .registry
@@ -869,7 +883,7 @@ fn seeded_combined_host() -> (Arc<FakeEngine>, tempfile::TempDir, String) {
     let actor_id = actor_container(&engine).id;
     running_actor(&engine, dir.path(), &actor_id)
         .resume()
-        .expect("a combined install");
+        .expect("a control-plane install");
     (engine, dir, actor_id)
 }
 
@@ -933,6 +947,52 @@ fn purging_a_combined_host_takes_a_final_dump_first_and_keeps_it() {
         "the helper is removed"
     );
     assert!(!state.networks.contains_key(names::PLATFORM_NETWORK));
+}
+
+#[test]
+fn purging_a_control_only_machine_says_nothing_about_homes() {
+    let (engine, dir, _) = seeded_control_only_host();
+    let id = installation(&engine);
+    engine.with_state(|s| {
+        s.containers.remove(SEED_ID);
+    });
+    let report = uninstaller(&engine, dir.path())
+        .run(&Options {
+            purge: true,
+            confirm: Some(id.clone()),
+            dump_to: None,
+        })
+        .expect("purged");
+    let purged = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("Purged."))
+        .unwrap_or_else(|| panic!("no Purged line: {report:?}"));
+    assert!(purged.contains("quasar-final-"), "{purged}");
+    assert!(!purged.contains("Homes"), "{purged}");
+    assert!(!purged.contains("  "), "an empty path left a gap: {purged}");
+}
+
+#[test]
+fn purging_a_combined_host_names_its_home_root() {
+    let (engine, dir, _) = seeded_combined_host();
+    engine.with_state(|s| {
+        s.containers.remove(SEED_ID);
+    });
+    let report = uninstaller(&engine, dir.path())
+        .run(&Options {
+            purge: true,
+            confirm: Some("gpu-host-01".into()),
+            dump_to: None,
+        })
+        .expect("purged");
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("Purged.") && l.contains(&format!("Homes under {HOME} "))),
+        "{report:?}"
+    );
 }
 
 #[test]
