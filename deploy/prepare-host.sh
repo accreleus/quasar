@@ -230,12 +230,10 @@ STEP="runtime directory"
 if [ "$MODE" = rootless ]; then
   printf '# Written by Quasar host preparation. The node agent'"'"'s runtime directory, shared with its sessions.\nd /run/quasar-agent 0750 %s %s -\n' "$QUSER" "$QUSER" \
     | put /etc/tmpfiles.d/quasar.conf 0644 "/run/quasar-agent for $QUSER, recreated at every boot (a rootless engine cannot create it)" || unchanged
-  if [ -d "$R/run/quasar-agent" ]; then
-    say ok "/run/quasar-agent exists"
-  else
-    run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
-    stand_in && mkdir -p "$R/run/quasar-agent"
-  fi
+  # Always applied (idempotent): it also corrects the owner and mode of a directory a
+  # rootful install, or an engine creating a missing bind source, left behind as root's.
+  run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
+  stand_in && mkdir -p "$R/run/quasar-agent"
 fi
 
 # ── device access ──────────────────────────────────────────────────────────

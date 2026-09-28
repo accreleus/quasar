@@ -1747,6 +1747,13 @@ fn host_has_fuse_node() -> bool {
     if host_dev.is_dir() {
         return host_dev.join("fuse").exists();
     }
+    // Recipe revision 3 (RH-07 #402) no longer mounts the host's /dev; the recovery actor,
+    // which probed the host, says instead.
+    match std::env::var("QUASAR_HOST_FUSE").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
     Path::new("/dev/fuse").exists()
 }
 

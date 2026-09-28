@@ -251,6 +251,11 @@ pub struct HostDevices {
     /// when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub engine_rootless: bool,
+    /// The host has `/dev/fuse`. From revision 3 the agent no longer sees the host's `/dev`,
+    /// so the recipe tells it (`QUASAR_HOST_FUSE`) whether sessions may be given the node.
+    /// Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fuse: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -263,6 +268,7 @@ impl Default for HostDevices {
             kmsg: true,
             kernel_log: false,
             engine_rootless: false,
+            fuse: false,
             unknown: Unknown::new(),
         }
     }
@@ -994,6 +1000,11 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
         spec.device_cgroup_rules.clear();
     }
     spec.security_opt = vec!["label=disable".into()];
+    // The host's answer the agent can no longer read from /host/dev.
+    spec.env.insert(
+        "QUASAR_HOST_FUSE".into(),
+        if inputs.devices.fuse { "1" } else { "0" }.into(),
+    );
 }
 
 /// The recovery actor's own container: the engine socket, its machine state and the agent

@@ -599,6 +599,14 @@ fn podman_without_systemd_fails_health_checks_naming_the_fix() {
     assert_eq!(c.status, FAIL, "{c:?}");
     assert!(c.summary.contains("cgroupfs"), "{c:?}");
     assert!(c.remediation.contains("linger"), "{c:?}");
+    // Rootful Podman has no user session to linger: its fix is systemd as init.
+    let mut rootful = engine(EngineKind::Podman, "5.8.4", EngineMode::Rootful, "fedora");
+    rootful.cgroup_driver = Some("cgroupfs".into());
+    let c = get(&probe(&observed(&root, Ok(rootful))), HEALTHCHECKS_ID);
+    assert!(
+        !c.remediation.contains("linger") && c.remediation.contains("systemd"),
+        "{c:?}"
+    );
     assert!(!c.remediation.to_lowercase().contains("as root"), "{c:?}");
     assert!(c.blocks.is_none(), "{c:?}");
 }

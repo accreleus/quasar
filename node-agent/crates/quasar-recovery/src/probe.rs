@@ -35,7 +35,7 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
-for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl) echo "dev ${f##*/}";; esac; done
+for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse) echo "dev ${f##*/}";; esac; done
 [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
@@ -53,6 +53,8 @@ pub struct ProbeReport {
     pub kmsg: bool,
     /// The host lets unprivileged processes read the kernel log (`dmesg_restrict=0`).
     pub kernel_log: bool,
+    /// The host has `/dev/fuse` (sessions may be given it).
+    pub fuse: bool,
     pub nvidia_nodes: bool,
     /// `(node, pci vendor id)`, render and card nodes, in the order printed.
     pub nodes: Vec<(String, Option<String>)>,
@@ -87,6 +89,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("uinput")) => report.uinput = true,
             (Some("dev"), Some("kmsg")) => report.kmsg = true,
             (Some("dev"), Some("nvidiactl")) => report.nvidia_nodes = true,
+            (Some("dev"), Some("fuse")) => report.fuse = true,
             (Some("kernel_log"), Some("open")) => report.kernel_log = true,
             (Some("node"), Some(node)) if node.starts_with("/dev/dri/") => {
                 let _majmin = words.next();
@@ -168,6 +171,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         uinput: report.uinput,
         kmsg: report.kmsg,
         kernel_log: report.kmsg && report.kernel_log,
+        fuse: report.fuse,
         engine_rootless: false,
     };
     (gpu, devices)
@@ -328,6 +332,13 @@ mod tests {
         assert!(!select(&restricted).1.kernel_log);
         let no_node = parse("quasar-probe 1\nkernel_log open\nend").unwrap();
         assert!(!select(&no_node).1.kernel_log);
+        // #402 review: the agent no longer sees the host's /dev, so FUSE is probed here.
+        assert!(
+            select(&parse("quasar-probe 1\ndev fuse\nend").unwrap())
+                .1
+                .fuse
+        );
+        assert!(!select(&restricted).1.fuse);
     }
 
     use super::*;
