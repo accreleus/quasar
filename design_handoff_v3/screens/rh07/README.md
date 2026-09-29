@@ -1,7 +1,10 @@
 # RH-07 surfaces — mockups (#394)
 
-**Status: awaiting the owner's approval (#394).** No RH-07 UI ticket builds against these
-until the owner approves them on #394 (D21).
+**Status: approved by the owner on 2026-09-29 (#394), on condition that the build follows
+the v3 handoff's tokens and components** (`DESIGN.md`, `web/src/styles/tokens.css`). Every
+surface and state below is the approved design for its implementing ticket. The open
+questions at the end were not answered one by one: the recommendations posted on #394 stand
+until the implementing ticket settles them with the owner.
 
 - Mockup: [`../rh07-v3.html`](../rh07-v3.html). A standalone reference page built the same
   way as `fleet-rh06-v3.html`: each specimen is one surface in one state.
@@ -146,7 +149,7 @@ Said explicitly rather than invented:
 | The engine profile's name and status in `runtime_engine`'s summary (the agent must know the OS) | readiness `rd-*` | #396 (agent-owned summary text) |
 | The engine-profile data the quick start's badges read | quick start | #406 (the docs page is the source; the badge table should be generated from it, not hand-kept in two places) |
 
-## Open questions for the owner
+## Open questions for the owner (recommendations on #394 stand, 2026-09-29)
 
 1. **Does "unsupported" block the quick start?** The mock blocks: Next waits and nothing is
    generated, which matches the enrollment command refusing an unsupported profile by name.

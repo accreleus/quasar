@@ -11,7 +11,7 @@ Quasar is a premium self-hosted cloud-gaming platform. This package covers the *
 
 **RH-06 additions: approved by the owner, 2026-09-25 (#354).** `screens/fleet-rh06-v3.html`, with the section renderer `screens/assets/pages-rh06.js`, adds the Quasar-owned-machine surfaces to Fleet and Fleet ▸ Releases: the per-machine service inventory, the seed-missing and owner-conflict warnings, "must update before it can be managed", the Add host dialog, the backup confirmation on a migrating update, the restore command after a failed one, Remove host and Developer apply. Screenshots, the surface-to-ticket table and the open questions are in `screens/rh06/README.md`. RH-06 UI slices build and visually verify against them.
 
-**RH-07 additions: awaiting the owner's approval (#394).** `screens/rh07-v3.html`, with the section renderer `screens/assets/pages-rh07.js`, adds the quick start's engine choice and profile badges, host preparation, the Quadlet unit for Podman, console mode on an owned host, and the readiness card's engine facts and "skipped, and why" rows. The quick-start specimens are drawn in the documentation site's own style, not console-v3. Screenshots, the surface-to-ticket table and the open questions are in `screens/rh07/README.md`. No RH-07 UI ticket builds against them until the owner approves (D21).
+**RH-07 additions: approved by the owner, 2026-09-29 (#394), on condition that the build follows the v3 tokens and components.** `screens/rh07-v3.html`, with the section renderer `screens/assets/pages-rh07.js`, adds the quick start's engine choice and profile badges, host preparation, the Quadlet unit for Podman, console mode on an owned host, and the readiness card's engine facts and "skipped, and why" rows. The quick-start specimens are drawn in the documentation site's own style, not console-v3. Screenshots, the surface-to-ticket table and the open questions are in `screens/rh07/README.md`. RH-07 UI tickets build and visually verify against them.
 
 This supersedes the earlier `design_handoff_quasar` package. Where the two differ, **v3 wins**: IBM Plex type instead of Space Grotesk/Hanken, Michroma for the wordmark, oklch tokens, squarer radii, denser chrome.
 
@@ -38,8 +38,8 @@ design_handoff_v3/
     ├── releases-v3.html         ← self-contained: Fleet ▸ Releases, the platform updater tab (installed vs available, per-release changelog rows, targets rollup, channel, apply history); releases-v3.png is its render
     ├── fleet-rh06-v3.html       ← RH-06 (approved, #354): Quasar-owned machines — service inventory, warnings, must-update, Add host, backup/restore, remove host, developer apply; uses console-v3.css + ui.js + pages-rh06.js
     ├── rh06/                    ← its screenshots (one per surface and state) + README (state list, surface → ticket table, open questions)
-    ├── rh07-v3.html             ← RH-07 additions: awaiting the owner's approval (#394). The quick start's engine step, profile badges, host preparation and Quadlet / docker run output (drawn in the docs site's own Starlight style), console mode on an owned host, and the readiness card's engine facts and "skipped, and why" rows; uses console-v3.css + ui.js + pages-rh06.js + pages-rh07.js
-    ├── rh07/                    ← RH-07 additions: awaiting the owner's approval (#394). Its screenshots (one per surface and state) + README (state list, surface → ticket table, open questions)
+    ├── rh07-v3.html             ← RH-07 additions (approved, #394). The quick start's engine step, profile badges, host preparation and Quadlet / docker run output (drawn in the docs site's own Starlight style), console mode on an owned host, and the readiness card's engine facts and "skipped, and why" rows; uses console-v3.css + ui.js + pages-rh06.js + pages-rh07.js
+    ├── rh07/                    ← RH-07 additions (approved, #394). Its screenshots (one per surface and state) + README (state list, surface → ticket table, open questions)
     └── assets/
         ├── console-v3.css       ← v3 token contract + console/HUD component styles (source of truth)
         ├── home-v3.css          ← v3 reskin layered over quasar.css for the home page
@@ -47,7 +47,7 @@ design_handoff_v3/
         ├── quasar.js            ← theme/density/user-menu helpers + SVG sparklines
         ├── data.js              ← mock fleet/session/user data for the console
         ├── ui.js                ← console shell: rail, topbar, drawer, command palette
-        └── pages-*.js           ← one renderer per console section (pages-rh06.js: the RH-06 surfaces above; pages-rh07.js: the RH-07 additions, awaiting the owner's approval, #394)
+        └── pages-*.js           ← one renderer per console section (pages-rh06.js: the RH-06 surfaces above; pages-rh07.js: the RH-07 additions, approved, #394)
 ```
 
 ## Design Tokens (v3 contract)
