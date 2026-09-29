@@ -352,9 +352,95 @@ fn app_ids(environment: &[String]) -> (u32, u32) {
     (id("PUID"), id("PGID"))
 }
 
+/// The agent→image contract naming gids the image adds to the app user (#428).
+pub(crate) const ENGINE_GROUPS_ENV: &str = "QUASAR_APP_ENGINE_GROUPS";
+
+/// Who the app user is on this engine and which groups reach it, from the engine's own
+/// facts. The one place an engine mode changes the app container's identity (D14, #428).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AppIdentity {
+    pub keep_id: Option<(u32, u32)>,
+    pub engine_groups: Vec<u32>,
+    pub group_add: Option<Vec<String>>,
+    pub reason: &'static str,
+}
+
+pub(super) fn app_identity(
+    dialect: super::dialect::Dialect,
+    rootless: bool,
+    request: &ApplicationRequest,
+    overflow_gid: u32,
+) -> AppIdentity {
+    use super::dialect::Dialect;
+    match (dialect, rootless) {
+        (Dialect::Podman, true) => AppIdentity {
+            keep_id: Some(app_ids(&request.environment)),
+            engine_groups: Vec::new(),
+            group_add: None,
+            reason: "rootless Podman maps the app user onto the Quasar account (keep-id)",
+        },
+        // Inside a rootless Docker container gid 0 is the Quasar account's group: the only
+        // group host preparation grants devices to. A host group the engine cannot map reads
+        // as the overflow gid, and a group-add of it grants nothing. No per-container
+        // mapping, so homes keep subordinate ids (a readiness gap, D14).
+        (Dialect::Docker, true) => AppIdentity {
+            keep_id: None,
+            engine_groups: vec![0],
+            group_add: Some(
+                request
+                    .group_add
+                    .iter()
+                    .filter(|g| g.parse::<u32>().ok() != Some(overflow_gid))
+                    .cloned()
+                    .collect(),
+            ),
+            reason: "rootless Docker has no per-container mapping; the app joins the Quasar \
+                     account's group (gid 0 inside)",
+        },
+        (_, false) => AppIdentity {
+            keep_id: None,
+            engine_groups: Vec::new(),
+            group_add: None,
+            reason: "rootful engine: device nodes carry their host groups",
+        },
+    }
+}
+
+/// The kernel's stand-in for an id this user namespace does not map.
+fn overflow_gid() -> u32 {
+    std::fs::read_to_string("/proc/sys/kernel/overflowgid")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(65534)
+}
+
+fn group_add(intent: &ApplicationIntent) -> &Vec<String> {
+    intent
+        .group_add
+        .as_ref()
+        .unwrap_or(&intent.request.group_add)
+}
+
+/// The request's environment with the agent-owned engine-groups entry: a caller's value
+/// never reaches the image.
+fn environment(intent: &ApplicationIntent) -> Vec<String> {
+    let mut entries: Vec<String> = intent
+        .request
+        .environment
+        .iter()
+        .filter(|e| e.split_once('=').map(|(k, _)| k) != Some(ENGINE_GROUPS_ENV))
+        .cloned()
+        .collect();
+    if !intent.engine_groups.is_empty() {
+        let gids: Vec<String> = intent.engine_groups.iter().map(u32::to_string).collect();
+        entries.push(format!("{ENGINE_GROUPS_ENV}={}", gids.join(",")));
+    }
+    canonical_env(&entries)
+}
+
 fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> ContainerCreateBody {
     let r = &intent.request;
-    let environment = canonical_env(&r.environment);
+    let environment = environment(intent);
     let mut labels = HashMap::new();
     labels.insert(container_ownership::LABEL.into(), intent.owner.clone());
     labels.insert(OPERATION_LABEL.into(), r.operation.clone());
@@ -393,7 +479,7 @@ fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> Containe
             readonly_paths: r.security.systempaths_unconfined.then_some(Vec::new()),
             pids_limit: Some(r.security.pids_limit),
             shm_size: Some(r.security.shm_size),
-            group_add: Some(r.group_add.clone()),
+            group_add: Some(group_add(intent).clone()),
             devices: Some(
                 r.devices
                     .iter()
@@ -823,7 +909,7 @@ async fn inspect_owned(
     // Inherited image environment is allowed. Request values were canonicalized
     // to their final caller precedence before create; that final value must be
     // the last realized value too.
-    let requested_env = canonical_env(&intent.request.environment);
+    let requested_env = environment(intent);
     let realized_env = info.config.as_ref().and_then(|c| c.env.as_ref());
     for wanted in requested_env {
         let realized_env = realized_env.ok_or(ErrorKind::Protocol)?;
@@ -933,7 +1019,7 @@ async fn inspect_owned(
             "shm size",
         ),
         (
-            normalized(host.group_add.as_ref()) != intent.request.group_add,
+            &normalized(host.group_add.as_ref()) != group_add(intent),
             "supplementary groups",
         ),
         (
@@ -1173,12 +1259,23 @@ pub(crate) async fn start(
             } else {
                 None
             };
-            // D14: rootless Podman maps the app's ids onto the Quasar user. Rootless Docker
-            // has no per-container mapping; its homes keep subordinate ids (a readiness gap).
-            let podman = docker.dialect == super::dialect::Dialect::Podman;
             // Docker confines with SELinux too when its daemon runs --selinux-enabled.
             let (rootless, selinux) = docker.confinement().await?;
-            let keep_id = (podman && rootless).then(|| app_ids(&request.environment));
+            let app = app_identity(docker.dialect, rootless, &request, overflow_gid());
+            let dropped: Vec<&String> = request
+                .group_add
+                .iter()
+                .filter(|g| app.group_add.as_ref().is_some_and(|kept| !kept.contains(g)))
+                .collect();
+            tracing::info!(
+                token = "app-engine-group-add",
+                application = %request.name,
+                engine_groups = ?app.engine_groups,
+                dropped_group_add = ?dropped,
+                "app container groups decided by the engine mode: {}",
+                app.reason
+            );
+            let keep_id = app.keep_id;
             // The catalog already runs these apps unconfined by seccomp for their own
             // sandboxes (bwrap); under SELinux the same need is the nested-sandbox type.
             let nested_sandbox_label = selinux
@@ -1207,6 +1304,8 @@ pub(crate) async fn start(
                 nvidia_params_repair: None,
                 gpu_injection,
                 keep_id,
+                engine_groups: app.engine_groups,
+                group_add: app.group_add,
                 nested_sandbox_label,
                 phase: ApplicationPhase::Creating,
                 result: None,
@@ -2002,5 +2101,153 @@ mod home_cleanup_tests {
             "quasar-sess-session-ab-g0",
             "session-a"
         ));
+    }
+}
+
+#[cfg(test)]
+mod app_identity_tests {
+    use super::super::dialect::Dialect;
+    use super::*;
+
+    const OVERFLOW: u32 = 65534;
+
+    fn request() -> ApplicationRequest {
+        ApplicationRequest {
+            operation: "op".into(),
+            name: "quasar-sess-op".into(),
+            image: "quasar-app:test".into(),
+            environment: vec!["PUID=1000".into(), "PGID=1000".into()],
+            devices: vec!["/dev/dri".into(), "/dev/input/event7".into()],
+            group_add: vec!["44".into(), OVERFLOW.to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn intent(request: ApplicationRequest, keep_id: Option<(u32, u32)>) -> ApplicationIntent {
+        ApplicationIntent {
+            request,
+            owner: "owner".into(),
+            socket: "/run/docker.sock".into(),
+            id: None,
+            image_id: Some("sha256:abc".into()),
+            image_entrypoint: None,
+            image_cmd: None,
+            image_user: None,
+            image_volumes: None,
+            image_volume_identities: None,
+            nvidia_params_repair: None,
+            gpu_injection: None,
+            keep_id,
+            engine_groups: Vec::new(),
+            group_add: None,
+            nested_sandbox_label: false,
+            phase: ApplicationPhase::Creating,
+            result: None,
+        }
+    }
+
+    fn decided(dialect: Dialect, rootless: bool) -> ApplicationIntent {
+        let app = app_identity(dialect, rootless, &request(), OVERFLOW);
+        ApplicationIntent {
+            engine_groups: app.engine_groups,
+            group_add: app.group_add,
+            ..intent(request(), app.keep_id)
+        }
+    }
+
+    fn spec(intent: &ApplicationIntent) -> serde_json::Value {
+        serde_json::to_value(body(intent, None)).unwrap()
+    }
+
+    #[test]
+    fn only_rootless_docker_gets_engine_groups() {
+        let modes = [
+            (Dialect::Docker, false),
+            (Dialect::Docker, true),
+            (Dialect::Podman, false),
+            (Dialect::Podman, true),
+        ];
+        for (dialect, rootless) in modes {
+            let app = app_identity(dialect, rootless, &request(), OVERFLOW);
+            let rootless_docker = dialect == Dialect::Docker && rootless;
+            assert_eq!(
+                app.engine_groups,
+                if rootless_docker { vec![0] } else { vec![] },
+                "{dialect:?} rootless={rootless}"
+            );
+            assert_eq!(
+                app.group_add,
+                rootless_docker.then(|| vec!["44".to_string()]),
+                "{dialect:?} rootless={rootless}"
+            );
+            assert_eq!(
+                app.keep_id,
+                (dialect == Dialect::Podman && rootless).then_some((1000, 1000)),
+                "{dialect:?} rootless={rootless}"
+            );
+        }
+    }
+
+    /// Rootful Docker and both Podman modes create exactly the container they did before
+    /// #428 (keep-id on rootless Podman, nothing else).
+    #[test]
+    fn other_engine_modes_keep_their_app_container_spec() {
+        assert_eq!(
+            spec(&decided(Dialect::Docker, false)),
+            spec(&intent(request(), None))
+        );
+        assert_eq!(
+            spec(&decided(Dialect::Podman, false)),
+            spec(&intent(request(), None))
+        );
+        assert_eq!(
+            spec(&decided(Dialect::Podman, true)),
+            spec(&intent(request(), Some((1000, 1000))))
+        );
+    }
+
+    #[test]
+    fn rootless_docker_names_the_account_group_and_drops_the_unmapped_one() {
+        let rootless = spec(&decided(Dialect::Docker, true));
+        let mut expected = spec(&intent(request(), None));
+        expected["Env"] =
+            serde_json::json!(["PUID=1000", "PGID=1000", "QUASAR_APP_ENGINE_GROUPS=0"]);
+        expected["HostConfig"]["GroupAdd"] = serde_json::json!(["44"]);
+        assert_eq!(rootless, expected);
+    }
+
+    #[test]
+    fn a_caller_cannot_name_engine_groups() {
+        let mut request = request();
+        request
+            .environment
+            .push(format!("{ENGINE_GROUPS_ENV}=0,10"));
+        let env = environment(&intent(request.clone(), None));
+        assert!(
+            !env.iter().any(|e| e.starts_with(ENGINE_GROUPS_ENV)),
+            "{env:?}"
+        );
+        let rootless = ApplicationIntent {
+            engine_groups: vec![0],
+            ..intent(request, None)
+        };
+        let env = environment(&rootless);
+        assert_eq!(
+            env.iter()
+                .filter(|e| e.starts_with(ENGINE_GROUPS_ENV))
+                .collect::<Vec<_>>(),
+            [&format!("{ENGINE_GROUPS_ENV}=0")]
+        );
+    }
+
+    #[test]
+    fn a_journal_from_before_428_reads_as_the_request_groups() {
+        let mut value = serde_json::to_value(intent(request(), None)).unwrap();
+        assert!(value.get("engine_groups").is_none());
+        assert!(value.get("group_add").is_none());
+        value["phase"] = serde_json::json!("Running");
+        let read: ApplicationIntent = serde_json::from_value(value).unwrap();
+        assert!(read.engine_groups.is_empty());
+        assert_eq!(group_add(&read), &request().group_add);
     }
 }

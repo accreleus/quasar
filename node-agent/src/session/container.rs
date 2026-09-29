@@ -769,7 +769,7 @@ impl ContainerRuntime {
                     .map(|n| format!("{}:{:o}:{}", n.name, n.mode & 0o777, n.gid))
                     .collect::<Vec<_>>()
                     .join(","),
-                "app container joins DRM node groups: {}",
+                "app container requests DRM node groups (the runtime drops any its engine cannot map, token=app-engine-group-add): {}",
                 group_add.join(" ")
             );
         }

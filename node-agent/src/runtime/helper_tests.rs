@@ -2551,6 +2551,8 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         nvidia_params_repair: None,
         gpu_injection: None,
         keep_id: None,
+        engine_groups: Vec::new(),
+        group_add: None,
         nested_sandbox_label: false,
         phase: ApplicationPhase::Running,
         result: None,
@@ -6056,6 +6058,50 @@ fn application_on_an_engine_without_gpu_injection_is_refused_before_the_journal(
         body["HostConfig"]["DeviceRequests"][0]["DeviceIDs"],
         json!(["nvidia.com/gpu=all"])
     );
+}
+
+/// #428: on rootless Docker the app container names the Quasar account's group for the
+/// image to add, drops the unmapped overflow group, and still reads back; rootful does not.
+#[test]
+fn rootless_docker_app_container_carries_the_engine_groups_and_reads_back() {
+    let app = |operation: &str| ApplicationRequest {
+        operation: operation.into(),
+        name: format!("quasar-sess-{operation}"),
+        image: "quasar-app:test".into(),
+        environment: vec!["PUID=1000".into()],
+        devices: vec!["/dev/dri".into(), "/dev/input/event7".into()],
+        group_add: vec!["44".into(), "65534".into()],
+        ..Default::default()
+    };
+    let created = |engine: &Engine, operation: &str| {
+        let id = engine
+            .client()
+            .start_application(app(operation))
+            .wait()
+            .unwrap();
+        let body = engine.state.lock().unwrap().body.clone().unwrap();
+        (id, body)
+    };
+
+    let engine = Engine::new();
+    let (_, rootful) = created(&engine, "engine-groups-rootful");
+    assert_eq!(rootful["Env"], json!(["PUID=1000"]));
+    assert_eq!(rootful["HostConfig"]["GroupAdd"], json!(["44", "65534"]));
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().info = Some(rootless_info(&[]));
+    let (id, rootless) = created(&engine, "engine-groups-rootless");
+    assert_eq!(
+        rootless["Env"],
+        json!(["PUID=1000", "QUASAR_APP_ENGINE_GROUPS=0"])
+    );
+    assert_eq!(rootless["HostConfig"]["GroupAdd"], json!(["44"]));
+    engine.finish();
+    engine
+        .client()
+        .stop_application(id, Duration::from_secs(1))
+        .wait()
+        .unwrap();
 }
 
 /// A refused GPU probe leaves no unfinished journal, so the next probe is not `Busy`.

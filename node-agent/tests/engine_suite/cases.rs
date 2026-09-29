@@ -108,12 +108,17 @@ fn session_security() -> ApplicationSecurity {
 }
 
 /// Runs `script` as the app user (`APP_ID`) holding every supplementary group the
-/// container was given, the way a session image's entrypoint drops from root.
+/// container was given, the way a session image's entrypoint drops from root. Root always
+/// holds gid 0, so 0 is joined only when the runtime names it in `QUASAR_APP_ENGINE_GROUPS`,
+/// as the image does (quasar-images `quasar-entrypoint`).
 fn as_app(script: &str) -> String {
     format!(
         "echo 'suite:x:{APP_ID}:{APP_ID}::/tmp:/bin/sh' >>/etc/passwd && \
          echo 'suite:x:{APP_ID}:' >>/etc/group && \
          for g in $(id -G); do [ \"$g\" = 0 ] || echo \"suite$g:x:$g:suite\" >>/etc/group; done && \
+         case \"$QUASAR_APP_ENGINE_GROUPS\" in ''|*[!0-9,]*) ;; *) \
+           for g in $(echo \"$QUASAR_APP_ENGINE_GROUPS\" | tr , ' '); do \
+             echo \"suiteengine$g:x:$g:suite\" >>/etc/group; done;; esac && \
          exec su -s /bin/sh suite -c '{script}'"
     )
 }

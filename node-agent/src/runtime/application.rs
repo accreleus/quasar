@@ -224,6 +224,14 @@ pub(crate) struct ApplicationIntent {
     /// user (`keep-id`), so home files on the host belong to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_id: Option<(u32, u32)>,
+    /// #428: gids the image adds to the app user itself, as `QUASAR_APP_ENGINE_GROUPS`
+    /// (`docs/configuration.md`). A `--group-add` cannot: the image's drop re-derives groups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_groups: Vec<u32>,
+    /// The container's supplementary groups when the engine cannot map some the request
+    /// named; `None` is the request's own list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_add: Option<Vec<String>>,
     /// On an engine that confines with SELinux the app runs as the nested-sandbox type
     /// (`dialect::NESTED_SANDBOX_LABEL`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
