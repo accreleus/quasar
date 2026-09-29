@@ -462,7 +462,7 @@ function dockerRootfulScript(a, r, p) {
 # Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Docker rootful.
 # Generated in your browser; nothing was sent anywhere. Read it before you run it.
 #
-# It prepares the host, then starts ONE container, the seed. The seed creates
+# It checks the host was prepared, then starts ONE container, the seed. The seed creates
 # Quasar's recovery actor, which generates every secret and creates the rest.
 # Nothing here writes a Compose file or an .env.
 set -euo pipefail
@@ -622,7 +622,7 @@ function podmanScript(a, r, p) {
 # Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Podman ${rootful ? 'rootful' : 'rootless'}.
 # Generated in your browser; nothing was sent anywhere. Read it before you run it.
 #
-# It prepares the host, resolves the three image digests, then writes and
+# It checks the host was prepared, resolves the three image digests, then writes and
 # starts a Quadlet unit for the seed. Nothing here writes a Compose file.
 set -euo pipefail
 
