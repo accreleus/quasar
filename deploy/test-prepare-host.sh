@@ -31,7 +31,7 @@ fail() { FAIL_N=$((FAIL_N + 1)); printf 'FAIL %s — %s\n' "$1" "${2:-}" >&2; }
 # A PATH with only the tools the script uses, plus stub engines, so engine
 # detection does not depend on what this machine has installed.
 bin="$tmp/bin"; mkdir -p "$bin"
-for t in awk cat cmp cp mv chmod mkdir mktemp grep dirname rm ln stat id printf sh basename tr head; do
+for t in awk cat cmp cp mv chmod mkdir mktemp grep dirname rm ln stat id printf sh basename tr head readlink; do
   p="$(command -v "$t" || true)"; [ -n "$p" ] && ln -s "$p" "$bin/$t"
 done
 stubs() { # stubs <dir> <name>... : empty executables that only exist
@@ -127,6 +127,30 @@ grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_KEYBOARD}=="1"' "$r
   && pass "--console grants the host's physical keyboards, mice and joysticks by udev property" || fail "physical input rules" "$(cat "$r3rules")"
 printf '%s' "$out3" | grep -q "the quasar group can read what is typed on this machine's keyboard" \
   && pass "--console states plainly that the quasar group can read this machine's keyboard" || fail "plain keyboard warning" "$out3"
+grep -q '^SUBSYSTEM=="tty", KERNEL=="tty8", ACTION!="remove", ENV{DEVNAME}=="?\*", RUN+="/usr/bin/setfacl -m g:quasar:rw \$devnode"$' "$r3rules" \
+  && [ "$(grep -c 'SUBSYSTEM=="tty"' "$r3rules")" = 1 ] \
+  && pass "--console grants tty8, and only tty8, by ACL" || fail "console VT rule" "$(grep tty "$r3rules")"
+if grep -q 'tty' <(grep -v '^#' "$r/etc/udev/rules.d/70-quasar.rules"); then fail "no terminal without --console" ""; else pass "no terminal access without --console"; fi
+grep -q 'udevadm trigger .*--subsystem-match=tty' "$r3/.prepare-host-commands" \
+  && pass "--console re-applies the rules to terminals" || fail "tty trigger" "$(grep udevadm "$r3/.prepare-host-commands")"
+[ "$(readlink "$r3/etc/systemd/system/getty@tty8.service")" = /dev/null ] && [ "$(readlink "$r3/etc/systemd/system/autovt@tty8.service")" = /dev/null ] \
+  && grep -q 'systemctl mask getty@tty8.service' "$r3/.prepare-host-commands" && grep -q 'systemctl mask autovt@tty8.service' "$r3/.prepare-host-commands" \
+  && pass "--console masks getty@tty8 and autovt@tty8" || fail "tty8 getty masked" "$(cat "$r3/.prepare-host-commands")"
+if grep -q -- '--now' "$r3/.prepare-host-commands"; then fail "nothing running is stopped" "$(grep -- --now "$r3/.prepare-host-commands")"; else pass "masking stops nothing that runs"; fi
+[ ! -e "$r/etc/systemd/system/getty@tty8.service" ] && pass "no unit is masked without --console" || fail "mask without --console" ""
+before3="$(tree "$r3")"
+out3again="$(prep "$r3" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
+[ "$before3" = "$(tree "$r3")" ] && printf '%s' "$out3again" | grep -q 'ok       getty@tty8.service masked' \
+  && [ "$(grep -c 'systemctl mask getty@tty8.service' "$r3/.prepare-host-commands")" = 1 ] \
+  && pass "--console re-run masks nothing again" || fail "tty8 mask idempotent" "$out3again"
+r3o="$tmp/r3o"; mk_root "$r3o"; mkdir -p "$r3o/etc/systemd/system"; printf '[Service]\n' > "$r3o/etc/systemd/system/getty@tty8.service"
+out3o="$(prep "$r3o" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)" || fail "operator unit run" "$out3o"
+printf '%s' "$out3o" | grep -q 'getty@tty8.service is this machine.s own unit, left as it is' && [ -f "$r3o/etc/systemd/system/getty@tty8.service" ] && [ ! -L "$r3o/etc/systemd/system/getty@tty8.service" ] \
+  && pass "an operator's own tty8 unit is left alone, with a warning" || fail "operator tty8 unit" "$out3o"
+r3d="$tmp/r3d"; mk_root "$r3d"
+out3d="$(prep "$r3d" "$tmp/podman-only" --mode rootless --engine podman --console --dry-run 2>&1)"
+[ ! -e "$r3d/etc/systemd/system" ] && printf '%s' "$out3d" | grep -q 'would    getty@tty8.service masked' \
+  && pass "--console dry run masks nothing and says it would" || fail "tty8 dry run" "$out3d"
 
 # ── 3b. console audio (PipeWire) ────────────────────────────────────────────
 r3b="$tmp/r3b"; mk_root "$r3b"; printf 'alice:x:1500:1500::/home/alice:/bin/bash\n' >> "$r3b/etc/passwd"

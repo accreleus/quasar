@@ -43,6 +43,9 @@ enum Mode {
     /// #500: one throwaway-home sweep, then exit. Same knobs, guards and code path as the
     /// daily timer; `make homes-gc` execs it in the running agent container.
     HomesGc { dry_run: bool },
+    /// #407: holds or reconciles console mode's virtual terminal for the agent
+    /// (`session::console_vt`). Spawned as a child; one answer line on stdout.
+    ConsoleVt { args: Vec<String> },
     /// Builds the encoder branch through the same code a session uses. A hand-typed
     /// `gst-launch` probe shares no code with production and negotiated `profile=main-444`,
     /// which read as a driver regression.
@@ -133,6 +136,9 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
                 json: args.iter().any(|a| a == "--json"),
             }
         }
+        Some(session::console_vt::HELPER_ARG) => Mode::ConsoleVt {
+            args: args[1..].to_vec(),
+        },
         Some("inject-selftest") => Mode::InjectSelfTest,
         Some("vinput-selftest") => Mode::VirtualInputSelfTest,
         Some("input-probe") => Mode::InputProbe,
@@ -214,6 +220,7 @@ async fn main() {
         } => run_session(addr, use_test_src, stun, image).await,
         Mode::SessionAnswerer { url } => run_session_answerer(url).await,
         Mode::HomesGc { dry_run } => run_homes_gc(dry_run),
+        Mode::ConsoleVt { args } => std::process::exit(session::console_vt::helper_main(&args)),
         Mode::ProbeEncoder {
             codec,
             width,
@@ -633,6 +640,7 @@ mod tests {
                 "EglSelfTest",
             ),
             ("homes-gc", "HomesGc"),
+            ("console-vt", "ConsoleVt"),
             ("probe-encoder", "ProbeEncoder"),
             ("inject-selftest", "InjectSelfTest"),
             ("vinput-selftest", "VirtualInputSelfTest"),

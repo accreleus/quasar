@@ -36,7 +36,7 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
-for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd) echo "dev ${f##*/}";; esac; done
+for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd|tty8) echo "dev ${f##*/}";; esac; done
 for f in /host/dev/i2c-*; do n=${f##*/i2c-}; case "$n" in ''|*[!0-9]*) ;; *) echo "i2c $n";; esac; done
 for f in /host/run/systemd/*; do case "${f##*/}" in seats|sessions) echo "logind ${f##*/}";; esac; done
 for f in /host/run/quasar-console-audi[o]; do [ "$f" = /host/run/quasar-console-audio ] && echo "console_audio dir"; done
@@ -69,6 +69,8 @@ pub struct ProbeReport {
     /// PipeWire socket directory (console audio, RH-07 #407).
     pub console_audio: bool,
     pub nvidia_nodes: bool,
+    /// The host has `/dev/tty8`, console mode's virtual terminal (RH-07 #407).
+    pub console_vt: bool,
     /// `(node, pci vendor id)`, render and card nodes, in the order printed.
     pub nodes: Vec<(String, Option<String>)>,
 }
@@ -104,6 +106,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("nvidiactl")) => report.nvidia_nodes = true,
             (Some("dev"), Some("fuse")) => report.fuse = true,
             (Some("dev"), Some("snd")) => report.sound = true,
+            (Some("dev"), Some("tty8")) => report.console_vt = true,
             (Some("kernel_log"), Some("open")) => report.kernel_log = true,
             (Some("console_audio"), Some("dir")) => report.console_audio = true,
             (Some("i2c"), Some(n)) => {
@@ -220,6 +223,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         logind: report.logind(),
         console_audio: report.console_audio,
         dri_nodes: report.dri_nodes(),
+        console_vt: report.console_vt,
         engine_rootless: false,
         host_sysfs: false,
     };
@@ -526,7 +530,7 @@ mod tests {
         std::fs::create_dir_all(host.join("dev")).unwrap();
         std::fs::create_dir_all(host.join("run/systemd/seats")).unwrap();
         std::fs::create_dir_all(host.join("run/systemd/sessions")).unwrap();
-        for n in ["i2c-4", "i2c-12", "i2c-dev", "i2c-"] {
+        for n in ["i2c-4", "i2c-12", "i2c-dev", "i2c-", "tty8", "tty80"] {
             std::fs::write(host.join("dev").join(n), "").unwrap();
         }
         let script = SCRIPT.replace("/host/", &format!("{}/", host.display()));
@@ -538,6 +542,8 @@ mod tests {
         let report = parse(&String::from_utf8_lossy(&out.stdout)).unwrap();
         assert_eq!(report.i2c, vec![4, 12]);
         assert!(report.logind());
+        assert!(report.console_vt, "RH-07 #407: the console VT is listed");
+        assert!(select(&report).1.console_vt);
     }
 
     /// The script prints exactly what `parse` reads, run by a real POSIX shell against a

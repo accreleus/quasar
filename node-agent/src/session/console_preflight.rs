@@ -217,12 +217,26 @@ fn run_with(probe: &dyn DisplayProbe, dri_root: &Path, host_run: &Path) -> Prefl
 /// reason `session::console::drm_open_lock` exists to prevent.
 static LAST: std::sync::RwLock<Option<Preflight>> = std::sync::RwLock::new(None);
 
-/// Blocking; run on `spawn_blocking` from the caller (file I/O and a DRM ioctl).
+/// A display that can be taken still fails when the console VT cannot
+/// (`session::console_vt`): a console session would refuse to start.
+fn with_console_vt(display: Preflight, vt: Result<(), String>) -> Preflight {
+    match vt {
+        Err(why) if display.ok => Preflight::fail(format!("console terminal: {why}")),
+        _ => display,
+    }
+}
+
+/// Blocking; run on `spawn_blocking` from the caller (file I/O, DRM and VT ioctls).
 pub(crate) fn run() -> Preflight {
-    let result = run_with(
-        &RealDisplayProbe,
-        Path::new("/dev/dri"),
-        Path::new("/host/run"),
+    // First: it also puts back a console an earlier agent left on the console VT.
+    let vt = crate::session::console_vt::reconcile_at_startup();
+    let result = with_console_vt(
+        run_with(
+            &RealDisplayProbe,
+            Path::new("/dev/dri"),
+            Path::new("/host/run"),
+        ),
+        vt,
     );
     if let Ok(mut slot) = LAST.write() {
         *slot = Some(result.clone());
@@ -338,6 +352,22 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn an_untakeable_console_terminal_fails_an_otherwise_good_preflight() {
+        let failed = with_console_vt(Preflight::ok(), Err("tty8 is busy".into()));
+        assert!(!failed.ok);
+        assert_eq!(
+            failed.detail.as_deref(),
+            Some("console terminal: tty8 is busy")
+        );
+        assert_eq!(with_console_vt(Preflight::ok(), Ok(())), Preflight::ok());
+        let display = Preflight::fail("someone holds the display".into());
+        assert_eq!(
+            with_console_vt(display.clone(), Err("tty8 is busy".into())),
+            display
+        );
     }
 
     #[test]

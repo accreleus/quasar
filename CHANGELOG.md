@@ -1114,6 +1114,18 @@ own; the two do not move together, and that is deliberate.
 
 ### Security
 - **Session input stays inside the session.** The compositor now takes the virtual keyboard and mouse it is given exclusively (`EVIOCGRAB`, compositor pin `6638e07`), so the host's own console input handlers no longer also receive a session's keys, and the virtual keyboard no longer declares keys only the host acts on (SysRq, power, sleep, suspend, wake, radio). Found in console-mode testing, where keys typed in a session appeared on the host's login prompt.
+- **A console session owns its own virtual terminal, with the kernel keyboard off (RH-07,
+  #407).** For the life of a local console session the node agent makes `tty8` the active
+  virtual terminal with its kernel keyboard turned off, and switches back to the previous
+  one when the session ends, so keys typed in the session no longer also reach the host's
+  text console (its login prompt). A small helper child holds the terminal as its
+  controlling terminal, which is all the kernel asks for: no capability is added. A host
+  whose terminal cannot be taken refuses console sessions and fails the console preflight
+  with the reason; a host with no virtual terminals is unaffected. If the agent dies
+  holding the terminal, its next start puts the previous one back. `prepare-host.sh
+  --console` gives the Quasar group `tty8` by ACL and masks `getty@tty8` and
+  `autovt@tty8`; the recovery actor passes `/dev/tty8` to a console agent when the host
+  has it, and `deploy/overlays/docker-compose.console.yml` does the same.
 
 ## 0.3.0 — 2026-09-13
 

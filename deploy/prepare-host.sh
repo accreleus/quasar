@@ -17,8 +17,9 @@
 #     devices Quasar itself creates (matched by name), and the GPU render nodes;
 #     with --console also the display cards, sound devices, i2c buses, and this
 #     machine's own keyboards, mice and game controllers (so console mode's
-#     exclusive grab can take them) that console mode needs. No broad group such
-#     as `input` or `video` is granted;
+#     exclusive grab can take them) that console mode needs, and its own virtual
+#     terminal (tty8, with no login prompt on it). No broad group such as `input` or
+#     `video` is granted;
 #   - with --console --console-audio-user USER, gives console mode a PipeWire
 #     Pulse socket on USER's own desktop session, reachable only by the `quasar`
 #     group, so it can play audio through a real login rather than raw ALSA;
@@ -63,7 +64,7 @@ Usage: prepare-host.sh --mode rootless|rootful [options]
   --homes DIR                   create the homes root DIR, owned by the Quasar user
   --templates DIR               the same for the templates root (Steam's prepared home)
   --console                     also grant the display, sound, i2c and physical
-                                input devices console mode uses
+                                input devices and the terminal (tty8) console mode uses
   --console-audio-user USER     with --console: give console mode a PipeWire audio
                                 socket on USER's desktop session (refused without
                                 --console, or if USER does not exist)
@@ -364,14 +365,40 @@ SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", $acl
 SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", $acl
 SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", $acl
 SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", $acl
+# Console mode: its own virtual terminal. A session makes it the active one with the
+# kernel keyboard off, so nothing typed in the session reaches a login prompt.
+SUBSYSTEM=="tty", KERNEL=="tty8", $acl
 EOF
   fi
 } | if put /etc/udev/rules.d/70-quasar.rules 0644 "give the $QUSER group the devices Quasar uses, and only those$([ "$CONSOLE" = 1 ] && printf '%s' " — with --console that includes this machine's keyboards, mice and game controllers while console mode uses them; the $QUSER group can read what is typed on this machine's keyboard")" || unchanged_then_false; then
   if run udevadm control --reload; then
-    run udevadm trigger --subsystem-match=misc --subsystem-match=input --subsystem-match=drm --subsystem-match=sound --subsystem-match=i2c-dev
+    tty_match=""
+    [ "$CONSOLE" = 1 ] && tty_match="--subsystem-match=tty"
+    # shellcheck disable=SC2086 # empty or one word
+    run udevadm trigger --subsystem-match=misc --subsystem-match=input --subsystem-match=drm --subsystem-match=sound --subsystem-match=i2c-dev $tty_match
   else
     say note "udev is not running here (a container?); the rules take effect when it runs, at the latest at boot"
   fi
+fi
+
+# ── console terminal ───────────────────────────────────────────────────────
+# No login prompt may run on tty8: console mode takes it as its terminal, and a getty
+# holding it would make every console session refuse to start. logind starts none there
+# by default (NAutoVTs=6); masking both units keeps it so. Nothing running is stopped.
+if [ "$CONSOLE" = 1 ]; then
+  STEP="console terminal"
+  for unit in getty@tty8.service autovt@tty8.service; do
+    link="/etc/systemd/system/$unit"
+    if [ "$(readlink "$R$link" 2>/dev/null)" = /dev/null ]; then
+      say ok "$unit masked"
+    elif [ -e "$R$link" ] || [ -L "$R$link" ]; then
+      say warn "$link is this machine's own unit, left as it is: while a login prompt runs on tty8, console sessions refuse to start"
+    else
+      run systemctl mask "$unit"
+      stand_in && { mkdir -p "$R/etc/systemd/system" && ln -s /dev/null "$R$link"; }
+      say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "$unit masked — console mode uses tty8 as its terminal, so no login prompt may run there"
+    fi
+  done
 fi
 
 # ── console audio (PipeWire) ───────────────────────────────────────────────
