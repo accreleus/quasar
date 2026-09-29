@@ -12,6 +12,7 @@ vi.mock("../../../api/admin", () => ({
 
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
+import { clockTime } from "../../../lib/format/clockTime";
 import { HostConsole } from "./HostConsole";
 
 describe("HostConsole truthful topology", () => {
@@ -310,6 +311,7 @@ describe("HostConsole console access (amendment 18)", () => {
 
     await screen.findByText("Console mode is off.");
     expect(screen.getByText("Off")).toBeTruthy();
+    expect(screen.getByText("This machine shows games on its own screen, and can stream them too.")).toBeTruthy();
 
     fireEvent.click(await screen.findByRole("switch", { name: "Enabled" }));
 
@@ -339,7 +341,7 @@ describe("HostConsole console access (amendment 18)", () => {
     expect(adminApi.updateConsoleConfig).not.toHaveBeenCalled();
   });
 
-  it("applying: locks the switch and shows the applying note; no confirm on click", async () => {
+  it("applying: locks the switch, shows the started time, and locks every other control", async () => {
     mockAccess(
       {
         state: "applying", target: true, request_id: "3f0812c4-6e1d-4f7a-9d55-8c1b0e2d44a2",
@@ -350,13 +352,38 @@ describe("HostConsole console access (amendment 18)", () => {
     );
     renderPage();
 
-    await screen.findByText("Turning console mode on.");
+    await screen.findByText("Turning on console mode.");
     expect(screen.getByText("Applying")).toBeTruthy();
+    const started = clockTime("2026-09-29T14:12:03Z", { seconds: false });
+    expect(screen.getByText(new RegExp(`\\(started ${started}\\)`))).toBeTruthy();
 
     const sw = await screen.findByRole("switch", { name: "Enabled" });
     expect(sw).toBeDisabled();
     fireEvent.click(sw);
     expect(screen.queryByRole("dialog")).toBeNull();
+
+    // The mockup's README: "applying ... settings locked" — every control,
+    // not just the switch.
+    expect(screen.getByRole("button", { name: "Discard" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Also stream" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Grab local input" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Auto-start on display" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Auto-connect controller" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Local audio output" })).toBeDisabled();
+    await screen.findByText("Input devices");
+    expect(screen.getByRole("tab", { name: "Specific devices" })).toBeDisabled();
+  });
+
+  it("applying with no started_at: omits the parenthetical", async () => {
+    mockAccess({
+      state: "applying", target: true, request_id: "3f0812c4-6e1d-4f7a-9d55-8c1b0e2d44a2",
+      reason: null, started_at: null, finished_at: null, summary: "Replacing the node agent.",
+    });
+    renderPage();
+
+    await screen.findByText("Turning on console mode.");
+    expect(screen.queryByText(/\(started/)).toBeNull();
   });
 
   it("on: reads as on when enabled and the host has access, with no note", async () => {
@@ -439,6 +466,8 @@ describe("HostConsole console access (amendment 18)", () => {
     expect(screen.queryByText("Off")).toBeNull();
     expect(screen.queryByText("On")).toBeNull();
     expect(screen.queryByText("Console mode is off.")).toBeNull();
+    expect(screen.getByText("Local display with an explicit per-session output topology.")).toBeTruthy();
+    expect(screen.queryByText(/shows games on its own screen/)).toBeNull();
   });
 
   it("409 surfaced: a conflicting PATCH toasts the server's message", async () => {

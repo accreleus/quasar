@@ -15,6 +15,7 @@ import { Diag } from "../Diag";
 import { Button } from "../../../../components/Button";
 import { IconRefresh } from "../../../../components/icons";
 import type { ConsoleAccess } from "../../../../api/types";
+import { clockTime } from "../../../../lib/format/clockTime";
 import { shortId } from "../../../../lib/format/shortId";
 import { accessReasonText, liveSessionsNoun } from "./access";
 
@@ -42,12 +43,13 @@ export function ConsoleAccessNote({
   }
 
   if (access.state === "applying") {
+    const started = access.started_at ? ` (started ${clockTime(access.started_at, { seconds: false })})` : "";
     return (
       <div className="note" role="status">
-        <strong>Turning console mode {access.target ? "on" : "off"}.</strong> The recovery actor
-        is replacing the node agent. Console mode reads as on only once the new node agent is
-        healthy; if it is not, the previous one is put back. New sessions on this host wait until
-        then.
+        <strong>Turning {access.target ? "on" : "off"} console mode.</strong> The recovery actor
+        is replacing the node agent{started}. Console mode reads as on only once the new node
+        agent is healthy; if it is not, the previous one is put back. New sessions on this host
+        wait until then.
       </div>
     );
   }

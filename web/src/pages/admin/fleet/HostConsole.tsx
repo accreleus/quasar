@@ -114,6 +114,9 @@ export function HostConsole() {
   const accessKnown = access != null;
   const applying = access?.state === "applying";
   const unsupported = access?.state === "unsupported";
+  // The mockup's README: "applying (... settings locked)" — every control on
+  // the page, not just the switch, while a replacement is in flight.
+  const locked = applying;
 
   const toggleAccess = useAdminAction(
     async (nextEnabled: boolean) => {
@@ -190,10 +193,10 @@ export function HostConsole() {
         sub={`Local display on ${host ? host.node_name : "this host"} with an explicit per-session output topology`}
         actions={
           <>
-            <Button variant="ghost" disabled={loading || saving || changedCount === 0} onClick={discard}>
+            <Button variant="ghost" disabled={loading || saving || locked || changedCount === 0} onClick={discard}>
               Discard
             </Button>
-            <Button variant="primary" disabled={loading || saving || changedCount === 0} onClick={() => void save()}>
+            <Button variant="primary" disabled={loading || saving || locked || changedCount === 0} onClick={() => void save()}>
               {saving ? "Saving…" : "Save changes"}
             </Button>
           </>
@@ -219,7 +222,9 @@ export function HostConsole() {
               <div>
                 <span className="panel-title">Console mode</span>
                 <p className="hint mt1">
-                  Local display with an explicit per-session output topology.
+                  {accessKnown
+                    ? "This machine shows games on its own screen, and can stream them too."
+                    : "Local display with an explicit per-session output topology."}
                 </p>
               </div>
               <div className="acts">
@@ -255,6 +260,7 @@ export function HostConsole() {
             <ConsoleRow title="Physical output" help="Card-scoped DRM connector. Automatic uses Weston's preferred connected output.">
               <select
                 className="select"
+                disabled={locked}
                 value={effective.output_id ?? NONE}
                 onChange={(e) => {
                   const output = connectedOutputs.find((item) => item.id === e.target.value);
@@ -281,7 +287,7 @@ export function HostConsole() {
               <select
                 className="select"
                 style={{ width: 260 }}
-                disabled={!selectedOutput}
+                disabled={locked || !selectedOutput}
                 value={selectedModeValue}
                 onChange={(e) => {
                   const mode = selectedOutput?.modes.find((item) =>
@@ -303,14 +309,14 @@ export function HostConsole() {
             <Group title="Streaming" />
 
             <ConsoleRow title="Also stream" help="Adds WebRTC video for dual output. Off is local-only.">
-              <Switch label="Also stream" checked={Boolean(effective.stream)} onChange={(v) => setField("stream", v)} />
+              <Switch label="Also stream" checked={Boolean(effective.stream)} disabled={locked} onChange={(v) => setField("stream", v)} />
             </ConsoleRow>
 
             <ConsoleRow title="Stream audio" help="Adds the WebRTC Opus audio leg when streaming is enabled.">
               <Switch
                 label="Stream audio"
                 checked={Boolean(effective.stream_audio)}
-                disabled={!effective.stream}
+                disabled={locked || !effective.stream}
                 onChange={(v) => setField("stream_audio", v)}
               />
             </ConsoleRow>
@@ -321,6 +327,7 @@ export function HostConsole() {
               <select
                 className="select"
                 aria-label="Local audio output"
+                disabled={locked}
                 value={effective.audio_output ?? NONE}
                 onChange={(e) => {
                   const v = e.target.value;
@@ -336,13 +343,14 @@ export function HostConsole() {
             </ConsoleRow>
 
             <ConsoleRow title="Grab local input" help="Exclusively grab the physical keyboard/mouse for the console session.">
-              <Switch label="Grab local input" checked={Boolean(effective.grab)} onChange={(v) => setField("grab", v)} />
+              <Switch label="Grab local input" checked={Boolean(effective.grab)} disabled={locked} onChange={(v) => setField("grab", v)} />
             </ConsoleRow>
 
             <InputDevicesRow
               value={effective.input_devices}
               devices={capabilities?.input_devices ?? []}
               onChange={(v) => setField("input_devices", v)}
+              disabled={locked}
             />
 
             <Group title="Startup" />
@@ -350,6 +358,7 @@ export function HostConsole() {
             <ConsoleRow title="Default app" help="App auto-launched on console start.">
               <select
                 className="select"
+                disabled={locked}
                 value={effective.default_app ?? NONE}
                 onChange={(e) => {
                   const v = e.target.value;
@@ -366,6 +375,7 @@ export function HostConsole() {
             <ConsoleRow title="Default user" help="Owner of auto-started console sessions. Required for auto-start on display.">
               <select
                 className="select"
+                disabled={locked}
                 value={effective.default_user ?? NONE}
                 onChange={(e) => {
                   const v = e.target.value;
@@ -383,6 +393,7 @@ export function HostConsole() {
               <Switch
                 label="Auto-start on display"
                 checked={Boolean(effective.auto_start_on_display)}
+                disabled={locked}
                 onChange={(v) => setField("auto_start_on_display", v)}
               />
             </ConsoleRow>
@@ -391,6 +402,7 @@ export function HostConsole() {
               <Switch
                 label="Auto-connect controller"
                 checked={Boolean(effective.auto_connect_controller)}
+                disabled={locked}
                 onChange={(v) => setField("auto_connect_controller", v)}
               />
             </ConsoleRow>

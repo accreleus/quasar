@@ -30,14 +30,18 @@ export function InputDevicesRow({
   value,
   devices,
   onChange,
+  disabled = false,
 }: {
   value: InputDevicesValue;
   devices: { path: string; label: string }[];
   onChange: (v: InputDevicesValue) => void;
+  /** Locks the whole row (segmented control, class chips, per-device
+   *  checkboxes) — a replacement `applying` through the recovery actor. */
+  disabled?: boolean;
 }) {
   const mode = modeOf(value);
   const passed = passedThroughPaths(value, devices);
-  const editable = mode === "specific";
+  const editable = mode === "specific" && !disabled;
   const current = Array.isArray(value) ? value : [];
 
   const setPaths = (paths: string[]) => onChange(paths);
@@ -70,6 +74,7 @@ export function InputDevicesRow({
           <SegmentedControl<Mode>
             aria-label="Input device selection"
             value={mode}
+            disabled={disabled}
             onChange={(next) => {
               if (next === "auto") onChange("auto");
               else if (next === "none") onChange([]);
