@@ -1,3 +1,4 @@
+use anyhow::Context;
 use quasar_node_agent::{agent, config, memstat, session};
 
 use session::SessionConfig;
@@ -506,12 +507,31 @@ fn run_inject_selftest() {
     }
 }
 
+/// Runs `write` only if `grab` succeeded; on a grab failure `write` is never
+/// called and the grab error is returned instead. The seam that makes "grab
+/// failed ⇒ nothing written" unit-testable without a real uinput/evdev node —
+/// see `tests::grab_failure_skips_the_write` below.
+fn write_if_grabbed<T>(
+    grab: anyhow::Result<T>,
+    write: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    grab.context("exclusive grab")?;
+    write()
+}
+
 /// Proves the uinput path end-to-end (device creation, fake-udev node, event write) with no
 /// compositor, GPU or browser. Needs `/dev/uinput`.
 ///
 /// The devices must be dropped (destroyed) before the caller exits, so no `exit` inside:
 /// each failure returns its one-line reason instead. Shared with `input-probe`.
+///
+/// Each write is gated on an exclusive `EVIOCGRAB` of that device's own node
+/// (`session::virtual_input::ExclusiveGrab`), taken and dropped around the
+/// write: nothing else holds these nodes at agent start, so an ungrabbed write
+/// here also reaches the host's VT console (keyboard) or any other reader.
 fn exercise_virtual_input() -> Result<(), String> {
+    use session::virtual_input::ExclusiveGrab;
+
     let devices = session::virtual_input::VirtualDevices::create("selftest")
         .map_err(|e| format!("virtual device creation failed: {e:#}"))?;
     tracing::info!(
@@ -532,19 +552,30 @@ fn exercise_virtual_input() -> Result<(), String> {
     };
     step(
         "key A down+up",
-        devices.key(30, true).and_then(|_| devices.key(30, false)),
+        write_if_grabbed(ExclusiveGrab::take(&devices.keyboard_path), || {
+            devices.key(30, true).and_then(|_| devices.key(30, false))
+        }),
     )?;
     step(
         "mouse move + left click",
-        devices
-            .mouse_move_rel(10.0, -5.0)
-            .and_then(|_| devices.mouse_button(0x110, true))
-            .and_then(|_| devices.mouse_button(0x110, false)),
+        write_if_grabbed(ExclusiveGrab::take(&devices.mouse_path), || {
+            devices
+                .mouse_move_rel(10.0, -5.0)
+                .and_then(|_| devices.mouse_button(0x110, true))
+                .and_then(|_| devices.mouse_button(0x110, false))
+        }),
     )?;
-    step("scroll", devices.scroll(0.0, 120.0))?;
+    step(
+        "scroll",
+        write_if_grabbed(ExclusiveGrab::take(&devices.mouse_path), || {
+            devices.scroll(0.0, 120.0)
+        }),
+    )?;
     step(
         "gamepad A + left stick",
-        devices.gamepad(&[1.0], &[0.5, -0.5]),
+        write_if_grabbed(ExclusiveGrab::take(&devices.gamepad_path), || {
+            devices.gamepad(&[1.0], &[0.5, -0.5])
+        }),
     )?;
     Ok(())
 }
@@ -598,6 +629,49 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `write_if_grabbed` is the seam behind the vinput self-test's fail-closed
+    /// rule: a grab failure must never be followed by a write. Exercised with a
+    /// plain `()` grab so it needs no real uinput/evdev node.
+    #[test]
+    fn grab_failure_skips_the_write() {
+        let wrote = Arc::new(AtomicBool::new(false));
+        let w = wrote.clone();
+        let result = write_if_grabbed(Err::<(), _>(anyhow::anyhow!("no such device")), move || {
+            w.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(
+            !wrote.load(Ordering::SeqCst),
+            "write ran after a failed grab"
+        );
+    }
+
+    #[test]
+    fn grab_success_runs_the_write() {
+        let wrote = Arc::new(AtomicBool::new(false));
+        let w = wrote.clone();
+        let result = write_if_grabbed(Ok::<_, anyhow::Error>(()), move || {
+            w.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(
+            wrote.load(Ordering::SeqCst),
+            "write did not run after a successful grab"
+        );
+    }
+
+    /// The write's own failure still propagates once the grab succeeded — the
+    /// gate only blocks the failed-grab case, not the write's own errors.
+    #[test]
+    fn write_failure_still_propagates_after_a_successful_grab() {
+        let result = write_if_grabbed(Ok::<_, anyhow::Error>(()), || {
+            Err(anyhow::anyhow!("write failed"))
+        });
+        assert!(result.is_err());
     }
 
     /// The production role: no arguments at all.
