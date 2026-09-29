@@ -470,6 +470,118 @@ describe("HostConsole console access (amendment 18)", () => {
     expect(screen.queryByText(/shows games on its own screen/)).toBeNull();
   });
 
+  it("restored: display held by another process leads with the summary's named holder, not the mapped reason", async () => {
+    mockAccess(
+      {
+        state: "restored", target: true, request_id: "3f0812c4-6e1d-4f7a-9d55-8c1b0e2d44a2",
+        reason: "unhealthy", started_at: "2026-09-29T14:12:03Z", finished_at: "2026-09-29T14:13:40Z",
+        summary: "gdm, the login screen holds the display Turning console mode on did not complete " +
+          "(unhealthy), so the recovery actor put the previous node agent back; console mode is off.",
+      },
+      { enabled: false },
+    );
+    renderPage();
+
+    await screen.findByText(/did not turn on/);
+    expect(screen.getByText(/gdm, the login screen holds the display/)).toBeTruthy();
+    expect(screen.getByText(
+      /Stop the login screen on this display, or choose another output, then try again\./,
+    )).toBeTruthy();
+    // The generic reason-mapped sentence no longer swallows the named cause.
+    expect(screen.queryByText(/started but never became healthy/)).toBeNull();
+    expect(screen.queryByTestId("console-access-prepare-snippet")).toBeNull();
+    expect(screen.getByText("Details")).toBeTruthy();
+  });
+
+  it("restored: host not prepared shows the copyable prepare-host snippet and Details", async () => {
+    mockAccess(
+      {
+        state: "restored", target: true, request_id: "9c1a2b3c-6e1d-4f7a-9d55-8c1b0e2d44a2",
+        reason: "unhealthy", started_at: "2026-09-29T14:12:03Z", finished_at: "2026-09-29T14:13:40Z",
+        summary: "host not prepared for console mode: no display device is visible to this agent; run " +
+          "host preparation (deploy/prepare-host.sh --console) as root, then try again Turning console " +
+          "mode on did not complete (unhealthy), so the recovery actor put the previous node agent back; " +
+          "console mode is off.",
+      },
+      { enabled: false },
+    );
+    renderPage();
+
+    await screen.findByText(/is not prepared for it/);
+    expect(screen.getByText("Run on Tower as root")).toBeTruthy();
+    // No reported engine facts on this host (BASE host mock): the generic form.
+    expect(screen.getByTestId("console-access-prepare-snippet")).toHaveTextContent(
+      "sudo sh prepare-host.sh --console …",
+    );
+    expect(screen.getByText("Details")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(adminApi.updateConsoleConfig).toHaveBeenCalledWith(
+      "token", "host-1", { enabled: true },
+    ));
+  });
+
+  it("restored: host not prepared uses an engine/mode-aware command once the host has reported its engine", async () => {
+    vi.mocked(adminApi.getHost).mockResolvedValue({
+      host: {
+        id: "host-1", node_name: "Tower", status: "online", capacity: { active_sessions: 2 },
+        engine: "podman", engine_version: "5.6.2", engine_mode: "rootless",
+      },
+    } as never);
+    mockAccess(
+      {
+        state: "restored", target: true, request_id: "9c1a2b3c-6e1d-4f7a-9d55-8c1b0e2d44a2",
+        reason: "unhealthy", started_at: "2026-09-29T14:12:03Z", finished_at: "2026-09-29T14:13:40Z",
+        summary: "host not prepared for console mode: no display device is visible to this agent; run " +
+          "host preparation (deploy/prepare-host.sh --console) as root, then try again.",
+      },
+      { enabled: false },
+    );
+    renderPage();
+
+    await screen.findByTestId("console-access-prepare-snippet");
+    expect(screen.getByTestId("console-access-prepare-snippet")).toHaveTextContent(
+      "sudo sh prepare-host.sh --mode rootless --engine podman --console",
+    );
+  });
+
+  it("Local audio output: PipeWire sinks show the PipeWire help line and labels", async () => {
+    vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
+      config: BASE_CONFIG,
+      capabilities: {
+        ...BASE_CAPS,
+        audio_sinks: [
+          { id: "pipewire:default", label: "Host PipeWire · default output" },
+          { id: "pipewire:alsa_output.hdmi", label: "Host PipeWire · HDMI (LG TV)" },
+        ],
+      },
+    } as never);
+    renderPage();
+
+    await screen.findByText("Host PipeWire · default output");
+    expect(screen.getByText("Host PipeWire · HDMI (LG TV)")).toBeTruthy();
+    expect(screen.getByText(
+      "This machine runs PipeWire, so console audio plays through it, beside the desktop's own " +
+        "sound. Quasar never takes the sound device from it.",
+    )).toBeTruthy();
+  });
+
+  it("Local audio output: ALSA sinks show the ALSA help line", async () => {
+    vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
+      config: BASE_CONFIG,
+      capabilities: {
+        ...BASE_CAPS,
+        audio_sinks: [{ id: "hw:0,3", label: "HDMI / DisplayPort (RTX 4080 Super)" }],
+      },
+    } as never);
+    renderPage();
+
+    await screen.findByText("HDMI / DisplayPort (RTX 4080 Super)");
+    expect(screen.getByText(
+      "No PipeWire runs on this machine, so console audio goes straight to the sound device (ALSA).",
+    )).toBeTruthy();
+  });
+
   it("409 surfaced: a conflicting PATCH toasts the server's message", async () => {
     mockAccess({
       state: "off", target: null, request_id: null, reason: null,
