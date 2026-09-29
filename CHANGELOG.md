@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH-07 acceptance map (#409).** `docs/rh07/acceptance-map.md` ties every RH-07 user
+  story and required engine-profile row (Docker rootful, Docker rootless, Podman rootless
+  on AMD and NVIDIA) to its evidence, with a Podman-rootful/Ubuntu-24.04 claimed vs
+  experimental accounting and an open-gaps list.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
