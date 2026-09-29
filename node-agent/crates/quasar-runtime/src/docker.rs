@@ -17,9 +17,10 @@ mod inspection;
 pub(crate) mod platform;
 pub use inspection::{all_container_image_ids, daemon_images};
 
-/// Inspect one container, tolerating Podman's health status `stopped` (an exited container
-/// whose image has a healthcheck), which Docker's API schema does not have and bollard
-/// cannot parse. Unparseable for any other reason is returned as it was.
+/// Inspect one container, tolerating what Podman reports outside Docker's API schema, which
+/// bollard cannot parse: the health status `stopped` (an exited container whose image has a
+/// healthcheck), and the libpod states `stopped` and `configured` as the container's status.
+/// Unparseable for any other reason is returned as it was.
 pub async fn inspect_container_tolerant(
     docker: &bollard::Docker,
     name_or_id: &str,
@@ -42,15 +43,28 @@ pub async fn inspect_container_tolerant(
     }
 }
 
-/// The health statuses Docker's schema knows; anything else reads as `none`.
+/// Health statuses Docker's schema does not know read as `none`. Libpod's `stopped` (exited,
+/// its cleanup pending) reads as `exited`, and `configured` (not yet in the OCI runtime) as
+/// `created`; any other unknown status stays unparseable.
 fn normalize_inspect(contents: &str) -> Option<bollard::models::ContainerInspectResponse> {
     let mut value: serde_json::Value = serde_json::from_str(contents).ok()?;
-    let status = value.pointer_mut("/State/Health/Status")?;
-    if !matches!(
-        status.as_str(),
-        Some("" | "none" | "starting" | "healthy" | "unhealthy")
-    ) {
-        *status = serde_json::Value::String("none".into());
+    if let Some(status) = value.pointer_mut("/State/Health/Status") {
+        if !matches!(
+            status.as_str(),
+            Some("" | "none" | "starting" | "healthy" | "unhealthy")
+        ) {
+            *status = serde_json::Value::String("none".into());
+        }
+    }
+    if let Some(status) = value.pointer_mut("/State/Status") {
+        let docker = match status.as_str() {
+            Some("stopped") => Some("exited"),
+            Some("configured") => Some("created"),
+            _ => None,
+        };
+        if let Some(docker) = docker {
+            *status = serde_json::Value::String(docker.into());
+        }
     }
     serde_json::from_value(value).ok()
 }
@@ -285,5 +299,44 @@ mod tolerant_tests {
         );
         assert_eq!(parsed.id.as_deref(), Some("abc"));
         assert!(super::normalize_inspect("not json").is_none());
+    }
+
+    /// Captured from Podman 4.9.3 on a hosted runner (engine suite, #408): a crash-looping
+    /// `unless-stopped` container just after a stop, with no healthcheck of its own.
+    #[test]
+    fn podmans_stopped_state_reads_as_exited_without_a_healthcheck() {
+        let body = r#"{"Id":"abc","Name":"/x","State":{"Dead":false,"Error":"","ExitCode":3,"Health":{"FailingStreak":0,"Log":null,"Status":""},"OOMKilled":false,"Paused":false,"Pid":0,"Restarting":false,"Running":false,"Status":"stopped"},"Config":{"Image":"i"}}"#;
+        assert!(serde_json::from_str::<bollard::models::ContainerInspectResponse>(body).is_err());
+        let state = super::normalize_inspect(body).unwrap().state.unwrap();
+        assert_eq!(
+            state.status,
+            Some(bollard::models::ContainerStateStatusEnum::EXITED)
+        );
+        assert_eq!(state.exit_code, Some(3));
+        assert_eq!(state.running, Some(false));
+
+        let no_health = body.replace(
+            r#""Health":{"FailingStreak":0,"Log":null,"Status":""},"#,
+            "",
+        );
+        assert_eq!(
+            super::normalize_inspect(&no_health)
+                .unwrap()
+                .state
+                .unwrap()
+                .status,
+            Some(bollard::models::ContainerStateStatusEnum::EXITED)
+        );
+        let configured = no_health.replace(r#""Status":"stopped""#, r#""Status":"configured""#);
+        assert_eq!(
+            super::normalize_inspect(&configured)
+                .unwrap()
+                .state
+                .unwrap()
+                .status,
+            Some(bollard::models::ContainerStateStatusEnum::CREATED)
+        );
+        let unknown = no_health.replace(r#""Status":"stopped""#, r#""Status":"weird""#);
+        assert!(super::normalize_inspect(&unknown).is_none());
     }
 }

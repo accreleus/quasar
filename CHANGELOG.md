@@ -825,6 +825,9 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The runtime reads Podman containers in libpod's `stopped` and `configured` states
+  (RH-07, #408).** Podman can report them where Docker's schema has none (a crash-looping
+  service just after a stop); every inspect of such a container failed as unreadable.
 - **A reconnected host no longer reads as offline (#407).** When an agent's old connection
   was noticed dead only after its replacement had registered (seen when console access
   recreated the agent), that old connection's teardown marked the host offline, and nothing
