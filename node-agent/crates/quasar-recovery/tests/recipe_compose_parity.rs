@@ -294,6 +294,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         trust: Default::default(),
         enroll: Default::default(),
         app: Default::default(),
+        console: false,
     }
 }
 
@@ -566,4 +567,116 @@ fn the_rendered_node_agent_matches_the_compose_definitions_except_the_listed_dif
         stale.is_empty(),
         "ALLOWED lists differences that no longer occur: {stale:?}"
     );
+}
+
+/// `(kind, item, reason)`: how the console additions (RH-07 #395) differ from what
+/// `deploy/overlays/docker-compose.console.yml` adds to the Compose service. `-`: the
+/// overlay adds it and the recipe does not; `+`: the reverse.
+const ALLOWED_CONSOLE: &[(&str, &str, &str)] = &[
+    (
+        "-rule",
+        "c 116:* rmw",
+        "ALSA nodes arrive with the /dev/snd bind and nothing creates one, so no `m`",
+    ),
+    ("+rule", "c 116:* rw", "the same ALSA access without `m`"),
+    (
+        "-rule",
+        "c 226:* rmw",
+        "revision 3 maps /dev/dri as a device, which already grants its DRM nodes",
+    ),
+    (
+        "+env",
+        "QUASAR_CONSOLE_ACCESS=1",
+        "how the agent tells that its container carries the console additions",
+    ),
+];
+
+/// What `with` adds to and removes from `without`, per field, as `(kind, item)`.
+fn delta(without: &Shape, with: &Shape) -> BTreeSet<(String, String)> {
+    let env =
+        |s: &Shape| -> BTreeSet<String> { s.env.iter().map(|(k, v)| format!("{k}={v}")).collect() };
+    let mut out = BTreeSet::new();
+    for (kind, a, b) in [
+        ("cap", &without.cap_add, &with.cap_add),
+        ("bind", &without.binds, &with.binds),
+        ("device", &without.devices, &with.devices),
+        (
+            "rule",
+            &without.device_cgroup_rules,
+            &with.device_cgroup_rules,
+        ),
+        ("env", &env(without), &env(with)),
+        ("port", &without.ports, &with.ports),
+    ] {
+        for x in b.difference(a) {
+            out.insert((format!("add {kind}"), x.clone()));
+        }
+        for x in a.difference(b) {
+            out.insert((format!("drop {kind}"), x.clone()));
+        }
+    }
+    out
+}
+
+/// The console additions compared as additions: the overlay's to the Compose service, the
+/// recipe's to revision 3 without console mode. Revision 3's own differences from Compose
+/// (RH-07 #402) are not the console's, so the base shapes are not compared here.
+#[test]
+fn the_console_additions_match_the_console_overlay_except_the_listed_differences() {
+    let base = deploy("docker-compose.yml");
+    let nvidia = deploy("docker-compose.nvidia.yml");
+    let console = deploy("overlays/docker-compose.console.yml");
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let secrets = SecretMounts {
+        volume: Some(names::NODE_AGENT_SECRETS_VOLUME.into()),
+        files: BTreeSet::from([secrets::ENROLLMENT.to_string()]),
+    };
+    let allowed: BTreeSet<(String, String)> = ALLOWED_CONSOLE
+        .iter()
+        .map(|(k, i, _)| (k.to_string(), i.to_string()))
+        .collect();
+    for vendor in [Some(GpuVendor::Nvidia), Some(GpuVendor::Amd)] {
+        let plain = inputs(vendor);
+        let mut on = plain.clone();
+        on.console = true;
+        let mut files = vec![base.clone()];
+        if vendor == Some(GpuVendor::Nvidia) {
+            files.push(nvidia.clone());
+        }
+        let compose_plain = compose_shape(&files, &dotenv(&plain));
+        files.push(console.clone());
+        let compose_console = compose_shape(&files, &dotenv(&on));
+        let overlay = delta(&compose_plain, &compose_console);
+        let recipe = delta(
+            &spec_shape(&render(Role::NodeAgent, 3, &plain, &image, &secrets).unwrap()),
+            &spec_shape(&render(Role::NodeAgent, 3, &on, &image, &secrets).unwrap()),
+        );
+        let mut found = BTreeSet::new();
+        for (kind, item) in overlay.difference(&recipe) {
+            found.insert((
+                format!("-{}", kind.trim_start_matches("add ")),
+                item.clone(),
+            ));
+        }
+        for (kind, item) in recipe.difference(&overlay) {
+            found.insert((
+                format!("+{}", kind.trim_start_matches("add ")),
+                item.clone(),
+            ));
+        }
+        assert!(
+            found.iter().all(|(k, _)| !k.contains("drop")),
+            "{vendor:?}: console mode takes something away: {found:?}"
+        );
+        let unexplained: Vec<_> = found.difference(&allowed).collect();
+        assert!(
+            unexplained.is_empty(),
+            "{vendor:?}: console differences from the overlay with no reason: {unexplained:#?}"
+        );
+        let stale: Vec<_> = allowed.difference(&found).collect();
+        assert!(
+            stale.is_empty(),
+            "{vendor:?}: listed console differences that no longer occur: {stale:?}"
+        );
+    }
 }
