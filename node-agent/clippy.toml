@@ -1,0 +1,5 @@
+# Podman reports health `stopped`, which bollard cannot parse: every container inspection
+# goes through quasar_runtime::docker::inspect_container_tolerant.
+disallowed-methods = [
+  { path = "bollard::Docker::inspect_container", reason = "use quasar_runtime::docker::inspect_container_tolerant (Podman's `stopped` health status)" },
+]

@@ -1747,6 +1747,13 @@ fn host_has_fuse_node() -> bool {
     if host_dev.is_dir() {
         return host_dev.join("fuse").exists();
     }
+    // Recipe revision 3 (RH-07 #402) no longer mounts the host's /dev; the recovery actor,
+    // which probed the host, says instead.
+    match std::env::var("QUASAR_HOST_FUSE").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
     Path::new("/dev/fuse").exists()
 }
 
@@ -2797,6 +2804,8 @@ mod tests {
                 format!("__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS={NVIDIA_DRIVER_VOLUME_DST}/egl_external_platform.d:/usr/share/egl/egl_external_platform.d"),
                 "-e".into(),
                 format!("VK_ADD_DRIVER_FILES={NVIDIA_DRIVER_VOLUME_DST}/vulkan/icd.d/nvidia_icd.json"),
+                "-e".into(),
+                "VK_LOADER_DRIVERS_DISABLE=*lvp_icd*".into(),
                 "--device".into(),
                 DRI_DIR.into(),
                 "--group-add".into(),

@@ -60,22 +60,15 @@ being dropped. The node agent runs with host networking, so its WebRTC UDP is
 filtered like any other host traffic, and a default-deny firewall blocks it out
 of the box.
 
-Check **Admin, Fleet, Hosts** for a `media_reachability` warning on that host.
-The agent probes the firewall at startup and on reconnect, reads the accept
-rules in front of the input chain, and warns only when the media path really is
-closed — naming the exact scoped rule for the tool it detected, or the half of
-the path that is missing. A host whose rules already cover the ephemeral UDP
-range and UDP/5353 passes instead, quoting the rules it matched.
+Check **Admin, Fleet, Hosts** for a failed `media_reachability` check on that
+host. The agent judges it from real sessions: it fails when a browser on another
+machine tried to connect and none of its connection checks arrived, and names
+the scoped rule to add.
 
-One thing it cannot see is whether those rules' **source scope** reaches the
-client you are testing from. A rule scoped to a subnet your client is not on
-reads as covered and still drops the media, so check the scope before ruling the
-firewall out on a green check.
-
-<Aside type="caution" title="No warning is not an all-clear">
-The probe reports no finding when it cannot reach a firewall client tool from
-inside the agent container, which is the common case on a stock image. Check the
-host directly before ruling the firewall out.
+<Aside type="caution" title="A pass is one client, not every client">
+A pass means one remote browser got through. A rule scoped to a subnet your
+client is not on still drops that client's media, so check the scope before
+ruling the firewall out.
 </Aside>
 
 The fix is a rule scoped to your LAN or VPN subnet, opening the ephemeral UDP

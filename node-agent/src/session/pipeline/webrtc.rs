@@ -591,6 +591,40 @@ pub(super) fn connect_ice_candidate(webrtc: &gst::Element, out_tx: OutTx, pc: Pc
     });
 }
 
+/// Read this peer connection's ICE stats once its state settles and record what they prove
+/// (`session::media_evidence`). The promise closure holds nothing of the element.
+fn record_media_evidence(
+    webrtc: &gst::Element,
+    state: gstreamer_webrtc::WebRTCICEConnectionState,
+    connected_once: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use crate::session::media_evidence::{ice_stats, record, IceOutcome};
+    use gstreamer_webrtc::WebRTCICEConnectionState as S;
+    use std::sync::atomic::Ordering;
+    let outcome = match state {
+        S::Connected | S::Completed => IceOutcome::Connected,
+        S::Failed => IceOutcome::Failed,
+        _ => return,
+    };
+    let before = if outcome == IceOutcome::Connected {
+        connected_once.swap(true, Ordering::SeqCst)
+    } else {
+        connected_once.load(Ordering::SeqCst)
+    };
+    // A failed ICE agent's stats list no candidates: what signaling delivered stands in.
+    let offered = crate::session::media_evidence::offered(webrtc);
+    let promise = gst::Promise::with_change_func(move |reply| {
+        if let Ok(Some(reply)) = reply {
+            let mut stats = ice_stats(reply);
+            if stats.remote.is_empty() {
+                stats.remote = offered;
+            }
+            record(&stats, before, outcome);
+        }
+    });
+    webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+}
+
 /// Log ICE / peer-connection transitions and release held inputs on disconnect (Wolf
 /// #302). The `Connected`/`Completed` line is the transport-established acceptance signal.
 ///
@@ -607,10 +641,17 @@ pub(super) fn connect_state_logging(
 ) {
     let ice_trace = trace_tx.clone();
     let ice_sid = session_id.clone();
+    // Survives ICE restarts: a failure after the first connection is a dropped session.
+    let connected_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
     webrtc.connect_notify(Some("ice-connection-state"), move |webrtc, _pspec| {
         let state =
             webrtc.property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
         tracing::info!("ICE connection state: {state:?}");
+        // RH-07 #403: a real session's settled ICE is the media-path evidence (the demo and
+        // test pipelines carry no trace channel and are not).
+        if ice_trace.is_some() {
+            record_media_evidence(webrtc, state, &connected_once);
+        }
         // ICE may jump Checking → Completed, skipping `Connected`. Both mean established.
         if matches!(
             state,

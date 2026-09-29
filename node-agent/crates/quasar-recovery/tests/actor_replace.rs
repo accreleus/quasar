@@ -915,3 +915,67 @@ fn an_unreadable_journal_fails_closed() {
         assert_eq!(engine.state(), before, "{name}: the engine changed");
     }
 }
+
+/// An update that moves the agent to recipe revision 3 asks the engine again with the
+/// request revision 3 renders: an answer recorded for `--gpus` says nothing about CDI.
+#[test]
+fn an_update_to_revision_3_asks_the_engine_by_cdi_again() {
+    let mut state = nvidia_host(&[], true);
+    state.host.gpu_injection = Some(quasar_recovery::recipe::GpuInjection::Cdi);
+    state.registry.insert(NEW_AGENT.into(), new_image("3"));
+    state.behaviour.insert(NEW_AGENT.into(), healthy());
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    actor_with(&engine, dir.path(), fast())
+        .resume()
+        .expect("a clean install");
+    let machine = |dir: &tempfile::TempDir| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join("machine.json")).unwrap()).unwrap()
+    };
+    assert!(
+        machine(&dir)["inputs"]["gpu"].get("cdi").is_none(),
+        "revision 1 asked by --gpus"
+    );
+
+    let actor = actor_with(&engine, dir.path(), fast());
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    assert_eq!(
+        result_of(&actor.status_for(Some(ID))).state,
+        State::Succeeded
+    );
+    assert_eq!(machine(&dir)["inputs"]["gpu"]["cdi"], true);
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert_eq!(
+        agent.spec.gpus[0].device_ids,
+        vec![quasar_recovery::recipe::NVIDIA_CDI_DEVICE.to_string()]
+    );
+}
+
+/// Review M1: an update never silently takes the GPU away from an agent that has it. The
+/// engine stops serving the request revision 3 renders: the update fails before anything
+/// stops, and the old agent keeps running with its GPU.
+#[test]
+fn an_update_that_would_lose_the_gpu_fails_before_anything_stops() {
+    let mut state = nvidia_host(&[], true);
+    state.host.gpu_injection = Some(quasar_recovery::recipe::GpuInjection::Cdi);
+    state.registry.insert(NEW_AGENT.into(), new_image("3"));
+    state.behaviour.insert(NEW_AGENT.into(), healthy());
+    let engine = Arc::new(FakeEngine::new(state));
+    let dir = tempfile::tempdir().unwrap();
+    actor_with(&engine, dir.path(), fast())
+        .resume()
+        .expect("a clean install");
+    let before = old_agent(&engine);
+    engine.with_state(|s| s.gpus_supported = false);
+
+    let actor = actor_with(&engine, dir.path(), fast());
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    let result = result_of(&actor.status_for(Some(ID)));
+    assert_eq!(result.state, State::Failed);
+    assert_eq!(result.reason, Some(Reason::RecreateFailed));
+    assert_unchanged(&engine.state(), &before, "after the refused update");
+    assert_eq!(before.spec.gpus.len(), 1);
+}

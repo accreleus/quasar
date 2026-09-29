@@ -157,9 +157,14 @@ impl VersionInventory {
         let mut by_ref = BTreeMap::new();
         for image in daemon {
             for reference in &image.refs {
-                if by_ref.insert(reference.clone(), image.id.clone()).is_some() {
-                    self.revoke();
-                    return Err(std::io::Error::other("duplicate daemon image ref"));
+                // Podman lists an image pulled by digest with that digest reference both
+                // as a tag and as a digest, so one image may carry a reference twice. Only
+                // a reference naming two different images is ambiguous.
+                if let Some(other) = by_ref.insert(reference.clone(), image.id.clone()) {
+                    if other != image.id {
+                        self.revoke();
+                        return Err(std::io::Error::other("duplicate daemon image ref"));
+                    }
                 }
             }
         }
@@ -375,6 +380,31 @@ mod tests {
             id: id.into(),
             refs: vec![reference.into()],
         }
+    }
+
+    /// RH-07: Podman reports a digest-pulled image's reference twice (as a tag and as a
+    /// digest). The same reference on the same image is one fact; on two images it is still
+    /// refused.
+    #[test]
+    fn a_reference_repeated_on_one_image_is_not_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = VersionInventory::open(dir.path().join("versions.json")).unwrap();
+        inventory.mark_authority_received();
+        let identity = identity("v1", "1111111");
+        let twice = DaemonImage {
+            id: "sha256:one".into(),
+            refs: vec![identity.image_ref.clone(), identity.image_ref.clone()],
+        };
+        let (complete, entries) = inventory
+            .reconcile(std::slice::from_ref(&identity), &[twice], &[])
+            .unwrap();
+        assert!(complete);
+        assert_eq!(entries[0].state, "present");
+        let two_images = [
+            daemon("sha256:one", &identity.image_ref),
+            daemon("sha256:two", &identity.image_ref),
+        ];
+        assert!(inventory.reconcile(&[identity], &two_images, &[]).is_err());
     }
 
     #[test]

@@ -784,20 +784,6 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # install the daemon explicitly (weak deps remain disabled above).
     alsa-lib pulseaudio-libs pulseaudio \
     pciutils-libs libsrtp \
-    # #527: the #483 media-reachability readiness check (node-agent/src/readiness.rs
-    # detect_firewall_posture) needs a firewall client tool inside the container to read the
-    # HOST's firewall posture (network_mode: host + CAP_NET_ADMIN already grant the netlink
-    # access; nothing baked into this image ever gave it the CLIENT). `nftables` provides
-    # `nft`, which alone covers a modern firewalld-on-nftables host (Fedora's default backend
-    # since F32) as well as a raw nftables setup -- `nft list ruleset` reads the same kernel
-    # tables firewalld itself programs. iptables/iptables-nft is deliberately NOT added: it is
-    # a legacy-backend fallback the readiness code also tries, but every host this image
-    # targets (Fedora/RHEL family) is nftables-backed, and adding both client stacks for one
-    # probe is not worth the bytes. Without this package the check can only report
-    # FirewallPosture::Unknown (readiness.rs combine_firewall_signals falls through when
-    # firewall-cmd is unreachable AND nft is absent) and the #483 WARN never fires even on a
-    # filtering host.
-    nftables \
     # Console local-output runtime: weston drives atomic KMS and seatd provides
     # VT-unbound device access inside the agent container.
     weston seatd ddcutil pulseaudio-utils procps-ng iproute \

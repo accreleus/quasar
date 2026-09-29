@@ -203,8 +203,9 @@ pub fn spawn(
         Err(e) => {
             tracing::info!(
                 "{XID_LOG_TOKEN}: {KMSG_PATH} is not readable ({e}) — GPU Xid / amdgpu fault \
-                 records will not be reported. This is the default in a container; see the \
-                 `xid_visibility` readiness check for what to add to compose."
+                 records will not be reported. This optional diagnostic needs a host that \
+                 allows kernel-log reads (host preparation's --allow-kernel-log); see the \
+                 `xid_visibility` readiness check."
             );
             return None;
         }

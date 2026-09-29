@@ -354,6 +354,7 @@ fn the_gpus_probe_gets_a_definite_answer_from_a_real_engine() {
     let answer = probe::serves_gpus(
         engine.as_ref(),
         &ImageRef::parse(&pinned).unwrap(),
+        quasar_recovery::recipe::GpuInjection::DeviceRequest,
         Duration::from_millis(200),
     )
     .expect("a definite answer");
@@ -441,6 +442,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
         template_root: "/var/lib/quasar/templates".into(),
         docker_socket: "/var/run/docker.sock".into(),
         gpu: GpuFacts {
+            cdi: false,
             unknown: Default::default(),
             vendor: None,
             render_node: None,
@@ -449,6 +451,10 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
         },
         devices: HostDevices {
             unknown: Default::default(),
+            kernel_log: false,
+            engine_rootless: false,
+            host_sysfs: false,
+            fuse: false,
             dri: false,
             uinput: false,
             kmsg: false,

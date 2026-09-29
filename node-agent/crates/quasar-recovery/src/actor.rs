@@ -1077,6 +1077,9 @@ impl Actor {
             }
             inputs.gpu = gpu;
             inputs.devices = devices;
+            inputs.devices.engine_rootless = host.rootless;
+            inputs.devices.host_sysfs =
+                host.rootless && host.kind == quasar_runtime::EngineKind::Docker;
         }
 
         let machine = Machine {
@@ -1214,13 +1217,13 @@ impl Actor {
             role,
             &secrets,
             FileOwner::ROOT,
-            |machine, image| {
+            |machine, image, revision| {
                 // A combined host's agent enrolls with the local token, which the control
                 // plane inserts when it boots.
                 if machine.role == MachineRole::Combined {
                     self.await_healthy(names::CONTROL_PLANE);
                 }
-                self.decide_gpus(machine, image)?;
+                self.decide_gpus(machine, image, revision)?;
                 if machine.inputs.gpu.nvidia_shape() {
                     self.ensure_volume(machine, names::NVIDIA_DRIVER_VOLUME, role)?;
                 }
@@ -1229,32 +1232,73 @@ impl Actor {
         )
     }
 
-    /// On an NVIDIA machine not yet known to serve `--gpus`, ask the engine before the agent
-    /// is created. Only a yes is recorded; a definite no installs the agent without the
-    /// NVIDIA shape (readiness reports the gap) and is asked again the next time the agent
-    /// is created; no answer stops this start.
+    /// On an NVIDIA machine, before the agent is created, ask the engine with the request
+    /// `revision` will render: CDI or `--gpus` as the engine injects it from revision 3,
+    /// always `--gpus` before. A recorded yes for that same request is not asked again. A
+    /// yes is recorded; a definite no installs this agent without the NVIDIA shape
+    /// (readiness reports the gap) and is asked again the next time the agent is created;
+    /// no answer stops this start.
     pub(crate) fn decide_gpus(
         &self,
         machine: &mut Machine,
         image: &ImageRef,
+        revision: u32,
     ) -> Result<(), ResumeError> {
+        use quasar_runtime::GpuInjection;
         let gpu = &machine.inputs.gpu;
-        if gpu.vendor != Some(recipe::GpuVendor::Nvidia) || gpu.gpus_served {
+        if gpu.vendor != Some(recipe::GpuVendor::Nvidia) {
             return Ok(());
         }
-        match probe::serves_gpus(self.engine.as_ref(), image, self.config.gpus_probe_backoff)? {
+        let want = if revision >= 3 {
+            // D10: decided from what the engine reports about itself, never from an error's
+            // wording. No way at all is a gap readiness names.
+            match self.engine.host()?.gpu_injection {
+                Some(injection) => injection,
+                None => {
+                    warn!(
+                        token = "actor-gpu-injection-unavailable",
+                        "NVIDIA device found, but this engine cannot be given an NVIDIA GPU: it reports no NVIDIA CDI device and is not a rootful Docker (run host preparation, which writes the NVIDIA CDI specification); installing without the NVIDIA shape"
+                    );
+                    machine.inputs.gpu.gpus_served = false;
+                    return Ok(());
+                }
+            }
+        } else {
+            GpuInjection::DeviceRequest
+        };
+        let recorded = if gpu.cdi {
+            GpuInjection::Cdi
+        } else {
+            GpuInjection::DeviceRequest
+        };
+        if gpu.gpus_served && recorded == want {
+            return Ok(());
+        }
+        match probe::serves_gpus(
+            self.engine.as_ref(),
+            image,
+            want,
+            self.config.gpus_probe_backoff,
+        )? {
             probe::GpusAnswer::Served => {
                 info!(
                     token = "actor-gpus-served",
-                    "NVIDIA: the engine started a --gpus all probe; installing the NVIDIA shape"
+                    via = ?want,
+                    "NVIDIA: the engine started a GPU probe; installing the NVIDIA shape"
                 );
                 machine.inputs.gpu.gpus_served = true;
+                machine.inputs.gpu.cdi = want == GpuInjection::Cdi;
                 self.dir.machine().store(machine)?;
             }
-            probe::GpusAnswer::Refused(why) => warn!(
-                token = "actor-gpus-refused",
-                "NVIDIA device found, but the engine does not serve --gpus: {why}; installing without the NVIDIA shape (is the NVIDIA Container Toolkit installed for this engine?)"
-            ),
+            probe::GpusAnswer::Refused(why) => {
+                warn!(
+                    token = "actor-gpus-refused",
+                    via = ?want,
+                    "NVIDIA device found, but the engine does not serve the GPU request: {why}; installing without the NVIDIA shape (is the NVIDIA Container Toolkit installed for this engine?)"
+                );
+                // This agent only; the stored answer is left for the next create to re-ask.
+                machine.inputs.gpu.gpus_served = false;
+            }
         }
         Ok(())
     }

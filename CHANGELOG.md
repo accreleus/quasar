@@ -25,6 +25,116 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Rootless Docker: the agent sees its GPUs and input devices (RH-07, #399).** A
+  host-network container on rootless Docker gets no sysfs of its own, so the agent found
+  no DRM inventory and could not resolve its input nodes. On rootless Docker only, recipe
+  revision 3 gives the agent the host's `/sys` read-only, the view any other container has.
+  On rootless Docker, `homes_root_writable` warns (never blocks) that session files are
+  owned on the host by a subordinate ID, since Docker cannot map a container's user onto
+  the Quasar user (owner decision on #404).
+  Docker whose daemon runs `--selinux-enabled` (Fedora CoreOS and uCore ship it so) is
+  treated like Podman under SELinux: host preparation labels the data roots, the runtime
+  directory (made at boot by systemd on rootful hosts too) and Quasar's input devices, and
+  installs the NVIDIA rule; Steam-type apps run as `container_engine_t` there as well.
+- **Input without `mknod` (RH-07, #401).** The agent waits for the host's own
+  `/dev/input/eventN` node (through its `/dev/input` bind) for each virtual device it
+  creates, and never creates or removes device nodes. It then proves it can open the node:
+  on a rootless engine that is host preparation's input rule, and the `input_probe` fails
+  with that fix when it is missing. Recipe revision 3 on a rootful engine grants the input
+  devices `c 13:* rw`, dropping `m`.
+- **Media reachability is judged from real traffic (RH-07, #403).** `media_reachability` no
+  longer reads the host's firewall rules, which needed `NET_ADMIN` and which a rootless
+  engine cannot grant. It reads what real sessions showed, from the session's own WebRTC
+  stats:
+  - **pass:** the selected connection's remote address is a browser on another machine;
+  - **fail:** a remote browser offered candidates, the connection failed, and none of its
+    checks arrived (no peer-reflexive candidate). The check names the firewall fix for the
+    host's media port range;
+  - **unknown:** before any session.
+
+  It never blocks. Traffic from the host itself, or from a container or VM on one of its
+  bridges, never counts. The agent image no longer ships `nftables`.
+- **Home files belong to the Quasar user on rootless Podman (RH-07, #404).** Session
+  containers map the app's `PUID`/`PGID` onto the Quasar user (`keep-id`), and start as root
+  when the image names no user, so its entrypoint still initialises the home before
+  dropping privileges. The read-back proves the mapping from Podman's own ID maps. Host
+  preparation gains `--templates DIR`, and on an SELinux Podman host labels the homes and
+  templates roots `container_file_t` with a persistent file context (labels only; nothing
+  is re-owned, SELinux stays enforcing), and labels `/run/quasar-agent` too, where sessions
+  reach the agent's Wayland and PulseAudio sockets (this was also why rootless Podman's
+  audio sidecar never became ready, #411). On SELinux Podman, app containers run as
+  `container_engine_t`, the policy's confined type for nested sandboxes, when the catalog
+  already runs them `seccomp=unconfined` for their own sandboxes, so Steam's and Flatpak's
+  `bwrap` can mount; `container_t` refused them and Steam never showed a window. On
+  an NVIDIA host, host preparation installs a one-rule SELinux module
+  (`quasar-nested-gpu`) giving `container_engine_t` the NVIDIA device access the
+  `container_use_xserver_devices` boolean gives `container_t`, and nothing more. The Steam
+  template's publish check forbids files owned by the app's root as the agent sees that
+  uid (1 under keep-id, where the Quasar user is the agent's 0).
+  The read-back checks the process label. Rootless Docker has no per-container user
+  mapping: its homes keep subordinate IDs. Host preparation's udev rule also labels Quasar's own
+  virtual input devices `container_file_t` on SELinux Podman hosts (#401), so a confined
+  session can read its keyboard, mouse and gamepad; every other input device keeps its
+  label. Host preparation refuses a data root that is a system tree, holds a user's home
+  or contains regex characters, and names the package when an SELinux tool is missing. An
+  update that would take the NVIDIA GPU away from an agent that has it fails before the
+  running agent is touched.
+- **NVIDIA GPUs by CDI (RH-07, #399).** Every container Quasar creates on an NVIDIA host (the
+  node agent, its helpers, app sessions and the actor's GPU probe) asks for the GPU the way
+  its engine can give it: by CDI (`nvidia.com/gpu=all`) on Podman and on a Docker with an
+  NVIDIA CDI device, by `--gpus` on a rootful Docker without one. A rootless Docker with
+  neither gets no GPU and readiness `runtime_cdi` fails naming host preparation, blocking the
+  host (or, on a mixed host, each NVIDIA GPU through `runtime_cdi_gpu<N>`). Podman lists no
+  CDI devices, so there the evidence is the agent's own NVIDIA device node. Each container
+  records the request it was created with and is read back against it, so an engine that
+  gains a CDI specification later does not orphan existing containers. The actor's GPU probe now
+  requires the NVIDIA control node inside the probe container (rootless Podman accepted a
+  `--gpus` request and injected nothing, which read as a yes), and an update that recreates
+  the agent asks the engine again when its revision renders a different request. The driver volume no longer carries the X.Org server
+  modules, and NVIDIA app containers disable lavapipe so a broken ICD cannot fall back to
+  software rendering.
+- **One least-privilege node-agent recipe (RH-07, #402).** Recipe revision 3, applied by the
+  recovery actor in every engine mode (rootful included), removes from the node agent:
+  - the host's `/dev` mount;
+  - `NET_ADMIN` and `SYSLOG`;
+  - `/dev/kmsg`, unless the host allows kernel-log reads (host preparation's
+    `--allow-kernel-log`).
+
+  On a rootless engine it also drops the input device-cgroup rule, which rootless engines
+  refuse; device access there comes from host preparation's udev rules. Host preparation
+  now creates `/run/quasar-agent` for the Quasar user at every boot (`tmpfiles.d`).
+  It adds `label=disable`, since the agent mounts the engine socket. GPU fault messages
+  become an optional diagnostic that reports "skipped" and names the setting. The agent
+  image now requires revision 3; revisions 1 and 2 render exactly as released.
+- **Quasar containers find themselves on Podman, and Podman's health checks are checked
+  (RH-07, #405).**
+  - The agent and the recovery actor recognise Podman's container layout, so they can
+    inspect their own containers (and the NVIDIA driver volume can be located) on Podman.
+  - Every restart-policy update is read back, and a mismatch fails the step (ADR 0007).
+  - A new `engine_healthchecks` readiness check fails, with the fix, when Podman has no
+    systemd session for its user and so could never run the health checks that installs
+    and updates wait on.
+- **The runtime checks what each engine created by that engine's own reporting (RH-07,
+  #397).** Session containers and helpers are still re-inspected and refused if they
+  differ from the request, but Podman is now read by its own rules:
+  - its exact effective capabilities come from its native inspect;
+  - `crun` is accepted as the runtime;
+  - its namespace and `no-new-privileges` spellings are understood;
+  - a device or GPU request it does not report is not taken as granted.
+
+  Anything reported that Quasar did not ask for is still refused, now with the name of the
+  check that failed. Rootful Docker's checks are unchanged. Real-engine tests pass on Docker
+  rootful, Docker rootless and Podman rootless.
+- **Hosts report their container engine (RH-07, #396).**
+  - The agent finds Podman's sockets (rootful and rootless) and honours `CONTAINER_HOST`,
+    after Docker's default. `DOCKER_HOST` and `CONTAINER_HOST` naming different engines is
+    refused as ambiguous.
+  - It reports the engine, its version and its engine mode on `register`. The control plane
+    stores them (migration 0098) and serves them on the host body.
+  - A new `runtime_engine` readiness check names the engine profile. Profiles not yet proven
+    on hardware read as experimental and block nothing.
+  - Engine-socket remediation names Docker and Podman and no longer suggests running the
+    agent as root.
 - **Host preparation (RH-07, #400).** `deploy/prepare-host.sh` is the one step that runs as
   root. For a rootless install it creates the `quasar` account, its subordinate ID ranges and
   lingering. It writes udev rules that give the `quasar` group `/dev/uinput`, Quasar's own
@@ -612,6 +722,27 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Podman's `stopped` health status no longer breaks inspection (RH-07, #404 live).** An
+  exited container whose image has a healthcheck reports health `stopped` on Podman, which
+  Docker's schema lacks; one such container made every inspection unparseable, so the
+  recovery actor refused all updates and the agent could not clean up its own helpers.
+  Inspection now reads an unknown health status as `none`, and one-shot helpers and probes
+  from the agent image run without a healthcheck.
+- **The audio sidecar says why it did not start (RH-07, #411).** When its socket does not
+  appear, the agent stops it and logs its exit state and last output with
+  `token="audio-pulse-socket-timeout"`. The rootless cause itself, the unlabelled
+  `/run/quasar-agent`, is fixed by host preparation (#404).
+- **Image inventory works on Podman.** Podman lists a digest-pulled image's reference twice,
+  and the agent read that as two images claiming one reference and refused its whole image
+  inventory. The same reference on the same image is now one fact. RH-07.
+- **A host whose GPU capacity cannot be read no longer loses its connection in a loop.** Its
+  capacity report carried `gpus: null`, which the control plane tried to store as hardware
+  evidence and failed, closing the connection each time. No GPUs is now an empty list. Found
+  on the first rootless Podman install (RH-07).
+- **The recovery actor finds `/dev/uinput` and `/dev/kmsg` on SELinux hosts.** Its probe
+  checked them with `stat`, which SELinux denies a confined container, so they read as
+  absent and the agent was created without input devices. It now lists `/dev` instead.
+  RH-07, #402.
 - **`uninstall --purge` on a control-only machine no longer prints an empty homes path (#389).**
   It said "Homes under  are host directories"; a control-only machine keeps no homes, so the
   purge report now leaves the homes sentence out there and names the home root everywhere else.

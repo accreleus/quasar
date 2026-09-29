@@ -63,20 +63,15 @@ internet. A scoped rule preserves the rest of the host firewall policy.
 
 ### How Quasar tells you
 
-The node agent's `media_reachability` readiness check probes the host firewall at
-startup and on reconnect, and surfaces its verdict in **Admin, Fleet, Hosts**.
+The node agent's `media_reachability` readiness check is judged from real
+sessions and surfaces in **Admin, Fleet, Hosts**. It does not read the firewall's
+rules. It is unknown until a browser on another machine has tried a session. It
+passes once one connects. It fails when a remote browser's connection attempt
+fails with none of its checks arriving, naming the scoped rule to add below.
 
-It reads the accept rules, not just the chain policy. A default-deny host whose
-rules already cover the ephemeral UDP range and UDP/5353 passes, quoting the
-matched rules. A host covering only one of the two warns and names the missing
-half. A host with no media rule at all gets the warning with the exact scoped
-rule for the firewall tool it detected.
-
-Two limits. The check cannot tell whether a rule's source scope reaches your
-clients, so a rule scoped to the wrong subnet still reads as covered. And
-detection degrades to no finding, not a failure, when no firewall client tool is
-reachable from inside the agent container, which is common on a stock image. Its
-silence is not proof the host is open.
+A pass covers the client that got through, not the whole range: behind a
+stateful firewall a reply can let one peer in, and a rule scoped to the wrong
+subnet still drops other clients.
 
 ### Adding the rule
 

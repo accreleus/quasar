@@ -27,8 +27,7 @@
           "weston", "seatd", "ddcutil", "procps-ng", "iproute",
           "hwdata",
           "avahi", "nss-mdns",
-          "openh264",
-          "nftables"
+          "openh264"
         ],
         "_required_notes": {
           "pulseaudio": "THE DAEMON, not just pulseaudio-libs/-utils. QUASAR_PULSE_IMAGE points at this image; without the daemon binary the agent logs 'silent audio fallback' and every session is mute. This exact package was the 2026-07-26 Tower audio outage.",
@@ -39,8 +38,7 @@
           "ddcutil": "Console local-output mode (CM-08).",
           "hwdata": "Ships /usr/share/hwdata/pci.ids -- the vendor/device id database host-observability GPU model detection falls back to.",
           "avahi": "Chrome sends .local mDNS ICE candidates; libnice resolves them via getaddrinfo INSIDE this container. The resolver stack is container-local even under network_mode:host, so a host-side avahi never reaches the agent.",
-          "vulkan-tools": "vulkaninfo -- the first diagnostic run on any 'no encoder found' report.",
-          "nftables": "#527: provides the `nft` client the #483 media-reachability readiness check (readiness.rs detect_firewall_posture) uses to read the HOST's firewall posture over the shared (network_mode:host) netlink socket. Without it the runtime image had no firewalld/nft/iptables client at all and the check could only report FirewallPosture::Unknown, never the WARN a filtering host should produce."
+          "vulkan-tools": "vulkaninfo -- the first diagnostic run on any 'no encoder found' report."
         },
         "forbidden": [
           "gcc", "gcc-c++", "cmake", "meson", "ninja-build",
@@ -58,11 +56,9 @@
           "curl", "gst-inspect-1.0", "gst-launch-1.0",
           "pulseaudio", "pactl",
           "avahi-daemon", "weston", "seatd",
-          "nft",
           "quasar-node-agent", "quasar-node-agent-entrypoint"
         ],
         "_required_notes": {
-          "nft": "#527: the nftables client readiness.rs's detect_firewall_posture shells out to. See the nftables package note above.",
           "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container."
         },
         "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja", "docker", "podman"],

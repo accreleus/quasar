@@ -35,9 +35,11 @@ pub struct VerifyPolicy {
     pub min_files: u64,
     /// Files whose presence proves the bootstrap ran, relative to the tree root.
     pub marker: &'static str,
-    /// Reject entries owned by uid 0. Skipped in tests (a fixture tree is owned
-    /// by whoever runs the test, which on a CI box may well be root).
-    pub reject_root_owned: bool,
+    /// Reject entries owned by the app's root, as the agent sees that uid: 0, or 1 on
+    /// rootless Podman, where keep-id puts the Quasar user at the agent's 0 and the app's
+    /// root at 1 ([`app_root_uid`]). `None` in tests (a fixture tree is owned by whoever
+    /// runs the test, which on a CI box may well be root).
+    pub reject_owner: Option<u32>,
 }
 
 impl Default for VerifyPolicy {
@@ -49,8 +51,16 @@ impl Default for VerifyPolicy {
             max_bytes: 8u64 << 30,
             min_files: 10_000,
             marker: SANITY_MARKER,
-            reject_root_owned: true,
+            reject_owner: Some(0),
         }
+    }
+}
+
+/// The uid, as the agent sees it, that owns what the app container's root writes.
+pub fn app_root_uid(engine: &crate::buildinfo::EngineIdentity) -> u32 {
+    match (engine.engine.as_deref(), engine.engine_mode.as_deref()) {
+        (Some("podman"), Some("rootless")) => 1,
+        _ => 0,
     }
 }
 
@@ -122,7 +132,7 @@ fn walk(
                 child_rel.display()
             ));
         }
-        if policy.reject_root_owned && meta.uid() == 0 {
+        if policy.reject_owner == Some(meta.uid()) {
             violations.push(format!("root-owned entry: {}", child_rel.display()));
         }
 
@@ -182,7 +192,7 @@ mod tests {
             max_bytes: 1 << 20,
             min_files: 1,
             marker: SANITY_MARKER,
-            reject_root_owned: false,
+            reject_owner: None,
         }
     }
 
@@ -272,5 +282,28 @@ mod tests {
         let err = verify_template(d.path(), &VerifyPolicy::default()).unwrap_err();
         assert!(err.iter().any(|v| v.contains("total size")), "{err:?}");
         assert!(err.iter().any(|v| v.contains("file count")), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod app_root_tests {
+    use super::app_root_uid;
+    use crate::buildinfo::EngineIdentity;
+
+    fn engine(kind: &str, mode: &str) -> EngineIdentity {
+        EngineIdentity {
+            engine: Some(kind.into()),
+            engine_version: None,
+            engine_mode: Some(mode.into()),
+        }
+    }
+
+    /// Under keep-id the Quasar user is the agent's uid 0; the app's root is uid 1.
+    #[test]
+    fn the_apps_root_is_uid_1_only_under_rootless_podman() {
+        assert_eq!(app_root_uid(&engine("podman", "rootless")), 1);
+        assert_eq!(app_root_uid(&engine("podman", "rootful")), 0);
+        assert_eq!(app_root_uid(&engine("docker", "rootless")), 0);
+        assert_eq!(app_root_uid(&EngineIdentity::default()), 0);
     }
 }

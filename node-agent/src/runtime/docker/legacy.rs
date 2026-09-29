@@ -48,7 +48,7 @@ pub(crate) async fn retire_legacy(
             outcome.preserved += 1;
             continue;
         };
-        let detail = match docker.inspect_container(&id, None).await {
+        let detail = match quasar_runtime::docker::inspect_container_tolerant(&docker, &id).await {
             Ok(detail) => detail,
             // Gone between the listing and the inspection: nothing to preserve
             // and nothing this pass removed.
@@ -93,7 +93,7 @@ pub(crate) async fn retire_legacy(
         }
         // Absence of the exact immutable ID is the only proof of removal. A
         // second attempt is never made in this pass; the next boot retries.
-        match docker.inspect_container(&id, None).await {
+        match quasar_runtime::docker::inspect_container_tolerant(&docker, &id).await {
             Err(Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => outcome.removed += 1,

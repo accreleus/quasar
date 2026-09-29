@@ -22,7 +22,9 @@
 #     --unprivileged-port-start N add two optional ones;
 #   - on an NVIDIA host, makes sure an NVIDIA CDI specification exists;
 #   - on Podman, makes the engine start Quasar's containers again at boot;
-#   - with --homes DIR, creates the homes root owned by the Quasar user.
+#   - with --homes DIR (and --templates DIR), creates the homes root (and the templates
+#     root) owned by the Quasar user; on an SELinux Podman host, labels each for
+#     containers (container_file_t), so sessions can write their homes.
 #
 # It writes under /etc, plus the Quasar user's own home and systemd's linger
 # record under /var. It never writes under /usr, so image-based systems
@@ -38,6 +40,7 @@ MODE=""
 ENGINE="auto"
 QUSER="quasar"
 HOMES=""
+TEMPLATES=""
 CONSOLE=0
 KERNEL_LOG=0
 PORT_START=""
@@ -52,6 +55,7 @@ Usage: prepare-host.sh --mode rootless|rootful [options]
   --engine auto|docker|podman   the container engine (default: auto, detected)
   --user NAME                   the Quasar user (default: quasar)
   --homes DIR                   create the homes root DIR, owned by the Quasar user
+  --templates DIR               the same for the templates root (Steam's prepared home)
   --console                     also grant the display, sound and i2c devices
                                 console mode uses
   --allow-kernel-log            optional: let Quasar read GPU fault messages from
@@ -70,6 +74,7 @@ while [ $# -gt 0 ]; do
     --engine) [ $# -ge 2 ] || die "--engine needs a value"; ENGINE="$2"; shift 2 ;;
     --user) [ $# -ge 2 ] || die "--user needs a value"; QUSER="$2"; shift 2 ;;
     --homes) [ $# -ge 2 ] || die "--homes needs a value"; HOMES="$2"; shift 2 ;;
+    --templates) [ $# -ge 2 ] || die "--templates needs a value"; TEMPLATES="$2"; shift 2 ;;
     --console) CONSOLE=1; shift ;;
     --allow-kernel-log) KERNEL_LOG=1; shift ;;
     --unprivileged-port-start) [ $# -ge 2 ] || die "--unprivileged-port-start needs a value"; PORT_START="$2"; shift 2 ;;
@@ -88,10 +93,19 @@ if [ -n "$PORT_START" ]; then
   case "$PORT_START" in ''|*[!0-9]*) die "--unprivileged-port-start must be a port number" ;; esac
   [ "$PORT_START" -ge 1 ] && [ "$PORT_START" -le 1024 ] || die "--unprivileged-port-start must be between 1 and 1024"
 fi
-if [ -n "$HOMES" ]; then
-  case "$HOMES" in /*) ;; *) die "--homes must be an absolute path" ;; esac
-  case "$HOMES" in /|/usr|/usr/*) die "--homes must not be / or under /usr" ;; esac
-fi
+for pair in "homes:$HOMES" "templates:$TEMPLATES"; do
+  opt="${pair%%:*}"; dir="${pair#*:}"
+  [ -n "$dir" ] || continue
+  case "$dir" in /*) ;; *) die "--$opt must be an absolute path" ;; esac
+  case "$dir" in /|/usr|/usr/*) die "--$opt must not be / or under /usr" ;; esac
+  # The path becomes an SELinux file-context regex: plain characters only.
+  case "$dir" in *[!A-Za-z0-9._/-]*|*//*|*/./*|*/../*|*/.|*/..) die "--$opt must be a plain path (letters, digits, . _ - /)" ;; esac
+  # Labelling a system tree for containers would break the host.
+  case "${dir%/}" in
+    /bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/var|/var/home|/var/lib|/var/log|/var/run|/var/tmp)
+      die "--$opt must be a directory of its own, not $dir" ;;
+  esac
+done
 
 live() { [ -z "$R" ]; }
 if live && [ "$(id -u)" != 0 ]; then
@@ -143,6 +157,46 @@ put() {
 
 # stand_in: true when a test root should record the effect of a command `run` skipped.
 stand_in() { ! live && [ "$DRY_RUN" = 0 ]; }
+
+# SELinux confines Podman's containers: a directory they write must carry the container
+# file label. A persistent file-context rule plus restorecon labels it (and anything
+# later created in it); that changes labels, never ownership, and SELinux stays enforcing.
+label_root() { # label_root DIR
+  re="$(printf '%s\n' "$1" | awk '{ gsub(/\./, "\\."); print }')"
+  # Never an existing user's home, or a directory holding one: it would be relabelled.
+  if awk -F: -v d="$1" '$6 == d || index($6, d "/") == 1 {f=1} END {exit !f}' "$R/etc/passwd" 2>/dev/null; then
+    die "$1 is, or holds, a user's home directory; choose a directory of its own for Quasar"
+  fi
+  if live; then
+    for tool in semanage restorecon; do
+      have "$tool" || die "$tool was not found: install policycoreutils-python-utils (on an image-based system: rpm-ostree install policycoreutils-python-utils, then reboot), then run this again"
+    done
+    if semanage fcontext -l -C 2>/dev/null | awk -v r="$re(/.*)?" '$1 == r && /container_file_t/ {f=1} END {exit !f}'; then
+      say ok "SELinux label on $1"; return
+    fi
+  elif grep -qxF "$1" "$R/.selinux-fcontext" 2>/dev/null; then
+    say ok "SELinux label on $1"; return
+  fi
+  if [ "$DRY_RUN" = 1 ]; then say would "label $1 for containers (container_file_t)"; return; fi
+  run semanage fcontext -a -t container_file_t "$re(/.*)?"
+  run restorecon -R "$1"
+  stand_in && printf '%s\n' "$1" >> "$R/.selinux-fcontext"
+  say changed "SELinux label on $1 — sessions in confined containers can write there; labels only, nothing is re-owned"
+}
+
+# containers_selinux: the engine confines its containers with SELinux here, so what they
+# share needs the label. Podman always does; Docker when its daemon runs --selinux-enabled
+# (Fedora CoreOS and uCore ship it so).
+docker_selinux() {
+  { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; } || return 1
+  grep -qs -- '--selinux-enabled' "$R/usr/lib/systemd/system/docker.service" \
+      "$R/etc/systemd/system/docker.service" "$R"/etc/systemd/system/docker.service.d/*.conf \
+    || grep -qs '"selinux-enabled"[[:space:]]*:[[:space:]]*true' "$R/etc/docker/daemon.json"
+}
+containers_selinux() {
+  [ -d "$R/sys/fs/selinux" ] || return 1
+  [ "$ENGINE" = podman ] || [ "$ENGINE" = both ] || docker_selinux
+}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -222,12 +276,41 @@ else
   fi
 fi
 
+# ── the agent's runtime directory ──────────────────────────────────────────
+STEP="runtime directory"
+# The node agent shares /run/quasar-agent with the sessions it starts, at the same path
+# on the host and in every container. /run is root's, and a rootless engine will not
+# create a missing bind source, so systemd creates it for the Quasar user at every boot.
+if [ "$MODE" = rootless ]; then
+  printf '# Written by Quasar host preparation. The node agent'"'"'s runtime directory, shared with its sessions.\nd /run/quasar-agent 0750 %s %s -\n' "$QUSER" "$QUSER" \
+    | put /etc/tmpfiles.d/quasar.conf 0644 "/run/quasar-agent for $QUSER, recreated at every boot (a rootless engine cannot create it)" || unchanged
+  # Always applied (idempotent): it also corrects the owner and mode of a directory a
+  # rootful install, or an engine creating a missing bind source, left behind as root's.
+  run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
+  stand_in && mkdir -p "$R/run/quasar-agent"
+elif containers_selinux; then
+  # Rootful: the engine would create a missing bind source itself, but unlabelled. Made
+  # at boot by systemd, it takes the container label the rule below records.
+  printf '# Written by Quasar host preparation. The node agent'"'"'s runtime directory, shared with its sessions.\nd /run/quasar-agent 0755 root root -\n' \
+    | put /etc/tmpfiles.d/quasar.conf 0644 "/run/quasar-agent, made at every boot with its SELinux label" || unchanged
+  run systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
+  stand_in && mkdir -p "$R/run/quasar-agent"
+fi
+# Sessions connect to the Wayland and PulseAudio sockets the agent makes here.
+if containers_selinux && { [ -d "$R/run/quasar-agent" ] || [ "$DRY_RUN" = 1 ]; }; then
+  label_root /run/quasar-agent
+fi
+
 # ── device access ──────────────────────────────────────────────────────────
 STEP="device rules"
 SETFACL=""
 for p in /usr/bin/setfacl /bin/setfacl; do [ -x "$R$p" ] || [ -x "$p" ] && { SETFACL="$p"; break; }; done
 [ -n "$SETFACL" ] || die "setfacl was not found (install the acl package). The device rules add access with it rather than changing a device's owner."
 acl="ACTION!=\"remove\", ENV{DEVNAME}==\"?*\", RUN+=\"$SETFACL -m g:$QUSER:rw \$devnode\""
+# Under SELinux a confined session may not open event_device_t nodes. Quasar's own input
+# devices, and only those, get the container file type (the rest keep theirs).
+input_label=""
+containers_selinux && input_label=', SECLABEL{selinux}="system_u:object_r:container_file_t:s0"'
 {
   cat <<EOF
 # Written by Quasar's host preparation (deploy/prepare-host.sh). Re-run it to change this file.
@@ -237,7 +320,7 @@ acl="ACTION!=\"remove\", ENV{DEVNAME}==\"?*\", RUN+=\"$SETFACL -m g:$QUSER:rw \$
 # Creating virtual input devices (keyboard, mouse, gamepad, touch).
 KERNEL=="uinput", SUBSYSTEM=="misc", $acl
 # The input devices Quasar itself creates, matched by name, and no others.
-SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{name}=="Quasar Virtual *", $acl
+SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{name}=="Quasar Virtual *", $acl$input_label
 # GPU render nodes: hardware encode and rendering.
 SUBSYSTEM=="drm", KERNEL=="renderD*", $acl
 EOF
@@ -357,7 +440,7 @@ if [ -e "$R/proc/driver/nvidia/version" ]; then
   # containers under SELinux, and the policy's own boolean for exactly that label is
   # what lets them open the GPU: narrower than disabling labels for the container.
   bool="$R/sys/fs/selinux/booleans/container_use_xserver_devices"
-  if { [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; } && [ -f "$bool" ]; then
+  if containers_selinux && [ -f "$bool" ]; then
     case "$(cat "$bool")" in
       1*) say ok "SELinux container_use_xserver_devices on" ;;
       *)
@@ -366,6 +449,27 @@ if [ -e "$R/proc/driver/nvidia/version" ]; then
         say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux container_use_xserver_devices on — lets confined containers open the NVIDIA device nodes (labelled xserver_misc_device_t), and nothing else; SELinux stays enforcing"
         ;;
     esac
+    # Sessions run as container_engine_t, the policy's confined type for nested sandboxes
+    # (Steam's bwrap). The boolean above covers container_t only; this one rule gives
+    # container_engine_t the same NVIDIA device access, and nothing more.
+    printf '%s\n' '; Written by Quasar host preparation (deploy/prepare-host.sh).' \
+      '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' \
+      | put /etc/quasar/selinux/quasar-nested-gpu.cil 0644 "the NVIDIA device rule for sessions' nested-sandbox SELinux type" || unchanged
+    if live && ! have semodule; then
+      die "semodule was not found: install policycoreutils, then run this again"
+    fi
+    if live && semodule -l 2>/dev/null | grep -qx quasar-nested-gpu \
+        && cmp -s "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"; then
+      say ok "SELinux module quasar-nested-gpu"
+    elif ! live && grep -qx quasar-nested-gpu "$R/.selinux-modules" 2>/dev/null; then
+      say ok "SELinux module quasar-nested-gpu"
+    else
+      run semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil
+      # What was loaded, so a changed rule is loaded again on the next run.
+      [ "$DRY_RUN" = 1 ] || cp "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"
+      stand_in && echo quasar-nested-gpu >> "$R/.selinux-modules"
+      say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module quasar-nested-gpu — lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
+    fi
   fi
 else
   say skipped "NVIDIA CDI specification — no NVIDIA driver loaded"
@@ -428,30 +532,49 @@ if [ "$ENGINE" = podman ] || [ "$ENGINE" = both ]; then
     fi
   fi
 fi
+# Rootful Docker restarts Quasar's containers itself, but only once its daemon runs: some
+# systems (Fedora CoreOS, uCore) ship it disabled.
+if [ "$MODE" = rootful ] && { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; }; then
+  link="/etc/systemd/system/multi-user.target.wants/docker.service"
+  if [ -L "$R$link" ] || [ -e "$R$link" ]; then
+    say ok "docker.service enabled"
+  elif [ -e "$R/usr/lib/systemd/system/docker.service" ]; then
+    run systemctl enable docker.service
+    stand_in && { mkdir -p "$(dirname "$R$link")" && ln -s /usr/lib/systemd/system/docker.service "$R$link"; }
+    say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "docker.service enabled — the daemon, and with it Quasar's containers, start at boot"
+  fi
+fi
 if [ "$MODE" = rootless ] && { [ "$ENGINE" = docker ] || [ "$ENGINE" = both ]; }; then
   say note "rootless Docker: install it for $QUSER with dockerd-rootless-setuptool.sh and enable its docker.service; lingering (above) keeps it running"
 fi
 
-# ── the homes root ─────────────────────────────────────────────────────────
-STEP="homes root"
-if [ -n "$HOMES" ]; then
-  if [ -d "$R$HOMES" ]; then
-    owner="$(stat -c %U "$R$HOMES" 2>/dev/null || echo unknown)"
+# ── the homes and templates roots ──────────────────────────────────────────
+data_root() { # data_root DIR WHAT
+  if [ -d "$R$1" ]; then
+    owner="$(stat -c %U "$R$1" 2>/dev/null || echo unknown)"
     if live && [ "$owner" != "$QUSER" ] && [ "$MODE" = rootless ]; then
-      say warn "$HOMES exists and is owned by $owner, not $QUSER. Quasar will not re-own it: give $QUSER write access to that one directory, or choose another --homes"
+      say warn "$1 exists and is owned by $owner, not $QUSER. Quasar will not re-own it: give $QUSER write access to that one directory, or choose another path"
     else
-      say ok "homes root $HOMES"
+      say ok "$2 $1"
     fi
   elif [ "$MODE" = rootful ]; then
-    say skipped "homes root $HOMES — a rootful install keeps today's ownership, which the installer sets"
+    say skipped "$2 $1 — a rootful install keeps today's ownership, which the installer sets"
   elif [ "$DRY_RUN" = 1 ]; then
-    say would "create $HOMES owned by $QUSER"
+    say would "create $1 owned by $QUSER"
   else
-    run install -d -m 0750 -o "$QUSER" -g "$QUSER" "$HOMES"
-    stand_in && mkdir -p "$R$HOMES"
-    say changed "homes root $HOMES — where each user's game saves and settings live"
+    run install -d -m 0750 -o "$QUSER" -g "$QUSER" "$1"
+    stand_in && mkdir -p "$R$1"
+    say changed "$2 $1 — $3"
   fi
-fi
+  if containers_selinux && { [ -d "$R$1" ] || [ "$DRY_RUN" = 1 ]; }; then
+    label_root "$1"
+  fi
+}
+
+STEP="homes root"
+[ -n "$HOMES" ] && data_root "$HOMES" "homes root" "where each user's game saves and settings live"
+STEP="templates root"
+[ -n "$TEMPLATES" ] && data_root "$TEMPLATES" "templates root" "where prepared app homes (Steam) are kept"
 
 STEP="done"
 printf 'Host preparation is complete. Run it again at any time: it changes only what is missing.\n'

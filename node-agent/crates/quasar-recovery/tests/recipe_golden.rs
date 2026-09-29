@@ -32,6 +32,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         template_root: "/var/lib/quasar/templates".into(),
         docker_socket: "/var/run/docker.sock".into(),
         gpu: GpuFacts {
+            cdi: false,
             unknown: Default::default(),
             vendor,
             render_node: render_node.map(str::to_owned),
@@ -40,6 +41,10 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         },
         devices: HostDevices {
             unknown: Default::default(),
+            kernel_log: false,
+            engine_rootless: false,
+            host_sysfs: false,
+            fuse: false,
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,
@@ -90,6 +95,121 @@ fn node_agent_revision_1_renders_its_golden_specification_per_vendor() {
         .unwrap();
         check(file, &spec);
     }
+}
+
+#[test]
+fn node_agent_revision_3_renders_its_golden_specification_per_vendor() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    for (vendor, file) in [
+        (Some(GpuVendor::Nvidia), "node-agent-r3-nvidia.json"),
+        (Some(GpuVendor::Amd), "node-agent-r3-amd.json"),
+        (Some(GpuVendor::Intel), "node-agent-r3-intel.json"),
+        (None, "node-agent-r3-none.json"),
+    ] {
+        let spec = render(
+            Role::NodeAgent,
+            3,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        check(file, &spec);
+    }
+}
+
+/// RH-07 #402 (D1, P1): revision 3 is one least-privilege recipe for every engine mode.
+/// The agent holds none of the host's /dev, NET_ADMIN, SYSLOG or /dev/kmsg, and carries
+/// label=disable because it mounts the engine socket. Kernel-log access, an optional
+/// diagnostic, comes back only when the host allows unprivileged reads of it.
+#[test]
+fn node_agent_revision_3_holds_none_of_the_removed_access() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    for vendor in [Some(GpuVendor::Nvidia), Some(GpuVendor::Amd), None] {
+        let spec = render(
+            Role::NodeAgent,
+            3,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        assert!(
+            !spec
+                .binds
+                .iter()
+                .any(|b| b.source == "/dev" || b.target == "/host/dev"),
+            "{vendor:?}: host /dev is mounted"
+        );
+        assert!(spec.cap_add.is_empty(), "{vendor:?}: {:?}", spec.cap_add);
+        assert!(
+            spec.security_opt.iter().any(|o| o == "label=disable"),
+            "{vendor:?}: the engine socket needs label=disable on SELinux hosts"
+        );
+        assert!(
+            !spec.devices.iter().any(|d| d.host == "/dev/kmsg"),
+            "{vendor:?}: /dev/kmsg without the host allowing it"
+        );
+    }
+    let mut allowed = inputs(Some(GpuVendor::Nvidia));
+    allowed.devices.kernel_log = true;
+    let spec = render(Role::NodeAgent, 3, &allowed, &image, &agent_secrets()).unwrap();
+    let kmsg = spec
+        .devices
+        .iter()
+        .find(|d| d.host == "/dev/kmsg")
+        .expect("kmsg when allowed");
+    assert_eq!(kmsg.permissions, "r");
+    assert!(
+        spec.cap_add.is_empty(),
+        "never SYSLOG: the host setting is what allows the read"
+    );
+    // On a rootless engine, which refuses device-cgroup rules, revision 3 carries none.
+    let mut rootless = inputs(Some(GpuVendor::Nvidia));
+    rootless.devices.engine_rootless = true;
+    let spec = render(Role::NodeAgent, 3, &rootless, &image, &agent_secrets()).unwrap();
+    assert!(
+        spec.device_cgroup_rules.is_empty(),
+        "{:?}",
+        spec.device_cgroup_rules
+    );
+    check("node-agent-r3-nvidia-rootless.json", &spec);
+    // Where the engine served the GPU through CDI, revision 3 asks by CDI.
+    let mut cdi = rootless.clone();
+    cdi.gpu.cdi = true;
+    let spec = render(Role::NodeAgent, 3, &cdi, &image, &agent_secrets()).unwrap();
+    assert_eq!(spec.gpus.len(), 1);
+    assert_eq!(spec.gpus[0].driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        spec.gpus[0].device_ids,
+        vec!["nvidia.com/gpu=all".to_string()]
+    );
+    check("node-agent-r3-nvidia-rootless-cdi.json", &spec);
+    // Rootless Docker mounts no sysfs for a host-network container: the host's, read-only.
+    let mut docker_rootless = cdi.clone();
+    docker_rootless.devices.host_sysfs = true;
+    let spec = render(
+        Role::NodeAgent,
+        3,
+        &docker_rootless,
+        &image,
+        &agent_secrets(),
+    )
+    .unwrap();
+    check("node-agent-r3-nvidia-docker-rootless.json", &spec);
+    // Revisions 1 and 2 never ask by CDI.
+    let r2 = render(Role::NodeAgent, 2, &cdi, &image, &agent_secrets()).unwrap();
+    assert!(r2.gpus.iter().all(|g| g.device_ids.is_empty()));
+    // Revisions 1 and 2 render exactly as released.
+    let r1 = render(
+        Role::NodeAgent,
+        1,
+        &inputs(Some(GpuVendor::Nvidia)),
+        &image,
+        &agent_secrets(),
+    )
+    .unwrap();
+    assert!(r1.cap_add.contains(&"NET_ADMIN".to_string()));
 }
 
 #[test]
@@ -151,7 +271,7 @@ fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
     let image = ImageRef::parse(AGENT_IMAGE).unwrap();
     for (role, revision) in [
         (Role::NodeAgent, 0),
-        (Role::NodeAgent, 3),
+        (Role::NodeAgent, 4),
         (Role::RecoveryActor, 2),
         (Role::ControlPlane, 0),
         (Role::ControlPlane, 3),
@@ -371,6 +491,9 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
     check("control-plane-r1-control-only-external.json", &spec);
     let spec = render(Role::NodeAgent, 2, &owned, &agent, &local_agent_secrets()).unwrap();
     check("node-agent-r2-combined-amd.json", &spec);
+    // Revision 3 on a combined host (RH-07 #402).
+    let spec = render(Role::NodeAgent, 3, &owned, &agent, &local_agent_secrets()).unwrap();
+    check("node-agent-r3-combined-amd.json", &spec);
 
     // Revision 2 (#365): Add host's install-time images are fallbacks below the installed
     // release, and only the operator's overrides reach QUASAR_ENROLL_*.

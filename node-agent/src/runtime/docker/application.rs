@@ -16,6 +16,11 @@ use bollard::{
 };
 use futures_util::StreamExt;
 
+use super::dialect::{
+    is_nvidia_request, nvidia_device_request, recorded_injection, Engine, Namespace,
+};
+use crate::runtime::GpuInjection;
+
 use crate::runtime::application::{
     ApplicationIntent, ApplicationJournal, ApplicationMount, ApplicationPhase, ImageVolumeIdentity,
     NvidiaParamsRepair,
@@ -37,8 +42,8 @@ const MAX_LOG_BYTES: usize = 16 * 1024;
 const LOG_TAIL_LINES: usize = 100;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 
-async fn open(config: &RuntimeConfig) -> Result<bollard::Docker, RuntimeError> {
-    Ok(super::discover(config).await?.0)
+async fn open(config: &RuntimeConfig) -> Result<Engine, RuntimeError> {
+    super::dialect::open(config).await
 }
 
 const REPAIR_MAX_STAGE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -322,7 +327,32 @@ fn owns(intent: &ApplicationIntent, config: &RuntimeConfig, owner: &str) -> bool
     intent.socket == config.socket && intent.owner == owner
 }
 
-fn body(intent: &ApplicationIntent) -> ContainerCreateBody {
+/// The container's user. Under keep-id Podman starts the process as the mapped user, so an
+/// image that names none is started as root explicitly: its entrypoint initialises the
+/// home as root, then drops to PUID.
+fn expected_user(intent: &ApplicationIntent) -> Option<&String> {
+    static ROOT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "0".to_string());
+    let image = intent.image_user.as_ref().filter(|u| !u.is_empty());
+    match (intent.keep_id, image) {
+        (Some(_), None) => Some(&ROOT),
+        (_, image) => image,
+    }
+}
+
+/// `PUID`/`PGID` from the request's environment, the ids the image drops to (1000 when
+/// unset, as the images default).
+fn app_ids(environment: &[String]) -> (u32, u32) {
+    let id = |key: &str| {
+        environment
+            .iter()
+            .rev()
+            .find_map(|e| e.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+            .unwrap_or(1000)
+    };
+    (id("PUID"), id("PGID"))
+}
+
+fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> ContainerCreateBody {
     let r = &intent.request;
     let environment = canonical_env(&r.environment);
     let mut labels = HashMap::new();
@@ -332,6 +362,8 @@ fn body(intent: &ApplicationIntent) -> ContainerCreateBody {
         // Resolve the mutable reference before journalling and create from the
         // immutable digest; the original reference remains caller evidence.
         image: Some(intent.image_id.clone().unwrap_or_else(|| r.image.clone())),
+        // Set only under keep-id: otherwise the image's own user applies, as it always did.
+        user: intent.keep_id.and(expected_user(intent)).cloned(),
         entrypoint: r.entrypoint.clone(),
         // Omission preserves the image's Cmd; an explicit empty vector does
         // not. The same distinction applies to Entrypoint above.
@@ -340,6 +372,9 @@ fn body(intent: &ApplicationIntent) -> ContainerCreateBody {
         labels: Some(labels),
         host_config: Some(HostConfig {
             network_mode: Some(r.network.clone()),
+            userns_mode: intent
+                .keep_id
+                .map(|(uid, gid)| format!("keep-id:uid={uid},gid={gid}")),
             auto_remove: Some(false),
             cap_drop: r.security.cap_drop_all.then_some(vec!["ALL".into()]),
             cap_add: Some(r.security.cap_add.clone()),
@@ -347,6 +382,9 @@ fn body(intent: &ApplicationIntent) -> ContainerCreateBody {
                 let mut options = r.security.security_opt.clone();
                 if r.security.no_new_privileges {
                     options.push("no-new-privileges:true".into());
+                }
+                if intent.nested_sandbox_label {
+                    options.push(super::dialect::NESTED_SANDBOX_LABEL.into());
                 }
                 options
             }),
@@ -366,12 +404,10 @@ fn body(intent: &ApplicationIntent) -> ContainerCreateBody {
                     })
                     .collect(),
             ),
-            device_requests: r.nvidia_gpu.then_some(vec![DeviceRequest {
-                driver: Some("nvidia".into()),
-                count: Some(-1),
-                capabilities: Some(vec![vec!["gpu".into()]]),
-                ..Default::default()
-            }]),
+            device_requests: match (r.nvidia_gpu, injection) {
+                (true, Some(injection)) => Some(vec![nvidia_device_request(injection)]),
+                _ => None,
+            },
             binds: Some(r.mounts.clone()),
             mounts: Some(
                 r.typed_mounts
@@ -625,31 +661,6 @@ fn matches_realized_legacy(actual: &bollard::models::MountPoint, wanted: &Legacy
         && actual.rw == Some(!wanted.read_only)
 }
 
-fn exact_nvidia_all_request(request: &DeviceRequest) -> bool {
-    request.driver.as_deref() == Some("nvidia")
-        && request.count == Some(-1)
-        && request.device_ids.as_ref().is_none_or(Vec::is_empty)
-        && request.capabilities.as_deref() == Some(&[vec!["gpu".to_owned()]])
-        && request.options.as_ref().is_none_or(HashMap::is_empty)
-}
-
-fn canonical_capabilities(values: Option<&Vec<String>>) -> Vec<String> {
-    let mut values = values
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| value.trim_start_matches("CAP_").to_ascii_uppercase())
-        .collect::<Vec<_>>();
-    values.sort();
-    values
-}
-
-fn canonical_security_options(values: Option<&Vec<String>>) -> Vec<String> {
-    let mut values = values.cloned().unwrap_or_default();
-    values.sort();
-    values
-}
-
 fn explicit_mount_targets(request: &ApplicationRequest) -> Result<Vec<String>, RuntimeError> {
     let mut targets = Vec::with_capacity(request.mounts.len() + request.typed_mounts.len());
     for mount in &request.mounts {
@@ -710,8 +721,7 @@ async fn inspect_identity_state(
     intent: &ApplicationIntent,
 ) -> Result<ApplicationState, RuntimeError> {
     let id = identity(intent)?;
-    let info = docker
-        .inspect_container(id.as_str(), None)
+    let info = quasar_runtime::docker::inspect_container_tolerant(docker, id.as_str())
         .await
         .map_err(uncertain)?;
     if info.id.as_deref() != Some(id.as_str())
@@ -755,15 +765,32 @@ async fn inspect_identity_state(
     }
 }
 
+/// A container that is not exactly what Quasar asked for: logged with what differed, and
+/// reported to the caller as a protocol refusal (the launch fails and the container is
+/// removed; nothing is retried with more privilege).
+fn refuse(what: &str, dialect: super::dialect::Dialect) -> RuntimeError {
+    tracing::warn!(
+        token = "runtime-readback-refused",
+        check = what,
+        engine = ?dialect,
+        "the engine created an application container that differs from the request in its \
+         {what}; refusing it"
+    );
+    ErrorKind::Protocol.into()
+}
+
 async fn inspect_owned(
-    docker: &bollard::Docker,
+    engine: &Engine,
     intent: &ApplicationIntent,
 ) -> Result<(ApplicationState, Vec<ImageVolumeIdentity>), RuntimeError> {
     let id = identity(intent)?;
-    let info = docker
+    let info = engine
         .inspect_container(id.as_str(), None)
         .await
         .map_err(uncertain)?;
+    // What each engine reports differs; the rules for each live in `dialect` (#397).
+    let dialect = engine.dialect;
+    let podman = engine.podman_facts(id.as_str()).await?;
     if info.id.as_deref() != Some(id.as_str())
         || info.name.as_deref() != Some(format!("/{}", intent.request.name).as_str())
         || intent
@@ -782,13 +809,14 @@ async fn inspect_owned(
             .and_then(|c| c.labels.as_ref())
             .and_then(|v| v.get(OPERATION_LABEL))
             != Some(&intent.request.operation)
-        || info.config.as_ref().and_then(|c| c.image.as_deref())
-            != Some(
-                intent
-                    .image_id
-                    .as_deref()
-                    .unwrap_or(intent.request.image.as_str()),
-            )
+        || (dialect.echoes_config_image()
+            && info.config.as_ref().and_then(|c| c.image.as_deref())
+                != Some(
+                    intent
+                        .image_id
+                        .as_deref()
+                        .unwrap_or(intent.request.image.as_str()),
+                ))
     {
         return Err(ErrorKind::UnknownOutcome.into());
     }
@@ -830,112 +858,163 @@ async fn inspect_owned(
     );
     if normalized_argv(config.entrypoint.as_ref()) != entrypoint
         || normalized_argv(config.cmd.as_ref()) != command
-        || normalized_user(config.user.as_ref()) != normalized_user(intent.image_user.as_ref())
+        || normalized_user(config.user.as_ref()) != expected_user(intent)
     {
         return Err(ErrorKind::Protocol.into());
     }
     let host = info.host_config.as_ref().ok_or(ErrorKind::UnknownOutcome)?;
     let normalized = |values: Option<&Vec<String>>| values.cloned().unwrap_or_default();
-    if host.network_mode.as_deref() != Some(&intent.request.network)
-        || host.auto_remove.unwrap_or(false)
-        || host.privileged.unwrap_or(false)
-        || host
-            .pid_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty() && mode != "private")
-        || host
-            .ipc_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty() && mode != "private")
-        || host
-            .uts_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty())
-        || host
-            .userns_mode
-            .as_deref()
-            .is_some_and(|mode| !mode.is_empty())
-        || matches!(
-            host.cgroupns_mode,
-            Some(bollard::models::HostConfigCgroupnsModeEnum::HOST)
-        )
-        || host.runtime.as_deref().is_some_and(|runtime| {
-            !runtime.is_empty()
-                && runtime != "runc"
-                && !(intent.request.nvidia_gpu && runtime == "nvidia")
-        })
-        || host.readonly_rootfs.unwrap_or(false) != intent.request.security.read_only_rootfs
-        || host.pids_limit != Some(intent.request.security.pids_limit)
-        || host.shm_size != Some(intent.request.security.shm_size)
-        || normalized(host.group_add.as_ref()) != intent.request.group_add
-        || normalized(host.binds.as_ref()) != intent.request.mounts
-        || canonical_capabilities(host.cap_add.as_ref())
-            != canonical_capabilities(Some(&intent.request.security.cap_add))
-        || canonical_capabilities(host.cap_drop.as_ref())
-            != if intent.request.security.cap_drop_all {
-                vec![String::from("ALL")]
-            } else {
-                Vec::new()
-            }
-    {
-        return Err(ErrorKind::Protocol.into());
-    }
     let mut wanted_security = intent.request.security.security_opt.clone();
     if intent.request.security.no_new_privileges {
         wanted_security.push("no-new-privileges:true".into());
     }
-    if canonical_security_options(host.security_opt.as_ref())
-        != canonical_security_options(Some(&wanted_security))
-    {
-        return Err(ErrorKind::Protocol.into());
+    if intent.nested_sandbox_label {
+        wanted_security.push(super::dialect::NESTED_SANDBOX_LABEL.into());
     }
-    if intent.request.security.systempaths_unconfined
-        && (host.masked_paths.as_deref() != Some(&[])
-            || host.readonly_paths.as_deref() != Some(&[]))
-    {
-        return Err(ErrorKind::Protocol.into());
+    // Each check names what it guards, so a refusal says why (#397). Any one failing
+    // refuses the container; nothing here ever retries with more privilege.
+    let refusals: [(bool, &str); 19] = [
+        (
+            host.network_mode.as_deref() != Some(&intent.request.network),
+            "network mode",
+        ),
+        (host.auto_remove.unwrap_or(false), "auto-remove"),
+        (host.privileged.unwrap_or(false), "privileged"),
+        (
+            !dialect.default_namespace(Namespace::Pid, host.pid_mode.as_deref()),
+            "pid namespace",
+        ),
+        (
+            !dialect.default_namespace(Namespace::Ipc, host.ipc_mode.as_deref()),
+            "ipc namespace",
+        ),
+        (
+            !dialect.default_namespace(Namespace::Uts, host.uts_mode.as_deref()),
+            "uts namespace",
+        ),
+        (
+            match intent.keep_id {
+                None => host
+                    .userns_mode
+                    .as_deref()
+                    .is_some_and(|mode| !mode.is_empty()),
+                Some((uid, gid)) => {
+                    !matches!(host.userns_mode.as_deref(), None | Some("" | "private"))
+                        || !super::dialect::keep_id_ok(podman.as_ref(), uid, gid)
+                }
+            },
+            "user namespace mode",
+        ),
+        (
+            matches!(
+                host.cgroupns_mode,
+                Some(bollard::models::HostConfigCgroupnsModeEnum::HOST)
+            ),
+            "host cgroup namespace",
+        ),
+        (
+            !dialect.runtime_ok(
+                host.runtime.as_deref(),
+                podman.as_ref(),
+                intent.request.nvidia_gpu,
+            ),
+            "container runtime",
+        ),
+        (
+            host.readonly_rootfs.unwrap_or(false) != intent.request.security.read_only_rootfs,
+            "read-only root filesystem",
+        ),
+        (
+            host.pids_limit != Some(intent.request.security.pids_limit),
+            "pids limit",
+        ),
+        (
+            host.shm_size != Some(intent.request.security.shm_size),
+            "shm size",
+        ),
+        (
+            normalized(host.group_add.as_ref()) != intent.request.group_add,
+            "supplementary groups",
+        ),
+        (
+            dialect.echoes_mount_requests()
+                && normalized(host.binds.as_ref()) != intent.request.mounts,
+            "bind requests",
+        ),
+        (
+            !dialect.capabilities_ok(
+                host.cap_add.as_ref(),
+                host.cap_drop.as_ref(),
+                podman.as_ref(),
+                &intent.request.security.cap_add,
+                intent.request.security.cap_drop_all,
+            ),
+            "capabilities",
+        ),
+        (
+            dialect.security_options(host.security_opt.as_ref())
+                != dialect.security_options(Some(&wanted_security)),
+            "security options",
+        ),
+        (
+            intent.request.security.systempaths_unconfined
+                && dialect.reports_masked_paths()
+                && (host.masked_paths.as_deref() != Some(&[])
+                    || host.readonly_paths.as_deref() != Some(&[])),
+            "masked paths",
+        ),
+        (
+            !dialect.devices_ok(
+                host.devices.as_deref().unwrap_or(&[]),
+                &intent.request.devices,
+                intent.request.nvidia_gpu,
+            ),
+            "devices",
+        ),
+        (
+            !dialect.mount_propagation_ok(podman.as_ref()),
+            "mount propagation",
+        ),
+    ];
+    if let Some((_, what)) = refusals.iter().find(|(refused, _)| *refused) {
+        return Err(refuse(what, dialect));
     }
-    let devices = host.devices.as_deref().unwrap_or(&[]);
-    if devices.len() != intent.request.devices.len()
-        || devices
-            .iter()
-            .zip(&intent.request.devices)
-            .any(|(actual, wanted)| {
-                actual.path_on_host.as_deref() != Some(wanted)
-                    || actual.path_in_container.as_deref() != Some(wanted)
-                    || actual.cgroup_permissions.as_deref() != Some("rwm")
-            })
+    if intent.nested_sandbox_label
+        && info
+            .process_label
+            .as_deref()
+            .is_none_or(|label| label.split(':').nth(2) != Some("container_engine_t"))
     {
-        return Err(ErrorKind::Protocol.into());
+        return Err(refuse("selinux process label", dialect));
     }
-    if intent.request.nvidia_gpu {
-        if !matches!(host.device_requests.as_deref(), Some([request]) if exact_nvidia_all_request(request))
-        {
-            return Err(ErrorKind::Protocol.into());
-        }
-    } else if host
-        .device_requests
-        .as_ref()
-        .is_some_and(|requests| !requests.is_empty())
-    {
-        return Err(ErrorKind::Protocol.into());
+    let injection = recorded_injection(intent.request.nvidia_gpu, intent.gpu_injection);
+    let nvidia_request =
+        |r: &DeviceRequest| injection.is_some_and(|injection| is_nvidia_request(injection, r));
+    let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &nvidia_request;
+    if !dialect.device_requests_ok(
+        host.device_requests.as_ref(),
+        intent.request.nvidia_gpu.then_some(nvidia_request),
+    ) {
+        return Err(refuse("device requests", dialect));
     }
     // HostConfig.Mounts carries the requested typed details that are absent from
     // MountPoint (CreateMountpoint, NoCopy, consistency). Check it separately
     // from MountPoint, whose source/type/RW values prove what Docker realized.
-    let requested_typed = host.mounts.as_deref().unwrap_or(&[]);
-    let mut unmatched_typed = requested_typed.iter().collect::<Vec<_>>();
-    for wanted in &intent.request.typed_mounts {
-        let Some(position) = unmatched_typed
-            .iter()
-            .position(|actual| matches_typed_request(actual, wanted))
-        else {
+    if dialect.echoes_mount_requests() {
+        let requested_typed = host.mounts.as_deref().unwrap_or(&[]);
+        let mut unmatched_typed = requested_typed.iter().collect::<Vec<_>>();
+        for wanted in &intent.request.typed_mounts {
+            let Some(position) = unmatched_typed
+                .iter()
+                .position(|actual| matches_typed_request(actual, wanted))
+            else {
+                return Err(ErrorKind::Protocol.into());
+            };
+            unmatched_typed.remove(position);
+        }
+        if !unmatched_typed.is_empty() {
             return Err(ErrorKind::Protocol.into());
-        };
-        unmatched_typed.remove(position);
-    }
-    if !unmatched_typed.is_empty() {
-        return Err(ErrorKind::Protocol.into());
+        }
     }
     let legacy = intent
         .request
@@ -1076,6 +1155,44 @@ pub(crate) async fn start(
                 Ok(_) => return Err(ErrorKind::UnknownOutcome.into()),
                 Err(e) => return Err(super::classify(e)),
             }
+            // Decided before anything is journalled: an engine that cannot be given the GPU
+            // is refused here, never given more privilege, and leaves no intent behind.
+            let gpu_injection = if request.nvidia_gpu {
+                match docker.gpu_injection().await? {
+                    Some(injection) => Some(injection),
+                    None => {
+                        tracing::warn!(
+                            token = "runtime-gpu-injection-unavailable",
+                            "this engine cannot be given an NVIDIA GPU (no NVIDIA CDI device, and \
+                             not a rootful Docker): refusing the launch; host preparation writes \
+                             the CDI specification"
+                        );
+                        return Err(ErrorKind::InvalidConfiguration.into());
+                    }
+                }
+            } else {
+                None
+            };
+            // D14: rootless Podman maps the app's ids onto the Quasar user. Rootless Docker
+            // has no per-container mapping; its homes keep subordinate ids (a readiness gap).
+            let podman = docker.dialect == super::dialect::Dialect::Podman;
+            // Docker confines with SELinux too when its daemon runs --selinux-enabled.
+            let (rootless, selinux) = docker.confinement().await?;
+            let keep_id = (podman && rootless).then(|| app_ids(&request.environment));
+            // The catalog already runs these apps unconfined by seccomp for their own
+            // sandboxes (bwrap); under SELinux the same need is the nested-sandbox type.
+            let nested_sandbox_label = selinux
+                && request
+                    .security
+                    .security_opt
+                    .iter()
+                    .any(|o| o == "seccomp=unconfined");
+            tracing::info!(
+                token = "application-confinement",
+                keep_id = ?keep_id,
+                nested_sandbox_label,
+                "app container user mapping and SELinux type decided"
+            );
             let intent = ApplicationIntent {
                 request,
                 owner,
@@ -1088,6 +1205,9 @@ pub(crate) async fn start(
                 image_volumes: image_config.volumes,
                 image_volume_identities: None,
                 nvidia_params_repair: None,
+                gpu_injection,
+                keep_id,
+                nested_sandbox_label,
                 phase: ApplicationPhase::Creating,
                 result: None,
             };
@@ -1130,13 +1250,14 @@ pub(crate) async fn start(
             intent.phase = ApplicationPhase::Created;
             journal.write(&intent)?;
         } else {
+            let injection = recorded_injection(intent.request.nvidia_gpu, intent.gpu_injection);
             let created = docker
                 .create_container(
                     Some(CreateContainerOptions {
                         name: Some(intent.request.name.clone()),
                         ..Default::default()
                     }),
-                    body(&intent),
+                    body(&intent, injection),
                 )
                 .await;
             match created {

@@ -1,6 +1,7 @@
 package agentws
 
 import (
+	"encoding/json"
 	"regexp"
 	"time"
 
@@ -23,6 +24,12 @@ type HostIdentity struct {
 	RecoveryActorVersion      *string
 	RecoveryActorSourceCommit *string
 	SeedVersion               *string
+
+	// Engine facts (amendment 17). Informational: not part of Known(), and nothing is
+	// decided on them.
+	Engine        *string
+	EngineVersion *string
+	EngineMode    *string
 }
 
 // Known reports whether all four fields are present, which is the
@@ -116,8 +123,41 @@ func identityFromRegister(reg RegisterMsg) (HostIdentity, []string) {
 		*f.dst = &v
 	}
 
+	for _, f := range []struct {
+		name  string
+		sent  json.RawMessage
+		valid func(string) bool
+		dst   **string
+	}{
+		{"engine", reg.Engine, engineToken.MatchString, &id.Engine},
+		{"engine_version", reg.EngineVersion, engineVersion.MatchString, &id.EngineVersion},
+		{"engine_mode", reg.EngineMode, func(v string) bool { return v == EngineRootful || v == EngineRootless }, &id.EngineMode},
+	} {
+		if len(f.sent) == 0 || string(f.sent) == "null" {
+			continue
+		}
+		var v string
+		if err := json.Unmarshal(f.sent, &v); err != nil || !f.valid(v) {
+			dropped = append(dropped, f.name)
+			continue
+		}
+		*f.dst = &v
+	}
+
 	return id, dropped
 }
+
+// Engine facts (amendment 17): an open lowercase engine token (docker and podman are the
+// known ones), an opaque printable version, and the two engine modes.
+var (
+	engineToken   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+	engineVersion = regexp.MustCompile(`^[!-~]{1,64}$`)
+)
+
+const (
+	EngineRootful  = "rootful"
+	EngineRootless = "rootless"
+)
 
 // The contract's MAJOR.MINOR.PATCH[-prerelease]: no leading v, no build
 // metadata, no leading zeros. semver.ParseFull alone is looser (it trims and

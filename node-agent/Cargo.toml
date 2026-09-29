@@ -19,7 +19,7 @@ tempfile = "3"
 anyhow = "1"
 # Docker context ignore matching (already pinned transitively in Cargo.lock).
 regex = "1"
-bollard = { version = "=0.21.1", default-features = false, features = ["pipe"] }
+bollard = { version = "=0.21.1", default-features = false, features = ["pipe", "json_data_content"] }
 tokio = { version = "1", features = ["full"] }
 # #12: TLS on the control-plane link. `rustls-tls-webpki-roots` — never native roots: the
 # OS store must not be in the pinned path. The ring provider is selected explicitly (the

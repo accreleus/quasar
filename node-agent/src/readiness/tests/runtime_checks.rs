@@ -6,8 +6,10 @@
 use super::super::runtime_facts::*;
 use super::super::*;
 use super::{get, FakeRoot};
+use crate::messages::ReadinessBlocks;
 use crate::runtime::{
-    ApiVersion, CdiFacts, EngineFacts, EngineInfo, ErrorKind, RuntimeError, API_FLOOR,
+    ApiVersion, CdiFacts, EngineFacts, EngineInfo, EngineKind, EngineMode, ErrorKind, RuntimeError,
+    API_FLOOR,
 };
 
 const ENDPOINT: &str = "unix:///var/run/docker.sock";
@@ -19,15 +21,18 @@ fn api(major: usize, minor: usize) -> ApiVersion {
 fn facts(cdi: Option<CdiFacts>) -> EngineFacts {
     EngineFacts {
         info: EngineInfo {
+            kind: EngineKind::Docker,
             name: "Docker Engine - Community".into(),
             version: "28.0.0".into(),
             api_version: api(1, 48),
             server_min_api: api(1, 24),
             server_max_api: api(1, 48),
         },
+        mode: EngineMode::Rootful,
         operating_system: Some("Ubuntu 24.04".into()),
         architecture: Some("x86_64".into()),
         cgroup_version: Some("2".into()),
+        cgroup_driver: Some("systemd".into()),
         security_options: vec![
             "name=seccomp,profile=builtin".into(),
             "name=cgroupns".into(),
@@ -51,7 +56,10 @@ fn observed(root: &FakeRoot, outcome: Result<EngineFacts, RuntimeFault>) -> Prob
 fn cdi_enabled_with_gpu() -> CdiFacts {
     CdiFacts {
         spec_dirs: vec!["/etc/cdi".into(), "/var/run/cdi".into()],
-        devices: vec!["nvidia.com/gpu=0 (cdi)".into()],
+        devices: vec![
+            "nvidia.com/gpu=0 (cdi)".into(),
+            "nvidia.com/gpu=all (cdi)".into(),
+        ],
     }
 }
 
@@ -356,61 +364,148 @@ fn an_indeterminate_inspection_warns_and_never_fails() {
     assert!(endpoint.summary.contains("busy"), "{endpoint:?}");
 }
 
-#[test]
-fn cdi_enabled_with_devices_reports_dirs_and_devices() {
-    let root = FakeRoot::new("runtime-cdi-devices");
-    let checks = probe(&observed(&root, Ok(facts(Some(cdi_enabled_with_gpu())))));
-    let c = get(&checks, CDI_ID);
-    assert_eq!(c.status, PASS, "{c:?}");
-    assert!(c.summary.contains("enabled"), "{c:?}");
-    assert!(c.summary.contains("/etc/cdi"), "{c:?}");
-    assert!(c.summary.contains("nvidia.com/gpu=0"), "{c:?}");
-    assert!(
-        c.remediation.is_empty(),
-        "observed only, nothing to fix: {c:?}"
-    );
+fn nvidia_env(root: &FakeRoot, facts: EngineFacts, gpus: Vec<(i32, bool)>) -> ProbeEnv {
+    ProbeEnv {
+        runtime: RuntimeView::Observed {
+            endpoint: ENDPOINT.into(),
+            outcome: Ok(facts),
+        },
+        gpus,
+        ..root.env(true, "")
+    }
+}
+
+fn rootless(mut f: EngineFacts) -> EngineFacts {
+    f.mode = EngineMode::Rootless;
+    f
+}
+
+fn no_cdi() -> Option<CdiFacts> {
+    Some(CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec![],
+    })
 }
 
 #[test]
-fn cdi_enabled_with_no_devices_says_so_without_a_verdict() {
+fn a_host_without_nvidia_passes_and_blocks_nothing() {
+    let root = FakeRoot::new("runtime-cdi-amd");
+    let checks = probe(&observed(&root, Ok(facts(no_cdi()))));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("No NVIDIA GPU"), "{c:?}");
+    assert!(c.blocks.is_none(), "{c:?}");
+}
+
+#[test]
+fn nvidia_on_an_engine_with_an_nvidia_cdi_device_goes_by_cdi_and_blocks_the_host() {
+    let root = FakeRoot::new("runtime-cdi-nvidia");
+    let checks = probe(&nvidia_env(
+        &root,
+        rootless(facts(Some(cdi_enabled_with_gpu()))),
+        vec![(0, true)],
+    ));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("by CDI (nvidia.com/gpu=all)"), "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+}
+
+#[test]
+fn nvidia_on_rootful_docker_without_cdi_goes_by_device_request() {
+    let root = FakeRoot::new("runtime-cdi-gpus");
+    let checks = probe(&nvidia_env(&root, facts(no_cdi()), vec![(0, true)]));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("--gpus"), "{c:?}");
+}
+
+/// Only the device Quasar requests counts: a specification listing per-index devices alone
+/// cannot serve `nvidia.com/gpu=all`.
+#[test]
+fn a_cdi_spec_without_the_all_device_is_not_used() {
+    let root = FakeRoot::new("runtime-cdi-index-only");
+    let per_index = Some(CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec!["nvidia.com/gpu=0 (cdi)".into()],
+    });
+    let checks = probe(&nvidia_env(
+        &root,
+        rootless(facts(per_index)),
+        vec![(0, true)],
+    ));
+    assert_eq!(get(&checks, CDI_ID).status, FAIL);
+}
+
+/// Podman's `/info` lists no CDI devices, so its evidence is the agent's own container:
+/// the NVIDIA nodes CDI put there, or their absence.
+#[test]
+fn podman_goes_by_cdi_with_the_agents_own_nvidia_nodes_as_evidence() {
+    let root = FakeRoot::new("runtime-cdi-podman");
+    let mut f = rootless(facts(None));
+    f.info.kind = EngineKind::Podman;
+    let checks = probe(&nvidia_env(&root, f.clone(), vec![(0, true)]));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(c.remediation.contains("prepare-host.sh"), "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+
+    root.file("dev/nvidiactl", "");
+    let checks = probe(&nvidia_env(&root, f, vec![(0, true)]));
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("by CDI"), "{c:?}");
+}
+
+/// Amendment 17: an NVIDIA host whose engine can inject the GPU by neither CDI nor
+/// `--gpus` fails, names host preparation, and never suggests running as root.
+#[test]
+fn nvidia_on_rootless_docker_without_cdi_fails_naming_host_preparation() {
     let root = FakeRoot::new("runtime-cdi-none");
-    let checks = probe(&observed(
+    let checks = probe(&nvidia_env(
         &root,
-        Ok(facts(Some(CdiFacts {
-            spec_dirs: vec!["/etc/cdi".into()],
-            devices: vec![],
-        }))),
+        rootless(facts(no_cdi())),
+        vec![(0, true)],
     ));
     let c = get(&checks, CDI_ID);
-    assert_eq!(c.status, PASS, "{c:?}");
-    assert!(c.summary.contains("enabled"), "{c:?}");
-    assert!(c.summary.contains("no devices"), "{c:?}");
-    assert!(c.remediation.is_empty(), "{c:?}");
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(c.remediation.contains("prepare-host.sh"), "{c:?}");
+    assert!(c.remediation.contains("Never run Quasar as root"), "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+    assert!(!checks.iter().any(|c| c.id.starts_with("runtime_cdi_gpu")));
 }
 
 #[test]
-fn cdi_disabled_is_reported_and_names_how_gpus_are_really_injected() {
-    let root = FakeRoot::new("runtime-cdi-disabled");
-    let checks = probe(&observed(
+fn a_mixed_host_blocks_each_nvidia_gpu_not_the_host() {
+    let root = FakeRoot::new("runtime-cdi-mixed");
+    let checks = probe(&nvidia_env(
         &root,
-        Ok(facts(Some(CdiFacts {
-            spec_dirs: vec![],
-            devices: vec![],
-        }))),
+        rootless(facts(no_cdi())),
+        vec![(0, false), (1, true)],
     ));
-    let c = get(&checks, CDI_ID);
-    assert_eq!(c.status, PASS, "{c:?}");
-    assert!(c.summary.contains("disabled"), "{c:?}");
-    assert!(c.summary.contains("device request"), "{c:?}");
-    assert!(c.remediation.is_empty(), "{c:?}");
+    let host = get(&checks, CDI_ID);
+    assert_eq!(host.status, FAIL, "{host:?}");
+    assert!(host.blocks.is_none(), "{host:?}");
+    let gpu = get(&checks, "runtime_cdi_gpu1");
+    assert_eq!(gpu.status, FAIL, "{gpu:?}");
+    assert_eq!(gpu.blocks, Some(ReadinessBlocks::gpu(1, "control_plane")));
+    assert!(!checks.iter().any(|c| c.id == "runtime_cdi_gpu0"));
 }
 
 #[test]
-fn cdi_not_reported_by_the_engine_skips() {
-    let root = FakeRoot::new("runtime-cdi-unreported");
-    let checks = probe(&observed(&root, Ok(facts(None))));
+fn an_engine_that_could_not_be_inspected_skips_cdi_without_blocking() {
+    let root = FakeRoot::new("runtime-cdi-unknown");
+    let checks = probe(&ProbeEnv {
+        runtime: RuntimeView::Observed {
+            endpoint: ENDPOINT.into(),
+            outcome: Err(RuntimeFault::Indeterminate("busy".into())),
+        },
+        gpus: vec![(0, true)],
+        ..root.env(true, "")
+    });
     let c = get(&checks, CDI_ID);
     assert_eq!(c.status, SKIP, "{c:?}");
+    assert!(c.blocks.is_none(), "{c:?}");
 }
 
 #[test]
@@ -435,4 +530,226 @@ fn an_invalid_endpoint_configuration_fails_the_endpoint_naming_the_knob() {
     let endpoint = get(&checks, ENDPOINT_ID);
     assert_eq!(endpoint.status, FAIL, "{endpoint:?}");
     assert!(endpoint.remediation.contains("DOCKER_HOST"), "{endpoint:?}");
+}
+
+// ── RH-07 #396: the engine, its mode, and remediation that names them ───────
+
+fn engine(kind: EngineKind, version: &str, mode: EngineMode, os: &str) -> EngineFacts {
+    let mut f = facts(None);
+    f.info.kind = kind;
+    f.info.version = version.into();
+    f.mode = mode;
+    f.operating_system = Some(os.into());
+    f
+}
+
+#[test]
+fn the_engine_check_names_the_engine_its_version_and_mode() {
+    let root = FakeRoot::new("runtime-engine-docker");
+    let checks = probe(&observed(
+        &root,
+        Ok(engine(
+            EngineKind::Docker,
+            "29.7.2",
+            EngineMode::Rootful,
+            "Fedora Linux 43",
+        )),
+    ));
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.summary.contains("Docker 29.7.2, rootful"), "{c:?}");
+    assert_eq!(c.source.as_deref(), Some("runtime"));
+    assert!(c.blocks.is_none(), "{c:?}");
+}
+
+/// Until the RH-07 acceptance map proves them, the new profiles read as experimental:
+/// a combination with no evidence is never implied supported (CONTEXT.md "Engine profile").
+#[test]
+fn a_profile_without_evidence_warns_as_experimental_and_blocks_nothing() {
+    let root = FakeRoot::new("runtime-engine-podman");
+    for (kind, mode) in [
+        (EngineKind::Podman, EngineMode::Rootless),
+        (EngineKind::Docker, EngineMode::Rootless),
+        (EngineKind::Podman, EngineMode::Rootful),
+    ] {
+        let checks = probe(&observed(&root, Ok(engine(kind, "5.8.4", mode, "fedora"))));
+        let c = get(&checks, ENGINE_ID);
+        assert_eq!(c.status, WARN, "{c:?}");
+        assert!(c.summary.contains("experimental"), "{c:?}");
+        assert!(c.summary.contains(mode.wire()), "{c:?}");
+        assert!(c.blocks.is_none(), "{c:?}");
+    }
+    let checks = probe(&observed(
+        &root,
+        Ok(engine(
+            EngineKind::Podman,
+            "5.8.4",
+            EngineMode::Rootless,
+            "Debian GNU/Linux 13",
+        )),
+    ));
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.summary.contains("unsupported"), "{c:?}");
+    assert!(
+        c.remediation.contains("Docker rootful"),
+        "names the alternative: {c:?}"
+    );
+}
+
+#[test]
+fn an_engine_that_cannot_be_named_is_unsupported_not_docker() {
+    let root = FakeRoot::new("runtime-engine-unknown");
+    let checks = probe(&observed(
+        &root,
+        Ok(engine(
+            EngineKind::Unknown,
+            "1.0",
+            EngineMode::Rootful,
+            "fedora",
+        )),
+    ));
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.summary.contains("unsupported"), "{c:?}");
+    assert!(!c.summary.contains("Docker 1.0"), "{c:?}");
+}
+
+/// The endpoint checks name the socket and both engines, and never tell an operator to
+/// run Quasar as root (#396 acceptance).
+#[test]
+fn no_endpoint_remediation_names_only_docker_or_suggests_root() {
+    let root = FakeRoot::new("runtime-remediation");
+    for fault in [
+        RuntimeFault::Unreachable("connection refused".into()),
+        RuntimeFault::PermissionDenied("permission denied".into()),
+        RuntimeFault::Unconfigured("DOCKER_CONTEXT is set".into()),
+        RuntimeFault::Ambiguous("two endpoints".into()),
+    ] {
+        let checks = probe(&observed(&root, Err(fault.clone())));
+        let c = get(&checks, ENDPOINT_ID);
+        assert_eq!(c.status, FAIL, "{c:?}");
+        let text = c.remediation.to_lowercase();
+        assert!(
+            !text.contains("as root") && !text.contains("run it as root"),
+            "{c:?}"
+        );
+        assert!(text.contains("podman"), "names Podman too: {c:?}");
+    }
+    let checks = probe(&observed(
+        &root,
+        Err(RuntimeFault::Unreachable("refused".into())),
+    ));
+    assert!(get(&checks, ENDPOINT_ID)
+        .remediation
+        .contains("/var/run/docker.sock"));
+}
+
+#[test]
+fn an_ambiguous_endpoint_is_refused_by_name_and_names_both_variables() {
+    let root = FakeRoot::new("runtime-ambiguous");
+    let fault = RuntimeFault::from(RuntimeError::from(ErrorKind::AmbiguousEndpoint));
+    assert!(matches!(fault, RuntimeFault::Ambiguous(_)), "{fault:?}");
+    let checks = probe(&observed(&root, Err(fault)));
+    let c = get(&checks, ENDPOINT_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(
+        c.summary.contains("DOCKER_HOST") && c.summary.contains("CONTAINER_HOST"),
+        "{c:?}"
+    );
+    assert!(
+        c.blocks.is_some(),
+        "an unusable endpoint keeps its agent-enforced block"
+    );
+}
+
+// ── RH-07 #405: can this engine run container health checks? ────────────────
+
+#[test]
+fn podman_with_systemd_runs_health_checks_and_docker_skips() {
+    let root = FakeRoot::new("runtime-healthchecks");
+    let podman = engine(EngineKind::Podman, "5.8.4", EngineMode::Rootless, "fedora");
+    let checks = probe(&observed(&root, Ok(podman)));
+    let c = get(&checks, HEALTHCHECKS_ID);
+    assert_eq!(c.status, PASS, "{c:?}");
+    assert!(c.blocks.is_none(), "a proxy check never blocks: {c:?}");
+    let docker = engine(EngineKind::Docker, "29.7.2", EngineMode::Rootful, "fedora");
+    let checks = probe(&observed(&root, Ok(docker)));
+    assert_eq!(get(&checks, HEALTHCHECKS_ID).status, SKIP);
+}
+
+/// A rootless Podman without a systemd user session never runs health checks, and
+/// installs wait on them: named, with the fix, instead of a timeout nobody can explain.
+#[test]
+fn podman_without_systemd_fails_health_checks_naming_the_fix() {
+    let root = FakeRoot::new("runtime-healthchecks-cgroupfs");
+    let mut podman = engine(EngineKind::Podman, "5.8.4", EngineMode::Rootless, "fedora");
+    podman.cgroup_driver = Some("cgroupfs".into());
+    let checks = probe(&observed(&root, Ok(podman)));
+    let c = get(&checks, HEALTHCHECKS_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(c.summary.contains("cgroupfs"), "{c:?}");
+    assert!(c.remediation.contains("linger"), "{c:?}");
+    // Rootful Podman has no user session to linger: its fix is systemd as init.
+    let mut rootful = engine(EngineKind::Podman, "5.8.4", EngineMode::Rootful, "fedora");
+    rootful.cgroup_driver = Some("cgroupfs".into());
+    let checks = probe(&observed(&root, Ok(rootful)));
+    let c = get(&checks, HEALTHCHECKS_ID);
+    assert!(
+        !c.remediation.contains("linger") && c.remediation.contains("systemd"),
+        "{c:?}"
+    );
+    assert!(!c.remediation.to_lowercase().contains("as root"), "{c:?}");
+    assert!(c.blocks.is_none(), "{c:?}");
+}
+
+/// Live on rootless Podman: the engine injected no GPU, so capacity dropped it and reported
+/// no NVIDIA. The agent still runs NVIDIA sessions, and `runtime_cdi` must say they cannot.
+#[test]
+fn an_nvidia_agent_whose_gpu_capacity_dropped_still_fails_cdi() {
+    let root = FakeRoot::new("runtime-cdi-dropped");
+    let mut f = rootless(facts(None));
+    f.info.kind = EngineKind::Podman;
+    let checks = probe(&ProbeEnv {
+        runtime: RuntimeView::Observed {
+            endpoint: ENDPOINT.into(),
+            outcome: Ok(f),
+        },
+        nvidia_runtime: true,
+        ..root.env(false, "")
+    });
+    let c = get(&checks, CDI_ID);
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
+}
+
+/// Owner decision on #404: rootless Docker homes carry subordinate IDs, said as a warning.
+#[test]
+fn a_writable_homes_root_warns_about_ownership_only_on_rootless_docker() {
+    let pass = super::super::pass(
+        crate::readiness::storage::HOMES_WRITABLE_ID,
+        "the agent created, wrote and removed a test home".into(),
+    );
+    let view = |kind, mode| RuntimeView::Observed {
+        endpoint: ENDPOINT.into(),
+        outcome: Ok({
+            let mut f = facts(None);
+            f.info.kind = kind;
+            f.mode = mode;
+            f
+        }),
+    };
+    let c = homes_mapping(
+        pass.clone(),
+        &view(EngineKind::Docker, EngineMode::Rootless),
+    );
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.summary.contains("subordinate ID"), "{c:?}");
+    assert!(c.blocks.is_none());
+    for (kind, mode) in [
+        (EngineKind::Podman, EngineMode::Rootless),
+        (EngineKind::Docker, EngineMode::Rootful),
+    ] {
+        assert_eq!(homes_mapping(pass.clone(), &view(kind, mode)).status, PASS);
+    }
 }

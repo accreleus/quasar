@@ -975,3 +975,37 @@ func TestAcceptedThenRecoveredCannotReplayOldReview(t *testing.T) {
 		t.Fatalf("recovery not bound into new review: %+v", fresh)
 	}
 }
+
+// Found on the first rootless Podman install (RH-07): an agent whose GPU capacity cannot
+// be read reports its GPU list as JSON null. Storing it violated the array CHECK, every
+// capacity report failed and the control plane closed the connection in a loop. Unknown
+// GPUs leave the stored evidence as it was (no error, nothing superseded).
+func TestAHardwareReportWithUnknownGPUsLeavesTheEvidenceAlone(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	ctx := context.Background()
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	connection := "00000000-0000-4000-8000-000000000338" // the one completeEmptyHostJournal reconciled
+	gpus := json.RawMessage(`[{"index":0,"vendor":"NVIDIA","render_node":"/dev/dri/renderD128","encode_slots_total":1}]`)
+	readiness := json.RawMessage(`[{"id":"runtime_engine","status":"warn"}]`)
+	if err := store.ObserveHardwareReport(ctx, hostID, connection, gpus, readiness); err != nil {
+		t.Fatal(err)
+	}
+	for _, unknown := range []json.RawMessage{json.RawMessage(`null`), nil} {
+		if err := store.ObserveHardwareReport(ctx, hostID, connection, unknown, readiness); err != nil {
+			t.Fatalf("gpus=%q: %v", unknown, err)
+		}
+	}
+	var stored string
+	if err := pool.QueryRow(ctx, `SELECT gpus::text FROM host_hardware_evidence WHERE host_id=$1::uuid`, hostID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stored, "renderD128") {
+		t.Fatalf("unknown GPUs replaced the evidence: %s", stored)
+	}
+}

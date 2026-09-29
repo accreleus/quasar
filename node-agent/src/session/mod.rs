@@ -10,6 +10,7 @@
 pub mod abr;
 pub mod adaptation;
 pub mod audio;
+pub mod media_evidence;
 // Bounded, admin-only observation of a LIVE session (graph dot / encoder props /
 // telemetry burst), driven from the runner's supervision tick. Never a pad probe,
 // never on a streaming thread.

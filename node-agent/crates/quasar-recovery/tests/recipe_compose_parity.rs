@@ -272,6 +272,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         template_root: "/srv/quasar/templates".into(),
         docker_socket: "/var/run/docker.sock".into(),
         gpu: GpuFacts {
+            cdi: false,
             unknown: Default::default(),
             vendor,
             render_node: render_node.map(str::to_owned),
@@ -280,6 +281,10 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         },
         devices: HostDevices {
             unknown: Default::default(),
+            kernel_log: false,
+            engine_rootless: false,
+            host_sysfs: false,
+            fuse: false,
             dri: vendor.is_some(),
             uinput: true,
             kmsg: true,

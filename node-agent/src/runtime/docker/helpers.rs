@@ -1,4 +1,5 @@
 //! Docker SDK details for the deliberately narrow owned helper lifecycle.
+use super::dialect::{Dialect, Engine, Namespace, PodmanFacts};
 use crate::runtime::helpers::{HelperPhase, HelperProfile, MAX_JOURNAL_BYTES, MAX_LOG_BYTES};
 use crate::{
     container_ownership,
@@ -644,16 +645,6 @@ fn has_nvidia_env(env: &[String], access: &NvidiaDriverAccess) -> bool {
         }
     })
 }
-fn is_nvidia_all_request(request: &DeviceRequest) -> bool {
-    request.driver.as_deref() == Some("nvidia")
-        && request.count == Some(-1)
-        && request.device_ids.as_ref().is_none_or(Vec::is_empty)
-        && request.capabilities.as_deref() == Some(&[vec!["gpu".to_owned()]])
-        && request
-            .options
-            .as_ref()
-            .is_none_or(std::collections::HashMap::is_empty)
-}
 fn matches_nvidia_mount(mount: &bollard::models::MountPoint, access: &NvidiaDriverAccess) -> bool {
     let (typ, source, name, target) = match &access.driver_mount {
         NvidiaDriverMount::ReadOnlyBind(bind) => ("bind", bind.source.to_str(), None, &bind.target),
@@ -704,6 +695,10 @@ fn safe_readonly_bind_options(options: Option<&MountBindOptions>) -> bool {
 fn inspect_owned(
     info: bollard::models::ContainerInspectResponse,
     intent: &HelperIntent,
+    dialect: Dialect,
+    podman: Option<&PodmanFacts>,
+    image_id: Option<&str>,
+    injection: Option<crate::runtime::GpuInjection>,
 ) -> Result<(OwnedHelperId, bool, Option<i64>), RuntimeError> {
     let h = helper(intent);
     let id = info.id.filter(|v| valid_id(v)).ok_or(ErrorKind::Protocol)?;
@@ -714,7 +709,9 @@ fn inspect_owned(
     let labels = c.labels.unwrap_or_default();
     if labels.get(container_ownership::LABEL).map(String::as_str) != Some(intent.owner.as_str())
         || labels.get(OPERATION_LABEL).map(String::as_str) != Some(h.operation.as_str())
-        || c.image.as_deref() != Some(&h.image)
+        || (dialect.echoes_config_image() && c.image.as_deref() != Some(&h.image))
+        || (!dialect.echoes_config_image()
+            && (image_id.is_none() || info.image.as_deref() != image_id))
         || c.user.as_deref() != Some("0:0")
     {
         return Err(ErrorKind::UnknownOutcome.into());
@@ -730,24 +727,34 @@ fn inspect_owned(
         || host.readonly_rootfs != Some(intent.profile != HelperProfile::Audio)
         || host.privileged != Some(false)
         || host.auto_remove != Some(false)
-        || host.cap_add.as_ref().is_some_and(|v| !v.is_empty())
+        || !dialect.capabilities_ok(
+            host.cap_add.as_ref(),
+            host.cap_drop.as_ref(),
+            podman,
+            &[],
+            true,
+        )
+        // Docker helpers keep today's rules exactly; Podman's runtime must be crun or runc.
+        || (dialect == Dialect::Podman
+            && !dialect.runtime_ok(host.runtime.as_deref(), podman, device_request))
         || (probe.is_none() && host.devices.as_ref().is_some_and(|v| !v.is_empty()))
         || (probe.is_none() && host.group_add.as_ref().is_some_and(|v| !v.is_empty()))
         || (!device_request && host.device_requests.as_ref().is_some_and(|v| !v.is_empty()))
         || host.volumes_from.as_ref().is_some_and(|v| !v.is_empty())
-        || host.binds.as_ref().is_some_and(|v| !v.is_empty())
-        || host.pid_mode.as_deref().is_some_and(|v| !v.is_empty())
-        || host
-            .ipc_mode
-            .as_deref()
-            .is_some_and(|v| !v.is_empty() && v != "private")
-        || host.uts_mode.as_deref().is_some_and(|v| !v.is_empty())
+        || (dialect.echoes_mount_requests() && host.binds.as_ref().is_some_and(|v| !v.is_empty()))
+        // Docker helpers keep today's exact rule (no pid mode at all).
+        || (dialect == Dialect::Docker && host.pid_mode.as_deref().is_some_and(|v| !v.is_empty()))
+        || (dialect == Dialect::Podman
+            && !dialect.default_namespace(Namespace::Pid, host.pid_mode.as_deref()))
+        || !dialect.mount_propagation_ok(podman)
+        || !dialect.default_namespace(Namespace::Ipc, host.ipc_mode.as_deref())
+        || !dialect.default_namespace(Namespace::Uts, host.uts_mode.as_deref())
         || host
             .cgroupns_mode
             .as_ref()
             .is_some_and(|v| format!("{v:?}").eq_ignore_ascii_case("host"))
-        || host.cap_drop.as_deref() != Some(&["ALL".to_owned()])
-        || host.security_opt.as_deref() != Some(&["no-new-privileges".to_owned()])
+        || dialect.security_options(host.security_opt.as_ref())
+            != dialect.security_options(Some(&vec!["no-new-privileges".to_owned()]))
         || (intent.profile == HelperProfile::Audio && host.pids_limit != Some(512))
     {
         return Err(ErrorKind::Protocol.into());
@@ -759,17 +766,11 @@ fn inspect_owned(
         }
     }
     if let Some(run) = probe {
-        let devices = host.devices.as_deref().unwrap_or(&[]);
-        if devices.len() != run.devices.len()
-            || devices
-                .iter()
-                .zip(run.devices.iter())
-                .any(|(realized, path)| {
-                    realized.path_on_host.as_deref() != Some(path.as_str())
-                        || realized.path_in_container.as_deref() != Some(path.as_str())
-                        || realized.cgroup_permissions.as_deref() != Some("rwm")
-                })
-        {
+        if !dialect.devices_ok(
+            host.devices.as_deref().unwrap_or(&[]),
+            &run.devices,
+            run.nvidia_device_request,
+        ) {
             return Err(ErrorKind::Protocol.into());
         }
         let mut realized_groups = host.group_add.clone().unwrap_or_default();
@@ -783,9 +784,14 @@ fn inspect_owned(
             return Err(ErrorKind::Protocol.into());
         }
     }
-    if device_request
-        && !matches!(host.device_requests.as_deref(), Some([request]) if is_nvidia_all_request(request))
-    {
+    let nvidia_request = |r: &DeviceRequest| {
+        injection.is_some_and(|injection| super::dialect::is_nvidia_request(injection, r))
+    };
+    let nvidia_request: &dyn Fn(&DeviceRequest) -> bool = &nvidia_request;
+    if !dialect.device_requests_ok(
+        host.device_requests.as_ref(),
+        device_request.then_some(nvidia_request),
+    ) {
         return Err(ErrorKind::Protocol.into());
     }
     if let Some(access) = &access {
@@ -800,8 +806,8 @@ fn inspect_owned(
         let requested = host.mounts.as_deref().unwrap_or(&[]);
         if mounts.len() != 1
             || !matches_nvidia_mount(&mounts[0], access)
-            || requested.len() != 1
-            || !requested_nvidia_mount(&requested[0], access)
+            || (dialect.echoes_mount_requests()
+                && (requested.len() != 1 || !requested_nvidia_mount(&requested[0], access)))
         {
             return Err(ErrorKind::Protocol.into());
         }
@@ -827,34 +833,38 @@ fn inspect_owned(
             {
                 return Err(ErrorKind::Protocol.into());
             }
-            // `Mounts` in HostConfig is the requested realization. Inspecting only
-            // the resulting mountpoint would miss an option such as host-path
-            // creation that weakens this fixed profile.
-            let requested = host.mounts.as_deref().unwrap_or(&[]);
-            if requested.len() != 1
-                || requested[0].typ != Some(MountType::BIND)
-                || requested[0].source.as_deref() != run.bind.source.to_str()
-                || requested[0].target.as_deref() != Some(&run.bind.target)
-                || requested[0].read_only != Some(true)
-            {
-                return Err(ErrorKind::Protocol.into());
-            }
-            if let Some(options) = &requested[0].bind_options {
-                let safe_propagation = options.propagation.is_none()
-                    || matches!(
-                        options.propagation,
-                        Some(
-                            bollard::models::MountBindOptionsPropagationEnum::PRIVATE
-                                | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
-                        )
-                    );
-                if options.create_mountpoint == Some(true)
-                    || !safe_propagation
-                    || options.non_recursive == Some(true)
-                    || options.read_only_non_recursive == Some(true)
-                    || options.read_only_force_recursive == Some(true)
+            // Engines that do not echo requested mounts (Podman) are held to the realized
+            // mount above; Docker's echo is checked as before.
+            if dialect.echoes_mount_requests() {
+                // `Mounts` in HostConfig is the requested realization. Inspecting only
+                // the resulting mountpoint would miss an option such as host-path
+                // creation that weakens this fixed profile.
+                let requested = host.mounts.as_deref().unwrap_or(&[]);
+                if requested.len() != 1
+                    || requested[0].typ != Some(MountType::BIND)
+                    || requested[0].source.as_deref() != run.bind.source.to_str()
+                    || requested[0].target.as_deref() != Some(&run.bind.target)
+                    || requested[0].read_only != Some(true)
                 {
                     return Err(ErrorKind::Protocol.into());
+                }
+                if let Some(options) = &requested[0].bind_options {
+                    let safe_propagation = options.propagation.is_none()
+                        || matches!(
+                            options.propagation,
+                            Some(
+                                bollard::models::MountBindOptionsPropagationEnum::PRIVATE
+                                    | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
+                            )
+                        );
+                    if options.create_mountpoint == Some(true)
+                        || !safe_propagation
+                        || options.non_recursive == Some(true)
+                        || options.read_only_non_recursive == Some(true)
+                        || options.read_only_force_recursive == Some(true)
+                    {
+                        return Err(ErrorKind::Protocol.into());
+                    }
                 }
             }
         } else if let Some(audio) = &intent.audio {
@@ -889,32 +899,34 @@ fn inspect_owned(
             {
                 return Err(ErrorKind::Protocol.into());
             }
-            let requested = host.mounts.as_deref().unwrap_or(&[]);
-            if requested.len() != 1 || requested[0].typ != Some(MountType::BIND)
-            || requested[0].source.as_deref() != audio.socket_dir.to_str()
-            || requested[0].target.as_deref() != audio.socket_dir.to_str()
-            // Docker omits `ReadOnly` when false in inspect output; the
-            // realized mount's RW=true remains mandatory for this profile.
-            || requested[0].read_only == Some(true)
-            || requested[0].bind_options.as_ref().is_some_and(|o| o.create_mountpoint == Some(true))
-            {
-                return Err(ErrorKind::Protocol.into());
-            }
-            if let Some(options) = &requested[0].bind_options {
-                let safe_propagation = options.propagation.is_none()
-                    || matches!(
-                        options.propagation,
-                        Some(
-                            bollard::models::MountBindOptionsPropagationEnum::PRIVATE
-                                | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
-                        )
-                    );
-                if !safe_propagation
-                    || options.non_recursive == Some(true)
-                    || options.read_only_non_recursive == Some(true)
-                    || options.read_only_force_recursive == Some(true)
+            if dialect.echoes_mount_requests() {
+                let requested = host.mounts.as_deref().unwrap_or(&[]);
+                if requested.len() != 1 || requested[0].typ != Some(MountType::BIND)
+                || requested[0].source.as_deref() != audio.socket_dir.to_str()
+                || requested[0].target.as_deref() != audio.socket_dir.to_str()
+                // Docker omits `ReadOnly` when false in inspect output; the
+                // realized mount's RW=true remains mandatory for this profile.
+                || requested[0].read_only == Some(true)
+                || requested[0].bind_options.as_ref().is_some_and(|o| o.create_mountpoint == Some(true))
                 {
                     return Err(ErrorKind::Protocol.into());
+                }
+                if let Some(options) = &requested[0].bind_options {
+                    let safe_propagation = options.propagation.is_none()
+                        || matches!(
+                            options.propagation,
+                            Some(
+                                bollard::models::MountBindOptionsPropagationEnum::PRIVATE
+                                    | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
+                            )
+                        );
+                    if !safe_propagation
+                        || options.non_recursive == Some(true)
+                        || options.read_only_non_recursive == Some(true)
+                        || options.read_only_force_recursive == Some(true)
+                    {
+                        return Err(ErrorKind::Protocol.into());
+                    }
                 }
             }
         } else if info.mounts.as_ref().is_some_and(|m| !m.is_empty()) {
@@ -938,8 +950,44 @@ fn inspect_owned(
     ))
 }
 
-async fn open(config: &RuntimeConfig) -> Result<bollard::Docker, RuntimeError> {
-    Ok(super::discover(config).await?.0)
+async fn open(config: &RuntimeConfig) -> Result<Engine, RuntimeError> {
+    super::dialect::open(config).await
+}
+
+/// The read-back of one inspected helper, with what its engine states beyond the
+/// compatible inspect (Podman's native facts; nothing on Docker).
+async fn read_back(
+    engine: &Engine,
+    info: bollard::models::ContainerInspectResponse,
+    intent: &HelperIntent,
+) -> Result<(OwnedHelperId, bool, Option<i64>), RuntimeError> {
+    let podman = match info.id.as_deref() {
+        Some(id) if valid_id(id) => engine.podman_facts(id).await?,
+        _ => None,
+    };
+    // Podman's Config.Image names the image rather than echoing the reference, so the
+    // helper's identity is proven by image ID there: the reference resolved now must be
+    // the image the container was created from.
+    let image_id = match engine.dialect {
+        Dialect::Docker => None,
+        Dialect::Podman => {
+            engine
+                .inspect_image(&helper(intent).image)
+                .await
+                .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
+                .id
+        }
+    };
+    let injection =
+        super::dialect::recorded_injection(intent_device_request(intent), intent.gpu_injection);
+    inspect_owned(
+        info,
+        intent,
+        engine.dialect,
+        podman.as_ref(),
+        image_id.as_deref(),
+        injection,
+    )
 }
 fn uncertain_inspection(error: Error) -> RuntimeError {
     let reconciliation = match error {
@@ -954,16 +1002,18 @@ fn uncertain_inspection(error: Error) -> RuntimeError {
     }
 }
 async fn inspect(
-    docker: &bollard::Docker,
+    docker: &Engine,
     intent: &HelperIntent,
 ) -> Result<(OwnedHelperId, bool, Option<i64>), RuntimeError> {
-    inspect_owned(
+    read_back(
+        docker,
         docker
             .inspect_container(owned(intent)?.as_str(), None)
             .await
             .map_err(uncertain_inspection)?,
         intent,
     )
+    .await
 }
 fn current_intent(config: &RuntimeConfig, intent: &HelperIntent) -> Result<(), RuntimeError> {
     if intent.socket != config.socket || intent.owner != owner(config)? {
@@ -978,7 +1028,7 @@ async fn create_or_adopt_inner(
     run: Option<DiagnosticRun>,
     gpu_probe: Option<GpuProbeRun>,
     audio: Option<AudioRun>,
-) -> Result<(bollard::Docker, HelperJournal, HelperIntent), RuntimeError> {
+) -> Result<(Engine, HelperJournal, HelperIntent), RuntimeError> {
     if !valid_helper(&helper)
         || run.as_ref().is_some_and(|r| !valid_run(r))
         || gpu_probe
@@ -1025,7 +1075,7 @@ async fn create_or_adopt_inner(
                 .ok_or(ErrorKind::UnknownOutcome)?;
             let mut adopted = intent;
             adopted.id = Some(id);
-            let _ = inspect_owned(info, &adopted)?;
+            let _ = read_back(&docker, info, &adopted).await?;
             journal.write(&adopted)?;
             return Ok((docker, journal, adopted));
         }
@@ -1063,6 +1113,7 @@ async fn create_or_adopt_inner(
         run,
         nvidia_gpu: None,
         gpu_probe,
+        gpu_injection: None,
         profile: if is_audio {
             HelperProfile::Audio
         } else if is_gpu_probe {
@@ -1085,6 +1136,22 @@ async fn create_or_adopt_inner(
     };
     if !reserves_final_evidence(&intent)? {
         return Err(ErrorKind::InvalidConfiguration.into());
+    }
+    // Decided before anything is journalled: an engine that cannot be given the GPU is
+    // refused here, never given more privilege, and leaves no intent to wedge later probes.
+    if intent_device_request(&intent) {
+        match docker.gpu_injection().await? {
+            Some(injection) => intent.gpu_injection = Some(injection),
+            None => {
+                tracing::warn!(
+                    token = "runtime-helper-gpu-injection-unavailable",
+                    "this engine cannot be given an NVIDIA GPU (no NVIDIA CDI device, and not a \
+                     rootful Docker): refusing the GPU helper; host preparation writes the CDI \
+                     specification"
+                );
+                return Err(ErrorKind::InvalidConfiguration.into());
+            }
+        }
     }
     journal.write(&intent)?;
     if intent.profile == HelperProfile::Audio {
@@ -1130,6 +1197,8 @@ async fn create_or_adopt_inner(
                 })
             })
     });
+    let injection =
+        super::dialect::recorded_injection(intent_device_request(&intent), intent.gpu_injection);
     let requirements = DiagnosticRequirements::FIXED;
     let devices = match requirements.devices {
         crate::runtime::DiagnosticDevices::None => Vec::new(),
@@ -1196,7 +1265,9 @@ async fn create_or_adopt_inner(
                 ]
             })
         }),
-        healthcheck: intent.audio.as_ref().map(|_| HealthConfig {
+        // One-shot helpers run the agent image, whose healthcheck means nothing for them;
+        // on Podman it also leaves an exited helper reporting health `stopped`.
+        healthcheck: Some(HealthConfig {
             test: Some(vec!["NONE".into()]),
             ..Default::default()
         }),
@@ -1213,15 +1284,12 @@ async fn create_or_adopt_inner(
             security_opt: Some(security_opt),
             devices: Some(devices),
             group_add,
-            device_requests: intent_device_request(&intent).then(|| {
-                vec![DeviceRequest {
-                    driver: Some("nvidia".into()),
-                    count: Some(-1),
-                    device_ids: None,
-                    capabilities: Some(vec![vec!["gpu".into()]]),
-                    options: None,
-                }]
-            }),
+            device_requests: match (intent_device_request(&intent), injection) {
+                (true, Some(injection)) => {
+                    Some(vec![super::dialect::nvidia_device_request(injection)])
+                }
+                _ => None,
+            },
             mounts,
             pids_limit: intent.audio.as_ref().map(|_| 512),
             ..Default::default()
@@ -1301,7 +1369,7 @@ async fn run_inner(
         let is_created = info.state.as_ref().and_then(|state| state.status)
             == Some(ContainerStateStatusEnum::CREATED)
             && info.state.as_ref().and_then(|state| state.running) == Some(false);
-        let _ = inspect_owned(info, &intent)?;
+        let _ = read_back(&docker, info, &intent).await?;
         if !is_created {
             return Err(ErrorKind::UnknownOutcome.into());
         }
@@ -1623,7 +1691,7 @@ pub(crate) async fn abandon_audio(
             .filter(|v| valid_id(v))
             .ok_or(ErrorKind::UnknownOutcome)?;
         intent.id = Some(id);
-        let _ = inspect_owned(info, &intent)?;
+        let _ = read_back(&docker, info, &intent).await?;
         journal.write(&intent)?;
     }
     let id = owned(&intent)?;
@@ -1656,7 +1724,7 @@ pub(crate) async fn cleanup(config: &RuntimeConfig, id: OwnedHelperId) -> Result
                 return journal.write(&intent);
             }
             Ok(info) => {
-                let _ = inspect_owned(info, &intent)?;
+                let _ = read_back(&docker, info, &intent).await?;
             }
             Err(error) => return Err(uncertain_inspection(error)),
         }
@@ -2095,7 +2163,7 @@ async fn finish_recorded(
             .filter(|v| valid_id(v))
             .ok_or(ErrorKind::UnknownOutcome)?;
         intent.id = Some(immutable_id);
-        let _ = inspect_owned(info, &intent)?;
+        let _ = read_back(&docker, info, &intent).await?;
         journal.write(&intent)?;
     }
     let id = owned(&intent)?;

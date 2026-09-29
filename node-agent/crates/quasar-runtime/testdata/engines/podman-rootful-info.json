@@ -1,0 +1,47 @@
+{
+ "Architecture": "amd64",
+ "CDISpecDirs": null,
+ "CgroupDriver": "systemd",
+ "CgroupVersion": "2",
+ "DefaultRuntime": "crun",
+ "DockerRootDir": "/var/lib/containers/storage",
+ "OSType": "linux",
+ "OperatingSystem": "fedora",
+ "Runtimes": {
+  "crun": {
+   "path": "/usr/bin/crun"
+  },
+  "crun-vm": {
+   "path": "/usr/bin/crun-vm"
+  },
+  "crun-wasm": {
+   "path": "/usr/bin/crun-wasm"
+  },
+  "kata": {
+   "path": "/usr/bin/kata-runtime"
+  },
+  "krun": {
+   "path": "/usr/bin/krun"
+  },
+  "ocijail": {
+   "path": "/usr/local/bin/ocijail"
+  },
+  "runc": {
+   "path": "/usr/bin/runc"
+  },
+  "runj": {
+   "path": "/usr/local/bin/runj"
+  },
+  "runsc": {
+   "path": "/usr/bin/runsc"
+  },
+  "youki": {
+   "path": "/usr/local/bin/youki"
+  }
+ },
+ "SecurityOptions": [
+  "name=seccomp,profile=default",
+  "name=selinux"
+ ],
+ "ServerVersion": "5.8.4"
+}

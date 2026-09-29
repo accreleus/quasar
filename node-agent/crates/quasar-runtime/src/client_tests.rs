@@ -250,3 +250,159 @@ fn environment_rejects_persisted_cli_context_without_explicit_endpoint() {
         .unwrap();
     assert!(status.success());
 }
+
+/// RH-07 #396: each engine and mode is identified from what the real engine reports.
+/// The fixtures are captured from Docker 29 and Podman 5.8, rootful and rootless.
+#[test]
+fn each_engine_and_mode_is_identified_from_its_own_version_and_info() {
+    let cases: [(&str, &str, &str, EngineKind, &str, EngineMode); 4] = [
+        (
+            "docker-rootful",
+            include_str!("../testdata/engines/docker-rootful-version.json"),
+            include_str!("../testdata/engines/docker-rootful-info.json"),
+            EngineKind::Docker,
+            "29.7.2",
+            EngineMode::Rootful,
+        ),
+        (
+            "docker-rootless",
+            include_str!("../testdata/engines/docker-rootless-version.json"),
+            include_str!("../testdata/engines/docker-rootless-info.json"),
+            EngineKind::Docker,
+            "29.8.1",
+            EngineMode::Rootless,
+        ),
+        (
+            "podman-rootful",
+            include_str!("../testdata/engines/podman-rootful-version.json"),
+            include_str!("../testdata/engines/podman-rootful-info.json"),
+            EngineKind::Podman,
+            "5.8.4",
+            EngineMode::Rootful,
+        ),
+        (
+            "podman-rootless",
+            include_str!("../testdata/engines/podman-rootless-version.json"),
+            include_str!("../testdata/engines/podman-rootless-info.json"),
+            EngineKind::Podman,
+            "5.8.4",
+            EngineMode::Rootless,
+        ),
+    ];
+    for (label, version, info, kind, engine_version, mode) in cases {
+        let api = if label.starts_with("podman") {
+            "1.44"
+        } else {
+            "1.53"
+        };
+        let info_path: &'static str = Box::leak(format!("/v{api}/info").into_boxed_str());
+        let version: &'static str = Box::leak(version.to_string().into_boxed_str());
+        let info: &'static str = Box::leak(info.to_string().into_boxed_str());
+        let (_dir, runtime, server) =
+            fixture(vec![("/version", 200, version), (info_path, 200, info)]);
+        let facts = runtime.inspect_engine().wait().unwrap();
+        assert_eq!(facts.info.kind, kind, "{label}");
+        assert_eq!(facts.info.version, engine_version, "{label}");
+        assert_eq!(facts.mode, mode, "{label}");
+        assert_eq!(facts.cgroup_driver.as_deref(), Some("systemd"), "{label}");
+        server.join().unwrap();
+    }
+}
+
+/// An engine this runtime does not know is `Unknown`, never guessed to be Docker.
+#[test]
+fn an_unrecognised_engine_is_named_by_its_component_or_unknown() {
+    let (_dir, runtime, server) = fixture(vec![(
+        "/version",
+        200,
+        r#"{"Components":[{"Name":"Moby Engine","Version":"1"}],"Version":"1.0","ApiVersion":"1.44","MinAPIVersion":"1.24"}"#,
+    )]);
+    assert_eq!(runtime.discover().wait().unwrap().kind, EngineKind::Unknown);
+    server.join().unwrap();
+    // Today's fixture (a Docker platform name and no components) is still Docker.
+    let (_dir, runtime, server) = fixture(vec![("/version", 200, VERSION)]);
+    assert_eq!(runtime.discover().wait().unwrap().kind, EngineKind::Docker);
+    server.join().unwrap();
+}
+
+#[test]
+fn the_wire_names_of_engine_kind_and_mode_are_the_contract_vocabulary() {
+    assert_eq!(EngineKind::Docker.wire(), Some("docker"));
+    assert_eq!(EngineKind::Podman.wire(), Some("podman"));
+    assert_eq!(EngineKind::Unknown.wire(), None);
+    assert_eq!(EngineMode::Rootful.wire(), "rootful");
+    assert_eq!(EngineMode::Rootless.wire(), "rootless");
+}
+
+const RESTART_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn restart_readback(reported: &'static str) -> Result<(), RuntimeError> {
+    let inspect: &'static str = Box::leak(
+        format!(
+            r#"{{"Id":"{RESTART_ID}","Name":"/quasar-recovery","HostConfig":{{"RestartPolicy":{{"Name":"{reported}","MaximumRetryCount":0}}}},"State":{{"Status":"running","Running":true}}}}"#
+        )
+        .into_boxed_str(),
+    );
+    let update: &'static str =
+        Box::leak(format!("POST /v1.48/containers/{RESTART_ID}/update").into_boxed_str());
+    let get: &'static str =
+        Box::leak(format!("/v1.48/containers/{RESTART_ID}/json").into_boxed_str());
+    let (_dir, runtime, server) = fixture(vec![
+        ("/version", 200, VERSION),
+        (update, 200, r#"{"Warnings":[]}"#),
+        (get, 200, inspect),
+    ]);
+    let result = runtime
+        .set_restart_policy(RESTART_ID, crate::platform::RestartPolicy::No)
+        .wait();
+    server.join().unwrap();
+    result
+}
+
+/// ADR 0007 (RH-07 clarification): after every restart-policy update the runtime reads
+/// the policy back, on every engine, and a mismatch fails the step.
+#[test]
+fn a_restart_policy_update_is_read_back() {
+    assert!(restart_readback("no").is_ok());
+    assert_eq!(
+        restart_readback("unless-stopped").unwrap_err().kind,
+        ErrorKind::Engine
+    );
+}
+
+/// D10: CDI everywhere it resolves; `--gpus` only on a rootful Docker without an
+/// NVIDIA CDI device; nothing on a rootless Docker without one.
+#[test]
+fn gpu_injection_is_decided_from_engine_facts() {
+    let with_nvidia = CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec![
+            "nvidia.com/gpu=0 (cdi)".into(),
+            "nvidia.com/gpu=all (cdi)".into(),
+        ],
+    };
+    let empty = CdiFacts {
+        spec_dirs: vec!["/etc/cdi".into()],
+        devices: vec![],
+    };
+    use EngineKind::*;
+    use EngineMode::*;
+    use GpuInjection::*;
+    for (kind, mode, cdi, want) in [
+        (Podman, Rootless, None, Some(Cdi)),
+        (Podman, Rootful, None, Some(Cdi)),
+        (Docker, Rootful, Some(&with_nvidia), Some(Cdi)),
+        (Docker, Rootless, Some(&with_nvidia), Some(Cdi)),
+        (Docker, Rootful, Some(&empty), Some(DeviceRequest)),
+        (Docker, Rootful, None, Some(DeviceRequest)),
+        (Docker, Rootless, Some(&empty), None),
+        (Docker, Rootless, None, None),
+        (Unknown, Rootful, None, Some(DeviceRequest)),
+    ] {
+        assert_eq!(
+            GpuInjection::for_engine(kind, mode, cdi),
+            want,
+            "{kind:?} {mode:?} {cdi:?}"
+        );
+    }
+}

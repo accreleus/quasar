@@ -1,0 +1,24 @@
+{
+ "ApiVersion": "1.44",
+ "Arch": "amd64",
+ "Components": [
+  {
+   "Name": "Podman Engine",
+   "Version": "5.8.4"
+  },
+  {
+   "Name": "Conmon",
+   "Version": "conmon version 2.2.1, commit: "
+  },
+  {
+   "Name": "OCI Runtime (crun)",
+   "Version": "crun version 1.28"
+  }
+ ],
+ "MinAPIVersion": "1.24",
+ "Os": "linux",
+ "Platform": {
+  "Name": "linux/amd64/fedora-44"
+ },
+ "Version": "5.8.4"
+}

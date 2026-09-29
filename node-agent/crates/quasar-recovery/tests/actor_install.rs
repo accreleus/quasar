@@ -493,7 +493,7 @@ fn a_container_holding_the_agent_name_without_our_labels_is_never_touched() {
 
 #[test]
 fn an_agent_image_without_a_revision_this_actor_carries_is_refused_before_anything_is_created() {
-    for label in [None, Some("3"), Some("one")] {
+    for label in [None, Some("4"), Some("one")] {
         let mut state = amd_host();
         state
             .registry
@@ -666,4 +666,88 @@ fn an_engine_that_refuses_a_call_fails_resume_without_a_partial_container_left_r
             .status,
         "running"
     );
+}
+
+/// D10: an engine that injects NVIDIA through CDI is probed and recorded that
+/// way, so recipe revision 3 asks for the GPU by CDI too.
+#[test]
+fn a_cdi_engine_is_probed_and_recorded_as_cdi() {
+    let mut state = nvidia_host(&[], true);
+    state.host.gpu_injection = Some(quasar_recovery::recipe::GpuInjection::Cdi);
+    state
+        .registry
+        .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
+    let (engine, dir) = installed(state);
+    let gpu = &machine_json(&dir)["inputs"]["gpu"];
+    assert_eq!(gpu["gpus_served"], true);
+    assert_eq!(gpu["cdi"], true);
+    let agent = engine
+        .state()
+        .container_named(names::NODE_AGENT)
+        .unwrap()
+        .clone();
+    assert_eq!(agent.spec.gpus.len(), 1, "the NVIDIA shape");
+}
+
+/// "No GPU" is decided from the engine's own facts, never from an error's
+/// wording. An engine that can inject no NVIDIA GPU is not probed at all, and the agent is
+/// installed without the NVIDIA shape; nothing is recorded, so it is asked again later.
+#[test]
+fn an_engine_that_cannot_inject_a_gpu_is_not_probed_and_gets_no_nvidia_shape() {
+    let mut state = nvidia_host(&[], true);
+    state.host.gpu_injection = None;
+    state
+        .registry
+        .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
+    let (engine, dir) = installed(state);
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert!(agent.spec.gpus.is_empty());
+    assert!(machine_json(&dir)["inputs"]["gpu"]
+        .get("gpus_served")
+        .is_none());
+    assert!(machine_json(&dir)["inputs"]["gpu"].get("cdi").is_none());
+}
+
+/// Review M2: the probe asks with the request the agent's revision renders. Before revision
+/// 3 that is always `--gpus`, whatever the engine prefers, so the recorded answer never
+/// claims CDI for an agent that will not use it.
+#[test]
+fn an_agent_before_revision_3_is_probed_and_recorded_as_gpus() {
+    let mut state = nvidia_host(&[], true);
+    state.host.gpu_injection = Some(quasar_recovery::recipe::GpuInjection::Cdi);
+    let (engine, dir) = installed(state);
+    let gpu = &machine_json(&dir)["inputs"]["gpu"];
+    assert_eq!(gpu["gpus_served"], true);
+    assert!(gpu.get("cdi").is_none());
+    let state = engine.state();
+    let agent = state.container_named(names::NODE_AGENT).unwrap();
+    assert_eq!(agent.spec.gpus.len(), 1, "the NVIDIA shape");
+    assert!(agent.spec.gpus[0].device_ids.is_empty(), "by --gpus");
+}
+
+/// Rootless Docker gives a host-network container no sysfs: the agent is given the host's
+/// `/sys` read-only there, and only there (rootless Podman binds it itself).
+#[test]
+fn only_rootless_docker_gives_the_agent_the_hosts_sysfs() {
+    for (kind, rootless, expected) in [
+        (quasar_runtime::EngineKind::Docker, true, true),
+        (quasar_runtime::EngineKind::Podman, true, false),
+        (quasar_runtime::EngineKind::Docker, false, false),
+    ] {
+        let mut state = amd_host();
+        state.host.kind = kind;
+        state.host.rootless = rootless;
+        state
+            .registry
+            .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
+        let (engine, _dir) = installed(state);
+        let state = engine.state();
+        let agent = state.container_named(names::NODE_AGENT).unwrap();
+        let sys = agent.spec.binds.iter().find(|b| b.target == "/sys");
+        assert_eq!(sys.is_some(), expected, "{kind:?} rootless={rootless}");
+        if let Some(sys) = sys {
+            assert!(sys.read_only && sys.source == "/sys");
+        }
+    }
 }

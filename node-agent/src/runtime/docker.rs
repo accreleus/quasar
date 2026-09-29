@@ -10,6 +10,7 @@ use quasar_runtime::docker::{
 use std::sync::OnceLock;
 pub(super) mod application;
 mod build;
+pub(crate) mod dialect;
 pub(super) mod helpers;
 pub(super) mod legacy;
 pub(super) use build::build as build_image;

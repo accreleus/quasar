@@ -5,6 +5,11 @@
 //! with the host's `/dev` bound read-only at `/host/dev`, reads what it printed, and
 //! removes it whatever happened.
 //!
+//! Presence is read by listing `/host/dev` (a glob, which is a directory read), never by
+//! `stat`ing a node: under SELinux a confined container may list the host's `/dev` but
+//! not `stat` most of its nodes, and a `[ -e ]` there reads "absent" (found on the first
+//! rootless Podman install, RH-07).
+//!
 //! Which evidence wins: **device nodes**. `/sys/class/drm` is not namespaced, so inside a
 //! system container (an LXC guest) it lists every GPU of the physical host, including
 //! ones whose nodes this machine does not have. The probe therefore starts from the
@@ -21,6 +26,7 @@ use crate::engine::{ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
 use crate::recipe::{
     labels, names, Bind, GpuFacts, GpuNode, GpuRequest, GpuVendor, HostDevices, ImageRef,
 };
+use quasar_runtime::GpuInjection;
 
 pub const PROBE_HELPER: &str = "gpu-probe";
 pub const GPUS_PROBE_HELPER: &str = "gpus-probe";
@@ -30,7 +36,8 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
-for d in uinput kmsg nvidiactl; do [ -e "/host/dev/$d" ] && echo "dev $d"; done
+for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse) echo "dev ${f##*/}";; esac; done
+[ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
   mm=$(stat -c '%t:%T' "$n") || continue
@@ -45,6 +52,10 @@ echo end"#;
 pub struct ProbeReport {
     pub uinput: bool,
     pub kmsg: bool,
+    /// The host lets unprivileged processes read the kernel log (`dmesg_restrict=0`).
+    pub kernel_log: bool,
+    /// The host has `/dev/fuse` (sessions may be given it).
+    pub fuse: bool,
     pub nvidia_nodes: bool,
     /// `(node, pci vendor id)`, render and card nodes, in the order printed.
     pub nodes: Vec<(String, Option<String>)>,
@@ -79,6 +90,8 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("uinput")) => report.uinput = true,
             (Some("dev"), Some("kmsg")) => report.kmsg = true,
             (Some("dev"), Some("nvidiactl")) => report.nvidia_nodes = true,
+            (Some("dev"), Some("fuse")) => report.fuse = true,
+            (Some("kernel_log"), Some("open")) => report.kernel_log = true,
             (Some("node"), Some(node)) if node.starts_with("/dev/dri/") => {
                 let _majmin = words.next();
                 let vendor = words.next().filter(|v| *v != "-").map(str::to_owned);
@@ -147,6 +160,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         vendor: chosen.map(|(_, _, v)| *v),
         render_node: chosen.map(|(_, n, _)| (*n).to_owned()),
         gpus_served: false,
+        cdi: false,
         fallback: nvidia.and(other).map(|(_, n, v)| GpuNode {
             unknown: Default::default(),
             vendor: *v,
@@ -158,6 +172,10 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         dri: !report.nodes.is_empty(),
         uinput: report.uinput,
         kmsg: report.kmsg,
+        kernel_log: report.kmsg && report.kernel_log,
+        fuse: report.fuse,
+        engine_rootless: false,
+        host_sysfs: false,
     };
     (gpu, devices)
 }
@@ -184,37 +202,51 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
         init: false,
         restart: RestartPolicy::No,
         ports: Vec::new(),
-        healthcheck: None,
+        healthcheck: Some(no_healthcheck()),
     }
 }
 
-/// The `--gpus all` probe: a container requesting every GPU, running `true`. The engine
-/// serves `--gpus` through an `nvidia` runtime, CDI, or the container toolkit's hook, and
-/// only the last is invisible in `/info`, so the evidence is whether this starts and exits
-/// 0. Removed on every path that created it.
-pub fn gpus_spec(image: &ImageRef) -> ContainerSpec {
+/// Exits 0 only when the NVIDIA control node is inside: listing /dev, since a confined
+/// container may be denied `stat` there.
+const GPUS_PROBE_TEST: &str = "set -- /dev/nvidiactl*; [ \"$1\" = /dev/nvidiactl ]";
+
+/// Probes run the agent image; its healthcheck means nothing for a one-shot container.
+fn no_healthcheck() -> quasar_runtime::platform::Healthcheck {
+    quasar_runtime::platform::Healthcheck {
+        test: vec!["NONE".into()],
+        interval_s: 0,
+        timeout_s: 0,
+        retries: 0,
+        start_period_s: 0,
+    }
+}
+
+/// The GPU probe: a container requesting every NVIDIA GPU the way the agent will (CDI or
+/// `--gpus`), which must start and find the control node inside; an engine may accept a
+/// request and inject nothing (rootless Podman with `--gpus`). Removed on every path that
+/// created it.
+pub fn gpus_spec(image: &ImageRef, injection: GpuInjection) -> ContainerSpec {
     ContainerSpec {
         name: names::GPU_PROBE.into(),
         image: image.reference(),
+        // Served means the NVIDIA control node is inside: an engine may accept a request it
+        // ignores (rootless Podman does with `--gpus`). Matched by listing /dev, since a
+        // confined container may be denied `stat` there.
         entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
-        cmd: Some(vec!["true".into()]),
+        cmd: Some(vec![GPUS_PROBE_TEST.into()]),
         env: BTreeMap::new(),
         labels: BTreeMap::from([(labels::HELPER.to_string(), GPUS_PROBE_HELPER.to_string())]),
         network_mode: Some("none".into()),
         binds: Vec::new(),
         devices: Vec::new(),
         device_cgroup_rules: Vec::new(),
-        gpus: vec![GpuRequest {
-            driver: None,
-            count: -1,
-            capabilities: vec![vec!["gpu".into()]],
-        }],
+        gpus: vec![GpuRequest::nvidia_all(injection)],
         cap_add: Vec::new(),
         security_opt: Vec::new(),
         init: false,
         restart: RestartPolicy::No,
         ports: Vec::new(),
-        healthcheck: None,
+        healthcheck: Some(no_healthcheck()),
     }
 }
 
@@ -235,11 +267,12 @@ pub enum GpusAnswer {
 pub fn serves_gpus(
     engine: &dyn PlatformEngine,
     image: &ImageRef,
+    injection: GpuInjection,
     backoff: Duration,
 ) -> Result<GpusAnswer, EngineError> {
     let mut attempt = 1;
     loop {
-        match gpus_attempt(engine, image) {
+        match gpus_attempt(engine, image, injection) {
             Err(e) if e.is_transient() && attempt < GPUS_PROBE_ATTEMPTS => {
                 warn!(
                     token = "actor-gpus-probe-retry",
@@ -253,8 +286,12 @@ pub fn serves_gpus(
     }
 }
 
-fn gpus_attempt(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<GpusAnswer, EngineError> {
-    let id = match engine.create_container(&gpus_spec(image)) {
+fn gpus_attempt(
+    engine: &dyn PlatformEngine,
+    image: &ImageRef,
+    injection: GpuInjection,
+) -> Result<GpusAnswer, EngineError> {
+    let id = match engine.create_container(&gpus_spec(image, injection)) {
         Ok(id) => id,
         Err(e) if e.is_device_request_refusal() => return Ok(GpusAnswer::Refused(e.to_string())),
         Err(e) => return Err(e),
@@ -265,7 +302,7 @@ fn gpus_attempt(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<GpusAns
         Ok(()) => match engine.wait_container(&id, PROBE_TIMEOUT) {
             Ok(0) => Ok(GpusAnswer::Served),
             Ok(code) => Ok(GpusAnswer::Refused(format!(
-                "the probe ran with the GPUs and exited {code}"
+                "the probe started but saw no NVIDIA device inside (exit {code})"
             ))),
             Err(e) => Err(e),
         },
@@ -306,6 +343,26 @@ pub fn run(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<ProbeReport,
 
 #[cfg(test)]
 mod tests {
+    /// RH-07 #402: kernel-log access is reported only when the host allows it, and the
+    /// agent is offered it only with /dev/kmsg present.
+    #[test]
+    fn kernel_log_access_follows_the_host_setting() {
+        let open = parse("quasar-probe 1\ndev kmsg\nkernel_log open\nend").unwrap();
+        assert!(open.kernel_log);
+        assert!(select(&open).1.kernel_log);
+        let restricted = parse("quasar-probe 1\ndev kmsg\nend").unwrap();
+        assert!(!select(&restricted).1.kernel_log);
+        let no_node = parse("quasar-probe 1\nkernel_log open\nend").unwrap();
+        assert!(!select(&no_node).1.kernel_log);
+        // #402 review: the agent no longer sees the host's /dev, so FUSE is probed here.
+        assert!(
+            select(&parse("quasar-probe 1\ndev fuse\nend").unwrap())
+                .1
+                .fuse
+        );
+        assert!(!select(&restricted).1.fuse);
+    }
+
     use super::*;
 
     const LXC_AMD: &str = "quasar-probe 1\ndev uinput\nnode /dev/dri/renderD129 226:129 0x1002\nnode /dev/dri/card1 226:1 0x1002\nend\n";

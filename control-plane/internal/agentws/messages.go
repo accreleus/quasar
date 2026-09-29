@@ -62,6 +62,13 @@ type RegisterMsg struct {
 	RecoveryActorVersion      *string `json:"recovery_actor_version"`
 	RecoveryActorSourceCommit *string `json:"recovery_actor_source_commit"`
 	SeedVersion               *string `json:"seed_version"`
+
+	// Engine facts (amendment 17, RH-07 #396): any install mode, replaced wholesale.
+	// Raw, so a value of the wrong JSON type is treated as absent, as the contract says,
+	// rather than failing the whole message decode.
+	Engine        json.RawMessage `json:"engine"`
+	EngineVersion json.RawMessage `json:"engine_version"`
+	EngineMode    json.RawMessage `json:"engine_mode"`
 }
 
 // AuthEnrollment is the auth field on first contact.

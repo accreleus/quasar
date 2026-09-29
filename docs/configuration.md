@@ -841,9 +841,17 @@ have a ten-minute budget, catalog pulls thirty minutes and removals one minute.
 The existing catalog queue still admits two simultaneous pulls/builds, serializes
 each image ID and retains only its latest pending replacement.
 
-The API uses `DOCKER_HOST`, the only endpoint knob. It must be a `unix://` absolute
-path and defaults to `unix:///var/run/docker.sock`; the compose file mounts the host
-socket at that path. Nonempty `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY` or
+The API uses `DOCKER_HOST`, or Podman's name for the same setting, `CONTAINER_HOST`
+(RH-07 #396). Each must be a `unix://` absolute path. Both set to different endpoints
+is **ambiguous** and refused by name (`runtime_endpoint` fails); the agent never picks
+one. With neither set, the endpoint is the first socket that exists of
+`/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`
+and `$XDG_RUNTIME_DIR/docker.sock` (Docker first, so a Docker host is unchanged when
+Podman is installed beside it), else `/var/run/docker.sock`. The compose file and the
+recovery actor mount the host socket at `/var/run/docker.sock` inside the agent.
+The agent reports the engine it found (Docker or Podman), its version and its engine
+mode (rootful or rootless) on `register` and in the `runtime_engine` readiness check;
+finding an engine is not a claim that any capability works on it. Nonempty `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY` or
 `DOCKER_API_VERSION` overrides are rejected instead of silently ignored. A saved
 non-default Docker CLI context is also rejected: an operator who switched context
 expects it honoured, and the agent cannot do that, so it refuses rather than silently
@@ -957,8 +965,9 @@ path preserves uncertainty across agent restarts without adding a compose settin
 ### Runtime endpoint, migration and recovery
 
 For an existing host, the socket mount remains unchanged; a host using the default
-socket needs no compose change. Podman operators may point `DOCKER_HOST` at Podman's
-Docker-compatible Unix socket, but that configuration is not certified.
+socket needs no compose change. Podman's Docker-compatible socket is found without
+configuration; Podman and rootless engines are experimental engine profiles until the
+RH-07 acceptance map proves them (`runtime_engine` says which profile a host runs).
 
 Every application, helper and audio journal records the endpoint it was written
 against. Changing `DOCKER_HOST` is safe while every record is terminal (`Completed`):
@@ -1013,7 +1022,8 @@ app's catalog `runtime_spec` (image/args/env/mounts/gpu) is used instead.
 | Variable | Default | Values / notes |
 |---|---|---|
 | `QUASAR_CONTAINER_RUNTIME` | retired (#239) | Ignored. If set, startup emits `runtime-cli-knob-retired`; select the engine only with `DOCKER_HOST`. |
-| `DOCKER_HOST` | `unix:///var/run/docker.sock` | The only endpoint knob. A `unix://` absolute path to the engine socket, mounted and accessible inside the agent; the default compose file mounts the host socket at this path. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are rejected. |
+| `DOCKER_HOST` | the first existing default socket (below) | The endpoint knob. A `unix://` absolute path to the engine socket, mounted and accessible inside the agent; the default compose file mounts the host socket at `/var/run/docker.sock`. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are rejected. |
+| `CONTAINER_HOST` | unset | Podman's name for `DOCKER_HOST`, with the same rules. Setting both to different endpoints is refused as ambiguous. With neither set the agent uses the first of `/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`, `$XDG_RUNTIME_DIR/docker.sock` that exists. |
 | `QUASAR_CONTAINER_NETWORK` | `none` | Host-wide fallback `--network` for app containers, applied only when the app itself states none. **Prefer the per-app knob below** — the network is an app requirement, so setting it here to fix one title (Steam sign-in/downloads) opens the network for every app on the host. Accepted: `none` \| `bridge` \| `host`; anything else fails the session with a named error rather than being handed to the runtime. **This is the only place `host` can be selected**, deliberately: it is set by the operator of one specific machine and travels nowhere. `--network host` removes the container's network namespace — the app then reaches every service on host loopback (control plane, Postgres, any admin-only port) and can bind host ports — so it is a host-administration decision, not an app property. |
 | *(per-app)* `runtime_spec.network` / preset `network` | inherit | Not an env var — the per-app container network (first-run experience §S2). Resolved at launch as **app `runtime_spec.network` → its runtime preset's `network` column → `QUASAR_CONTAINER_NETWORK` → `none`**. Accepted at every layer: `""` (inherit) \| `none` \| `bridge`. **`host` is refused here even though the env knob above accepts it** — these values are portable (a preset is materialized from a catalog image manifest authored elsewhere), so an app-authored `host` would dissolve container network isolation on every host that installs the image. A rejected value is a 400 from the admin preset API, a failed image install from a manifest `runtime` block, a failed launch from an app's `runtime_spec`, and a failed session at the agent. Steam's catalog image declares `bridge` because its first boot must download `steamui.so` — without it the app clean-exits and the session surfaces as "media path interrupted" (#463). |
 | `QUASAR_APP_PUID` | unset | Run-as **user** id for app containers, forwarded as `PUID` (not docker `--user`, which would bypass the images' root init). The quasar-images base entrypoint starts as root, then drops to `PUID`/`PGID`. Unset ⇒ image default (unchanged). Unraid convention: `99`. An app-catalog `PUID` in the app's `runtime_spec.env` overrides this host default. |
@@ -1031,7 +1041,7 @@ app's catalog `runtime_spec` (image/args/env/mounts/gpu) is used instead.
 | *(per-app)* `runtime_spec.mounts` / preset `mounts` | `[]` | Not an env var — the host paths an app binds. Both the control plane (image install, admin preset write) and the node agent vet them; what a given host actually permits is `QUASAR_APP_MOUNT_ALLOW` above, which is default-deny apart from the managed-home root. |
 | *(per-app)* `runtime_spec.on_app_exit` | `fail` | Not an env var — an additive string key (`"fail"` \| `"keep"`) in an app's `runtime_spec` (admin app catalog). App-liveness: policy for a steady-state app-container exit (crash, OOM, or a clean quit), detected through runtime-API observation by immutable container identity. `fail` (default) ends the session — a dead app streaming a stale frame forever is the bug this closes. `keep` logs the exit and lets the session continue; set it explicitly on catalog rows whose app legitimately exits mid-session (e.g. a console/local_only desktop process). A container torn down by Quasar itself (session stop, launcher↔game swap) is never misclassified as an app exit either way. |
 | `QUASAR_APP_EXIT_POLICY` | `fail` | Host default for `runtime_spec.on_app_exit` on the dev/standalone `QUASAR_APP_*` launch path (`from_env`). `keep` restores the pre-liveness behaviour of ignoring app exits; any other value (including unset) is `fail`. A catalog app's own `runtime_spec.on_app_exit` always wins on a control-plane assignment — this only affects the direct demo/dev path. |
-| `QUASAR_GPU_NVIDIA` | off | `1`/`true` → NVIDIA passthrough (`--gpus all` / CDI); otherwise `--device /dev/dri` (AMD/Intel). |
+| `QUASAR_GPU_NVIDIA` | off | `1`/`true` → NVIDIA passthrough (CDI, or `--gpus all` on a rootful Docker without an NVIDIA CDI device); otherwise `--device /dev/dri` (AMD/Intel). |
 | `QUASAR_NV_LIB32_PATH` | unset (auto-detect) | #375: host directory holding the **32-bit** NVIDIA driver libs (e.g. `/usr/lib` on unraid), bind-mounted read-only into NVIDIA app containers at `/opt/quasar/nvidia-lib32` so native 32-bit Linux titles resolve `libGLX_nvidia.so.*` (the container ships only 64-bit driver libs; the container toolkit/CDI spec never injects 32-bit). Must be empty or an absolute path. Empty ⇒ the agent auto-detects at startup via a short-lived probe container that globs the host `/usr` (`busybox`/`alpine`), and failing that falls back to the `lib32/` half of the Quasar-provisioned driver volume (`QUASAR_NVIDIA_DRIVER_VOLUME`) — which reuses this exact mount mechanism, just pointed at the volume's host path; if both fail (no network on a locked-down host), set this explicitly. Also a per-host `nvidia_lib32_path` admin knob (live-class); the override wins over auto-detect. **NVIDIA-only** — inert on VA/AMD hosts. Requires the quasar-images `ld.so.conf.d` entry for `/opt/quasar/nvidia-lib32` (the mount deliberately avoids GOW's `/usr/nvidia` driver-volume path — upstream GOW images' cont-init treats that as a full driver volume and exits 1 when it isn't one). |
 | `QUASAR_NVIDIA_DRIVER_HOST_PATH` | unset → automatic Docker mount discovery | Advanced recovery escape hatch for the **host** directory already mounted at `/opt/quasar/nvidia-driver` inside the node agent. Unset preserves named-volume discovery and injection. A non-empty value takes precedence and must be an absolute directory other than `/`, without parent traversal, commas or control characters. It does **not** create or change the agent's mount. Quasar writes a temporary nonce inside that mount and verifies the same nonce through a read-only Docker sibling bind before provisioning and before app launch; a missing, wrong or unverifiable path blocks injection and appears as `nvidia_driver_mount` readiness, without silently falling back. The check uses the existing `QUASAR_PULSE_IMAGE` (the generated Compose supplies the agent image), requires that image locally and never pulls it; a custom stack with no discoverable container identity must supply that image too. Checks retry after transient failure, and temporary markers/helper containers are cleaned up. Recreate the agent after changing this setting. For a named volume, its Docker-reported `Mountpoint` is a possible override, but leaving discovery enabled is preferred because that path can change with Docker's data root. |
 | `QUASAR_NVIDIA_DRIVER_VOLUME` | `1` (on) | First-run S1: Wolf-style **NVIDIA driver-volume auto-provisioning**. When the host readiness probe reports the NVIDIA graphics gap (no EGL vendor json / no `libnvidia-eglcore` / no 32-bit GL — the CUDA-only install of #462) the agent downloads `https://download.nvidia.com/XFree86/Linux-x86_64/<ver>/NVIDIA-Linux-x86_64-<ver>.run` for the **loaded kernel-module version** (`/sys/module/nvidia/version`), runs it `--extract-only` (**never** `--install`; nothing is written outside the volume), and populates the named volume `quasar-nvidia-driver` (`lib64/`, `lib32/`, `glvnd/egl_vendor.d/10_nvidia.json`, `egl_external_platform.d/`, `vulkan/icd.d/nvidia_icd.json`, `gbm/`, `ld.so.conf.d/`, `manifest.json`). Precedence: a host with its own graphics driver (CDI injection) **never** provisions. Re-provisions when the host driver version changes; concurrency-guarded by a lockfile in the volume. After a successful provision that closed an **EGL** gap the agent restarts itself (the dynamic loader latches `LD_LIBRARY_PATH` at exec); a 32-bit-only gap takes effect on the next session launch with no restart. Progress is reported on the readiness card as the additive `provisioning` status and logged on the `quasar.nvidia_volume` tracing target. **A virgin NVIDIA deploy therefore logs an INFO `vulkan-codec-plan-pending-driver-volume` line on its first boot** — the Vulkan ICD isn't visible to the GStreamer registry scan until the volume is provisioned — and only re-probes as the healthy `vulkan codec plan: h264=vulkan, …` line after the self-restart above; a WARN `vulkan-codec-plan-degraded` on a **later** boot (volume already adopted) means a codec's vulkan element is genuinely missing from the image and is worth investigating. The volume carries **vendor libraries only** — the installer's own vendor-neutral glvnd dispatch copies (`libEGL.so.*`, `libGLdispatch.so.*`, `libGL.so.*`, `libGLX.so.*`, `libOpenGL.so.*`, `libGLESv*.so.*`, `libOpenCL.so.*`) are deliberately excluded, because with the volume on `LD_LIBRARY_PATH` they shadow the image's libglvnd and NVIDIA's legacy pre-glvnd `libEGL.so.<ver>` wins the `libEGL.so.1` SONAME, stripping `EGL_EXT_device_enumeration` and panicking the compositor. Vulkan AV1 was live-validated with a provisioned 610.57.04 volume on RTX 5090. The agent establishes EGL vendor, external-platform, GBM and Vulkan ICD discovery paths together; an ad-hoc `docker exec gst-inspect` does not inherit those process-internal settings and can misleadingly report a missing encoder. See [the driver comparison](reports/2026-09-06-av1-vulkan-driver-comparison.md). Set `0` (or `false`/`no`) to keep the manual remediation path — appropriate for an air-gapped or bandwidth-capped host, or one that mirrors drivers internally. The generated Compose includes the driver volume. Without that mount the agent reports the gap and cannot provision driver libraries. **Safety rails (#475–#478):** the trigger is **file presence only** — the runtime EGL self-test can turn the readiness card red but can never start a download or the self-restart, so a slow/timed-out/killed self-test on a healthy host does nothing (a timeout is `Indeterminate`, not "broken"); the installer's sha256 is **verified before the `.run` is executed** — first against `REVIEWED_DRIVER_DIGESTS` in `node-agent/src/nvidia_volume.rs` (reviewed digests compiled into the agent; the only control that covers a *first* provision — see `docs/third-party-pins.md`), then against the per-host pins in `driver-digests.json` inside the volume, which refuse a changed digest for an already-accepted version (delete that file, or the volume, to re-pin; a **corrupt** pin file is itself a refusal, never an empty pin set). A version with neither pin is accepted on trust and pinned (WARN `drvvol-trust-on-first-use`) unless `QUASAR_NVIDIA_DRIVER_TRUST_ON_FIRST_USE=0`, which refuses it with a message naming the staging and opt-out routes; a `statvfs` preflight refuses to start without ~3 GiB free in the volume's filesystem (the download plus the extracted tree land in the docker data root); scratch is removed on every exit path; and repeated **failures** back off (5 min doubling to a 6 h cap, tracked in `.provision-attempts.json`, reset on success or on a driver-version change) so an agent crash-looping for an unrelated reason cannot become a download loop. |
@@ -1226,7 +1236,7 @@ compose). See `CLAUDE.md` for the full rationale.
 
 Host kernel/network tuning (UDP `wmem_default`, etc.) lives in `deploy/host-tuning.md`.
 The node agent's device and capability grants (`/dev/dri`, `/dev/uinput`, `/dev/kmsg`
-read-only, `NET_ADMIN` + `SYSLOG`) are compose-level, not environment variables — they
+read-only, `SYSLOG`; `NET_ADMIN` is granted but unused since #403) are compose-level, not environment variables — they
 are listed in `deploy/README.md` §"Prerequisites in detail", and each one is what makes
 a specific readiness check answerable rather than `skip`.
 
@@ -1690,13 +1700,25 @@ registers as `seed_version`.
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
 **NVIDIA detection.** When the device probe finds an NVIDIA render node, the actor asks
-the engine, just before it creates the agent, with a second disposable probe that requests
-`--gpus all` (the evidence that holds whether `--gpus` is served by an `nvidia` runtime, CDI
-or only the container toolkit's hook).
-- It starts and exits 0: the NVIDIA shape is installed (`token="actor-gpus-served"`) and that
-  yes is recorded in machine state.
+the engine, just before it creates the agent (on install and on an update alike), with a
+second disposable probe that requests the GPU the way the agent's recipe revision will
+(RH-07 #399). From revision 3 that is the way every Quasar container on this engine asks;
+before it, always `--gpus all`:
+- **by CDI** (`nvidia.com/gpu=all`) on Podman, and on a Docker that reports an NVIDIA CDI
+  device;
+- **by `--gpus all`** on a rootful Docker that reports none;
+- **not at all** on a rootless Docker that reports none: the agent is installed without the
+  NVIDIA shape (`token="actor-gpu-injection-unavailable"`) and readiness `runtime_cdi`
+  fails, naming host preparation (`deploy/prepare-host.sh` writes the CDI specification).
+  Nothing falls back to more privilege.
+
+Then:
+- It starts and finds the NVIDIA control node inside (an engine may accept a request and
+  ignore it, as rootless Podman does with `--gpus`): the NVIDIA shape is installed
+  (`token="actor-gpus-served"`) and that yes is recorded in machine state, with the request
+  it answered. A later create whose revision renders a different request asks again.
 - The engine refuses the device request ("could not select device driver", or with CDI enabled "failed to discover GPU vendor from CDI") or the probe
-  exits non-zero: the agent is installed without the NVIDIA shape, pointed at the machine's
+  finds no NVIDIA device: the agent is installed without the NVIDIA shape, pointed at the machine's
   other GPU if it has one (`token="actor-gpus-refused"`, with the reason), and RH-02
   readiness reports the gap. The no is not recorded: the next time the agent is created
   (after removing it, for instance once the toolkit is installed) the engine is asked again.
@@ -1874,7 +1896,7 @@ volume exits, `token="actor-lease-unavailable"`, unless it is one of a hand-over
 actors, which waits), creates machine state, detects the GPU
 with a disposable probe container, and creates `quasar-node-agent` from its recipe with its
 volumes (`quasar-agent-data`, `quasar-node-agent-secrets`, and `quasar-nvidia-driver` on an
-NVIDIA host whose engine serves `--gpus`). A second start on an installed machine changes
+NVIDIA host whose engine serves the GPU). A second start on an installed machine changes
 nothing; an interrupted install is completed by the next start. A failed install (an
 unreachable engine, an owner conflict) logs `token="actor-resume-failed"`, keeps serving
 status (`stale: true` while the engine does not answer) and is retried only on the next
