@@ -13,9 +13,12 @@ env_file="${GITHUB_ENV:?not on a GitHub runner}"
 user="$(id -un)"
 uid="$(id -u)"
 
+# A rootful Podman's /run/podman is root's alone, so its socket is looked at as root.
 wait_for_socket() {
+  local as=()
+  [ "${2:-}" = root ] && as=(sudo)
   for _ in $(seq 1 60); do
-    [ -S "$1" ] && return 0
+    "${as[@]}" test -S "$1" && return 0
     sleep 1
   done
   echo "no engine socket at $1" >&2
@@ -45,7 +48,7 @@ case "$target" in
   podman-rootful)
     sudo systemctl start podman.socket
     socket=/run/podman/podman.sock
-    wait_for_socket "$socket"
+    wait_for_socket "$socket" root
     sudo podman version --format 'Podman {{.Server.Version}}'
     echo "ENGINE_SUITE_AS_ROOT=1" >>"$env_file"
     ;;

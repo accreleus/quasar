@@ -333,6 +333,14 @@ fn main() -> ExitCode {
         }
     };
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The runtime's own warnings (a refused read-back names the field) explain a FAIL.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("QUASAR_ENGINE_SUITE_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     // The runtime's ownership lease, fresh per run: this run owns only what it creates.
     std::env::set_var("NODE_SECRET_PATH", root.path().join("node-secret"));
     // A failed assertion is reported on its case's line, with where it was raised.

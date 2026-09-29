@@ -66,6 +66,7 @@ binary links only libc.
 | `QUASAR_ENGINE_SUITE_LACKS` | What this host cannot give: `;`-separated `[<mode>:]<capability>=<reason>`, capabilities `cdi`, `dri`, `uinput`, `health`. A declared gap turns the cases that need it into `SKIP` with the reason. An undeclared one fails them. |
 | `QUASAR_ENGINE_SUITE_IMAGE` | The fixture image, when the engine cannot pull the default from Docker Hub. Any image with `sh`, `su`, `df` and `grep`, by digest. |
 | `QUASAR_ENGINE_SUITE_STATE_DIR` | Where the run's fixtures and runtime journals live (default: the system temp directory). It must be a path on the engine's host. |
+| `QUASAR_ENGINE_SUITE_LOG` | The runtime's log filter (default `warn`): its warnings, on stderr, name what a refused read-back differed in. |
 | `ENGINE_SUITE_BIN` | Run this binary instead of building one. |
 
 Everything the suite creates is named `quasar-sess-suite-<run>-…` (applications) or
