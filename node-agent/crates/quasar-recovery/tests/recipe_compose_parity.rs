@@ -284,6 +284,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             kernel_log: false,
             engine_rootless: false,
             host_sysfs: false,
+            dri_nodes: vec![],
             sound: false,
             i2c: Vec::new(),
             logind: false,

@@ -151,6 +151,14 @@ fn render_number(node: &str) -> Option<u32> {
 }
 
 impl ProbeReport {
+    /// Every DRM card and render node listed, sorted and without duplicates.
+    pub fn dri_nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self.nodes.iter().map(|(n, _)| n.clone()).collect();
+        nodes.sort();
+        nodes.dedup();
+        nodes
+    }
+
     /// Both of logind's state directories are there to bind.
     pub fn logind(&self) -> bool {
         ["seats", "sessions"]
@@ -211,6 +219,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         i2c: report.i2c.clone(),
         logind: report.logind(),
         console_audio: report.console_audio,
+        dri_nodes: report.dri_nodes(),
         engine_rootless: false,
         host_sysfs: false,
     };

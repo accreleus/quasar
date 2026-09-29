@@ -44,6 +44,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             kernel_log: false,
             engine_rootless: false,
             host_sysfs: false,
+            dri_nodes: vec![],
             sound: false,
             i2c: Vec::new(),
             logind: false,
@@ -1060,4 +1061,38 @@ fn control_inputs_that_could_inject_are_refused() {
             "{i:?}"
         );
     }
+}
+
+/// RH-07 #407, found live: rootless Podman refused the `/dev/dri` directory as a device
+/// ("no devices found in /dev/dri") on a host where each node alone was accepted. On a
+/// rootless engine the agent gets each DRM node the probe listed instead; with no list
+/// recorded (a machine installed before the list existed), the directory as before.
+#[test]
+fn a_rootless_agent_gets_each_drm_node_rather_than_the_directory() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let devices = |i: &Inputs| -> Vec<String> {
+        render(Role::NodeAgent, 3, i, &image, &agent_secrets())
+            .unwrap()
+            .devices
+            .iter()
+            .map(|d| d.host.clone())
+            .collect()
+    };
+    let mut rootless = inputs(Some(GpuVendor::Nvidia));
+    rootless.devices.engine_rootless = true;
+    rootless.devices.dri_nodes = vec!["/dev/dri/card0".into(), "/dev/dri/renderD128".into()];
+    let got = devices(&rootless);
+    assert!(got.contains(&"/dev/dri/card0".to_string()), "{got:?}");
+    assert!(got.contains(&"/dev/dri/renderD128".to_string()), "{got:?}");
+    assert!(!got.contains(&"/dev/dri".to_string()), "{got:?}");
+
+    let mut unlisted = rootless.clone();
+    unlisted.devices.dri_nodes.clear();
+    assert!(devices(&unlisted).contains(&"/dev/dri".to_string()));
+
+    let mut rootful = rootless.clone();
+    rootful.devices.engine_rootless = false;
+    let got = devices(&rootful);
+    assert!(got.contains(&"/dev/dri".to_string()), "{got:?}");
+    assert!(!got.contains(&"/dev/dri/card0".to_string()), "{got:?}");
 }

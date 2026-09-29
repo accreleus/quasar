@@ -295,6 +295,13 @@ pub struct HostDevices {
     /// sound device. Read with `i2c`; written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub console_audio: bool,
+    /// The host's DRM nodes (`/dev/dri/card*`, `/dev/dri/renderD*`), as the probe listed
+    /// them (RH-07 #407). On a rootless engine each is passed as its own device instead of
+    /// the `/dev/dri` directory, which rootless Podman refuses to expand in some hosts
+    /// ("no devices found"); it is also the narrower grant. Read again whenever console
+    /// mode is turned on. Sorted, without duplicates; written only when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dri_nodes: Vec<String>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -313,6 +320,7 @@ impl Default for HostDevices {
             i2c: Vec::new(),
             logind: false,
             console_audio: false,
+            dri_nodes: Vec::new(),
             unknown: Unknown::new(),
         }
     }
@@ -981,11 +989,21 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
 
     let mut devices = Vec::new();
     if inputs.devices.dri {
-        devices.push(Device {
-            host: "/dev/dri".into(),
-            container: "/dev/dri".into(),
-            permissions: "rwm".into(),
-        });
+        if inputs.devices.engine_rootless && !inputs.devices.dri_nodes.is_empty() {
+            for node in &inputs.devices.dri_nodes {
+                devices.push(Device {
+                    host: node.clone(),
+                    container: node.clone(),
+                    permissions: "rwm".into(),
+                });
+            }
+        } else {
+            devices.push(Device {
+                host: "/dev/dri".into(),
+                container: "/dev/dri".into(),
+                permissions: "rwm".into(),
+            });
+        }
     }
     if inputs.devices.uinput {
         devices.push(Device {

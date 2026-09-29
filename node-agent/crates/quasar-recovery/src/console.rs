@@ -206,7 +206,8 @@ impl Actor {
                 sound: report.sound,
                 logind: report.logind(),
                 console_audio: report.console_audio,
-                i2c: report.i2c,
+                i2c: report.i2c.clone(),
+                dri_nodes: report.dri_nodes(),
             }),
             Err(e) => {
                 warn!(
@@ -424,6 +425,7 @@ struct ConsoleDevices {
     logind: bool,
     console_audio: bool,
     i2c: Vec<u32>,
+    dri_nodes: Vec<String>,
 }
 
 impl ConsoleDevices {
@@ -432,5 +434,8 @@ impl ConsoleDevices {
         devices.logind = self.logind;
         devices.console_audio = self.console_audio;
         devices.i2c = self.i2c;
+        if !self.dri_nodes.is_empty() {
+            devices.dri_nodes = self.dri_nodes;
+        }
     }
 }
