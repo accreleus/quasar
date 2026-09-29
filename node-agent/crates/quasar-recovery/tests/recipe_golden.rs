@@ -49,6 +49,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             i2c: Vec::new(),
             logind: false,
             console_audio: false,
+            console_vt: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -446,6 +447,68 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
         .binds
         .iter()
         .any(|b| b.target == "/host/run/systemd/seats" && b.read_only));
+}
+
+/// RH-07 #407: a host with VTs gets console mode's VT as one read/write device on either
+/// engine, and nothing else changes: no capability, no device-cgroup rule, no bind. A host
+/// without it gets nothing the engine would have to find.
+#[test]
+fn node_agent_revision_3_with_console_mode_passes_the_console_vt() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let rootless = || {
+        let mut i = inputs(Some(GpuVendor::Amd));
+        i.devices.engine_rootless = true;
+        i
+    };
+    for (plain, file) in [
+        (
+            inputs(Some(GpuVendor::Amd)),
+            "node-agent-r3-amd-console-vt.json",
+        ),
+        (rootless(), "node-agent-r3-amd-rootless-console-vt.json"),
+    ] {
+        let mut console = plain.clone();
+        console.console = true;
+        let without = render(Role::NodeAgent, 3, &console, &image, &agent_secrets()).unwrap();
+        console.devices.console_vt = true;
+        let with = render(Role::NodeAgent, 3, &console, &image, &agent_secrets()).unwrap();
+        check(file, &with);
+
+        let added: Vec<(String, String, String)> = with
+            .devices
+            .iter()
+            .filter(|d| !without.devices.contains(d))
+            .map(|d| (d.host.clone(), d.container.clone(), d.permissions.clone()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![("/dev/tty8".into(), "/dev/tty8".into(), "rw".into())],
+            "{file}"
+        );
+        assert_eq!(with.devices.len(), without.devices.len() + 1, "{file}");
+        assert_eq!(with.cap_add, without.cap_add, "{file}");
+        assert_eq!(
+            with.device_cgroup_rules, without.device_cgroup_rules,
+            "{file}"
+        );
+        assert_eq!(with.binds, without.binds, "{file}");
+        assert_eq!(with.env, without.env, "{file}");
+        assert_eq!(with.security_opt, without.security_opt, "{file}");
+
+        // Only with console mode on.
+        let mut off = plain.clone();
+        off.devices.console_vt = true;
+        let off = render(Role::NodeAgent, 3, &off, &image, &agent_secrets()).unwrap();
+        assert!(!off.devices.iter().any(|d| d.host == "/dev/tty8"), "{file}");
+    }
+    let mut plain = inputs(Some(GpuVendor::Amd));
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json["devices"].get("console_vt").is_none(), "{json}");
+    plain.devices.console_vt = true;
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap()["devices"]["console_vt"],
+        true
+    );
 }
 
 /// RH-07 #407 (D13): a host prepared with `--console-audio-user` has the desktop user's

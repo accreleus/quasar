@@ -302,6 +302,12 @@ pub struct HostDevices {
     /// mode is turned on. Sorted, without duplicates; written only when non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dri_nodes: Vec<String>,
+    /// The host has [`CONSOLE_VT_NODE`] (RH-07 #407): console mode's own virtual terminal,
+    /// which the agent makes active with the kernel keyboard off for a console session's
+    /// life. Absent on a host without VTs, which has no kernel keyboard handler to turn
+    /// off. Read with `i2c`; written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console_vt: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -321,6 +327,7 @@ impl Default for HostDevices {
             logind: false,
             console_audio: false,
             dri_nodes: Vec::new(),
+            console_vt: false,
             unknown: Unknown::new(),
         }
     }
@@ -1155,8 +1162,21 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
         // (`/dev/dri`), so no major-226 rule.
         spec.device_cgroup_rules.push("c 89:* rmw".to_string());
     }
+    // The console VT, by device on either engine: opening it needs no capability, and the
+    // agent needs nothing more than read/write on it (session/console_vt.rs).
+    if inputs.devices.console_vt {
+        spec.devices.push(Device {
+            host: CONSOLE_VT_NODE.into(),
+            container: CONSOLE_VT_NODE.into(),
+            permissions: "rw".into(),
+        });
+    }
     spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
 }
+
+/// Console mode's own virtual terminal. The other halves: the agent's
+/// `session::console_vt::CONSOLE_VT` and `deploy/prepare-host.sh --console`.
+pub const CONSOLE_VT_NODE: &str = "/dev/tty8";
 
 /// logind's state directories console mode binds read-only (`HostDevices::logind`).
 pub const LOGIND_DIRS: [&str; 2] = ["/run/systemd/seats", "/run/systemd/sessions"];

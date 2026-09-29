@@ -15,7 +15,7 @@
 //! release relay (`GET /v1/status`) never adopts it.
 //!
 //! **Console devices (RH-07 #407).** Whether the host has sound, logind's state, the
-//! console-audio socket directory (D13) and which
+//! console-audio socket directory (D13), the console VT (`/dev/tty8`) and which
 //! `/dev/i2c-*` nodes are read by the device probe whenever console mode is turned on, and
 //! again at every start of the recovery actor while it is on
 //! ([`Actor::recheck_console_devices`]): i2c bus numbers can change across reboots, and an
@@ -195,7 +195,7 @@ impl Actor {
         }
     }
 
-    /// The console devices the host has now (sound, logind's state, i2c nodes), read by
+    /// The console devices the host has now (sound, logind's state, i2c nodes, the VT), read by
     /// the device probe from the node agent's current image: they can change after the
     /// install (a card added, a host prepared later, i2c buses renumbered by a reboot).
     /// `None` when they cannot be read; the last reading stands.
@@ -208,6 +208,7 @@ impl Actor {
                 console_audio: report.console_audio,
                 i2c: report.i2c.clone(),
                 dri_nodes: report.dri_nodes(),
+                console_vt: report.console_vt,
             }),
             Err(e) => {
                 warn!(
@@ -342,6 +343,7 @@ impl Actor {
             sound = after.devices.sound,
             logind = after.devices.logind,
             console_audio = after.devices.console_audio,
+            console_vt = after.devices.console_vt,
             re_created = !replaced.is_empty(),
             "the host's console devices changed since the agent was created"
         );
@@ -426,6 +428,7 @@ struct ConsoleDevices {
     console_audio: bool,
     i2c: Vec<u32>,
     dri_nodes: Vec<String>,
+    console_vt: bool,
 }
 
 impl ConsoleDevices {
@@ -434,6 +437,7 @@ impl ConsoleDevices {
         devices.logind = self.logind;
         devices.console_audio = self.console_audio;
         devices.i2c = self.i2c;
+        devices.console_vt = self.console_vt;
         if !self.dri_nodes.is_empty() {
             devices.dri_nodes = self.dri_nodes;
         }

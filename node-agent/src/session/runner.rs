@@ -288,6 +288,16 @@ fn assert_vulkan_encoder_device(
     Ok(())
 }
 
+/// A console session drives the host's own display: LocalOnly always, DualOutput when
+/// `console_config` enables it (`console_required` in `run_blocking`).
+fn wants_console_vt(cfg: &SessionConfig) -> bool {
+    cfg.console_config.as_ref().is_some_and(|c| c.enabled)
+        && matches!(
+            cfg.video_topology,
+            VideoTopology::LocalOnly | VideoTopology::DualOutput
+        )
+}
+
 /// Fail the whole DualOutput session when a required console local-display leg cannot
 /// be built or played: for a console session the local monitor IS the purpose, so emit
 /// `Failed` and tear down source + encode + audio rather than stream to the browser
@@ -1357,6 +1367,27 @@ pub fn run_blocking(
     emit(SessionEvent::Starting);
     emit(SessionEvent::Progress("preparing resources and image"));
 
+    // #407: a local console session holds the console VT, keyboard off, from before its
+    // virtual keyboard exists until after it is gone, so nothing typed in the session
+    // reaches a host login prompt. Must be declared before `res`, weston and the physical
+    // input forwarder so it drops after them. Fail-closed.
+    let mut console_vt: Option<super::console_vt::ConsoleVt> = if wants_console_vt(&cfg) {
+        match super::console_vt::ConsoleVt::take() {
+            Ok(vt) => Some(vt),
+            Err(e) => {
+                tracing::error!(
+                    token = "runner-console-vt-failed",
+                    error = %format_args!("{e:#}"),
+                    "console session refused: the console terminal could not be taken"
+                );
+                emit(SessionEvent::Failed(format!("console terminal: {e:#}")));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // Session-level resources (input devices + PulseAudio sidecar) shared across
     // swaps. Dropping `res` releases the sidecar; each AppSource borrows its nodes.
     let (res, pulse_server) = match SessionResources::prepare(&session_id, &cfg) {
@@ -1591,6 +1622,7 @@ pub fn run_blocking(
             vulkan_contexts.as_ref(),
             local_backend,
             prestarted_weston,
+            console_vt.as_mut(),
         );
         return;
     }
@@ -2057,6 +2089,20 @@ pub fn run_blocking(
     let mut last_ice_ufrag: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     loop {
+        if let Some(reason) = console_vt.as_mut().and_then(|vt| vt.lost()) {
+            if let Some(ld) = _local_display.as_ref() {
+                let _ = ld.pipeline.set_state(gst::State::Null);
+            }
+            fail_dualoutput_console(
+                &emit,
+                format!("console terminal lost: {reason}"),
+                &mut current_source,
+                &encode_pipe,
+                audio_pipeline.as_ref(),
+                defer_encode_teardown,
+            );
+            return;
+        }
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
             current_source.teardown(); // remove the app container before media
@@ -2882,6 +2928,7 @@ fn run_local_only<F: Fn(SessionEvent)>(
     vulkan_contexts: Option<&VulkanContextBridge>,
     local_backend: console::LocalBackend,
     prestarted_weston: Option<console::WestonConsole>,
+    mut console_vt: Option<&mut super::console_vt::ConsoleVt>,
 ) {
     let Some(cc) = cfg.console_config.as_ref().filter(|c| c.enabled) else {
         tracing::error!(
@@ -3029,6 +3076,19 @@ fn run_local_only<F: Fn(SessionEvent)>(
     // See the matching declaration in run_blocking.
     let mut renderer_degrade_tracker = RendererDegradeTracker::default();
     loop {
+        if let Some(reason) = console_vt.as_mut().and_then(|vt| vt.lost()) {
+            tracing::error!(
+                token = "runner-console-vt-lost",
+                reason = %reason,
+                "console terminal lost mid-session"
+            );
+            emit(SessionEvent::Failed(format!(
+                "console terminal lost: {reason}"
+            )));
+            let _ = local_display.pipeline.set_state(gst::State::Null);
+            current_source.teardown();
+            return;
+        }
         if let Some(weston) = weston.as_mut() {
             match weston.try_exit() {
                 Ok(Some(status)) => {
