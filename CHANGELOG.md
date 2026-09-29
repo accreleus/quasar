@@ -39,7 +39,11 @@ own; the two do not move together, and that is deliberate.
   keeps today's shape minus what `prepare-host.sh` now owns, Docker rootless never uses
   `sudo` past that one prep line and creates no directories, and Podman writes and starts a
   Quadlet unit whose socket maps to `/var/run/docker.sock` per ADR 0007's RH07 amendment;
-  Unraid is untouched.
+  Unraid is untouched. The quick start wizard itself grows a new Engine step between Host
+  and Role: four profile badges that update live as the platform changes, a blocked Next on
+  an unsupported combination, and a Result step that shows host preparation, the per-engine
+  install command, and (Podman) the Quadlet unit it writes plus a closed "just trying it
+  out" `podman run` disclosure.
 - **Console mode on rootful owned installs (RH-07, #395).** The recovery actor gives an
   owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd` and
   `/proc/asound` read-only (only on a host that has sound, read again each time console mode

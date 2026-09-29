@@ -30,12 +30,21 @@ import {
   prepFlags,
   effectiveLowPorts,
   quadletUnit,
+  podmanRunSeed,
+  setPrepareHostSha256,
 } from './stack-template.js';
 import { PROXIES, proxyConfig } from './proxy-configs.js';
 import { PLATFORMS } from './platforms.js';
 import { profileFor } from './engine-profiles.js';
 import { PREPARE_HOST_SHA256, PREPARE_HOST_SOURCE } from './prepare-host-source.js';
 import { fakeEngineDir, runScript } from './test-harness.js';
+
+// stack-template.js no longer imports prepare-host-source.js itself (that file
+// is Node-only — node:fs — and stack-template.js is also bundled into the
+// quick start's browser <script>; see both files' comments). The real
+// checksum has to be supplied explicitly, the same way QuickStart.astro's
+// frontmatter does for the client.
+setPrepareHostSha256(PREPARE_HOST_SHA256);
 
 const UNRAID_GOLDEN = readFileSync(fileURLToPath(new URL('./__fixtures__/unraid-golden.sh', import.meta.url)), 'utf8');
 
@@ -384,6 +393,27 @@ test('podman -dryrun accepts the generated unit, when quadlet is available', () 
   writeFileSync(path, unit);
   const r = spawnSync(quadlet, ['-dryrun', '-no-kmsg-log', tmp], { encoding: 'utf8' });
   assert.equal(r.status, 0, r.stdout + r.stderr);
+});
+
+test('generate() offers podmanRun only for a supported/experimental Podman profile, never Docker', () => {
+  assert.equal(generate(full({ engine: 'docker', mode: 'rootful' })).podmanRun, null);
+  assert.equal(generate(full({ platform: 'unraid', engine: 'podman', mode: 'rootless' })).podmanRun, null);
+  for (const mode of MODES) {
+    assert.match(generate(full({ engine: 'podman', mode })).podmanRun, /podman run -d --name quasar-seed/);
+  }
+});
+
+test('podmanRunSeed mounts the same in-container path as the Quadlet unit, never the mockup bug', () => {
+  for (const mode of MODES) {
+    const cmd = podmanRunSeed(full({ engine: 'podman', mode }));
+    assert.match(cmd, /:\/var\/run\/docker\.sock/);
+    assert.ok(!cmd.includes('/run/podman/podman.sock:/run/podman/podman.sock'));
+  }
+});
+
+test('podmanRunSeed uses sudo only when rootful', () => {
+  assert.match(podmanRunSeed(full({ engine: 'podman', mode: 'rootful' })), /^sudo podman run/);
+  assert.match(podmanRunSeed(full({ engine: 'podman', mode: 'rootless' })), /^podman run/);
 });
 
 /** Runs a generated script against the hardened fake engine (test-harness.js). */

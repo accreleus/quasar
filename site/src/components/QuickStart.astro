@@ -2,35 +2,64 @@
 /**
  * The quick start wizard.
  *
- * Six steps, one output: the seed for one machine (src/data/stack-template.js).
+ * Seven steps, one output: the seed for one machine (src/data/stack-template.js).
  * Everything happens in the browser. No fetch, no analytics, no secret: the
  * recovery actor generates every secret on the machine, and the operator's own
  * database password never passes through this page.
  *
- * Design: existing --q-* tokens and qs-* classes from this component only.
+ * Step 2, Engine (RH07-14, #406), asks which container engine and mode runs
+ * Quasar. The four badges are server-rendered here (Starlight's own <Badge>,
+ * so its CSS ships) for the wizard's default platform; the client script
+ * (below) recomputes them from `engine-profiles.js` — the same table the
+ * node agent's `runtime_engine` check and the enrollment script read — every
+ * time the platform or engine choice changes.
+ *
+ * Design: existing --q-* tokens and qs-* classes from this component only,
+ * plus Starlight's <Badge> unmodified (theme.css maps its success/caution/
+ * danger variants onto the product's --success/--warning/--danger tokens).
  */
+import { Badge } from '@astrojs/starlight/components';
+import { DEFAULTS } from '../data/stack-template.js';
+import { profileFor } from '../data/engine-profiles.js';
+// Node-only (node:fs) — safe here (SSR/build), never imported by stack-template.js
+// itself or the client <script> below; see prepare-host-source.js and
+// stack-template.js#setPrepareHostSha256 for why.
+import { PREPARE_HOST_SHA256 } from '../data/prepare-host-source.js';
+
+// Neutral order: there is no default engine yet (D3), so nothing is
+// preselected and every option is offered on equal footing.
+const ENGINE_OPTIONS = [
+	{ engine: 'docker', mode: 'rootful', label: 'Docker, rootful', hint: 'Docker running as root, as Quasar runs today.' },
+	{ engine: 'docker', mode: 'rootless', label: 'Docker, rootless', hint: 'Docker installed for a dedicated quasar account.' },
+	{ engine: 'podman', mode: 'rootless', label: 'Podman, rootless', hint: 'Podman run by a dedicated quasar account.' },
+	{ engine: 'podman', mode: 'rootful', label: 'Podman, rootful', hint: 'Podman running as root.' },
+];
+const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
+const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
 ---
 
-<div class="qs" data-quickstart>
+<div class="qs" data-quickstart data-prepare-host-sha256={PREPARE_HOST_SHA256}>
 	<ol class="qs-progress" aria-label="Progress">
 		<li data-dot="1" class="on">Host</li>
-		<li data-dot="2">Role</li>
-		<li data-dot="3">Storage</li>
-		<li data-dot="4">Owner</li>
-		<li data-dot="5">Access</li>
-		<li data-dot="6">Result</li>
+		<li data-dot="2">Engine</li>
+		<li data-dot="3">Role</li>
+		<li data-dot="4">Storage</li>
+		<li data-dot="5">Owner</li>
+		<li data-dot="6">Access</li>
+		<li data-dot="7">Result</li>
 	</ol>
 
 	<!-- 1. Platform -->
 	<section data-step="1" class="qs-step on">
 		<h2>Where are you deploying Quasar?</h2>
 		<p class="qs-hint">
-			This sets sensible defaults later, and it changes how the script makes
-			things survive a reboot.
+			This sets sensible defaults later, and decides which container
+			engines are supported here.
 		</p>
 		<div class="qs-choices">
-			<label><input type="radio" name="platform" value="fedora" checked /><span><strong>Fedora</strong><em>What the install is verified on</em></span></label>
-			<label><input type="radio" name="platform" value="debian" /><span><strong>Debian or Ubuntu</strong></span></label>
+			<label><input type="radio" name="platform" value="fedora" checked /><span><strong>Fedora</strong><em>What the install is verified on. Includes Silverblue, Bazzite and uCore</em></span></label>
+			<label><input type="radio" name="platform" value="ubuntu" /><span><strong>Ubuntu 24.04</strong></span></label>
+			<label><input type="radio" name="platform" value="debian" /><span><strong>Debian</strong></span></label>
 			<label><input type="radio" name="platform" value="arch" /><span><strong>Arch</strong></span></label>
 			<label><input type="radio" name="platform" value="unraid" /><span><strong>Unraid</strong><em>Different paths, different persistence</em></span></label>
 			<label><input type="radio" name="platform" value="other" /><span><strong>Another systemd Linux</strong></span></label>
@@ -38,8 +67,34 @@
 		<p class="qs-note" data-platform-note></p>
 	</section>
 
-	<!-- 2. Role -->
+	<!-- 2. Engine (RH07-14, #406) -->
 	<section data-step="2" class="qs-step">
+		<h2>Which container engine will run Quasar?</h2>
+		<p class="qs-hint">
+			Quasar runs on Docker or Podman, either as root (rootful) or as an
+			ordinary account (rootless). Not sure what this machine has? Run
+			this on it:
+		</p>
+		<pre><code>for e in docker podman; do command -v $e &gt;/dev/null &amp;&amp; $e --version; done</code></pre>
+		<div class="qs-choices" data-engine-choices>
+			{ENGINE_OPTIONS.map(({ engine, mode, label, hint }) => {
+				const p = profileFor(DEFAULTS.platform, engine, mode);
+				return (
+					<label>
+						<input type="radio" name="engine" value={`${engine}:${mode}`} />
+						<span><strong>{label}</strong><em>{hint}</em></span>
+						<span class="qs-badge" data-badge>
+							<Badge size="small" variant={BADGE_VARIANT[p.status]} text={BADGE_TEXT[p.status]} />
+						</span>
+					</label>
+				);
+			})}
+		</div>
+		<p class="qs-note" data-engine-note></p>
+	</section>
+
+	<!-- 3. Role -->
+	<section data-step="3" class="qs-step">
 		<h2>What does this machine run?</h2>
 		<p class="qs-hint">
 			Every machine runs one container you declare, the seed. It creates
@@ -62,8 +117,8 @@
 		</p>
 	</section>
 
-	<!-- 3. Storage -->
-	<section data-step="3" class="qs-step">
+	<!-- 4. Storage -->
+	<section data-step="4" class="qs-step">
 		<h2>Where should Quasar keep things?</h2>
 		<div data-when-agent>
 			<p class="qs-hint">
@@ -95,10 +150,10 @@
 		</figure>
 	</section>
 
-	<!-- 4. Owner -->
-	<section data-step="4" class="qs-step">
+	<!-- 5. Owner -->
+	<section data-step="5" class="qs-step">
 		<h2>Who should own your save data?</h2>
-		<div data-when-agent>
+		<div data-when-agent data-owner-choice>
 			<p class="qs-hint">
 				Game containers drop to this user, so it decides who can read the saves
 				from outside Quasar. It does not change what Quasar's own services run as.
@@ -112,11 +167,15 @@
 				<label class="qs-field"><span>gid</span><input type="number" name="gid" value="1000" min="0" /></label>
 			</div>
 		</div>
+		<p class="qs-note" data-owner-rootless-note>
+			Nothing to choose: on a rootless engine, home files belong to the quasar
+			account, not a uid you pick.
+		</p>
 		<p class="qs-note" data-when-role="control-only">Nothing to choose: a control-only machine runs no games.</p>
 	</section>
 
-	<!-- 5. Access -->
-	<section data-step="5" class="qs-step">
+	<!-- 6. Access -->
+	<section data-step="6" class="qs-step">
 		<h2>How will you reach Quasar?</h2>
 		<div data-when-control>
 			<p class="qs-hint">
@@ -199,11 +258,12 @@
 		</p>
 	</section>
 
-	<!-- 6. Result -->
-	<section data-step="6" class="qs-step">
+	<!-- 7. Result -->
+	<section data-step="7" class="qs-step">
 		<h2>Your install</h2>
 		<dl class="qs-summary">
 			<div class="qs-sum-row"><dt>Host</dt><dd data-sum="platform"></dd></div>
+			<div class="qs-sum-row" data-sum-row="engine"><dt>Engine</dt><dd data-sum="engine"></dd></div>
 			<div class="qs-sum-row"><dt>Role</dt><dd data-sum="role"></dd></div>
 			<div class="qs-sum-row" data-sum-row="homes"><dt>User homes</dt><dd data-sum="homes"></dd></div>
 			<div class="qs-sum-row" data-sum-row="owner"><dt>Owned by</dt><dd data-sum="owner"></dd></div>
@@ -219,30 +279,89 @@
 			</div>
 		</details>
 
-		<div class="qs-out" data-out-block="script">
+		<p class="qs-note qs-warn" data-out-block="unavailable" hidden>
+			Choose a supported or experimental engine in step 2 to see install commands.
+		</p>
+
+		<!-- 1. Host preparation (RH07-14) -->
+		<div class="qs-out" data-out-block="prep">
 			<div class="qs-out-head">
-				<h3>Run this on the machine</h3>
-				<button type="button" data-copy="script">Copy</button>
+				<h3 data-prep-title></h3>
+				<button type="button" data-copy="prep">Copy</button>
 			</div>
-			<p class="qs-hint">
-				Read it before you run it. It checks the host, sets one sysctl and
-				loads the uinput module on a machine with a GPU, pins the images to
-				their digests, and starts one container, the seed. Quasar generates
-				its own secrets on the machine.
-			</p>
-			<pre><code data-out="script"></code></pre>
+			<p class="qs-hint" data-prep-hint></p>
+			<label class="qs-check"><input type="checkbox" name="console" /><span>This machine also shows games on its own screen (console mode). Adds its display, sound and monitor control.</span></label>
+			<label class="qs-check"><input type="checkbox" name="kernelLog" /><span>Let Quasar read GPU fault messages from the kernel log. Optional; every account on the machine can then read it.</span></label>
+			<label class="qs-check"><input type="checkbox" name="lowPorts" /><span data-lowports-label></span></label>
+			<pre><code data-out="prep"></code></pre>
+			<details class="qs-adv">
+				<summary>What it changes</summary>
+				<p class="qs-hint qs-prep-preview-caption">
+					An example. What it actually prints depends on this machine (its GPU
+					and what is already in place) and this profile; run it to see the real
+					lines, and again at any time to confirm nothing is left to change.
+				</p>
+				<pre class="qs-pre-full qs-pre-wrap"><code data-out="prep-preview"></code></pre>
+				<p class="qs-hint">
+					Every file it writes is under <code>/etc</code>, plus the quasar
+					account's own home and systemd's lingering record. It never writes
+					under <code>/usr</code>, never re-owns existing files and never
+					relaxes SELinux.
+				</p>
+			</details>
 		</div>
 
-		<div class="qs-out">
+		<!-- Docker rootless only: the daemon has to be set up for the quasar account -->
+		<div class="qs-out" data-out-block="docker-setup">
+			<div class="qs-out-head">
+				<h3 data-docker-setup-title></h3>
+				<button type="button" data-copy="docker-setup">Copy</button>
+			</div>
+			<p class="qs-hint">
+				Rootless Docker belongs to the quasar account. Host preparation turns
+				lingering on, so it keeps running with nobody logged in.
+			</p>
+			<pre><code data-out="docker-setup"></code></pre>
+		</div>
+
+		<!-- 2./3. Install: the seed, per engine -->
+		<div class="qs-out" data-out-block="script">
+			<div class="qs-out-head">
+				<h3 data-script-title></h3>
+				<button type="button" data-copy="script">Copy</button>
+			</div>
+			<p class="qs-hint" data-script-hint></p>
+			<pre class="qs-pre-full"><code data-out="script"></code></pre>
+		</div>
+
+		<!-- Podman: the Quadlet unit the script above writes, for reference (owner decision 3) -->
+		<div class="qs-out" data-out-block="quadlet">
+			<div class="qs-out-head">
+				<h4>The Quadlet unit it writes, for reference</h4>
+				<button type="button" data-copy="quadlet">Copy</button>
+			</div>
+			<pre class="qs-pre-full"><code data-out="quadlet"></code></pre>
+			<details class="qs-adv">
+				<summary>Only trying it out? Run the seed with podman run instead</summary>
+				<pre class="qs-pre-full"><code data-out="podman-run"></code></pre>
+			</details>
+			<p class="qs-note">
+				The seed creates Quasar's recovery actor, which generates every secret
+				and creates the rest. Nothing here writes a Compose file or an .env.
+			</p>
+		</div>
+
+		<!-- Docker (and Unraid): the Dockge/Arcane stack. Not Podman (D15): the Quadlet unit is its equivalent. -->
+		<div class="qs-out" data-out-block="stack">
 			<div class="qs-out-head">
 				<h3 data-stack-title>Using Dockge or Arcane? Paste this stack instead</h3>
 				<button type="button" data-copy="stack">Copy</button>
 			</div>
 			<p class="qs-hint">
 				One service, stored in your manager's own storage. Preparing the host
-				(the sysctl and uinput above) is then your job, and the readiness card
-				lists anything missing. Replace each <code>&lt;digest&gt;</code> with
-				the pins this prints on the machine:
+				is then your job, and the readiness card lists anything missing.
+				Replace each <code>&lt;digest&gt;</code> with the pins this prints on
+				the machine:
 			</p>
 			<pre><code data-out="pins"></code></pre>
 			<pre><code data-out="stack"></code></pre>
@@ -274,19 +393,41 @@
 
 	<nav class="qs-nav">
 		<button type="button" data-back disabled>Back</button>
-		<span class="qs-count"><span data-current>1</span> of 6</span>
+		<span class="qs-count"><span data-current>1</span> of 7</span>
 		<button type="button" data-next>Next</button>
 	</nav>
 </div>
 
 <script>
-	import { DEFAULTS, generate, homePath, templatePath, role } from '../data/stack-template.js';
+	import { DEFAULTS, generate, homePath, templatePath, role, setPrepareHostSha256 } from '../data/stack-template.js';
 	import { platform } from '../data/platforms.js';
+	import { profileFor } from '../data/engine-profiles.js';
+	import { prepPreviewLines } from '../data/prep-preview.js';
+
+	// Kept in step with the frontmatter's own copy above: four options, in a
+	// neutral order (no default engine yet, D3).
+	const ENGINE_OPTIONS = [
+		{ engine: 'docker', mode: 'rootful', label: 'Docker, rootful' },
+		{ engine: 'docker', mode: 'rootless', label: 'Docker, rootless' },
+		{ engine: 'podman', mode: 'rootless', label: 'Podman, rootless' },
+		{ engine: 'podman', mode: 'rootful', label: 'Podman, rootful' },
+	];
+	const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
+	const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
+	const badgeHtml = (status) => `<span class="sl-badge small ${BADGE_VARIANT[status]}">${BADGE_TEXT[status]}</span>`;
+	const engineLabel = (engine, mode) => ENGINE_OPTIONS.find((o) => o.engine === engine && o.mode === mode)?.label ?? `${engine}, ${mode}`;
+
+	const DOCKER_ROOTLESS_SETUP = `sudo machinectl shell quasar@ /bin/sh -c \\
+  'dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker'`;
 
 	for (const root of document.querySelectorAll('[data-quickstart]')) {
-		const answers = { ...DEFAULTS };
+		// The checksum itself is computed server-side (prepare-host-source.js is
+		// Node-only) and handed down through this data attribute.
+		if (root.dataset.prepareHostSha256) setPrepareHostSha256(root.dataset.prepareHostSha256);
+		const answers = { ...DEFAULTS, engine: '', mode: '' }; // no default engine yet (D3)
 		let step = 1;
-		const LAST = 6;
+		const LAST = 7;
+		const ACCESS_STEP = 6;
 		// Only overwrite a path or uid the reader has not typed into themselves.
 		const touched = new Set();
 
@@ -299,6 +440,8 @@
 		function collect() {
 			const val = (n) => field(n)?.value?.trim() ?? '';
 			answers.platform = checked('platform', 'fedora');
+			const engineMode = checked('engine', '');
+			[answers.engine, answers.mode] = engineMode ? engineMode.split(':') : ['', ''];
 			answers.role = checked('role', 'combined');
 			answers.owner = checked('owner', 'dedicated');
 			answers.access = checked('access', 'self-signed');
@@ -308,6 +451,9 @@
 			answers.savesPath = val('savesPath');
 			answers.uid = Number(val('uid') || platform(answers.platform).defaultUid);
 			answers.gid = Number(val('gid') || platform(answers.platform).defaultGid);
+			answers.console = field('console')?.checked ?? false;
+			answers.kernelLog = field('kernelLog')?.checked ?? false;
+			answers.lowPorts = field('lowPorts')?.checked ?? false;
 			answers.publicHost = val('publicHost');
 			answers.tlsHosts = val('tlsHosts');
 			answers.proxy = val('proxy') || 'caddy';
@@ -336,6 +482,47 @@
 			note.textContent = p.note;
 			note.hidden = !p.note;
 			$('[data-owner-default]').textContent = p.ownerLabel;
+		}
+
+		/** The four engine badges, and the note below them, for the current platform/choice. */
+		function updateEngineStep() {
+			$$('[data-engine-choices] label').forEach((label, i) => {
+				const { engine, mode } = ENGINE_OPTIONS[i];
+				const status = profileFor(answers.platform, engine, mode).status;
+				const badge = label.querySelector('.sl-badge');
+				if (badge) {
+					badge.className = `sl-badge small ${BADGE_VARIANT[status]}`;
+					badge.textContent = BADGE_TEXT[status];
+				}
+			});
+
+			const note = $('[data-engine-note]');
+			note.classList.remove('qs-warn');
+			if (!answers.engine || !answers.mode) {
+				note.innerHTML =
+					'Rootless is the safer choice: if Quasar were ever compromised, it could not take over the machine. On a rootful engine, whoever controls the engine’s socket controls the machine, and Quasar holds that socket. <a href="/quasar/start/engine-profiles/">Engine profiles</a> lists what each choice is tested on.';
+				return;
+			}
+			const p = profileFor(answers.platform, answers.engine, answers.mode);
+			const name = `${platform(answers.platform).label} with ${engineLabel(answers.engine, answers.mode)}`;
+			const badge = badgeHtml(p.status);
+			if (p.status === 'supported') {
+				const rootEquiv =
+					answers.mode === 'rootful'
+						? ' The engine runs as root, so its socket is equivalent to root on this machine; a rootless engine avoids that.'
+						: '';
+				note.innerHTML = `${badge} <strong>${name}</strong> — ${p.reason}${rootEquiv} <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
+			} else if (p.status === 'experimental') {
+				note.classList.add('qs-warn');
+				note.innerHTML = `${badge} <strong>${name}</strong> is experimental — ${p.reason} You can install it; if something does not work, the host’s readiness card names it, and a report helps make this profile supported. <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
+			} else {
+				note.classList.add('qs-warn');
+				const alts = p.alternatives
+					.filter((alt) => alt.status !== 'unsupported')
+					.map((alt) => `<strong>${platform(alt.platform).label} with ${engineLabel(alt.engine, alt.mode)}</strong>`)
+					.join(' or ');
+				note.innerHTML = `${badge} <strong>${name}</strong> is not supported — ${p.reason}${alts ? ` Choose ${alts} instead.` : ''}`;
+			}
 		}
 
 		/** A picture of what lands where. */
@@ -377,11 +564,41 @@
 			$$('[data-when-database]').forEach((el) => (el.hidden = el.dataset.whenDatabase !== answers.database));
 			const saves = $('[data-when-saves]');
 			if (saves) saves.hidden = !answers.separateSaves;
+
+			// The uid/gid a reader would pick means nothing on a rootless engine
+			// (D14): home files belong to the quasar account regardless.
+			const ownerChoice = $('[data-owner-choice]');
+			if (ownerChoice) ownerChoice.hidden = !r.agent || answers.mode === 'rootless';
+			const ownerNote = $('[data-owner-rootless-note]');
+			if (ownerNote) ownerNote.hidden = !r.agent || answers.mode !== 'rootless';
 		}
 
-		/** The access step needs the console's name before Next; nothing else blocks. */
-		const ACCESS_STEP = 5;
+		/** The low-ports checkbox: forced on (and disabled) when a chosen port needs it. */
+		function updateLowPortsCheckbox() {
+			const input = field('lowPorts');
+			const label = $('[data-lowports-label]');
+			if (!input || !label) return;
+			const portForced =
+				answers.mode === 'rootless' && [Number(answers.controlPort), Number(answers.tlsPort)].some((n) => Number.isFinite(n) && n > 0 && n < 1024);
+			if (portForced && !answers.lowPorts) {
+				const port = [Number(answers.controlPort), Number(answers.tlsPort)].find((n) => Number.isFinite(n) && n > 0 && n < 1024);
+				input.checked = true;
+				input.disabled = true;
+				label.textContent = `Let Quasar use port ${port}. Needed because you chose a port below 1024.`;
+			} else {
+				input.disabled = false;
+				label.textContent = 'Let Quasar use ports below 1024. Only needed if you choose one under “Change the ports”.';
+			}
+		}
+
+		/** Step 2 is complete once a supported or experimental engine profile is chosen (D-d). */
+		function engineChosenAndAllowed() {
+			return Boolean(answers.engine && answers.mode) && profileFor(answers.platform, answers.engine, answers.mode).status !== 'unsupported';
+		}
+
+		/** The access step needs the console's name before Next; the engine step needs a non-blocked choice. */
 		function stepComplete(n) {
+			if (n === 2) return engineChosenAndAllowed();
 			if (n !== ACCESS_STEP || !role(answers.role).control) return true;
 			if (!answers.publicHost) return false;
 			if (answers.access === 'proxy' && !answers.publicUrl) return false;
@@ -395,29 +612,100 @@
 			set('platform', platform(answers.platform).label);
 			set('role', r.label);
 			set('homes', homePath(answers));
-			set('owner', `uid ${answers.uid}, gid ${answers.gid}`);
-			set('public', answers.access === 'proxy' && answers.publicUrl ? answers.publicUrl : `https://${answers.publicHost}:${answers.tlsPort}`);
+			set('owner', answers.mode === 'rootless' ? 'the quasar account' : `uid ${answers.uid}, gid ${answers.gid}`);
+			const port = Number(answers.tlsPort);
+			set(
+				'public',
+				answers.access === 'proxy' && answers.publicUrl ? answers.publicUrl : `https://${answers.publicHost}${port === 443 ? '' : `:${port}`}`,
+			);
 			set('database', answers.database === 'external' ? `Your own, at ${answers.dbHost}` : "Quasar's own");
 			$('[data-sum-row="homes"]').hidden = !r.agent;
 			$('[data-sum-row="owner"]').hidden = !r.agent;
 			$('[data-sum-row="public"]').hidden = !r.control;
 			$('[data-sum-row="database"]').hidden = !r.control;
+
+			const chosen = Boolean(answers.engine && answers.mode);
+			$('[data-sum-row="engine"]').hidden = !chosen;
+			if (chosen) $(`[data-sum="engine"]`).innerHTML = `${engineLabel(answers.engine, answers.mode)} &nbsp;${badgeHtml(profileFor(answers.platform, answers.engine, answers.mode).status)}`;
 		}
 
-		function render() {
-			collect();
-			applyPlatformDefaults();
-			collect();
-			reveal();
-			tree();
+		/** Sequential numbering for the Result step's blocks. Unraid keeps its original, unnumbered heading (D-h). */
+		function resultTitles(showInstall) {
+			const unraid = answers.platform === 'unraid';
+			const podman = answers.engine === 'podman';
+			const dockerRootless = answers.engine === 'docker' && answers.mode === 'rootless';
+			if (unraid) {
+				$('[data-script-title]').textContent = 'Run this on the machine';
+				return;
+			}
+			if (!showInstall) return;
+			$('[data-prep-title]').textContent = '1. Prepare the machine, once, as root';
+			if (dockerRootless) {
+				$('[data-docker-setup-title]').textContent = '2. Set up Docker for the quasar account';
+				$('[data-script-title]').textContent = '3. Run this as the quasar account';
+			} else {
+				$('[data-script-title]').textContent = podman ? `2. Install Quasar as ${answers.mode === 'rootful' ? 'root' : 'the quasar account'}` : '2. Run this on the machine';
+			}
+		}
+
+		function scriptHint() {
+			const unraid = answers.platform === 'unraid';
+			const podman = answers.engine === 'podman';
+			if (unraid) {
+				return 'It checks the host, sets one sysctl and loads the uinput module on a machine with a GPU, pins the images to their digests, and starts one container, the seed. Quasar generates its own secrets on the machine.';
+			}
+			if (podman) {
+				return 'Resolves the image digests, writes the Quadlet unit below with them, then starts it through systemd. Quasar generates its own secrets on the machine.';
+			}
+			return 'Read it before you run it. It checks the engine and the host, pins the images to their digests, and starts one container, the seed. Quasar generates its own secrets on the machine.';
+		}
+
+		function prepHint() {
+			const rootless = answers.mode === 'rootless';
+			return `The only step that needs root; Quasar itself never runs as root. It ${rootless ? 'creates the quasar account, gives it' : 'creates a quasar group, gives it'} the devices Quasar uses and nothing more, and sets the kernel settings Quasar needs. It prints every change and why, and is safe to run again.`;
+		}
+
+		function output() {
+			const r = role(answers.role);
 			const out = generate(answers);
+			const showInstall = Boolean(out.script);
+			const podman = answers.engine === 'podman';
+			const dockerRootless = answers.engine === 'docker' && answers.mode === 'rootless';
+			const unraid = answers.platform === 'unraid';
+
+			$('[data-out-block="unavailable"]').hidden = !r.control || showInstall || unraid;
+
+			const prepBlock = $('[data-out-block="prep"]');
+			prepBlock.hidden = !out.prep;
+			if (out.prep) {
+				$('[data-out="prep"]').textContent = out.prep;
+				$('[data-prep-hint]').textContent = prepHint();
+				$('[data-out="prep-preview"]').textContent = prepPreviewLines(answers);
+			}
+
+			const setupBlock = $('[data-out-block="docker-setup"]');
+			setupBlock.hidden = !(showInstall && dockerRootless);
+			if (showInstall && dockerRootless) $('[data-out="docker-setup"]').textContent = DOCKER_ROOTLESS_SETUP;
 
 			const scriptBlock = $('[data-out-block="script"]');
 			scriptBlock.hidden = !out.script;
-			if (out.script) $('[data-out="script"]').textContent = out.script;
-			$('[data-stack-title]').textContent = out.script
-				? 'Using Dockge or Arcane? Paste this stack instead'
-				: 'The stack for Dockge or Arcane';
+			if (out.script) {
+				$('[data-out="script"]').textContent = out.script;
+				$('[data-script-hint]').textContent = scriptHint();
+			}
+
+			const quadletBlock = $('[data-out-block="quadlet"]');
+			quadletBlock.hidden = !out.quadlet;
+			if (out.quadlet) {
+				$('[data-out="quadlet"]').textContent = out.quadlet;
+				$('[data-out="podman-run"]').textContent = out.podmanRun ?? '';
+			}
+
+			// The Dockge/Arcane stack is a Docker (and Unraid) thing; Podman's
+			// equivalent is the Quadlet unit above (D15).
+			const stackBlock = $('[data-out-block="stack"]');
+			stackBlock.hidden = podman;
+			$('[data-stack-title]').textContent = out.script && !unraid ? 'Using Dockge or Arcane? Paste this stack instead' : 'The stack for Dockge or Arcane';
 			$('[data-out="pins"]').textContent = out.pins;
 			$('[data-out="stack"]').textContent = out.stack;
 
@@ -433,6 +721,18 @@
 				$('[data-out="proxyFile"]').textContent = out.proxyConfig.filename;
 			}
 
+			resultTitles(showInstall);
+		}
+
+		function render() {
+			collect();
+			applyPlatformDefaults();
+			collect();
+			reveal();
+			updateEngineStep();
+			updateLowPortsCheckbox();
+			tree();
+			output();
 			summary();
 			$('[data-next]').disabled = step === LAST || !stepComplete(step);
 			$('[data-back]').disabled = step === 1;
@@ -554,6 +854,50 @@
 		font-style: normal;
 		font-size: 0.8125rem;
 		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+	}
+	/* The engine step's badge (RH07-14): trailing element, nothing else about
+	   the row changes. */
+	.qs-choices label .qs-badge {
+		margin-left: auto;
+		align-self: center;
+	}
+	/* Starlight's own <Badge> (unmodified; theme.css maps its success/caution/
+	   danger variants to the product's tokens — see that file). Its scoped
+	   styles are not reliably included in this page's bundle (the component's
+	   whole stylesheet lives behind :global() with no locally-scoped selector
+	   tying it to this page, so Astro/Vite's CSS extraction can drop it), and
+	   the engine step's badges are also rewritten as plain strings by the
+	   client script below (profileFor() can change per platform), which
+	   Astro's static CSS scoping never sees either way. Both need these rules
+	   to actually exist; the four custom properties per variant are the exact
+	   ones theme.css already defines for Badge, so no colour is invented here. */
+	:global(.sl-badge) {
+		display: inline-block;
+		border: 1px solid var(--sl-color-border-badge, var(--q-line-2));
+		border-radius: 0.25rem;
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		line-height: normal;
+		color: var(--sl-color-text-badge, inherit);
+		background-color: var(--sl-color-bg-badge, transparent);
+	}
+	:global(.sl-badge.small) {
+		font-size: 0.75rem;
+		padding: 0.125rem 0.375rem;
+	}
+	:global(.sl-badge.success) {
+		--sl-color-bg-badge: var(--sl-badge-success-bg, var(--q-success-bg));
+		--sl-color-border-badge: var(--sl-badge-success-border, var(--q-success-line));
+		--sl-color-text-badge: var(--sl-badge-success-text, var(--q-success-text));
+	}
+	:global(.sl-badge.caution) {
+		--sl-color-bg-badge: var(--sl-badge-caution-bg, var(--q-warning-bg));
+		--sl-color-border-badge: var(--sl-badge-caution-border, var(--q-warning-line));
+		--sl-color-text-badge: var(--sl-badge-caution-text, var(--q-warning-text));
+	}
+	:global(.sl-badge.danger) {
+		--sl-color-bg-badge: var(--sl-badge-danger-bg, var(--q-danger-bg));
+		--sl-color-border-badge: var(--sl-badge-danger-border, var(--q-danger-line));
+		--sl-color-text-badge: var(--sl-badge-danger-text, var(--q-danger-text));
 	}
 
 	.qs-field {
@@ -683,6 +1027,15 @@
 		padding: 0.9rem;
 		font-size: 0.8125rem;
 		line-height: 1.5;
+	}
+	/* Long printed output, the Quadlet unit and the install scripts: no cap,
+	   the whole thing is on screen (README "Where DESIGN.md or the v3
+	   patterns did not cover something", #4). */
+	.qs-pre-full {
+		max-height: none;
+	}
+	pre.qs-pre-wrap {
+		white-space: pre-wrap;
 	}
 
 	.qs-adv {

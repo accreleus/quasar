@@ -32,11 +32,31 @@
 import { proxyConfig } from './proxy-configs.js';
 import { platform } from './platforms.js';
 import { profileFor } from './engine-profiles.js';
-import { PREPARE_HOST_SHA256, PREPARE_HOST_URL } from './prepare-host-source.js';
 
-export const REGISTRY_NS = process.env.QUASAR_IMAGE_NAMESPACE || 'ghcr.io/accreleus/quasar';
+/**
+ * `prepare-host-source.js` is Node-only (it reads `deploy/prepare-host.sh`
+ * with `node:fs`) and must never be imported from here: this module is also
+ * bundled into the quick start's browser `<script>`, and Vite externalizes
+ * `node:fs` to a stub that throws on property access for that target — a
+ * static import used to crash the whole wizard silently before any event
+ * listener attached. `QuickStart.astro`'s frontmatter (SSR, safe) reads the
+ * real checksum and calls `setPrepareHostSha256()`; the test file does the
+ * same for its own assertions. Until called, `prepText()` falls back to a
+ * placeholder rather than a stale or wrong digest.
+ */
+let prepareHostSha256 = '<checksum unavailable — call setPrepareHostSha256()>';
+export function setPrepareHostSha256(value) {
+  prepareHostSha256 = value;
+}
+export const PREPARE_HOST_URL = 'https://accreleus.github.io/quasar/prepare-host.sh';
+
+// `process` itself is a Node global, undefined in the browser this module is
+// also bundled for (the quick start's client <script>) — `typeof` is the one
+// operator that can safely probe an undeclared identifier without throwing.
+const env = typeof process !== 'undefined' ? process.env : {};
+export const REGISTRY_NS = env.QUASAR_IMAGE_NAMESPACE || 'ghcr.io/accreleus/quasar';
 /** The edge channel's tag family for builds that ship owned installs (#365). */
-export const CHANNEL_TAG = process.env.QUASAR_IMAGE_TAG || 'o2-develop';
+export const CHANNEL_TAG = env.QUASAR_IMAGE_TAG || 'o2-develop';
 export const IMAGE_NAMES = {
   seed: 'quasar-recovery',
   control: 'quasar-control-plane',
@@ -270,7 +290,7 @@ export function prepText(a) {
     .map((t) => (t.startsWith('--') ? t : shellQuote(t)))
     .join(' ');
   return `curl -fsSL -o prepare-host.sh ${shellQuote(PREPARE_HOST_URL)}
-echo ${shellQuote(`${PREPARE_HOST_SHA256}  prepare-host.sh`)} | sha256sum -c
+echo ${shellQuote(`${prepareHostSha256}  prepare-host.sh`)} | sha256sum -c
 sudo sh prepare-host.sh ${flags}`;
 }
 
@@ -318,6 +338,24 @@ export function quadletUnit(a, images = PLACEHOLDERS) {
   if (external) lines.push('Secret=quasar-db-password,type=env,target=QUASAR_DATABASE_PASSWORD');
   lines.push('', '[Service]', 'Restart=always', '', '[Install]', `WantedBy=${rootful ? 'multi-user.target' : 'default.target'}`, '');
   return lines.join('\n');
+}
+
+/**
+ * The seed as a bare `podman run`, for "only trying it out" — not the
+ * installed path (the Quadlet unit is), so it is offered behind a closed
+ * disclosure in the Result step. Same socket mapping as the unit
+ * (`/var/run/docker.sock` in-container, per ADR 0007's RH07 amendment).
+ */
+export function podmanRunSeed(a, images = PLACEHOLDERS) {
+  const rootful = a.mode === 'rootful';
+  const sudo = rootful ? 'sudo ' : '';
+  const sock = rootful ? '/run/podman/podman.sock' : '${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock';
+  return `${sudo}podman run -d --name quasar-seed --restart unless-stopped \\
+  --security-opt label=disable \\
+  -v "${sock}:/var/run/docker.sock" \\
+  -v quasar-machine:/var/lib/quasar-machine:ro \\
+${envArgsFor(a, images)}
+  ${images.seed} seed`;
 }
 
 // --- the scripts, per engine and mode ---------------------------------------
@@ -779,7 +817,7 @@ function scriptText(a) {
  * Turn wizard answers into every artifact the install needs.
  *
  * @returns {{stack: string, env: string|null, pins: string, prep: string|null,
- *            quadlet: string|null, script: string|null,
+ *            quadlet: string|null, podmanRun: string|null, script: string|null,
  *            proxyConfig: {name: string, filename: string, language: string, body: string}|null}}
  */
 export function generate(input = {}) {
@@ -789,6 +827,7 @@ export function generate(input = {}) {
   }
   const r = role(a.role);
   const showInstall = r.control && supportedProfile(a);
+  const podman = showInstall && a.engine === 'podman';
   return {
     stack: seedStack(a),
     env: stackEnv(a),
@@ -797,7 +836,10 @@ export function generate(input = {}) {
     // one-line command, which prepares the host too. Unraid needs no separate prep
     // block: prepare-host.sh writes under /etc, a ramdisk there.
     prep: showInstall && a.platform !== 'unraid' ? prepText(a) : null,
-    quadlet: showInstall && a.engine === 'podman' ? quadletUnit(a) : null,
+    quadlet: podman ? quadletUnit(a) : null,
+    // "Only trying it out?" alternative to the Quadlet unit (owner decision 3):
+    // never the installed path, so it is offered behind a closed disclosure.
+    podmanRun: podman ? podmanRunSeed(a) : null,
     script: showInstall ? scriptText(a) : null,
     proxyConfig:
       r.control && a.access === 'proxy'

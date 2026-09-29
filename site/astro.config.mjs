@@ -35,6 +35,19 @@ export default defineConfig({
 	site: SITE,
 	base: BASE,
 	trailingSlash: 'always',
+	// The quick start's engine-profiles.js (RH07-14, #406) reads
+	// testdata/engine-profiles/profiles.json, and prepare-host-source.js (Node
+	// only — see that file) reads deploy/prepare-host.sh: both outside site/,
+	// so both single sources of truth stay in the repo root rather than a copy
+	// drifting under site/. The dev server's default `server.fs.allow` is the
+	// project root, which would otherwise 403 those imports.
+	vite: {
+		server: {
+			fs: {
+				allow: ['..'],
+			},
+		},
+	},
 	integrations: [
 		starlight({
 			plugins: [
