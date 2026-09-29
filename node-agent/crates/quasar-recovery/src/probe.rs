@@ -3,7 +3,7 @@
 //! The actor cannot look for itself: a container sees only the devices it was given, and
 //! the actor is given none. So the actor runs a short-lived probe from the agent image
 //! with the host's `/dev` bound read-only at `/host/dev` (and `/run` at `/host/run`, for
-//! logind's state, RH-07 #407), reads what it printed, and removes it whatever happened.
+//! logind's state and the console-audio socket directory, RH-07 #407), reads what it printed, and removes it whatever happened.
 //!
 //! Presence is read by listing `/host/dev` (a glob, which is a directory read), never by
 //! `stat`ing a node: under SELinux a confined container may list the host's `/dev` but
@@ -39,6 +39,7 @@ pub const SCRIPT: &str = r#"echo "quasar-probe 1"
 for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd) echo "dev ${f##*/}";; esac; done
 for f in /host/dev/i2c-*; do n=${f##*/i2c-}; case "$n" in ''|*[!0-9]*) ;; *) echo "i2c $n";; esac; done
 for f in /host/run/systemd/*; do case "${f##*/}" in seats|sessions) echo "logind ${f##*/}";; esac; done
+for f in /host/run/quasar-console-audi[o]; do [ "$f" = /host/run/quasar-console-audio ] && echo "console_audio dir"; done
 [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
@@ -64,6 +65,9 @@ pub struct ProbeReport {
     pub i2c: Vec<u32>,
     /// Which of logind's `seats` and `sessions` directories the host's `/run/systemd` has.
     pub logind: Vec<String>,
+    /// The host's `/run` has `quasar-console-audio`, the desktop user's Quasar-only
+    /// PipeWire socket directory (console audio, RH-07 #407).
+    pub console_audio: bool,
     pub nvidia_nodes: bool,
     /// `(node, pci vendor id)`, render and card nodes, in the order printed.
     pub nodes: Vec<(String, Option<String>)>,
@@ -101,6 +105,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("fuse")) => report.fuse = true,
             (Some("dev"), Some("snd")) => report.sound = true,
             (Some("kernel_log"), Some("open")) => report.kernel_log = true,
+            (Some("console_audio"), Some("dir")) => report.console_audio = true,
             (Some("i2c"), Some(n)) => {
                 let bus = n
                     .parse::<u32>()
@@ -205,6 +210,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         sound: report.sound,
         i2c: report.i2c.clone(),
         logind: report.logind(),
+        console_audio: report.console_audio,
         engine_rootless: false,
         host_sysfs: false,
     };
@@ -474,6 +480,32 @@ mod tests {
         assert!(select(&half).1.i2c.is_empty());
         assert!(parse("quasar-probe 1\ni2c x\nend").is_err());
         assert!(parse("quasar-probe 1\nlogind other\nend").is_err());
+    }
+
+    /// RH-07 #407 (D13): the console-audio socket directory is read by listing `/host/run`,
+    /// and becomes the recipe input.
+    #[test]
+    fn the_console_audio_directory_is_reported_from_a_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host");
+        std::fs::create_dir_all(host.join("dev")).unwrap();
+        std::fs::create_dir_all(host.join("run")).unwrap();
+        let run = |host: &std::path::Path| {
+            let script = SCRIPT.replace("/host/", &format!("{}/", host.display()));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("sh");
+            parse(&String::from_utf8_lossy(&out.stdout)).unwrap()
+        };
+        assert!(!run(&host).console_audio);
+        assert!(!select(&run(&host)).1.console_audio);
+        std::fs::create_dir_all(host.join("run/quasar-console-audio")).unwrap();
+        let report = run(&host);
+        assert!(report.console_audio);
+        assert!(select(&report).1.console_audio);
+        assert!(parse("quasar-probe 1\nconsole_audio other\nend").is_err());
     }
 
     /// The script lists i2c nodes and logind's directories by glob: a real shell against a

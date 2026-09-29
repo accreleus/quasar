@@ -14,7 +14,8 @@
 //! The attempt is journalled as the operator's, like every reconfigure, so the agent's
 //! release relay (`GET /v1/status`) never adopts it.
 //!
-//! **Console devices (RH-07 #407).** Whether the host has sound, logind's state and which
+//! **Console devices (RH-07 #407).** Whether the host has sound, logind's state, the
+//! console-audio socket directory (D13) and which
 //! `/dev/i2c-*` nodes are read by the device probe whenever console mode is turned on, and
 //! again at every start of the recovery actor while it is on
 //! ([`Actor::recheck_console_devices`]): i2c bus numbers can change across reboots, and an
@@ -204,6 +205,7 @@ impl Actor {
             Ok(report) => Some(ConsoleDevices {
                 sound: report.sound,
                 logind: report.logind(),
+                console_audio: report.console_audio,
                 i2c: report.i2c,
             }),
             Err(e) => {
@@ -338,6 +340,7 @@ impl Actor {
             i2c = ?after.devices.i2c,
             sound = after.devices.sound,
             logind = after.devices.logind,
+            console_audio = after.devices.console_audio,
             re_created = !replaced.is_empty(),
             "the host's console devices changed since the agent was created"
         );
@@ -419,6 +422,7 @@ impl Actor {
 struct ConsoleDevices {
     sound: bool,
     logind: bool,
+    console_audio: bool,
     i2c: Vec<u32>,
 }
 
@@ -426,6 +430,7 @@ impl ConsoleDevices {
     fn apply(self, devices: &mut crate::recipe::HostDevices) {
         devices.sound = self.sound;
         devices.logind = self.logind;
+        devices.console_audio = self.console_audio;
         devices.i2c = self.i2c;
     }
 }

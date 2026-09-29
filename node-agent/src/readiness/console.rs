@@ -30,13 +30,37 @@ pub struct ConsoleView {
     pub ddc: crate::ddc::DdcSummary,
 }
 
-/// For now, ALSA only (chunk 4 lands the PipeWire alternative, RH07-15 §3): `sinks` is
-/// whatever `capacity::detect_audio_sinks` found and could actually open. That function
-/// already carries `pipewire:*` ids alongside `hw:*` ones once chunk 4 lands, so this
-/// check needs no change then — it only ever asks "is there at least one usable sink".
-#[derive(Debug, Clone, Default)]
+/// What `console_audio` judges: the sinks discovery offers, and the route a console
+/// session would take for the configured output (`session::console_audio::choose_route`,
+/// RH-07 #407 D13) — the host's PipeWire while it answers, ALSA only on a free device.
+#[derive(Debug, Clone)]
 pub struct AudioView {
     pub sinks: Vec<crate::messages::AudioSink>,
+    pub route: Result<crate::session::console_audio::Route, crate::session::console_audio::Refusal>,
+    /// A console ALSA leg of this agent is playing: an open PCM is then ours.
+    pub playing: bool,
+}
+
+impl Default for AudioView {
+    fn default() -> Self {
+        AudioView {
+            sinks: Vec::new(),
+            route: Ok(crate::session::console_audio::Route::Alsa { device: None }),
+            playing: false,
+        }
+    }
+}
+
+impl AudioView {
+    /// The live host, judged for `output` (the configured console `audio_output`).
+    pub fn observe(host: &dyn crate::session::console_audio::HostAudio, output: &str) -> Self {
+        let playing = crate::session::console_audio::alsa_leg_live();
+        AudioView {
+            sinks: crate::session::console_audio::sinks(host),
+            route: crate::session::console_audio::choose_route(output, host),
+            playing,
+        }
+    }
 }
 
 pub fn check_display(v: &ConsoleView) -> ReadinessCheck {
@@ -74,20 +98,45 @@ pub fn check_display(v: &ConsoleView) -> ReadinessCheck {
 }
 
 pub fn check_audio(v: &ConsoleView) -> ReadinessCheck {
+    use crate::session::console_audio::Route;
     if !v.enabled {
         return super::skip(CHECK_AUDIO, OFF_SUMMARY);
     }
-    match v.audio.sinks.first() {
-        Some(sink) => super::pass(
+    let a = &v.audio;
+    if a.playing {
+        return super::pass(
             CHECK_AUDIO,
-            format!("{} ({}) is usable for console audio", sink.label, sink.id),
+            "console audio is playing on the host's sound device".into(),
+        );
+    }
+    match &a.route {
+        Ok(route @ Route::PipeWire { .. }) => super::pass(
+            CHECK_AUDIO,
+            format!(
+                "the host's PipeWire answers on the console-audio socket; console audio \
+                 plays through {}",
+                route.describe()
+            ),
         ),
-        None => super::warn_check(
+        Ok(Route::Alsa { .. }) => match a.sinks.first() {
+            Some(sink) => super::pass(
+                CHECK_AUDIO,
+                format!("{} ({}) is usable for console audio", sink.label, sink.id),
+            ),
+            None => super::warn_check(
+                CHECK_AUDIO,
+                "no local audio sink was found for console mode".into(),
+                "Check the host has a sound device passed to the agent (/dev/snd) and that \
+                 /proc/asound lists a card, or run host preparation with \
+                 --console-audio-user so console audio plays through the desktop user's \
+                 PipeWire."
+                    .into(),
+            ),
+        },
+        Err(refusal) => super::fail(
             CHECK_AUDIO,
-            "no local audio sink was found for console mode".into(),
-            "Check the host has a sound device passed to the agent (/dev/snd) and that \
-             /proc/asound lists a card."
-                .into(),
+            refusal.to_string(),
+            refusal.remediation().into(),
         ),
     }
 }
@@ -203,6 +252,89 @@ mod tests {
         let c = check_audio(&v);
         assert_eq!(c.status, super::super::PASS);
         assert!(c.summary.contains("hw:0,3"), "{c:?}");
+    }
+
+    #[test]
+    fn audio_passes_through_pipewire_and_fails_named_when_the_device_is_held() {
+        use crate::session::console_audio::{Refusal, Route};
+        let mut v = view(true);
+        v.audio.route = Ok(Route::PipeWire { device: None });
+        let c = check_audio(&v);
+        assert_eq!(c.status, super::super::PASS, "{c:?}");
+        assert!(c.summary.contains("PipeWire"), "{c:?}");
+
+        v.audio.route = Err(Refusal::DeviceHeld {
+            device: "hw:0,3".into(),
+            owner_pid: None,
+        });
+        let held = check_audio(&v);
+        assert_eq!(held.status, super::super::FAIL, "{held:?}");
+        assert!(
+            held.summary
+                .contains("the sound device (hw:0,3) is held by another program (PipeWire/pulse)"),
+            "{held:?}"
+        );
+        assert!(held.blocks.is_none());
+        assert!(!held.remediation.is_empty());
+
+        // Our own leg holding it is not "another program".
+        v.audio.playing = true;
+        assert_eq!(check_audio(&v).status, super::super::PASS);
+
+        v.audio.playing = false;
+        v.audio.route = Err(Refusal::PipeWireSilent {
+            output: "pipewire:default".into(),
+        });
+        let silent = check_audio(&v);
+        assert_eq!(silent.status, super::super::FAIL);
+        assert!(silent.blocks.is_none());
+
+        let mut off = v.clone();
+        off.enabled = false;
+        assert_eq!(check_audio(&off).status, super::super::SKIP);
+    }
+
+    /// Through the live host view: a temporary `/proc/asound` whose PCM is open, then a
+    /// real listening socket that takes over.
+    #[test]
+    fn audio_view_observes_a_held_pcm_and_a_listening_pipewire() {
+        use crate::session::console_audio::LiveHostAudio;
+        let dir = tempfile::tempdir().unwrap();
+        let asound = dir.path().join("asound");
+        let dev_snd = dir.path().join("snd");
+        std::fs::create_dir_all(asound.join("card1/pcm0p/sub0")).unwrap();
+        std::fs::create_dir_all(&dev_snd).unwrap();
+        std::fs::write(
+            asound.join("cards"),
+            " 1 [Generic ]: HDA-Intel - HD-Audio Generic\n",
+        )
+        .unwrap();
+        std::fs::write(
+            asound.join("pcm"),
+            "01-00: ALC1220 Analog : ALC1220 Analog : playback 1\n",
+        )
+        .unwrap();
+        std::fs::write(dev_snd.join("pcmC1D0p"), "").unwrap();
+        std::fs::write(asound.join("card1/pcm0p/sub0/status"), "state: RUNNING\n").unwrap();
+        let host = LiveHostAudio {
+            socket: dir.path().join("native"),
+            asound,
+            dev_snd,
+        };
+        let mut v = view(true);
+        v.audio = AudioView::observe(&host, "hw:1,0");
+        v.audio.playing = false;
+        let held = check_audio(&v);
+        assert_eq!(held.status, super::super::FAIL, "{held:?}");
+        assert!(held.summary.contains("held by another program"), "{held:?}");
+
+        let _listener = std::os::unix::net::UnixListener::bind(&host.socket).unwrap();
+        v.audio = AudioView::observe(&host, "auto");
+        v.audio.playing = false;
+        let pw = check_audio(&v);
+        assert_eq!(pw.status, super::super::PASS, "{pw:?}");
+        assert!(pw.summary.contains("PipeWire"), "{pw:?}");
+        assert_eq!(v.audio.sinks[0].id, "pipewire:default");
     }
 
     #[test]

@@ -51,7 +51,11 @@ own; the two do not move together, and that is deliberate.
   output, since it means the group can read this machine's keyboard) for console
   mode's exclusive grab, and `--console-audio-user USER` gives console mode a
   restricted PipeWire Pulse socket on a real desktop login, reachable only by that
-  group. The console UI is still to come.
+  group. Console audio now plays through that socket to the desktop user's PipeWire
+  (its sinks listed as "Host PipeWire", the `hw:*` ones hidden while it answers), and
+  falls back to ALSA only when no PipeWire answers and the device is free; otherwise the
+  console runs quiet and `console_audio` names what holds the device. The console UI is
+  still to come.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,

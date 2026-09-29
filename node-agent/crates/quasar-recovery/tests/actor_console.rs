@@ -749,6 +749,38 @@ fn a_rootless_host_without_sound_logind_or_i2c_gets_none_of_them() {
     );
 }
 
+/// D13: a host prepared with `--console-audio-user` has the PipeWire socket directory;
+/// turning console mode on reads it and binds it read-write into the agent.
+#[test]
+fn a_host_with_the_console_audio_directory_gets_it_bound() {
+    let mut state = rootless();
+    state.probe_output = PROBE_ROOTLESS.replace("\nend\n", "\nconsole_audio dir\nend\n");
+    let m = Machine::install(state);
+    let actor = m.actor();
+    run(&actor, enable());
+    let agent = m.one_running_agent("rootless console with PipeWire");
+    assert!(
+        agent
+            .spec
+            .binds
+            .iter()
+            .any(|b| b.source == "/run/quasar-console-audio"
+                && b.target == "/run/quasar-console-audio"
+                && !b.read_only),
+        "{:?}",
+        agent.spec.binds
+    );
+    assert_eq!(m.inputs()["devices"]["console_audio"], true);
+
+    run(&actor, disable());
+    let off = m.one_running_agent("console off");
+    assert!(!off
+        .spec
+        .binds
+        .iter()
+        .any(|b| b.source == "/run/quasar-console-audio"));
+}
+
 // ----- the console agent's preflight (#407) -----
 
 fn held() -> ConsolePreflight {
