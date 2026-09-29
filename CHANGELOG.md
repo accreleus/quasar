@@ -778,7 +778,7 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
-- **CI's node-agent job passes clippy on Rust 1.98 again.** Four lints new in that toolchain (an import used only by tests, `>= x + 1`, a redundant `&` in `format!`, a collapsible `if` in a `match`) failed the job on every branch.
+- **CI's node-agent job passes clippy on Rust 1.98 again.** Four lints new in that toolchain (an import used only by tests, `>= x + 1`, a redundant `&` in `format!`, a collapsible `if` in a `match`) failed the job on every branch. Nine `source_policy`/warm-up tests also failed in CI only: their fixture's `ImageManager::new` reconciled a synthetic "ready" record against whichever container engine socket happened to be reachable on the machine running the test, which a CI runner's real Docker daemon flips to absent; the fixture now builds an `ImageManager` with no state file and sets the record ready directly, bypassing that reconciliation.
 - **`make test-rust` in two worktrees at once no longer cross-contaminates (#417).** Every
   worktree built into the same in-container `CARGO_TARGET_DIR` on the shared
   `quasar-cargo-target` volume, at identical source paths, so cargo's mtime-based freshness

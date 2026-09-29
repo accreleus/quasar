@@ -471,13 +471,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let homes = dir.path().join("homes");
         std::fs::create_dir(&homes).unwrap();
-        let path = dir.path().join("images.json");
         let image = identity();
-        std::fs::write(&path,json!({"images":{"steam":{"registry_ref":image.registry_ref,"version":image.version,"state":"ready"}}}).to_string()).unwrap();
-        let images = crate::images::ImageManager::new(
-            crate::session::container::ContainerRuntime::new(false),
-            path.to_str().unwrap().into(),
-        );
+        // empty_for_test: ImageManager::new reconciles against whatever container
+        // engine happens to be reachable on the test machine, which flips this
+        // synthetic "ready" record to absent on a runner with a real docker daemon.
+        let images = crate::images::ImageManager::empty_for_test();
+        images.set_ready_for_test(&image.image_id, &image.registry_ref, &image.version);
         let policy = SourcePolicy::new(
             homes.to_str().unwrap(),
             Arc::new(WarmupControl::new()),

@@ -2283,6 +2283,49 @@ fn stage_building(
 }
 
 #[cfg(test)]
+impl ImageManager {
+    /// A manager with no state file and no daemon reconciliation, for tests that only
+    /// need a synthetic `is_exact_ready` answer. `ImageManager::new` reconciles every
+    /// loaded record against whichever engine socket [`crate::runtime::configured`]
+    /// finds on the machine running the test — on a CI runner with a real Docker
+    /// daemon that silently flips a synthetic "ready" record to absent, unlike the
+    /// sandboxed dev container, which has none.
+    pub(crate) fn empty_for_test() -> Arc<Self> {
+        Arc::new(ImageManager {
+            runtime: ContainerRuntime::new(false),
+            state_path: String::new(),
+            records: Mutex::new(BTreeMap::new()),
+            ops: Mutex::new(HashMap::new()),
+            generations: AtomicU64::new(0),
+            semaphore: CountingSemaphore::new(MAX_CONCURRENT_PULLS),
+            upstream: RwLock::new(None),
+            terminal_pending: Mutex::new(HashSet::new()),
+            lifecycle: RwLock::new(None),
+            cleanup: None,
+            image_locks: Mutex::new(HashMap::new()),
+            admission: RwLock::new(()),
+            inventory_refresh_busy: AtomicBool::new(false),
+            inventory_last_refresh: Mutex::new(Instant::now()),
+            warmup_controls: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Directly mark `image_id` ready, bypassing both the on-disk state file and the
+    /// daemon reconciliation `ImageManager::new` performs — see [`Self::empty_for_test`].
+    pub(crate) fn set_ready_for_test(&self, image_id: &str, registry_ref: &str, version: &str) {
+        self.records.lock().unwrap().insert(
+            image_id.to_string(),
+            ImageRecord {
+                registry_ref: registry_ref.to_string(),
+                version: version.to_string(),
+                state: ImageState::Ready,
+                ..ImageRecord::empty()
+            },
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
