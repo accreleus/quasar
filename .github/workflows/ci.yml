@@ -189,20 +189,20 @@ jobs:
       fail-fast: false
       matrix:
         target: [docker-rootful, docker-rootless, podman-rootful, podman-rootless]
-        # Findings Ubuntu's Podman 4.9 fails on, recorded rather than hidden: each still runs,
-        # reports KNOWN, and fails the job once it passes so the entry is dropped. The
-        # required Podman profiles are Fedora's Podman 5, which the lab runs.
+        # Findings Podman fails on, recorded rather than hidden: each still runs, reports
+        # KNOWN, and fails the job once it passes so the entry is dropped. restart is 4.9's
+        # alone (no restart-policy update); the other two reproduce the lab's Podman 5.
         include:
           - target: podman-rootful
             known: >-
-              podman-rootful:create-read-back=Podman 4.9 - the runtime cannot read back the session-shaped container (UnknownOutcome, reconciliation Protocol);
               podman-rootful:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
-              podman-rootful:missing-bind-source=a missing bind source is not refused on Podman (finding from #408), and 4.9 leaves a created container and reports UnknownOutcome
+              podman-rootful:stop-crash-loop=a crash-looping unless-stopped service restarts after a stop on Podman (finding from #408);
+              podman-rootful:missing-bind-source=Podman creates a missing bind source and starts the container (finding from #408)
           - target: podman-rootless
             known: >-
-              podman-rootless:create-read-back=Podman 4.9 - the runtime cannot read back the session-shaped container (UnknownOutcome, reconciliation Protocol);
               podman-rootless:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
-              podman-rootless:missing-bind-source=a missing bind source is not refused on Podman (finding from #408), and 4.9 leaves a created container and reports UnknownOutcome
+              podman-rootless:stop-crash-loop=a crash-looping unless-stopped service restarts after a stop on Podman (finding from #408);
+              podman-rootless:missing-bind-source=Podman creates a missing bind source and starts the container (finding from #408)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The suite links the agent crate, which needs the same headers as the rust job.

@@ -102,17 +102,15 @@ runner; `scripts/verify/ci-engine-target.sh` brings each engine up):
 | `podman-rootful` | yes: Ubuntu's Podman 4.9, suite run as root | every GPU case; Fedora's Podman 5 |
 | `podman-rootless` | yes: Ubuntu's Podman 4.9 through the user's `podman.socket` | every GPU case; the must-pass Fedora Atomic VM (SELinux enforcing, read-only `/usr`) |
 
-Ubuntu's Podman 4.9 fails three cases in both Podman modes. CI records them in
-`QUASAR_ENGINE_SUITE_KNOWN` (the job's `known` matrix value) instead of hiding them:
+CI's Podman jobs record three failures in `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known`
+matrix value) instead of hiding them:
 
-- `create-read-back`: the runtime cannot read back the session-shaped container. Start
-  reports `UnknownOutcome` with reconciliation `Protocol`. (`user-mapping`, the same shape
-  without the named volume, passes.) Podman 5 passes this case.
-- `restart`: Podman 4.9's compatible container update refuses a restart policy (`Engine`).
-  Podman 5 accepts it.
-- `missing-bind-source`: a product finding on every Podman tested, 4.9 and 5 alike. The
-  create is not refused. On 4.9 the created container is left behind and the runtime
-  reports `UnknownOutcome`; on 5 the application starts.
+- `restart`: Podman 4.9's compatible container update refuses a restart policy
+  (`Engine`). Podman 5 accepts it.
+- `stop-crash-loop`: a product finding on Podman 4.9 and 5 alike. A crash-looping
+  `unless-stopped` service keeps being restarted after a successful stop.
+- `missing-bind-source`: a product finding on Podman 4.9 and 5 alike. Podman creates the
+  missing source on the host and starts the container.
 
 What only the lab can run, in every mode, and why:
 
