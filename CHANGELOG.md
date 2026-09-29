@@ -34,7 +34,12 @@ own; the two do not move together, and that is deliberate.
   host by its os-release `ID`/`ID_LIKE`, so Fedora's image-based editions (Bazzite, uCore)
   read as Fedora on Podman too, and only Ubuntu 24.04 counts as Ubuntu; a test holds the
   agent to the table row by row. The documentation site reads the same table, and Starlight
-  badges take the product's success, warning and danger colours.
+  badges take the product's success, warning and danger colours. The quick start now
+  generates a script per (platform, engine, mode), gated on that same table: Docker rootful
+  keeps today's shape minus what `prepare-host.sh` now owns, Docker rootless never uses
+  `sudo` past that one prep line and creates no directories, and Podman writes and starts a
+  Quadlet unit whose socket maps to `/var/run/docker.sock` per ADR 0007's RH07 amendment;
+  Unraid is untouched.
 - **Console mode on rootful owned installs (RH-07, #395).** The recovery actor gives an
   owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd` and
   `/proc/asound` read-only (only on a host that has sound, read again each time console mode
