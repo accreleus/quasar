@@ -45,8 +45,12 @@ own; the two do not move together, and that is deliberate.
   whether it can take the display (no crash on a held one, just a named failure posted to
   the actor's new preflight endpoint) before it ever reports healthy, `ddc.rs` stops
   creating `/dev/i2c-*` nodes on a rootless engine and reads the ones the recipe passed
-  instead, and readiness gains `console_display`/`console_audio`/`console_ddc`. Host
-  preparation and the console UI are still to come.
+  instead, and readiness gains `console_display`/`console_audio`/`console_ddc`. The
+  console UI now leads a failed attempt with the agent's own named cause (who holds the
+  display, or that the host needs `prepare-host.sh --console` again, with a copyable
+  command) instead of hiding it behind the generic mapped reason, and its "Local audio
+  output" picker and help text tell a host's PipeWire sinks from its ALSA ones. Host
+  preparation is still to come.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
