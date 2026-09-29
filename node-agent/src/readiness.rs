@@ -280,9 +280,10 @@ impl ProbeEnv {
                 has_access: std::env::var(crate::release::console::MARKER_ENV)
                     .is_ok_and(|v| v.trim() == "1"),
                 preflight: crate::session::console_preflight::last(),
-                audio: console::AudioView {
-                    sinks: crate::capacity::detect_audio_sinks(),
-                },
+                audio: console::AudioView::observe(
+                    &crate::session::console_audio::LiveHostAudio::live(),
+                    &crate::session::console_audio::configured_output(),
+                ),
                 ddc: crate::ddc::summary(),
             },
         }

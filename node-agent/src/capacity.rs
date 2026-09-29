@@ -339,31 +339,28 @@ fn detect_drm_connectors() -> Vec<String> {
     crate::ddc::powered_connectors(out)
 }
 
-/// Host audio sinks from `/proc/asound` or the host bind at `/host-proc/asound`. A card name
-/// alone is insufficient for HDMI/DP: the active output is often `hw:<card>,<device>`, not
-/// the non-existent device zero.
+/// Console audio sinks: the host PipeWire's while its console-audio socket answers (the
+/// `hw:*` ones hidden then, never fought for), otherwise the host's ALSA playback PCMs
+/// (`session::console_audio`, RH-07 #407 D13).
 pub(crate) fn detect_audio_sinks() -> Vec<AudioSink> {
-    // Docker creates an empty `/proc/asound` even with no host ALSA metadata visible, so
-    // pick the first root that actually has `cards` or the explicit host bind is shadowed.
-    let asound = ["/proc/asound", "/host-proc/asound"]
-        .into_iter()
-        .find(|root| std::path::Path::new(root).join("cards").is_file())
-        .unwrap_or("/proc/asound");
-    let cards = std::fs::read_to_string(format!("{asound}/cards")).unwrap_or_default();
-    let pcm = std::fs::read_to_string(format!("{asound}/pcm")).unwrap_or_default();
+    crate::session::console_audio::sinks(&crate::session::console_audio::LiveHostAudio::live())
+}
+
+/// ALSA playback sinks from an asound root (`/proc/asound` or the host bind at
+/// `/host-proc/asound`). A card name alone is insufficient for HDMI/DP: the active output
+/// is often `hw:<card>,<device>`, not the non-existent device zero.
+pub(crate) fn alsa_sinks_at(asound: &std::path::Path, dev_snd: &std::path::Path) -> Vec<AudioSink> {
+    let cards = std::fs::read_to_string(asound.join("cards")).unwrap_or_default();
+    let pcm = std::fs::read_to_string(asound.join("pcm")).unwrap_or_default();
     parse_audio_sinks(&cards, &pcm)
         .into_iter()
         // Compose may expose only one sound device; advertising the rest of the host's
         // inventory hands an operator a sink whose ALSA node the pipeline cannot open.
-        .filter(|sink| audio_sink_device_visible(&sink.id))
+        .filter(|sink| audio_sink_device_path(dev_snd, &sink.id).is_none_or(|p| p.exists()))
         .collect()
 }
 
-fn audio_sink_device_visible(id: &str) -> bool {
-    audio_sink_device_path(id).is_none_or(|path| path.exists())
-}
-
-fn audio_sink_device_path(id: &str) -> Option<std::path::PathBuf> {
+fn audio_sink_device_path(dev_snd: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
     let Some((card, device)) = id
         .strip_prefix("hw:")
         .and_then(|address| address.split_once(','))
@@ -372,9 +369,7 @@ fn audio_sink_device_path(id: &str) -> Option<std::path::PathBuf> {
         // host that exposes no pcm data.
         return None;
     };
-    Some(std::path::PathBuf::from(format!(
-        "/dev/snd/pcmC{card}D{device}p"
-    )))
+    Some(dev_snd.join(format!("pcmC{card}D{device}p")))
 }
 
 fn parse_audio_sinks(cards: &str, pcm: &str) -> Vec<AudioSink> {
@@ -1463,10 +1458,10 @@ mod tests {
     #[test]
     fn audio_sink_pcm_path_matches_alsa_endpoint() {
         assert_eq!(
-            audio_sink_device_path("hw:0,3").as_deref(),
+            audio_sink_device_path(std::path::Path::new("/dev/snd"), "hw:0,3").as_deref(),
             Some(std::path::Path::new("/dev/snd/pcmC0D3p"))
         );
-        assert!(audio_sink_device_path("hw:0").is_none());
+        assert!(audio_sink_device_path(std::path::Path::new("/dev/snd"), "hw:0").is_none());
     }
 
     #[test]

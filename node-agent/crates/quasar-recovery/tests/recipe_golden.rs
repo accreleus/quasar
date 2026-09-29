@@ -47,6 +47,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             sound: false,
             i2c: Vec::new(),
             logind: false,
+            console_audio: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -444,6 +445,58 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
         .binds
         .iter()
         .any(|b| b.target == "/host/run/systemd/seats" && b.read_only));
+}
+
+/// RH-07 #407 (D13): a host prepared with `--console-audio-user` has the desktop user's
+/// Quasar-only PipeWire socket directory; console mode binds it read-write at the same path
+/// on either engine, and a host without it gets nothing the engine would have to create.
+#[test]
+fn node_agent_revision_3_with_console_mode_binds_the_pipewire_socket_directory() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let audio_bind = "/run/quasar-console-audio:/run/quasar-console-audio".to_string();
+    let binds = |s: &quasar_recovery::recipe::ContainerSpec| -> Vec<String> {
+        s.binds.iter().map(|b| b.to_engine()).collect()
+    };
+
+    let mut rootless = inputs(Some(GpuVendor::Nvidia));
+    rootless.devices.engine_rootless = true;
+    rootless.gpu.cdi = true;
+    rootless.console = true;
+    rootless.devices.sound = true;
+    rootless.devices.logind = true;
+    rootless.devices.i2c = vec![3, 12];
+    let without = render(Role::NodeAgent, 3, &rootless, &image, &agent_secrets()).unwrap();
+    rootless.devices.console_audio = true;
+    let with = render(Role::NodeAgent, 3, &rootless, &image, &agent_secrets()).unwrap();
+    check("node-agent-r3-nvidia-rootless-console-pipewire.json", &with);
+    let added: Vec<String> = binds(&with)
+        .into_iter()
+        .filter(|b| !binds(&without).contains(b))
+        .collect();
+    assert_eq!(added, vec![audio_bind.clone()]);
+    assert!(!binds(&without).contains(&audio_bind));
+    assert!(with.cap_add.is_empty() && with.device_cgroup_rules.is_empty());
+    assert_eq!(with.devices, without.devices);
+
+    let mut rootful = inputs(Some(GpuVendor::Amd));
+    rootful.console = true;
+    rootful.devices.console_audio = true;
+    let spec = render(Role::NodeAgent, 3, &rootful, &image, &agent_secrets()).unwrap();
+    assert!(binds(&spec).contains(&audio_bind), "{:?}", binds(&spec));
+
+    // Console mode off: never bound, whatever the host has.
+    let mut off = rootful.clone();
+    off.console = false;
+    let spec = render(Role::NodeAgent, 3, &off, &image, &agent_secrets()).unwrap();
+    assert!(!binds(&spec).contains(&audio_bind));
+
+    // Written only when true.
+    let json = serde_json::to_value(inputs(Some(GpuVendor::Amd))).unwrap();
+    assert!(json["devices"].get("console_audio").is_none(), "{json}");
+    assert_eq!(
+        serde_json::to_value(&rootful).unwrap()["devices"]["console_audio"],
+        true
+    );
 }
 
 /// Machine state gains the console devices only where the host has them, so every existing

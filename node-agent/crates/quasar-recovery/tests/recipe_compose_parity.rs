@@ -287,6 +287,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             sound: false,
             i2c: Vec::new(),
             logind: false,
+            console_audio: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,

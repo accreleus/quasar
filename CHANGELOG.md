@@ -51,7 +51,12 @@ own; the two do not move together, and that is deliberate.
   output, since it means the group can read this machine's keyboard) for console
   mode's exclusive grab, and `--console-audio-user USER` gives console mode a
   restricted PipeWire Pulse socket on a real desktop login, reachable only by that
-  group. The console UI
+  group.
+  Console audio now plays through that socket to the desktop user's PipeWire (its sinks
+  listed as "Host PipeWire", the `hw:*` ones hidden while it answers), and falls back to
+  ALSA only when no PipeWire answers and the device is free; otherwise the console runs
+  quiet and `console_audio` names what holds the device.
+  The console UI
   now leads a failed attempt with the agent's own named cause (who holds the display, or
   that the host needs `prepare-host.sh --console` again, with a copyable command) instead
   of hiding it behind the generic mapped reason, and its "Local audio output" picker and

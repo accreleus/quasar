@@ -457,6 +457,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
             sound: false,
             i2c: Vec::new(),
             logind: false,
+            console_audio: false,
             fuse: false,
             dri: false,
             uinput: false,

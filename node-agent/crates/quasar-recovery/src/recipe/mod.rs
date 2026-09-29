@@ -288,6 +288,13 @@ pub struct HostDevices {
     /// only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub logind: bool,
+    /// The host has `/run/quasar-console-audio` (RH-07 #407, D13): host preparation's
+    /// `--console-audio-user` made the desktop user's PipeWire listen there, in a directory
+    /// only that user and the Quasar group can enter. Console mode binds it read-write so
+    /// the agent plays console audio through that PipeWire instead of fighting it for the
+    /// sound device. Read with `i2c`; written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console_audio: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -305,6 +312,7 @@ impl Default for HostDevices {
             sound: false,
             i2c: Vec::new(),
             logind: false,
+            console_audio: false,
             unknown: Unknown::new(),
         }
     }
@@ -1106,6 +1114,13 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
                 .push(bind(dir, &format!("{CONSOLE_HOST_PREFIX}{dir}"), true));
         }
     }
+    // The desktop user's PipeWire, through the Quasar-only socket host preparation made
+    // (D13): read-write, since connecting to a socket is a write. The same path inside, as
+    // the agent names the server by it.
+    if inputs.devices.console_audio {
+        spec.binds
+            .push(bind(CONSOLE_AUDIO_DIR, CONSOLE_AUDIO_DIR, false));
+    }
     spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
     if rootless {
         // No mknod inside a user namespace: each i2c node the host has is passed in.
@@ -1127,6 +1142,10 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
 
 /// logind's state directories console mode binds read-only (`HostDevices::logind`).
 pub const LOGIND_DIRS: [&str; 2] = ["/run/systemd/seats", "/run/systemd/sessions"];
+
+/// The directory holding the desktop user's Quasar-only PipeWire (pulse protocol) socket,
+/// on the host and inside the agent (`HostDevices::console_audio`).
+pub const CONSOLE_AUDIO_DIR: &str = "/run/quasar-console-audio";
 
 /// Where console mode's host views live inside the agent: `/host/run/systemd/seats`, ...
 pub const CONSOLE_HOST_PREFIX: &str = "/host";
