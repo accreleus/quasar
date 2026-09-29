@@ -26,8 +26,9 @@ own; the two do not move together, and that is deliberate.
 
 ### Added
 - **Console mode on rootful owned installs (RH-07, #395).** The recovery actor gives an
-  owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd`,
-  `/proc/asound` read-only, and device rules for ALSA and i2c-dev (DDC power detection),
+  owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd` and
+  `/proc/asound` read-only (only on a host that has sound, read again each time console mode
+  is turned on), and device rules for ALSA and i2c-dev (DDC power detection),
   the Compose console overlay's grant minus the `m` and DRM rules revision 3 does not need.
   The agent asks on its own socket (`GET`/`POST /v1/console`; the control socket has
   neither), and the actor replaces the agent alone through the reconfigure machinery: the
