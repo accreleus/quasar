@@ -817,6 +817,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A reconnected host no longer reads as offline (#407).** When an agent's old connection
+  was noticed dead only after its replacement had registered (seen when console access
+  recreated the agent), that old connection's teardown marked the host offline, and nothing
+  set it back while the new connection stayed up: every launch then failed with
+  `no_host_available`. Only the host's current connection now marks it offline.
 - **Host preparation relabels a homes or templates root that was recreated (#407).** It
   counted the persistent `container_file_t` rule as done, but a root recreated after it was
   written (a reinstall) inherits `var_lib_t`, so every app in a confined container failed to
