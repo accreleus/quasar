@@ -232,6 +232,13 @@ impl Machine {
         let free = self.knobs.free.clone();
         config.free_space = Box::new(move |_| Ok(free.load(Ordering::SeqCst)));
         config.socket_dir = self.knobs.sockets.clone();
+        // `chown` to the fixed production uid needs real privilege this test process may
+        // not have; chown to its own uid/gid, read off a file it owns, always succeeds.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owned = std::fs::metadata(self.dir.path()).unwrap();
+            config.control_socket_owner = Some((owned.uid(), owned.gid()));
+        }
         config
     }
 

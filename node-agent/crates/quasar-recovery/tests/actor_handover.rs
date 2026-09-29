@@ -139,13 +139,10 @@ fn fast() -> ReplaceTiming {
 
 fn handover_timing() -> HandoverTiming {
     HandoverTiming {
-        // Scheduling budgets, not assertions: 3s starved a contended CI runner's
-        // successor thread (real UnixListener bind+serve) and failed 7 tests on
-        // "Connection refused" that never reproduced under any local cpu/thread cap.
-        ready: Duration::from_secs(10),
-        takeover: Duration::from_secs(10),
-        verify: Duration::from_secs(10),
-        agent_contact: Duration::from_secs(10),
+        ready: Duration::from_secs(3),
+        takeover: Duration::from_secs(3),
+        verify: Duration::from_secs(3),
+        agent_contact: Duration::from_secs(3),
         poll: Duration::from_millis(2),
         orphan_check: Duration::from_secs(3600),
     }
@@ -554,6 +551,13 @@ impl Lab {
         config.timing = fast();
         config.healthy_wait = Duration::from_millis(20);
         config.handover = *self.handover.lock().unwrap();
+        // `chown` to the fixed production uid needs real privilege this test process may
+        // not have; chown to its own uid/gid (read off a file it owns) always succeeds.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owned = std::fs::metadata(self.dir.path()).unwrap();
+            config.control_socket_owner = Some((owned.uid(), owned.gid()));
+        }
         config.socket_dir = if self.no_socket.lock().unwrap().iter().any(|i| *i == image) {
             // A directory under a regular file: nothing can be bound there.
             let file = self.sockets.path().join("not-a-directory");

@@ -142,6 +142,13 @@ pub struct ActorConfig {
     /// the phase; `true` makes the process die right there.
     #[cfg(any(test, feature = "test-support"))]
     pub crash_after: Option<CrashAfter>,
+    /// Overrides the control socket's chowned owner (default `recipe::CONTROL_PLANE_UID`).
+    /// Production always runs the actor with the privilege to give the socket away; an
+    /// in-process test does not, so `chown` to a fixed uid it isn't fails with EPERM on
+    /// any CI runner not coincidentally uid 1000. Tests set this to their own uid/gid,
+    /// which `chown` always permits.
+    #[cfg(any(test, feature = "test-support"))]
+    pub control_socket_owner: Option<(u32, u32)>,
 }
 
 /// See [`ActorConfig::free_space`].
@@ -260,6 +267,8 @@ impl ActorConfig {
             database_timeout: crate::database::DEFAULT_TIMEOUT,
             #[cfg(any(test, feature = "test-support"))]
             crash_after: None,
+            #[cfg(any(test, feature = "test-support"))]
+            control_socket_owner: None,
         }
     }
 }
@@ -949,10 +958,17 @@ impl Actor {
             caller: crate::trust::Caller::Agent,
             owner: None,
         };
+        #[cfg(any(test, feature = "test-support"))]
+        let control_owner = self
+            .config
+            .control_socket_owner
+            .unwrap_or((recipe::CONTROL_PLANE_UID, recipe::CONTROL_PLANE_UID));
+        #[cfg(not(any(test, feature = "test-support")))]
+        let control_owner = (recipe::CONTROL_PLANE_UID, recipe::CONTROL_PLANE_UID);
         let control = SocketPlan {
             path: at(paths::CONTROL_SOCKET),
             caller: crate::trust::Caller::ControlPlane,
-            owner: Some((recipe::CONTROL_PLANE_UID, recipe::CONTROL_PLANE_UID)),
+            owner: Some(control_owner),
         };
         Ok(match role {
             MachineRole::Gpu => vec![agent(paths::AGENT_SOCKET)],
