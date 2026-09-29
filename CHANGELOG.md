@@ -25,6 +25,16 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
+  profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
+  engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
+  why, and what to use instead. Rootful Docker is supported everywhere, Unraid included;
+  the rootless engines and rootful Podman are experimental on Fedora and Ubuntu 24.04 until
+  proven, and unsupported elsewhere. The node agent's `runtime_engine` check now matches the
+  host by its os-release `ID`/`ID_LIKE`, so Fedora's image-based editions (Bazzite, uCore)
+  read as Fedora on Podman too, and only Ubuntu 24.04 counts as Ubuntu; a test holds the
+  agent to the table row by row. The documentation site reads the same table, and Starlight
+  badges take the product's success, warning and danger colours.
 - **Console mode on rootful owned installs (RH-07, #395).** The recovery actor gives an
   owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd` and
   `/proc/asound` read-only (only on a host that has sound, read again each time console mode
