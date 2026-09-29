@@ -43,7 +43,11 @@ own; the two do not move together, and that is deliberate.
   and Role: four profile badges that update live as the platform changes, a blocked Next on
   an unsupported combination, and a Result step that shows host preparation, the per-engine
   install command, and (Podman) the Quadlet unit it writes plus a closed "just trying it
-  out" `podman run` disclosure.
+  out" `podman run` disclosure. `enroll-host.sh` now finds the engine and its mode by their
+  sockets (never `sudo` on a rootless one), refuses an unsupported profile by name before
+  pulling anything, and on a rootless host without host preparation prints the
+  `prepare-host.sh` command, which the control plane now serves at `/prepare-host.sh` and
+  the documentation site publishes beside the quick start.
 - **Console mode on rootful owned installs (RH-07, #395).** The recovery actor gives an
   owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd` and
   `/proc/asound` read-only (only on a host that has sound, read again each time console mode
