@@ -829,6 +829,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Host preparation no longer treats a machine with the NVIDIA driver loaded but no NVIDIA
+  device as an NVIDIA host (RH-07).** It keyed on `/proc/driver/nvidia/version` alone, so a
+  container on a host that runs NVIDIA elsewhere, or a hybrid machine with the discrete GPU
+  off, failed at the CDI step asking for the NVIDIA Container Toolkit. It now also requires
+  `/dev/nvidiactl` and says which case it skipped.
 - **CI's node-agent job passes clippy on Rust 1.98 again.** Four lints new in that toolchain (an import used only by tests, `>= x + 1`, a redundant `&` in `format!`, a collapsible `if` in a `match`) failed the job on every branch. Nine `source_policy`/warm-up tests also failed in CI only: their fixture's `ImageManager::new` reconciled a synthetic "ready" record against whichever container engine socket happened to be reachable on the machine running the test, which a CI runner's real Docker daemon flips to absent; the fixture now builds an `ImageManager` with no state file and sets the record ready directly, bypassing that reconciliation. Seven `quasar-recovery` actor-handover tests also failed in CI only, on "Connection refused": their control socket is `chown`'d to the fixed production uid (`recipe::CONTROL_PLANE_UID`), which needs real privilege the CI runner's own user does not have and the devtools container's root user always has; the actor's socket-owner is now overridable under `test-support`, and the tests use their own uid/gid instead.
 - **The runtime reads Podman containers in libpod's `stopped` and `configured` states
   (RH-07, #408).** Podman can report them where Docker's schema has none (a crash-looping

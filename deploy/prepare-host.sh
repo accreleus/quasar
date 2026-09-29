@@ -513,7 +513,9 @@ fi
 
 # ── NVIDIA: the CDI specification and SELinux ──────────────────────────────
 STEP="NVIDIA CDI specification"
-if [ -e "$R/proc/driver/nvidia/version" ]; then
+# The driver alone is not an NVIDIA host: a container shares its host's /proc, and a hybrid
+# machine can load the driver with no usable device. The control node says a GPU is here.
+if [ -e "$R/proc/driver/nvidia/version" ] && [ -e "$R/dev/nvidiactl" ]; then
   drv="$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' "$R/proc/driver/nvidia/version" | head -n 1)"
   # A specification someone else keeps (the toolkit's refresh service writes
   # /var/run/cdi) counts only while it describes the loaded driver.
@@ -573,6 +575,8 @@ if [ -e "$R/proc/driver/nvidia/version" ]; then
       say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module quasar-nested-gpu — lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
     fi
   fi
+elif [ -e "$R/proc/driver/nvidia/version" ]; then
+  say skipped "NVIDIA CDI specification — the NVIDIA driver is loaded but this machine has no NVIDIA device (/dev/nvidiactl)"
 else
   say skipped "NVIDIA CDI specification — no NVIDIA driver loaded"
 fi
