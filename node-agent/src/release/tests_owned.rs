@@ -453,3 +453,62 @@ async fn an_agent_that_connects_before_its_actor_serves_reports_the_attempt_once
         ("failed", Some("unhealthy"), true)
     );
 }
+
+/// #395, found live: an agent asks the actor about console mode while the update that
+/// created it is still being verified, so the actor still has the old recipe revision on
+/// record and answers unsupported. That answer is read again, so it clears once the update
+/// has settled without waiting for a reconnect (the console refuses to enable it meanwhile).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_console_answer_clears_once_an_update_to_a_console_capable_recipe_settles() {
+    let mut state = host(Behaviour {
+        health: Some("healthy".into()),
+        ..Default::default()
+    });
+    let reference = format!("{REPO}@{NEW}");
+    state
+        .registry
+        .get_mut(&reference)
+        .unwrap()
+        .labels
+        .insert("org.quasar.recipe".to_string(), "3".to_string());
+    let m = machine_on(state);
+
+    let console = super::console::ConsoleAccessManager::owned_for_test(&m.socket, false);
+    console.set_engine_mode(Some("rootful"));
+    console.refresh();
+    let before = console.report().expect("an owned agent reports access");
+    assert_eq!(
+        before.state,
+        crate::messages::ConsoleAccessState::Unsupported,
+        "{before:?}"
+    );
+    console.watch_if_applying();
+
+    let mgr = ReleaseManager::owned(&m.socket);
+    let (tx, mut rx) = mpsc::channel(32);
+    let _guard = mgr.attach_upstream(tx);
+    let (ok, err) = ack_of(&mgr.handle_apply(
+        "c1".into(),
+        REQ.into(),
+        release(),
+        components("node-agent", NEW),
+        false,
+    ));
+    assert!(ok, "{err:?}");
+    let msgs = states_until_terminal(&mut rx, REQ).await;
+    assert_eq!(terminal(&msgs).0, "succeeded");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = console.report().unwrap();
+        if now.state == crate::messages::ConsoleAccessState::Off {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still {:?} after the update settled",
+            now.state
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

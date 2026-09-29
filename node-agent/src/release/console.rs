@@ -40,6 +40,11 @@ pub const MARKER_ENV: &str = "QUASAR_CONSOLE_ACCESS";
 /// the attempt itself (its verification deadline), so this never polls for ever.
 const POLL_APPLYING: Duration = Duration::from_secs(2);
 
+/// How often the actor's status is read again while it says console mode is unsupported.
+/// Its answer can change without a restart of this agent: an update this agent started
+/// under reads the machine record before the actor has written the new recipe revision.
+const POLL_UNSUPPORTED: Duration = Duration::from_secs(30);
+
 /// How long one request to the actor may take.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -139,6 +144,8 @@ pub struct ConsoleAccessManager {
     /// Publish the report for [`published`] (the process-wide manager only).
     publish: bool,
     poll: Duration,
+    /// How often an `unsupported` answer from the actor is read again.
+    poll_unsupported: Duration,
 }
 
 /// The process-wide manager's current report, for every `capacity` the agent sends.
@@ -190,6 +197,8 @@ impl ConsoleAccessManager {
             worker: Mutex::new(None),
             publish,
             poll,
+            // Tests poll fast; a real agent re-reads an unsupported answer every half minute.
+            poll_unsupported: if publish { POLL_UNSUPPORTED } else { poll },
         })
     }
 
@@ -288,11 +297,28 @@ impl ConsoleAccessManager {
         tx
     }
 
-    /// Start the worker if an attempt is applying, so it is watched to its end.
+    /// Start the worker if the actor's answer is still expected to change (an attempt is
+    /// applying, or the actor said unsupported), so it is read again until it settles.
     pub fn watch_if_applying(self: &Arc<Self>) {
-        if self.applying() {
+        if self.recheck().is_some() {
             let _ = self.worker_tx();
         }
+    }
+
+    /// How soon the actor's status should be read again, if at all.
+    fn recheck(&self) -> Option<Duration> {
+        if self.applying() {
+            return Some(self.poll);
+        }
+        // A rootless engine is this agent's own finding and cannot change while it runs.
+        let unsupported = self
+            .inner
+            .lock()
+            .unwrap()
+            .report
+            .as_ref()
+            .is_some_and(|r| r.state == ConsoleAccessState::Unsupported);
+        (unsupported && !self.rootless()).then_some(self.poll_unsupported)
     }
 
     fn applying(&self) -> bool {
@@ -453,8 +479,7 @@ impl ConsoleAccessManager {
 fn worker(mgr: Weak<ConsoleAccessManager>, rx: std::sync::mpsc::Receiver<bool>) {
     loop {
         let wait = match mgr.upgrade() {
-            Some(m) if m.applying() => m.poll,
-            Some(_) => Duration::from_secs(3600),
+            Some(m) => m.recheck().unwrap_or(Duration::from_secs(3600)),
             None => return,
         };
         match rx.recv_timeout(wait) {
@@ -463,7 +488,7 @@ fn worker(mgr: Weak<ConsoleAccessManager>, rx: std::sync::mpsc::Receiver<bool>) 
                 None => return,
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match mgr.upgrade() {
-                Some(m) if m.applying() => m.refresh(),
+                Some(m) if m.recheck().is_some() => m.refresh(),
                 Some(_) => {}
                 None => return,
             },
