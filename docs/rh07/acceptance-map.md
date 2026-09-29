@@ -1,6 +1,6 @@
 # RH-07 acceptance map
 
-Written for #409 (D19). Sources: #393–#408 and their comments, the defect issues filed
+Written for #409 (D19). Sources: #393–#409 and their comments, the defect issues filed
 during RH-07 (#410–#423), `docs/rh07/2026-09-28-decisions.md` (D1–D23), the specification
 (#390) and `testdata/engine-profiles/profiles.json`. Citations are an issue plus its
 comment URL, or a commit hash. Hosts are named by role only: the AMD test host, the NVIDIA
@@ -22,7 +22,7 @@ an update applied from the console (**Update**); a reboot after which everything
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS (video, input, audio; microphone untested) — #399 comment [5877729442](https://github.com/accreleus/quasar/issues/399#issuecomment-5877729442), #402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | PASS — #402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | GAP — not run on this host; #399's table records it as "—" (comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911)) | GAP — no console-mode run on the AMD test host; #395/#407 evidence is NVIDIA-only | GAP — no bench run cited against the AMD test host in #399/#402/#403 |
+| AMD | PARTIAL — video, input, audio pass; microphone untested: — #399 comment [5877729442](https://github.com/accreleus/quasar/issues/399#issuecomment-5877729442), #402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | PASS — #402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | GAP — not run on this host; #399's table records it as "—" (comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911)) | GAP — no console-mode run on the AMD test host; #395/#407 evidence is NVIDIA-only | GAP — no bench run cited against the AMD test host in #399/#402/#403 |
 | NVIDIA | PARTIAL — CDI path PASS (video, input, audio; microphone untested), #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911); the `--gpus` fallback path (CDI switched off) FAILS — Steam's Vulkan loader fails on this CUDA-only host, filed as #413 | PASS (CDI path) — #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) | PASS (CDI path) — same table | PASS — enable/disable, Steam on the local screen, keyboard/mouse grabbed, DDC power detection, audio all confirmed by the owner watching the monitor: #395 comment [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398) | PASS — run `3e38e6e3` (`baseline/steam-1440p60-av1-observe`), #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) |
 
 ### Docker rootless
@@ -37,11 +37,12 @@ an update applied from the console (**Update**); a reboot after which everything
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
 | AMD | GAP — no rootless-Podman run on the AMD test host anywhere in #393–#423 | GAP | GAP | GAP | GAP |
-| NVIDIA | PASS — video/input/audio PASS, #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911); full per-button gamepad+keyboard+d-pad+trigger replay via the input DataChannel, every code arrived correctly: #401 comment [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775); audio energy 21.9 on a real browser, survives a VM reboot: #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147); microphone untested | PASS — install→update→verify on the recovery actor: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — all five owned-install containers came back on their own via `podman-restart.service` and lingering: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — picture OK, keyboard/mouse grabbed, audio tone heard (ALSA, not PipeWire — see gaps), owner watched the monitor: #407 comment [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657) | PASS — run `9cf88ede` vs `1d8d15be`, verbatim "0 regressed, 0 improved, 1 unchanged. result: clean": #399 comment [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652) |
+| NVIDIA | PARTIAL (microphone untested) — video/input/audio PASS, #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911); full per-button gamepad+keyboard+d-pad+trigger replay via the input DataChannel, every code arrived correctly: #401 comment [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775); audio energy 21.9 on a real browser, survives a VM reboot: #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147); microphone untested | PASS — install→update→verify on the recovery actor: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — all five owned-install containers came back on their own via `podman-restart.service` and lingering: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — picture OK, keyboard/mouse grabbed, audio tone heard (ALSA, not PipeWire — see gaps), owner watched the monitor: #407 comment [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657) | PASS — run `9cf88ede` vs `1d8d15be`, verbatim "0 regressed, 0 improved, 1 unchanged. result: clean": #399 comment [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652) |
 
-**Reading the matrix:** every required row has full evidence on the NVIDIA side (Docker
-rootful's `--gpus` fallback aside, which is a named defect, #413, not an unproven row — the
-same host works end to end over CDI). The AMD side has only one required cell run at all
+**Reading the matrix:** on NVIDIA, every required row except the microphone half of
+**Session** has evidence in all three profiles (Docker rootful's `--gpus` fallback aside, a
+named defect, #413; the same host works end to end over CDI). No profile has a Session cell
+that is fully met until the microphone is exercised. The AMD side has only one required cell run at all
 (Docker rootful); Docker rootless and Podman rootless on AMD are untested, not failing —
 the AMD test host currently lacks the host input-device mount its rootless containers
 would need, so no agent has been run there under an unprivileged rootless account. This
@@ -101,8 +102,8 @@ the agent's `runtime_engine` check all read):
 | 26 | Reinstall + dump restore, rootful to rootless | Not yet evidenced | D16 defers this to a fresh install plus the separate dump-restore ticket (#380); no #393–#423 ticket exercises it |
 | 27 | Docs say a rootful engine socket is root-equivalent | Met | Engine-profile page states it plainly; the accepted `label=disable` exception is documented the same way: #406 comment [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
 | 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run in #393–#423 keeps `getenforce` at `Enforcing` throughout, including after reboot: #400, #402, #404, #405, #407. The one exception is the node agent's own `label=disable`, accepted under D17 (story 10); sessions themselves stay confined (`container_t`/`container_engine_t`) |
-| 29 | Same behavioural suite across every engine mode | Not yet evidenced | #408 (RH07-16) is open with no comments — the suite has not been built or run |
-| 30 | Each required profile proven on real hardware before `main` | Partly met | NVIDIA: all three required profiles pass the full row set (matrix above). AMD: only Docker rootful has been run at all; Docker rootless and Podman rootless on AMD are gaps, not failures |
+| 29 | Same behavioural suite across every engine mode | Partly met | One suite (identity, create-read-back, user mapping, devices, CDI, restart, health, removal, errors) runs unchanged against each mode, and CI runs it on Docker rootful, Docker rootless, Podman rootful and Podman rootless (branch `rh07/408-engine-suite`, commit `293c537f`). Not yet met: the CDI, DRM and uinput cases need the lab procedure on real hardware, and Podman 4.9 (Ubuntu) has three recorded known failures (create-read-back, restart policy update, missing bind source) |
+| 30 | Each required profile proven on real hardware before `main` | Partly met | NVIDIA: all three required profiles pass every row except the microphone half of Session (matrix above). AMD: only Docker rootful has been run at all; Docker rootless and Podman rootless on AMD are gaps, not failures |
 
 **Count:** 16 met, 8 partly met, 6 not yet evidenced (stories 23, 26, 29 not yet evidenced;
 13, 20 count as partly met above — recount below for clarity).
@@ -148,8 +149,9 @@ Each item names what would close it.
    with "nobody has run it yet."
 
 **Story gaps:**
-8. **#408 (RH07-16), the cross-engine behavioural test suite, has not been started.**
-   Story 29 depends on it directly.
+8. **#408's suite runs in CI but not yet in the lab.** Its CDI, DRM and uinput cases need
+   the lab procedure on real hardware per engine mode, and its Podman 4.9 known failures
+   need tickets and fixes. Story 29 depends on it.
 9. **Console audio over PipeWire (story 23) has no hardware proof** — both live runs
    fell back to ALSA because the tested hosts run no PipeWire session. Needs a rootless
    host with an active PipeWire session (the plan named the Bazzite VM, #407 comment
