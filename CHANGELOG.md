@@ -25,6 +25,33 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
+  profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
+  engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
+  why, and what to use instead. Rootful Docker is supported everywhere, Unraid included;
+  the rootless engines and rootful Podman are experimental on Fedora and Ubuntu 24.04 until
+  proven, and unsupported elsewhere. The node agent's `runtime_engine` check now matches the
+  host by its os-release `ID`/`ID_LIKE`, so Fedora's image-based editions (Bazzite, uCore)
+  read as Fedora on Podman too, and only Ubuntu 24.04 counts as Ubuntu; a test holds the
+  agent to the table row by row. The documentation site reads the same table, and Starlight
+  badges take the product's success, warning and danger colours. The quick start now
+  generates a script per (platform, engine, mode), gated on that same table: Docker rootful
+  keeps today's shape minus what `prepare-host.sh` now owns, Docker rootless never uses
+  `sudo` past that one prep line and creates no directories, and Podman writes and starts a
+  Quadlet unit whose socket maps to `/var/run/docker.sock` per ADR 0007's RH07 amendment;
+  Unraid is untouched. The quick start wizard itself grows a new Engine step between Host
+  and Role: four profile badges that update live as the platform changes, a blocked Next on
+  an unsupported combination, and a Result step that shows host preparation, the per-engine
+  install command, and (Podman) the Quadlet unit it writes plus a closed "just trying it
+  out" `podman run` disclosure. `enroll-host.sh` now finds the engine and its mode by their
+  sockets (never `sudo` on a rootless one), refuses an unsupported profile by name before
+  pulling anything, and on a rootless host without host preparation prints the
+  `prepare-host.sh` command, which the control plane now serves at `/prepare-host.sh` and
+  the documentation site publishes beside the quick start. The site gains an engine-profiles
+  page (the same table, rendered), a Podman Quadlet install page, and a moving-to-rootless
+  guide (fresh install plus a dump restore, homes copied into a freshly owned root rather
+  than re-owned in place); Requirements, Install Quasar and Add a second GPU host now cover
+  engine choice and host preparation too.
 - **Console mode on rootful owned installs (RH-07, #395).** The recovery actor gives an
   owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd` and
   `/proc/asound` read-only (only on a host that has sound, read again each time console mode

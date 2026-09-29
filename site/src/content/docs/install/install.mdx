@@ -10,6 +10,21 @@ and, on NVIDIA, the container toolkit. Nothing here compiles Quasar. It pulls
 published images, which is about 20 GB on a machine that runs the agent. The
 [quick start](/quasar/start/quickstart/) writes everything on this page for you.
 
+**Choose an engine and mode first**: rootful Docker, shown throughout this
+page, or Podman/rootless — see [Engine profiles](/quasar/start/engine-profiles/)
+for what is Supported or Experimental on your platform. Every mode needs one
+root-run host-preparation step before the seed starts: on rootful Docker that
+is only the sysctl and container-toolkit steps in
+[Requirements](/quasar/start/requirements/); rootless and Podman also run
+`prepare-host.sh` once as root, which creates the `quasar` account, its
+lingering session, and the udev rules Quasar's devices need — see [Install
+with Podman (Quadlet)](/quasar/install/podman-quadlet/#installing). The quick
+start runs host preparation for you and prints it either way. For Podman
+specifically, see [Install with Podman
+(Quadlet)](/quasar/install/podman-quadlet/) — the commands below are all
+Docker's; replace `docker` with `podman`, run as the `quasar` account on
+rootless, and install through a Quadlet unit rather than `docker run`.
+
 <Aside type="caution" title="Edge builds only">
 Installs owned by Quasar ship on the **edge** channel, which follows the
 `develop` branch. There is no stable release of them yet. Each image is

@@ -11,6 +11,18 @@ Each host runs one node agent. It reports its GPUs, capacity and readiness to th
 control plane and receives sessions from it. The control plane holds no GPU state, so
 adding a host is enrolling one more agent.
 
+The command **detects the new host's container engine and its mode** (Docker or
+Podman, rootful or rootless) itself — you do not tell it which. It looks up that
+combination, plus the host's platform, in the same [engine
+profiles](/quasar/start/engine-profiles/) table the quick start uses: an
+Unsupported profile is refused by name, with the reason and the nearest
+supported alternative, before anything is pulled. On a **rootless** engine, run
+the command as the `quasar` account (the one [host
+preparation](/quasar/install/podman-quadlet/) created), not as root or your own
+login — a rootless engine's socket belongs to that account, and running as
+root would either miss it or reach a different, rootful engine on the same
+machine by mistake.
+
 ## Before you start
 
 On the new machine you need:
@@ -76,7 +88,17 @@ shell history, and the token is dead once used.
 
 ## 2. Run it on the new machine
 
-Paste the command as root, or as a user who can `sudo`. The script prints every step.
+Paste the command as root, or as a user who can `sudo` — or, on a rootless
+engine, as the `quasar` account (`machinectl shell quasar@` gets you a proper
+session for it; see [Install with Podman
+(Quadlet)](/quasar/install/podman-quadlet/#getting-a-rootless-session-as-the-quasar-account)).
+The script prints every step.
+
+<Aside type="tip" title="Podman users">
+Everywhere this page shows a `docker` command, replace it with `podman`; on
+rootless, run it as the `quasar` account rather than root. The script itself
+detects the engine and needs no such substitution.
+</Aside>
 
 It checks the host the way the agent's own readiness check will: Docker, a render node,
 `/dev/uinput`, unprivileged user namespaces (on Ubuntu 24.04 and later that means

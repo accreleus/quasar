@@ -1,0 +1,167 @@
+---
+title: Install with Podman (Quadlet)
+description: The documented way to run Quasar's seed under Podman — a Quadlet systemd unit, rootful or rootless — and how to check on it afterwards.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Podman installs through a **Quadlet** unit, not a bare `podman run`. Quadlet is
+systemd's own way to describe a container: you write one small unit file, and
+systemd starts, restarts and stops the container the same way it does any
+other service. The [quick start](/quasar/start/quickstart/) generates this
+unit for you, resolves the three image digests, writes the file, and starts it
+— read this page for what it did and how to work with it afterwards, or to do
+it by hand. See [Engine profiles](/quasar/start/engine-profiles/) for which
+platforms this is validated on today.
+
+A bare `podman run` seed still works and is covered below, but only as a way
+to try Quasar out: it does not restart at boot the way the Quadlet unit does,
+and it is not the path the quick start or this site documents as the install.
+
+## Rootful or rootless
+
+Both modes run the same unit, in a different place:
+
+| | Rootful | Rootless |
+| --- | --- | --- |
+| Unit file | `/etc/containers/systemd/quasar-seed.container` | `~/.config/containers/systemd/quasar-seed.container` |
+| Managed by | `systemctl` | `systemctl --user` |
+| Runs as | root | the `quasar` account |
+| Socket | `/run/podman/podman.sock` | `$XDG_RUNTIME_DIR/podman/podman.sock` |
+
+The unit itself does not need to know which: it mounts `%t/podman/podman.sock`
+into the container at `/var/run/docker.sock` — the one path the seed accepts —
+and systemd resolves `%t` to `/run` for a system unit and to the user's
+runtime directory for a `--user` one. Same file, either mode.
+
+<Aside type="caution" title="The socket path, if you write the unit by hand">
+The socket lives at `/run/podman/podman.sock` (rootful) or
+`$XDG_RUNTIME_DIR/podman/podman.sock` (rootless) on the host, but the seed
+only accepts it mounted at `/var/run/docker.sock` **inside** the container.
+Mounting it at `/run/podman/podman.sock` in the container, as an early mockup
+of this page showed, is refused by the seed at startup. `Volume=%t/podman/podman.sock:/var/run/docker.sock`
+gets this right in both modes; the quick start's generated unit already has
+it.
+</Aside>
+
+Rootless is the [engine mode Quasar targets](/quasar/start/engine-profiles/#root-equivalence);
+rootful gives up nothing except that.
+
+## Installing
+
+Run [Host preparation](/quasar/start/requirements/) first — `prepare-host.sh
+--mode rootless --engine podman` (or `--mode rootful`) — before the unit is
+started. It is what creates the `quasar` account, enables its lingering
+session, and turns on `podman-restart.service` and `podman.socket` so Podman's
+containers come back after a reboot; without it the unit can start but nothing
+survives a restart.
+
+<Steps>
+
+1. **Get the quick start's engine step** to Podman, rootful or rootless, and
+   step through to **Result**. It shows the same prep command, then a script
+   that resolves the digests and installs the unit — copy and run that script
+   as `quasar` (rootless) or as root (rootful). Nothing here needs hand
+   editing: the script substitutes the resolved digests into the unit before
+   it writes it.
+
+2. **Or write and start the unit by hand.** The Result step also shows the
+   Quadlet unit itself, with placeholders where the script fills in real
+   image digests. Resolve them yourself with `podman pull` and `podman image
+   inspect`, replace the `Image=` and `Environment=QUASAR_*_IMAGE=` lines, and
+   write the file to the location for your mode above, then:
+
+   ```bash
+   # rootless, as the quasar account
+   systemctl --user daemon-reload
+   systemctl --user start quasar-seed
+   ```
+
+   ```bash
+   # rootful
+   sudo systemctl daemon-reload
+   sudo systemctl start quasar-seed
+   ```
+
+</Steps>
+
+Quadlet turns the unit into a regular systemd service the first time
+`daemon-reload` sees it; `quasar-seed.service` is what you are actually
+starting and checking on below.
+
+## Getting a rootless session as the quasar account
+
+Host preparation enables lingering for `quasar`, so its Podman keeps running
+with nobody logged in and starts at boot. To run the rootless commands above
+yourself, you need a proper **systemd user session** for that account, not
+just its shell — `sudo -u quasar sh` alone does not give you one, and Podman
+health checks under Quadlet need a user session to run in.
+
+```bash
+machinectl shell quasar@
+```
+
+That logs you into a full session for `quasar`, with its own `systemctl
+--user` and its own `$XDG_RUNTIME_DIR`. Exit it the normal way (`exit` or
+Ctrl-D) when you are done; the account's lingering keeps its Podman and
+Quasar's containers running after you leave.
+
+## Status and logs
+
+```bash
+# rootless, as quasar (machinectl shell quasar@, or ssh -t)
+systemctl --user status quasar-seed
+podman logs quasar-seed
+podman exec quasar-recovery quasar-recovery status
+```
+
+```bash
+# rootful
+sudo systemctl status quasar-seed
+sudo podman logs quasar-seed
+sudo podman exec quasar-recovery quasar-recovery status
+```
+
+`systemctl status` tells you whether the unit itself is up; the recovery
+actor's own `status` (once it exists — the seed creates it) is the more
+useful one, and is what the quick start's script polls while it waits for the
+install to finish.
+
+## Only trying it out
+
+For a quick look, without a Quadlet unit, the Result step's "only trying it
+out" disclosure has a bare `podman run` line instead:
+
+```bash
+podman run -d --name quasar-seed --restart unless-stopped \
+  --security-opt label=disable \
+  -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/docker.sock" \
+  -v quasar-machine:/var/lib/quasar-machine:ro \
+  ... \
+  <seed image> seed
+```
+
+`--restart unless-stopped` is Podman's own restart policy, which — without
+Quadlet — only takes effect once `podman-restart.service` is enabled (host
+preparation does this) **and** you are in a session that keeps `quasar`'s
+Podman reachable; it is not equivalent to the Quadlet unit's own
+`Restart=always` under systemd. Use this to look at Quasar quickly. Move to
+the Quadlet unit for anything you intend to keep running.
+
+## Boot behaviour
+
+- **Quadlet units restart under systemd**, the normal way any `.service` does,
+  and the rootless unit needs the `quasar` account's lingering session, which
+  host preparation turns on — without it, the account's units stop at logout
+  and never come back on their own after a reboot.
+- **`podman-restart.service`** is what brings Podman's own containers back
+  after the *engine* restarts (a reboot, or a manual `systemctl restart
+  podman`), whether or not you use Quadlet. Host preparation enables it in
+  both modes.
+- **Health checks need a running systemd user session** for the account whose
+  Podman you are checking. If nothing has ever logged that account in (no
+  lingering, or lingering enabled but nothing has started a session since),
+  health-gated steps — the install waiting for the recovery actor and its
+  services to report healthy, or a later update — can stall until they time
+  out. `machinectl shell quasar@` above is the fix if that happens: it starts
+  the session, after which the pending health checks catch up.

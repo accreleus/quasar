@@ -6,6 +6,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightOpenAPI, { createOpenAPISidebarGroup } from 'starlight-openapi';
 
+import { prepareHostIntegration } from './src/data/prepare-host-source.js';
+
 // GitHub Pages project site. If the repo moves org, or the site later gets a
 // custom domain, these two constants are the only thing that has to change.
 const SITE = 'https://accreleus.github.io';
@@ -35,7 +37,24 @@ export default defineConfig({
 	site: SITE,
 	base: BASE,
 	trailingSlash: 'always',
+	// The quick start's engine-profiles.js (RH07-14, #406) reads
+	// testdata/engine-profiles/profiles.json, and prepare-host-source.js (Node
+	// only — see that file) reads deploy/prepare-host.sh: both outside site/,
+	// so both single sources of truth stay in the repo root rather than a copy
+	// drifting under site/. The dev server's default `server.fs.allow` is the
+	// project root, which would otherwise 403 those imports.
+	vite: {
+		server: {
+			fs: {
+				allow: ['..'],
+			},
+		},
+	},
 	integrations: [
+		// deploy/prepare-host.sh, published at <site>/quasar/prepare-host.sh: the quick
+		// start's prep block fetches it from there and checks it against the sha256 it
+		// prints, computed from the same bytes (src/data/prepare-host-source.js).
+		prepareHostIntegration(),
 		starlight({
 			plugins: [
 				starlightOpenAPI([
@@ -111,6 +130,7 @@ export default defineConfig({
 						{ label: 'What Quasar is', slug: 'start/what-quasar-is' },
 						{ label: 'How it works', slug: 'start/how-it-works' },
 						{ label: 'Requirements', slug: 'start/requirements' },
+						{ label: 'Engine profiles', slug: 'start/engine-profiles' },
 					],
 				},
 				{
@@ -118,9 +138,11 @@ export default defineConfig({
 					items: [
 						{ label: 'Quick start', slug: 'start/quickstart' },
 						{ label: 'Install Quasar', slug: 'install/install' },
+						{ label: 'Install with Podman (Quadlet)', slug: 'install/podman-quadlet' },
 						{ label: 'First-run setup', slug: 'install/first-run' },
 						{ label: 'Check your install', slug: 'install/verify' },
 						{ label: 'Add a second GPU host', slug: 'install/second-host' },
+						{ label: 'Moving to rootless', slug: 'install/move-to-rootless' },
 						{ label: 'Move a Compose install', slug: 'install/move-existing' },
 						{ label: 'Legacy Compose installs', slug: 'install/legacy-compose' },
 					],

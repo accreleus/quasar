@@ -60,10 +60,15 @@ export const PLATFORMS = {
     label: 'Fedora',
     note: 'Fedora is what the install is verified on. SELinux can stay enforcing.',
   },
+  ubuntu: {
+    ...SYSTEMD,
+    label: 'Ubuntu 24.04',
+    note: 'Use Docker Engine from Docker\'s own repository, or Podman from Ubuntu\'s. The older docker.io packages may predate what Quasar needs.',
+  },
   debian: {
     ...SYSTEMD,
-    label: 'Debian or Ubuntu',
-    note: 'Use Docker Engine from Docker\'s own repository. The older docker.io packages may predate what Quasar needs.',
+    label: 'Debian',
+    note: 'Use Docker Engine from Docker\'s own repository. The Debian-packaged docker.io may predate what Quasar needs.',
   },
   arch: {
     ...SYSTEMD,

@@ -30,6 +30,7 @@ fn facts(cdi: Option<CdiFacts>) -> EngineFacts {
         },
         mode: EngineMode::Rootful,
         operating_system: Some("Ubuntu 24.04".into()),
+        os_version: None,
         architecture: Some("x86_64".into()),
         cgroup_version: Some("2".into()),
         cgroup_driver: Some("systemd".into()),

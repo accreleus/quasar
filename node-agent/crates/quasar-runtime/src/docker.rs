@@ -255,6 +255,7 @@ pub async fn inspect_engine(config: &RuntimeConfig) -> Result<crate::EngineFacts
         info,
         mode: crate::EngineMode::from_security_options(&security_options),
         operating_system: sys.operating_system,
+        os_version: sys.os_version.filter(|v| !v.is_empty()),
         architecture: sys.architecture,
         cgroup_version,
         cgroup_driver: sys

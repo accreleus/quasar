@@ -522,6 +522,7 @@ mod tests {
             },
             mode,
             operating_system: None,
+            os_version: None,
             architecture: None,
             cgroup_version: None,
             cgroup_driver: None,

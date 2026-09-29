@@ -478,18 +478,151 @@ pub enum ProfileStatus {
     Unsupported,
 }
 
-/// RH-07 decision D5, as far as evidence goes today. Rootful Docker is the validated
-/// profile. Docker rootless, Podman rootless and Podman rootful on Fedora and Ubuntu are
+/// The host's os-release identity: the three fields an engine profile is matched on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostOs {
+    /// `ID`, lowercased.
+    pub id: String,
+    /// `ID_LIKE`, lowercased, one entry per word.
+    pub id_like: Vec<String>,
+    pub version_id: Option<String>,
+}
+
+impl HostOs {
+    /// Parse an os-release body. `None` when it names no `ID`: the engine's own report is
+    /// then the better evidence.
+    pub fn parse(os_release: &str) -> Option<HostOs> {
+        let value = |key: &str| -> Option<String> {
+            os_release.lines().find_map(|line| {
+                let rest = line.trim().strip_prefix(key)?.strip_prefix('=')?;
+                let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                (!v.is_empty()).then(|| v.to_string())
+            })
+        };
+        let id = value("ID")?.to_ascii_lowercase();
+        let id_like = value("ID_LIKE")
+            .map(|v| {
+                v.to_ascii_lowercase()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(HostOs {
+            id,
+            id_like,
+            version_id: value("VERSION_ID"),
+        })
+    }
+
+    fn is(&self, name: &str) -> bool {
+        self.id == name || self.id_like.iter().any(|like| like == name)
+    }
+}
+
+/// The platform half of an engine profile: which rows of
+/// `testdata/engine-profiles/profiles.json` a host reads. Ubuntu means 24.04 only (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfilePlatform {
+    Fedora,
+    Ubuntu2404,
+    Debian,
+    Arch,
+    Unraid,
+    Other,
+}
+
+impl ProfilePlatform {
+    /// The platform key in `profiles.json`, and the site quick start's platform id.
+    pub fn wire(self) -> &'static str {
+        match self {
+            ProfilePlatform::Fedora => "fedora",
+            ProfilePlatform::Ubuntu2404 => "ubuntu",
+            ProfilePlatform::Debian => "debian",
+            ProfilePlatform::Arch => "arch",
+            ProfilePlatform::Unraid => "unraid",
+            ProfilePlatform::Other => "other",
+        }
+    }
+
+    /// The host's os-release when the agent can read it, the engine's report otherwise.
+    /// os-release is preferred because its `ID_LIKE` names the family: Podman reports only
+    /// `ID` (Bazzite says `bazzite`), and Docker reports `PRETTY_NAME`.
+    pub fn of(facts: &EngineFacts, host_os: Option<&HostOs>) -> ProfilePlatform {
+        match host_os {
+            Some(os) => Self::from_os_release(os),
+            None => Self::from_engine_report(
+                facts.operating_system.as_deref().unwrap_or(""),
+                facts.os_version.as_deref(),
+            ),
+        }
+    }
+
+    /// `ID` or `ID_LIKE`: Fedora's image-based editions (Silverblue, Bazzite, uCore) are
+    /// Fedora; Enterprise Linux, which also lists `fedora` in `ID_LIKE`, is not.
+    pub fn from_os_release(os: &HostOs) -> ProfilePlatform {
+        let enterprise = os.is("rhel") || os.is("centos");
+        if os.is("fedora") && !enterprise {
+            ProfilePlatform::Fedora
+        } else if os.is("ubuntu") {
+            if os.version_id.as_deref().is_some_and(is_ubuntu_2404) {
+                ProfilePlatform::Ubuntu2404
+            } else {
+                ProfilePlatform::Other
+            }
+        } else if os.id.starts_with("unraid") {
+            ProfilePlatform::Unraid
+        } else if os.is("debian") {
+            ProfilePlatform::Debian
+        } else if os.is("arch") || os.is("archlinux") {
+            ProfilePlatform::Arch
+        } else {
+            ProfilePlatform::Other
+        }
+    }
+
+    /// The engine's `OperatingSystem` and `OSVersion`, word by word. It cannot see a
+    /// derivative's family, so it is only the fallback.
+    fn from_engine_report(os: &str, version: Option<&str>) -> ProfilePlatform {
+        let os = os.to_ascii_lowercase();
+        let words: Vec<&str> = os.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+        let has = |w: &str| words.contains(&w);
+        if has("fedora") {
+            ProfilePlatform::Fedora
+        } else if has("ubuntu") {
+            if version.is_some_and(is_ubuntu_2404) || os.contains("24.04") {
+                ProfilePlatform::Ubuntu2404
+            } else {
+                ProfilePlatform::Other
+            }
+        } else if has("unraid") {
+            ProfilePlatform::Unraid
+        } else if has("debian") {
+            ProfilePlatform::Debian
+        } else if has("arch") || has("archlinux") {
+            ProfilePlatform::Arch
+        } else {
+            ProfilePlatform::Other
+        }
+    }
+}
+
+fn is_ubuntu_2404(version: &str) -> bool {
+    version == "24.04" || version.starts_with("24.04.")
+}
+
+/// RH-07 decision D5, as far as evidence goes today; the published table is
+/// `testdata/engine-profiles/profiles.json`, and a test holds this function to it row by
+/// row. Rootful Docker is the validated profile on any platform, Unraid included. Docker
+/// rootless, Podman rootless and Podman rootful on Fedora and Ubuntu 24.04 are
 /// experimental until the RH-07 acceptance map proves them (#409 moves the Fedora rows to
-/// supported); a rootless engine elsewhere, or an engine this agent cannot name, is
-/// unsupported. Unraid's rootful Docker is covered by the first row.
-pub fn engine_profile(facts: &EngineFacts) -> ProfileStatus {
-    let os = facts
-        .operating_system
-        .as_deref()
-        .unwrap_or("")
-        .to_lowercase();
-    let known_os = os.contains("fedora") || os.contains("ubuntu");
+/// supported); anything else, or an engine this agent cannot name, is unsupported.
+pub fn engine_profile(facts: &EngineFacts, host_os: Option<&HostOs>) -> ProfileStatus {
+    let platform = ProfilePlatform::of(facts, host_os);
+    let known_os = matches!(
+        platform,
+        ProfilePlatform::Fedora | ProfilePlatform::Ubuntu2404
+    );
     match (facts.info.kind, facts.mode) {
         (EngineKind::Unknown, _) => ProfileStatus::Unsupported,
         (EngineKind::Docker, EngineMode::Rootful) => ProfileStatus::Supported,
@@ -498,11 +631,12 @@ pub fn engine_profile(facts: &EngineFacts) -> ProfileStatus {
     }
 }
 
-pub fn check_runtime_engine(view: &RuntimeView) -> ReadinessCheck {
-    check_runtime_engine_inner(view).with_source("runtime")
+/// `host_os` is the host's os-release, when the agent can read it.
+pub fn check_runtime_engine(view: &RuntimeView, host_os: Option<&HostOs>) -> ReadinessCheck {
+    check_runtime_engine_inner(view, host_os).with_source("runtime")
 }
 
-fn check_runtime_engine_inner(view: &RuntimeView) -> ReadinessCheck {
+fn check_runtime_engine_inner(view: &RuntimeView, host_os: Option<&HostOs>) -> ReadinessCheck {
     let RuntimeView::Observed { outcome, .. } = view else {
         return super::skip(ENGINE_ID, "The container engine was not asked");
     };
@@ -519,10 +653,10 @@ fn check_runtime_engine_inner(view: &RuntimeView) -> ReadinessCheck {
     let mode = facts.mode.wire();
     let named = engine_named(facts);
     let alternatives = "Docker rootful is the supported profile. Docker rootless, Podman \
-                        rootless and Podman rootful on Fedora or Ubuntu are experimental until \
-                        proven on hardware; other rootless combinations are unsupported (see \
-                        the engine-profile docs).";
-    match engine_profile(facts) {
+                        rootless and Podman rootful on Fedora (its image-based editions \
+                        included) or Ubuntu 24.04 are experimental until proven on hardware; \
+                        other combinations are unsupported (see the engine-profile docs).";
+    match engine_profile(facts, host_os) {
         ProfileStatus::Supported => super::pass(
             ENGINE_ID,
             format!("{named}, {mode}, on {os}: a supported engine profile"),

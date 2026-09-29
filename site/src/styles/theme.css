@@ -57,8 +57,14 @@
 	--q-teal: oklch(0.78 0.11 196);
 
 	--q-success-text: oklch(0.82 0.13 164);
+	--q-success-bg: oklch(0.76 0.15 164 / 0.12);
+	--q-success-line: oklch(0.76 0.15 164 / 0.34);
 	--q-warning-text: oklch(0.87 0.12 85);
+	--q-warning-bg: oklch(0.82 0.14 85 / 0.12);
+	--q-warning-line: oklch(0.82 0.14 85 / 0.34);
 	--q-danger-text: oklch(0.82 0.12 27);
+	--q-danger-bg: oklch(0.69 0.19 27 / 0.13);
+	--q-danger-line: oklch(0.69 0.19 27 / 0.4);
 
 	--q-font-brand: 'Michroma', ui-sans-serif, sans-serif;
 	--q-font-display: 'IBM Plex Sans', Inter, ui-sans-serif, system-ui, sans-serif;
@@ -143,8 +149,14 @@
 	--q-accent-text: oklch(0.5 0.19 273.21);
 	--q-accent-soft: oklch(0.5998 0.2179 273.21 / 0.12);
 	--q-success-text: oklch(0.5 0.13 164);
+	--q-success-bg: oklch(0.76 0.15 164 / 0.15);
+	--q-success-line: oklch(0.6 0.14 164 / 0.34);
 	--q-warning-text: oklch(0.52 0.12 78);
+	--q-warning-bg: oklch(0.82 0.14 85 / 0.2);
+	--q-warning-line: oklch(0.68 0.13 82 / 0.36);
 	--q-danger-text: oklch(0.52 0.2 27);
+	--q-danger-bg: oklch(0.69 0.19 27 / 0.14);
+	--q-danger-line: oklch(0.6 0.19 27 / 0.34);
 	--q-teal: oklch(0.62 0.11 196);
 
 	--q-shadow-md: 0 1px 2px oklch(0.24 0.022 268 / 0.06),
@@ -178,6 +190,24 @@
 	--sl-color-text: var(--q-text-2);
 	--sl-color-text-accent: var(--q-accent-text);
 	--sl-color-text-invert: var(--q-ink-3);
+}
+
+/* ---------- Starlight badges in the product's state colours ----------
+   <Badge variant="success|caution|danger"> reads as the product's
+   .chip-success / -warning / -danger (web/src/styles/primitives.css) rather
+   than Starlight's own green, orange and red. The engine-profile badges use
+   these. Unlayered, so it wins over Starlight's layered defaults in both
+   themes; the --q-* values switch with the theme. */
+:root {
+	--sl-badge-success-bg: var(--q-success-bg);
+	--sl-badge-success-border: var(--q-success-line);
+	--sl-badge-success-text: var(--q-success-text);
+	--sl-badge-caution-bg: var(--q-warning-bg);
+	--sl-badge-caution-border: var(--q-warning-line);
+	--sl-badge-caution-text: var(--q-warning-text);
+	--sl-badge-danger-bg: var(--q-danger-bg);
+	--sl-badge-danger-border: var(--q-danger-line);
+	--sl-badge-danger-text: var(--q-danger-text);
 }
 
 /* ---------- Display face for headings ---------- */
