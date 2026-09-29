@@ -120,6 +120,38 @@ type Capabilities struct {
 	Outputs      []DRMOutput       `json:"outputs,omitempty"`
 	AudioSinks   []AudioSink       `json:"audio_sinks"`
 	InputDevices []InputDevicePath `json:"input_devices"`
+	// Access (amendment 18, agent-api.md `capacity.console_capabilities.access`)
+	// is the agent's latest console-access report on an owned host. Nil when
+	// the agent reports none (a Compose/source install, or a pre-amendment
+	// agent) — matches openapi.yaml ConsoleCapabilities.access.
+	Access *Access `json:"access,omitempty"`
+}
+
+// Access mirrors protocol/openapi.yaml ConsoleAccess (amendment 18) exactly —
+// passed through from the agent's report to the admin GET response verbatim.
+type Access struct {
+	State      string  `json:"state"`
+	Target     *bool   `json:"target"`
+	RequestID  *string `json:"request_id"`
+	Reason     *string `json:"reason"`
+	StartedAt  *string `json:"started_at"`
+	FinishedAt *string `json:"finished_at"`
+	Summary    string  `json:"summary"`
+}
+
+// HasAccess is amendment 18's definition (agent-api.md): the host currently
+// has console access when the agent is verified `on`, or a failed attempt
+// left it `restored` with `target` false (the attempt was trying to turn
+// access off and failed, so it still has it). Every other state, and a nil
+// report, means no access.
+func (a *Access) HasAccess() bool {
+	if a == nil {
+		return false
+	}
+	if a.State == "on" {
+		return true
+	}
+	return a.State == "restored" && a.Target != nil && !*a.Target
 }
 
 type DRMOutput struct {

@@ -58,6 +58,23 @@ type candidacy struct {
 const unrestrictedHostSQL = ` AND NOT EXISTS (
 	SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id)`
 
+// consoleAccessHoldSQL is amendment 18's placement hold (control-api.md
+// §Console mode "Placement"): a host is unplaceable while its latest
+// console-access report is `applying` (a recovery-actor replacement in
+// flight, whatever triggered it), or while the console-config PATCH's
+// `_placement_hold_pending` marker is still set (console.Store,
+// SetPlacementHoldPending / cleared by agentws once a settling report
+// arrives). Read straight from the console_capabilities JSONB — no Go-side
+// per-host state needed, so this is restart-safe by construction: whatever
+// survives in Postgres is exactly what the next query sees. A host with no
+// console_capabilities row, or one with no `access` key, matches neither
+// condition and is unaffected, as before this amendment.
+const consoleAccessHoldSQL = ` AND NOT EXISTS (
+	SELECT 1 FROM console_capabilities cc
+	WHERE cc.host_id = h.id
+	  AND (cc.capabilities->'access'->>'state' = 'applying'
+	       OR (cc.capabilities->'_placement_hold_pending') = 'true'::jsonb))`
+
 // pinGate restricts candidates to one host (cert bench; a derived tile's hard
 // pin) and, beside a host pin only, to one GPU on it (cert bench). Empty when no
 // pin is set.
@@ -156,7 +173,7 @@ func (c candidacy) candidateQuery(policy PlacementPolicy) (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + placement + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + consoleAccessHoldSQL + schedulableBindingSQL + pin + image + gate + codec + placement + `
 		GROUP BY g.id
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + `
 		ORDER BY ` + policyOrder + `
@@ -188,7 +205,7 @@ func (c candidacy) recheckQuery(gpuID string) (string, []any) {
 	placement := c.placementGate(a)
 
 	return `
-		SELECT h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + `
+		SELECT h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + consoleAccessHoldSQL + `
 		   AND g.encode_slots_total
 		         - COALESCE((SELECT SUM(x.reserved_encode_slots) FROM sessions x
 		                     WHERE x.gpu_id = g.id AND x.state IN ` + activeStatesSQL + `), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + image + gate + codec + placement + `
@@ -219,7 +236,7 @@ func (c candidacy) totalsQuery() (string, []any) {
 	return `
 		SELECT EXISTS (
 			SELECT 1 FROM gpus g JOIN hosts h ON h.id = g.host_id
-			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + codec + placement + `
+			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + consoleAccessHoldSQL + schedulableBindingSQL + pin + image + codec + placement + `
 			  AND g.encode_slots_total >= $` + fmt.Sprint(slotsIdx) + `
 		)
 	`, a.args()
@@ -254,7 +271,7 @@ func (c candidacy) vetoDiagQuery() (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + placement + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + consoleAccessHoldSQL + schedulableBindingSQL + pin + image + gate + codec + placement + `
 		GROUP BY g.id
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + `
 		ORDER BY g.id
@@ -291,7 +308,7 @@ func (c candidacy) readinessDiagQuery() (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + blocked + codec + placement + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + consoleAccessHoldSQL + schedulableBindingSQL + pin + image + blocked + codec + placement + `
 		GROUP BY g.id, h.readiness_block_host, h.readiness_block_homes
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + `
 		ORDER BY g.id
@@ -318,7 +335,7 @@ func (c candidacy) readinessTotalsQuery() (string, []any) {
 	return `
 		SELECT EXISTS (
 			SELECT 1 FROM gpus g JOIN hosts h ON h.id = g.host_id
-			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + placement + `
+			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + consoleAccessHoldSQL + schedulableBindingSQL + pin + image + gate + codec + placement + `
 			  AND g.encode_slots_total >= $` + fmt.Sprint(slotsIdx) + `
 		)
 	`, a.args()

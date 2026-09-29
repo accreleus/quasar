@@ -23,6 +23,10 @@ func normSQL(s string) string { return strings.TrimSpace(wsRun.ReplaceAllString(
 
 func withoutRH05Restriction(s string) string {
 	s = strings.ReplaceAll(s, normSQL(unrestrictedHostSQL), "")
+	// Amendment 18 (#395) adds the console-access placement hold beside the
+	// RH05 owner restriction, in the same unconditional position. The
+	// historical capture predates it.
+	s = strings.ReplaceAll(s, normSQL(consoleAccessHoldSQL), "")
 	// RH05 #345 adds a managed-image cleanup gate inside imageReadySQL. The
 	// historical SQL capture predates that gate; its exact predicate is checked
 	// separately below before removing it for the legacy comparison.
@@ -208,6 +212,9 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 			}
 			if !strings.Contains(s, normSQL(unrestrictedHostSQL)) {
 				t.Fatalf("%s query omitted the RH05 owner restriction", shape)
+			}
+			if !strings.Contains(s, normSQL(consoleAccessHoldSQL)) {
+				t.Fatalf("%s query omitted the amendment 18 console-access placement hold", shape)
 			}
 			if !placementAnchorGate.MatchString(s) {
 				t.Fatalf("%s query omitted the app placement predicate", shape)

@@ -154,15 +154,48 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	oldResolved, err := Resolve(old)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not resolve console config")
+		return
+	}
+	resolved, err := Resolve(merged)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not resolve console config")
+		return
+	}
+	enabledChanged := oldResolved.Enabled != resolved.Enabled
+
+	// Amendment 18 console-access refusals (control-api.md §Console mode):
+	// one replacement at a time (applying), and a false→true change cannot be
+	// accepted onto a host that cannot ever grant it (unsupported). Every
+	// other key, and a true→false change even while unsupported, goes through
+	// — the admin's confirmation that live sessions end belongs to the UI, not
+	// this gate.
+	if caps.Access != nil && enabledChanged {
+		switch {
+		case caps.Access.State == "applying":
+			httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "a console access change is already in progress on this host")
+			return
+		case !oldResolved.Enabled && resolved.Enabled && caps.Access.State == "unsupported":
+			httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, caps.Access.Summary)
+			return
+		}
+	}
+
 	if err := h.store.Upsert(ctx, hostID, merged, adminUserID(r)); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not save console config")
 		return
 	}
 
-	resolved, err := Resolve(merged)
-	if err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not resolve console config")
-		return
+	// Amendment 18 placement hold: an accepted PATCH that changes `enabled` on
+	// a host reporting access holds new placements until a subsequent access
+	// report settles it (admission_query.go consoleAccessGate reads this same
+	// marker). A host with no access report behaves exactly as before.
+	if caps.Access != nil && enabledChanged {
+		if err := h.store.SetPlacementHoldPending(ctx, hostID, true); err != nil {
+			slog.Warn("console: set placement hold failed", "host_id", hostID, "err", err)
+		}
 	}
 
 	// Persist + push (control-api.md): the resolved console_config is pushed to

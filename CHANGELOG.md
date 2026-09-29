@@ -39,6 +39,11 @@ own; the two do not move together, and that is deliberate.
   target that was put back, and reports `console_capabilities.access` (off, applying, on,
   restored, unsupported on a rootless engine) in every `capacity`, re-sent when it changes;
   it refuses a console launch while it lacks access. A Compose or source agent reports none.
+  The control plane passes `access` through on `GET .../console-config`, refuses a
+  console-config PATCH that changes `enabled` with `409` while a replacement is applying or
+  (false→true) unsupported, holds new placements on the host until a settling access report,
+  and resets a failed attempt's `enabled` back to what the host actually kept, once per
+  `request_id`, audited as `console.access.restored`.
 - **RH-07 console mockups, approved by the owner (#394).**
   `design_handoff_v3/screens/rh07-v3.html` adds the quick start's engine choice and
   profile badges, host preparation, the Quadlet unit for Podman, console mode on an

@@ -617,7 +617,8 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	signalHandler := signalpkg.NewHandler(sessionStore, agentRegistry, relayBus, log, originResolver).
 		WithTrustedProxies(cfg.TrustedProxies)
 	agentHandler := agentws.NewHandler(pool, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore, idleBoot).
-		WithTrustedProxies(cfg.TrustedProxies)
+		WithTrustedProxies(cfg.TrustedProxies).
+		WithAuditor(auditStore)
 	// CM-09 item 2: console re-eval hook, set after both exist. A plain func value
 	// because session must not import agentws.Handler, only its agentws.Events subset.
 	coordinator.ConsoleReeval = agentHandler.ConsoleSessionTerminated
