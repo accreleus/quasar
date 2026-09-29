@@ -1,14 +1,21 @@
+/**
+ * SAFETY: these tests generate real install scripts and execute some of them
+ * against a fake container engine. NEVER run this file natively — on this
+ * repo's dev host, a fake can be bypassed and a REAL docker daemon is
+ * reachable; a prior native run left a real Quasar install behind. Run only
+ * in a container with no docker/podman socket, e.g.:
+ *   docker run --rm -v "$PWD":/w -w /w/site node:22 sh -c 'npm ci && npm test'
+ * See test-harness.js for how execution is isolated even so.
+ */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { load } from 'js-yaml';
 
 import { DEFAULTS, ROLES, REGISTRY_NS, CHANNEL_TAG, generate, homePath, templatePath, appUser, seedInputs } from './stack-template.js';
 import { PROXIES, proxyConfig } from './proxy-configs.js';
 import { PLATFORMS } from './platforms.js';
+import { fakeEngineDir, runScript } from './test-harness.js';
 
 const ROLE_IDS = Object.keys(ROLES);
 const ACCESS = ['self-signed', 'proxy'];
@@ -206,59 +213,29 @@ test('every platform is complete', () => {
   }
 });
 
-/**
- * Run a generated script against a fake docker and curl on PATH. The fake docker
- * logs every call; `legacy` makes it report a Compose-labelled control plane.
- */
+/** Runs a generated script against the hardened fake engine (test-harness.js). */
 function runFake(answers, { legacy = false, existing = false, extraEnv = {} } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'quasar-qs-'));
-  const log = join(dir, 'calls');
-  writeFileSync(join(dir, 'docker'), `#!/usr/bin/env bash
-echo "$*" >> ${JSON.stringify(log)}
-case "$1" in
-  info) exit 0 ;;
-  ps) case "$*" in *service=quasar-control-plane*) ${legacy ? 'echo deadbeef' : ':'} ;; esac ;;
-  container) ${existing ? 'exit 0' : 'exit 1'} ;;
-  pull) exit 0 ;;
-  image) ref="\${@: -1}"; echo "\${ref%:*}@sha256:0123abcd" ;;
-  run) echo cafe ;;
-  exec) exit 0 ;;
-esac
-`);
-  writeFileSync(join(dir, 'curl'), '#!/usr/bin/env bash\nexit 0\n');
-  chmodSync(join(dir, 'docker'), 0o755);
-  chmodSync(join(dir, 'curl'), 0o755);
-  try {
-    const r = spawnSync('bash', ['-c', generate(answers).script], {
-      encoding: 'utf8',
-      env: { PATH: `${dir}:${process.env.PATH}`, ...extraEnv },
-    });
-    let calls = '';
-    try { calls = readFileSync(log, 'utf8'); } catch {}
-    return { ...r, calls };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  return runScript(generate(answers).script, { engine: fakeEngineDir({ legacy, existing }), extraEnv });
 }
 
 test('the script refuses a host still running a stack made from the Compose files', () => {
   const r = runFake(full({ role: 'control-only' }), { legacy: true });
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stderr, /made from the Compose files: quasar-control-plane/);
-  assert.ok(!/^run /m.test(r.calls), 'nothing may start');
+  assert.ok(!/^docker run /m.test(r.calls), 'nothing may start');
 });
 
 test('the script refuses a machine that is already installed', () => {
   const r = runFake(full({ role: 'control-only' }), { existing: true });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /already installed/);
-  assert.ok(!/^run /m.test(r.calls));
+  assert.ok(!/^docker run /m.test(r.calls));
 });
 
 test('the script pins every image to its digest and starts the seed with them', () => {
   const r = runFake(full({ role: 'control-only' }));
   assert.equal(r.status, 0, r.stdout + r.stderr);
-  const run = r.calls.split('\n').find((l) => l.startsWith('run '));
+  const run = r.calls.split('\n').find((l) => l.startsWith('docker run '));
   assert.ok(run, r.calls);
   assert.ok(run.includes(`-e QUASAR_CONTROL_PLANE_IMAGE=${REGISTRY_NS}/quasar-control-plane@sha256:0123abcd`), run);
   assert.ok(run.includes(`-e QUASAR_AGENT_IMAGE=${REGISTRY_NS}/quasar-node-agent@sha256:0123abcd`), run);
@@ -274,7 +251,7 @@ test("the script needs the operator's database password from its environment, an
   assert.match(without.stderr, /QUASAR_DATABASE_PASSWORD/);
   const withPw = runFake(a, { extraEnv: { QUASAR_DATABASE_PASSWORD: 'not-in-the-script' } });
   assert.equal(withPw.status, 0, withPw.stderr);
-  const run = withPw.calls.split('\n').find((l) => l.startsWith('run '));
+  const run = withPw.calls.split('\n').find((l) => l.startsWith('docker run '));
   assert.ok(run.includes('-e QUASAR_DATABASE_PASSWORD -e') || run.includes('-e QUASAR_DATABASE_PASSWORD '), run);
   assert.ok(!run.includes('not-in-the-script'));
   assert.ok(!generate(a).script.includes('not-in-the-script'));
@@ -304,5 +281,27 @@ test('the path-based proxies name both websocket routes', () => {
     assert.match(body, /v1\/signal/, `${id}: must route /v1/signal`);
     assert.match(body, /agent\/ws/, `${id}: must route /agent/ws`);
     assert.match(body, /proxy_buffering off/, `${id}: must turn buffering off`);
+  }
+});
+
+// --- the safety net --------------------------------------------------------
+
+/**
+ * The check that would have caught the accident this file's header warns
+ * about. It runs last (node:test runs a file's tests in declared order) and
+ * looks for a REAL docker/podman on the machine running the suite — found by
+ * absolute path, never through the fake PATH the tests above build — then
+ * asserts no `quasar-*` container exists there. If every test above stayed
+ * inside the fake engine, this always passes trivially, including when no
+ * real engine is reachable at all (the sanctioned case: the node:22
+ * container this suite is meant to run in has neither docker nor podman).
+ */
+test('no generated script ever reaches a real container engine', () => {
+  for (const bin of ['/usr/bin/docker', '/usr/local/bin/docker', '/usr/bin/podman', '/usr/local/bin/podman']) {
+    const probe = spawnSync(bin, ['ps', '-a', '--format', '{{.Names}}'], { encoding: 'utf8' });
+    if (probe.error || probe.status !== 0) continue; // not installed, or no socket reachable: nothing to check
+    const names = probe.stdout.split('\n').filter(Boolean);
+    const leaked = names.find((n) => n.startsWith('quasar-'));
+    assert.equal(leaked, undefined, `a REAL ${bin} container named "${leaked}" exists — a generated script escaped the fake engine`);
   }
 });
