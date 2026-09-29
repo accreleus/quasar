@@ -20,6 +20,10 @@ Each reader is held to it by a test:
   platform's samples;
 - the site: `site/src/data/engine-profiles.js` imports this file (`profileFor(platform,
   engine, mode)`), tested by `site/src/data/engine-profiles.test.js`.
+- the enrollment script: `deploy/enroll-host.sh` carries this table as shell records between
+  its `engine profiles (generated)` markers; `deploy/test-enroll-host.sh` fails when they
+  differ (`--write-profiles` regenerates them), reads every sample's `os-release` as its
+  platform, and refuses every unsupported row by name.
 
 A status changes here first, in the same change as the agent's `engine_profile()` and the
 evidence that justifies it.

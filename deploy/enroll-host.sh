@@ -23,9 +23,24 @@ fingerprint carried INSIDE the enrollment string. The string travels in an
 environment variable, never a URL or an argv: it is single-use and expires, which
 is what makes a shell-history exposure bounded.
 
+Engines and modes. It finds the container engine it runs against, and that engine's
+mode, by itself, and never uses sudo against a rootless engine (`sudo docker` would
+reach the rootful daemon instead):
+  Docker, rootful     /var/run/docker.sock (as root or through passwordless sudo)
+  Docker, rootless    $XDG_RUNTIME_DIR/docker.sock (run it as the account that owns it)
+  Podman, rootful     /run/podman/podman.sock (as root or through passwordless sudo)
+  Podman, rootless    $XDG_RUNTIME_DIR/podman/podman.sock (as that account)
+DOCKER_HOST or CONTAINER_HOST (unix://…) names the socket instead. Run as a user it
+looks for that user's rootless engine first. When it finds both engines, set
+QUASAR_ENGINE=docker or QUASAR_ENGINE=podman. The engine's own report confirms the
+mode. The machine's engine profile (docs: engine profiles) must not be unsupported:
+an unsupported one is refused by name, with the profiles to use instead, before
+anything is pulled. A rootless engine needs host preparation (prepare-host.sh, run
+once as root) done first: if it is missing, this prints the command and stops.
+
 What it does, in order (it prints each step; nothing is silent):
   1. parses the string, refuses a ws:// (cleartext) control plane;
-  2. checks the host the way the agent's readiness will: Docker, a DRM render node,
+  2. checks the host the way the agent's readiness will: the engine, a DRM render node,
      /dev/uinput, unprivileged user namespaces (incl. the Ubuntu 24.04+ AppArmor
      knob), the NVIDIA container toolkit on NVIDIA, and loads the app-container
      AppArmor profile. A failed check stops here, before anything is started, and
@@ -51,7 +66,11 @@ Inputs (environment):
   QUASAR_UPDATER_ALLOWED_NAMESPACES, QUASAR_PLATFORM_INSECURE_REGISTRIES
                         this machine's release trust (default: the serving control
                         plane's own, served below)
-  QUASAR_ENROLL_FIX=1   apply a failed check's fix without asking; =0 never ask
+  QUASAR_ENGINE         docker or podman, when the machine has both
+  DOCKER_HOST, CONTAINER_HOST  unix:// socket of the engine to use (Docker, Podman)
+  QUASAR_ENROLL_FIX=1   apply a failed check's fix without asking; =0 never ask.
+                        Rootful only: on a rootless engine a fix is printed, never
+                        applied
   QUASAR_ENROLL_APPARMOR_PERSIST=1  also install the AppArmor profile in
                         /etc/apparmor.d so it survives a reboot (QUASAR_ENROLL_FIX=1
                         does too)
@@ -446,18 +465,200 @@ else
   read_install_inputs
 fi
 
+# ── engine profiles ──────────────────────────────────────────────────────────
+# testdata/engine-profiles/profiles.json as records, one per line, split on '|':
+#   platform|<id>|<label>        engine|<id>|<label>
+#   profile|<platform>|<engine>|<mode>|<status>|<alternatives>|<reason>
+#   unknown|<status>|<alternatives>|<reason>
+# An alternative is engine/mode on this machine, or engine/mode@platform. The block
+# between the markers is generated: `bash deploy/test-enroll-host.sh --write-profiles`
+# rewrites it from the table, and deploy/test-enroll-host.sh fails when they differ.
+# BEGIN engine profiles (generated)
+engine_profiles() {
+cat <<'PROFILES'
+platform|fedora|Fedora
+platform|ubuntu|Ubuntu 24.04
+platform|debian|Debian
+platform|arch|Arch
+platform|unraid|Unraid
+platform|other|Another Linux
+engine|docker|Docker
+engine|podman|Podman
+profile|fedora|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, with AMD and NVIDIA GPUs.
+profile|fedora|docker|rootless|experimental||A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.
+profile|fedora|podman|rootless|experimental||A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.
+profile|fedora|podman|rootful|experimental||It has not yet been through the same end-to-end tests as the other Fedora profiles; it becomes supported once it passes.
+profile|ubuntu|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
+profile|ubuntu|docker|rootless|experimental||Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.
+profile|ubuntu|podman|rootless|experimental||Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.
+profile|ubuntu|podman|rootful|experimental||Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.
+profile|debian|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
+profile|debian|docker|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Debian.
+profile|debian|podman|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Debian.
+profile|debian|podman|rootful|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Debian.
+profile|arch|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
+profile|arch|docker|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Arch.
+profile|arch|podman|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Arch.
+profile|arch|podman|rootful|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Arch.
+profile|unraid|docker|rootful|supported||Unraid's own Docker runs as root, and it is the engine Quasar has always installed on there.
+profile|unraid|docker|rootless|unsupported|docker/rootful|Unraid has no rootless Docker.
+profile|unraid|podman|rootless|unsupported|docker/rootful|Unraid has no Podman.
+profile|unraid|podman|rootful|unsupported|docker/rootful|Unraid has no Podman.
+profile|other|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
+profile|other|docker|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on this distribution.
+profile|other|podman|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on this distribution.
+profile|other|podman|rootful|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on this distribution.
+unknown|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|Quasar cannot tell which container engine this is, so nothing about it has been tested.
+PROFILES
+}
+# END engine profiles (generated)
+
+label_of() { # label_of platform|engine <id>
+  engine_profiles | awk -F'|' -v k="$1" -v id="$2" '$1 == k && $2 == id { print $3; exit }'
+}
+# profile_row <platform> <engine> <mode>: "status|alternatives|reason"; an engine or
+# mode outside the table is the unknown engine's row.
+profile_row() {
+  engine_profiles | awk -F'|' -v p="$1" -v e="$2" -v m="$3" '
+    $1 == "profile" && $2 == p && $3 == e && $4 == m { print $5 "|" $6 "|" $7; found = 1; exit }
+    $1 == "unknown" { u = $2 "|" $3 "|" $4 }
+    END { if (!found) print u }'
+}
+# describe_alternatives <platform> <alternatives>: each one named, with its own status.
+describe_alternatives() {
+  said=""
+  for alt in $2; do
+    to="$1"
+    case "$alt" in *@*) to="${alt#*@}"; alt="${alt%@*}" ;; esac
+    alt_engine="${alt%/*}"; alt_mode="${alt#*/}"
+    alt_status="$(profile_row "$to" "$alt_engine" "$alt_mode" | cut -d'|' -f1)"
+    where="on this machine"
+    [ "$to" = "$1" ] || where="on $(label_of platform "$to")"
+    said="${said:+$said; }$(label_of engine "$alt_engine") $alt_mode $where ($alt_status)"
+  done
+  printf '%s' "$said"
+}
+
+# The host's platform, matched as the agent's runtime_engine check matches it
+# (ProfilePlatform::from_os_release): os-release ID or ID_LIKE, so Fedora's image-based
+# editions are Fedora and Enterprise Linux is not; Ubuntu counts only at 24.04.
+os_value() { # os_value <KEY>: the value, unquoted
+  [ -r "$ROOT/etc/os-release" ] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" "$ROOT/etc/os-release" | head -n 1 | sed "s/^[\"']//; s/[\"'][[:space:]]*\$//"
+}
+os_id="$(os_value ID | tr '[:upper:]' '[:lower:]')"
+os_like=" $(os_value ID_LIKE | tr '[:upper:]' '[:lower:]') "
+os_version="$(os_value VERSION_ID)"
+os_pretty="$(os_value PRETTY_NAME)"
+os_is() {
+  [ "$os_id" = "$1" ] && return 0
+  case "$os_like" in *" $1 "*) return 0 ;; esac
+  return 1
+}
+if os_is fedora && ! os_is rhel && ! os_is centos; then
+  platform=fedora
+elif os_is ubuntu; then
+  case "$os_version" in 24.04|24.04.*) platform=ubuntu ;; *) platform=other ;; esac
+elif case "$os_id" in unraid*) true ;; *) false ;; esac; then
+  platform=unraid
+elif os_is debian; then
+  platform=debian
+elif os_is arch || os_is archlinux; then
+  platform=arch
+else
+  platform=other
+fi
+distro="$os_id"
+
+# ── the engine and its mode ──────────────────────────────────────────────────
+# Found by its socket, never assumed: an explicit DOCKER_HOST/CONTAINER_HOST first; as a
+# user, that user's rootless engine; then the rootful sockets. The engine's own report
+# confirms the mode below. The socket found is also the one the seed is given.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+want_engine="${QUASAR_ENGINE:-}"
+case "$want_engine" in
+  ''|docker|podman) ;;
+  *) usage_error "QUASAR_ENGINE must be docker or podman, not '$want_engine'" ;;
+esac
+ENGINE=""; ENGINE_SOCKET=""; ENGINE_HOST_ENV=""; MODE=""
+# pick <docker socket or ''> <podman socket or ''> <where>: settle the engine from what
+# was found, QUASAR_ENGINE deciding when both were.
+pick() {
+  if [ -n "$1" ] && [ -n "$2" ]; then
+    case "$want_engine" in
+      docker) ENGINE=docker; ENGINE_SOCKET="$1" ;;
+      podman) ENGINE=podman; ENGINE_SOCKET="$2" ;;
+      *) usage_error "this machine has both Docker ($1) and Podman ($2) $3. Say which one Quasar uses: put QUASAR_ENGINE=docker or QUASAR_ENGINE=podman in front of sh." ;;
+    esac
+  elif [ -n "$1" ] && [ "$want_engine" != podman ]; then
+    ENGINE=docker; ENGINE_SOCKET="$1"
+  elif [ -n "$2" ] && [ "$want_engine" != docker ]; then
+    ENGINE=podman; ENGINE_SOCKET="$2"
+  fi
+}
+unix_socket() { # unix_socket <VAR> <value>: the path of a unix:// URL
+  case "$2" in
+    unix:///*) printf '%s' "${2#unix://}" ;;
+    *) usage_error "$1=$2 is not a local unix:// socket. The seed is given the engine's socket, so it must be one on this machine." ;;
+  esac
+}
+if [ -n "${DOCKER_HOST:-}${CONTAINER_HOST:-}" ]; then
+  d=""; p=""
+  [ -z "${DOCKER_HOST:-}" ] || d="$(unix_socket DOCKER_HOST "$DOCKER_HOST")"
+  [ -z "${CONTAINER_HOST:-}" ] || p="$(unix_socket CONTAINER_HOST "$CONTAINER_HOST")"
+  pick "$d" "$p" "named by DOCKER_HOST and CONTAINER_HOST"
+  [ -n "$ENGINE" ] || usage_error "QUASAR_ENGINE=$want_engine, but only ${d:+DOCKER_HOST}${p:+CONTAINER_HOST} names a socket"
+  [ -e "$ENGINE_SOCKET" ] || host_error "$ENGINE_SOCKET, the socket DOCKER_HOST/CONTAINER_HOST names, does not exist. Is the engine running?"
+  if [ "$ENGINE" = docker ]; then ENGINE_HOST_ENV="DOCKER_HOST=unix://$ENGINE_SOCKET"; else ENGINE_HOST_ENV="CONTAINER_HOST=unix://$ENGINE_SOCKET"; fi
+  case "$ENGINE_SOCKET" in "$RUNTIME_DIR"/*|/run/user/*) MODE=rootless ;; *) MODE=rootful ;; esac
+fi
+if [ -z "$ENGINE" ] && [ "$(id -u)" -ne 0 ]; then
+  d=""; p=""
+  [ ! -e "$RUNTIME_DIR/docker.sock" ] || d="$RUNTIME_DIR/docker.sock"
+  [ ! -e "$RUNTIME_DIR/podman/podman.sock" ] || p="$RUNTIME_DIR/podman/podman.sock"
+  pick "$d" "$p" "running rootless for $(id -un)"
+  if [ -n "$ENGINE" ]; then
+    MODE=rootless
+    # Podman's CLI reaches the user's own engine without a socket; Docker's is told.
+    [ "$ENGINE" = podman ] || ENGINE_HOST_ENV="DOCKER_HOST=unix://$ENGINE_SOCKET"
+  fi
+fi
+if [ -z "$ENGINE" ]; then
+  d=""; p=""
+  [ ! -e "$ROOT/var/run/docker.sock" ] || d=/var/run/docker.sock
+  [ ! -e "$ROOT/run/podman/podman.sock" ] || p=/run/podman/podman.sock
+  # podman-docker links Docker's socket to Podman's: one engine, and it is Podman.
+  if [ -n "$d" ] && [ -n "$p" ] && [ "$(readlink -f "$ROOT$d")" = "$(readlink -f "$ROOT$p")" ]; then d=""; fi
+  pick "$d" "$p" "running rootful"
+  MODE=rootful
+fi
+if [ -z "$ENGINE" ]; then
+  host_error "no container engine found${want_engine:+ for QUASAR_ENGINE=$want_engine}. Looked for a rootless one of $(id -un) ($RUNTIME_DIR/docker.sock, $RUNTIME_DIR/podman/podman.sock) and the rootful ones (/var/run/docker.sock, /run/podman/podman.sock). Install Docker or Podman first (this script installs neither), and on Podman start its socket: systemctl --user enable --now podman.socket as the account that runs it, or systemctl enable --now podman.socket for rootful. Or name the socket with DOCKER_HOST or CONTAINER_HOST."
+fi
+ENGINE_LABEL="$(label_of engine "$ENGINE")"
+
 # ── privileges ───────────────────────────────────────────────────────────────
-# Never prompt from inside a pipe: every privileged command runs `sudo -n`, and a
-# host whose sudo wants a password is refused up front with the way out.
+# Rootful: never prompt from inside a pipe. Every privileged command runs `sudo -n`,
+# and a host whose sudo wants a password is refused up front with the way out.
+# Rootless: never sudo at all. `sudo docker` would reach the rootful daemon, and host
+# preparation (prepare-host.sh) is the one step of a rootless install that is root's.
 SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-  command -v sudo >/dev/null 2>&1 || host_error "not root and no sudo: this talks to the Docker daemon and prepares the host. Run it from a root shell (su -, then paste the command)."
+if [ "$MODE" = rootful ] && [ "$(id -u)" -ne 0 ]; then
+  command -v sudo >/dev/null 2>&1 || host_error "not root and no sudo: this talks to the rootful $ENGINE_LABEL engine and prepares the host. Run it from a root shell (su -, then paste the command)."
   if ! sudo -n true 2>/dev/null; then
     host_error "sudo asks $(id -un) for a password on this host, and this script never prompts. Either allow passwordless sudo for this user (NOPASSWD in sudoers), or open a root shell first (sudo -i) and paste the command there."
   fi
   SUDO="sudo -n"
 fi
-dk() { $SUDO docker "$@"; }
+# The engine's CLI, pointed at the socket found. Rootless, SUDO is always empty.
+dk() {
+  if [ -n "$ENGINE_HOST_ENV" ]; then $SUDO env "$ENGINE_HOST_ENV" "$ENGINE" "$@"; else $SUDO "$ENGINE" "$@"; fi
+}
+# lbl <key>: a label in a `ps`/`volume ls` --format. Docker's rows carry a Label method
+# (their .Labels is a string); Podman's carry a .Labels map.
+lbl() {
+  if [ "$ENGINE" = podman ]; then printf '{{index .Labels "%s"}}' "$1"; else printf '{{.Label "%s"}}' "$1"; fi
+}
 
 # ── 2. host checks, before anything is started ───────────────────────────────
 step "Host checks"
@@ -469,10 +670,11 @@ can_ask() { [ "$STYLE" = tty ] && (exec </dev/tty) 2>/dev/null; }
 # fix_or_stop <problem> <fix command> <still-failing test command>
 # Applies the fix when asked to (QUASAR_ENROLL_FIX=1, --fix, or yes at the terminal),
 # then re-runs the test; otherwise stops with the fix printed. The fix runs as root.
+# Rootless, a fix is only ever printed: applying it would need root.
 fix_or_stop() {
   problem="$1"; fix="$2"; still="$3"
   apply=0
-  if [ "$DRY" = 1 ]; then
+  if [ "$DRY" = 1 ] || [ "$MODE" = rootless ]; then
     apply=0
   elif [ "$FIX" = 1 ]; then
     apply=1
@@ -494,20 +696,96 @@ fix_or_stop() {
     warn "$problem Fix: $fix"
     return 0
   fi
+  if [ "$MODE" = rootless ]; then
+    host_error "$problem Fix it as root (a rootless install never uses sudo), then re-run this as $(id -un):
+  $fix"
+  fi
   host_error "$problem Fix, then re-run (or re-run with QUASAR_ENROLL_FIX=1 to apply it):
   $fix"
 }
 
-spin "checking docker"
-command -v docker >/dev/null 2>&1 || host_error "docker is not installed. Install Docker Engine first (https://docs.docker.com/engine/install/) — this script does not install it."
-if [ "$DRY" != 1 ]; then
-  dk info >/dev/null 2>&1 || host_error "the Docker daemon is not reachable (is it running, and can $(id -un) use it?)"
+spin "checking $ENGINE"
+if ! command -v "$ENGINE" >/dev/null 2>&1; then
+  if [ "$ENGINE" = docker ]; then
+    host_error "docker is not installed. Install Docker Engine first (https://docs.docker.com/engine/install/) — this script does not install it."
+  fi
+  host_error "podman is not installed. Install Podman first (https://podman.io/docs/installation) — this script does not install it."
 fi
-ok "docker: ok"
+# The mode as the engine reports it; it must be the mode its socket was found as.
+if [ "$ENGINE" = docker ]; then
+  reported="$(dk info --format '{{json .SecurityOptions}}' 2>/dev/null)" ||
+    host_error "the Docker daemon at $ENGINE_SOCKET is not reachable (is it running, and can $(id -un) use it?)"
+  case "$reported" in *rootless*) reported=rootless ;; *) reported=rootful ;; esac
+else
+  reported="$(dk info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" ||
+    host_error "Podman is not answering $(id -un) (podman info failed; is its socket $ENGINE_SOCKET running?)"
+  case "$reported" in true) reported=rootless ;; *) reported=rootful ;; esac
+fi
+if [ "$reported" != "$MODE" ]; then
+  host_var=DOCKER_HOST; [ "$ENGINE" = docker ] || host_var=CONTAINER_HOST
+  host_error "$ENGINE_SOCKET is where a $MODE $ENGINE_LABEL engine would be, but the engine behind it reports that it runs $reported. Name the socket of the engine Quasar should use with $host_var=unix://…, then re-run."
+fi
+ok "engine: $ENGINE_LABEL, $MODE ($ENGINE_SOCKET)"
 
-distro=""
-if [ -r "$ROOT/etc/os-release" ]; then
-  distro="$(sed -n 's/^ID=//p' "$ROOT/etc/os-release" | tr -d '"')"
+# The engine profile, before anything is pulled: unsupported is refused by name.
+row="$(profile_row "$platform" "$ENGINE" "$MODE")"
+profile_status="${row%%|*}"; row="${row#*|}"
+profile_alternatives="${row%%|*}"; profile_reason="${row#*|}"
+profile_named="$ENGINE_LABEL $MODE on $(label_of platform "$platform")${os_pretty:+ ($os_pretty)}"
+case "$profile_status" in
+  supported) ok "engine profile: $profile_named: supported" ;;
+  experimental) warn "engine profile: $profile_named: experimental. $profile_reason Nothing is blocked." ;;
+  *) host_error "engine profile: $profile_named is unsupported, so this script does not install Quasar on it. $profile_reason Use instead: $(describe_alternatives "$platform" "$profile_alternatives"). Nothing was pulled or started." ;;
+esac
+
+# Host preparation (deploy/prepare-host.sh) is root's one step of a rootless install,
+# and on rootful Podman it is what brings the containers back at boot. This checks what
+# it leaves behind and, when something is missing, prints the command and stops.
+prep_missing=""
+prep_need() { prep_missing="${prep_missing:+$prep_missing; }$1"; }
+prep_homes="${home_root:-${QUASAR_HOME_ROOT:-/var/lib/quasar/homes}}"; prep_homes="${prep_homes%/}"
+prep_templates="${template_root:-${QUASAR_TEMPLATE_ROOT:-${prep_homes%/*}/templates}}"
+me="$(id -un)"
+if [ "$MODE" = rootless ]; then
+  FIX=0
+  [ -e "$ROOT/var/lib/systemd/linger/$me" ] || prep_need "lingering for $me"
+  grep -q "^$me:" "$ROOT/etc/subuid" 2>/dev/null || prep_need "a subordinate UID range for $me (/etc/subuid)"
+  [ -e "$ROOT/etc/udev/rules.d/70-quasar.rules" ] || prep_need "the device rules (/etc/udev/rules.d/70-quasar.rules)"
+  [ -e "$ROOT/etc/tmpfiles.d/quasar.conf" ] || prep_need "the agent's runtime directory (/etc/tmpfiles.d/quasar.conf)"
+  if [ "$ENGINE" = podman ]; then
+    my_home="$(awk -F: -v u="$me" '$1 == u { print $6; exit }' "$ROOT/etc/passwd" 2>/dev/null || true)"
+    link="${my_home:-$HOME}/.config/systemd/user/default.target.wants/podman-restart.service"
+    [ -e "$ROOT$link" ] || [ -L "$ROOT$link" ] || prep_need "Podman's restart at boot (podman-restart.service for $me)"
+  fi
+  [ -d "$ROOT$prep_homes" ] || prep_need "the homes root $prep_homes"
+  [ -d "$ROOT$prep_templates" ] || prep_need "the templates root $prep_templates"
+elif [ "$ENGINE" = podman ]; then
+  link=/etc/systemd/system/default.target.wants/podman-restart.service
+  [ -e "$ROOT$link" ] || [ -L "$ROOT$link" ] || prep_need "Podman's restart at boot (podman-restart.service)"
+fi
+if [ -n "$prep_missing" ]; then
+  # From the control plane this script came from; the quick start's copy is the same file.
+  prep_origin="https://<control-plane>"
+  if [ -n "${url:-}" ]; then prep_origin="${url#wss://}"; prep_origin="https://${prep_origin%%/*}"; fi
+  prep_curl="curl -fsSL -o prepare-host.sh $prep_origin/prepare-host.sh"
+  [ -z "${fp:-}" ] || prep_curl="curl -fsSL -k --pinnedpubkey 'sha256//…' -o prepare-host.sh $prep_origin/prepare-host.sh"
+  prep_run="sudo sh prepare-host.sh --mode $MODE --engine $ENGINE"
+  [ "$me" = quasar ] || [ "$MODE" = rootful ] || prep_run="$prep_run --user $me"
+  [ "$MODE" = rootful ] || prep_run="$prep_run --homes $prep_homes --templates $prep_templates"
+  prep_text="this machine is not prepared for $ENGINE_LABEL $MODE yet. Missing: $prep_missing.
+  Run host preparation once, as root (from an administrator's account$([ "$MODE" = rootful ] || echo '; this one never uses sudo')):
+    $prep_curl
+    $prep_run"
+  [ -z "${fp:-}" ] || prep_text="$prep_text
+  (the same -k --pinnedpubkey as the Add host command, which fetched this script)"
+  if [ "$DRY" = 1 ]; then
+    warn "$prep_text"
+  else
+    host_error "$prep_text
+  then run this command again$([ "$MODE" = rootful ] || echo " as $me"). Nothing was pulled or started."
+  fi
+elif [ "$MODE" = rootless ] || [ "$ENGINE" = podman ]; then
+  ok "host preparation: done"
 fi
 
 # GPU: sysfs is the kernel's own view; the same source the agent's readiness reads.
@@ -598,7 +876,14 @@ aa_load() { # aa_load <file>: load, retrying without the AppArmor 4 `userns` rul
   $SUDO apparmor_parser -r -W "$aa_tmp" 2>/dev/null
 }
 knob="$ROOT/sys/module/apparmor/parameters/enabled"
-if knob_is "$knob" Y; then
+if knob_is "$knob" Y && [ "$MODE" = rootless ]; then
+  # Loading policy is root's, and a rootless install never uses sudo: say so, and how.
+  if grep -q '^quasar-app ' "$ROOT/sys/kernel/security/apparmor/profiles" 2>/dev/null; then
+    ok "app-container AppArmor profile: already loaded"
+  else
+    warn "the quasar-app AppArmor profile is not loaded (or $me cannot read the loaded list), and a rootless install never loads it: app containers may run apparmor-unconfined. As root: sh enroll-host.sh --print-apparmor-profile > quasar-app && sudo apparmor_parser -r -W quasar-app && sudo install -m 0644 quasar-app /etc/apparmor.d/quasar-app"
+  fi
+elif knob_is "$knob" Y; then
   loaded=0
   if $SUDO cat "$ROOT/sys/kernel/security/apparmor/profiles" 2>/dev/null | grep -q '^quasar-app '; then
     loaded=1
@@ -630,7 +915,11 @@ fi
 
 if [ "$FIX_ONLY" = 1 ]; then
   say ""
-  ok "host prepared: every check passes. Nothing was pulled or started; add the host with the Dockge or Arcane stack."
+  if [ "$ENGINE" = podman ]; then
+    ok "host prepared: every check passes. Nothing was pulled or started; install the seed with its Quadlet unit (the quick start writes it)."
+  else
+    ok "host prepared: every check passes. Nothing was pulled or started; add the host with the Dockge or Arcane stack."
+  fi
   exit 0
 fi
 
@@ -644,7 +933,7 @@ if [ "$DRY" != 1 ]; then
   # A Compose-installed agent (the pre-RH06 enroll-host.sh stack) would hold the
   # same node name and health port: the two cannot share a machine.
   legacy="$(dk ps -a --filter label=com.docker.compose.service=quasar-node-agent \
-    --format '{{.Names}}|{{.Label "io.quasar.installation"}}' 2>/dev/null | sed -n 's/|$//p' | head -n 1 || true)"
+    --format "{{.Names}}|$(lbl io.quasar.installation)" 2>/dev/null | sed -n 's/|$//p' | head -n 1 || true)"
   if [ -n "$legacy" ]; then
     host_error "this machine still runs the Compose-installed node agent '$legacy'. Remove that stack first (for the earlier one-line install: docker compose --project-directory /opt/quasar-agent down; homes are kept), then re-run this command."
   fi
@@ -678,7 +967,7 @@ json_string() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p
 UNINSTALL_SAID=""
 uninstall_with() {
   said="$(dk run --rm --security-opt label=disable \
-    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$ENGINE_SOCKET:/var/run/docker.sock" \
     -v "$MACHINE_VOLUME:/var/lib/quasar-machine" \
     "$1" uninstall --purge --confirm "$2" 2>&1)" && return 0
   said="$(printf '%s\n' "$said" | sed '/^[[:space:]]*$/d' | tail -n 3 | tr '\n' ' ' | sed 's/[. ]*$//')"
@@ -706,18 +995,18 @@ remove_install() {
   done
   [ -n "$inst" ] || inst="$(machine_file machine.json | json_string installation_id)"
   if [ -z "$inst" ] && ! dk volume inspect "$MACHINE_VOLUME" >/dev/null 2>&1; then
-    inst="$(dk volume ls --filter label=io.quasar.installation --format '{{.Label "io.quasar.installation"}}' 2>/dev/null | sed '/^$/d' | head -n 1 || true)"
+    inst="$(dk volume ls --filter label=io.quasar.installation --format "$(lbl io.quasar.installation)" 2>/dev/null | sed '/^$/d' | head -n 1 || true)"
   fi
   # Anything of another installation stays, and so would block the fresh install: refuse
   # before removing anything, and name it. The final-dump volume a purge leaves is the
   # exception: it is a keepsake of the machine, never removed by a purge, reused by the
   # next one, and in no install's way, so it must not stop the machine being reused.
   stray="$( {
-    dk ps -a --filter label=io.quasar.installation --format '{{.Names}}|{{.Label "io.quasar.installation"}}|' 2>/dev/null
-    dk volume ls --filter label=io.quasar.installation --format '{{.Name}}|{{.Label "io.quasar.installation"}}|{{.Label "io.quasar.helper"}}' 2>/dev/null
+    dk ps -a --filter label=io.quasar.installation --format "{{.Names}}|$(lbl io.quasar.installation)|" 2>/dev/null
+    dk volume ls --filter label=io.quasar.installation --format "{{.Name}}|$(lbl io.quasar.installation)|$(lbl io.quasar.helper)" 2>/dev/null
   } | awk -F'|' -v id="$inst" '$2 != "" && $2 != id && $3 != "final-dump" { print $1 " (installation " $2 ")" }' | head -n 3 | tr '\n' ',' | sed 's/,$//; s/,/, /g' || true)"
   if [ -n "$stray" ]; then
-    host_error "this machine holds $stray, which belongs to another Quasar installation than this one${inst:+ ($inst)}. Nothing was removed. Remove what is not needed by hand (docker rm / docker volume rm), then run this again."
+    host_error "this machine holds $stray, which belongs to another Quasar installation than this one${inst:+ ($inst)}. Nothing was removed. Remove what is not needed by hand ($ENGINE rm / $ENGINE volume rm), then run this again."
   fi
   # The seed first: it is this script's own, and it would re-create a removed actor.
   if [ -n "$(state_of "$SEED")" ]; then
@@ -767,7 +1056,12 @@ if [ "$DRY" != 1 ]; then
     fresh=0
   fi
 fi
-machine_name="$(dk info --format '{{.Name}}' 2>/dev/null || hostname)"
+# Podman's info names no host; its machine name is the host's own.
+if [ "$ENGINE" = podman ]; then
+  machine_name="$(hostname 2>/dev/null || uname -n)"
+else
+  machine_name="$(dk info --format '{{.Name}}' 2>/dev/null || hostname)"
+fi
 shown_name="${node_name:-$machine_name}"
 
 if [ -n "$actors" ]; then
@@ -797,7 +1091,11 @@ else
   pull() { # pull <image> <what>
     if dk image inspect "$1" >/dev/null 2>&1; then ok "$2 image: present"; return 0; fi
     spin "pulling the $2 image"
-    dk pull -q "$1" >/dev/null 2>&1 || host_error "could not pull $1. Check that this machine can reach its registry (a plain-HTTP registry must be listed in the Docker daemon's insecure-registries)."
+    if [ "$ENGINE" = podman ]; then
+      dk pull -q "$1" >/dev/null 2>&1 || host_error "could not pull $1. Check that this machine can reach its registry (a plain-HTTP registry must be marked insecure in registries.conf: /etc/containers/registries.conf, or ~/.config/containers/registries.conf rootless)."
+    else
+      dk pull -q "$1" >/dev/null 2>&1 || host_error "could not pull $1. Check that this machine can reach its registry (a plain-HTTP registry must be listed in the Docker daemon's insecure-registries)."
+    fi
     ok "pulled the $2 image"
   }
   pull "$seed_image" seed
@@ -810,7 +1108,7 @@ else
     dk rm -f "$SEED" >/dev/null 2>&1 || host_error "could not replace the earlier seed '$SEED'; remove it by hand and re-run."
     dim "replaced the seed an earlier, unfinished run started"
   fi
-  # The string reaches the seed through a 0600 env file, never a docker argv.
+  # The string reaches the seed through a 0600 env file, never an engine argv.
   new_tmp; env_file="$NEW_TMP"
   {
     printf 'QUASAR_ROLE=gpu\n'
@@ -823,13 +1121,14 @@ else
     [ -z "$insecure_registries" ] || printf 'QUASAR_PLATFORM_INSECURE_REGISTRIES=%s\n' "$insecure_registries"
   } > "$env_file"
   run_ok=1
+  # The engine's socket, at the one path the seed accepts inside it (ADR 0007).
   dk run -d --name "$SEED" --restart unless-stopped --security-opt label=disable \
-    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$ENGINE_SOCKET:/var/run/docker.sock" \
     -v "$MACHINE_VOLUME:/var/lib/quasar-machine:ro" \
     --env-file "$env_file" "$seed_image" seed >/dev/null || run_ok=0
   # The engine has read it; the token stays on disk no longer than that.
   rm -f "$env_file"
-  [ "$run_ok" = 1 ] || host_error "the seed did not start: docker run failed (output above)"
+  [ "$run_ok" = 1 ] || host_error "the seed did not start: $ENGINE run failed (output above)"
   ok "started the seed ($SEED); it creates the recovery actor, which creates the node agent"
 fi
 
@@ -918,7 +1217,7 @@ while :; do
   if [ -n "$(state_of "$SEED")" ] && [ -z "$(state_of "$ACTOR")$(state_of "$AGENT")" ] || [ "$(state_of "$ACTOR")" = created ]; then
     seed_status="$(dk exec "$SEED" quasar-recovery status 2>/dev/null || true)"
     case "$seed_status" in
-      *'docker start quasar-recovery'*)
+      *' start quasar-recovery'*)
         # A seed replaced by this run between its predecessor's create and start
         # leaves the actor unstarted; starting it finishes that create (ADR 0007).
         if [ "$started_actor" = 0 ]; then
@@ -942,8 +1241,8 @@ done
 
 summary() {
   say ""
-  dim "services: docker ps --filter label=io.quasar.installation"
-  dim "logs:     docker logs $AGENT (the agent), docker logs $ACTOR (the recovery actor)"
+  dim "services: $ENGINE ps --filter label=io.quasar.installation"
+  dim "logs:     $ENGINE logs $AGENT (the agent), $ENGINE logs $ACTOR (the recovery actor)"
   dim "again:    running this command again changes nothing"
   say "Firewall was not touched. If sessions launch but video never arrives, the"
   say "host's readiness in Admin → Fleet names the UDP range and the exact rule."
@@ -978,18 +1277,18 @@ case "$verdict" in
   stale_identity)
     refused "this machine's node agent holds a node secret the control plane does not recognise, and no enrollment string to fall back on." ;;
   unconfigured)
-    fail_install "the node agent started without an enrollment string (boot-enrollment-unconfigured). Its log: docker logs $AGENT" ;;
+    fail_install "the node agent started without an enrollment string (boot-enrollment-unconfigured). Its log: $ENGINE logs $AGENT" ;;
   agent_exited)
-    fail_install "the node agent exited. Its log: docker logs $AGENT" ;;
+    fail_install "the node agent exited. Its log: $ENGINE logs $AGENT" ;;
   actor_failed)
     fail_install "the recovery actor could not install this machine: ${detail#*token=}" ;;
   actor_exited)
-    fail_install "the recovery actor exited. Its log: docker logs $ACTOR" ;;
+    fail_install "the recovery actor exited. Its log: $ENGINE logs $ACTOR" ;;
   seed_idle)
     fail_install "the seed refused to install: $detail" ;;
   seed_exited)
-    fail_install "the seed exited. Its log: docker logs $SEED" ;;
+    fail_install "the seed exited. Its log: $ENGINE logs $SEED" ;;
   *)
-    printf 'enroll-host: not enrolled after %ss — still connecting. Watch it with:\n  docker logs -f %s\nRunning this command again resumes the wait and changes nothing.\n' "$TAIL_SECS" "$AGENT" >&2
+    printf 'enroll-host: not enrolled after %ss — still connecting. Watch it with:\n  %s logs -f %s\nRunning this command again resumes the wait and changes nothing.\n' "$TAIL_SECS" "$ENGINE" "$AGENT" >&2
     exit 3 ;;
 esac

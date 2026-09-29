@@ -14,14 +14,59 @@
 #   5. re-running on an installed machine starts and changes nothing;
 #   6. a refused string leaves nothing behind on a machine this run installed, and an
 #      installed machine is reset only on request;
-#   7. the app-container AppArmor profile is loaded on an AppArmor host only.
+#   7. the app-container AppArmor profile is loaded on an AppArmor host only;
+#   8. the engine and its mode are found by their sockets and confirmed by the engine
+#      (Docker and Podman, rootful and rootless, with a mock podman beside the mock
+#      docker); a rootless run never calls sudo; an unsupported engine profile is
+#      refused by name before anything is pulled; a rootless host without host
+#      preparation gets the prepare-host.sh command and nothing else;
+#   9. the script's engine-profile table is testdata/engine-profiles/profiles.json.
 #
 # Run: bash deploy/test-enroll-host.sh
+#      bash deploy/test-enroll-host.sh --write-profiles   (regenerate the table in
+#      deploy/enroll-host.sh from testdata/engine-profiles/profiles.json)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="$root/deploy/enroll-host.sh"
 pins="$root/testdata/enroll-host/pins.json"
+profiles="$root/testdata/engine-profiles/profiles.json"
+
+# The table enroll-host.sh carries between its markers, generated from profiles.json.
+# The shell has no JSON reader, so the table is rendered here, where python3 is (the DX
+# layer needs it anyway), and the test below fails when the two drift.
+PROFILES_BEGIN='# BEGIN engine profiles (generated)'
+PROFILES_END='# END engine profiles (generated)'
+generate_profiles() {
+  python3 - "$profiles" <<'PY_GEN'
+import json, sys
+t = json.load(open(sys.argv[1]))
+def alts(a):
+    return ' '.join(x['engine'] + '/' + x['mode'] + ('@' + x['platform'] if 'platform' in x else '') for x in a)
+out = ["engine_profiles() {", "cat <<'PROFILES'"]
+out += ['platform|%s|%s' % (k, v['label']) for k, v in t['platforms'].items()]
+out += ['engine|%s|%s' % (k, v['label']) for k, v in t['engines'].items()]
+for r in t['profiles']:
+    out.append('profile|%s|%s|%s|%s|%s|%s' % (r['platform'], r['engine'], r['mode'], r['status'], alts(r['alternatives']), r['reason']))
+u = t['unknownEngine']
+out.append('unknown|%s|%s|%s' % (u['status'], alts(u['alternatives']), u['reason']))
+out += ["PROFILES", "}"]
+for line in out:
+    if '\n' in line or line.count('|') > 7:
+        sys.exit('profiles.json: a field carries a newline or a | the shell table cannot hold: ' + line)
+print('\n'.join(out))
+PY_GEN
+}
+embedded_profiles() { sed -n "/^$PROFILES_BEGIN\$/,/^$PROFILES_END\$/p" "$script" | sed '1d;$d'; }
+if [ "${1:-}" = --write-profiles ]; then
+  generated="$(generate_profiles)"
+  awk -v b="$PROFILES_BEGIN" -v e="$PROFILES_END" -v g="$generated" '
+    $0 == b { print; print g; skip = 1; next }
+    $0 == e { skip = 0 }
+    !skip { print }' "$script" > "$script.new" && cat "$script.new" > "$script" && rm -f "$script.new"
+  echo "rewrote the engine-profile table in deploy/enroll-host.sh"
+  exit 0
+fi
 tmp="$(mktemp -d /tmp/quasar-enroll-host.XXXXXX)"
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
@@ -56,6 +101,8 @@ mk_root() { # mk_root <dir> [vendor]
   : > "$r/dev/uinput"
   printf '15000\n' > "$r/proc/sys/user/max_user_namespaces"
   printf 'ID=ubuntu\nVERSION_ID="24.04"\n' > "$r/etc/os-release"
+  # The rootful Docker socket (a plain file: the script tests existence).
+  mkdir -p "$r/var/run"; : > "$r/var/run/docker.sock"
 }
 
 # The engine model: $MOCK_STATE/c/<name>/{state,command,labels,logs}, $MOCK_STATE/v/<name>/labels.
@@ -93,7 +140,17 @@ cat >"$tmp/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 set -uo pipefail
 S="${MOCK_STATE:?}"
+CLI="${0##*/}"
 printf '%s\n' "$*" >>"${MOCK_DOCKER_LOG:?}"
+printf '%s DOCKER_HOST=%s CONTAINER_HOST=%s\n' "$CLI" "${DOCKER_HOST:-}" "${CONTAINER_HOST:-}" >>"${MOCK_CLI_LOG:-/dev/null}"
+# A row's labels in a --format: Docker's rows have a Label method and a string .Labels;
+# Podman's have a .Labels map and no Label method. The wrong form fails as the real one does.
+case "$*" in
+  *'{{.Label "'*) [ "$CLI" = podman ] && { echo "Error: template: ps:1: can't evaluate field Label" >&2; exit 125; } ;;
+esac
+case "$*" in
+  *'{{index .Labels "'*) case "${1:-}" in ps|volume) [ "$CLI" = docker ] && { echo "template: :1: error calling index: cannot index slice/array with type string" >&2; exit 1; } ;; esac ;;
+esac
 mk() {
   local d="$S/c/$1"; mkdir -p "$d"
   printf '%s' "$2" >"$d/state"; printf '%s' "$3" >"$d/command"; : >"$d/labels"; : >"$d/logs"
@@ -105,7 +162,14 @@ label_value() { sed -n "s/^$2=//p" "$1/labels" | head -n 1; }
 last="${!#}"
 cmd="$1"; shift
 case "$cmd" in
-  info) [ "${1:-}" = --format ] && echo "${MOCK_HOSTNAME:-gpu-b}"; exit 0 ;;
+  info)
+    [ "${MOCK_INFO_OK:-1}" = 1 ] || { echo "Cannot connect to the engine" >&2; exit 1; }
+    case "${2:-}" in
+      *SecurityOptions*) if [ "${MOCK_ROOTLESS:-0}" = 1 ]; then echo '["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]'; else echo '["name=seccomp,profile=builtin","name=cgroupns"]'; fi ;;
+      *Rootless*) if [ "${MOCK_ROOTLESS:-0}" = 1 ]; then echo true; else echo false; fi ;;
+      *) echo "${MOCK_HOSTNAME:-gpu-b}" ;;
+    esac
+    exit 0 ;;
   ps)
     fmt='{{.Names}}'; filters=()
     while [ $# -gt 0 ]; do
@@ -123,6 +187,7 @@ case "$cmd" in
       [ "$keep" = 1 ] || continue
       out="${fmt//\{\{.Names\}\}/${d##*/}}"
       out="${out//\{\{.Label \"io.quasar.installation\"\}\}/$(label_value "$d" io.quasar.installation)}"
+      out="${out//\{\{index .Labels \"io.quasar.installation\"\}\}/$(label_value "$d" io.quasar.installation)}"
       out="${out//\{\{.Command\}\}/\"$(cat "$d/command")\"}"
       printf '%s\n' "$out"
     done
@@ -145,6 +210,7 @@ case "$cmd" in
       ls)
         want=""; fmt=""
         for a in "$@"; do case "$a" in label=*) want="${a#label=}" ;; *'.Label'*) fmt="$a" ;; esac; done
+        fmt="${fmt//\{\{index .Labels /\{\{.Label }"
         for d in "$S"/v/*; do
           [ -d "$d" ] && { [ -z "$want" ] || has_label "$d" "$want"; } || continue
           if [ -n "$fmt" ]; then
@@ -214,11 +280,14 @@ case "$cmd" in
 esac
 MOCK
 chmod +x "$tmp/bin/docker"
+ln -s docker "$tmp/bin/podman"
+printf '#!/bin/sh\necho "${MOCK_HOSTNAME:-gpu-b}"\n' > "$tmp/bin/hostname"; chmod +x "$tmp/bin/hostname"
 # sudo shim: the tests never run as root. It refuses to run without -n (the
 # installer must never let sudo prompt from inside a pipe); MOCK_SUDO_PASSWORD=1
 # makes it behave like a host whose sudo wants a password.
 cat >"$tmp/bin/sudo" <<'MOCK'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_SUDO_LOG:-/dev/null}"
 [ "${1:-}" = "-n" ] || { echo "mock sudo: invoked without -n (would prompt)" >&2; exit 97; }
 shift
 [ "${MOCK_SUDO_PASSWORD:-0}" = 1 ] && { echo "sudo: a password is required" >&2; exit 1; }
@@ -261,9 +330,14 @@ chmod +x "$tmp/bin/curl"
 run_installer() {
   local label="$1"; shift
   local log="$tmp/$label.docker.log" aalog="$tmp/$label.aa.log" fixlog="$tmp/$label.fix.log"
-  : > "$log"; : > "$aalog"; : > "$fixlog"
+  local clilog="$tmp/$label.cli.log" sudolog="$tmp/$label.sudo.log"
+  : > "$log"; : > "$aalog"; : > "$fixlog"; : > "$clilog"; : > "$sudolog"
   set +e
-  env PATH="$tmp/bin:$PATH" MOCK_STATE="$state" MOCK_DOCKER_LOG="$log" MOCK_AA_LOG="$aalog" MOCK_FIX_LOG="$fixlog" \
+  # The workstation's own engine never leaks in: no DOCKER_HOST, and a runtime directory
+  # holding only the sockets a test put there.
+  env -u DOCKER_HOST -u CONTAINER_HOST -u QUASAR_ENGINE XDG_RUNTIME_DIR="${XDG:-$tmp/xdg-none}" \
+      PATH="$tmp/bin:$PATH" MOCK_STATE="$state" MOCK_DOCKER_LOG="$log" MOCK_AA_LOG="$aalog" MOCK_FIX_LOG="$fixlog" \
+      MOCK_CLI_LOG="$clilog" MOCK_SUDO_LOG="$sudolog" \
       QUASAR_ENROLL_ROOT="${ROOT_DIR:-$tmp/root}" QUASAR_ENROLL_TAIL_SECS=1 QUASAR_ENROLL_FIX="${FIX:-0}" \
       QUASAR_ENROLL_STYLE="${STYLE:-plain}" "$@" sh ${EXTRA_ARGS:-} < "${SCRIPT:-$served}" > "$tmp/$label.out" 2>&1
   RC=$?
@@ -272,6 +346,8 @@ run_installer() {
   DOCKER_LOG="$(cat "$log")"
   AA_LOG="$(cat "$aalog")"
   FIX_LOG="$(cat "$fixlog")"
+  CLI_LOG="$(cat "$clilog")"
+  SUDO_LOG="$(cat "$sudolog")"
 }
 ENROLLED_LOG='2026-09-25T10:00:00Z INFO quasar_node_agent::agent: enrolled as host 3f2c…; node_secret saved to /var/lib/quasar-agent/node-secret'
 OK_ENV=(QUASAR_ENROLLMENT="$WSS_BLOB" MOCK_AGENT_LOG="$ENROLLED_LOG")
@@ -841,7 +917,7 @@ fi
 esc="$(printf '\033')"
 mk_root "$tmp/root"; reset_engine
 STYLE="tty" run_installer tty-ok "${OK_ENV[@]}" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-if [ "$RC" -eq 0 ] && grep -q "${esc}\[32m✔${esc}\[0m docker: ok" <<<"$OUT" \
+if [ "$RC" -eq 0 ] && grep -q "${esc}\[32m✔${esc}\[0m engine: Docker, rootful (/var/run/docker.sock)" <<<"$OUT" \
    && grep -q "✔${esc}\[0m enrolled: this host is now 'gpu-b'" <<<"$OUT" \
    && grep -q "${esc}\[1m==> Host checks" <<<"$OUT"; then
   pass "tty: bold steps, green ticks"
@@ -927,6 +1003,312 @@ if grep -q 'QUASAR_RESET_IDENTITY' <<<"$help_out" && grep -q 'QUASAR_ENROLL_FIX'
   pass "--help carries the knobs and the --pinnedpubkey/-k pairing, and stops at its marker"
 else
   fail "help text" "$(tail -5 <<<"$help_out")"
+fi
+
+# ── 9. engines and modes (RH-07, #406) ───────────────────────────────────────
+ME="$(id -un)"
+xdg="$tmp/xdg"
+mk_xdg() { # mk_xdg [docker] [podman]: a runtime directory holding those rootless sockets
+  rm -rf "$xdg"; mkdir -p "$xdg"
+  local s; for s in "$@"; do
+    case "$s" in
+      docker) : > "$xdg/docker.sock" ;;
+      podman) mkdir -p "$xdg/podman"; : > "$xdg/podman/podman.sock" ;;
+    esac
+  done
+}
+os_release() { printf '%s\n' "$@" > "$tmp/root/etc/os-release"; }
+FEDORA=(ID=fedora VERSION_ID=43 'PRETTY_NAME="Fedora Linux 43 (Workstation Edition)"')
+# What prepare-host.sh leaves on a rootless host, for the account running the tests.
+prepared() { # prepared [podman]
+  local r="$tmp/root"
+  mkdir -p "$r/var/lib/systemd/linger" "$r/etc/udev/rules.d" "$r/etc/tmpfiles.d" "$r/var/lib/quasar/homes" "$r/var/lib/quasar/templates"
+  : > "$r/var/lib/systemd/linger/$ME"
+  printf '%s:524288:65536\n' "$ME" > "$r/etc/subuid"
+  : > "$r/etc/udev/rules.d/70-quasar.rules"
+  : > "$r/etc/tmpfiles.d/quasar.conf"
+  printf '%s:x:%s:%s:Quasar:/home/%s:/bin/bash\n' "$ME" "$(id -u)" "$(id -g)" "$ME" > "$r/etc/passwd"
+  if [ "${1:-}" = podman ]; then
+    mkdir -p "$r/home/$ME/.config/systemd/user/default.target.wants"
+    ln -sf /usr/lib/systemd/user/podman-restart.service "$r/home/$ME/.config/systemd/user/default.target.wants/podman-restart.service"
+  fi
+}
+rootful_podman_root() { # the rootful Podman socket and podman-restart, no Docker socket
+  rm -f "$tmp/root/var/run/docker.sock"
+  mkdir -p "$tmp/root/run/podman" "$tmp/root/etc/systemd/system/default.target.wants"
+  : > "$tmp/root/run/podman/podman.sock"
+  ln -sf /usr/lib/systemd/system/podman-restart.service "$tmp/root/etc/systemd/system/default.target.wants/podman-restart.service"
+}
+only_cli() { ! grep -qv "^$1 " <<<"$CLI_LOG" && [ -n "$CLI_LOG" ]; }
+seed_run() { grep '^run -d --name quasar-seed' <<<"$DOCKER_LOG" || true; }
+
+# Rootless Podman on Fedora: found as the user, never through sudo, the seed given the
+# user's socket, and the profile is experimental (a warning, nothing blocked).
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared podman; mk_xdg podman; reset_engine
+XDG="$xdg" run_installer podman-rootless "${OK_ENV[@]}" MOCK_ROOTLESS=1
+if [ "$RC" -eq 0 ] && [ -z "$SUDO_LOG" ] && only_cli podman \
+   && grep -q -- "-v $xdg/podman/podman.sock:/var/run/docker.sock -v quasar-machine:/var/lib/quasar-machine:ro --env-file " <<<"$(seed_run)" \
+   && grep -q "engine: Podman, rootless ($xdg/podman/podman.sock)" <<<"$OUT" \
+   && grep -q 'engine profile: Podman rootless on Fedora (Fedora Linux 43 (Workstation Edition)): experimental' <<<"$OUT" \
+   && grep -q 'host preparation: done' <<<"$OUT" && [ "$(cat "$state/seed.env.mode")" = 600 ] \
+   && ! grep -q 'CONTAINER_HOST=[^ ]' <<<"$CLI_LOG" && grep -q 'podman logs quasar-node-agent' <<<"$OUT" \
+   && grep -q "enrolled: this host is now 'gpu-b'" <<<"$OUT"; then
+  pass "rootless Podman: its user socket, the podman CLI only, never sudo; the seed gets that socket at /var/run/docker.sock and a 0600 env file; experimental is a warning"
+else
+  fail "rootless podman" "rc=$RC sudo=[$SUDO_LOG] cli=[$(sort -u <<<"$CLI_LOG" | head -3)] run=[$(seed_run)] out=$(tail -6 <<<"$OUT")"
+fi
+
+# Rootless Docker: DOCKER_HOST points the CLI at the user's daemon, never sudo.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared; mk_xdg docker; reset_engine
+XDG="$xdg" run_installer docker-rootless "${OK_ENV[@]}" MOCK_ROOTLESS=1
+if [ "$RC" -eq 0 ] && [ -z "$SUDO_LOG" ] && only_cli docker \
+   && ! grep -qv "DOCKER_HOST=unix://$xdg/docker.sock " <<<"$CLI_LOG" \
+   && grep -q -- "-v $xdg/docker.sock:/var/run/docker.sock " <<<"$(seed_run)" \
+   && grep -q 'engine: Docker, rootless' <<<"$OUT"; then
+  pass "rootless Docker: every docker call carries DOCKER_HOST=unix://\$XDG_RUNTIME_DIR/docker.sock, never sudo; the seed gets that socket"
+else
+  fail "rootless docker" "rc=$RC sudo=[$SUDO_LOG] cli=[$(sort -u <<<"$CLI_LOG" | head -3)] run=[$(seed_run)] out=$(tail -5 <<<"$OUT")"
+fi
+
+# Rootful Podman: its system socket through sudo -n, the podman CLI.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; reset_engine
+run_installer podman-rootful "${OK_ENV[@]}" MOCK_ROOTLESS=0
+if [ "$RC" -eq 0 ] && grep -q '^-n podman ' <<<"$SUDO_LOG" && only_cli podman \
+   && grep -q -- "-v /run/podman/podman.sock:/var/run/docker.sock " <<<"$(seed_run)" \
+   && grep -q 'engine: Podman, rootful (/run/podman/podman.sock)' <<<"$OUT"; then
+  pass "rootful Podman: /run/podman/podman.sock through sudo -n; the seed gets that socket"
+else
+  fail "rootful podman" "rc=$RC sudo=[$(head -2 <<<"$SUDO_LOG")] run=[$(seed_run)] out=$(tail -5 <<<"$OUT")"
+fi
+
+# Rootful Docker is the path every earlier section ran; said explicitly here.
+mk_root "$tmp/root"; reset_engine
+run_installer docker-rootful "${OK_ENV[@]}"
+if [ "$RC" -eq 0 ] && grep -q '^-n docker ' <<<"$SUDO_LOG" && only_cli docker \
+   && grep -q -- "-v /var/run/docker.sock:/var/run/docker.sock " <<<"$(seed_run)" \
+   && grep -q 'engine profile: Docker rootful on Ubuntu 24.04: supported' <<<"$OUT" && ! grep -q 'host preparation' <<<"$OUT"; then
+  pass "rootful Docker: /var/run/docker.sock through sudo -n, supported, and no host-preparation check (D4: today's checks)"
+else
+  fail "rootful docker" "rc=$RC out=$(tail -5 <<<"$OUT")"
+fi
+
+# Both engines: the operator says which.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared podman; mk_xdg docker podman; reset_engine
+XDG="$xdg" run_installer both-rootless "${OK_ENV[@]}" MOCK_ROOTLESS=1
+if [ "$RC" -eq 2 ] && grep -q 'both Docker' <<<"$OUT" && grep -q 'QUASAR_ENGINE=podman' <<<"$OUT" && [ -z "$DOCKER_LOG" ] && [ -z "$SUDO_LOG" ]; then
+  pass "both rootless engines: refused until QUASAR_ENGINE says which; no engine touched"
+else
+  fail "both rootless" "rc=$RC docker=[$DOCKER_LOG] out=$(tail -3 <<<"$OUT")"
+fi
+XDG="$xdg" run_installer both-rootless-chosen "${OK_ENV[@]}" MOCK_ROOTLESS=1 QUASAR_ENGINE=podman
+if [ "$RC" -eq 0 ] && only_cli podman && grep -q -- "-v $xdg/podman/podman.sock:" <<<"$(seed_run)"; then
+  pass "both rootless engines with QUASAR_ENGINE=podman: Podman's socket"
+else
+  fail "both rootless chosen" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; : > "$tmp/root/var/run/docker.sock"; reset_engine
+run_installer both-rootful "${OK_ENV[@]}"
+if [ "$RC" -eq 2 ] && grep -q 'both Docker (/var/run/docker.sock) and Podman (/run/podman/podman.sock) running rootful' <<<"$OUT" && [ -z "$DOCKER_LOG" ]; then
+  pass "both rootful engines: refused until QUASAR_ENGINE says which"
+else
+  fail "both rootful" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+rm -f "$tmp/root/var/run/docker.sock"; ln -s ../../run/podman/podman.sock "$tmp/root/var/run/docker.sock"; reset_engine
+run_installer podman-docker "${OK_ENV[@]}"
+if [ "$RC" -eq 0 ] && only_cli podman && grep -q 'engine: Podman, rootful' <<<"$OUT"; then
+  pass "podman-docker's docker.sock is Podman's own socket: one engine, Podman"
+else
+  fail "podman-docker link" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+
+# Rootless first for a user; only then the rootful sockets through sudo.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared podman; mk_xdg podman; reset_engine
+XDG="$xdg" run_installer rootless-first "${OK_ENV[@]}" MOCK_ROOTLESS=1
+if [ "$RC" -eq 0 ] && [ -z "$SUDO_LOG" ] && only_cli podman; then
+  pass "a user with a rootless engine and a rootful Docker socket on the machine: the rootless engine, never sudo"
+else
+  fail "rootless first" "rc=$RC sudo=[$SUDO_LOG]"
+fi
+XDG="$xdg" run_installer rootless-first-docker "${OK_ENV[@]}" QUASAR_ENGINE=docker
+if [ "$RC" -eq 0 ] && only_cli docker && grep -q '^-n docker ' <<<"$SUDO_LOG" && grep -q 'engine: Docker, rootful' <<<"$OUT"; then
+  pass "QUASAR_ENGINE=docker past a rootless Podman: the rootful Docker socket, through sudo"
+else
+  fail "rootless first, docker chosen" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+
+# The engine's report decides the mode, and disagreeing with the socket stops.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared; mk_xdg docker; reset_engine
+XDG="$xdg" run_installer mode-mismatch "${OK_ENV[@]}" MOCK_ROOTLESS=0
+if [ "$RC" -eq 1 ] && grep -q 'reports that it runs rootful' <<<"$OUT" && nothing_started && [ -z "$SUDO_LOG" ]; then
+  pass "a rootless socket whose engine reports rootful: refused, nothing started"
+else
+  fail "mode mismatch" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+
+# DOCKER_HOST names the socket; only a local one will do.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared; mk_xdg; reset_engine
+mkdir -p "$tmp/other-run"; : > "$tmp/other-run/docker.sock"
+run_installer docker-host "${OK_ENV[@]}" DOCKER_HOST="unix://$tmp/other-run/docker.sock"
+if [ "$RC" -eq 0 ] && ! grep -qv "DOCKER_HOST=unix://$tmp/other-run/docker.sock " <<<"$CLI_LOG" \
+   && grep -q -- "-v $tmp/other-run/docker.sock:/var/run/docker.sock " <<<"$(seed_run)"; then
+  pass "DOCKER_HOST=unix://…: that socket for the CLI and for the seed"
+else
+  fail "docker host" "rc=$RC cli=[$(head -2 <<<"$CLI_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+run_installer docker-host-tcp "${OK_ENV[@]}" DOCKER_HOST=tcp://10.0.0.1:2375
+if [ "$RC" -eq 2 ] && grep -q 'not a local unix:// socket' <<<"$OUT" && [ -z "$DOCKER_LOG" ]; then
+  pass "DOCKER_HOST=tcp://…: refused, the seed needs a socket on this machine"
+else
+  fail "docker host tcp" "rc=$RC out=$(tail -2 <<<"$OUT")"
+fi
+mk_root "$tmp/root"; rm -f "$tmp/root/var/run/docker.sock"; reset_engine
+run_installer no-engine "${OK_ENV[@]}"
+if [ "$RC" -eq 1 ] && grep -q 'no container engine found' <<<"$OUT" && grep -q 'podman.socket' <<<"$OUT" && [ -z "$DOCKER_LOG" ]; then
+  pass "no engine socket anywhere: named, with where it looked and Podman's socket units"
+else
+  fail "no engine" "rc=$RC out=$(tail -2 <<<"$OUT")"
+fi
+
+# Missing host preparation on a rootless engine: the command, and nothing else.
+prep_user=""; [ "$ME" = quasar ] || prep_user=" --user $ME"
+NOFP_BLOB="qenr1..$(b64url 'wss://cp.example:8443/').$TOKEN"
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; mk_xdg podman; reset_engine
+XDG="$xdg" run_installer unprepared QUASAR_ENROLLMENT="$NOFP_BLOB" MOCK_ROOTLESS=1 FIX=1
+if [ "$RC" -eq 1 ] && grep -qxF '    curl -fsSL -o prepare-host.sh https://cp.example:8443/prepare-host.sh' <<<"$OUT" \
+   && grep -qxF "    sudo sh prepare-host.sh --mode rootless --engine podman$prep_user --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates" <<<"$OUT" \
+   && grep -q "lingering for $ME" <<<"$OUT" && grep -q '70-quasar.rules' <<<"$OUT" && grep -q 'tmpfiles.d/quasar.conf' <<<"$OUT" \
+   && grep -q 'podman-restart.service' <<<"$OUT" && grep -q '/etc/subuid' <<<"$OUT" \
+   && nothing_started && ! grep -q '^pull' <<<"$DOCKER_LOG" && [ -z "$SUDO_LOG" ] && [ -z "$FIX_LOG" ]; then
+  pass "rootless without host preparation: names what is missing, prints the curl and sudo sh prepare-host.sh lines for this control plane, and stops (QUASAR_ENROLL_FIX=1 applies nothing)"
+else
+  fail "unprepared" "rc=$RC sudo=[$SUDO_LOG] out=$(tail -8 <<<"$OUT")"
+fi
+XDG="$xdg" run_installer unprepared-pinned "${OK_ENV[@]}" MOCK_ROOTLESS=1 QUASAR_HOME_ROOT=/srv/q/homes
+if [ "$RC" -eq 1 ] && grep -qF "curl -fsSL -k --pinnedpubkey 'sha256//…' -o prepare-host.sh https://cp.example:8443/prepare-host.sh" <<<"$OUT" \
+   && grep -q -- '--homes /srv/q/homes --templates /srv/q/templates' <<<"$OUT" && nothing_started; then
+  pass "a pinned control plane: the prep curl carries -k --pinnedpubkey like Add host's; the homes follow QUASAR_HOME_ROOT"
+else
+  fail "unprepared pinned" "rc=$RC out=$(tail -6 <<<"$OUT")"
+fi
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; rm "$tmp/root/etc/systemd/system/default.target.wants/podman-restart.service"; reset_engine
+run_installer unprepared-rootful-podman "${OK_ENV[@]}"
+if [ "$RC" -eq 1 ] && grep -qxF '    sudo sh prepare-host.sh --mode rootful --engine podman' <<<"$OUT" && nothing_started; then
+  pass "rootful Podman without podman-restart enabled: the rootful prep command, nothing started"
+else
+  fail "unprepared rootful podman" "rc=$RC out=$(tail -4 <<<"$OUT")"
+fi
+
+# Rootless: a failing check's fix is printed as root's, never applied; AppArmor warns.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared podman; mk_xdg podman; reset_engine
+printf '1\n' > "$tmp/root/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+XDG="$xdg" run_installer rootless-fix "${OK_ENV[@]}" MOCK_ROOTLESS=1 FIX=1
+if [ "$RC" -eq 1 ] && grep -q 'Fix it as root' <<<"$OUT" && grep -q 'sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' <<<"$OUT" \
+   && [ -z "$FIX_LOG" ] && [ -z "$SUDO_LOG" ] && nothing_started; then
+  pass "rootless with a failing host check: the fix is printed for root, never applied, even with QUASAR_ENROLL_FIX=1"
+else
+  fail "rootless fix" "rc=$RC fix=[$FIX_LOG] sudo=[$SUDO_LOG] out=$(tail -4 <<<"$OUT")"
+fi
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared podman; mk_xdg podman; reset_engine
+mkdir -p "$tmp/root/sys/module/apparmor/parameters"; printf 'Y\n' > "$tmp/root/sys/module/apparmor/parameters/enabled"
+XDG="$xdg" run_installer rootless-apparmor "${OK_ENV[@]}" MOCK_ROOTLESS=1
+if [ "$RC" -eq 0 ] && [ -z "$AA_LOG" ] && [ -z "$SUDO_LOG" ] && grep -q 'WARN: the quasar-app AppArmor profile is not loaded' <<<"$OUT"; then
+  pass "rootless on an AppArmor host: the profile load is a warning with the root command; apparmor_parser never runs"
+else
+  fail "rootless apparmor" "rc=$RC aa=[$AA_LOG] out=$(grep -i apparmor <<<"$OUT" | head -2)"
+fi
+
+# Re-runs on Podman: an installed machine is left alone, a leftover seed replaced.
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; prepared podman; mk_xdg podman
+installed_machine 'INFO quasar_node_agent::agent: reconnected as host 3f2c…'
+before="$(find "$state" -type f | sort | xargs cat | md5sum)"
+XDG="$xdg" run_installer podman-rerun QUASAR_ENROLLMENT="$WSS_BLOB" MOCK_ROOTLESS=1
+if [ "$RC" -eq 0 ] && nothing_started && [ "$(find "$state" -type f | sort | xargs cat | md5sum)" = "$before" ] \
+   && grep -q 'Already installed' <<<"$OUT" && [ -z "$SUDO_LOG" ]; then
+  pass "rootless Podman re-run on an installed machine: nothing pulled, started, removed or changed"
+else
+  fail "podman rerun" "rc=$RC docker=[$(grep -E '^(run|pull|start|rm)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+reset_engine
+container quasar-seed exited "/usr/local/bin/quasar-recovery seed"
+XDG="$xdg" run_installer podman-resume-seed "${OK_ENV[@]}" MOCK_ROOTLESS=1
+if [ "$RC" -eq 0 ] && [ "$(grep -n '^rm -f quasar-seed' <<<"$DOCKER_LOG" | cut -d: -f1)" -lt "$(grep -n '^run -d' <<<"$DOCKER_LOG" | cut -d: -f1)" ] \
+   && grep -q 'replaced the seed' <<<"$OUT" && grep -q 'enrolled' <<<"$OUT"; then
+  pass "rootless Podman after an interrupted run: the leftover seed is replaced and the run completes"
+else
+  fail "podman resume seed" "rc=$RC docker=[$(grep -E '^(rm|run)' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+installed_machine 'ERROR control plane rejected register: auth_failed: authentication failed'
+XDG="$xdg" run_installer podman-reset "${OK_ENV[@]}" QUASAR_RESET_IDENTITY=1 MOCK_ROOTLESS=1
+if [ "$RC" -eq 0 ] && grep -q "^run --rm --security-opt label=disable -v $xdg/podman/podman.sock:/var/run/docker.sock .* uninstall --purge --confirm inst-0\$" <<<"$DOCKER_LOG" \
+   && grep -q 'enrolled' <<<"$OUT" && [ -z "$SUDO_LOG" ]; then
+  pass "rootless Podman reset: the actor's uninstall is given the engine's own socket"
+else
+  fail "podman reset" "rc=$RC docker=[$(grep ' uninstall ' <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+
+# Every platform sample in the table reads as its platform, as the agent reads it.
+while IFS=$'\t' read -r want_platform want_label sample_name os_lines; do
+  mk_root "$tmp/root"; prepared podman; mk_xdg podman; reset_engine
+  printf '%b' "$os_lines" > "$tmp/root/etc/os-release"
+  XDG="$xdg" run_installer "sample-$want_platform" "${OK_ENV[@]}" MOCK_ROOTLESS=1 QUASAR_ENROLL_DRY_RUN=1
+  if grep -q "engine profile: Podman rootless on $want_label" <<<"$OUT"; then
+    pass "os-release of $sample_name reads as $want_label"
+  else
+    fail "platform of $sample_name" "want $want_label: $(grep 'engine profile' <<<"$OUT")"
+  fi
+done < <(python3 - "$profiles" <<'PY_SAMPLES'
+import json, sys
+t = json.load(open(sys.argv[1]))
+for pid, p in t['platforms'].items():
+    for s in p['samples']:
+        print('\t'.join([pid, p['label'], s['name'], '\\n'.join(s['osRelease']) + '\\n']))
+PY_SAMPLES
+)
+
+# Every unsupported row is refused by name, with its alternatives, before any pull.
+while IFS=$'\t' read -r u_platform u_label u_engine u_engine_label u_mode u_alts os_lines; do
+  mk_root "$tmp/root"; reset_engine; mk_xdg
+  printf '%b' "$os_lines" > "$tmp/root/etc/os-release"
+  rootless=0
+  case "$u_engine/$u_mode" in
+    */rootless) mk_xdg "$u_engine"; prepared "$u_engine"; rootless=1 ;;
+    podman/rootful) rootful_podman_root ;;
+  esac
+  XDG="$xdg" run_installer "unsupported-$u_platform-$u_engine-$u_mode" "${OK_ENV[@]}" MOCK_ROOTLESS="$rootless"
+  alts_ok=1
+  IFS=';' read -ra alt_list <<<"$u_alts"
+  for a in "${alt_list[@]}"; do grep -qF "$a" <<<"$OUT" || alts_ok=0; done
+  if [ "$RC" -eq 1 ] && grep -qF "engine profile: $u_engine_label $u_mode on $u_label" <<<"$OUT" && grep -q 'is unsupported' <<<"$OUT" \
+     && [ "$alts_ok" = 1 ] && ! grep -qE '^(pull|run|start|rm) ' <<<"$DOCKER_LOG" && ! grep -qv '^info ' <<<"$DOCKER_LOG" \
+     && { [ "$rootless" = 0 ] || [ -z "$SUDO_LOG" ]; }; then
+    pass "unsupported: $u_engine_label $u_mode on $u_label is refused by name with its alternatives; the engine was only asked for its info"
+  else
+    fail "unsupported $u_platform/$u_engine/$u_mode" "rc=$RC docker=[$DOCKER_LOG] out=$(tail -2 <<<"$OUT")"
+  fi
+done < <(python3 - "$profiles" <<'PY_ROWS'
+import json, sys
+t = json.load(open(sys.argv[1]))
+P, E = t['platforms'], t['engines']
+def status(pl, e, m):
+    return next(r['status'] for r in t['profiles'] if (r['platform'], r['engine'], r['mode']) == (pl, e, m))
+for r in t['profiles']:
+    if r['status'] != 'unsupported':
+        continue
+    alts = []
+    for a in r['alternatives']:
+        to = a.get('platform', r['platform'])
+        where = 'on this machine' if to == r['platform'] else 'on ' + P[to]['label']
+        alts.append('%s %s %s (%s)' % (E[a['engine']]['label'], a['mode'], where, status(to, a['engine'], a['mode'])))
+    os_lines = '\\n'.join(P[r['platform']]['samples'][0]['osRelease']) + '\\n'
+    print('\t'.join([r['platform'], P[r['platform']]['label'], r['engine'], E[r['engine']]['label'], r['mode'], ';'.join(alts), os_lines]))
+PY_ROWS
+)
+
+# ── 10. the engine-profile table is profiles.json ────────────────────────────
+if diff <(embedded_profiles) <(generate_profiles) >/dev/null; then
+  pass "deploy/enroll-host.sh's engine-profile table is testdata/engine-profiles/profiles.json, row for row"
+else
+  fail "engine-profile table drift" "run: bash deploy/test-enroll-host.sh --write-profiles — $(diff <(embedded_profiles) <(generate_profiles) | head -6)"
 fi
 
 # Every run above must have kept the token off stdout/stderr.
