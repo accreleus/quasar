@@ -274,6 +274,20 @@ pub struct HostDevices {
     /// on, since sound may appear after the install. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sound: bool,
+    /// The host's `/dev/i2c-<n>` bus numbers (RH-07 #407), for console mode's DDC on a
+    /// rootless engine, where the agent cannot `mknod` them: each is passed as a device.
+    /// Bus numbers can change across reboots and the engine refuses to create (or start) a
+    /// container naming a node the host lacks, so the list is read again whenever console
+    /// mode is turned on and at every recovery-actor start while it is on
+    /// ([`crate::console`]). Sorted, without duplicates; written only when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub i2c: Vec<u32>,
+    /// The host runs logind: `/run/systemd/seats` and `/run/systemd/sessions` exist (RH-07
+    /// #407). Console mode binds them read-only so the agent can name what holds the
+    /// display (the login screen, someone's desktop session). Read with `i2c`; written
+    /// only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logind: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -289,6 +303,8 @@ impl Default for HostDevices {
             fuse: false,
             host_sysfs: false,
             sound: false,
+            i2c: Vec::new(),
+            logind: false,
             unknown: Unknown::new(),
         }
     }
@@ -781,11 +797,6 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
             ));
         }
     }
-    if inputs.console && inputs.devices.engine_rootless {
-        return Err(RenderError::Invalid(
-            "console mode needs a rootful engine: console mode on a rootless engine is #407".into(),
-        ));
-    }
     if inputs.console && !inputs.devices.dri {
         return Err(RenderError::Invalid(
             "console mode needs the host's /dev/dri, which this host lacks".into(),
@@ -1057,13 +1068,24 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
     );
 }
 
-/// Console mode (RH-07 #395): what `deploy/overlays/docker-compose.console.yml` grants, on
-/// a rootful engine only (`validate`). Each difference from the overlay is listed in
+/// Console mode (RH-07 #395, #407): what `deploy/overlays/docker-compose.console.yml`
+/// grants, shaped for the engine mode. Each rootful difference from the overlay is listed in
 /// `tests/recipe_compose_parity.rs`.
+///
+/// Taking a free display needs no capability: the first opener of a card node with no
+/// DRM master becomes master, and may set master again on that fd (Linux >= 5.8,
+/// `drm_auth.c`). So a rootless engine, where `SYS_ADMIN` never reaches the initial user
+/// namespace the kernel checks, gets no capability and no device-cgroup rules (it refuses
+/// them): device access is the host's, which host preparation grants the Quasar account.
 fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
-    // seatd's drmSetMaster on weston's behalf (session/console.rs): today's display-control
-    // capability, which #407 replaces.
-    spec.cap_add.push("SYS_ADMIN".into());
+    let rootless = inputs.devices.engine_rootless;
+    if !rootless {
+        // seatd's drmSetMaster on weston's behalf (session/console.rs).
+        // TODO(#407, owner decision 1): drop SYS_ADMIN here too once the agent's display
+        // preflight has landed and hardware has proven the rootful recipe path without it
+        // (a free display needs none, the spike showed); the rootful goldens change then.
+        spec.cap_add.push("SYS_ADMIN".into());
+    }
     // Sound only on a host that has it: console mode runs quiet without, and the agent's
     // console_audio check says why.
     if inputs.devices.sound {
@@ -1071,15 +1093,43 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
         // Docker forbids a bind into the container's own /proc; sink discovery reads this.
         spec.binds
             .push(bind("/proc/asound", "/host-proc/asound", true));
-        spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
-        // ALSA nodes arrive with the bind, so no `m`.
-        spec.device_cgroup_rules.push("c 116:* rw".to_string());
+        if !rootless {
+            // ALSA nodes arrive with the bind, so no `m`.
+            spec.device_cgroup_rules.push("c 116:* rw".to_string());
+        }
     }
-    // The agent mknods /dev/i2c-N for DDC (ddc.rs). DRM is already a mapped device
-    // (`/dev/dri`), so no major-226 rule.
-    spec.device_cgroup_rules.push("c 89:* rmw".to_string());
+    // logind's seat and session files, read-only: how the agent names what holds the
+    // display when it cannot take it.
+    if inputs.devices.logind {
+        for dir in LOGIND_DIRS {
+            spec.binds
+                .push(bind(dir, &format!("{CONSOLE_HOST_PREFIX}{dir}"), true));
+        }
+    }
+    spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
+    if rootless {
+        // No mknod inside a user namespace: each i2c node the host has is passed in.
+        for bus in &inputs.devices.i2c {
+            let node = format!("/dev/i2c-{bus}");
+            spec.devices.push(Device {
+                host: node.clone(),
+                container: node,
+                permissions: "rw".into(),
+            });
+        }
+    } else {
+        // The agent mknods /dev/i2c-N for DDC (ddc.rs). DRM is already a mapped device
+        // (`/dev/dri`), so no major-226 rule.
+        spec.device_cgroup_rules.push("c 89:* rmw".to_string());
+    }
     spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
 }
+
+/// logind's state directories console mode binds read-only (`HostDevices::logind`).
+pub const LOGIND_DIRS: [&str; 2] = ["/run/systemd/seats", "/run/systemd/sessions"];
+
+/// Where console mode's host views live inside the agent: `/host/run/systemd/seats`, ...
+pub const CONSOLE_HOST_PREFIX: &str = "/host";
 
 /// `1` on an agent container created with the console additions, and absent otherwise.
 pub const CONSOLE_ACCESS_ENV: &str = "QUASAR_CONSOLE_ACCESS";

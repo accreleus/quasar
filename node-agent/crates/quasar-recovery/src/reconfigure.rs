@@ -77,6 +77,10 @@ pub struct Outcome {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behind: Vec<Role>,
     pub settled_at: String,
+    /// The console agent's preflight text when a failed preflight is why the attempt failed
+    /// (RH-07 #407, [`crate::console::ConsoleLast::detail`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -869,8 +873,15 @@ impl Actor {
             .filter(|role| matches!(self.dir.load_service(*role), Ok(Some(_))))
             .filter(|role| !self.runs(*role, in_force))
             .collect();
+        let detail = journal.and_then(|j| {
+            j.steps
+                .iter()
+                .filter_map(|s| s.failure.as_ref())
+                .find_map(|f| crate::console::preflight_detail(&f.detail))
+        });
         Outcome {
             behind,
+            detail,
             settled,
             state,
             reason,

@@ -285,6 +285,8 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             engine_rootless: false,
             host_sysfs: false,
             sound: false,
+            i2c: Vec::new(),
+            logind: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,

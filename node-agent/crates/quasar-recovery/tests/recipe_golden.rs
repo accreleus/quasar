@@ -45,6 +45,8 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             engine_rootless: false,
             host_sysfs: false,
             sound: false,
+            i2c: Vec::new(),
+            logind: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -324,22 +326,158 @@ fn console_mode_off_is_not_written() {
     assert_eq!(serde_json::to_value(&on).unwrap()["console"], true);
 }
 
+/// RH-07 #407: console mode on a rootless engine. No capability (SYS_ADMIN never reaches the
+/// initial user namespace the kernel checks, and a free display needs none) and no
+/// device-cgroup rule (a rootless engine refuses them); the i2c nodes the host has are
+/// passed as devices, since the agent cannot mknod them; sound and logind's state are bound
+/// only where the host has them.
+#[test]
+fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let rootless = |vendor, host_sysfs: bool, cdi: bool| {
+        let mut i = inputs(Some(vendor));
+        i.devices.engine_rootless = true;
+        i.devices.host_sysfs = host_sysfs;
+        i.gpu.cdi = cdi;
+        i
+    };
+    for (plain, file) in [
+        (
+            rootless(GpuVendor::Nvidia, false, true),
+            "node-agent-r3-nvidia-rootless-console.json",
+        ),
+        (
+            rootless(GpuVendor::Nvidia, true, true),
+            "node-agent-r3-nvidia-docker-rootless-console.json",
+        ),
+        (
+            rootless(GpuVendor::Amd, false, false),
+            "node-agent-r3-amd-rootless-console.json",
+        ),
+    ] {
+        let mut console = plain.clone();
+        console.console = true;
+        console.devices.sound = true;
+        console.devices.logind = true;
+        console.devices.i2c = vec![3, 12];
+        let without = render(Role::NodeAgent, 3, &plain, &image, &agent_secrets()).unwrap();
+        let with = render(Role::NodeAgent, 3, &console, &image, &agent_secrets()).unwrap();
+        check(file, &with);
+
+        assert!(with.cap_add.is_empty(), "{file}: {:?}", with.cap_add);
+        assert!(
+            with.device_cgroup_rules.is_empty(),
+            "{file}: {:?}",
+            with.device_cgroup_rules
+        );
+        let binds = |s: &quasar_recovery::recipe::ContainerSpec| -> Vec<String> {
+            s.binds.iter().map(|b| b.to_engine()).collect()
+        };
+        let added: Vec<String> = binds(&with)
+            .into_iter()
+            .filter(|b| !binds(&without).contains(b))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                "/dev/snd:/dev/snd".to_string(),
+                "/proc/asound:/host-proc/asound:ro".to_string(),
+                "/run/systemd/seats:/host/run/systemd/seats:ro".to_string(),
+                "/run/systemd/sessions:/host/run/systemd/sessions:ro".to_string(),
+            ],
+            "{file}"
+        );
+        assert!(
+            binds(&without).iter().all(|b| binds(&with).contains(b)),
+            "{file}: a bind was dropped"
+        );
+        let new_devices: Vec<(String, String, String)> = with
+            .devices
+            .iter()
+            .filter(|d| !without.devices.contains(d))
+            .map(|d| (d.host.clone(), d.container.clone(), d.permissions.clone()))
+            .collect();
+        assert_eq!(
+            new_devices,
+            [3, 12]
+                .map(|n| (
+                    format!("/dev/i2c-{n}"),
+                    format!("/dev/i2c-{n}"),
+                    "rw".into()
+                ))
+                .to_vec(),
+            "{file}"
+        );
+        let mut env = with.env.clone();
+        assert_eq!(env.remove("QUASAR_CONSOLE_ACCESS").as_deref(), Some("1"));
+        assert_eq!(env, without.env, "{file}");
+        assert_eq!(with.security_opt, without.security_opt, "{file}");
+        assert_eq!(with.gpus, without.gpus, "{file}");
+
+        // A host with none of them: the console marker alone, nothing the engine would
+        // have to find on the host.
+        let mut bare = console.clone();
+        bare.devices.sound = false;
+        bare.devices.logind = false;
+        bare.devices.i2c.clear();
+        let bare = render(Role::NodeAgent, 3, &bare, &image, &agent_secrets()).unwrap();
+        assert_eq!(binds(&bare), binds(&without), "{file}");
+        assert_eq!(bare.devices, without.devices, "{file}");
+        assert!(bare.cap_add.is_empty() && bare.device_cgroup_rules.is_empty());
+        assert_eq!(
+            bare.env.get("QUASAR_CONSOLE_ACCESS").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    // Rootful keeps SYS_ADMIN and its mknod path for i2c (until owner decision 1 is proven
+    // on hardware), and names a display holder from logind the same way.
+    let mut rootful = inputs(Some(GpuVendor::Amd));
+    rootful.console = true;
+    rootful.devices.logind = true;
+    rootful.devices.i2c = vec![3];
+    let spec = render(Role::NodeAgent, 3, &rootful, &image, &agent_secrets()).unwrap();
+    assert_eq!(spec.cap_add, vec!["SYS_ADMIN".to_string()]);
+    assert!(spec.device_cgroup_rules.contains(&"c 89:* rmw".to_string()));
+    assert!(!spec.devices.iter().any(|d| d.host.starts_with("/dev/i2c")));
+    assert!(spec
+        .binds
+        .iter()
+        .any(|b| b.target == "/host/run/systemd/seats" && b.read_only));
+}
+
+/// Machine state gains the console devices only where the host has them, so every existing
+/// machine and golden stays as it was.
+#[test]
+fn console_devices_absent_are_not_written() {
+    let plain = inputs(Some(GpuVendor::Amd));
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json["devices"].get("i2c").is_none(), "{json}");
+    assert!(json["devices"].get("logind").is_none(), "{json}");
+    let mut on = plain;
+    on.devices.i2c = vec![4];
+    on.devices.logind = true;
+    let json = serde_json::to_value(&on).unwrap();
+    assert_eq!(json["devices"]["i2c"], serde_json::json!([4]));
+    assert_eq!(json["devices"]["logind"], true);
+    assert_eq!(serde_json::from_value::<Inputs>(json).unwrap(), on);
+}
+
 #[test]
 fn console_mode_is_refused_where_the_recipe_cannot_grant_it() {
     let image = ImageRef::parse(AGENT_IMAGE).unwrap();
     let mut rootless = inputs(Some(GpuVendor::Nvidia));
     rootless.devices.engine_rootless = true;
     rootless.console = true;
+    quasar_recovery::recipe::validate(&rootless).expect("#407: a rootless engine takes it");
     let mut no_dri = inputs(None);
     no_dri.console = true;
-    for (i, says) in [(rootless, "#407"), (no_dri, "/dev/dri")] {
-        let refused = quasar_recovery::recipe::validate(&i).expect_err(says);
-        assert!(refused.to_string().contains(says), "{refused}");
-        assert!(matches!(
-            render(Role::NodeAgent, 3, &i, &image, &agent_secrets()),
-            Err(RenderError::Invalid(_))
-        ));
-    }
+    let refused = quasar_recovery::recipe::validate(&no_dri).expect_err("no /dev/dri");
+    assert!(refused.to_string().contains("/dev/dri"), "{refused}");
+    assert!(matches!(
+        render(Role::NodeAgent, 3, &no_dri, &image, &agent_secrets()),
+        Err(RenderError::Invalid(_))
+    ));
     let mut older = inputs(Some(GpuVendor::Amd));
     older.console = true;
     for revision in [1, 2] {

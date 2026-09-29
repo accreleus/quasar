@@ -25,6 +25,22 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Console mode on rootless engines (RH-07, #407).** The recovery actor no longer
+  refuses console mode on a rootless engine. There the node agent gets no added capability
+  and no device-cgroup rules: taking a free display needs neither. It gets `/dev/dri` as
+  before, the host's sound devices only when the host has them, each `/dev/i2c-*` node the
+  host has as a device (it cannot create them itself), and read-only views of logind's
+  seat and session state so it can say what holds the display. The actor's device probe
+  now reports i2c buses and logind, re-reads them whenever console mode is turned on, and
+  re-reads them at every actor start while console mode is on. When they change (a reboot
+  can renumber i2c buses or drop one), it re-creates the agent through a verified
+  replacement of its own, so a vanished node never leaves the agent unable to start. The
+  agent socket gains `POST /v1/console/preflight`: a console agent that reports it cannot
+  take the display fails the attempt at once (`unhealthy`), the previous agent is put
+  back, and the agent's text appears as `last.detail` in `GET /v1/console`. This is the
+  actor side only. The agent's own preflight, audio, host preparation and console UI
+  follow, so rootless console mode is not usable yet. Rootful console mode still keeps
+  `SYS_ADMIN` until hardware proves the recipe works without it.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,

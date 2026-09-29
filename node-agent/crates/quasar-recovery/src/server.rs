@@ -4,7 +4,8 @@
 //! control plane), so the socket a request arrives on is its caller. Not a frozen
 //! interface. Both serve `GET /v1/status[?request_id=<uuid>]`, whose `result` is only ever an
 //! attempt submitted on the same socket, and `POST /v1/submit` (a `socket::Request`). The
-//! agent socket alone serves `GET` and `POST /v1/console` ([`crate::console`]).
+//! agent socket alone serves `GET` and `POST /v1/console` and `POST /v1/console/preflight`
+//! ([`crate::console`]).
 //!
 //! Answers are `HTTP/1.1` with `Content-Length` and `Connection: close`, and the
 //! connection is closed after one response, so an HTTP/1.0 client reading to EOF (the
@@ -21,7 +22,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::actor::Actor;
-use crate::console::ConsoleRequest;
+use crate::console::{ConsolePreflight, ConsoleRequest};
 use crate::socket::{Reason, Rejection, Request};
 use crate::trust::Caller;
 
@@ -151,10 +152,13 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
             respond(&mut stream, 200, &body)
         }
         ("POST", "/v1/console") if caller == Caller::Agent => console(&mut stream, &head, actor),
+        ("POST", "/v1/console/preflight") if caller == Caller::Agent => {
+            preflight(&mut stream, &head, actor)
+        }
         (_, "/v1/status") | (_, "/v1/submit") => {
             respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
         }
-        (_, "/v1/console") if caller == Caller::Agent => {
+        (_, "/v1/console") | (_, "/v1/console/preflight") if caller == Caller::Agent => {
             respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
         }
         _ => respond(&mut stream, 404, r#"{"error":"not_found"}"#),
@@ -218,6 +222,30 @@ fn console(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Resul
             );
             refused(stream, &rejection)
         }
+    }
+}
+
+/// `POST /v1/console/preflight` (agent socket only, RH-07 #407): `200` with the report as
+/// kept, `400` with the `Rejection` for one that is not a preflight or fails without saying
+/// why.
+fn preflight(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result<()> {
+    let Some(body) = read_body(stream, head)? else {
+        return respond(stream, 413, r#"{"error":"request_too_large"}"#);
+    };
+    let answer = match serde_json::from_slice::<ConsolePreflight>(&body) {
+        Ok(report) => actor.console_preflight(report),
+        Err(e) => Err(Rejection {
+            request_id: String::new(),
+            reason: Reason::Invalid,
+            message: format!("not a console preflight: {e}"),
+        }),
+    };
+    match answer {
+        Ok(report) => {
+            let body = serde_json::to_string(&report).map_err(io::Error::other)?;
+            respond(stream, 200, &body)
+        }
+        Err(rejection) => refused(stream, &rejection),
     }
 }
 
