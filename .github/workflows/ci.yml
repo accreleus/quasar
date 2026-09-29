@@ -197,12 +197,12 @@ jobs:
             known: >-
               podman-rootful:create-read-back=Podman 4.9 - the runtime cannot read back the session-shaped container (UnknownOutcome, reconciliation Protocol);
               podman-rootful:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
-              podman-rootful:missing-bind-source=a missing bind source is not refused on Podman (finding filed from #408); 4.9 leaves a created container and reports UnknownOutcome
+              podman-rootful:missing-bind-source=a missing bind source is not refused on Podman (finding from #408), and 4.9 leaves a created container and reports UnknownOutcome
           - target: podman-rootless
             known: >-
               podman-rootless:create-read-back=Podman 4.9 - the runtime cannot read back the session-shaped container (UnknownOutcome, reconciliation Protocol);
               podman-rootless:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
-              podman-rootless:missing-bind-source=a missing bind source is not refused on Podman (finding filed from #408); 4.9 leaves a created container and reports UnknownOutcome
+              podman-rootless:missing-bind-source=a missing bind source is not refused on Podman (finding from #408), and 4.9 leaves a created container and reports UnknownOutcome
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The suite links the agent crate, which needs the same headers as the rust job.
