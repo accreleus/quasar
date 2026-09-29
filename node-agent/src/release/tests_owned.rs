@@ -19,12 +19,13 @@ use super::*;
 
 const REQ: &str = "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22";
 const REQ2: &str = "3c0a6f2e-8d1b-4f7e-9a55-2b8e1c0d9f41";
-const REPO: &str = "registry.example.invalid/quasar/quasar-node-agent";
-const OLD: &str = "sha256:bb22000000000000000000000000000000000000000000000000000000000000";
+pub(super) const REPO: &str = "registry.example.invalid/quasar/quasar-node-agent";
+pub(super) const OLD: &str =
+    "sha256:bb22000000000000000000000000000000000000000000000000000000000000";
 const NEW: &str = "sha256:dd44000000000000000000000000000000000000000000000000000000000000";
 const ACTOR_ID: &str = "ac00000000000000000000000000000000000000000000000000000000000000";
 
-fn image(reference: &str) -> Image {
+pub(super) fn image(reference: &str) -> Image {
     Image {
         id: format!("sha256:{:0>64}", reference.len()),
         repo_digests: vec![reference.into()],
@@ -33,7 +34,7 @@ fn image(reference: &str) -> Image {
 }
 
 /// An AMD GPU host with the hand-started actor on it.
-fn host(new: Behaviour) -> FakeState {
+pub(super) fn host(new: Behaviour) -> FakeState {
     let mut state = FakeState {
         host: EngineHost {
             name: Some("gpu-host-01".into()),
@@ -103,12 +104,12 @@ fn host(new: Behaviour) -> FakeState {
     state
 }
 
-struct Machine {
-    engine: Arc<FakeEngine>,
-    actor: Arc<RecoveryActor>,
+pub(super) struct Machine {
+    pub(super) engine: Arc<FakeEngine>,
+    pub(super) actor: Arc<RecoveryActor>,
     _machine_dir: tempfile::TempDir,
     socket_dir: tempfile::TempDir,
-    socket: PathBuf,
+    pub(super) socket: PathBuf,
 }
 
 /// The actor serves `path` from now on, as a restarted actor does.
@@ -125,7 +126,12 @@ fn serve_at(actor: &Arc<RecoveryActor>, path: &Path) {
 
 /// An installed owned GPU host whose recovery actor serves its agent socket.
 fn machine(new: Behaviour) -> Machine {
-    let engine = Arc::new(FakeEngine::new(host(new)));
+    machine_on(host(new))
+}
+
+/// [`machine`] on a given engine state.
+pub(super) fn machine_on(state: FakeState) -> Machine {
+    let engine = Arc::new(FakeEngine::new(state));
     let machine_dir = tempfile::tempdir().unwrap();
     let mut config = ActorConfig::new(
         machine_dir.path(),

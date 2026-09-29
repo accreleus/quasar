@@ -982,6 +982,39 @@ pub struct ConsoleCapabilities {
     pub outputs: Vec<DrmOutputCapability>,
     pub audio_sinks: Vec<AudioSink>,
     pub input_devices: Vec<InputDeviceInfo>,
+    /// Amendment 18 (RH-07 #395): whether this agent can run console mode, on an owned
+    /// host whose recovery actor replaces the agent to grant it. Absent on a host with no
+    /// recovery actor. Filled in by the capacity sender, never by the hotplug snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<ConsoleAccess>,
+}
+
+/// `capacity.console_capabilities.access` (agent-api.md amendment 18). Every field is
+/// always present, `null` where the contract says so.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleAccess {
+    pub state: ConsoleAccessState,
+    /// The console access the current or last attempt moves to.
+    pub target: Option<bool>,
+    /// The recovery actor's attempt.
+    pub request_id: Option<String>,
+    /// Set exactly when `state` is `restored`: a `release_state` failure identifier.
+    pub reason: Option<String>,
+    /// RFC 3339.
+    pub started_at: Option<String>,
+    /// RFC 3339; `null` while `applying`.
+    pub finished_at: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleAccessState {
+    Off,
+    Applying,
+    On,
+    Restored,
+    Unsupported,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]

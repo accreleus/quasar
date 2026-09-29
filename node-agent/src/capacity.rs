@@ -164,6 +164,7 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
         outputs,
         audio_sinks: detect_audio_sinks(),
         input_devices: detect_input_devices(),
+        access: None,
     }
 }
 

@@ -34,7 +34,11 @@ own; the two do not move together, and that is deliberate.
   old agent is kept until the new one verifies and put back if it does not, and console
   mode is not reported on until the change has settled. A rootless engine (#407) or a host
   without `/dev/dri` is refused with the reason, and the operator's `reconfigure` cannot
-  set it. With console mode off the recipe renders as before.
+  set it. With console mode off the recipe renders as before. The owned agent asks for the
+  replacement when a received `enabled` differs from the access it has, never twice for a
+  target that was put back, and reports `console_capabilities.access` (off, applying, on,
+  restored, unsupported on a rootless engine) in every `capacity`, re-sent when it changes;
+  it refuses a console launch while it lacks access. A Compose or source agent reports none.
 - **RH-07 console mockups, approved by the owner (#394).**
   `design_handoff_v3/screens/rh07-v3.html` adds the quick start's engine choice and
   profile badges, host preparation, the Quadlet unit for Podman, console mode on an

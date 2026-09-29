@@ -308,6 +308,7 @@ pub async fn run(cfg: Config) {
         image_mgr.clone(),
         release_mgr.clone(),
     );
+    sessions.mgr.console_access = crate::release::console::ConsoleAccessManager::from_env();
     match crate::home_cleanup::verified_ledger_path(&cfg.node_secret_path) {
         Some(path) => {
             let result = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(path)
@@ -1085,7 +1086,9 @@ async fn run_readiness_refresh<F>(
 /// from the synchronous `handle_control`, where the `OnceLock`ed `nvidia-smi` fork
 /// cannot be awaited. Paying it before any assignment arrives leaves that a cache read.
 fn detect_capacity_blocking() -> capacity::SystemCapacity {
-    let cap = capacity::detect();
+    let mut cap = capacity::detect();
+    // Amendment 18: every capacity carries the current console access (#395).
+    cap.console.access = crate::release::console::published();
     if cap.gpus.iter().any(|g| g.vendor == "nvidia") {
         capacity::prewarm_nvidia_smi_rows();
     }
@@ -1922,6 +1925,15 @@ async fn connect_and_run(
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
+    // Before the first `capacity`, which carries `console_capabilities.access`.
+    let console_access = sessions.mgr.console_access.clone();
+    console_access.set_engine_mode(install.engine.engine_mode.as_deref());
+    let mut console_access_rx = console_access.owned().then(|| console_access.subscribe());
+    {
+        let ca = console_access.clone();
+        offload_probe(move || ca.refresh()).await;
+    }
+    console_access.watch_if_applying();
 
     let prep = prep_started.elapsed();
     if register_prep_over_budget(prep) {
@@ -2589,6 +2601,14 @@ async fn connect_and_run(
                     send(&mut tx, &capacity_msg).await?;
                 }
             }
+            changed = recv_or_disabled(&mut console_access_rx) => {
+                if changed.is_none() {
+                    console_access_rx = None;
+                    continue;
+                }
+                info!("console access changed; re-sending capacity");
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
+            }
             evt = recv_or_disabled(&mut *evt_rx) => {
                 // `None` means every sender is gone — disable the arm.
                 let Some((session_id, event)) = evt else {
@@ -3102,6 +3122,9 @@ struct SessionManager {
     /// `release_apply` dispatch target. Process-wide for the same reason as
     /// `image_mgr`: its poller outlives this connection.
     release_mgr: Arc<ReleaseManager>,
+    /// Console access on an owned install (amendment 18). Process-wide: its worker
+    /// watches an attempt that outlives this connection.
+    console_access: Arc<crate::release::console::ConsoleAccessManager>,
     /// Present only after startup proved prior API-owned source cleanup and
     /// opened the durable session-ID ledger. This is the advertised capability.
     home_cleanup: Option<crate::home_cleanup::HomeCleanupLedger>,
@@ -3262,6 +3285,7 @@ impl SessionManager {
             warmup_control: None,
             image_mgr,
             release_mgr,
+            console_access: crate::release::console::ConsoleAccessManager::without_actor(),
             home_cleanup: None,
             home_cleanup_reports: Vec::new(),
             home_source_retire: None,
@@ -3582,6 +3606,13 @@ impl SessionManager {
                         false,
                         Some("agent draining for restart".to_string()),
                     ));
+                }
+                if let Some(refusal) = self.console_access.launch_refusal(video_topology) {
+                    warn!(
+                        token = "session-assign-rejected",
+                        "session {session_id} assignment rejected: {refusal}"
+                    );
+                    return Some(ack(id, false, Some(refusal)));
                 }
                 if self
                     .home_cleanup
@@ -4271,6 +4302,7 @@ impl SessionManager {
                     // on the 2 s hotplug poll, and nothing consumes a reading unless
                     // console mode is on — latch it so `ddc` can short-circuit.
                     crate::ddc::set_console_enabled(cc.enabled);
+                    self.console_access.request(cc.enabled);
                     // The control plane's capacity-report diff is the primary stop path
                     // for a local-only session, but its tracker is in-memory and lost on
                     // a control-plane restart. Stopping them here too means such a
@@ -7715,6 +7747,47 @@ mod tests {
             plan_none,
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(session_assign_msg("s1", 0), &evt_tx, &diagnostic_sender());
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: true, .. })),
+            "{reply:?}"
+        );
+    }
+
+    /// #395: on an owned host, an agent created without console access refuses a console
+    /// launch (fail closed); a stream-only launch is unaffected.
+    #[test]
+    fn an_owned_agent_without_console_access_refuses_a_console_launch() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_none,
+        );
+        mgr.console_access = crate::release::console::ConsoleAccessManager::owned_for_test(
+            "/nonexistent/agent.sock",
+            false,
+        );
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(4);
+        for topology in ["local_only", "dual_output"] {
+            let msg = serde_json::json!({
+                "type": "session_assign", "id": "c1", "session_id": topology, "gpu_index": 0,
+                "stream": {"width": 1920, "height": 1080, "fps": 60,
+                    "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"},
+                "video_topology": topology
+            });
+            let reply = mgr.handle_control(
+                serde_json::from_value(msg).unwrap(),
+                &evt_tx,
+                &diagnostic_sender(),
+            );
+            match reply {
+                Some(AgentMsg::Ack {
+                    ok: false,
+                    error: Some(e),
+                    ..
+                }) => assert!(e.contains("without console access"), "{topology}: {e}"),
+                other => panic!("{topology}: expected a refusal, got {other:?}"),
+            }
+        }
         let reply = mgr.handle_control(session_assign_msg("s1", 0), &evt_tx, &diagnostic_sender());
         assert!(
             matches!(reply, Some(AgentMsg::Ack { ok: true, .. })),

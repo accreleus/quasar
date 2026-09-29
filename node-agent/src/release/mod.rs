@@ -11,6 +11,7 @@
 //! outlives both the agent and the actor. A host with none answers every apply
 //! `updater_absent`. The socket is not frozen (protocol/schema.md §"Not frozen").
 
+pub mod console;
 pub(crate) mod unix_http;
 
 use std::path::{Path, PathBuf};
@@ -672,3 +673,6 @@ mod tests;
 
 #[cfg(test)]
 mod tests_owned;
+
+#[cfg(test)]
+mod tests_console;
