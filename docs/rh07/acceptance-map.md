@@ -7,10 +7,9 @@ comment URL, or a commit hash. Hosts are named by role only: the AMD test host, 
 test host, the rootless lab VM (NVIDIA-GPU passthrough, SELinux enforcing, read-only
 `/usr`, per D23).
 
-A cross-cutting gap applies to every cell below and is not repeated per row: every
-"audio" row proves session/console **playback** (a tone or Steam's own sound reaching a
-browser or a monitor); no RH-07 evidence exercises the **microphone** capture direction,
-though D19 and every ticket's acceptance criteria ask for both.
+Microphone capture is proven only on Podman rootless with NVIDIA (#409 comment
+[5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346)); every
+other Session cell proves playback only, so it reads PARTIAL.
 
 ## 1. Profile matrix (D19)
 
@@ -37,12 +36,12 @@ an update applied from the console (**Update**); a reboot after which everything
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
 | AMD | GAP — no rootless-Podman run on the AMD test host anywhere in #393–#423 | GAP | GAP | GAP | GAP |
-| NVIDIA | PARTIAL (microphone untested) — video/input/audio PASS, #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911); full per-button gamepad+keyboard+d-pad+trigger replay via the input DataChannel, every code arrived correctly: #401 comment [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775); audio energy 21.9 on a real browser, survives a VM reboot: #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147); microphone untested | PASS — install→update→verify on the recovery actor: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — all five owned-install containers came back on their own via `podman-restart.service` and lingering: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — picture OK, keyboard/mouse grabbed, audio tone heard (ALSA, not PipeWire — see gaps), owner watched the monitor: #407 comment [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657) | PASS — run `9cf88ede` vs `1d8d15be`, verbatim "0 regressed, 0 improved, 1 unchanged. result: clean": #399 comment [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652) |
+| NVIDIA | PASS — microphone: #409 comment [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346); video/input/audio PASS, #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911); full per-button gamepad+keyboard+d-pad+trigger replay via the input DataChannel, every code arrived correctly: #401 comment [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775); audio energy 21.9 on a real browser, survives a VM reboot: #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147) | PASS — install→update→verify on the recovery actor: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — all five owned-install containers came back on their own via `podman-restart.service` and lingering: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — picture OK, keyboard/mouse grabbed, audio tone heard (ALSA, not PipeWire — see gaps), owner watched the monitor: #407 comment [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657) | PASS — run `9cf88ede` vs `1d8d15be`, verbatim "0 regressed, 0 improved, 1 unchanged. result: clean": #399 comment [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652) |
 
 **Reading the matrix:** on NVIDIA, every required row except the microphone half of
 **Session** has evidence in all three profiles (Docker rootful's `--gpus` fallback aside, a
-named defect, #413; the same host works end to end over CDI). No profile has a Session cell
-that is fully met until the microphone is exercised. The AMD side has only one required cell run at all
+named defect, #413; the same host works end to end over CDI). Only Podman rootless has its
+microphone proven so far. The AMD side has only one required cell run at all
 (Docker rootful); Docker rootless and Podman rootless on AMD are untested, not failing —
 the AMD test host currently lacks the host input-device mount its rootless containers
 would need, so no agent has been run there under an unprivileged rootless account. This
@@ -86,7 +85,7 @@ the agent's `runtime_engine` check all read):
 | 10 | Quasar never runs as root / escalates at run time | Met | No code path adds privilege on read-back failure (#397 comment [5872048545](https://github.com/accreleus/quasar/issues/397#issuecomment-5872048545)); the one accepted exception is the node agent's own SELinux label (`label=disable`, D17, owner decision #402 comment [5884609826](https://github.com/accreleus/quasar/issues/402#issuecomment-5884609826)), which is a confinement label, not privilege escalation — the agent never becomes root and grants nothing beyond the engine socket it always held |
 | 11 | Controller, keyboard, mouse work rootless | Partly met | Full per-button/axis replay passed only on rootless Podman: #401 comment [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775). Docker rootful/rootless have only the coarse motion/click probe; the same full check on Docker "needs the lab owner" per that comment |
 | 12 | NVIDIA hardware encode + GPU game on every engine mode | Partly met | CDI path passes on all three required NVIDIA rows (matrix above). The rootful `--gpus` fallback on a CUDA-only host fails Steam's Vulkan init, filed as #413 |
-| 13 | Session audio and microphone on every engine mode | Partly met | Playback proven on every profile with NVIDIA evidence (matrix above; #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147)). Microphone capture is not tested anywhere in #393–#423 |
+| 13 | Session audio and microphone on every engine mode | Partly met | Playback proven on every profile with NVIDIA evidence (matrix above; #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147)). Microphone capture proven on Podman rootless with NVIDIA only: #409 comment [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346) |
 | 14 | Home files owned by the Quasar user | Partly met | True on rootless Podman via `keep-id`: #404 comment [5876278031](https://github.com/accreleus/quasar/issues/404#issuecomment-5876278031). Rootless Docker has no per-container user mapping in its API; homes keep subordinate IDs, and the owner accepted this with a readiness warning rather than a refusal: #404 comment [5884610200](https://github.com/accreleus/quasar/issues/404#issuecomment-5884610200) |
 | 15 | Console updates work on every engine mode | Met | Update-from-console proven on Docker rootful (#402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916)), Docker rootless and Podman rootless (matrix above). Rootful Podman was not exercised (not a required profile) |
 | 16 | Rootless/Podman machine returns after reboot | Met | Podman: all five containers returned via `podman-restart.service` + lingering: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293). Rootless Docker: reboot row PASS in the #399 matrix |
@@ -135,9 +134,11 @@ Each item names what would close it.
    re-running on those two engine modes; the same comment notes it "needs the lab owner"
    because one test host is unavailable while the rootless lab VM holds the GPU, and a
    container setting on the other stops runtime-created input nodes from appearing.
-5. **Microphone capture is untested everywhere.** Every audio row above is playback
-   only. Needs a mic-capture probe (the reverse of the existing tone/energy check) run
-   once per required profile.
+5. **Microphone capture is proven on Podman rootless (NVIDIA) only.** The method (a real
+   browser with a fake capture device, then the RMS of the app's `quasar_mic_src` inside
+   the session) is in #409 comment
+   [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346);
+   it needs running once per remaining profile.
 6. **Podman rootful — no Steam session, update, reboot or console-mode evidence**, and
    a known LAN-reachability defect under firewalld (#416: netavark forwards published
    ports, so INPUT-zone rules don't cover them). Not a required profile (D5), so this
