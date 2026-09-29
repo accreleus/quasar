@@ -12,6 +12,12 @@
 //! already open (`/proc/asound/cardN/pcmMp/sub0/status` reads `closed`); an open one is a
 //! named refusal, never a fight.
 //!
+//! ALSA sinks are reported by card id, `hw:CARD=<id>,DEV=<device>` (the id is
+//! `/proc/asound/cardN/id`): a card's index moves when a driver reloads, its id does not,
+//! so an operator's stored choice keeps naming the same device (#407 live). An id is
+//! mapped to the card's current index only where an index is needed (the open-PCM check).
+//! A stored legacy `hw:<card>,<device>` is still accepted and read by index, as before.
+//!
 //! [`choose_route`] is the whole decision and does no I/O of its own: what it reads of the
 //! host comes through [`HostAudio`], whose live implementation ([`LiveHostAudio`]) takes
 //! its paths as fields so tests can point it at a temporary `/proc/asound` and a real
@@ -64,9 +70,11 @@ pub trait HostAudio {
     /// The PipeWire sinks, when they can be listed; empty when they cannot (restricted
     /// access may hide them), which leaves `pipewire:default` alone.
     fn pipewire_sinks(&self) -> Vec<PipeWireSink>;
-    /// The ALSA playback sinks this agent can open (`hw:<card>,<device>`, or `hw:<card>`
-    /// when the host lists no PCMs).
+    /// The ALSA playback sinks this agent can open (`hw:CARD=<id>,DEV=<device>`, or
+    /// `hw:CARD=<id>` when the host lists no PCMs).
     fn alsa_sinks(&self) -> Vec<AudioSink>;
+    /// The current index of the card whose id is `id`, if the host has it.
+    fn card_index(&self, id: &str) -> Option<u32>;
     fn pcm_status(&self, card: u32, device: u32) -> PcmStatus;
 }
 
@@ -103,6 +111,8 @@ pub enum Refusal {
         device: String,
         owner_pid: Option<u32>,
     },
+    /// The chosen ALSA card id names no card on the host now.
+    DeviceAbsent { device: String },
 }
 
 impl Refusal {
@@ -112,6 +122,7 @@ impl Refusal {
             Refusal::PipeWireSilent { .. } => "console-audio-pipewire-silent",
             Refusal::PipeWireOwnsSound { .. } => "console-audio-pipewire-owns-sound",
             Refusal::DeviceHeld { .. } => "console-audio-device-held",
+            Refusal::DeviceAbsent { .. } => "console-audio-device-absent",
         }
     }
 
@@ -129,6 +140,10 @@ impl Refusal {
                 "Run host preparation with --console-audio-user for the desktop user whose \
                  PipeWire holds the device, so console audio plays through it, or close the \
                  program holding it."
+            }
+            Refusal::DeviceAbsent { .. } => {
+                "Choose one of the host's current audio outputs (or auto) for console \
+                 audio, or put the sound card back."
             }
         }
     }
@@ -157,25 +172,80 @@ impl std::fmt::Display for Refusal {
                 }
                 Ok(())
             }
+            Refusal::DeviceAbsent { device } => write!(
+                f,
+                "console audio is set to the sound device {device}, which this host does \
+                 not have now"
+            ),
         }
     }
 }
 
-/// `hw:<card>,<device>` (also `plughw:`), else `None`.
-fn pcm_of(id: &str) -> Option<(u32, u32)> {
-    let address = id
-        .strip_prefix("hw:")
-        .or_else(|| id.strip_prefix("plughw:"))?;
-    let (card, device) = address.split_once(',')?;
-    Some((card.trim().parse().ok()?, device.trim().parse().ok()?))
+/// The sink id reported for an ALSA playback PCM: by card id, which survives a driver
+/// reload that moves the card's index.
+pub fn alsa_sink_id(card_id: &str, device: u32) -> String {
+    format!("hw:CARD={card_id},DEV={device}")
 }
 
-/// `hw:<card>` / `plughw:<card>` with no device, else `None`.
-fn card_of(id: &str) -> Option<u32> {
+/// The sink id reported for a card with no PCM detail.
+pub fn alsa_card_sink_id(card_id: &str) -> String {
+    format!("hw:CARD={card_id}")
+}
+
+/// An ALSA card as an id names it: by index (legacy `hw:1,3`) or by card id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CardRef {
+    Index(u32),
+    Id(String),
+}
+
+/// An ALSA `hw:` / `plughw:` address: `<card>[,<device>]` or `CARD=<card>[,DEV=<device>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlsaAddress {
+    card: CardRef,
+    device: Option<u32>,
+}
+
+fn parse_alsa(id: &str) -> Option<AlsaAddress> {
     let address = id
         .strip_prefix("hw:")
         .or_else(|| id.strip_prefix("plughw:"))?;
-    address.trim().parse().ok()
+    let (mut card, mut device) = (None, None);
+    for (i, part) in address.split(',').map(str::trim).enumerate() {
+        let (key, value) = match part.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (if i == 0 { "CARD" } else { "DEV" }, part),
+        };
+        match key {
+            "CARD" if !value.is_empty() => {
+                card = Some(match value.parse() {
+                    Ok(n) => CardRef::Index(n),
+                    Err(_) => CardRef::Id(value.to_string()),
+                })
+            }
+            "DEV" => device = Some(value.parse().ok()?),
+            // SUBDEV and the like say nothing about which PCM.
+            _ => {}
+        }
+    }
+    Some(AlsaAddress {
+        card: card?,
+        device,
+    })
+}
+
+/// The card's current index; `None` when a card id names no card on the host now.
+fn card_index(card: &CardRef, host: &dyn HostAudio) -> Option<u32> {
+    match card {
+        CardRef::Index(n) => Some(*n),
+        CardRef::Id(id) => host.card_index(id),
+    }
+}
+
+/// `(card index, device)` for a PCM address, read at use time.
+fn pcm_of(id: &str, host: &dyn HostAudio) -> Option<(u32, u32)> {
+    let address = parse_alsa(id)?;
+    Some((card_index(&address.card, host)?, address.device?))
 }
 
 /// Where the console audio leg for `output` (`auto`, `pipewire:*`, `hw:*`) plays, or why
@@ -205,20 +275,36 @@ pub fn choose_route(output: &str, host: &dyn HostAudio) -> Result<Route, Refusal
             output: output.into(),
         });
     }
-    let pcms: Vec<(u32, u32)> = if let Some(pcm) = pcm_of(output) {
-        vec![pcm]
-    } else {
-        let card = card_of(output);
-        host.alsa_sinks()
-            .iter()
-            .filter_map(|s| pcm_of(&s.id))
-            .filter(|(c, _)| output == "auto" || card == Some(*c))
-            .collect()
+    let address = parse_alsa(output);
+    let card = match &address {
+        Some(a) => match card_index(&a.card, host) {
+            Some(n) => Some(n),
+            // A card id the host does not have now: say so, rather than let alsasink fail
+            // to open it. (A legacy index is not checked here, as before.)
+            None => {
+                return Err(Refusal::DeviceAbsent {
+                    device: output.into(),
+                })
+            }
+        },
+        None => None,
     };
-    for (card, device) in pcms {
+    let pcms: Vec<(String, u32, u32)> = match (card, address.and_then(|a| a.device)) {
+        (Some(card), Some(device)) => vec![(output.to_string(), card, device)],
+        _ => host
+            .alsa_sinks()
+            .into_iter()
+            .filter_map(|s| {
+                let (c, d) = pcm_of(&s.id, host)?;
+                Some((s.id, c, d))
+            })
+            .filter(|(_, c, _)| output == "auto" || card == Some(*c))
+            .collect(),
+    };
+    for (name, card, device) in pcms {
         if let PcmStatus::Open { owner_pid } = host.pcm_status(card, device) {
             return Err(Refusal::DeviceHeld {
-                device: format!("hw:{card},{device}"),
+                device: name,
                 owner_pid,
             });
         }
@@ -314,9 +400,45 @@ impl HostAudio for LiveHostAudio {
         crate::capacity::alsa_sinks_at(&self.asound, &self.dev_snd)
     }
 
+    fn card_index(&self, id: &str) -> Option<u32> {
+        read_card_ids(&self.asound)
+            .into_iter()
+            .find_map(|(index, card_id)| (card_id == id).then_some(index))
+    }
+
     fn pcm_status(&self, card: u32, device: u32) -> PcmStatus {
         read_pcm_status(&self.asound, card, device)
     }
+}
+
+/// Each card's index and id under an asound root: the index and bracketed id from
+/// `cards`, the id from `cardN/id` where it can be read (the kernel's own file for it).
+pub fn read_card_ids(asound: &Path) -> std::collections::BTreeMap<u32, String> {
+    let cards = std::fs::read_to_string(asound.join("cards")).unwrap_or_default();
+    let mut out = std::collections::BTreeMap::new();
+    for line in cards.lines() {
+        // " 0 [NVidia         ]: HDA-Intel - HDA NVidia"; the card's second line has no index.
+        let Some((index, rest)) = line.trim_start().split_once(' ') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<u32>() else {
+            continue;
+        };
+        let bracketed = rest
+            .trim_start()
+            .strip_prefix('[')
+            .and_then(|r| r.split_once(']'))
+            .map(|(id, _)| id.trim().to_string());
+        let id = std::fs::read_to_string(asound.join(format!("card{index}/id")))
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .or(bracketed.filter(|id| !id.is_empty()));
+        if let Some(id) = id {
+            out.insert(index, id);
+        }
+    }
+    out
 }
 
 /// Sink discovery runs on the console hotplug poll; the listing forks `pactl`, so it is
@@ -465,6 +587,7 @@ mod tests {
         answers: bool,
         listed: Vec<PipeWireSink>,
         alsa: Vec<AudioSink>,
+        cards: BTreeMap<String, u32>,
         status: BTreeMap<(u32, u32), PcmStatus>,
     }
 
@@ -478,6 +601,9 @@ mod tests {
         fn alsa_sinks(&self) -> Vec<AudioSink> {
             self.alsa.clone()
         }
+        fn card_index(&self, id: &str) -> Option<u32> {
+            self.cards.get(id).copied()
+        }
         fn pcm_status(&self, card: u32, device: u32) -> PcmStatus {
             *self
                 .status
@@ -490,14 +616,15 @@ mod tests {
         FakeHost {
             alsa: vec![
                 AudioSink {
-                    id: "hw:0,3".into(),
+                    id: "hw:CARD=NVidia,DEV=3".into(),
                     label: "HDA NVidia — HDMI 0".into(),
                 },
                 AudioSink {
-                    id: "hw:1,0".into(),
+                    id: "hw:CARD=Generic,DEV=0".into(),
                     label: "Generic — Analog".into(),
                 },
             ],
+            cards: BTreeMap::from([("NVidia".into(), 0), ("Generic".into(), 1)]),
             status: BTreeMap::from([((0, 3), PcmStatus::Closed), ((1, 0), PcmStatus::Closed)]),
             ..Default::default()
         }
@@ -572,11 +699,98 @@ mod tests {
         assert!(choose_route("hw:1", &host).is_ok());
     }
 
+    /// A stable id follows its card to whatever index it has now (#407 live: a driver
+    /// reload moved the NVIDIA HDA from card 4 to card 1); a legacy index id still reads
+    /// by index; a card id the host no longer has is a named refusal.
+    #[test]
+    fn a_card_id_is_read_at_its_current_index_and_a_legacy_index_still_works() {
+        let mut host = hdmi();
+        assert_eq!(
+            choose_route("hw:CARD=NVidia,DEV=3", &host),
+            Ok(Route::Alsa {
+                device: Some("hw:CARD=NVidia,DEV=3".into())
+            })
+        );
+        // The driver reloads: NVidia is card 1 now, Generic card 0.
+        host.cards = BTreeMap::from([("NVidia".into(), 1), ("Generic".into(), 0)]);
+        host.status = BTreeMap::from([
+            ((1, 3), PcmStatus::Open { owner_pid: Some(7) }),
+            ((0, 0), PcmStatus::Closed),
+        ]);
+        let held = choose_route("hw:CARD=NVidia,DEV=3", &host).unwrap_err();
+        assert_eq!(held.reason(), "console-audio-device-held");
+        assert!(held.to_string().contains("hw:CARD=NVidia,DEV=3"), "{held}");
+        assert!(choose_route("hw:CARD=Generic,DEV=0", &host).is_ok());
+        // A card-level id checks that card's PCMs at its current index.
+        assert!(choose_route("hw:CARD=NVidia", &host).is_err());
+        assert!(choose_route("plughw:CARD=Generic", &host).is_ok());
+        // A stored legacy id reads by index, as before.
+        assert!(choose_route("hw:1,3", &host).is_err());
+        assert_eq!(
+            choose_route("hw:0,0", &host),
+            Ok(Route::Alsa {
+                device: Some("hw:0,0".into())
+            })
+        );
+        // A card id the host does not have now.
+        let absent = choose_route("hw:CARD=USB,DEV=0", &host).unwrap_err();
+        assert_eq!(absent.reason(), "console-audio-device-absent");
+        assert!(absent.to_string().contains("hw:CARD=USB,DEV=0"), "{absent}");
+    }
+
+    #[test]
+    fn alsa_addresses_parse_positional_and_keyed_forms() {
+        let at = |card: CardRef, device: Option<u32>| Some(AlsaAddress { card, device });
+        assert_eq!(parse_alsa("hw:1,3"), at(CardRef::Index(1), Some(3)));
+        assert_eq!(parse_alsa("plughw:2"), at(CardRef::Index(2), None));
+        assert_eq!(
+            parse_alsa("hw:CARD=NVidia,DEV=3"),
+            at(CardRef::Id("NVidia".into()), Some(3))
+        );
+        assert_eq!(
+            parse_alsa("hw:NVidia,7"),
+            at(CardRef::Id("NVidia".into()), Some(7))
+        );
+        assert_eq!(
+            parse_alsa("hw:CARD=Generic"),
+            at(CardRef::Id("Generic".into()), None)
+        );
+        assert_eq!(parse_alsa("hw:"), None);
+        assert_eq!(parse_alsa("hw:0,x"), None);
+        assert_eq!(parse_alsa("auto"), None);
+        assert_eq!(alsa_sink_id("NVidia", 3), "hw:CARD=NVidia,DEV=3");
+        assert_eq!(alsa_card_sink_id("NVidia"), "hw:CARD=NVidia");
+    }
+
+    #[test]
+    fn card_ids_come_from_the_card_id_file_then_the_cards_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cards"),
+            " 0 [Generic        ]: HDA-Intel - HD-Audio Generic\n                      HD-Audio Generic at 0xfc\n 1 [NVidia         ]: HDA-Intel - HDA NVidia\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("card1")).unwrap();
+        std::fs::write(dir.path().join("card1/id"), "NVidiaHDA\n").unwrap();
+        assert_eq!(
+            read_card_ids(dir.path()),
+            BTreeMap::from([(0, "Generic".to_string()), (1, "NVidiaHDA".to_string())])
+        );
+        let host = LiveHostAudio {
+            socket: dir.path().join("native"),
+            asound: dir.path().into(),
+            dev_snd: dir.path().join("snd"),
+        };
+        assert_eq!(host.card_index("NVidiaHDA"), Some(1));
+        assert_eq!(host.card_index("Generic"), Some(0));
+        assert_eq!(host.card_index("NVidia"), None);
+    }
+
     #[test]
     fn sinks_are_pipewire_only_while_it_answers() {
         let mut host = hdmi();
         let alsa: Vec<String> = sinks(&host).into_iter().map(|s| s.id).collect();
-        assert_eq!(alsa, vec!["hw:0,3", "hw:1,0"]);
+        assert_eq!(alsa, vec!["hw:CARD=NVidia,DEV=3", "hw:CARD=Generic,DEV=0"]);
 
         host.answers = true;
         assert_eq!(
@@ -659,7 +873,7 @@ mod tests {
         assert!(!host.pipewire_answers());
         assert_eq!(
             sinks(&host).into_iter().map(|s| s.id).collect::<Vec<_>>(),
-            vec!["hw:0,3"]
+            vec!["hw:CARD=NVidia,DEV=3"]
         );
         assert!(matches!(
             choose_route("auto", &host),

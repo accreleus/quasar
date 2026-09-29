@@ -348,38 +348,45 @@ pub(crate) fn detect_audio_sinks() -> Vec<AudioSink> {
 
 /// ALSA playback sinks from an asound root (`/proc/asound` or the host bind at
 /// `/host-proc/asound`). A card name alone is insufficient for HDMI/DP: the active output
-/// is often `hw:<card>,<device>`, not the non-existent device zero.
+/// is often device 3 or 7, not the non-existent device zero. Ids name the card by its id
+/// (`hw:CARD=<id>,DEV=<device>`), which a driver reload does not move (#407 live).
 pub(crate) fn alsa_sinks_at(asound: &std::path::Path, dev_snd: &std::path::Path) -> Vec<AudioSink> {
     let cards = std::fs::read_to_string(asound.join("cards")).unwrap_or_default();
     let pcm = std::fs::read_to_string(asound.join("pcm")).unwrap_or_default();
-    parse_audio_sinks(&cards, &pcm)
+    let ids = crate::session::console_audio::read_card_ids(asound);
+    parse_audio_sinks(&cards, &pcm, &ids)
         .into_iter()
         // Compose may expose only one sound device; advertising the rest of the host's
         // inventory hands an operator a sink whose ALSA node the pipeline cannot open.
-        .filter(|sink| audio_sink_device_path(dev_snd, &sink.id).is_none_or(|p| p.exists()))
+        // Card-level fallbacks name a controller, not a playback PCM; still useful on a
+        // host that exposes no pcm data.
+        .filter(|(pcm, _)| {
+            pcm.is_none_or(|(card, device)| pcm_device_path(dev_snd, card, device).exists())
+        })
+        .map(|(_, sink)| sink)
         .collect()
 }
 
-fn audio_sink_device_path(dev_snd: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
-    let Some((card, device)) = id
-        .strip_prefix("hw:")
-        .and_then(|address| address.split_once(','))
-    else {
-        // Card-level fallbacks name a controller, not a playback PCM; still useful on a
-        // host that exposes no pcm data.
-        return None;
-    };
-    Some(dev_snd.join(format!("pcmC{card}D{device}p")))
+fn pcm_device_path(dev_snd: &std::path::Path, card: u32, device: u32) -> std::path::PathBuf {
+    dev_snd.join(format!("pcmC{card}D{device}p"))
 }
 
-fn parse_audio_sinks(cards: &str, pcm: &str) -> Vec<AudioSink> {
+/// Each playback sink with the `(card index, device)` it is at now (`None` for a
+/// card-level fallback). `ids` maps a card index to its id; a card with none keeps the
+/// index form.
+fn parse_audio_sinks(
+    cards: &str,
+    pcm: &str,
+    ids: &std::collections::BTreeMap<u32, String>,
+) -> Vec<(Option<(u32, u32)>, AudioSink)> {
+    use crate::session::console_audio::{alsa_card_sink_id, alsa_sink_id};
     let mut labels = std::collections::BTreeMap::new();
     for line in cards.lines() {
         let trimmed = line.trim_start();
         let Some((idx_str, rest)) = trimmed.split_once(' ') else {
             continue;
         };
-        let Ok(idx) = idx_str.trim().parse::<i32>() else {
+        let Ok(idx) = idx_str.trim().parse::<u32>() else {
             continue;
         };
         let label = rest
@@ -403,7 +410,7 @@ fn parse_audio_sinks(cards: &str, pcm: &str) -> Vec<AudioSink> {
         let Some((card, device)) = address.trim().split_once('-') else {
             continue;
         };
-        let (Ok(card), Ok(device)) = (card.parse::<i32>(), device.parse::<i32>()) else {
+        let (Ok(card), Ok(device)) = (card.parse::<u32>(), device.parse::<u32>()) else {
             continue;
         };
         let endpoint = detail
@@ -416,17 +423,27 @@ fn parse_audio_sinks(cards: &str, pcm: &str) -> Vec<AudioSink> {
             .get(&card)
             .cloned()
             .unwrap_or_else(|| format!("card {card}"));
-        out.push(AudioSink {
-            id: format!("hw:{card},{device}"),
-            label: format!("{card_label} — {endpoint}"),
-        });
+        let id = match ids.get(&card) {
+            Some(card_id) => alsa_sink_id(card_id, device),
+            None => format!("hw:{card},{device}"),
+        };
+        out.push((
+            Some((card, device)),
+            AudioSink {
+                id,
+                label: format!("{card_label} — {endpoint}"),
+            },
+        ));
     }
 
     // A card with no PCM detail yet (a USB DAC still initializing) keeps a card-level option.
     if out.is_empty() {
-        out.extend(labels.into_iter().map(|(idx, label)| AudioSink {
-            id: format!("hw:{idx}"),
-            label,
+        out.extend(labels.into_iter().map(|(idx, label)| {
+            let id = match ids.get(&idx) {
+                Some(card_id) => alsa_card_sink_id(card_id),
+                None => format!("hw:{idx}"),
+            };
+            (None, AudioSink { id, label })
         }));
     }
     out
@@ -1424,44 +1441,93 @@ mod tests {
 00-07: HDMI 1 : HDMI 1 : playback 1
 01-00: ALC1220 Analog : ALC1220 Analog : playback 1 : capture 1
 ";
+        let ids = std::collections::BTreeMap::from([
+            (0, "NVidia".to_string()),
+            (1, "Generic".to_string()),
+        ]);
         assert_eq!(
-            parse_audio_sinks(cards, pcm),
+            parse_audio_sinks(cards, pcm, &ids),
             vec![
-                AudioSink {
-                    id: "hw:0,3".to_string(),
-                    label: "HDA NVidia — HDMI 0".to_string(),
-                },
-                AudioSink {
-                    id: "hw:0,7".to_string(),
-                    label: "HDA NVidia — HDMI 1".to_string(),
-                },
-                AudioSink {
-                    id: "hw:1,0".to_string(),
-                    label: "HD-Audio Generic — ALC1220 Analog".to_string(),
-                },
+                (
+                    Some((0, 3)),
+                    AudioSink {
+                        id: "hw:CARD=NVidia,DEV=3".to_string(),
+                        label: "HDA NVidia — HDMI 0".to_string(),
+                    }
+                ),
+                (
+                    Some((0, 7)),
+                    AudioSink {
+                        id: "hw:CARD=NVidia,DEV=7".to_string(),
+                        label: "HDA NVidia — HDMI 1".to_string(),
+                    }
+                ),
+                (
+                    Some((1, 0)),
+                    AudioSink {
+                        id: "hw:CARD=Generic,DEV=0".to_string(),
+                        label: "HD-Audio Generic — ALC1220 Analog".to_string(),
+                    }
+                ),
             ]
+        );
+        // A card whose id cannot be read keeps the index form.
+        assert_eq!(
+            parse_audio_sinks(cards, pcm, &Default::default())[2].1.id,
+            "hw:1,0"
+        );
+    }
+
+    /// Through a temporary asound root: the id is the card's, wherever its index moved.
+    #[test]
+    fn alsa_sinks_name_the_card_id_and_keep_only_openable_pcms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asound, dev_snd) = (dir.path().join("asound"), dir.path().join("snd"));
+        std::fs::create_dir_all(asound.join("card1")).unwrap();
+        std::fs::create_dir_all(&dev_snd).unwrap();
+        std::fs::write(
+            asound.join("cards"),
+            " 0 [Generic        ]: HDA-Intel - HD-Audio Generic\n 1 [NVidia         ]: HDA-Intel - HDA NVidia\n",
+        )
+        .unwrap();
+        std::fs::write(asound.join("card1/id"), "NVidia\n").unwrap();
+        std::fs::write(
+            asound.join("pcm"),
+            "00-00: ALC1220 Analog : ALC1220 Analog : playback 1\n01-03: HDMI 0 : HDMI 0 : playback 1\n",
+        )
+        .unwrap();
+        std::fs::write(dev_snd.join("pcmC1D3p"), "").unwrap();
+        assert_eq!(
+            alsa_sinks_at(&asound, &dev_snd),
+            vec![AudioSink {
+                id: "hw:CARD=NVidia,DEV=3".to_string(),
+                label: "HDA NVidia — HDMI 0".to_string(),
+            }]
         );
     }
 
     #[test]
     fn audio_sinks_fall_back_to_card_when_pcm_is_unavailable() {
         let cards = " 0 [NVidia ]: HDA-Intel - HDA NVidia\n";
+        let ids = std::collections::BTreeMap::from([(0, "NVidia".to_string())]);
         assert_eq!(
-            parse_audio_sinks(cards, ""),
-            vec![AudioSink {
-                id: "hw:0".to_string(),
-                label: "HDA NVidia".to_string(),
-            }]
+            parse_audio_sinks(cards, "", &ids),
+            vec![(
+                None,
+                AudioSink {
+                    id: "hw:CARD=NVidia".to_string(),
+                    label: "HDA NVidia".to_string(),
+                }
+            )]
         );
     }
 
     #[test]
     fn audio_sink_pcm_path_matches_alsa_endpoint() {
         assert_eq!(
-            audio_sink_device_path(std::path::Path::new("/dev/snd"), "hw:0,3").as_deref(),
-            Some(std::path::Path::new("/dev/snd/pcmC0D3p"))
+            pcm_device_path(std::path::Path::new("/dev/snd"), 0, 3),
+            std::path::Path::new("/dev/snd/pcmC0D3p")
         );
-        assert!(audio_sink_device_path(std::path::Path::new("/dev/snd"), "hw:0").is_none());
     }
 
     #[test]

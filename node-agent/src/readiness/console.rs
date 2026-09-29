@@ -118,7 +118,23 @@ pub fn check_audio(v: &ConsoleView) -> ReadinessCheck {
                 route.describe()
             ),
         ),
-        Ok(Route::Alsa { .. }) => match a.sinks.first() {
+        // The configured device itself, by the id the operator chose (a card id, or a
+        // stored legacy index), not merely the first sink discovery found.
+        Ok(Route::Alsa { device: Some(d) }) => {
+            let label = a
+                .sinks
+                .iter()
+                .find(|s| &s.id == d)
+                .map(|s| s.label.as_str());
+            super::pass(
+                CHECK_AUDIO,
+                match label {
+                    Some(label) => format!("{label} ({d}) is usable for console audio"),
+                    None => format!("the sound device {d} is usable for console audio"),
+                },
+            )
+        }
+        Ok(Route::Alsa { device: None }) => match a.sinks.first() {
             Some(sink) => super::pass(
                 CHECK_AUDIO,
                 format!("{} ({}) is usable for console audio", sink.label, sink.id),
@@ -252,6 +268,40 @@ mod tests {
         let c = check_audio(&v);
         assert_eq!(c.status, super::super::PASS);
         assert!(c.summary.contains("hw:0,3"), "{c:?}");
+    }
+
+    #[test]
+    fn audio_names_the_configured_device_and_fails_named_when_it_is_absent() {
+        use crate::session::console_audio::{Refusal, Route};
+        let mut v = view(true);
+        v.audio.sinks = vec![
+            crate::messages::AudioSink {
+                id: "hw:CARD=Generic,DEV=0".into(),
+                label: "Analog".into(),
+            },
+            crate::messages::AudioSink {
+                id: "hw:CARD=NVidia,DEV=3".into(),
+                label: "HDMI / DisplayPort".into(),
+            },
+        ];
+        v.audio.route = Ok(Route::Alsa {
+            device: Some("hw:CARD=NVidia,DEV=3".into()),
+        });
+        let c = check_audio(&v);
+        assert_eq!(c.status, super::super::PASS, "{c:?}");
+        assert!(
+            c.summary
+                .contains("HDMI / DisplayPort (hw:CARD=NVidia,DEV=3)"),
+            "{c:?}"
+        );
+
+        v.audio.route = Err(Refusal::DeviceAbsent {
+            device: "hw:CARD=USB,DEV=0".into(),
+        });
+        let absent = check_audio(&v);
+        assert_eq!(absent.status, super::super::FAIL, "{absent:?}");
+        assert!(absent.summary.contains("hw:CARD=USB,DEV=0"), "{absent:?}");
+        assert!(absent.blocks.is_none());
     }
 
     #[test]

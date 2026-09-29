@@ -17,6 +17,14 @@
 //! (or that the actor refused) is not asked for again until this process has received an
 //! `enabled` that differs from it.
 //!
+//! **The trigger is kept until it can be asked** (#407): a received `enabled` the actor
+//! could not act on yet — it was still settling after its own start (`busy`, the normal
+//! case right after an install or enrollment, when the agent's first `config_update`
+//! arrives while the actor is still verifying that agent), it did not answer, or it said
+//! unsupported — is remembered and tried again as the actor is re-read, so an agent that
+//! starts with console mode already enabled asks once the actor can take it. The put-back
+//! and refusal holds above apply to those retries exactly as to a received config.
+//!
 //! A host with no recovery actor (Compose, source) reports no `access` at all, and never
 //! asks for anything.
 
@@ -44,6 +52,9 @@ const POLL_APPLYING: Duration = Duration::from_secs(2);
 /// Its answer can change without a restart of this agent: an update this agent started
 /// under reads the machine record before the actor has written the new recipe revision.
 const POLL_UNSUPPORTED: Duration = Duration::from_secs(30);
+
+/// How often a trigger the actor could not take yet (busy, silent) is tried again.
+const POLL_RETRY: Duration = Duration::from_secs(5);
 
 /// How long one request to the actor may take.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
@@ -131,6 +142,9 @@ struct Inner {
     lifted: Option<String>,
     /// A target the actor refused (`400`), not asked for again until `enabled` differs.
     refused: Option<bool>,
+    /// A received `enabled` the trigger wanted but the actor could not take yet (busy,
+    /// silent, unsupported): reconciled again as the actor is re-read.
+    retry: Option<bool>,
 }
 
 pub struct ConsoleAccessManager {
@@ -151,6 +165,8 @@ pub struct ConsoleAccessManager {
     poll: Duration,
     /// How often an `unsupported` answer from the actor is read again.
     poll_unsupported: Duration,
+    /// How often a trigger the actor could not take yet is tried again.
+    poll_retry: Duration,
 }
 
 /// The process-wide manager's current report, for every `capacity` the agent sends.
@@ -204,6 +220,7 @@ impl ConsoleAccessManager {
             poll,
             // Tests poll fast; a real agent re-reads an unsupported answer every half minute.
             poll_unsupported: if publish { POLL_UNSUPPORTED } else { poll },
+            poll_retry: if publish { POLL_RETRY } else { poll },
         })
     }
 
@@ -303,7 +320,8 @@ impl ConsoleAccessManager {
     }
 
     /// Start the worker if the actor's answer is still expected to change (an attempt is
-    /// applying, or the actor said unsupported), so it is read again until it settles.
+    /// applying, the actor said unsupported, or a trigger waits for it), so it is read
+    /// again until it settles.
     pub fn watch_if_applying(self: &Arc<Self>) {
         if self.recheck().is_some() {
             let _ = self.worker_tx();
@@ -315,17 +333,23 @@ impl ConsoleAccessManager {
         if self.applying() {
             return Some(self.poll);
         }
+        let inner = self.inner.lock().unwrap();
         // The actor's answer can change without a restart of this agent (a recipe
         // revision that now supports this host lands): read it again either way,
         // rootless engines included (#407 — no longer a fixed local finding).
-        let unsupported = self
-            .inner
-            .lock()
-            .unwrap()
+        let unsupported = inner
             .report
             .as_ref()
             .is_some_and(|r| r.state == ConsoleAccessState::Unsupported);
-        unsupported.then_some(self.poll_unsupported)
+        if unsupported {
+            return Some(self.poll_unsupported);
+        }
+        inner.retry.is_some().then_some(self.poll_retry)
+    }
+
+    /// The trigger still waiting for the actor, if any.
+    fn pending_retry(&self) -> Option<bool> {
+        self.inner.lock().unwrap().retry
     }
 
     fn applying(&self) -> bool {
@@ -364,10 +388,21 @@ impl ConsoleAccessManager {
                 .filter(|l| l.put_back() && l.target == want)
                 .is_some_and(|l| inner.lifted.as_deref() != Some(l.key().as_str()));
             let suppressed = held_put_back || inner.refused == Some(want);
+            // Settled by this reconcile unless it finds the actor unable to take it yet.
+            inner.retry = None;
             (inner.report.clone(), suppressed)
         };
         let Some(report) = report else { return };
         if !starts_replacement(&report, want) {
+            // The actor cannot take it now (unsupported), or another attempt is applying
+            // toward the other target: keep the trigger for when that settles.
+            if want != has_access(&report)
+                && (report.state == ConsoleAccessState::Unsupported
+                    || (report.state == ConsoleAccessState::Applying
+                        && report.target != Some(want)))
+            {
+                self.inner.lock().unwrap().retry = Some(want);
+            }
             debug!(
                 want,
                 state = ?report.state,
@@ -421,17 +456,27 @@ impl ConsoleAccessManager {
                     "the recovery actor refused console mode {} ({reason}): {message}",
                     on_off(want)
                 );
-                if reason != "busy" {
-                    self.inner.lock().unwrap().refused = Some(want);
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    if reason == "busy" {
+                        // Settling after its own start (right after an install, say):
+                        // asked again once it can take it.
+                        inner.retry = Some(want);
+                    } else {
+                        inner.refused = Some(want);
+                    }
                 }
                 self.read_actor();
             }
-            Err(e) => warn!(
-                token = "console-access-actor-unreachable",
-                "console mode {}: the recovery actor at {} did not answer: {e}",
-                on_off(want),
-                socket.display()
-            ),
+            Err(e) => {
+                warn!(
+                    token = "console-access-actor-unreachable",
+                    "console mode {}: the recovery actor at {} did not answer: {e}",
+                    on_off(want),
+                    socket.display()
+                );
+                self.inner.lock().unwrap().retry = Some(want);
+            }
         }
     }
 
@@ -495,7 +540,10 @@ fn worker(mgr: Weak<ConsoleAccessManager>, rx: std::sync::mpsc::Receiver<bool>) 
                 None => return,
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match mgr.upgrade() {
-                Some(m) if m.recheck().is_some() => m.refresh(),
+                Some(m) if m.recheck().is_some() => match m.pending_retry() {
+                    Some(want) => m.reconcile(want),
+                    None => m.refresh(),
+                },
                 Some(_) => {}
                 None => return,
             },
