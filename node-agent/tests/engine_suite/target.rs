@@ -72,6 +72,8 @@ pub struct Target {
     pub socket: PathBuf,
     /// Capability -> the reason this host cannot give it.
     pub lacks: BTreeMap<Capability, String>,
+    /// Case -> the recorded finding it fails on for this engine mode.
+    pub known: BTreeMap<String, String>,
 }
 
 fn engine(value: &str) -> Result<EngineKind, String> {
@@ -201,6 +203,7 @@ pub fn from_environment(
             mode,
             socket: PathBuf::from(socket),
             lacks: BTreeMap::new(),
+            known: BTreeMap::new(),
         });
     }
     if out.is_empty() {
@@ -237,6 +240,34 @@ pub fn from_environment(
         }
     }
     Ok(out)
+}
+
+/// `QUASAR_ENGINE_SUITE_KNOWN`: `;`-separated `<target>:<case>=<finding>`. Such a case
+/// still runs: its failure reports KNOWN with the finding, and a pass fails the run so the
+/// entry is removed once the finding is fixed.
+pub fn known_failures(targets: &mut [Target], cases: &[&str], spec: &str) -> Result<(), String> {
+    for entry in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let (scope, finding) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("known failure {entry:?} is not <target>:<case>=<finding>"))?;
+        let (target, case) = scope
+            .split_once(':')
+            .ok_or_else(|| format!("known failure {entry:?} names no target"))?;
+        let (target, case, finding) = (target.trim(), case.trim(), finding.trim());
+        if finding.is_empty() {
+            return Err(format!("known failure {entry:?} records no finding"));
+        }
+        if !cases.contains(&case) {
+            return Err(format!("known failure for unknown case {case:?}"));
+        }
+        let Some(t) = targets.iter_mut().find(|t| t.mode.name == target) else {
+            return Err(format!(
+                "known failure for {target}, which this run does not target"
+            ));
+        };
+        t.known.insert(case.to_string(), finding.to_string());
+    }
+    Ok(())
 }
 
 /// The mode table and the environment parser run on every `cargo test`, targets or not.
@@ -279,6 +310,23 @@ pub fn self_check() -> Result<(), String> {
         expect(
             from_environment(&modes, targets, lacks).is_err(),
             &format!("refused: {targets:?} with {lacks:?}"),
+        )?;
+    }
+    let mut known = parsed;
+    known_failures(&mut known, &["restart"], "podman-rootless:restart=finding")?;
+    expect(
+        known[1].known["restart"] == "finding" && known[0].known.is_empty(),
+        "a known failure applies to its target only",
+    )?;
+    for spec in [
+        "restart=no target",
+        "podman-rootless:restart=",
+        "podman-rootless:nosuchcase=finding",
+        "podman-rootful:restart=not targeted",
+    ] {
+        expect(
+            known_failures(&mut known, &["restart"], spec).is_err(),
+            &format!("refused: {spec:?}"),
         )?;
     }
     Ok(())

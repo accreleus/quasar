@@ -189,6 +189,20 @@ jobs:
       fail-fast: false
       matrix:
         target: [docker-rootful, docker-rootless, podman-rootful, podman-rootless]
+        # Findings Ubuntu's Podman 4.9 fails on, recorded rather than hidden: each still runs,
+        # reports KNOWN, and fails the job once it passes so the entry is dropped. The
+        # required Podman profiles are Fedora's Podman 5, which the lab runs.
+        include:
+          - target: podman-rootful
+            known: >-
+              podman-rootful:create-read-back=Podman 4.9 - the runtime cannot read back the session-shaped container (UnknownOutcome, reconciliation Protocol);
+              podman-rootful:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
+              podman-rootful:errors=Podman 4.9 - a missing bind source leaves a created container behind and the runtime reports UnknownOutcome
+          - target: podman-rootless
+            known: >-
+              podman-rootless:create-read-back=Podman 4.9 - the runtime cannot read back the session-shaped container (UnknownOutcome, reconciliation Protocol);
+              podman-rootless:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
+              podman-rootless:errors=Podman 4.9 - a missing bind source leaves a created container behind and the runtime reports UnknownOutcome
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The suite links the agent crate, which needs the same headers as the rust job.
@@ -220,6 +234,7 @@ jobs:
         run: bash scripts/verify/ci-engine-target.sh "${{ matrix.target }}"
       - name: Run the suite
         env:
+          QUASAR_ENGINE_SUITE_KNOWN: ${{ matrix.known }}
           QUASAR_ENGINE_SUITE_LACKS: >-
             cdi=a hosted runner has no NVIDIA GPU;
             dri=a hosted runner has no DRM node;
@@ -227,7 +242,7 @@ jobs:
         run: |
           suite="$(cat "$RUNNER_TEMP/engine-suite-path")"
           if [ "${ENGINE_SUITE_AS_ROOT:-}" = 1 ]; then
-            sudo --preserve-env=QUASAR_ENGINE_SUITE_TARGETS,QUASAR_ENGINE_SUITE_LACKS "$suite"
+            sudo --preserve-env=QUASAR_ENGINE_SUITE_TARGETS,QUASAR_ENGINE_SUITE_LACKS,QUASAR_ENGINE_SUITE_KNOWN "$suite"
           else
             "$suite"
           fi

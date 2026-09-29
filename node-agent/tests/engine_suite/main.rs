@@ -206,6 +206,8 @@ impl Ctx {
 enum Verdict {
     Pass(String),
     Skip(String),
+    /// Failed on a finding recorded for this engine mode.
+    Known(String),
     Fail(String),
 }
 
@@ -213,6 +215,7 @@ fn report(target: &str, case: &str, verdict: &Verdict, took: Duration) {
     let (word, detail) = match verdict {
         Verdict::Pass(d) => ("PASS", d),
         Verdict::Skip(d) => ("SKIP", d),
+        Verdict::Known(d) => ("KNOWN", d),
         Verdict::Fail(d) => ("FAIL", d),
     };
     println!(
@@ -299,7 +302,11 @@ fn main() -> ExitCode {
     };
     let modes = target::modes().expect("checked above");
     let lacks = std::env::var("QUASAR_ENGINE_SUITE_LACKS").ok();
-    let targets = match target::from_environment(&modes, &targets, lacks.as_deref()) {
+    let case_names: Vec<&str> = cases::CASES.iter().map(|c| c.name).collect();
+    let known_spec = std::env::var("QUASAR_ENGINE_SUITE_KNOWN").unwrap_or_default();
+    let targets = match target::from_environment(&modes, &targets, lacks.as_deref())
+        .and_then(|mut t| target::known_failures(&mut t, &case_names, &known_spec).map(|()| t))
+    {
         Ok(t) => t,
         Err(e) => {
             eprintln!("engine-suite: {e}");
@@ -351,7 +358,7 @@ fn main() -> ExitCode {
     }));
 
     println!("engine-suite run {run}, image {image}");
-    let (mut passed, mut skipped, mut failed) = (0, 0, 0);
+    let (mut passed, mut skipped, mut known, mut failed) = (0, 0, 0, 0);
     let mut keep_state = false;
     for target in &targets {
         let name = target.mode.name.as_str();
@@ -386,7 +393,7 @@ fn main() -> ExitCode {
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (case.run)(&ctx)));
                 let left = ctx.clean_case();
-                match (outcome, left.is_empty()) {
+                let verdict = match (outcome, left.is_empty()) {
                     (Ok(detail), true) => Verdict::Pass(detail),
                     (Ok(_), false) => Verdict::Fail(format!("left behind: {left:?}")),
                     (Err(payload), _) => {
@@ -396,11 +403,22 @@ fn main() -> ExitCode {
                         }
                         Verdict::Fail(text)
                     }
+                };
+                match (verdict, target.known.get(case.name)) {
+                    (Verdict::Fail(text), Some(finding)) => {
+                        Verdict::Known(format!("{finding} (this run: {text})"))
+                    }
+                    (Verdict::Pass(_), Some(finding)) => Verdict::Fail(format!(
+                        "passed, but is recorded as failing ({finding}): drop it from \
+                         QUASAR_ENGINE_SUITE_KNOWN"
+                    )),
+                    (verdict, _) => verdict,
                 }
             };
             match verdict {
                 Verdict::Pass(_) => passed += 1,
                 Verdict::Skip(_) => skipped += 1,
+                Verdict::Known(_) => known += 1,
                 Verdict::Fail(_) => failed += 1,
             }
             report(name, case.name, &verdict, started.elapsed());
@@ -435,7 +453,8 @@ fn main() -> ExitCode {
     }
     let names: Vec<&str> = targets.iter().map(|t| t.mode.name.as_str()).collect();
     println!(
-        "RESULT engine-suite: {passed} passed, {skipped} skipped, {failed} failed (targets: {})",
+        "RESULT engine-suite: {passed} passed, {skipped} skipped, {known} known, {failed} failed \
+         (targets: {})",
         names.join(", ")
     );
     if keep_state {
