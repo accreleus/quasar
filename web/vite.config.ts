@@ -95,27 +95,33 @@ function preloadFonts(): Plugin {
 const controlOrigin = process.env.QUASAR_CONTROL_ORIGIN ?? "http://localhost:8080";
 
 // The control plane serves deploy/enroll-host.sh from the SPA root as
-// /enroll-host.sh (#100), so the installer a second host fetches is the one from
-// the tree the control plane was built from. Copied at build time, never
-// duplicated in web/: deploy/ stays the single home of operator scripts.
+// /enroll-host.sh (#100), and deploy/prepare-host.sh beside it as
+// /prepare-host.sh (#406: the host preparation a rootless host runs before
+// enrolling), so the scripts a second host fetches are the ones from the tree
+// the control plane was built from. Copied at build time, never duplicated in
+// web/: deploy/ stays the single home of operator scripts. Both are static files,
+// not API routes (protocol/control-api.md's note on /enroll-host.sh).
 // Missing must fail the build — the SPA handler would otherwise answer the URL
 // with index.html and `sh` would choke on HTML.
-function enrollHostScript(): Plugin {
-  const src = path.resolve(__dirname, "..", "deploy", "enroll-host.sh");
+const OPERATOR_SCRIPTS = ["enroll-host.sh", "prepare-host.sh"] as const;
+function operatorScripts(): Plugin {
   return {
-    name: "quasar-enroll-host-script",
+    name: "quasar-operator-scripts",
     apply: "build",
     generateBundle() {
-      if (!fs.existsSync(src)) {
-        throw new Error(`quasar-enroll-host-script: ${src} not found — the build context must include deploy/enroll-host.sh`);
+      for (const name of OPERATOR_SCRIPTS) {
+        const src = path.resolve(__dirname, "..", "deploy", name);
+        if (!fs.existsSync(src)) {
+          throw new Error(`quasar-operator-scripts: ${src} not found — the build context must include deploy/${name}`);
+        }
+        this.emitFile({ type: "asset", fileName: name, source: fs.readFileSync(src) });
       }
-      this.emitFile({ type: "asset", fileName: "enroll-host.sh", source: fs.readFileSync(src) });
     },
   };
 }
 
 export default defineConfig({
-  plugins: [react(), preloadFonts(), enrollHostScript()],
+  plugins: [react(), preloadFonts(), operatorScripts()],
   define: { __QUASAR_SOURCE_REF__: JSON.stringify(sourceRef()) },
   server: {
     proxy: {

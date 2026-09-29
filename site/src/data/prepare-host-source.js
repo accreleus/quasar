@@ -4,8 +4,8 @@
  * one place both the URL and the checksum come from, so the prep block never
  * drifts from the file it downloads.
  *
- * The quick start fetches the file from the docs site (this is chunk 4's job:
- * actually publishing it there), because the first machine in an install has
+ * The quick start fetches the file from the docs site (`prepareHostIntegration`
+ * below publishes it there), because the first machine in an install has
  * no control plane yet to fetch it from. Enrollment of later hosts fetches
  * the control plane's own copy instead (`/prepare-host.sh`, served next to
  * `/enroll-host.sh` the same way — protocol/control-api.md's note on
@@ -24,7 +24,7 @@
  * `data-*` attribute; `stack-template.js#setPrepareHostSha256` is how the
  * client (and this file's own test) supplies it to `generate()`.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -40,5 +40,55 @@ const PREPARE_HOST_PATH = CANDIDATES.find(existsSync) ?? CANDIDATES[0];
 export const PREPARE_HOST_SOURCE = readFileSync(PREPARE_HOST_PATH);
 export const PREPARE_HOST_SHA256 = createHash('sha256').update(PREPARE_HOST_SOURCE).digest('hex');
 
-/** Served from the docs site's own origin (chunk 4 wires up the actual copy). */
-export const PREPARE_HOST_URL = 'https://accreleus.github.io/quasar/prepare-host.sh';
+/** The file name the site publishes it under, at the root of its base path. */
+export const PREPARE_HOST_ASSET = 'prepare-host.sh';
+
+/**
+ * Served from the docs site's own origin: `prepareHostIntegration()` below writes the
+ * file into the built site, so this URL answers with the very bytes whose checksum the
+ * quick start prints. `stack-template.js` repeats the URL (it cannot import this file);
+ * a test holds the two equal.
+ */
+export const PREPARE_HOST_URL = `https://accreleus.github.io/quasar/${PREPARE_HOST_ASSET}`;
+
+/**
+ * Writes the script into a built site's output directory and checks what landed
+ * there against the checksum the quick start shows. Returns the path written.
+ */
+export function writePrepareHost(outDir) {
+  const dest = join(outDir, PREPARE_HOST_ASSET);
+  writeFileSync(dest, PREPARE_HOST_SOURCE);
+  const written = createHash('sha256').update(readFileSync(dest)).digest('hex');
+  if (written !== PREPARE_HOST_SHA256) {
+    throw new Error(`${dest}: sha256 ${written}, but the quick start shows ${PREPARE_HOST_SHA256}`);
+  }
+  return dest;
+}
+
+/**
+ * The Astro integration that publishes `deploy/prepare-host.sh` with the site: into
+ * the build output (served at `PREPARE_HOST_URL` under the site's base path), and
+ * from the dev server at the same path. The bytes are `PREPARE_HOST_SOURCE`, the
+ * same the checksum was computed from, never a copy under `site/`.
+ */
+export function prepareHostIntegration() {
+  return {
+    name: 'quasar-prepare-host',
+    hooks: {
+      'astro:server:setup': ({ server }) => {
+        server.middlewares.use((req, res, next) => {
+          if ((req.url ?? '').split('?')[0].endsWith(`/${PREPARE_HOST_ASSET}`)) {
+            res.setHeader('Content-Type', 'text/x-shellscript; charset=utf-8');
+            res.end(PREPARE_HOST_SOURCE);
+            return;
+          }
+          next();
+        });
+      },
+      'astro:build:done': ({ dir, logger }) => {
+        const dest = writePrepareHost(fileURLToPath(dir));
+        logger.info(`${PREPARE_HOST_ASSET} (sha256 ${PREPARE_HOST_SHA256}) -> ${dest}`);
+      },
+    },
+  };
+}

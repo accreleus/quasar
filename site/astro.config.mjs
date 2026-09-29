@@ -6,6 +6,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightOpenAPI, { createOpenAPISidebarGroup } from 'starlight-openapi';
 
+import { prepareHostIntegration } from './src/data/prepare-host-source.js';
+
 // GitHub Pages project site. If the repo moves org, or the site later gets a
 // custom domain, these two constants are the only thing that has to change.
 const SITE = 'https://accreleus.github.io';
@@ -49,6 +51,10 @@ export default defineConfig({
 		},
 	},
 	integrations: [
+		// deploy/prepare-host.sh, published at <site>/quasar/prepare-host.sh: the quick
+		// start's prep block fetches it from there and checks it against the sha256 it
+		// prints, computed from the same bytes (src/data/prepare-host-source.js).
+		prepareHostIntegration(),
 		starlight({
 			plugins: [
 				starlightOpenAPI([

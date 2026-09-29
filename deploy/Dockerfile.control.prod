@@ -33,8 +33,9 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ .
-# vite copies ../deploy/enroll-host.sh into dist so the control plane serves it.
-COPY deploy/enroll-host.sh /deploy/enroll-host.sh
+# vite copies ../deploy/enroll-host.sh and ../deploy/prepare-host.sh into dist so
+# the control plane serves them (/enroll-host.sh, /prepare-host.sh).
+COPY deploy/enroll-host.sh deploy/prepare-host.sh /deploy/
 # The ref this tree is at, baked into the bundle for the enroll-host one-liner
 # (#100); build-images.sh passes it, since the build context carries no .git.
 ARG QUASAR_SOURCE_REF=
