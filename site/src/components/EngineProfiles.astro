@@ -1,0 +1,85 @@
+---
+/**
+ * The published engine-profile table (RH07-14, #406): for each platform,
+ * container engine and engine mode, whether Quasar calls it supported,
+ * experimental or unsupported, and why.
+ *
+ * Reads testdata/engine-profiles/profiles.json through engine-profiles.js —
+ * the same table the quick start's step 2 renders and the node agent's
+ * runtime_engine readiness check is held to, so this page can never show a
+ * status the host's own readiness card would disagree with. Nothing here
+ * decides a status; see that file to change one.
+ *
+ * Design: Starlight's own <Badge>, in the product's state colours (theme.css
+ * "Starlight badges in the product's state colours") — the same component and
+ * variant map the quick start's step 2 uses server-side. No new styling is
+ * invented for this page.
+ */
+import { Badge } from '@astrojs/starlight/components';
+import { ENGINES, MODES, PLATFORMS, profileFor } from '../data/engine-profiles.js';
+
+const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
+const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
+
+const engineIds = Object.keys(ENGINES);
+const platformIds = Object.keys(PLATFORMS);
+---
+
+{platformIds.map((platformId) => {
+	const platform = PLATFORMS[platformId];
+	const rows = engineIds.flatMap((engine) =>
+		MODES.map((mode) => ({ engine, mode, profile: profileFor(platformId, engine, mode) })),
+	);
+	return (
+		<div class="ep-platform">
+			<h3>{platform.label}</h3>
+			<table class="ep-table">
+				<thead>
+					<tr>
+						<th>Engine</th>
+						<th>Mode</th>
+						<th>Status</th>
+						<th>Why</th>
+					</tr>
+				</thead>
+				<tbody>
+					{rows.map(({ engine, mode, profile }) => (
+						<tr>
+							<td>{ENGINES[engine].label}</td>
+							<td>{mode === 'rootful' ? 'Rootful' : 'Rootless'}</td>
+							<td>
+								<Badge size="small" variant={BADGE_VARIANT[profile.status]} text={BADGE_TEXT[profile.status]} />
+							</td>
+							<td>{profile.reason}</td>
+						</tr>
+					))}
+				</tbody>
+			</table>
+		</div>
+	);
+})}
+
+<style>
+	.ep-platform {
+		margin: 1.75rem 0;
+	}
+	.ep-platform h3 {
+		margin-bottom: 0.5rem;
+	}
+	.ep-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.875rem;
+	}
+	.ep-table th,
+	.ep-table td {
+		text-align: left;
+		padding: 0.5rem 0.75rem;
+		border-bottom: 1px solid var(--sl-color-hairline, var(--q-line-2));
+		vertical-align: top;
+	}
+	.ep-table th {
+		color: var(--sl-color-gray-2, inherit);
+		font-weight: 600;
+	}
+</style>

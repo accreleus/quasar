@@ -47,7 +47,11 @@ own; the two do not move together, and that is deliberate.
   sockets (never `sudo` on a rootless one), refuses an unsupported profile by name before
   pulling anything, and on a rootless host without host preparation prints the
   `prepare-host.sh` command, which the control plane now serves at `/prepare-host.sh` and
-  the documentation site publishes beside the quick start.
+  the documentation site publishes beside the quick start. The site gains an engine-profiles
+  page (the same table, rendered), a Podman Quadlet install page, and a moving-to-rootless
+  guide (fresh install plus a dump restore, homes copied into a freshly owned root rather
+  than re-owned in place); Requirements, Install Quasar and Add a second GPU host now cover
+  engine choice and host preparation too.
 - **Console mode on rootful owned installs (RH-07, #395).** The recovery actor gives an
   owned agent console mode's additions again: `SYS_ADMIN` for DRM master, `/dev/snd` and
   `/proc/asound` read-only (only on a host that has sound, read again each time console mode

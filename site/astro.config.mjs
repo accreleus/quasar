@@ -130,6 +130,7 @@ export default defineConfig({
 						{ label: 'What Quasar is', slug: 'start/what-quasar-is' },
 						{ label: 'How it works', slug: 'start/how-it-works' },
 						{ label: 'Requirements', slug: 'start/requirements' },
+						{ label: 'Engine profiles', slug: 'start/engine-profiles' },
 					],
 				},
 				{
@@ -137,9 +138,11 @@ export default defineConfig({
 					items: [
 						{ label: 'Quick start', slug: 'start/quickstart' },
 						{ label: 'Install Quasar', slug: 'install/install' },
+						{ label: 'Install with Podman (Quadlet)', slug: 'install/podman-quadlet' },
 						{ label: 'First-run setup', slug: 'install/first-run' },
 						{ label: 'Check your install', slug: 'install/verify' },
 						{ label: 'Add a second GPU host', slug: 'install/second-host' },
+						{ label: 'Moving to rootless', slug: 'install/move-to-rootless' },
 						{ label: 'Move a Compose install', slug: 'install/move-existing' },
 						{ label: 'Legacy Compose installs', slug: 'install/legacy-compose' },
 					],

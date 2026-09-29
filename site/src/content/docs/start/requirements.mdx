@@ -13,21 +13,38 @@ and Windows cannot do that, so media will not work there at all. Any systemd
 distribution with Docker should be fine. Fedora 44 is what the install is
 verified on.
 
-**Docker Engine**, with Engine API 1.40 or newer (Docker 19.03 and later).
-Quasar creates its own services through the Engine API, so Compose is not
-needed. A stack manager is optional: the seed can be one `docker run` line.
+**A container engine**: Docker Engine (API 1.40 or newer, Docker 19.03 and
+later) or Podman, either running as root (**rootful**) or as an ordinary
+account (**rootless**) — see [Engine profiles](/quasar/start/engine-profiles/)
+for which combination of engine, mode and platform is Supported,
+Experimental or Unsupported today, and why. Rootful Docker is Supported
+everywhere, including Unraid, and is what this section otherwise describes;
+rootless is the design target Quasar is moving towards. Quasar creates its own
+services through the engine's API, so Compose is not needed. A stack manager
+is optional: the seed can be one `docker run` (or, on Podman, one Quadlet
+unit — see [Install with Podman](/quasar/install/podman-quadlet/)).
 
 | | Status |
 | --- | --- |
-| Plain Docker Engine on Linux | Supported |
+| Plain Docker Engine on Linux, rootful | Supported |
 | Dockge, Arcane | Supported, running the one-service seed stack |
 | A `docker run` seed on Unraid | Supported, as plain Docker |
+| Podman (Quadlet), rootless or rootful | See [Engine profiles](/quasar/start/engine-profiles/) |
+| Docker, rootless | See [Engine profiles](/quasar/start/engine-profiles/) |
 | Portainer | Not supported |
 | An Unraid Community Applications template | None ships |
-| Podman, rootless Docker | Not supported |
 | Kubernetes | Not supported |
 
 One Quasar installation per container engine.
+
+<Aside type="note" title="Rootless and the quasar account">
+A rootless install runs everything — the engine itself, the seed, and every
+Quasar service — under a dedicated, unprivileged Linux account, not your own
+login. [Host preparation](/quasar/install/podman-quadlet/#installing) creates
+that account for you (`quasar` by default) and everything below on this page
+that says "as root" is instead the one host-preparation step, run once, as
+root, on a rootless install.
+</Aside>
 
 On Docker older than 20.10, `/var/lib/docker` is traversable, so a host user
 whose uid is 1000 can read the control plane's secret files in its volume. Use a
