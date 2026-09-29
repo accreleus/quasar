@@ -778,6 +778,18 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **`make test-rust` in two worktrees at once no longer cross-contaminates (#417).** Every
+  worktree built into the same in-container `CARGO_TARGET_DIR` on the shared
+  `quasar-cargo-target` volume, at identical source paths, so cargo's mtime-based freshness
+  check happily served one worktree's test binaries to another — a false pass or false fail
+  depending on which branch ran last. `scripts/verify.sh` now derives the same per-worktree
+  `QUASAR_INSTANCE` id the rest of the dx layer uses (`scripts/dx/common.sh`) and threads it
+  into a per-worktree `CARGO_TARGET_DIR` subdirectory of the cache volume (downloads/registry
+  caches stay shared, only build output is isolated) and a per-worktree compose project name
+  (`-p`), so concurrent runs can no longer share containers either. The Go build cache stays
+  one shared volume — it is content-addressed and safe to share — and `web/`'s node_modules
+  volume was already safe: `npm ci` reinstalls it clean every run. First `make test-rust` run
+  per worktree now builds cold.
 - **Podman's `stopped` health status no longer breaks inspection (RH-07, #404 live).** An
   exited container whose image has a healthcheck reports health `stopped` on Podman, which
   Docker's schema lacks; one such container made every inspection unparseable, so the

@@ -968,6 +968,55 @@ else
   fail "instance:override" "expected my-override, got $C"
 fi
 
+# ── #417: scripts/verify.sh threads QUASAR_INSTANCE into a per-worktree
+# compose project AND a per-worktree cargo-target subdir, so two worktrees
+# running `make test-rust` at once never share containers or build output. No
+# real docker daemon: a stub `docker` just records its argv, and the shared
+# quasar-cargo-target VOLUME name stays constant by design (only the in-volume
+# subdir the container sees differs) — checked by reading the compose file's
+# CARGO_TARGET_DIR line, not by asking a real docker to interpolate it.
+VERIFY_STUB="$WORK/verify-stubbin"
+mkdir -p "$VERIFY_STUB"
+cat > "$VERIFY_STUB/docker" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$VERIFY_DOCKER_LOG"
+exit 0
+SH
+chmod +x "$VERIFY_STUB/docker"
+
+VERIFY_LOG_A="$WORK/verify-docker-args-alpha.log"
+VERIFY_LOG_B="$WORK/verify-docker-args-beta.log"
+: > "$VERIFY_LOG_A"; : > "$VERIFY_LOG_B"
+
+env PATH="$VERIFY_STUB:$PATH" VERIFY_DOCKER_LOG="$VERIFY_LOG_A" \
+  QUASAR_DX_ROOT=/fake/worktree-alpha \
+  bash "$ROOT/scripts/verify.sh" quick >/dev/null 2>&1 || true
+env PATH="$VERIFY_STUB:$PATH" VERIFY_DOCKER_LOG="$VERIFY_LOG_B" \
+  QUASAR_DX_ROOT=/fake/worktree-beta \
+  bash "$ROOT/scripts/verify.sh" quick >/dev/null 2>&1 || true
+
+VPROJ_A="$(grep -m1 -oE -- '-p [^ ]+' "$VERIFY_LOG_A" | awk '{print $2}')"
+VPROJ_B="$(grep -m1 -oE -- '-p [^ ]+' "$VERIFY_LOG_B" | awk '{print $2}')"
+
+if [ -n "$VPROJ_A" ] && [ -n "$VPROJ_B" ] && [ "$VPROJ_A" != "$VPROJ_B" ]; then
+  pass "verify:project-distinct" "$VPROJ_A != $VPROJ_B"
+else
+  fail "verify:project-distinct" "two worktree roots produced the same verify.sh compose project ('$VPROJ_A' / '$VPROJ_B')"
+fi
+
+if printf '%s' "$VPROJ_A" | grep -qE '^dx-[0-9a-f]+-verify$'; then
+  pass "verify:project-shape" "$VPROJ_A follows dx-<hash>-verify (distinct namespace from dx_local_compose's bare \$QUASAR_INSTANCE)"
+else
+  fail "verify:project-shape" "$VPROJ_A does not match dx-<hash>-verify"
+fi
+
+if grep -qF 'CARGO_TARGET_DIR: /cache/cargo-target/${QUASAR_INSTANCE:-default}' \
+    "$ROOT/scripts/verify/docker-compose.devtools.yml"; then
+  pass "verify:cargo-target-per-instance" "CARGO_TARGET_DIR is a \$QUASAR_INSTANCE subdir of the shared cargo-target volume"
+else
+  fail "verify:cargo-target-per-instance" "docker-compose.devtools.yml no longer keys CARGO_TARGET_DIR off \$QUASAR_INSTANCE"
+fi
+
 printf '\n== degraded reporting ==\n'
 
 # ── doctor with an unreachable gpu-test role → degraded, rc 0 ────────────────
