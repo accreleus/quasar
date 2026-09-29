@@ -140,11 +140,19 @@ export function fakeEnv(dir, extra = {}) {
   };
 }
 
-/** Runs a generated script's text against the fake engine, returns the result plus the call log. */
+/**
+ * Runs a generated script's text against the fake engine, returns the result
+ * plus the call log. `cwd` is the fake bin dir itself: the prep block's
+ * `curl -o prepare-host.sh` writes a relative path, and without pinning `cwd`
+ * that lands wherever the test process happens to be running — which is how
+ * an earlier version of this harness left a stray `prepare-host.sh` sitting
+ * in the site's own working tree.
+ */
 export function runScript(script, { engine = fakeEngineDir(), extraEnv = {} } = {}) {
   try {
     const r = spawnSync('bash', ['-c', script], {
       encoding: 'utf8',
+      cwd: engine.dir,
       env: fakeEnv(engine.dir, extraEnv),
     });
     return { ...r, calls: engine.read() };
