@@ -55,7 +55,7 @@ mk_root() { # mk_root <dir> [nvidia]
   printf 'someone:100000:65536\n' > "$r/etc/subuid"
   printf 'someone:100000:65536\n' > "$r/etc/subgid"
   printf '#!/bin/sh\n' > "$r/usr/bin/setfacl"; chmod +x "$r/usr/bin/setfacl"
-  if [ "${2:-}" = nvidia ]; then mkdir -p "$r/proc/driver/nvidia"; printf 'NVRM version: 615.71.09\n' > "$r/proc/driver/nvidia/version"; fi
+  if [ "${2:-}" = nvidia ]; then mkdir -p "$r/proc/driver/nvidia" "$r/dev"; printf 'NVRM version: 615.71.09\n' > "$r/proc/driver/nvidia/version"; : > "$r/dev/nvidiactl"; fi
 }
 
 prep() { # prep <root> <stubdir> args...
@@ -69,7 +69,8 @@ tree() { (cd "$1" && find . \( -type f -o -type l \) ! -name .prepare-host-comma
 # ── 1. fresh rootless Podman on NVIDIA: exactly these files ─────────────────
 r="$tmp/r1"; mk_root "$r" nvidia
 out="$(prep "$r" "$tmp/podman-only" --mode rootless --engine podman --homes /var/lib/quasar 2>&1)" || { fail "fresh rootless run" "$out"; }
-expected="./etc/cdi/nvidia.yaml
+expected="./dev/nvidiactl
+./etc/cdi/nvidia.yaml
 ./etc/group
 ./etc/modules-load.d/quasar.conf
 ./etc/passwd
@@ -209,6 +210,10 @@ grep -q '620.10.01' "$r/etc/cdi/nvidia.yaml" && pass "a re-run after a driver up
 r6b="$tmp/r6b"; mk_root "$r6b"
 out6b="$(prep "$r6b" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 printf '%s' "$out6b" | grep -q 'skipped  NVIDIA CDI specification — no NVIDIA driver loaded' && pass "no CDI work on a host without NVIDIA" || fail "no nvidia" "$out6b"
+r6c="$tmp/r6c"; mk_root "$r6c" nvidia; rm -f "$r6c/dev/nvidiactl"
+out6c="$(prep "$r6c" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
+printf '%s' "$out6c" | grep -q 'skipped  NVIDIA CDI specification — the NVIDIA driver is loaded but this machine has no NVIDIA device' && [ ! -e "$r6c/etc/cdi/nvidia.yaml" ] \
+  && pass "a loaded driver with no NVIDIA device (another GPU's container, a hybrid machine) is not an NVIDIA host" || fail "driver without device" "$out6c"
 
 # ── 7. a failing step: earlier steps stay, and the fix is to re-run ─────────
 r7="$tmp/r7"; mk_root "$r7" nvidia
