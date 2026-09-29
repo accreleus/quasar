@@ -94,6 +94,17 @@ impl Ctx {
         }
     }
 
+    /// `Err(id)` when it started; the case's cleanup removes it.
+    pub fn start_application_result(
+        &self,
+        request: ApplicationRequest,
+    ) -> Result<RuntimeError, String> {
+        match self.start_application(request) {
+            Ok(id) => Err(id.as_str().to_string()),
+            Err(error) => Ok(error),
+        }
+    }
+
     pub fn labels(&self) -> BTreeMap<String, String> {
         BTreeMap::from([(LABEL.to_string(), self.run.clone())])
     }
@@ -219,7 +230,7 @@ fn report(target: &str, case: &str, verdict: &Verdict, took: Duration) {
         Verdict::Fail(d) => ("FAIL", d),
     };
     println!(
-        "engine-suite {target:<16} {case:<17} {word}  {detail} ({:.1}s)",
+        "engine-suite {target:<16} {case:<19} {word}  {detail} ({:.1}s)",
         took.as_secs_f64()
     );
 }

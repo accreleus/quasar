@@ -22,12 +22,14 @@ reported as a skip with its reason, never counted as a pass). The mode table is
 | `create-read-back` | A session-shaped container (all capabilities dropped but the session's eight, no-new-privileges, `seccomp=unconfined`, a 64 MiB `/dev/shm`, a named volume) passes the runtime's engine-aware read-back, sees exactly that capability bounding set, and its volume outlives it. | |
 | `user-mapping` | Who owns, on the host, a file the app user writes into a bind-mounted home (decision D14). | |
 | `device-dri` | The host's DRM nodes, passed in with the groups the launcher grants, open for the app user. | `dri` |
-| `device-uinput` | `/dev/uinput`, passed in the same way, opens for the app user (D9). | `uinput` |
-| `cdi` | The engine injects NVIDIA through CDI (D10) and a session sees the device nodes. | `cdi` |
-| `restart` | An `unless-stopped` service comes back after it exits, and stays down after an explicit stop. | |
+| `device-uinput` | `/dev/uinput`, given as the recovery actor's recipe gives it to the node agent (a device of an agent-shaped service with `label=disable`), opens for the container's root (D9). Sessions never get `/dev/uinput`, only the event nodes the agent creates. | `uinput` |
+| `cdi` | The engine injects NVIDIA through CDI (D10), and the app user opens what encode and render use: `/dev/nvidiactl`, `/dev/nvidia-uvm` and each `/dev/nvidiaN`. Other nodes a CDI specification lists may be withheld by host policy. | `cdi` |
+| `restart` | An `unless-stopped` service comes back after it exits, and a running one that is stopped stays down. | |
+| `stop-crash-loop` | A crash-looping `unless-stopped` service that is stopped stays down, as the recovery actor's stop-then-disable sequences assume (`migrate.rs` `stop_failed`, `replace.rs` `keep_old`). | |
 | `health` | The engine runs a service's own healthcheck, to `healthy` and to `unhealthy`. | `health` |
 | `removal` | A running service is removed; a volume in use refuses removal (`Busy`), outlives its container and is then removed; removing what is gone is not an error. | |
-| `errors` | A missing image and a missing bind source are refused with a named error and leave nothing behind. | |
+| `errors` | A missing image is refused with a named error on both lifecycles and leaves nothing behind. | |
+| `missing-bind-source` | A typed bind whose source is missing is refused, the source is not created on the host, and nothing is left. | |
 
 The app user is uid/gid 4321, chosen to be nobody's account, so a file's owner says which
 mapping applied. The fixture image is a digest-pinned busybox (`sh`, `su`, `df`).
@@ -103,14 +105,14 @@ runner; `scripts/verify/ci-engine-target.sh` brings each engine up):
 Ubuntu's Podman 4.9 fails three cases in both Podman modes. CI records them in
 `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known` matrix value) instead of hiding them:
 
-- `create-read-back`: the runtime cannot read back the session-shaped container; start
+- `create-read-back`: the runtime cannot read back the session-shaped container. Start
   reports `UnknownOutcome` with reconciliation `Protocol`. (`user-mapping`, the same shape
-  without the named volume, passes.)
+  without the named volume, passes.) Podman 5 passes this case.
 - `restart`: Podman 4.9's compatible container update refuses a restart policy (`Engine`).
-- `errors`: with a missing bind source the container is still created and is left behind
-  after the launch fails; the runtime reports `UnknownOutcome`.
-
-Whether Fedora's Podman 5 shares them is for the lab run to show.
+  Podman 5 accepts it.
+- `missing-bind-source`: a product finding on every Podman tested, 4.9 and 5 alike. The
+  create is not refused. On 4.9 the created container is left behind and the runtime
+  reports `UnknownOutcome`; on 5 the application starts.
 
 What only the lab can run, in every mode, and why:
 
@@ -161,6 +163,12 @@ map (#409). Hosts are named here by role only.
 
 6. **Image.** A host that cannot reach Docker Hub sets `QUASAR_ENGINE_SUITE_IMAGE` to the
    same busybox in the test registry, by digest, never `:latest`.
-7. **Record** every case line and the `RESULT` line. A `FAIL` is a finding about that engine
+7. **SELinux.** A state directory inside the labelled homes root is enough. On the
+   Fedora Atomic VM (Podman rootless, SELinux enforcing), `user-mapping` passed with
+   `QUASAR_ENGINE_SUITE_STATE_DIR=<homes root>/.engine-suite`, with nothing relabelled,
+   and the home file belonged to the Quasar user. `device-dri` passed through the
+   `video` group. A CDI-listed node the app does not need (`/dev/nvidia-uvm-tools`) could
+   not even be listed there. That is host policy, and the `cdi` case does not ask for it.
+8. **Record** every case line and the `RESULT` line. A `FAIL` is a finding about that engine
    mode: file it rather than retrying until it passes. A lab run sets no
    `QUASAR_ENGINE_SUITE_KNOWN`: CI's entries describe Ubuntu's Podman, not the lab's.

@@ -54,6 +54,11 @@ pub const CASES: &[Case] = &[
         run: restart,
     },
     Case {
+        name: "stop-crash-loop",
+        needs: &[],
+        run: stop_crash_loop,
+    },
+    Case {
         name: "health",
         needs: &[Capability::Health],
         run: health,
@@ -67,6 +72,11 @@ pub const CASES: &[Case] = &[
         name: "errors",
         needs: &[],
         run: errors,
+    },
+    Case {
+        name: "missing-bind-source",
+        needs: &[],
+        run: missing_bind_source,
     },
 ];
 
@@ -306,12 +316,40 @@ fn device_dri(ctx: &Ctx) -> String {
     pass_devices(ctx, "dri", &nodes)
 }
 
+/// Decision D9: `/dev/uinput` goes to the node agent alone, as a device of its service
+/// container (the recovery actor's recipe), opened by the container's root. Sessions never
+/// get it: they get the event nodes the agent creates.
 fn device_uinput(ctx: &Ctx) -> String {
     assert!(
         std::path::Path::new("/dev/uinput").exists(),
         "no /dev/uinput on this host: declare uinput=<reason> for this run"
     );
-    pass_devices(ctx, "uinput", &["/dev/uinput".to_string()])
+    let mut spec = ctx.service("uinput", "exec 3<>/dev/uinput && echo open-ok && exec 3>&-");
+    // The agent's own confinement (recipe `least_privilege`): it mounts the engine socket.
+    spec.security_opt = vec!["label=disable".into()];
+    spec.devices.push(quasar_runtime::platform::Device {
+        host: "/dev/uinput".into(),
+        container: "/dev/uinput".into(),
+        permissions: "rwm".into(),
+    });
+    let id = ctx.create(spec);
+    ctx.start(&id);
+    let code = ctx
+        .runtime
+        .wait_container(&id, Duration::from_secs(30))
+        .wait()
+        .expect("wait for exit");
+    let logs = ctx
+        .runtime
+        .container_logs_tail(&id, 20)
+        .wait()
+        .expect("logs");
+    assert_eq!(
+        code, 0,
+        "the agent-shaped service could not open /dev/uinput: {logs}"
+    );
+    assert!(logs.contains("open-ok"), "{logs}");
+    "an agent-shaped service opened /dev/uinput".into()
 }
 
 /// Decision D10: the NVIDIA GPU reaches a session through CDI.
@@ -323,21 +361,29 @@ fn cdi(ctx: &Ctx) -> String {
         "the engine injects NVIDIA through CDI (devices it lists: {:?})",
         host.cdi_devices
     );
+    // What NVENC, CUDA and Vulkan open, as the app user. Other nodes a CDI specification
+    // lists (`nvidia-uvm-tools`, a profiling interface) may be withheld by the host's policy.
+    let opens = "for n in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia[0-9]*; do \
+                 exec 3<>$n && echo open-ok $n && exec 3>&-; done; echo /dev/nvidia*";
     let result = ctx.run_application(ApplicationRequest {
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "exec 3<>/dev/nvidiactl && ls /dev/nvidia* && echo cdi-ok".into(),
-        ],
+        command: vec!["sh".into(), "-c".into(), as_app(opens)],
+        environment: app_env(),
         nvidia_gpu: true,
         security: session_security(),
         ..ctx.application("cdi")
     });
-    assert!(result.stdout.contains("cdi-ok"), "{result:?}");
+    for node in ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia0"] {
+        assert!(
+            result.stdout.contains(&format!("open-ok {node}")),
+            "the app user could not open {node}: {result:?}"
+        );
+    }
     let nodes: Vec<&str> = result
         .stdout
         .lines()
-        .filter(|l| l.starts_with("/dev/"))
+        .last()
+        .unwrap_or_default()
+        .split_whitespace()
         .collect();
     format!("CDI gave the session {nodes:?}")
 }
@@ -351,7 +397,8 @@ fn log_count(ctx: &Ctx, id: &str, marker: &str) -> usize {
         .count()
 }
 
-/// An `unless-stopped` service comes back after it exits, and stays down once stopped.
+/// An `unless-stopped` service comes back after it exits; a running one stopped stays
+/// down, as the recovery actor's stop-then-disable sequences assume.
 fn restart(ctx: &Ctx) -> String {
     let spec = ctx.service("restart", "echo suite-run; exit 3");
     assert_eq!(spec.restart, RestartPolicy::No);
@@ -371,26 +418,62 @@ fn restart(ctx: &Ctx) -> String {
             ctx.inspect(&id).map(|c| c.status)
         )
     });
-    let seen = ctx.inspect(&id).expect("still exists");
-    assert_eq!(seen.restart, Some(RestartPolicy::UnlessStopped));
+    assert_eq!(
+        ctx.inspect(&id).expect("still exists").restart,
+        Some(RestartPolicy::UnlessStopped)
+    );
+
+    let spec = ContainerSpec {
+        restart: RestartPolicy::UnlessStopped,
+        ..ctx.service("running", "echo suite-up; exec sleep 300")
+    };
+    let running = ctx.create(spec);
+    ctx.start(&running);
+    assert!(poll(Duration::from_secs(30), || (log_count(
+        ctx, &running, "suite-up"
+    ) == 1)
+        .then_some(()))
+    .is_some());
+    stays_down(ctx, &running, "suite-up");
+    format!("restarted by the engine ({runs} runs seen); a running service stopped stays down")
+}
+
+/// Stop, then check for four seconds that it neither runs nor starts again.
+fn stays_down(ctx: &Ctx, id: &str, marker: &str) {
     ctx.runtime
-        .stop_container(&id, Duration::from_secs(2))
+        .stop_container(id, Duration::from_secs(2))
         .wait()
         .expect("stop");
-    let stopped = log_count(ctx, &id, "suite-run");
+    let stopped = log_count(ctx, id, marker);
     std::thread::sleep(Duration::from_secs(4));
-    let after = ctx.inspect(&id).expect("still exists");
+    let after = ctx.inspect(id).expect("still exists");
     assert!(
         !after.running,
         "an explicit stop was undone: {}",
         after.status
     );
     assert_eq!(
-        log_count(ctx, &id, "suite-run"),
+        log_count(ctx, id, marker),
         stopped,
         "it ran again after an explicit stop"
     );
-    format!("restarted by the engine ({runs} runs seen), stayed down after stop")
+}
+
+/// A crash-looping `unless-stopped` service stopped stays down: the recovery actor stops a
+/// failed control plane this way before disabling its restart (`migrate.rs` `stop_failed`).
+fn stop_crash_loop(ctx: &Ctx) -> String {
+    let spec = ContainerSpec {
+        restart: RestartPolicy::UnlessStopped,
+        ..ctx.service("crash-loop", "echo suite-run; exit 3")
+    };
+    let id = ctx.create(spec);
+    ctx.start(&id);
+    poll(Duration::from_secs(60), || {
+        (log_count(ctx, &id, "suite-run") >= 2).then_some(())
+    })
+    .expect("the engine restarts it");
+    stays_down(ctx, &id, "suite-run");
+    "a crash-looping service stopped stays down".into()
 }
 
 /// The engine runs a service's own healthcheck, both ways.
@@ -484,7 +567,7 @@ fn removal(ctx: &Ctx) -> String {
     "container removed while running; volume refused while in use, then removed".into()
 }
 
-/// What the engine cannot do is a named error, and leaves nothing behind.
+/// A missing image is a named error on both lifecycles, and leaves nothing behind.
 fn errors(ctx: &Ctx) -> String {
     let absent = format!("localhost/quasar-engine-suite-absent-{}:none", ctx.run);
 
@@ -512,13 +595,24 @@ fn errors(ctx: &Ctx) -> String {
     assert_eq!(error.kind, ErrorKind::Missing, "{error}");
     assert!(ctx.inspect(&name).is_none(), "nothing created");
 
+    assert!(ctx
+        .runtime
+        .inspect_platform_container(format!("quasar-engine-suite-{}-nothing", ctx.run))
+        .wait()
+        .expect("a missing container is an answer, not an error")
+        .is_none());
+    "a missing image is refused (404 on create, Missing on launch); nothing left".into()
+}
+
+/// A typed bind whose source is missing is refused, never created: a catalog bind of an
+/// unmounted share must not become an empty directory (`runtime/docker/application.rs`
+/// asks the engine for `CreateMountpoint=false`).
+fn missing_bind_source(ctx: &Ctx) -> String {
+    let source = ctx.fixture_path("never-created");
     let request = ApplicationRequest {
         command: vec!["true".into()],
         typed_mounts: vec![ApplicationMount::Bind {
-            source: ctx
-                .fixture_path("never-created")
-                .to_string_lossy()
-                .into_owned(),
+            source: source.to_string_lossy().into_owned(),
             target: "/suite/missing".into(),
             read_only: false,
             consistency: None,
@@ -526,18 +620,21 @@ fn errors(ctx: &Ctx) -> String {
         ..ctx.application("missing-bind")
     };
     let name = request.name.clone();
-    let error = ctx.start_application_err(request);
+    let outcome = ctx.start_application_result(request);
+    let created = source.exists();
+    let error = outcome.unwrap_or_else(|id| {
+        panic!(
+            "started {id} with a missing bind source; the engine {} it on the host",
+            if created { "created" } else { "did not create" }
+        )
+    });
+    assert!(
+        !created,
+        "refused ({error}), but the engine created the source on the host"
+    );
     assert!(ctx.inspect(&name).is_none(), "nothing left: {error}");
-
-    assert!(ctx
-        .runtime
-        .inspect_platform_container(format!("quasar-engine-suite-{}-nothing", ctx.run))
-        .wait()
-        .expect("a missing container is an answer, not an error")
-        .is_none());
     format!(
-        "missing image refused (404, {:?}); missing bind source refused ({:?}); nothing left",
-        ErrorKind::Missing,
+        "refused ({:?}); the source was not created; nothing left",
         error.kind
     )
 }
