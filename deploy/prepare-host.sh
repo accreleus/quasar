@@ -15,8 +15,14 @@
 #   - rootful: creates a `quasar` group, which owns nothing else;
 #   - writes udev rules that give the `quasar` group /dev/uinput, the input
 #     devices Quasar itself creates (matched by name), and the GPU render nodes;
-#     with --console also the display cards, sound devices and i2c buses that
-#     console mode needs. No broad group such as `input` or `video` is granted;
+#     with --console also the display cards, sound devices, i2c buses, and this
+#     machine's own keyboards, mice and game controllers (so console mode's
+#     exclusive grab can take them) that console mode needs, and its own virtual
+#     terminal (tty8, with no login prompt on it). No broad group such as `input` or
+#     `video` is granted;
+#   - with --console --console-audio-user USER, gives console mode a PipeWire
+#     Pulse socket on USER's own desktop session, reachable only by the `quasar`
+#     group, so it can play audio through a real login rather than raw ALSA;
 #   - loads the kernel modules Quasar needs, now and at boot;
 #   - sets the kernel settings Quasar needs; --allow-kernel-log and
 #     --unprivileged-port-start N add two optional ones;
@@ -42,6 +48,7 @@ QUSER="quasar"
 HOMES=""
 TEMPLATES=""
 CONSOLE=0
+CONSOLE_AUDIO_USER=""
 KERNEL_LOG=0
 PORT_START=""
 DRY_RUN=0
@@ -56,8 +63,11 @@ Usage: prepare-host.sh --mode rootless|rootful [options]
   --user NAME                   the Quasar user (default: quasar)
   --homes DIR                   create the homes root DIR, owned by the Quasar user
   --templates DIR               the same for the templates root (Steam's prepared home)
-  --console                     also grant the display, sound and i2c devices
-                                console mode uses
+  --console                     also grant the display, sound, i2c and physical
+                                input devices and the terminal (tty8) console mode uses
+  --console-audio-user USER     with --console: give console mode a PipeWire audio
+                                socket on USER's desktop session (refused without
+                                --console, or if USER does not exist)
   --allow-kernel-log            optional: let Quasar read GPU fault messages from
                                 the kernel log (kernel.dmesg_restrict=0)
   --unprivileged-port-start N   optional: let unprivileged services bind ports
@@ -76,6 +86,7 @@ while [ $# -gt 0 ]; do
     --homes) [ $# -ge 2 ] || die "--homes needs a value"; HOMES="$2"; shift 2 ;;
     --templates) [ $# -ge 2 ] || die "--templates needs a value"; TEMPLATES="$2"; shift 2 ;;
     --console) CONSOLE=1; shift ;;
+    --console-audio-user) [ $# -ge 2 ] || die "--console-audio-user needs a value"; CONSOLE_AUDIO_USER="$2"; shift 2 ;;
     --allow-kernel-log) KERNEL_LOG=1; shift ;;
     --unprivileged-port-start) [ $# -ge 2 ] || die "--unprivileged-port-start needs a value"; PORT_START="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -92,6 +103,10 @@ esac
 if [ -n "$PORT_START" ]; then
   case "$PORT_START" in ''|*[!0-9]*) die "--unprivileged-port-start must be a port number" ;; esac
   [ "$PORT_START" -ge 1 ] && [ "$PORT_START" -le 1024 ] || die "--unprivileged-port-start must be between 1 and 1024"
+fi
+if [ -n "$CONSOLE_AUDIO_USER" ]; then
+  [ "$CONSOLE" = 1 ] || die "--console-audio-user needs --console"
+  case "$CONSOLE_AUDIO_USER" in ''|-*|*[!a-z0-9_-]*) die "--console-audio-user must be a lowercase account name" ;; esac
 fi
 for pair in "homes:$HOMES" "templates:$TEMPLATES"; do
   opt="${pair%%:*}"; dir="${pair#*:}"
@@ -172,7 +187,15 @@ label_root() { # label_root DIR
       have "$tool" || die "$tool was not found: install policycoreutils-python-utils (on an image-based system: rpm-ostree install policycoreutils-python-utils, then reboot), then run this again"
     done
     if semanage fcontext -l -C 2>/dev/null | awk -v r="$re(/.*)?" '$1 == r && /container_file_t/ {f=1} END {exit !f}'; then
-      say ok "SELinux label on $1"; return
+      # The rule only labels what restorecon visits: a root recreated since (a reinstall)
+      # inherits its parent's type until it is relabelled.
+      if [ "$(stat -c %C "$1" 2>/dev/null | cut -d: -f3)" = container_file_t ]; then
+        say ok "SELinux label on $1"; return
+      fi
+      if [ "$DRY_RUN" = 1 ]; then say would "relabel $1 for containers (container_file_t)"; return; fi
+      run restorecon -R "$1"
+      say changed "SELinux label on $1 — relabelled to its container_file_t rule; nothing is re-owned"
+      return
     fi
   elif grep -qxF "$1" "$R/.selinux-fcontext" 2>/dev/null; then
     say ok "SELinux label on $1"; return
@@ -210,6 +233,11 @@ passwd_has() {
   if live && { [ "$1" = passwd ] || [ "$1" = group ]; }; then getent "$1" "$2" >/dev/null 2>&1
   else grep -q "^$2:" "$R/etc/$1" 2>/dev/null; fi
 }
+
+if [ -n "$CONSOLE_AUDIO_USER" ]; then
+  passwd_has passwd "$CONSOLE_AUDIO_USER" \
+    || die "--console-audio-user: no such account ($CONSOLE_AUDIO_USER). Console audio reaches a real desktop login, so the account must already exist."
+fi
 
 printf 'Quasar host preparation (%s%s)\n' "$MODE" "$([ "$DRY_RUN" = 1 ] && echo ', dry run' || true)"
 
@@ -331,14 +359,88 @@ EOF
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", $acl
 SUBSYSTEM=="sound", KERNEL=="pcmC*|controlC*|timer", $acl
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", $acl
+# Console mode: this machine's own keyboards, mice and game controllers, so its
+# exclusive grab (EVIOCGRAB) can take them while a session runs. Quasar's own
+# virtual input devices are already covered by the rule above (matched by name).
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", $acl
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", $acl
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", $acl
+# Console mode: its own virtual terminal. A session makes it the active one with the
+# kernel keyboard off, so nothing typed in the session reaches a login prompt.
+SUBSYSTEM=="tty", KERNEL=="tty8", $acl
 EOF
   fi
-} | if put /etc/udev/rules.d/70-quasar.rules 0644 "give the $QUSER group the devices Quasar uses, and only those" || unchanged_then_false; then
+} | if put /etc/udev/rules.d/70-quasar.rules 0644 "give the $QUSER group the devices Quasar uses, and only those$([ "$CONSOLE" = 1 ] && printf '%s' " — with --console that includes this machine's keyboards, mice and game controllers while console mode uses them; the $QUSER group can read what is typed on this machine's keyboard")" || unchanged_then_false; then
   if run udevadm control --reload; then
-    run udevadm trigger --subsystem-match=misc --subsystem-match=input --subsystem-match=drm --subsystem-match=sound --subsystem-match=i2c-dev
+    tty_match=""
+    [ "$CONSOLE" = 1 ] && tty_match="--subsystem-match=tty"
+    # shellcheck disable=SC2086 # empty or one word
+    run udevadm trigger --subsystem-match=misc --subsystem-match=input --subsystem-match=drm --subsystem-match=sound --subsystem-match=i2c-dev $tty_match
   else
     say note "udev is not running here (a container?); the rules take effect when it runs, at the latest at boot"
   fi
+fi
+
+# ── console terminal ───────────────────────────────────────────────────────
+# No login prompt may run on tty8: console mode takes it as its terminal, and a getty
+# holding it would make every console session refuse to start. logind starts none there
+# by default (NAutoVTs=6); masking both units keeps it so. Nothing running is stopped.
+if [ "$CONSOLE" = 1 ]; then
+  STEP="console terminal"
+  for unit in getty@tty8.service autovt@tty8.service; do
+    link="/etc/systemd/system/$unit"
+    if [ "$(readlink "$R$link" 2>/dev/null)" = /dev/null ]; then
+      say ok "$unit masked"
+    elif [ -e "$R$link" ] || [ -L "$R$link" ]; then
+      say warn "$link is this machine's own unit, left as it is: while a login prompt runs on tty8, console sessions refuse to start"
+    else
+      run systemctl mask "$unit"
+      stand_in && { mkdir -p "$R/etc/systemd/system" && ln -s /dev/null "$R$link"; }
+      say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "$unit masked — console mode uses tty8 as its terminal, so no login prompt may run there"
+    fi
+  done
+fi
+
+# ── console audio (PipeWire) ───────────────────────────────────────────────
+if [ -n "$CONSOLE_AUDIO_USER" ]; then
+  STEP="console audio"
+  {
+    cat <<EOF
+# Written by Quasar host preparation (deploy/prepare-host.sh). A second PipeWire
+# Pulse listen socket for console mode, reachable only through
+# /run/quasar-console-audio (see quasar-console-audio.conf in tmpfiles.d, which
+# restricts that directory to $CONSOLE_AUDIO_USER and the $QUSER group). The
+# default socket (unix:native) is kept as-is, so $CONSOLE_AUDIO_USER's own
+# desktop audio is unaffected; $CONSOLE_AUDIO_USER's pipewire-pulse must be
+# restarted (or $CONSOLE_AUDIO_USER must log in again) to pick this file up.
+#
+# This is PipeWire's documented server.address form: a plain string is today's
+# default, an object adds an access-controlled extra socket. Drop-in merge
+# behaviour for this array can vary by PipeWire version — verify against the
+# version installed here. If the socket does not appear after a restart, check
+# "pactl info" as $CONSOLE_AUDIO_USER and merge this by hand into
+# pipewire-pulse.conf instead of this drop-in.
+pulse.properties = {
+    server.address = [
+        "unix:native"
+        {
+            address = "unix:/run/quasar-console-audio/native"
+            # "restricted" if playback still works through a restricted socket
+            # (the default here); flip to "unrestricted" and update this
+            # comment if it does not, and record that choice for the operator.
+            client.access = "restricted"
+        }
+    ]
+}
+EOF
+  } | put /etc/pipewire/pipewire-pulse.conf.d/90-quasar-console.conf 0644 \
+      "a Quasar-only PipeWire socket on $CONSOLE_AUDIO_USER's session, so console mode can play audio through a real desktop login without full access to it — restart $CONSOLE_AUDIO_USER's pipewire-pulse (or have $CONSOLE_AUDIO_USER log in again) to pick it up" \
+    || unchanged
+
+  printf '# Written by Quasar host preparation. The console-audio socket %s'"'"'s pipewire-pulse listens on, reachable by the %s group only.\nd /run/quasar-console-audio 0750 %s %s -\n' "$CONSOLE_AUDIO_USER" "$QUSER" "$CONSOLE_AUDIO_USER" "$QUSER" \
+    | put /etc/tmpfiles.d/quasar-console-audio.conf 0644 "/run/quasar-console-audio, owned by $CONSOLE_AUDIO_USER and readable by the $QUSER group, recreated at every boot" || unchanged
+  run systemd-tmpfiles --create /etc/tmpfiles.d/quasar-console-audio.conf
+  stand_in && mkdir -p "$R/run/quasar-console-audio"
 fi
 
 # ── kernel modules ─────────────────────────────────────────────────────────

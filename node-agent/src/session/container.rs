@@ -2003,7 +2003,7 @@ fn granted_dri_gids(nodes: &[DrmNodeOwner]) -> Vec<u32> {
 ///
 /// A world-rw node needs no group. gid 0 is never granted: root-group membership widens
 /// far past the DRM node, so a 0660 root:root node stays unopenable and readiness says so.
-pub(crate) fn dri_group_granted(mode: u32, gid: u32) -> bool {
+pub fn dri_group_granted(mode: u32, gid: u32) -> bool {
     mode & 0o006 != 0o006 && mode & 0o060 != 0 && gid != 0
 }
 

@@ -13,7 +13,8 @@
       "reason": null,
       "restored": false,
       "started_at": "2026-09-29T10:00:01Z",
-      "finished_at": "2026-09-29T10:00:05Z"
+      "finished_at": "2026-09-29T10:00:05Z",
+      "detail": null
     },
     "supported": true,
     "why": null

@@ -84,11 +84,11 @@ case "$cmd" in
     trap '"${COMPOSE[@]}" stop postgres >/dev/null 2>&1 || true' EXIT
     "${COMPOSE[@]}" run --rm ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash "scripts/verify/$cmd.sh"
     ;;
-  quick|web|control|agent)
+  quick|web|control|agent|engine-suite-build)
     "${COMPOSE[@]}" run --rm --no-deps ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash "scripts/verify/$cmd.sh"
     ;;
   *)
-    echo "usage: $0 [quick|web|control|agent|db|full|versions|build|reset-db]" >&2
+    echo "usage: $0 [quick|web|control|agent|engine-suite-build|db|full|versions|build|reset-db]" >&2
     exit 2
     ;;
 esac

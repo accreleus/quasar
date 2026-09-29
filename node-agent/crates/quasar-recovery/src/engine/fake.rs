@@ -540,7 +540,15 @@ impl PlatformEngine for FakeEngine {
             if let Some(d) = spec
                 .devices
                 .iter()
-                .find(|d| !s.host_devices.contains(&d.host))
+                // A node under a listed directory exists too, as in a real /dev.
+                .find(|d| {
+                    !s.host_devices.contains(&d.host)
+                        && !s.host_devices.iter().any(|dir| {
+                            d.host
+                                .strip_prefix(dir.as_str())
+                                .is_some_and(|rest| rest.starts_with('/'))
+                        })
+                })
             {
                 return Err(refused(
                     500,

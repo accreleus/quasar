@@ -5,8 +5,10 @@
  * the component.
  */
 
-import type { ConsoleAccess } from "../../../../api/types";
+import type { ConsoleAccess, ConsoleCapabilities, Host } from "../../../../api/types";
 import { failureText } from "../releasesCopy";
+
+type AudioSink = ConsoleCapabilities["audio_sinks"][number];
 
 /** "Has access": `state` is `on`, or `restored` with `target` false (a failed
  *  attempt to turn it OFF, so the host kept the access it had). Every other
@@ -37,4 +39,58 @@ export function liveSessionsNoun(liveSessions: number | null): string {
  *  (`agent-api.md` §`capacity`) — shared verbatim, not a second mapping. */
 export function accessReasonText(reason: string | null | undefined): string {
   return failureText(reason);
+}
+
+/**
+ * RH07-15 (#407): a restored (failed) attempt's `summary` is built server-side
+ * as the console preflight's own detail text, in front of the generic
+ * put-back sentence (`node-agent/src/release/console.rs` `derive`,
+ * `node-agent/src/session/console_preflight.rs` `run_with` — not a contract
+ * field, so this stays a text match, not a parsed one). Two of that
+ * preflight's outcomes get bespoke copy per the approved mock
+ * (`design_handoff_v3/screens/rh07/README.md` "d"): a display another
+ * process holds, and a host never prepared with `--console`. Every other
+ * restored attempt (a plain replacement failure with no preflight detail)
+ * reads as "generic" and keeps the existing reason-mapped copy.
+ */
+export type ConsoleFailureCategory = "held" | "unprepared" | "generic";
+
+const UNPREPARED_PHRASE = "host not prepared for console mode";
+const HELD_PHRASE = "holds the display";
+
+export function consoleFailureCategory(access: ConsoleAccess): ConsoleFailureCategory {
+  if (access.state !== "restored") return "generic";
+  const summary = access.summary ?? "";
+  if (summary.includes(UNPREPARED_PHRASE)) return "unprepared";
+  if (summary.includes(HELD_PHRASE)) return "held";
+  return "generic";
+}
+
+/**
+ * The copyable "run this as root" command for the "unprepared" restored
+ * state. Engine/mode-aware when the host has reported its engine facts
+ * (amendment 17, `Host.engine` / `Host.engine_mode`); otherwise the generic
+ * form the mock shows, since there is nothing truthful to fill in for a host
+ * that has never registered them.
+ */
+export function prepareHostConsoleCommand(host: Pick<Host, "engine" | "engine_mode"> | null | undefined): string {
+  const mode = host?.engine_mode;
+  if (!mode) return "sudo sh prepare-host.sh --console …";
+  const engine = host?.engine ? ` --engine ${host.engine}` : "";
+  return `sudo sh prepare-host.sh --mode ${mode}${engine} --console`;
+}
+
+/**
+ * Whether the "Local audio output" selector's reported sinks are the host's
+ * PipeWire (ids `pipewire:<node>` / `pipewire:default`, RH07-15 §3) or ALSA
+ * `hw:*` sinks — the two never mix, since the agent reports one family or the
+ * other for a given host. `"none"` when no sinks were reported at all (an
+ * older agent, or a host that has not probed audio), which keeps today's
+ * generic help text.
+ */
+export type ConsoleAudioBackend = "pipewire" | "alsa" | "none";
+
+export function consoleAudioBackend(sinks: AudioSink[] | undefined | null): ConsoleAudioBackend {
+  if (!sinks || sinks.length === 0) return "none";
+  return sinks.some((s) => s.id.startsWith("pipewire:")) ? "pipewire" : "alsa";
 }

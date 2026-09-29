@@ -44,6 +44,9 @@ enum Mode {
     /// #500: one throwaway-home sweep, then exit. Same knobs, guards and code path as the
     /// daily timer; `make homes-gc` execs it in the running agent container.
     HomesGc { dry_run: bool },
+    /// #407: holds or reconciles console mode's virtual terminal for the agent
+    /// (`session::console_vt`). Spawned as a child; one answer line on stdout.
+    ConsoleVt { args: Vec<String> },
     /// Builds the encoder branch through the same code a session uses. A hand-typed
     /// `gst-launch` probe shares no code with production and negotiated `profile=main-444`,
     /// which read as a driver regression.
@@ -134,6 +137,9 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
                 json: args.iter().any(|a| a == "--json"),
             }
         }
+        Some(session::console_vt::HELPER_ARG) => Mode::ConsoleVt {
+            args: args[1..].to_vec(),
+        },
         Some("inject-selftest") => Mode::InjectSelfTest,
         Some("vinput-selftest") => Mode::VirtualInputSelfTest,
         Some("input-probe") => Mode::InputProbe,
@@ -206,7 +212,10 @@ async fn main() {
     install_sigusr1_fallback();
 
     match parse_args() {
-        Mode::Agent => spawn_agent().await,
+        Mode::Agent => {
+            install_shutdown_handler();
+            spawn_agent().await
+        }
         Mode::Session {
             addr,
             use_test_src,
@@ -215,6 +224,7 @@ async fn main() {
         } => run_session(addr, use_test_src, stun, image).await,
         Mode::SessionAnswerer { url } => run_session_answerer(url).await,
         Mode::HomesGc { dry_run } => run_homes_gc(dry_run),
+        Mode::ConsoleVt { args } => std::process::exit(session::console_vt::helper_main(&args)),
         Mode::ProbeEncoder {
             codec,
             width,
@@ -285,6 +295,40 @@ fn install_sigusr1_fallback() {
             token = "sigusr1-handler-install-failed",
             "could not install SIGUSR1 fallback handler: {e}"
         ),
+    }
+}
+
+/// #407: SIGTERM (an engine stop, the recovery actor replacing this agent) and SIGINT exit
+/// only once a console session's VT is back. The helper holding it cannot outlive this
+/// process: it dies with the container. Bounded well inside an engine's default stop grace
+/// (10 s); without a console session the exit is immediate, as it was.
+fn install_shutdown_handler() {
+    use tokio::signal::unix::{signal, SignalKind};
+    const SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    for (kind, name, code) in [
+        (SignalKind::terminate(), "SIGTERM", 143),
+        (SignalKind::interrupt(), "SIGINT", 130),
+    ] {
+        match signal(kind) {
+            Ok(mut sig) => {
+                tokio::spawn(async move {
+                    if sig.recv().await.is_some() {
+                        tracing::info!(token = "agent-shutdown-signal", "{name} received, exiting");
+                        let _ = tokio::task::spawn_blocking(|| {
+                            session::console_vt::release_for_shutdown(SESSION_WAIT, RELEASE_TIMEOUT)
+                        })
+                        .await;
+                        std::process::exit(code);
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(
+                token = "shutdown-handler-install-failed",
+                "could not install the {name} handler: {e}; a console session's terminal \
+                 is then left for the next start to restore"
+            ),
+        }
     }
 }
 
@@ -707,6 +751,7 @@ mod tests {
                 "EglSelfTest",
             ),
             ("homes-gc", "HomesGc"),
+            ("console-vt", "ConsoleVt"),
             ("probe-encoder", "ProbeEncoder"),
             ("inject-selftest", "InjectSelfTest"),
             ("vinput-selftest", "VirtualInputSelfTest"),

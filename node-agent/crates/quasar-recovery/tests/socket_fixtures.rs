@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use quasar_recovery::console::{ConsoleRequest, ConsoleStatus};
+use quasar_recovery::console::{ConsolePreflight, ConsoleRequest, ConsoleStatus};
 use quasar_recovery::reconfigure::Settled;
 use quasar_recovery::socket::{
     Accepted, AttemptResult, Reason, Rejection, Request, RequestKind, State, Status,
@@ -227,7 +227,8 @@ fn every_agent_socket_console_fixture_round_trips_and_the_vocabulary_is_covered(
     let mut requests = BTreeSet::new();
     let mut settled = BTreeSet::new();
     let mut rejections = BTreeSet::new();
-    let (mut applying, mut unsupported) = (false, false);
+    let (mut applying, mut unsupported, mut named) = (false, false, false);
+    let mut preflights = BTreeSet::new();
     for (name, f) in fixtures_in("agent-socket") {
         shapes.insert(f.shape.clone());
         match f.shape.as_str() {
@@ -257,8 +258,25 @@ fn every_agent_socket_console_fixture_round_trips_and_the_vocabulary_is_covered(
                         last.settled != Settled::Applied,
                         "{name}: a reason exactly when not applied"
                     );
+                    if let Some(detail) = &last.detail {
+                        assert_eq!(
+                            last.reason,
+                            Some(Reason::Unhealthy),
+                            "{name}: a preflight's detail comes with unhealthy"
+                        );
+                        assert!(last.restored && !detail.is_empty(), "{name}");
+                        named = true;
+                    }
                     settled.insert(format!("{:?}", last.settled));
                 }
+            }
+            "console_preflight" => {
+                let p: ConsolePreflight = round_trip(&name, &f.body);
+                assert!(
+                    p.ok || p.detail.is_some(),
+                    "{name}: a failed preflight says why"
+                );
+                preflights.insert(p.ok);
             }
             "rejection" => {
                 let r: Rejection = round_trip(&name, &f.body);
@@ -270,8 +288,15 @@ fn every_agent_socket_console_fixture_round_trips_and_the_vocabulary_is_covered(
     let set = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<BTreeSet<_>>();
     assert_eq!(
         shapes,
-        set(&["console_request", "console_status", "rejection"])
+        set(&[
+            "console_preflight",
+            "console_request",
+            "console_status",
+            "rejection"
+        ])
     );
+    assert_eq!(preflights, [false, true].into_iter().collect());
+    assert!(named, "a put-back change naming its preflight's text");
     assert_eq!(requests, [false, true].into_iter().collect());
     assert_eq!(settled, set(&["Applied", "PutBack"]));
     assert_eq!(rejections, set(&["busy", "invalid"]));
@@ -282,6 +307,14 @@ fn every_agent_socket_console_fixture_round_trips_and_the_vocabulary_is_covered(
 fn a_console_request_refuses_a_field_it_does_not_know() {
     assert!(serde_json::from_str::<ConsoleRequest>(r#"{"enabled":true,"force":true}"#).is_err());
     assert!(serde_json::from_str::<ConsoleRequest>("{}").is_err());
+}
+
+#[test]
+fn a_console_preflight_refuses_a_field_it_does_not_know() {
+    assert!(
+        serde_json::from_str::<ConsolePreflight>(r#"{"ok":true,"detail":null,"x":1}"#).is_err()
+    );
+    assert!(serde_json::from_str::<ConsolePreflight>(r#"{"detail":"x"}"#).is_err());
 }
 
 #[test]

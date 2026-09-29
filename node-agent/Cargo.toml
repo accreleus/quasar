@@ -144,6 +144,13 @@ tokio = { version = "1", features = ["test-util"] }
 name = "encode_metrics"
 harness = false
 
+# RH-07 #408: one behavioural suite for every engine mode. Its own harness reports a
+# capability a target lacks as a skip with the reason, which libtest cannot.
+[[test]]
+name = "engine_suite"
+path = "tests/engine_suite/main.rs"
+harness = false
+
 # #149: the production agent runs the release binary (deploy/docker-compose.yml).
 # Debug Rust is 3-10x slower on the hot media/metrics paths and ~5x larger.
 # Dev/test loops (dev.sh build/test, acceptance scripts) stay on debug builds.

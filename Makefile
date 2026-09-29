@@ -100,7 +100,7 @@ DRY_RUN ?= 0
 export VERSION DRY_RUN
 
 .PHONY: help init doctor config-check verify docs-metrics-sync docs-trace \
-	test test-go test-rust test-web \
+	test test-go test-rust test-web test-engines test-engines-build \
         test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
@@ -158,6 +158,12 @@ test-web: ## Web SPA: install, typecheck, unit tests, production build
 
 test-db: ## Control-plane DB tests against a FRESH ephemeral Postgres (-p 1)
 	@bash $(DX)/testdb.sh
+
+test-engines: ## Runtime suite against this host's engines (QUASAR_ENGINE_SUITE_TARGETS; docs/testing-engine-suite.md)
+	@bash $(DX)/engine_suite.sh run
+
+test-engines-build: ## Build the engine suite binary only (to copy to a lab host)
+	@bash $(DX)/engine_suite.sh build
 
 docs-metrics-sync: ## Copy the metric manifest to its Go + web consumers (drift-tested both sides)
 	@bash $(DX)/metrics_manifest.sh sync

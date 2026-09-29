@@ -1,0 +1,8 @@
+{
+  "shape": "console_preflight",
+  "about": "POST /v1/console/preflight: the console agent cannot take the display, and says why.",
+  "body": {
+    "ok": false,
+    "detail": "gdm, the login screen, holds the display"
+  }
+}

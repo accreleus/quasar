@@ -2,8 +2,8 @@
 //!
 //! The actor cannot look for itself: a container sees only the devices it was given, and
 //! the actor is given none. So the actor runs a short-lived probe from the agent image
-//! with the host's `/dev` bound read-only at `/host/dev`, reads what it printed, and
-//! removes it whatever happened.
+//! with the host's `/dev` bound read-only at `/host/dev` (and `/run` at `/host/run`, for
+//! logind's state and the console-audio socket directory, RH-07 #407), reads what it printed, and removes it whatever happened.
 //!
 //! Presence is read by listing `/host/dev` (a glob, which is a directory read), never by
 //! `stat`ing a node: under SELinux a confined container may list the host's `/dev` but
@@ -36,7 +36,10 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
-for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd) echo "dev ${f##*/}";; esac; done
+for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd|tty8) echo "dev ${f##*/}";; esac; done
+for f in /host/dev/i2c-*; do n=${f##*/i2c-}; case "$n" in ''|*[!0-9]*) ;; *) echo "i2c $n";; esac; done
+for f in /host/run/systemd/*; do case "${f##*/}" in seats|sessions) echo "logind ${f##*/}";; esac; done
+for f in /host/run/quasar-console-audi[o]; do [ "$f" = /host/run/quasar-console-audio ] && echo "console_audio dir"; done
 [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
@@ -58,7 +61,16 @@ pub struct ProbeReport {
     pub fuse: bool,
     /// The host has `/dev/snd` (console mode may be given it, RH-07 #395).
     pub sound: bool,
+    /// The host's `/dev/i2c-<n>` bus numbers, sorted (console mode's DDC, RH-07 #407).
+    pub i2c: Vec<u32>,
+    /// Which of logind's `seats` and `sessions` directories the host's `/run/systemd` has.
+    pub logind: Vec<String>,
+    /// The host's `/run` has `quasar-console-audio`, the desktop user's Quasar-only
+    /// PipeWire socket directory (console audio, RH-07 #407).
+    pub console_audio: bool,
     pub nvidia_nodes: bool,
+    /// The host has `/dev/tty8`, console mode's virtual terminal (RH-07 #407).
+    pub console_vt: bool,
     /// `(node, pci vendor id)`, render and card nodes, in the order printed.
     pub nodes: Vec<(String, Option<String>)>,
 }
@@ -94,7 +106,20 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("nvidiactl")) => report.nvidia_nodes = true,
             (Some("dev"), Some("fuse")) => report.fuse = true,
             (Some("dev"), Some("snd")) => report.sound = true,
+            (Some("dev"), Some("tty8")) => report.console_vt = true,
             (Some("kernel_log"), Some("open")) => report.kernel_log = true,
+            (Some("console_audio"), Some("dir")) => report.console_audio = true,
+            (Some("i2c"), Some(n)) => {
+                let bus = n
+                    .parse::<u32>()
+                    .map_err(|_| ProbeError::Unreadable(format!("unexpected line {line:?}")))?;
+                if !report.i2c.contains(&bus) {
+                    report.i2c.push(bus);
+                }
+            }
+            (Some("logind"), Some(dir @ ("seats" | "sessions"))) => {
+                report.logind.push(dir.to_owned())
+            }
             (Some("node"), Some(node)) if node.starts_with("/dev/dri/") => {
                 let _majmin = words.next();
                 let vendor = words.next().filter(|v| *v != "-").map(str::to_owned);
@@ -110,6 +135,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
     if !ended {
         return Err(ProbeError::Unreadable("no `end` line".into()));
     }
+    report.i2c.sort_unstable();
     Ok(report)
 }
 
@@ -128,6 +154,21 @@ fn render_number(node: &str) -> Option<u32> {
 }
 
 impl ProbeReport {
+    /// Every DRM card and render node listed, sorted and without duplicates.
+    pub fn dri_nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self.nodes.iter().map(|(n, _)| n.clone()).collect();
+        nodes.sort();
+        nodes.dedup();
+        nodes
+    }
+
+    /// Both of logind's state directories are there to bind.
+    pub fn logind(&self) -> bool {
+        ["seats", "sessions"]
+            .iter()
+            .all(|d| self.logind.iter().any(|l| l == d))
+    }
+
     /// An NVIDIA device node, the only case worth asking the engine for `--gpus`.
     pub fn has_nvidia(&self) -> bool {
         self.nvidia_nodes
@@ -178,6 +219,11 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         kernel_log: report.kmsg && report.kernel_log,
         fuse: report.fuse,
         sound: report.sound,
+        i2c: report.i2c.clone(),
+        logind: report.logind(),
+        console_audio: report.console_audio,
+        dri_nodes: report.dri_nodes(),
+        console_vt: report.console_vt,
         engine_rootless: false,
         host_sysfs: false,
     };
@@ -193,11 +239,25 @@ pub fn probe_spec(image: &ImageRef) -> ContainerSpec {
         env: BTreeMap::new(),
         labels: BTreeMap::from([(labels::HELPER.to_string(), PROBE_HELPER.to_string())]),
         network_mode: Some("none".into()),
-        binds: vec![Bind {
-            source: "/dev".into(),
-            target: "/host/dev".into(),
-            read_only: true,
-        }],
+        binds: vec![
+            Bind {
+                source: "/dev".into(),
+                target: "/host/dev".into(),
+                read_only: true,
+            },
+            // For logind's state directories (RH-07 #407), listed and never read. `/run`
+            // rather than `/run/systemd`: a host without systemd has no such directory, and
+            // Podman refuses a bind of a missing source (Docker would create it on the
+            // host). It holds the engine socket on a rootful host; the probe runs a fixed
+            // script from the agent's own image, which is given that socket anyway, with
+            // no network. Under SELinux a confined listing may be denied, which reads as no
+            // logind: the agent then names no display holder, and nothing else changes.
+            Bind {
+                source: "/run".into(),
+                target: "/host/run".into(),
+                read_only: true,
+            },
+        ],
         devices: Vec::new(),
         device_cgroup_rules: Vec::new(),
         gpus: Vec::new(),
@@ -415,6 +475,75 @@ mod tests {
         assert!(parse("").is_err());
         assert!(parse("quasar-probe 1\ndev uinput\n").is_err());
         assert!(parse("quasar-probe 1\nsomething else\nend").is_err());
+    }
+
+    /// RH-07 #407: i2c buses and logind's directories, read by listing; a bus number that
+    /// is not one is refused, and logind counts only with both directories.
+    #[test]
+    fn i2c_buses_and_logind_are_reported_for_console_mode() {
+        let report =
+            parse("quasar-probe 1\ni2c 7\ni2c 3\ni2c 7\nlogind seats\nlogind sessions\nend")
+                .unwrap();
+        assert_eq!(report.i2c, vec![3, 7]);
+        let (_, devices) = select(&report);
+        assert_eq!(devices.i2c, vec![3, 7]);
+        assert!(devices.logind);
+        let half = parse("quasar-probe 1\nlogind seats\nend").unwrap();
+        assert!(!select(&half).1.logind);
+        assert!(select(&half).1.i2c.is_empty());
+        assert!(parse("quasar-probe 1\ni2c x\nend").is_err());
+        assert!(parse("quasar-probe 1\nlogind other\nend").is_err());
+    }
+
+    /// RH-07 #407 (D13): the console-audio socket directory is read by listing `/host/run`,
+    /// and becomes the recipe input.
+    #[test]
+    fn the_console_audio_directory_is_reported_from_a_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host");
+        std::fs::create_dir_all(host.join("dev")).unwrap();
+        std::fs::create_dir_all(host.join("run")).unwrap();
+        let run = |host: &std::path::Path| {
+            let script = SCRIPT.replace("/host/", &format!("{}/", host.display()));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("sh");
+            parse(&String::from_utf8_lossy(&out.stdout)).unwrap()
+        };
+        assert!(!run(&host).console_audio);
+        assert!(!select(&run(&host)).1.console_audio);
+        std::fs::create_dir_all(host.join("run/quasar-console-audio")).unwrap();
+        let report = run(&host);
+        assert!(report.console_audio);
+        assert!(select(&report).1.console_audio);
+        assert!(parse("quasar-probe 1\nconsole_audio other\nend").is_err());
+    }
+
+    /// The script lists i2c nodes and logind's directories by glob: a real shell against a
+    /// fake `/host` tree (regular files stand in for nodes; nothing is `stat`ed).
+    #[test]
+    fn the_script_reports_i2c_and_logind_from_a_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host");
+        std::fs::create_dir_all(host.join("dev")).unwrap();
+        std::fs::create_dir_all(host.join("run/systemd/seats")).unwrap();
+        std::fs::create_dir_all(host.join("run/systemd/sessions")).unwrap();
+        for n in ["i2c-4", "i2c-12", "i2c-dev", "i2c-", "tty8", "tty80"] {
+            std::fs::write(host.join("dev").join(n), "").unwrap();
+        }
+        let script = SCRIPT.replace("/host/", &format!("{}/", host.display()));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("sh");
+        let report = parse(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!(report.i2c, vec![4, 12]);
+        assert!(report.logind());
+        assert!(report.console_vt, "RH-07 #407: the console VT is listed");
+        assert!(select(&report).1.console_vt);
     }
 
     /// The script prints exactly what `parse` reads, run by a real POSIX shell against a

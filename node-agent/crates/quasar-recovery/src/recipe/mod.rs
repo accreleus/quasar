@@ -274,6 +274,40 @@ pub struct HostDevices {
     /// on, since sound may appear after the install. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sound: bool,
+    /// The host's `/dev/i2c-<n>` bus numbers (RH-07 #407), for console mode's DDC on a
+    /// rootless engine, where the agent cannot `mknod` them: each is passed as a device.
+    /// Bus numbers can change across reboots and the engine refuses to create (or start) a
+    /// container naming a node the host lacks, so the list is read again whenever console
+    /// mode is turned on and at every recovery-actor start while it is on
+    /// ([`crate::console`]). Sorted, without duplicates; written only when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub i2c: Vec<u32>,
+    /// The host runs logind: `/run/systemd/seats` and `/run/systemd/sessions` exist (RH-07
+    /// #407). Console mode binds them read-only so the agent can name what holds the
+    /// display (the login screen, someone's desktop session). Read with `i2c`; written
+    /// only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logind: bool,
+    /// The host has `/run/quasar-console-audio` (RH-07 #407, D13): host preparation's
+    /// `--console-audio-user` made the desktop user's PipeWire listen there, in a directory
+    /// only that user and the Quasar group can enter. Console mode binds it read-write so
+    /// the agent plays console audio through that PipeWire instead of fighting it for the
+    /// sound device. Read with `i2c`; written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console_audio: bool,
+    /// The host's DRM nodes (`/dev/dri/card*`, `/dev/dri/renderD*`), as the probe listed
+    /// them (RH-07 #407). On a rootless engine each is passed as its own device instead of
+    /// the `/dev/dri` directory, which rootless Podman refuses to expand in some hosts
+    /// ("no devices found"); it is also the narrower grant. Read again whenever console
+    /// mode is turned on. Sorted, without duplicates; written only when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dri_nodes: Vec<String>,
+    /// The host has [`CONSOLE_VT_NODE`] (RH-07 #407): console mode's own virtual terminal,
+    /// which the agent makes active with the kernel keyboard off for a console session's
+    /// life. Absent on a host without VTs, which has no kernel keyboard handler to turn
+    /// off. Read with `i2c`; written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console_vt: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -289,6 +323,11 @@ impl Default for HostDevices {
             fuse: false,
             host_sysfs: false,
             sound: false,
+            i2c: Vec::new(),
+            logind: false,
+            console_audio: false,
+            dri_nodes: Vec::new(),
+            console_vt: false,
             unknown: Unknown::new(),
         }
     }
@@ -344,8 +383,24 @@ pub struct Inputs {
     /// never by an operator reconfigure. Written only when true.
     #[serde(default, skip_serializing_if = "is_false")]
     pub console: bool,
+    /// Console mode has been on here with the console VT (RH-07 #407), and stays set when it
+    /// is turned off: every later agent is still given [`CONSOLE_VT_NODE`], so its startup
+    /// can put back a VT a killed console agent left switched with the keyboard off. Set
+    /// only by the actor's console paths ([`Inputs::keep_console_vt`]). Written only when
+    /// true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub console_vt_kept: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
+}
+
+impl Inputs {
+    /// With console mode on and the host's console VT seen, remember it for good.
+    pub fn keep_console_vt(&mut self) {
+        if self.console && self.devices.console_vt {
+            self.console_vt_kept = true;
+        }
+    }
 }
 
 /// Host defaults the agent gives its app containers (`QUASAR_APP_PUID`, `QUASAR_APP_PGID`,
@@ -673,6 +728,7 @@ pub fn render(
                 if inputs.console {
                     console_access(&mut spec, inputs);
                 }
+                console_vt(&mut spec, inputs);
             } else if inputs.console {
                 // Fail closed: an older revision would render without the console additions
                 // and a console request would settle `applied` with no console access.
@@ -780,11 +836,6 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
                 "a combined or control-only machine needs its socket volume's host path".into(),
             ));
         }
-    }
-    if inputs.console && inputs.devices.engine_rootless {
-        return Err(RenderError::Invalid(
-            "console mode needs a rootful engine: console mode on a rootless engine is #407".into(),
-        ));
     }
     if inputs.console && !inputs.devices.dri {
         return Err(RenderError::Invalid(
@@ -962,11 +1013,21 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
 
     let mut devices = Vec::new();
     if inputs.devices.dri {
-        devices.push(Device {
-            host: "/dev/dri".into(),
-            container: "/dev/dri".into(),
-            permissions: "rwm".into(),
-        });
+        if inputs.devices.engine_rootless && !inputs.devices.dri_nodes.is_empty() {
+            for node in &inputs.devices.dri_nodes {
+                devices.push(Device {
+                    host: node.clone(),
+                    container: node.clone(),
+                    permissions: "rwm".into(),
+                });
+            }
+        } else {
+            devices.push(Device {
+                host: "/dev/dri".into(),
+                container: "/dev/dri".into(),
+                permissions: "rwm".into(),
+            });
+        }
     }
     if inputs.devices.uinput {
         devices.push(Device {
@@ -1057,13 +1118,24 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
     );
 }
 
-/// Console mode (RH-07 #395): what `deploy/overlays/docker-compose.console.yml` grants, on
-/// a rootful engine only (`validate`). Each difference from the overlay is listed in
+/// Console mode (RH-07 #395, #407): what `deploy/overlays/docker-compose.console.yml`
+/// grants, shaped for the engine mode. Each rootful difference from the overlay is listed in
 /// `tests/recipe_compose_parity.rs`.
+///
+/// Taking a free display needs no capability: the first opener of a card node with no
+/// DRM master becomes master, and may set master again on that fd (Linux >= 5.8,
+/// `drm_auth.c`). So a rootless engine, where `SYS_ADMIN` never reaches the initial user
+/// namespace the kernel checks, gets no capability and no device-cgroup rules (it refuses
+/// them): device access is the host's, which host preparation grants the Quasar account.
 fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
-    // seatd's drmSetMaster on weston's behalf (session/console.rs): today's display-control
-    // capability, which #407 replaces.
-    spec.cap_add.push("SYS_ADMIN".into());
+    let rootless = inputs.devices.engine_rootless;
+    if !rootless {
+        // seatd's drmSetMaster on weston's behalf (session/console.rs).
+        // TODO(#407, owner decision 1): drop SYS_ADMIN here too once the agent's display
+        // preflight has landed and hardware has proven the rootful recipe path without it
+        // (a free display needs none, the spike showed); the rootful goldens change then.
+        spec.cap_add.push("SYS_ADMIN".into());
+    }
     // Sound only on a host that has it: console mode runs quiet without, and the agent's
     // console_audio check says why.
     if inputs.devices.sound {
@@ -1071,15 +1143,73 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
         // Docker forbids a bind into the container's own /proc; sink discovery reads this.
         spec.binds
             .push(bind("/proc/asound", "/host-proc/asound", true));
-        spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
-        // ALSA nodes arrive with the bind, so no `m`.
-        spec.device_cgroup_rules.push("c 116:* rw".to_string());
+        if !rootless {
+            // ALSA nodes arrive with the bind, so no `m`.
+            spec.device_cgroup_rules.push("c 116:* rw".to_string());
+        }
     }
-    // The agent mknods /dev/i2c-N for DDC (ddc.rs). DRM is already a mapped device
-    // (`/dev/dri`), so no major-226 rule.
-    spec.device_cgroup_rules.push("c 89:* rmw".to_string());
+    // logind's seat and session files, read-only: how the agent names what holds the
+    // display when it cannot take it.
+    if inputs.devices.logind {
+        for dir in LOGIND_DIRS {
+            spec.binds
+                .push(bind(dir, &format!("{CONSOLE_HOST_PREFIX}{dir}"), true));
+        }
+    }
+    // The desktop user's PipeWire, through the Quasar-only socket host preparation made
+    // (D13): read-write, since connecting to a socket is a write. The same path inside, as
+    // the agent names the server by it.
+    if inputs.devices.console_audio {
+        spec.binds
+            .push(bind(CONSOLE_AUDIO_DIR, CONSOLE_AUDIO_DIR, false));
+    }
+    spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
+    if rootless {
+        // No mknod inside a user namespace: each i2c node the host has is passed in.
+        for bus in &inputs.devices.i2c {
+            let node = format!("/dev/i2c-{bus}");
+            spec.devices.push(Device {
+                host: node.clone(),
+                container: node,
+                permissions: "rw".into(),
+            });
+        }
+    } else {
+        // The agent mknods /dev/i2c-N for DDC (ddc.rs). DRM is already a mapped device
+        // (`/dev/dri`), so no major-226 rule.
+        spec.device_cgroup_rules.push("c 89:* rmw".to_string());
+    }
     spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
 }
+
+/// The console VT, by device on either engine, while console mode is on and, once it has
+/// been on, after it is turned off ([`Inputs::console_vt_kept`]): a console agent killed
+/// holding it leaves the host's console switched with the keyboard off, and only an agent
+/// with the node can put it back. Read/write only; opening it needs no capability
+/// (session/console_vt.rs), and host preparation's ACL is what grants it.
+fn console_vt(spec: &mut ContainerSpec, inputs: &Inputs) {
+    if inputs.devices.console_vt && (inputs.console || inputs.console_vt_kept) {
+        spec.devices.push(Device {
+            host: CONSOLE_VT_NODE.into(),
+            container: CONSOLE_VT_NODE.into(),
+            permissions: "rw".into(),
+        });
+    }
+}
+
+/// Console mode's own virtual terminal. The other halves: the agent's
+/// `session::console_vt::CONSOLE_VT` and `deploy/prepare-host.sh --console`.
+pub const CONSOLE_VT_NODE: &str = "/dev/tty8";
+
+/// logind's state directories console mode binds read-only (`HostDevices::logind`).
+pub const LOGIND_DIRS: [&str; 2] = ["/run/systemd/seats", "/run/systemd/sessions"];
+
+/// The directory holding the desktop user's Quasar-only PipeWire (pulse protocol) socket,
+/// on the host and inside the agent (`HostDevices::console_audio`).
+pub const CONSOLE_AUDIO_DIR: &str = "/run/quasar-console-audio";
+
+/// Where console mode's host views live inside the agent: `/host/run/systemd/seats`, ...
+pub const CONSOLE_HOST_PREFIX: &str = "/host";
 
 /// `1` on an agent container created with the console additions, and absent otherwise.
 pub const CONSOLE_ACCESS_ENV: &str = "QUASAR_CONSOLE_ACCESS";
