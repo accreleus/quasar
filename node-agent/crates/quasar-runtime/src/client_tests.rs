@@ -72,7 +72,7 @@ fn discovery_reports_negotiated_engine_identity() {
     server.join().unwrap();
 }
 
-const INFO_WITH_CDI: &str = r#"{"OperatingSystem":"Ubuntu 24.04","OSType":"linux","Architecture":"x86_64","CgroupVersion":"2","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"],"Runtimes":{"runc":{"path":"runc"},"nvidia":{"path":"nvidia-container-runtime"}},"DefaultRuntime":"runc","CDISpecDirs":["/etc/cdi","/var/run/cdi"],"DiscoveredDevices":[{"Source":"cdi","ID":"nvidia.com/gpu=0"}]}"#;
+const INFO_WITH_CDI: &str = r#"{"OperatingSystem":"Ubuntu 24.04","OSVersion":"24.04","OSType":"linux","Architecture":"x86_64","CgroupVersion":"2","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"],"Runtimes":{"runc":{"path":"runc"},"nvidia":{"path":"nvidia-container-runtime"}},"DefaultRuntime":"runc","CDISpecDirs":["/etc/cdi","/var/run/cdi"],"DiscoveredDevices":[{"Source":"cdi","ID":"nvidia.com/gpu=0"}]}"#;
 
 /// #254: one inspection carries the negotiated identity, the engine's stated
 /// capabilities and its CDI facts. Nothing is mutated: two GETs, no more.
@@ -86,6 +86,7 @@ fn engine_inspection_reports_identity_capabilities_and_cdi() {
     assert_eq!(facts.info.version, "28.0.0");
     assert_eq!(facts.info.api_version.to_string(), "1.48");
     assert_eq!(facts.operating_system.as_deref(), Some("Ubuntu 24.04"));
+    assert_eq!(facts.os_version.as_deref(), Some("24.04"));
     assert_eq!(facts.architecture.as_deref(), Some("x86_64"));
     assert_eq!(facts.cgroup_version.as_deref(), Some("2"));
     assert_eq!(

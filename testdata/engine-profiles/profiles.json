@@ -1,0 +1,641 @@
+{
+  "about": "The engine profiles Quasar publishes: one row per (platform, engine, mode). The site's quick start and engine-profile page, the enrollment script and the node agent's runtime_engine check all follow this table; see README.md.",
+  "statuses": [
+    "supported",
+    "experimental",
+    "unsupported"
+  ],
+  "engines": {
+    "docker": {
+      "label": "Docker"
+    },
+    "podman": {
+      "label": "Podman"
+    }
+  },
+  "modes": [
+    "rootful",
+    "rootless"
+  ],
+  "platforms": {
+    "fedora": {
+      "label": "Fedora",
+      "samples": [
+        {
+          "name": "Fedora Workstation 43",
+          "osRelease": [
+            "ID=fedora",
+            "VERSION_ID=43",
+            "VARIANT_ID=workstation",
+            "PRETTY_NAME=\"Fedora Linux 43 (Workstation Edition)\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Fedora Linux 43 (Workstation Edition)",
+              "osVersion": "43"
+            },
+            "podman": {
+              "operatingSystem": "fedora",
+              "osVersion": "43"
+            }
+          }
+        },
+        {
+          "name": "uCore (Fedora CoreOS)",
+          "osRelease": [
+            "ID=fedora",
+            "VERSION_ID=44",
+            "VARIANT_ID=ucore",
+            "PRETTY_NAME=\"Fedora CoreOS 44.20260829.3.1 (uCore)\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Fedora CoreOS 44.20260829.3.1 (uCore)",
+              "osVersion": "44"
+            },
+            "podman": {
+              "operatingSystem": "fedora",
+              "osVersion": "44"
+            }
+          }
+        },
+        {
+          "name": "Bazzite 42",
+          "osRelease": [
+            "ID=bazzite",
+            "ID_LIKE=\"fedora\"",
+            "VERSION_ID=42",
+            "PRETTY_NAME=\"Bazzite 42 (FROM Fedora Kinoite)\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Bazzite 42 (FROM Fedora Kinoite)",
+              "osVersion": "42"
+            },
+            "podman": {
+              "operatingSystem": "bazzite",
+              "osVersion": "42",
+              "withoutOsRelease": "other"
+            }
+          }
+        }
+      ]
+    },
+    "ubuntu": {
+      "label": "Ubuntu 24.04",
+      "samples": [
+        {
+          "name": "Ubuntu 24.04",
+          "osRelease": [
+            "ID=ubuntu",
+            "ID_LIKE=debian",
+            "VERSION_ID=\"24.04\"",
+            "PRETTY_NAME=\"Ubuntu 24.04.3 LTS\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Ubuntu 24.04.3 LTS",
+              "osVersion": "24.04"
+            },
+            "podman": {
+              "operatingSystem": "ubuntu",
+              "osVersion": "24.04"
+            }
+          }
+        },
+        {
+          "name": "Pop!_OS 24.04",
+          "osRelease": [
+            "ID=pop",
+            "ID_LIKE=\"ubuntu debian\"",
+            "VERSION_ID=\"24.04\"",
+            "PRETTY_NAME=\"Pop!_OS 24.04 LTS\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Pop!_OS 24.04 LTS",
+              "osVersion": "24.04",
+              "withoutOsRelease": "other"
+            },
+            "podman": {
+              "operatingSystem": "pop",
+              "osVersion": "24.04",
+              "withoutOsRelease": "other"
+            }
+          }
+        }
+      ]
+    },
+    "debian": {
+      "label": "Debian",
+      "samples": [
+        {
+          "name": "Debian 13",
+          "osRelease": [
+            "ID=debian",
+            "VERSION_ID=\"13\"",
+            "PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Debian GNU/Linux 13 (trixie)",
+              "osVersion": "13"
+            },
+            "podman": {
+              "operatingSystem": "debian",
+              "osVersion": "13"
+            }
+          }
+        }
+      ]
+    },
+    "arch": {
+      "label": "Arch",
+      "samples": [
+        {
+          "name": "Arch Linux",
+          "osRelease": [
+            "ID=arch",
+            "PRETTY_NAME=\"Arch Linux\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Arch Linux",
+              "osVersion": ""
+            },
+            "podman": {
+              "operatingSystem": "arch",
+              "osVersion": ""
+            }
+          }
+        },
+        {
+          "name": "CachyOS",
+          "osRelease": [
+            "ID=cachyos",
+            "ID_LIKE=arch",
+            "PRETTY_NAME=\"CachyOS\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "CachyOS",
+              "osVersion": "",
+              "withoutOsRelease": "other"
+            },
+            "podman": {
+              "operatingSystem": "cachyos",
+              "osVersion": "",
+              "withoutOsRelease": "other"
+            }
+          }
+        }
+      ]
+    },
+    "unraid": {
+      "label": "Unraid",
+      "samples": [
+        {
+          "name": "Unraid 7",
+          "osRelease": [
+            "ID=\"unraid-os\"",
+            "ID_LIKE=\"slackware\"",
+            "VERSION_ID=\"7.1.4\"",
+            "PRETTY_NAME=\"Unraid OS 7.1 x86_64\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Unraid OS 7.1 x86_64",
+              "osVersion": "7.1.4"
+            }
+          }
+        }
+      ]
+    },
+    "other": {
+      "label": "Another Linux",
+      "samples": [
+        {
+          "name": "Ubuntu 22.04",
+          "osRelease": [
+            "ID=ubuntu",
+            "ID_LIKE=debian",
+            "VERSION_ID=\"22.04\"",
+            "PRETTY_NAME=\"Ubuntu 22.04.5 LTS\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Ubuntu 22.04.5 LTS",
+              "osVersion": "22.04"
+            },
+            "podman": {
+              "operatingSystem": "ubuntu",
+              "osVersion": "22.04"
+            }
+          }
+        },
+        {
+          "name": "Rocky Linux 9",
+          "osRelease": [
+            "ID=\"rocky\"",
+            "ID_LIKE=\"rhel centos fedora\"",
+            "VERSION_ID=\"9.6\"",
+            "PRETTY_NAME=\"Rocky Linux 9.6 (Blue Onyx)\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "Rocky Linux 9.6 (Blue Onyx)",
+              "osVersion": "9.6"
+            },
+            "podman": {
+              "operatingSystem": "rocky",
+              "osVersion": "9.6"
+            }
+          }
+        },
+        {
+          "name": "openSUSE Tumbleweed",
+          "osRelease": [
+            "ID=\"opensuse-tumbleweed\"",
+            "ID_LIKE=\"opensuse suse\"",
+            "VERSION_ID=\"20260901\"",
+            "PRETTY_NAME=\"openSUSE Tumbleweed\""
+          ],
+          "engineReports": {
+            "docker": {
+              "operatingSystem": "openSUSE Tumbleweed",
+              "osVersion": "20260901"
+            },
+            "podman": {
+              "operatingSystem": "opensuse-tumbleweed",
+              "osVersion": "20260901"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "profiles": [
+    {
+      "platform": "fedora",
+      "engine": "docker",
+      "mode": "rootful",
+      "status": "supported",
+      "reason": "Rootful Docker is the engine profile Quasar is validated on, with AMD and NVIDIA GPUs.",
+      "alternatives": []
+    },
+    {
+      "platform": "fedora",
+      "engine": "docker",
+      "mode": "rootless",
+      "status": "experimental",
+      "reason": "A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.",
+      "alternatives": []
+    },
+    {
+      "platform": "fedora",
+      "engine": "podman",
+      "mode": "rootless",
+      "status": "experimental",
+      "reason": "A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.",
+      "alternatives": []
+    },
+    {
+      "platform": "fedora",
+      "engine": "podman",
+      "mode": "rootful",
+      "status": "experimental",
+      "reason": "It has not yet been through the same end-to-end tests as the other Fedora profiles; it becomes supported once it passes.",
+      "alternatives": []
+    },
+    {
+      "platform": "ubuntu",
+      "engine": "docker",
+      "mode": "rootful",
+      "status": "supported",
+      "reason": "Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.",
+      "alternatives": []
+    },
+    {
+      "platform": "ubuntu",
+      "engine": "docker",
+      "mode": "rootless",
+      "status": "experimental",
+      "reason": "Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.",
+      "alternatives": []
+    },
+    {
+      "platform": "ubuntu",
+      "engine": "podman",
+      "mode": "rootless",
+      "status": "experimental",
+      "reason": "Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.",
+      "alternatives": []
+    },
+    {
+      "platform": "ubuntu",
+      "engine": "podman",
+      "mode": "rootful",
+      "status": "experimental",
+      "reason": "Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.",
+      "alternatives": []
+    },
+    {
+      "platform": "debian",
+      "engine": "docker",
+      "mode": "rootful",
+      "status": "supported",
+      "reason": "Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.",
+      "alternatives": []
+    },
+    {
+      "platform": "debian",
+      "engine": "docker",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on Debian.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "debian",
+      "engine": "podman",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on Debian.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "debian",
+      "engine": "podman",
+      "mode": "rootful",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on Debian.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "arch",
+      "engine": "docker",
+      "mode": "rootful",
+      "status": "supported",
+      "reason": "Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.",
+      "alternatives": []
+    },
+    {
+      "platform": "arch",
+      "engine": "docker",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on Arch.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "arch",
+      "engine": "podman",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on Arch.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "arch",
+      "engine": "podman",
+      "mode": "rootful",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on Arch.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "unraid",
+      "engine": "docker",
+      "mode": "rootful",
+      "status": "supported",
+      "reason": "Unraid's own Docker runs as root, and it is the engine Quasar has always installed on there.",
+      "alternatives": []
+    },
+    {
+      "platform": "unraid",
+      "engine": "docker",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "Unraid has no rootless Docker.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        }
+      ]
+    },
+    {
+      "platform": "unraid",
+      "engine": "podman",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "Unraid has no Podman.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        }
+      ]
+    },
+    {
+      "platform": "unraid",
+      "engine": "podman",
+      "mode": "rootful",
+      "status": "unsupported",
+      "reason": "Unraid has no Podman.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        }
+      ]
+    },
+    {
+      "platform": "other",
+      "engine": "docker",
+      "mode": "rootful",
+      "status": "supported",
+      "reason": "Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.",
+      "alternatives": []
+    },
+    {
+      "platform": "other",
+      "engine": "docker",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on this distribution.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "other",
+      "engine": "podman",
+      "mode": "rootless",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on this distribution.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    },
+    {
+      "platform": "other",
+      "engine": "podman",
+      "mode": "rootful",
+      "status": "unsupported",
+      "reason": "No engine profile other than rootful Docker has been tested on this distribution.",
+      "alternatives": [
+        {
+          "engine": "docker",
+          "mode": "rootful"
+        },
+        {
+          "engine": "podman",
+          "mode": "rootless",
+          "platform": "fedora"
+        },
+        {
+          "engine": "docker",
+          "mode": "rootless",
+          "platform": "fedora"
+        }
+      ]
+    }
+  ],
+  "unknownEngine": {
+    "status": "unsupported",
+    "reason": "Quasar cannot tell which container engine this is, so nothing about it has been tested.",
+    "alternatives": [
+      {
+        "engine": "docker",
+        "mode": "rootful"
+      },
+      {
+        "engine": "podman",
+        "mode": "rootless",
+        "platform": "fedora"
+      },
+      {
+        "engine": "docker",
+        "mode": "rootless",
+        "platform": "fedora"
+      }
+    ]
+  }
+}

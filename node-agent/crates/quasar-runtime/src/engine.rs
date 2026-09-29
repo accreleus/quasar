@@ -114,7 +114,10 @@ pub struct EngineFacts {
     pub info: EngineInfo,
     /// Rootful or rootless, as the engine states it.
     pub mode: EngineMode,
+    /// Docker reports the host's os-release `PRETTY_NAME` here, Podman its `ID`.
     pub operating_system: Option<String>,
+    /// The host's os-release `VERSION_ID`, as both engines report it (`OSVersion`).
+    pub os_version: Option<String>,
     pub architecture: Option<String>,
     pub cgroup_version: Option<String>,
     /// `systemd` or `cgroupfs`. Podman schedules container health checks through systemd

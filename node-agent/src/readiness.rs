@@ -346,6 +346,14 @@ fn detect_distro(env: &ProbeEnv) -> Distro {
     }
 }
 
+/// The host's os-release identity, for the engine profile. `None` when the agent cannot
+/// read it (no `/host/etc/os-release` mount): the engine's own report is used instead.
+fn detect_host_os(env: &ProbeEnv) -> Option<runtime_facts::HostOs> {
+    std::fs::read_to_string(env.host_root.join("etc/os-release"))
+        .ok()
+        .and_then(|body| runtime_facts::HostOs::parse(&body))
+}
+
 fn is_containerized() -> bool {
     Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
@@ -515,7 +523,7 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             &env.gpus,
             own_nvidia_nodes(env),
         ),
-        runtime_facts::check_runtime_engine(&env.runtime),
+        runtime_facts::check_runtime_engine(&env.runtime, detect_host_os(env).as_ref()),
         runtime_facts::check_engine_healthchecks(&env.runtime),
         // Runtime veto: files present but the stack not loading must never read green.
         veto_if_egl_broken(check_nvidia_egl_vendor(env, distro), env),
@@ -3448,6 +3456,7 @@ mod tests {
         assert!(c.blocks.is_none());
     }
 
+    mod engine_profiles;
     mod host_probes;
     mod mounts;
     mod provenance;
