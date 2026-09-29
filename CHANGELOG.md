@@ -55,7 +55,10 @@ own; the two do not move together, and that is deliberate.
   Console audio now plays through that socket to the desktop user's PipeWire (its sinks
   listed as "Host PipeWire", the `hw:*` ones hidden while it answers), and falls back to
   ALSA only when no PipeWire answers and the device is free; otherwise the console runs
-  quiet and `console_audio` names what holds the device.
+  quiet and `console_audio` names what holds the device. ALSA sinks are reported by card
+  id (`hw:CARD=<id>,DEV=<n>`), which a driver reload does not move (a stored `hw:N,M`
+  still works), and an agent that starts with console mode already on now asks its actor
+  for access once the actor can take it.
   The console UI
   now leads a failed attempt with the agent's own named cause (who holds the display, or
   that the host needs `prepare-host.sh --console` again, with a copyable command) instead

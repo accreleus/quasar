@@ -271,3 +271,69 @@ fn only_an_owned_agent_without_the_marker_refuses_a_console_launch() {
     }
     assert!(without.launch_refusal(VideoTopology::StreamOnly).is_none());
 }
+
+/// Polls until `until` holds; panics naming `what` after 20 s.
+fn wait_for(what: &str, until: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !until() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The console attempt an agent's worker asked for, once the actor has settled it. (The
+/// request is asynchronous, so the actor's worker handle may not exist yet when the
+/// attempt first shows: wait on the recorded outcome rather than on `wait_attempt`.)
+fn wait_settled(m: &Machine) -> String {
+    wait_for("a settled console attempt", || {
+        let s = m.actor.console_status();
+        s.in_flight.is_none() && s.last.is_some()
+    });
+    m.actor.wait_attempt();
+    last_attempt(m).unwrap()
+}
+
+/// #407 live: an agent that starts with console mode already enabled gets its first
+/// `config_update` while the actor is still settling after its own start (an install or
+/// enrollment verifies this very agent), so its request is refused `busy`. The trigger is
+/// kept and asked again once the actor can take it: exactly one attempt, and none after.
+#[test]
+fn an_agent_starting_with_console_enabled_asks_once_the_actor_can_take_it() {
+    let m = console_machine(Behaviour::default());
+    // The actor is settling after its start: submits are refused `busy` until it resumes.
+    m.actor.acquire_lease().unwrap();
+    let a = agent(&m, false);
+    assert_eq!(state(&a), ConsoleAccessState::Off);
+    // The startup `config_update`: console mode enabled, this agent has no access.
+    a.request(true);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(last_attempt(&m), None, "busy: nothing admitted yet");
+
+    m.actor.resume().unwrap();
+    let id = wait_settled(&m);
+    assert!(node_agent_marker(&m), "the new agent carries the marker");
+    // The worker has nothing left to ask for: no second attempt.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(last_attempt(&m).as_deref(), Some(id.as_str()));
+    let on = agent(&m, true);
+    assert_eq!(state(&on), ConsoleAccessState::On);
+}
+
+/// The same startup trigger through the worker when the attempt it asks for is put back:
+/// one attempt, then the put-back hold, never a retry loop.
+#[test]
+fn a_startup_request_that_is_put_back_is_not_retried() {
+    let m = console_machine(unhealthy());
+    let a = agent(&m, false);
+    a.request(true);
+    let id = wait_settled(&m);
+    assert!(!node_agent_marker(&m), "the previous agent is back");
+
+    // The agent put back starts with the same config: held, not asked for again.
+    let back = agent(&m, false);
+    assert_eq!(state(&back), ConsoleAccessState::Restored);
+    back.request(true);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(last_attempt(&m).as_deref(), Some(id.as_str()));
+    assert_eq!(state(&back), ConsoleAccessState::Restored);
+}
