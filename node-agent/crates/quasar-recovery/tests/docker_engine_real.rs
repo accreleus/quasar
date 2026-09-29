@@ -454,6 +454,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
             kernel_log: false,
             engine_rootless: false,
             host_sysfs: false,
+            sound: false,
             fuse: false,
             dri: false,
             uinput: false,
@@ -473,6 +474,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
         trust: Default::default(),
         enroll: Default::default(),
         app: Default::default(),
+        console: false,
     };
     let mounts = SecretMounts {
         volume: Some(secrets_vol.clone()),

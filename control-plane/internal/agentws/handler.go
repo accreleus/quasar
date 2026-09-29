@@ -26,6 +26,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/console"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
@@ -89,6 +90,18 @@ type Handler struct {
 	// hardened topology (deploy/Caddyfile.hardened proxies /agent/ws) makes
 	// every fleet host share one enrollment budget.
 	trustedProxies []*net.IPNet
+
+	// auditor records the amendment 18 console.access.restored event; nil in
+	// tests and the route-recording drift test.
+	auditor audit.Recorder
+}
+
+// WithAuditor wires the activity-log store so a restored-access reset
+// (console_access.go) is audited. Optional, mirroring WithTrustedProxies — a
+// nil auditor is a silent no-op (audit.TryRecord).
+func (h *Handler) WithAuditor(rec audit.Recorder) *Handler {
+	h.auditor = rec
+	return h
 }
 
 // WithTrustedProxies configures which direct peers are reverse proxies whose
@@ -1579,11 +1592,22 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 			return err
 		}
 	}
-	if h.consoleStore != nil && cap.ConsoleCapabilities != nil {
-		if err := h.consoleStore.UpsertCapabilities(ctx, hostID, *cap.ConsoleCapabilities); err != nil {
-			h.log.Warn("console capabilities upsert failed", "host_id", hostID, "err", err)
+	if h.consoleStore != nil {
+		if cap.ConsoleCapabilities != nil {
+			if err := h.consoleStore.UpsertCapabilities(ctx, hostID, *cap.ConsoleCapabilities); err != nil {
+				h.log.Warn("console capabilities upsert failed", "host_id", hostID, "err", err)
+			}
+			h.handleConsoleAutoStart(ctx, hostID, cap.ConsoleCapabilities.Connectors)
+			if access := cap.ConsoleCapabilities.Access; access != nil {
+				h.applyConsoleAccessReport(ctx, hostID, *access)
+			}
+		} else if err := h.consoleStore.ClearAccess(ctx, hostID); err != nil {
+			// amendment 18: a capacity with no console_capabilities at all
+			// (pre-amendment agent, or Compose/source install) clears any
+			// stored access — but leaves connectors/outputs/etc alone, since
+			// this agent simply isn't reporting on them this time.
+			h.log.Warn("console access clear failed", "host_id", hostID, "err", err)
 		}
-		h.handleConsoleAutoStart(ctx, hostID, cap.ConsoleCapabilities.Connectors)
 	}
 	return nil
 }

@@ -7,7 +7,8 @@
 //! - [`recipe`] is the pure recipe book (ADR 0008): each role's container shape by
 //!   revision. [`probe`] detects the GPU through a disposable container.
 //! - [`engine`] is the engine port: the real Docker adapter and an in-memory fake.
-//! - [`machine`] is the machine-state layout; [`server`] the agent socket.
+//! - [`machine`] is the machine-state layout; [`server`] the agent socket. [`console`] is
+//!   the agent's console-mode request (RH-07 #395), a reconfigure of the agent alone.
 //! - [`seed`] is the seed mode (ADR 0007): the frozen `seed.json`, labels and actor
 //!   profile, and the loop that keeps a recovery actor in existence. [`bootstrap`] is the
 //!   install inputs the seed checks and its first actor reads.
@@ -20,6 +21,7 @@
 
 pub mod actor;
 pub mod bootstrap;
+pub mod console;
 pub mod database;
 pub mod dump;
 pub mod dump_dir;

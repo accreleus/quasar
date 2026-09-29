@@ -19,12 +19,13 @@ use super::*;
 
 const REQ: &str = "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22";
 const REQ2: &str = "3c0a6f2e-8d1b-4f7e-9a55-2b8e1c0d9f41";
-const REPO: &str = "registry.example.invalid/quasar/quasar-node-agent";
-const OLD: &str = "sha256:bb22000000000000000000000000000000000000000000000000000000000000";
+pub(super) const REPO: &str = "registry.example.invalid/quasar/quasar-node-agent";
+pub(super) const OLD: &str =
+    "sha256:bb22000000000000000000000000000000000000000000000000000000000000";
 const NEW: &str = "sha256:dd44000000000000000000000000000000000000000000000000000000000000";
 const ACTOR_ID: &str = "ac00000000000000000000000000000000000000000000000000000000000000";
 
-fn image(reference: &str) -> Image {
+pub(super) fn image(reference: &str) -> Image {
     Image {
         id: format!("sha256:{:0>64}", reference.len()),
         repo_digests: vec![reference.into()],
@@ -33,7 +34,7 @@ fn image(reference: &str) -> Image {
 }
 
 /// An AMD GPU host with the hand-started actor on it.
-fn host(new: Behaviour) -> FakeState {
+pub(super) fn host(new: Behaviour) -> FakeState {
     let mut state = FakeState {
         host: EngineHost {
             name: Some("gpu-host-01".into()),
@@ -103,12 +104,12 @@ fn host(new: Behaviour) -> FakeState {
     state
 }
 
-struct Machine {
-    engine: Arc<FakeEngine>,
-    actor: Arc<RecoveryActor>,
+pub(super) struct Machine {
+    pub(super) engine: Arc<FakeEngine>,
+    pub(super) actor: Arc<RecoveryActor>,
     _machine_dir: tempfile::TempDir,
     socket_dir: tempfile::TempDir,
-    socket: PathBuf,
+    pub(super) socket: PathBuf,
 }
 
 /// The actor serves `path` from now on, as a restarted actor does.
@@ -125,7 +126,12 @@ fn serve_at(actor: &Arc<RecoveryActor>, path: &Path) {
 
 /// An installed owned GPU host whose recovery actor serves its agent socket.
 fn machine(new: Behaviour) -> Machine {
-    let engine = Arc::new(FakeEngine::new(host(new)));
+    machine_on(host(new))
+}
+
+/// [`machine`] on a given engine state.
+pub(super) fn machine_on(state: FakeState) -> Machine {
+    let engine = Arc::new(FakeEngine::new(state));
     let machine_dir = tempfile::tempdir().unwrap();
     let mut config = ActorConfig::new(
         machine_dir.path(),
@@ -446,4 +452,63 @@ async fn an_agent_that_connects_before_its_actor_serves_reports_the_attempt_once
         (state.as_str(), reason.as_deref(), restored),
         ("failed", Some("unhealthy"), true)
     );
+}
+
+/// #395, found live: an agent asks the actor about console mode while the update that
+/// created it is still being verified, so the actor still has the old recipe revision on
+/// record and answers unsupported. That answer is read again, so it clears once the update
+/// has settled without waiting for a reconnect (the console refuses to enable it meanwhile).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_console_answer_clears_once_an_update_to_a_console_capable_recipe_settles() {
+    let mut state = host(Behaviour {
+        health: Some("healthy".into()),
+        ..Default::default()
+    });
+    let reference = format!("{REPO}@{NEW}");
+    state
+        .registry
+        .get_mut(&reference)
+        .unwrap()
+        .labels
+        .insert("org.quasar.recipe".to_string(), "3".to_string());
+    let m = machine_on(state);
+
+    let console = super::console::ConsoleAccessManager::owned_for_test(&m.socket, false);
+    console.set_engine_mode(Some("rootful"));
+    console.refresh();
+    let before = console.report().expect("an owned agent reports access");
+    assert_eq!(
+        before.state,
+        crate::messages::ConsoleAccessState::Unsupported,
+        "{before:?}"
+    );
+    console.watch_if_applying();
+
+    let mgr = ReleaseManager::owned(&m.socket);
+    let (tx, mut rx) = mpsc::channel(32);
+    let _guard = mgr.attach_upstream(tx);
+    let (ok, err) = ack_of(&mgr.handle_apply(
+        "c1".into(),
+        REQ.into(),
+        release(),
+        components("node-agent", NEW),
+        false,
+    ));
+    assert!(ok, "{err:?}");
+    let msgs = states_until_terminal(&mut rx, REQ).await;
+    assert_eq!(terminal(&msgs).0, "succeeded");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = console.report().unwrap();
+        if now.state == crate::messages::ConsoleAccessState::Off {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still {:?} after the update settled",
+            now.state
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

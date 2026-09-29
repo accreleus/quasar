@@ -44,6 +44,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             kernel_log: false,
             engine_rootless: false,
             host_sysfs: false,
+            sound: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -54,6 +55,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         trust: Default::default(),
         enroll: Default::default(),
         app: Default::default(),
+        console: false,
     }
 }
 
@@ -210,6 +212,145 @@ fn node_agent_revision_3_holds_none_of_the_removed_access() {
     )
     .unwrap();
     assert!(r1.cap_add.contains(&"NET_ADMIN".to_string()));
+}
+
+/// RH-07 #395: console mode adds exactly the console additions to revision 3, on a rootful
+/// engine with the host's /dev/dri, and nothing else changes.
+#[test]
+fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let owned = combined(DatabaseInputs::Owned);
+    for (plain, secrets, file) in [
+        (
+            inputs(Some(GpuVendor::Nvidia)),
+            agent_secrets(),
+            "node-agent-r3-nvidia-console.json",
+        ),
+        (
+            inputs(Some(GpuVendor::Amd)),
+            agent_secrets(),
+            "node-agent-r3-amd-console.json",
+        ),
+        (
+            owned,
+            local_agent_secrets(),
+            "node-agent-r3-combined-amd-console.json",
+        ),
+    ] {
+        let mut console = plain.clone();
+        console.console = true;
+        console.devices.sound = true;
+        let without = render(Role::NodeAgent, 3, &plain, &image, &secrets).unwrap();
+        let with = render(Role::NodeAgent, 3, &console, &image, &secrets).unwrap();
+        check(file, &with);
+
+        assert_eq!(with.cap_add, vec!["SYS_ADMIN".to_string()], "{file}");
+        let added = |a: Vec<String>, b: Vec<String>| -> Vec<String> {
+            b.into_iter().filter(|x| !a.contains(x)).collect()
+        };
+        let binds = |s: &quasar_recovery::recipe::ContainerSpec| -> Vec<String> {
+            s.binds.iter().map(|b| b.to_engine()).collect()
+        };
+        assert_eq!(
+            added(binds(&without), binds(&with)),
+            vec![
+                "/dev/snd:/dev/snd".to_string(),
+                "/proc/asound:/host-proc/asound:ro".to_string()
+            ],
+            "{file}"
+        );
+        assert!(
+            added(binds(&with), binds(&without)).is_empty(),
+            "{file}: a bind was dropped"
+        );
+        assert_eq!(
+            added(
+                without.device_cgroup_rules.clone(),
+                with.device_cgroup_rules.clone()
+            ),
+            vec!["c 116:* rw".to_string(), "c 89:* rmw".to_string()],
+            "{file}"
+        );
+        let mut env = with.env.clone();
+        assert_eq!(
+            env.remove("QUASAR_CONSOLE_ACCESS").as_deref(),
+            Some("1"),
+            "{file}"
+        );
+        assert_eq!(env, without.env, "{file}");
+        assert_eq!(with.devices, without.devices, "{file}");
+        assert_eq!(with.security_opt, without.security_opt, "{file}");
+        assert_eq!(with.gpus, without.gpus, "{file}");
+        assert_ne!(
+            with.labels["io.quasar.spec"], without.labels["io.quasar.spec"],
+            "{file}"
+        );
+        assert!(!without.env.contains_key("QUASAR_CONSOLE_ACCESS"), "{file}");
+
+        // A host without sound: console mode without the sound devices, and nothing the
+        // engine would have to create.
+        let mut quiet = console.clone();
+        quiet.devices.sound = false;
+        let quiet = render(Role::NodeAgent, 3, &quiet, &image, &secrets).unwrap();
+        assert_eq!(quiet.cap_add, vec!["SYS_ADMIN".to_string()], "{file}");
+        assert_eq!(binds(&quiet), binds(&without), "{file}");
+        assert_eq!(
+            added(
+                without.device_cgroup_rules.clone(),
+                quiet.device_cgroup_rules
+            ),
+            vec!["c 89:* rmw".to_string()],
+            "{file}"
+        );
+        assert_eq!(
+            quiet.env.get("QUASAR_CONSOLE_ACCESS").map(String::as_str),
+            Some("1"),
+            "{file}"
+        );
+    }
+}
+
+/// Machine state written with console mode off reads and writes back without the field, so
+/// every existing machine and golden stays as it was.
+#[test]
+fn console_mode_off_is_not_written() {
+    let plain = inputs(Some(GpuVendor::Amd));
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json.get("console").is_none(), "{json}");
+    let read: Inputs = serde_json::from_value(json).unwrap();
+    assert!(!read.console);
+    let mut on = plain;
+    on.console = true;
+    assert_eq!(serde_json::to_value(&on).unwrap()["console"], true);
+}
+
+#[test]
+fn console_mode_is_refused_where_the_recipe_cannot_grant_it() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let mut rootless = inputs(Some(GpuVendor::Nvidia));
+    rootless.devices.engine_rootless = true;
+    rootless.console = true;
+    let mut no_dri = inputs(None);
+    no_dri.console = true;
+    for (i, says) in [(rootless, "#407"), (no_dri, "/dev/dri")] {
+        let refused = quasar_recovery::recipe::validate(&i).expect_err(says);
+        assert!(refused.to_string().contains(says), "{refused}");
+        assert!(matches!(
+            render(Role::NodeAgent, 3, &i, &image, &agent_secrets()),
+            Err(RenderError::Invalid(_))
+        ));
+    }
+    let mut older = inputs(Some(GpuVendor::Amd));
+    older.console = true;
+    for revision in [1, 2] {
+        assert!(
+            matches!(
+                render(Role::NodeAgent, revision, &older, &image, &agent_secrets()),
+                Err(RenderError::Invalid(_))
+            ),
+            "revision {revision} would render without the console additions"
+        );
+    }
 }
 
 #[test]

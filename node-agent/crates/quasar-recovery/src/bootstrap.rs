@@ -240,6 +240,7 @@ impl Bootstrap {
             trust: op.trust.clone(),
             enroll: Default::default(),
             app: app.clone(),
+            console: false,
         };
         recipe::validate(&probe).map_err(|e| e.to_string())?;
         trust_config(&op.trust)?;

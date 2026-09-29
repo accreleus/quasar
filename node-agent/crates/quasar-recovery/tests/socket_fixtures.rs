@@ -1,10 +1,13 @@
 //! The shared control-socket fixtures (#356). The Go twin runs the same files in
 //! `control-plane/internal/actorsocket/actorsocket_test.go`; both decode each fixture
-//! into their type and must re-encode it to the same JSON value.
+//! into their type and must re-encode it to the same JSON value. The agent socket's
+//! console fixtures (RH-07 #395, `testdata/recovery/agent-socket`) are Rust's alone.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use quasar_recovery::console::{ConsoleRequest, ConsoleStatus};
+use quasar_recovery::reconfigure::Settled;
 use quasar_recovery::socket::{
     Accepted, AttemptResult, Reason, Rejection, Request, RequestKind, State, Status,
 };
@@ -22,7 +25,13 @@ struct Fixture {
 }
 
 fn fixtures() -> Vec<(String, Fixture)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../testdata/recovery/socket");
+    fixtures_in("socket")
+}
+
+fn fixtures_in(name: &str) -> Vec<(String, Fixture)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../testdata/recovery")
+        .join(name);
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("read the fixture directory")
         .map(|e| e.expect("dir entry").path())
@@ -210,4 +219,79 @@ fn a_status_from_a_newer_actor_still_decodes() {
     body["a_field_from_a_later_release"] = Value::Bool(true);
     body["services"][0]["another"] = Value::from(1);
     serde_json::from_value::<Status>(body).expect("an older reader accepts a newer status");
+}
+
+#[test]
+fn every_agent_socket_console_fixture_round_trips_and_the_vocabulary_is_covered() {
+    let mut shapes = BTreeSet::new();
+    let mut requests = BTreeSet::new();
+    let mut settled = BTreeSet::new();
+    let mut rejections = BTreeSet::new();
+    let (mut applying, mut unsupported) = (false, false);
+    for (name, f) in fixtures_in("agent-socket") {
+        shapes.insert(f.shape.clone());
+        match f.shape.as_str() {
+            "console_request" => {
+                requests.insert(round_trip::<ConsoleRequest>(&name, &f.body).enabled);
+            }
+            "console_status" => {
+                let s: ConsoleStatus = round_trip(&name, &f.body);
+                assert_eq!(
+                    s.supported,
+                    s.why.is_none(),
+                    "{name}: why exactly when unsupported"
+                );
+                assert_eq!(
+                    (s.in_flight.is_some(), s.in_flight.is_some()),
+                    (
+                        s.in_flight_target.is_some(),
+                        s.in_flight_started_at.is_some()
+                    ),
+                    "{name}: the attempt's target and start exactly while one is in flight"
+                );
+                applying |= s.in_flight.is_some();
+                unsupported |= !s.supported;
+                if let Some(last) = s.last {
+                    assert_eq!(
+                        last.reason.is_some(),
+                        last.settled != Settled::Applied,
+                        "{name}: a reason exactly when not applied"
+                    );
+                    settled.insert(format!("{:?}", last.settled));
+                }
+            }
+            "rejection" => {
+                let r: Rejection = round_trip(&name, &f.body);
+                rejections.insert(r.reason.as_str().to_owned());
+            }
+            other => panic!("{name}: unknown shape {other:?}"),
+        }
+    }
+    let set = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<BTreeSet<_>>();
+    assert_eq!(
+        shapes,
+        set(&["console_request", "console_status", "rejection"])
+    );
+    assert_eq!(requests, [false, true].into_iter().collect());
+    assert_eq!(settled, set(&["Applied", "PutBack"]));
+    assert_eq!(rejections, set(&["busy", "invalid"]));
+    assert!(applying && unsupported);
+}
+
+#[test]
+fn a_console_request_refuses_a_field_it_does_not_know() {
+    assert!(serde_json::from_str::<ConsoleRequest>(r#"{"enabled":true,"force":true}"#).is_err());
+    assert!(serde_json::from_str::<ConsoleRequest>("{}").is_err());
+}
+
+#[test]
+fn a_console_status_from_a_newer_actor_still_decodes() {
+    let (_, f) = fixtures_in("agent-socket")
+        .into_iter()
+        .find(|(n, _)| n == "console-status-on.json")
+        .expect("fixture");
+    let mut body = f.body;
+    body["a_field_from_a_later_release"] = Value::Bool(true);
+    body["last"]["another"] = Value::from(1);
+    serde_json::from_value::<ConsoleStatus>(body).expect("an older reader accepts a newer status");
 }

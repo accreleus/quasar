@@ -6100,6 +6100,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
             };
         };
         trace?: never;
@@ -8756,6 +8757,15 @@ export interface components {
             recovery_actor_source_commit?: string | null;
             /** @description Opaque version of the seed the recovery actor last saw on the machine. Informational; nothing is decided on it (ADR 0007). */
             seed_version?: string | null;
+            /** @description The container engine the host's agent drives: docker, podman, or another lowercase token a newer agent reports (a client shows an unrecognized value verbatim). */
+            engine?: string | null;
+            /** @description The engine's own product version, opaque; never parsed or ordered. */
+            engine_version?: string | null;
+            /**
+             * @description Whether that engine runs as root on its host (rootful) or as an ordinary user (rootless). A capability a mode lacks is reported by readiness checks, never inferred from this field.
+             * @enum {string|null}
+             */
+            engine_mode?: "rootful" | "rootless" | null;
             /** @description Summed over this host's REPORTED GPUs. Null - not a zeroed object - when the host has no schedulable GPUs to sum: none reported yet, or `capacity_detection` is not `ok`, which is the same condition under which `GET /v1/hosts/{id}/gpus` returns an empty list. "Nothing to say" and "zero capacity" are different facts and a fleet gauge must not draw the first as the second. */
             capacity: components["schemas"]["HostCapacity"];
         };
@@ -10578,6 +10588,22 @@ export interface components {
                 path: string;
                 label: string;
             }[];
+            access?: components["schemas"]["ConsoleAccess"];
+        };
+        /** @description Amendment 18 (RH07 #395): whether the host's node agent can run console mode, on an owned host where its recovery actor replaces the agent to grant it (agent-api capacity.console_capabilities.access). Absent when the agent reports none. */
+        ConsoleAccess: {
+            /** @description off | applying | on | restored | unsupported; an unknown value is shown verbatim and treated as off. */
+            state: string;
+            target: boolean | null;
+            /** Format: uuid */
+            request_id: string | null;
+            /** @description A release_state failure identifier; set exactly when state is restored. */
+            reason: string | null;
+            /** Format: date-time */
+            started_at: string | null;
+            /** Format: date-time */
+            finished_at: string | null;
+            summary: string;
         };
         DrmOutputCapability: {
             /** @description Stable card-scoped output id, e.g. card1:DP-4. */

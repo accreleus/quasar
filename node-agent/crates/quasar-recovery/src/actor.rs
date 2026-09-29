@@ -1012,6 +1012,7 @@ impl Actor {
             trust: checked.trust.clone(),
             enroll: Default::default(),
             app: checked.app.clone(),
+            console: false,
         };
         if checked.control.is_some() {
             // The seed a new GPU host runs is this machine's recovery image.

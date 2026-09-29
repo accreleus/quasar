@@ -3,7 +3,8 @@
 //! container it is for (the agent socket to the node agent, the control socket to the
 //! control plane), so the socket a request arrives on is its caller. Not a frozen
 //! interface. Both serve `GET /v1/status[?request_id=<uuid>]`, whose `result` is only ever an
-//! attempt submitted on the same socket, and `POST /v1/submit` (a `socket::Request`).
+//! attempt submitted on the same socket, and `POST /v1/submit` (a `socket::Request`). The
+//! agent socket alone serves `GET` and `POST /v1/console` ([`crate::console`]).
 //!
 //! Answers are `HTTP/1.1` with `Content-Length` and `Connection: close`, and the
 //! connection is closed after one response, so an HTTP/1.0 client reading to EOF (the
@@ -20,6 +21,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::actor::Actor;
+use crate::console::ConsoleRequest;
 use crate::socket::{Reason, Rejection, Request};
 use crate::trust::Caller;
 
@@ -144,10 +146,78 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
             respond(&mut stream, 200, &body)
         }
         ("POST", "/v1/submit") => submit(&mut stream, &head, actor, caller),
+        ("GET", "/v1/console") if caller == Caller::Agent => {
+            let body = serde_json::to_string(&actor.console_status()).map_err(io::Error::other)?;
+            respond(&mut stream, 200, &body)
+        }
+        ("POST", "/v1/console") if caller == Caller::Agent => console(&mut stream, &head, actor),
         (_, "/v1/status") | (_, "/v1/submit") => {
             respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
         }
+        (_, "/v1/console") if caller == Caller::Agent => {
+            respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
+        }
         _ => respond(&mut stream, 404, r#"{"error":"not_found"}"#),
+    }
+}
+
+/// The request body, by its `Content-Length`; `None` when it is over the limit.
+fn read_body(stream: &mut UnixStream, head: &str) -> io::Result<Option<Vec<u8>>> {
+    let length = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    if length > MAX_BODY {
+        return Ok(None);
+    }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body)?;
+    Ok(Some(body))
+}
+
+fn refused(stream: &mut UnixStream, rejection: &Rejection) -> io::Result<()> {
+    let status = if rejection.reason == Reason::Busy {
+        409
+    } else {
+        400
+    };
+    let body = serde_json::to_string(rejection).map_err(io::Error::other)?;
+    respond(stream, status, &body)
+}
+
+/// `POST /v1/console` (agent socket only): `202` with the `ConsoleStatus` once a
+/// replacement is admitted, `200` when nothing needed re-creating, `409` (`busy`) or `400`
+/// with the `Rejection`.
+fn console(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result<()> {
+    let Some(body) = read_body(stream, head)? else {
+        return respond(stream, 413, r#"{"error":"request_too_large"}"#);
+    };
+    let answer = match serde_json::from_slice::<ConsoleRequest>(&body) {
+        Ok(req) => actor.console(req),
+        Err(e) => Err(Rejection {
+            request_id: String::new(),
+            reason: Reason::Invalid,
+            message: format!("not a console request: {e}"),
+        }),
+    };
+    match answer {
+        Ok(admitted) => {
+            let body = serde_json::to_string(&actor.console_status()).map_err(io::Error::other)?;
+            respond(stream, if admitted.is_some() { 202 } else { 200 }, &body)
+        }
+        Err(rejection) => {
+            warn!(
+                token = "actor-console-refused",
+                reason = %rejection.reason,
+                "a console request was refused: {}", rejection.message
+            );
+            refused(stream, &rejection)
+        }
     }
 }
 
@@ -159,20 +229,9 @@ fn submit(
     actor: &Arc<Actor>,
     caller: Caller,
 ) -> io::Result<()> {
-    let length = head
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| v.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    if length > MAX_BODY {
+    let Some(body) = read_body(stream, head)? else {
         return respond(stream, 413, r#"{"error":"request_too_large"}"#);
-    }
-    let mut body = vec![0u8; length];
-    stream.read_exact(&mut body)?;
+    };
     let request: Request = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -197,13 +256,7 @@ fn submit(
                 socket = socket_name(caller),
                 "a submit was refused: {}", rejection.message
             );
-            let status = if rejection.reason == Reason::Busy {
-                409
-            } else {
-                400
-            };
-            let body = serde_json::to_string(&rejection).map_err(io::Error::other)?;
-            respond(stream, status, &body)
+            refused(stream, &rejection)
         }
     }
 }
