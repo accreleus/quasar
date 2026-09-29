@@ -160,7 +160,12 @@ impl Ctx {
         self.runtime
             .inspect_platform_container(name_or_id)
             .wait()
-            .expect("inspect")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "inspect: {e}; the engine's own state: {}",
+                    raw_state(&self.target.socket, name_or_id)
+                )
+            })
     }
 
     /// A path under this run's host-backed directory, not created.
@@ -211,6 +216,31 @@ impl Ctx {
                 .collect(),
             Err(e) => vec![format!("cannot list containers: {e}")],
         }
+    }
+}
+
+/// `State` from the engine's raw inspect, for a failure the runtime could not parse. Only
+/// `State` is printed: the rest of an inspect carries the environment.
+fn raw_state(socket: &Path, name_or_id: &str) -> String {
+    use std::io::{Read, Write};
+    let fetch = || -> std::io::Result<String> {
+        let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        write!(
+            stream,
+            "GET /containers/{name_or_id}/json HTTP/1.0\r\nHost: engine\r\n\r\n"
+        )?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply)?;
+        Ok(reply)
+    };
+    match fetch() {
+        Ok(reply) => reply
+            .split_once("\r\n\r\n")
+            .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+            .map(|v| v["State"].to_string())
+            .unwrap_or_else(|| "unreadable".into()),
+        Err(e) => format!("not fetched: {e}"),
     }
 }
 
