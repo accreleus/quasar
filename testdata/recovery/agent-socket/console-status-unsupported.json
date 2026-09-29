@@ -1,0 +1,11 @@
+{
+  "shape": "console_status",
+  "about": "A rootless engine: console mode cannot be given.",
+  "body": {
+    "enabled": false,
+    "in_flight": null,
+    "last": null,
+    "supported": false,
+    "why": "node-agent: invalid machine inputs: console mode needs a rootful engine: console mode on a rootless engine is #407"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "shape": "console_status",
+  "about": "Console mode turned on: the new agent verified.",
+  "body": {
+    "enabled": true,
+    "in_flight": null,
+    "last": {
+      "target": true,
+      "settled": "applied",
+      "reason": null,
+      "restored": false,
+      "finished_at": "2026-09-29T10:00:05Z"
+    },
+    "supported": true,
+    "why": null
+  }
+}

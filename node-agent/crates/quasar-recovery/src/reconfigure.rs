@@ -365,7 +365,7 @@ impl Actor {
 
     /// The `io.quasar.spec` of `role` rendered with `inputs` on its recorded revision and
     /// image; `None` when machine state has no record of it.
-    fn spec_with(&self, role: Role, inputs: &Inputs) -> Result<Option<String>, String> {
+    pub(crate) fn spec_with(&self, role: Role, inputs: &Inputs) -> Result<Option<String>, String> {
         let Some(record) = self.dir.load_service(role).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
@@ -393,7 +393,7 @@ impl Actor {
     /// specification is not the one `after` renders, which also catches up one a partly
     /// applied reconfigure left behind and leaves alone one already on `after`. Postgres and
     /// the actor are compared render to render, since their records need not be renders.
-    fn moved_by(&self, before: &Inputs, after: &Inputs) -> Result<Vec<Role>, String> {
+    pub(crate) fn moved_by(&self, before: &Inputs, after: &Inputs) -> Result<Vec<Role>, String> {
         let mut moved = Vec::new();
         for role in ORDER {
             let Some(new) = self.spec_with(role, after)? else {
@@ -416,30 +416,8 @@ impl Actor {
         self: &Arc<Self>,
         req: ReconfigureRequest,
     ) -> Result<Planned, crate::socket::Rejection> {
-        use std::sync::atomic::Ordering;
         let _gate = self.gate.lock().unwrap();
-        if self.resuming.load(Ordering::SeqCst) {
-            return Err(refuse(
-                Reason::Busy,
-                "the recovery actor is still settling this machine after a start; try again in a moment",
-            ));
-        }
-        if let Some(why) = crate::uninstall::uninstalled(&self.dir) {
-            return Err(refuse(
-                Reason::Invalid,
-                format!("{why}; there is nothing to reconfigure"),
-            ));
-        }
-        let machine = match self.dir.load_machine() {
-            Ok(Some(m)) => m,
-            Ok(None) => return Err(refuse(Reason::Invalid, "this machine is not installed yet")),
-            Err(e) => {
-                return Err(refuse(
-                    Reason::Invalid,
-                    format!("machine state is unreadable: {e}"),
-                ))
-            }
-        };
+        let machine = self.admissible()?;
         if req.changes.is_empty() {
             return Err(refuse(
                 Reason::Invalid,
@@ -470,6 +448,45 @@ impl Actor {
         if req.dry_run || (changed.is_empty() && replaced.is_empty()) {
             return Ok(planned(None));
         }
+        let request_id = self.admit(&machine, after, &changed, &replaced)?;
+        Ok(planned(request_id))
+    }
+
+    /// Machine state, when a reconfigure may be admitted at all. The caller holds the gate.
+    pub(crate) fn admissible(&self) -> Result<crate::machine::Machine, crate::socket::Rejection> {
+        use std::sync::atomic::Ordering;
+        if self.resuming.load(Ordering::SeqCst) {
+            return Err(refuse(
+                Reason::Busy,
+                "the recovery actor is still settling this machine after a start; try again in a moment",
+            ));
+        }
+        if let Some(why) = crate::uninstall::uninstalled(&self.dir) {
+            return Err(refuse(
+                Reason::Invalid,
+                format!("{why}; there is nothing to reconfigure"),
+            ));
+        }
+        match self.dir.load_machine() {
+            Ok(Some(m)) => Ok(m),
+            Ok(None) => Err(refuse(Reason::Invalid, "this machine is not installed yet")),
+            Err(e) => Err(refuse(
+                Reason::Invalid,
+                format!("machine state is unreadable: {e}"),
+            )),
+        }
+    }
+
+    /// Admits a reconfigure of `machine` to `after`, which replaces `replaced`: `Some` with
+    /// the attempt being driven, `None` when nothing needed re-creating and `after` was
+    /// simply recorded. The caller holds the gate.
+    pub(crate) fn admit(
+        self: &Arc<Self>,
+        machine: &crate::machine::Machine,
+        after: Inputs,
+        changed: &[String],
+        replaced: &[Role],
+    ) -> Result<Option<String>, crate::socket::Rejection> {
         let scan = self.journals.scan();
         if let Some(open) = scan.open_id() {
             return Err(refuse(
@@ -550,22 +567,22 @@ impl Actor {
                 )
             })?;
             info!(changed = ?changed, "reconfigured: no service needed re-creating");
-            return Ok(planned(None));
+            return Ok(None);
         }
 
         let request_id = crate::actor::random_uuid();
         let record = Record {
             format: RECORD_FORMAT,
             request_id: request_id.clone(),
-            changed: changed.clone(),
+            changed: changed.to_vec(),
             before: machine.inputs.clone(),
             after: after.clone(),
-            replaced: replaced.clone(),
+            replaced: replaced.to_vec(),
             started_at: (self.config.now)(),
             outcome: None,
         };
         let journal = self
-            .reconfigure_journal(&request_id, &replaced)
+            .reconfigure_journal(&request_id, replaced)
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;
         // The record, then the inputs, then the attempt (module documentation).
         self.dir.reconfigure_file().store(&record).map_err(|e| {
@@ -603,7 +620,7 @@ impl Actor {
             actor.drive(&id);
             actor.settle_reconfigure();
         }));
-        Ok(planned(Some(request_id)))
+        Ok(Some(request_id))
     }
 
     /// The attempt: one step per service, each on the image machine state records for it,

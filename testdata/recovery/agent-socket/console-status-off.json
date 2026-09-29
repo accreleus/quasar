@@ -1,0 +1,11 @@
+{
+  "shape": "console_status",
+  "about": "A rootful host that never changed console mode.",
+  "body": {
+    "enabled": false,
+    "in_flight": null,
+    "last": null,
+    "supported": true,
+    "why": null
+  }
+}

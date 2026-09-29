@@ -1,0 +1,7 @@
+{
+  "shape": "console_request",
+  "about": "POST /v1/console: turn console mode on.",
+  "body": {
+    "enabled": true
+  }
+}

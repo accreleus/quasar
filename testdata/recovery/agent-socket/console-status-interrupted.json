@@ -1,0 +1,17 @@
+{
+  "shape": "console_status",
+  "about": "The actor restarted before the change was verified: the previous inputs are back.",
+  "body": {
+    "enabled": false,
+    "in_flight": null,
+    "last": {
+      "target": true,
+      "settled": "put_back",
+      "reason": "interrupted",
+      "restored": false,
+      "finished_at": "2026-09-29T10:00:05Z"
+    },
+    "supported": true,
+    "why": null
+  }
+}

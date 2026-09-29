@@ -1,0 +1,17 @@
+{
+  "shape": "console_status",
+  "about": "Turning console mode on failed: the new agent reported unhealthy and the previous one was put back.",
+  "body": {
+    "enabled": false,
+    "in_flight": null,
+    "last": {
+      "target": true,
+      "settled": "put_back",
+      "reason": "unhealthy",
+      "restored": true,
+      "finished_at": "2026-09-29T10:00:05Z"
+    },
+    "supported": true,
+    "why": null
+  }
+}
