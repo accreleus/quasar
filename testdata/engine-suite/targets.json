@@ -1,0 +1,34 @@
+{
+  "about": "The engine modes the runtime's behavioural suite runs against (RH-07 #408). One row per engine and mode in testdata/engine-profiles/profiles.json, and nothing else: the suite refuses to start when the two disagree. A row says only what differs by mode; every assertion is the same for every row. See docs/testing-engine-suite.md.",
+  "homeOwners": {
+    "app-id": "a file the app user writes into a bind-mounted home belongs, on the host, to the app's own PUID",
+    "engine-user": "it belongs to the engine's own user, the Quasar user (decision D14, Podman keep-id)",
+    "subordinate-id": "it belongs to one of the engine user's subordinate ids: rootless Docker has no per-container mapping (the documented D14 gap)"
+  },
+  "targets": [
+    {
+      "name": "docker-rootful",
+      "engine": "docker",
+      "mode": "rootful",
+      "homeOwner": "app-id"
+    },
+    {
+      "name": "docker-rootless",
+      "engine": "docker",
+      "mode": "rootless",
+      "homeOwner": "subordinate-id"
+    },
+    {
+      "name": "podman-rootful",
+      "engine": "podman",
+      "mode": "rootful",
+      "homeOwner": "app-id"
+    },
+    {
+      "name": "podman-rootless",
+      "engine": "podman",
+      "mode": "rootless",
+      "homeOwner": "engine-user"
+    }
+  ]
+}

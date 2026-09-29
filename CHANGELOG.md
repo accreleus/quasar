@@ -25,6 +25,13 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **One behavioural suite for every engine mode (RH-07, #408).** The container runtime is
+  tested against a real engine with the same cases for Docker and Podman, rootful and
+  rootless: create and read-back, user mapping, DRM and uinput device passing, CDI, restart,
+  health, removal and errors. A capability a host cannot give is declared and reported as a
+  skip with its reason, never passed silently. CI runs all four modes on hosted runners;
+  the GPU and device cases run in the lab (`make test-engines`,
+  `docs/testing-engine-suite.md`).
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
