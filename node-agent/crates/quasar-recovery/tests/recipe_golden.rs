@@ -44,6 +44,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             kernel_log: false,
             engine_rootless: false,
             host_sysfs: false,
+            sound: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -238,6 +239,7 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
     ] {
         let mut console = plain.clone();
         console.console = true;
+        console.devices.sound = true;
         let without = render(Role::NodeAgent, 3, &plain, &image, &secrets).unwrap();
         let with = render(Role::NodeAgent, 3, &console, &image, &secrets).unwrap();
         check(file, &with);
@@ -284,6 +286,27 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
             "{file}"
         );
         assert!(!without.env.contains_key("QUASAR_CONSOLE_ACCESS"), "{file}");
+
+        // A host without sound: console mode without the sound devices, and nothing the
+        // engine would have to create.
+        let mut quiet = console.clone();
+        quiet.devices.sound = false;
+        let quiet = render(Role::NodeAgent, 3, &quiet, &image, &secrets).unwrap();
+        assert_eq!(quiet.cap_add, vec!["SYS_ADMIN".to_string()], "{file}");
+        assert_eq!(binds(&quiet), binds(&without), "{file}");
+        assert_eq!(
+            added(
+                without.device_cgroup_rules.clone(),
+                quiet.device_cgroup_rules
+            ),
+            vec!["c 89:* rmw".to_string()],
+            "{file}"
+        );
+        assert_eq!(
+            quiet.env.get("QUASAR_CONSOLE_ACCESS").map(String::as_str),
+            Some("1"),
+            "{file}"
+        );
     }
 }
 

@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::actor::Actor;
 use crate::machine::Machine;
@@ -143,10 +143,29 @@ impl Actor {
         }
     }
 
+    /// Whether the host has sound devices now, read by the device probe from the node
+    /// agent's current image: sound can appear after the install (a card added, a host
+    /// prepared later). `None` when it cannot be read; the last reading stands.
+    fn host_sound(&self) -> Option<bool> {
+        let record = self.dir.load_service(Role::NodeAgent).ok().flatten()?;
+        match crate::probe::run(self.engine.as_ref(), &record.image) {
+            Ok(report) => Some(report.sound),
+            Err(e) => {
+                warn!(
+                    token = "console-sound-probe-failed",
+                    "could not read the host's sound devices ({e}); keeping the last reading"
+                );
+                None
+            }
+        }
+    }
+
     /// `POST /v1/console`: console mode on or off, through a verified replacement of the
     /// node agent alone. `Some` names the admitted attempt; `None`: nothing needed
     /// re-creating (enabling what is already in force, say).
     pub fn console(self: &Arc<Self>, req: ConsoleRequest) -> Result<Option<String>, Rejection> {
+        // Before the gate: the probe is a short-lived container, up to a minute.
+        let sound = if req.enabled { self.host_sound() } else { None };
         let _gate = self.gate.lock().unwrap();
         let machine = self.admissible()?;
         if machine.role == MachineRole::ControlOnly {
@@ -155,10 +174,13 @@ impl Actor {
                 "a control-only machine runs no node agent",
             ));
         }
-        let after = Inputs {
+        let mut after = Inputs {
             console: req.enabled,
             ..machine.inputs.clone()
         };
+        if let Some(sound) = sound {
+            after.devices.sound = sound;
+        }
         recipe::validate(&after).map_err(|e| {
             refuse(
                 Reason::Invalid,

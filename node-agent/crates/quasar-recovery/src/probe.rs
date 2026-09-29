@@ -36,7 +36,7 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
-for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse) echo "dev ${f##*/}";; esac; done
+for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd) echo "dev ${f##*/}";; esac; done
 [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
@@ -56,6 +56,8 @@ pub struct ProbeReport {
     pub kernel_log: bool,
     /// The host has `/dev/fuse` (sessions may be given it).
     pub fuse: bool,
+    /// The host has `/dev/snd` (console mode may be given it, RH-07 #395).
+    pub sound: bool,
     pub nvidia_nodes: bool,
     /// `(node, pci vendor id)`, render and card nodes, in the order printed.
     pub nodes: Vec<(String, Option<String>)>,
@@ -91,6 +93,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("kmsg")) => report.kmsg = true,
             (Some("dev"), Some("nvidiactl")) => report.nvidia_nodes = true,
             (Some("dev"), Some("fuse")) => report.fuse = true,
+            (Some("dev"), Some("snd")) => report.sound = true,
             (Some("kernel_log"), Some("open")) => report.kernel_log = true,
             (Some("node"), Some(node)) if node.starts_with("/dev/dri/") => {
                 let _majmin = words.next();
@@ -174,6 +177,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         kmsg: report.kmsg,
         kernel_log: report.kmsg && report.kernel_log,
         fuse: report.fuse,
+        sound: report.sound,
         engine_rootless: false,
         host_sysfs: false,
     };

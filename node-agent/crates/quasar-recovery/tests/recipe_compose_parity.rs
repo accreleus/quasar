@@ -284,6 +284,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             kernel_log: false,
             engine_rootless: false,
             host_sysfs: false,
+            sound: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -639,6 +640,8 @@ fn the_console_additions_match_the_console_overlay_except_the_listed_differences
         let plain = inputs(vendor);
         let mut on = plain.clone();
         on.console = true;
+        // The overlay grants sound unconditionally; the recipe only on a host that has it.
+        on.devices.sound = true;
         let mut files = vec![base.clone()];
         if vendor == Some(GpuVendor::Nvidia) {
             files.push(nvidia.clone());

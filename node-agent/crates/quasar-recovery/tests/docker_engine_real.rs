@@ -454,6 +454,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
             kernel_log: false,
             engine_rootless: false,
             host_sysfs: false,
+            sound: false,
             fuse: false,
             dri: false,
             uinput: false,

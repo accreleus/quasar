@@ -268,6 +268,12 @@ pub struct HostDevices {
     /// other container sees. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_sysfs: bool,
+    /// The host has `/dev/snd` (RH-07 #395). Console mode gives the agent the host's sound
+    /// devices only then: a bind of a missing source is refused by Podman and silently
+    /// created as an empty directory by Docker. Read again whenever console mode is turned
+    /// on, since sound may appear after the install. Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sound: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -282,6 +288,7 @@ impl Default for HostDevices {
             engine_rootless: false,
             fuse: false,
             host_sysfs: false,
+            sound: false,
             unknown: Unknown::new(),
         }
     }
@@ -664,7 +671,7 @@ pub fn render(
             if revision >= 3 {
                 least_privilege(&mut spec, inputs);
                 if inputs.console {
-                    console_access(&mut spec);
+                    console_access(&mut spec, inputs);
                 }
             } else if inputs.console {
                 // Fail closed: an older revision would render without the console additions
@@ -1053,19 +1060,24 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
 /// Console mode (RH-07 #395): what `deploy/overlays/docker-compose.console.yml` grants, on
 /// a rootful engine only (`validate`). Each difference from the overlay is listed in
 /// `tests/recipe_compose_parity.rs`.
-fn console_access(spec: &mut ContainerSpec) {
+fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
     // seatd's drmSetMaster on weston's behalf (session/console.rs): today's display-control
     // capability, which #407 replaces.
     spec.cap_add.push("SYS_ADMIN".into());
-    spec.binds.push(bind("/dev/snd", "/dev/snd", false));
-    // Docker forbids a bind into the container's own /proc; sink discovery reads this.
-    spec.binds
-        .push(bind("/proc/asound", "/host-proc/asound", true));
-    spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
-    // ALSA nodes arrive with the bind, so no `m`; the agent mknods /dev/i2c-N for DDC
-    // (ddc.rs). DRM is already a mapped device (`/dev/dri`), so no major-226 rule.
-    spec.device_cgroup_rules
-        .extend(["c 116:* rw".to_string(), "c 89:* rmw".to_string()]);
+    // Sound only on a host that has it: console mode runs quiet without, and the agent's
+    // console_audio check says why.
+    if inputs.devices.sound {
+        spec.binds.push(bind("/dev/snd", "/dev/snd", false));
+        // Docker forbids a bind into the container's own /proc; sink discovery reads this.
+        spec.binds
+            .push(bind("/proc/asound", "/host-proc/asound", true));
+        spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
+        // ALSA nodes arrive with the bind, so no `m`.
+        spec.device_cgroup_rules.push("c 116:* rw".to_string());
+    }
+    // The agent mknods /dev/i2c-N for DDC (ddc.rs). DRM is already a mapped device
+    // (`/dev/dri`), so no major-226 rule.
+    spec.device_cgroup_rules.push("c 89:* rmw".to_string());
     spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
 }
 

@@ -28,13 +28,27 @@ const MARKER: &str = "QUASAR_CONSOLE_ACCESS";
 const NEW_AGENT: &str = "registry.example.invalid/quasar/quasar-node-agent@sha256:dd44000000000000000000000000000000000000000000000000000000000000";
 const RELEASE_ID: &str = "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22";
 
-/// A rootful AMD GPU host whose agent image carries recipe revision 3.
+/// The AMD probe's report, on a host that also has sound devices.
+const PROBE_AMD_SOUND: &str =
+    "quasar-probe 1\ndev uinput\ndev kmsg\ndev snd\nnode /dev/dri/renderD129 226:129 0x1002\nend\n";
+
+/// A rootful AMD GPU host with sound whose agent image carries recipe revision 3.
 fn rootful() -> FakeState {
     let mut state = amd_host();
+    state.probe_output = PROBE_AMD_SOUND.into();
     state
         .registry
         .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
     state
+}
+
+fn binds_sound(agent: &FakeContainer) -> bool {
+    agent.spec.binds.iter().any(|b| b.source == "/dev/snd")
+        || agent
+            .spec
+            .device_cgroup_rules
+            .iter()
+            .any(|r| r.starts_with("c 116:"))
 }
 
 struct Machine {
@@ -254,6 +268,34 @@ fn enabling_replaces_only_the_agent_with_the_console_additions_and_disabling_tak
     assert!(!status.enabled);
     assert!(!status.last.unwrap().target);
     assert_eq!(actor.console(disable()).expect("answered"), None);
+}
+
+/// Sound is read when console mode is turned on, not only at the install: a host without
+/// it gets console mode without sound devices (nothing for the engine to create), and one
+/// whose sound appeared after the install gets them.
+#[test]
+fn console_mode_gives_sound_devices_only_on_a_host_that_has_them_now() {
+    let mut state = rootful();
+    state.probe_output = PROBE_AMD.into();
+    let m = Machine::install(state);
+    let actor = m.actor();
+
+    run(&actor, enable());
+    let quiet = m.one_running_agent("enabled without sound");
+    assert!(console_on(&quiet));
+    assert!(!binds_sound(&quiet), "{:?}", quiet.spec);
+    assert!(quiet
+        .spec
+        .device_cgroup_rules
+        .contains(&"c 89:* rmw".to_string()));
+    run(&actor, disable());
+
+    // A sound card appears; the next enable reads it.
+    m.engine
+        .with_state(|s| s.probe_output = PROBE_AMD_SOUND.into());
+    run(&actor, enable());
+    let loud = m.one_running_agent("enabled with sound");
+    assert!(console_on(&loud) && binds_sound(&loud), "{:?}", loud.spec);
 }
 
 /// An operator reconfigure keeps console mode as it is, and cannot set it.
