@@ -78,6 +78,10 @@ const platformIds = Object.keys(PLATFORMS);
 		border-bottom: 1px solid var(--sl-color-hairline, var(--q-line-2));
 		vertical-align: top;
 	}
+	/* The status badge never wraps mid-word in a narrow column. */
+	.ep-table td:nth-child(3) {
+		white-space: nowrap;
+	}
 	.ep-table th {
 		color: var(--sl-color-gray-2, inherit);
 		font-weight: 600;

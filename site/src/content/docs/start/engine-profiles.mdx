@@ -11,11 +11,9 @@ An **engine profile** is one tested combination of platform, container engine
 ordinary account). Quasar publishes a status for each one it has an opinion about, and
 never implies one it has not tested. The quick start's engine step and the
 [one-line add-host command](/quasar/install/second-host/) show the same
-statuses, from the same table, because both read it: `profileFor()` in
-`site/src/data/engine-profiles.js`, over
-`testdata/engine-profiles/profiles.json`. The node agent's own `runtime_engine`
-readiness check is held to that file by a test, so the badge below is the
-verdict a host's readiness card will give it.
+statuses, from the same table. A host's readiness card (its `runtime_engine`
+check) is held to that table too, so the badge below is the verdict the card will
+give it.
 
 ## What the statuses mean
 
