@@ -315,9 +315,28 @@ streaming keeps working as before — the setting never claims access the host d
 have. A rootful engine's socket is already equivalent to root on that machine, so
 granting the agent its display and sound is not a new exposure.
 
-Console mode on a **rootless** engine is not available yet; it is coming with later
-RH-07 work. A Compose or source install keeps granting console access the way it
-always has, with [`deploy/overlays/docker-compose.console.yml`](https://github.com/accreleus/quasar/blob/main/deploy/overlays/docker-compose.console.yml)
+On a **rootless** owned host (Docker or Podman) console mode works the same way, with
+no added capabilities. The agent reaches the display, sound, monitor control and
+physical keyboards, mice and controllers through device access that host preparation
+grants the Quasar user, so prepare the machine with `--console` first:
+
+```sh
+sudo sh prepare-host.sh --mode rootless --console
+```
+
+Two things differ from a rootful host:
+
+- **The display must be free.** A rootless agent can take the screen only when no other
+  process holds it. If a desktop or login screen is running on that display, the
+  console session does not start and the console page names the reason. Stop the
+  desktop, or use a machine without one.
+- **Sound goes through the desktop's PipeWire when there is one.** Add
+  `--console-audio-user USER` (the account whose desktop session runs PipeWire), and
+  console audio plays through it, beside the desktop's own sound. Quasar never takes
+  the sound device away from it. Without PipeWire, console audio goes straight to the
+  sound device you pick on the console page.
+
+A Compose or source install keeps granting console access the way it always has, with [`deploy/overlays/docker-compose.console.yml`](https://github.com/accreleus/quasar/blob/main/deploy/overlays/docker-compose.console.yml)
 — an owned host's recovery actor does not read that overlay.
 
 ## Storage

@@ -725,11 +725,6 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		return fmt.Errorf("register: %w", err)
 	}
 	h.failures.Forget(clientIP)
-	defer func() {
-		if err := h.store.markOffline(bg, hostID); err != nil {
-			h.log.Error("mark offline failed", "host_id", hostID, "err", err)
-		}
-	}()
 
 	h.log.Info("agent registered", "host_id", hostID)
 
@@ -761,6 +756,13 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		ac.imageVersionsObservedAt = time.Now().UTC()
 	}
 	h.registry.add(ac)
+	// The predecessor may have projected offline between this register's write and
+	// add; restate liveness now that this connection is current.
+	h.registry.withCurrent(ac, func() {
+		if err := h.store.markLive(bg, hostID); err != nil {
+			h.log.Error("mark live failed", "host_id", hostID, "err", err)
+		}
+	})
 	go ac.runWriter(h.log)
 	// Every path after add, including a rejected reconciliation start, must
 	// remove this socket before registration can be retried. The lifecycle gate
@@ -769,7 +771,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		// schema.md invariant #3: a lost agent connection reaps the host's
 		// non-terminal sessions to failed — but only if this connection is
 		// still the current one. A displaced connection must not reap the live
-		// sessions the newer connection now owns (P2-06 race).
+		// sessions the newer connection now owns (P2-06 race), nor project the
+		// host offline under it.
 		h.registry.removeWithLifecycle(ac, func() {
 			ctx, cancel := context.WithTimeout(bg, agentDBCallTimeout)
 			defer cancel()
@@ -781,6 +784,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			h.events.HostDisconnected(ctx, hostID)
 			// Bounds the rate-limiter map by the live connection set.
 			h.imageLimiter.evict(hostID)
+			if err := h.store.markOffline(bg, hostID); err != nil {
+				h.log.Error("mark offline failed", "host_id", hostID, "err", err)
+			}
 		})
 	}()
 	if policyTyped && h.cfgStore != nil {

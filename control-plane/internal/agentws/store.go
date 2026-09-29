@@ -678,6 +678,19 @@ func (s *agentStore) updateHeartbeat(ctx context.Context, hostID string) error {
 	return nil
 }
 
+// markLive undoes a displaced connection's markOffline for the current one; it keeps
+// a drain exactly as registerStatusSQL does.
+func (s *agentStore) markLive(ctx context.Context, hostID string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE hosts SET status=`+registerStatusSQL+`, agent_disconnected_at=NULL
+		WHERE id=$1 AND (status='offline' OR agent_disconnected_at IS NOT NULL)
+	`, hostID)
+	if err != nil {
+		return fmt.Errorf("mark live: %w", err)
+	}
+	return nil
+}
+
 // markOffline stamps a WS disconnect (every path that ends the read loop).
 // An owned restriction keeps the compatibility status draining; the connection
 // stamp remains the source of liveness. Also stamps agent_disconnected_at =

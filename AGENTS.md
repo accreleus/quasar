@@ -280,6 +280,7 @@ does not agree with; do the same in anything else that writes host settings.
 | Any change | `make verify` (fmt/lint/build all components + shellcheck + DX self-tests) |
 | Go code | + `make test-go`; **DB-touching: + `make test-db`** (green `test-go` alone means DB tests were SKIPPED) |
 | Rust code | + `make test-rust` (runs in the `quasar-agent-dev` container) |
+| Container runtime (`node-agent/src/runtime*`, `crates/quasar-runtime`) | + `make test-engines` against the engines at hand; CI runs every engine mode, the lab runs the GPU cases (`docs/testing-engine-suite.md`) |
 | Web code | + `make test-web` — includes a `web/src/api/schema.d.ts` drift check against `protocol/openapi.yaml` (the `npm run gen:api` output; Go's `TestOpenAPIDrift` counterpart); UI surfaces additionally need the design-handoff visual check (CLAUDE.md) |
 | Pre-merge to develop | `make preflight` |
 | Pipeline / encoder / streaming | remote validation on the gpu-test host (`quasar-host`, `quasar-session` skills) — a compiling pipeline is not a working pipeline — **+ `make bench-check`** on runs posted for the new commit before it merges into `develop` (exit 3 blocks; exit 4 is stated in the summary, never called a pass). See "Performance evidence" above |

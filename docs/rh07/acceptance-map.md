@@ -101,7 +101,7 @@ the agent's `runtime_engine` check all read):
 | 26 | Reinstall + dump restore, rootful to rootless | Not yet evidenced | D16 defers this to a fresh install plus the separate dump-restore ticket (#380); no #393–#423 ticket exercises it |
 | 27 | Docs say a rootful engine socket is root-equivalent | Met | Engine-profile page states it plainly; the accepted `label=disable` exception is documented the same way: #406 comment [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
 | 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run in #393–#423 keeps `getenforce` at `Enforcing` throughout, including after reboot: #400, #402, #404, #405, #407. The one exception is the node agent's own `label=disable`, accepted under D17 (story 10); sessions themselves stay confined (`container_t`/`container_engine_t`) |
-| 29 | Same behavioural suite across every engine mode | Partly met | One suite (identity, create-read-back, user mapping, devices, CDI, restart, health, removal, errors) runs unchanged against each mode, and CI runs it on Docker rootful, Docker rootless, Podman rootful and Podman rootless (branch `rh07/408-engine-suite`, commit `293c537f`). Not yet met: the CDI, DRM and uinput cases need the lab procedure on real hardware, and Podman 4.9 (Ubuntu) has three recorded known failures (create-read-back, restart policy update, missing bind source) |
+| 29 | Same behavioural suite across every engine mode | Met | One suite runs unchanged against each mode (#408, integrated `6e938912`): CI runs Docker rootful and rootless and Podman rootful and rootless; the lab ran Podman rootless and rootful (NVIDIA) and Docker rootful (AMD). Its findings are filed, not hidden: #424, #425, #426. Evidence: #408 comment [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059) |
 | 30 | Each required profile proven on real hardware before `main` | Partly met | NVIDIA: all three required profiles pass every row except the microphone half of Session (matrix above). AMD: only Docker rootful has been run at all; Docker rootless and Podman rootless on AMD are gaps, not failures |
 
 **Count:** 16 met, 8 partly met, 6 not yet evidenced (stories 23, 26, 29 not yet evidenced;
@@ -150,9 +150,9 @@ Each item names what would close it.
    with "nobody has run it yet."
 
 **Story gaps:**
-8. **#408's suite runs in CI but not yet in the lab.** Its CDI, DRM and uinput cases need
-   the lab procedure on real hardware per engine mode, and its Podman 4.9 known failures
-   need tickets and fixes. Story 29 depends on it.
+8. **#408's suite has no Docker rootless lab run yet** (it runs in CI), and its Podman
+   findings are open: #425 (a crash-looping service restarts after an explicit stop) and
+   #426 (a missing bind source is created on the host), on Podman 5 as well as 4.9.
 9. **Console audio over PipeWire (story 23) has no hardware proof** — both live runs
    fell back to ALSA because the tested hosts run no PipeWire session. Needs a rootless
    host with an active PipeWire session (the plan named the Bazzite VM, #407 comment

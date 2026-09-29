@@ -241,6 +241,7 @@ impl Bootstrap {
             enroll: Default::default(),
             app: app.clone(),
             console: false,
+            console_vt_kept: false,
         };
         recipe::validate(&probe).map_err(|e| e.to_string())?;
         trust_config(&op.trust)?;

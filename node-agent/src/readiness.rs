@@ -10,6 +10,8 @@
 //! host-side read is `/etc/os-release` (via `/host`), used purely to pick remediation wording;
 //! its absence degrades to generic wording, never a failed check.
 
+/// `console_display` / `console_audio` / `console_ddc` (RH-07 #407).
+pub mod console;
 /// `owner_conflict` on an owned install.
 pub mod owner_conflict;
 /// The update-path checks (preflight ids), with their collectors.
@@ -147,6 +149,8 @@ pub struct ProbeEnv {
     /// The agent runs NVIDIA sessions (`ContainerRuntime::is_nvidia`), even when capacity
     /// detection dropped the GPU, as it does when the engine injected none.
     pub nvidia_runtime: bool,
+    /// `console_display` / `console_audio` / `console_ddc` inputs (RH-07 #407).
+    pub console: console::ConsoleView,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -271,6 +275,17 @@ impl ProbeEnv {
             runtime,
             gpus: Vec::new(),
             nvidia_runtime: crate::session::container::ContainerRuntime::from_env().is_nvidia(),
+            console: console::ConsoleView {
+                enabled: crate::ddc::is_console_enabled(),
+                has_access: std::env::var(crate::release::console::MARKER_ENV)
+                    .is_ok_and(|v| v.trim() == "1"),
+                preflight: crate::session::console_preflight::last(),
+                audio: console::AudioView::observe(
+                    &crate::session::console_audio::LiveHostAudio::live(),
+                    &crate::session::console_audio::configured_output(),
+                ),
+                ddc: crate::ddc::summary(),
+            },
         }
     }
 
@@ -557,6 +572,9 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         // The update path: what preflight reads about this host.
         platform_update::check_updater_socket(env.recovery_actor.as_ref()),
         platform_update::check_health_addr_bindable(&env.health, &env.self_identity),
+        console::check_display(&env.console),
+        console::check_audio(&env.console),
+        console::check_ddc(&env.console),
     ]
 }
 
@@ -1999,6 +2017,7 @@ mod tests {
                 runtime: runtime_facts::RuntimeView::NotObserved,
                 gpus: Vec::new(),
                 nvidia_runtime: false,
+                console: console::ConsoleView::default(),
             }
         }
 

@@ -29,6 +29,53 @@ own; the two do not move together, and that is deliberate.
   story and required engine-profile row (Docker rootful, Docker rootless, Podman rootless
   on AMD and NVIDIA) to its evidence, with a Podman-rootful/Ubuntu-24.04 claimed vs
   experimental accounting and an open-gaps list.
+- **One behavioural suite for every engine mode (RH-07, #408).** The container runtime is
+  tested against a real engine with the same cases for Docker and Podman, rootful and
+  rootless: create and read-back, user mapping, DRM and uinput device passing, CDI, restart,
+  health, removal and errors. A capability a host cannot give is declared and reported as a
+  skip with its reason, never passed silently. CI runs all four modes on hosted runners;
+  the GPU and device cases run in the lab (`make test-engines`,
+  `docs/testing-engine-suite.md`).
+- **Console mode on rootless engines (RH-07, #407).** The recovery actor no longer
+  refuses console mode on a rootless engine. There the node agent gets no added capability
+  and no device-cgroup rules: taking a free display needs neither. It gets `/dev/dri` as
+  before, the host's sound devices only when the host has them, each `/dev/i2c-*` node the
+  host has as a device (it cannot create them itself), and read-only views of logind's
+  seat and session state so it can say what holds the display. The actor's device probe
+  now reports i2c buses and logind, re-reads them whenever console mode is turned on, and
+  re-reads them at every actor start while console mode is on. When they change (a reboot
+  can renumber i2c buses or drop one), it re-creates the agent through a verified
+  replacement of its own, so a vanished node never leaves the agent unable to start. The
+  agent socket gains `POST /v1/console/preflight`: a console agent that reports it cannot
+  take the display fails the attempt at once (`unhealthy`), the previous agent is put
+  back, and the agent's text appears as `last.detail` in `GET /v1/console`. Rootful
+  console mode still keeps `SYS_ADMIN` until hardware proves the recipe works without it.
+  At startup, a console-access agent checks for itself
+  whether it can take the display (no crash on a held one, just a named failure posted to
+  the actor's new preflight endpoint) before it ever reports healthy, `ddc.rs` stops
+  creating `/dev/i2c-*` nodes on a rootless engine and reads the ones the recipe passed
+  instead, and readiness gains `console_display`/`console_audio`/`console_ddc`. Host
+  preparation (`deploy/prepare-host.sh --console`) now also grants the `quasar` group
+  this machine's physical keyboards, mice and game controllers (stated plainly in its
+  output, since it means the group can read this machine's keyboard) for console
+  mode's exclusive grab, and `--console-audio-user USER` gives console mode a
+  restricted PipeWire Pulse socket on a real desktop login, reachable only by that
+  group.
+  Console audio now plays through that socket to the desktop user's PipeWire (its sinks
+  listed as "Host PipeWire", the `hw:*` ones hidden while it answers), and falls back to
+  ALSA only when no PipeWire answers and the device is free; otherwise the console runs
+  quiet and `console_audio` names what holds the device. ALSA sinks are reported by card
+  id (`hw:CARD=<id>,DEV=<n>`), which a driver reload does not move (a stored `hw:N,M`
+  still works), and an agent that starts with console mode already on now asks its actor
+  for access once the actor can take it.
+  The console UI
+  now leads a failed attempt with the agent's own named cause (who holds the display, or
+  that the host needs `prepare-host.sh --console` again, with a copyable command) instead
+  of hiding it behind the generic mapped reason, and its "Local audio output" picker and
+  help text tell a host's PipeWire sinks from its ALSA ones.
+  Proven on hardware with Docker rootless and Podman rootless (display, keyboard and
+  mouse, audio, DDC auto-start); the site's host administration page describes the
+  rootless setup.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
@@ -782,6 +829,19 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The runtime reads Podman containers in libpod's `stopped` and `configured` states
+  (RH-07, #408).** Podman can report them where Docker's schema has none (a crash-looping
+  service just after a stop); every inspect of such a container failed as unreadable.
+- **A reconnected host no longer reads as offline (#407).** When an agent's old connection
+  was noticed dead only after its replacement had registered (seen when console access
+  recreated the agent), that old connection's teardown marked the host offline, and nothing
+  set it back while the new connection stayed up: every launch then failed with
+  `no_host_available`. Only the host's current connection now marks it offline.
+- **Host preparation relabels a homes or templates root that was recreated (#407).** It
+  counted the persistent `container_file_t` rule as done, but a root recreated after it was
+  written (a reinstall) inherits `var_lib_t`, so every app in a confined container failed to
+  set up its home and exited at once. `prepare-host.sh` now checks the directory's actual
+  label and runs `restorecon` when it differs; labels only, nothing is re-owned.
 - **`make test-rust` in two worktrees at once no longer cross-contaminates (#417).** Every
   worktree built into the same in-container `CARGO_TARGET_DIR` on the shared
   `quasar-cargo-target` volume, at identical source paths, so cargo's mtime-based freshness
@@ -1074,6 +1134,22 @@ own; the two do not move together, and that is deliberate.
 
 ### Security
 - **Session input stays inside the session.** The compositor now takes the virtual keyboard and mouse it is given exclusively (`EVIOCGRAB`, compositor pin `6638e07`), so the host's own console input handlers no longer also receive a session's keys, and the virtual keyboard no longer declares keys only the host acts on (SysRq, power, sleep, suspend, wake, radio). Found in console-mode testing, where keys typed in a session appeared on the host's login prompt. The input self-test that runs at agent start now grabs its own devices the same way before writing to them, so its test keystroke no longer reaches the host console either.
+- **A console session owns its own virtual terminal, with the kernel keyboard off (RH-07,
+  #407).** For the life of a local console session the node agent makes `tty8` the active
+  virtual terminal with its kernel keyboard turned off, and switches back to the previous
+  one when the session ends, so keys typed in the session no longer also reach the host's
+  text console (its login prompt). A small helper child holds the terminal as its
+  controlling terminal, which is all the kernel asks for: no capability is added. A host
+  whose terminal cannot be taken refuses console sessions and fails the console preflight
+  with the reason; a host with no virtual terminals is unaffected. On SIGTERM or SIGINT
+  (an engine stop, or the recovery actor replacing it) the agent ends the console session
+  and gives the terminal back before it exits, within about 8 seconds. If it dies holding
+  the terminal anyway, its next start puts the previous one back: once console mode has
+  been on, the recovery actor keeps giving the agent `/dev/tty8` (read/write, nothing
+  else) after console mode is turned off, for exactly that. `prepare-host.sh
+  --console` gives the Quasar group `tty8` by ACL and masks `getty@tty8` and
+  `autovt@tty8`; the recovery actor passes `/dev/tty8` to a console agent when the host
+  has it, and `deploy/overlays/docker-compose.console.yml` does the same.
 
 ## 0.3.0 — 2026-09-13
 

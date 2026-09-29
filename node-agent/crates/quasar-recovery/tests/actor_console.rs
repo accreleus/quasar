@@ -1,4 +1,4 @@
-//! Console mode on a rootful owned install (RH-07 #395): the node agent's `POST
+//! Console mode on an owned install (RH-07 #395, rootless #407): the node agent's `POST
 //! /v1/console` re-creates the agent alone with the console additions on or off, verified
 //! and put back if it does not verify. Against the in-memory engine with crash injection
 //! and a temporary machine-state directory, observed through the actor's console request
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quasar_recovery::actor::{Actor, ActorConfig, ReplaceTiming, TrustConfig};
-use quasar_recovery::console::{ConsoleRequest, ConsoleStatus};
+use quasar_recovery::console::{ConsolePreflight, ConsoleRequest, ConsoleStatus};
 use quasar_recovery::engine::{Behaviour, FakeContainer, FakeEngine, FakeState, Lifecycle};
 use quasar_recovery::journal::Phase;
 use quasar_recovery::recipe::names;
@@ -559,27 +559,6 @@ fn a_release_is_busy_while_a_console_change_is_in_flight_and_never_adopts_it() {
 // ----- where console mode cannot be given -----
 
 #[test]
-fn a_rootless_engine_is_refused_naming_rootless_console_mode() {
-    let mut state = rootful();
-    state.host.rootless = true;
-    let m = Machine::install(state);
-    let actor = m.actor();
-    let old = m.agent().id;
-    let status = actor.console_status();
-    assert!(!status.supported);
-    assert!(
-        status.why.as_deref().unwrap().contains("#407"),
-        "{status:?}"
-    );
-    let refused = actor.console(enable()).expect_err("rootless");
-    assert_eq!(refused.reason, Reason::Invalid);
-    assert!(refused.message.contains("#407"), "{}", refused.message);
-    assert_eq!(m.agent().id, old);
-    assert!(!m.console_input());
-    assert_eq!(actor.console(disable()).expect("off is off"), None);
-}
-
-#[test]
 fn a_host_without_dri_is_refused() {
     let mut state = host(PROBE_NONE, &["runc"], false, &["/dev/uinput", "/dev/kmsg"]);
     state
@@ -678,4 +657,472 @@ fn only_the_agent_socket_serves_console_mode() {
     assert_eq!(served.last.unwrap().settled, Settled::Applied);
     let (status, _) = raw(&agent, &post(r#"{"enabled":true}"#));
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+}
+
+// ----- rootless engines (#407) -----
+
+/// A rootless AMD host with sound, logind, and two i2c buses.
+const PROBE_ROOTLESS: &str = "quasar-probe 1\ndev uinput\ndev kmsg\ndev snd\ni2c 3\ni2c 5\nlogind seats\nlogind sessions\nnode /dev/dri/renderD129 226:129 0x1002\nend\n";
+
+fn rootless() -> FakeState {
+    let mut state = rootful();
+    state.host.rootless = true;
+    state.probe_output = PROBE_ROOTLESS.into();
+    state
+        .host_devices
+        .extend(["/dev/i2c-3".to_string(), "/dev/i2c-5".to_string()]);
+    state
+}
+
+fn i2c_devices(agent: &FakeContainer) -> Vec<String> {
+    agent
+        .spec
+        .devices
+        .iter()
+        .filter(|d| d.host.starts_with("/dev/i2c-"))
+        .map(|d| d.host.clone())
+        .collect()
+}
+
+fn binds_logind(agent: &FakeContainer) -> bool {
+    agent
+        .spec
+        .binds
+        .iter()
+        .any(|b| b.source.starts_with("/run/systemd/") && b.read_only)
+}
+
+#[test]
+fn a_rootless_engine_takes_console_mode_without_a_capability_or_device_rules() {
+    let m = Machine::install(rootless());
+    let actor = m.actor();
+    let status = actor.console_status();
+    assert!(status.supported && status.why.is_none(), "{status:?}");
+    let old = m.agent();
+
+    let id = run(&actor, enable());
+    let result = actor.status_operator(Some(&id)).result.expect("journalled");
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    let agent = m.one_running_agent("rootless console");
+    assert_ne!(agent.id, old.id);
+    assert!(console_on(&agent));
+    assert!(agent.spec.cap_add.is_empty(), "{:?}", agent.spec.cap_add);
+    assert!(
+        agent.spec.device_cgroup_rules.is_empty(),
+        "{:?}",
+        agent.spec.device_cgroup_rules
+    );
+    assert_eq!(i2c_devices(&agent), vec!["/dev/i2c-3", "/dev/i2c-5"]);
+    assert!(agent.spec.binds.iter().any(|b| b.source == "/dev/snd"));
+    assert!(binds_logind(&agent));
+    assert_eq!(m.inputs()["devices"]["i2c"], serde_json::json!([3, 5]));
+    assert_eq!(m.inputs()["devices"]["logind"], true);
+    let last = actor.console_status().last.expect("settled");
+    assert_eq!(last.settled, Settled::Applied);
+    assert_eq!(last.detail, None);
+
+    run(&actor, disable());
+    let off = m.one_running_agent("rootless console off");
+    assert!(!console_on(&off) && i2c_devices(&off).is_empty() && !binds_logind(&off));
+    assert_eq!(off.spec.binds, old.spec.binds);
+    assert_eq!(off.spec.devices, old.spec.devices);
+}
+
+/// Sound, logind and i2c are each given only where the host has them now.
+#[test]
+fn a_rootless_host_without_sound_logind_or_i2c_gets_none_of_them() {
+    let mut state = rootless();
+    state.probe_output = PROBE_AMD.into();
+    let m = Machine::install(state);
+    let actor = m.actor();
+    run(&actor, enable());
+    let agent = m.one_running_agent("bare rootless console");
+    assert!(console_on(&agent));
+    assert!(!binds_sound(&agent), "{:?}", agent.spec);
+    assert!(!binds_logind(&agent), "{:?}", agent.spec);
+    assert!(i2c_devices(&agent).is_empty(), "{:?}", agent.spec);
+    assert!(agent.spec.cap_add.is_empty() && agent.spec.device_cgroup_rules.is_empty());
+    let devices = &m.inputs()["devices"];
+    assert!(
+        devices.get("i2c").is_none() && devices.get("logind").is_none(),
+        "{devices}"
+    );
+}
+
+/// D13: a host prepared with `--console-audio-user` has the PipeWire socket directory;
+/// turning console mode on reads it and binds it read-write into the agent.
+#[test]
+fn a_host_with_the_console_audio_directory_gets_it_bound() {
+    let mut state = rootless();
+    state.probe_output = PROBE_ROOTLESS.replace("\nend\n", "\nconsole_audio dir\nend\n");
+    let m = Machine::install(state);
+    let actor = m.actor();
+    run(&actor, enable());
+    let agent = m.one_running_agent("rootless console with PipeWire");
+    assert!(
+        agent
+            .spec
+            .binds
+            .iter()
+            .any(|b| b.source == "/run/quasar-console-audio"
+                && b.target == "/run/quasar-console-audio"
+                && !b.read_only),
+        "{:?}",
+        agent.spec.binds
+    );
+    assert_eq!(m.inputs()["devices"]["console_audio"], true);
+
+    run(&actor, disable());
+    let off = m.one_running_agent("console off");
+    assert!(!off
+        .spec
+        .binds
+        .iter()
+        .any(|b| b.source == "/run/quasar-console-audio"));
+}
+
+// ----- the console agent's preflight (#407) -----
+
+fn held() -> ConsolePreflight {
+    ConsolePreflight {
+        ok: false,
+        detail: Some("gdm, the login screen, holds the display".into()),
+    }
+}
+
+/// Stands in for the new console agent: when a node-agent container other than `old`
+/// starts, it posts `report` on the agent socket's preflight route (called directly).
+fn agent_posts_preflight(m: &Machine, old: String, report: ConsolePreflight) {
+    let caller = m.actor();
+    let engine = Arc::downgrade(&m.engine);
+    m.engine.on_lifecycle(move |event| {
+        let Lifecycle::Started(id) = event else {
+            return;
+        };
+        let Some(engine) = engine.upgrade() else {
+            return;
+        };
+        let console = engine
+            .state()
+            .containers
+            .get(id)
+            .is_some_and(|c| c.spec.env.get(MARKER).map(String::as_str) == Some("1"));
+        if *id != old && console {
+            caller
+                .console_preflight(report.clone())
+                .expect("a preflight is kept");
+        }
+    });
+}
+
+#[test]
+fn a_console_agent_whose_preflight_fails_is_put_back_naming_why() {
+    let m = Machine::install(rootless());
+    let old = m.agent().id;
+    agent_posts_preflight(&m, old.clone(), held());
+    failed_enable(&m, Reason::Unhealthy);
+    let actor = m.actor();
+    let last = actor.console_status().last.expect("settled");
+    assert_eq!(
+        last.detail.as_deref(),
+        Some("gdm, the login screen, holds the display")
+    );
+    let id = last.request_id.clone();
+    let result = actor.status_operator(Some(&id)).result.unwrap();
+    assert!(
+        result.output.contains("holds the display"),
+        "{}",
+        result.output
+    );
+
+    // Once the display is free the next attempt verifies, and its outcome names nothing.
+    agent_posts_preflight(
+        &m,
+        old,
+        ConsolePreflight {
+            ok: true,
+            detail: None,
+        },
+    );
+    run(&actor, enable());
+    assert!(console_on(&m.one_running_agent("the display freed")));
+    let last = actor.console_status().last.unwrap();
+    assert_eq!(last.settled, Settled::Applied);
+    assert_eq!(last.detail, None);
+}
+
+/// A failed preflight an earlier console agent reported is not the next attempt's.
+#[test]
+fn a_stale_failed_preflight_does_not_fail_the_next_attempt() {
+    let m = Machine::install(rootless());
+    let actor = m.actor();
+    actor.console_preflight(held()).unwrap();
+    run(&actor, enable());
+    assert!(console_on(&m.one_running_agent("stale preflight")));
+    assert_eq!(
+        actor.console_status().last.unwrap().settled,
+        Settled::Applied
+    );
+}
+
+/// The preflight is kept in machine state: a verification a restart interrupted reads it.
+#[test]
+fn a_failed_preflight_survives_a_restart_mid_verification() {
+    let m = Machine::install(rootless());
+    let old = m.agent().id;
+    agent_posts_preflight(&m, old.clone(), held());
+    let actor = m.actor_with(|c| {
+        c.crash_after = Some(Box::new(|name, p| {
+            name == "node-agent" && p == Phase::Verifying
+        }));
+    });
+    actor
+        .console(enable())
+        .expect("admitted")
+        .expect("an attempt");
+    actor.wait_attempt();
+    drop(actor);
+    m.actor().resume().expect("settles");
+    let agent = m.one_running_agent("after the restart");
+    assert_eq!(agent.id, old, "the previous agent is back");
+    let last = m.actor().console_status().last.expect("settled");
+    assert_eq!(last.settled, Settled::PutBack);
+    assert_eq!(last.reason, Some(Reason::Unhealthy));
+    assert_eq!(
+        last.detail.as_deref(),
+        Some("gdm, the login screen, holds the display")
+    );
+    assert!(!m.console_input());
+}
+
+#[test]
+fn a_preflight_that_fails_must_say_why() {
+    let m = Machine::install(rootless());
+    let actor = m.actor();
+    for detail in [None, Some("  ".to_string()), Some("two\nlines".to_string())] {
+        let refused = actor
+            .console_preflight(ConsolePreflight { ok: false, detail })
+            .expect_err("refused");
+        assert_eq!(refused.reason, Reason::Invalid);
+    }
+    let long = ConsolePreflight {
+        ok: false,
+        detail: Some("x".repeat(2000)),
+    };
+    assert_eq!(
+        actor.console_preflight(long).expect_err("too long").reason,
+        Reason::Invalid
+    );
+}
+
+// ----- console devices read again at every start (#407, owner decision 4) -----
+
+/// The agent's release relay reads its own attempts only: a re-creation for changed
+/// console devices is the actor's own.
+fn assert_actors_own(actor: &Arc<Actor>, id: &str) {
+    let result = actor.status_operator(Some(id)).result.expect("journalled");
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    assert!(actor.status_as(Caller::Agent, Some(id)).result.is_none());
+    assert!(actor.status_as(Caller::Agent, None).in_flight.is_none());
+}
+
+#[test]
+fn renumbered_i2c_buses_at_a_start_re_create_the_agent_through_a_verified_replacement() {
+    let m = Machine::install(rootless());
+    let actor = m.actor();
+    run(&actor, enable());
+    let before = m.one_running_agent("console on");
+    // A failed preflight left over from an earlier agent does not gate the actor's own
+    // re-creation: it is not a console change.
+    actor.console_preflight(held()).unwrap();
+    drop(actor);
+
+    // A reboot renumbers the buses.
+    m.engine.with_state(|s| {
+        s.probe_output = PROBE_ROOTLESS.replace("i2c 3\ni2c 5", "i2c 4\ni2c 6");
+        s.host_devices.retain(|d| !d.starts_with("/dev/i2c-"));
+        s.host_devices
+            .extend(["/dev/i2c-4".to_string(), "/dev/i2c-6".to_string()]);
+    });
+    let actor = m.actor();
+    actor.resume().unwrap();
+    let id = actor
+        .recheck_console_devices()
+        .expect("a re-creation was admitted");
+    actor.wait_attempt();
+    assert_actors_own(&actor, &id);
+    let agent = m.one_running_agent("re-created");
+    assert_ne!(agent.id, before.id);
+    assert!(console_on(&agent));
+    assert_eq!(i2c_devices(&agent), vec!["/dev/i2c-4", "/dev/i2c-6"]);
+    assert_eq!(m.inputs()["devices"]["i2c"], serde_json::json!([4, 6]));
+    let status = actor.console_status();
+    assert!(status.enabled && status.in_flight.is_none(), "{status:?}");
+    assert!(status.last.is_none(), "not a console change: {status:?}");
+
+    // Nothing changed since: the next start re-creates nothing.
+    drop(actor);
+    let actor = m.actor();
+    actor.resume().unwrap();
+    assert_eq!(actor.recheck_console_devices(), None);
+    assert_eq!(m.agent().id, agent.id);
+}
+
+/// A bus gone after a reboot leaves an agent the engine will not start (it names a node
+/// the host lacks). The start re-creates it without that node.
+#[test]
+fn a_vanished_i2c_node_never_leaves_the_agent_unstartable() {
+    let m = Machine::install(rootless());
+    run(&m.actor(), enable());
+    let before = m.one_running_agent("console on");
+    m.engine.with_state(|s| {
+        s.probe_output = PROBE_ROOTLESS.replace("i2c 3\ni2c 5\n", "i2c 3\n");
+        s.host_devices.remove("/dev/i2c-5");
+        // What a reboot left: the engine could not start the agent.
+        let c = s.containers.get_mut(&before.id).unwrap();
+        c.status = "exited".into();
+        c.exit_code = Some(128);
+    });
+    let actor = m.actor();
+    actor.resume().unwrap();
+    let id = actor.recheck_console_devices().expect("re-created");
+    actor.wait_attempt();
+    assert_actors_own(&actor, &id);
+    let agent = m.one_running_agent("without the vanished node");
+    assert_eq!(i2c_devices(&agent), vec!["/dev/i2c-3"]);
+    assert!(console_on(&agent));
+
+    // Every bus gone: console mode stays on, with no i2c device.
+    m.engine.with_state(|s| {
+        s.probe_output = PROBE_ROOTLESS.replace("i2c 3\ni2c 5\n", "");
+        s.host_devices.remove("/dev/i2c-3");
+    });
+    drop(actor);
+    let actor = m.actor();
+    actor.resume().unwrap();
+    actor.recheck_console_devices().expect("re-created");
+    actor.wait_attempt();
+    let agent = m.one_running_agent("no i2c at all");
+    assert!(i2c_devices(&agent).is_empty() && console_on(&agent));
+    assert!(m.inputs()["devices"].get("i2c").is_none());
+}
+
+/// Rootful DDC makes its own nodes, so renumbered buses move nothing there; with console
+/// mode off, nothing is read at all.
+#[test]
+fn a_start_re_creates_nothing_that_does_not_move_the_agent() {
+    let mut state = rootful();
+    state.probe_output = PROBE_ROOTLESS.into();
+    let m = Machine::install(state);
+    let actor = m.actor();
+    assert_eq!(actor.recheck_console_devices(), None, "console mode is off");
+    run(&actor, enable());
+    let agent = m.one_running_agent("rootful console");
+    assert!(i2c_devices(&agent).is_empty());
+    m.engine.with_state(|s| {
+        s.probe_output = PROBE_ROOTLESS.replace("i2c 3\ni2c 5", "i2c 9");
+    });
+    drop(actor);
+    let actor = m.actor();
+    actor.resume().unwrap();
+    assert_eq!(actor.recheck_console_devices(), None);
+    assert_eq!(m.agent().id, agent.id, "not re-created");
+    assert_eq!(m.inputs()["devices"]["i2c"], serde_json::json!([9]));
+}
+
+/// A probe that cannot run keeps the agent as it is.
+#[test]
+fn a_start_whose_probe_fails_keeps_the_agent() {
+    let m = Machine::install(rootless());
+    run(&m.actor(), enable());
+    let agent = m.one_running_agent("console on");
+    m.engine
+        .with_state(|s| s.probe_output = "not a report".into());
+    let actor = m.actor();
+    actor.resume().unwrap();
+    assert_eq!(actor.recheck_console_devices(), None);
+    assert_eq!(m.agent().id, agent.id);
+}
+
+#[test]
+fn only_the_agent_socket_takes_a_preflight() {
+    let m = Machine::install(rootless());
+    let actor = m.actor();
+    let sockets = tempfile::tempdir().unwrap();
+    let agent = serve(&actor, sockets.path(), Caller::Agent);
+    let control = serve(&actor, sockets.path(), Caller::ControlPlane);
+    let post = |body: &str| {
+        format!(
+            "POST /v1/console/preflight HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    // No body: the control socket answers without reading one.
+    let (status, _) = raw(
+        &control,
+        "POST /v1/console/preflight HTTP/1.0\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(status.starts_with("HTTP/1.1 404"), "{status}");
+    let (status, _) = raw(&agent, "GET /v1/console/preflight HTTP/1.0\r\n\r\n");
+    assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+    let (status, body) = raw(&agent, &post(r#"{"ok":false,"detail":null}"#));
+    assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+    assert!(body.contains("invalid"), "{body}");
+    let (status, _) = raw(&agent, &post(r#"{"ok":true,"detail":null,"more":1}"#));
+    assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+    let (status, body) = raw(
+        &agent,
+        &post(r#"{"ok":false,"detail":"  gdm, the login screen, holds the display "}"#),
+    );
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    assert_eq!(
+        serde_json::from_str::<ConsolePreflight>(&body).unwrap(),
+        held()
+    );
+}
+
+fn has_console_vt(agent: &FakeContainer) -> bool {
+    agent
+        .spec
+        .devices
+        .iter()
+        .any(|d| d.host == "/dev/tty8" && d.container == "/dev/tty8" && d.permissions == "rw")
+}
+
+/// RH-07 #407: the console VT is given with console mode, and kept once it has been on, so
+/// the agent that replaces a console agent killed holding the VT can put it back. Nothing
+/// else of console mode stays, and no capability or device rule comes with it.
+#[test]
+fn the_console_vt_is_kept_after_console_mode_is_turned_off() {
+    let mut state = rootless();
+    state.probe_output = PROBE_ROOTLESS.replace("dev snd\n", "dev snd\ndev tty8\n");
+    state.host_devices.insert("/dev/tty8".to_string());
+    let m = Machine::install(state);
+    let actor = m.actor();
+    let before = m.agent();
+    assert!(!has_console_vt(&before), "never given before console mode");
+
+    run(&actor, enable());
+    let on = m.one_running_agent("console on");
+    assert!(
+        console_on(&on) && has_console_vt(&on),
+        "{:?}",
+        on.spec.devices
+    );
+    assert_eq!(m.inputs()["devices"]["console_vt"], true);
+    assert_eq!(m.inputs()["console_vt_kept"], true);
+
+    run(&actor, disable());
+    let off = m.one_running_agent("console off");
+    assert!(
+        !console_on(&off) && has_console_vt(&off),
+        "{:?}",
+        off.spec.devices
+    );
+    assert!(off.spec.cap_add.is_empty() && off.spec.device_cgroup_rules.is_empty());
+    assert!(i2c_devices(&off).is_empty() && !binds_logind(&off));
+    let mut devices = off.spec.devices.clone();
+    devices.retain(|d| d.host != "/dev/tty8");
+    assert_eq!(devices, before.spec.devices);
+    assert_eq!(m.inputs()["console_vt_kept"], true);
 }

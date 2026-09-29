@@ -507,6 +507,10 @@ fn actor() -> ExitCode {
         if !actor.serving() {
             return ExitCode::FAILURE;
         }
+        // RH-07 #407: console devices (i2c nodes above all) can change across a reboot.
+        if let Some(id) = actor.recheck_console_devices() {
+            info!(request = %id, "re-creating the node agent for the host's console devices");
+        }
     }
 
     // A hand-over stops this process's sockets on purpose while it waits to be stopped or

@@ -32,7 +32,7 @@ import { ResourceStates } from "../../../components/ResourceStates";
 import { useToast } from "../../../components/Toast";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useConsoleLoad } from "./console/useConsoleLoad";
-import { readsAsOn } from "./console/access";
+import { consoleAudioBackend, readsAsOn } from "./console/access";
 import { ConsoleAccessNote } from "./console/ConsoleAccessNote";
 import { ConsoleAccessConfirmModal } from "./console/ConsoleAccessConfirmModal";
 import { InputDevicesRow } from "./console/InputDevicesRow";
@@ -155,6 +155,17 @@ export function HostConsole() {
     capabilities.audio_sinks.length > 0 ||
     capabilities.input_devices.length > 0
   );
+  // RH07-15 (#407): the reported audio_sinks are one family or the other —
+  // the agent hides ALSA hw:* sinks while its host's PipeWire answers — so
+  // the help line under the selector names whichever this host reported
+  // (design_handoff_v3/screens/rh07/README.md specimens "on" / "on-alsa").
+  const audioBackend = consoleAudioBackend(capabilities?.audio_sinks);
+  const audioHelp =
+    audioBackend === "pipewire"
+      ? "This machine runs PipeWire, so console audio plays through it, beside the desktop's own sound. Quasar never takes the sound device from it."
+      : audioBackend === "alsa"
+        ? "No PipeWire runs on this machine, so console audio goes straight to the sound device (ALSA)."
+        : "Host sink for console-mode audio. Quiet plays no local audio.";
   const connectedOutputs = (capabilities?.outputs ?? []).filter((output) => output.connected);
   const selectedOutput = connectedOutputs.find((output) => output.id === effective.output_id);
   const selectedModeValue = effective.mode
@@ -208,7 +219,7 @@ export function HostConsole() {
       {!loading && access && host && (
         <ConsoleAccessNote
           access={access}
-          hostName={host.node_name}
+          host={host}
           liveSessions={host.capacity?.active_sessions ?? null}
           onTryAgain={tryAgain}
           tryAgainPending={toggleAccess.pending != null}
@@ -323,7 +334,7 @@ export function HostConsole() {
 
             <Group title="Local input and audio" />
 
-            <ConsoleRow title="Local audio output" help="Host sink for console-mode audio. Quiet plays no local audio.">
+            <ConsoleRow title="Local audio output" help={audioHelp}>
               <select
                 className="select"
                 aria-label="Local audio output"
