@@ -769,12 +769,10 @@ impl VirtualDevices {
         let h = open_uinput()?;
         h.set_evbit(EventKind::Key)?;
         h.set_evbit(EventKind::Synchronize)?;
-        // Every key, but NOT buttons: exposing BTN_GAMEPAD/BTN_MOUSE would
-        // misclassify this device in libinput.
-        for key in <Key as input_linux::enum_iterator::IterableEnum>::iter() {
-            if key.is_key() {
-                let _ = h.set_keybit(key);
-            }
+        // Every key, but NOT buttons (exposing BTN_GAMEPAD/BTN_MOUSE would
+        // misclassify this device in libinput), and never a key the HOST acts on.
+        for key in keyboard_keys() {
+            let _ = h.set_keybit(key);
         }
         let name = device_name("Keyboard", tag);
         h.create(&input_id(0x0001), name.as_bytes(), 0, &[])?;
@@ -1346,6 +1344,32 @@ const PAD_AXES: &[(usize, u16)] = &[
     (3, isys::ABS_RY as u16), // right stick Y
 ];
 
+/// Keys the virtual keyboard never declares, because the HOST acts on them. This
+/// device is a real keyboard to the host kernel: its console handlers (`kbd`,
+/// `sysrq`) and logind attach to every keyboard, so a declared SysRq would give a
+/// session the host's Magic SysRq (reboot, crash), and a power, sleep or radio key
+/// would reach logind and rfkill. The input core drops events for undeclared keys, so
+/// leaving them out closes that path whatever the client sends. No game needs them.
+const HOST_ONLY_KEYS: &[Key] = &[
+    Key::Sysrq,
+    Key::Power,
+    Key::Power2,
+    Key::Sleep,
+    Key::Suspend,
+    Key::Wakeup,
+    Key::Rfkill,
+    Key::WLAN,
+    Key::Bluetooth,
+    Key::WWAN,
+    Key::UWB,
+];
+
+/// The keys the virtual keyboard declares: every key, no buttons, no host-only key.
+fn keyboard_keys() -> impl Iterator<Item = Key> {
+    <Key as input_linux::enum_iterator::IterableEnum>::iter()
+        .filter(|k| k.is_key() && !HOST_ONLY_KEYS.contains(k))
+}
+
 /// Map a raw BTN_* code to the typed `Key` needed for `set_keybit`.
 fn key_from_code(code: u16) -> Option<Key> {
     <Key as input_linux::enum_iterator::IterableEnum>::iter().find(|k| *k as u16 == code)
@@ -1354,6 +1378,19 @@ fn key_from_code(code: u16) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security: a session's keyboard never declares a key the host acts on (Magic
+    /// SysRq, power, sleep, radio), so the host kernel and logind never see one.
+    #[test]
+    fn the_virtual_keyboard_declares_no_key_the_host_acts_on() {
+        let declared: Vec<Key> = keyboard_keys().collect();
+        for key in HOST_ONLY_KEYS {
+            assert!(!declared.contains(key), "{key:?} is declared");
+        }
+        assert!(!declared.iter().any(|k| *k as u16 == 99), "KEY_SYSRQ");
+        assert!(declared.contains(&Key::A) && declared.contains(&Key::LeftAlt));
+        assert!(!declared.iter().any(|k| !k.is_key()), "no buttons");
+    }
 
     /// #401: the host's node is waited for, never made or removed.
     #[test]
