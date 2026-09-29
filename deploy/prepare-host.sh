@@ -186,7 +186,15 @@ label_root() { # label_root DIR
       have "$tool" || die "$tool was not found: install policycoreutils-python-utils (on an image-based system: rpm-ostree install policycoreutils-python-utils, then reboot), then run this again"
     done
     if semanage fcontext -l -C 2>/dev/null | awk -v r="$re(/.*)?" '$1 == r && /container_file_t/ {f=1} END {exit !f}'; then
-      say ok "SELinux label on $1"; return
+      # The rule only labels what restorecon visits: a root recreated since (a reinstall)
+      # inherits its parent's type until it is relabelled.
+      if [ "$(stat -c %C "$1" 2>/dev/null | cut -d: -f3)" = container_file_t ]; then
+        say ok "SELinux label on $1"; return
+      fi
+      if [ "$DRY_RUN" = 1 ]; then say would "relabel $1 for containers (container_file_t)"; return; fi
+      run restorecon -R "$1"
+      say changed "SELinux label on $1 — relabelled to its container_file_t rule; nothing is re-owned"
+      return
     fi
   elif grep -qxF "$1" "$R/.selinux-fcontext" 2>/dev/null; then
     say ok "SELinux label on $1"; return

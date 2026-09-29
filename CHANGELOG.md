@@ -814,6 +814,11 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Host preparation relabels a homes or templates root that was recreated (#407).** It
+  counted the persistent `container_file_t` rule as done, but a root recreated after it was
+  written (a reinstall) inherits `var_lib_t`, so every app in a confined container failed to
+  set up its home and exited at once. `prepare-host.sh` now checks the directory's actual
+  label and runs `restorecon` when it differs; labels only, nothing is re-owned.
 - **`make test-rust` in two worktrees at once no longer cross-contaminates (#417).** Every
   worktree built into the same in-container `CARGO_TARGET_DIR` on the shared
   `quasar-cargo-target` volume, at identical source paths, so cargo's mtime-based freshness
