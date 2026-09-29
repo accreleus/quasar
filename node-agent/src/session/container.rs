@@ -122,10 +122,8 @@ fn writable_application_sources(request: &ApplicationRequest) -> BTreeSet<String
                 source,
                 read_only: false,
                 ..
-            } => {
-                if !source.is_empty() {
-                    sources.insert(format!("volume:{source}"));
-                }
+            } if !source.is_empty() => {
+                sources.insert(format!("volume:{source}"));
             }
             _ => {}
         }

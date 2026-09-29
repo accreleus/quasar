@@ -301,7 +301,7 @@ impl Actor {
         let now = self.now();
         let mut name = format!("{}-schema-{}", dump::stamp(&now), schema.version);
         if dir.load(&name).ok().flatten().is_some() {
-            name = format!("{name}-{}", &j.request.request_id[..8].to_ascii_lowercase());
+            name = format!("{name}-{}", j.request.request_id[..8].to_ascii_lowercase());
         }
         let renamed =
             std::fs::rename(&partial, dir.partial(&name)).and_then(|()| dir.complete(&name));

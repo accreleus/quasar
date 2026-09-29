@@ -778,6 +778,7 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **CI's node-agent job passes clippy on Rust 1.98 again.** Four lints new in that toolchain (an import used only by tests, `>= x + 1`, a redundant `&` in `format!`, a collapsible `if` in a `match`) failed the job on every branch.
 - **`make test-rust` in two worktrees at once no longer cross-contaminates (#417).** Every
   worktree built into the same in-container `CARGO_TARGET_DIR` on the shared
   `quasar-cargo-target` volume, at identical source paths, so cargo's mtime-based freshness

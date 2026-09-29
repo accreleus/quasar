@@ -90,7 +90,7 @@ pub(super) fn package(
                     return Err(ErrorKind::Timeout.into());
                 }
                 if count + stack.len() as u64 + entries.len() as u64
-                    >= crate::images::build::MAX_ENTRIES + 1
+                    > crate::images::build::MAX_ENTRIES
                 {
                     return Err(invalid());
                 }

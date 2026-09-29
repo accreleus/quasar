@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 use crate::bootstrap::Bootstrap;
 use crate::engine::{Container, ContainerSpec, EngineError, PlatformEngine, RestartPolicy};
-use crate::journal::{JournalDir, Phase};
+use crate::journal::JournalDir;
 use crate::machine::{Machine, MachineDir, ServiceRecord, FORMAT};
 use crate::probe;
 use crate::recipe::{
@@ -149,7 +149,7 @@ pub type FreeSpace = Box<dyn Fn(&std::path::Path) -> io::Result<u64> + Send + Sy
 
 /// See [`ActorConfig::crash_after`].
 #[cfg(any(test, feature = "test-support"))]
-pub type CrashAfter = Box<dyn Fn(&str, Phase) -> bool + Send + Sync>;
+pub type CrashAfter = Box<dyn Fn(&str, crate::journal::Phase) -> bool + Send + Sync>;
 
 /// A hand-over's clocks (architecture §5.6). Fields, not constants, so a test can compress
 /// them.
