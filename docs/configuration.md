@@ -1099,9 +1099,13 @@ controlling terminal, which is what the kernel requires in place of a capability
 its container (the recovery actor's recipe and the console Compose overlay pass it). If it cannot
 be taken, console sessions fail with `console terminal: <reason>` and the console preflight fails
 with the same text; a host without virtual terminals (`CONFIG_VT` off) takes none and is
-unaffected. An agent that dies holding `tty8` leaves the display on it with the keyboard off; the
-next agent start switches back (`token=console-vt-restored-at-startup`), or `chvt 1` from a shell
-does.
+unaffected. On SIGTERM or SIGINT the agent asks the console session to stop and waits up to 3 s,
+then releases `tty8` itself (up to 5 s more) before exiting. An agent killed holding `tty8` leaves
+the display on it with the keyboard off; the next agent start switches back
+(`token=console-vt-restored-at-startup`), whether or not console mode is still on: once it has
+been on, the recovery actor keeps passing `/dev/tty8` to the agent. By hand, first put `tty8` back
+in text mode (a switch away from a graphics-mode terminal is ignored), then `chvt` to the previous
+terminal.
 
 ---
 

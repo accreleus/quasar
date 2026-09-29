@@ -216,6 +216,15 @@ pub async fn run(cfg: Config) {
             );
             health.set_not_ready(result.detail.clone());
         }
+    } else if let Some(Err(why)) =
+        offload_probe(crate::session::console_vt::reconcile_if_given).await
+    {
+        // #407: a console agent killed holding the VT left the host's console switched
+        // away with its keyboard off, and this agent (console mode off) could not undo it.
+        warn!(
+            token = "console-vt-reconcile-failed",
+            "could not check the console terminal a console agent may have left: {why}"
+        );
     }
 
     // Returns only once the cleanup has succeeded; everything below is withheld until then.

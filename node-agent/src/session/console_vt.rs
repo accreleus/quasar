@@ -11,9 +11,12 @@
 //! (`quasar-node-agent console-vt hold`) calls `setsid`, opens the VT so it becomes its
 //! controlling terminal, and holds it until its stdin closes or it is signalled, restoring
 //! on the way out. Fail-closed: a host with VTs never runs a console session without the
-//! VT taken. `K_OFF` also disables the VT-switch keys, so a helper killed before it could
-//! restore leaves the console on the dedicated VT: the next agent start
-//! ([`reconcile_at_startup`], run by the console preflight) and the next take put it back.
+//! VT taken. The helper dies with the agent's container, so an agent shutdown signal
+//! releases it first ([`release_for_shutdown`]). `K_OFF` also disables the VT-switch keys,
+//! so a helper killed before it could restore leaves the console on the dedicated VT: the
+//! next agent start puts it back ([`reconcile_at_startup`], run by the console preflight,
+//! or [`reconcile_if_given`] on an agent with console mode off, which the recovery recipe
+//! still gives the VT), as does the next take.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -21,7 +24,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Outside logind's default `NAutoVTs=6`, so no getty is started on it. The other halves:
@@ -207,8 +210,13 @@ pub(crate) fn take(vt: &dyn Vt, n: u32, state: &Path, timeout: Duration) -> Resu
     }
 }
 
-/// Switch back to `saved.prev` if VT `n` is still active, then give `n` its keyboard and
-/// text mode back. Every step is tried; the record is removed only when all succeeded.
+/// Put VT `n` back in text mode, switch back to `saved.prev` if `n` is still active, then
+/// turn `n`'s keyboard back on. Every step is tried; the record is removed only when all
+/// succeeded.
+///
+/// Order is the kernel's: a switch away from a `KD_GRAPHICS` VT in `VT_AUTO` mode is
+/// silently ignored (`vt.c` `change_console`), so text mode must come first. The keyboard
+/// stays off until the switch has happened, so nothing typed meanwhile lands on `n`.
 pub(crate) fn restore(
     vt: &dyn Vt,
     n: u32,
@@ -218,6 +226,9 @@ pub(crate) fn restore(
 ) -> Result<(), String> {
     let saved = saved.sanitized(n);
     let mut problems = Vec::new();
+    if let Err(e) = vt.set_kd_mode(saved.kd) {
+        problems.push(io_msg("set text mode", e));
+    }
     match vt.active() {
         Ok(a) if a == n => {
             if let Err(e) = vt.activate(saved.prev) {
@@ -235,9 +246,6 @@ pub(crate) fn restore(
     }
     if let Err(e) = vt.set_kb_mode(saved.kb) {
         problems.push(io_msg("turn the keyboard back on", e));
-    }
-    if let Err(e) = vt.set_kd_mode(saved.kd) {
-        problems.push(io_msg("set text mode", e));
     }
     if problems.is_empty() {
         let _ = std::fs::remove_file(state);
@@ -541,8 +549,8 @@ pub fn helper_main(args: &[String]) -> i32 {
         Err(e) => {
             tracing::error!(
                 token = "console-vt-restore-failed",
-                "could not fully restore the console terminal: {e}; from a shell on this \
-                 host, `chvt {}` switches back",
+                "could not fully restore the console terminal: {e}; the next agent start \
+                 retries (by hand: text mode on tty{n} first, then `chvt {}`)",
                 saved.prev
             );
             1
@@ -684,15 +692,28 @@ impl Holder {
 /// The console VT, held for one local console session. Dropping it restores the previous
 /// VT; declare it before anything that can type (the session's virtual devices, the
 /// physical-input forwarder) so it drops after them.
+/// The console session holding the VT, for [`release_for_shutdown`].
+struct Registered {
+    holder: Arc<Mutex<Holder>>,
+    stop: Arc<AtomicBool>,
+}
+
+static ACTIVE: Mutex<Option<Registered>> = Mutex::new(None);
+
+fn active_slot() -> MutexGuard<'static, Option<Registered>> {
+    ACTIVE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 pub struct ConsoleVt {
-    holder: Option<Holder>,
+    holder: Option<Arc<Mutex<Holder>>>,
     // Last: the next take must not start before this one has restored.
     _lock: MutexGuard<'static, ()>,
 }
 
 impl ConsoleVt {
-    /// Blocking. `Ok` with nothing held on a host with no VTs.
-    pub fn take() -> anyhow::Result<ConsoleVt> {
+    /// Blocking. `Ok` with nothing held on a host with no VTs. `stop` is the session's
+    /// own stop flag, which an agent shutdown sets ([`release_for_shutdown`]).
+    pub fn take(stop: Arc<AtomicBool>) -> anyhow::Result<ConsoleVt> {
         let lock = lock_bounded().map_err(anyhow::Error::msg)?;
         match presence(Path::new("/sys/class/tty"), &node_path(CONSOLE_VT)) {
             Presence::NoVts => {
@@ -717,8 +738,13 @@ impl ConsoleVt {
             token = "console-vt-taken",
             "console: tty{CONSOLE_VT} is the active terminal with its keyboard off (was tty{prev})"
         );
+        let holder = Arc::new(Mutex::new(Holder::from_started(child)));
+        *active_slot() = Some(Registered {
+            holder: holder.clone(),
+            stop,
+        });
         Ok(ConsoleVt {
-            holder: Some(Holder::from_started(child)),
+            holder: Some(holder),
             _lock: lock,
         })
     }
@@ -726,7 +752,8 @@ impl ConsoleVt {
     /// `Some(reason)` once the helper has exited mid-session: the VT may be back in the
     /// kernel's hands, so the session must end.
     pub fn lost(&mut self) -> Option<String> {
-        let holder = self.holder.as_mut()?;
+        let holder = self.holder.as_ref()?;
+        let mut holder = holder.lock().unwrap_or_else(|p| p.into_inner());
         match holder.child.try_wait() {
             Ok(None) => None,
             Ok(Some(status)) => Some(format!("the console terminal helper exited ({status})")),
@@ -737,10 +764,23 @@ impl ConsoleVt {
 
 impl Drop for ConsoleVt {
     fn drop(&mut self) {
-        let Some(holder) = self.holder.as_mut() else {
+        let Some(holder) = self.holder.take() else {
             return;
         };
-        match holder.release(RELEASE_TIMEOUT) {
+        let released = holder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .release(RELEASE_TIMEOUT);
+        {
+            let mut slot = active_slot();
+            if slot
+                .as_ref()
+                .is_some_and(|r| Arc::ptr_eq(&r.holder, &holder))
+            {
+                *slot = None;
+            }
+        }
+        match released {
             Ok(()) => tracing::info!(
                 token = "console-vt-released",
                 "console: the previous terminal is active again"
@@ -752,6 +792,51 @@ impl Drop for ConsoleVt {
             ),
         }
     }
+}
+
+/// On an agent shutdown signal, before the process exits: the kernel kills the helper with
+/// the rest of the container once the agent (its init's child) is gone, so the VT must be
+/// back first. Asks the console session to stop, which releases the VT last; if it has not
+/// within `session_wait`, releases the holder directly. Bounded by `session_wait` plus
+/// `release_timeout`. No-op without a console session.
+pub fn release_for_shutdown(session_wait: Duration, release_timeout: Duration) {
+    let Some((holder, stop)) = active_slot()
+        .as_ref()
+        .map(|r| (r.holder.clone(), r.stop.clone()))
+    else {
+        return;
+    };
+    stop.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + session_wait;
+    while active_slot().is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if active_slot().is_none() {
+        return;
+    }
+    let released = holder
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .release(release_timeout);
+    match released {
+        Ok(()) => tracing::info!(
+            token = "console-vt-released-at-shutdown",
+            "console: the session did not end within {}s; the previous terminal is active again",
+            session_wait.as_secs()
+        ),
+        Err(e) => tracing::error!(
+            token = "console-vt-shutdown-release-failed",
+            "console: tty{CONSOLE_VT} may still be active with its keyboard off: {e}; the \
+             next agent start restores it"
+        ),
+    }
+}
+
+/// At startup on an agent without console mode: an agent given the console VT anyway
+/// (the recipe keeps it once console mode has been on) puts back what a killed console
+/// agent left. `None` when this container has no console VT.
+pub(crate) fn reconcile_if_given() -> Option<Result<(), String>> {
+    node_path(CONSOLE_VT).exists().then(reconcile_at_startup)
 }
 
 /// Run by the console preflight at startup: undo what a killed holder left, and prove the
@@ -836,9 +921,11 @@ mod tests {
             self.kd.set(mode);
             Ok(())
         }
+        /// The kernel ignores a switch away from a `KD_GRAPHICS` VT in `VT_AUTO`, silently.
         fn activate(&self, n: u32) -> io::Result<()> {
             self.log.borrow_mut().push(format!("activate={n}"));
-            if !self.switch_stalls {
+            let leaving_graphics = self.active.get() == self.n && self.kd.get() == KD_GRAPHICS;
+            if !self.switch_stalls && !leaving_graphics {
                 self.active.set(n);
             }
             Ok(())
@@ -871,9 +958,24 @@ mod tests {
         assert_eq!(vt.log.borrow()[..3], ["kb=4", "kd=1", "activate=8"]);
         assert_eq!(Saved::load(&path), Some(saved));
 
+        vt.log.borrow_mut().clear();
         restore(&vt, 8, &saved, &path, SHORT).unwrap();
         assert!(back(&vt, 2), "{:?}", vt.log);
+        // Text mode before the switch (the kernel ignores it otherwise); keyboard last.
+        assert_eq!(*vt.log.borrow(), ["kd=0", "activate=2", "kb=3"]);
         assert!(!path.exists(), "a clean restore removes the record");
+    }
+
+    /// The fake follows the kernel: from a graphics-mode VT a switch is a silent no-op.
+    #[test]
+    fn a_switch_away_from_a_graphics_vt_is_ignored() {
+        let vt = FakeVt::new(8, 8);
+        vt.kd.set(KD_GRAPHICS);
+        vt.activate(1).unwrap();
+        assert_eq!(vt.active.get(), 8);
+        vt.kd.set(KD_TEXT);
+        vt.activate(1).unwrap();
+        assert_eq!(vt.active.get(), 1);
     }
 
     /// A holder killed with the VT taken: the startup reconcile restores from its record.
@@ -1030,11 +1132,77 @@ mod tests {
         assert!(e.contains("did not answer"), "{e}");
     }
 
+    /// A console session that ends on its stop flag releases the VT itself; shutdown only
+    /// waits for it.
+    #[test]
+    fn shutdown_stops_the_console_session_and_waits_for_it() {
+        let _serial = SHUTDOWN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let (child, _) = start(sh("echo ok 1; cat >/dev/null; exit 0"), SHORT * 50).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let holder = Arc::new(Mutex::new(Holder::from_started(child)));
+        *active_slot() = Some(Registered {
+            holder: holder.clone(),
+            stop: stop.clone(),
+        });
+        let session = std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // What ConsoleVt's Drop does at the end of the runner's teardown.
+            holder
+                .lock()
+                .unwrap()
+                .release(Duration::from_secs(5))
+                .unwrap();
+            *active_slot() = None;
+        });
+        let started = Instant::now();
+        release_for_shutdown(Duration::from_secs(5), Duration::from_secs(5));
+        assert!(active_slot().is_none());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        session.join().unwrap();
+    }
+
+    /// A session stuck in its teardown: the holder is released directly, bounded.
+    #[test]
+    fn shutdown_releases_the_holder_itself_when_the_session_does_not_end() {
+        let _serial = SHUTDOWN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let (child, _) = start(sh("echo ok 1; cat >/dev/null; exit 0"), SHORT * 50).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let holder = Arc::new(Mutex::new(Holder::from_started(child)));
+        *active_slot() = Some(Registered {
+            holder: holder.clone(),
+            stop: stop.clone(),
+        });
+        let started = Instant::now();
+        release_for_shutdown(SHORT, Duration::from_secs(5));
+        assert!(stop.load(Ordering::SeqCst), "the session was asked to stop");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let status = holder.lock().unwrap().child.try_wait().unwrap();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the helper restored and exited"
+        );
+        // The runner's later Drop finds it already released.
+        holder.lock().unwrap().release(SHORT).unwrap();
+        *active_slot() = None;
+    }
+
+    #[test]
+    fn shutdown_without_a_console_session_does_nothing() {
+        let _serial = SHUTDOWN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let started = Instant::now();
+        release_for_shutdown(Duration::from_secs(5), Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    static SHUTDOWN_TESTS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_helper_that_exits_mid_session_is_lost() {
         let (child, _) = start(sh("echo ok 1; exit 0"), SHORT * 50).unwrap();
         let mut vt = ConsoleVt {
-            holder: Some(Holder::from_started(child)),
+            holder: Some(Arc::new(Mutex::new(Holder::from_started(child)))),
             _lock: CONSOLE_VT_LOCK
                 .get_or_init(|| Mutex::new(()))
                 .lock()

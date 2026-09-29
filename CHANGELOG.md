@@ -1127,8 +1127,12 @@ own; the two do not move together, and that is deliberate.
   text console (its login prompt). A small helper child holds the terminal as its
   controlling terminal, which is all the kernel asks for: no capability is added. A host
   whose terminal cannot be taken refuses console sessions and fails the console preflight
-  with the reason; a host with no virtual terminals is unaffected. If the agent dies
-  holding the terminal, its next start puts the previous one back. `prepare-host.sh
+  with the reason; a host with no virtual terminals is unaffected. On SIGTERM or SIGINT
+  (an engine stop, or the recovery actor replacing it) the agent ends the console session
+  and gives the terminal back before it exits, within about 8 seconds. If it dies holding
+  the terminal anyway, its next start puts the previous one back: once console mode has
+  been on, the recovery actor keeps giving the agent `/dev/tty8` (read/write, nothing
+  else) after console mode is turned off, for exactly that. `prepare-host.sh
   --console` gives the Quasar group `tty8` by ACL and masks `getty@tty8` and
   `autovt@tty8`; the recovery actor passes `/dev/tty8` to a console agent when the host
   has it, and `deploy/overlays/docker-compose.console.yml` does the same.

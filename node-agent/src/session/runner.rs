@@ -1372,7 +1372,7 @@ pub fn run_blocking(
     // reaches a host login prompt. Must be declared before `res`, weston and the physical
     // input forwarder so it drops after them. Fail-closed.
     let mut console_vt: Option<super::console_vt::ConsoleVt> = if wants_console_vt(&cfg) {
-        match super::console_vt::ConsoleVt::take() {
+        match super::console_vt::ConsoleVt::take(stop.clone()) {
             Ok(vt) => Some(vt),
             Err(e) => {
                 tracing::error!(

@@ -1080,3 +1080,49 @@ fn only_the_agent_socket_takes_a_preflight() {
         held()
     );
 }
+
+fn has_console_vt(agent: &FakeContainer) -> bool {
+    agent
+        .spec
+        .devices
+        .iter()
+        .any(|d| d.host == "/dev/tty8" && d.container == "/dev/tty8" && d.permissions == "rw")
+}
+
+/// RH-07 #407: the console VT is given with console mode, and kept once it has been on, so
+/// the agent that replaces a console agent killed holding the VT can put it back. Nothing
+/// else of console mode stays, and no capability or device rule comes with it.
+#[test]
+fn the_console_vt_is_kept_after_console_mode_is_turned_off() {
+    let mut state = rootless();
+    state.probe_output = PROBE_ROOTLESS.replace("dev snd\n", "dev snd\ndev tty8\n");
+    state.host_devices.insert("/dev/tty8".to_string());
+    let m = Machine::install(state);
+    let actor = m.actor();
+    let before = m.agent();
+    assert!(!has_console_vt(&before), "never given before console mode");
+
+    run(&actor, enable());
+    let on = m.one_running_agent("console on");
+    assert!(
+        console_on(&on) && has_console_vt(&on),
+        "{:?}",
+        on.spec.devices
+    );
+    assert_eq!(m.inputs()["devices"]["console_vt"], true);
+    assert_eq!(m.inputs()["console_vt_kept"], true);
+
+    run(&actor, disable());
+    let off = m.one_running_agent("console off");
+    assert!(
+        !console_on(&off) && has_console_vt(&off),
+        "{:?}",
+        off.spec.devices
+    );
+    assert!(off.spec.cap_add.is_empty() && off.spec.device_cgroup_rules.is_empty());
+    assert!(i2c_devices(&off).is_empty() && !binds_logind(&off));
+    let mut devices = off.spec.devices.clone();
+    devices.retain(|d| d.host != "/dev/tty8");
+    assert_eq!(devices, before.spec.devices);
+    assert_eq!(m.inputs()["console_vt_kept"], true);
+}

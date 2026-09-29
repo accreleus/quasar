@@ -61,6 +61,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         enroll: Default::default(),
         app: Default::default(),
         console: false,
+        console_vt_kept: false,
     }
 }
 
@@ -495,20 +496,50 @@ fn node_agent_revision_3_with_console_mode_passes_the_console_vt() {
         assert_eq!(with.env, without.env, "{file}");
         assert_eq!(with.security_opt, without.security_opt, "{file}");
 
-        // Only with console mode on.
+        // Not before console mode has been on here.
         let mut off = plain.clone();
         off.devices.console_vt = true;
-        let off = render(Role::NodeAgent, 3, &off, &image, &agent_secrets()).unwrap();
-        assert!(!off.devices.iter().any(|d| d.host == "/dev/tty8"), "{file}");
+        let never = render(Role::NodeAgent, 3, &off, &image, &agent_secrets()).unwrap();
+        assert!(
+            !never.devices.iter().any(|d| d.host == "/dev/tty8"),
+            "{file}"
+        );
+
+        // Kept once it has been: the VT alone, nothing else of console mode.
+        off.console_vt_kept = true;
+        let kept = render(Role::NodeAgent, 3, &off, &image, &agent_secrets()).unwrap();
+        check(&file.replace(".json", "-kept.json"), &kept);
+        let mut devices = kept.devices.clone();
+        devices.retain(|d| d.host != "/dev/tty8");
+        assert_eq!(devices, never.devices, "{file}");
+        assert_eq!(kept.devices.len(), never.devices.len() + 1, "{file}");
+        assert_eq!(kept.cap_add, never.cap_add, "{file}");
+        assert_eq!(
+            kept.device_cgroup_rules, never.device_cgroup_rules,
+            "{file}"
+        );
+        assert_eq!(kept.binds, never.binds, "{file}");
+        assert_eq!(kept.env, never.env, "{file}");
+        assert!(!kept.env.contains_key("QUASAR_CONSOLE_ACCESS"), "{file}");
     }
     let mut plain = inputs(Some(GpuVendor::Amd));
     let json = serde_json::to_value(&plain).unwrap();
     assert!(json["devices"].get("console_vt").is_none(), "{json}");
+    assert!(json.get("console_vt_kept").is_none(), "{json}");
     plain.devices.console_vt = true;
     assert_eq!(
         serde_json::to_value(&plain).unwrap()["devices"]["console_vt"],
         true
     );
+    // Kept only with console mode on and the VT seen.
+    plain.keep_console_vt();
+    assert!(!plain.console_vt_kept);
+    plain.console = true;
+    plain.keep_console_vt();
+    assert!(plain.console_vt_kept);
+    plain.console = false;
+    plain.keep_console_vt();
+    assert!(plain.console_vt_kept, "turning console mode off keeps it");
 }
 
 /// RH-07 #407 (D13): a host prepared with `--console-audio-user` has the desktop user's

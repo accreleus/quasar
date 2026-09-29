@@ -383,8 +383,24 @@ pub struct Inputs {
     /// never by an operator reconfigure. Written only when true.
     #[serde(default, skip_serializing_if = "is_false")]
     pub console: bool,
+    /// Console mode has been on here with the console VT (RH-07 #407), and stays set when it
+    /// is turned off: every later agent is still given [`CONSOLE_VT_NODE`], so its startup
+    /// can put back a VT a killed console agent left switched with the keyboard off. Set
+    /// only by the actor's console paths ([`Inputs::keep_console_vt`]). Written only when
+    /// true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub console_vt_kept: bool,
     #[serde(flatten)]
     pub unknown: Unknown,
+}
+
+impl Inputs {
+    /// With console mode on and the host's console VT seen, remember it for good.
+    pub fn keep_console_vt(&mut self) {
+        if self.console && self.devices.console_vt {
+            self.console_vt_kept = true;
+        }
+    }
 }
 
 /// Host defaults the agent gives its app containers (`QUASAR_APP_PUID`, `QUASAR_APP_PGID`,
@@ -712,6 +728,7 @@ pub fn render(
                 if inputs.console {
                     console_access(&mut spec, inputs);
                 }
+                console_vt(&mut spec, inputs);
             } else if inputs.console {
                 // Fail closed: an older revision would render without the console additions
                 // and a console request would settle `applied` with no console access.
@@ -1162,16 +1179,22 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
         // (`/dev/dri`), so no major-226 rule.
         spec.device_cgroup_rules.push("c 89:* rmw".to_string());
     }
-    // The console VT, by device on either engine: opening it needs no capability, and the
-    // agent needs nothing more than read/write on it (session/console_vt.rs).
-    if inputs.devices.console_vt {
+    spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
+}
+
+/// The console VT, by device on either engine, while console mode is on and, once it has
+/// been on, after it is turned off ([`Inputs::console_vt_kept`]): a console agent killed
+/// holding it leaves the host's console switched with the keyboard off, and only an agent
+/// with the node can put it back. Read/write only; opening it needs no capability
+/// (session/console_vt.rs), and host preparation's ACL is what grants it.
+fn console_vt(spec: &mut ContainerSpec, inputs: &Inputs) {
+    if inputs.devices.console_vt && (inputs.console || inputs.console_vt_kept) {
         spec.devices.push(Device {
             host: CONSOLE_VT_NODE.into(),
             container: CONSOLE_VT_NODE.into(),
             permissions: "rw".into(),
         });
     }
-    spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
 }
 
 /// Console mode's own virtual terminal. The other halves: the agent's

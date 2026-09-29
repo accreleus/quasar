@@ -211,7 +211,10 @@ async fn main() {
     install_sigusr1_fallback();
 
     match parse_args() {
-        Mode::Agent => spawn_agent().await,
+        Mode::Agent => {
+            install_shutdown_handler();
+            spawn_agent().await
+        }
         Mode::Session {
             addr,
             use_test_src,
@@ -291,6 +294,40 @@ fn install_sigusr1_fallback() {
             token = "sigusr1-handler-install-failed",
             "could not install SIGUSR1 fallback handler: {e}"
         ),
+    }
+}
+
+/// #407: SIGTERM (an engine stop, the recovery actor replacing this agent) and SIGINT exit
+/// only once a console session's VT is back. The helper holding it cannot outlive this
+/// process: it dies with the container. Bounded well inside an engine's default stop grace
+/// (10 s); without a console session the exit is immediate, as it was.
+fn install_shutdown_handler() {
+    use tokio::signal::unix::{signal, SignalKind};
+    const SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    for (kind, name, code) in [
+        (SignalKind::terminate(), "SIGTERM", 143),
+        (SignalKind::interrupt(), "SIGINT", 130),
+    ] {
+        match signal(kind) {
+            Ok(mut sig) => {
+                tokio::spawn(async move {
+                    if sig.recv().await.is_some() {
+                        tracing::info!(token = "agent-shutdown-signal", "{name} received, exiting");
+                        let _ = tokio::task::spawn_blocking(|| {
+                            session::console_vt::release_for_shutdown(SESSION_WAIT, RELEASE_TIMEOUT)
+                        })
+                        .await;
+                        std::process::exit(code);
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(
+                token = "shutdown-handler-install-failed",
+                "could not install the {name} handler: {e}; a console session's terminal \
+                 is then left for the next start to restore"
+            ),
+        }
     }
 }
 

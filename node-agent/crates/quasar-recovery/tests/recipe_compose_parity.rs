@@ -301,6 +301,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         enroll: Default::default(),
         app: Default::default(),
         console: false,
+        console_vt_kept: false,
     }
 }
 

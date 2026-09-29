@@ -324,6 +324,7 @@ impl Actor {
         }
         let mut after = machine.inputs.clone();
         devices.apply(&mut after.devices);
+        after.keep_console_vt();
         if after == machine.inputs {
             return None;
         }
@@ -381,6 +382,7 @@ impl Actor {
         if let Some(devices) = devices {
             devices.apply(&mut after.devices);
         }
+        after.keep_console_vt();
         recipe::validate(&after).map_err(|e| {
             refuse(
                 Reason::Invalid,
