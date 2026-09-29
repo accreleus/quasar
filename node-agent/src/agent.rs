@@ -162,6 +162,16 @@ pub async fn run(cfg: Config) {
     .await;
 
     let health = HealthState::new();
+    // #407: this agent was created with console access — hold `/health` at
+    // not-ready BEFORE the endpoint is even bound, so no window exists where a
+    // fast prober reads healthy before the preflight below has run and been
+    // posted to the recovery actor (chunk 2's note: otherwise verification can
+    // pass on health alone).
+    let console_marker =
+        std::env::var(crate::release::console::MARKER_ENV).is_ok_and(|v| v.trim() == "1");
+    if console_marker {
+        health.set_not_ready(Some("console preflight pending (#407)".into()));
+    }
     // #152 — a health endpoint another process answers is worse than none. The
     // stack uses host networking, so agents on one machine share this port; the
     // loser of the bind used to carry on while its container HEALTHCHECK, and
@@ -183,6 +193,28 @@ pub async fn run(cfg: Config) {
             );
             sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
             crate::restart::exit_now(1);
+        }
+    }
+
+    // #407: run the preflight and tell the recovery actor before anything else. A
+    // failed preflight leaves `/health` not-ready with the detail text as its reason;
+    // the actor's own verification of this agent (if it is mid-replacement) already
+    // failed the instant the POST landed, so this agent staying unhealthy locally is
+    // belt-and-suspenders for an operator who reads `/health` directly.
+    if console_marker {
+        let socket = crate::buildinfo::owned_socket();
+        let result = offload_probe(crate::session::console_preflight::run).await;
+        crate::session::console_preflight::post(socket.as_deref(), &result);
+        if result.ok {
+            health.set_ready();
+        } else {
+            warn!(
+                token = "console-preflight-startup-unhealthy",
+                detail = result.detail.as_deref().unwrap_or(""),
+                "console preflight failed at startup: {}",
+                result.detail.as_deref().unwrap_or("no detail")
+            );
+            health.set_not_ready(result.detail.clone());
         }
     }
 
@@ -1928,6 +1960,7 @@ async fn connect_and_run(
     // Before the first `capacity`, which carries `console_capabilities.access`.
     let console_access = sessions.mgr.console_access.clone();
     console_access.set_engine_mode(install.engine.engine_mode.as_deref());
+    crate::ddc::set_rootless(install.engine.engine_mode.as_deref() == Some("rootless"));
     let mut console_access_rx = console_access.owned().then(|| console_access.subscribe());
     {
         let ca = console_access.clone();

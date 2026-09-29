@@ -87,6 +87,11 @@ struct ActorConsoleLast {
     started_at: Option<String>,
     #[serde(default)]
     finished_at: Option<String>,
+    /// The console agent's own preflight text (#407) when `reason` is `unhealthy` because
+    /// its preflight failed; `null` otherwise. Owner decision 5: this rides in front of the
+    /// generic reason in `access.summary` rather than becoming a new contract field there.
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 impl ActorConsoleLast {
@@ -310,7 +315,9 @@ impl ConsoleAccessManager {
         if self.applying() {
             return Some(self.poll);
         }
-        // A rootless engine is this agent's own finding and cannot change while it runs.
+        // The actor's answer can change without a restart of this agent (a recipe
+        // revision that now supports this host lands): read it again either way,
+        // rootless engines included (#407 — no longer a fixed local finding).
         let unsupported = self
             .inner
             .lock()
@@ -318,7 +325,7 @@ impl ConsoleAccessManager {
             .report
             .as_ref()
             .is_some_and(|r| r.state == ConsoleAccessState::Unsupported);
-        (unsupported && !self.rootless()).then_some(self.poll_unsupported)
+        unsupported.then_some(self.poll_unsupported)
     }
 
     fn applying(&self) -> bool {
@@ -564,8 +571,11 @@ fn rfc3339(stamp: Option<&str>) -> Option<String> {
 }
 
 /// The `access` report from how this agent was created (`marker`), the engine mode and
-/// the actor's console status.
-fn derive(marker: bool, rootless: bool, actor: &ActorConsole) -> ConsoleAccess {
+/// the actor's console status. `_rootless` is no longer read here (#407: a rootless
+/// engine is a fully supported console host, same as rootful) but stays a parameter so
+/// the two call sites keep computing and passing it — a future engine-mode-aware report
+/// (e.g. decision 1's rootful SYS_ADMIN drop) has it ready without another plumbing pass.
+fn derive(marker: bool, _rootless: bool, actor: &ActorConsole) -> ConsoleAccess {
     let unsupported = |summary: String| ConsoleAccess {
         state: ConsoleAccessState::Unsupported,
         target: None,
@@ -575,13 +585,6 @@ fn derive(marker: bool, rootless: bool, actor: &ActorConsole) -> ConsoleAccess {
         finished_at: None,
         summary,
     };
-    if rootless {
-        return unsupported(
-            "Console mode needs a rootful container engine on this host for now; console \
-             access on a rootless engine comes with later rootless work (RH07-15)."
-                .into(),
-        );
-    }
     if let Some(id) = &actor.in_flight {
         let target = actor.in_flight_target.unwrap_or(!actor.enabled);
         return ConsoleAccess {
@@ -640,6 +643,23 @@ fn derive(marker: bool, rootless: bool, actor: &ActorConsole) -> ConsoleAccess {
             .clone()
             .filter(|r| !r.is_empty())
             .unwrap_or_else(|| REASON_UNKNOWN_RESTORE.into());
+        let generic = format!(
+            "Turning console mode {} did not complete ({reason}), so the recovery actor put \
+             the previous node agent back; console mode is {}.",
+            on_off(last.target),
+            on_off(!last.target)
+        );
+        // Owner decision 5: a failed preflight's own text (what holds the display, or the
+        // host-preparation fix) goes in front of the generic reason, not into a new field.
+        let summary = match last
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            Some(detail) => format!("{detail} {generic}"),
+            None => generic,
+        };
         ConsoleAccess {
             state: ConsoleAccessState::Restored,
             target: None,
@@ -647,12 +667,7 @@ fn derive(marker: bool, rootless: bool, actor: &ActorConsole) -> ConsoleAccess {
             reason: Some(reason.clone()),
             started_at: None,
             finished_at: None,
-            summary: format!(
-                "Turning console mode {} did not complete ({reason}), so the recovery actor put \
-                 the previous node agent back; console mode is {}.",
-                on_off(last.target),
-                on_off(!last.target)
-            ),
+            summary,
         }
     } else {
         plain(marker)
@@ -676,6 +691,7 @@ mod tests_derive {
             reason: reason.map(Into::into),
             started_at: Some("2026-09-29T10:00:01Z".into()),
             finished_at: Some("2026-09-29T10:00:05Z".into()),
+            detail: None,
         }
     }
 
@@ -738,6 +754,41 @@ mod tests_derive {
             &status(false, Some(last(true, "put_back", None))),
         );
         assert_eq!(r.reason.as_deref(), Some("interrupted"));
+    }
+
+    #[test]
+    fn a_failed_preflight_detail_rides_in_front_of_the_generic_reason() {
+        let mut l = last(true, "put_back", Some("unhealthy"));
+        l.detail = Some("gdm, the login screen, holds the display".into());
+        let r = derive(false, false, &status(false, Some(l)));
+        assert!(
+            r.summary.starts_with("gdm, the login screen, holds the display Turning console mode on did not complete (unhealthy)"),
+            "{}",
+            r.summary
+        );
+    }
+
+    #[test]
+    fn no_detail_leaves_the_generic_summary_alone() {
+        let r = derive(
+            false,
+            false,
+            &status(false, Some(last(true, "put_back", Some("unhealthy")))),
+        );
+        assert!(
+            r.summary
+                .starts_with("Turning console mode on did not complete (unhealthy)"),
+            "{}",
+            r.summary
+        );
+    }
+
+    #[test]
+    fn rootless_is_no_longer_forced_unsupported_by_derive() {
+        // `_rootless` used to short-circuit to `Unsupported` regardless of the actor's
+        // answer (#407); it must now be read exactly like a rootful client.
+        let r = derive(false, true, &unknown(false));
+        assert_ne!(r.state, ConsoleAccessState::Unsupported, "{r:?}");
     }
 
     #[test]

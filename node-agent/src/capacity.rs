@@ -225,6 +225,12 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
     let mut outputs = Vec::new();
     for entry in cards {
         let card_name = entry.file_name().to_string_lossy().into_owned();
+        // #407: opening a primary node read-write can make the opener DRM master
+        // automatically when the display is free, racing spawn_weston_console's own
+        // open for it — see session::console::drm_open_lock. Held for this card only.
+        let _drm_open_guard = crate::session::console::drm_open_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -336,7 +342,7 @@ fn detect_drm_connectors() -> Vec<String> {
 /// Host audio sinks from `/proc/asound` or the host bind at `/host-proc/asound`. A card name
 /// alone is insufficient for HDMI/DP: the active output is often `hw:<card>,<device>`, not
 /// the non-existent device zero.
-fn detect_audio_sinks() -> Vec<AudioSink> {
+pub(crate) fn detect_audio_sinks() -> Vec<AudioSink> {
     // Docker creates an empty `/proc/asound` even with no host ALSA metadata visible, so
     // pick the first root that actually has `cards` or the explicit host bind is shadowed.
     let asound = ["/proc/asound", "/host-proc/asound"]

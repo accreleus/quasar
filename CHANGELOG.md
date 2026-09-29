@@ -41,6 +41,12 @@ own; the two do not move together, and that is deliberate.
   actor side only. The agent's own preflight, audio, host preparation and console UI
   follow, so rootless console mode is not usable yet. Rootful console mode still keeps
   `SYS_ADMIN` until hardware proves the recipe works without it.
+  The node agent side now lands too: at startup, a console-access agent checks for itself
+  whether it can take the display (no crash on a held one, just a named failure posted to
+  the actor's new preflight endpoint) before it ever reports healthy, `ddc.rs` stops
+  creating `/dev/i2c-*` nodes on a rootless engine and reads the ones the recipe passed
+  instead, and readiness gains `console_display`/`console_audio`/`console_ddc`. Host
+  preparation and the console UI are still to come.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,

@@ -183,28 +183,24 @@ fn a_failed_disable_keeps_access_and_counts_as_having_it() {
 }
 
 #[test]
-fn a_rootless_engine_is_unsupported_and_asks_for_nothing() {
+fn a_rootless_engine_is_no_longer_forced_unsupported() {
+    // #407: a rootless engine is a fully supported console host now — the client no
+    // longer short-circuits to `unsupported` on its own; it reads the actor like any
+    // other agent, and can ask for console mode.
     let m = console_machine(Behaviour::default());
     let a = ConsoleAccessManager::owned_for_test(&m.socket, false);
     a.set_engine_mode(Some("rootless"));
     a.refresh();
     let report = json(&a);
-    assert_eq!(report["state"], "unsupported");
-    for key in [
-        "target",
-        "request_id",
-        "reason",
-        "started_at",
-        "finished_at",
-    ] {
-        assert!(report[key].is_null(), "{key}: {report}");
-    }
-    assert!(
-        report["summary"].as_str().unwrap().contains("RH07-15"),
-        "{report}"
-    );
+    assert_eq!(report["state"], "off", "{report}");
     a.reconcile(true);
-    assert_eq!(last_attempt(&m), None);
+    m.actor.wait_attempt();
+    assert!(
+        last_attempt(&m).is_some(),
+        "a rootless-engine agent must be able to ask the actor for console mode"
+    );
+    // An agent without the marker still refuses a console launch, same as rootful —
+    // asking for console mode is independent of already having it.
     assert!(a.launch_refusal(VideoTopology::LocalOnly).is_some());
 }
 

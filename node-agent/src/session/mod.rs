@@ -19,6 +19,9 @@ pub mod container;
 // Headless weston process manager for the nvidia-drm local-display path.
 pub(crate) mod console;
 pub mod console_hotplug;
+// Startup check that this agent can actually take the console display before it
+// reports healthy (#407 RH07-15).
+pub(crate) mod console_preflight;
 // The live display/external-size/ladder echo, and the one statement of the
 // absent-when-default rule (`echo::Reported`).
 pub mod echo;

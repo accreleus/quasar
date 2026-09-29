@@ -67,6 +67,13 @@ static NODES_READY: OnceLock<bool> = OnceLock::new();
 /// before the first `config_update` arrives.
 static CONSOLE_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// #407: whether this agent runs on a rootless container engine (`register`'s
+/// `engine_mode`). A user namespace cannot `mknod`, so on rootless the recovery actor
+/// passes each host `/dev/i2c-N` it found as a device instead of this module creating
+/// them (`recipe::HostDevices::i2c`). Defaults `false` (rootful), matching every host
+/// before the first `register` round-trip.
+static ROOTLESS: AtomicBool = AtomicBool::new(false);
+
 /// #411: count of `ddcutil` probe attempts, incremented before the fork so a test
 /// can assert the console gate short-circuits before any subprocess work.
 static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -79,6 +86,21 @@ pub(crate) fn set_console_enabled(enabled: bool) {
 
 fn console_enabled() -> bool {
     CONSOLE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether console mode is on, for `readiness::console`'s `skip`-while-off rule.
+pub(crate) fn is_console_enabled() -> bool {
+    console_enabled()
+}
+
+/// Latch the engine mode. Called once per connection alongside
+/// `release::console::ConsoleAccessManager::set_engine_mode`.
+pub(crate) fn set_rootless(rootless: bool) {
+    ROOTLESS.store(rootless, Ordering::Relaxed);
+}
+
+fn rootless() -> bool {
+    ROOTLESS.load(Ordering::Relaxed)
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -115,11 +137,25 @@ fn ddcutil_available() -> bool {
     })
 }
 
+/// Whether this call should `mknod` — split out so the rootless/rootful choice is a
+/// pure, directly testable decision rather than buried in the `mknod` loop.
+fn should_mknod_i2c_nodes(rootless: bool) -> bool {
+    !rootless
+}
+
 /// mknod `/dev/i2c-0..=MAX_I2C_MINOR` (major 89) if missing, once. Best-effort:
 /// a failed/missing node just yields `Unknown` for that bus (not gated). Mirrors
 /// `session::virtual_input::ensure_dev_node`.
+///
+/// On a rootless engine (#407) a user namespace cannot `mknod`: the recovery actor
+/// already passed each host `/dev/i2c-N` it found as a device, so this is a no-op —
+/// a bus the recipe did not pass through just yields `Unknown` for that connector,
+/// same graceful downgrade as a failed mknod on a rootful host.
 fn ensure_i2c_nodes() {
     NODES_READY.get_or_init(|| {
+        if !should_mknod_i2c_nodes(rootless()) {
+            return true;
+        }
         for minor in 0..=MAX_I2C_MINOR {
             let path = format!("/dev/i2c-{minor}");
             if std::path::Path::new(&path).exists() {
@@ -254,6 +290,29 @@ fn probe_calls() -> usize {
     PROBE_CALLS.load(Ordering::Relaxed)
 }
 
+/// What `readiness::console::check_ddc` reads — a snapshot of what the hotplug poll has
+/// already learned, not a fresh probe (a readiness check runs far more often than the
+/// hotplug watcher's own cadence would justify forking `ddcutil` for).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DdcSummary {
+    pub available: bool,
+    pub bus_mapped: bool,
+    pub any_read: bool,
+    pub all_off: bool,
+}
+
+pub(crate) fn summary() -> DdcSummary {
+    let available = ddcutil_available();
+    let cache = cache().lock().unwrap();
+    let any_read = !cache.power.is_empty();
+    DdcSummary {
+        available,
+        bus_mapped: !cache.bus_map.is_empty(),
+        any_read,
+        all_off: any_read && cache.power.values().all(|(p, _)| *p == Power::Off),
+    }
+}
+
 /// Read a fresh connector→bus map from `ddcutil detect`. Parses the paired
 /// `I2C bus:  /dev/i2c-N` and `DRM connector:  cardX-<suffix>` lines. `None`
 /// when the fork itself failed.
@@ -383,6 +442,15 @@ mod tests {
     #[test]
     fn power_ttl_outlives_the_hotplug_poll_interval() {
         assert!(POWER_TTL > Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn rootless_never_mknods_i2c_nodes() {
+        assert!(should_mknod_i2c_nodes(false), "rootful still creates them");
+        assert!(
+            !should_mknod_i2c_nodes(true),
+            "rootless cannot mknod in a user namespace — the recipe passes the nodes instead"
+        );
     }
 
     #[test]
