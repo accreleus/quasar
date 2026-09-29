@@ -4,8 +4,17 @@
 //! weston's `drm-backend.so` speaks atomic KMS, so: spawn headless weston (takes DRM
 //! master, enables the connected output), then `waylandsink` renders into its socket.
 //!
-//! weston needs container `CAP_SYS_ADMIN` at runtime for `drmSetMaster` — granted by
-//! the compose/deploy layer, not this module.
+//! On a rootful engine the compose/deploy layer grants `CAP_SYS_ADMIN`. On a rootless
+//! engine (#407) none is granted, and none is needed for the common case: the kernel
+//! makes the first opener of a free primary node master with no capability check
+//! (`drm_auth.c`, proven live on nvidia-test 2026-09-29) — only re-asserting master over
+//! an *already-held* display needs `CAP_SYS_ADMIN`, and a rootless container's capability
+//! can never satisfy that check (it is checked against the host's initial user namespace).
+//! So this module's own logic is unchanged either way; what differs is that a held
+//! display now fails loud instead of being masked by the capability: seatd logs
+//! `Could not make device fd drm master: Permission denied` and weston's atomic commits
+//! fail silently from this process's point of view, which is exactly what
+//! `session::console_preflight` checks for before this agent ever reports healthy.
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -26,6 +35,21 @@ const CONSOLE_SOCKET: &str = "wayland-console";
 /// racing the shared DRM node for master. `OnceLock` gives the lock a `'static`
 /// lifetime so the guard can live inside the returned `WestonConsole`.
 static CONSOLE_WESTON_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Process-wide lock around the *moment* of opening a DRM primary node, shared with
+/// `capacity::detect_drm_outputs_at` (#407). Opening a card node read-write can make the
+/// opener DRM master automatically when the display is currently free (`drm_auth.c`), so
+/// a capacity probe's brief open racing `spawn_weston_console`'s can make weston lose
+/// master to the probe instead. Distinct from [`CONSOLE_WESTON_LOCK`], which serialises
+/// whole weston launches against each other rather than guarding a single open.
+static DRM_OPEN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Take the DRM-open lock. Callers hold it only around the open (or, in
+/// `spawn_weston_console`'s case, until the socket confirms weston/seatd already hold
+/// master) — never across a whole session.
+pub(crate) fn drm_open_lock() -> &'static Mutex<()> {
+    DRM_OPEN_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalBackend {
@@ -219,7 +243,8 @@ fn drain_weston_group(
 }
 
 /// Ensure a **VT-unbound** `seatd` is running so weston's DRM backend can acquire
-/// the device without full `privileged` — only `CAP_SYS_ADMIN`.
+/// the device without full `privileged` — only `CAP_SYS_ADMIN` on a rootful engine,
+/// nothing extra on a rootless one (#407; see the module doc).
 ///
 /// A container has no VT (and no logind), so seatd's default VT-bound seat never
 /// goes "active" and every device open is refused (`seatd/seat.c: client is not
@@ -285,7 +310,15 @@ pub fn spawn_weston_console(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // seatd instead of builtin libseat: the agent needs only CAP_SYS_ADMIN.
+    // #407: held until the socket wait below confirms weston/seatd already have the
+    // display — see `drm_open_lock`. A capacity probe's own brief open cannot race in
+    // between and steal master from underneath this launch.
+    let _drm_open_guard = drm_open_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // seatd instead of builtin libseat: on a rootful engine the agent needs only
+    // CAP_SYS_ADMIN; on rootless (#407) it needs none — see the module doc.
     ensure_seatd()?;
 
     let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".to_string());
@@ -445,6 +478,26 @@ mod tests {
                 .unwrap()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            order_clone.lock().unwrap().push("second");
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        order.lock().unwrap().push("first-still-held");
+        drop(first);
+        waiter.join().unwrap();
+
+        let seen = order.lock().unwrap().clone();
+        assert_eq!(seen, vec!["first-still-held", "second"]);
+    }
+
+    #[test]
+    fn drm_open_lock_serializes_concurrent_holders() {
+        let first = drm_open_lock().lock().unwrap_or_else(|p| p.into_inner());
+
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let order_clone = order.clone();
+        let waiter = std::thread::spawn(move || {
+            let _second = drm_open_lock().lock().unwrap_or_else(|p| p.into_inner());
             order_clone.lock().unwrap().push("second");
         });
 

@@ -18,7 +18,15 @@ pub mod capture;
 pub mod container;
 // Headless weston process manager for the nvidia-drm local-display path.
 pub(crate) mod console;
+// Where console local audio plays: the host's PipeWire, or ALSA when no PipeWire answers
+// and the device is free (#407 RH07-15, D13).
+pub(crate) mod console_audio;
 pub mod console_hotplug;
+// Startup check that this agent can actually take the console display before it
+// reports healthy (#407 RH07-15).
+pub(crate) mod console_preflight;
+// Console mode's own virtual terminal, keyboard off, for a local console session (#407).
+pub mod console_vt;
 // The live display/external-size/ladder echo, and the one statement of the
 // absent-when-default rule (`echo::Reported`).
 pub mod echo;

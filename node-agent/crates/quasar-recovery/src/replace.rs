@@ -721,7 +721,18 @@ impl Actor {
         let mut ran = false;
         let mut steady = 0;
         let mut last: String;
+        let console_on = self.role(j, i) == Role::NodeAgent;
         loop {
+            // RH-07 #407: a console agent that reports it cannot take the display fails
+            // at once, whatever its health says (`crate::console`, preflight).
+            if console_on {
+                if let Some(why) = self.failed_preflight(&j.request.request_id) {
+                    return Err(fail(
+                        Reason::Unhealthy,
+                        format!("{}{why}", crate::console::PREFLIGHT_FAILED),
+                    ));
+                }
+            }
             let seen = match &j.steps[i].new_container {
                 Some(id) => self.engine.inspect_container(id),
                 None => Ok(None),
