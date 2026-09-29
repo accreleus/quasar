@@ -24,6 +24,17 @@ services:
     environment:
       HOME: /tmp/quasar-home
       TEST_DATABASE_URL: postgres://quasar_test:quasar_test@postgres:5432/quasar_test?sslmode=disable
+      # Per-worktree subdirectory of the shared quasar-cargo-target volume
+      # (#417): every worktree used to build into the SAME path in-container,
+      # so cargo's mtime-based freshness check happily served one worktree's
+      # test binaries to another. QUASAR_INSTANCE (scripts/dx/common.sh) is a
+      # hash of the worktree root, exported by verify.sh before this file is
+      # parsed; the `:-default` fallback keeps `docker compose config`
+      # (scripts/dx/config_check.sh) and any other caller that doesn't source
+      # common.sh first working with a fixed path, same as before this fix.
+      # Registry/git download caches (CARGO_HOME, set in the image) stay one
+      # shared volume — only build OUTPUT is isolated.
+      CARGO_TARGET_DIR: /cache/cargo-target/${QUASAR_INSTANCE:-default}
     volumes:
       - ../..:/workspace
       - quasar-go-build-cache:/cache/go-build
