@@ -246,7 +246,8 @@ test('unraid persists through the boot script, runs without sudo, and has no pre
 test('non-Unraid platforms drop host preparation into prepare-host.sh, not the script', () => {
   for (const platform of Object.keys(PLATFORMS).filter((p) => p !== 'unraid')) {
     const out = generate(full({ platform }));
-    assert.ok(!out.script.includes('sysctl.d'), platform);
+    // The script only checks for the sysctl file preparation leaves; it never writes one.
+    assert.ok(!/sysctl (-w|-p|--system)/.test(out.script), platform);
     assert.ok(!out.script.includes('modules-load.d'), platform);
     assert.ok(!out.script.includes('wmem_default'), platform);
     assert.ok(out.prep, platform);
@@ -336,12 +337,30 @@ test('QUASAR_IMAGE_NAMESPACE / QUASAR_IMAGE_TAG override the defaults', () => {
 
 // --- rootless: no sudo but the one prep line --------------------------------
 
-test('rootless scripts contain no sudo apart from the prepare-host line', () => {
+test('rootless scripts never use sudo; host preparation is step 1, run as root', () => {
   for (const engine of ENGINES) {
     const out = generate(full({ engine, mode: 'rootless' }));
-    const withoutPrep = out.script.replace(out.prep, '');
-    assert.ok(!withoutPrep.includes('sudo '), `${engine} rootless: ${withoutPrep}`);
+    assert.ok(!out.script.includes('sudo '), `${engine} rootless: ${out.script}`);
     assert.match(out.prep, /sudo sh prepare-host\.sh/, `${engine} rootless prep`);
+  }
+});
+
+test('an unprepared host stops the install script and names step 1', () => {
+  const r = runFake(full({ role: 'control-only' }), { prepared: false });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /not prepared for Quasar\. Run step 1/);
+  assert.ok(!/\brun\b/.test(String(r.calls)), 'nothing started');
+});
+
+test('install scripts check host preparation and never run it', () => {
+  for (const engine of ENGINES) {
+    for (const mode of ['rootful', 'rootless']) {
+      const out = generate(full({ engine, mode }));
+      assert.ok(!out.script.includes('prepare-host.sh --mode'), `${engine} ${mode} runs prep`);
+      assert.match(out.script, /Checking host preparation/, `${engine} ${mode}`);
+      assert.match(out.script, /70-quasar\.rules/, `${engine} ${mode}`);
+      if (mode === 'rootless') assert.match(out.script, /\/etc\/subuid/, `${engine} rootless`);
+    }
   }
 });
 
@@ -417,8 +436,8 @@ test('podmanRunSeed uses sudo only when rootful', () => {
 });
 
 /** Runs a generated script against the hardened fake engine (test-harness.js). */
-function runFake(answers, { legacy = false, existing = false, extraEnv = {} } = {}) {
-  return runScript(generate(answers).script, { engine: fakeEngineDir({ legacy, existing }), extraEnv });
+function runFake(answers, { legacy = false, existing = false, extraEnv = {}, prepared = true } = {}) {
+  return runScript(generate(answers).script, { engine: fakeEngineDir({ legacy, existing }), extraEnv, prepared });
 }
 
 test('the script refuses a host still running a stack made from the Compose files', () => {

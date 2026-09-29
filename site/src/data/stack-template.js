@@ -294,6 +294,39 @@ echo ${shellQuote(`${prepareHostSha256}  prepare-host.sh`)} | sha256sum -c
 sudo sh prepare-host.sh ${flags}`;
 }
 
+/**
+ * The install scripts' host-preparation check. Preparation is the quick start's own
+ * step 1, run once as root; the install script never runs it, because on a rootless
+ * engine the script runs as the quasar account, which has no sudo (least privilege).
+ * It only checks what preparation always leaves behind, and names step 1 if not.
+ */
+export function prepCheck(a) {
+  const files = ['/etc/udev/rules.d/70-quasar.rules', '/etc/sysctl.d/99-quasar.conf'];
+  if (a.mode === 'rootless') files.push('/etc/tmpfiles.d/quasar.conf');
+  const lines = [
+    'echo "==> Checking host preparation"',
+    'unprepared=0',
+    '# QUASAR_PREP_ROOT is for tests only: the root the checked files live under.',
+    'pr="${QUASAR_PREP_ROOT:-}"',
+    `for f in ${files.join(' ')}; do`,
+    '  [ -e "$pr$f" ] || { echo "Missing $f." >&2; unprepared=1; }',
+    'done',
+  ];
+  if (a.mode === 'rootless') {
+    lines.push(
+      'grep -q "^$(id -un):" "$pr/etc/subuid" 2>/dev/null || { echo "No subordinate IDs for $(id -un) in /etc/subuid." >&2; unprepared=1; }',
+      '[ -e "$pr/var/lib/systemd/linger/$(id -un)" ] || { echo "Lingering is off for $(id -un)." >&2; unprepared=1; }',
+    );
+  }
+  lines.push(
+    'if [ "$unprepared" != 0 ]; then',
+    '  echo "This host is not prepared for Quasar. Run step 1 (Prepare the machine) as root, then run this again." >&2',
+    '  exit 1',
+    'fi',
+  );
+  return lines.join('\n');
+}
+
 // --- the Podman Quadlet unit -------------------------------------------------
 
 /**
@@ -497,8 +530,7 @@ if [ -n "$legacy" ]; then
 fi
 ${EXISTING_INSTALL_CHECK('docker', '')}
 
-echo "==> Preparing the host"
-${prepText(a)}
+${prepCheck(a)}
 
 ${imagesBlock('docker', '', r)}
 ${r.agent ? `
@@ -560,8 +592,7 @@ ${preflightBlock({
 echo "==> Existing installs"
 ${EXISTING_INSTALL_CHECK('docker', '')}
 
-echo "==> Preparing the host"
-${prepText(a)}
+${prepCheck(a)}
 
 ${imagesBlock('docker', '', r)}
 
@@ -641,8 +672,7 @@ fi
 echo "==> Existing installs"
 ${EXISTING_INSTALL_CHECK('podman', sudo)}
 
-echo "==> Preparing the host"
-${prepText(a)}
+${prepCheck(a)}
 
 ${imagesBlock('podman', sudo, r)}
 ${rootful && r.agent ? `

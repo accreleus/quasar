@@ -40,9 +40,9 @@
  * — see site/src/data/stack-template.test.js's file header.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
+import { dirname, join } from 'node:path';
 
 function shim(dir, name, body) {
   const path = join(dir, name);
@@ -132,6 +132,27 @@ exit 0`);
  * coreutils (bash, mkdir, tee, id, seq, sleep, grep, awk, sha256sum for the
  * non `-c` case…) still resolve from /usr/bin and /bin after it.
  */
+/**
+ * A fake root holding what host preparation leaves behind, for the install scripts'
+ * preparation check (`QUASAR_PREP_ROOT`). `prepared = false` leaves it empty.
+ */
+export function preparedRoot(dir, prepared = true) {
+  const root = join(dir, 'prep-root');
+  mkdirSync(root, { recursive: true });
+  if (!prepared) return root;
+  const user = userInfo().username;
+  const put = (path, text) => {
+    mkdirSync(join(root, dirname(path)), { recursive: true });
+    writeFileSync(join(root, path), text);
+  };
+  put('etc/udev/rules.d/70-quasar.rules', '# prepared\n');
+  put('etc/sysctl.d/99-quasar.conf', '# prepared\n');
+  put('etc/tmpfiles.d/quasar.conf', '# prepared\n');
+  put('etc/subuid', `${user}:100000:65536\n`);
+  put(`var/lib/systemd/linger/${user}`, '');
+  return root;
+}
+
 export function fakeEnv(dir, extra = {}) {
   return {
     PATH: `${dir}:/usr/bin:/bin`,
@@ -148,12 +169,12 @@ export function fakeEnv(dir, extra = {}) {
  * an earlier version of this harness left a stray `prepare-host.sh` sitting
  * in the site's own working tree.
  */
-export function runScript(script, { engine = fakeEngineDir(), extraEnv = {} } = {}) {
+export function runScript(script, { engine = fakeEngineDir(), extraEnv = {}, prepared = true } = {}) {
   try {
     const r = spawnSync('bash', ['-c', script], {
       encoding: 'utf8',
       cwd: engine.dir,
-      env: fakeEnv(engine.dir, extraEnv),
+      env: fakeEnv(engine.dir, { QUASAR_PREP_ROOT: preparedRoot(engine.dir, prepared), ...extraEnv }),
     });
     return { ...r, calls: engine.read() };
   } finally {
