@@ -401,11 +401,28 @@ const EXISTING_INSTALL_CHECK = (cli, sudo) => `for name in quasar-seed quasar-re
   fi
 done`;
 
+/**
+ * Before the seed starts: a control plane already answering on the port belongs to
+ * another install (this engine has none; the existing-install check passed), and the
+ * new one could never bind it, while the wait below would be answered by the other.
+ */
+function portCheck(a, r) {
+  if (!r.control) return '';
+  return `if curl -fsS -m 3 http://localhost:${a.controlPort}/health >/dev/null 2>&1; then
+  echo "Something already answers on port ${a.controlPort}: another Quasar install (on another engine?) or another service." >&2
+  echo "Stop it, or choose other ports under Change the ports, then run this again." >&2
+  exit 1
+fi
+`;
+}
+
 function readyBlock(a, r, cli, sudo, statusCmd) {
   return `echo "==> Waiting for Quasar"
 ready=0
 for _ in $(seq 1 120); do
-  if ${statusCmd} >/dev/null 2>&1${r.control ? ` && curl -fsS http://localhost:${a.controlPort}/health >/dev/null 2>&1` : ''}; then
+  if ${statusCmd} >/dev/null 2>&1${r.control ? ` \\
+    && [ "$(${sudo}${cli} inspect -f '{{.State.Health.Status}}' quasar-control-plane 2>/dev/null)" = healthy ] \\
+    && curl -fsS http://localhost:${a.controlPort}/health >/dev/null 2>&1` : ''}; then
     ready=1
     break
   fi
@@ -538,7 +555,7 @@ echo "==> Directories"
 sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
 sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(templatePath(a))}
 ` : ''}
-echo "==> Starting the seed"
+${portCheck(a, r)}echo "==> Starting the seed"
 docker run -d --name quasar-seed --restart unless-stopped \\
   --security-opt label=disable \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
@@ -596,7 +613,7 @@ ${prepCheck(a)}
 
 ${imagesBlock('docker', '', r)}
 
-echo "==> Starting the seed"
+${portCheck(a, r)}echo "==> Starting the seed"
 docker run -d --name quasar-seed --restart unless-stopped \\
   --security-opt label=disable \\
   -v "${sockExpr}:/var/run/docker.sock" \\
@@ -694,7 +711,7 @@ cat <<UNIT | ${sudo}tee -a "${unitDir}/quasar-seed.container" >/dev/null
 ${unitLines.join('\n')}
 UNIT
 
-echo "==> Starting the seed"
+${portCheck(a, r)}echo "==> Starting the seed"
 ${sudo}${svc} daemon-reload
 ${sudo}${svc} start quasar-seed
 

@@ -57,7 +57,7 @@ function shim(dir, name, body) {
  * for a Compose-labelled control plane, matching the flags the generated
  * script checks for before it will start the seed.
  */
-export function fakeEngineDir({ legacy = false, existing = false } = {}) {
+export function fakeEngineDir({ legacy = false, existing = false, portTaken = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'quasar-qs-'));
   const log = join(dir, 'calls');
   writeFileSync(log, '');
@@ -71,6 +71,7 @@ case "$1" in
   image) ref="\${@: -1}"; echo "\${ref%:*}@sha256:0123abcd" ;;
   run) echo cafe ;;
   exec) exit 0 ;;
+  inspect) echo healthy ;;
 esac`);
 
   shim(dir, 'podman', `echo "podman $*" >> ${JSON.stringify(log)}
@@ -81,6 +82,7 @@ case "$1" in
   image) ref="\${@: -1}"; echo "\${ref%:*}@sha256:0123abcd" ;;
   secret) case "$2" in exists) exit ${existing ? 0 : 1} ;; create) echo fakesecret ;; esac ;;
   exec) exit 0 ;;
+  inspect) echo healthy ;;
 esac`);
 
   // Never the real, setuid `sudo`: strip the name and run the rest directly,
@@ -111,6 +113,11 @@ for a in "$@"; do
   prev="$a"
 done
 [ -z "$out" ] || printf '#!/bin/sh\\nexit 0\\n' > "$out"
+# A control plane answers /health only once this script has started the seed:
+# before that the port is free (the scripts refuse to start on a taken port).
+case "$*" in
+  */health*) ${portTaken ? ':' : `grep -q -e 'run -d --name quasar-seed' -e 'start quasar-seed' ${JSON.stringify(log)} || exit 7`} ;;
+esac
 exit 0`);
 
   return {

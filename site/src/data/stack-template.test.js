@@ -345,6 +345,13 @@ test('rootless scripts never use sudo; host preparation is step 1, run as root',
   }
 });
 
+test('a control port another install already answers on stops the script before the seed', () => {
+  const r = runFake(full({ role: 'control-only' }), { portTaken: true });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /already answers on port 8080/);
+  assert.ok(!/run -d --name quasar-seed/.test(String(r.calls)), 'no seed started');
+});
+
 test('an unprepared host stops the install script and names step 1', () => {
   const r = runFake(full({ role: 'control-only' }), { prepared: false });
   assert.notEqual(r.status, 0);
@@ -436,8 +443,8 @@ test('podmanRunSeed uses sudo only when rootful', () => {
 });
 
 /** Runs a generated script against the hardened fake engine (test-harness.js). */
-function runFake(answers, { legacy = false, existing = false, extraEnv = {}, prepared = true } = {}) {
-  return runScript(generate(answers).script, { engine: fakeEngineDir({ legacy, existing }), extraEnv, prepared });
+function runFake(answers, { legacy = false, existing = false, portTaken = false, extraEnv = {}, prepared = true } = {}) {
+  return runScript(generate(answers).script, { engine: fakeEngineDir({ legacy, existing, portTaken }), extraEnv, prepared });
 }
 
 test('the script refuses a host still running a stack made from the Compose files', () => {
