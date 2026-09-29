@@ -117,9 +117,35 @@ grep -q 'ATTRS{name}=="Quasar Virtual \*"' "$rules" && pass "input rule matches 
 if grep -qE 'card|sound|i2c' <(grep -v '^#' "$rules"); then fail "console devices only with --console" ""; else pass "no display, sound or i2c access without --console"; fi
 if grep -qiE 'g:(input|video|render|audio):' "$rules"; then fail "no broad group" ""; else pass "no broad group such as input or video is granted"; fi
 r3="$tmp/r3"; mk_root "$r3"
-prep "$r3" "$tmp/podman-only" --mode rootless --engine podman --console >/dev/null 2>&1
+out3="$(prep "$r3" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
 grep -q 'KERNEL=="card\[0-9\]\*"' "$r3/etc/udev/rules.d/70-quasar.rules" && grep -q 'i2c-dev' "$r3/etc/modules-load.d/quasar.conf" \
   && pass "--console adds display, sound and i2c, and loads i2c-dev" || fail "--console" ""
+r3rules="$r3/etc/udev/rules.d/70-quasar.rules"
+grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_KEYBOARD}=="1"' "$r3rules" \
+  && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_MOUSE}=="1"' "$r3rules" \
+  && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_JOYSTICK}=="1"' "$r3rules" \
+  && pass "--console grants the host's physical keyboards, mice and joysticks by udev property" || fail "physical input rules" "$(cat "$r3rules")"
+printf '%s' "$out3" | grep -q "the quasar group can read what is typed on this machine's keyboard" \
+  && pass "--console states plainly that the quasar group can read this machine's keyboard" || fail "plain keyboard warning" "$out3"
+
+# ── 3b. console audio (PipeWire) ────────────────────────────────────────────
+r3b="$tmp/r3b"; mk_root "$r3b"; printf 'alice:x:1500:1500::/home/alice:/bin/bash\n' >> "$r3b/etc/passwd"
+out3b="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)" || fail "console audio run" "$out3b"
+pw="$r3b/etc/pipewire/pipewire-pulse.conf.d/90-quasar-console.conf"
+grep -q '"unix:native"' "$pw" && grep -q 'address = "unix:/run/quasar-console-audio/native"' "$pw" && grep -q 'client.access = "restricted"' "$pw" \
+  && pass "the PipeWire drop-in keeps unix:native and adds the Quasar console socket" || fail "pipewire drop-in" "$(cat "$pw" 2>&1)"
+tf="$r3b/etc/tmpfiles.d/quasar-console-audio.conf"
+grep -q '^d /run/quasar-console-audio 0750 alice quasar -$' "$tf" \
+  && pass "tmpfiles.d creates /run/quasar-console-audio owned alice:quasar 0750" || fail "console audio tmpfiles" "$(cat "$tf" 2>&1)"
+printf '%s' "$out3b" | grep -q "restart alice's pipewire-pulse" && pass "console audio output explains the desktop user must restart pipewire-pulse" || fail "console audio restart note" "$out3b"
+
+if prep "$tmp/none" "$tmp/podman-only" --mode rootless --console-audio-user ghost 2>/dev/null; then fail "unknown console-audio-user" "exit 0"; else pass "--console-audio-user refuses an unknown account"; fi
+if prep "$tmp/none" "$tmp/podman-only" --mode rootless --console-audio-user alice 2>/dev/null; then fail "console-audio-user without --console" "exit 0"; else pass "--console-audio-user without --console is refused"; fi
+
+before3b="$(tree "$r3b")"
+out3b2="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)"
+[ "$before3b" = "$(tree "$r3b")" ] && pass "console audio re-run leaves every file identical" || fail "console audio idempotent files" "$(diff <(echo "$before3b") <(tree "$r3b") | head)"
+if printf '%s' "$out3b2" | grep -qE '^  (changed|would) '; then fail "console audio re-run reports no change" "$(printf '%s' "$out3b2" | grep -E '^  (changed|would)')"; else pass "console audio re-run prints only ok lines"; fi
 
 # ── 4. optional settings only when asked ────────────────────────────────────
 if grep -qE 'dmesg_restrict|unprivileged_port_start' "$r/etc/sysctl.d/99-quasar.conf"; then fail "no optional sysctl by default" ""; else pass "optional kernel settings absent unless asked"; fi

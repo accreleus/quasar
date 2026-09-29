@@ -46,7 +46,12 @@ own; the two do not move together, and that is deliberate.
   the actor's new preflight endpoint) before it ever reports healthy, `ddc.rs` stops
   creating `/dev/i2c-*` nodes on a rootless engine and reads the ones the recipe passed
   instead, and readiness gains `console_display`/`console_audio`/`console_ddc`. Host
-  preparation and the console UI are still to come.
+  preparation (`deploy/prepare-host.sh --console`) now also grants the `quasar` group
+  this machine's physical keyboards, mice and game controllers (stated plainly in its
+  output, since it means the group can read this machine's keyboard) for console
+  mode's exclusive grab, and `--console-audio-user USER` gives console mode a
+  restricted PipeWire Pulse socket on a real desktop login, reachable only by that
+  group. The console UI is still to come.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
