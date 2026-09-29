@@ -1189,6 +1189,39 @@ impl VirtualDevices {
     }
 }
 
+/// Exclusive hold (`EVIOCGRAB`) on one of this process's own evdev nodes
+/// (a `VirtualDevices::{keyboard,mouse,gamepad}_path`). While held, the kernel
+/// delivers that device's events only to this fd — not to the host's VT
+/// keyboard handler or any other reader — which matters for callers that write
+/// real events outside a session (the vinput self-test / input probe run at
+/// agent start, with nothing else holding these nodes). Not used on the
+/// in-session path: there the compositor's own libinput open is the intended
+/// exclusive reader, and this would race it.
+///
+/// Grab is per-open-fd; dropping (closing the fd) releases it, so there is no
+/// explicit ungrab.
+// Held only for Drop's close(); never read directly (RAII holder, like
+// `session::console_hotplug::ConsoleHotplugWatcher`).
+#[allow(dead_code)]
+pub struct ExclusiveGrab(input_linux::EvdevHandle<File>);
+
+impl ExclusiveGrab {
+    /// Open `path` and take an exclusive `EVIOCGRAB`. Fails if the node can't
+    /// be opened or is already grabbed — callers must not write to the device
+    /// on error (see `write_if_grabbed` in `main.rs`).
+    pub fn take(path: &Path) -> Result<Self> {
+        let f = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .with_context(|| format!("open {} for exclusive grab", path.display()))?;
+        let handle = input_linux::EvdevHandle::new(f);
+        handle
+            .grab(true)
+            .with_context(|| format!("EVIOCGRAB {}", path.display()))?;
+        Ok(Self(handle))
+    }
+}
+
 impl super::teardown::UdevExport for VirtualDevices {
     fn retire(&self) {
         self.retire_udev_export();
