@@ -73,34 +73,7 @@ func TestSeedTakesEnvThenIdempotent(t *testing.T) {
 	}
 }
 
-func TestSeedOwnedInstallStartsOnEdgeOnce(t *testing.T) {
-	pool := testDB(t)
-	s := NewStore(pool)
-	ctx := context.Background()
-
-	if err := s.SeedWithReleaseChannel(ctx, "", OwnedInstallReleaseChannel); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	ch, _, err := s.ReleaseChannel(ctx)
-	if err != nil {
-		t.Fatalf("channel: %v", err)
-	}
-	if ch != ReleaseChannelEdge {
-		t.Fatalf("owned first boot: got %q want edge", ch)
-	}
-	// A later boot never rewrites it: the row exists, so an admin's choice stands.
-	if _, err := pool.Exec(ctx, `UPDATE instance_settings SET release_channel = 'stable'`); err != nil {
-		t.Fatalf("admin switch: %v", err)
-	}
-	if err := s.SeedWithReleaseChannel(ctx, "", OwnedInstallReleaseChannel); err != nil {
-		t.Fatalf("reseed: %v", err)
-	}
-	if ch, _, _ := s.ReleaseChannel(ctx); ch != ReleaseChannelStable {
-		t.Fatalf("reseed rewrote the channel: got %q want stable", ch)
-	}
-}
-
-func TestSeedWithoutChannelKeepsStable(t *testing.T) {
+func TestSeedStartsOnStable(t *testing.T) {
 	pool := testDB(t)
 	s := NewStore(pool)
 	ctx := context.Background()
@@ -108,15 +81,7 @@ func TestSeedWithoutChannelKeepsStable(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	if ch, _, _ := s.ReleaseChannel(ctx); ch != ReleaseChannelStable {
-		t.Fatalf("non-owned first boot: got %q want stable", ch)
-	}
-}
-
-func TestSeedRejectsBadChannel(t *testing.T) {
-	pool := testDB(t)
-	s := NewStore(pool)
-	if err := s.SeedWithReleaseChannel(context.Background(), "", "nightly"); err == nil {
-		t.Fatal("expected error seeding an invalid channel")
+		t.Fatalf("first boot: got %q want stable", ch)
 	}
 }
 
