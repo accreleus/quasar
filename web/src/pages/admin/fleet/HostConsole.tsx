@@ -7,20 +7,34 @@
 // `"auto" | string[]` of device paths and `ConsoleCapabilities.input_devices`
 // reports only `{path, label}` — no server-side class or hot-plug/pinned
 // distinction, so class is a client-side label heuristic, display only.
+//
+// Console access (amendment 18, RH07 #395): a host whose agent reports
+// `capabilities.access` needs console mode's `enabled` switch to go through a
+// confirmation and an immediate PATCH — turning it on or off replaces the
+// node agent through the recovery actor and ends the host's live sessions —
+// rather than riding the draft/"Save changes" flow the rest of this page
+// uses. A host reporting no `access` (Compose/source/older agent) keeps
+// today's page exactly: `access` stays undefined and every branch below
+// falls through to the original behaviour.
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useParams } from "react-router-dom";
-import { ApiError } from "../../../api/client";
 import * as adminApi from "../../../api/admin";
+import { ApiError } from "../../../api/client";
 import type { AdminApp, AdminUser, ConsoleConfig } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Breadcrumbs } from "../../../components/Breadcrumbs";
 import { shortId } from "../../../lib/format/shortId";
 import { Button } from "../../../components/Button";
-import { LoadingState } from "../../../components/LoadingState";
+import { Chip } from "../../../components/Chip";
 import { PageHeader } from "../../../components/PageHeader";
+import { ResourceStates } from "../../../components/ResourceStates";
 import { useToast } from "../../../components/Toast";
+import { useAdminAction } from "../../../lib/resource/action";
 import { useConsoleLoad } from "./console/useConsoleLoad";
+import { readsAsOn } from "./console/access";
+import { ConsoleAccessNote } from "./console/ConsoleAccessNote";
+import { ConsoleAccessConfirmModal } from "./console/ConsoleAccessConfirmModal";
 import { InputDevicesRow } from "./console/InputDevicesRow";
 import { CapabilitiesRail } from "./console/CapabilitiesRail";
 
@@ -74,9 +88,17 @@ export function HostConsole() {
   const { id } = useParams();
   const { addToast } = useToast();
 
-  const { host, config, capabilities, apps, users, loading, error, setError, setLoaded } = useConsoleLoad(id);
+  const res = useConsoleLoad(id);
+  const { data, loading, errorMessage } = res;
+  const host = data?.host ?? null;
+  const config = data?.config ?? null;
+  const capabilities = data?.capabilities ?? null;
+  const apps = data?.apps ?? [];
+  const users = data?.users ?? [];
+
   const [pending, setPending] = useState<ConsoleConfig>({});
   const [saving, setSaving] = useState(false);
+  const [confirmTarget, setConfirmTarget] = useState<boolean | null>(null);
 
   // A fresh host means a fresh draft.
   useEffect(() => setPending({}), [id]);
@@ -86,6 +108,42 @@ export function HostConsole() {
 
   const setField = <K extends keyof ConsoleConfig>(key: K, value: ConsoleConfig[K]) => {
     setPending((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const access = capabilities?.access;
+  const accessKnown = access != null;
+  const applying = access?.state === "applying";
+  const unsupported = access?.state === "unsupported";
+
+  const toggleAccess = useAdminAction(
+    async (nextEnabled: boolean) => {
+      if (!token || !id) throw new Error("missing token or host id");
+      return adminApi.updateConsoleConfig(token, id, { enabled: nextEnabled });
+    },
+    {
+      success: (_r, nextEnabled) =>
+        `Turning console mode ${nextEnabled ? "on" : "off"} on ${host?.node_name ?? "this host"}.`,
+      failure: (e) => (e instanceof ApiError ? e.message : "Could not change console mode."),
+      onSuccess: async () => {
+        setConfirmTarget(null);
+        await res.refresh({ silent: true });
+      },
+      onFailure: () => setConfirmTarget(null),
+    },
+  );
+
+  const handleEnabledClick = (v: boolean) => {
+    if (!accessKnown) {
+      setField("enabled", v);
+      return;
+    }
+    if (applying || unsupported) return;
+    setConfirmTarget(v);
+  };
+
+  const tryAgain = () => {
+    if (!access) return;
+    void toggleAccess.run(access.target ?? !config?.enabled);
   };
 
   const hasCapabilities = capabilities != null && (
@@ -105,15 +163,13 @@ export function HostConsole() {
   const save = async () => {
     if (!token || !id || changedCount === 0) return;
     setSaving(true);
-    setError(null);
     try {
-      const res = await adminApi.updateConsoleConfig(token, id, pending);
-      setLoaded(res.config, res.capabilities);
+      const saved = await adminApi.updateConsoleConfig(token, id, pending);
+      res.setData((prev) => ({ ...prev, config: saved.config, capabilities: saved.capabilities }));
       setPending({});
       addToast({ variant: "success", title: "Console config saved" });
     } catch (e: unknown) {
       const msg = e instanceof ApiError ? e.message : "Save failed.";
-      setError(msg);
       addToast({ variant: "danger", title: msg });
     } finally {
       setSaving(false);
@@ -144,8 +200,17 @@ export function HostConsole() {
         }
       />
 
-      {loading && <LoadingState>Loading...</LoadingState>}
-      {error && <p className="form-error">{error}</p>}
+      <ResourceStates loading={loading} error={errorMessage} loadingLabel="Loading..." />
+
+      {!loading && access && host && (
+        <ConsoleAccessNote
+          access={access}
+          hostName={host.node_name}
+          liveSessions={host.capacity?.active_sessions ?? null}
+          onTryAgain={tryAgain}
+          tryAgainPending={toggleAccess.pending != null}
+        />
+      )}
 
       {!loading && (
         <div className="split" style={{ gridTemplateColumns: "minmax(0,1fr) 300px" }}>
@@ -158,7 +223,19 @@ export function HostConsole() {
                 </p>
               </div>
               <div className="acts">
-                <Switch label="Enabled" checked={Boolean(effective.enabled)} onChange={(v) => setField("enabled", v)} />
+                {accessKnown && (
+                  applying
+                    ? <Chip variant="info">Applying</Chip>
+                    : readsAsOn(config?.enabled, access)
+                      ? <Chip variant="success">On</Chip>
+                      : <Chip>Off</Chip>
+                )}
+                <Switch
+                  label="Enabled"
+                  checked={Boolean(accessKnown ? config?.enabled : effective.enabled)}
+                  disabled={accessKnown ? applying || unsupported : false}
+                  onChange={handleEnabledClick}
+                />
               </div>
             </div>
 
@@ -341,6 +418,17 @@ export function HostConsole() {
             />
           </div>
         </div>
+      )}
+
+      {confirmTarget != null && host && (
+        <ConsoleAccessConfirmModal
+          hostName={host.node_name}
+          turningOn={confirmTarget}
+          liveSessions={host.capacity?.active_sessions ?? null}
+          pending={toggleAccess.pending != null}
+          onCancel={() => setConfirmTarget(null)}
+          onConfirm={() => void toggleAccess.run(confirmTarget)}
+        />
       )}
     </section>
   );

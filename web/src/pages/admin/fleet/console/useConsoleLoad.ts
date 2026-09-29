@@ -1,78 +1,48 @@
-// The console-config page's one load effect: host + console-config +
-// app/user pickers, in parallel. Split out so HostConsole.tsx reads as the
-// form, not the fetch.
+// The console-config page's one read: host + console-config + app/user
+// pickers, in parallel, on `web/src/lib/resource/`'s shared load/poll/error
+// machine. Split out so HostConsole.tsx reads as the form, not the fetch.
+//
+// Polls every ~2s while the host's latest console-access report (amendment
+// 18) is `applying` — a replacement is in flight through the recovery actor —
+// and not otherwise, so an ordinary host never pays for a timer it has no use
+// for.
 
-import { useEffect, useState } from "react";
 import * as adminApi from "../../../../api/admin";
-import { ApiError } from "../../../../api/client";
 import type { AdminApp, AdminUser, ConsoleCapabilities, ConsoleConfig, Host } from "../../../../api/types";
-import { useAuth } from "../../../../auth/context";
+import { useResource, type UseResourceResult } from "../../../../lib/resource/react";
 
-export interface ConsoleLoadState {
-  host: Host | null;
-  config: ConsoleConfig | null;
-  capabilities: ConsoleCapabilities | null;
+export interface ConsoleLoadData {
+  host: Host;
+  config: ConsoleConfig;
+  capabilities: ConsoleCapabilities;
   apps: AdminApp[];
   users: AdminUser[];
-  loading: boolean;
-  error: string | null;
-  setError: (message: string | null) => void;
-  /** Applies a freshly-saved config+capabilities pair without a re-fetch. */
-  setLoaded: (config: ConsoleConfig, capabilities: ConsoleCapabilities) => void;
 }
 
-export function useConsoleLoad(id: string | undefined): ConsoleLoadState {
-  const { token } = useAuth();
-  const [host, setHost] = useState<Host | null>(null);
-  const [config, setConfig] = useState<ConsoleConfig | null>(null);
-  const [capabilities, setCapabilities] = useState<ConsoleCapabilities | null>(null);
-  const [apps, setApps] = useState<AdminApp[]>([]);
-  const [users, setUsers] = useState<AdminUser[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+const APPLYING_POLL_MS = 2000;
 
-  useEffect(() => {
-    if (!token || !id) return;
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    void (async () => {
-      try {
+export function useConsoleLoad(id: string | undefined): UseResourceResult<ConsoleLoadData> {
+  const hostId = id ?? "";
+  return useResource<ConsoleLoadData>(
+    {
+      label: "console config",
+      pollMs: (data) => (data.capabilities.access?.state === "applying" ? APPLYING_POLL_MS : null),
+      fetch: async (ctx) => {
         const [hostRes, consoleRes, appsRes, usersRes] = await Promise.all([
-          adminApi.getHost(token, id),
-          adminApi.getConsoleConfig(token, id),
-          adminApi.listAdminApps(token),
-          adminApi.listUsers(token),
+          adminApi.getHost(ctx.token, hostId),
+          adminApi.getConsoleConfig(ctx.token, hostId),
+          adminApi.listAdminApps(ctx.token),
+          adminApi.listUsers(ctx.token),
         ]);
-        if (cancelled) return;
-        setHost(hostRes.host);
-        setConfig(consoleRes.config);
-        setCapabilities(consoleRes.capabilities);
-        setApps(appsRes.items);
-        setUsers(usersRes.items);
-      } catch (e: unknown) {
-        if (!cancelled) {
-          setError(e instanceof ApiError ? e.message : "Could not load console config.");
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [id, token]);
-
-  return {
-    host,
-    config,
-    capabilities,
-    apps,
-    users,
-    loading,
-    error,
-    setError,
-    setLoaded: (nextConfig, nextCapabilities) => {
-      setConfig(nextConfig);
-      setCapabilities(nextCapabilities);
+        return {
+          host: hostRes.host,
+          config: consoleRes.config,
+          capabilities: consoleRes.capabilities,
+          apps: appsRes.items,
+          users: usersRes.items,
+        };
+      },
     },
-  };
+    [hostId],
+  );
 }

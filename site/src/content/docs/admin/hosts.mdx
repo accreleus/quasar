@@ -303,10 +303,22 @@ not connected after about a minute without a heartbeat, even while it reads
 ## The console
 
 Each host has a console page for local-display mode, where the host renders to a
-physically attached screen, not to a browser. It needs additional privileges and
-a separate compose overlay, and it is not part of the default deployment. An
-owned install has no way to enable it in this release: the recovery actor
-creates the agent without those privileges, and there is no input for them.
+physically attached screen, not to a browser. It needs additional privileges — this
+machine's display, sound and monitor control — that the default agent does not have.
+
+On a rootful **owned** host, an admin turns console mode on from that page. Doing so
+replaces the node agent: the recovery actor recreates it with those additions, verifies
+it came up healthy, and only then does console mode read as on. That replacement ends
+the host's live sessions, the same way turning it off does. If the new agent does not
+become healthy, the recovery actor puts the previous one back and reports why, and
+streaming keeps working as before — the setting never claims access the host does not
+have. A rootful engine's socket is already equivalent to root on that machine, so
+granting the agent its display and sound is not a new exposure.
+
+Console mode on a **rootless** engine is not available yet; it is coming with later
+RH-07 work. A Compose or source install keeps granting console access the way it
+always has, with [`deploy/overlays/docker-compose.console.yml`](https://github.com/accreleus/quasar/blob/main/deploy/overlays/docker-compose.console.yml)
+— an owned host's recovery actor does not read that overlay.
 
 ## Storage
 

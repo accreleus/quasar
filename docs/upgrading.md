@@ -331,7 +331,7 @@ short:
 
 1. **Write down** each host's node name and every machine's home root, and keep `deploy/.env`.
 2. **Stop the old control plane and agents, not the database**:
-   `docker compose -f deploy/docker-compose.yml stop quasar-control-plane quasar-node-agent quasar-updater`
+   `docker compose -f deploy/docker-compose.yml stop quasar-control-plane quasar-node-agent`
    on the control-plane machine, and `docker compose --project-directory /opt/quasar-agent down`
    on every other GPU host.
 3. **Dump it, custom format**:

@@ -680,6 +680,11 @@ export type ConsoleCapabilities = Schemas["ConsoleCapabilities"];
 
 export type ConsoleConfigEnvelope = Schemas["ConsoleConfigEnvelope"];
 
+/** Amendment 18. "Has access" (`control-api.md` §Console mode, `agent-api.md`
+ *  `capacity.console_capabilities.access`): `state` is `on`, or `restored` with
+ *  `target` false. An unrecognised `state` reads as `off`. */
+export type ConsoleAccess = Schemas["ConsoleAccess"];
+
 // ── Session trace types (ST-07) ───────────────────────────────────────────────
 
 // Req-massaged: the trace/diagnostic schemas still lack `required:` arrays.
