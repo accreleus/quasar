@@ -139,10 +139,13 @@ fn fast() -> ReplaceTiming {
 
 fn handover_timing() -> HandoverTiming {
     HandoverTiming {
-        ready: Duration::from_secs(3),
-        takeover: Duration::from_secs(3),
-        verify: Duration::from_secs(3),
-        agent_contact: Duration::from_secs(3),
+        // Scheduling budgets, not assertions: 3s starved a contended CI runner's
+        // successor thread (real UnixListener bind+serve) and failed 7 tests on
+        // "Connection refused" that never reproduced under any local cpu/thread cap.
+        ready: Duration::from_secs(10),
+        takeover: Duration::from_secs(10),
+        verify: Duration::from_secs(10),
+        agent_contact: Duration::from_secs(10),
         poll: Duration::from_millis(2),
         orphan_check: Duration::from_secs(3600),
     }
