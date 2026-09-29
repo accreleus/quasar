@@ -25,6 +25,11 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH-07 console mockups, approved by the owner (#394).**
+  `design_handoff_v3/screens/rh07-v3.html` adds the quick start's engine choice and
+  profile badges, host preparation, the Quadlet unit for Podman, console mode on an
+  owned host, and the readiness card's engine facts and "skipped, and why" rows.
+  Approved on condition that the build follows the v3 tokens and components.
 - **Rootless Docker: the agent sees its GPUs and input devices (RH-07, #399).** A
   host-network container on rootless Docker gets no sysfs of its own, so the agent found
   no DRM inventory and could not resolve its input nodes. On rootless Docker only, recipe
