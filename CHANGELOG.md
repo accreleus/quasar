@@ -37,11 +37,9 @@ own; the two do not move together, and that is deliberate.
   replacement of its own, so a vanished node never leaves the agent unable to start. The
   agent socket gains `POST /v1/console/preflight`: a console agent that reports it cannot
   take the display fails the attempt at once (`unhealthy`), the previous agent is put
-  back, and the agent's text appears as `last.detail` in `GET /v1/console`. This is the
-  actor side only. The agent's own preflight, audio, host preparation and console UI
-  follow, so rootless console mode is not usable yet. Rootful console mode still keeps
-  `SYS_ADMIN` until hardware proves the recipe works without it.
-  The node agent side now lands too: at startup, a console-access agent checks for itself
+  back, and the agent's text appears as `last.detail` in `GET /v1/console`. Rootful
+  console mode still keeps `SYS_ADMIN` until hardware proves the recipe works without it.
+  At startup, a console-access agent checks for itself
   whether it can take the display (no crash on a held one, just a named failure posted to
   the actor's new preflight endpoint) before it ever reports healthy, `ddc.rs` stops
   creating `/dev/i2c-*` nodes on a rootless engine and reads the ones the recipe passed
@@ -64,6 +62,9 @@ own; the two do not move together, and that is deliberate.
   that the host needs `prepare-host.sh --console` again, with a copyable command) instead
   of hiding it behind the generic mapped reason, and its "Local audio output" picker and
   help text tell a host's PipeWire sinks from its ALSA ones.
+  Proven on hardware with Docker rootless and Podman rootless (display, keyboard and
+  mouse, audio, DDC auto-start); the site's host administration page describes the
+  rootless setup.
 - **Install surfaces for every engine mode (RH-07, #406).** One published table of engine
   profiles (`testdata/engine-profiles/profiles.json`) says, for each platform, container
   engine and engine mode, whether Quasar calls it supported, experimental or unsupported,
