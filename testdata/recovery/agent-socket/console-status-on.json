@@ -4,11 +4,15 @@
   "body": {
     "enabled": true,
     "in_flight": null,
+    "in_flight_target": null,
+    "in_flight_started_at": null,
     "last": {
+      "request_id": "0b7e3c52-6f0e-4d0a-9c1e-5a2b7d8e9f10",
       "target": true,
       "settled": "applied",
       "reason": null,
       "restored": false,
+      "started_at": "2026-09-29T10:00:01Z",
       "finished_at": "2026-09-29T10:00:05Z"
     },
     "supported": true,

@@ -241,6 +241,14 @@ fn every_agent_socket_console_fixture_round_trips_and_the_vocabulary_is_covered(
                     s.why.is_none(),
                     "{name}: why exactly when unsupported"
                 );
+                assert_eq!(
+                    (s.in_flight.is_some(), s.in_flight.is_some()),
+                    (
+                        s.in_flight_target.is_some(),
+                        s.in_flight_started_at.is_some()
+                    ),
+                    "{name}: the attempt's target and start exactly while one is in flight"
+                );
                 applying |= s.in_flight.is_some();
                 unsupported |= !s.supported;
                 if let Some(last) = s.last {

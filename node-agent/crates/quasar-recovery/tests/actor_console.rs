@@ -197,6 +197,8 @@ fn enabling_replaces_only_the_agent_with_the_console_additions_and_disabling_tak
         ConsoleStatus {
             enabled: false,
             in_flight: None,
+            in_flight_target: None,
+            in_flight_started_at: None,
             last: None,
             supported: true,
             why: None,

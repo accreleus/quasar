@@ -43,6 +43,10 @@ pub struct ConsoleStatus {
     pub enabled: bool,
     /// The console change being applied, until it settles.
     pub in_flight: Option<String>,
+    /// The console mode the change in flight asks for; `null` when none is.
+    pub in_flight_target: Option<bool>,
+    /// When the change in flight started (RFC 3339); `null` when none is.
+    pub in_flight_started_at: Option<String>,
     /// How the last console change settled; `null` when the last reconfigure was not one.
     pub last: Option<ConsoleLast>,
     /// Whether this machine can take console mode; `why` says why not.
@@ -52,6 +56,8 @@ pub struct ConsoleStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleLast {
+    /// The attempt: the id `in_flight` named while it ran.
+    pub request_id: String,
     /// The console mode that change asked for.
     pub target: bool,
     pub settled: Settled,
@@ -59,6 +65,7 @@ pub struct ConsoleLast {
     pub reason: Option<Reason>,
     /// The attempt put the previous agent back.
     pub restored: bool,
+    pub started_at: String,
     pub finished_at: String,
 }
 
@@ -76,21 +83,28 @@ impl Actor {
         let machine = self.dir.load_machine().ok().flatten();
         let record = self.dir.reconfigure_file().load().ok().flatten();
         let mut enabled = machine.as_ref().is_some_and(|m| m.inputs.console);
-        let (mut in_flight, mut last) = (None, None);
+        let (mut in_flight, mut in_flight_target, mut in_flight_started_at, mut last) =
+            (None, None, None, None);
         if let Some(r) = record {
             let console = r.changed.iter().any(|c| c == CHANGED);
             match r.outcome {
                 // Machine state already holds the new inputs; the old are what runs.
                 None => {
                     enabled = r.before.console;
-                    in_flight = console.then_some(r.request_id);
+                    if console {
+                        in_flight_target = Some(r.after.console);
+                        in_flight_started_at = Some(r.started_at);
+                        in_flight = Some(r.request_id);
+                    }
                 }
                 Some(o) if console => {
                     last = Some(ConsoleLast {
+                        request_id: r.request_id,
                         target: r.after.console,
                         settled: o.settled,
                         reason: o.reason,
                         restored: o.restored,
+                        started_at: r.started_at,
                         finished_at: o.settled_at,
                     })
                 }
@@ -101,6 +115,8 @@ impl Actor {
         ConsoleStatus {
             enabled,
             in_flight,
+            in_flight_target,
+            in_flight_started_at,
             last,
             supported: support.is_ok(),
             why: support.err(),

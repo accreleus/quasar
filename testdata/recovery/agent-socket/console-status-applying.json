@@ -4,6 +4,8 @@
   "body": {
     "enabled": false,
     "in_flight": "0b7e3c52-6f0e-4d0a-9c1e-5a2b7d8e9f10",
+    "in_flight_target": true,
+    "in_flight_started_at": "2026-09-29T10:00:01Z",
     "last": null,
     "supported": true,
     "why": null

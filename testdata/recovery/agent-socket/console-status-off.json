@@ -4,6 +4,8 @@
   "body": {
     "enabled": false,
     "in_flight": null,
+    "in_flight_target": null,
+    "in_flight_started_at": null,
     "last": null,
     "supported": true,
     "why": null
