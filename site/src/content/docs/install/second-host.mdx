@@ -3,26 +3,23 @@ title: Add a second GPU host
 description: Enroll another GPU machine with one command from the admin console.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 {/* Keep this page's slug: the console's Add host dialog links to /install/second-host/ (web/src/pages/admin/fleet/AddHostModal.tsx). */}
 
-Each GPU host runs one node agent. Adding a host means enrolling one more agent
-with the control plane.
+Each GPU host runs one node agent. Adding a host enrolls one more agent with the
+control plane.
 
-## Before you start
-
-On the new machine:
+## 1. Prepare the host
 
 - Linux with a working GPU driver (`ls /dev/dri` shows a `renderD*` node).
 - Docker or Podman, in a [supported engine profile](/quasar/start/engine-profiles/).
   The command detects which.
 - On NVIDIA, the NVIDIA Container Toolkit.
-- Root or passwordless `sudo`. On a **rootless** engine, use the `quasar` account
-  from [host preparation](/quasar/install/prepare-host/) instead.
+- A shell as the account that runs the engine: root (or passwordless `sudo`) for a
+  rootful engine, the `quasar` account from
+  [host preparation](/quasar/install/prepare-host/) for a rootless one.
 - Network access to the control plane's `https://` address.
 
-## 1. Create the command
+## 2. Generate the command
 
 In the admin console, go to **Fleet ▸ Hosts** and press **Add host**. Optionally
 name the host (reusing an existing name re-enrolls it), pick how long the command
@@ -33,67 +30,61 @@ curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll
   | QUASAR_ENROLLMENT='qenr1.…' sh
 ```
 
-The enrollment string works once. With the default self-signed certificate, the
-dialog shows its fingerprint: it should match the `fingerprint=` the control plane
-printed at startup. If it doesn't, stop.
+## 3. Inspect the script
 
-<Aside type="tip" title="Read before you run">
-As with any script piped to `sh`, read it first. Download it with the same `curl`
-flags plus `-o enroll-host.sh`, then read it or run `sh enroll-host.sh --help`.
-</Aside>
+Read the enrollment script before running it: run the same `curl` with
+`-o enroll-host.sh` instead of the pipe. Keep the generated command unchanged and
+the single-use token private. If the dialog shows a certificate fingerprint,
+check it matches the `fingerprint=` the control plane printed at startup.
 
-## 2. Run it on the new machine
+## 4. Run it
 
-Paste the command as root, a `sudo` user, or on rootless, the `quasar` account
-(`machinectl shell quasar@`, see
+Paste the command on the new machine. On a rootless engine, get a proper session
+for the `quasar` account first (`machinectl shell quasar@`, see
 [Install with Podman](/quasar/install/podman-quadlet/#getting-a-rootless-session-as-the-quasar-account)).
 
-The script checks the host (engine, render node, `/dev/uinput`, user namespaces,
-NVIDIA toolkit), offers to fix what fails, then pulls the images and starts the
-seed. When it's done you'll see:
+The script checks the host, offers to fix anything missing, then pulls the images
+and starts Quasar. It's safe to run again.
+
+## 5. Confirm it worked
+
+The script ends with:
 
 > `enrolled: this host is now '<name>' in Admin → Fleet.`
 
-The host appears in the Fleet table within seconds. Running the command again is
-safe.
-
-Optional settings, set in front of `sh` like the string:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `QUASAR_HOME_ROOT` | `/var/lib/quasar/homes` | Where user homes live on this machine. |
-| `QUASAR_TEMPLATE_ROOT` | beside the home root | The template root. |
-| `QUASAR_NODE_NAME` | the machine's host name | The host's name, if the command didn't set one. |
-| `QUASAR_ENROLL_FIX` | off | `1` fixes failed checks without asking. |
-| `QUASAR_ENROLL_DRY_RUN` | off | `1` checks the host and starts nothing. |
-
-To check what's running on the host:
-
-```bash
-docker ps --filter label=io.quasar.installation
-docker exec quasar-recovery quasar-recovery status
-```
+The host appears online in **Fleet ▸ Hosts** within seconds.
 
 ## When it says no
 
-The last line names the reason. A failed install removes itself, so just fix the
-cause and run a fresh command.
+The last line names the reason. A failed install removes itself: fix the cause and
+run a fresh command.
 
 | Message | Fix |
 | --- | --- |
-| `auth_failed` | The string expired, was used, or is for another name. Create a new command. |
+| `auth_failed` | The token expired, was used, or is for another name. Create a new command. |
 | Name already registered | That host's agent is still connected. Stop it, or pick another name. |
 | `cp-tls-pin-mismatch` | The certificate doesn't match. Create the command from the control plane's own page. |
 | A host check failed | Apply the printed fix and rerun the same command. |
 | Old Compose agent found | Run `docker compose --project-directory /opt/quasar-agent down` (homes are kept), then rerun. |
-| A seed already exists | Quasar is already installed here, through that seed. Keep it, or remove it first. |
+| A seed already exists | Quasar is already installed here. Keep it, or remove it first. |
 | Still connecting | Check `docker logs -f quasar-node-agent`. Usually the control plane's address isn't reachable from this machine. |
 
 To re-enroll a machine that was installed before, put `QUASAR_RESET_IDENTITY=1` in
 front of `sh`. It removes that machine's Quasar containers and volumes (never the
-homes) and enrolls from scratch. It refuses on a machine that runs the control plane.
+homes) and starts over. It refuses on a machine that runs the control plane.
 
 More: [Install and startup problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor).
+
+## Options
+
+Set in front of `sh`, like the token. `sh enroll-host.sh --help` lists them all.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_HOME_ROOT` | `/var/lib/quasar/homes` | Where user homes live on this machine. |
+| `QUASAR_NODE_NAME` | the machine's host name | The host's name, if the command didn't set one. |
+| `QUASAR_ENROLL_FIX` | off | `1` fixes failed checks without asking. |
+| `QUASAR_ENROLL_DRY_RUN` | off | `1` checks the host and starts nothing. |
 
 ## Using Dockge or Arcane
 
