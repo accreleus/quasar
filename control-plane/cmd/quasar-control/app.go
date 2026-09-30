@@ -316,16 +316,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		return nil, fmt.Errorf("secrets: %w", err)
 	}
 
-	// LP-SEC-01 §A.0: seeds registration_mode from the env on first boot only. An
-	// owned install (a recovery actor's control socket) also starts on the channel
-	// its releases are published on (amendment 16).
+	// LP-SEC-01 §A.0: seeds registration_mode from the env on first boot only.
 	settingsStore := settings.NewStore(pool)
-	seedChannel := ""
-	if cfg.RecoveryControlSocket != "" {
-		seedChannel = settings.OwnedInstallReleaseChannel
-	}
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	seedErr := settingsStore.SeedWithReleaseChannel(seedCtx, cfg.RegistrationMode, seedChannel)
+	seedErr := settingsStore.Seed(seedCtx, cfg.RegistrationMode)
 	seedCancel()
 	if seedErr != nil {
 		return nil, fmt.Errorf("seed instance settings: %w", seedErr)

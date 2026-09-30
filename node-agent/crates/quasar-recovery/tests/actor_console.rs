@@ -947,7 +947,7 @@ fn renumbered_i2c_buses_at_a_start_re_create_the_agent_through_a_verified_replac
     let actor = m.actor();
     actor.resume().unwrap();
     let id = actor
-        .recheck_console_devices()
+        .recheck_on_start()
         .expect("a re-creation was admitted");
     actor.wait_attempt();
     assert_actors_own(&actor, &id);
@@ -964,7 +964,7 @@ fn renumbered_i2c_buses_at_a_start_re_create_the_agent_through_a_verified_replac
     drop(actor);
     let actor = m.actor();
     actor.resume().unwrap();
-    assert_eq!(actor.recheck_console_devices(), None);
+    assert_eq!(actor.recheck_on_start(), None);
     assert_eq!(m.agent().id, agent.id);
 }
 
@@ -985,7 +985,7 @@ fn a_vanished_i2c_node_never_leaves_the_agent_unstartable() {
     });
     let actor = m.actor();
     actor.resume().unwrap();
-    let id = actor.recheck_console_devices().expect("re-created");
+    let id = actor.recheck_on_start().expect("re-created");
     actor.wait_attempt();
     assert_actors_own(&actor, &id);
     let agent = m.one_running_agent("without the vanished node");
@@ -1000,7 +1000,7 @@ fn a_vanished_i2c_node_never_leaves_the_agent_unstartable() {
     drop(actor);
     let actor = m.actor();
     actor.resume().unwrap();
-    actor.recheck_console_devices().expect("re-created");
+    actor.recheck_on_start().expect("re-created");
     actor.wait_attempt();
     let agent = m.one_running_agent("no i2c at all");
     assert!(i2c_devices(&agent).is_empty() && console_on(&agent));
@@ -1015,7 +1015,7 @@ fn a_start_re_creates_nothing_that_does_not_move_the_agent() {
     state.probe_output = PROBE_ROOTLESS.into();
     let m = Machine::install(state);
     let actor = m.actor();
-    assert_eq!(actor.recheck_console_devices(), None, "console mode is off");
+    assert_eq!(actor.recheck_on_start(), None, "console mode is off");
     run(&actor, enable());
     let agent = m.one_running_agent("rootful console");
     assert!(i2c_devices(&agent).is_empty());
@@ -1025,7 +1025,7 @@ fn a_start_re_creates_nothing_that_does_not_move_the_agent() {
     drop(actor);
     let actor = m.actor();
     actor.resume().unwrap();
-    assert_eq!(actor.recheck_console_devices(), None);
+    assert_eq!(actor.recheck_on_start(), None);
     assert_eq!(m.agent().id, agent.id, "not re-created");
     assert_eq!(m.inputs()["devices"]["i2c"], serde_json::json!([9]));
 }
@@ -1040,7 +1040,7 @@ fn a_start_whose_probe_fails_keeps_the_agent() {
         .with_state(|s| s.probe_output = "not a report".into());
     let actor = m.actor();
     actor.resume().unwrap();
-    assert_eq!(actor.recheck_console_devices(), None);
+    assert_eq!(actor.recheck_on_start(), None);
     assert_eq!(m.agent().id, agent.id);
 }
 

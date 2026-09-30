@@ -637,6 +637,23 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Dependencies updated (batch of 18 Dependabot PRs).** `node-agent`: the
+  gstreamer-rs group (gstreamer/gstreamer-webrtc/gstreamer-video 0.25.4, glib
+  0.22.10), tokio-rustls 0.26.5, ureq 3.4.2, regex 1.13.1, rustls 0.23.45.
+  `web`: the vite group (vite 8.3.1, @vitest/coverage-v8 5.0.2, jsdom 30.1.0),
+  the react group (react/react-dom/@types/react/@types/react-dom 19.3.0),
+  react-router-dom 7.18.4, @types/node 25.9.8. `site`: astro 7.3.3,
+  @astrojs/starlight 0.42.2, starlight-openapi 0.26.2. `control-plane`:
+  golang.org/x/crypto 0.57.0, github.com/jackc/pgx/v5 5.11.0,
+  github.com/golang-migrate/migrate/v4 4.20.1. CI: docker/setup-buildx-action
+  4.4.1, docker/build-push-action 7.4.0. No behaviour changes beyond the
+  version bumps; full Rust/Go/web/site gates green.
+- **Owned installs start on the stable channel (RH-07, #409).** This is the first stable
+  release of owned installs, so the `edge` start amendment 16 gave them is withdrawn: a
+  new install follows `stable` like any other. **If you installed before this release,
+  your instance is still on `edge`** and keeps receiving branch builds. To follow stable
+  releases, open Admin, Fleet, Releases, set the channel to `stable` and press **Check
+  now**. Nothing is reinstalled; stable lists only releases newer than what you run.
 - **A new owned install starts on the edge release channel (amendment 16).** Every release of
   owned installs is an edge build until a stable one ships, so on `stable` a fresh install's
   Fleet ▸ Releases listed nothing, ever. A control plane running under a recovery actor now
@@ -840,6 +857,25 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A reconnect test no longer fails on a busy machine (#423).** Its waits for a thread that must return were 100 ms; they are now 5 s, so only a real hang fails it.
+- **An app image whose pull was interrupted can be pulled again (#429).** Replacing the node
+  agent while it pulled an image left that pull's journal entry behind, and every later pull
+  of the image failed at once with "image operation outcome unknown" until the control plane
+  gave up and launches failed as `no_host_available`. The next pull now retires the entry and
+  pulls, and the agent clears such entries at startup. A launch refused for want of a host now
+  logs how many hosts have the app's image failed (`hosts_image_failed`).
+- **A GPU change after install no longer leaves the node agent unable to start (RH-07,
+  #432).** The recovery actor probed the GPU only when it installed the agent, so after a
+  card swap, or an NVIDIA machine losing its CDI specification, the engine refused to start
+  the agent it had recorded (`unresolvable CDI devices nvidia.com/gpu=all`) and the actor
+  still logged `this machine's services are installed and running`. Every actor start now
+  probes again: a GPU that changed, vanished or appeared, or an NVIDIA GPU the engine no
+  longer serves, re-creates the agent for what the machine has, through the verified
+  replacement that puts the old one back if the new one does not verify
+  (`actor-gpu-changed`). An agent left stopped with its `unless-stopped` policy is started
+  (`actor-agent-started`), or re-created when the engine refuses (`actor-agent-unstartable`);
+  one Quasar stopped itself is left alone. The start's closing line says what the engine
+  reports, and `actor-services-not-running` names any service that is not running.
 - **On rootless Docker a session's gamepad reaches the game (RH-07, #428).** The app
   user could not open the session's own `/dev/input/event*` nodes: host preparation grants
   them to the Quasar account's group, which is gid 0 inside a rootless Docker container, and

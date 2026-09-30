@@ -1262,10 +1262,23 @@ impl Actor {
         image: &ImageRef,
         revision: u32,
     ) -> Result<(), ResumeError> {
+        if self.decide_gpu_facts(&mut machine.inputs.gpu, image, revision)? {
+            self.dir.machine().store(machine)?;
+        }
+        Ok(())
+    }
+
+    /// [`Actor::decide_gpus`] on `gpu` alone, recording nothing: `true` when the engine
+    /// answered yes and the caller must record it.
+    pub(crate) fn decide_gpu_facts(
+        &self,
+        gpu: &mut recipe::GpuFacts,
+        image: &ImageRef,
+        revision: u32,
+    ) -> Result<bool, ResumeError> {
         use quasar_runtime::GpuInjection;
-        let gpu = &machine.inputs.gpu;
         if gpu.vendor != Some(recipe::GpuVendor::Nvidia) {
-            return Ok(());
+            return Ok(false);
         }
         let want = if revision >= 3 {
             // D10: decided from what the engine reports about itself, never from an error's
@@ -1277,8 +1290,8 @@ impl Actor {
                         token = "actor-gpu-injection-unavailable",
                         "NVIDIA device found, but this engine cannot be given an NVIDIA GPU: it reports no NVIDIA CDI device and is not a rootful Docker (run host preparation, which writes the NVIDIA CDI specification); installing without the NVIDIA shape"
                     );
-                    machine.inputs.gpu.gpus_served = false;
-                    return Ok(());
+                    gpu.gpus_served = false;
+                    return Ok(false);
                 }
             }
         } else {
@@ -1290,7 +1303,7 @@ impl Actor {
             GpuInjection::DeviceRequest
         };
         if gpu.gpus_served && recorded == want {
-            return Ok(());
+            return Ok(false);
         }
         match probe::serves_gpus(
             self.engine.as_ref(),
@@ -1304,9 +1317,9 @@ impl Actor {
                     via = ?want,
                     "NVIDIA: the engine started a GPU probe; installing the NVIDIA shape"
                 );
-                machine.inputs.gpu.gpus_served = true;
-                machine.inputs.gpu.cdi = want == GpuInjection::Cdi;
-                self.dir.machine().store(machine)?;
+                gpu.gpus_served = true;
+                gpu.cdi = want == GpuInjection::Cdi;
+                Ok(true)
             }
             probe::GpusAnswer::Refused(why) => {
                 warn!(
@@ -1315,10 +1328,10 @@ impl Actor {
                     "NVIDIA device found, but the engine does not serve the GPU request: {why}; installing without the NVIDIA shape (is the NVIDIA Container Toolkit installed for this engine?)"
                 );
                 // This agent only; the stored answer is left for the next create to re-ask.
-                machine.inputs.gpu.gpus_served = false;
+                gpu.gpus_served = false;
+                Ok(false)
             }
         }
-        Ok(())
     }
 
     pub(crate) fn record(

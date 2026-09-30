@@ -17,8 +17,9 @@ which of your machines can take one.
 Each release also publishes a **floor**: the oldest node agent and recovery actor
 its control plane still manages. A host below it reads **Must update before it
 can be managed**, and is offered only the update that lifts it, never a revert.
-Every release so far is on the **edge** channel; there is no stable release of
-owned installs yet.
+Owned installs have stable releases now. An install that started on the **edge**
+channel before the first one stays there until you
+[switch it](#moving-an-edge-install-to-stable).
 
 This is Quasar updating Quasar. It has nothing to do with the app catalog's
 images, which have their own versions and their own [rollout
@@ -63,9 +64,9 @@ An instance follows one **channel** at a time.
 
 | Channel | What it lists |
 | --- | --- |
-| `stable` | Tagged releases, with notes and a published release manifest. Prereleases are hidden. The default, except on an owned install. |
+| `stable` | Tagged releases, with notes and a published release manifest. Prereleases are hidden. The default. |
 | `beta` | The same tagged releases and the prereleases among them, such as a release candidate. Applied through exactly the same path as a stable release. |
-| `edge` | Whatever was last published from a branch. No version and no notes. Where an owned install starts, for now. |
+| `edge` | Whatever was last published from a branch. No version and no notes. |
 
 A prerelease has not been through a release cut. It can carry a migration that
 the next prerelease revises, and migrations only go forward, so run `beta` on an
@@ -81,14 +82,13 @@ failure and needs no action.
 selector. That field selects nothing while the channel is stable, and it survives
 a switch, so you can set it once.
 
-<Aside type="caution" title="An owned install needs edge, for now">
-Every release of owned installs so far is on `edge`, so a new owned install
-starts on `edge`. A legacy Compose or source install starts on `stable`. An owned
-install made before this default arrived started on `stable`, where it lists
-nothing and says nothing newer has been detected: set the channel to `edge` once,
-press **Check now**, and leave it there until a stable release of owned installs
-ships.
-</Aside>
+### Moving an edge install to stable
+
+Until the first stable release, every owned install started on `edge`, and it
+stays there after upgrading. To follow stable releases instead, set the channel
+to `stable` and press **Check now**. Nothing is reinstalled: stable lists only
+releases newer than what is installed, so on a recent edge build it may list
+nothing until the next stable release ships, and says so.
 
 Switching the channel changes **what is listed, never what is installed**, and it
 does not start a check by itself.

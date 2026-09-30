@@ -485,13 +485,12 @@ fn actor() -> ExitCode {
     unbound(actor.serve());
     serve_operator(&actor);
 
-    match actor.resume() {
-        Ok(()) if actor.retired() => {}
-        Ok(()) => info!("this machine's services are installed and running"),
-        Err(e) => error!(
+    let resumed = actor.resume();
+    if let Err(e) = &resumed {
+        error!(
             token = "actor-resume-failed",
             "{e}; the install is retried on the next start, and status keeps being served"
-        ),
+        );
     }
     if !actor.retired() {
         // A first install learns its role from the seed's inputs; bind what it needs.
@@ -507,10 +506,8 @@ fn actor() -> ExitCode {
         if !actor.serving() {
             return ExitCode::FAILURE;
         }
-        // RH-07 #407: console devices (i2c nodes above all) can change across a reboot.
-        if let Some(id) = actor.recheck_console_devices() {
-            info!(request = %id, "re-creating the node agent for the host's console devices");
-        }
+        // The GPU (#432) and console devices (#407) can change across a reboot.
+        actor.finish_start(resumed.is_ok());
     }
 
     // A hand-over stops this process's sockets on purpose while it waits to be stopped or

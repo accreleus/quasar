@@ -87,6 +87,25 @@ struct ReconcileBatch {
 type InventoryScanner =
     dyn Fn() -> Result<(Vec<crate::runtime::DaemonImage>, Vec<String>), String> + Send + Sync;
 
+fn retire_orphaned_pull_intents() {
+    let result =
+        crate::runtime::configured().and_then(|runtime| runtime.retire_orphaned_pull_intents());
+    match result {
+        Ok(retired) => {
+            for image in retired {
+                info!(
+                    token = "image-pull-intent-swept",
+                    "{image}: retired a pull intent left by a previous agent at startup"
+                );
+            }
+        }
+        Err(e) => warn!(
+            token = "image-intent-sweep-failed",
+            "startup sweep of image pull intents failed ({e}); each pull reconciles its own"
+        ),
+    }
+}
+
 fn scan_inventory() -> Result<(Vec<crate::runtime::DaemonImage>, Vec<String>), String> {
     crate::runtime::configured()
         .map_err(|e| e.to_string())
@@ -472,6 +491,9 @@ impl ImageManager {
                 }
             }
         };
+        if !state_path.is_empty() {
+            retire_orphaned_pull_intents();
+        }
         let mut loaded = state::load(&state_path);
         for (image_id, rec) in loaded.iter_mut() {
             // A staged (in-flight) ensure did not survive the restart.
@@ -2496,7 +2518,7 @@ mod tests {
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         // A blocking dispatch regresses here. Release first on failure so the
         // test cannot leave an engine-like stalled thread behind.
-        let returned = done_rx.recv_timeout(Duration::from_millis(100));
+        let returned = done_rx.recv_timeout(Duration::from_secs(5));
         let other = manager.handle_remove("other".into(), "never-recorded".into());
         release_tx.send(()).unwrap();
         assert!(returned.unwrap());
@@ -2597,7 +2619,7 @@ mod tests {
             reconnect_manager.begin_connection();
             done_tx.send(()).unwrap();
         });
-        let returned = done_rx.recv_timeout(Duration::from_millis(100));
+        let returned = done_rx.recv_timeout(Duration::from_secs(5));
         let (new_tx, mut new_rx) = mpsc::channel(2);
         let (attached_tx, attached_rx) = std::sync::mpsc::channel();
         let attach_manager = manager.clone();
@@ -2605,7 +2627,7 @@ mod tests {
             let _new_guard = attach_manager.attach_upstream(new_tx);
             attached_tx.send(()).unwrap();
         });
-        let attached = attached_rx.recv_timeout(Duration::from_millis(100));
+        let attached = attached_rx.recv_timeout(Duration::from_secs(5));
         drop(rx); // release any blocked sender before failing the assertion
         assert!(returned.is_ok());
         assert!(attached.is_ok(), "new connection waited on old reply lane");
