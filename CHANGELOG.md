@@ -841,6 +841,18 @@ own; the two do not move together, and that is deliberate.
   gave up and launches failed as `no_host_available`. The next pull now retires the entry and
   pulls, and the agent clears such entries at startup. A launch refused for want of a host now
   logs how many hosts have the app's image failed (`hosts_image_failed`).
+- **A GPU change after install no longer leaves the node agent unable to start (RH-07,
+  #432).** The recovery actor probed the GPU only when it installed the agent, so after a
+  card swap, or an NVIDIA machine losing its CDI specification, the engine refused to start
+  the agent it had recorded (`unresolvable CDI devices nvidia.com/gpu=all`) and the actor
+  still logged `this machine's services are installed and running`. Every actor start now
+  probes again: a GPU that changed, vanished or appeared, or an NVIDIA GPU the engine no
+  longer serves, re-creates the agent for what the machine has, through the verified
+  replacement that puts the old one back if the new one does not verify
+  (`actor-gpu-changed`). An agent left stopped with its `unless-stopped` policy is started
+  (`actor-agent-started`), or re-created when the engine refuses (`actor-agent-unstartable`);
+  one Quasar stopped itself is left alone. The start's closing line says what the engine
+  reports, and `actor-services-not-running` names any service that is not running.
 - **On rootless Docker a session's gamepad reaches the game (RH-07, #428).** The app
   user could not open the session's own `/dev/input/event*` nodes: host preparation grants
   them to the Quasar account's group, which is gid 0 inside a rootless Docker container, and

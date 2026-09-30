@@ -15,7 +15,7 @@ use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
 use quasar_recovery::socket::{Request, State};
 use quasar_recovery::trust::{self, SignatureEvidence};
 use quasar_recovery::{identity, operator, server, shutdown, uninstall};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const USAGE: &str = "usage: quasar-recovery <command>
 
@@ -485,13 +485,12 @@ fn actor() -> ExitCode {
     unbound(actor.serve());
     serve_operator(&actor);
 
-    match actor.resume() {
-        Ok(()) if actor.retired() => {}
-        Ok(()) => info!("this machine's services are installed and running"),
-        Err(e) => error!(
+    let resumed = actor.resume();
+    if let Err(e) = &resumed {
+        error!(
             token = "actor-resume-failed",
             "{e}; the install is retried on the next start, and status keeps being served"
-        ),
+        );
     }
     if !actor.retired() {
         // A first install learns its role from the seed's inputs; bind what it needs.
@@ -507,9 +506,10 @@ fn actor() -> ExitCode {
         if !actor.serving() {
             return ExitCode::FAILURE;
         }
-        // RH-07 #407: console devices (i2c nodes above all) can change across a reboot.
-        if let Some(id) = actor.recheck_console_devices() {
-            info!(request = %id, "re-creating the node agent for the host's console devices");
+        // The GPU (#432) and console devices (#407) can change across a reboot.
+        let attempt = actor.recheck_on_start();
+        if resumed.is_ok() {
+            report_services(&actor, attempt);
         }
     }
 
@@ -532,6 +532,31 @@ fn actor() -> ExitCode {
             return ExitCode::FAILURE;
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// What this start leaves running, as the engine says it is.
+fn report_services(actor: &Actor, attempt: Option<String>) {
+    if let Some(id) = attempt {
+        info!(
+            request = %id,
+            "this machine's services are installed; the node agent is being re-created"
+        );
+        return;
+    }
+    match actor.services_not_running() {
+        Ok(stopped) if stopped.is_empty() => {
+            info!("this machine's services are installed and running")
+        }
+        Ok(stopped) => warn!(
+            token = "actor-services-not-running",
+            "this machine's services are installed, but these are not running: {}",
+            stopped.join(", ")
+        ),
+        Err(e) => warn!(
+            token = "actor-services-state-unknown",
+            "this machine's services are installed; the engine did not say whether they run ({e})"
+        ),
     }
 }
 

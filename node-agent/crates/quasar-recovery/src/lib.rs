@@ -9,6 +9,8 @@
 //! - [`engine`] is the engine port: the real Docker adapter and an in-memory fake.
 //! - [`machine`] is the machine-state layout; [`server`] the agent socket. [`console`] is
 //!   the agent's console-mode request (RH-07 #395), a reconfigure of the agent alone.
+//!   [`start_check`] is what every start looks at once `resume` is done: the agent fits
+//!   this machine's GPU and devices, and runs (#432).
 //! - [`seed`] is the seed mode (ADR 0007): the frozen `seed.json`, labels and actor
 //!   profile, and the loop that keeps a recovery actor in existence. [`bootstrap`] is the
 //!   install inputs the seed checks and its first actor reads.
@@ -46,6 +48,7 @@ pub mod server;
 pub mod settle;
 pub mod shutdown;
 pub mod socket;
+pub mod start_check;
 pub mod submit;
 pub mod trust;
 pub mod uninstall;
