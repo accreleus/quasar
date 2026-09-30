@@ -630,11 +630,25 @@ mod tests {
     #[test]
     fn every_helper_script_parses_in_the_helper_shell() {
         use std::process::Command;
-        for op in [DbOp::Size, DbOp::Dump, DbOp::Inspect, DbOp::Load, DbOp::Import, DbOp::Schema] {
+        for op in [
+            DbOp::Size,
+            DbOp::Dump,
+            DbOp::Inspect,
+            DbOp::Load,
+            DbOp::Import,
+            DbOp::Schema,
+        ] {
             let script = op.script();
             assert!(script.contains("set -o pipefail"), "{op:?} lost pipefail");
-            let out = Command::new(HELPER_SHELL).args(["-n", "-c", &script]).output().unwrap();
-            assert!(out.status.success(), "{op:?}: {}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new(HELPER_SHELL)
+                .args(["-n", "-c", &script])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{op:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 
