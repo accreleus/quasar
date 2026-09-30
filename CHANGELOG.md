@@ -637,6 +637,17 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Dependencies updated (batch of 18 Dependabot PRs).** `node-agent`: the
+  gstreamer-rs group (gstreamer/gstreamer-webrtc/gstreamer-video 0.25.4, glib
+  0.22.10), tokio-rustls 0.26.5, ureq 3.4.2, regex 1.13.1, rustls 0.23.45.
+  `web`: the vite group (vite 8.3.1, @vitest/coverage-v8 5.0.2, jsdom 30.1.0),
+  the react group (react/react-dom/@types/react/@types/react-dom 19.3.0),
+  react-router-dom 7.18.4, @types/node 25.9.8. `site`: astro 7.3.3,
+  @astrojs/starlight 0.42.2, starlight-openapi 0.26.2. `control-plane`:
+  golang.org/x/crypto 0.57.0, github.com/jackc/pgx/v5 5.11.0,
+  github.com/golang-migrate/migrate/v4 4.20.1. CI: docker/setup-buildx-action
+  4.4.1, docker/build-push-action 7.4.0. No behaviour changes beyond the
+  version bumps; full Rust/Go/web/site gates green.
 - **Owned installs start on the stable channel (RH-07, #409).** This is the first stable
   release of owned installs, so the `edge` start amendment 16 gave them is withdrawn: a
   new install follows `stable` like any other. **If you installed before this release,
