@@ -1,105 +1,41 @@
 ---
 title: Engine profiles
-description: What Quasar has tested on each container engine, engine mode and platform, and what to do about a profile that is not supported.
+description: Which container engine and mode Quasar supports on each platform.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
 import EngineProfiles from '../../../components/EngineProfiles.astro';
 
-An **engine profile** is one tested combination of platform, container engine
-(Docker or Podman) and engine mode (rootful, running as root, or rootless, an
-ordinary account). Quasar publishes a status for each one it has an opinion about, and
-never implies one it has not tested. The quick start's engine step and the
-[one-line add-host command](/quasar/install/second-host/) show the same
-statuses, from the same table. A host's readiness card (its `runtime_engine`
-check) is held to that table too, so the badge below is the verdict the card will
-give it.
-
-## What the statuses mean
-
-- **Supported.** Validated end to end: a real session with input and audio, an
-  update applied from the console, and a reboot after which everything comes
-  back. Rootful Docker is this everywhere, including Unraid. It is the engine
-  profile Quasar has always run on, so nothing about it changed.
-- **Experimental.** Works, or is expected to, but has not yet been through that
-  same acceptance run on hardware. The quick start and enrollment let it
-  through; if something does not work, the host's readiness card names it, and
-  a report helps turn it into Supported. Fedora and Ubuntu 24.04 carry most of
-  the experimental rows today, waiting on the acceptance evidence tracked
-  in #409.
-- **Unsupported.** Nothing has been tested, or it is known not to work, and the
-  reason says which. The quick start generates nothing for it (Next stays
-  disabled at the engine step), and enrollment refuses it by name before
-  anything is pulled. The table's alternatives column (shown when you pick an
-  unsupported combination) points at the nearest profile that is Supported or
-  Experimental instead: rootful Docker on this platform, or Fedora with
-  rootless Podman or rootless Docker.
-
-## The table
+An **engine profile** is a platform plus a container engine (Docker or Podman) in
+one mode: **rootful** (runs as root) or **rootless** (runs as an ordinary account).
+The quick start, the add-host command and each host's readiness card all use this
+table.
 
 <EngineProfiles />
 
-## Unraid
+- **Supported**: tested end to end (sessions, input, audio, updates, reboot).
+- **Experimental**: expected to work, not yet fully tested. Allowed.
+- **Unsupported**: untested or known not to work. The quick start and the add-host
+  command refuse it and suggest an alternative.
 
-Unraid stays on rootful Docker. It has neither Podman nor rootless Docker, so
-nothing about its install path changed for RH-07: the quick start's Unraid
-script is the same one it has always been, host preparation is skipped (it
-writes under `/etc`, which Unraid recreates at every boot), and the sysctl and
-`uinput` module are persisted through `/boot/config/go` as before.
-
-## GPU vendors
-
-The table above is about the engine, not the GPU. AMD and NVIDIA are what
-Quasar is validated on, on every required profile. Intel GPUs are untested
-on any engine profile. VA-API is what detection picks, and nobody has run a
-session on one yet. See [Requirements](/quasar/start/requirements/#gpu) for the
-GPU-vendor table.
+Hover a badge for the reason. Rootful Docker works everywhere, including Unraid.
+GPU support is separate: see [Requirements](/quasar/start/requirements/#gpu).
 
 ## Root equivalence
 
-**A rootful engine's socket is equivalent to root on that machine.** Docker
-Engine and rootful Podman both run as root, and whoever holds their socket can
-do anything the machine's root account can: start a container with any mount,
-any capability, any device. Quasar holds that socket on a rootful install, the
-same way any container manager does. This is not a Quasar limitation to work
-around; it is what a rootful engine is. A request filter in front of the
-socket, narrowing what a holder of it can ask for, is a real idea and a
-tracked follow-up issue, not part of this release. Choosing rootless
-Docker or rootless Podman is how you avoid holding a root-equivalent socket at
-all: the engine itself never runs as root, so there is no root-equivalent
-socket to protect.
+A rootful engine's socket is root on that machine, and Quasar holds it on a rootful
+install, like any container manager does. To avoid that, use rootless Docker or
+rootless Podman.
 
-<Aside type="note" title="Why the node agent runs unconfined by SELinux">
-On an SELinux host the node agent's container is started with
-`--security-opt label=disable` (visible in every install command on this
-site). That looks like a step backward, but it is not: the agent already holds
-a root-equivalent engine socket on a rootful install, so an SELinux label on
-top of it narrows nothing that matters: the socket is the privilege boundary,
-not the label. The **sessions** the agent starts are not exempted: they get no
-such flag and stay confined under their own container's policy, same as
-before.
-</Aside>
+For the same reason the node agent runs with `--security-opt label=disable` on
+SELinux hosts: the socket is already the privilege boundary. Game sessions stay
+confined.
 
 ## Rootless Docker and home ownership
 
-On **rootless Podman**, session containers map their app user onto the Quasar
-account with `keep-id`, so every file a session writes under the homes root is
-owned on the host by the `quasar` account, the same account that runs
-everything else.
+On rootless Docker, files in user homes are owned on the host by a subordinate uid
+rather than the `quasar` account, so `ls -n` shows a large number as owner. This is
+harmless, and the `homes_root_writable` readiness check notes it. Rootless Podman
+maps them to `quasar`.
 
-**Rootless Docker has no equivalent per-container user mapping.** A session's
-files are still written safely, but they land on the host owned by a
-subordinate UID/GID, one of the range `prepare-host.sh` assigned the account,
-not the account's own uid. Nothing is blocked by this: sessions run and homes
-work. It only means a listing of the homes root, `ls -n`, shows a large
-unfamiliar number as the owner instead of `quasar`. The `homes_root_writable`
-readiness check warns about it by name on rootless Docker, so it shows up on
-the host's readiness card rather than being a surprise the first time someone
-looks at the filesystem.
-
-If you want home files owned by the `quasar` account on disk, use rootless
-Podman. Do not try to fix rootless Docker's homes after the fact by re-owning
-them in place. See [Moving to rootless](/quasar/install/move-to-rootless/)
-for the supported way to change engine and pick up correct ownership, which
-copies files into a freshly owned homes root rather than `chown -R`-ing the
-one you have.
+Don't `chown -R` the homes to change this. To switch engines, see
+[Moving to rootless](/quasar/install/move-to-rootless/).

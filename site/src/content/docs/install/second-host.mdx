@@ -1,238 +1,108 @@
 ---
 title: Add a second GPU host
-description: One command on the new machine, created from the admin console. What it checks, what it starts, and what to do when it says no.
+description: Enroll another GPU machine with one command from the admin console.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
 {/* Keep this page's slug: the console's Add host dialog links to /install/second-host/ (web/src/pages/admin/fleet/AddHostModal.tsx). */}
 
-Each host runs one node agent. It reports its GPUs, capacity and readiness to the
-control plane and receives sessions from it. The control plane holds no GPU state, so
-adding a host is enrolling one more agent.
-
-The command **detects the new host's container engine and its mode** (Docker or
-Podman, rootful or rootless) itself; you do not tell it which. It looks up that
-combination, plus the host's platform, in the same [engine
-profiles](/quasar/start/engine-profiles/) table the quick start uses: an
-Unsupported profile is refused by name, with the reason and the nearest
-supported alternative, before anything is pulled. On a **rootless** engine, run
-the command as the `quasar` account (the one [host
-preparation](/quasar/install/prepare-host/) created), not as root or your own
-login. A rootless engine's socket belongs to that account, and running as
-root would either miss it or reach a different, rootful engine on the same
-machine by mistake.
+Each GPU host runs one node agent. Adding a host means enrolling one more agent
+with the control plane.
 
 ## Before you start
 
-On the new machine you need:
+On the new machine:
 
-- Linux with a GPU whose kernel driver is loaded (`ls /dev/dri` shows a `renderD*` node).
-- Docker Engine. The command does not install Docker, and needs no Compose.
-- On an NVIDIA host, the NVIDIA Container Toolkit. Quasar asks the engine for the GPU
-  itself and accepts the toolkit however it is wired in: an `nvidia` runtime, CDI, or
-  the toolkit's hook.
-- Root, or a user with passwordless `sudo`. The script never prompts for a password; if
-  your `sudo` asks for one, open a root shell first (`sudo -i`) and paste the command
-  there.
-- A route to the control plane's `https://` address. Nothing else needs to be open
-  towards the control plane; players reach the host directly for media, which the
-  host's readiness check reports on afterwards.
-
-The control plane has to know which images a new host installs: the seed and the node
-agent, both by digest. It offers the installed release's images, otherwise the
-recovery and agent images its own machine runs now (after a developer apply, the ones
-it was moved to), and otherwise the ones that machine was installed with. To pin others, give
-the first machine's seed `QUASAR_ENROLL_SEED_IMAGE` and `QUASAR_ENROLL_AGENT_IMAGE`
-at its install. If it knows neither, the dialog says so and creates nothing.
+- Linux with a working GPU driver (`ls /dev/dri` shows a `renderD*` node).
+- Docker or Podman, in a [supported engine profile](/quasar/start/engine-profiles/).
+  The command detects which.
+- On NVIDIA, the NVIDIA Container Toolkit.
+- Root or passwordless `sudo`. On a **rootless** engine, use the `quasar` account
+  from [host preparation](/quasar/install/prepare-host/) instead.
+- Network access to the control plane's `https://` address.
 
 ## 1. Create the command
 
-Open the admin console **over `https://`**, go to **Fleet, Hosts** and press **Add
-host**. Optionally give a node name: it binds the command to that name, and using an
-existing host's name re-enrolls that host and keeps its history. Choose how long the
-command stays valid (one hour by default, up to 30 days), then press **Create
-command**. The **One-line command** tab shows a command of this shape:
+In the admin console, go to **Fleet ▸ Hosts** and press **Add host**. Optionally
+name the host (reusing an existing name re-enrolls it), pick how long the command
+stays valid, and press **Create command**. You get:
 
 ```bash
 curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
   | QUASAR_ENROLLMENT='qenr1.…' sh
 ```
 
-The control plane serves the script itself, with the seed and agent images it installs
-written into it, so a host you add tomorrow runs what the control plane names today,
-and the command and the stack on the other tab cannot name different images.
+The enrollment string works once. With the default self-signed certificate, the
+dialog shows its fingerprint: it should match the `fingerprint=` the control plane
+printed at startup. If it doesn't, stop.
 
-If the control plane serves its own self-signed certificate, the dialog also shows that
-certificate's fingerprint. It is the same value the control plane printed as
-`fingerprint=` when it started. If the two differ, stop: something between your browser
-and the control plane is presenting another certificate. With a real-CA certificate there
-is nothing to compare and nothing is pinned.
-
-The string inside the command is single use. Copy the command whole; it is meant to be
-pasted, not typed.
-
-<Aside type="tip" title="About -k, and why the string is an environment variable">
-`-k` never appears alone. With the default self-signed certificate the command pairs it
-with `--pinnedpubkey`, so `curl` trusts nothing except the control plane's own public
-key, whose hash the dialog read from the same certificate it shows the fingerprint of.
-Anyone on the path presenting another certificate is refused. With a real-CA
-certificate neither flag appears and `curl` verifies normally. The pairing also runs the
-other way: `--pinnedpubkey` **on its own** fails a self-signed control plane with
-`SSL certificate problem: self-signed certificate (18)`, because `curl` validates the
-chain before it ever looks at the pin. Keep both flags, or neither. The agent then pins the
-fingerprint inside the string. A token in a URL would land in proxy logs and browser
-history; in an environment variable, on a disposable credential, the only trace is your
-shell history, and the token is dead once used.
+<Aside type="tip" title="Read before you run">
+As with any script piped to `sh`, read it first. Download it with the same `curl`
+flags plus `-o enroll-host.sh`, then read it or run `sh enroll-host.sh --help`.
 </Aside>
 
 ## 2. Run it on the new machine
 
-Paste the command as root, or as a user who can `sudo`, or, on a rootless
-engine, as the `quasar` account (`machinectl shell quasar@` gets you a proper
-session for it; see [Install with Podman
-(Quadlet)](/quasar/install/podman-quadlet/#getting-a-rootless-session-as-the-quasar-account)).
-The script prints every step.
+Paste the command as root, a `sudo` user, or on rootless, the `quasar` account
+(`machinectl shell quasar@`, see
+[Install with Podman](/quasar/install/podman-quadlet/#getting-a-rootless-session-as-the-quasar-account)).
 
-<Aside type="tip" title="Podman users">
-Everywhere this page shows a `docker` command, replace it with `podman`; on
-rootless, run it as the `quasar` account rather than root. The script itself
-detects the engine and needs no such substitution.
-</Aside>
+The script checks the host (engine, render node, `/dev/uinput`, user namespaces,
+NVIDIA toolkit), offers to fix what fails, then pulls the images and starts the
+seed. When it's done you'll see:
 
-It checks the host the way the agent's own readiness check will: Docker, a render node,
-`/dev/uinput`, unprivileged user namespaces (on Ubuntu 24.04 and later that means
-`kernel.apparmor_restrict_unprivileged_userns`), and the NVIDIA Container Toolkit on an
-NVIDIA host. It also loads the app-container AppArmor profile. A failed check stops
-before anything is started and prints its fix, which the script applies if you answer
-`y`, or if you run it with `QUASAR_ENROLL_FIX=1` or `sh -s -- --fix`.
+> `enrolled: this host is now '<name>' in Admin → Fleet.`
 
-Then it pulls the two images, starts the seed with the enrollment string, the home root
-and the template root beside it, and waits until the agent has enrolled.
+The host appears in the Fleet table within seconds. Running the command again is
+safe.
 
-> You should see `enrolled: this host is now '<name>' in Admin → Fleet.` The host
-> appears in the Fleet table within a few seconds, online.
-
-It writes **no compose file, no `.env` and no install directory**. A host installed by
-the command is indistinguishable afterwards from one whose seed you started yourself.
-Running the command again on an installed machine starts nothing and changes nothing;
-a run interrupted before the recovery actor existed is completed by running it again.
-
-The script's own inputs, set in front of `sh` like the string:
+Optional settings, set in front of `sh` like the string:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_HOME_ROOT` | `/var/lib/quasar/homes` | The home root on this machine. |
+| `QUASAR_HOME_ROOT` | `/var/lib/quasar/homes` | Where user homes live on this machine. |
 | `QUASAR_TEMPLATE_ROOT` | beside the home root | The template root. |
-| `QUASAR_NODE_NAME` | the machine's host name | The node name, when the command was not bound to one. |
-| `QUASAR_ENROLL_APPARMOR_PERSIST` | off | `1` also installs the AppArmor profile so it loads at every boot. `QUASAR_ENROLL_FIX=1` and `--fix` do the same; answering `y` at a prompt does not. |
-| `QUASAR_ENROLL_DRY_RUN` | off | `1` checks the host and prints what it would start, and starts nothing. |
+| `QUASAR_NODE_NAME` | the machine's host name | The host's name, if the command didn't set one. |
+| `QUASAR_ENROLL_FIX` | off | `1` fixes failed checks without asking. |
+| `QUASAR_ENROLL_DRY_RUN` | off | `1` checks the host and starts nothing. |
 
-The script lists every input, including `QUASAR_RESET_IDENTITY` (below), when run
-with `--help`. It reads that text from its own file, so download it first, with the
-same `curl` flags as the command from the dialog, then run it:
-
-```bash
-curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
-  -o enroll-host.sh
-```
-
-```bash
-sh enroll-host.sh --help
-```
-
-## The recovery actor comes with it
-
-What starts on the host is the **seed**, one small container. It creates the host's
-**recovery actor**, and the recovery actor creates the node agent. The recovery actor is
-what lets this host be updated from the admin console later, because a container cannot
-replace itself. It stores the enrollment string as a secret file in the host's
-`quasar-machine` volume and hands it to the agent as a file, never as an environment
-variable.
-
-The host's page under Admin, Fleet, Hosts has a **Services on this machine** card: the
-seed, the recovery actor and the node agent, each with its version and owner. A seed that
-reads *not found* has been stopped or removed. Quasar keeps running without it, but a
-deleted recovery actor could then not be re-created, so start the seed again.
-
-From the host itself:
+To check what's running on the host:
 
 ```bash
 docker ps --filter label=io.quasar.installation
-```
-
-```bash
 docker exec quasar-recovery quasar-recovery status
 ```
 
 ## When it says no
 
-The last line names the reason. On a machine this run was installing, a refusal takes
-the install away again, so nothing is left behind: create a new command in **Add host**
-and run it.
+The last line names the reason. A failed install removes itself, so just fix the
+cause and run a fresh command.
 
-- **The enrollment string was refused (`auth_failed`).** It expired, was already used, or
-  was created for a different node name. Create a new command.
-- **A live agent is already registered under this name.** A name cannot be taken over
-  while its agent is connected. Stop that agent, or create a command with another node
-  name.
-- **`cp-tls-pin-mismatch`.** The certificate the control plane presented is not the one
-  the string pins. Create the command from the control plane's own page.
-- **A host check.** The fix is printed with it. Apply it, or let the script apply it,
-  and run the same command again: nothing was started, so the string is still unused.
-- **This machine still runs the Compose-installed node agent** from the earlier one-line
-  install. Remove that stack first, then run the command again. Homes are kept:
+| Message | Fix |
+| --- | --- |
+| `auth_failed` | The string expired, was used, or is for another name. Create a new command. |
+| Name already registered | That host's agent is still connected. Stop it, or pick another name. |
+| `cp-tls-pin-mismatch` | The certificate doesn't match. Create the command from the control plane's own page. |
+| A host check failed | Apply the printed fix and rerun the same command. |
+| Old Compose agent found | Run `docker compose --project-directory /opt/quasar-agent down` (homes are kept), then rerun. |
+| A seed already exists | Quasar is already installed here, through that seed. Keep it, or remove it first. |
+| Still connecting | Check `docker logs -f quasar-node-agent`. Usually the control plane's address isn't reachable from this machine. |
 
-  ```bash
-  docker compose --project-directory /opt/quasar-agent down
-  ```
+To re-enroll a machine that was installed before, put `QUASAR_RESET_IDENTITY=1` in
+front of `sh`. It removes that machine's Quasar containers and volumes (never the
+homes) and enrolls from scratch. It refuses on a machine that runs the control plane.
 
-- **This machine already has a seed** started by a stack manager or by hand. Quasar is
-  installed through that one: keep it, or remove that seed first.
-- **Still connecting.** The agent has not reached the control plane in time. Follow its
-  log, and run the command again to resume the wait; it changes nothing:
-
-  ```bash
-  docker logs -f quasar-node-agent
-  ```
-
-  The usual cause is that the control plane's address in the string is not reachable
-  from this machine.
-
-**A machine installed earlier keeps the string it was installed with**, so a new string
-does nothing on its own there: for instance after its identity was lost, or to repurpose
-it. Create a new command and run it with `QUASAR_RESET_IDENTITY=1` in front of `sh`. It
-first removes this machine's seed, recovery actor, node agent and their volumes, the
-agent's saved identity included, never the homes, and then enrolls from scratch. It
-refuses, and removes nothing, on a machine that holds a Quasar control plane or
-Postgres: a container of either, or either one's volume.
-
-If the seed or the recovery actor refuses to install, the script quotes its log line.
-[Install and startup
-problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor) explains the
-ones you are likely to meet.
+More: [Install and startup problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor).
 
 ## Using Dockge or Arcane
 
-The **Dockge or Arcane** tab of the same dialog creates a stack instead: the seed alone,
-with the enrollment string and images filled in. Paste it into your stack manager. The
-stack holds only the seed. Quasar's own services start beside it as separate containers,
-and redeploying or removing the stack never touches them.
-
-**Preparing the host is then your job**: the render node, `/dev/uinput`, user
-namespaces and the AppArmor profile, which the one-line command checks and fixes and a
-stack cannot. Once the host enrolls, its readiness card lists anything that is missing.
-The same seed as a `docker run` line is in [Install
-Quasar](/quasar/install/install/#add-a-gpu-host).
-
-Private or credentialed registries are not supported, so an air-gapped install is not
-covered.
-
-A host added to a [legacy Compose install](/quasar/install/legacy-compose/#adding-a-gpu-host)
-gets that release's agent-only Compose project instead.
+The dialog's **Dockge or Arcane** tab gives you a stack to paste instead. You then
+prepare the host yourself (render node, `/dev/uinput`, user namespaces, AppArmor);
+the host's readiness card lists anything missing.
 
 ## Storage across hosts
 
-Hosts can use different local storage roots. If you want saves to follow a user between
-machines, back those roots with shared storage. Otherwise set the `locality` placement
-policy so Quasar prefers the host that already holds that user's home directory.
+To have saves follow a user between hosts, put the home roots on shared storage.
+Otherwise, set the `locality` placement policy so Quasar prefers the host that
+already has the user's home.

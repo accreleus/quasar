@@ -1,8 +1,8 @@
 ---
 /**
- * The published engine-profile table (RH07-14, #406): for each platform,
- * container engine and engine mode, whether Quasar calls it supported,
- * experimental or unsupported, and why.
+ * The published engine-profile table (RH07-14, #406): one row per platform,
+ * one column per container engine and engine mode, a status badge in each cell
+ * (the reason is the cell's tooltip).
  *
  * Reads testdata/engine-profiles/profiles.json through engine-profiles.js —
  * the same table the quick start's step 2 renders and the node agent's
@@ -21,51 +21,39 @@ import { ENGINES, MODES, PLATFORMS, profileFor } from '../data/engine-profiles.j
 const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
 const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
 
-const engineIds = Object.keys(ENGINES);
 const platformIds = Object.keys(PLATFORMS);
+// One column per engine and mode: Docker rootful, Docker rootless, Podman rootful, Podman rootless.
+const columns = Object.keys(ENGINES).flatMap((engine) => MODES.map((mode) => ({ engine, mode })));
+const modeLabel = (mode) => (mode === 'rootful' ? 'rootful' : 'rootless');
 ---
 
-{platformIds.map((platformId) => {
-	const platform = PLATFORMS[platformId];
-	const rows = engineIds.flatMap((engine) =>
-		MODES.map((mode) => ({ engine, mode, profile: profileFor(platformId, engine, mode) })),
-	);
-	return (
-		<div class="ep-platform">
-			<h3>{platform.label}</h3>
-			<table class="ep-table">
-				<thead>
-					<tr>
-						<th>Engine</th>
-						<th>Mode</th>
-						<th>Status</th>
-						<th>Why</th>
-					</tr>
-				</thead>
-				<tbody>
-					{rows.map(({ engine, mode, profile }) => (
-						<tr>
-							<td>{ENGINES[engine].label}</td>
-							<td>{mode === 'rootful' ? 'Rootful' : 'Rootless'}</td>
-							<td>
-								<Badge size="small" variant={BADGE_VARIANT[profile.status]} text={BADGE_TEXT[profile.status]} />
-							</td>
-							<td>{profile.reason}</td>
-						</tr>
-					))}
-				</tbody>
-			</table>
-		</div>
-	);
-})}
+<table class="ep-table">
+	<thead>
+		<tr>
+			<th>Platform</th>
+			{columns.map(({ engine, mode }) => (
+				<th>{ENGINES[engine].label} {modeLabel(mode)}</th>
+			))}
+		</tr>
+	</thead>
+	<tbody>
+		{platformIds.map((platformId) => (
+			<tr>
+				<td>{PLATFORMS[platformId].label}</td>
+				{columns.map(({ engine, mode }) => {
+					const profile = profileFor(platformId, engine, mode);
+					return (
+						<td title={profile.reason}>
+							<Badge size="small" variant={BADGE_VARIANT[profile.status]} text={BADGE_TEXT[profile.status]} />
+						</td>
+					);
+				})}
+			</tr>
+		))}
+	</tbody>
+</table>
 
 <style>
-	.ep-platform {
-		margin: 1.75rem 0;
-	}
-	.ep-platform h3 {
-		margin-bottom: 0.5rem;
-	}
 	.ep-table {
 		width: 100%;
 		border-collapse: collapse;
@@ -78,8 +66,8 @@ const platformIds = Object.keys(PLATFORMS);
 		border-bottom: 1px solid var(--sl-color-hairline, var(--q-line-2));
 		vertical-align: top;
 	}
-	/* The status badge never wraps mid-word in a narrow column. */
-	.ep-table td:nth-child(3) {
+	/* A status badge never wraps mid-word in a narrow column. */
+	.ep-table td:not(:first-child) {
 		white-space: nowrap;
 	}
 	.ep-table th {
