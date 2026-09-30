@@ -1147,7 +1147,7 @@ own; the two do not move together, and that is deliberate.
   behaviour, logged as a `device-scope fallback`. No schema change and no re-login needed.
 
 ### Security
-- **Session input stays inside the session.** The compositor now takes the virtual keyboard and mouse it is given exclusively (`EVIOCGRAB`, compositor pin `6638e07`), so the host's own console input handlers no longer also receive a session's keys, and the virtual keyboard no longer declares keys only the host acts on (SysRq, power, sleep, suspend, wake, radio). Found in console-mode testing, where keys typed in a session appeared on the host's login prompt. The input self-test that runs at agent start now grabs its own devices the same way before writing to them, so its test keystroke no longer reaches the host console either.
+- **Session input stays inside the session.** The compositor now takes the virtual keyboard and mouse it is given exclusively (`EVIOCGRAB`, compositor pin `6638e07`), so the host's own console input handlers no longer also receive a session's keys, and the virtual keyboard no longer declares keys only the host acts on (SysRq, power, sleep, suspend, wake, radio). Found in console-mode testing, where keys typed in a session appeared on the host's login prompt. The input self-test that runs at agent start now grabs its own devices the same way and holds the grab for the whole write, so its test keystroke no longer reaches the host console either.
 - **A console session owns its own virtual terminal, with the kernel keyboard off (RH-07,
   #407).** For the life of a local console session the node agent makes `tty8` the active
   virtual terminal with its kernel keyboard turned off, and switches back to the previous

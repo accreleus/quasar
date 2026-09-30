@@ -559,7 +559,8 @@ fn write_if_grabbed<T>(
     grab: anyhow::Result<T>,
     write: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    grab.context("exclusive grab")?;
+    // The grab must outlive the write: dropping it releases EVIOCGRAB.
+    let _grab = grab.context("exclusive grab")?;
     write()
 }
 
@@ -705,6 +706,34 @@ mod tests {
         assert!(
             wrote.load(Ordering::SeqCst),
             "write did not run after a successful grab"
+        );
+    }
+
+    /// The grab is still held while the write runs, and released after it (a grab
+    /// dropped before the write let the self-test's key reach the host console).
+    #[test]
+    fn the_grab_is_held_for_the_whole_write() {
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let held = Arc::new(AtomicBool::new(true));
+        let seen_during_write = Arc::new(AtomicBool::new(false));
+        let (h, s) = (held.clone(), seen_during_write.clone());
+        write_if_grabbed(Ok::<_, anyhow::Error>(Guard(held.clone())), move || {
+            s.store(h.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            seen_during_write.load(Ordering::SeqCst),
+            "grab released before the write"
+        );
+        assert!(
+            !held.load(Ordering::SeqCst),
+            "grab not released after the write"
         );
     }
 
