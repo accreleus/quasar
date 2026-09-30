@@ -5,10 +5,9 @@ description: Initialise a Quasar development checkout and run the local UI and A
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-The local development stack is Postgres, the control plane, and the web app.
-There is no node agent, because the agent needs a Linux GPU host. A local
-checkout covers UI and API work; streaming work happens on a fleet host, unless
-your workstation is also configured as one.
+The local stack is Postgres, the control plane and the web app, with no node agent
+(that needs a Linux GPU host). Use it for UI and API work; streaming work happens
+on a GPU host.
 
 <Steps>
 
@@ -27,15 +26,11 @@ your workstation is also configured as one.
    make help
    ```
 
-3. Initialise the checkout.
+3. Initialise the checkout (idempotent; never overwrites `.env`).
 
    ```bash
    make init
    ```
-
-   This is idempotent. It initialises the protocol submodule, builds the
-   containerised development toolchain, and checks the environment. It never
-   overwrites an existing `.env`.
 
 4. Check the environment and configuration.
 
@@ -44,7 +39,7 @@ your workstation is also configured as one.
    make config-check
    ```
 
-5. Start the local agentless stack.
+5. Start the local stack.
 
    ```bash
    make up
@@ -53,24 +48,19 @@ your workstation is also configured as one.
 
 </Steps>
 
-Use `make dev-web` for the Vite development loop and `make dev-cp` to run the Go
-control plane against an ephemeral Postgres database. Stop the local stack with
-`make down`; its volumes are preserved.
+`make dev-web` runs the Vite loop; `make dev-cp` runs the control plane against an
+ephemeral Postgres. `make down` stops the stack and keeps its volumes.
 
 ## Worktrees and parallel checkouts
 
-Each worktree gets a derived `QUASAR_INSTANCE`, its own Compose project, a
-dedicated ten-port block, and an ephemeral test database, so two checkouts
-cannot collide on containers, volumes, ports, or Postgres.
+Each worktree gets its own `QUASAR_INSTANCE`, Compose project, port block and test
+database, so checkouts don't collide. Don't hardcode ports, container names or
+project names in new tooling: use the helpers in `scripts/dx/` and expose routine
+workflows through the root Makefile.
 
-That holds only while everything goes through the derivation. Do not hardcode
-ports, container names, or Compose project names in new tooling. Use
-the helpers under `scripts/dx/` and expose routine workflows through the root
-Makefile.
-
-<Aside type="note" title="A remote warning from doctor is advisory">
-An unreachable GPU host can make `make doctor` report degraded when you are off
-that network. It does not mean the local toolchain is unusable.
+<Aside type="note" title="Remote warnings from doctor are advisory">
+`make doctor` reports degraded when a GPU host is unreachable. The local toolchain
+still works.
 </Aside>
 
 ## Working on this site
@@ -81,13 +71,8 @@ npm ci
 npm run dev
 ```
 
-Build the production site with `npm run build`. Keep user and operator material
-outside this developer section; implementation and contribution material belongs
-here or in the repository's canonical `docs/` tree.
+`npm run build` builds the production site. It needs the protocol submodule for
+the [Control-plane API](/quasar/developer/api/) pages; without `make init`, run
+`git submodule update --init protocol` first (`go test ./...` needs it too).
 
-The build reads `protocol/openapi.yaml` to generate the
-[Control-plane API](/quasar/developer/api/) reference, so it needs the protocol
-submodule present. `make init` handles that; in a checkout cloned without
-`--recurse-submodules`, run `git submodule update --init protocol` first. The
-build says so if it is missing. `go test ./...` reads the same file and fails
-with only a missing-file error.
+Keep user and operator material out of this developer section.
