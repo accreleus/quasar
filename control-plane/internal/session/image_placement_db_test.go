@@ -592,3 +592,26 @@ func TestLaunchAppImageResolution(t *testing.T) {
 		})
 	}
 }
+
+// TestNoHostRejectionCountsHostsWhoseAppImageFailed: a launch refused because
+// the app's image failed on every host says so in the launcher's log (#429);
+// an absent image elsewhere is not counted as failed.
+func TestNoHostRejectionCountsHostsWhoseAppImageFailed(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	host2, _ := addHost(t, pool, "host-2", 2)
+	installCatalogImage(t, pool, false)
+	setAppImage(t, pool, s.appID, testImageRef)
+	setHostImage(t, pool, s.hostID, "failed", testImageVer)
+	setHostImage(t, pool, host2, "absent", testImageVer)
+
+	_, err := store.ScheduleAndCreate(context.Background(), imageLaunch(s, testImageRef))
+	var rej *NoHostRejection
+	if !errors.As(err, &rej) {
+		t.Fatalf("got %v, want a *NoHostRejection", err)
+	}
+	if rej.HostsImageFailed != 1 {
+		t.Fatalf("hosts_image_failed: got %d, want 1", rej.HostsImageFailed)
+	}
+}

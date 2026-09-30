@@ -769,7 +769,8 @@ func (c *Coordinator) logNoHostRejection(userID, appID string, err error) {
 		"online_hosts", rej.OnlineHosts,
 		"hosts_capacity_not_ok", rej.HostsCapacityNotOK,
 		"gpus_unreported", rej.GPUsUnreported,
-		"hosts_recently_registered", rej.HostsRecentlyRegistered)
+		"hosts_recently_registered", rej.HostsRecentlyRegistered,
+		"hosts_image_failed", rej.HostsImageFailed)
 }
 
 // dispatchAssignStart performs the two-step agent handshake: assign, then start.

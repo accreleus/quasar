@@ -829,6 +829,12 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **An app image whose pull was interrupted can be pulled again (#429).** Replacing the node
+  agent while it pulled an image left that pull's journal entry behind, and every later pull
+  of the image failed at once with "image operation outcome unknown" until the control plane
+  gave up and launches failed as `no_host_available`. The next pull now retires the entry and
+  pulls, and the agent clears such entries at startup. A launch refused for want of a host now
+  logs how many hosts have the app's image failed (`hosts_image_failed`).
 - **On rootless Docker a session's gamepad reaches the game (RH-07, #428).** The app
   user could not open the session's own `/dev/input/event*` nodes: host preparation grants
   them to the Quasar account's group, which is gid 0 inside a rootless Docker container, and

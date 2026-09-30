@@ -124,7 +124,23 @@ async fn reconcile_image(
     let existing = state.as_ref().map(|s| s.info.clone());
     let mut recovered_build = None;
     if let Some(intent) = journal.pending()? {
-        if intent.image != image || intent.socket != config.socket {
+        if intent.image != image {
+            return Err(ErrorKind::UnknownOutcome.into());
+        }
+        // A pull intent is retired whatever the engine shows: the lease proves no agent
+        // still drives it, and an orphaned engine-side pull can only land the image a
+        // re-pull then verifies. Leaving it stranded every later pull (#429).
+        if intent.is_pull() {
+            journal.clear()?;
+            tracing::info!(
+                token = "image-pull-intent-retired",
+                image,
+                present = existing.is_some(),
+                "retired an interrupted pull intent; engine state re-observed"
+            );
+            return Ok((docker, journal, existing, None));
+        }
+        if intent.socket != config.socket {
             return Err(ErrorKind::UnknownOutcome.into());
         }
         if let Some(id) = intent.build_id {

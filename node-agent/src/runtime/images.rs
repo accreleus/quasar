@@ -117,8 +117,9 @@ impl RuntimeClient {
     }
 }
 
-/// A synced intent survives process/transport failure. Only conclusive observed
-/// state or a terminal daemon response clears it; absence is not pull completion.
+/// A synced intent survives process/transport failure. A remove or build intent is
+/// cleared only by conclusive observed state or a terminal daemon response; a pull
+/// intent is retired by the next lease holder (`docker::reconcile_image`, #429).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct Intent {
     pub image: String,
@@ -130,17 +131,29 @@ pub(super) struct Intent {
     pub build_fingerprint: Option<String>,
 }
 
+impl Intent {
+    pub fn is_pull(&self) -> bool {
+        self.remove_id.is_none() && self.build_id.is_none()
+    }
+}
+
+fn journal_key(image: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(image.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The lease is an exclusive flock held for an operation's whole life and released
+/// when its future is dropped or its process exits, in this agent or a replaced one.
 pub(super) struct Journal {
     path: PathBuf,
     _lease: std::fs::File,
 }
 impl Journal {
     pub async fn acquire(config: &RuntimeConfig, image: &str) -> Result<Self, RuntimeError> {
-        use sha2::{Digest, Sha256};
-        use std::os::{
-            fd::AsRawFd,
-            unix::fs::{DirBuilderExt, OpenOptionsExt},
-        };
+        use std::os::unix::fs::DirBuilderExt;
         let root = config
             .image_state_path
             .as_ref()
@@ -150,10 +163,18 @@ impl Journal {
             .mode(0o700)
             .create(root)
             .map_err(|_| ErrorKind::Unavailable)?;
-        let key = Sha256::digest(image.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let key = journal_key(image);
+        loop {
+            if let Some(journal) = Self::try_acquire(root, &key)? {
+                return Ok(journal);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// `None` while another operation holds the lease.
+    fn try_acquire(root: &std::path::Path, key: &str) -> Result<Option<Self>, RuntimeError> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
         let lease = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -163,20 +184,18 @@ impl Journal {
             .custom_flags(libc::O_NOFOLLOW)
             .open(root.join(format!("{key}.lock")))
             .map_err(|_| ErrorKind::Unavailable)?;
-        loop {
-            // SAFETY: lease owns a live file descriptor until this operation ends.
-            if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                break;
-            }
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
-                return Err(ErrorKind::Unavailable.into());
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        // SAFETY: lease owns a live file descriptor until this operation ends.
+        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(ErrorKind::Unavailable.into())
+            };
         }
-        Ok(Self {
+        Ok(Some(Self {
             path: root.join(key),
             _lease: lease,
-        })
+        }))
     }
     pub fn pending(&self) -> Result<Option<Intent>, RuntimeError> {
         use std::{io::Read, os::unix::fs::OpenOptionsExt};
@@ -230,4 +249,42 @@ impl Journal {
             .and_then(|f| f.sync_all())
             .map_err(|_| ErrorKind::Unavailable.into())
     }
+}
+
+/// Boot-time sweep: retire every pull intent whose lease nobody holds, so a pull
+/// interrupted by an agent replacement is not reported as pending (#429). Remove
+/// and build intents are left to their next operation's reconciliation.
+pub(super) fn retire_orphaned_pull_intents(
+    config: &RuntimeConfig,
+) -> Result<Vec<String>, RuntimeError> {
+    let root = config
+        .image_state_path
+        .as_ref()
+        .ok_or(ErrorKind::InvalidConfiguration)?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(ErrorKind::Unavailable.into()),
+    };
+    let mut retired = Vec::new();
+    for entry in entries {
+        let name = entry.map_err(|_| ErrorKind::Unavailable)?.file_name();
+        let Some(key) = name
+            .to_str()
+            .filter(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()))
+        else {
+            continue;
+        };
+        let Some(journal) = Journal::try_acquire(root, key)? else {
+            continue;
+        };
+        match journal.pending() {
+            Ok(Some(intent)) if intent.is_pull() && journal_key(&intent.image) == key => {
+                journal.clear()?;
+                retired.push(intent.image);
+            }
+            _ => {}
+        }
+    }
+    Ok(retired)
 }
