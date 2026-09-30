@@ -18,7 +18,7 @@
 //! console-audio socket directory (D13), the console VT (`/dev/tty8`) and which
 //! `/dev/i2c-*` nodes are read by the device probe whenever console mode is turned on, and
 //! again at every start of the recovery actor while it is on
-//! ([`Actor::recheck_console_devices`]): i2c bus numbers can change across reboots, and an
+//! ([`Actor::recheck_on_start`]): i2c bus numbers can change across reboots, and an
 //! engine refuses to create or start a container naming a node the host no longer has. A
 //! changed set that moves the agent's rendered specification re-creates it through the same
 //! verified replacement, recorded under [`DEVICES_CHANGED`] rather than [`CHANGED`]: it is
@@ -202,14 +202,7 @@ impl Actor {
     fn host_console_devices(&self) -> Option<ConsoleDevices> {
         let record = self.dir.load_service(Role::NodeAgent).ok().flatten()?;
         match crate::probe::run(self.engine.as_ref(), &record.image) {
-            Ok(report) => Some(ConsoleDevices {
-                sound: report.sound,
-                logind: report.logind(),
-                console_audio: report.console_audio,
-                i2c: report.i2c.clone(),
-                dri_nodes: report.dri_nodes(),
-                console_vt: report.console_vt,
-            }),
+            Ok(report) => Some(ConsoleDevices::from_report(&report)),
             Err(e) => {
                 warn!(
                     token = "console-devices-probe-failed",
@@ -300,63 +293,6 @@ impl Actor {
         }
     }
 
-    /// At every start, while console mode is on: the console devices read again, and the
-    /// agent re-created through a verified replacement when they move its specification (a
-    /// renumbered or vanished i2c node, sound or logind gone or come). `Some` names the
-    /// admitted attempt. Never fails the start: a probe that cannot run, or a machine that
-    /// cannot take the attempt now, keeps the agent as it is (logged).
-    pub fn recheck_console_devices(self: &Arc<Self>) -> Option<String> {
-        let machine = self.dir.load_machine().ok().flatten()?;
-        if !machine.inputs.console || machine.role == MachineRole::ControlOnly {
-            return None;
-        }
-        let devices = self.host_console_devices()?;
-        let _gate = self.gate.lock().unwrap();
-        let machine = match self.admissible() {
-            Ok(m) => m,
-            Err(r) => {
-                warn!(token = "console-devices-recheck-deferred", "{}", r.message);
-                return None;
-            }
-        };
-        if !machine.inputs.console {
-            return None;
-        }
-        let mut after = machine.inputs.clone();
-        devices.apply(&mut after.devices);
-        after.keep_console_vt();
-        if after == machine.inputs {
-            return None;
-        }
-        let replaced: Vec<Role> = match self.moved_by(&machine.inputs, &after) {
-            Ok(moved) => moved
-                .into_iter()
-                .filter(|r| *r == Role::NodeAgent)
-                .collect(),
-            Err(why) => {
-                warn!(token = "console-devices-unrenderable", "{why}");
-                return None;
-            }
-        };
-        info!(
-            token = "console-devices-changed",
-            i2c = ?after.devices.i2c,
-            sound = after.devices.sound,
-            logind = after.devices.logind,
-            console_audio = after.devices.console_audio,
-            console_vt = after.devices.console_vt,
-            re_created = !replaced.is_empty(),
-            "the host's console devices changed since the agent was created"
-        );
-        match self.admit(&machine, after, &[DEVICES_CHANGED.to_string()], &replaced) {
-            Ok(id) => id,
-            Err(r) => {
-                warn!(token = "console-devices-recreate-refused", "{}", r.message);
-                None
-            }
-        }
-    }
-
     /// `POST /v1/console`: console mode on or off, through a verified replacement of the
     /// node agent alone. `Some` names the admitted attempt; `None`: nothing needed
     /// re-creating (enabling what is already in force, say).
@@ -424,7 +360,7 @@ impl Actor {
 
 /// What the device probe read of the host's console devices.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ConsoleDevices {
+pub(crate) struct ConsoleDevices {
     sound: bool,
     logind: bool,
     console_audio: bool,
@@ -434,7 +370,18 @@ struct ConsoleDevices {
 }
 
 impl ConsoleDevices {
-    fn apply(self, devices: &mut crate::recipe::HostDevices) {
+    pub(crate) fn from_report(report: &crate::probe::ProbeReport) -> Self {
+        ConsoleDevices {
+            sound: report.sound,
+            logind: report.logind(),
+            console_audio: report.console_audio,
+            i2c: report.i2c.clone(),
+            dri_nodes: report.dri_nodes(),
+            console_vt: report.console_vt,
+        }
+    }
+
+    pub(crate) fn apply(self, devices: &mut crate::recipe::HostDevices) {
         devices.sound = self.sound;
         devices.logind = self.logind;
         devices.console_audio = self.console_audio;
