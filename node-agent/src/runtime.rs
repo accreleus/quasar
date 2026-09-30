@@ -132,6 +132,11 @@ impl RuntimeClient {
         self.submit(async move { docker::inspect_image(&config, &image).await })
     }
 
+    /// Retire pull intents left by a previous agent; returns the image refs retired.
+    pub fn retire_orphaned_pull_intents(&self) -> Result<Vec<String>, RuntimeError> {
+        images::retire_orphaned_pull_intents(self.config())
+    }
+
     pub fn image_inventory_snapshot(&self) -> Operation<(Vec<DaemonImage>, Vec<String>)> {
         let config = self.config().clone();
         self.submit(async move { docker::image_inventory_snapshot(&config).await })

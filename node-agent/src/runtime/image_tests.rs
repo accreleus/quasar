@@ -179,7 +179,7 @@ fn server_failure_after_pull_submission_is_an_unknown_outcome() {
 }
 
 #[test]
-fn interrupted_pull_is_reconciled_after_client_restart_without_blind_retry() {
+fn interrupted_pull_is_retired_and_pulled_again_after_client_restart() {
     let mut interrupted = reply(PULL, 200, "{\"status\":\"Downloading\"}\n");
     interrupted.incomplete = true;
     let (_dir, config, server) = serve(vec![
@@ -188,7 +188,7 @@ fn interrupted_pull_is_reconciled_after_client_restart_without_blind_retry() {
         interrupted,
         discovery(),
         reply(INSPECT, 404, ABSENT),
-        discovery(),
+        reply(PULL, 200, ""),
         reply(INSPECT, 200, PRESENT),
     ]);
     let runtime = RuntimeClient::new(config.clone()).unwrap();
@@ -206,14 +206,6 @@ fn interrupted_pull_is_reconciled_after_client_restart_without_blind_retry() {
         runtime
             .ensure_image("test", Duration::from_secs(2))
             .wait(|_| {})
-            .unwrap_err()
-            .kind,
-        ErrorKind::UnknownOutcome
-    );
-    assert_eq!(
-        runtime
-            .ensure_image("test", Duration::from_secs(2))
-            .wait(|_| {})
             .unwrap()
             .bytes,
         100
@@ -222,7 +214,7 @@ fn interrupted_pull_is_reconciled_after_client_restart_without_blind_retry() {
 }
 
 #[test]
-fn silent_pull_deadline_releases_capacity_without_claiming_cancellation() {
+fn silent_pull_deadline_releases_capacity_and_the_next_pull_proceeds() {
     let mut silent = reply(PULL, 200, "");
     silent.incomplete = true;
     silent.hold = Duration::from_millis(350);
@@ -232,6 +224,8 @@ fn silent_pull_deadline_releases_capacity_without_claiming_cancellation() {
         silent,
         discovery(),
         reply(INSPECT, 404, ABSENT),
+        reply(PULL, 200, ""),
+        reply(INSPECT, 200, PRESENT),
     ]);
     config.max_in_flight = 1;
     let runtime = RuntimeClient::new(config).unwrap();
@@ -245,16 +239,104 @@ fn silent_pull_deadline_releases_capacity_without_claiming_cancellation() {
         ErrorKind::UnknownOutcome
     );
     assert!(start.elapsed() < Duration::from_secs(2));
-    // A second operation gets capacity, but absence cannot prove the old pull stopped.
     assert_eq!(
         runtime
             .ensure_image("test", Duration::from_secs(2))
             .wait(|_| {})
-            .unwrap_err()
-            .kind,
-        ErrorKind::UnknownOutcome
+            .unwrap()
+            .id,
+        "sha256:fixture"
     );
     server.join().unwrap();
+}
+
+/// The journal entry a replaced agent leaves when it dies mid-pull (#429).
+fn strand_pull_intent(config: &RuntimeConfig, image: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let root = config.image_state_path.clone().unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let key: String = Sha256::digest(image.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = root.join(key);
+    let intent = serde_json::json!({
+        "image": image,
+        "socket": "/previous-incarnation/engine.sock",
+        "remove_id": null,
+    });
+    std::fs::write(&path, intent.to_string()).unwrap();
+    path
+}
+
+#[test]
+fn a_pull_intent_left_by_a_previous_agent_does_not_strand_the_next_pull() {
+    let (_dir, config, server) = serve(vec![
+        discovery(),
+        reply(INSPECT, 404, ABSENT),
+        reply(PULL, 200, "{\"status\":\"Pull complete\"}\n"),
+        reply(INSPECT, 200, PRESENT),
+    ]);
+    let journal = strand_pull_intent(&config, "test");
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image("test", Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:fixture"
+    );
+    assert!(!journal.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn a_pull_intent_whose_image_landed_is_retired_without_pulling_again() {
+    let (_dir, config, server) = serve(vec![discovery(), reply(INSPECT, 200, PRESENT)]);
+    let journal = strand_pull_intent(&config, "test");
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert!(runtime
+        .ensure_image("test", Duration::from_secs(2))
+        .wait(|_| {})
+        .is_ok());
+    assert!(!journal.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn startup_sweep_retires_unleased_pull_intents_only() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = RuntimeConfig::unix(dir.path().join("engine.sock"));
+    config.image_state_path = Some(dir.path().join("operations"));
+    let orphan = strand_pull_intent(&config, "orphan");
+    let live = strand_pull_intent(&config, "live");
+    let removal = strand_pull_intent(&config, "removal");
+    std::fs::write(
+        &removal,
+        serde_json::json!({"image":"removal","socket":"/s","remove_id":"sha256:x"}).to_string(),
+    )
+    .unwrap();
+    // A held lease is an operation still running, here or in a replaced agent.
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(live.with_extension("lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime.retire_orphaned_pull_intents().unwrap(),
+        vec!["orphan".to_owned()]
+    );
+    assert!(!orphan.exists());
+    assert!(live.exists());
+    assert!(removal.exists());
 }
 
 #[test]
