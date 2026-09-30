@@ -221,49 +221,22 @@ type Store struct {
 // NewStore constructs a Store from the shared pool.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
-// OwnedInstallReleaseChannel is the channel an owned install's first boot seeds
-// (amendment 16). Every release of owned installs is an edge build until a stable
-// one ships, so on the column default a new owned install would be shown nothing.
-// Withdraw it, making owned installs seed the column default again, when the first
-// stable release of owned installs is cut.
-const OwnedInstallReleaseChannel = ReleaseChannelEdge
-
 // Seed inserts the singleton row on first boot, taking registration_mode from
 // defaultMode (the REGISTRATION_MODE env, or 'closed'). Idempotent: a no-op once the
 // row exists, so the admin-set value is never clobbered on a later boot. Mirrors the
 // bootstrap-admin custody model — env seeds first boot only.
 func (s *Store) Seed(ctx context.Context, defaultMode string) error {
-	return s.SeedWithReleaseChannel(ctx, defaultMode, "")
-}
-
-// SeedWithReleaseChannel is Seed that also chooses the first boot's release
-// channel. Empty leaves the column default ('stable'). Like the mode, it is written
-// only when this call inserts the row, never over an existing one.
-func (s *Store) SeedWithReleaseChannel(ctx context.Context, defaultMode, channel string) error {
 	if defaultMode == "" {
 		defaultMode = RegistrationClosed
 	}
 	if !ValidMode(defaultMode) {
 		return fmt.Errorf("invalid REGISTRATION_MODE %q: must be closed|invite_only|open", defaultMode)
 	}
-	var err error
-	if channel == "" {
-		_, err = s.pool.Exec(ctx, `
-			INSERT INTO instance_settings (id, registration_mode)
-			VALUES (true, $1)
-			ON CONFLICT (id) DO NOTHING
-		`, defaultMode)
-	} else {
-		if !ValidReleaseChannel(channel) {
-			return fmt.Errorf("invalid seed release channel %q", channel)
-		}
-		_, err = s.pool.Exec(ctx, `
-			INSERT INTO instance_settings (id, registration_mode, release_channel)
-			VALUES (true, $1, $2)
-			ON CONFLICT (id) DO NOTHING
-		`, defaultMode, channel)
-	}
-	if err != nil {
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO instance_settings (id, registration_mode)
+		VALUES (true, $1)
+		ON CONFLICT (id) DO NOTHING
+	`, defaultMode); err != nil {
 		return fmt.Errorf("seed instance_settings: %w", err)
 	}
 	return nil
