@@ -846,6 +846,7 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A reconnect test no longer fails on a busy machine (#423).** Its waits for a thread that must return were 100 ms; they are now 5 s, so only a real hang fails it.
 - **An app image whose pull was interrupted can be pulled again (#429).** Replacing the node
   agent while it pulled an image left that pull's journal entry behind, and every later pull
   of the image failed at once with "image operation outcome unknown" until the control plane
