@@ -860,6 +860,15 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Release review fixes (PR #435).** The control plane builds on Go 1.26, which its
+  dependencies now require; every Go pin (CI, both Dockerfiles, the dev tooling) moved with
+  it. The recovery actor's database helpers run under bash, so a Debian-based
+  `QUASAR_POSTGRES_IMAGE` no longer fails every backup and restore on `pipefail`. Removing a
+  host keeps it drained when the outcome is uncertain, instead of reopening a machine whose
+  removal may already be queued. The profile menu offers only codecs the app's selected hosts
+  (and its home's host) can encode. A helper on Podman records the image it was created from,
+  so a repointed tag no longer strands its stop and cleanup. A web module renamed to avoid a
+  case-insensitive filename collision on macOS.
 - **A reconnect test no longer fails on a busy machine (#423).** Its waits for a thread that must return were 100 ms; they are now 5 s, so only a real hang fails it.
 - **An app image whose pull was interrupted can be pulled again (#429).** Replacing the node
   agent while it pulled an image left that pull's journal entry behind, and every later pull
