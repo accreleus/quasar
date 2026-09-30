@@ -745,7 +745,7 @@ compose_cmd() { docker compose -p "$RID" --env-file "$ENV_FILE" "${COMPOSE_FILES
 
 build_fixture_image() {
   cat >"$WORKDIR/Dockerfile.fixture" <<'DOCKER'
-FROM golang:1.25
+FROM golang:1.26
 WORKDIR /src
 COPY . .
 RUN go build -o /usr/local/bin/readiness-fixture .

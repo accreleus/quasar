@@ -3,7 +3,10 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/accreleus/quasar/control-plane/internal/profile"
 )
@@ -16,9 +19,12 @@ import (
 // gate and the app's own encode-slot totals all apply, same as at launch. No
 // VRAM veto: like totalsQuery, that gate is a LOAD term (§4.1 abstains whenever
 // vram_mb_total <= floor, so such a GPU is still servable) and this is a totals
-// question, not an availability one. Placement remains the authoritative check.
+// question, not an availability one. The app's host selection (app_placement)
+// and its home's owner pin apply too, so an app pinned to an H.264-only host is
+// not offered AV1 because some other host has it. Placement remains the
+// authoritative check.
 func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (profile.HostCaps, error) {
-	p := CreateParams{NeedEncodeSlots: 1}
+	p := CreateParams{UserID: userID, AppID: appID, NeedEncodeSlots: 1}
 	if appID != "" {
 		app, err := s.GetLaunchApp(ctx, appID)
 		if err != nil {
@@ -30,11 +36,28 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 		// engages for a tile exactly as it does at launch.
 		p.ManagedHome = app.ManagedHome
 		p.NeedEncodeSlots = app.DefaultEncodeSlots
+		p.HomeAppID = homeAppID(app)
 		if app.IsDerived() {
 			p.PinHostID, err = s.HomeHostForApp(ctx, userID, homeAppID(app))
 			if err != nil || p.PinHostID == "" {
 				return profile.HostCaps{}, err
 			}
+		}
+		// A managed home that already lives on one host pins the launch there
+		// (scheduleAttempt); a home in conflict launches nowhere, so its menu is
+		// advisory-unknown rather than the fleet's union.
+		owner, err := s.previewHomeOwner(ctx, p)
+		if err != nil {
+			if errors.Is(err, ErrHomeConflict) {
+				return profile.HostCaps{}, nil
+			}
+			return profile.HostCaps{}, err
+		}
+		if owner != "" {
+			if p.PinHostID != "" && p.PinHostID != owner {
+				return profile.HostCaps{}, nil
+			}
+			p.PinHostID = owner
 		}
 	}
 	a := &argset{}
@@ -43,10 +66,14 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 	pin := c.pinGate(a)
 	image := c.imageGate(a, " AND ")
 	gate := c.readinessGate(a, " AND ")
+	placement := ""
+	if appID != "" {
+		placement = c.placementGate(a)
+	}
 	rows, err := s.pool.Query(ctx, `SELECT `+gpuCodecSetSQL("g", "h", true)+`
 		FROM gpus g JOIN hosts h ON h.id = g.host_id
 		WHERE h.status = 'online' AND h.capacity_detection = 'ok'
-		AND g.reported AND g.encode_slots_total >= $`+fmt.Sprint(slotsIdx)+schedulableBindingSQL+pin+image+gate, a.args()...)
+		AND g.reported AND g.encode_slots_total >= $`+fmt.Sprint(slotsIdx)+schedulableBindingSQL+pin+image+gate+placement, a.args()...)
 	if err != nil {
 		return profile.HostCaps{}, fmt.Errorf("query profile host codecs: %w", err)
 	}
@@ -63,6 +90,20 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 		return profile.HostCaps{}, err
 	}
 	return profile.HostCaps{Codecs: profileCodecUnion(reports)}, nil
+}
+
+// previewHomeOwner is homeClaimOwner in a read-only transaction: the host a
+// managed home is bound to, without reserving anything.
+func (s *Store) previewHomeOwner(ctx context.Context, p CreateParams) (string, error) {
+	if !p.ManagedHome {
+		return "", nil
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	return homeClaimOwner(ctx, tx, p)
 }
 
 // nil means no candidate GPU rows at all (every GPU blocked, or the fleet down)

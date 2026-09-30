@@ -79,7 +79,7 @@ fi
 # change works — so an absent `go` selects the containerised runner instead of
 # failing the target (#125). TESTDB_CONTAINERISED=1 forces it where a host
 # toolchain does exist, to reproduce what a fleet host will do.
-GO_IMAGE="${GO_IMAGE:-golang:1.25}"
+GO_IMAGE="${GO_IMAGE:-golang:1.26}"
 if [ "${TESTDB_CONTAINERISED:-0}" = "1" ]; then
   TESTDB_RUNNER=container
   dx_pass runner "container ($GO_IMAGE) — TESTDB_CONTAINERISED=1"

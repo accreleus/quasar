@@ -41,6 +41,12 @@ const DUMPS_MOUNT: &str = "/dumps";
 /// The helper's input: the dump file under [`DUMPS_MOUNT`].
 pub const DUMP_FILE_ENV: &str = "QUASAR_DUMP_FILE";
 
+/// The shell a helper runs its script in. bash, not sh: the scripts need `pipefail`,
+/// which Debian's dash rejects, so a Debian-based `QUASAR_POSTGRES_IMAGE` would fail
+/// every read, backup and restore. Every official postgres image carries bash (its
+/// own entrypoint is a bash script), Alpine and Debian alike.
+const HELPER_SHELL: &str = "bash";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbOp {
     /// `pg_database_size`, in bytes.
@@ -427,7 +433,7 @@ impl Actor {
         Ok(ContainerSpec {
             name: HELPER.into(),
             image: image.reference(),
-            entrypoint: Some(vec!["sh".into(), "-c".into(), op.script()]),
+            entrypoint: Some(vec![HELPER_SHELL.into(), "-c".into(), op.script()]),
             cmd: None,
             env,
             labels: BTreeMap::from([(labels::HELPER.to_string(), op.label().to_string())]),
@@ -620,6 +626,17 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_helper_script_parses_in_the_helper_shell() {
+        use std::process::Command;
+        for op in [DbOp::Size, DbOp::Dump, DbOp::Inspect, DbOp::Load, DbOp::Import, DbOp::Schema] {
+            let script = op.script();
+            assert!(script.contains("set -o pipefail"), "{op:?} lost pipefail");
+            let out = Command::new(HELPER_SHELL).args(["-n", "-c", &script]).output().unwrap();
+            assert!(out.status.success(), "{op:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
 
     #[test]
     fn the_schema_line_is_read_from_the_end_of_the_output() {
