@@ -365,3 +365,108 @@ fn an_agent_that_will_not_start_is_re_created_once_and_reported_truthfully() {
         .count();
     assert!(journals <= 1, "{journals} attempts");
 }
+
+// ----- the start's closing line (#432) -----
+
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The lines one start logs, `resume` then `finish_start`, as the binary runs them.
+fn logged_start(m: &Machine) -> Vec<String> {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let actor = m.actor();
+        let resumed = actor.resume();
+        actor.finish_start(resumed.is_ok());
+        actor.wait_attempt();
+    });
+    let bytes = captured.0.lock().unwrap().clone();
+    String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+const RUNNING_LINE: &str = "this machine's services are installed and running";
+
+fn position(lines: &[String], needle: &str) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains(needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// An agent exited at the actor's start: nothing claims the services run until the start
+/// check has started it, and then it is said once.
+#[test]
+fn an_exited_agent_is_started_before_the_start_says_the_services_run() {
+    let m = Machine::install(amd_host());
+    m.agent_left_exited();
+    let lines = logged_start(&m);
+    let started = position(&lines, "actor-agent-started");
+    let running = position(&lines, RUNNING_LINE);
+    assert_eq!(started.len(), 1, "{lines:#?}");
+    assert_eq!(running.len(), 1, "said once: {lines:#?}");
+    assert!(running[0] > started[0], "said after the start: {lines:#?}");
+    assert_eq!(m.agent().status, "running");
+}
+
+/// An agent the start check leaves stopped is named, and nothing says the services run.
+#[test]
+fn a_start_that_leaves_the_agent_stopped_never_says_the_services_run() {
+    let m = Machine::install(amd_host());
+    m.agent_left_exited();
+    let id = m.agent().id;
+    m.engine
+        .with_state(|s| s.containers.get_mut(&id).unwrap().restart = RestartPolicy::No);
+    let lines = logged_start(&m);
+    assert!(position(&lines, RUNNING_LINE).is_empty(), "{lines:#?}");
+    let stopped = position(&lines, "actor-services-not-running");
+    assert_eq!(stopped.len(), 1, "{lines:#?}");
+    assert!(lines[stopped[0]].contains(names::NODE_AGENT));
+}
+
+/// A GPU change: the closing line says the agent is being re-created, not that it runs.
+#[test]
+fn a_start_that_re_creates_the_agent_says_so_instead() {
+    let m = Machine::install(nvidia_cdi());
+    m.engine.with_state(|s| {
+        s.probe_output = PROBE_AMD.into();
+        s.host.gpu_injection = None;
+        s.gpus_supported = false;
+    });
+    m.agent_left_exited();
+    let lines = logged_start(&m);
+    assert!(position(&lines, RUNNING_LINE).is_empty(), "{lines:#?}");
+    let changed = position(&lines, "actor-gpu-changed");
+    let recreating = position(&lines, "actor-services-recreating");
+    assert_eq!(recreating.len(), 1, "{lines:#?}");
+    assert!(
+        changed.len() == 1 && changed[0] < recreating[0],
+        "{lines:#?}"
+    );
+}
