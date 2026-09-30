@@ -3,65 +3,46 @@ title: Health and logs
 description: The containers Quasar runs, how to check each one, and the log lines worth recognising.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ## The containers
 
-| Container | What it is |
-| --- | --- |
-| `quasar-seed` | Yours, not Quasar's: the one container your manager or `docker run` line declares. It only makes sure the recovery actor exists. |
-| `quasar-recovery` | The recovery actor. Creates and replaces this machine's other Quasar services, and answers `quasar-recovery status`. |
-| `quasar-postgres` | All state. Users, apps, hosts, GPUs, sessions, entitlements. Only on the control plane's machine, and only when the database is Quasar's own. |
-| `quasar-control-plane` | The Go service. API, signaling, scheduler, and it serves the web app. Applies database migrations at startup. |
-| `quasar-node-agent` | The Rust agent. Runs with host networking, drives the compositor and encoder, launches app containers. |
+| Container | What it is | Runs on |
+| --- | --- | --- |
+| `quasar-seed` | The one container you declare. It makes sure the recovery actor exists. | Every machine |
+| `quasar-recovery` | The recovery actor. Creates and replaces the other Quasar services; answers `quasar-recovery status`. | Every machine |
+| `quasar-postgres` | All state. | Control plane, with Quasar's own database |
+| `quasar-control-plane` | API, signaling, scheduler, web app. Runs migrations at startup. | Control plane |
+| `quasar-node-agent` | Runs sessions: compositor, encoder, app containers. Host networking. | GPU hosts |
 
-Which of them run depends on the machine: a GPU host has the seed, the recovery
-actor and the agent; a combined host has all of them; a control-only host has
-no agent; and with your own database there is no `quasar-postgres`. During a session you will also see the app container itself
-and a PulseAudio sidecar, both launched by the agent as siblings. During an
-update you may briefly see a stopped `quasar-node-agent.kept`, the old agent held
-until the new one is verified.
+During a session you'll also see the app container and a PulseAudio sidecar.
+During an update, a stopped `quasar-node-agent.kept` may briefly appear: the old
+agent, kept until the new one is verified.
 
-A [legacy Compose install](/quasar/install/legacy-compose/#health-and-logs) runs
-Postgres, the control plane and the agent as Compose services, and on a release
-that shipped it, `quasar-updater`. Use
-`docker compose -f deploy/docker-compose.yml` in place of the `docker` commands
-below.
+On a [legacy Compose install](/quasar/install/legacy-compose/#health-and-logs),
+use `docker compose -f deploy/docker-compose.yml` in place of the `docker`
+commands below.
 
 ## Health checks
 
-Control plane:
+Control plane (works over plain HTTP, before certificates are set up):
 
 ```bash
 curl http://localhost:8080/health
+# {"status":"ok","db":"ok"}
 ```
 
-```json
-{"status":"ok","db":"ok"}
-```
-
-Excluded from the HTTPS redirect so it works before certificates are sorted.
-
-Node agent, on the host it runs on:
+Node agent, on its host:
 
 ```bash
 curl http://127.0.0.1:9091/health
+# {"status":"ok","sessions":0,"connected":true}
 ```
 
-```json
-{"status":"ok","sessions":0,"connected":true}
-```
+`connected: false` means the agent is up but can't reach the control plane.
 
-`connected` is whether the agent's WebSocket to the control plane is up. False
-means the agent is alive but isolated.
-
-Container states, and what the recovery actor knows about them:
+Containers and the recovery actor's view:
 
 ```bash
 docker ps --filter label=io.quasar.installation
-```
-
-```bash
 docker exec quasar-recovery quasar-recovery status
 ```
 
@@ -69,96 +50,60 @@ docker exec quasar-recovery quasar-recovery status
 
 ```bash
 docker logs -f quasar-control-plane
-```
-
-```bash
 docker logs -f quasar-node-agent
-```
-
-```bash
 docker logs -f quasar-recovery
 ```
 
-Errors only from the node agent:
+Node agent errors only:
 
 ```bash
 docker logs --tail 2000 quasar-node-agent 2>&1 \
   | grep -iE '\b(error|fatal|panic)\b'
 ```
 
-The seed's and the recovery actor's log lines each carry a `token=`, listed in
+Seed and recovery actor lines carry a `token=`, listed in
 [Install and startup problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor).
 
 ## Log lines worth recognising
 
 ### Good
 
-`render_node <raw> -> <canonical>` means the agent resolved a by-path render node
-symlink. Exactly what you want on a multi-GPU host.
-
-`EGL hardware-acceleration enabled` confirms the compositor got hardware
-acceleration.
-
-`codec resolved` logs the codec decision for a session, including what was
-considered and why the winner won. This is the first place to look when a session
-got an unexpected codec.
+| Line | Meaning |
+| --- | --- |
+| `render_node <raw> -> <canonical>` | The agent resolved a render node symlink (expected on multi-GPU hosts). |
+| `EGL hardware-acceleration enabled` | The compositor has hardware acceleration. |
+| `codec resolved` | The session's codec decision and why. Check here for an unexpected codec. |
 
 ### Bad
 
-`no VA H264 encoder found` means the VA encoder did not register. Usually a
-stale GStreamer registry, or software Mesa being forced by an environment
-variable that should not be set.
-
-`quasar-renderer-degraded` means a hardware frame import fell back to software
-rendering. Two of these within 30 seconds fails the session, unless
-`QUASAR_REQUIRE_HW_RENDER=0`.
-
-`media path interrupted` is a catch-all for the media path breaking. The real
-cause is usually a few lines above it. Common ones are the app container exiting
-immediately, or an app that needs network access not having it.
-
-`Steam needs to be` in the log means Steam could not start, and almost always
-means the container has no network. See [The Steam library](/quasar/admin/steam/).
-
-`no migration found for version N` in the control plane is the rollback
-crash-loop. See [Upgrading](/quasar/operations/upgrading/).
-
-`no command specified` on a container means an overlay cleared the command on an
-image that has no entrypoint of its own.
+| Line | Meaning |
+| --- | --- |
+| `no VA H264 encoder found` | The VA encoder didn't register. Usually a stale GStreamer registry or a stray env var forcing software Mesa. |
+| `quasar-renderer-degraded` | Frame import fell back to software. Two within 30 s fail the session unless `QUASAR_REQUIRE_HW_RENDER=0`. |
+| `media path interrupted` | Catch-all. The cause is usually a few lines above, often the app exiting at once or lacking network. |
+| `Steam needs to be` | Steam couldn't start, almost always no network. See [The Steam library](/quasar/admin/steam/). |
+| `no migration found for version N` | Control plane rolled back below the database. See [the hard rule](/quasar/operations/upgrading/#the-hard-rule). |
+| `no command specified` | An overlay cleared the command on an image with no entrypoint. |
 
 ## Reading a session, not a log
 
-For anything about a specific session, the admin session detail is better than
-the logs. It has the metrics time series and the event stream already correlated.
-See [Sessions and audit log](/quasar/admin/sessions/) and
+For a specific session, the admin session detail is better than logs. See
+[Sessions and audit log](/quasar/admin/sessions/) and
 [Diagnostics](/quasar/operations/diagnostics/).
 
 ## Checking the whole stack quickly
 
-The repository ships a diagnostic script that collects the state of everything in
-one pass: git revision, container states, health endpoints and recent errors from
-each container, with secrets redacted. It is repository tooling: it runs from a
-checkout and reads that checkout's `deploy/` stack, so it only helps on a machine
-that runs Quasar from a checkout. On a registry install, use the commands above.
+On a machine running Quasar from a repository checkout (not a registry install):
 
 ```bash
-make diagnose
+make diagnose          # container states, health, recent errors
+make diagnose-bundle   # the same, redacted, to share
 ```
 
-For something shareable:
-
-```bash
-make diagnose-bundle
-```
-
-<Aside type="note" title="Repository tooling">
-These commands are also part of the developer workflow. Their full contract is
-documented under [Developing Quasar](/quasar/developer/overview/).
-</Aside>
+See [Developing Quasar](/quasar/developer/overview/).
 
 ## Metric retention
 
-Running sessions keep a rolling hour of telemetry. At a terminal state the
-remaining telemetry is frozen and retained for 24 hours by default. Capture
-results remain with the session row. Take or export a diagnostic bundle before
-the post-mortem window expires if you need a longer-lived record.
+Running sessions keep a rolling hour of telemetry; ended sessions keep it for 24
+hours by default. Take a [diagnostic bundle](/quasar/operations/diagnostics/)
+before then if you need it longer.

@@ -1,15 +1,13 @@
 ---
 title: In a session
-description: Capturing input, the session drawer, gamepads, the Escape key, microphone, quick switch, and what the health banners mean.
+description: Input capture, the session drawer, gamepads, Escape, microphone, quick switch and health banners.
 ---
 
 import Shot from '../../../components/Shot.astro';
 import session_drawer from '../../../assets/shots/session-drawer.png';
 import session_stats from '../../../assets/shots/session-stats.png';
-import { Aside } from '@astrojs/starlight/components';
 
-Once the stream starts you are looking at a full-bleed video of the game with no
-chrome around it. Everything you need is behind one keyboard shortcut.
+The stream fills the window. Everything else is behind one shortcut.
 
 <Shot
 	label="Session"
@@ -20,82 +18,58 @@ chrome around it. Everything you need is behind one keyboard shortcut.
 
 ## Opening the drawer
 
-**Ctrl+Alt+Shift+Q** opens and closes the session drawer. **Escape** closes it.
-
-On a touch device there is a visible menu button instead, because the chord does
-not exist without a keyboard.
+**Ctrl+Alt+Shift+Q** opens and closes the drawer. **Escape** closes it. Touch
+devices get a menu button instead.
 
 ## Capturing input
 
-The first thing in the drawer is Capture input. Until you capture, your mouse
-belongs to the browser. Once you capture, it belongs to the game and the pointer
-is locked.
-
-Release it with the release combination shown in the drawer.
+Press **Capture input** in the drawer to lock the pointer to the game. Release
+it with the combination shown in the drawer.
 
 ### The Escape key
 
-Escape is awkward, because the browser wants it for leaving fullscreen and the
-game wants it for the pause menu.
-
-Quasar uses the Keyboard Lock API to route Escape to the game. That needs three
-things at once: a Chromium-based browser, fullscreen, and a secure context
-(HTTPS). If any of those is missing, the drawer says so, and Escape leaves
-fullscreen instead of reaching the game.
-
-If Escape is not working, check whether the page is on HTTPS first. That is
-almost always the reason.
+Escape reaches the game only with all three: a Chromium-based browser,
+fullscreen, and HTTPS. Otherwise Escape leaves fullscreen, and the drawer says
+what's missing. If Escape isn't working, check HTTPS first.
 
 ## Gamepads
 
-Controllers work through the browser's Gamepad API, and the input travels over
-the same data channel as everything else.
+Press a button after connecting a controller: browsers hide it until it sends
+input. The drawer lists the pads it sees. The game sees a wired Xbox 360
+controller.
 
-Browsers do not reveal a gamepad until it has sent input, so press a button
-after connecting one. The drawer lists what it currently sees. The game sees a
-wired Xbox 360 controller, whatever pad you hold.
-
-Your keyboard, mouse and controller reach only your session. On the host they are
-virtual devices held exclusively by the session's compositor, so nothing else on
-that machine, its own login screen included, receives what you type.
+Your input reaches only your session, not anything else on the host.
 
 ## Microphone
 
-If your administrator has enabled microphone capture, the bar has a microphone
-button. Three things have to line up: the instance setting has to be on, you
-have to turn it on, and your browser has to grant permission. The microphone is
-off at the start of every session, and the button does nothing while input is
-captured, so release capture first.
+If your administrator has enabled it, the bar has a microphone button. It is off
+at the start of every session, needs browser permission and HTTPS, and doesn't
+respond while input is captured (release capture first).
 
-A live microphone always shows a persistent **MIC** indicator. It cannot be
-hidden. If the microphone is on, you can see that it is on.
-
-Microphone capture needs a secure context, so it does not work over plain HTTP.
+A live microphone always shows a **MIC** indicator that can't be hidden.
 
 ## Quick switch
 
-Swap to a different app without ending the session. The stream stays up while
-the new app comes in behind it. Useful for moving between a game and a desktop.
+Swap to another app without ending the session. The stream stays up while the
+new app starts.
 
 ## Scaling and fullscreen
 
-Scaling controls how the stream fits your window. Fullscreen is a toggle, and it
-is also a precondition for Escape reaching the game.
+Scaling sets how the stream fits your window. Fullscreen is a toggle, and is
+required for Escape to reach the game.
 
-The launch tier sets the maximum size and frame rate. During a session you can
-change stream resolution and render resolution independently, and adjust the
-interface-scale hint. Each resolution is bounded by the launch size. Returning
-stream resolution to the launch size releases the manual pin so an enabled ABR
-resolution rung can resume.
+The launch tier sets the maximum resolution and frame rate. In a session you can
+change stream resolution, render resolution and the interface-scale hint, each
+up to the launch size. Setting stream resolution back to the launch size lets
+automatic resolution changes resume, if enabled.
 
-There is no manual frame-rate control. An optional ABR FPS rung can step a 120
-fps session down to 60 and restore it; it is disabled by default.
+There is no manual frame-rate control.
 
 ## Performance stats
 
-The menu's **Performance stats** pane shows frame rate, latency, bitrate and the
-jitter buffer, each with a short history, and a **Detailed** view with the full
-table. The session bar shows frame rate, latency and bitrate at a glance.
+**Performance stats** in the menu shows frame rate, latency, bitrate and jitter
+buffer, with a **Detailed** view. The session bar shows frame rate, latency and
+bitrate.
 
 <Shot
 	label="Performance stats"
@@ -104,23 +78,17 @@ table. The session bar shows frame rate, latency and bitrate at a glance.
 	alt="A live session with the Performance stats pane open"
 />
 
-Two of them are worth understanding.
+- **Frame rate** is what the host produces. Well below your tier means the host
+  is the bottleneck, not the network.
+- **Presentation interval variation** is how even the frame gaps are. This is
+  what stutter feels like.
 
-**Frame rate** is what the host is producing. If this is well below your tier,
-the bottleneck is the host, not your network.
-
-**Presentation interval variation** is how consistent the gaps between displayed
-frames are. This is the number that matches what stutter feels like. A high
-frame rate with high variation looks worse than a slightly lower frame rate with
-low variation.
-
-See [Stream quality problems](/quasar/troubleshooting/quality/) for reading
-these properly.
+See [Stream quality problems](/quasar/troubleshooting/quality/).
 
 ## Health banners
 
-Quasar tells you when it thinks the stream is in trouble, then waits for you to
-decide. It does not silently end sessions and it does not silently retry.
+Quasar shows a banner when the stream is in trouble. It doesn't end or retry
+sessions on its own.
 
 | Banner | Meaning |
 | --- | --- |
@@ -131,13 +99,9 @@ decide. It does not silently end sessions and it does not silently retry.
 
 ## Not available yet
 
-**Screenshot** and **Save last 30 seconds** appear in the drawer but are
-disabled. They are placeholders for work that has not landed.
+**Screenshot** and **Save last 30 seconds** are shown but disabled.
 
 ## Ending the session
 
-Exit session in the drawer, or close the tab. Either way the container stops and
-your save data is written to your persistent home directory.
-
-You get a summary afterwards: how long you played, frame rate and latency
-figures, and a plain-language note on how the session went.
+Press **Exit session** in the drawer, or close the tab. Your saves are kept in
+your home directory. You then get a short summary of the session.

@@ -8,16 +8,15 @@ import Shot from '../../../components/Shot.astro';
 import quickstart_engine from '../../../assets/shots/quickstart-engine.png';
 import QuickStart from '../../../components/QuickStart.astro';
 
-A few questions, then one command to run on the machine, or one stack to paste
-into Dockge or Arcane. You need Linux, Docker or Podman, and about 20 GB of disk;
-the [requirements](/quasar/start/requirements/) have the detail.
+Answer a few questions and get one command to run, or one stack to paste into Dockge
+or Arcane. You need Linux, Docker or Podman, and about 20 GB of disk. See
+[requirements](/quasar/start/requirements/).
 
-The **Engine** step picks the container engine and its mode, and shows the status
-of each [engine profile](/quasar/start/engine-profiles/) for your platform. An
-unsupported combination cannot go further. Except on Unraid, the result starts
-with [host preparation](/quasar/install/prepare-host/): fetch the script, check its
-checksum, run it as root. Then comes the install itself, a script for Docker or a
-Quadlet unit for Podman.
+The **Engine** step shows each [engine profile](/quasar/start/engine-profiles/)'s
+status for your platform. Except on Unraid, the result starts with [host
+preparation](/quasar/install/prepare-host/), then the install: a script for Docker,
+or a Quadlet unit for Podman. Read each script and check its checksum before you
+run it.
 
 <Shot
 	label="Quick start, engine step"
@@ -26,25 +25,18 @@ Quadlet unit for Podman.
 	alt="The quick start's engine step, with four engine profile badges"
 />
 
-Either way the machine runs one container you declare, the **seed**. It creates
-Quasar's **recovery actor**, which generates every secret on the machine and
-creates Postgres, the control plane and, on a machine with a GPU, the node
-agent. Nothing sensitive is on this page to leak, and nothing here writes an
-`.env` of secrets. [Install Quasar](/quasar/install/install/) says the same in
-prose, with every input.
+The result installs the **seed**, which creates everything else and generates all
+secrets. [Install Quasar](/quasar/install/install/) covers every input.
 
 <Aside type="note" title="Stable releases">
-The script pins the current stable release's images by digest, so the install
-never moves on its own: it updates when you apply an update from the admin
-console, and it follows the **stable** channel. An install made before the first
-stable release is on `edge`: see [Moving an edge install to
-stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
+The install is pinned to the current stable release and updates only from the admin
+console. An install made before the first stable release is on `edge`: see [Moving
+an edge install to stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
 </Aside>
 
 <Aside type="note" title="Already running Quasar from the Compose files?">
-The script stops if it finds one. To keep your accounts, library and settings,
-follow [Move a Compose install](/quasar/install/move-existing/) instead of this
-script: it dumps the old database first and loads it into the new install.
+The script stops if it finds one. To keep your data, follow [Move a Compose
+install](/quasar/install/move-existing/) instead.
 </Aside>
 
 <QuickStart />

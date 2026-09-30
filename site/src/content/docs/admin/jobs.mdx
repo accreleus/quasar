@@ -1,73 +1,55 @@
 ---
 title: Jobs and schedules
-description: Inspect background work, run a job immediately, change a schedule, and read bounded job history.
+description: See background jobs, run one now, change a schedule, and read run history.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-Admin, Fleet, Jobs is the central view of background work. It includes
-instance-wide jobs, work that runs once per host, and older unmanaged jobs that
-are visible but not yet controllable through the common scheduler.
+**Admin ▸ Fleet ▸ Jobs** lists background work: instance-wide jobs, per-host jobs,
+and older unmanaged jobs (visible, not controllable).
 
 ## What the table shows
 
-For each job you can see its scope, whether it is enabled, its schedule, last and
-next run, current state, and latest result. Expand a host-scoped job to see the
-state of each host independently.
+Each job's scope, enabled state, schedule, last and next run, current state and
+latest result. Expand a per-host job to see each host.
 
-Schedules may be periodic, limited to a time window and selected days, event
-driven, or manual only.
+Schedules can be periodic, limited to a time window and days, event-driven, or
+manual only.
 
 ## Run now
 
-Use the actions menu and choose **Run now**. A disabled job cannot run, and a job
-that is already active refuses a second overlapping run instead of queuing one.
-Host-scoped jobs ask which host should receive the run.
+Actions menu ▸ **Run now**. Disabled jobs cannot run, and an active job refuses a
+second run. Per-host jobs ask which host.
 
 ## Edit a schedule
 
-Managed schedules can be enabled or disabled and their interval or execution
-window changed from the page. Some schedules are locked by an environment
-variable; the UI names that variable and disables the fields it controls. Remove
-the environment override and restart before expecting an admin change to win.
-
-Unmanaged jobs are listed for visibility but have no editable common schedule.
+Managed schedules can be enabled, disabled, or given a new interval or window.
+A schedule locked by an environment variable names it; remove the variable and
+restart to edit it here.
 
 ## The release detection job
 
-`platform.release_detect` is the job that notices a new version of Quasar itself.
-It reads the release list of the project's own repository (the tagged releases
-and their manifests on the `stable` and `beta` channels, or the branch build's
-image on `edge`) and records what it found. On its own it installs nothing. With
-[Install updates automatically](/quasar/admin/releases/#install-updates-automatically)
-turned on, a pass that finds an eligible release that runs no migration also
-starts the fleet update, so this job's schedule is then the update window. The
-same pass sends the [release
-notification](/quasar/admin/releases/#release-notifications), if one is set up.
+`platform.release_detect` checks for new Quasar releases on the current channel.
+It installs nothing, unless [Install updates
+automatically](/quasar/admin/releases/#install-updates-automatically) is on, in
+which case this schedule is the update window. It also sends the [release
+notification](/quasar/admin/releases/#release-notifications), if set up.
 
-It runs **weekly by default: Monday, in a one-hour window opening 02:00 UTC**,
-which is enough for something that ships at the pace of a release. If you would
-rather hear sooner, edit its interval here to daily like any other managed
-schedule.
+- **Default: weekly, Monday, one-hour window from 02:00 UTC.** Change it here like
+  any managed schedule.
+- **Check now** on the Releases tab is the same as Run now. Both ignore the window.
+- The repository and token are environment settings (see [Updates and
+  releases](/quasar/reference/environment/#updates-and-releases)). Setting the
+  repository to `off` skips every run; empty means the default repository.
 
-**Check now** on the Releases tab is this job's Run now. Both bypass the window.
-Detection finding nothing is the normal result on an instance that is current.
-
-The repository it reads, and the token it uses if you point it at a private fork,
-are environment settings. See [Updates and
-releases](/quasar/reference/environment/#updates-and-releases). Setting the
-repository to `off` turns detection off: the job stays visible and every run is
-skipped. An empty value means the default repository, not off. What it finds is
-shown on [Updating Quasar](/quasar/admin/releases/).
+Results show on [Updating Quasar](/quasar/admin/releases/).
 
 ## Run history
 
-Open a job to see bounded, newest-first run history. The result distinguishes a
-successful run, a failure, a skipped run, and an active run. Use the recorded
-message and timestamps before searching raw container logs.
+Open a job for its recent runs, newest first, with result, message and
+timestamps. Check these before container logs.
 
 <Aside type="caution" title="Run now can change external state">
-Jobs do real work: they can scan libraries, install or inspect images, remove old
-telemetry, or perform host maintenance. Read the job name and target before
-starting it manually.
+Jobs do real work (scanning libraries, installing images, deleting old telemetry,
+host maintenance). Check the job and target before running one by hand.
 </Aside>
