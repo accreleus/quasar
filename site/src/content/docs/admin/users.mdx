@@ -1,6 +1,6 @@
 ---
 title: Users and invites
-description: Registration modes, invite codes, roles, session limits, device binding and the audit log.
+description: Registration modes, invite codes, roles, session limits, devices and entitlements.
 ---
 
 import Shot from '../../../components/Shot.astro';
@@ -9,36 +9,26 @@ import { Aside } from '@astrojs/starlight/components';
 
 ## Registration modes
 
-Set under Admin, People, Invites.
+Set under **Admin ▸ People ▸ Invites**.
 
 | Mode | Behaviour |
 | --- | --- |
 | `closed` | Nobody can register. The default. |
-| `invite_only` | Registration requires a valid invite code. |
-| `open` | Anyone who can reach the page can create an account. |
+| `invite_only` | Registration needs a valid invite code. |
+| `open` | Anyone who can reach the page can register. |
 
-On an owned install the admin UI is the only place it is set: a fresh install
-starts `closed`. On a legacy Compose install, `REGISTRATION_MODE` in
-`deploy/.env` seeds this value on the first boot of a fresh database and is
-ignored afterwards; the setting in the admin UI is the authority from then on. If
-you change the environment variable on a running instance and nothing happens,
-that is why.
+On a legacy Compose install, `REGISTRATION_MODE` in `deploy/.env` only seeds this
+on a fresh database's first boot. After that, the admin UI setting wins.
 
 <Aside type="caution" title="Think before setting `open`">
-Remember that the media path only works for clients that can already reach your
-GPU host directly. `open` on an instance exposed to the internet gives strangers
-accounts and the ability to occupy scheduling capacity, without giving them
-anything playable.
+On an internet-facing instance, `open` lets strangers create accounts and take
+scheduling capacity.
 </Aside>
 
 ## Invites
 
-Mint an invite and you get a code and a link, shown **once**. Copy it then. It is
-not retrievable afterwards.
-
-The link carries the code as a query parameter, so the person you send it to
-never types anything. You can list outstanding invites and revoke any that have
-not been used.
+Minting an invite shows a code and a link **once**. Copy it then. The link carries
+the code, so the recipient types nothing. You can list and revoke unused invites.
 
 <Shot
 	label="Admin invites"
@@ -49,42 +39,26 @@ not been used.
 
 ## Users
 
-Under Admin, People, Users you can see accounts, change roles, and set per-user
-concurrent session limits.
+**Admin ▸ People ▸ Users** shows accounts, roles and session limits.
 
-**Roles** are `user` and `admin`. There is nothing in between. An admin can do
-everything in this documentation.
-
-**Concurrent session limit** caps how many sessions one account can have running
-at once. Note that a limit of zero blocks that user from launching anything at
-all, which is occasionally what you want and more often a misconfiguration
-someone is confused by.
+- **Roles**: `user` or `admin`. Admins can do everything.
+- **Concurrent session limit**: sessions one account may run at once. `0` blocks
+  the user from launching anything.
 
 ## Devices
 
-Every browser a user logs in from is recorded as a device, along with what
-Quasar measured it can decode. That measurement is what stops the server sending
-a codec the client cannot play.
-
-Users manage their own devices from their account page: rename, trust, revoke.
-Revoking invalidates that device's login.
-
-Login tokens can be bound to a device, which means a stolen token is not useful
-from somewhere else.
+Each browser a user logs in from is a device, with its measured decode support
+(used to pick a codec it can play). Users rename, trust and revoke their devices
+from their account page; revoking logs that device out. Login tokens can be bound
+to a device, so a stolen token doesn't work elsewhere.
 
 ## The audit log
 
-Admin, Audit log records admin actions. Check it when something changed and
-nobody remembers changing it.
+**Admin ▸ Audit log** records admin actions. See
+[Sessions and audit log](/quasar/admin/sessions/#the-audit-log).
 
 ## Entitlements: who sees what
 
-Access to an app is a separate thing from having an account. An app is either
-granted to everyone or granted to named users, and a user's library only shows
-what they have been granted.
-
-Grants are managed on the app itself, under Admin, Library, Apps. See
-[Apps and runtime presets](/quasar/admin/apps/).
-
-A user who is not entitled to an app cannot see it and cannot launch it, even
-with the app's identifier in hand. The check is on the server.
+A user's library shows only apps granted to everyone or to them. Grants are set on
+the app under **Admin ▸ Library ▸ Apps**; see
+[Apps and runtime presets](/quasar/admin/apps/#access).

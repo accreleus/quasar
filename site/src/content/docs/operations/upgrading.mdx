@@ -7,214 +7,152 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 
 ## The hard rule
 
-**Do not run a control-plane image older than the database's applied migration
-version.** The control plane migrates Postgres at startup. A binary that does not
-contain a migration the database has already applied refuses to start.
+**Never run a control-plane image older than the database's migration version.**
+The control plane migrates Postgres at startup, and an older binary refuses to
+start against a newer database. A rollback needs both the older image and the
+database backup taken before the upgrade.
 
-Restoring the old image alone is therefore not a rollback. A rollback requires
-both the older image and the database backup taken before the upgrade.
-
-The console enforces this for you: a release carrying a schema below the
-database's own is never listed or offered, and the control plane always moves
-before any agent.
+The console enforces this: it never offers a release below the database's
+schema, and it always moves the control plane before any agent.
 
 <Aside type="caution" title="A release that changes the database empties the instance first">
-A control-plane update that runs no migration does not end sessions. The agent
-holds its running sessions while the control plane restarts, and the browser
-keeps the media path it already has. A release that **carries a migration** is
-different: a fleet update from the console drains the whole instance and waits
-for it to be empty before the control-plane step, unless you tick the box that
-ends the sessions now. Every migration Quasar has shipped was written assuming
-no session was live while it ran. The update confirmation says which case you
-are in. Updating a host's agent always ends that host's sessions.
+An update without a migration doesn't end sessions. One **with** a migration
+drains the whole instance before the control-plane step, unless you tick the box
+to end sessions now. The confirmation says which case you're in. Updating a
+host's agent always ends that host's sessions.
 </Aside>
 
 ## Upgrade from the console
 
-For a Quasar-owned install this is the only path. Admin, Fleet, Releases lists
-what is available, says which of your machines can take it, and applies it: the
-control plane first, then each eligible host in turn, each one cordoned and
-drained before its agent is replaced.
+This is the only upgrade path for a Quasar-owned install.
 
 <Steps>
 
-1. **Read what the release changes.** Open Admin, Fleet, Releases and read the
-   notes. The confirmation says whether this release migrates the database.
+1. **Read the notes** under **Admin ▸ Fleet ▸ Releases**. The confirmation says
+   whether the release migrates the database.
 
-2. **Know how the database is covered.** Migrations only go forward. With
-   Quasar's own database, the recovery actor takes a dump before a release that
-   migrates it, checks it reads back, and keeps the last three; if it cannot
-   take one, or there is not room, the update is refused (`backup_failed`) and
-   nothing is touched. With your own database, the confirmation asks you to tick
-   that you have a current backup of it; without the tick the update is refused
-   (`backup_unconfirmed`). See [Backup and restore](/quasar/operations/backup/).
+2. **Check the database is covered.** With Quasar's own database, the recovery
+   actor takes a dump first; if it can't, the update is refused
+   (`backup_failed`). With your own database, you must tick that you have a
+   current backup (`backup_unconfirmed` otherwise). See
+   [Backup and restore](/quasar/operations/backup/).
 
-3. **Press Update Quasar**, or Apply on a single host. The confirmation names how
-   many live sessions are involved.
+3. **Press Update Quasar**, or Apply on a single host. The confirmation shows how
+   many live sessions are affected.
 
-4. **Reload the console** when it offers to. The tab was loaded from the previous
-   build.
+4. **Reload the console** when it offers to.
 
-5. **Verify.** Hosts back online under Admin, Fleet, Hosts, then a real session.
-   Container health does not prove video, audio, or input.
+5. **Verify**: hosts back online under **Admin ▸ Fleet ▸ Hosts**, then a real
+   session. Container health doesn't prove video, audio or input.
 
 </Steps>
 
-[Updating Quasar](/quasar/admin/releases/) covers channels, why a target might
-not be eligible, reverting a host, unattended updates, and what the history
-records.
+The control plane updates first, then each eligible host, drained in turn. Each
+machine's **recovery actor** does the replacing; a control plane that never
+becomes healthy is put back automatically, unless the release migrated the
+database (see below). Hosts built from source are never offered updates.
 
-The console needs the **recovery actor** on each machine, which is part of every
-owned install. It is what replaces the machine's services, because a container
-cannot replace itself. A GPU host's recovery actor is instructed through that
-host's own agent; the control plane's machine is instructed over a local socket.
-The console never offers an update to a control plane or host built from source.
-
-- **The recovery actor moves first** inside each attempt. It replaces itself by
-  handing over to a successor, which must verify itself before the old one is
-  discarded.
-- **The control plane** is replaced by the recovery actor on its own machine. The
-  console goes away for the length of the replacement. A new control plane that
-  never becomes healthy is put back automatically, unless the release migrates
-  the database (below).
-
-There is no by-hand upgrade for an owned install: no file to edit, no image to
-pin. A [legacy Compose install](/quasar/install/legacy-compose/#upgrade-by-hand)
-keeps its own by-hand recipe and its updater, but is not offered releases that
-ship owned installs.
+[Updating Quasar](/quasar/admin/releases/) covers channels, eligibility,
+reverting a host and unattended updates. A [legacy Compose
+install](/quasar/install/legacy-compose/#upgrade-by-hand) keeps its own by-hand
+recipe.
 
 ## Release signatures
 
-**Optional, and off unless you turn it on.** What gets installed is always the
-digest the release manifest pins, whether or not anything is signed. A release
-may also publish a detached signature over that manifest, which covers every
-component image, and each machine's recovery actor can check it before applying
-anything, with the same `verify` and `require` modes as the legacy updater.
-`verify` refuses a release whose signature does not check out and accepts an
-unsigned one. `require` also refuses an unsigned release, an edge build and a
-developer apply.
+**Optional, off by default.** Quasar always installs the digests the release
+manifest pins. If you also want each machine to check the manifest's signature,
+set these seed inputs (recorded at first install):
 
-On an owned machine the mode and the trusted keys are seed inputs,
-`QUASAR_UPDATER_SIGNATURE_MODE` (`off`, `verify` or `require`) and
-`QUASAR_UPDATER_TRUSTED_KEYS` (`<key-id>:<base64 public key>`, comma-separated),
-recorded in the machine's own state at the first install. Change them later, on
-each machine, with `reconfigure` inside its recovery actor:
+| Variable | Values |
+| --- | --- |
+| `QUASAR_UPDATER_SIGNATURE_MODE` | `off` (default); `verify` refuses a bad signature but accepts unsigned; `require` also refuses unsigned releases, edge builds and developer applies. |
+| `QUASAR_UPDATER_TRUSTED_KEYS` | `<key-id>:<base64 public key>`, comma-separated. |
+
+Change them later on each machine:
 
 ```bash
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
   QUASAR_UPDATER_SIGNATURE_MODE=verify QUASAR_UPDATER_TRUSTED_KEYS=<key-id>:<base64 public key>
 ```
 
-Enabling either mode with no trusted keys refuses every update, on purpose. The
-recovery actor fetches the signature from GitHub over HTTPS with its own
-certificate roots and no proxy: on a machine that reaches the internet only
-through a proxy, or that must trust a private CA, leave the mode `off`, since
-`verify` and `require` would refuse every release there. A legacy Compose
-install sets these on its updater; see [Legacy Compose
-installs](/quasar/install/legacy-compose/#verify-release-signatures).
+- A mode with no trusted keys refuses every update.
+- The signature is fetched from GitHub directly, without a proxy or private CA.
+  Behind either, leave the mode `off`.
+- Legacy Compose: see [Legacy Compose
+  installs](/quasar/install/legacy-compose/#verify-release-signatures).
 
-Publishing signed releases from your own fork, and rotating a key without a flag
-day, are in the repository's `docs/upgrading.md`.
+Signing releases from your own fork and rotating keys are covered in the
+repository's `docs/upgrading.md`.
 
 ## If the control plane crash-loops after a rollback
 
-Redeploy the newer control-plane image containing the migration already present
-in the database. If you must return to the older release, restore the pre-upgrade
-database backup as well. Do not hand-edit migration bookkeeping or run down
-migrations against production state.
+Redeploy the newer control-plane image. To go back to the older release, you must
+also restore the pre-upgrade backup. Don't hand-edit migration bookkeeping or run
+down migrations.
 
-On an owned install Quasar enforces the rule: once a control plane has migrated
-the database, no control plane below that schema is created, started or put back
-on that machine again. A migrating update is never restored automatically. If
-the new control plane does not verify, it is left running (it matches the
-migrated schema), and the failed attempt ends with the one command that goes
-back, run on that machine:
+A migrating update is never undone automatically. If the new control plane fails
+to verify, it is left running and the failed attempt prints the command to go
+back:
 
 ```bash
 docker exec quasar-recovery quasar-recovery restore --dump <name> --to <version>
 ```
 
-`--to` is the version the control plane was on, and `<name>` is the dump the
-recovery actor took before the update. On your own database, restore your backup
-first with the control plane stopped, then run `restore --to <version>` alone.
-`restore --list` shows the dumps kept on the machine. See
+With your own database, restore your backup first (control plane stopped), then
+run `restore --to <version>` alone. See
 [Restoring](/quasar/operations/backup/#restoring).
 
-Check the current migration version on Quasar's own database with:
+Check the migration version on Quasar's own database:
 
 ```bash
 docker exec quasar-postgres \
   psql -U quasar -d quasar -c 'SELECT version, dirty FROM schema_migrations;'
 ```
 
-On a legacy Compose install, run the same `psql` through
-`docker compose -f deploy/docker-compose.yml exec quasar-postgres` instead.
-
-`dirty=true` means a migration failed partway and needs investigation before
-another upgrade attempt.
+On legacy Compose, run the same `psql` through
+`docker compose -f deploy/docker-compose.yml exec quasar-postgres`.
+`dirty=true` means a migration failed partway: investigate before upgrading again.
 
 ## Contributor builds: two lanes
 
-A machine is in exactly one of two lanes at a time.
+A machine is in one lane at a time.
 
-**The contributor lane.** A stack built from source with `deploy/redeploy.sh` or
-the Makefile verbs (`make redeploy-cp`, `make rebuild`). It is contributor
-tooling, not a supported install. It is never acted on by a recovery actor, and
-it is never offered a release from the console: it shows the
-`deploy/redeploy.sh <va|nvidia> <ref>` command for its own situation instead,
-which rebuilds and restarts it in place. See [GPU and remote
-workflows](/quasar/developer/gpu-workflows/). Do not turn the release
-instructions into an implicit branch deployment.
-
-**The product lane.** Images built with `deploy/build-images.sh` and pushed to a
-registry namespace you control, installed with the seed exactly as a user would,
-and moved with a **developer apply**. This is how a branch build runs on the
-path users run.
+- **Contributor lane:** a stack built from source with `deploy/redeploy.sh`,
+  `make redeploy-cp` or `make rebuild`. Never updated from the console; it shows
+  its `deploy/redeploy.sh <va|nvidia> <ref>` command instead. See [GPU and remote
+  workflows](/quasar/developer/gpu-workflows/).
+- **Product lane:** images built with `deploy/build-images.sh`, pushed to a
+  registry you control, installed with the seed, and moved with a developer
+  apply.
 
 ### Developer apply
 
-Admin, Fleet, Releases, **Developer apply** applies a set of image digests to one
-Quasar-owned host without publishing a release. It is admin-only, it is never
-offered and never unattended, and it follows the same rules as any update:
-digests only, never a tag, and only from an allowed registry namespace. The
-attempt is recorded in the apply history like any other, and a new agent that
-never becomes healthy is put back automatically.
+**Admin ▸ Fleet ▸ Releases ▸ Developer apply** applies image digests (never tags)
+to one owned host without publishing a release. It is admin-only, recorded in
+the apply history, and rolls back an agent that never becomes healthy.
 
-- The control plane checks the namespace first, against its own
-  `QUASAR_UPDATER_ALLOWED_NAMESPACES`, and refuses anything outside it before any
-  registry is contacted. Each machine's recovery actor then enforces its own
-  list, which is a first-install input of that machine's seed. A host installed
-  with only the default namespace refuses a test registry's images.
-- For a contributor's plain-HTTP test registry, name it in the control plane's
-  `QUASAR_PLATFORM_INSECURE_REGISTRIES`. The images must still be in an allowed
-  namespace, and the manifest must hash to the digest you gave. Leave it unset in
-  production.
-- A host under signature mode `require` refuses a developer apply, which names no
-  signed release.
-- A developer apply to a GPU host names its node agent, its recovery actor, or
-  both. One to the first machine names its control plane, with or without the
-  recovery actor beside it (never the actor alone). The node agent of a combined
-  host is applied on its own: that machine's recovery actor moves with its
-  control plane. A control-plane digest that migrates the database takes
-  the pre-update dump, or needs the backup confirmation, exactly as a release
-  does.
-- The allowlist and the plain-HTTP registries are seed inputs of each machine
-  (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`),
-  recorded at its first install, and changed later with `reconfigure` inside
-  that machine's recovery actor. On the first machine that replaces the control
-  plane, which restarts the console for a moment.
+- Images must be in a namespace listed in `QUASAR_UPDATER_ALLOWED_NAMESPACES`,
+  on both the control plane and the target machine. A host installed with only
+  the default namespace refuses a test registry.
+- For a plain-HTTP test registry, set `QUASAR_PLATFORM_INSECURE_REGISTRIES`.
+  Leave it unset in production.
+- Both are seed inputs; change them later with `reconfigure` in the machine's
+  recovery actor (on the first machine this briefly restarts the console).
+- Signature mode `require` refuses a developer apply.
+- A GPU host takes its node agent, its recovery actor, or both. The first machine
+  takes its control plane, optionally with its recovery actor. A combined host's
+  node agent is applied on its own.
+- A migrating control-plane digest needs the same dump or backup confirmation as
+  a release.
 
 <Aside type="caution" title="Multiple hosts must stay version-aligned">
-Upgrade the control plane and every agent host as one planned operation. Brief
-skew while containers restart may work, but a permanently mixed fleet is not a
-supported target. A fleet update from the console is exactly this operation, in
-the right order.
+Upgrade the control plane and every agent as one operation. A permanently mixed
+fleet isn't supported. A console fleet update does this in the right order.
 </Aside>
 
 ## Coming from a Compose install
 
-A legacy Compose install is not converted in place. It is replaced by a fresh
-install, and its accounts, library, profiles and settings come across in a
-database dump loaded before the new control plane first starts. See [Move a
-Compose install](/quasar/install/move-existing/), or [Legacy Compose
-installs](/quasar/install/legacy-compose/) to stay where you are.
+A legacy Compose install isn't converted in place: install fresh and load its
+database dump before first start. See [Move a Compose
+install](/quasar/install/move-existing/), or [Legacy Compose
+installs](/quasar/install/legacy-compose/) to stay put.

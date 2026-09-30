@@ -3,13 +3,13 @@ title: First-run setup
 description: Claiming the founding admin account and completing the five-step setup wizard.
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 import Shot from '../../../components/Shot.astro';
 import setup_claim from '../../../assets/shots/setup-claim.png';
 import setup_hosts from '../../../assets/shots/setup-hosts.png';
 
-The first time you open Quasar it sends you to `/setup` instead of a login page,
-because there is nobody to log in as yet.
+The first time you open Quasar, it sends you to `/setup`. The wizard is resumable:
+close the tab and you come back where you left off.
 
 <Shot
 	label="Setup wizard"
@@ -20,43 +20,30 @@ because there is nobody to log in as yet.
 
 ## Step 1: Claim
 
-The first admin account is created here, and it is protected by a one-time token
-so that whoever reaches the page first cannot simply make themselves the
-administrator of your machine.
-
-On first boot, if no admin exists, the control plane writes a random token to a
-file inside the container. It is never logged and never printed. Read it with:
+Create the first admin account. It needs a one-time setup token, which only
+someone with shell access to the host can read:
 
 ```bash
 docker exec quasar-control-plane cat /run/quasar/setup-token
 ```
 
-On a [legacy Compose install](/quasar/install/legacy-compose/), run it through
-Compose from the stack directory instead:
+On a [legacy Compose install](/quasar/install/legacy-compose/), from the stack directory:
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
   cat /run/quasar/setup-token
 ```
 
-Paste that into the wizard along with the email, username and password you want
-for the admin account.
-
-To claim the instance you must be able to run a command on the host. If you can
-do that, you already own the machine.
+Paste the token with the email, username and password you want.
 
 <Aside type="note" title="Restarting rotates the token">
-The token lives in memory-backed storage and is regenerated if the control plane
-restarts before you claim. Read it again; do not reuse an old one.
+If the control plane restarts before you claim, read the token again.
 </Aside>
 
 ### Or skip the wizard entirely
 
-Not on an owned install: the seed takes no admin account, so the setup token is
-the way in. On a [legacy Compose install](/quasar/install/legacy-compose/) or a
-source checkout, the control plane can instead provision the admin from three
-settings at its first boot. Set all three in `deploy/.env` before the first
-boot:
+Legacy Compose and source installs only (an owned install always uses the token).
+Set all three in `deploy/.env` before the first boot, with a strong password:
 
 ```bash
 BOOTSTRAP_ADMIN_EMAIL=you@example.com
@@ -64,65 +51,43 @@ BOOTSTRAP_ADMIN_USERNAME=you
 BOOTSTRAP_ADMIN_PASSWORD=
 ```
 
-Replace the blank password with a strong password you choose before starting.
-The example deliberately contains no usable password.
-
-The control plane creates that account at startup. It is idempotent and does
-nothing once an admin exists. The Claim step is then skipped.
-
-There is no "first person to register becomes admin" path, by design. The
-registration endpoint can only ever create ordinary users.
+The control plane creates that admin at startup (and does nothing once an admin
+exists), and the Claim step is skipped. Registration never creates an admin.
 
 ## Step 2: Basics
 
-Choose how new accounts are created:
+Choose how new accounts are created (change later under Admin ▸ People ▸ Invites):
 
 | Mode | Behaviour |
 | --- | --- |
-| `closed` | Nobody can register. You create accounts. This is the default. |
-| `invite_only` | Registration works only with a valid invite code. |
-| `open` | Anyone who can reach the page can create an account. |
+| `closed` | Default. Only you create accounts. |
+| `invite_only` | Registration needs an invite code. |
+| `open` | Anyone who can reach the page can register. |
 
-You can change this later under Admin, People, Invites.
+**Open setup through the address users will use**, including your reverse proxy's
+public hostname. From 0.2.4, **Continue** saves that origin for streaming, keeping
+any already allowed. It doesn't configure DNS or proxy routing.
 
-The public URL is detected from this browser. From Quasar 0.2.4, **Continue**
-saves that exact origin for streaming and preserves any addresses already allowed.
-Open setup through the address users will use, including your reverse proxy's
-public hostname. The wizard verifies that the saved origin is active before
-advancing; it does not configure DNS, proxy routing, or media connectivity.
-
-An explicit `QUASAR_ALLOWED_ORIGINS` environment override remains authoritative,
-even if empty. Setup checks it without changing it. If it rejects this browser
-address, setup explains how to add the origin to the override or remove the
-override to use the saved setting. Existing releases that only display the URL
-need the [manual allowed-origin configuration](/quasar/network/reverse-proxy/#allowed-origins)
-before stream testing. A successful login does not establish that signaling
-accepts that address.
+If `QUASAR_ALLOWED_ORIGINS` is set (even empty), it wins; setup tells you if it
+rejects this address. On older releases, set the
+[allowed origins by hand](/quasar/network/reverse-proxy/#allowed-origins) before
+testing a stream.
 
 ## Step 3: Hosts
 
-A check of what each node agent has actually reported, as opposed to what the
-configuration claims, plus the managed-home root each host will use.
+Shows what each node agent actually reported: registered, GPUs found, encoder
+detected, and named problems like a missing `/dev/uinput` or input rules. See
+[Readiness checks](/quasar/troubleshooting/readiness/). Nothing here blocks you.
 
-It tells you whether the agent registered at all, whether GPUs were found, and
-whether an encoder was detected on each one. Known misconfigurations are named
-directly: no encoder registered, driver components missing, `/dev/uinput`
-not writable, input device rules absent. Each check is explained on [Readiness
-checks](/quasar/troubleshooting/readiness/).
-
-Nothing here blocks you. A failing check warns and links you to Admin, Fleet,
-Hosts. For storage, the wizard can keep the agent-reported root or select one of
-its subdirectories. Moving to an entirely different root means changing the
-machine's home root, so the bind mount moves too. On an owned host that is
-`reconfigure`, run inside its recovery actor, which replaces the agent with the
-new root and puts it back if it does not verify. On a combined host it replaces
-the control plane first, then the agent:
+It also sets each host's home root. You can keep the reported root or pick a
+subdirectory. For a different root, reconfigure the host through its recovery
+actor (it reverts if the agent doesn't verify):
 
 ```bash
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
 ```
 
-Changing the root does not move existing homes; see [Storage](/quasar/admin/hosts/#storage).
+Existing homes are not moved; see [Storage](/quasar/admin/hosts/#storage).
 
 <Shot
 	label="Setup wizard, hosts step"
@@ -133,52 +98,31 @@ Changing the root does not move existing homes; see [Storage](/quasar/admin/host
 
 ## Step 4: Libraries
 
-Turn on one or more library providers from the image catalog. Steam is the
-provider currently shipped by the project.
+Turn on a library provider (Steam today) and choose who sees it: everyone, only
+you, or later. Quasar installs the image on your hosts and adds the launcher app.
 
-Enabling one triggers a chain on the server: its container image is installed on
-your hosts, a runtime preset is created from the image manifest, a launcher app
-is added to the catalog, and an entitlement is created according to the
-visibility you choose.
-
-You choose who can see it: everyone, only you, or decide later.
-
-From Quasar 0.2.4, supported Steam images also prepare reusable files in
-the background for new users. Control this separately from discovery under
-Library → Sources → Steam; see [Steam preparation](/quasar/install/steam-preparation/).
-Preparation never gates a normal launch.
-
-The published Steam image is public. If installation fails, check the image job
-under Admin, Fleet, Jobs and see [Images](/quasar/admin/images/) rather than
-assuming registry access is required.
+From 0.2.4, Steam images also prepare files for new users in the background; see
+[Steam preparation](/quasar/install/steam-preparation/). The Steam image is
+public. If it fails to install, check Admin ▸ Fleet ▸ Jobs and
+[Images](/quasar/admin/images/).
 
 ## Step 5: Finishing touches
 
-The last step contains optional settings that can all be changed later in the
-admin area:
+All optional, all changeable later:
 
-- Add a SteamGridDB API key for cover artwork (later: Admin, Library, Sources).
-  On an owned install this is the only way to set it, and a fresh install needs
-  it entered again.
-- Enable or disable browser microphone capture.
-- Start the first Steam library scan when discovery is enabled.
-- A reminder that `QUASAR_SECRET_KEY` cannot be recovered. On an owned install it
-  lives in the `quasar-machine` volume, the one volume on each machine that must
-  never be deleted, and the wizard says so. On a legacy Compose install it is in
-  `deploy/.env`, and the wizard tells you to back that file up.
+- A SteamGridDB API key for cover art (later: Admin ▸ Library ▸ Sources). On an
+  owned install, a fresh install needs it again.
+- Browser microphone on or off.
+- Start the first Steam library scan. A failed scan doesn't block you.
 
-The scan is best-effort. A failed or slow scan does not trap you in the wizard;
-you can run it later from the administration area.
+<Aside type="caution" title="Back up the secret key">
+`QUASAR_SECRET_KEY` cannot be recovered. On an owned install it lives in the
+`quasar-machine` volume: never delete it. On legacy Compose, back up `deploy/.env`.
+</Aside>
 
 ## After the wizard
 
-You land in the admin area. The sensible order from here:
-
-1. **Check the update channel.** Admin, Fleet, Releases reads `stable`, which
-   offers tagged releases with notes. See [Channels](/quasar/admin/releases/#channels).
-2. [Check your install](/quasar/install/verify/) works end to end.
-3. [Add apps](/quasar/admin/apps/) beyond whatever library discovery gave you.
-4. [Invite people](/quasar/admin/users/), if it is not just you.
-
-The wizard is resumable. If you close the tab partway through, you come back to
-where you were.
+1. Check Admin ▸ Fleet ▸ Releases reads `stable` ([Channels](/quasar/admin/releases/#channels)).
+2. [Check your install](/quasar/install/verify/) end to end.
+3. [Add apps](/quasar/admin/apps/).
+4. [Invite people](/quasar/admin/users/).

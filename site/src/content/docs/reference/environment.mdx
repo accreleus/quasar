@@ -3,103 +3,80 @@ title: Environment variables
 description: The settings a self-hoster is likely to touch, grouped by what they do, with defaults.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+**An owned install takes only the [seed inputs](#seed-inputs).** Everything else
+it either runs with defaults or edits in the admin UI (allowed origins,
+registration, release channel, host policy, the catalog, stored secrets).
 
-On a Quasar-owned machine you write only the **seed inputs** below, in the seed's
-`docker run` line or stack. The recovery actor renders every service's settings
-from them and keeps the result in the machine's own state. On a [legacy Compose
-install](/quasar/install/legacy-compose/) or a source checkout, deployment and
-process settings are environment variables in `deploy/.env`. Instance settings
-and many host settings are persisted and editable through the admin UI; where
-both exist, the table notes whether the environment is a seed, fallback, or
-authoritative override.
+The other sections are process settings for a [legacy Compose
+install](/quasar/install/legacy-compose/) or a source checkout, set in
+`deploy/.env`.
 
-Everything below the seed inputs describes the process settings of a legacy
-Compose install or a source checkout. **An owned install takes only the seed
-inputs**: its control plane runs with its own defaults for the rest (a
-certificate of your own, ICE servers, placement policy, the release repository
-and token, the catalog registry allowlist, artwork keys, `PUBLIC_BASE_URL` and
-`BOOTSTRAP_ADMIN_*` have no input in this release), and what the admin UI edits
-(allowed origins, registration mode, the release channel, host policy, the app
-catalog, stored secrets) is set there.
+Many node agent settings can also be set per host in **Admin ▸ Fleet ▸ Hosts ▸
+Settings**. Precedence: per-host override, then agent environment, then default.
 
-Many node agent settings can also be overridden per host from Admin, Fleet, Hosts,
-Settings, which is easier than editing a file on every machine.
-Precedence runs: per-host override, then agent environment, then catalog default.
-
-<Aside type="note" title="This is the practical subset">
-The full catalogue including debug and development settings lives in
-`docs/configuration.md` in the repository. Anything not listed here is either
-internal or something you should not change without a measurement.
-</Aside>
+This is the practical subset. The full list is `docs/configuration.md` in the repository.
 
 ## Seed inputs
 
-What the seed and the recovery actor read, **once**, on a clean machine. After
-the first install the machine's own state wins and later values are ignored, so
-the enrollment string can be removed from the stack. See [Install
-Quasar](/quasar/install/install/).
+Read **once**, on a clean machine. Afterwards the machine's own state wins, so you
+can remove the enrollment string from the stack. See [Install Quasar](/quasar/install/install/).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_ROLE` | `gpu` | The machine's role: `gpu`, `combined` or `control-only`. |
-| `QUASAR_ENROLLMENT` | required on a GPU host | The single-use `qenr1.…` string from Admin, Fleet, Hosts, Add host. Stored as a secret file and handed to the agent as a file, never as an environment variable. |
-| `QUASAR_HOME_ROOT` | required on a machine with an agent | Host path of the home root, bound into the agent at the same path. Optional on a control-only machine: set, every GPU host must use that same path. |
+| `QUASAR_ROLE` | `gpu` | `gpu`, `combined` or `control-only`. |
+| `QUASAR_ENROLLMENT` | required on a GPU host | The single-use `qenr1.…` string from **Fleet ▸ Hosts ▸ Add host**. Stored as a secret file. |
+| `QUASAR_HOME_ROOT` | required with an agent | Host path of the home root, mounted at the same path in the agent. If set on a control-only machine, every GPU host must use it. |
 | `QUASAR_TEMPLATE_ROOT` | `templates` beside the home root | Host path of the template root. |
-| `QUASAR_NODE_NAME` | the machine's host name | The agent's node name. A node name bound into the enrollment string must match. |
-| `QUASAR_AGENT_IMAGE` | required on a machine with an agent | The node-agent image as `repository@sha256:<digest>`. A tag is refused, and so is an image whose container shape this recovery actor does not carry. Optional on a control-only machine: named, it is the agent Add host installs on new GPU hosts when no release names one; left out, Add host offers the installed release's images. |
-| `QUASAR_APP_PUID`, `QUASAR_APP_PGID` | the image's user | Who owns game and save data (Unraid: `99` and `100`). |
-| `QUASAR_CONTAINER_NETWORK` | `none` | The app containers' network: `none`, `bridge` or `host`. |
+| `QUASAR_NODE_NAME` | the host name | The agent's node name. Must match a name bound into the enrollment string. |
+| `QUASAR_AGENT_IMAGE` | required with an agent | The node-agent image as `repository@sha256:<digest>`; tags are refused. On a control-only machine, optional: the agent Add host installs when no release names one. |
+| `QUASAR_APP_PUID`, `QUASAR_APP_PGID` | the image's user | Owner of game and save data (Unraid: `99` and `100`). |
+| `QUASAR_CONTAINER_NETWORK` | `none` | App container network: `none`, `bridge` or `host`. |
 
 On the first machine (`combined` or `control-only`), also:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_CONTROL_PLANE_IMAGE` | required | The control-plane image as `repository@sha256:<digest>`. |
-| `QUASAR_PUBLIC_HOST` | unset; set it | The name or LAN address the console is reached by. The self-signed certificate names it. |
-| `QUASAR_TLS_HOSTS` | unset | More names for the certificate, comma-separated. |
-| `QUASAR_TRUSTED_PROXIES` | unset | The reverse proxies in front of the console. A `/0` or a malformed entry refuses the install. |
-| `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT` | `8080`, `8443` | Host ports of the HTTP (agents, `/health`) and HTTPS (console) listeners. |
-| `QUASAR_POSTGRES_IMAGE` | the digest this recovery actor carries | Quasar's own Postgres, by digest. Created once, never updated. |
-| `QUASAR_DATABASE_HOST` | unset | Makes the database your own: no Postgres is created. |
+| `QUASAR_PUBLIC_HOST` | unset; set it | The console's name or LAN address. The certificate names it. |
+| `QUASAR_TLS_HOSTS` | unset | More certificate names, comma-separated. |
+| `QUASAR_TRUSTED_PROXIES` | unset | Reverse proxies in front of the console. `/0` or a malformed entry refuses the install. |
+| `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT` | `8080`, `8443` | Host ports for HTTP (agents, `/health`) and HTTPS (console). |
+| `QUASAR_POSTGRES_IMAGE` | built in | Quasar's own Postgres, by digest. Created once, never updated. |
+| `QUASAR_DATABASE_HOST` | unset | Use your own database instead of creating one. |
 | `QUASAR_DATABASE_PORT`, `QUASAR_DATABASE_USER`, `QUASAR_DATABASE_NAME` | `5432`, `quasar`, `quasar` | Your database's connection. |
-| `QUASAR_DATABASE_SSLMODE` | `disable` | Set `require` or `verify-full` for a database on another machine. |
-| `QUASAR_DATABASE_PASSWORD` | required with `QUASAR_DATABASE_HOST` | Interpolate it from the stack's `.env`. Not read again once installed. |
-| `QUASAR_AWAIT_RESTORE` | unset | `1` holds a fresh install's control plane until you load a Compose install's database dump into it. See [Move a Compose install](/quasar/install/move-existing/). Quasar's own database only. |
-| `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | the installed release's | Pins the images Add host installs on new GPU hosts, by digest. |
+| `QUASAR_DATABASE_SSLMODE` | `disable` | Use `require` or `verify-full` for a remote database. |
+| `QUASAR_DATABASE_PASSWORD` | required with `QUASAR_DATABASE_HOST` | Take it from the stack's `.env`. Read only at install. |
+| `QUASAR_AWAIT_RESTORE` | unset | `1` holds the new control plane until you load a Compose dump. Quasar's own database only. See [Move a Compose install](/quasar/install/move-existing/). |
+| `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | the installed release's | Pins, by digest, the images Add host installs. |
 
-The seed itself also needs two mounts, not variables: the engine socket, and the
-`quasar-machine` volume read-only at `/var/lib/quasar-machine`.
+The seed also needs two mounts: the engine socket, and the `quasar-machine` volume
+read-only at `/var/lib/quasar-machine`.
 
 ### The recovery actor's trust settings
 
-Seed inputs too, recorded in the machine's own state at the first install. The
-names are kept from the retired Compose updater, whose rules the recovery actor
-carries.
+Also seed inputs.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this machine pulls platform images from, matched on path segment boundaries. Anything outside is refused before a byte is pulled. Unset or blank means the project's own namespace, never "allow nothing" and never "allow everything". On the first machine the control plane checks a developer apply against the same list. |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Registry namespaces platform images may come from, comma-separated. Blank means the default. The first machine also checks developer applies against it. |
 | `QUASAR_UPDATER_SIGNATURE_MODE` | `off` | `off`, `verify` or `require`. See [Release signatures](/quasar/operations/upgrading/#release-signatures). |
 | `QUASAR_UPDATER_TRUSTED_KEYS` | none | `<key-id>:<base64 public key>`, comma-separated. |
 | `QUASAR_UPDATER_MANIFEST_BASE_URL` | the project's GitHub Releases | Where signatures are fetched from. |
-| `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | How long that fetch may take. |
-| `QUASAR_PLATFORM_INSECURE_REGISTRIES` | unset | The first machine: plain-HTTP registries a developer apply's image may be read from, for a test registry. |
+| `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | Timeout for that fetch. |
+| `QUASAR_PLATFORM_INSECURE_REGISTRIES` | unset | First machine: plain-HTTP registries allowed for a developer apply. |
 
-To change them later, run `reconfigure` inside the machine's recovery actor:
+To change an input later:
 
 ```bash
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER_SIGNATURE_MODE=verify
 ```
 
-`reconfigure` also takes `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`,
-`QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`, and on the
-first machine every control-plane input above: `QUASAR_PUBLIC_HOST`,
-`QUASAR_TLS_HOSTS`, `QUASAR_TRUSTED_PROXIES`, `QUASAR_HTTP_PORT`,
-`QUASAR_TLS_PORT` and the Add host images. Each change replaces the services it
-moves, on the same images, and puts them back if they do not verify. The
-database inputs and the node name are refused: changing them means reinstalling
-(`docs/configuration.md` "Changing machine inputs").
+`reconfigure` accepts the trust settings, `QUASAR_HOME_ROOT`,
+`QUASAR_TEMPLATE_ROOT`, `QUASAR_APP_PUID`, `QUASAR_APP_PGID`,
+`QUASAR_CONTAINER_NETWORK`, and on the first machine `QUASAR_PUBLIC_HOST`,
+`QUASAR_TLS_HOSTS`, `QUASAR_TRUSTED_PROXIES`, the ports and the Add host images.
+It replaces the affected services and rolls back if they don't verify. Database
+inputs and the node name need a reinstall.
 
 ## Required on a legacy Compose install
 
@@ -109,32 +86,27 @@ database inputs and the node name are refused: changing them means reinstalling
 | `CONTROL_PLANE_URL` | Agent side. WebSocket URL of the control plane. |
 | `POSTGRES_PASSWORD` | Compose. Generated on a fresh install. |
 
-The release install has you generate these values before first boot. The
-source-build `redeploy.sh` path generates missing secrets and never overwrites
-existing ones.
-
-A host joins with a single-use `QUASAR_ENROLLMENT` string minted from Admin,
-Fleet, Hosts, Add host. The string carries the control-plane address too. The
-static, deployment-wide `ENROLLMENT_TOKEN` is retired: a control plane no longer
-accepts one.
+`redeploy.sh` generates missing secrets and never overwrites existing ones. Hosts
+join with a `QUASAR_ENROLLMENT` string from Add host; the old static
+`ENROLLMENT_TOKEN` is no longer accepted.
 
 ## Setup and identity
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BOOTSTRAP_ADMIN_EMAIL` | unset | Provisions the first admin at boot. Idempotent. |
+| `BOOTSTRAP_ADMIN_EMAIL` | unset | Creates the first admin at boot. Idempotent. |
 | `BOOTSTRAP_ADMIN_USERNAME` | unset | With the above. |
 | `BOOTSTRAP_ADMIN_PASSWORD` | unset | With the above. Set all three or none. |
-| `REGISTRATION_MODE` | `closed` | Seeds the registration mode on first boot of a fresh database only. The admin UI is authoritative afterwards. |
-| `PUBLIC_BASE_URL` | unset | Canonical public URL for invite links and proxied signaling. Set it when a proxy rewrites `Host`; otherwise the public host can be derived from forwarded or request headers. |
-| `NODE_NAME` | hostname | Agent side. A stable identity for this host. |
-| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Hosts, Add host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use token that expires after an hour by default (up to 30 days if the admin chose longer), together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it; the token must then be one Add host minted. |
+| `REGISTRATION_MODE` | `closed` | Initial registration mode for a fresh database. The admin UI wins afterwards. |
+| `PUBLIC_BASE_URL` | unset | Public URL for invite links and signaling. Set it when a proxy rewrites `Host`. |
+| `NODE_NAME` | hostname | Agent side. Stable identity for this host. |
+| `QUASAR_ENROLLMENT` | unset | Agent side. The Add host string: control-plane address, pinned fingerprint and a single-use token (1 hour by default, up to 30 days). `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN` override its parts. |
 
 ## Secrets
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_SECRET_KEY` | unset | Base64 of 32 bytes. Encrypts credentials stored through the admin UI. **Back this up. It is not recoverable.** |
+| `QUASAR_SECRET_KEY` | unset | Base64 of 32 bytes. Encrypts credentials stored in the admin UI. **Back it up; it can't be recovered.** |
 
 ## TLS and access
 
@@ -142,45 +114,45 @@ accepts one.
 | --- | --- | --- |
 | `QUASAR_TLS` | `auto` | `auto` or `off`. |
 | `QUASAR_TLS_ADDR` | `:8443` | HTTPS listener. |
-| `QUASAR_TLS_HOSTS` | unset | Comma-separated names and IPs the generated certificate should cover. **Required for LAN access.** |
+| `QUASAR_TLS_HOSTS` | unset | Names and IPs for the generated certificate. **Required for LAN access.** |
 | `QUASAR_TLS_CERT` | unset | Your own certificate. Set with the key or not at all. |
 | `QUASAR_TLS_KEY` | unset | Your own key. |
 | `QUASAR_TLS_DIR` | `/var/lib/quasar-control/tls` | Where the generated certificate is kept. |
-| `QUASAR_HTTP_REDIRECT` | `auto` | HTTP to HTTPS redirect for browser routes. |
-| `QUASAR_ALLOWED_ORIGINS` | unset | Authoritative override for signaling WebSocket origins. Leave unset for Admin, Settings and first-run setup (Quasar 0.2.4+) to manage the saved list. Explicitly empty still overrides that list. With neither source set, same-origin is allowed. `*` is rejected. |
-| `QUASAR_TRUSTED_PROXIES` | unset | Proxy IPs or CIDRs whose forwarded client-address headers are trusted. Empty ignores forwarded addresses. |
+| `QUASAR_HTTP_REDIRECT` | `auto` | Redirect browser routes from HTTP to HTTPS. |
+| `QUASAR_ALLOWED_ORIGINS` | unset | Overrides the allowed-origins list in Admin (even when empty). Unset: Admin manages it; with no list, same-origin only. `*` is rejected. |
+| `QUASAR_TRUSTED_PROXIES` | unset | Proxy IPs or CIDRs whose forwarded client addresses are trusted. |
 | `LISTEN_ADDR` | `:8080` | HTTP listener. |
 | `CONTROL_PORT` | `8080` | Compose. Host port for HTTP. |
 | `QUASAR_TLS_PORT` | `8443` | Compose. Host port for HTTPS. |
-| `CONTROL_PLANE_FINGERPRINT` | unset | Agent side. Manual pin of the control plane's certificate (the SHA-256 it logs at startup), for rotating without re-enrolling. Overrides the fingerprint carried in `QUASAR_ENROLLMENT`. |
-| `QUASAR_ALLOW_PLAINTEXT_AGENT` | unset (off) | Agent side. A `wss://` `CONTROL_PLANE_URL` is pinned to that fingerprint and just works; a `ws://` URL to anything but localhost is refused unless this is `1`, since the enrollment token and node secret would cross it in cleartext. |
+| `CONTROL_PLANE_FINGERPRINT` | unset | Agent side. Manual certificate pin (SHA-256), overriding the one in `QUASAR_ENROLLMENT`. |
+| `QUASAR_ALLOW_PLAINTEXT_AGENT` | off | Agent side. `1` allows a `ws://` control-plane URL to a non-localhost address. |
 
 ## Storage
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_HOME_ROOT` | unset | Lowest-priority managed-home root fallback. A host with no effective root cannot launch a managed-home app. Fresh `redeploy.sh` installs seed `/var/lib/quasar/homes`. |
-| `QUASAR_STORAGE_PROVIDER` | `auto` | `auto` or `local`, which both select mount-path storage. `volume` was removed and is rejected. |
+| `QUASAR_HOME_ROOT` | unset | Fallback managed-home root. Without any root, managed-home apps can't launch. `redeploy.sh` sets `/var/lib/quasar/homes`. |
+| `QUASAR_STORAGE_PROVIDER` | `auto` | `auto` or `local` (mount-path storage). `volume` is rejected. |
 | `QUASAR_ARTWORK_DIR` | `/var/lib/quasar-control/artwork` | Artwork cache. Needs a persistent volume. |
 | `QUASAR_ARTWORK_PROVIDER` | `steamgriddb` | `steamgriddb` or `none`. |
-| `QUASAR_STEAMGRIDDB_API_KEY` | unset | Or set it through the admin UI, which takes precedence. |
+| `QUASAR_STEAMGRIDDB_API_KEY` | unset | Or set it in the admin UI, which wins. |
 
 ## Encoding
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_ENCODER` | unset, auto-detect | AMD and NVIDIA default to `vulkan`, Intel to `va`, and no GPU to `openh264`. Explicit `va`, `nvenc`, `vulkan`, or `openh264` wins. |
-| `QUASAR_RENDER_NODE` | unset | Optional DRM render-node pin. Prefer a `/dev/dri/by-path/` path when pinning a multi-GPU host. |
-| `QUASAR_NVIDIA_DRIVER_HOST_PATH` | unset, automatic discovery | Advanced recovery override: the absolute **host** directory already mounted at `/opt/quasar/nvidia-driver` in the agent. Quasar verifies that Docker sees the same directory before provisioning and app launch; wrong or unverifiable paths produce a readiness error. It does not create the mount. Leave unset for normal named-volume discovery. A custom stack without discoverable container identity must also set `QUASAR_PULSE_IMAGE` to its locally installed agent image; the generated Compose already does this. Recreate the agent after changing the value. |
+| `QUASAR_ENCODER` | auto | AMD and NVIDIA use `vulkan`, Intel `va`, no GPU `openh264`. Set `va`, `nvenc`, `vulkan` or `openh264` to override. |
+| `QUASAR_RENDER_NODE` | unset | Pin a DRM render node. Prefer a `/dev/dri/by-path/` path. |
+| `QUASAR_NVIDIA_DRIVER_HOST_PATH` | automatic | Recovery override: the host directory already mounted at `/opt/quasar/nvidia-driver` in the agent. It doesn't create the mount. Custom stacks without container identity also need `QUASAR_PULSE_IMAGE`. Recreate the agent after changing it. |
 | `QUASAR_CUDA_DEVICE` | `0` | NVENC device index on a multi-GPU host. |
 | `QUASAR_ZEROCOPY` | off | Full zero-copy on the VA path. |
 | `QUASAR_GOP` | `60` | Frames between keyframes. |
-| `QUASAR_SLICES` | `8` | H.264 slices per frame. Supported by Quasar's patched Vulkan H.264 encoder as well as applicable vendor paths. |
+| `QUASAR_SLICES` | `8` | H.264 slices per frame. |
 | `QUASAR_TARGET_USAGE` | `6` | VA speed against quality, 1 to 7. |
 | `QUASAR_QUEUE_BUFFERS` | `3` | Encode queue depth. |
-| `QUASAR_VULKAN_H264` | on | Set `0` to move H.264 off Vulkan when a vendor fallback exists. |
-| `QUASAR_VULKAN_HEVC` | on | Set `0` to move HEVC off Vulkan when a vendor fallback exists. |
-| `QUASAR_VULKAN_AV1` | on | Set `0` to move AV1 off Vulkan when a vendor fallback exists. This does not bypass a known GPU/driver AV1 restriction; see [compatibility](/quasar/tuning/encoders/#av1-driver-compatibility). |
+| `QUASAR_VULKAN_H264` | on | `0` moves H.264 off Vulkan when a vendor fallback exists. |
+| `QUASAR_VULKAN_HEVC` | on | `0` moves HEVC off Vulkan when a vendor fallback exists. |
+| `QUASAR_VULKAN_AV1` | on | `0` moves AV1 off Vulkan when a vendor fallback exists. Doesn't bypass a [driver restriction](/quasar/tuning/encoders/#av1-driver-compatibility). |
 | `QUASAR_VULKAN_MAX_SESSIONS` | `2` | Concurrent Vulkan encode sessions per GPU. |
 | `QUASAR_REQUIRE_HW_RENDER` | `1` | Fail a session that falls back to software rendering. |
 
@@ -189,81 +161,76 @@ accepts one.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_ABR_MODE` | `smooth` | `smooth`, `protective` or `off`. |
-| `QUASAR_ABR` | `1` | Legacy on and off. `0` maps to `off`. |
+| `QUASAR_ABR` | `1` | Legacy switch. `0` means `off`. |
 | `QUASAR_ABR_FLOOR_KBPS` | unset | Explicit floor. |
 | `QUASAR_ABR_FLOOR_RATIO` | `0.3` | Floor as a fraction of the tier bitrate. |
 | `QUASAR_ABR_LADDER` | on in `smooth` | Encoder speed escalation under saturation. |
-| `QUASAR_ABR_LADDER_RESOLUTION` | off | Opt-in external-resolution rung. Requires `smooth`; applies to the next session. |
-| `QUASAR_ABR_LADDER_FPS` | off | Opt-in 120-to-60 FPS rung. Requires `smooth`; applies to the next session. |
+| `QUASAR_ABR_LADDER_RESOLUTION` | off | Opt-in resolution step-down. Needs `smooth`; applies to the next session. |
+| `QUASAR_ABR_LADDER_FPS` | off | Opt-in 120-to-60 fps step-down. Needs `smooth`; applies to the next session. |
 
-Roughly fifteen further hysteresis settings exist. Every default matches the
-value that used to be hardcoded. Do not change them without a measurement.
+About fifteen more tuning settings exist; leave them unless you've measured a problem.
 
 ## Capacity and placement
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_VRAM_MIN_FREE_MB` | `1024` | Free GPU memory floor for admission. `0` disables the veto. |
-| `QUASAR_VRAM_INFLIGHT_ESTIMATE_MB` | the floor | Memory debited for very recent launches. |
-| `QUASAR_VRAM_STALENESS_SECS` | `20` | How fresh a memory sample has to be. |
+| `QUASAR_VRAM_MIN_FREE_MB` | `1024` | Free GPU memory needed to admit a launch. `0` disables the check. |
+| `QUASAR_VRAM_INFLIGHT_ESTIMATE_MB` | the floor | Memory reserved for very recent launches. |
+| `QUASAR_VRAM_STALENESS_SECS` | `20` | Maximum age of a memory sample. |
 | `QUASAR_PLACEMENT_POLICY` | `spread` | `spread`, `least-loaded` or `locality`. |
 
 ## Apps and containers
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_APP_DISPLAY_ENV` | on | Inject session resolution and frame rate into app containers. |
-| `QUASAR_APP_GAMESCOPE_ENV` | on | Also emit the gamescope compatibility variables. |
+| `QUASAR_APP_DISPLAY_ENV` | on | Pass session resolution and frame rate to app containers. |
+| `QUASAR_APP_GAMESCOPE_ENV` | on | Also pass the gamescope variables. |
 | `QUASAR_APP_SHM_SIZE` | `1g` | Shared memory for app containers. |
 | `QUASAR_APP_STOP_TIMEOUT_SECS` | `10` | Graceful stop window. |
 | `QUASAR_APP_PUID` | unset | Run apps as this user ID. |
 | `QUASAR_APP_PGID` | unset | Run apps as this group ID. |
-| `QUASAR_APP_PIDS_LIMIT` | `8192` | Process limit backstop. |
-| `QUASAR_IDLE_TIMEOUT_SECS` | `120` | Reap idle sessions after this long. |
+| `QUASAR_APP_PIDS_LIMIT` | `8192` | Process limit. |
+| `QUASAR_IDLE_TIMEOUT_SECS` | `120` | End idle sessions after this long. |
 
 ## Audio and microphone
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_AUDIO_REQUIRED` | off | Fail the session rather than run silently. Worth setting. |
-| `QUASAR_MIC_DISABLED` | off | Host-level microphone kill switch. |
+| `QUASAR_AUDIO_REQUIRED` | off | Fail the session instead of running silently. Recommended. |
+| `QUASAR_MIC_DISABLED` | off | Turn the microphone off for this host. |
 
 ## Libraries and images
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_LIBRARY_SCAN_INTERVAL` | 360 minutes | Library discovery interval. `0` disables scheduled scans. |
-| `QUASAR_LIBRARY_PROVIDERS` | `steam` | Allowlisted providers. |
-| `QUASAR_IMAGE_REGISTRY_HOSTS` | `ghcr.io` | Registries Quasar will resolve digests and artwork from. |
-| `QUASAR_ARTWORK_MAX_BYTES` | `8388608` | Cap on fetched artwork, 8 MiB. |
+| `QUASAR_LIBRARY_PROVIDERS` | `steam` | Allowed providers. |
+| `QUASAR_IMAGE_REGISTRY_HOSTS` | `ghcr.io` | Registries Quasar resolves images and artwork from. |
+| `QUASAR_ARTWORK_MAX_BYTES` | `8388608` | Maximum artwork size (8 MiB). |
 
 ## Updates and releases
 
-On an owned install the recovery actor's trust settings are seed inputs (above).
-A legacy Compose install's `quasar-updater` service keeps the settings of the
-release it shipped with; see [Legacy Compose
+On an owned install, see the [trust settings](#the-recovery-actors-trust-settings)
+above; it detects releases from the project's repository with no token. A legacy
+Compose install's updater is described in [Legacy Compose
 installs](/quasar/install/legacy-compose/#the-updater-service).
 
-Release detection, on the control plane of a legacy Compose install or a source
-checkout (an owned install detects from the project's own repository, with no
-token):
-
+Release detection on a legacy Compose or source control plane:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_PLATFORM_RELEASE_REPO` | `accreleus/quasar` | The `owner/name` repository whose GitHub Releases the detection job reads. Point it at a fork to follow that fork's releases. Set it to **`off`** to turn detection off entirely: every run is skipped, no outbound request is made, and the Releases page reports nothing available. An empty value means the default, not off. |
-| `QUASAR_PLATFORM_RELEASE_TOKEN` | unset | Optional bearer token for the release listing and asset download. A public repository needs none; set it for a private fork or to lift the unauthenticated rate limit. Never logged. |
-| `QUASAR_PLATFORM_RELEASE_ASSET_HOSTS` | `github.com,objects.githubusercontent.com,release-assets.githubusercontent.com` | Hosts a release asset may be downloaded from, and the only hosts the download's single redirect may point at. GitHub moves the CDN it serves assets from, so if a release stops being recorded with "redirect host is not allowed", add the host the job summary names. |
-| `QUASAR_PLATFORM_REGISTRY` | `ghcr.io` | The registry the two platform component images are published to. Used only on the `edge` channel, which resolves a branch tag to a digest; `stable` reads a release manifest and never touches a registry. This host is added to `QUASAR_IMAGE_REGISTRY_HOSTS` automatically. Anonymous pull only. |
-| `QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL` | unset; the job defaults to `168h` | Overrides the `platform.release_detect` schedule, which is otherwise weekly in a one-hour window opening 02:00 Monday UTC. A Go duration, authoritative over the admin Jobs page while set; `0` stops the job being scheduled at all. "Check now" bypasses the window either way. |
+| `QUASAR_PLATFORM_RELEASE_REPO` | `accreleus/quasar` | GitHub repository (`owner/name`) to read releases from; a fork works. **`off`** disables detection (empty means the default). |
+| `QUASAR_PLATFORM_RELEASE_TOKEN` | unset | Optional GitHub token, for a private fork or higher rate limits. Never logged. |
+| `QUASAR_PLATFORM_RELEASE_ASSET_HOSTS` | `github.com,objects.githubusercontent.com,release-assets.githubusercontent.com` | Hosts release assets may download from. If you see "redirect host is not allowed", add the host the job names. |
+| `QUASAR_PLATFORM_REGISTRY` | `ghcr.io` | Registry for platform images on the `edge` channel. Added to `QUASAR_IMAGE_REGISTRY_HOSTS` automatically. Anonymous pull only. |
+| `QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL` | `168h` | Overrides the detection schedule (weekly, Monday 02:00 UTC) as a Go duration. `0` stops scheduling. "Check now" always works. |
 
-<Aside type="note" title="The channel is not an environment variable">
-Which channel an instance follows, and which branch `edge` follows, are instance
-settings edited on the Releases tab. See [Updating
+The release channel is set on the Releases tab, not here. See [Updating
 Quasar](/quasar/admin/releases/#channels).
-</Aside>
 
 ## Experimental
+
+See [Experimental options](/quasar/tuning/experimental/) before enabling these.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -272,12 +239,9 @@ Quasar](/quasar/admin/releases/#channels).
 | `QUASAR_INTRA_REFRESH` | `0` | Vulkan only, patched image only. |
 | `QUASAR_INTRA_REFRESH_PERIOD` | `0` | `60` is the validated value. |
 
-See [Experimental options](/quasar/tuning/experimental/) before enabling any of
-these.
-
 ## The host sysctl
 
-Not an environment variable, but required on every host that serves media:
+Required on every host that serves media:
 
 ```bash
 sudo sysctl -w net.core.wmem_default=2097152

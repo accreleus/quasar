@@ -3,245 +3,189 @@ title: Glossary
 description: The terms Quasar uses, defined once.
 ---
 
-**ABR.** Adaptive bitrate. The controller that moves the encoder's target
-bitrate to match what the connection can carry. On by default in `smooth` mode.
+**ABR.** Adaptive bitrate: moves the encoder's target bitrate to fit the
+connection. On by default, in `smooth` mode.
 
-**Admission.** The check that decides whether a GPU can take a new session. Needs
-a free encode slot and enough free GPU memory.
+**Admission.** The check that a GPU can take a new session: a free encode slot and
+enough free GPU memory.
 
 **Agent.** See node agent.
 
 **App.** A catalog entry a user can launch: content, a container specification and
-a launch command. Classified as a game, a desktop or a launcher.
+a launch command. A game, a desktop or a launcher.
 
-**Attempt.** One target's move to one set of images: the control plane, or one
-host. Every apply produces one, succeeded or failed, and it is the only durable
-record of what that target was running before.
+**Attempt.** One target (the control plane or a host) moving to one set of images.
+Every apply records one, and it's the only record of what ran before.
 
-**AV1.** A modern video codec. Saves 40 to 50 percent of H.264's bitrate at
-equivalent quality, and Chrome can decode it everywhere thanks to a software
-fallback.
+**AV1.** A modern codec using 40 to 50 percent less bitrate than H.264. Chrome
+decodes it everywhere.
 
-**Channel.** Which platform releases an instance is shown. `stable` is a tagged
-release with notes; `beta` is those and the prereleases among them; `edge` is
-whatever was last published from a branch, with none. An instance follows one at
-a time, and switching changes what is listed, never what is installed.
+**Channel.** Which platform releases an instance is offered: `stable` (tagged
+releases), `beta` (plus prereleases) or `edge` (latest branch build). Switching
+changes what's listed, not what's installed.
 
-**Console mode.** A host showing sessions on a screen plugged into it, rather than
-only streaming them. Turned on per host from its Local console page. See [Console
-mode](/quasar/admin/console/).
+**Console mode.** A host showing sessions on a screen plugged into it. See
+[Console mode](/quasar/admin/console/).
 
-**Constrained baseline.** The H.264 profile browser sessions are clamped to,
-because Chrome's WebRTC receiver cannot decode High profile from any encoder.
+**Constrained baseline.** The H.264 profile browser sessions use, because Chrome
+can't decode High profile over WebRTC.
 
-**Control plane.** The Go service holding accounts, the API, signaling and the
-scheduler. Backed by Postgres. Holds no per-host GPU state.
+**Control plane.** The Go service for accounts, the API, signaling and scheduling,
+backed by Postgres. Holds no per-host GPU state.
 
-**Device.** A browser Quasar has seen a user log in from, along with the decode
-capabilities it measured. Used to avoid sending a codec the client cannot play.
+**Device.** A browser a user has logged in from, with its measured decode
+capabilities, so Quasar never sends a codec it can't play.
 
-**Developer apply.** An admin applying an arbitrary set of image digests,
-typically a branch build from an allowed registry namespace, to one
-Quasar-owned machine without it being published as a release. It is never
-offered and never unattended, and it follows the same digest, namespace and
-ordering rules as any update.
+**Developer apply.** An admin applying unpublished image digests (such as a branch
+build) to one Quasar-owned machine. Never automatic; same safety rules as any update.
 
-**Diagnostic bundle.** A bounded window of a session's metrics, events, clock
-alignment and an automated verdict. The thing to attach to a bug report.
+**Diagnostic bundle.** A window of a session's metrics and events with an
+automated verdict. Attach it to bug reports.
 
-**DMABuf.** The Linux mechanism that lets the compositor hand a frame to the
-VA-API encoder without copying it through system memory.
+**DMABuf.** The Linux mechanism for passing a frame to the VA-API encoder without
+copying it.
 
-**Encode slot.** A unit of concurrent encoding capacity on a GPU. The real
-reservation in admission control.
+**Encode slot.** One unit of concurrent encoding capacity on a GPU.
 
-**Entitlement.** The grant that decides whether an app appears in a user's
-library. Granted to everyone or to named users.
+**Entitlement.** The grant that puts an app in a user's library: for everyone or
+named users.
 
 **Engine mode.** Whether the container engine runs as root (**rootful**) or as an
 ordinary account (**rootless**).
 
-**Engine profile.** One combination of platform, container engine and engine mode,
-with the status Quasar gives it: supported, experimental or unsupported. See
-[Engine profiles](/quasar/start/engine-profiles/).
+**Engine profile.** A platform, container engine and engine mode combination, rated
+supported, experimental or unsupported. See [Engine profiles](/quasar/start/engine-profiles/).
 
-**Enrollment token.** A secret an admin mints in Admin, Fleet, Hosts, Add host to
-let one agent enroll: single use, expiring after an hour by default (an admin may
-choose up to 30 days), optionally bound to one node name, and stored only as a
-hash. After a successful enrollment the agent uses its
-own stored node secret instead. On a combined host the agent uses a single-use
-local token that its recovery actor generates at install.
+**Enrollment token.** A single-use secret from **Fleet ▸ Hosts ▸ Add host** that
+lets one agent enroll. Expires after an hour by default (up to 30 days); the agent
+then uses its own node secret.
 
-**FEC.** Forward error correction. Adds redundancy so lost packets can be
-reconstructed. Off by default and not recommended for browser clients.
+**FEC.** Forward error correction: redundancy to rebuild lost packets. Off by
+default; not recommended for browsers.
 
-**Fleet run.** One platform release applied across a whole instance: the control
-plane first, then every eligible host in sequence. A host that cannot take it is
-skipped, which is not a failure; a target that fails stops the run where it
-stands.
+**Fleet run.** One release applied across the instance: control plane first, then
+each eligible host. Skipped hosts aren't failures; a failed target stops the run.
 
-**Floor.** The oldest node-agent and recovery-actor release that a control-plane
-release still manages, published with the release. A host below the floor is not
-failed: it must update before it can be managed, and it is offered only an
-update.
+**Floor.** The oldest node agent and recovery actor a control-plane release still
+manages. A host below it is offered only the update that lifts it.
 
-**GOP.** Group of pictures. The interval between keyframes. Defaults to 60
-frames.
+**GOP.** Group of pictures: frames between keyframes. Default 60.
 
-**Hand-over.** The recovery actor replacing itself. A successor starts beside
-it, takes over the machine only when the current actor lets go, and verifies
-itself before the old actor is discarded. A successor that never verifies is
-removed and the previous actor restored.
+**Hand-over.** The recovery actor replacing itself. The successor takes over only
+after it verifies; otherwise the previous actor is restored.
 
-**H.264.** The baseline video codec. Decodes everywhere. Every quality tier ends
-in an H.264 rung.
+**H.264.** The baseline codec. Decodes everywhere, and every quality tier ends in
+an H.264 rung.
 
-**HEVC.** Also called H.265. Saves 30 to 40 percent over H.264, but Chrome only
-decodes it with operating system hardware support, so effectively macOS and
-Windows only. The catalog calls it `hevc` and the wire calls it `h265`.
+**HEVC.** H.265. 30 to 40 percent less bitrate than H.264, but Chrome decodes it
+only with OS hardware support (macOS, Windows). The catalog says `hevc`, the wire `h265`.
 
-**Home claim.** The record of where one user's home for one app lives. Once a home
-exists, that app launches on its host for that user, whatever the placement
-policy, and Quasar never creates a second home to get round an unknown or
-conflicting location. An admin can release the claim of a host that is gone for
-good.
+**Home claim.** Where one user's home for one app lives. Once it exists, that app
+launches on that host for that user. An admin can release the claim of a host
+that's gone for good.
 
-**Home root.** The directory on a host where managed home directories live. Each
-host can have its own. For saves to follow users between machines it must be real
-shared storage, not merely the same path on each one; otherwise a user's
-existing home keeps their launches on the host that holds their files.
+**Home root.** The directory on a host holding managed homes. For saves to follow
+users between hosts it must be shared storage.
 
-**Host.** A machine running the node agent. Owns GPUs and runs sessions.
+**Host.** A machine running the node agent.
 
-**Host preparation.** `prepare-host.sh`, the one step of an install that runs as
-root. It creates the Quasar account or group and grants the devices Quasar uses.
-See [Prepare the host](/quasar/install/prepare-host/).
+**Host preparation.** `prepare-host.sh`, the one install step that runs as root.
+It creates the Quasar account and grants devices. See [Prepare the host](/quasar/install/prepare-host/).
 
-**ICE.** The WebRTC mechanism for discovering a network path between two peers.
-A session stuck at "checking" means ICE found no working path.
+**ICE.** How WebRTC finds a network path between peers. Stuck at "checking" means
+no path worked.
 
-**Install mode.** How a host got its platform images: from the registry, built
-from source on the machine, or **owned**, meaning created and replaced by the
-machine's recovery actor. A source-built host can be told about a release but not
-given one.
+**Install mode.** How a host got its images: from the registry, built from source,
+or **owned** (managed by its recovery actor). Source-built hosts aren't updated
+from the console.
 
-**Intra refresh.** Replacing periodic keyframes with a rolling wave of
-intra-coded blocks. Vulkan encoder only, and needs a patched image.
+**Intra refresh.** A rolling wave of intra-coded blocks instead of periodic
+keyframes. Vulkan only, patched image only.
 
-**Launch profile.** An ordered list of stream profiles, best first. This is what
-a user picks, and what "1080p60" means in the interface.
+**Launch profile.** An ordered list of stream profiles, best first. What "1080p60"
+means in the interface.
 
-**Library provider.** A source of games that can be discovered automatically.
-Steam is the only one that exists today.
+**Library provider.** A source of automatically discovered games. Currently Steam only.
 
-**Machine state.** What the recovery actor keeps on its machine and nowhere
-else, in the `quasar-machine` volume: the machine's install-time inputs, its
-generated secrets, the record of each update in progress, what each service was
-last verified as, the pre-update dumps and the seed's state file. It is what lets
-the recovery actor act while the control plane is down, and it is the one volume
-that must never be deleted.
+**Machine state.** The `quasar-machine` volume: the machine's inputs, secrets,
+update records and pre-update dumps. It lets recovery work while the control plane
+is down. Never delete it.
 
-**Managed home.** A user's persistent directory for one app. Single writer, which
-is why only one session per user per app can run at a time.
+**Managed home.** A user's persistent directory for one app. One writer at a time,
+so one session per user per app.
 
-**Node agent.** The Rust program on every GPU host. Owns the GPUs, runs the
-compositor and encoder, launches app containers.
+**Node agent.** The Rust program on each GPU host. Runs the compositor, encoder and
+app containers.
 
 **NVENC.** NVIDIA's hardware encoder.
 
-**Owner conflict.** A container on a Quasar-owned machine that looks like a
-Quasar service but does not carry the installation's labels: a leftover Compose
-stack, or a definition a stack manager still holds. The recovery actor never acts
-on it and says so.
+**Owner conflict.** A Quasar-like container not created by this installation, such
+as a leftover Compose stack. The recovery actor won't touch it.
 
-**Placement.** Choosing which host and GPU run a session. Limited by the user's
-home claim, the app's own host selection and each host's readiness, then ordered
-by `QUASAR_PLACEMENT_POLICY`.
+**Placement.** Choosing the host and GPU for a session, limited by home claims,
+the app's host selection and readiness, then ordered by `QUASAR_PLACEMENT_POLICY`.
 
-**Platform release.** A matched set of Quasar's own images (the control plane, the
-node agent and the recovery actor) built from one commit and published together.
-This is Quasar updating Quasar; app catalog images have their own versions
-entirely. The seed and Postgres are not part of a release. A release also
-publishes a floor: the oldest agent and recovery actor its control plane still
-manages.
+**Platform release.** Quasar's own images (control plane, node agent, recovery
+actor) built from one commit and published together, with a floor. Not the seed,
+Postgres or app images.
 
-**Playout buffer.** The client-side jitter buffer. Adapts to how evenly frames
-arrive. Uneven arrival forces a bigger buffer, and the buffer is latency.
+**Playout buffer.** The client's jitter buffer. Uneven frame arrival makes it
+bigger, which adds latency.
 
-**Pre-update dump.** The database dump the recovery actor takes before it
-replaces the control plane with a release that migrates the database, when that
-database is Quasar's own. It is the way back from a failed migration, through one
-printed `restore` command, and the last three are kept on the machine. A
-database you run yourself gets no dump: its backup is yours, and you confirm it
-before the update.
+**Pre-update dump.** A dump of Quasar's own database taken before a migrating
+update, restorable with one printed `restore` command. The last three are kept.
+Your own database gets none; you confirm your backup instead.
 
-**Presentation interval variation.** The standard deviation of the gap between
-displayed frames. The number that matches perceived stutter. Below 12 ms is
-healthy, above 18 ms is visible.
+**Presentation interval variation.** Standard deviation of the gap between
+displayed frames; tracks perceived stutter. Below 12 ms is healthy, above 18 ms visible.
 
-**Readiness check.** One named verdict about a host, shown on its readiness card
-with the fix when it fails. Most are advice. One that rests on evidence and is
-failing blocks launches on the host, its homes or one GPU, until it passes or an
-admin overrides it.
+**Readiness check.** One verdict about a host, with a fix when it fails. Some
+failing checks block launches until fixed or overridden.
 
-**Recovery actor.** The Quasar-owned container on each machine that creates and
-replaces that machine's other Quasar services, and replaces itself by a
-hand-over. It exists because a container cannot replace itself, and it is what
-keeps a control plane recoverable while the control plane is down. Its container
-is `quasar-recovery`.
+**Recovery actor.** The `quasar-recovery` container on each machine. It creates and
+replaces the machine's Quasar services, including the control plane.
 
-**Release manifest.** The machine-readable description of one stable platform
-release: which component images it contains, by digest, and the commit they were
-built from. Published with the release, so the notes and the digests cannot
-disagree.
+**Release manifest.** The machine-readable list of a stable release's images, by
+digest, and their commit.
 
-**Render node.** The DRM device the compositor and encoder use, under `/dev/dri`.
-Prefer a `/dev/dri/by-path/` name, because the numbered names can move between
-reboots.
+**Render node.** The GPU device under `/dev/dri` used for compositing and encoding.
+Prefer `/dev/dri/by-path/` names; numbered names can change on reboot.
 
-**Replacement.** Moving one Quasar service to a new image: stop the old container
-and keep it, start the new one, verify it, then discard the old one, or restore
-the old one if verification fails. One update may replace several services in
-order, the recovery actor first.
+**Replacement.** Moving one service to a new image: start the new one, verify it,
+then remove the old one, or restore it if verification fails.
 
 **Rung.** One stream profile inside a launch profile.
 
-**Runtime preset.** A reusable container specification several apps can share.
+**Runtime preset.** A reusable container specification shared by apps.
 
-**Seed.** The one container you, or a stack manager such as Dockge or Arcane,
-declare for Quasar on a machine. It only makes sure the machine's recovery actor
-exists and runs, starting it again if it was stopped from outside, and it is
-built to stay unchanged for years. Your manager updates it, not
-Quasar, and removing or redeploying it never stops Quasar.
+**Seed.** The one container you declare for Quasar on a machine. It keeps the
+recovery actor running. Your stack manager updates it, not Quasar, and removing it
+never stops Quasar.
 
 **Session.** One user, one app, one host, one connection.
 
-**Signaling.** The exchange over `/v1/signal` that lets a browser and a node
-agent find each other before they connect directly.
+**Signaling.** The exchange over `/v1/signal` that lets a browser and a node agent
+set up a direct connection.
 
-**STUN and TURN.** Standard WebRTC mechanisms for NAT traversal and relaying. A
-normal Quasar install uses neither: media takes a direct route between the
-browser and the GPU host, which means a LAN or a VPN.
+**STUN and TURN.** WebRTC NAT traversal and relaying. Quasar uses neither: media
+goes directly, over a LAN or VPN.
 
-**Stream profile.** One concrete encode rung: codec, resolution, frame rate,
-bitrate and eligibility thresholds. Users never see these.
+**Stream profile.** One encode rung: codec, resolution, frame rate, bitrate and
+eligibility thresholds. Users don't see these.
 
-**Updater.** On a legacy Compose install, the per-host service that pulls a
-platform release and recreates the containers it replaces, because a container
-cannot recreate itself. It acts only when told to, and only on the stack it sits
-beside. On a Quasar-owned machine the recovery actor does this job instead.
+**Updater.** On a legacy Compose install, the per-host service that applies
+releases. Owned machines use the recovery actor instead.
 
-**VA-API.** The video acceleration interface used for AMD and Intel encoding.
+**VA-API.** The video acceleration interface for AMD and Intel encoding.
 
-**Vulkan encoder.** The Vulkan Video encode path. Auto-detection selects it by
-default on AMD and NVIDIA; Quasar's universal agent image carries its patched
-H.264, HEVC, and AV1 elements.
+**Vulkan encoder.** The Vulkan Video encode path, the default on AMD and NVIDIA,
+for H.264, HEVC and AV1.
 
-**Wayland compositor.** The `gst-wayland-display` element that gives a game
-something to render into and produces the frames that get encoded.
+**Wayland compositor.** The `gst-wayland-display` element games render into; it
+produces the frames that are encoded.
 
-**WebRTC.** The browser technology carrying video, audio and input between the
-client and the GPU host.
+**WebRTC.** The browser technology carrying video, audio and input between client
+and GPU host.
 
-**Zero copy.** Moving a frame from the compositor to the encoder without a trip
-through system memory. How the VA and NVENC paths are built.
+**Zero copy.** Passing frames from compositor to encoder without going through
+system memory.

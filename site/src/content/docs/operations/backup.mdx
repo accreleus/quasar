@@ -1,11 +1,11 @@
 ---
 title: Backup and restore
-description: What holds state, how to back it up, and how to prove the backup restores.
+description: What holds state, how to back it up, and how to restore it.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-This page describes a Quasar-owned install. A [legacy Compose
+This page covers a Quasar-owned install. A [legacy Compose
 install](/quasar/install/legacy-compose/#back-up-and-restore) keeps its secrets in
 `deploy/.env` and runs the same commands through Compose.
 
@@ -13,24 +13,19 @@ install](/quasar/install/legacy-compose/#back-up-and-restore) keeps its secrets 
 
 | Where | What | Losing it means |
 | --- | --- | --- |
-| The database (`quasar-postgres-data`, or your own) | Users, apps, hosts, sessions, entitlements, settings, the apply history. Everything. | Total loss. Start over. |
-| The managed home root | Every user's save games and installed content. | Users lose their saves. |
-| The `quasar-machine` volume, on each machine | The machine's inputs and generated secrets, including `QUASAR_SECRET_KEY` and the database password, the record of every update, and the pre-update dumps. | Credentials stored through the admin area become unreadable, and the recovery actor loses what it needs to act on that machine. |
-| `quasar-control-data` | The control plane's TLS certificate and the artwork cache. | A new certificate is generated. Clients re-trust. Artwork re-fetches. |
-| `quasar-agent-data`, on each GPU host | The agent's node secret. | The host has to enroll again under the same node name, which keeps its history. The machine keeps the string it was installed with, so create a new command in Add host and run it with `QUASAR_RESET_IDENTITY=1`; see [When it says no](/quasar/install/second-host/#when-it-says-no). |
+| The database (`quasar-postgres-data`, or your own) | Everything: users, apps, hosts, sessions, entitlements, settings, the apply history. | Total loss. |
+| The managed home root | Users' saves and installed content. | Users lose their saves. |
+| `quasar-machine`, on each machine | Generated secrets (`QUASAR_SECRET_KEY`, the database password), update records, pre-update dumps. | Stored credentials become unreadable; the recovery actor can't act on that machine. |
+| `quasar-control-data` | TLS certificate, artwork cache. | A new certificate; clients re-trust. |
+| `quasar-agent-data`, on each GPU host | The agent's node secret. | Re-enroll the host with `QUASAR_RESET_IDENTITY=1` ([details](/quasar/install/second-host/#when-it-says-no)). |
 
 The first three matter. The last two regenerate.
 
 <Aside type="danger" title="Never delete the `quasar-machine` volume">
-It is the one volume that must survive. `QUASAR_SECRET_KEY` in it cannot be
-recovered, although it protects only values you can enter again: the SteamGridDB
-key and the release-notification signing secret. The database password Quasar
-generated for its own Postgres is in it too, and this release has no command that
-resets it.
+`QUASAR_SECRET_KEY` can't be recovered, and there is no command to reset the
+generated database password. Quasar can't copy machine state off the machine, so
+back up the database and the homes.
 </Aside>
-
-Quasar provides no way to copy machine state off the machine in this release.
-Back up the database and the homes instead: they are what cannot be recreated.
 
 ## Backing up the database
 
@@ -41,71 +36,51 @@ docker exec quasar-postgres \
   pg_dump -U quasar -Fc quasar > quasar-$(date +%Y%m%d-%H%M).dump
 ```
 
-Custom format, because it restores selectively and compresses. Copy it off the
-machine. Do this on a schedule and before anything you are unsure about.
+Copy it off the machine. Do this on a schedule, ideally while no sessions are
+running.
 
-**Before an update that migrates the database**, the recovery actor takes its own
-dump into the `quasar-machine` volume, checks it reads back, and keeps the last
-three, each with the schema version it was taken at. If it cannot take one, or
-the machine lacks room for it, the update is refused (`backup_failed`) and
-nothing is touched; the console checks for room before it offers the update.
-The kept dumps are listed by:
+Before an update that migrates the database, the recovery actor also takes a
+dump into `quasar-machine` and keeps the last three. If it can't, the update is
+refused (`backup_failed`) and nothing changes. List them with:
 
 ```bash
 docker exec quasar-recovery quasar-recovery restore --list
 ```
 
-These dumps stay on the machine. They protect an update, not the machine: keep
-your own copy off it as well.
+These stay on the machine, so keep your own copy too.
 
-<Aside type="caution" title="Pause writes for a clean capture">
-A dump taken while sessions are launching is consistent as a snapshot but may not
-reflect a coherent moment. For a backup you intend to rely on, take it when
-nothing is running.
-</Aside>
-
-If you run your own Postgres, back it up the way you back up that database.
-Quasar never dumps, restores or resets it. Before an update that migrates it, the
-console asks you to confirm you have a current backup; without that the update is
-refused (`backup_unconfirmed`).
+**Your own Postgres:** back it up your usual way. Quasar never dumps, restores or
+resets it. Before a migrating update, the console asks you to confirm a current
+backup (`backup_unconfirmed` otherwise).
 
 ## Backing up saves
 
-The managed home root is a directory on the host. Back it up like any other
-directory.
+The home root is a plain directory:
 
 ```bash
 tar -czf quasar-homes-$(date +%Y%m%d).tar.gz -C /var/lib/quasar homes
 ```
 
-It will be large. Users install games into it.
-
-If hosts use different local roots, back up every one. A shared root only needs
-one storage-level backup, but test it from each GPU host so a mount failure does
-not look like an empty library after recovery.
+It will be large. Back up every host's root if they differ. For a shared root,
+test the restore from each GPU host.
 
 ## Restoring
 
-A restore returns the first machine to the control plane it ran before an update
-that migrated the database. It is one command, run inside the recovery actor on
-that machine. A failed migrating update prints it for you, filled in:
+This returns the first machine to the control plane it ran before a migrating
+update. A failed update prints the command, filled in:
 
 ```bash
 docker exec quasar-recovery quasar-recovery restore --dump <name> --to <version>
 ```
 
-`<name>` is one of the pre-update dumps (`restore --list`), and `<version>` the
-control-plane version it was taken under; a dump that returns to another version
-is refused. The restore checks the dump before it touches anything (its checksum,
-that it reads, and that its schema matches that version), holds every control
-plane off, loads the dump into a fresh database, starts that version's control
-plane and waits for it to report healthy. Interrupted, it continues on the
-recovery actor's next start, and the same command can always be run again. Once
-it has succeeded, running it again is refused; `--force-again` restores the same
-dump anyway, discarding everything written since.
+`<name>` comes from `restore --list`; `<version>` is the control-plane version the
+dump was taken under. The restore verifies the dump, stops the control planes,
+loads it into a fresh database and starts that version. It is safe to rerun if
+interrupted. After a success, rerunning is refused; `--force-again` restores the
+same dump anyway, **discarding everything written since**.
 
-**With your own database** there is no dump. Stop the control plane, restore your
-backup, then start the version that matches it:
+**With your own database**, stop the control plane, restore your backup, then
+start the matching version:
 
 ```bash
 docker stop quasar-control-plane
@@ -113,61 +88,38 @@ docker stop quasar-control-plane
 docker exec quasar-recovery quasar-recovery restore --to <version>
 ```
 
-It checks that the database's schema matches that version before it starts it.
+`restore` only loads the recovery actor's own dumps, or a Compose install's dump
+into a fresh install ([Move a Compose install](/quasar/install/move-existing/)).
+Loading your own dump into a running owned install is not a documented procedure.
 
-`restore` loads the dumps this machine's recovery actor took, and one more kind:
-a dump of a Compose install, loaded once into a fresh install before its first
-start (`restore --dump -`, see [Move a Compose install](/quasar/install/move-existing/)).
-A dump you took of an owned install yourself is your copy for disaster recovery;
-loading one into a running owned install by hand is not a documented procedure
-in this release.
+Restore homes separately, then check the health endpoint, that hosts registered,
+and a real session.
 
-Restore the home directories separately if you are restoring those too, then
-verify: the health endpoint, hosts registered, a real session.
-
-Quasar never runs an older control plane against a newer database. Going back to
-an earlier release always means restoring a dump taken before the migration, into
-a stopped database. See [the hard rule](/quasar/operations/upgrading/#the-hard-rule).
+Going back to an earlier release always means restoring a dump taken before the
+migration. See [the hard rule](/quasar/operations/upgrading/#the-hard-rule).
 
 ## Developer restore rehearsal
 
-Contributors can exercise the database mechanism in a disposable environment.
-This is a development check, not an operator restore command; it never touches
-the deployed database or volumes.
+For contributors, in a disposable environment. It never touches a deployed
+database:
 
 ```bash
 bash deploy/db-backup-restore-drill.sh
 ```
 
-It builds the control plane from source, migrates a blank database, seeds real
-rows across the tables that matter (including entitlements, because a partial
-restore that dropped those would silently empty every user's library), dumps,
-restores into a separate database, then checks that the schema hashes match, that
-the seeded rows survived, and that the same binary starts cleanly against the
-restored database.
-
-<Aside type="caution" title="A passing rehearsal is not a tested production backup">
-It proves the mechanism. It does not prove your dump of your data restores. For
-something you are relying on: restore your actual dump into an isolated Postgres,
-point a control plane at it with your real configuration, and confirm it comes
-up and the data is there.
-</Aside>
-
-See [Testing and verification](/quasar/developer/verification/) for the rest of
-the developer verification workflow.
+It seeds a database, dumps, restores into another, and checks schema, rows and
+startup. It proves the mechanism, not your backup: to trust a real dump, restore
+it into an isolated Postgres and start a control plane against it. See
+[Testing and verification](/quasar/developer/verification/).
 
 ## The apply history, and what Revert depends on
 
-Every platform update this instance has made to itself is recorded in the
-database, including the image digests each target was running before it moved.
-That record is the only thing that makes [Revert](/quasar/admin/releases/#revert-a-host)
-possible, so restoring an older database loses it: the hosts keep running what
-they are running, but the console can no longer say what to put them back to.
+The database records every platform update, including the image digests each
+target ran before. [Revert](/quasar/admin/releases/#revert-a-host) needs that
+record, so restoring an older database loses it: hosts keep running, but the
+console can't say what to put them back to.
 
-Each machine's recovery actor also keeps its own record of every update it
-carried out, in the `quasar-machine` volume, and `quasar-recovery status` shows
-the last one's result. It is how an update interrupted by a restart ends in a
-stated outcome, and the fastest way to see what a machine was running before.
+Each machine also keeps its own update record in `quasar-machine`:
 
 ```bash
 docker exec quasar-recovery quasar-recovery status
@@ -175,8 +127,5 @@ docker exec quasar-recovery quasar-recovery status
 
 ## Version compatibility
 
-There is no published matrix of which control plane versions work with which
-database states. Combined with the one-way migration rule, the practical policy
-is: back up before every upgrade, and restore forward; do not roll back.
-
-See [Upgrading](/quasar/operations/upgrading/).
+There is no compatibility matrix. Back up before every upgrade and restore
+forward; don't roll back. See [Upgrading](/quasar/operations/upgrading/).

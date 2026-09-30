@@ -3,140 +3,87 @@ title: Connecting and certificates
 description: Certificate warnings, name mismatches, signaling failures, and sessions that start but never appear.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
-On a [legacy Compose install](/quasar/install/legacy-compose/), put `docker compose -f deploy/docker-compose.yml exec` or `logs` in place of `docker exec` or `docker logs` in the commands on this page.
+On a [legacy Compose install](/quasar/install/legacy-compose/), use
+`docker compose -f deploy/docker-compose.yml exec` or `logs` instead of
+`docker exec` or `docker logs` below.
 
 ## The browser warns about the certificate
 
-Expected on a default install. Quasar generates its own certificate.
-
-On a LAN you control, accept it. On anything less trusted, verify the fingerprint
-first, because the first visit is when the founding admin account gets claimed.
+Expected: Quasar makes its own certificate. On an untrusted network, check the
+fingerprint before the first visit (that's when the first admin is claimed):
 
 ```bash
 docker exec quasar-control-plane \
   sh -c 'openssl x509 -in /var/lib/quasar-control/tls/cert.pem -noout -fingerprint -sha256'
 ```
 
-Compare that against what the browser shows.
-
 ## `ERR_CERT_COMMON_NAME_INVALID`
 
-The certificate does not name the address you are using. This is a **name**
-mismatch, not a trust failure, so clicking through the warning does not fix it.
+The certificate doesn't name the address you're using. Clicking through won't fix it.
 
-The control plane runs in a container, so the addresses it can see on its own
-interfaces are Docker bridge addresses, never your host's LAN address. It has to
-be told.
+- **Owned install:** browse to a name the certificate has, or change
+  `QUASAR_PUBLIC_HOST` / `QUASAR_TLS_HOSTS` with `reconfigure` and re-issue the certificate.
+- **Legacy Compose:** add every address to `QUASAR_TLS_HOSTS` in `deploy/.env`,
+  then delete the certificate so it regenerates.
 
-On an owned install the names are the seed's `QUASAR_PUBLIC_HOST` and
-`QUASAR_TLS_HOSTS`, read at the first install. Browse to a name the certificate
-has, put a reverse proxy in front for the new one, or change them with
-`reconfigure` and re-issue the certificate. On a legacy Compose install, add every address you use to
-`QUASAR_TLS_HOSTS` in `deploy/.env`; if the certificate already exists, delete it
-and let it regenerate. See [HTTPS and certificates](/quasar/network/https/).
+See [HTTPS and certificates](/quasar/network/https/).
 
 ## Gamepad, Escape or microphone not working
 
-All three need a secure context, which means HTTPS.
-
-If you are on `http://`, that is the answer. If you are on `https://` with an
-accepted exception, that counts as secure and something else is wrong.
-
-Escape specifically also needs a Chromium-based browser and fullscreen. The
-session drawer says which condition is not met.
+All three need HTTPS (an accepted certificate exception counts). Escape also needs
+a Chromium browser in fullscreen. The session drawer says which condition is missing.
 
 ## The session launches and video never arrives
 
-The session negotiates, reaches **running** in Admin, Sessions, and the client
-stays black. About two minutes later the agent reaps it and logs `WebRTC
-transport never established`.
+The session reaches **running**, the screen stays black, and about two minutes
+later the agent logs `WebRTC transport never established`.
 
-On a freshly installed Linux server the usual cause is the host firewall. The
-control plane's ports are published through Docker and bypass it, so the login
-page, the API and session launch all work perfectly while the media path is
-being dropped. The node agent runs with host networking, so its WebRTC UDP is
-filtered like any other host traffic, and a default-deny firewall blocks it out
-of the box.
+Usually the host firewall. Docker-published control-plane ports bypass it, but the
+node agent's WebRTC UDP doesn't. Check **Admin ▸ Fleet ▸ Hosts** for a failed
+`media_reachability`, then open the ephemeral UDP range and UDP/5353 to your LAN or
+VPN subnet: [Ports and endpoints](/quasar/reference/ports/#firewall).
 
-Check **Admin, Fleet, Hosts** for a failed `media_reachability` check on that
-host. The agent judges it from real sessions: it fails when a browser on another
-machine tried to connect and none of its connection checks arrived, and names
-the scoped rule to add.
-
-<Aside type="caution" title="A pass is one client, not every client">
-A pass means one remote browser got through. A rule scoped to a subnet your
-client is not on still drops that client's media, so check the scope before
-ruling the firewall out.
-</Aside>
-
-The fix is a rule scoped to your LAN or VPN subnet, opening the ephemeral UDP
-range and UDP/5353. Per-tool commands are in
-[Ports and endpoints](/quasar/reference/ports/#firewall).
-
-If the firewall is already open, work through the remote-access checks below.
+A pass only proves one browser's path. A rule scoped to another subnet still blocks
+other clients.
 
 ## Login works, sessions never start
 
-This is the classic remote-access failure. The control path proxies fine, the
-media path does not.
+The control path works through a proxy; the media path doesn't. Check in order:
 
-Work through it in order.
-
-**1. Can the client reach the GPU host directly?** Ping its IP from the client
-machine. If it does not answer, media has nowhere to go. Put both ends on a VPN.
-See [Reaching Quasar remotely](/quasar/network/remote-access/).
-
-**2. Is there a reverse proxy in front?** Check allowed origins under Admin,
-Settings. A proxy that rewrites the public host, or an instance reached through
-several names, needs each browser origin listed. `QUASAR_ALLOWED_ORIGINS` is an
-environment override; leave it unset to use the saved admin setting.
-
-Set `PUBLIC_BASE_URL` when the proxy rewrites `Host`, or ensure it forwards the
-public host correctly. Otherwise the signaling address can point at the control
-plane's private listener.
-
-**3. Does the proxy forward WebSocket upgrades**, and does it have a long enough
-read timeout? These connections are long-lived.
-
-**4. Check the session in Admin, Sessions.** If it reaches running and the user
-still sees nothing, the pipeline is fine and the connection is not.
+1. **The client can reach the GPU host directly** (ping it). If not, use a VPN.
+   See [Reaching Quasar remotely](/quasar/network/remote-access/).
+2. **Allowed origins** (Admin ▸ Settings) list every browser origin. Set
+   `PUBLIC_BASE_URL` if the proxy rewrites `Host`.
+3. **The proxy forwards WebSocket upgrades** with a long read timeout.
+4. **Admin ▸ Sessions:** if the session is running but the user sees nothing, the
+   problem is the connection, not the pipeline.
 
 ## The connection sits at "checking"
 
-ICE could not find a working candidate pair.
-
-Chrome sends `.local` hostnames as ICE candidates rather than IP addresses, as a
-privacy measure. The node agent images carry their own resolver for these, so
-this should work without host-side configuration.
-
-Check the resolver is alive:
+No working ICE candidate pair. Chrome sends `.local` names; the agent image
+resolves them itself. Check:
 
 ```bash
 docker exec quasar-node-agent avahi-daemon --check
 docker exec quasar-node-agent getent hosts <name>.local
 ```
 
-If that is fine, the problem is routing between client and host.
+If those work, the problem is routing between client and host.
 
 ## The session ends by itself
 
-Look at the session detail in Admin, Sessions.
+Check the session in **Admin ▸ Sessions**:
 
-**"peer disconnected"** means the browser's connection died. Closing the tab,
-sleeping the laptop, or losing WiFi. Not a fault.
-
-**Host lost** means the agent stopped heartbeating. Check the agent is running on
-that machine.
-
-**A failure with an app-related reason** is the app container exiting. See
-[Launching a game](/quasar/troubleshooting/launching/).
+| Reason | Meaning |
+| --- | --- |
+| peer disconnected | The browser went away (tab closed, sleep, WiFi). Not a fault. |
+| Host lost | The agent stopped heartbeating. Check it's running. |
+| App-related failure | The app exited. See [Launching a game](/quasar/troubleshooting/launching/). |
 
 ## Direct LAN access broke after adding a public name
 
-You overwrote the saved allowed-origins list or environment override instead of
-extending it. List every origin people actually use, including the LAN ones:
+You replaced the allowed-origins list instead of extending it. List every origin,
+LAN ones included. Wildcards (`*`) are rejected.
 
 ```bash
 QUASAR_ALLOWED_ORIGINS=https://quasar.example.com,https://192.0.2.50:8443
@@ -144,9 +91,4 @@ QUASAR_ALLOWED_ORIGINS=https://quasar.example.com,https://192.0.2.50:8443
 
 ## Invite links point at the wrong address
 
-Set `PUBLIC_BASE_URL` to the address people actually use. Without it, Quasar
-builds links from what its own listener sees.
-
-<Aside type="note" title="`*` is not accepted">
-Wildcards in the allowed origins list are rejected outright. List the origins.
-</Aside>
+Set `PUBLIC_BASE_URL` to the address people use.

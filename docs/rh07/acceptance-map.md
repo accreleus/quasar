@@ -1,182 +1,125 @@
 # RH-07 acceptance map
 
-Written for #409 (D19). Sources: #393–#409 and their comments, the defect issues filed
-during RH-07 (#410–#423), `docs/rh07/2026-09-28-decisions.md` (D1–D23), the specification
-(#390) and `testdata/engine-profiles/profiles.json`. Citations are an issue plus its
-comment URL, or a commit hash. Hosts are named by role only: the AMD test host, the NVIDIA
-test host, the rootless lab VM (NVIDIA-GPU passthrough, SELinux enforcing, read-only
-`/usr`, per D23).
+Written for #409 (D19); reconciled 2026-10-01 against the newest hardware reports. Sources:
+#393–#437 and their comments, `docs/rh07/2026-09-28-decisions.md` (D1–D23), the
+specification (#390) and `testdata/engine-profiles/profiles.json`. Citations are an issue
+comment or a commit. Hosts are named by role: the AMD test host, the NVIDIA test host, and
+the rootless lab VM (SELinux enforcing, read-only `/usr`, per D23), which ran with either the
+NVIDIA card or the host's AMD iGPU passed through.
 
-Microphone capture is proven only on Podman rootless with NVIDIA (#409 comment
-[5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346)); every
-other Session cell proves playback only, so it reads PARTIAL.
+**Candidate coverage.** Every hardware row below predates the final candidate: the #429
+and #432 fixes, the dependency updates and the Go 1.26 toolchain landed afterwards. The rows
+are real evidence for the code paths they ran; they are not a hardware pass of the final
+build.
 
 ## 1. Profile matrix (D19)
 
-Required rows per cell: a real Steam session with input, audio and microphone (**Session**);
-an update applied from the console (**Update**); a reboot after which everything returns
-(**Reboot**); console mode on one host per engine (**Console**); bench runs posted (**Bench**).
+Required per cell: a real session with input, audio and microphone (**Session**); an update
+applied from the console (**Update**); a machine reboot after which everything returns
+(**Reboot**; a container restart does not count); console mode on one host per engine
+(**Console**); a bench run posted (**Bench**).
+
+Evidence keys used in the tables:
+
+| Key | Source |
+|---|---|
+| E1 | #409 [5900734046](https://github.com/accreleus/quasar/issues/409#issuecomment-5900734046): full input and microphone on rootful Docker (AMD, NVIDIA); keyboard and microphone on rootless Docker (AMD, NVIDIA) |
+| E2 | #428 [5914198622](https://github.com/accreleus/quasar/issues/428#issuecomment-5914198622): every gamepad event reaches the app on rootless Docker (AMD, NVIDIA) with the published 2026.09.30 images |
+| E3 | #409 [5912107407](https://github.com/accreleus/quasar/issues/409#issuecomment-5912107407): AMD rows on the lab VM (rootless Podman) |
+| E4 | #399 [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911): NVIDIA engine-mode table |
+| E5 | #405 [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293): rootless Podman install, update, reboot (NVIDIA) |
+| E6 | #409 [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346): microphone, rootless Podman (NVIDIA) |
+| E7 | #401 [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775): full per-button input replay, rootless Podman (NVIDIA) |
 
 ### Docker rootful
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS — full gamepad+keyboard input and microphone: #409 comment [5900734046](https://github.com/accreleus/quasar/issues/409#issuecomment-5900734046); video/audio: — #399 comment [5877729442](https://github.com/accreleus/quasar/issues/399#issuecomment-5877729442), #402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | PASS — #402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | GAP — not run on this host; #399's table records it as "—" (comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911)) | GAP — no console-mode run on the AMD test host; #395/#407 evidence is NVIDIA-only | GAP — no bench run cited against the AMD test host in #399/#402/#403 |
-| NVIDIA | PASS (CDI path) — full input and microphone: #409 comment [5900734046](https://github.com/accreleus/quasar/issues/409#issuecomment-5900734046); the `--gpus` fallback fails on this CUDA-only host (#413); video/audio: #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) | PASS (CDI path) — #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) | PASS (CDI path) — same table | PASS — enable/disable, Steam on the local screen, keyboard/mouse grabbed, DDC power detection, audio all confirmed by the owner watching the monitor: #395 comment [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398) | PASS — run `3e38e6e3` (`baseline/steam-1440p60-av1-observe`), #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) |
+| AMD | PASS (E1) | PASS: #402 [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | GAP | GAP | GAP |
+| NVIDIA | PASS over CDI (E1, E4); the `--gpus` fallback fails on a CUDA-only host (#413) | PASS (E4) | PASS (E4) | PASS: #395 [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398) | PASS: run `3e38e6e3` (E4) |
 
 ### Docker rootless
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PARTIAL — session, keyboard and microphone pass; gamepad reaches the game only with #428 (agent side integrated, image side unpublished): #409 comment [5900734046](https://github.com/accreleus/quasar/issues/409#issuecomment-5900734046) | GAP | GAP (container restarts only) | GAP | GAP |
-| NVIDIA | PARTIAL — keyboard and microphone pass; gamepad reaches the game only with #428 (agent side integrated, image side unpublished): #409 comment [5900734046](https://github.com/accreleus/quasar/issues/409#issuecomment-5900734046); video/audio: #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) | PASS — #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) | PASS — same table | PASS — enable in ~6s, `console_display`/`console_ddc`/`console_audio` pass, owner confirmed XFCE on the monitor with physical keyboard/mouse grabbed and DP audio: #407 comment [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752) | PASS — run `9384a95d`, cross-engine comparison recorded as run-to-run noise not regression: #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911) |
+| AMD | PASS (E1, E2) | GAP | GAP (container restarts only) | GAP | GAP |
+| NVIDIA | PASS (E1, E2, E4) | PASS (E4) | PASS (E4) | PASS: #407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752) | PASS: run `9384a95d` (E4) |
 
-### Podman rootless (Fedora, required)
+### Podman rootless (Fedora family)
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS — full input and microphone, on the rootless lab VM with the host AMD iGPU passed through: #409 comment [5912107407](https://github.com/accreleus/quasar/issues/409#issuecomment-5912107407) | PASS (install and apply from the console): #409 comment [5912107407](https://github.com/accreleus/quasar/issues/409#issuecomment-5912107407) | PASS — VM reboot, everything back in about 30 s: #409 comment [5912107407](https://github.com/accreleus/quasar/issues/409#issuecomment-5912107407) | PASS — HDMI picture, mouse, audio, DDC (keyboard not attached): #409 comment [5912107407](https://github.com/accreleus/quasar/issues/409#issuecomment-5912107407) | PASS — run posted; `qbench check`: no_comparable_runs (first run of the scenario): #409 comment [5912107407](https://github.com/accreleus/quasar/issues/409#issuecomment-5912107407) |
-| NVIDIA | PASS — microphone: #409 comment [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346); video/input/audio PASS, #399 comment [5880870911](https://github.com/accreleus/quasar/issues/399#issuecomment-5880870911); full per-button gamepad+keyboard+d-pad+trigger replay via the input DataChannel, every code arrived correctly: #401 comment [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775); audio energy 21.9 on a real browser, survives a VM reboot: #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147) | PASS — install→update→verify on the recovery actor: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — all five owned-install containers came back on their own via `podman-restart.service` and lingering: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) | PASS — picture OK, keyboard/mouse grabbed, audio tone heard (ALSA, not PipeWire — see gaps), owner watched the monitor: #407 comment [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657) | PASS — run `9cf88ede` vs `1d8d15be`, verbatim "0 regressed, 0 improved, 1 unchanged. result: clean": #399 comment [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652) |
+| AMD | PASS (E3): gamepad sequence identical to the reference, 30/30 keys, microphone RMS 2902 | GAP: E3 has no update row | PASS: VM reboot (E3) | PASS: HDMI picture, mouse, audio, DDC (E3; #407 [5912107863](https://github.com/accreleus/quasar/issues/407#issuecomment-5912107863)); no physical keyboard attached | PASS with no baseline: XFCE 1080p60 soak, `no_comparable_runs` (E3) |
+| NVIDIA | PASS (E4, E6, E7; audio: #411 [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147)) | PASS (E5) | PASS (E5) | PASS: #407 [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657) | PASS: run `9cf88ede`, "result: clean" (#399 [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652)) |
 
-**Reading the matrix:** on NVIDIA, every required row except the microphone half of
-**Session** has evidence in all three profiles (Docker rootful's `--gpus` fallback aside, a
-named defect, #413; the same host works end to end over CDI). Only Podman rootless has its
-microphone proven so far. The AMD side has only one required cell run at all
-(Docker rootful); Docker rootless and Podman rootless on AMD are untested, not failing —
-the AMD test host currently lacks the host input-device mount its rootless containers
-would need, so no agent has been run there under an unprivileged rootless account. This
-needs the lab owner.
+The AMD Podman bench is an XFCE soak, not a Steam game.
 
-### Podman rootful and Ubuntu 24.04 (not required; claimed/experimental/unsupported by evidence)
+### Not required
 
-Per `testdata/engine-profiles/profiles.json` (the table the site, the enrollment script and
-the agent's `runtime_engine` check all read):
+- **Podman rootful (Fedora):** experimental. A fresh Quadlet install reached `online, owned`
+  (#406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850));
+  no session, update, reboot or console evidence; LAN traffic to the console port is
+  dropped under firewalld (#416).
+- **Ubuntu 24.04:** no RH-07 hardware run on any engine. Docker rootful's `supported` label
+  predates RH-07; the other rows are experimental.
 
-- **Podman rootful, Fedora:** labelled **experimental** — "It has not yet been through the
-  same end-to-end tests as the other Fedora profiles; it becomes supported once it passes."
-  Evidence matches the label: a fresh install from the generated Quadlet output reached
-  `online, owned` on the rootless lab VM, #406 comment [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850);
-  no Steam session, update, reboot or console-mode evidence exists for it, and it carries a
-  known defect (LAN traffic to the console port is dropped under firewalld's INPUT-only
-  rules, since netavark forwards published ports rather than binding a host socket), filed
-  as #416.
-- **Ubuntu 24.04, every engine/mode:** labelled **experimental** ("Nobody has run Quasar
-  end to end on Ubuntu 24.04 with this engine yet; it should work") except Docker rootful,
-  labelled **supported** on the claim that "Rootful Docker is the engine profile Quasar is
-  validated on, and it works the same on any distribution" — a claim carried over from
-  before RH-07, not new RH-07 hardware evidence. No RH-07 ticket ran anything on Ubuntu;
-  every live run in #393–#423 is on Fedora-family hosts (the rootless lab VM, the AMD test
-  host, the NVIDIA test host). Ubuntu rootless rows should be read as **experimental: no
-  hardware evidence**, matching the table.
+## 2. User stories (spec #390)
 
-## 2. User story map (30 stories, spec #390)
-
-| # | Story | Status | Evidence / why not |
+| # | Story | Status | Evidence |
 |---|---|---|---|
-| 1 | Rootless engine, compromise can't take the machine | Met | Least-privilege recipe revision 3 drops host `/dev`, `NET_ADMIN`, `SYSLOG`, `/dev/kmsg`: #402 comment [5873589343](https://github.com/accreleus/quasar/issues/402#issuecomment-5873589343). Host prep grants only named devices by ACL, no broad group: #400 comment [5870987736](https://github.com/accreleus/quasar/issues/400#issuecomment-5870987736) |
-| 2 | Podman install and update | Met | Install, update-from-console and reboot all pass on rootless Podman: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) |
-| 3 | Rootless Docker install and update | Met | Quick start installs it without edits: #406 comment [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850); update-from-console proven in the #409 matrix (Docker rootless row) |
-| 4 | Rootful Docker/Unraid unchanged, less privilege | Met | Recipe revision 3 proven on the AMD test host with sessions, probes and readiness unchanged: #402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916). Unraid itself was not separately run (D4 keeps it on the unmodified rootful path by design; nothing in RH-07 touches that path) |
-| 5 | Quick start/enrollment detect engine and mode | Met | Host facts (`engine`/`engine_version`/`engine_mode`) from real `/version`/`/info`: #396 comment [5871843388](https://github.com/accreleus/quasar/issues/396#issuecomment-5871843388). Enrollment detects and refuses correctly: #406 comment [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
-| 6 | Quick start shows supported/experimental/unsupported | Met | `testdata/engine-profiles/profiles.json` drives the quick start's badges and the enrollment refusal, covered offline for all 12 unsupported rows: #406 comment [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
-| 7 | One host-prep command, idempotent, explains itself | Met | `deploy/prepare-host.sh`, 52 offline tests plus two live runs (fresh + idempotent no-op) on the rootless lab VM and the AMD test host: #400 comment [5870987736](https://github.com/accreleus/quasar/issues/400#issuecomment-5870987736) |
-| 8 | Host prep touches only `/etc`, works on read-only `/usr` | Met | `touch /usr/x` fails with "Read-only file system"; the script still completes: #400 comment [5870987736](https://github.com/accreleus/quasar/issues/400#issuecomment-5870987736) |
-| 9 | Dedicated `quasar` account | Met | Host prep creates it with subordinate ID ranges and lingering; the whole owned stack runs under it: #400, #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293) |
-| 10 | Quasar never runs as root / escalates at run time | Met | No code path adds privilege on read-back failure (#397 comment [5872048545](https://github.com/accreleus/quasar/issues/397#issuecomment-5872048545)); the one accepted exception is the node agent's own SELinux label (`label=disable`, D17, owner decision #402 comment [5884609826](https://github.com/accreleus/quasar/issues/402#issuecomment-5884609826)), which is a confinement label, not privilege escalation — the agent never becomes root and grants nothing beyond the engine socket it always held |
-| 11 | Controller, keyboard, mouse work rootless | Partly met | Full per-button/axis replay passed only on rootless Podman: #401 comment [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775). Docker rootful/rootless have only the coarse motion/click probe; the same full check on Docker "needs the lab owner" per that comment |
-| 12 | NVIDIA hardware encode + GPU game on every engine mode | Partly met | CDI path passes on all three required NVIDIA rows (matrix above). The rootful `--gpus` fallback on a CUDA-only host fails Steam's Vulkan init, filed as #413 |
-| 13 | Session audio and microphone on every engine mode | Partly met | Playback proven on every profile with NVIDIA evidence (matrix above; #411 comment [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147)). Microphone capture proven on Podman rootless with NVIDIA only: #409 comment [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346) |
-| 14 | Home files owned by the Quasar user | Partly met | True on rootless Podman via `keep-id`: #404 comment [5876278031](https://github.com/accreleus/quasar/issues/404#issuecomment-5876278031). Rootless Docker has no per-container user mapping in its API; homes keep subordinate IDs, and the owner accepted this with a readiness warning rather than a refusal: #404 comment [5884610200](https://github.com/accreleus/quasar/issues/404#issuecomment-5884610200) |
-| 15 | Console updates work on every engine mode | Met | Update-from-console proven on Docker rootful (#402 comment [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916)), Docker rootless and Podman rootless (matrix above). Rootful Podman was not exercised (not a required profile) |
-| 16 | Rootless/Podman machine returns after reboot | Met | Podman: all five containers returned via `podman-restart.service` + lingering: #405 comment [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293). Rootless Docker: reboot row PASS in the #399 matrix |
-| 17 | Readiness card names engine/mode, explains missing capability | Met | Amendment 17 defines `skip` with the setting named, no remediation and no `blocks`: #393 comment [5870715357](https://github.com/accreleus/quasar/issues/393#issuecomment-5870715357). `runtime_engine`/`runtime_endpoint` name the detected engine: #396 comment [5871843388](https://github.com/accreleus/quasar/issues/396#issuecomment-5871843388) |
-| 18 | Missing permission produces an exact-fix readiness check | Met | `input_probe` names `deploy/prepare-host.sh` on failure: #401 comment [5878347040](https://github.com/accreleus/quasar/issues/401#issuecomment-5878347040); no remediation text tells an operator to run Quasar as root: #396 comment [5871843388](https://github.com/accreleus/quasar/issues/396#issuecomment-5871843388) |
-| 19 | Media reachability tests the real path, not firewall rules | Met | Active probe from real ICE traffic, pass/fail/unknown proven rootful and rootless: #403 comment [5877723197](https://github.com/accreleus/quasar/issues/403#issuecomment-5877723197) |
-| 20 | GPU fault (Xid) messages when allowed, clear skip otherwise | Partly met | The skip path is implemented and reports the setting (`xid_visibility`, amendment 17): #402 comment [5873589343](https://github.com/accreleus/quasar/issues/402#issuecomment-5873589343). No live run exercises the "shown when allowed" positive path (an actual Xid fault surfaced in a trace) |
-| 21 | Console mode available again on owned installs | Met | #395 comment [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398) |
-| 22 | Console mode on rootless and Podman | Met | Rootless Docker and rootless Podman console rows both PASS on hardware (matrix above) |
-| 23 | Console local audio through the host's PipeWire when present | Not yet evidenced | Designed (host prep would add a Quasar-only PipeWire listen socket): #407 comment [5887423634](https://github.com/accreleus/quasar/issues/407#issuecomment-5887423634). Both live console-audio runs used the ALSA fallback because the tested hosts run no PipeWire session: #407 comments [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752) and [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657). The PipeWire path itself has no hardware proof |
-| 24 | DDC monitor control keeps working rootless | Met | DDC power-cycle auto-starts/stops the session on rootless Docker and rootless Podman: #407 comments [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752), [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657); rootful: #395 comment [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398) |
-| 25 | Podman Quadlet documented install | Met | Generated Quadlet unit installs without edits, rootful and rootless: #406 comment [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
-| 26 | Reinstall + dump restore, rootful to rootless | Not yet evidenced | D16 defers this to a fresh install plus the separate dump-restore ticket (#380); no #393–#423 ticket exercises it |
-| 27 | Docs say a rootful engine socket is root-equivalent | Met | Engine-profile page states it plainly; the accepted `label=disable` exception is documented the same way: #406 comment [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
-| 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run in #393–#423 keeps `getenforce` at `Enforcing` throughout, including after reboot: #400, #402, #404, #405, #407. The one exception is the node agent's own `label=disable`, accepted under D17 (story 10); sessions themselves stay confined (`container_t`/`container_engine_t`) |
-| 29 | Same behavioural suite across every engine mode | Met | One suite runs unchanged against each mode (#408, integrated `6e938912`): CI runs Docker rootful and rootless and Podman rootful and rootless; the lab ran Podman rootless and rootful (NVIDIA) and Docker rootful (AMD). Its findings are filed, not hidden: #424, #425, #426. Evidence: #408 comment [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059) |
-| 30 | Each required profile proven on real hardware before `main` | Partly met | NVIDIA: all three required profiles pass every row except the microphone half of Session (matrix above). AMD: only Docker rootful has been run at all; Docker rootless and Podman rootless on AMD are gaps, not failures |
+| 1 | Rootless engine; a compromise can't take the machine | Met | Recipe revision 3: #402 [5873589343](https://github.com/accreleus/quasar/issues/402#issuecomment-5873589343); ACL-only device grants: #400 [5870987736](https://github.com/accreleus/quasar/issues/400#issuecomment-5870987736) |
+| 2 | Podman install and update | Met | E5 |
+| 3 | Rootless Docker install and update | Met | #406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850); update on NVIDIA (E4) |
+| 4 | Rootful Docker and Unraid unchanged, with less privilege | Met | #402 [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916); Unraid's path is unchanged by design (D4) |
+| 5 | Quick start and enrollment detect engine and mode | Met | #396 [5871843388](https://github.com/accreleus/quasar/issues/396#issuecomment-5871843388), #406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
+| 6 | Quick start shows supported, experimental, unsupported | Met | #406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
+| 7 | One idempotent host-preparation command | Met | #400 [5870987736](https://github.com/accreleus/quasar/issues/400#issuecomment-5870987736) |
+| 8 | Host preparation touches only `/etc` | Met | #400 [5870987736](https://github.com/accreleus/quasar/issues/400#issuecomment-5870987736) |
+| 9 | Dedicated `quasar` account | Met | #400; E5 |
+| 10 | Quasar never runs as root or escalates at run time | Met | #397 [5872048545](https://github.com/accreleus/quasar/issues/397#issuecomment-5872048545); the agent's `label=disable` is an accepted confinement exception (D17, #402 [5884609826](https://github.com/accreleus/quasar/issues/402#issuecomment-5884609826)) |
+| 11 | Controller, keyboard and mouse work rootless | Met | Full replay on rootless Podman (E7, E3); full input on rootful Docker (E1); rootless Docker gamepad (E2) |
+| 12 | NVIDIA encode and GPU games on every engine mode | Partly met | CDI passes on all three required NVIDIA rows; the rootful `--gpus` fallback on a CUDA-only host fails (#413) |
+| 13 | Session audio and microphone on every engine mode | Met | Microphone: E1 (Docker, both vendors), E6 and E3 (Podman, both vendors) |
+| 14 | Home files owned by the Quasar user | Partly met | Rootless Podman: #404 [5876278031](https://github.com/accreleus/quasar/issues/404#issuecomment-5876278031); rootless Docker keeps subordinate IDs, accepted with a readiness warning: #404 [5884610200](https://github.com/accreleus/quasar/issues/404#issuecomment-5884610200) |
+| 15 | Console updates work on every engine mode | Met | One host per required engine mode (matrix Update column) |
+| 16 | A rootless or Podman machine returns after reboot | Met | E5, E3, E4 |
+| 17 | Readiness names engine and mode, explains a missing capability | Met | #393 [5870715357](https://github.com/accreleus/quasar/issues/393#issuecomment-5870715357), #396 [5871843388](https://github.com/accreleus/quasar/issues/396#issuecomment-5871843388) |
+| 18 | A missing permission gives an exact-fix readiness check | Met | #401 [5878347040](https://github.com/accreleus/quasar/issues/401#issuecomment-5878347040) |
+| 19 | Media reachability tests the real path | Met | #403 [5877723197](https://github.com/accreleus/quasar/issues/403#issuecomment-5877723197) |
+| 20 | GPU fault (Xid) messages when allowed, a clear skip otherwise | Partly met | The skip path is live (#402 [5873589343](https://github.com/accreleus/quasar/issues/402#issuecomment-5873589343)); no live Xid fault has exercised the shown path |
+| 21 | Console mode on owned installs | Met | #395 [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398) |
+| 22 | Console mode on rootless and Podman | Met | Console column: rootless Docker and rootless Podman on both vendors' evidence |
+| 23 | Console audio through the host's PipeWire | Met | #407 [5912430462](https://github.com/accreleus/quasar/issues/407#issuecomment-5912430462): Quasar's Pulse socket bound, HDMI playback audible with ALSA owned by PipeWire (rootless Podman, NVIDIA) |
+| 24 | DDC monitor control rootless | Met | #407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752), [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657), [5912107863](https://github.com/accreleus/quasar/issues/407#issuecomment-5912107863) |
+| 25 | Documented Podman Quadlet install | Met | #406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
+| 26 | Reinstall plus dump restore, rootful to rootless | Partly met | A v0.3.0 dump restored and a Steam session streamed (#380, landed `da0ffdca`); not into a fresh rootless install, no v0.2.x dump, and the mid-restore crash was tested in memory only |
+| 27 | Docs say a rootful socket is root-equivalent | Met | #406 [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
+| 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run stayed `Enforcing`; sessions stay confined; the agent's `label=disable` per D17 |
+| 29 | One behavioural suite across every engine mode | Met | #408 [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059), in CI on all four modes; its Podman findings are open (#424, #425, #426) |
+| 30 | Each required profile proven on hardware before `main` | Partly met | Every NVIDIA row passes. AMD gaps: Docker rootful reboot, console, bench; Docker rootless update, reboot, console, bench; Podman rootless update |
 
-**Count:** 16 met, 8 partly met, 6 not yet evidenced (stories 23, 26, 29 not yet evidenced;
-13, 20 count as partly met above — recount below for clarity).
-
-Met: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17, 18, 19, 21, 22, 24, 25, 27, 28 — **21**.
-Partly met: 11, 12, 13, 14, 20, 30 — **6**.
-Not yet evidenced: 23, 26, 29 — **3**.
+Met: 1–11, 13, 15–19, 21–25, 27–29 (**23**). Partly met: 12, 14, 20, 26, 30 (**5**). Not
+evidenced: none.
 
 ## 3. Open gaps
 
-Each item names what would close it.
+Each needs a run, or the owner's named acceptance under #409.
 
-**Matrix gaps:**
-1. **Docker rootful/AMD — no reboot, console mode or bench run.** Needs a reboot cycle,
-   a console-mode run and a bench run on the AMD test host; the lab owner's go-ahead is
-   needed for the reboot.
-2. **Docker rootless/AMD and Podman rootless/AMD — entirely untested.** The AMD test
-   host currently lacks the host input-device mount its container needs for a rootless
-   agent, so `input_probe` cannot pass there yet. Needs the lab owner to add that mount
-   (or an equivalent unprivileged account with the right device access), then the full
-   row set from the matrix.
-3. **Docker rootful/NVIDIA, `--gpus` fallback — Steam's Vulkan loader fails on a
-   CUDA-only host (#413).** Open, unresolved; suspected cause is the legacy hook's
-   injected libraries colliding with the driver volume's `libGLX_nvidia`. Needs a
-   comparison of the hook's mounts against the CDI spec and a retest with
-   `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`.
-4. **Docker rootful/rootless on NVIDIA — no full per-button gamepad/keyboard replay,
-   only the coarse motion/click probe.** The full check (#401 comment 5891242775) needs
-   re-running on those two engine modes; the same comment notes it "needs the lab owner"
-   because one test host is unavailable while the rootless lab VM holds the GPU, and a
-   container setting on the other stops runtime-created input nodes from appearing.
-5. **Microphone capture is proven on Podman rootless (NVIDIA) only.** The method (a real
-   browser with a fake capture device, then the RMS of the app's `quasar_mic_src` inside
-   the session) is in #409 comment
-   [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346);
-   it needs running once per remaining profile.
-6. **Podman rootful — no Steam session, update, reboot or console-mode evidence**, and
-   a known LAN-reachability defect under firewalld (#416: netavark forwards published
-   ports, so INPUT-zone rules don't cover them). Not a required profile (D5), so this
-   does not block release, but its `experimental` label is correct and should stay
-   until #416 is fixed and the row set is run.
-7. **Ubuntu 24.04 — no hardware run on any engine/mode.** All RH-07 live evidence is
-   Fedora-family. The `supported` label on Docker rootful/Ubuntu predates RH-07 and
-   carries no RH-07-specific evidence; the other three rows are correctly `experimental`
-   with "nobody has run it yet."
+1. **AMD, Docker rootful:** reboot, console mode, bench. (#409 asks for console on one host
+   per engine; NVIDIA covers that.)
+2. **AMD, Docker rootless:** update, machine reboot, console, bench.
+3. **AMD, Podman rootless:** update from the console; console run with a physical keyboard;
+   a Steam bench with a baseline.
+4. **Final candidate:** no hardware run of the release build itself (see Candidate coverage).
+5. **#413:** the rootful `--gpus` fallback on a CUDA-only NVIDIA host (CDI works).
+6. **Known Podman defects, need a release decision:** #425 (a crash-looping service can
+   restart after an explicit stop), #426 (Podman creates a missing bind source), #424
+   (restart-policy update unsupported on Podman 4.9).
+7. **Story 26:** restore into a fresh rootless install, a v0.2.x dump, a live mid-restore
+   crash.
+8. **Story 20:** no live Xid fault on the shown path.
+9. **Podman rootful and Ubuntu:** not required; labels stay experimental (#416).
+10. **#429 and #432:** fixed in code, not yet verified on hardware.
 
-**Story gaps:**
-8. **#408's suite has no Docker rootless lab run yet** (it runs in CI), and its Podman
-   findings are open: #425 (a crash-looping service restarts after an explicit stop) and
-   #426 (a missing bind source is created on the host), on Podman 5 as well as 4.9.
-9. **Console audio over PipeWire (story 23) has no hardware proof** — both live runs
-   fell back to ALSA because the tested hosts run no PipeWire session. Needs a rootless
-   host with an active PipeWire session (the plan named the Bazzite VM, #407 comment
-   5887423634) and a repeat of the console-audio check there.
-10. **Dump restore into a fresh rootless install (story 26)** is out of RH-07's own
-    tickets; it needs #380 to close first, then a live reinstall-and-restore run.
-11. **GPU-fault (Xid) visibility's "shown when allowed" path (story 20)** has no live
-    trigger; only the skip-and-why path has been exercised.
-
-**Known lab constraints (not RH-07 defects, recorded here as the reason several rows
-above are gaps rather than failures):**
-- The NVIDIA test host's GPU is shared with a lab VM; only one can hold the card at a
-  time, so NVIDIA rows sometimes had to wait or move to the rootless lab VM.
-- The AMD test host currently lacks the host input-device mount its rootless container
-  would need, so its input probe fails there; this needs the lab owner.
-- Console-mode VT restore defects are being fixed on a separate branch
-  (`rh07/407-console-vt`) and are not reflected in the console-mode rows above, which
-  predate that fix.
-
-**Filed defects still open, relevant to the matrix or stories above:** #410 (Podman
-non-recursive read-only binds, hardening), #412 (`engine_restart_on_boot` readiness check
-not implemented — the underlying behaviour is proven, but the check itself is a stub),
-#413 (see gap 3), #414 (console mode black picture under GPU passthrough to a VM — a
-hypervisor issue, not Quasar), #415 (a rotted offline test, unrelated to any gate), #416
-(see gap 6), #418 (homes-root reconfigure leaves stale paths), #419/#420 (XFCE app-image
-defects found during console-mode evidence), #421 (console hotplug devices never
-grabbed), #422 (console app display doesn't expose real monitor modes).
+**Open defects touching these rows:** #410, #412, #413, #414, #416, #418, #421, #422, #424,
+#425, #426, #429, #432, #433, #434.

@@ -1,64 +1,47 @@
 ---
 title: Move a Compose install
-description: Replace a Compose install with one owned by Quasar, and bring its accounts, library and settings with you.
+description: Replace a Compose install with one owned by Quasar, keeping accounts, library and settings.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-An install started from `deploy/docker-compose.yml` and `deploy/.env` is a
-[legacy Compose install](/quasar/install/legacy-compose/). Installs owned by
-Quasar are a different shape, and nothing converts one into the other in place.
-You move by installing afresh with the seed and loading the old database into
-the new install before it first starts.
+A [legacy Compose install](/quasar/install/legacy-compose/) can't be converted in
+place. You install afresh with the seed and load the old database before the new
+install first starts.
 
-- **The old install keeps working** on the release it has. It is never offered a
-  release that ships owned installs, so nothing updates it out from under you,
-  and the console shows no new release rather than an error. You can take your
-  time.
-- **The database comes with you.** You take a dump of the old database, and the
-  new install loads it before its control plane first starts. The control plane
-  then upgrades the data as it starts, as any update would. Accounts, the app
-  library, profiles and settings come back as they were.
-- **Hosts are added again, under their old names.** Every agent is replaced, so
-  every host from the old install shows as offline until it is added again. A
-  host added under its old node name keeps its history, and its users' homes are
-  found again.
-- **Homes stay where they are.** Nothing is copied. Give the new install the
-  same home root, and each user's saves and installed games are where they were.
+- **The old install keeps working** meanwhile and gets no updates. No rush.
+- **The database comes with you:** accounts, app library, profiles and settings.
+- **Hosts are added again, under their old node names**, which keeps their
+  history and homes.
+- **Homes stay where they are.** Give the new install the same home root.
 
 ## Before you start
 
-- Read [Install Quasar](/quasar/install/install/) once, so the new shape is
-  familiar: one container per machine, the seed, and Quasar creates the rest.
-- Write down, from **Admin**, **Fleet**, each host's **node name** and the home
-  root of every machine. Keep the old `deploy/.env` too.
-- The new install must be the same release as the old one, or newer. A dump
-  from a newer release than the one you install is refused, with nothing
-  changed.
-- Plan a window with no one playing. Stopping the old stack ends every session.
+- Read [Install Quasar](/quasar/install/install/) once.
+- From **Admin**, **Fleet**, note each host's **node name** and every machine's
+  home root. Keep the old `deploy/.env`.
+- Install the same release as the old one, or newer. A dump from a newer release
+  is refused.
+- Plan a window with no one playing.
 
 ## Moving
 
 <Steps>
 
-1. **Stop the old control plane and every agent**, but not the database. On the
+1. **Stop the old control plane and every agent, but not the database.** On the
    first machine, from its stack directory:
 
    ```bash
    docker compose -f deploy/docker-compose.yml stop quasar-control-plane quasar-node-agent quasar-updater
    ```
 
-   On each other GPU host, stop its agent stack. The one-line command put it in
-   `/opt/quasar-agent`:
+   On each other GPU host:
 
    ```bash
    docker compose --project-directory /opt/quasar-agent down
    ```
 
-   With the control plane stopped, nothing writes to the database while you
-   dump it.
-
-2. **Take a dump of the old database**, in Postgres's custom format (`-Fc`):
+2. **Dump the old database** in custom format (`-Fc`):
 
    ```bash
    docker compose -f deploy/docker-compose.yml exec -T quasar-postgres \
@@ -66,125 +49,90 @@ the new install before it first starts.
    head -c 5 quasar-move.dump; echo    # prints PGDMP
    ```
 
-   If your `deploy/.env` sets `POSTGRES_USER`, use that user in place of
-   `quasar`. A plain-text dump (without `-Fc`) is refused later, so check for
-   `PGDMP` now.
+   If `deploy/.env` sets `POSTGRES_USER`, use that instead of `quasar`. A dump
+   without `PGDMP` will be refused.
 
-3. **Stop the old stack on the first machine**, without `-v`:
+3. **Remove the old stack** on the first machine, without `-v`:
 
    ```bash
    docker compose -f deploy/docker-compose.yml down
    ```
 
-   Leaving off `-v` keeps the old database and volumes, so the old install can
-   come back. The old containers must be gone, not merely stopped: a leftover
-   Quasar container that the new install did not create is an owner conflict,
-   which Quasar refuses to act around, and it would also hold ports 8080 and
-   8443.
+   This keeps the old volumes so you can go back. The old containers must be
+   removed, not just stopped: the new install refuses to work around them, and
+   they hold ports 8080 and 8443.
 
-4. **Install the first machine with the seed, holding it for the restore.**
-   Follow [Install the first
-   machine](/quasar/install/install/#install-the-first-machine) with three
-   differences:
+4. **Install the first machine, held for the restore.** Follow
+   [Install the first machine](/quasar/install/install/#install-the-first-machine)
+   with three changes:
 
-   - add `QUASAR_AWAIT_RESTORE=1` (`-e QUASAR_AWAIT_RESTORE=1` with `docker
-     run`, or `QUASAR_AWAIT_RESTORE: "1"` in the stack's `environment`);
-   - give it the **same home root** as the old stack's `QUASAR_HOME_ROOT`;
-   - on a combined machine, set `QUASAR_NODE_NAME` to the old stack's
-     `NODE_NAME`, so its own agent takes over the old host.
+   - add `QUASAR_AWAIT_RESTORE=1` (`-e QUASAR_AWAIT_RESTORE=1` with `docker run`,
+     or `QUASAR_AWAIT_RESTORE: "1"` in the stack's `environment`);
+   - use the **same home root** as the old `QUASAR_HOME_ROOT`;
+   - on a combined machine, set `QUASAR_NODE_NAME` to the old `NODE_NAME`.
 
-   The seed installs Quasar's own Postgres and then waits: the control plane is
-   not created, and on a combined machine neither is its agent, so the console
-   does not come up yet. `docker logs quasar-recovery` says so, with the command
-   for the next step. Use Quasar's own database: the restore does not load into
-   a database of your own (`QUASAR_DATABASE_HOST`), which you restore with your
-   own tools before the install instead.
+   The seed installs Postgres and waits; the console isn't up yet.
+   `docker logs quasar-recovery` shows the next command. Restore only works into
+   Quasar's own database. If you use your own (`QUASAR_DATABASE_HOST`), restore it
+   with your own tools before installing.
 
-5. **Load the dump.** On the same machine, where `quasar-move.dump` is:
+5. **Load the dump**, on the machine holding `quasar-move.dump`:
 
    ```bash
    docker exec -i quasar-recovery quasar-recovery restore --dump - < quasar-move.dump
    ```
 
-   The `-i` matters: the dump is read from standard input. Before anything is
-   changed the restore checks that the file is a whole custom-format dump of a
-   Quasar database, and that it is not from a newer release than this one. Then
-   it loads it, creates the control plane, and waits until it reports healthy,
-   which includes upgrading the data. It ends by printing what it did.
+   Keep `-i`: the dump comes from standard input. The restore checks the file,
+   loads it, creates the control plane and waits until it's healthy. If it fails
+   before creating the control plane, nothing is kept: fix the named problem and
+   rerun. Rerunning after an interruption is also safe.
 
-   If it fails before the control plane was created, nothing is kept: fix what
-   it names and run the same command again. You can always run it again after
-   an interruption, too.
+6. **Sign in with your old admin account.** Every host shows **Offline**, except a
+   combined machine's own.
 
-6. **Sign in with your old admin account.** Accounts, the app library, profiles
-   and settings are as they were. Every host shows **Offline**, except a
-   combined machine's own, which its agent has already taken back.
+7. **Add each GPU host again** ([Add a second GPU host](/quasar/install/second-host/))
+   **with its old node name** and the same home root. A new name makes a new host;
+   the old one stays offline until you remove it.
 
-7. **Add each GPU host again**, under Admin, Fleet, Add host, as in [Add a
-   second GPU host](/quasar/install/second-host/), **with its old node name**
-   and the same home root it used before. On a combined machine its own agent
-   has already taken its old host back. A host added under its old name keeps
-   its history and its homes; one added under a new name is a new host, and the
-   old one stays offline until you remove it.
+8. **Enter stored credentials again**, such as the SteamGridDB key (Admin,
+   Library, Sources) and Admin, Settings, Secrets. They were encrypted with the
+   old `QUASAR_SECRET_KEY` and show as not readable.
 
-8. **Enter stored credentials again.** Saved credentials, such as the
-   SteamGridDB key (Admin, Library, Sources) and the values under Admin,
-   Settings, Secrets, were encrypted with the old `QUASAR_SECRET_KEY`, and the
-   new install has a key of its own. They show as not readable: enter each one
-   again.
-
-9. **Verify** as in [Check your install](/quasar/install/verify/): hosts online
-   and a real session that plays. Sign-ins carry over with the database, so
-   players who were signed in stay signed in.
+9. **Verify** as in [Check your install](/quasar/install/verify/): hosts online and
+   a real session plays. Players stay signed in.
 
 </Steps>
 
-Once it is installed, `QUASAR_AWAIT_RESTORE` does nothing more and can be
-removed from the seed.
+After the install, you can remove `QUASAR_AWAIT_RESTORE` from the seed.
 
 <Aside type="caution" title="Keep the old install until you are sure">
-Do not run `docker compose down -v`, delete the old volumes, or remove the old
-`deploy/.env` until the new install has run a real session. The move only reads
-the old database. To go back, take the new install apart (see
-[Uninstalling](/quasar/operations/uninstall/)), then bring the old stack back
-with `docker compose -f deploy/docker-compose.yml up -d` from its stack
-directory, and each GPU host's with `docker compose --project-directory
-/opt/quasar-agent up -d`.
+Don't run `docker compose down -v`, delete old volumes or remove the old
+`deploy/.env` until the new install has run a real session. To go back, take the
+new install apart ([Uninstalling](/quasar/operations/uninstall/)), then run
+`docker compose -f deploy/docker-compose.yml up -d` in the old stack directory
+and `docker compose --project-directory /opt/quasar-agent up -d` on each GPU host.
 </Aside>
 
 ## If the restore says no
 
-- **The dump is newer than this install's control plane**: the old stack ran a
-  newer release than the one you installed. Take the new install apart with
-  `uninstall --purge` and install that release or a newer one.
-- **It is not a custom-format archive**, or **`pg_restore` cannot read it**:
-  take the dump again with `-Fc`, and check it is whole (`PGDMP` at the start,
-  and the same size as on the old machine).
-- **This machine's control plane has already been created**: the install was
-  not started with `QUASAR_AWAIT_RESTORE=1`, or it has booted since. A dump is
-  loaded only before the first boot. Take the new install apart with
-  `docker exec quasar-recovery quasar-recovery uninstall --purge`, remove the
-  `quasar-machine` volume, and install again with `QUASAR_AWAIT_RESTORE=1`.
-- **The control plane did not report healthy** after the load: its first start
-  upgrades the old data, and `docker logs quasar-control-plane` says how far it
-  got. To try again from the start, take the new install apart as above.
+| Message | Fix |
+| --- | --- |
+| Dump is newer than this install's control plane | Take the new install apart with `uninstall --purge` and install that release or newer. |
+| Not a custom-format archive, or `pg_restore` can't read it | Dump again with `-Fc`. Check it starts with `PGDMP` and matches the size on the old machine. |
+| This machine's control plane has already been created | The install wasn't held, or has booted since. Run `docker exec quasar-recovery quasar-recovery uninstall --purge`, remove the `quasar-machine` volume, and install again with `QUASAR_AWAIT_RESTORE=1`. |
+| Control plane did not report healthy | Check `docker logs quasar-control-plane`. To start over, take the new install apart as above. |
 
 ## What does not come across
 
-- **Stored credentials**: they are entered again (step 8).
-- **The old hosts' agents.** Each host is added again (step 7).
-- **The old stack's files.** There is no compose file and no `.env` in the new
-  install, and most `deploy/.env` settings have no input on it: the [environment
-  reference](/quasar/reference/environment/) lists what an owned install takes.
-- **Portainer.** It is not a supported manager for the new install. Plain Docker
-  Engine, Dockge and Arcane are, and a `docker run` seed on Unraid counts as plain
-  Docker.
+- **Stored credentials** (step 8).
+- **The old hosts' agents** (step 7).
+- **The old stack's files.** Most `deploy/.env` settings don't apply; see the
+  [environment reference](/quasar/reference/environment/).
+- **Portainer** isn't supported. Plain Docker (including a `docker run` seed on
+  Unraid), Dockge and Arcane are.
 
 ## Staying on Compose
 
-You do not have to move yet. A legacy install keeps working on its release,
-with the commands on [Legacy Compose installs](/quasar/install/legacy-compose/).
-It simply stops receiving updates.
-
-Building from source with Compose remains available for contributors. It is not
-a supported install. See [Set up a checkout](/quasar/developer/getting-started/).
+A legacy install keeps working on its release, without updates. See
+[Legacy Compose installs](/quasar/install/legacy-compose/). Building from source
+with Compose is for contributors only: [Set up a checkout](/quasar/developer/getting-started/).

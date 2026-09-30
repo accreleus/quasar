@@ -637,6 +637,11 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The documentation site is about 40% shorter.** Every page leads with what you need,
+  what to do and how to know it worked; rationale, internals and repeated explanations are
+  cut or linked. The engine-profile page is one platform-by-engine table, and the add-host
+  page follows prepare, generate, inspect, run, confirm. The RH-07 acceptance map is
+  reconciled with the newest hardware reports.
 - **Dependencies updated (batch of 18 Dependabot PRs).** `node-agent`: the
   gstreamer-rs group (gstreamer/gstreamer-webrtc/gstreamer-video 0.25.4, glib
   0.22.10), tokio-rustls 0.26.5, ureq 3.4.2, regex 1.13.1, rustls 0.23.45.

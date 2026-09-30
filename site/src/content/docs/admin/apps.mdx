@@ -1,17 +1,14 @@
 ---
 title: Apps and runtime presets
-description: Creating catalog entries, sharing container specs between them, granting access, and the settings that most often stop an app working.
+description: Create catalog entries, share container specs between them, grant access, and avoid the settings that break apps.
 ---
 
 import Shot from '../../../components/Shot.astro';
 import admin_apps from '../../../assets/shots/admin-apps.png';
 import { Aside } from '@astrojs/starlight/components';
 
-An **app** is a catalog entry a user can launch. It is content plus a container
-specification plus a launch command, not one monolithic image.
-
-A **runtime preset** is a container specification several apps can share, so
-that a change to the base setup does not mean editing ten apps.
+An **app** is a catalog entry a user can launch. A **runtime preset** is a
+container specification several apps can share.
 
 <Shot
 	label="Admin apps"
@@ -22,115 +19,60 @@ that a change to the base setup does not mean editing ten apps.
 
 ## Creating an app
 
-1. Install the image first, under [Images](/quasar/admin/images/). Installing it
-   creates the runtime preset.
+1. Install the image under [Images](/quasar/admin/images/). This creates the
+   runtime preset.
 2. Create the app and point it at that preset.
-3. Set the kind: **game**, **desktop** or **launcher**. This drives the filters
-   users see.
-4. Choose which quality tiers it may launch at, if you want to restrict them.
+3. Set the kind: **game**, **desktop** or **launcher** (drives users' filters).
+4. Optionally restrict which quality tiers it may launch at.
 5. Grant access.
+
+<Aside type="caution" title="Images must come from the Quasar family">
+An app image must derive from Quasar's graphics base layer, which provides GPU
+access, Wayland and audio. An arbitrary public image will not launch.
+</Aside>
 
 ## Access
 
-An app is visible to a user only if they are entitled to it. Grant to everyone,
-or to named users.
-
-This is enforced on the server, on both listing and launching. A user who is not
-entitled cannot see the app and cannot launch it with a direct identifier.
-
-Library discovery creates an everyone grant automatically when it adds an app,
-so that discovered games are launchable without further work.
+A user sees and can launch an app only if granted it: to everyone, or to named
+users. The server enforces this. Library discovery grants its apps to everyone.
 
 ## Placement
 
-An app's **Placement** tab says which hosts may start new sessions of it. It is
-saved on its own, separately from the app's other changes.
+The **Placement** tab sets which hosts may start new sessions of the app. It saves
+separately from the app's other changes.
 
-- **Every eligible host** (dynamic): any host that can run the app is used,
-  including hosts added later. The default.
-- **Only these hosts** (fixed): only the hosts you tick. A host added later is
-  not used until you tick it.
+- **Every eligible host** (default): any host that can run it, including new ones.
+- **Only these hosts**: only the hosts you tick.
 
-Each selected host prepares the app's image ahead of the first launch, and the
-tab shows every host's state: selected, prepared, and ready. A failed preparation
-can be retried from there. A game tile found by library discovery inherits its
-placement from its parent app and is edited there.
+The tab shows each host as selected, prepared and ready; selected hosts pull the
+image ahead of the first launch, and a failed preparation can be retried. A game
+tile from library discovery takes its placement from its parent app.
 
-Placement narrows where a session can start; it never moves an existing home. A
-user whose home for the app is on a host you untick cannot launch it until that
-host is allowed again or the [home claim is
-released](/quasar/admin/hosts/#releasing-a-home-claim).
+Placement never moves an existing home. A user whose home is on a host you untick
+can't launch the app until that host is allowed again or the
+[home claim is released](/quasar/admin/hosts/#releasing-a-home-claim).
 
 ## Runtime preset settings that matter
 
-Most defaults are fine. These four are the ones that cause problems.
-
-### Network
-
-App containers get **no network** by default. That is the right default for a
-local game.
-
-It is wrong for anything that needs to reach the internet. Steam is the obvious
-case: on first launch it downloads part of its own interface, and without
-network it exits cleanly and the session dies with an unhelpful message about
-the media path.
-
-Set `network: bridge` on the preset for apps that need it. Set it per app, not
-globally.
-
-### GPU access
-
-The preset declares whether the container gets the GPU. Games need it. A trivial
-tool might not.
-
-### Environment
-
-Environment variables passed into the container.
-
-Quasar injects the session's resolution and frame rate automatically as
-`QUASAR_STREAM_WIDTH`, `QUASAR_STREAM_HEIGHT` and `QUASAR_STREAM_FPS`, plus
-`GAMESCOPE_*` equivalents for images that bake gamescope defaults. Without this,
-an image built for 1080p60 renders at 1080p60 even when the session is 1440p120,
-and the result gets upscaled into the stream, spending your bitrate on
-interpolated detail.
-
-A value you set explicitly wins over the injected one.
-
-### Exit policy
-
-What happens when the app process exits.
-
-`fail` is the default and it is usually right: the app is gone, so the session
-should end rather than stream a frozen frame at somebody.
-
-`keep` holds the session open. Only useful for apps that legitimately come and
-go.
+| Setting | Default | Notes |
+| --- | --- | --- |
+| Network | none | Set `network: bridge` per app for anything that needs the internet, such as Steam. Without it Steam exits and the session fails with a misleading media-path error. |
+| GPU access | per preset | Games need it. |
+| Environment | none | Passed into the container. Quasar injects `QUASAR_STREAM_WIDTH`, `QUASAR_STREAM_HEIGHT`, `QUASAR_STREAM_FPS` and `GAMESCOPE_*` equivalents so the app renders at the session's size; a value you set wins. |
+| Exit policy | `fail` | `fail` ends the session when the app exits. `keep` holds it open, for apps that come and go. |
 
 ## Shared storage
 
-Each user gets a persistent home directory per app, mounted in as the app's
-home. Only one session per user per app can run at a time, because two writers
-on the same save directory corrupts save files.
+Each user gets a persistent home per app. Only one session per user per app can
+run at a time, so saves aren't corrupted.
 
 ## Quality tiers per app
 
-You can restrict which tiers an app is allowed to launch at, which is worth
-doing for something that has no business running at 4K120.
-
-The tier a session actually gets is still resolved at launch against what the
-host can encode and the client can decode. Restricting the list narrows the
-options, it does not force an outcome.
-
-<Aside type="caution" title="Images must come from the Quasar family">
-An app image has to derive from the project's graphics base layer. That is what
-provides GPU access, Wayland and audio plumbing. An arbitrary image from a
-public registry will not launch, and the failure will not be obvious.
-</Aside>
+Restricting an app's tiers narrows the options. The session's tier is still
+resolved at launch against what the host can encode and the client can decode.
 
 ## Artwork
 
-If you set a SteamGridDB key under Admin, Library, Sources, Quasar fetches
-artwork for catalog entries. Games a library scan adds get theirs as soon as the
-scan finishes; anything else, or anything that fetch missed, is picked up by the
-artwork job. Artwork you uploaded or chose yourself is never replaced. Without a
-key, tiles render as gradient panels. It is entirely cosmetic.
+With a SteamGridDB key set under **Admin ▸ Library ▸ Sources**, Quasar fetches
+artwork for catalog entries; the artwork job fills in anything missed. Artwork you
+chose yourself is never replaced. Without a key, tiles show gradients.

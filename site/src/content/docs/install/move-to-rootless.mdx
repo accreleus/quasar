@@ -1,169 +1,117 @@
 ---
 title: Moving to rootless
-description: "Move an existing rootful install to a rootless engine: a fresh install plus a dump restore, never an in-place conversion."
+description: "Move a rootful install to a rootless engine: a fresh install plus a dump restore."
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Steps } from '@astrojs/starlight/components';
 
-There is no in-place way to flip a running install from rootful to rootless:
-the engine itself, root versus the `quasar` account, is fixed at install (D16
-in the RH-07 decisions). Moving to rootless is a **fresh rootless install**,
-loaded from a dump of the old one, the same shape as
-[Move a Compose install](/quasar/install/move-existing/). Read that page
-first if you have not moved an install this way before, and read
-[Install with Podman (Quadlet)](/quasar/install/podman-quadlet/) and [Engine
-profiles](/quasar/start/engine-profiles/) too.
+An install can't be switched from rootful to rootless in place. You do a
+**fresh rootless install** and load a dump of the old one, like
+[Move a Compose install](/quasar/install/move-existing/). See also
+[Install with Podman (Quadlet)](/quasar/install/podman-quadlet/) and
+[Engine profiles](/quasar/start/engine-profiles/).
 
-- **The database comes with you.** A final dump is taken by the *old*
-  install's own recovery actor, and the new install loads it before its
-  control plane first starts.
-- **Hosts are added again**, under their old node names, which keeps their
-  history and finds their homes again, as in any move.
-- **Homes are copied, not re-owned in place.** The old homes root keeps
-  whatever ownership its engine gave it (root-equivalent on rootful, or a
-  subordinate ID on rootless Docker). The new install gets a **freshly owned**
-  homes root instead: files are copied in with the `quasar` account as their
-  owner as the copy happens, never `chown -R`ed onto the directory you already
-  have. See [Engine profiles: rootless Docker and home
-  ownership](/quasar/start/engine-profiles/#rootless-docker-and-home-ownership)
-  for why this matters.
-- **This can be the same machine or a different one.** Either way, the old
-  install has to be fully uninstalled before the new one starts: they would
-  otherwise fight over the same ports and, on the same machine, the same
-  engine socket path.
+- **The database comes with you.**
+- **Hosts are added again** under their old node names, keeping history and homes.
+- **Homes are copied** into a new root owned by the `quasar` account, never
+  re-owned in place ([why](/quasar/start/engine-profiles/#rootless-docker-and-home-ownership)).
+- **Same machine or a different one.** Either way, fully uninstall the old
+  install before starting the new one.
 
 ## Before you start
 
-- Read [Engine profiles](/quasar/start/engine-profiles/) and pick the target:
-  rootless Podman is the design target and the one this page shows; rootless
-  Docker works the same way with `docker` in place of `podman` throughout.
-- Write down, from **Admin**, **Fleet**: each host's **node name**, and every
-  machine's home root and template root.
-- Plan a window with no one playing: the old install stops during this.
-- The new install must be the same release as the old one, or newer.
+- This page shows rootless Podman. For rootless Docker, use `docker` in place of `podman`.
+- From **Admin**, **Fleet**, note each host's **node name** and every machine's
+  home root and template root.
+- Plan a window with no one playing.
+- Install the same release as the old one, or newer.
 
 ## Moving
 
 <Steps>
 
-1. **Stop the old install's seed**, however you started it (`docker rm -f
-   quasar-seed`, or removed from your stack manager). `uninstall --purge`
-   below refuses to run while a seed exists.
+1. **Stop the old seed** (`docker rm -f quasar-seed`, or remove it in your stack
+   manager). The next step refuses while a seed exists.
 
-2. **Take a final dump and remove the old install**, from the old machine:
+2. **Take a final dump and remove the old install**, on the old machine:
 
    ```bash
    docker exec quasar-recovery quasar-recovery uninstall --purge \
      --confirm <old node name> --dump-to /var/lib/quasar/move
    ```
 
-   Before anything is deleted this takes a `pg_dump` (custom format) of
-   Quasar's own database into `/var/lib/quasar/move/quasar-final-<timestamp>.dump`
-   on the old machine (an absolute host directory, not a path inside the
-   container), and only then removes the old installation's containers,
-   volumes and network. It keeps the homes root and the template root: those
-   are never installation volumes. If the dump fails, nothing is deleted; the
-   command prints exactly what it did either way. Once you have copied the
-   dump file off (if this is a different machine), remove the emptied
-   `quasar-machine` volume as it tells you to:
+   This writes `/var/lib/quasar/move/quasar-final-<timestamp>.dump` on the host,
+   then removes the old containers, volumes and network. Homes and templates are
+   kept. If the dump fails, nothing is deleted. Copy the dump off if you're
+   changing machines, then:
 
    ```bash
    docker volume rm quasar-machine
    ```
 
-   A database of your own (`QUASAR_DATABASE_HOST`) is never dumped by this
-   command. Restore it with your own tools before the new install's first
-   start, the same as any other move.
+   Your own database (`QUASAR_DATABASE_HOST`) is not dumped. Restore it with your
+   own tools before the new install first starts.
 
-3. **Prepare the new host for rootless**, if you have not already:
+3. **Prepare the new host for rootless**, with **new** homes and templates paths:
 
    ```bash
    sudo sh prepare-host.sh --mode rootless --engine podman \
      --homes /var/lib/quasar/homes-rootless --templates /var/lib/quasar/templates-rootless
    ```
 
-   Give `--homes`/`--templates` a **new** path here, distinct from the old
-   rootful homes root. That is what gets you a homes root the `quasar`
-   account owns from the moment it exists, instead of one you would otherwise
-   have to re-own after the fact. If you are converting the same physical
-   machine, this runs after step 2 removed the old rootful install; the two
-   engine modes' sockets and services do not collide with each other once the
-   old one is gone.
+   On the same machine, run this after step 2.
 
-4. **Copy the homes and templates**, into the freshly owned roots, setting
-   ownership as part of the copy rather than afterwards:
+4. **Copy homes and templates**, setting the owner during the copy:
 
    ```bash
    sudo rsync -a --chown=quasar:quasar /var/lib/quasar/homes/ /var/lib/quasar/homes-rootless/
    sudo rsync -a --chown=quasar:quasar /var/lib/quasar/templates/ /var/lib/quasar/templates-rootless/
    ```
 
-   Do this before removing the old roots, and do not `chown -R` the old
-   directories themselves. Leave them as they were until you have verified
-   the new install plays a real session from the copies. `rsync -a` preserves
-   file content, permissions bits and mtimes; `--chown` sets the owner as each
-   file is written, so nothing is ever re-owned in place.
+   Don't `chown -R` or delete the old roots until the new install has played a
+   real session.
 
-5. **Install fresh, holding it for the restore.** From the
-   [Quick start](/quasar/start/quickstart/), choose Podman and rootless, the
-   same role the old install had (combined or control-only), and the **new**
-   homes root from step 3. Before running the generated script, add
-   `QUASAR_AWAIT_RESTORE=1` to its environment lines, and on a combined
-   machine set `QUASAR_NODE_NAME` to the old node name, so its own agent takes
-   the old host back under its old identity:
+5. **Install fresh, held for the restore.** In the
+   [Quick start](/quasar/start/quickstart/), choose Podman, rootless, the old
+   install's role (combined or control-only) and the **new** homes root. Before
+   running the script, add to the Quadlet unit:
 
    ```bash
    Environment=QUASAR_AWAIT_RESTORE="1"
    Environment=QUASAR_NODE_NAME="<old node name>"
    ```
 
-   in the Quadlet unit (or `-e QUASAR_AWAIT_RESTORE=1 -e QUASAR_NODE_NAME=...`
-   if you are installing with the bare `podman run` line instead). The seed
-   installs Quasar's own Postgres, then waits: the control plane is not
-   created yet, so nothing answers on its ports. `podman logs quasar-seed` (as
-   the `quasar` account, or `machinectl shell quasar@` first if that account
-   has no session yet; see [Install with Podman
-   (Quadlet)](/quasar/install/podman-quadlet/#getting-a-rootless-session-as-the-quasar-account))
-   says so, with the restore command for the next step.
+   (`QUASAR_NODE_NAME` on a combined machine only. With `podman run`, use `-e`.)
+   The seed installs Postgres and waits. As the `quasar` account,
+   `podman logs quasar-seed` shows the restore command (no session yet? see
+   [getting a rootless session](/quasar/install/podman-quadlet/#getting-a-rootless-session-as-the-quasar-account)).
 
-6. **Restore the dump**, on the new machine, where the file from step 2 is:
+6. **Restore the dump**, on the new machine:
 
    ```bash
    podman exec -i quasar-recovery quasar-recovery restore --dump - < quasar-final-<timestamp>.dump
    ```
 
-   The `-i` matters: the dump is read from standard input. It checks the
-   file is a whole custom-format dump of a Quasar database and not from a
-   newer release than this install, loads it, creates the control plane, and
-   waits for it to report healthy (which includes upgrading the schema). If
-   it fails before the control plane is created, nothing is kept: fix what it
-   names and run the same command again.
+   Keep `-i`: the dump comes from standard input. If it fails before the control
+   plane is created, nothing is kept: fix the named problem and rerun.
 
-7. **Sign in with the old admin account**, and add each GPU host again under
-   Admin, Fleet, Add host, with its old node name and the new homes root, as
-   in [Add a second GPU host](/quasar/install/second-host/#2-run-it-on-the-new-machine).
-   On rootless, run the command as the `quasar` account, not root or your own
-   login. A combined machine's own agent has already taken its host back.
+7. **Sign in with the old admin account** and add each GPU host again
+   ([Add a second GPU host](/quasar/install/second-host/#4-run-it))
+   with its old node name and the new homes root. On rootless, run the command as
+   the `quasar` account.
 
-8. **Enter stored credentials again.** The SteamGridDB key and any secrets
-   under Admin, Settings were encrypted with the old install's
-   `QUASAR_SECRET_KEY`, and the new install has a key of its own.
+8. **Enter stored credentials again** (the SteamGridDB key and Admin, Settings
+   secrets). The new install has a new `QUASAR_SECRET_KEY`.
 
-9. **Verify**, as in [Check your install](/quasar/install/verify/): hosts
-   online, and a real session that plays and writes into the copied homes.
-   Once you are sure, remove the old rootful homes and template roots.
+9. **Verify** as in [Check your install](/quasar/install/verify/): hosts online and
+   a real session that saves into the copied homes. Then remove the old homes and
+   template roots.
 
 </Steps>
 
 ## If it says no
 
-The refusals are the same ones [Move a Compose
-install](/quasar/install/move-existing/#if-the-restore-says-no) documents for
-`restore`: a dump newer than the installed release, a file that is not a whole
-custom-format archive, a control plane that has already been created (the
-install was not started with `QUASAR_AWAIT_RESTORE=1`, or has booted since:
-`uninstall --purge`, remove `quasar-machine`, and install again), or a control
-plane that never reported healthy after the load.
-
-`uninstall --purge` itself refuses while a seed still exists (stop it first,
-as in step 1) or from inside the recovery actor's own container.
+`restore` refusals and fixes are the same as in
+[Move a Compose install](/quasar/install/move-existing/#if-the-restore-says-no).
+`uninstall --purge` also refuses while a seed exists (step 1) or when run inside
+the recovery actor's own container.
