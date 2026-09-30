@@ -637,6 +637,12 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Owned installs start on the stable channel (RH-07, #409).** This is the first stable
+  release of owned installs, so the `edge` start amendment 16 gave them is withdrawn: a
+  new install follows `stable` like any other. **If you installed before this release,
+  your instance is still on `edge`** and keeps receiving branch builds. To follow stable
+  releases, open Admin, Fleet, Releases, set the channel to `stable` and press **Check
+  now**. Nothing is reinstalled; stable lists only releases newer than what you run.
 - **A new owned install starts on the edge release channel (amendment 16).** Every release of
   owned installs is an edge build until a stable one ships, so on `stable` a fresh install's
   Fleet ▸ Releases listed nothing, ever. A control plane running under a recovery actor now
