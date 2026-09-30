@@ -3,14 +3,11 @@ title: Testing and verification
 description: The required checks for Go, Rust, web, database, streaming, and deployment changes.
 ---
 
-The root Makefile is the test interface. Run this for every change:
+Run this for every change (format, lint, build, shell checks, DX self-tests):
 
 ```bash
 make verify
 ```
-
-It formats, lints, and builds all components, checks shell scripts, and runs the
-developer-experience self-tests.
 
 ## Checks by change type
 
@@ -25,13 +22,11 @@ developer-experience self-tests.
 | Images or deployment | Image contract validation through the canonical build scripts |
 | Candidate application image | `make qa IMAGE=<tag> PROFILE=<name> HOST=<role-or-host>` |
 
-A green `make test-go` does not mean the database tests passed. They skip
-themselves when no test database is configured. `make test-db` provisions a
-fresh throwaway Postgres and runs them for real, and it is not optional after a
-migration or a store or query change.
+`make test-go` skips the database tests. `make test-db` runs them against a fresh
+Postgres, and is required after any migration, store or query change.
 
-`make test-web` is the typecheck gate for the same reason. Hand-typed `tsc`
-invocations have been seen passing here while checking nothing.
+`make test-web` is the only reliable typecheck; hand-typed `tsc` can pass without
+checking anything.
 
 ## Useful diagnostics
 
@@ -40,19 +35,12 @@ make diagnose
 make diagnose-bundle
 ```
 
-The bundle is sanitised, stored under the gitignored `.diagnostics/` directory,
-and includes a manifest of included and excluded material. Review it before
-sharing it.
+The bundle is sanitised and saved under the gitignored `.diagnostics/`. Review it
+before sharing.
 
 ## Git and generated files
 
-Branches are based on `develop` and merge back to `develop`; promotion from
-`develop` to `main` is sign-off gated, because `main` is production. Push the
-branch to origin as you work, and pull `develop` before starting a migration.
-Two branches both numbering a migration 0070 give you a control plane that
-crash-loops on boot.
+Branch from `develop` and merge back into it; `develop` to `main` needs sign-off.
+Push as you go, and pull `develop` before adding a migration so numbers don't clash.
 
-Do not patch vendored generated clients or generated API types by hand.
-Regenerate them from their declared source and keep the source revision recorded
-where the repository requires it. A hand edit trips the schema drift check and
-gets dropped by the next regeneration anyway.
+Never hand-edit generated clients or API types. Regenerate them from their source.

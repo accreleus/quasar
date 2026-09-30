@@ -5,79 +5,56 @@ description: How contributors validate changes on a fleet host without bypassing
 
 import { Aside } from '@astrojs/starlight/components';
 
-GPU and streaming work must be validated on a Linux GPU host, because a pipeline
-that compiles is not a pipeline that works. Address a host by its configured
-role or hostname, and pass it explicitly:
+Validate GPU and streaming changes on a Linux GPU host. Pass the host explicitly,
+by role or hostname:
 
 ```bash
 make status HOST=<role-or-host>
 make session-list HOST=<role-or-host>
 ```
 
-The host map used by repository tooling lives at
-`.claude/skills/_shared/hosts.json`, which is operator-local and not committed.
-Keep real hostnames out of prose and scripts. Roles let the same workflow run
-against a different fleet.
+The host map is `.claude/skills/_shared/hosts.json`, operator-local and not
+committed. Keep real hostnames out of prose and scripts.
 
 ## Deploy the component that changed
 
 | Changed | Command | Expected cost |
 | --- | --- | --- |
-| Go control plane only | `make redeploy-cp HOST=<role-or-host>` | About one minute |
+| Go control plane only | `make redeploy-cp HOST=<role-or-host>` | About one minute; sessions survive |
 | Rust, GStreamer, or agent image | `make rebuild HOST=<role-or-host>` | 40 minutes or more |
 
-Match the verb to what changed. `redeploy-cp` recreates one service and leaves
-the node agent alone, so sessions in flight survive; `rebuild` on a Go-only
-change spends forty minutes recompiling Rust and GStreamer that did not.
+Both accept `REF=<branch-or-sha>` and otherwise keep the host's current branch.
+Don't call `deploy/redeploy.sh` remotely without a ref: it defaults to `origin/main`.
 
-Both commands accept `REF=<branch-or-sha>` and otherwise preserve the branch the
-host is already testing. Do not call `deploy/redeploy.sh` remotely with an
-implicit ref. It checks out its ref on the host and defaults to `origin/main`,
-so a bare call moves the host off the branch under test mid-run.
-
-Images are built only through `deploy/build-images.sh` and the Makefile
-wrappers. Do not substitute a hand-written `docker build` or weaken
-`deploy/image-contract.json` to make a candidate pass. The wrapper forces an
-explicit `--target`, because a bare build takes the last stage in the file
-regardless of what you tagged it, and it validates every artifact against the
-contract before promoting `:latest`. That contract is the durable form of every
-image defect that reached production.
+Build images only with `deploy/build-images.sh` or the Makefile wrappers. Never
+hand-write a `docker build` or weaken `deploy/image-contract.json` to pass.
 
 <Aside type="danger" title="Remote mutation is explicit">
-Starting, stopping, rebuilding, or redeploying a remote stack requires an
-explicit `HOST=`. Destructive fleet, database, volume, or image operations still
-require operator authorisation.
+Starting, stopping, rebuilding or redeploying a remote stack needs an explicit
+`HOST=`. Destructive fleet, database, volume or image operations need operator
+authorisation.
 </Aside>
 
 ## Two lanes: source builds and owned installs
 
-Everything above is the **contributor lane**: a stack built from source and run
-with Compose. It is fast to iterate on, it is not a supported install, and a
-recovery actor never acts on it. The console shows it the `redeploy.sh` recipe
-rather than offering it a release.
+**Contributor lane:** everything above. A source-built Compose stack; fast, not a
+supported install, and never updated from the console.
 
-The **product lane** runs a branch build on exactly the path users run: images
-from `deploy/build-images.sh`, pushed to a registry namespace you control under a
-content-addressed tag, installed with the seed, and moved with a **developer
-apply** from Admin, Fleet, Releases. Both the control plane and each machine's
-recovery actor check the registry namespace, and on an owned install both lists
-come from the seed inputs `QUASAR_UPDATER_ALLOWED_NAMESPACES` and, for a
-plain-HTTP registry, `QUASAR_PLATFORM_INSECURE_REGISTRIES`, recorded at the first
-install. Install a product-lane machine with the test registry already in them:
+**Product lane:** the user's path. Build with `deploy/build-images.sh`, push to a
+registry namespace you control with a content-addressed tag, install with the
+seed, and move it with a **developer apply** from **Admin ▸ Fleet ▸ Releases**.
+Allow the test registry in the seed inputs at install:
 
 ```yaml
       QUASAR_UPDATER_ALLOWED_NAMESPACES: "<test-registry>:5000/<namespace>,ghcr.io/accreleus/quasar"
       QUASAR_PLATFORM_INSECURE_REGISTRIES: "<test-registry>:5000"
 ```
 
-The engine that pulls the images also needs a plain-HTTP registry in its own
-`insecure-registries`. Any machine can widen its list later with `reconfigure`;
-on the first machine that replaces the control plane. The rules are under [Developer
-apply](/quasar/operations/upgrading/#developer-apply).
+A plain-HTTP registry must also be in the engine's `insecure-registries`. Widen
+the lists later with `reconfigure`. See [Developer apply](/quasar/operations/upgrading/#developer-apply).
 
-A machine is in one lane at a time. Move a shared test host between lanes
-deliberately, one host at a time, and follow the shared-host preflight in
-`AGENTS.md` before you do.
+A machine is in one lane at a time. Switch shared test hosts one at a time,
+following the shared-host preflight in `AGENTS.md`.
 
 ## Inspect a live session
 
@@ -89,8 +66,6 @@ make session-trace SID=latest HOST=<role-or-host>
 make session-logs SID=latest HOST=<role-or-host> SINCE=10m
 ```
 
-Use these bounded commands before reaching for raw SQL or unbounded log streams.
-Each is finite and exits 1 on a degraded verdict.
-
-For multi-run comparisons, impairment experiments, and soak reports, follow the
-current workflow documented in `AGENTS.md` and `docs/developer-tooling.md`.
+Each is bounded and exits 1 on a degraded verdict. Use them before raw SQL or log
+streams. Comparisons, impairment and soak workflows are in `AGENTS.md` and
+`docs/developer-tooling.md`.

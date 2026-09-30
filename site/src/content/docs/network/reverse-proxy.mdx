@@ -3,56 +3,42 @@ title: Behind a reverse proxy
 description: Running the control plane behind Caddy or your own proxy, and the two settings that make signaling work.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
-You might want a proxy for a real certificate on a public name, to put Quasar on
-port 443 alongside other services, or to bring it under an existing ingress.
-
-The control plane proxies fine. The media path does not go through the proxy at
-all, so read
-[Reaching Quasar remotely](/quasar/network/remote-access/) before assuming this
-gets you internet play.
+The control plane can sit behind a proxy. The stream never goes through it, so
+see [Reaching Quasar remotely](/quasar/network/remote-access/) before expecting
+internet play.
 
 ## On an owned install
 
-Quasar ships no proxy of its own for an owned install: bring yours. The [quick
-start](/quasar/start/quickstart/) writes a Caddy, Traefik, nginx or NGINX Proxy
-Manager snippet for your public URL. Point it at the control plane's **HTTP**
-port (8080 by default), not 8443.
+Bring your own proxy. The [quick start](/quasar/start/quickstart/) writes a Caddy,
+Traefik, nginx or NGINX Proxy Manager snippet. Point it at the control plane's
+**HTTP** port (8080 by default), not 8443.
 
-Three things make it work:
+- **Pass the original `Host` and send `X-Forwarded-Proto`.** The signaling address
+  is built from them; owned installs have no `PUBLIC_BASE_URL`. The quick-start
+  snippets do this.
+- **Add the public URL to allowed origins** in **Admin ▸ Settings**. Opening
+  first-run setup through the public address saves it for you. There is no
+  environment override on an owned install.
+- **Set `QUASAR_TRUSTED_PROXIES`** (a seed input) to your proxy's address or CIDR.
+  To change it later, on the first machine:
 
-- **The proxy passes the original `Host`** and sends `X-Forwarded-Proto`. The
-  signaling address handed to the browser is built from them. An owned install
-  takes no `PUBLIC_BASE_URL` in this release, so a proxy that rewrites `Host` to
-  its upstream address sends browsers to a listener they cannot reach. Every
-  snippet the quick start writes preserves it. Invite links are composed from
-  the address the admin browses to.
-- **The allowed origins** include the public URL. Opening first-run setup through
-  the public address and pressing Continue on Basics saves that exact browser
-  origin; manage more under Admin, Settings. An owned install has no environment
-  override for them, so the Admin list is the only list.
-- **`QUASAR_TRUSTED_PROXIES`**, a seed input, names your proxy's address or
-  network, so forwarded client addresses are believed only from it. It is read at
-  the first install, like the other inputs. To change it later, run
-  `docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_TRUSTED_PROXIES=<address or CIDR>`
-  on the first machine; it replaces the control plane with the new value.
+  ```bash
+  docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_TRUSTED_PROXIES=<address or CIDR>
+  ```
 
-The seed's `QUASAR_PUBLIC_HOST` still names the certificate on the control
-plane's own HTTPS port, which you keep for direct LAN access.
+Keep `QUASAR_PUBLIC_HOST` for direct LAN access on the HTTPS port.
 
 ## On a legacy Compose install
 
-A legacy stack can use the hardened Compose overlay, which puts Caddy in front
-with ACME certificates, stops the control plane publishing its own ports, and
-derives the public URL and origins from `QUASAR_PUBLIC_HOST` in `deploy/.env`:
+The hardened overlay puts Caddy with ACME certificates in front and derives the URL
+and origins from `QUASAR_PUBLIC_HOST` in `deploy/.env`:
 
 ```bash
 docker compose -f deploy/docker-compose.yml \
                -f deploy/docker-compose.hardened.yml up -d
 ```
 
-With your own proxy instead, the settings below go in `deploy/.env`.
+With your own proxy, set these in `deploy/.env`.
 
 ### PUBLIC_BASE_URL
 
@@ -60,8 +46,7 @@ With your own proxy instead, the settings below go in `deploy/.env`.
 PUBLIC_BASE_URL=https://quasar.example.com
 ```
 
-Without this, Quasar builds URLs from what its own listener sees. A proxy that
-rewrites `Host` then hands the browser a signaling address it cannot reach.
+Needed when the proxy rewrites `Host`.
 
 ### Allowed origins
 
@@ -69,62 +54,32 @@ rewrites `Host` then hands the browser a signaling address it cannot reach.
 QUASAR_ALLOWED_ORIGINS=https://quasar.example.com
 ```
 
-This gates the signaling WebSocket. Leave it unset to use the list saved in
-Admin, Settings; set, it is an authoritative override. An explicitly empty value
-still pins the environment policy and overrides a list saved in Admin. Unset with
-no saved list means same-origin only, which is correct for a direct deployment
-and for a proxy that preserves the public host consistently.
+Gates the signaling WebSocket. Unset uses the list in **Admin ▸ Settings**; set
+(even empty), it overrides that list. With neither, only same-origin is allowed.
 
-Rules for the value, and for the Admin list:
-
-- Comma-separated, exact `scheme://host[:port]` entries.
-- No path, no query, no credentials.
-- `*` is rejected outright.
-- A malformed entry stops the control plane from starting.
+- Comma-separated exact `scheme://host[:port]` entries, no path, query or credentials.
+- `*` is rejected. A malformed entry stops startup.
+- Keep your LAN origins (such as `https://<lan-ip>:8443`) when adding a public one.
 
 ### QUASAR_TRUSTED_PROXIES
 
-Only trust forwarded client-address headers from proxies you operate. Set it to
-the proxy network or address. With the bundled Caddy stack, use that Compose
-project's specific bridge subnet, not the broad Docker private-address range.
-Empty is safe: forwarded addresses are ignored and the direct peer is used for
-rate limiting and logs.
-
-<Aside type="caution" title="Keep your LAN origins in the list">
-Adding a public name and overwriting the list instead of extending it breaks
-direct access at `https://<lan-ip>:8443`. List every origin people actually use.
-</Aside>
-
-Use Admin's access check from the same browser address before launching a
-stream. The launch screen distinguishes an unopened signaling connection from a
-failed media connection; its signaling advice points to the public address,
-WebSocket proxying and allowed origins.
+The proxy's address or network, and nothing broader. With the bundled Caddy, use
+that Compose project's bridge subnet. Empty is safe: forwarded addresses are ignored.
 
 ## Proxy requirements
 
-**WebSocket upgrade.** Both `/v1/signal` and `/agent/ws` are WebSockets. A proxy
-that does not forward upgrade headers breaks signaling entirely.
-
-**No aggressive buffering** on those paths.
-
-**A generous read timeout.** These connections are long-lived. A proxy that
-closes idle connections after 60 seconds will cut sessions.
-
-**Forwarded protocol headers.** Send `X-Forwarded-Proto` so Quasar can tell it is
-being fronted and does not try to redirect a request that already arrived over
-HTTPS.
+- Forward WebSocket upgrades on `/v1/signal` and `/agent/ws`.
+- No buffering on those paths.
+- A long read timeout (a 60-second idle timeout cuts sessions).
+- Send `X-Forwarded-Proto`.
 
 ## What not to proxy
 
-Node agents connect to the control plane over `/agent/ws` on plain HTTP, and
-`/health` is exempt from the HTTPS redirect so healthchecks work.
-
-If the agents are on the same machine or the same trusted network, point them at
-the control plane's direct address instead of through the proxy. Fewer moving
-parts in the path that keeps your fleet registered is a good thing.
+Point node agents on the same machine or trusted network at the control plane
+directly (`/agent/ws` over HTTP), not through the proxy.
 
 ## Checking it worked
 
-Log in from outside, open the library, launch something. If login works and the
-session never starts, the origin setting is the first thing to check, then
-whether the client can route directly to the GPU host.
+Run Admin's access check from the public address, then log in from outside and
+launch something. If the session never starts, check allowed origins, then whether
+the client can reach the GPU host directly.

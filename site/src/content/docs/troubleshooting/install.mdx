@@ -3,104 +3,87 @@ title: Install and startup problems
 description: The images, the seed and the recovery actor, the containers, the GPU, and the agent registration. Symptoms with causes and fixes.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ## The install stops part way through
 
-**Out of disk.** The most common cause. The published images are about 20 GB and
-you want 40 GB free. A build from source needs around 25 GB on top of that.
+Usually out of disk. The published images need about 20 GB; keep 40 GB free, plus
+25 GB more to build from source.
 
 ```bash
 df -h /var/lib/docker
 ```
 
-On Fedora, the default 15 GB root logical volume is not enough. Grow it with
-`lvextend` and `xfs_growfs`.
-
 ## The seed and the recovery actor
 
-On a Quasar-owned machine the seed looks every 30 seconds and logs only a change,
-and every warning or error carries a `token=`. Read them with:
+On a Quasar-owned machine the seed checks every 30 seconds and logs only changes.
+Every warning or error carries a `token=`.
 
 ```bash
 docker logs quasar-seed
-```
-
-```bash
 docker logs quasar-recovery
+docker exec quasar-seed quasar-recovery status       # the seed's last check
+docker exec quasar-recovery quasar-recovery status   # services, blockers, last update
 ```
-
-`docker exec quasar-seed quasar-recovery status` prints what the seed's last look
-came to, and `docker exec quasar-recovery quasar-recovery status` the machine's
-services, any container in the way, and the result of the last update.
 
 ### What the seed says
 
 | Log | Meaning and fix |
 | --- | --- |
-| `seed-actor-created` | It created and started `quasar-recovery`. The install proceeds there. |
-| `a recovery actor exists; nothing to do` | The normal state after the first install. |
-| `seed-inputs-invalid` | An input is missing or invalid, or the agent image declares no container shape this recovery actor carries. The line names the variable. Nothing was created. Correct the stack or `docker run` line and start the seed again. |
-| `seed-agent-image-unavailable` | An image the install names cannot be pulled: the agent's, or on a combined or control-only machine the control plane's or Postgres's. The line names the variable. Nothing was created; it tries again at the next look. |
-| `seed-self-invalid` | A mount is missing, the volume is not the machine's `quasar-machine` volume (a stack without `name: quasar-machine`), or the seed's image has no registry digest. Start it by digest with both mounts. |
+| `seed-actor-created` | It created and started `quasar-recovery`. The install continues there. |
+| `a recovery actor exists; nothing to do` | Normal after the first install. |
+| `seed-inputs-invalid` | An input is missing or invalid (the line names it). Nothing was created. Fix the stack or `docker run` line and start the seed again. |
+| `seed-agent-image-unavailable` | An image can't be pulled (the line names it). Nothing was created; retried at the next check. |
+| `seed-self-invalid` | A mount is missing, the volume isn't `quasar-machine`, or the seed image has no digest. Start it by digest with both mounts. |
 | `seed-uninstalled` | The machine was uninstalled. The seed stays idle. |
-| `seed-file-unknown-format`, `seed-file-unreadable` | The seed's state file is of a format it does not know, or invalid. The seed stays idle rather than guess. |
-| `seed-name-taken` | A container named `quasar-recovery` exists without this installation's labels, such as one started by hand. It is left alone. Remove it and the seed creates the recovery actor. |
-| `seed-actor-unstarted` | A recovery actor was created and never started, by an earlier seed container. `docker start quasar-recovery` finishes it. |
-| `seed-actor-started` | `quasar-recovery` had been stopped with `docker stop` or `docker kill`, which Docker never restarts, so the seed started it again after about a minute. It finishes what it was doing. To keep it stopped, stop the seed first. |
-| `seed-actor-stopped` | No recovery actor is running and the seed will not start it: after an interrupted update, or with two of them. Nothing on the machine can be updated or recovered meanwhile. The line names the command that brings it back. The seed shows unhealthy until then. |
-| `seed-engine-unreachable`, `seed-pull-failed`, `seed-create-failed`, `seed-start-failed` | Retried at the next look. |
-| `seed-look-failed` | A look failed for a reason with no line of its own; the message says what. Retried at the next look. |
-| `seed-engine-config` | The container engine endpoint the seed was given is unusable, for instance a `DOCKER_HOST` it refuses. The seed exits. Fix the socket mount or the variable. |
+| `seed-file-unknown-format`, `seed-file-unreadable` | The seed's state file is unknown or invalid. The seed stays idle. |
+| `seed-name-taken` | A `quasar-recovery` container without this installation's labels exists. Remove it and the seed creates its own. |
+| `seed-actor-unstarted` | A recovery actor was created but never started. Run `docker start quasar-recovery`. |
+| `seed-actor-started` | `quasar-recovery` had been stopped by hand, so the seed restarted it. To keep it stopped, stop the seed first. |
+| `seed-actor-stopped` | No recovery actor is running and the seed won't start it (interrupted update, or two actors). Nothing can be updated meanwhile. Run the command the line names. |
+| `seed-engine-unreachable`, `seed-pull-failed`, `seed-create-failed`, `seed-start-failed`, `seed-look-failed` | Retried at the next check. |
+| `seed-engine-config` | The engine endpoint (for instance `DOCKER_HOST`) is unusable. The seed exits. Fix the socket mount or variable. |
 
 ### What the recovery actor says
 
 | Log | Meaning and fix |
 | --- | --- |
-| `actor-resume-failed` | The install failed, for example on an unreachable engine or an owner conflict. The actor keeps answering `status` and tries again only at its next start. |
-| `actor-role-invalid` | `QUASAR_ROLE` names a role this build does not install. The actor exits. |
-| `actor-engine-config` | The container engine endpoint is unusable, for instance a refused `DOCKER_HOST`. The actor exits. |
-| `actor-no-gpu` | The probe found no usable GPU render node. The agent is installed anyway and its readiness reports the gap. |
-| `actor-gpus-served` | The engine started a GPU probe container, by CDI or `--gpus`, so the agent gets the NVIDIA shape. |
-| `actor-gpu-injection-unavailable` | An NVIDIA device was found, but this engine can hand a GPU over neither by CDI nor, being rootless or Podman, by `--gpus`. The agent is installed without the NVIDIA shape and its `runtime_cdi` check fails. Run [host preparation](/quasar/install/prepare-host/), which writes the NVIDIA CDI specification, restart the engine, then remove the agent container so the next start asks again. |
-| `actor-gpu-probe-unreadable` | GPU detection failed. The agent is installed without GPU devices and its readiness reports the gap. |
-| `actor-gpus-refused` | The engine refused the GPU request. The agent is installed without the NVIDIA shape, and readiness reports the gap. Fix the NVIDIA Container Toolkit (or, on Podman and rootless Docker, the CDI specification host preparation writes), then remove the agent container so the next start asks again. |
-| `actor-gpus-probe-retry` | The engine did not answer the GPU probe. It is asked up to three times. |
-| `actor-helper-name-taken` | A container this actor did not create holds one of its helper names (`quasar-gpu-probe`, `quasar-secrets-writer`). It is left alone and the start stops. Remove it. |
-| `actor-lease-unavailable` | A second recovery actor on the same machine state. Only one runs. |
-| `actor-input-ignored` | A later start carried a different input. Machine state wins after the first install. |
-| `actor-installation-label-differs` | A machine installed by a hand-started actor, then given a seed. Remove the actor once more (`docker rm -f quasar-recovery`) and the seed re-creates it. |
-| `actor-trust-config-invalid` | An invalid signature mode or trusted key. The start stops. |
-| `actor-spec-differs` | The running node agent differs from what this actor would create. It is left as it is. |
-| `actor-socket-bind-failed` | The actor cannot create the agent's socket, usually because the `quasar-recovery-agent` volume is not mounted at `/run/quasar-recovery`. The start stops. |
-| `actor-socket-busy` | Too many connections on the agent socket; one was closed unanswered. |
-| `actor-socket-failed` | The agent socket stopped. The actor exits, and its restart policy starts it again. |
-| `actor-console-refused` | The actor refused a request to turn console mode on or off; the line names the reason. |
-| `actor-submit-refused` | The actor refused an update request from its agent, for instance `busy` while another attempt is in flight. The line names the reason. |
-| `actor-attempt-failed`, `actor-verification-failed` | An update did not complete. If the new agent had been started and never became healthy, it was removed and the old one put back. The console's apply history has the reason. |
-| `actor-journal-unreadable` | The record of an update cannot be read (corrupt, or written by a newer actor). Every update waits, and nothing is settled, until the file is dealt with. |
-| `actor-journal-write-failed` | The record of an update could not be written. The attempt stops there, and the next start settles it. Check the free space of the volume holding `quasar-machine`. |
-| `actor-kept-not-removed` | An update was verified, but the old, stopped container could not be removed. The next update removes it. |
+| `actor-resume-failed` | The install failed (engine unreachable, owner conflict). Retried at the next start. |
+| `actor-role-invalid` | `QUASAR_ROLE` names a role this build doesn't install. The actor exits. |
+| `actor-engine-config` | The engine endpoint is unusable. The actor exits. |
+| `actor-no-gpu`, `actor-gpu-probe-unreadable` | No usable GPU found. The agent is installed anyway; readiness reports the gap. |
+| `actor-gpus-served` | The agent gets the NVIDIA device setup. Normal. |
+| `actor-gpu-injection-unavailable` | An NVIDIA GPU was found but this engine can't pass it through. Run [host preparation](/quasar/install/prepare-host/), restart the engine, then remove the agent container. |
+| `actor-gpus-refused` | The engine refused the GPU. Fix the NVIDIA Container Toolkit (or the CDI spec on Podman and rootless Docker), then remove the agent container. |
+| `actor-gpus-probe-retry` | The engine didn't answer the GPU probe. Asked up to three times. |
+| `actor-helper-name-taken` | A foreign container holds `quasar-gpu-probe` or `quasar-secrets-writer`. Remove it. |
+| `actor-lease-unavailable` | A second recovery actor on the same machine. Only one runs. |
+| `actor-input-ignored` | A later start had different inputs. Machine state wins after the first install. |
+| `actor-installation-label-differs` | A hand-started actor was later given a seed. Run `docker rm -f quasar-recovery`; the seed re-creates it. |
+| `actor-trust-config-invalid` | Invalid signature mode or trusted key. The start stops. |
+| `actor-spec-differs` | The running agent differs from what the actor would create. Left as is. |
+| `actor-socket-bind-failed` | The `quasar-recovery-agent` volume isn't mounted at `/run/quasar-recovery`. |
+| `actor-socket-busy` | Too many connections; one was closed. |
+| `actor-socket-failed` | The agent socket stopped. The actor exits and restarts. |
+| `actor-console-refused`, `actor-submit-refused` | A console-mode or update request was refused; the line names why. |
+| `actor-attempt-failed`, `actor-verification-failed` | An update didn't complete. An unhealthy new agent is rolled back. The apply history has the reason. |
+| `actor-journal-unreadable` | The update record is corrupt or from a newer actor. Updates wait until it's dealt with. |
+| `actor-journal-write-failed` | The update record couldn't be written. Check free space on the `quasar-machine` volume. |
+| `actor-kept-not-removed` | The old container couldn't be removed. The next update removes it. |
 
-These are the lines you are likely to meet. The repository's
-`docs/configuration.md`, under "Seed" and "Recovery actor", is the full record.
+The full list is in the repository's `docs/configuration.md` ("Seed", "Recovery actor").
 
-An update that the recovery actor refused or could not finish ends with one of
-these reasons, shown on the Releases tab and in the apply history:
+A refused or failed update shows one of these reasons on the Releases tab:
 
-| Reason | What it means |
+| Reason | Fix |
 | --- | --- |
-| `owner_conflict` | A container that looks like a Quasar service but was not created by this installation is in the way, such as a leftover Compose stack. Nothing was replaced. Remove it, and whatever re-creates it. |
-| `recipe_unsupported` | This machine's recovery actor does not know how to install the new image. Nothing changed. Update the recovery actor first. |
-| `backup_failed` | Quasar could not dump its own database before a migrating update, or there was not room for the dump. The control plane was not replaced and the database was not touched. Free space on the volume holding `quasar-machine`, then apply again. |
-| `backup_unconfirmed` | The update migrates your own database and no backup of it was confirmed. Take one, tick the confirmation, apply again. |
-| `interrupted` | The recovery actor restarted before it had touched the service it was replacing. That service was not changed, and nothing was retried. Apply again when you are ready. |
+| `owner_conflict` | A Quasar-like container not created by this install (such as an old Compose stack) is in the way. Nothing was replaced. Remove it and whatever re-creates it. |
+| `recipe_unsupported` | This recovery actor can't install the new image. Update the recovery actor first. |
+| `backup_failed` | The database dump failed or had no room. Nothing changed. Free space on the `quasar-machine` volume and apply again. |
+| `backup_unconfirmed` | The update migrates your own database. Take a backup, tick the confirmation, apply again. |
+| `interrupted` | The actor restarted before changing anything. Apply again. |
 
-**An install that did not complete** is corrected where it was declared. A
-refused install wrote nothing durable, so fix the inputs and start the seed
-again. If the recovery actor had already been created and its install then
-failed, fix the inputs and run `docker restart quasar-recovery`. It installs once
-per start, from the seed's current inputs.
+**A failed install:** fix the inputs, then start the seed again. If the recovery
+actor already exists, run `docker restart quasar-recovery` instead; it reinstalls
+from the seed's current inputs.
 
 ## The control plane will not start
 
@@ -108,55 +91,36 @@ per start, from the seed's current inputs.
 docker logs quasar-control-plane
 ```
 
-On a legacy Compose install, run `docker compose -f deploy/docker-compose.yml logs quasar-control-plane`
-from the stack directory.
+(Legacy Compose: `docker compose -f deploy/docker-compose.yml logs quasar-control-plane`.)
 
-**`no migration found for version N`.** The database is ahead of the binary. You
-rolled back to an older version. See [Upgrading](/quasar/operations/upgrading/).
-The fix is to redeploy the version that has the migration.
-
-**Cannot connect to the database.** Postgres has not come up yet, or, on a legacy
-Compose install, `POSTGRES_PASSWORD` does not match what the database was created
-with. If you have exported that variable in your shell, Compose uses the shell
-value over `deploy/.env` and they drift apart. Unset it. A database you run
-yourself is reported the same way: check that it is reachable from the machine.
-On an owned install, `docker exec quasar-recovery quasar-recovery status` names the
-database address to check when the control plane is unhealthy on your own
-database. Quasar's own database password is generated into machine state, so it
-cannot drift from the database the way a Compose `.env` can.
-
-**Malformed allowed origins.** A bad entry in `QUASAR_ALLOWED_ORIGINS` stops
-startup on purpose. Entries must be exact `scheme://host[:port]` with no path.
+| Symptom | Fix |
+| --- | --- |
+| `no migration found for version N` | You rolled back below the database's version. Redeploy the version that has the migration. See [Upgrading](/quasar/operations/upgrading/). |
+| Cannot connect to the database | Postgres isn't up yet, or it isn't reachable. On legacy Compose, `POSTGRES_PASSWORD` in your shell overrides `deploy/.env`; unset it. On an owned install, `quasar-recovery status` names the database address to check. |
+| Malformed allowed origins | Each `QUASAR_ALLOWED_ORIGINS` entry must be exact `scheme://host[:port]`, no path. |
 
 ## A container reports "no command specified"
 
-An overlay cleared the container's command on an image whose entrypoint is
-already empty, leaving nothing to run. Check which Compose overlays you have
-stacked and in what order.
+A Compose overlay cleared the command. Check which overlays you stack, and in what order.
 
 ## The node agent starts but never registers
 
-Check its own health endpoint on the host it runs on:
+On the agent's host:
 
 ```bash
 curl http://127.0.0.1:9091/health
 ```
 
-`"connected": false` means it is alive but cannot reach the control plane.
+`"connected": false` means it can't reach the control plane. Check:
 
-- Is `CONTROL_PLANE_URL` right, and reachable from that machine?
-- A static, deployment-wide `ENROLLMENT_TOKEN` no longer enrolls anything: the
-  control plane accepts only a token minted by Add host. Use the string it gives.
-- Is the control plane's HTTP port reachable? Enrollment uses plain HTTP on 8080
-  and is exempt from the HTTPS redirect for that reason.
-- Did you paste the one-value `QUASAR_ENROLLMENT` string from Admin, Fleet,
-  Hosts, Add host instead of setting the two above by hand? It supplies a `wss://`
-  address that the agent pins to the certificate fingerprint inside it. A
-  `ws://` address to any host but localhost is refused unless
+- `CONTROL_PLANE_URL` is right and reachable from that machine, including port 8080.
+- You used the `QUASAR_ENROLLMENT` string from **Fleet ▸ Hosts ▸ Add host**. A
+  static `ENROLLMENT_TOKEN` no longer works.
+- The address is `wss://`. `ws://` to anything but localhost is refused unless
   `QUASAR_ALLOW_PLAINTEXT_AGENT=1`.
 
-If the agent previously enrolled and now cannot, its stored node secret may be
-gone. Enrollment then needs the token again, and the token has to still be valid.
+An agent that enrolled before and now can't has lost its node secret. Enroll it
+again with a fresh string.
 
 ## The GPU is not detected
 
@@ -164,13 +128,9 @@ gone. Enrollment then needs the token again, and the token has to still be valid
 ls -l /dev/dri
 ```
 
-No `renderD128` means no GPU is available to containers at all. Check the driver
-is loaded on the host first.
-
-If the nodes exist but the agent cannot open them, check group and mode, and
-confirm the device is declared in the Compose file.
-
-On NVIDIA:
+No `renderD128`: the host driver isn't loaded. If the nodes exist but the agent
+can't open them, check group and mode, and that the device is passed to the
+container. On NVIDIA:
 
 ```bash
 nvidia-smi
@@ -179,52 +139,27 @@ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 
 ## The GPU is detected but there is no encoder
 
-This is a different problem and it is common.
+`no VA H264 encoder found` while `vainfo` works:
 
-**`no VA H264 encoder found` while `vainfo` works.** Two usual causes.
-
-The GStreamer plugin registry was built when no GPU was present, so it cached
-the conclusion that there is no encoder. The agent forces a rescan for VA, but a
-stale registry from a strange build can survive. Recreating the container is the
-blunt fix.
-
-Or software rendering is being forced by an environment variable that should not
-be set. `MESA_LOADER_DRIVER_OVERRIDE` and `LIBGL_ALWAYS_SOFTWARE` must be
-**unset**, not set to an empty string. The `.env.example` file contains
-a software-only configuration block and a hardware block, and copying both is an
-easy mistake.
+- A stale GStreamer plugin cache. Recreate the container.
+- `MESA_LOADER_DRIVER_OVERRIDE` or `LIBGL_ALWAYS_SOFTWARE` is set. They must be
+  **unset**, not empty. Don't copy both the software and hardware blocks from `.env.example`.
 
 ## NVIDIA host with a CUDA-only driver install
 
-Installing only the CUDA packages leaves out EGL and 32-bit GL. The compositor
-needs EGL. Native 32-bit game binaries need the 32-bit libraries.
+CUDA-only installs lack EGL and 32-bit GL. Quasar fills the gap by default with a
+driver volume built from the running kernel module; readiness in **Fleet ▸ Hosts**
+shows progress and anything still missing. It can't fix the kernel module itself.
+After a host driver update, recreate the agent container.
 
-The host readiness checks in Admin, Fleet, Hosts report exactly which components
-are missing, with the command for your distribution.
-
-Quasar can work around it automatically by provisioning a driver volume from the
-running kernel module, which is on by default. It closes the gap without
-installing anything on the host.
-
-Provisioning supplies container userspace libraries; it cannot install, upgrade
-or repair the host kernel module. The agent checks the loaded driver version on
-startup and prepares matching libraries when provisioning is needed. After a host
-driver update, recreate the agent container so Docker refreshes its injected
-libraries, then check readiness again.
-
-Provisioning progress and failures appear in the setup host checks and Admin,
-Fleet, Hosts. Temporary failures are retried; missing host permissions, unavailable
-files or a failed integrity check still need the action shown there. A driver
-volume does not by itself rule out Vulkan. See
-[AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility) for
-the confirmed RTX 5090 restriction.
-
-Fedora, installing the full stack properly:
+To install the full stack instead (Fedora):
 
 ```bash
 sudo dnf install nvidia-driver-libs nvidia-driver-libs.i686 egl-wayland
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 ```
+
+For the RTX 5090 AV1 restriction, see [AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
 
 ## Input devices are not working
 
@@ -232,143 +167,75 @@ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 ls -l /dev/uinput
 ```
 
-Missing:
+If it's missing:
 
 ```bash
 sudo modprobe uinput
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 ```
 
-Present but the agent cannot use it: the agent needs to open it for **writing**.
-A read-only open succeeds even on a broken setup, which is what makes this easy
-to misdiagnose. The `uinput` and `input_probe` readiness checks test the real
-thing and report it on the host's page. On a rootless engine the agent can reach
-`/dev/uinput` and its own input devices only through the device rule [host
-preparation](/quasar/install/prepare-host/) writes: run it, then restart the node
-agent. See [Readiness checks](/quasar/troubleshooting/readiness/#input).
+If it exists, the agent must be able to open it for writing. The `uinput` and
+`input_probe` readiness checks test this. On a rootless engine, run [host
+preparation](/quasar/install/prepare-host/) and restart the agent. See
+[Readiness checks](/quasar/troubleshooting/readiness/#input).
 
 ## A GPU-less host will not start
 
-On a legacy Compose install, comment out the `/dev/dri` device line in
-`deploy/docker-compose.yml`. Docker refuses to start a container that declares a
-device which does not exist. On a Quasar-owned machine the recovery actor probes
-the machine first and declares only the devices it found.
+Legacy Compose: comment out the `/dev/dri` device line in
+`deploy/docker-compose.yml`. Owned installs only declare devices that exist.
 
 ## The web app is blank after a redeploy
 
-The browser has cached an index page pointing at a bundle that no longer exists.
-Hard refresh.
-
-If a hard refresh does not fix it, the control plane is serving a stale directory
-and needs restarting:
+Hard refresh. If that doesn't help:
 
 ```bash
 docker restart quasar-control-plane
 ```
 
-On a source-built stack, `redeploy.sh` checks for this and warns.
-
 ## The Releases tab says a target cannot be updated from here
 
-Two causes account for nearly all of them, and the page prints the recipe for the
-one you have under the Targets table.
+The page prints the recipe under the Targets table.
 
-**Built from source on the host.** The published image is a different build from
-one compiled on the machine, so it cannot replace it in place. Update it the way
-it was installed:
-
-```bash
-deploy/redeploy.sh <va|nvidia> <ref>
-```
-
-**No recovery actor answers on this machine.** On an owned machine the recovery
-actor did not answer: check that it is running, and read its log.
-
-```bash
-docker ps -a --filter name=quasar-recovery
-docker logs --tail 50 quasar-recovery
-```
-
-If it is gone, the seed re-creates it; if the seed is gone too, start the seed
-again. On a legacy Compose install the same reason means there is no recovery
-actor at all: it is updated by hand, or moved to a fresh install with its data (see
-[Move a Compose install](/quasar/install/move-existing/)).
-
-Two more reasons are worth knowing:
-
-- **Must update before it can be managed.** The host's node agent or recovery
-  actor is below the control plane's floor. It keeps running, and is offered only
-  the update that lifts it. Apply it.
-- **A preflight check failed.** The check under the target names the fix. An
-  *other owner's container in the way* is a container that looks like a Quasar
-  service but was not created by this installation, such as a leftover Compose
-  stack: remove it, and whatever re-creates it.
-
-A third, on an older install: **this target has not reported what it is running.**
-That agent predates build identity. Upgrade it once by hand and it will report
-like any other. See [Updating Quasar](/quasar/admin/releases/#targets).
+| Reason | Fix |
+| --- | --- |
+| Built from source | Update it the way it was installed: `deploy/redeploy.sh <va\|nvidia> <ref>`. |
+| No recovery actor answers | Check `docker ps -a --filter name=quasar-recovery` and `docker logs --tail 50 quasar-recovery`. The seed re-creates a missing actor; restart the seed if it's gone too. Legacy Compose has no actor: update by hand or [move the install](/quasar/install/move-existing/). |
+| Must update before it can be managed | Apply the update offered. |
+| A preflight check failed | Follow the fix shown. For *other owner's container in the way*, remove that container and whatever re-creates it. |
+| Target has not reported what it is running | An old agent. Upgrade it once by hand. See [Updating Quasar](/quasar/admin/releases/#targets). |
 
 ## An apply failed with `namespace_rejected`
 
-The image was refused before a byte of it was pulled, because it is outside the
-registry namespaces that are accepted. The allowlist is
-`QUASAR_UPDATER_ALLOWED_NAMESPACES`, and it defaults to the project's own
-namespace. The control plane checks it for a developer apply, and every machine
-that pulls checks its own: the recovery actor on an owned machine, or the updater
-on a legacy Compose install, set in the host's `deploy/.env`.
-
-You see this after repointing an instance at a fork's registry without widening
-the allowlist, or after narrowing it deliberately. On a legacy Compose install,
-set it to the namespace the images actually live in. On an owned machine the
-list is a seed input, recorded at the first install. Change it with
-`reconfigure`:
+The image is outside `QUASAR_UPDATER_ALLOWED_NAMESPACES` (default: the project's
+own namespace), usually after pointing at a fork's registry. On legacy Compose, set
+it in the host's `deploy/.env`. On an owned machine:
 
 ```bash
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
   QUASAR_UPDATER_ALLOWED_NAMESPACES=ghcr.io/accreleus/quasar,<your namespace>
 ```
 
-On the first machine the control plane carries the same list, so `reconfigure`
-replaces the control plane with the new one. It is matched on path
-segment boundaries, so a namespace never admits a lookalike that merely starts
-with the same characters.
+On the first machine this also replaces the control plane.
 
 ## The control plane is unhealthy after an update
-
-Check its logs first. If it reports that it cannot write its TLS key:
 
 ```
 fatal: tls: write TLS key /var/lib/quasar-control/tls/key.pem: permission denied
 ```
 
-then this stack was built from source at some point, and its `quasar-control-tls`
-volume is owned by root while the published image runs as uid 1000. Nothing is
-damaged. [Legacy Compose installs](/quasar/install/legacy-compose/#if-your-install-ever-ran-a-source-build)
-has the one-time fix.
+The stack once ran a source build, so `quasar-control-tls` is owned by root. See
+[the one-time fix](/quasar/install/legacy-compose/#if-your-install-ever-ran-a-source-build).
+Don't mix: update published images from the console, source builds with `redeploy.sh`.
 
-Avoid the mixed case entirely: use the console's update path on installs running
-published images, and `redeploy.sh` on installs built from source. The console
-will not offer an update to a source-built control plane for exactly this reason.
-
-If instead it reports a migration version it does not recognise, an older image
-is running against a newer database. See [the hard
-rule](/quasar/operations/upgrading/#the-hard-rule).
+An unrecognised migration version means an older image on a newer database. See
+[the hard rule](/quasar/operations/upgrading/#the-hard-rule).
 
 ## "Quasar was updated. This page is running the previous build"
 
-The control plane restarted under your open tab, which is now old JavaScript
-talking to a new API. Press Reload in the toast, or refresh. Nothing is wrong,
-and the update itself is unaffected. During the restart the page says the control
-plane is restarting rather than showing an error; that lasts about twenty
-seconds.
+Press Reload in the toast, or refresh. Nothing is wrong.
 
 ## Still stuck
 
-Collect what the containers are saying with the commands on [Health and
-logs](/quasar/operations/health/), and attach them to a report with secrets
-removed.
-
-From a repository checkout, `make diagnose` does the same in one pass, with
-secrets redacted. It reads the checkout's own `deploy/` stack, so it only helps on
-a machine that runs Quasar from that checkout. A registry install has no checkout
-to run it from.
+Collect logs with the commands on [Health and logs](/quasar/operations/health/)
+and attach them to a report with secrets removed. From a repository checkout that
+runs Quasar, `make diagnose` does this in one pass.
