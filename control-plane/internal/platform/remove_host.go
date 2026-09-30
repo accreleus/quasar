@@ -187,7 +187,7 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 	sctx, cancel := context.WithTimeout(ctx, h.AckTimeout)
 	ack, err := h.deps.Send(sctx, hostID, requestID)
 	cancel()
-	const stillDrained = "; the host stays drained in case the removal went through, so release the operator drain once it is back online"
+	const stillDrained = "; the host stays drained in case the removal went through, so lift the operator drain from the console once it is back online"
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		httpx.WriteError(w, http.StatusNotImplemented, CodeApplyUnsupported,

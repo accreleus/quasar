@@ -42,7 +42,7 @@ import { useSectionHead } from "../../../components/shell/sectionHead";
 import { relativeTime } from "../../../lib/format/relativeTime";
 import { clockTime } from "../../../lib/format/clockTime";
 import { ThisMachineBlock } from "./ThisMachine";
-import { isOwnedMachine, thisMachine, type MachineReport } from "./thisMachine";
+import { isOwnedMachine, thisMachine, type MachineReport } from "./machineReport";
 import { manualUpdatePath } from "../../../lib/platform/manualUpdate";
 import {
   parseReleaseNotes,
