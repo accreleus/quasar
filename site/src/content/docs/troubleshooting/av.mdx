@@ -58,9 +58,11 @@ The session then fails instead of degrading to silence.
 **Sound in some apps and not others** is the application picking a different
 output device. That is inside the container and is the app's own configuration.
 
-## The microphone toggle is missing or does nothing
+## The microphone button is missing or does nothing
 
 Missing: the instance setting is off. Admin, Settings.
+
+Greyed out: input is captured. Release capture, then turn the microphone on.
 
 Present but nothing happens: browser permission was denied, or the page is not on
 HTTPS. Microphone capture needs a secure context.
@@ -73,9 +75,10 @@ see the indicator, it is not capturing.
 **Capture input first.** Until you do, the mouse belongs to the browser. The
 drawer's first item is the capture toggle.
 
-**Check `/dev/uinput`** on the host is present and writable by the agent. Read
-access succeeds even on a broken setup, which makes this easy to misdiagnose. The
-host readiness check tests writing.
+**Check the host's `uinput` and `input_probe` readiness checks.** They test that
+the agent can create and open its virtual devices. On a rootless engine the fix is
+[host preparation](/quasar/install/prepare-host/); see [Readiness
+checks](/quasar/troubleshooting/readiness/#input).
 
 **Pointer offset in a desktop session** was a compositor focus problem that has
 been fixed. If you see it, you are on an older version.
@@ -100,10 +103,13 @@ Browsers do not reveal a gamepad until it has sent input, so press a button.
 
 Then confirm the page is on HTTPS, since the Gamepad API needs a secure context.
 
-Then check `/dev/uinput` on the host is present and writable by the agent. A
-read-only open succeeds even on a broken setup, which is what makes this easy to
-misdiagnose. The agent's readiness check tests for write access and reports the
-result on the host detail page.
+Then check the host's `uinput` and `input_probe` readiness checks, as for the
+mouse above.
+
+**The drawer lists the pad but the game ignores it, on a rootless Docker host.**
+There the session's input devices belong to a group the app's image has to add to
+its own user; the agent names it in `QUASAR_APP_ENGINE_GROUPS`. An app image from
+before that change drops it. Update the app's image.
 
 ## Controller buttons are in the wrong places
 

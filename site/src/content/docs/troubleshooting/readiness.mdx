@@ -1,0 +1,113 @@
+---
+title: Readiness checks
+description: What each host readiness check means, which ones can block launches, and the fix for each, including the engine, device and console checks.
+---
+
+import Shot from '../../../components/Shot.astro';
+import host_readiness from '../../../assets/shots/host-readiness.png';
+import { Aside } from '@astrojs/starlight/components';
+
+Every host reports a set of readiness checks: what the node agent **found** on its
+machine, not what the configuration claims. They are on the host's page under
+Admin, Fleet, and in step 3 of the first-run wizard. How a failing check can block
+launches, and how to override one, is on [Hosts and
+GPUs](/quasar/admin/hosts/#when-a-check-blocks-launches).
+
+<Shot
+	label="Host readiness"
+	sublabel="Part of a rootless Docker host's readiness card: a home-ownership warning, media reachability from a real session, the experimental engine profile, and the console checks."
+	src={host_readiness}
+	alt="A host's readiness card showing storage, network and engine checks"
+/>
+
+Each check has a status:
+
+| Status | Meaning |
+| --- | --- |
+| Pass | Checked, and fine. |
+| Warn | Works, with something worth knowing. Never blocks. |
+| Fail | Broken. Blocks launches only when the check rests on evidence and names what it blocks, shown as **Blocks launches**. |
+| Unknown | Not checked yet, or the last attempt was inconclusive. Never blocks. |
+| Skipped | Not applicable to this host, listed apart as "not applicable". An optional diagnostic the host was not prepared to allow also reads skipped, and names the setting that would allow it. |
+
+A fix that says **run host preparation** means [`prepare-host.sh`](/quasar/install/prepare-host/),
+run again as root with the options for your install. It changes only what is
+missing. No fix ever asks you to run Quasar as root.
+
+## Container engine
+
+| Check | What it means, and the fix |
+| --- | --- |
+| `runtime_endpoint` | The Docker or Podman socket the agent uses, and whether it answers. Unreachable fails and blocks the host. If both `DOCKER_HOST` and `CONTAINER_HOST` are set and name different engines, the agent refuses to guess: unset one. |
+| `runtime_engine` | The engine, its version and its engine mode, and which [engine profile](/quasar/start/engine-profiles/) that is. A supported profile passes. An experimental or unsupported one warns and blocks nothing. |
+| `runtime_cdi` | How NVIDIA GPUs reach containers: by CDI on Podman and on a Docker with an NVIDIA CDI device, by `--gpus` on a rootful Docker without one. An NVIDIA host whose engine can do neither fails and blocks the host. Run host preparation, which writes the NVIDIA CDI specification, then restart the engine. |
+| `runtime_cdi_gpu<N>` | The same, per NVIDIA GPU, on a host that mixes NVIDIA with another vendor. It blocks only that GPU; the others keep serving. |
+| `engine_healthchecks` | Podman only (Docker reads *skipped*). Podman runs container health checks through systemd, and installs and updates wait on them. Without a systemd session for the Quasar account it cannot, so an install waits out its whole timeout. Rootless: enable lingering for the account (host preparation does), then restart its Podman service. Rootful: run Podman under systemd with the systemd cgroup manager. |
+
+## Input
+
+| Check | What it means, and the fix |
+| --- | --- |
+| `uinput` | The agent can open `/dev/uinput` for writing, which is how it creates virtual keyboards, mice and gamepads. A read-only open succeeds even on a broken setup, so the check writes. On a rootless engine the fix is host preparation's device rule. |
+| `input_probe` | A real test: the agent creates a virtual device and proves it can open it. Fails with blocks on the host, so a session with dead input is refused rather than started. Rootless: run host preparation, which gives the Quasar account Quasar's own input devices. Rootful: check `/dev/uinput` and `/dev/input` reach the agent. |
+
+## Storage
+
+`homes_root_writable` writes a test home under the homes root. A failure blocks
+every launch that needs a home. On rootless Docker it passes with a **warning**:
+files that sessions write are owned on the host by a subordinate ID rather than the
+Quasar account, because Docker cannot map a container's user onto it. Nothing needs
+fixing for sessions to work. For home files owned by the Quasar account, use
+rootless Podman. Never re-own existing homes recursively; see [Moving to
+rootless](/quasar/install/move-to-rootless/).
+
+`homes_free_space` warns below 5 GiB free (`QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`) and
+fails only when the homes filesystem is full.
+
+## Network
+
+`media_reachability` is judged from real sessions, never from firewall rules:
+
+- **Unknown** until a browser on another machine has tried a session.
+- **Pass** once such a browser's WebRTC media reached the host. That proves that
+  browser's path, not that every port in the media range is open.
+- **Fail** when a remote browser offered its candidates, the connection failed, and
+  none of its checks ever arrived. The fix names the firewall rule for the host's
+  media port range; see [Ports and endpoints](/quasar/reference/ports/#firewall).
+
+It never blocks. Traffic from the host itself, or from a container or virtual
+machine on one of its bridges, never counts.
+
+## GPU fault messages
+
+`xid_visibility` says whether the agent can read NVIDIA Xid and amdgpu fault
+messages from the kernel log, which then appear in session traces. It is an
+optional diagnostic: on a host that keeps the kernel log restricted it reads
+*skipped* and names `prepare-host.sh --allow-kernel-log`. Without it, read the
+host's `dmesg` when investigating a GPU fault.
+
+## Console mode
+
+`console_display`, `console_audio` and `console_ddc` read *skipped* while console
+mode is off, and never block a streamed session. See [Console
+mode](/quasar/admin/console/#readiness).
+
+| Failure | Fix |
+| --- | --- |
+| The agent was not created with console access | Turn console mode on from the host's Local console page; the recovery actor replaces the agent. |
+| Another process holds the display | Stop the desktop or login screen on that output, or choose another output. On a rootless host, also check the host was prepared with `--console`. Then turn console mode off and on again. |
+| No local audio sink | Check the host has a sound device, or run host preparation with `--console-audio-user` so console audio plays through the desktop user's PipeWire. |
+| `ddcutil` missing, or no i2c bus mapped to a connector | Monitor power detection is off and every connected display counts as on. Check `/dev/i2c-*` exists (host preparation grants it on a rootless host) and a monitor is connected. |
+
+## Owner conflict
+
+`owner_conflict` appears on an owned install when a container that looks like a
+Quasar service, but was not created by this installation, is in the way: typically
+a leftover Compose stack. The recovery actor never touches it, and updates to that
+machine are blocked until you remove it and whatever re-creates it.
+
+<Aside type="note" title="Readiness does not test the browser's path">
+Every check describes the host. Whether a particular browser can reach it depends
+on the network between them; that is what `media_reachability` reports afterwards,
+from real sessions.
+</Aside>

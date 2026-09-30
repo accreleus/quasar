@@ -512,17 +512,17 @@ const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsup
 					answers.mode === 'rootful'
 						? ' The engine runs as root, so its socket is equivalent to root on this machine; a rootless engine avoids that.'
 						: '';
-				note.innerHTML = `${badge} <strong>${name}</strong> — ${p.reason}${rootEquiv} <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
+				note.innerHTML = `${badge} <strong>${name}</strong>: ${p.reason}${rootEquiv} <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
 			} else if (p.status === 'experimental') {
 				note.classList.add('qs-warn');
-				note.innerHTML = `${badge} <strong>${name}</strong> is experimental — ${p.reason} You can install it; if something does not work, the host’s readiness card names it, and a report helps make this profile supported. <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
+				note.innerHTML = `${badge} <strong>${name}</strong> is experimental. ${p.reason} You can install it; if something does not work, the host’s readiness card names it, and a report helps make this profile supported. <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
 			} else {
 				note.classList.add('qs-warn');
 				const alts = p.alternatives
 					.filter((alt) => alt.status !== 'unsupported')
 					.map((alt) => `<strong>${platform(alt.platform).label} with ${engineLabel(alt.engine, alt.mode)}</strong>`)
 					.join(' or ');
-				note.innerHTML = `${badge} <strong>${name}</strong> is not supported — ${p.reason}${alts ? ` Choose ${alts} instead.` : ''}`;
+				note.innerHTML = `${badge} <strong>${name}</strong> is not supported. ${p.reason}${alts ? ` Choose ${alts} instead.` : ''}`;
 			}
 		}
 

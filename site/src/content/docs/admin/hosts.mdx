@@ -11,7 +11,7 @@ Admin, Fleet, Hosts lists every machine running a node agent, with its GPUs.
 
 <Shot
 	label="Admin hosts"
-	sublabel="The fleet host list, with per-GPU slot use and VRAM, RAM and disk bars."
+	sublabel="The fleet host list, with per-GPU slot use and VRAM and disk bars, and one host expanded: its hardware, the services on the machine, its build, and the codecs its GPU has proven."
 	src={admin_hosts}
 	alt="The admin fleet page listing hosts and their GPUs"
 />
@@ -25,17 +25,18 @@ The readiness checks are the useful part, because they report what the agent
 **found**, not what the configuration claims. A host can be configured for NVENC
 and still have no working encoder.
 
-Checks cover the render node, `/dev/uinput` write access, the managed home root,
-media reachability through the host firewall, whether GPU faults are visible, and
-on NVIDIA the presence of the EGL and 32-bit GL components that a CUDA-only driver
-install leaves out.
+Checks cover the container engine and its engine mode, how GPUs reach containers,
+the render node, virtual input, the managed home root, media reachability, whether
+GPU faults are visible, console mode when it is on, and on NVIDIA the presence of
+the EGL and 32-bit GL components that a CUDA-only driver install leaves out. Each
+one, with its fix, is on [Readiness checks](/quasar/troubleshooting/readiness/).
 
-`xid_visibility` is the odd one out: it reports whether the agent can read
-`/dev/kmsg`, which is where the kernel logs an NVIDIA Xid or an amdgpu fault. The
-generator makes this an optional diagnostics choice because some hosts do not
-provide that device. When enabled, it passes the device read-only and grants
-`SYSLOG`, allowing GPU faults to appear in the session trace. Otherwise, read the
-host’s `dmesg` when investigating a GPU fault.
+`xid_visibility` is the odd one out: it reports whether the agent can read the
+kernel log, which is where the kernel logs an NVIDIA Xid or an amdgpu fault. It is
+an optional diagnostic: host preparation grants it only with `--allow-kernel-log`,
+and otherwise the check reads *skipped* and names that option. When allowed, GPU
+faults appear in the session trace. Otherwise, read the host's `dmesg` when
+investigating a GPU fault.
 
 `media_reachability` is read from real sessions. It stays unknown until a browser
 on another machine has tried one, passes once such a session connects, and fails
@@ -104,7 +105,7 @@ reported itself.
 
 Any of these can read **Unknown**, and on an agent from before the self-update
 feature they all will: it has no way to say what it is running. Such a host keeps
-working exactly as before — it simply cannot be updated from the console until it
+working exactly as before. It simply cannot be updated from the console until it
 is upgraded once by hand, after which it reports its identity like any other. The
 Releases tab shows the recipe for it.
 
@@ -150,7 +151,7 @@ offers it only the update that lifts it; see [Updating
 Quasar](/quasar/admin/releases/).
 
 An agent **newer than the control plane** turns up as *Agent ahead of the control
-plane* under Needs attention. Nothing is broken, but it is the wrong way round —
+plane* under Needs attention. Nothing is broken, but it is the wrong way round:
 the control plane carries the migrations and always moves first. It is only
 reachable if something was rolled back by hand. See [Updating
 Quasar](/quasar/admin/releases/).
@@ -302,42 +303,12 @@ not connected after about a minute without a heartbeat, even while it reads
 
 ## The console
 
-Each host has a console page for local-display mode, where the host renders to a
-physically attached screen, not to a browser. It needs additional privileges — this
-machine's display, sound and monitor control — that the default agent does not have.
-
-On a rootful **owned** host, an admin turns console mode on from that page. Doing so
-replaces the node agent: the recovery actor recreates it with those additions, verifies
-it came up healthy, and only then does console mode read as on. That replacement ends
-the host's live sessions, the same way turning it off does. If the new agent does not
-become healthy, the recovery actor puts the previous one back and reports why, and
-streaming keeps working as before — the setting never claims access the host does not
-have. A rootful engine's socket is already equivalent to root on that machine, so
-granting the agent its display and sound is not a new exposure.
-
-On a **rootless** owned host (Docker or Podman) console mode works the same way, with
-no added capabilities. The agent reaches the display, sound, monitor control and
-physical keyboards, mice and controllers through device access that host preparation
-grants the Quasar user, so prepare the machine with `--console` first:
-
-```sh
-sudo sh prepare-host.sh --mode rootless --console
-```
-
-Two things differ from a rootful host:
-
-- **The display must be free.** A rootless agent can take the screen only when no other
-  process holds it. If a desktop or login screen is running on that display, the
-  console session does not start and the console page names the reason. Stop the
-  desktop, or use a machine without one.
-- **Sound goes through the desktop's PipeWire when there is one.** Add
-  `--console-audio-user USER` (the account whose desktop session runs PipeWire), and
-  console audio plays through it, beside the desktop's own sound. Quasar never takes
-  the sound device away from it. Without PipeWire, console audio goes straight to the
-  sound device you pick on the console page.
-
-A Compose or source install keeps granting console access the way it always has, with [`deploy/overlays/docker-compose.console.yml`](https://github.com/accreleus/quasar/blob/main/deploy/overlays/docker-compose.console.yml)
-— an owned host's recovery actor does not read that overlay.
+Each host has a **Local console** page for console mode, where the host shows games
+on a screen plugged into it rather than only streaming them. On an owned install,
+turning it on replaces the node agent with one that can use the machine's display,
+sound and monitor control, which ends the host's live sessions. It works on rootful
+and rootless engines alike; a rootless host needs host preparation with `--console`
+first. See [Console mode](/quasar/admin/console/).
 
 ## Storage
 

@@ -61,8 +61,10 @@ services, any container in the way, and the result of the last update.
 | `actor-role-invalid` | `QUASAR_ROLE` names a role this build does not install. The actor exits. |
 | `actor-engine-config` | The container engine endpoint is unusable, for instance a refused `DOCKER_HOST`. The actor exits. |
 | `actor-no-gpu` | The probe found no usable GPU render node. The agent is installed anyway and its readiness reports the gap. |
-| `actor-gpus-served` | The engine serves `--gpus`, so the agent gets the NVIDIA shape. |
-| `actor-gpus-refused` | The engine refused the GPU request. The agent is installed without the NVIDIA shape, and readiness reports the gap. Fix the NVIDIA Container Toolkit, then remove the agent container so the next start asks again. |
+| `actor-gpus-served` | The engine started a GPU probe container, by CDI or `--gpus`, so the agent gets the NVIDIA shape. |
+| `actor-gpu-injection-unavailable` | An NVIDIA device was found, but this engine can hand a GPU over neither by CDI nor, being rootless or Podman, by `--gpus`. The agent is installed without the NVIDIA shape and its `runtime_cdi` check fails. Run [host preparation](/quasar/install/prepare-host/), which writes the NVIDIA CDI specification, restart the engine, then remove the agent container so the next start asks again. |
+| `actor-gpu-probe-unreadable` | GPU detection failed. The agent is installed without GPU devices and its readiness reports the gap. |
+| `actor-gpus-refused` | The engine refused the GPU request. The agent is installed without the NVIDIA shape, and readiness reports the gap. Fix the NVIDIA Container Toolkit (or, on Podman and rootless Docker, the CDI specification host preparation writes), then remove the agent container so the next start asks again. |
 | `actor-gpus-probe-retry` | The engine did not answer the GPU probe. It is asked up to three times. |
 | `actor-helper-name-taken` | A container this actor did not create holds one of its helper names (`quasar-gpu-probe`, `quasar-secrets-writer`). It is left alone and the start stops. Remove it. |
 | `actor-lease-unavailable` | A second recovery actor on the same machine state. Only one runs. |
@@ -73,6 +75,7 @@ services, any container in the way, and the result of the last update.
 | `actor-socket-bind-failed` | The actor cannot create the agent's socket, usually because the `quasar-recovery-agent` volume is not mounted at `/run/quasar-recovery`. The start stops. |
 | `actor-socket-busy` | Too many connections on the agent socket; one was closed unanswered. |
 | `actor-socket-failed` | The agent socket stopped. The actor exits, and its restart policy starts it again. |
+| `actor-console-refused` | The actor refused a request to turn console mode on or off; the line names the reason. |
 | `actor-submit-refused` | The actor refused an update request from its agent, for instance `busy` while another attempt is in flight. The line names the reason. |
 | `actor-attempt-failed`, `actor-verification-failed` | An update did not complete. If the new agent had been started and never became healthy, it was removed and the old one put back. The console's apply history has the reason. |
 | `actor-journal-unreadable` | The record of an update cannot be read (corrupt, or written by a newer actor). Every update waits, and nothing is settled, until the file is dealt with. |
@@ -238,8 +241,11 @@ echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 
 Present but the agent cannot use it: the agent needs to open it for **writing**.
 A read-only open succeeds even on a broken setup, which is what makes this easy
-to misdiagnose. The agent's readiness check tests for write access and reports
-the result on the host detail page.
+to misdiagnose. The `uinput` and `input_probe` readiness checks test the real
+thing and report it on the host's page. On a rootless engine the agent can reach
+`/dev/uinput` and its own input devices only through the device rule [host
+preparation](/quasar/install/prepare-host/) writes: run it, then restart the node
+agent. See [Readiness checks](/quasar/troubleshooting/readiness/#input).
 
 ## A GPU-less host will not start
 
@@ -329,13 +335,13 @@ with the same characters.
 
 ## The control plane is unhealthy after an update
 
-Check its logs first. If it reports that it cannot write its TLS key —
+Check its logs first. If it reports that it cannot write its TLS key:
 
 ```
 fatal: tls: write TLS key /var/lib/quasar-control/tls/key.pem: permission denied
 ```
 
-— this stack was built from source at some point, and its `quasar-control-tls`
+then this stack was built from source at some point, and its `quasar-control-tls`
 volume is owned by root while the published image runs as uid 1000. Nothing is
 damaged. [Legacy Compose installs](/quasar/install/legacy-compose/#if-your-install-ever-ran-a-source-build)
 has the one-time fix.
@@ -345,7 +351,7 @@ published images, and `redeploy.sh` on installs built from source. The console
 will not offer an update to a source-built control plane for exactly this reason.
 
 If instead it reports a migration version it does not recognise, an older image
-is running against a newer database — see [the hard
+is running against a newer database. See [the hard
 rule](/quasar/operations/upgrading/#the-hard-rule).
 
 ## "Quasar was updated. This page is running the previous build"

@@ -27,6 +27,10 @@ release with notes; `beta` is those and the prereleases among them; `edge` is
 whatever was last published from a branch, with none. An instance follows one at
 a time, and switching changes what is listed, never what is installed.
 
+**Console mode.** A host showing sessions on a screen plugged into it, rather than
+only streaming them. Turned on per host from its Local console page. See [Console
+mode](/quasar/admin/console/).
+
 **Constrained baseline.** The H.264 profile browser sessions are clamped to,
 because Chrome's WebRTC receiver cannot decode High profile from any encoder.
 
@@ -53,6 +57,13 @@ reservation in admission control.
 
 **Entitlement.** The grant that decides whether an app appears in a user's
 library. Granted to everyone or to named users.
+
+**Engine mode.** Whether the container engine runs as root (**rootful**) or as an
+ordinary account (**rootless**).
+
+**Engine profile.** One combination of platform, container engine and engine mode,
+with the status Quasar gives it: supported, experimental or unsupported. See
+[Engine profiles](/quasar/start/engine-profiles/).
 
 **Enrollment token.** A secret an admin mints in Admin, Fleet, Hosts, Add host to
 let one agent enroll: single use, expiring after an hour by default (an admin may
@@ -101,6 +112,10 @@ shared storage, not merely the same path on each one; otherwise a user's
 existing home keeps their launches on the host that holds their files.
 
 **Host.** A machine running the node agent. Owns GPUs and runs sessions.
+
+**Host preparation.** `prepare-host.sh`, the one step of an install that runs as
+root. It creates the Quasar account or group and grants the devices Quasar uses.
+See [Prepare the host](/quasar/install/prepare-host/).
 
 **ICE.** The WebRTC mechanism for discovering a network path between two peers.
 A session stuck at "checking" means ICE found no working path.

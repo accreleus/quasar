@@ -137,6 +137,7 @@ export default defineConfig({
 					label: 'Install',
 					items: [
 						{ label: 'Quick start', slug: 'start/quickstart' },
+						{ label: 'Prepare the host', slug: 'install/prepare-host' },
 						{ label: 'Install Quasar', slug: 'install/install' },
 						{ label: 'Install with Podman (Quadlet)', slug: 'install/podman-quadlet' },
 						{ label: 'First-run setup', slug: 'install/first-run' },
@@ -166,6 +167,7 @@ export default defineConfig({
 						{ label: 'The Steam library', slug: 'admin/steam' },
 						{ label: 'Quality profiles', slug: 'admin/profiles' },
 						{ label: 'Hosts and GPUs', slug: 'admin/hosts' },
+						{ label: 'Console mode', slug: 'admin/console' },
 						{ label: 'Sessions and audit log', slug: 'admin/sessions' },
 						{ label: 'Jobs and schedules', slug: 'admin/jobs' },
 						{ label: 'Updating Quasar', slug: 'admin/releases' },
@@ -203,6 +205,7 @@ export default defineConfig({
 					label: 'Troubleshooting',
 					items: [
 						{ label: 'Install and startup', slug: 'troubleshooting/install' },
+						{ label: 'Readiness checks', slug: 'troubleshooting/readiness' },
 						{ label: 'Connecting and certificates', slug: 'troubleshooting/connecting' },
 						{ label: 'Launching a game', slug: 'troubleshooting/launching' },
 						{ label: 'Picture, sound and input', slug: 'troubleshooting/av' },

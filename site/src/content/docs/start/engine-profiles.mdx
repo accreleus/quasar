@@ -19,7 +19,7 @@ give it.
 
 - **Supported.** Validated end to end: a real session with input and audio, an
   update applied from the console, and a reboot after which everything comes
-  back. Rootful Docker is this everywhere, including Unraid — it is the engine
+  back. Rootful Docker is this everywhere, including Unraid. It is the engine
   profile Quasar has always run on, so nothing about it changed.
 - **Experimental.** Works, or is expected to, but has not yet been through that
   same acceptance run on hardware. The quick start and enrollment let it
@@ -28,8 +28,8 @@ give it.
   the experimental rows today, waiting on the acceptance evidence tracked
   in #409.
 - **Unsupported.** Nothing has been tested, or it is known not to work, and the
-  reason says which. The quick start generates nothing for it — Next stays
-  disabled at the engine step — and enrollment refuses it by name before
+  reason says which. The quick start generates nothing for it (Next stays
+  disabled at the engine step), and enrollment refuses it by name before
   anything is pulled. The table's alternatives column (shown when you pick an
   unsupported combination) points at the nearest profile that is Supported or
   Experimental instead: rootful Docker on this platform, or Fedora with
@@ -51,7 +51,7 @@ writes under `/etc`, which Unraid recreates at every boot), and the sysctl and
 
 The table above is about the engine, not the GPU. AMD and NVIDIA are what
 Quasar is validated on, on every required profile. Intel GPUs are untested
-on any engine profile — VA-API is what detection picks, and nobody has run a
+on any engine profile. VA-API is what detection picks, and nobody has run a
 session on one yet. See [Requirements](/quasar/start/requirements/#gpu) for the
 GPU-vendor table.
 
@@ -59,12 +59,12 @@ GPU-vendor table.
 
 **A rootful engine's socket is equivalent to root on that machine.** Docker
 Engine and rootful Podman both run as root, and whoever holds their socket can
-do anything the machine's root account can — start a container with any mount,
+do anything the machine's root account can: start a container with any mount,
 any capability, any device. Quasar holds that socket on a rootful install, the
 same way any container manager does. This is not a Quasar limitation to work
 around; it is what a rootful engine is. A request filter in front of the
 socket, narrowing what a holder of it can ask for, is a real idea and a
-tracked follow-up issue — it is not part of this release. Choosing rootless
+tracked follow-up issue, not part of this release. Choosing rootless
 Docker or rootless Podman is how you avoid holding a root-equivalent socket at
 all: the engine itself never runs as root, so there is no root-equivalent
 socket to protect.
@@ -74,7 +74,7 @@ On an SELinux host the node agent's container is started with
 `--security-opt label=disable` (visible in every install command on this
 site). That looks like a step backward, but it is not: the agent already holds
 a root-equivalent engine socket on a rootful install, so an SELinux label on
-top of it narrows nothing that matters — the socket is the privilege boundary,
+top of it narrows nothing that matters: the socket is the privilege boundary,
 not the label. The **sessions** the agent starts are not exempted: they get no
 such flag and stay confined under their own container's policy, same as
 before.
@@ -89,7 +89,7 @@ everything else.
 
 **Rootless Docker has no equivalent per-container user mapping.** A session's
 files are still written safely, but they land on the host owned by a
-subordinate UID/GID — one of the range `prepare-host.sh` assigned the account,
+subordinate UID/GID, one of the range `prepare-host.sh` assigned the account,
 not the account's own uid. Nothing is blocked by this: sessions run and homes
 work. It only means a listing of the homes root, `ls -n`, shows a large
 unfamiliar number as the owner instead of `quasar`. The `homes_root_writable`
@@ -99,7 +99,7 @@ looks at the filesystem.
 
 If you want home files owned by the `quasar` account on disk, use rootless
 Podman. Do not try to fix rootless Docker's homes after the fact by re-owning
-them in place — see [Moving to rootless](/quasar/install/move-to-rootless/)
+them in place. See [Moving to rootless](/quasar/install/move-to-rootless/)
 for the supported way to change engine and pick up correct ownership, which
 copies files into a freshly owned homes root rather than `chown -R`-ing the
 one you have.

@@ -654,6 +654,17 @@ own; the two do not move together, and that is deliberate.
   first-launch pulls and cached-version removal, Codecs documents the launch panel's codec
   picker, and troubleshooting covers the 20-second `no_host_available` retry and a controller
   the browser does not recognise. The glossary adds home claim and readiness check.
+- **The documentation site covers RH-07, with fresh screenshots.** New pages for host
+  preparation (`prepare-host.sh` and every option, `--console` and
+  `--console-audio-user` included), console mode (rootful and rootless, the `tty8`
+  console terminal, PipeWire or ALSA audio, input grab, DDC auto-start) and the
+  readiness checks with their fixes; the quick start, requirements, install, Podman,
+  hosts, in-session, audio and troubleshooting pages follow the RH-07 behaviour. Every
+  screenshot but the Steam source one is retaken from a local demo stack with dummy
+  data (fictional hosts and `example.com` accounts), and new ones show the quick
+  start's engine step, the Local console page, a host's readiness card and the
+  in-session microphone and stats. The demo library uses SteamGridDB art, credited in
+  `site/src/assets/shots/demo-art/CREDITS.md`.
 - **The contract now says `/enroll-host.sh` is rendered per control plane.** `control-api.md`
   no longer calls it a static file: each control plane serves its own copy with the images its
   Add host command installs written in (protocol pin bump, wording only).

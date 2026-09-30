@@ -1,0 +1,184 @@
+---
+title: Console mode
+description: Showing sessions on a host's own screen. Turning it on, rootful and rootless hosts, the console terminal, local audio, input grab and monitor power detection.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_console from '../../../assets/shots/admin-console.png';
+import { Aside } from '@astrojs/starlight/components';
+
+Console mode makes a host show games on a screen plugged into it, like a games
+console under the television, instead of only streaming them to a browser. A
+console session can also stream at the same time. Each host has its own console
+page: Admin, Fleet, the host, **Local console**.
+
+<Shot
+	label="Local console"
+	sublabel="The console page of a host with console mode on: the physical output and its mode, the stream switches, and local audio through the desktop's PipeWire."
+	src={admin_console}
+	alt="The Local console page for a host, with console mode on"
+/>
+
+## What a console session is
+
+| Setting | What it does |
+| --- | --- |
+| **Physical output**, **Physical mode** | Which connector the picture goes to and at what timing. Both can stay automatic: the connected output the compositor prefers, at its preferred mode. |
+| **Also stream** | Off, the session is local only and uses no encoder. On, the same picture is also streamed to a browser (dual output). |
+| **Stream audio** | With **Also stream**, the browser gets the sound too. |
+| **Local audio output** | Where the host plays the sound: **Auto**, a sink the host reported, or **Quiet**. See [Local audio](#local-audio). |
+| **Grab local input**, **Input devices** | Takes the host's own keyboards, mice and controllers for the session. See [Local input](#local-input). |
+| **Default app**, **Default user**, **Auto-start on display** | Launches that app as that user when a display comes on. See [Starting on its own](#starting-on-its-own). |
+| **Auto-connect controller** | Attaches a connected controller to the console session. |
+
+The right-hand column lists what the host reported: its connectors and their
+modes, its audio sinks, and its input devices.
+
+## Turning it on
+
+On an install owned by Quasar, console mode needs a node agent created with access
+to this machine's display, sound and monitor control, which an ordinary agent does
+not have. Turning console mode on asks the host's recovery actor to replace the
+node agent with one that has them. The page asks you to confirm first, because the
+replacement **ends the host's live sessions**, and so does turning it off again.
+
+While the replacement runs, the page reads **Applying** and new sessions on the
+host wait. Console mode reads as on only once the new agent is healthy. If it is
+not, the recovery actor puts the previous agent back, streaming carries on as
+before, and the page says why, leading with the agent's own named cause: what
+holds the display, or that the host needs host preparation with `--console`,
+with the command to copy. **Try again** repeats the attempt.
+
+A host where console mode cannot work at all (one without a display device, for
+instance) reads as not available, with the reason.
+
+A Compose or source install grants the same access with
+[`deploy/overlays/docker-compose.console.yml`](https://github.com/accreleus/quasar/blob/main/deploy/overlays/docker-compose.console.yml)
+instead. An owned host's recovery actor does not read that overlay.
+
+## Rootful and rootless hosts
+
+Console mode works with every engine mode. Prepare the host with `--console` first
+on either; on a rootless host it is required:
+
+```bash
+sudo sh prepare-host.sh --mode rootless --console
+```
+
+See [Prepare the host](/quasar/install/prepare-host/#console-mode) for exactly what
+that grants.
+
+**Rootful.** The agent gets `SYS_ADMIN` (to become the display's master), the sound
+devices and `/proc/asound` read-only when the host has sound, and device rules for
+sound and the i2c buses used for monitor control. A rootful engine's socket is
+already equivalent to root on that machine, so this is not a new exposure.
+
+**Rootless.** The agent gets no added capability and no device-cgroup rules. It
+reaches the display, sound, the i2c buses and the physical input devices through
+the device access host preparation gives the Quasar account, plus read-only views
+of logind's seat and session state so it can name what holds the display. Two
+things follow from that:
+
+- **The display must be free.** A rootless agent takes the screen only when no
+  other process holds it. At startup the agent checks this itself before it
+  reports healthy, so a desktop or login screen on that display makes the attempt
+  fail at once, naming what holds it. Stop the login screen on that output, or
+  choose another output.
+- **Devices are read again.** The recovery actor re-reads the host's i2c buses and
+  logind state whenever console mode is turned on, and at every start while it is
+  on. A reboot can renumber the i2c buses; when they change, the actor replaces
+  the agent so it never starts without a device it expects.
+
+## The console terminal
+
+For the life of a console session the agent makes virtual terminal 8 (`tty8`) the
+active one, with the kernel keyboard turned off, and switches back to the previous
+terminal when the session ends. Without that, keys typed in the session would also
+reach the host's text console and its login prompt.
+
+- Host preparation with `--console` gives the Quasar group `tty8` and stops a login
+  prompt from running there (it masks `getty@tty8` and `autovt@tty8`). A
+  `getty@tty8` unit of your own is left alone, and console sessions refuse to start
+  while it runs.
+- If the terminal cannot be taken, console sessions fail with `console terminal:`
+  and the reason, and the console check at agent start fails with the same text.
+  A host with no virtual terminals at all is unaffected.
+- When the agent is stopped (an engine stop, or the recovery actor replacing it), it
+  ends the console session and gives the terminal back first, within about eight
+  seconds. If it dies holding the terminal anyway, its next start puts the previous
+  terminal back. For that reason the agent keeps access to `tty8` once console mode
+  has been on, even after it is turned off.
+
+To get the screen back by hand, put `tty8` back in text mode first (a switch away
+from a terminal in graphics mode is ignored), then switch with `chvt` to the
+terminal you want.
+
+## Local audio
+
+**Local audio output** lists what the host reported, and the help under it says
+which kind the host has.
+
+- **Through the desktop's PipeWire.** When host preparation was run with
+  `--console-audio-user USER`, console audio plays through that user's PipeWire,
+  beside the desktop's own sound. Quasar never takes the sound device away from the
+  desktop. The host's PipeWire outputs are listed as **Host PipeWire**, and the raw
+  sound devices are hidden while PipeWire answers.
+- **Straight to the sound device (ALSA).** Used only when no PipeWire answers and
+  the device is free. Sound devices are listed by card name
+  (`hw:CARD=<id>,DEV=<n>`), which a driver reload does not move; a setting saved as
+  `hw:N,M` still works.
+- Otherwise the console runs quiet, and the host's `console_audio` readiness check
+  names what holds the device.
+
+<Aside type="note">
+Console audio through PipeWire is newer than the ALSA path and has had less
+testing on real desktops. If it misbehaves, the ALSA path is what the host falls
+back to without PipeWire.
+</Aside>
+
+## Local input
+
+**Grab local input** takes the host's physical keyboards and mice exclusively for
+the console session, so nothing else on the machine sees what is typed. **Input
+devices** picks which devices are passed to the session: by class (keyboards,
+mice, controllers and so on), individual devices by path, or none.
+
+A device plugged in while a console session is already running is not grabbed by
+that session. Plug it in before the session starts.
+
+Separately from console mode, every session's own virtual keyboard and mouse are
+held exclusively by the compositor, so keys typed in a streamed session never
+reach the host's own console either.
+
+## Starting on its own
+
+With **Auto-start on display** on and both a **Default app** and a **Default
+user** set, a display coming on launches that app as that user. The launch goes
+through the same entitlement check as any other, so the default user must be
+allowed to launch the default app.
+
+Whether a display is really on is read over DDC/CI from the monitor itself, since
+a monitor that is switched off still reports itself connected. That needs the i2c
+buses (granted by `--console` on a rootless host) and a monitor that answers DDC.
+Without them, every connected display counts as on, and hotplug still works.
+`QUASAR_CONSOLE_DDC=0` on the agent turns the power reading off.
+
+## Readiness
+
+Three readiness checks report console mode, and all three read *skipped* while
+console mode is off for the host. None of them ever blocks a streamed session.
+
+| Check | What it reports |
+| --- | --- |
+| `console_display` | Whether the agent was created with console access, and whether its startup check found the display free. A display another process holds fails, naming it. |
+| `console_audio` | Which route console audio takes (the host's PipeWire or a named sound device), or why none is usable. |
+| `console_ddc` | Whether monitor power can be read: `ddcutil` present, an i2c bus mapped to a connector, a reading taken. |
+
+See [Readiness checks](/quasar/troubleshooting/readiness/) for the fixes.
+
+## Known limits
+
+- The console picture uses the modes the compositor offers, which do not yet
+  include every mode and refresh rate the monitor itself supports.
+- With an NVIDIA GPU passed through to a virtual machine, the console picture can
+  stay black. This is a limitation of that GPU passthrough, not of the host.

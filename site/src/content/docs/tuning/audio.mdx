@@ -56,7 +56,8 @@ cost you your session.
 
 ### 2. The user turns it on
 
-In the session drawer. Off at the start of every session, always. There is no
+With the microphone button on the session bar. Off at the start of every session,
+always. There is no
 setting that makes a microphone hot on connect.
 
 ### 3. The browser grants permission
@@ -105,10 +106,10 @@ configurable.
 sidecar image matches the agent image lineage. Then set `QUASAR_AUDIO_REQUIRED=1`
 so the next occurrence fails visibly.
 
-**Microphone toggle missing.** The instance setting is off.
+**Microphone button missing.** The instance setting is off.
 
-**Microphone toggle present but does nothing.** Browser permission was denied, or
-the page is not on HTTPS.
+**Microphone button present but does nothing.** Browser permission was denied, the
+page is not on HTTPS, or input is captured (release capture first).
 
 **Sound in some apps and not others.** The application is choosing a different
 output device. That is inside the container and is the app's own configuration.

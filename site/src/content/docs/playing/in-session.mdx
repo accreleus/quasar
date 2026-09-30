@@ -5,6 +5,7 @@ description: Capturing input, the session drawer, gamepads, the Escape key, micr
 
 import Shot from '../../../components/Shot.astro';
 import session_drawer from '../../../assets/shots/session-drawer.png';
+import session_stats from '../../../assets/shots/session-stats.png';
 import { Aside } from '@astrojs/starlight/components';
 
 Once the stream starts you are looking at a full-bleed video of the game with no
@@ -12,7 +13,7 @@ chrome around it. Everything you need is behind one keyboard shortcut.
 
 <Shot
 	label="Session"
-	sublabel="A live session with the menu open on Controller and input: the capture toggle, the release combination, and the readout along the bar."
+	sublabel="A live session with the menu open on Controller and input: the capture toggle, the release combination, the readout along the bar, and the microphone on, with its indicator top right."
 	src={session_drawer}
 	alt="A live Quasar session with the session menu open"
 />
@@ -51,16 +52,23 @@ Controllers work through the browser's Gamepad API, and the input travels over
 the same data channel as everything else.
 
 Browsers do not reveal a gamepad until it has sent input, so press a button
-after connecting one. The drawer lists what it currently sees.
+after connecting one. The drawer lists what it currently sees. The game sees a
+wired Xbox 360 controller, whatever pad you hold.
+
+Your keyboard, mouse and controller reach only your session. On the host they are
+virtual devices held exclusively by the session's compositor, so nothing else on
+that machine, its own login screen included, receives what you type.
 
 ## Microphone
 
-If your administrator has enabled microphone capture, the drawer has a toggle
-for it. Three things have to line up: the instance setting has to be on, you
-have to turn it on, and your browser has to grant permission.
+If your administrator has enabled microphone capture, the bar has a microphone
+button. Three things have to line up: the instance setting has to be on, you
+have to turn it on, and your browser has to grant permission. The microphone is
+off at the start of every session, and the button does nothing while input is
+captured, so release capture first.
 
-A live microphone always shows a persistent indicator. It cannot be hidden. If
-the microphone is on, you can see that it is on.
+A live microphone always shows a persistent **MIC** indicator. It cannot be
+hidden. If the microphone is on, you can see that it is on.
 
 Microphone capture needs a secure context, so it does not work over plain HTTP.
 
@@ -85,8 +93,16 @@ fps session down to 60 and restore it; it is disabled by default.
 
 ## Performance stats
 
-Turning on performance stats opens a diagnostics overlay and closes the drawer,
-so the numbers stay visible while you play.
+The menu's **Performance stats** pane shows frame rate, latency, bitrate and the
+jitter buffer, each with a short history, and a **Detailed** view with the full
+table. The session bar shows frame rate, latency and bitrate at a glance.
+
+<Shot
+	label="Performance stats"
+	sublabel="The Performance stats pane of a live session."
+	src={session_stats}
+	alt="A live session with the Performance stats pane open"
+/>
 
 Two of them are worth understanding.
 

@@ -4,11 +4,27 @@ description: Answer a few questions and get one command, or one stack, that inst
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import Shot from '../../../components/Shot.astro';
+import quickstart_engine from '../../../assets/shots/quickstart-engine.png';
 import QuickStart from '../../../components/QuickStart.astro';
 
 A few questions, then one command to run on the machine, or one stack to paste
-into Dockge or Arcane. You need Linux, Docker and about 20 GB of disk; the
-[requirements](/quasar/start/requirements/) have the detail.
+into Dockge or Arcane. You need Linux, Docker or Podman, and about 20 GB of disk;
+the [requirements](/quasar/start/requirements/) have the detail.
+
+The **Engine** step picks the container engine and its mode, and shows the status
+of each [engine profile](/quasar/start/engine-profiles/) for your platform. An
+unsupported combination cannot go further. Except on Unraid, the result starts
+with [host preparation](/quasar/install/prepare-host/): fetch the script, check its
+checksum, run it as root. Then comes the install itself, a script for Docker or a
+Quadlet unit for Podman.
+
+<Shot
+	label="Quick start, engine step"
+	sublabel="The engine step for Fedora: each engine and mode with its profile status."
+	src={quickstart_engine}
+	alt="The quick start's engine step, with four engine profile badges"
+/>
 
 Either way the machine runs one container you declare, the **seed**. It creates
 Quasar's **recovery actor**, which generates every secret on the machine and

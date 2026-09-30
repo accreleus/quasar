@@ -1,0 +1,129 @@
+---
+title: Prepare the host
+description: prepare-host.sh, the one step that runs as root. What it changes, its options, console mode's extra grants, and running it again.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Quasar never runs as root. The one step that does is **host preparation**:
+`prepare-host.sh`, run once on each machine before its install. It readies the
+machine for the engine and mode you chose (see [Engine
+profiles](/quasar/start/engine-profiles/)) and changes nothing else. The [quick
+start](/quasar/start/quickstart/) prints the exact command for your answers, with
+the script's checksum.
+
+```bash
+sudo sh prepare-host.sh --mode rootless --engine podman
+```
+
+The script is published beside the quick start, at
+`https://accreleus.github.io/quasar/prepare-host.sh`, and every control plane
+serves its own copy at `/prepare-host.sh`, which is what the
+[add-host command](/quasar/install/second-host/) points a rootless host at when it
+has not been prepared.
+
+## When you need it
+
+| Install | Host preparation |
+| --- | --- |
+| Rootless Docker or rootless Podman | Required. It creates the account Quasar runs as. |
+| Rootful Podman | Required. It is what makes Podman start Quasar's containers at boot. |
+| Rootful Docker | Recommended. The quick start runs it. Without it, do the kernel steps in [Requirements](/quasar/start/requirements/) by hand. |
+| Unraid | Not used. It writes under `/etc`, which Unraid recreates at every boot, so the Unraid script persists the same settings through `/boot/config/go`. |
+
+## What it changes
+
+Every change is printed with its reason, as `changed`, `ok`, `skipped`, `note` or
+`warn`. It adds device access rather than changing any device's owner, never
+re-owns existing files, never writes under `/usr` (so read-only, image-based
+systems such as Fedora Atomic, Bazzite and uCore work), and never relaxes
+SELinux.
+
+- **The Quasar account.** On a rootless install it creates the `quasar` account,
+  its subordinate UID and GID ranges, and enables lingering, so its engine keeps
+  running with nobody logged in and starts at boot. On a rootful install it
+  creates only a `quasar` group, which owns the device access and nothing else.
+- **Device rules.** A udev rule gives the `quasar` group `/dev/uinput`, the virtual
+  input devices Quasar itself creates (matched by name) and the GPU render nodes.
+  No broad group such as `input` or `video` is granted.
+- **The agent's runtime directory.** `/run/quasar-agent`, recreated at every boot,
+  where sessions reach the agent's display and audio sockets.
+- **Kernel modules and settings.** It loads `uinput` now and at boot, and sets the
+  UDP send buffer sysctl ([why](/quasar/start/requirements/#one-sysctl)).
+- **NVIDIA.** It makes sure an NVIDIA CDI specification exists for the loaded
+  driver, which is how Podman and rootless Docker hand the GPU to containers. A
+  machine with the NVIDIA driver loaded but no NVIDIA device is skipped, and the
+  output says so.
+- **Boot.** On Podman it enables `podman-restart.service` (and, rootless, the
+  Quasar user's `podman.socket`), since Podman has no daemon to restart
+  containers. On rootful Docker it enables `docker.service`. Rootless Docker is
+  installed for the `quasar` account with `dockerd-rootless-setuptool.sh`; the
+  script says so rather than doing it.
+- **SELinux.** On an SELinux host running Podman, or a Docker daemon started with
+  `--selinux-enabled`, it labels the homes, templates and runtime directories
+  `container_file_t` (labels only, nothing is re-owned), labels Quasar's own
+  virtual input devices so a confined session can read them, and on an NVIDIA
+  host turns on the `container_use_xserver_devices` boolean and installs a
+  one-rule module, `quasar-nested-gpu`, so sessions can open the GPU. A root that
+  was recreated after an earlier run is relabelled.
+
+## Options
+
+| Option | What it does |
+| --- | --- |
+| `--mode rootless\|rootful` | Required. The engine mode Quasar will run under. |
+| `--engine auto\|docker\|podman` | The container engine. `auto`, the default, detects it, and prepares for both when both are installed. |
+| `--user NAME` | The Quasar account or group. `quasar` by default. |
+| `--homes DIR` | Create the homes root, owned by the Quasar account. Rootless only: a rootful install keeps the ownership the installer sets. |
+| `--templates DIR` | The same for the templates root, where Steam's prepared home lives. |
+| `--console` | Also grant what [console mode](/quasar/admin/console/) uses. See below. |
+| `--console-audio-user USER` | With `--console`: give console mode a PipeWire socket on `USER`'s desktop session. |
+| `--allow-kernel-log` | Optional. Let Quasar read GPU fault messages from the kernel log (`kernel.dmesg_restrict=0`). Without it the host's `xid_visibility` check reads *skipped* and names this option. |
+| `--unprivileged-port-start N` | Optional. Let unprivileged services bind ports from `N`. Only needed when a rootless install publishes the console on a port below 1024. |
+| `--dry-run` | Print what would change, and change nothing. |
+
+`--homes` refuses a path that is a system tree, holds a user's home, or contains
+regular-expression characters, and it never takes over a directory another
+account owns: it warns and leaves it for you to grant.
+
+## Console mode
+
+`--console` adds what a host needs to show sessions on its own screen:
+
+- the display cards, sound devices and i2c buses (monitor power detection over
+  DDC), and loads `i2c-dev`;
+- this machine's physical keyboards, mice and game controllers, so console mode
+  can grab them for the session. **This means the `quasar` group can read what is
+  typed on this machine's keyboard**, and the script says so when it writes the
+  rule;
+- the terminal console sessions use, `tty8`, by ACL, and masks `getty@tty8` and
+  `autovt@tty8` so no login prompt runs there. A `getty@tty8` unit of your own is
+  left alone with a warning, and console sessions refuse to start while it runs.
+
+`--console-audio-user USER` names the account whose desktop session runs
+PipeWire. The script adds a second, Quasar-only socket to that user's
+`pipewire-pulse`, reachable by the `quasar` group alone, so console audio plays
+through the desktop's own sound server. Restart that user's `pipewire-pulse`, or
+log them in again, to pick it up. It is refused without `--console`, or when the
+user does not exist.
+
+```bash
+sudo sh prepare-host.sh --mode rootless --engine podman --console --console-audio-user alex
+```
+
+## Running it again
+
+Run it again at any time, for instance to add `--console` later. It changes only
+what is missing, and a run with nothing left to do prints every line as `ok`. If a
+step fails, every earlier step is in place, nothing is half-written, and the
+output names the step: fix the cause and run it again.
+
+A permission Quasar needs and does not have shows up on the host's readiness card
+with this command as the fix. See [Readiness
+checks](/quasar/troubleshooting/readiness/).
+
+<Aside type="note" title="An option you drop is not undone">
+Leaving out an option you gave before does not revoke what it granted. A sysctl
+granted by an earlier run stays in effect in the running kernel until reboot,
+and the script warns about it.
+</Aside>

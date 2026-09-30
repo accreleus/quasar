@@ -15,14 +15,14 @@ verified on.
 
 **A container engine**: Docker Engine (API 1.40 or newer, Docker 19.03 and
 later) or Podman, either running as root (**rootful**) or as an ordinary
-account (**rootless**) — see [Engine profiles](/quasar/start/engine-profiles/)
+account (**rootless**). See [Engine profiles](/quasar/start/engine-profiles/)
 for which combination of engine, mode and platform is Supported,
 Experimental or Unsupported today, and why. Rootful Docker is Supported
 everywhere, including Unraid, and is what this section otherwise describes;
 rootless is the design target Quasar is moving towards. Quasar creates its own
 services through the engine's API, so Compose is not needed. A stack manager
 is optional: the seed can be one `docker run` (or, on Podman, one Quadlet
-unit — see [Install with Podman](/quasar/install/podman-quadlet/)).
+unit, see [Install with Podman](/quasar/install/podman-quadlet/)).
 
 | | Status |
 | --- | --- |
@@ -38,9 +38,9 @@ unit — see [Install with Podman](/quasar/install/podman-quadlet/)).
 One Quasar installation per container engine.
 
 <Aside type="note" title="Rootless and the quasar account">
-A rootless install runs everything — the engine itself, the seed, and every
-Quasar service — under a dedicated, unprivileged Linux account, not your own
-login. [Host preparation](/quasar/install/podman-quadlet/#installing) creates
+A rootless install runs everything (the engine itself, the seed, and every
+Quasar service) under a dedicated, unprivileged Linux account, not your own
+login. [Host preparation](/quasar/install/prepare-host/) creates
 that account for you (`quasar` by default) and everything below on this page
 that says "as root" is instead the one host-preparation step, run once, as
 root, on a rootless install.
@@ -112,8 +112,11 @@ sudo modprobe uinput
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 ```
 
-The agent's container declares the device and the input cgroup rule, so loading
-the module is all you do.
+[Host preparation](/quasar/install/prepare-host/) loads it now and at every
+boot, and on a rootless engine also gives the Quasar account `/dev/uinput` and the
+input devices Quasar creates, which a rootless container cannot be granted any
+other way. On rootful Docker without host preparation, loading the module is all
+you do: the agent's container is given the device and its input rule.
 
 ### One sysctl
 
@@ -124,10 +127,10 @@ echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
 sudo sysctl --system
 ```
 
-The quick-start script applies and persists this setting for your selected
-platform. On Unraid, use the generated Unraid script, which persists the setting
+Host preparation applies and persists this setting, and the quick start runs it
+for you. On Unraid, use the generated Unraid script, which persists the setting
 in `/boot/config/go` because `/etc` is recreated at boot. On a GPU host added with
-the one-line command, set it yourself: that command checks and fixes the render
+the one-line command, run host preparation or set it yourself: that command checks and fixes the render
 node, `uinput` (loading it and persisting the module), user namespaces and the
 app-container AppArmor profile, but not this sysctl. When you start the seed
 yourself, or from Dockge or Arcane, all host preparation is yours, and the host's

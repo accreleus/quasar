@@ -107,7 +107,8 @@ configuration claims, plus the managed-home root each host will use.
 It tells you whether the agent registered at all, whether GPUs were found, and
 whether an encoder was detected on each one. Known misconfigurations are named
 directly: no encoder registered, driver components missing, `/dev/uinput`
-not writable, input device rules absent.
+not writable, input device rules absent. Each check is explained on [Readiness
+checks](/quasar/troubleshooting/readiness/).
 
 Nothing here blocks you. A failing check warns and links you to Admin, Fleet,
 Hosts. For storage, the wizard can keep the agent-reported root or select one of
@@ -125,9 +126,9 @@ Changing the root does not move existing homes; see [Storage](/quasar/admin/host
 
 <Shot
 	label="Setup wizard, hosts step"
-	sublabel="The host and GPU check. This host is online and reports H.264, but it has no storage root, so sessions placed on it could not start."
+	sublabel="The host and GPU check for a host whose virtual input is not set up: its input checks fail, block launches, and name host preparation as the fix."
 	src={setup_hosts}
-	alt="The host and GPU check step of the setup wizard, showing one host with a passing and a failing check"
+	alt="The host and GPU check step of the setup wizard, showing a host with passing checks and two failing input checks"
 />
 
 ## Step 4: Libraries
