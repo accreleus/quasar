@@ -1,6 +1,6 @@
 ---
 title: Updating Quasar
-description: Platform releases in the console — channels, what each target can take, applying to one host or the whole fleet, and reverting an agent.
+description: "Platform releases in the console: channels, what each target can take, applying to one host or the whole fleet, and reverting an agent."
 ---
 
 import Shot from '../../../components/Shot.astro';
@@ -32,8 +32,8 @@ page](/quasar/admin/images/).
 	alt="The admin Releases tab showing installed versions, channel selection and nothing available"
 />
 
-When a newer release is listed, a banner appears across the admin area —
-*Quasar X.Y.Z is available* — with a link here. Dismissing it lasts for the
+When a newer release is listed, a banner appears across the admin area,
+*Quasar X.Y.Z is available*, with a link here. Dismissing it lasts for the
 browser session, not forever.
 
 ## Installed
@@ -41,9 +41,9 @@ browser session, not forever.
 The **Installed** section is what this instance is actually running, as reported
 by the components themselves rather than read from a configuration file.
 
-- **Control plane** — its version, its commit, the database schema version it is
+- **Control plane**: its version, its commit, the database schema version it is
   on, and when it was built.
-- **Node agents** — how many hosts, and how many have not reported an identity.
+- **Node agents**: how many hosts, and how many have not reported an identity.
 - **This machine**: the control plane's own machine, on a combined or
   control-only install. It lists the **Seed**, the **Recovery actor**, the
   **Database** (Quasar's own, or yours), the **Control plane** and, on a combined
@@ -101,7 +101,7 @@ that age comparison; the existing schema and identity checks still apply.
 
 ## Available, and the notes
 
-Each entry shows its name — the version on stable, a short commit on edge — when
+Each entry shows its name (the version on stable, a short commit on edge) when
 it was built, the commit, and the schema version it carries.
 
 A stable release renders the notes published with it. A release with no notes
@@ -115,7 +115,7 @@ you can pick by mistake.
 
 ## Check now
 
-Detection runs on a schedule as the `platform.release_detect` job — weekly by
+Detection runs on a schedule as the `platform.release_detect` job, weekly by
 default. **Check now** runs that job immediately, which is the same thing as
 Run now on the [Jobs tab](/quasar/admin/jobs/#the-release-detection-job). It
 reads the release list, and never applies anything.
@@ -133,7 +133,7 @@ target says why.
 | Already on the newest release. | Nothing to do. |
 | Nothing newer has been detected on this channel. | No release is on offer. |
 | This target has not reported what it is running. | An older agent, from before this feature. It cannot be updated from here until it is upgraded once by hand. |
-| Built from source on the host — update it with git, not from here. | A source install. The published image is a different build and cannot replace one built on the machine. |
+| Built from source on the host: update it with git, not from here. | A source install. The published image is a different build and cannot replace one built on the machine. |
 | No recovery actor answers on this machine: it was not installed with the seed, or its actor is down. | Nothing on the machine can replace its containers. A legacy Compose install, or a recovery actor that is stopped. |
 | Must update before it can be managed. | The host's node agent or recovery actor is below this control plane's floor. It is offered only the update. |
 | A preflight check failed on this target; the check below names the fix. | See the checks, below. |
@@ -179,9 +179,9 @@ A ready host offers **Apply**. What happens, in order:
    [draining](/quasar/admin/hosts/#draining-and-removing) does.
 
 2. **The attempt waits for that host's sessions to end**, showing how many are
-   left. The confirmation's checkbox — *Update now — ends N live sessions* —
-   skips the wait and names the count, because recreating the agent ends them
-   either way. Leave it off and nothing is lost.
+   left. The confirmation's checkbox, *Update now — ends every live session on
+   this host* (the UI's own wording), skips the wait, because recreating the agent
+   ends them either way. Leave it off and nothing is lost.
 
 3. **The host's recovery actor replaces the agent.** It pulls the release's
    digest, stops the old agent and keeps it, stopped and disabled, then starts
@@ -194,7 +194,7 @@ A ready host offers **Apply**. What happens, in order:
    the attempt as succeeded. The old agent cannot report its own success; it is
    the thing being replaced.
 
-5. **The cordon is restored to whatever it was before** — a host you had already
+5. **The cordon is restored to whatever it was before**: a host you had already
    cordoned stays cordoned, one that was serving goes back to serving, whether
    the apply worked or not.
 
@@ -253,14 +253,14 @@ failed migrating update is never put back on its own, and ends with the one
 `restore` command that goes back (see
 [Restoring](/quasar/operations/backup/#restoring)). The build that
 boots reads back the request written down before the restart and reports the
-outcome — the process carrying out its own update cannot survive to report
+outcome, since the process carrying out its own update cannot survive to report
 success. Then each host follows in the fleet list's order, cordoned, drained,
 updated and uncordoned exactly as a single Apply is.
 
 The run **stops at the first target that fails** and says which. Targets behind
 it are already updated; targets ahead of it were never started.
 
-Hosts that cannot take the release are **skipped, not failed** — offline,
+Hosts that cannot take the release are **skipped, not failed**: offline,
 source-built, below the floor, or with no recovery actor answering. They are listed with their reason and the
 run still finishes as succeeded. "Nothing was eligible" is a legitimate outcome.
 
@@ -274,7 +274,7 @@ The published image is a different build from one compiled on the host, and
 swapping one for the other leaves a control plane that starts and cannot write
 its own state. The control plane learns its own install mode from its own
 machine's recovery actor, over the control socket, and refuses the run outright
-when it has none or the mode is unknown — nothing moves before the control
+when it has none or the mode is unknown, and nothing moves before the control
 plane.
 </Aside>
 
@@ -283,7 +283,7 @@ plane.
 An admin tab left open across the control-plane step keeps polling through the
 restart and says the control plane is restarting rather than showing an error.
 Once the served build differs from the one the page was loaded from, a toast
-appears: **Quasar was updated — This page is running the previous build**, with a
+appears: **Quasar was updated**, *This page is running the previous build*, with a
 Reload button. Take it; the tab is running old JavaScript against a new API.
 
 ## Revert a host
@@ -302,7 +302,7 @@ revert is itself recorded, so it can be reverted in turn.
 The control plane carries database migrations, and rolling it below the schema
 version already applied is the crash loop described under [the hard
 rule](/quasar/operations/upgrading/#the-hard-rule). Agents carry no migrations,
-so they can move back — but never above the control plane's own release.
+so they can move back, but never above the control plane's own release.
 </Aside>
 
 ## Developer apply
@@ -368,7 +368,7 @@ repository's `docs/upgrading.md`.
 **Apply history**, below the targets, is every update this instance has made to
 itself, newest first: the target, whether it was an apply or a revert, the
 outcome, and the digests it replaced. Those recorded digests are what makes
-Revert possible, so they are worth keeping — see [Backup and
+Revert possible, so they are worth keeping. See [Backup and
 restore](/quasar/operations/backup/#the-apply-history-and-what-revert-depends-on).
 
 Every action is also written to the [audit log](/quasar/admin/sessions/), with
@@ -381,6 +381,6 @@ the admin who started it: `platform.apply.host`, `platform.apply.run`,
   signatures and developer apply.
 - [Legacy Compose installs](/quasar/install/legacy-compose/): the updater, and
   the by-hand recipe for a Compose stack.
-- [Jobs and schedules](/quasar/admin/jobs/) — the detection job's schedule.
-- [Environment variables](/quasar/reference/environment/#updates-and-releases) —
+- [Jobs and schedules](/quasar/admin/jobs/): the detection job's schedule.
+- [Environment variables](/quasar/reference/environment/#updates-and-releases):
   every knob behind this page.

@@ -53,17 +53,20 @@ site/
 
 The quick start writes the seed for one machine (combined, control-only or GPU
 host): a `docker run` script and the same seed as a one-service stack for Dockge
-or Arcane. It holds the seed's input names and the edge channel's tag, so a change
+or Arcane. It holds the seed's input names and the image tag it resolves, so a change
 to the seed's inputs (`docs/configuration.md` "Seed") or to the published image
 names needs the matching change in `stack-template.js` and its tests.
 
 ## Before publishing
 
-The site describes installs owned by Quasar (RH-06: the seed and the recovery
-actor), which ship on the **edge** channel only; the pages say so and promise no
-stable release. Publish it with the `pages` workflow once that work is on the
-branch you publish from, and not before: the published site must never describe
-an install the published images cannot make.
+The site describes installs owned by Quasar (the seed and the recovery actor) on
+the **stable** channel. The quick start and Install Quasar resolve each image's
+`latest` tag, which `images.yml` moves onto the newest stable release (or `main`),
+so publish the site with the `pages` workflow from the released tree **after** the
+release's Images run has succeeded, and not before: until then `latest` names a
+build from before owned installs, which the seed refuses. The published site must
+never describe an install the published images cannot make. To preview the
+quick start against edge builds, build with `QUASAR_IMAGE_TAG=o2-develop`.
 
 - **Every unfinished part carries a hidden marker**, an MDX comment such as
   `{/* TODO(#361): … */}`, or `TODO(open, …)` for a question no ticket owns yet.

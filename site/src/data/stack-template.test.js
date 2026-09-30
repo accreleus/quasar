@@ -332,7 +332,7 @@ test('QUASAR_IMAGE_NAMESPACE / QUASAR_IMAGE_TAG override the defaults', () => {
   assert.equal(tag, 'edge-test');
   // Defaults are unchanged when the env vars are absent.
   assert.equal(REGISTRY_NS, 'ghcr.io/accreleus/quasar');
-  assert.equal(CHANNEL_TAG, 'o2-develop');
+  assert.equal(CHANNEL_TAG, 'latest');
 });
 
 // --- rootless: no sudo but the one prep line --------------------------------

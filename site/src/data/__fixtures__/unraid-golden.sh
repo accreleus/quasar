@@ -53,10 +53,10 @@ for name in quasar-seed quasar-recovery; do
 done
 
 echo "==> Images"
-# The edge channel's builds that ship owned installs, pinned to their digests here:
+# The current stable release's images, pinned to their digests here:
 # the seed refuses a tag for the images it installs.
 resolve() {
-  local ref="ghcr.io/accreleus/quasar/$1:o2-develop" pinned
+  local ref="ghcr.io/accreleus/quasar/$1:latest" pinned
   docker pull -q "$ref" >/dev/null || { echo "Could not pull $ref." >&2; return 1; }
   pinned=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" | grep -m1 "^ghcr.io/accreleus/quasar/$1@sha256:" || true)
   [ -n "$pinned" ] || { echo "$ref has no registry digest." >&2; return 1; }

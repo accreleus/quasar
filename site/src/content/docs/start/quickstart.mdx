@@ -33,11 +33,12 @@ agent. Nothing sensitive is on this page to leak, and nothing here writes an
 `.env` of secrets. [Install Quasar](/quasar/install/install/) says the same in
 prose, with every input.
 
-<Aside type="caution" title="Edge builds only">
-Installs owned by Quasar ship on the **edge** channel, which follows the
-`develop` branch. There is no stable release of them yet. The script pins the
-edge channel's current images by digest, so the install never moves on its own:
-it updates when you apply an update from the admin console.
+<Aside type="note" title="Stable releases">
+The script pins the current stable release's images by digest, so the install
+never moves on its own: it updates when you apply an update from the admin
+console, and it follows the **stable** channel. An install made before the first
+stable release is on `edge`: see [Moving an edge install to
+stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
 </Aside>
 
 <Aside type="note" title="Already running Quasar from the Compose files?">

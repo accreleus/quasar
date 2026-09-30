@@ -681,7 +681,10 @@ own; the two do not move together, and that is deliberate.
   data (fictional hosts and `example.com` accounts), and new ones show the quick
   start's engine step, the Local console page, a host's readiness card and the
   in-session microphone and stats. The demo library uses SteamGridDB art, credited in
-  `site/src/assets/shots/demo-art/CREDITS.md`.
+  `site/src/assets/shots/demo-art/CREDITS.md`. The quick start and Install Quasar now
+  pin the stable release's images (the `latest` tag, resolved to digests on the host)
+  instead of the edge channel's `o2-develop`, so the site is published after the
+  release's images exist.
 - **The contract now says `/enroll-host.sh` is rendered per control plane.** `control-api.md`
   no longer calls it a static file: each control plane serves its own copy with the images its
   Add host command installs written in (protocol pin bump, wording only).

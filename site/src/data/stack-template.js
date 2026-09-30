@@ -9,9 +9,11 @@
  * same shape Admin -> Fleet -> Add host writes (web/src/lib/addHost.ts).
  *
  * Images: a static page cannot know the current digests, and the seed refuses a
- * tag for the agent and control-plane images. So the script resolves the edge
- * channel's `o2-develop` tags to digests on the host at run time, and the stack
- * pane carries placeholders plus a one-line command that prints the three pins.
+ * tag for the agent and control-plane images. So the script resolves the stable
+ * channel's `latest` tags (the newest release, or `main`, images.yml) to digests
+ * on the host at run time, and the stack pane carries placeholders plus a
+ * one-line command that prints the three pins. Publish the site only after the
+ * release is cut: before it, `latest` names a build from before owned installs.
  *
  * Engine and mode (RH07-14, #406). Which (platform, engine, mode) combinations
  * are offered at all is `testdata/engine-profiles/profiles.json` via
@@ -55,8 +57,8 @@ export const PREPARE_HOST_URL = 'https://accreleus.github.io/quasar/prepare-host
 // operator that can safely probe an undeclared identifier without throwing.
 const env = typeof process !== 'undefined' ? process.env : {};
 export const REGISTRY_NS = env.QUASAR_IMAGE_NAMESPACE || 'ghcr.io/accreleus/quasar';
-/** The edge channel's tag family for builds that ship owned installs (#365). */
-export const CHANNEL_TAG = env.QUASAR_IMAGE_TAG || 'o2-develop';
+/** The stable channel's moving tag; `QUASAR_IMAGE_TAG=o2-develop` pins edge instead. */
+export const CHANNEL_TAG = env.QUASAR_IMAGE_TAG || 'latest';
 export const IMAGE_NAMES = {
   seed: 'quasar-recovery',
   control: 'quasar-control-plane',
@@ -473,7 +475,7 @@ fi`;
 
 function imagesBlock(cli, sudo, r) {
   return `echo "==> Images"
-# The edge channel's builds that ship owned installs, pinned to their digests here:
+# The current stable release's images, pinned to their digests here:
 # the seed refuses a tag for the images it installs.
 resolve() {
   local ref="${REGISTRY_NS}/$1:${CHANNEL_TAG}" pinned
@@ -794,7 +796,7 @@ for name in quasar-seed quasar-recovery; do
 done
 
 echo "==> Images"
-# The edge channel's builds that ship owned installs, pinned to their digests here:
+# The current stable release's images, pinned to their digests here:
 # the seed refuses a tag for the images it installs.
 resolve() {
   local ref="${REGISTRY_NS}/$1:${CHANNEL_TAG}" pinned

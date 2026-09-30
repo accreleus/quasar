@@ -25,10 +25,12 @@ specifically, see [Install with Podman
 Docker's; replace `docker` with `podman`, run as the `quasar` account on
 rootless, and install through a Quadlet unit rather than `docker run`.
 
-<Aside type="caution" title="Edge builds only">
-Installs owned by Quasar ship on the **edge** channel, which follows the
-`develop` branch. There is no stable release of them yet. Each image is
-published with the edge tag `o2-develop`; an install names it by digest.
+<Aside type="note" title="Stable releases">
+A new install starts on the **stable** channel. Each release's images are
+published with its version tag and the moving `latest` tag; an install names
+them by digest, so it never moves on its own. An install made before the first
+stable release is on `edge`: see [Moving an edge install to
+stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
 </Aside>
 
 ## How an install is put together
@@ -98,13 +100,13 @@ too. A `docker run` seed on Unraid is a plain Docker install.
 
 **Pin the images.** The seed runs the recovery image, and names the control-plane
 and node-agent images, each **by digest**: the seed refuses a tag for the images
-it installs, and resolves its own. This prints all three for the edge channel:
+it installs, and resolves its own. This prints all three for the current stable release:
 
 ```bash
 for i in quasar-recovery quasar-control-plane quasar-node-agent; do
-  docker pull -q ghcr.io/accreleus/quasar/$i:o2-develop >/dev/null &&
+  docker pull -q ghcr.io/accreleus/quasar/$i:latest >/dev/null &&
   docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-    ghcr.io/accreleus/quasar/$i:o2-develop | grep -m1 "^ghcr.io/accreleus/quasar/$i@"
+    ghcr.io/accreleus/quasar/$i:latest | grep -m1 "^ghcr.io/accreleus/quasar/$i@"
 done
 ```
 
