@@ -15,7 +15,7 @@ use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
 use quasar_recovery::socket::{Request, State};
 use quasar_recovery::trust::{self, SignatureEvidence};
 use quasar_recovery::{identity, operator, server, shutdown, uninstall};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 const USAGE: &str = "usage: quasar-recovery <command>
 
@@ -507,10 +507,7 @@ fn actor() -> ExitCode {
             return ExitCode::FAILURE;
         }
         // The GPU (#432) and console devices (#407) can change across a reboot.
-        let attempt = actor.recheck_on_start();
-        if resumed.is_ok() {
-            report_services(&actor, attempt);
-        }
+        actor.finish_start(resumed.is_ok());
     }
 
     // A hand-over stops this process's sockets on purpose while it waits to be stopped or
@@ -532,31 +529,6 @@ fn actor() -> ExitCode {
             return ExitCode::FAILURE;
         }
         std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-/// What this start leaves running, as the engine says it is.
-fn report_services(actor: &Actor, attempt: Option<String>) {
-    if let Some(id) = attempt {
-        info!(
-            request = %id,
-            "this machine's services are installed; the node agent is being re-created"
-        );
-        return;
-    }
-    match actor.services_not_running() {
-        Ok(stopped) if stopped.is_empty() => {
-            info!("this machine's services are installed and running")
-        }
-        Ok(stopped) => warn!(
-            token = "actor-services-not-running",
-            "this machine's services are installed, but these are not running: {}",
-            stopped.join(", ")
-        ),
-        Err(e) => warn!(
-            token = "actor-services-state-unknown",
-            "this machine's services are installed; the engine did not say whether they run ({e})"
-        ),
     }
 }
 

@@ -46,6 +46,40 @@ enum Agent {
 }
 
 impl Actor {
+    /// The end of a start, after `resume`: [`Actor::recheck_on_start`], then one line
+    /// saying what the engine reports running. Nothing says the services run before the
+    /// check has looked (#432); `resumed` false (the error is already logged) says nothing.
+    pub fn finish_start(self: &Arc<Self>, resumed: bool) -> Option<String> {
+        let attempt = self.recheck_on_start();
+        if !resumed {
+            return attempt;
+        }
+        if let Some(id) = &attempt {
+            info!(
+                token = "actor-services-recreating",
+                request = %id,
+                "this machine's services are installed; the node agent is being re-created"
+            );
+            return attempt;
+        }
+        match self.services_not_running() {
+            Ok(stopped) if stopped.is_empty() => info!(
+                token = "actor-services-running",
+                "this machine's services are installed and running"
+            ),
+            Ok(stopped) => warn!(
+                token = "actor-services-not-running",
+                "this machine's services are installed, but these are not running: {}",
+                stopped.join(", ")
+            ),
+            Err(e) => warn!(
+                token = "actor-services-state-unknown",
+                "this machine's services are installed; the engine did not say whether they run ({e})"
+            ),
+        }
+        attempt
+    }
+
     /// Once per start, after `resume`: the node agent re-created through a verified
     /// replacement when this machine's GPU or console devices no longer match it, or when
     /// it is not running and the engine will not start it. `Some` names the admitted
