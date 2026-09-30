@@ -3,7 +3,7 @@ module github.com/accreleus/quasar/control-plane
 go 1.26.0
 
 require (
-	github.com/golang-migrate/migrate/v4 v4.19.1
+	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.11.0
 	go.uber.org/goleak v1.3.0
