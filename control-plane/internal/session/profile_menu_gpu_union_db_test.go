@@ -306,3 +306,60 @@ func TestProfileMenuZeroSlotGPUContributesNothing(t *testing.T) {
 		t.Fatalf("a zero-slot GPU must not contribute the host's av1 via inheritance: %+v", av1)
 	}
 }
+
+// TestProfileMenuUnionHonoursAppPlacement: an app whose host selection is fixed
+// to an H.264/HEVC host is not offered AV1 because an unselected host has it —
+// the launch could never place there, so the menu must not either.
+func TestProfileMenuUnionHonoursAppPlacement(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	hostB, _ := addHost(t, pool, "host-2", 4)
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265"]`)
+	setGPUCodecsRaw(t, pool, hostB, 0, `["h264","h265","av1"]`)
+	must(t, exec(t, pool, `UPDATE app_placement SET mode='fixed',revision=revision+1 WHERE app_id=$1::uuid`, s.appID))
+	must(t, exec(t, pool, `INSERT INTO app_placement_hosts(app_id,host_id) VALUES ($1::uuid,$2::uuid)`, s.appID, s.hostID))
+
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "menu-placed@test.local", "menu-placed", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "menu-placed@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+
+	_, body := getProfiles(t, srv.URL+"/v1/me/profiles?app_id="+s.appID, tok)
+	av1 := rungByID(body, "1440p60-av1")
+	if av1 == nil || av1.Eligibility != "ineligible" || !hasReasonCode(av1.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("av1 must not come from a host outside the app's selection: %+v", av1)
+	}
+	if hevc := rungByID(body, "1440p60-hevc"); hevc == nil || hevc.Eligibility != "eligible" {
+		t.Fatalf("hevc (offered by the selected host) must stay available: %+v", hevc)
+	}
+}
+
+// TestProfileMenuUnionHonoursTheManagedHomeOwner: a managed-home app whose home
+// already lives on one host launches only there, so another host's AV1 is not
+// offered.
+func TestProfileMenuUnionHonoursTheManagedHomeOwner(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	managed := seedSteamApp(t, pool, `{"image":"steam:1"}`)
+	hostB, _ := addHost(t, pool, "host-2", 4)
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265"]`)
+	setGPUCodecsRaw(t, pool, hostB, 0, `["h264","h265","av1"]`)
+
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "menu-home@test.local", "menu-home", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "menu-home@test.local", "quasar-fixture-pw-08")
+	provisionHome(t, pool, u.ID, managed, s.hostID)
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+
+	_, body := getProfiles(t, srv.URL+"/v1/me/profiles?app_id="+managed, tok)
+	av1 := rungByID(body, "1440p60-av1")
+	if av1 == nil || av1.Eligibility != "ineligible" || !hasReasonCode(av1.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("av1 must not come from a host other than the home's: %+v", av1)
+	}
+}

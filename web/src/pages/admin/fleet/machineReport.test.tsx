@@ -4,7 +4,7 @@ import type { Host, PlatformHostIdentity, PlatformIdentity } from "../../../api/
 import { ServicesCard } from "./hostDetail/ServicesCard";
 import { hostServices, isControlPlaneMachine } from "./hostServices";
 import { ThisMachineBlock } from "./ThisMachine";
-import { thisMachine } from "./thisMachine";
+import { thisMachine } from "./machineReport";
 
 const binary: PlatformIdentity = {
   version: "0.5.2",

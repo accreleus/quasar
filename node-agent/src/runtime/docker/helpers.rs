@@ -968,15 +968,19 @@ async fn read_back(
     // Podman's Config.Image names the image rather than echoing the reference, so the
     // helper's identity is proven by image ID there: the reference resolved now must be
     // the image the container was created from.
+    // The ID recorded at create wins: the reference may have been repointed since.
     let image_id = match engine.dialect {
         Dialect::Docker => None,
-        Dialect::Podman => {
-            engine
-                .inspect_image(&helper(intent).image)
-                .await
-                .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
-                .id
-        }
+        Dialect::Podman => match &intent.image_id {
+            Some(id) => Some(id.clone()),
+            None => {
+                engine
+                    .inspect_image(&helper(intent).image)
+                    .await
+                    .map_err(|_| RuntimeError::from(ErrorKind::UnknownOutcome))?
+                    .id
+            }
+        },
     };
     let injection =
         super::dialect::recorded_injection(intent_device_request(intent), intent.gpu_injection);
@@ -1133,6 +1137,7 @@ async fn create_or_adopt_inner(
             HelperPhase::Creating
         },
         result: None,
+        image_id: None,
     };
     if !reserves_final_evidence(&intent)? {
         return Err(ErrorKind::InvalidConfiguration.into());
@@ -1152,6 +1157,17 @@ async fn create_or_adopt_inner(
                 return Err(ErrorKind::InvalidConfiguration.into());
             }
         }
+    }
+    // Podman: pin the image by ID before anything is journalled, and create from that
+    // ID, so read-back never depends on where a mutable tag points later.
+    if docker.dialect == Dialect::Podman {
+        let id = docker
+            .inspect_image(&helper.image)
+            .await
+            .map_err(super::classify)?
+            .id
+            .ok_or(ErrorKind::Protocol)?;
+        intent.image_id = Some(id);
     }
     journal.write(&intent)?;
     if intent.profile == HelperProfile::Audio {
@@ -1232,7 +1248,7 @@ async fn create_or_adopt_inner(
         crate::runtime::DiagnosticNetwork::None => "none",
     };
     let body = ContainerCreateBody {
-        image: Some(helper.image),
+        image: Some(intent.image_id.clone().unwrap_or(helper.image)),
         labels: Some(labels),
         user: Some(user.into()),
         entrypoint: intent

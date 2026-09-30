@@ -224,6 +224,13 @@ pub(crate) struct HelperIntent {
     pub phase: HelperPhase,
     #[serde(default)]
     pub result: Option<HelperResult>,
+    /// The image ID the helper was created from, on an engine whose inspect names the
+    /// image rather than echoing the reference (Podman). Read-back proves identity
+    /// against this, so a mutable tag repointed later cannot strand the helper's stop
+    /// and cleanup. Absent in journals written before it existed: those resolve the
+    /// reference at read-back, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
 }
 fn default_phase() -> HelperPhase {
     HelperPhase::Creating

@@ -24,6 +24,14 @@ struct LogGate {
 struct State {
     /// The engine's `/info`; `{}` (a rootful Docker with no CDI) when unset.
     info: Option<Value>,
+    /// The engine answers `/version` as Podman and serves Podman's native container
+    /// inspect; its compatible inspect reports the image ID the container came from.
+    podman: bool,
+    /// The image ID an image reference resolves to now: a mutable tag, repointable
+    /// mid-test. `sha256:fixture-image` when unset.
+    ref_image_id: Option<String>,
+    /// The image ID the current container was created from (reported on Podman).
+    created_image_id: Option<String>,
     managed_ref: Option<String>,
     managed_id: String,
     managed_present: bool,
@@ -429,8 +437,30 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
     let mut response = json!({});
     let mut raw = None;
     let mut gate = None;
-    if route == "/version" {
+    if route == "/version" && s.podman {
+        response = json!({"Platform":{"Name":"linux/amd64"},"Components":[{"Name":"Podman Engine","Version":"5.8.4"}],"Version":"5.8.4","ApiVersion":"1.48","MinAPIVersion":"1.40"});
+    } else if route == "/version" {
         response = json!({"Platform":{"Name":"Docker"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"});
+    } else if method == "GET" && route.starts_with("/v4.0.0/libpod/containers/") {
+        // Podman's native inspect: the exact caps (none, after drop-all), the OCI
+        // runtime, and each realized mount's propagation.
+        assert!(s.podman, "native inspect asked of a Docker engine");
+        assert!(
+            route.contains(ID),
+            "native inspect must use the immutable id"
+        );
+        if let Some(body) = &s.body {
+            let mounts: Vec<Value> = body["HostConfig"]["Mounts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|_| json!({"Propagation":"rprivate"}))
+                .collect();
+            response = json!({"EffectiveCaps":null,"BoundingCaps":null,"OCIRuntime":"crun","Mounts":mounts});
+        } else {
+            code = 404;
+            response = json!({"message":"no such container"});
+        }
     } else if route == "/info" {
         // `inspect_engine`, which the runtime readiness checks call. Every field it
         // folds is optional, so an empty object is a complete answer.
@@ -456,7 +486,7 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
                         .collect(),
                 )
             });
-            response = json!({"Id":if s.managed_ref.is_some() { s.managed_id.as_str() } else { "sha256:fixture-image" },"Config":{"Env":[],"Entrypoint":["/image-entry"],"Cmd":["image-command"],"User":null,"Volumes":volumes}});
+            response = json!({"Id":if s.managed_ref.is_some() { s.managed_id.as_str() } else { s.ref_image_id.as_deref().unwrap_or("sha256:fixture-image") },"Config":{"Env":[],"Entrypoint":["/image-entry"],"Cmd":["image-command"],"User":null,"Volumes":volumes}});
         }
     } else if method == "DELETE" && route.starts_with("/images/") {
         assert!(
@@ -488,6 +518,18 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
         } else {
             assert!(s.body.is_none(), "duplicate create");
             s.body = Some(serde_json::from_slice(&body).unwrap());
+            // Podman resolves a reference at create; an image ID is taken as given.
+            let image = s.body.as_ref().unwrap()["Image"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            s.created_image_id = Some(if image.starts_with("sha256:") {
+                image
+            } else {
+                s.ref_image_id
+                    .clone()
+                    .unwrap_or_else(|| "sha256:fixture-image".into())
+            });
             s.name = route
                 .split("name=")
                 .nth(1)
@@ -684,7 +726,14 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
                 let env = config["Env"].as_array_mut().unwrap();
                 env.extend(s.inherited_env.iter().cloned().map(Value::String));
             }
-            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Image":if s.managed_ref.is_some() { s.managed_id.as_str() } else { "sha256:fixture-image" },"Name":format!("/{}",s.name),"Config":config,"HostConfig":host_config,"Mounts":realized_mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit,"OOMKilled":s.oom_killed}});
+            let image = if s.podman {
+                s.created_image_id.clone().unwrap_or_default()
+            } else if s.managed_ref.is_some() {
+                s.managed_id.clone()
+            } else {
+                "sha256:fixture-image".to_owned()
+            };
+            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Image":image,"Name":format!("/{}",s.name),"Config":config,"HostConfig":host_config,"Mounts":realized_mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit,"OOMKilled":s.oom_killed}});
             if let Some(inspect_code) = s.inspect_code.or_else(|| {
                 (s.running || s.exited)
                     .then_some(s.inspect_after_start_code)
@@ -3219,6 +3268,152 @@ fn helper_intent_path(engine: &Engine, operation: &str) -> std::path::PathBuf {
 
 fn helper_intent(engine: &Engine, operation: &str) -> HelperIntent {
     serde_json::from_slice(&std::fs::read(helper_intent_path(engine, operation)).unwrap()).unwrap()
+}
+
+const IMAGE_A: &str = "sha256:image-a";
+const IMAGE_B: &str = "sha256:image-b";
+
+/// A Podman engine whose helper reference (`quasar-agent:test`) points at image A.
+fn podman_engine() -> Engine {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.podman = true;
+        state.ref_image_id = Some(IMAGE_A.into());
+        state.keep_running = true;
+    }
+    engine
+}
+
+#[test]
+fn podman_audio_sidecar_survives_a_repointed_tag_through_stop_retirement_and_cleanup() {
+    for teardown in ["stop", "boot retirement"] {
+        let engine = podman_engine();
+        let (helper, run) = audio_request(&engine);
+        let operation = helper.operation.clone();
+        let id = engine
+            .client()
+            .run_audio_sidecar(helper, run)
+            .wait()
+            .unwrap();
+        assert_eq!(
+            helper_intent(&engine, &operation).image_id.as_deref(),
+            Some(IMAGE_A),
+            "{teardown}: the image ID is journalled at create"
+        );
+        assert_eq!(
+            engine.state.lock().unwrap().body.as_ref().unwrap()["Image"],
+            json!(IMAGE_A),
+            "{teardown}: the container is created from the pinned ID"
+        );
+        assert!(
+            engine.requests("GET /v4.0.0/libpod/containers/") > 0,
+            "{teardown}: the Podman read-back ran"
+        );
+        // The mutable tag now names image B; the container is still A's.
+        engine.state.lock().unwrap().ref_image_id = Some(IMAGE_B.into());
+        let resolved = engine.requests("GET /images/");
+        match teardown {
+            "stop" => engine
+                .client()
+                .stop_audio_sidecar(id.clone())
+                .wait()
+                .unwrap(),
+            _ => engine.client().retire_audio_sidecars().wait().unwrap(),
+        }
+        assert_eq!(
+            engine.requests(&format!("POST /containers/{ID}/stop")),
+            1,
+            "{teardown}"
+        );
+        assert!(!engine.state.lock().unwrap().running, "{teardown}");
+        engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+        assert_eq!(
+            engine.requests(&format!("DELETE /containers/{ID}")),
+            1,
+            "{teardown}"
+        );
+        assert!(engine.state.lock().unwrap().body.is_none(), "{teardown}");
+        assert_eq!(
+            engine.requests("GET /images/"),
+            resolved,
+            "{teardown}: read-back proves identity by the recorded ID, not the tag"
+        );
+    }
+}
+
+#[test]
+fn podman_journal_without_an_image_id_still_resolves_the_reference_at_read_back() {
+    let engine = podman_engine();
+    let (helper, run) = audio_request(&engine);
+    let operation = helper.operation.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    // A journal written before `image_id` existed.
+    rewrite_helper_intent(&engine, &operation, |intent| intent.image_id = None);
+    assert!(
+        !std::fs::read_to_string(helper_intent_path(&engine, &operation))
+            .unwrap()
+            .contains("image_id")
+    );
+    // Unchanged for old journals: the reference is resolved again, and a repointed
+    // tag cannot prove identity, so no stop is issued.
+    engine.state.lock().unwrap().ref_image_id = Some(IMAGE_B.into());
+    let resolved = engine.requests("GET /images/");
+    assert_eq!(
+        engine
+            .client()
+            .stop_audio_sidecar(id.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(engine.requests("GET /images/") > resolved);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert!(engine.state.lock().unwrap().running);
+    // With the tag still on the created image, the old journal tears down as before.
+    engine.state.lock().unwrap().ref_image_id = Some(IMAGE_A.into());
+    let resolved = engine.requests("GET /images/");
+    engine
+        .client()
+        .stop_audio_sidecar(id.clone())
+        .wait()
+        .unwrap();
+    assert!(engine.requests("GET /images/") > resolved);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
+    assert_eq!(helper_intent(&engine, &operation).image_id, None);
+}
+
+#[test]
+fn docker_audio_sidecar_records_no_image_id_and_creates_from_the_reference() {
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let operation = helper.operation.clone();
+    let reference = helper.image.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    assert_eq!(helper_intent(&engine, &operation).image_id, None);
+    assert!(
+        !std::fs::read_to_string(helper_intent_path(&engine, &operation))
+            .unwrap()
+            .contains("image_id")
+    );
+    assert_eq!(
+        engine.state.lock().unwrap().body.as_ref().unwrap()["Image"],
+        json!(reference)
+    );
+    assert_eq!(engine.requests("GET /v4.0.0/libpod/"), 0);
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
 }
 
 #[test]

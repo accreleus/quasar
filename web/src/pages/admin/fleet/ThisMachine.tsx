@@ -5,7 +5,7 @@
  * thisMachine.ts.
  */
 
-import type { ThisMachine } from "./thisMachine";
+import type { ThisMachine } from "./machineReport";
 import { elapsedWords } from "../../../lib/format/relativeTime";
 
 export function ThisMachineBlock({ machine, now }: { machine: ThisMachine; now: number }) {

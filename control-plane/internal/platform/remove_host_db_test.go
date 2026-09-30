@@ -303,17 +303,21 @@ func TestRemoveHostWithSessionsRefusesWithoutForceAndRestoresTheCordon(t *testin
 	}
 }
 
-func TestRemoveHostAckOutcomesRestoreTheCordon(t *testing.T) {
+func TestRemoveHostAckOutcomesRestoreTheCordonOnlyOnARefusal(t *testing.T) {
 	for _, c := range []struct {
-		name string
-		ack  Ack
-		err  error
-		code int
-		errc string
+		name     string
+		ack      Ack
+		err      error
+		code     int
+		errc     string
+		reopened bool
 	}{
-		{"the actor refused", Ack{OK: false, Error: "busy"}, nil, http.StatusConflict, CodeHostNotRemovable},
-		{"no ack", Ack{}, context.DeadlineExceeded, http.StatusNotImplemented, CodeApplyUnsupported},
-		{"undeliverable", Ack{}, io.ErrClosedPipe, http.StatusConflict, CodeHostNotEligible},
+		{"the actor refused", Ack{OK: false, Error: "busy"}, nil, http.StatusConflict, CodeHostNotRemovable, true},
+		// The actor records a removal before it answers, so each of these may hide one
+		// that is already queued: the host must stay closed to new sessions.
+		{"the actor's answer was lost", Ack{OK: false, Error: ReasonUpdaterUnreachable}, nil, http.StatusConflict, CodeHostNotRemovable, false},
+		{"no ack", Ack{}, context.DeadlineExceeded, http.StatusNotImplemented, CodeApplyUnsupported, false},
+		{"undeliverable", Ack{}, io.ErrClosedPipe, http.StatusConflict, CodeHostNotEligible, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			h := newRemoveHarness(t)
@@ -328,8 +332,11 @@ func TestRemoveHostAckOutcomesRestoreTheCordon(t *testing.T) {
 			if c.errc == CodeHostNotEligible && (reasonOf(t, body) != ReasonHostOffline || bytes.Contains(body, []byte("release"))) {
 				t.Errorf("an undeliverable removal = %s, want host_offline in removal wording", body)
 			}
-			if h.status(t) != "online" {
-				t.Error("the cordon was not restored")
+			if got := h.status(t) == "online"; got != c.reopened {
+				t.Errorf("host status %q, want reopened=%v", h.status(t), c.reopened)
+			}
+			if !c.reopened && !bytes.Contains(body, []byte("stays drained")) {
+				t.Errorf("an uncertain outcome does not say the host stays drained: %s", body)
 			}
 		})
 	}

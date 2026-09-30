@@ -176,23 +176,33 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Send, and wait for the ack.
+	// 4. Send, and wait for the ack. Only a definite refusal from the recovery actor
+	// lifts the cordon. Every other failure is uncertain: the actor records a removal
+	// before it answers, so a lost answer (a timeout, a connection that closed, the
+	// agent's own updater_unreachable) may hide one that is already queued, and
+	// reopening the host would let new sessions land on a machine about to be taken
+	// apart. The cordon stays, and the operator lifts it from the console once the
+	// host is back and still there.
 	requestID := h.NewRequestID()
 	sctx, cancel := context.WithTimeout(ctx, h.AckTimeout)
 	ack, err := h.deps.Send(sctx, hostID, requestID)
 	cancel()
+	const stillDrained = "; the host stays drained in case the removal went through, so lift the operator drain from the console once it is back online"
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		restore(ctx)
 		httpx.WriteError(w, http.StatusNotImplemented, CodeApplyUnsupported,
-			"this host's agent did not answer the removal, so it predates it and nothing was removed; update it first")
+			"this host's agent did not answer the removal; it may predate it"+stillDrained)
 		return
 	case err != nil:
 		// Undeliverable: the agent's connection is gone (the send found none, or it closed
 		// before an ack). The contract's word for "nobody to tell" is host_offline; a
 		// removal the actor did accept shows as the host staying offline.
-		restore(ctx)
-		writeRemovalNotEligible(w, ReasonHostOffline)
+		writeNotEligibleMessage(w, ReasonHostOffline,
+			"this host's agent disconnected before it answered the removal"+stillDrained)
+		return
+	case !ack.OK && ack.Error == ReasonUpdaterUnreachable:
+		httpx.WriteError(w, http.StatusConflict, CodeHostNotRemovable,
+			"the host's recovery actor did not answer the removal ("+ack.Error+")"+stillDrained)
 		return
 	case !ack.OK:
 		restore(ctx)
