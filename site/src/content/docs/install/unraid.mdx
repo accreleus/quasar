@@ -1,0 +1,125 @@
+---
+title: Install on Unraid
+description: Install Quasar on Unraid with one docker run seed. No host preparation script; storage off the FUSE layer; NVIDIA driver notes.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Unraid uses its own Docker, which runs as root: **rootful Docker is the supported
+mode**. Unraid has no rootless Docker and no Podman. Plain `docker run` and Dockge
+both work.
+
+## What you need
+
+- A GPU whose driver is loaded: `ls /dev/dri` shows a `renderD*` node.
+- About 20 GB free where Docker stores images, plus room for games and saves.
+- A root shell on the Unraid host. Commands run without `sudo`.
+
+### NVIDIA
+
+- Install the **NVIDIA driver plugin**, then check `nvidia-smi` lists the GPU.
+- RTX 50-series cards need the **open** kernel modules.
+- Unraid 7's plugin provides the **595** driver branch. On the RTX 5090,
+  **595.99.02 corrupts AV1**. Update to the **610** branch (**610.57.04** is clean),
+  or use HEVC or H.264. See [AV1 driver
+  compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
+
+## Storage paths
+
+`/mnt/user` is Unraid's FUSE user-share layer (shfs). Point the homes root, the
+templates root and any other Quasar data at a path that **bypasses** it:
+
+| Use | Example |
+| --- | --- |
+| A pool path | `/mnt/cache/appdata/quasar` |
+| A single disk | `/mnt/disk1/appdata/quasar` |
+| An exclusive-access share | the share's path |
+
+- The quick start fills in `/mnt/user/appdata/quasar` as the **Base path** for
+  Unraid. Change it to one of the paths above.
+- `/root` is a ramdisk. Never keep homes, templates or a Dockge stacks directory
+  there. Keep Dockge's stacks directory under `/mnt/user/appdata` so it survives a
+  reboot.
+- Game and save data is owned by uid 99 and gid 100, the Unraid convention. The
+  quick start sets `QUASAR_APP_PUID=99` and `QUASAR_APP_PGID=100` for you.
+
+## Host preparation
+
+`prepare-host.sh` is **not used** on Unraid: it writes under `/etc`, which Unraid
+recreates at every boot. Instead the quick start's script sets the
+[UDP send buffer](/quasar/start/requirements/#one-sysctl) and loads `uinput`, and
+persists both in `/boot/config/go`:
+
+```bash
+sysctl -w net.core.wmem_default=2097152 >/dev/null
+# /etc is a ramdisk on Unraid, so persist through the boot script instead.
+grep -q 'wmem_default' /boot/config/go || echo 'sysctl -w net.core.wmem_default=2097152' >> /boot/config/go
+modprobe uinput
+grep -q 'modprobe uinput' /boot/config/go || echo 'modprobe uinput' >> /boot/config/go
+```
+
+Re-running it adds nothing twice.
+
+## Install
+
+1. In the [quick start](/quasar/start/quickstart/), pick **Unraid**, your role and
+   access, and change the **Base path** (see [Storage paths](#storage-paths)).
+2. **Read the script** it shows, then run it in the Unraid shell.
+
+The script:
+
+- checks for `docker`, `curl` and `/dev/dri`;
+- stops if a Compose-made Quasar stack or an existing seed is on the machine;
+- pins the current stable release's images by digest;
+- creates the homes and templates roots, owned by 99:100;
+- sets the sysctl and `uinput` as above;
+- starts **one container, the seed**, and waits up to ten minutes for Quasar.
+
+The seed it starts, with your values in place of the examples:
+
+```bash
+docker run -d --name quasar-seed --restart unless-stopped \
+  --security-opt label=disable \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine:ro \
+  -e QUASAR_ROLE=combined \
+  -e QUASAR_PUBLIC_HOST=192.168.1.50 \
+  -e QUASAR_HOME_ROOT=/mnt/cache/appdata/quasar/homes \
+  -e QUASAR_TEMPLATE_ROOT=/mnt/cache/appdata/quasar/templates \
+  -e QUASAR_APP_PUID=99 \
+  -e QUASAR_APP_PGID=100 \
+  -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest> \
+  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
+  ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
+```
+
+Every input, the Dockge stack form, your own Postgres and the image-digest loop are
+the same as on Docker: see [Install the first
+machine](/quasar/install/docker/#install-the-first-machine).
+
+## How to know it worked
+
+The script ends with:
+
+> `Quasar is running. Open https://<host>:8443 and accept the certificate once.`
+
+Check it again any time:
+
+```bash
+docker exec quasar-recovery quasar-recovery status
+curl http://localhost:8080/health
+```
+
+You want `{"status":"ok","db":"ok"}`. Then continue with [First run and
+checks](/quasar/install/first-run/).
+
+<Aside type="caution" title="A Compose stack under /root">
+An older Compose install kept in `/root` is lost at the next reboot. See [Moving an
+existing stack](/quasar/install/legacy-compose/#moving-an-existing-stack).
+</Aside>
+
+## Removing it
+
+Uninstall as on any host ([Uninstalling](/quasar/operations/uninstall/)), then remove
+the `sysctl -w net.core.wmem_default=2097152` and `modprobe uinput` lines from
+`/boot/config/go`.

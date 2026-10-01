@@ -1,6 +1,6 @@
 ---
-title: First-run setup
-description: Claiming the founding admin account and completing the five-step setup wizard.
+title: First run and checks
+description: Claim the first admin account, finish the five-step setup wizard, then check the install end to end.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -9,7 +9,8 @@ import setup_claim from '../../../assets/shots/setup-claim.png';
 import setup_hosts from '../../../assets/shots/setup-hosts.png';
 
 The first time you open Quasar, it sends you to `/setup`. The wizard is resumable:
-close the tab and you come back where you left off.
+close the tab and you come back where you left off. Then [check your
+install](#check-your-install). On Podman, use `podman` where a command says `docker`.
 
 <Shot
 	label="Setup wizard"
@@ -123,6 +124,113 @@ All optional, all changeable later:
 ## After the wizard
 
 1. Check Admin ▸ Fleet ▸ Releases reads `stable` ([Channels](/quasar/admin/releases/#channels)).
-2. [Check your install](/quasar/install/verify/) end to end.
+2. [Check your install](#check-your-install) end to end.
 3. [Add apps](/quasar/admin/apps/).
 4. [Invite people](/quasar/admin/users/).
+
+## Check your install
+
+Work down the list. Each step assumes the ones above passed.
+
+### 1. The control plane answers
+
+```bash
+curl http://localhost:8080/health
+```
+
+Expected: `{"status":"ok","db":"ok"}`. This works before HTTPS is set up.
+
+### 2. The containers are up
+
+```bash
+docker ps --filter label=io.quasar.installation
+```
+
+| Machine | You want |
+| --- | --- |
+| Combined host | `quasar-recovery`, `quasar-postgres`, `quasar-control-plane`, `quasar-node-agent` |
+| Control-only host | `quasar-recovery`, `quasar-postgres`, `quasar-control-plane` |
+| GPU host | `quasar-recovery`, `quasar-node-agent` |
+
+All should be healthy. The seed (`quasar-seed`) is not listed. With your own
+database there is no `quasar-postgres`.
+
+The recovery actor lists the same services and anything in the way:
+
+```bash
+docker exec quasar-recovery quasar-recovery status
+```
+
+On a [legacy Compose install](/quasar/install/legacy-compose/), use
+`docker compose -f deploy/docker-compose.yml ps`.
+
+### 3. The node agent registered
+
+Your machine should be in **Admin ▸ Fleet ▸ Hosts** with a recent heartbeat. From
+the shell:
+
+```bash
+curl http://127.0.0.1:9091/health
+```
+
+```json
+{"status":"ok","sessions":0,"connected":true}
+```
+
+`connected: false` means the agent can't reach the control plane. On a GPU host, the
+enrollment string may be spent or expired: create a fresh command. See [When it says
+no](/quasar/install/second-host/#when-it-says-no).
+
+### 4. The GPU was found, and an encoder with it
+
+Open the host in **Admin ▸ Fleet ▸ Hosts**. The GPU should be listed with a render
+node and an encoder. A GPU with no encoder is the common failure: see [Install and
+startup problems](/quasar/troubleshooting/install/).
+
+```bash
+ls -l /dev/dri
+```
+
+No `renderD128` means no GPU is available to containers.
+
+### 5. Virtual input works
+
+```bash
+ls -l /dev/uinput
+```
+
+It must exist and be **writable** by the agent. The host detail page's readiness
+check tests this.
+
+### 6. A session actually streams
+
+Launch something from the library in Chrome. You should see moving video and hear
+audio.
+
+<Aside type="caution" title="A session in the `running` state is not proof">
+A session can report running while the browser decodes nothing. Look at the picture.
+</Aside>
+
+Press **Ctrl+Alt+Shift+Q**, turn on performance stats, and check the frame rate is
+close to the tier you launched.
+
+### 7. Certificates cover the address you use
+
+The certificate must name the address you browse to. The names come from
+`QUASAR_PUBLIC_HOST` and `QUASAR_TLS_HOSTS` (on legacy Compose, `QUASAR_TLS_HOSTS` in
+`deploy/.env`). To fix a missing one, see [HTTPS and
+certificates](/quasar/network/https/).
+
+```bash
+docker exec quasar-control-plane \
+  sh -c 'openssl x509 -in /var/lib/quasar-control/tls/cert.pem -noout -text' \
+  | grep -A1 'Subject Alternative Name'
+```
+
+On legacy Compose, use `docker compose -f deploy/docker-compose.yml exec
+quasar-control-plane` instead of `docker exec quasar-control-plane`.
+
+### If something failed
+
+See [Install and startup problems](/quasar/troubleshooting/install/) and [Health and
+logs](/quasar/operations/health/).

@@ -1,0 +1,244 @@
+---
+title: Moving an install
+description: "Replace a Compose install, or move a rootful install to rootless: a fresh install plus a database dump restore."
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Neither move happens in place. You do a **fresh install** and load a dump of the old
+database before the new install first starts.
+
+| From | To | Follow |
+| --- | --- | --- |
+| A [legacy Compose install](/quasar/install/legacy-compose/) | An owned install | [Move a Compose install](#move-a-compose-install) |
+| A rootful owned install | Rootless Docker or Podman | [Move to rootless](#move-to-rootless) |
+
+Either way:
+
+- **The database comes with you:** accounts, app library, profiles and settings.
+- **Hosts are added again, under their old node names**, which keeps their
+  history and homes.
+- **Stored credentials are entered again.** The new install has a new
+  `QUASAR_SECRET_KEY`.
+
+## Before you start
+
+- From **Admin**, **Fleet**, note each host's **node name** and every machine's
+  home root (and template root).
+- Install the same release as the old one, or newer. A dump from a newer release
+  is refused.
+- Plan a window with no one playing.
+- Read [Install with Docker](/quasar/install/docker/) or [Install with
+  Podman](/quasar/install/podman/) once.
+
+## Move a Compose install
+
+- **The old install keeps working** meanwhile and gets no updates. No rush.
+- **Homes stay where they are.** Give the new install the same home root.
+- Keep the old `deploy/.env`.
+
+<Steps>
+
+1. **Stop the old control plane and every agent, but not the database.** On the
+   first machine, from its stack directory:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml stop quasar-control-plane quasar-node-agent quasar-updater
+   ```
+
+   On each other GPU host:
+
+   ```bash
+   docker compose --project-directory /opt/quasar-agent down
+   ```
+
+2. **Dump the old database** in custom format (`-Fc`):
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml exec -T quasar-postgres \
+     pg_dump -Fc -U quasar quasar > quasar-move.dump
+   head -c 5 quasar-move.dump; echo    # prints PGDMP
+   ```
+
+   If `deploy/.env` sets `POSTGRES_USER`, use that instead of `quasar`. A dump
+   without `PGDMP` will be refused.
+
+3. **Remove the old stack** on the first machine, without `-v`:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml down
+   ```
+
+   This keeps the old volumes so you can go back. The old containers must be
+   removed, not just stopped: the new install refuses to work around them, and
+   they hold ports 8080 and 8443.
+
+4. **Install the first machine, held for the restore.** Follow
+   [Install the first machine](/quasar/install/docker/#install-the-first-machine)
+   with three changes:
+
+   - add `QUASAR_AWAIT_RESTORE=1` (`-e QUASAR_AWAIT_RESTORE=1` with `docker run`,
+     or `QUASAR_AWAIT_RESTORE: "1"` in the stack's `environment`);
+   - use the **same home root** as the old `QUASAR_HOME_ROOT`;
+   - on a combined machine, set `QUASAR_NODE_NAME` to the old `NODE_NAME`.
+
+   The seed installs Postgres and waits; the console isn't up yet.
+   `docker logs quasar-recovery` shows the next command. Restore only works into
+   Quasar's own database. If you use your own (`QUASAR_DATABASE_HOST`), restore it
+   with your own tools before installing.
+
+5. **Load the dump**, on the machine holding `quasar-move.dump`:
+
+   ```bash
+   docker exec -i quasar-recovery quasar-recovery restore --dump - < quasar-move.dump
+   ```
+
+   Keep `-i`: the dump comes from standard input. The restore checks the file,
+   loads it, creates the control plane and waits until it's healthy. If it fails
+   before creating the control plane, nothing is kept: fix the named problem and
+   rerun. Rerunning after an interruption is also safe.
+
+6. **Sign in with your old admin account.** Every host shows **Offline**, except a
+   combined machine's own.
+
+7. **Add each GPU host again** ([Add a GPU host](/quasar/install/second-host/))
+   **with its old node name** and the same home root. A new name makes a new host;
+   the old one stays offline until you remove it.
+
+8. **Enter stored credentials again**, such as the SteamGridDB key (Admin,
+   Library, Sources) and Admin, Settings, Secrets. They were encrypted with the
+   old `QUASAR_SECRET_KEY` and show as not readable.
+
+9. **Verify** as in [Check your install](/quasar/install/first-run/#check-your-install):
+   hosts online and a real session plays. Players stay signed in.
+
+</Steps>
+
+After the install, you can remove `QUASAR_AWAIT_RESTORE` from the seed.
+
+<Aside type="caution" title="Keep the old install until you are sure">
+Don't run `docker compose down -v`, delete old volumes or remove the old
+`deploy/.env` until the new install has run a real session. To go back, take the
+new install apart ([Uninstalling](/quasar/operations/uninstall/)), then run
+`docker compose -f deploy/docker-compose.yml up -d` in the old stack directory
+and `docker compose --project-directory /opt/quasar-agent up -d` on each GPU host.
+</Aside>
+
+### What does not come across
+
+- **Stored credentials** (step 8).
+- **The old hosts' agents** (step 7).
+- **The old stack's files.** Most `deploy/.env` settings don't apply; see the
+  [environment reference](/quasar/reference/environment/).
+- **Portainer** isn't supported. Plain Docker (including a `docker run` seed on
+  Unraid), Dockge and Arcane are.
+
+## Move to rootless
+
+An install can't be switched from rootful to rootless in place.
+
+- **Homes are copied** into a new root owned by the `quasar` account, never
+  re-owned in place ([why](/quasar/start/engine-profiles/#rootless-docker-and-home-ownership)).
+- **Same machine or a different one.** Either way, fully uninstall the old
+  install before starting the new one.
+- These steps show rootless Podman. For rootless Docker, use `docker` in place of
+  `podman`.
+
+<Steps>
+
+1. **Stop the old seed** (`docker rm -f quasar-seed`, or remove it in your stack
+   manager). The next step refuses while a seed exists.
+
+2. **Take a final dump and remove the old install**, on the old machine:
+
+   ```bash
+   docker exec quasar-recovery quasar-recovery uninstall --purge \
+     --confirm <old node name> --dump-to /var/lib/quasar/move
+   ```
+
+   This writes `/var/lib/quasar/move/quasar-final-<timestamp>.dump` on the host,
+   then removes the old containers, volumes and network. Homes and templates are
+   kept. If the dump fails, nothing is deleted. Copy the dump off if you're
+   changing machines, then:
+
+   ```bash
+   docker volume rm quasar-machine
+   ```
+
+   Your own database (`QUASAR_DATABASE_HOST`) is not dumped. Restore it with your
+   own tools before the new install first starts.
+
+3. **Prepare the new host for rootless**, with **new** homes and templates paths:
+
+   ```bash
+   sudo sh prepare-host.sh --mode rootless --engine podman \
+     --homes /var/lib/quasar/homes-rootless --templates /var/lib/quasar/templates-rootless
+   ```
+
+   On the same machine, run this after step 2.
+
+4. **Copy homes and templates**, setting the owner during the copy:
+
+   ```bash
+   sudo rsync -a --chown=quasar:quasar /var/lib/quasar/homes/ /var/lib/quasar/homes-rootless/
+   sudo rsync -a --chown=quasar:quasar /var/lib/quasar/templates/ /var/lib/quasar/templates-rootless/
+   ```
+
+   Don't `chown -R` or delete the old roots until the new install has played a
+   real session.
+
+5. **Install fresh, held for the restore.** In the
+   [Quick start](/quasar/start/quickstart/), choose Podman, rootless, the old
+   install's role (combined or control-only) and the **new** homes root. Before
+   running the script, add to the Quadlet unit:
+
+   ```bash
+   Environment=QUASAR_AWAIT_RESTORE="1"
+   Environment=QUASAR_NODE_NAME="<old node name>"
+   ```
+
+   (`QUASAR_NODE_NAME` on a combined machine only. With `podman run`, use `-e`.)
+   The seed installs Postgres and waits. As the `quasar` account,
+   `podman logs quasar-seed` shows the restore command (no session yet? see
+   [getting a rootless session](/quasar/install/podman/#getting-a-rootless-session-as-the-quasar-account)).
+
+6. **Restore the dump**, on the new machine:
+
+   ```bash
+   podman exec -i quasar-recovery quasar-recovery restore --dump - < quasar-final-<timestamp>.dump
+   ```
+
+   Keep `-i`: the dump comes from standard input. If it fails before the control
+   plane is created, nothing is kept: fix the named problem and rerun.
+
+7. **Sign in with the old admin account** and add each GPU host again
+   ([Add a GPU host](/quasar/install/second-host/#4-run-it))
+   with its old node name and the new homes root. On rootless, run the command as
+   the `quasar` account.
+
+8. **Enter stored credentials again** (the SteamGridDB key and Admin, Settings
+   secrets).
+
+9. **Verify** as in [Check your install](/quasar/install/first-run/#check-your-install):
+   hosts online and a real session that saves into the copied homes. Then remove
+   the old homes and template roots.
+
+</Steps>
+
+`uninstall --purge` also refuses while a seed exists (step 1) or when run inside
+the recovery actor's own container.
+
+## If the restore says no
+
+| Message | Fix |
+| --- | --- |
+| Dump is newer than this install's control plane | Take the new install apart with `uninstall --purge` and install that release or newer. |
+| Not a custom-format archive, or `pg_restore` can't read it | Dump again with `-Fc`. Check it starts with `PGDMP` and matches the size on the old machine. |
+| This machine's control plane has already been created | The install wasn't held, or has booted since. Run `docker exec quasar-recovery quasar-recovery uninstall --purge`, remove the `quasar-machine` volume, and install again with `QUASAR_AWAIT_RESTORE=1`. |
+| Control plane did not report healthy | Check `docker logs quasar-control-plane`. To start over, take the new install apart as above. |
+
+## Staying on Compose
+
+A legacy install keeps working on its release, without updates. See
+[Legacy Compose installs](/quasar/install/legacy-compose/). Building from source
+with Compose is for contributors only: [Set up a checkout](/quasar/developer/getting-started/).

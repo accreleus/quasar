@@ -19,7 +19,7 @@ This is the practical subset. The full list is `docs/configuration.md` in the re
 ## Seed inputs
 
 Read **once**, on a clean machine. Afterwards the machine's own state wins, so you
-can remove the enrollment string from the stack. See [Install Quasar](/quasar/install/install/).
+can remove the enrollment string from the stack. See [Install with Docker](/quasar/install/docker/).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -46,7 +46,7 @@ On the first machine (`combined` or `control-only`), also:
 | `QUASAR_DATABASE_PORT`, `QUASAR_DATABASE_USER`, `QUASAR_DATABASE_NAME` | `5432`, `quasar`, `quasar` | Your database's connection. |
 | `QUASAR_DATABASE_SSLMODE` | `disable` | Use `require` or `verify-full` for a remote database. |
 | `QUASAR_DATABASE_PASSWORD` | required with `QUASAR_DATABASE_HOST` | Take it from the stack's `.env`. Read only at install. |
-| `QUASAR_AWAIT_RESTORE` | unset | `1` holds the new control plane until you load a Compose dump. Quasar's own database only. See [Move a Compose install](/quasar/install/move-existing/). |
+| `QUASAR_AWAIT_RESTORE` | unset | `1` holds the new control plane until you load a Compose dump. Quasar's own database only. See [Move a Compose install](/quasar/install/moving/#move-a-compose-install). |
 | `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | the installed release's | Pins, by digest, the images Add host installs. |
 
 The seed also needs two mounts: the engine socket, and the `quasar-machine` volume

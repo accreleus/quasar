@@ -37,6 +37,17 @@ export default defineConfig({
 	site: SITE,
 	base: BASE,
 	trailingSlash: 'always',
+	// Install was reorganised by platform (Docker, Podman, Unraid). Old URLs are
+	// printed by released quick-start scripts and linked from outside, so each one
+	// keeps working. Keys omit the base; targets include it.
+	redirects: {
+		'/install/install/': '/quasar/install/docker/',
+		'/install/prepare-host/': '/quasar/install/docker/#prepare-the-host',
+		'/install/podman-quadlet/': '/quasar/install/podman/',
+		'/install/verify/': '/quasar/install/first-run/#check-your-install',
+		'/install/move-existing/': '/quasar/install/moving/#move-a-compose-install',
+		'/install/move-to-rootless/': '/quasar/install/moving/#move-to-rootless',
+	},
 	// The quick start's engine-profiles.js (RH07-14, #406) reads
 	// testdata/engine-profiles/profiles.json, and prepare-host-source.js (Node
 	// only — see that file) reads deploy/prepare-host.sh: both outside site/,
@@ -137,15 +148,18 @@ export default defineConfig({
 					label: 'Install',
 					items: [
 						{ label: 'Quick start', slug: 'start/quickstart' },
-						{ label: 'Prepare the host', slug: 'install/prepare-host' },
-						{ label: 'Install Quasar', slug: 'install/install' },
-						{ label: 'Install with Podman (Quadlet)', slug: 'install/podman-quadlet' },
-						{ label: 'First-run setup', slug: 'install/first-run' },
-						{ label: 'Check your install', slug: 'install/verify' },
-						{ label: 'Add a second GPU host', slug: 'install/second-host' },
-						{ label: 'Moving to rootless', slug: 'install/move-to-rootless' },
-						{ label: 'Move a Compose install', slug: 'install/move-existing' },
-						{ label: 'Legacy Compose installs', slug: 'install/legacy-compose' },
+						{ label: 'Docker', slug: 'install/docker' },
+						{ label: 'Podman', slug: 'install/podman' },
+						{ label: 'Unraid', slug: 'install/unraid' },
+						{ label: 'First run and checks', slug: 'install/first-run' },
+						{ label: 'Add a GPU host', slug: 'install/second-host' },
+						{
+							label: 'Moving an install',
+							items: [
+								{ label: 'Move to a new install', slug: 'install/moving' },
+								{ label: 'Legacy Compose installs', slug: 'install/legacy-compose' },
+							],
+						},
 					],
 				},
 				{

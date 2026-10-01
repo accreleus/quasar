@@ -541,7 +541,7 @@ for svc in quasar-postgres quasar-control-plane quasar-node-agent quasar-updater
 done
 if [ -n "$legacy" ]; then
   echo "This host still runs a Quasar stack made from the Compose files:$legacy." >&2
-  echo "To keep its accounts and library, follow https://accreleus.github.io/quasar/install/move-existing/" >&2
+  echo "To keep its accounts and library, follow https://accreleus.github.io/quasar/install/moving/#move-a-compose-install" >&2
   echo "instead of this script: it dumps the old database before anything is stopped." >&2
   echo "To start afresh, remove its containers without deleting its volumes" >&2
   echo "(docker compose -f <its directory>/docker-compose.yml down) and run this again." >&2
@@ -781,7 +781,7 @@ for svc in quasar-postgres quasar-control-plane quasar-node-agent quasar-updater
 done
 if [ -n "$legacy" ]; then
   echo "This host still runs a Quasar stack made from the Compose files:$legacy." >&2
-  echo "To keep its accounts and library, follow https://accreleus.github.io/quasar/install/move-existing/" >&2
+  echo "To keep its accounts and library, follow https://accreleus.github.io/quasar/install/moving/#move-a-compose-install" >&2
   echo "instead of this script: it dumps the old database before anything is stopped." >&2
   echo "To start afresh, remove its containers without deleting its volumes" >&2
   echo "(docker compose -f <its directory>/docker-compose.yml down) and run this again." >&2

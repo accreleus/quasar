@@ -73,7 +73,7 @@ docker compose -f deploy/docker-compose.yml exec quasar-control-plane cat /run/q
 ```
 
 Full walkthrough, including pinning a release and the certificate options:
-**[Install guide](https://accreleus.github.io/quasar/install/install/)**.
+**[Install guide](https://accreleus.github.io/quasar/install/docker/)**.
 
 <p align="center">
   <img src="site/src/assets/shots/admin-overview.png" width="820" alt="The admin console: hosts, GPUs and live sessions." />

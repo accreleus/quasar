@@ -51,7 +51,7 @@ docker exec quasar-recovery quasar-recovery status   # services, blockers, last 
 | `actor-engine-config` | The engine endpoint is unusable. The actor exits. |
 | `actor-no-gpu`, `actor-gpu-probe-unreadable` | No usable GPU found. The agent is installed anyway; readiness reports the gap. |
 | `actor-gpus-served` | The agent gets the NVIDIA device setup. Normal. |
-| `actor-gpu-injection-unavailable` | An NVIDIA GPU was found but this engine can't pass it through. Run [host preparation](/quasar/install/prepare-host/), restart the engine, then remove the agent container. |
+| `actor-gpu-injection-unavailable` | An NVIDIA GPU was found but this engine can't pass it through. Run [host preparation](/quasar/install/docker/#prepare-the-host), restart the engine, then remove the agent container. |
 | `actor-gpus-refused` | The engine refused the GPU. Fix the NVIDIA Container Toolkit (or the CDI spec on Podman and rootless Docker), then remove the agent container. |
 | `actor-gpus-probe-retry` | The engine didn't answer the GPU probe. Asked up to three times. |
 | `actor-helper-name-taken` | A foreign container holds `quasar-gpu-probe` or `quasar-secrets-writer`. Remove it. |
@@ -176,7 +176,7 @@ echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 
 If it exists, the agent must be able to open it for writing. The `uinput` and
 `input_probe` readiness checks test this. On a rootless engine, run [host
-preparation](/quasar/install/prepare-host/) and restart the agent. See
+preparation](/quasar/install/docker/#prepare-the-host) and restart the agent. See
 [Readiness checks](/quasar/troubleshooting/readiness/#input).
 
 ## A GPU-less host will not start
@@ -199,7 +199,7 @@ The page prints the recipe under the Targets table.
 | Reason | Fix |
 | --- | --- |
 | Built from source | Update it the way it was installed: `deploy/redeploy.sh <va\|nvidia> <ref>`. |
-| No recovery actor answers | Check `docker ps -a --filter name=quasar-recovery` and `docker logs --tail 50 quasar-recovery`. The seed re-creates a missing actor; restart the seed if it's gone too. Legacy Compose has no actor: update by hand or [move the install](/quasar/install/move-existing/). |
+| No recovery actor answers | Check `docker ps -a --filter name=quasar-recovery` and `docker logs --tail 50 quasar-recovery`. The seed re-creates a missing actor; restart the seed if it's gone too. Legacy Compose has no actor: update by hand or [move the install](/quasar/install/moving/#move-a-compose-install). |
 | Must update before it can be managed | Apply the update offered. |
 | A preflight check failed | Follow the fix shown. For *other owner's container in the way*, remove that container and whatever re-creates it. |
 | Target has not reported what it is running | An old agent. Upgrade it once by hand. See [Updating Quasar](/quasar/admin/releases/#targets). |

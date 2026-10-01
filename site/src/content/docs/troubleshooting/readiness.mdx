@@ -25,7 +25,7 @@ wizard. Blocking and overrides: [Hosts and GPUs](/quasar/admin/hosts/#when-a-che
 | Unknown | Not checked yet, or inconclusive. Never blocks. |
 | Skipped | Not applicable, or an optional diagnostic not enabled (it names the setting). |
 
-**Run host preparation** means run [`prepare-host.sh`](/quasar/install/prepare-host/)
+**Run host preparation** means run [`prepare-host.sh`](/quasar/install/docker/#prepare-the-host)
 again as root with your install's options. It only changes what's missing.
 
 ## Container engine
@@ -49,7 +49,7 @@ again as root with your install's options. It only changes what's missing.
 
 | Check | Meaning and fix |
 | --- | --- |
-| `homes_root_writable` | A test home can be written. Failing blocks launches that need a home. On rootless Docker it warns: session files are owned by a subordinate ID. Sessions still work; use rootless Podman if you want files owned by the Quasar account. Never re-own existing homes recursively ([Moving to rootless](/quasar/install/move-to-rootless/)). |
+| `homes_root_writable` | A test home can be written. Failing blocks launches that need a home. On rootless Docker it warns: session files are owned by a subordinate ID. Sessions still work; use rootless Podman if you want files owned by the Quasar account. Never re-own existing homes recursively ([Moving to rootless](/quasar/install/moving/#move-to-rootless)). |
 | `homes_free_space` | Warns below 5 GiB free (`QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`); fails when full. |
 
 ## Network

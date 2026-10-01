@@ -12,11 +12,22 @@ Answer a few questions and get one command to run, or one stack to paste into Do
 or Arcane. You need Linux, Docker or Podman, and about 20 GB of disk. See
 [requirements](/quasar/start/requirements/).
 
-The **Engine** step shows each [engine profile](/quasar/start/engine-profiles/)'s
-status for your platform. Except on Unraid, the result starts with [host
-preparation](/quasar/install/prepare-host/), then the install: a script for Docker,
-or a Quadlet unit for Podman. Read each script and check its checksum before you
-run it.
+## Pick your path
+
+| You run | Status | Read |
+| --- | --- | --- |
+| Docker, rootful | Supported | [Docker](/quasar/install/docker/) |
+| Docker, rootless | Experimental | [Docker](/quasar/install/docker/) |
+| Podman (Quadlet), rootless or rootful | Experimental | [Podman](/quasar/install/podman/) |
+| Unraid | Supported | [Unraid](/quasar/install/unraid/) |
+| Quasar from the Compose files, or rootful and moving to rootless | | [Moving an install](/quasar/install/moving/) |
+| Quasar already, adding a machine | | [Add a GPU host](/quasar/install/second-host/) |
+
+Status per platform: [engine profiles](/quasar/start/engine-profiles/). The wizard
+below writes the same install those pages describe. Except on Unraid, the result
+starts with [host preparation](/quasar/install/docker/#prepare-the-host), then the
+install: a script for Docker, or a Quadlet unit for Podman. Read each script and
+check its checksum before you run it.
 
 <Shot
 	label="Quick start, engine step"
@@ -26,7 +37,8 @@ run it.
 />
 
 The result installs the **seed**, which creates everything else and generates all
-secrets. [Install Quasar](/quasar/install/install/) covers every input.
+secrets. When it finishes, continue with [First run and
+checks](/quasar/install/first-run/).
 
 <Aside type="note" title="Stable releases">
 The install is pinned to the current stable release and updates only from the admin
@@ -36,7 +48,7 @@ an edge install to stable](/quasar/admin/releases/#moving-an-edge-install-to-sta
 
 <Aside type="note" title="Already running Quasar from the Compose files?">
 The script stops if it finds one. To keep your data, follow [Move a Compose
-install](/quasar/install/move-existing/) instead.
+install](/quasar/install/moving/#move-a-compose-install) instead.
 </Aside>
 
 <QuickStart />
