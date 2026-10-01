@@ -7,11 +7,20 @@ import starlight from '@astrojs/starlight';
 import starlightOpenAPI, { createOpenAPISidebarGroup } from 'starlight-openapi';
 
 import { prepareHostIntegration } from './src/data/prepare-host-source.js';
+import { DOCS_ROOT, docsVersion } from './src/data/docs-version.js';
+import { baseLinks, rebaseRedirects } from './src/data/base-links.js';
 
 // GitHub Pages project site. If the repo moves org, or the site later gets a
-// custom domain, these two constants are the only thing that has to change.
+// custom domain, SITE and DOCS_ROOT (src/data/docs-version.js) are the only
+// thing that has to change.
 const SITE = 'https://accreleus.github.io';
-const BASE = '/quasar';
+// Stable docs at DOCS_ROOT, edge (develop) docs under DOCS_ROOT/edge: the pages
+// workflow builds this config once per version and says which through the
+// environment (QUASAR_DOCS_CHANNEL; see docs-version.js). Content links are
+// written against DOCS_ROOT, and baseLinks moves them under BASE.
+const VERSION = docsVersion();
+const BASE = VERSION.base;
+const EDGE = VERSION.channel === 'edge';
 
 // The control-plane API reference is generated from the frozen contract itself
 // (`protocol/openapi.yaml`), not transcribed. That makes the spec the single
@@ -40,14 +49,14 @@ export default defineConfig({
 	// Install was reorganised by platform (Docker, Podman, Unraid). Old URLs are
 	// printed by released quick-start scripts and linked from outside, so each one
 	// keeps working. Keys omit the base; targets include it.
-	redirects: {
+	redirects: rebaseRedirects({
 		'/install/install/': '/quasar/install/docker/',
 		'/install/prepare-host/': '/quasar/install/docker/#prepare-the-host',
 		'/install/podman-quadlet/': '/quasar/install/podman/',
 		'/install/verify/': '/quasar/install/first-run/#check-your-install',
 		'/install/move-existing/': '/quasar/install/moving/#move-a-compose-install',
 		'/install/move-to-rootless/': '/quasar/install/moving/#move-to-rootless',
-	},
+	}, DOCS_ROOT, BASE),
 	// The quick start's engine-profiles.js (RH07-14, #406) reads
 	// testdata/engine-profiles/profiles.json, and prepare-host-source.js (Node
 	// only — see that file) reads deploy/prepare-host.sh: both outside site/,
@@ -62,6 +71,7 @@ export default defineConfig({
 		},
 	},
 	integrations: [
+		baseLinks({ root: DOCS_ROOT, base: BASE }),
 		// deploy/prepare-host.sh, published at <site>/quasar/prepare-host.sh: the quick
 		// start's prep block fetches it from there and checks it against the sha256 it
 		// prints, computed from the same bytes (src/data/prepare-host-source.js).
@@ -103,6 +113,8 @@ export default defineConfig({
 				alt: 'Quasar',
 			},
 			customCss: ['./src/styles/theme.css'],
+			// The stable / edge switcher rides in the SocialIcons slot.
+			components: { SocialIcons: './src/components/SocialIcons.astro' },
 			// Corrects the titles starlight-openapi generates; see the file.
 			routeMiddleware: './src/route-data.ts',
 			head: [
@@ -114,6 +126,9 @@ export default defineConfig({
 					content:
 						"try{if(!localStorage.getItem('starlight-theme')){localStorage.setItem('starlight-theme','dark');document.documentElement.dataset.theme='dark'}}catch(e){}",
 				},
+				// Edge describes develop, not a release: keep it out of search
+				// engines so a search lands on the stable docs.
+				...(EDGE ? [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex' } }] : []),
 			],
 			social: [
 				{
@@ -123,7 +138,7 @@ export default defineConfig({
 				},
 			],
 			editLink: {
-				baseUrl: 'https://github.com/accreleus/quasar/edit/main/site/',
+				baseUrl: `https://github.com/accreleus/quasar/edit/${EDGE ? 'develop' : 'main'}/site/`,
 			},
 			lastUpdated: true,
 			expressiveCode: {

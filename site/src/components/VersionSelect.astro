@@ -1,0 +1,76 @@
+---
+/**
+ * Stable / edge documentation switcher, in the header next to the GitHub link
+ * (and in the mobile menu, which renders the same SocialIcons slot).
+ *
+ * Starlight's own <Select> (the theme and language pickers use it), unmodified,
+ * so it carries no styling of its own. Each option's value is the current page's
+ * path in that version. The script checks that page exists there before going,
+ * and goes to that version's home if it does not: a page added on develop has
+ * no stable counterpart, and one removed on develop has no edge one.
+ *
+ * Renders nothing unless the build was told which version it is
+ * (QUASAR_DOCS_CHANNEL, src/data/docs-version.js), so a local build looks as
+ * it always did.
+ */
+import Select from '@astrojs/starlight/components/Select.astro';
+import { docsVersion, counterpartPath, CHANNEL_BASES } from '../data/docs-version.js';
+
+const version = docsVersion();
+const pathname = Astro.url.pathname;
+const options = [
+	{
+		channel: 'stable',
+		label: version.stableLabel ? `Stable (${version.stableLabel})` : 'Stable',
+	},
+	{ channel: 'edge', label: 'Edge (develop)' },
+].map(({ channel, label }) => {
+	const target = CHANNEL_BASES[channel];
+	const current = channel === version.channel;
+	return {
+		label,
+		selected: current,
+		value: current ? pathname : counterpartPath(pathname, version.base, target),
+		home: `${target}/`,
+	};
+});
+---
+
+{
+	version.switcher && (
+		<quasar-version-select data-homes={JSON.stringify(Object.fromEntries(options.map((o) => [o.value, o.home])))}>
+			<Select icon="seti:git" label="Documentation version" options={options} width="10.5em" />
+		</quasar-version-select>
+	)
+}
+
+<script>
+	class QuasarVersionSelect extends HTMLElement {
+		constructor() {
+			super();
+			const select = this.querySelector('select');
+			if (!select) return;
+			const homes: Record<string, string> = JSON.parse(this.dataset.homes ?? '{}');
+			select.addEventListener('change', async () => {
+				const target = select.value;
+				let destination = homes[target] ?? target;
+				try {
+					const res = await fetch(target, { method: 'HEAD' });
+					// Same page in the other version: keep the reader's place on it.
+					if (res.ok) destination = target + window.location.hash;
+				} catch {
+					// Offline or blocked: the version's home is the safe landing.
+				}
+				window.location.href = destination;
+			});
+			// A page restored from the back/forward cache keeps the changed
+			// selection; put it back to the version actually shown.
+			window.addEventListener('pageshow', (event) => {
+				if (!event.persisted) return;
+				const index = select.querySelector<HTMLOptionElement>('option[selected]')?.index;
+				if (index !== undefined && index !== select.selectedIndex) select.selectedIndex = index;
+			});
+		}
+	}
+	customElements.define('quasar-version-select', QuasarVersionSelect);
+</script>

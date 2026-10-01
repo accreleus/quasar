@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Stable and edge documentation.** The docs site now publishes the latest release's docs
+  at `/quasar/` (as before) and `develop`'s at `/quasar/edge/`, with a version switcher in
+  the header that keeps your page when it exists in both. Edge pages are not indexed by
+  search engines. The `pages` workflow resolves the latest release tag when it runs.
 - **RH-07 acceptance map (#409).** `docs/rh07/acceptance-map.md` ties every RH-07 user
   story and required engine-profile row (Docker rootful, Docker rootless, Podman rootless
   on AMD and NVIDIA) to its evidence, with a Podman-rootful/Ubuntu-24.04 claimed vs

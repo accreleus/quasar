@@ -1,0 +1,12 @@
+---
+/**
+ * Starlight's SocialIcons slot, overridden only to put the documentation
+ * version switcher in front of the GitHub link. The links themselves are
+ * Starlight's own component, unchanged.
+ */
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+import VersionSelect from './VersionSelect.astro';
+---
+
+<VersionSelect />
+<Default />
