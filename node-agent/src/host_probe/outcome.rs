@@ -115,11 +115,13 @@ pub fn remediation(kind: ProbeKind) -> String {
         ProbeKind::Media => "Check the render node is passed to the agent container, the \
             driver/driver volume, and the agent log for `token=\"host-probe-` lines."
             .into(),
-        ProbeKind::Input => "On a rootless engine, install Quasar's device rules (docs: Install, Device \
+        ProbeKind::Input => {
+            "On a rootless engine, install Quasar's device rules (docs: Install, Device \
             rules): they give the Quasar user Quasar's own input devices. \
             On a rootful engine, check /dev/uinput and /dev/input are passed to the agent and \
             device_cgroup_rules allows `c 13:* rw`."
-            .into(),
+                .into()
+        }
         ProbeKind::Audio => "Check the runtime lets the agent image start the audio sidecar as \
             a sibling container: the runtime_endpoint check, and the agent logs."
             .into(),
