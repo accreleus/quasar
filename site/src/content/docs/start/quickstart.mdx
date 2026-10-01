@@ -16,24 +16,24 @@ or Arcane. You need Linux, Docker or Podman, and about 20 GB of disk. See
 
 | You run | Status | Read |
 | --- | --- | --- |
-| Docker, rootful | Supported | [Docker](/quasar/install/docker/) |
-| Docker, rootless | Experimental | [Docker](/quasar/install/docker/) |
-| Podman (Quadlet), rootless or rootful | Experimental | [Podman](/quasar/install/podman/) |
-| Unraid | Supported | [Unraid](/quasar/install/unraid/) |
+| Docker, rootful | Supported | This wizard, or [Docker](/quasar/install/docker/) |
+| Podman (Quadlet), rootful | Experimental | This wizard, or [Podman](/quasar/install/podman/) |
+| Unraid | Supported | This wizard, or [Unraid](/quasar/install/unraid/) |
+| Docker or Podman, rootless | Experimental | [Install rootless](/quasar/install/rootless/) |
 | Quasar from the Compose files, or rootful and moving to rootless | | [Moving an install](/quasar/install/moving/) |
 | Quasar already, adding a machine | | [Add a GPU host](/quasar/install/second-host/) |
 
 Status per platform: [engine profiles](/quasar/start/engine-profiles/). The wizard
 below writes the same install those pages describe. Except on Unraid, the result
-starts with [host preparation](/quasar/install/docker/#prepare-the-host), then the
-install: a script for Docker, or a Quadlet unit for Podman. Read each script and
-check its checksum before you run it.
+starts with a few host commands you run yourself (the engine at boot, and NVIDIA
+if you have it), then the install: a script for Docker, or a Quadlet unit for
+Podman. Read the script before you run it.
 
 <Shot
 	label="Quick start, engine step"
-	sublabel="The engine step for Fedora: each engine and mode with its profile status."
+	sublabel="The engine step for Fedora: each engine with its profile status."
 	src={quickstart_engine}
-	alt="The quick start's engine step, with four engine profile badges"
+	alt="The quick start's engine step, with an engine profile badge per engine"
 />
 
 The result installs the **seed**, which creates everything else and generates all

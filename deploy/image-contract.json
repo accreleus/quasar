@@ -250,9 +250,9 @@
         "forbidden": ["go", "node", "npm", "cargo", "gcc"]
       },
       "paths": {
-        "required": ["/app/web/index.html", "/app/web/enroll-host.sh", "/app/web/prepare-host.sh"],
-        "_required_note": "The web root the control plane serves: the SPA, and the two operator scripts a host fetches from it (/enroll-host.sh, /prepare-host.sh, #100/#406). web/vite.config.ts fails the build when deploy/ lacks either script; this catches a Dockerfile that stops copying them into the web build.",
-        "forbidden": ["/root/.npm", "/go", "/usr/local/go"]
+        "required": ["/app/web/index.html", "/app/web/enroll-host.sh"],
+        "_required_note": "The web root the control plane serves: the SPA, and the operator script a host fetches from it (/enroll-host.sh, #100). web/vite.config.ts fails the build when deploy/ lacks it; this catches a Dockerfile that stops copying it into the web build. /prepare-host.sh is forbidden below: host preparation is written out in the docs, never served for download.",
+        "forbidden": ["/root/.npm", "/go", "/usr/local/go", "/app/web/prepare-host.sh"]
       },
       "labels": {
         "required": [

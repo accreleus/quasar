@@ -33,12 +33,11 @@ One Quasar installation per container engine.
 | Intel | VA-API | Untested |
 | None | openh264 (software) | Works, too slow to play on |
 
-**NVIDIA** needs the full driver (not CUDA-only) and the NVIDIA Container Toolkit:
-
-```bash
-sudo nvidia-ctk runtime configure
-sudo systemctl restart docker
-```
+**NVIDIA** needs the full driver (not CUDA-only) and the NVIDIA Container Toolkit.
+The install pages show the one or two commands that wire it to your engine:
+[Docker](/quasar/install/docker/#prepare-the-host),
+[Podman](/quasar/install/podman/#prepare-the-host),
+[rootless](/quasar/install/rootless/).
 
 ### NVIDIA on Unraid
 
@@ -46,25 +45,9 @@ See [Install on Unraid](/quasar/install/unraid/#nvidia).
 
 ### Kernel
 
-`/dev/uinput` must exist (Quasar's virtual keyboard, mouse and gamepads):
-
-```bash
-sudo modprobe uinput
-echo uinput | sudo tee /etc/modules-load.d/uinput.conf
-```
-
-### One sysctl
-
-Raise the UDP send buffer on every GPU host. Without it, keyframes get dropped and
-the stream throttles as if the network were bad:
-
-```bash
-echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
-sudo sysctl --system
-```
-
-[Host preparation](/quasar/install/docker/#prepare-the-host) and the quick start's scripts
-do this and the `uinput` step for you.
+Nothing to set for the install. `/dev/uinput` (Quasar's virtual keyboard, mouse and
+gamepads) loads on demand. For smoother streams, raise the [UDP send
+buffer](/quasar/tuning/latency/#the-udp-send-buffer): recommended, not required.
 
 ### Firewall
 

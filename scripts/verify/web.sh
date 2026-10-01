@@ -59,12 +59,11 @@ run "web typecheck" npm run typecheck
 run "web unit tests" npm test -- run
 run "web production build" npm run build
 
-# The control plane serves the operator scripts from the SPA root (web/vite.config.ts
-# emits them): each must be in dist, byte for byte the file in deploy/.
+# The control plane serves the operator script from the SPA root (web/vite.config.ts
+# emits it): it must be in dist, byte for byte the file in deploy/. Host preparation
+# is never served (the docs write its steps out), so dist must not carry it.
 served_scripts_check() {
-  local name
-  for name in enroll-host.sh prepare-host.sh; do
-    cmp -s "dist/$name" "../deploy/$name" || { echo "web/dist/$name is missing or differs from deploy/$name" >&2; return 1; }
-  done
+  cmp -s dist/enroll-host.sh ../deploy/enroll-host.sh || { echo "web/dist/enroll-host.sh is missing or differs from deploy/enroll-host.sh" >&2; return 1; }
+  [ ! -e dist/prepare-host.sh ] || { echo "web/dist/prepare-host.sh must not be served" >&2; return 1; }
 }
-run "web build ships /enroll-host.sh and /prepare-host.sh" served_scripts_check
+run "web build ships /enroll-host.sh and not /prepare-host.sh" served_scripts_check

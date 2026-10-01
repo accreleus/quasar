@@ -647,6 +647,19 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Installing never asks you to download and run a script as root.** The quick start
+  covers rootful Docker, rootful Podman and Unraid, and shows the few host commands it
+  needs as commands you run yourself (the engine at boot; on Podman its socket,
+  `podman-restart.service` and the agent's runtime directory at boot; on NVIDIA the
+  container toolkit wiring). Rootless has its own page with every step written out;
+  `deploy/prepare-host.sh` is linked there only as an optional read-it-first shortcut,
+  and is no longer published on the docs site or served by the control plane
+  (`/prepare-host.sh` is gone). Install no longer sets the UDP send buffer or loads
+  `uinput` (it loads on demand), including the Unraid script: the send buffer is a
+  recommended setting under Tuning ▸ Latency, and kernel-log access for GPU fault
+  messages is an optional diagnostic. The Add host command names missing rootless
+  preparation with a link to those steps, prints the exact commands for rootful
+  Podman, and says to run as root when rootful Podman's socket is out of reach.
 - **The documentation's Install section is organised by platform.** Docker (rootful, and
   experimental rootless), Podman (Quadlet) and a new Unraid page replace the per-mechanism
   pages; first run and the install checks are one page, and the two moves (from Compose,

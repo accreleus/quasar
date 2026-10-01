@@ -11,7 +11,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { load } from 'js-yaml';
 
@@ -27,24 +26,17 @@ import {
   templatePath,
   appUser,
   seedInputs,
-  prepFlags,
-  effectiveLowPorts,
+  hostSteps,
   quadletUnit,
   podmanRunSeed,
-  setPrepareHostSha256,
+  ROOTLESS_DOCS_URL,
+  NESTED_GPU_CIL,
+  RUNTIME_DIR_TMPFILES,
 } from './stack-template.js';
 import { PROXIES, proxyConfig } from './proxy-configs.js';
 import { PLATFORMS } from './platforms.js';
 import { profileFor } from './engine-profiles.js';
-import { PREPARE_HOST_SHA256, PREPARE_HOST_SOURCE } from './prepare-host-source.js';
 import { fakeEngineDir, runScript } from './test-harness.js';
-
-// stack-template.js no longer imports prepare-host-source.js itself (that file
-// is Node-only — node:fs — and stack-template.js is also bundled into the
-// quick start's browser <script>; see both files' comments). The real
-// checksum has to be supplied explicitly, the same way QuickStart.astro's
-// frontmatter does for the client.
-setPrepareHostSha256(PREPARE_HOST_SHA256);
 
 const UNRAID_GOLDEN = readFileSync(fileURLToPath(new URL('./__fixtures__/unraid-golden.sh', import.meta.url)), 'utf8');
 
@@ -202,16 +194,17 @@ test('generated scripts parse for every platform, engine, mode, role and access 
         for (const role of ROLE_IDS.filter((r) => ROLES[r].control)) {
           for (const access of ACCESS) {
             for (const database of ['owned', 'external']) {
-              const out = generate(full({ platform, engine, mode, role, access, database, dbHost: 'db' }));
+              const out = generate(full({ platform, engine, mode, role, access, database, dbHost: 'db', nvidia: true }));
               const label = `${platform}/${engine}/${mode}/${role}/${access}/${database}`;
-              if (profileFor(platform, engine, mode).status === 'unsupported') {
-                assert.equal(out.script, null, `${label}: unsupported must yield no script`);
+              if (profileFor(platform, engine, mode).status === 'unsupported' || (mode === 'rootless' && platform !== 'unraid')) {
+                assert.equal(out.script, null, `${label}: unsupported or rootless must yield no script`);
+                assert.equal(out.hostSteps, null, `${label}: no host steps either`);
                 continue;
               }
               assert.ok(out.script, `${label}: expected a script`);
               const r = spawnSync('bash', ['-n'], { input: out.script, encoding: 'utf8' });
               assert.equal(r.status, 0, `${label}: ${r.stderr}`);
-              if (out.prep) assert.equal(spawnSync('bash', ['-n'], { input: out.prep, encoding: 'utf8' }).status, 0, `${label}: prep`);
+              if (out.hostSteps) assert.equal(spawnSync('bash', ['-n'], { input: out.hostSteps, encoding: 'utf8' }).status, 0, `${label}: host steps`);
             }
           }
         }
@@ -224,7 +217,7 @@ test('an unsupported profile generates no install artifacts: the UI blocks it', 
   // Unraid + rootless Docker is unsupported per testdata/engine-profiles/profiles.json.
   const out = generate(full({ platform: 'unraid', engine: 'docker', mode: 'rootless' }));
   assert.equal(out.script, null);
-  assert.equal(out.prep, null);
+  assert.equal(out.hostSteps, null);
   assert.equal(out.quadlet, null);
   // The seed's own stack (Dockge/Arcane) and pins are not engine/mode specific and stay available.
   assert.ok(out.stack);
@@ -235,29 +228,42 @@ test('unraid keeps its self-contained script, byte for byte (D4)', () => {
   assert.equal(script, UNRAID_GOLDEN);
 });
 
-test('unraid persists through the boot script, runs without sudo, and has no prep block', () => {
+test('unraid runs without sudo, touches no kernel setting, and has no host steps', () => {
   const out = generate(full({ platform: 'unraid' }));
-  assert.match(out.script, /\/boot\/config\/go/);
   assert.ok(!out.script.includes('sudo '));
-  assert.ok(!out.script.includes('/etc/sysctl.d'));
-  assert.equal(out.prep, null);
+  for (const s of ['/boot/config/go', 'sysctl', 'wmem_default', 'modprobe', 'uinput']) assert.ok(!out.script.includes(s), s);
+  assert.equal(out.hostSteps, null);
 });
 
-test('non-Unraid platforms drop host preparation into prepare-host.sh, not the script', () => {
-  for (const platform of Object.keys(PLATFORMS).filter((p) => p !== 'unraid')) {
-    const out = generate(full({ platform }));
-    // The script only checks for the sysctl file preparation leaves; it never writes one.
-    assert.ok(!/sysctl (-w|-p|--system)/.test(out.script), platform);
-    assert.ok(!out.script.includes('modules-load.d'), platform);
-    assert.ok(!out.script.includes('wmem_default'), platform);
-    assert.ok(out.prep, platform);
-    assert.match(out.prep, /sudo sh prepare-host\.sh/, platform);
+test('no generated output downloads a script or touches kernel settings', () => {
+  for (const platform of Object.keys(PLATFORMS)) {
+    for (const engine of ENGINES) {
+      for (const nvidia of [false, true]) {
+        const out = generate(full({ platform, engine, nvidia }));
+        for (const text of [out.script, out.hostSteps, out.quadlet, out.podmanRun, out.stack].filter(Boolean)) {
+          for (const s of ['prepare-host', 'sha256sum -c', 'curl -fsSL -o', 'wmem_default', 'dmesg_restrict', 'modprobe', 'modules-load.d', 'sysctl']) {
+            assert.ok(!text.includes(s), `${platform}/${engine}/nvidia=${nvidia}: ${s}`);
+          }
+        }
+      }
+    }
   }
+});
+
+test('a rootless answer generates no install artifacts: the rootless page covers it', () => {
+  for (const engine of ENGINES) {
+    const out = generate(full({ engine, mode: 'rootless' }));
+    assert.equal(out.script, null, engine);
+    assert.equal(out.hostSteps, null, engine);
+    assert.equal(out.quadlet, null, engine);
+    assert.equal(out.podmanRun, null, engine);
+  }
+  assert.equal(ROOTLESS_DOCS_URL, 'https://accreleus.github.io/quasar/install/rootless/');
 });
 
 test('a control-only machine prepares nothing for games', () => {
   const script = generate(full({ role: 'control-only' })).script;
-  for (const s of ['/dev/dri', 'uinput', 'wmem_default', 'install -d']) assert.ok(!script.includes(s), s);
+  for (const s of ['/dev/dri', 'uinput', 'install -d']) assert.ok(!script.includes(s), s);
 });
 
 test('the script never restarts the Docker daemon', () => {
@@ -272,48 +278,55 @@ test('every platform is complete', () => {
     for (const key of ['label', 'sudo', 'defaultUid', 'defaultGid', 'defaultBasePath', 'ownerLabel']) {
       assert.ok(p[key] !== undefined, `${id} is missing ${key}`);
     }
-    assert.equal(typeof p.sysctl(), 'string', `${id}: sysctl must render`);
-    assert.equal(typeof p.module(), 'string', `${id}: module must render`);
   }
 });
 
-// --- host preparation and env overrides ------------------------------------
+// --- host steps and env overrides --------------------------------------------
 
-test('prep flags follow the toggles', () => {
-  const base = full({ engine: 'docker', mode: 'rootful' });
-  assert.deepEqual(prepFlags(base), ['--mode', 'rootful', '--engine', 'docker']);
-
-  const rootless = full({ engine: 'docker', mode: 'rootless', role: 'combined' });
-  const flags = prepFlags(rootless);
-  assert.deepEqual(flags.slice(0, 4), ['--mode', 'rootless', '--engine', 'docker']);
-  assert.ok(flags.includes('--homes') && flags.includes(homePath(rootless)), flags.join(' '));
-  assert.ok(flags.includes('--templates') && flags.includes(templatePath(rootless)), flags.join(' '));
-
-  const controlOnlyRootless = full({ engine: 'docker', mode: 'rootless', role: 'control-only' });
-  assert.ok(!prepFlags(controlOnlyRootless).includes('--homes'), 'a control-only host has no agent, so no homes root');
-
-  const toggled = full({ console: true, kernelLog: true });
-  assert.ok(prepFlags(toggled).includes('--console'));
-  assert.ok(prepFlags(toggled).includes('--allow-kernel-log'));
-  assert.ok(!prepFlags(base).includes('--console'));
-  assert.ok(!prepFlags(base).includes('--allow-kernel-log'));
+test('host steps: Docker starts at boot; Podman gets its socket and podman-restart', () => {
+  const docker = hostSteps(full({ engine: 'docker' }));
+  assert.match(docker, /^sudo systemctl enable --now docker$/m);
+  assert.ok(!docker.includes('nvidia'), 'no NVIDIA lines unless asked');
+  const podman = hostSteps(full({ engine: 'podman' }));
+  assert.match(podman, /^sudo systemctl enable --now podman\.socket$/m);
+  assert.match(podman, /^sudo systemctl enable podman-restart\.service$/m);
+  assert.ok(podman.includes(`echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf`));
+  assert.match(podman, /^sudo systemd-tmpfiles --create \/etc\/tmpfiles\.d\/quasar\.conf$/m);
+  assert.ok(!podman.includes('nvidia'));
+  // Docker recreates a missing bind source itself.
+  assert.ok(!docker.includes('tmpfiles'));
 });
 
-test('low ports switch on automatically on a rootless engine below 1024', () => {
-  assert.equal(effectiveLowPorts(full({ mode: 'rootful', controlPort: 80 })), false);
-  assert.equal(effectiveLowPorts(full({ mode: 'rootless', controlPort: 80 })), true);
-  assert.equal(effectiveLowPorts(full({ mode: 'rootless', controlPort: 8080, tlsPort: 8443 })), false);
-  assert.equal(effectiveLowPorts(full({ mode: 'rootless', lowPorts: true })), true);
-  const flags = prepFlags(full({ mode: 'rootless', controlPort: 443 }));
-  const i = flags.indexOf('--unprivileged-port-start');
-  assert.ok(i >= 0);
-  assert.equal(flags[i + 1], '443');
+test('the runtime directory line is the one deploy/prepare-host.sh writes for rootful', () => {
+  const prep = readFileSync(fileURLToPath(new URL('../../../deploy/prepare-host.sh', import.meta.url)), 'utf8');
+  assert.ok(prep.includes(RUNTIME_DIR_TMPFILES));
 });
 
-test('the prep checksum matches deploy/prepare-host.sh', () => {
-  assert.equal(PREPARE_HOST_SHA256, createHash('sha256').update(PREPARE_HOST_SOURCE).digest('hex'));
-  const out = generate(full());
-  assert.match(out.prep, new RegExp(PREPARE_HOST_SHA256));
+test('host steps on NVIDIA: Docker gets the toolkit runtime, Podman a CDI specification', () => {
+  const docker = hostSteps(full({ engine: 'docker', nvidia: true }));
+  assert.match(docker, /^sudo nvidia-ctk runtime configure --runtime=docker$/m);
+  assert.match(docker, /^sudo systemctl restart docker$/m);
+  assert.ok(!docker.includes('cdi generate'));
+  const podman = hostSteps(full({ engine: 'podman', nvidia: true }));
+  assert.match(podman, /^sudo nvidia-ctk cdi generate --output=\/etc\/cdi\/nvidia\.yaml$/m);
+  assert.ok(!podman.includes('runtime configure'));
+  // A control-only machine has no GPU work, whatever the checkbox says.
+  assert.ok(!hostSteps(full({ engine: 'podman', role: 'control-only', nvidia: true })).includes('nvidia-ctk'));
+});
+
+test('host steps on NVIDIA under SELinux (Fedora): the boolean and the one nested-sandbox rule', () => {
+  for (const engine of ENGINES) {
+    const fedora = hostSteps(full({ engine, nvidia: true, platform: 'fedora' }));
+    assert.match(fedora, /^sudo setsebool -P container_use_xserver_devices on$/m, engine);
+    assert.ok(fedora.includes(NESTED_GPU_CIL), engine);
+    assert.match(fedora, /^sudo semodule -i quasar-nested-gpu\.cil$/m, engine);
+    assert.ok(!hostSteps(full({ engine, nvidia: true, platform: 'ubuntu' })).includes('setsebool'), `${engine} on Ubuntu`);
+  }
+});
+
+test('the nested-sandbox rule is the one deploy/prepare-host.sh writes', () => {
+  const prep = readFileSync(fileURLToPath(new URL('../../../deploy/prepare-host.sh', import.meta.url)), 'utf8');
+  assert.ok(prep.includes(NESTED_GPU_CIL));
 });
 
 test('QUASAR_IMAGE_NAMESPACE / QUASAR_IMAGE_TAG override the defaults', () => {
@@ -335,15 +348,7 @@ test('QUASAR_IMAGE_NAMESPACE / QUASAR_IMAGE_TAG override the defaults', () => {
   assert.equal(CHANNEL_TAG, 'latest');
 });
 
-// --- rootless: no sudo but the one prep line --------------------------------
-
-test('rootless scripts never use sudo; host preparation is step 1, run as root', () => {
-  for (const engine of ENGINES) {
-    const out = generate(full({ engine, mode: 'rootless' }));
-    assert.ok(!out.script.includes('sudo '), `${engine} rootless: ${out.script}`);
-    assert.match(out.prep, /sudo sh prepare-host\.sh/, `${engine} rootless prep`);
-  }
-});
+// --- the script against a fake engine ----------------------------------------
 
 test('a control port another install already answers on stops the script before the seed', () => {
   const r = runFake(full({ role: 'control-only' }), { portTaken: true });
@@ -352,31 +357,29 @@ test('a control port another install already answers on stops the script before 
   assert.ok(!/run -d --name quasar-seed/.test(String(r.calls)), 'no seed started');
 });
 
-test('an unprepared host stops the install script and names step 1', () => {
-  const r = runFake(full({ role: 'control-only' }), { prepared: false });
+test('rootful Podman with podman-restart.service off stops before anything is pulled, naming the command', () => {
+  const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir({ restartOff: true }) });
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /not prepared for Quasar\. Run step 1/);
-  assert.ok(!/\brun\b/.test(String(r.calls)), 'nothing started');
+  assert.match(r.stderr, /sudo systemctl enable podman-restart\.service/);
+  assert.ok(!/podman pull/.test(r.calls), 'nothing pulled');
 });
 
-test('install scripts check host preparation and never run it', () => {
-  for (const engine of ENGINES) {
-    for (const mode of ['rootful', 'rootless']) {
-      const out = generate(full({ engine, mode }));
-      assert.ok(!out.script.includes('prepare-host.sh --mode'), `${engine} ${mode} runs prep`);
-      assert.match(out.script, /Checking host preparation/, `${engine} ${mode}`);
-      assert.match(out.script, /70-quasar\.rules/, `${engine} ${mode}`);
-      if (mode === 'rootless') assert.match(out.script, /\/etc\/subuid/, `${engine} rootless`);
-    }
-  }
+test('rootful Podman with nothing making /run/quasar-agent at boot stops before anything is pulled', () => {
+  const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir({ runDirOff: true }) });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /\/etc\/tmpfiles\.d\/quasar\.conf/);
+  assert.ok(!/podman pull/.test(r.calls), 'nothing pulled');
 });
 
-test('docker rootless mounts the rootless socket and creates no directories', () => {
-  const script = generate(full({ engine: 'docker', mode: 'rootless' })).script;
-  assert.match(script, /DOCKER_HOST="unix:\/\/\$\{XDG_RUNTIME_DIR:-\/run\/user\/\$\(id -u\)\}\/docker\.sock"/);
-  assert.match(script, /-v "\$\{XDG_RUNTIME_DIR:-\/run\/user\/\$\(id -u\)\}\/docker\.sock:\/var\/run\/docker\.sock"/);
-  assert.ok(!script.includes('install -d'), 'rootless creates no directories: prepare-host.sh --homes/--templates does');
-  assert.match(script, /Run this as the quasar account, not root/);
+test('rootful Podman installs end to end against the fake engine', () => {
+  const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir() });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.calls, /systemctl start quasar-seed/);
+});
+
+test('a Docker rootless engine is refused by the rootful script, pointing at the rootless page', () => {
+  const script = generate(full({ engine: 'docker' })).script;
+  assert.ok(script.includes(ROOTLESS_DOCS_URL));
 });
 
 // --- Podman: the Quadlet unit ------------------------------------------------
@@ -421,12 +424,10 @@ test('podman -dryrun accepts the generated unit, when quadlet is available', () 
   assert.equal(r.status, 0, r.stdout + r.stderr);
 });
 
-test('generate() offers podmanRun only for a supported/experimental Podman profile, never Docker', () => {
+test('generate() offers podmanRun only for a rootful Podman profile it supports, never Docker', () => {
   assert.equal(generate(full({ engine: 'docker', mode: 'rootful' })).podmanRun, null);
-  assert.equal(generate(full({ platform: 'unraid', engine: 'podman', mode: 'rootless' })).podmanRun, null);
-  for (const mode of MODES) {
-    assert.match(generate(full({ engine: 'podman', mode })).podmanRun, /podman run -d --name quasar-seed/);
-  }
+  assert.equal(generate(full({ platform: 'unraid', engine: 'podman', mode: 'rootful' })).podmanRun, null);
+  assert.match(generate(full({ engine: 'podman', mode: 'rootful' })).podmanRun, /^sudo podman run -d --name quasar-seed/);
 });
 
 test('podmanRunSeed mounts the same in-container path as the Quadlet unit, never the mockup bug', () => {
@@ -443,8 +444,8 @@ test('podmanRunSeed uses sudo only when rootful', () => {
 });
 
 /** Runs a generated script against the hardened fake engine (test-harness.js). */
-function runFake(answers, { legacy = false, existing = false, portTaken = false, extraEnv = {}, prepared = true } = {}) {
-  return runScript(generate(answers).script, { engine: fakeEngineDir({ legacy, existing, portTaken }), extraEnv, prepared });
+function runFake(answers, { legacy = false, existing = false, portTaken = false, extraEnv = {} } = {}) {
+  return runScript(generate(answers).script, { engine: fakeEngineDir({ legacy, existing, portTaken }), extraEnv });
 }
 
 test('the script refuses a host still running a stack made from the Compose files', () => {

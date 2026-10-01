@@ -8,7 +8,7 @@ from, how to retake them, and what is still worth adding.
 | Page | Asset | What it shows |
 | --- | --- | --- |
 | `index.mdx` (landing) | `library-home.png` | The library home: the rail of recent and newly added apps, then the tiles. |
-| `start/quickstart.mdx` | `quickstart-engine.png` | The quick start's engine step for Fedora, with the four engine profile badges. |
+| `start/quickstart.mdx` | `quickstart-engine.png` | The quick start's engine step for Fedora: rootful Docker and Podman with their profile badges, and the pointer to rootless. Retaken 2026-10-01. |
 | `install/first-run.mdx` | `setup-claim.png` | Step 1 of the wizard on an unclaimed instance. |
 | `install/first-run.mdx` | `setup-hosts.png` | Step 3, the host check, cropped to a host whose input checks fail and block launches. |
 | `playing/library.mdx` | `library.png` | The full library, grouped by source. |

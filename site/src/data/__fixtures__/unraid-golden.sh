@@ -2,9 +2,9 @@
 # Quasar quick start: a combined host on Unraid. Generated in your
 # browser; nothing was sent anywhere. Read it before you run it.
 #
-# It checks the host, prepares it, and starts ONE container, the seed. The seed
-# creates Quasar's recovery actor, which generates every secret and creates the
-# rest. Nothing here writes a Compose file or an .env.
+# It checks the host and starts ONE container, the seed. The seed creates
+# Quasar's recovery actor, which generates every secret and creates the rest.
+# Nothing here writes a Compose file or an .env.
 set -euo pipefail
 
 echo "==> Host preflight"
@@ -69,19 +69,6 @@ agent_image=$(resolve quasar-node-agent)
 echo "==> Directories"
 install -d -m 0755 -o 99 -g 100 '/var/lib/quasar/homes'
 install -d -m 0755 -o 99 -g 100 '/var/lib/quasar/templates'
-
-echo "==> UDP send buffer"
-# libnice never calls setsockopt(SO_SNDBUF), so media sockets inherit the kernel
-# default of 208 KB. A keyframe burst at 8 Mbps overflows it, the kernel drops
-# the overflow silently, and the bitrate estimator reads that as congestion.
-sysctl -w net.core.wmem_default=2097152 >/dev/null
-# /etc is a ramdisk on Unraid, so persist through the boot script instead.
-grep -q 'wmem_default' /boot/config/go || echo 'sysctl -w net.core.wmem_default=2097152' >> /boot/config/go
-
-echo "==> Virtual input"
-modprobe uinput
-grep -q 'modprobe uinput' /boot/config/go || echo 'modprobe uinput' >> /boot/config/go
-[ -c /dev/uinput ] || { echo "Virtual input device /dev/uinput is unavailable after loading uinput" >&2; exit 1; }
 
 echo "==> Starting the seed"
 docker run -d --name quasar-seed --restart unless-stopped \

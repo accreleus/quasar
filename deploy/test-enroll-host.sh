@@ -19,7 +19,7 @@
 #      (Docker and Podman, rootful and rootless, with a mock podman beside the mock
 #      docker); a rootless run never calls sudo; an unsupported engine profile is
 #      refused by name before anything is pulled; a rootless host without host
-#      preparation gets the prepare-host.sh command and nothing else;
+#      preparation gets a pointer to the rootless steps and nothing else;
 #   9. the script's engine-profile table is testdata/engine-profiles/profiles.json.
 #
 # Run: bash deploy/test-enroll-host.sh
@@ -1033,10 +1033,11 @@ prepared() { # prepared [podman]
     ln -sf /usr/lib/systemd/user/podman-restart.service "$r/home/$ME/.config/systemd/user/default.target.wants/podman-restart.service"
   fi
 }
-rootful_podman_root() { # the rootful Podman socket and podman-restart, no Docker socket
+rootful_podman_root() { # the rootful Podman socket, podman-restart and the runtime directory, no Docker socket
   rm -f "$tmp/root/var/run/docker.sock"
-  mkdir -p "$tmp/root/run/podman" "$tmp/root/etc/systemd/system/default.target.wants"
+  mkdir -p "$tmp/root/run/podman" "$tmp/root/etc/systemd/system/default.target.wants" "$tmp/root/etc/tmpfiles.d"
   : > "$tmp/root/run/podman/podman.sock"
+  printf 'd /run/quasar-agent 0755 root root -\n' > "$tmp/root/etc/tmpfiles.d/quasar.conf"
   ln -sf /usr/lib/systemd/system/podman-restart.service "$tmp/root/etc/systemd/system/default.target.wants/podman-restart.service"
 }
 only_cli() { ! grep -qv "^$1 " <<<"$CLI_LOG" && [ -n "$CLI_LOG" ]; }
@@ -1163,39 +1164,47 @@ else
 fi
 mk_root "$tmp/root"; rm -f "$tmp/root/var/run/docker.sock"; reset_engine
 run_installer no-engine "${OK_ENV[@]}"
-if [ "$RC" -eq 1 ] && grep -q 'no container engine found' <<<"$OUT" && grep -q 'podman.socket' <<<"$OUT" && [ -z "$DOCKER_LOG" ]; then
-  pass "no engine socket anywhere: named, with where it looked and Podman's socket units"
+if [ "$RC" -eq 1 ] && grep -q 'no container engine found' <<<"$OUT" && grep -q 'podman.socket' <<<"$OUT" && [ -z "$DOCKER_LOG" ] \
+   && { [ "$(id -u)" -eq 0 ] || grep -q 'run this command as root' <<<"$OUT"; }; then
+  pass "no engine socket anywhere: named, with where it looked, Podman's socket units, and (not root) that rootful Podman needs root"
 else
   fail "no engine" "rc=$RC out=$(tail -2 <<<"$OUT")"
 fi
 
-# Missing host preparation on a rootless engine: the command, and nothing else.
-prep_user=""; [ "$ME" = quasar ] || prep_user=" --user $ME"
+# Missing host preparation on a rootless engine: what is missing, where the steps are, and nothing else.
 NOFP_BLOB="qenr1..$(b64url 'wss://cp.example:8443/').$TOKEN"
 mk_root "$tmp/root"; os_release "${FEDORA[@]}"; mk_xdg podman; reset_engine
 XDG="$xdg" run_installer unprepared QUASAR_ENROLLMENT="$NOFP_BLOB" MOCK_ROOTLESS=1 FIX=1
-if [ "$RC" -eq 1 ] && grep -qxF '    curl -fsSL -o prepare-host.sh https://cp.example:8443/prepare-host.sh' <<<"$OUT" \
-   && grep -qxF "    sudo sh prepare-host.sh --mode rootless --engine podman$prep_user --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates" <<<"$OUT" \
+if [ "$RC" -eq 1 ] && grep -qF 'https://accreleus.github.io/quasar/install/rootless/' <<<"$OUT" \
+   && ! grep -q 'prepare-host' <<<"$OUT" && ! grep -q 'curl ' <<<"$OUT" \
    && grep -q "lingering for $ME" <<<"$OUT" && grep -q '70-quasar.rules' <<<"$OUT" && grep -q 'tmpfiles.d/quasar.conf' <<<"$OUT" \
    && grep -q 'podman-restart.service' <<<"$OUT" && grep -q '/etc/subuid' <<<"$OUT" \
    && nothing_started && ! grep -q '^pull' <<<"$DOCKER_LOG" && [ -z "$SUDO_LOG" ] && [ -z "$FIX_LOG" ]; then
-  pass "rootless without host preparation: names what is missing, prints the curl and sudo sh prepare-host.sh lines for this control plane, and stops (QUASAR_ENROLL_FIX=1 applies nothing)"
+  pass "rootless without host preparation: names what is missing, points at the rootless steps (no script download), and stops (QUASAR_ENROLL_FIX=1 applies nothing)"
 else
   fail "unprepared" "rc=$RC sudo=[$SUDO_LOG] out=$(tail -8 <<<"$OUT")"
 fi
 XDG="$xdg" run_installer unprepared-pinned "${OK_ENV[@]}" MOCK_ROOTLESS=1 QUASAR_HOME_ROOT=/srv/q/homes
-if [ "$RC" -eq 1 ] && grep -qF "curl -fsSL -k --pinnedpubkey 'sha256//…' -o prepare-host.sh https://cp.example:8443/prepare-host.sh" <<<"$OUT" \
-   && grep -q -- '--homes /srv/q/homes --templates /srv/q/templates' <<<"$OUT" && nothing_started; then
-  pass "a pinned control plane: the prep curl carries -k --pinnedpubkey like Add host's; the homes follow QUASAR_HOME_ROOT"
+if [ "$RC" -eq 1 ] && grep -q 'the homes root /srv/q/homes' <<<"$OUT" && grep -q 'the templates root /srv/q/templates' <<<"$OUT" \
+   && ! grep -q 'prepare-host' <<<"$OUT" && nothing_started; then
+  pass "a pinned control plane: the same pointer, no script download; the homes follow QUASAR_HOME_ROOT"
 else
   fail "unprepared pinned" "rc=$RC out=$(tail -6 <<<"$OUT")"
 fi
 mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; rm "$tmp/root/etc/systemd/system/default.target.wants/podman-restart.service"; reset_engine
 run_installer unprepared-rootful-podman "${OK_ENV[@]}"
-if [ "$RC" -eq 1 ] && grep -qxF '    sudo sh prepare-host.sh --mode rootful --engine podman' <<<"$OUT" && nothing_started; then
-  pass "rootful Podman without podman-restart enabled: the rootful prep command, nothing started"
+if [ "$RC" -eq 1 ] && grep -qxF '    systemctl enable podman-restart.service' <<<"$OUT" && ! grep -q 'prepare-host' <<<"$OUT" && nothing_started; then
+  pass "rootful Podman without podman-restart enabled: the commands to run, nothing started"
 else
   fail "unprepared rootful podman" "rc=$RC out=$(tail -4 <<<"$OUT")"
+fi
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; rm "$tmp/root/etc/tmpfiles.d/quasar.conf"; reset_engine
+run_installer unprepared-rootful-podman-rundir "${OK_ENV[@]}"
+if [ "$RC" -eq 1 ] && grep -q 'tmpfiles.d/quasar.conf' <<<"$OUT" \
+   && grep -qxF "    echo 'd /run/quasar-agent 0755 root root -' > /etc/tmpfiles.d/quasar.conf" <<<"$OUT" && nothing_started; then
+  pass "rootful Podman without the boot-time runtime directory: named with its tmpfiles line (Podman never creates a missing bind source), nothing started"
+else
+  fail "unprepared rootful podman rundir" "rc=$RC out=$(tail -6 <<<"$OUT")"
 fi
 
 # Rootless: a failing check's fix is printed as root's, never applied; AppArmor warns.

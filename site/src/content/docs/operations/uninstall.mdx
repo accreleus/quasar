@@ -127,9 +127,9 @@ on it.
 
 | Change | Undo |
 | --- | --- |
-| Socket buffer sysctl | `sudo rm /etc/sysctl.d/99-quasar.conf` |
+| Socket buffer sysctl, if you set it | `sudo rm /etc/sysctl.d/99-quasar.conf` |
 | User-namespace sysctls (written by the enroll command's fixes) | Read `/etc/sysctl.d/99-quasar-userns.conf`, remove it, then reboot or set each value back to your distribution's default (on Ubuntu 24.04+: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1`). |
-| uinput module load | `sudo rm /etc/modules-load.d/uinput.conf` |
+| uinput module load (older installs) | `sudo rm /etc/modules-load.d/uinput.conf` |
 | Unraid | Remove the `sysctl -w net.core.wmem_default=2097152` and `modprobe uinput` lines from `/boot/config/go`. |
 | App-container AppArmor profile | `sudo rm /etc/apparmor.d/quasar-app` if present, then reboot to unload it. |
 | TLS certificate | Remove it from any trust stores you added it to. |

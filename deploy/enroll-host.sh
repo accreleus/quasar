@@ -35,8 +35,8 @@ looks for that user's rootless engine first. When it finds both engines, set
 QUASAR_ENGINE=docker or QUASAR_ENGINE=podman. The engine's own report confirms the
 mode. The machine's engine profile (docs: engine profiles) must not be unsupported:
 an unsupported one is refused by name, with the profiles to use instead, before
-anything is pulled. A rootless engine needs host preparation (prepare-host.sh, run
-once as root) done first: if it is missing, this prints the command and stops.
+anything is pulled. A rootless engine needs host preparation (docs: install/rootless,
+done once as root) first: if it is missing, this names what is missing and stops.
 
 What it does, in order (it prints each step; nothing is silent):
   1. parses the string, refuses a ws:// (cleartext) control plane;
@@ -633,7 +633,7 @@ if [ -z "$ENGINE" ]; then
   MODE=rootful
 fi
 if [ -z "$ENGINE" ]; then
-  host_error "no container engine found${want_engine:+ for QUASAR_ENGINE=$want_engine}. Looked for a rootless one of $(id -un) ($RUNTIME_DIR/docker.sock, $RUNTIME_DIR/podman/podman.sock) and the rootful ones (/var/run/docker.sock, /run/podman/podman.sock). Install Docker or Podman first (this script installs neither), and on Podman start its socket: systemctl --user enable --now podman.socket as the account that runs it, or systemctl enable --now podman.socket for rootful. Or name the socket with DOCKER_HOST or CONTAINER_HOST."
+  host_error "no container engine found${want_engine:+ for QUASAR_ENGINE=$want_engine}. Looked for a rootless one of $(id -un) ($RUNTIME_DIR/docker.sock, $RUNTIME_DIR/podman/podman.sock) and the rootful ones (/var/run/docker.sock, /run/podman/podman.sock). Install Docker or Podman first (this script installs neither), and on Podman start its socket: systemctl --user enable --now podman.socket as the account that runs it, or systemctl enable --now podman.socket for rootful. Or name the socket with DOCKER_HOST or CONTAINER_HOST.$([ "$(id -u)" -eq 0 ] || echo " Rootful Podman's socket is visible to root only: for rootful Podman, run this command as root (sudo -i, then paste it).")"
 fi
 ENGINE_LABEL="$(label_of engine "$ENGINE")"
 
@@ -641,7 +641,7 @@ ENGINE_LABEL="$(label_of engine "$ENGINE")"
 # Rootful: never prompt from inside a pipe. Every privileged command runs `sudo -n`,
 # and a host whose sudo wants a password is refused up front with the way out.
 # Rootless: never sudo at all. `sudo docker` would reach the rootful daemon, and host
-# preparation (prepare-host.sh) is the one step of a rootless install that is root's.
+# preparation is the one step of a rootless install that is root's.
 SUDO=""
 if [ "$MODE" = rootful ] && [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null 2>&1 || host_error "not root and no sudo: this talks to the rootful $ENGINE_LABEL engine and prepares the host. Run it from a root shell (su -, then paste the command)."
@@ -738,9 +738,10 @@ case "$profile_status" in
   *) host_error "engine profile: $profile_named is unsupported, so this script does not install Quasar on it. $profile_reason Use instead: $(describe_alternatives "$platform" "$profile_alternatives"). Nothing was pulled or started." ;;
 esac
 
-# Host preparation (deploy/prepare-host.sh) is root's one step of a rootless install,
-# and on rootful Podman it is what brings the containers back at boot. This checks what
-# it leaves behind and, when something is missing, prints the command and stops.
+# Host preparation is root's one step of a rootless install (the docs' install/rootless
+# page, or deploy/prepare-host.sh), and on rootful Podman podman-restart.service is what
+# brings the containers back at boot. This checks what it leaves behind and, when
+# something is missing, names it, points at the steps, and stops.
 prep_missing=""
 prep_need() { prep_missing="${prep_missing:+$prep_missing; }$1"; }
 prep_homes="${home_root:-${QUASAR_HOME_ROOT:-/var/lib/quasar/homes}}"; prep_homes="${prep_homes%/}"
@@ -762,22 +763,22 @@ if [ "$MODE" = rootless ]; then
 elif [ "$ENGINE" = podman ]; then
   link=/etc/systemd/system/default.target.wants/podman-restart.service
   [ -e "$ROOT$link" ] || [ -L "$ROOT$link" ] || prep_need "Podman's restart at boot (podman-restart.service)"
+  # /run is a tmpfs, and Podman (unlike Docker) never creates a missing bind source:
+  # without this the agent cannot start after a reboot.
+  [ -e "$ROOT/etc/tmpfiles.d/quasar.conf" ] || prep_need "the agent's runtime directory at boot (/etc/tmpfiles.d/quasar.conf)"
 fi
 if [ -n "$prep_missing" ]; then
-  # From the control plane this script came from; the quick start's copy is the same file.
-  prep_origin="https://<control-plane>"
-  if [ -n "${url:-}" ]; then prep_origin="${url#wss://}"; prep_origin="https://${prep_origin%%/*}"; fi
-  prep_curl="curl -fsSL -o prepare-host.sh $prep_origin/prepare-host.sh"
-  [ -z "${fp:-}" ] || prep_curl="curl -fsSL -k --pinnedpubkey 'sha256//…' -o prepare-host.sh $prep_origin/prepare-host.sh"
-  prep_run="sudo sh prepare-host.sh --mode $MODE --engine $ENGINE"
-  [ "$me" = quasar ] || [ "$MODE" = rootful ] || prep_run="$prep_run --user $me"
-  [ "$MODE" = rootful ] || prep_run="$prep_run --homes $prep_homes --templates $prep_templates"
-  prep_text="this machine is not prepared for $ENGINE_LABEL $MODE yet. Missing: $prep_missing.
-  Run host preparation once, as root (from an administrator's account$([ "$MODE" = rootful ] || echo '; this one never uses sudo')):
-    $prep_curl
-    $prep_run"
-  [ -z "${fp:-}" ] || prep_text="$prep_text
-  (the same -k --pinnedpubkey as the Add host command, which fetched this script)"
+  if [ "$MODE" = rootless ]; then
+    prep_text="this machine is not prepared for $ENGINE_LABEL rootless yet. Missing: $prep_missing.
+  Prepare it once, as root (from an administrator's account; this one never uses sudo),
+  with the steps at https://accreleus.github.io/quasar/install/rootless/"
+  else
+    prep_text="this machine is not prepared for $ENGINE_LABEL rootful yet. Missing: $prep_missing.
+  Run once, as root:
+    systemctl enable podman-restart.service
+    echo 'd /run/quasar-agent 0755 root root -' > /etc/tmpfiles.d/quasar.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf"
+  fi
   if [ "$DRY" = 1 ]; then
     warn "$prep_text"
   else

@@ -95,15 +95,15 @@ function preloadFonts(): Plugin {
 const controlOrigin = process.env.QUASAR_CONTROL_ORIGIN ?? "http://localhost:8080";
 
 // The control plane serves deploy/enroll-host.sh from the SPA root as
-// /enroll-host.sh (#100), and deploy/prepare-host.sh beside it as
-// /prepare-host.sh (#406: the host preparation a rootless host runs before
-// enrolling), so the scripts a second host fetches are the ones from the tree
-// the control plane was built from. Copied at build time, never duplicated in
-// web/: deploy/ stays the single home of operator scripts. Both are static files,
-// not API routes (protocol/control-api.md's note on /enroll-host.sh).
+// /enroll-host.sh (#100), so the script a second host fetches is the one from the
+// tree the control plane was built from. Copied at build time, never duplicated in
+// web/: deploy/ stays the single home of operator scripts. A static file, not an
+// API route (protocol/control-api.md's note on /enroll-host.sh). Host preparation
+// (deploy/prepare-host.sh) is deliberately not served: nobody is told to download
+// and run a script as root; the docs write its steps out instead.
 // Missing must fail the build — the SPA handler would otherwise answer the URL
 // with index.html and `sh` would choke on HTML.
-const OPERATOR_SCRIPTS = ["enroll-host.sh", "prepare-host.sh"] as const;
+const OPERATOR_SCRIPTS = ["enroll-host.sh"] as const;
 function operatorScripts(): Plugin {
   return {
     name: "quasar-operator-scripts",

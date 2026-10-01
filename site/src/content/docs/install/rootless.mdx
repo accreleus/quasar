@@ -1,0 +1,253 @@
+---
+title: Install rootless
+description: Run Quasar as an ordinary account instead of root. The one-time root steps, written out, then the install as that account.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Rootless runs the whole of Quasar under one unprivileged account, `quasar`. If
+Quasar were ever compromised, it could not take over the machine. Both engines are
+**experimental** rootless: see [Engine profiles](/quasar/start/engine-profiles/).
+For a rootful install, use the [quick start](/quasar/start/quickstart/) instead.
+
+## What you need
+
+- Linux with systemd, and root once, for the steps below.
+- Podman, or Docker with its rootless extras (`dockerd-rootless-setuptool.sh`).
+- `setfacl` (the `acl` package) for the device rules.
+- On SELinux (Fedora and its relatives): `semanage` and `restorecon`, from
+  `policycoreutils-python-utils`. On an image-based system:
+  `sudo rpm-ostree install policycoreutils-python-utils`, then reboot.
+- On NVIDIA: the driver and the [NVIDIA Container
+  Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+
+The examples keep homes in `/var/lib/quasar/homes` and templates beside them. Use a
+directory of its own, never `/home` or another system tree.
+
+## Prepare the host, once, as root
+
+Run each step from an account with `sudo`. Every step is safe to repeat.
+
+<Steps>
+
+1. **Create the `quasar` account** and turn on lingering, so its engine runs with
+   nobody logged in and starts at boot:
+
+   ```bash
+   sudo useradd --create-home --user-group --comment Quasar quasar
+   sudo loginctl enable-linger quasar
+   ```
+
+2. **Check its subordinate ID ranges.** The containers' own users map into them.
+
+   ```bash
+   grep '^quasar:' /etc/subuid /etc/subgid
+   ```
+
+   Most distributions add both with `useradd`. If either line is missing, add a
+   65536-wide range that no other line in that file uses, for example:
+
+   ```bash
+   sudo usermod --add-subuids 524288-589823 --add-subgids 524288-589823 quasar
+   ```
+
+3. **Install the device rules** from [Device rules](/quasar/install/device-rules/).
+   They give the `quasar` group `/dev/uinput`, Quasar's own virtual input devices
+   and the GPU render nodes, and nothing else.
+
+4. **Create the agent's runtime directory**, made again at every boot:
+
+   ```bash
+   echo 'd /run/quasar-agent 0750 quasar quasar -' | sudo tee /etc/tmpfiles.d/quasar.conf
+   sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
+   ```
+
+5. **Create the homes and templates roots**, owned by `quasar`:
+
+   ```bash
+   sudo install -d -m 0750 -o quasar -g quasar /var/lib/quasar/homes /var/lib/quasar/templates
+   ```
+
+6. **SELinux only (Podman, or Docker with SELinux on):** label those directories
+   for containers. This changes labels only; SELinux stays enforcing.
+
+   ```bash
+   for d in /run/quasar-agent /var/lib/quasar/homes /var/lib/quasar/templates; do
+     sudo semanage fcontext -a -t container_file_t "$d(/.*)?"
+     sudo restorecon -R "$d"
+   done
+   ```
+
+7. **Start the engine for `quasar`.**
+
+   Podman, its API socket and the restart of Quasar's containers at boot:
+
+   ```bash
+   sudo machinectl shell quasar@ /bin/sh -c \
+     'systemctl --user enable --now podman.socket podman-restart.service'
+   ```
+
+   Docker, installed and started for `quasar`:
+
+   ```bash
+   sudo machinectl shell quasar@ /bin/sh -c \
+     'dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker'
+   ```
+
+8. **NVIDIA only:** describe the GPU to the engine. Run it again after a driver
+   upgrade.
+
+   ```bash
+   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+   ```
+
+   On SELinux, also let containers open the NVIDIA devices:
+
+   ```bash
+   sudo setsebool -P container_use_xserver_devices on
+   echo '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' > quasar-nested-gpu.cil
+   sudo semodule -i quasar-nested-gpu.cil
+   ```
+
+9. **Only for a port below 1024** (the defaults are 8080 and 8443): let
+   unprivileged services bind from that port, here 443:
+
+   ```bash
+   echo 'net.ipv4.ip_unprivileged_port_start=443' | sudo tee /etc/sysctl.d/99-quasar-ports.conf
+   sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
+   ```
+
+</Steps>
+
+For a machine that shows games on its own screen, add the console rules from
+[Device rules](/quasar/install/device-rules/) and see [Console
+mode](/quasar/admin/console/). For smoother streams, set the [UDP send
+buffer](/quasar/tuning/latency/#the-udp-send-buffer).
+
+### Check it worked
+
+| Check | Expect |
+| --- | --- |
+| `grep '^quasar:' /etc/subuid /etc/subgid` | A line in each. |
+| `ls /var/lib/systemd/linger/` | `quasar` listed. |
+| `ls -ld /run/quasar-agent /var/lib/quasar/homes /var/lib/quasar/templates` | All three owned by `quasar`. |
+| `ls /etc/udev/rules.d/70-quasar.rules` | The file exists. |
+| `ls -Zd /var/lib/quasar/homes` (SELinux) | `container_file_t` in the label. |
+| `sudo machinectl shell quasar@ /bin/sh -c 'systemctl --user is-enabled podman.socket podman-restart.service'` (Podman) | `enabled` twice. |
+
+The add-host command checks the same things, and names anything still missing.
+
+### Optional shortcut
+
+[`deploy/prepare-host.sh`](https://github.com/accreleus/quasar/blob/main/deploy/prepare-host.sh)
+does the steps above in one go (step 9 only with `--unprivileged-port-start`). It
+also sets the UDP send buffer and loads `uinput` at boot. **Read it before you run
+it.** `--dry-run` prints what it would change and changes nothing:
+
+```bash
+sudo sh prepare-host.sh --mode rootless --engine podman \
+  --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates --dry-run
+```
+
+## Install, as `quasar`
+
+Open a full session as the account (`sudo -u quasar` is not enough):
+
+```bash
+sudo machinectl shell quasar@
+```
+
+<Steps>
+
+1. **Pin the images.** The seed refuses tags. This prints the three digests of the
+   current stable release (use `docker` for Docker):
+
+   ```bash
+   for i in quasar-recovery quasar-control-plane quasar-node-agent; do
+     podman pull -q ghcr.io/accreleus/quasar/$i:latest >/dev/null &&
+     podman image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+       ghcr.io/accreleus/quasar/$i:latest | grep -m1 "^ghcr.io/accreleus/quasar/$i@"
+   done
+   ```
+
+2. **Start the seed.** Fill in the digests and `QUASAR_PUBLIC_HOST`, the name or
+   LAN address you type into the browser.
+
+   Podman: write `~/.config/containers/systemd/quasar-seed.container`:
+
+   ```ini
+   [Unit]
+   Description=Quasar seed
+   Wants=network-online.target
+   Requires=podman.socket
+   After=network-online.target podman.socket
+
+   [Container]
+   ContainerName=quasar-seed
+   Image=ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest>
+   Exec=seed
+   SecurityLabelDisable=true
+   Volume=%t/podman/podman.sock:/var/run/docker.sock
+   Volume=quasar-machine:/var/lib/quasar-machine:ro
+   Environment=QUASAR_ROLE="combined"
+   Environment=QUASAR_PUBLIC_HOST="192.168.1.50"
+   Environment=QUASAR_HOME_ROOT="/var/lib/quasar/homes"
+   Environment=QUASAR_TEMPLATE_ROOT="/var/lib/quasar/templates"
+   Environment=QUASAR_CONTROL_PLANE_IMAGE="ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest>"
+   Environment=QUASAR_AGENT_IMAGE="ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>"
+
+   [Service]
+   Restart=always
+
+   [Install]
+   WantedBy=default.target
+   ```
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user start quasar-seed
+   ```
+
+   Docker:
+
+   ```bash
+   docker run -d --name quasar-seed --restart unless-stopped \
+     --security-opt label=disable \
+     -v "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock:/var/run/docker.sock" \
+     -v quasar-machine:/var/lib/quasar-machine:ro \
+     -e QUASAR_ROLE=combined \
+     -e QUASAR_PUBLIC_HOST=192.168.1.50 \
+     -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
+     -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
+     -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest> \
+     -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
+     ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
+   ```
+
+   Other inputs (control-only, your own Postgres, ports) are the same as on
+   [Docker](/quasar/install/docker/#install-the-first-machine).
+
+3. **Check it came up**, then claim it with the one-time setup token (`docker` for
+   Docker):
+
+   ```bash
+   podman exec quasar-recovery quasar-recovery status
+   curl http://localhost:8080/health
+   podman exec quasar-control-plane cat /run/quasar/setup-token
+   ```
+
+   `/health` answers `{"status":"ok","db":"ok"}`. Open
+   `https://<QUASAR_PUBLIC_HOST>:8443` and continue with [First run and
+   checks](/quasar/install/first-run/).
+
+</Steps>
+
+## Add a rootless GPU host
+
+Prepare it as above, then run the [Add host](/quasar/install/second-host/) command
+from a `sudo machinectl shell quasar@` session. It never uses `sudo`.
+
+<Aside type="caution" title="Moving an existing install">
+Never re-own a rootful install's homes in place. To move one to rootless, follow
+[Move to rootless](/quasar/install/moving/#move-to-rootless).
+</Aside>

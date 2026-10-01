@@ -1,6 +1,6 @@
 ---
 title: Install with Docker
-description: Install Quasar on Docker, rootful (supported) or rootless (experimental). One container per machine, the seed.
+description: Install Quasar on rootful Docker (supported). One container per machine, the seed. Rootless has its own page.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -10,12 +10,9 @@ Read [Requirements](/quasar/start/requirements/) first. The install pulls publis
 images (about 20 GB on a machine that runs the agent) and compiles nothing. On
 Unraid, follow [Unraid](/quasar/install/unraid/) instead.
 
-| Mode | Status | Runs as | Host preparation |
-| --- | --- | --- | --- |
-| Rootful | Supported | root | Recommended. Otherwise do the kernel steps in [Requirements](/quasar/start/requirements/) by hand. |
-| Rootless | Experimental | the `quasar` account | Required. Creates the account Quasar runs as. |
-
-Status per platform: [Engine profiles](/quasar/start/engine-profiles/).
+This page is **rootful** Docker (supported): Docker runs as root. To run Quasar
+as an ordinary account instead, follow [Install rootless](/quasar/install/rootless/)
+(experimental). Status per platform: [Engine profiles](/quasar/start/engine-profiles/).
 
 <Aside type="note" title="Stable releases">
 A new install starts on the **stable** channel, with images pinned by digest, so it
@@ -58,89 +55,36 @@ It holds the Docker socket. Its limits:
 
 ## Prepare the host
 
-Quasar never runs as root. The one exception is `prepare-host.sh`, run once on each
-machine before installing. The quick start prints the exact command for your
-[engine profile](/quasar/start/engine-profiles/), with the script's checksum. Read
-the script before you run it.
+Once, from an account with `sudo`. The quick start shows the same commands.
 
 ```bash
-sudo sh prepare-host.sh --mode rootful --engine docker
+sudo systemctl enable --now docker
 ```
 
-Get it from `https://accreleus.github.io/quasar/prepare-host.sh`, or from any
-control plane at `/prepare-host.sh`. The same script prepares
-[Podman](/quasar/install/podman/) hosts.
-
-**Rootless:** use `--mode rootless`, then run `dockerd-rootless-setuptool.sh` as the
-`quasar` account. Run everything below as that account, with its socket as the
-seed's first mount:
+**NVIDIA:** install the [NVIDIA Container
+Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+then give Docker its runtime:
 
 ```bash
--v "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock:/var/run/docker.sock"
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
 ```
 
-### What it changes
-
-Each change is printed with its reason. It never changes device owners, re-owns
-existing files, writes under `/usr` (so image-based systems like Fedora Atomic,
-Bazzite and uCore work), or relaxes SELinux.
-
-| Area | Change |
-| --- | --- |
-| Account | Rootless: the `quasar` account, subordinate UID/GID ranges, and lingering so its engine runs at boot. Rootful: a `quasar` group only. |
-| Devices | A udev rule gives the `quasar` group `/dev/uinput`, Quasar's own virtual input devices and the GPU render nodes. No broad groups like `input` or `video`. |
-| Runtime directory | `/run/quasar-agent`, recreated at every boot. |
-| Kernel | Loads `uinput` now and at boot; sets the [UDP send buffer sysctl](/quasar/start/requirements/#one-sysctl). |
-| NVIDIA | Makes sure a CDI specification exists for the loaded driver. |
-| Boot | Podman: enables `podman-restart.service` (rootless: also the user's `podman.socket`). Rootful Docker: enables `docker.service`. Rootless Docker: tells you to run `dockerd-rootless-setuptool.sh` as `quasar`. |
-| SELinux | Labels the homes, templates and runtime directories `container_file_t` and Quasar's virtual input devices. On NVIDIA, enables `container_use_xserver_devices` and installs the `quasar-nested-gpu` module. |
-
-### Options
-
-| Option | What it does |
-| --- | --- |
-| `--mode rootless\|rootful` | Required. The engine mode. |
-| `--engine auto\|docker\|podman` | Default `auto`: detects the engine, or prepares both if both are installed. |
-| `--user NAME` | The Quasar account or group. Default `quasar`. |
-| `--homes DIR` | Rootless only: create the homes root, owned by the Quasar account. |
-| `--templates DIR` | The same for the templates root (Steam's prepared home). |
-| `--console` | Also grant what [console mode](/quasar/admin/console/) needs. See below. |
-| `--console-audio-user USER` | With `--console`: route console audio through `USER`'s PipeWire. |
-| `--allow-kernel-log` | Let Quasar read GPU faults from the kernel log (`kernel.dmesg_restrict=0`). Without it, the `xid_visibility` check reads *skipped*. |
-| `--unprivileged-port-start N` | Let unprivileged services bind ports from `N`. Only for a rootless console on a port below 1024. |
-| `--dry-run` | Print what would change; change nothing. |
-
-`--homes` refuses system trees, users' homes, and directories another account owns.
-
-### Console mode
-
-`--console` lets a host show sessions on its own screen. It grants:
-
-- display cards, sound devices and i2c buses (monitor power over DDC), and loads `i2c-dev`;
-- the machine's keyboards, mice and controllers, so console mode can grab them.
-  **The `quasar` group can then read what is typed on this keyboard;**
-- `tty8`, and masks `getty@tty8` and `autovt@tty8`. If you run your own
-  `getty@tty8`, it is left alone and console sessions refuse to start.
-
-`--console-audio-user USER` adds a Quasar-only PipeWire socket to that user's
-desktop session. Restart their `pipewire-pulse` (or log in again) afterwards.
+If Docker runs with SELinux on (uCore and Fedora CoreOS do; `docker info` lists
+`selinux` under Security Options), also let containers open the NVIDIA devices:
 
 ```bash
-sudo sh prepare-host.sh --mode rootless --engine podman --console --console-audio-user alex
+sudo setsebool -P container_use_xserver_devices on
+echo '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' > quasar-nested-gpu.cil
+sudo semodule -i quasar-nested-gpu.cil
 ```
 
-### Running it again
+**Check it worked:** `systemctl is-enabled docker` says `enabled`; on NVIDIA,
+`docker info` lists `nvidia` under Runtimes.
 
-Safe to rerun at any time, for example to add `--console`. It changes only what is
-missing. If a step fails, fix the cause and rerun.
-
-A missing permission shows on the host's readiness card with this command as the
-fix ([Readiness checks](/quasar/troubleshooting/readiness/)).
-
-<Aside type="caution" title="Dropping an option doesn't undo it">
-Leaving out an option you gave before does not revoke what it granted. A sysctl
-stays in effect until reboot.
-</Aside>
+Optional: [console mode](/quasar/admin/console/) needs the console rules from
+[Device rules](/quasar/install/device-rules/), and the [UDP send
+buffer](/quasar/tuning/latency/#the-udp-send-buffer) makes streams smoother.
 
 ## Before you start
 
@@ -151,8 +95,7 @@ holds saves and installed games. The template root sits beside it:
 sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes /var/lib/quasar/templates
 ```
 
-Use the owner that suits your host. Rootless: let `prepare-host.sh --homes` and
-`--templates` create them instead.
+Use the owner that suits your host.
 
 **Pin the images by digest.** The seed refuses tags. This prints all three digests
 for the current stable release:
@@ -328,9 +271,8 @@ On every machine:
   name, and must match a name bound into the enrollment string.
 - **Inputs are read once**, on a clean machine. After that you can delete the
   enrollment string from the stack. It enrolls nothing after first use.
-- **Host preparation is yours** when you start the seed yourself: the sysctl,
-  `uinput` and, on NVIDIA, the container toolkit. The host's readiness card lists
-  anything missing.
+- **Host preparation is yours** when you start the seed yourself: see [Prepare the
+  host](#prepare-the-host). The host's readiness card lists anything missing.
 
 All inputs: [environment reference](/quasar/reference/environment/#seed-inputs).
 

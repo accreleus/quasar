@@ -40,8 +40,8 @@ because this **ends the host's live sessions**.
 
 - While it runs, the page reads **Applying** and new sessions on the host wait.
 - If the new agent is unhealthy, the old one is put back and the page shows the
-  cause (for example, what holds the display, or the `--console` host preparation
-  command to copy). **Try again** retries.
+  cause (for example, what holds the display, or the device access the host
+  still needs). **Try again** retries.
 - A host where console mode cannot work (no display device, for instance) reads as
   not available, with the reason.
 
@@ -51,14 +51,11 @@ instead.
 
 ## Rootful and rootless hosts
 
-Console mode works in every engine mode. Prepare the host with `--console` first;
-on a rootless host this is required:
-
-```bash
-sudo sh prepare-host.sh --mode rootless --console
-```
-
-See [Prepare the host](/quasar/install/docker/#console-mode) for what it grants.
+Console mode works in every engine mode. Install the console rules from [Device
+rules](/quasar/install/device-rules/) first; on a rootless host this is required.
+They grant the display cards, sound devices, i2c buses (monitor power over DDC),
+this machine's keyboards, mice and controllers (so console mode can grab them;
+**the `quasar` group can then read what is typed on this keyboard**), and `tty8`.
 
 On a rootless host:
 
@@ -74,8 +71,10 @@ During a console session the agent switches to virtual terminal 8 (`tty8`) with
 the kernel keyboard off, so keys don't reach the host's login prompt. It switches
 back when the session ends.
 
-- `--console` host preparation grants `tty8` and masks `getty@tty8` and
-  `autovt@tty8`. If you run your own `getty@tty8`, console sessions refuse to start.
+- The console device rules grant `tty8`; no login prompt may run there
+  (`getty@tty8` and `autovt@tty8` masked, see [Device
+  rules](/quasar/install/device-rules/)). If you run your own `getty@tty8`,
+  console sessions refuse to start.
 - If the terminal can't be taken, sessions fail with `console terminal:` and the
   reason.
 - If the agent dies holding the terminal, its next start restores it.
@@ -87,9 +86,10 @@ terminal you want.
 
 **Local audio output** lists what the host reported:
 
-- **Host PipeWire**: when host preparation was run with
-  `--console-audio-user USER`, sound plays through that user's PipeWire, beside
-  the desktop's own sound. Raw devices are hidden while PipeWire answers.
+- **Host PipeWire**: when the host has a Quasar-only PipeWire socket on a desktop
+  user's session ([`deploy/prepare-host.sh`](https://github.com/accreleus/quasar/blob/main/deploy/prepare-host.sh)
+  `--console-audio-user USER` sets one up; read it first), sound
+  plays through that user's PipeWire, beside the desktop's own sound. Raw devices are hidden while PipeWire answers.
 - **Sound device (ALSA)**: used when no PipeWire answers and the device is free.
   Listed as `hw:CARD=<id>,DEV=<n>`; an older `hw:N,M` setting still works.
 - Otherwise the console is quiet, and the `console_audio` readiness check names
@@ -112,7 +112,7 @@ a display coming on launches that app as that user. The default user must be
 entitled to the app.
 
 Monitor power is read over DDC/CI. This needs the i2c buses (granted by
-`--console` on rootless) and a monitor that answers DDC. Without them, every
+the console device rules on rootless) and a monitor that answers DDC. Without them, every
 connected display counts as on. Set `QUASAR_CONSOLE_DDC=0` on the agent to turn
 the power reading off.
 

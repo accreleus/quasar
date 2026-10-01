@@ -3,12 +3,12 @@
  *
  * SAFETY. A generated script's own preflight only ever calls `docker`/`podman`
  * through PATH, so a fake `docker`/`podman` placed ahead of the real ones on
- * PATH used to look like enough isolation. It is not: the quick start's host
- * preparation step runs `sudo sh prepare-host.sh …`, and `sudo` does not honour
- * the PATH we hand a child process — it re-execs through its own
- * `secure_path`/PAM environment, which can still find a REAL `docker` or
- * `podman` on the machine running the test. On this host that is exactly what
- * happened once: a native `npm test` run left a real Quasar install behind.
+ * PATH used to look like enough isolation. It is not: the rootful scripts run
+ * `sudo …`, and `sudo` does not honour the PATH we hand a child process — it
+ * re-execs through its own `secure_path`/PAM environment, which can still find
+ * a REAL `docker` or `podman` on the machine running the test. On this host
+ * that is exactly what happened once: a native `npm test` run left a real
+ * Quasar install behind.
  *
  * So this harness:
  *   - never inherits the calling process's environment (no stray PATH, no
@@ -16,17 +16,14 @@
  *     scratch by `fakeEnv()`;
  *   - intercepts `sudo` itself (never the real setuid binary): the shim logs
  *     the call and re-execs its argument directly, unprivileged, through the
- *     same fake PATH, so a `sudo docker …` or `sudo podman …` nested inside
- *     `sudo sh prepare-host.sh` still lands on the fakes below, not a real
- *     engine;
- *   - intercepts `systemctl` (Quadlet's `daemon-reload`/`start`) so nothing
- *     here ever asks a real init system to start a unit;
- *   - intercepts `sha256sum -c` so the checksum step in the generated prep
- *     block always resolves without needing to fetch the real
- *     `deploy/prepare-host.sh` over the network;
- *   - intercepts `curl`, which never contacts the network: a `-o FILE` request
- *     is answered with a harmless local no-op script, and every other call
- *     just succeeds.
+ *     same fake PATH, so a `sudo docker …` or `sudo podman …` still lands on
+ *     the fakes below, not a real engine;
+ *   - intercepts `systemctl` (Quadlet's `daemon-reload`/`start`, and the
+ *     podman-restart.service check) so nothing here ever asks a real init
+ *     system anything; `restartOff` makes `is-enabled` answer "disabled";
+ *   - intercepts `systemd-tmpfiles`, whose `--cat-config` lists the agent's
+ *     runtime directory unless `runDirOff`;
+ *   - intercepts `curl`, which never contacts the network.
  *
  * Nothing here ever calls a real `docker`, `podman` or `sudo` binary, by name
  * or by absolute path. The suite's last test, "no generated script ever
@@ -40,9 +37,9 @@
  * — see site/src/data/stack-template.test.js's file header.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir, userInfo } from 'node:os';
-import { dirname, join } from 'node:path';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function shim(dir, name, body) {
   const path = join(dir, name);
@@ -57,7 +54,7 @@ function shim(dir, name, body) {
  * for a Compose-labelled control plane, matching the flags the generated
  * script checks for before it will start the seed.
  */
-export function fakeEngineDir({ legacy = false, existing = false, portTaken = false } = {}) {
+export function fakeEngineDir({ legacy = false, existing = false, portTaken = false, restartOff = false, runDirOff = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'quasar-qs-'));
   const log = join(dir, 'calls');
   writeFileSync(log, '');
@@ -91,28 +88,16 @@ esac`);
 exec "$@"`);
 
   shim(dir, 'systemctl', `echo "systemctl $*" >> ${JSON.stringify(log)}
+case "$*" in
+  *is-enabled*podman-restart*) exit ${restartOff ? 1 : 0} ;;
+esac
 exit 0`);
 
-  shim(dir, 'sha256sum', `echo "sha256sum $*" >> ${JSON.stringify(log)}
-case "$*" in
-  *-c*)
-    # The fake curl below never fetches the real prepare-host.sh, so a real
-    # checksum can never match here. This only proves the script calls
-    # \`sha256sum -c\`, not that a real mismatch would be caught.
-    cat >/dev/null
-    exit 0
-    ;;
-  *) exec /usr/bin/sha256sum "$@" ;;
-esac`);
+  shim(dir, 'systemd-tmpfiles', `echo "systemd-tmpfiles $*" >> ${JSON.stringify(log)}
+${runDirOff ? '' : "echo 'd /run/quasar-agent 0755 root root -'"}
+exit 0`);
 
   shim(dir, 'curl', `echo "curl $*" >> ${JSON.stringify(log)}
-out=""
-prev=""
-for a in "$@"; do
-  [ "$prev" = "-o" ] && out="$a"
-  prev="$a"
-done
-[ -z "$out" ] || printf '#!/bin/sh\\nexit 0\\n' > "$out"
 # A control plane answers /health only once this script has started the seed:
 # before that the port is free (the scripts refuse to start on a taken port).
 case "$*" in
@@ -136,30 +121,9 @@ exit 0`);
 /**
  * A from-scratch environment for a generated script: no inherited PATH, no
  * inherited docker/podman/systemd env vars. The fake bin dir goes first; real
- * coreutils (bash, mkdir, tee, id, seq, sleep, grep, awk, sha256sum for the
- * non `-c` case…) still resolve from /usr/bin and /bin after it.
+ * coreutils (bash, mkdir, tee, id, seq, sleep, grep, awk…) still resolve from
+ * /usr/bin and /bin after it.
  */
-/**
- * A fake root holding what host preparation leaves behind, for the install scripts'
- * preparation check (`QUASAR_PREP_ROOT`). `prepared = false` leaves it empty.
- */
-export function preparedRoot(dir, prepared = true) {
-  const root = join(dir, 'prep-root');
-  mkdirSync(root, { recursive: true });
-  if (!prepared) return root;
-  const user = userInfo().username;
-  const put = (path, text) => {
-    mkdirSync(join(root, dirname(path)), { recursive: true });
-    writeFileSync(join(root, path), text);
-  };
-  put('etc/udev/rules.d/70-quasar.rules', '# prepared\n');
-  put('etc/sysctl.d/99-quasar.conf', '# prepared\n');
-  put('etc/tmpfiles.d/quasar.conf', '# prepared\n');
-  put('etc/subuid', `${user}:100000:65536\n`);
-  put(`var/lib/systemd/linger/${user}`, '');
-  return root;
-}
-
 export function fakeEnv(dir, extra = {}) {
   return {
     PATH: `${dir}:/usr/bin:/bin`,
@@ -170,18 +134,16 @@ export function fakeEnv(dir, extra = {}) {
 
 /**
  * Runs a generated script's text against the fake engine, returns the result
- * plus the call log. `cwd` is the fake bin dir itself: the prep block's
- * `curl -o prepare-host.sh` writes a relative path, and without pinning `cwd`
- * that lands wherever the test process happens to be running — which is how
- * an earlier version of this harness left a stray `prepare-host.sh` sitting
- * in the site's own working tree.
+ * plus the call log. `cwd` is the fake bin dir itself, so anything a script
+ * writes to a relative path lands there and is cleaned up with it, never in
+ * the site's own working tree.
  */
-export function runScript(script, { engine = fakeEngineDir(), extraEnv = {}, prepared = true } = {}) {
+export function runScript(script, { engine = fakeEngineDir(), extraEnv = {} } = {}) {
   try {
     const r = spawnSync('bash', ['-c', script], {
       encoding: 'utf8',
       cwd: engine.dir,
-      env: fakeEnv(engine.dir, { QUASAR_PREP_ROOT: preparedRoot(engine.dir, prepared), ...extraEnv }),
+      env: fakeEnv(engine.dir, extraEnv),
     });
     return { ...r, calls: engine.read() };
   } finally {
