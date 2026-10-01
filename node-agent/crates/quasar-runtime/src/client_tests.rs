@@ -49,7 +49,9 @@ fn fixture(
                 "{}",
                 String::from_utf8_lossy(&request)
             );
-            write!(socket, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            // A client that already has what it needs may close first (BrokenPipe on a
+            // busy runner); the test's own assertions on the result judge the exchange.
+            let _ = write!(socket, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         }
     });
     let mut config = RuntimeConfig::unix(path);

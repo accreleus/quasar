@@ -574,7 +574,6 @@ ${doneBlock(a, r, host, 'docker exec quasar-control-plane')}
 function podmanScript(a, r, p) {
   const { uid, gid } = appUser(a);
   const external = r.control && a.database === 'external';
-  const unitDir = '/etc/containers/systemd';
   const vars = { seed: '$seed_image', control: '$control_image', agent: '$agent_image' };
   const host = a.publicHost.trim() || '<this-host>';
   const unit = quadletUnit(a, vars).replace(/\n$/, '');
@@ -621,11 +620,13 @@ if ! sudo podman secret exists quasar-db-password 2>/dev/null; then
 fi
 ` : ''}
 echo "==> Writing the Quadlet unit"
-sudo mkdir -p "${unitDir}"
-sudo tee "${unitDir}/quasar-seed.container" >/dev/null <<'QUASAR_UNIT_HEADER'
+# QUASAR_QUADLET_DIR is for the site's own tests only (a temporary directory).
+unit_dir="\${QUASAR_QUADLET_DIR:-/etc/containers/systemd}"
+sudo mkdir -p "$unit_dir"
+sudo tee "$unit_dir/quasar-seed.container" >/dev/null <<'QUASAR_UNIT_HEADER'
 # Written by the Quasar quick start.
 QUASAR_UNIT_HEADER
-cat <<UNIT | sudo tee -a "${unitDir}/quasar-seed.container" >/dev/null
+cat <<UNIT | sudo tee -a "$unit_dir/quasar-seed.container" >/dev/null
 ${unit}
 UNIT
 

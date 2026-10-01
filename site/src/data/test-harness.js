@@ -128,6 +128,8 @@ export function fakeEnv(dir, extra = {}) {
   return {
     PATH: `${dir}:/usr/bin:/bin`,
     HOME: dir,
+    // The rootful Podman script writes its Quadlet unit here, never /etc.
+    QUASAR_QUADLET_DIR: `${dir}/quadlet`,
     ...extra,
   };
 }

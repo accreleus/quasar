@@ -902,6 +902,10 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Two test-only fixes.** The site's rootful Podman script test writes its Quadlet unit
+  into a temporary directory (`QUASAR_QUADLET_DIR`), never `/etc`; it failed in CI, where
+  the tests do not run as root. A runtime client test's fake engine no longer panics when
+  the client closes first.
 - **Audio works on an unprepared rootful SELinux host.** The node agent gives its runtime
   directory the container SELinux type at start (keeping user, role and level), so the
   audio sidecar can create its socket there. Before, a rootful Podman host that had not
