@@ -563,8 +563,9 @@ fn the_engine_check_names_the_engine_its_version_and_mode() {
     assert!(c.blocks.is_none(), "{c:?}");
 }
 
-/// Until the RH-07 acceptance map proves them, the new profiles read as experimental:
-/// a combination with no evidence is never implied supported (CONTEXT.md "Engine profile").
+/// Every profile but rootful Docker reads as experimental on any Linux: a combination
+/// not yet through every release check is never implied supported (CONTEXT.md
+/// "Engine profile").
 #[test]
 fn a_profile_without_evidence_warns_as_experimental_and_blocks_nothing() {
     let root = FakeRoot::new("runtime-engine-podman");
@@ -580,6 +581,7 @@ fn a_profile_without_evidence_warns_as_experimental_and_blocks_nothing() {
         assert!(c.summary.contains(mode.wire()), "{c:?}");
         assert!(c.blocks.is_none(), "{c:?}");
     }
+    // Any Linux reads the same: Docker and Podman are portable across distributions.
     let checks = probe(&observed(
         &root,
         Ok(engine(
@@ -587,6 +589,19 @@ fn a_profile_without_evidence_warns_as_experimental_and_blocks_nothing() {
             "5.8.4",
             EngineMode::Rootless,
             "Debian GNU/Linux 13",
+        )),
+    ));
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.summary.contains("experimental"), "{c:?}");
+    // Unraid ships only rootful Docker, so anything else there is unsupported.
+    let checks = probe(&observed(
+        &root,
+        Ok(engine(
+            EngineKind::Docker,
+            "27.5.1",
+            EngineMode::Rootless,
+            "Unraid OS 7.1 x86_64",
         )),
     ));
     let c = get(&checks, ENGINE_ID);

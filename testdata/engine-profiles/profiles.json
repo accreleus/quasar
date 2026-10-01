@@ -288,7 +288,7 @@
       "engine": "docker",
       "mode": "rootless",
       "status": "experimental",
-      "reason": "A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
       "alternatives": []
     },
     {
@@ -296,7 +296,7 @@
       "engine": "podman",
       "mode": "rootless",
       "status": "experimental",
-      "reason": "A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
       "alternatives": []
     },
     {
@@ -304,7 +304,7 @@
       "engine": "podman",
       "mode": "rootful",
       "status": "experimental",
-      "reason": "It has not yet been through the same end-to-end tests as the other Fedora profiles; it becomes supported once it passes.",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
       "alternatives": []
     },
     {
@@ -320,7 +320,7 @@
       "engine": "docker",
       "mode": "rootless",
       "status": "experimental",
-      "reason": "Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
       "alternatives": []
     },
     {
@@ -328,7 +328,7 @@
       "engine": "podman",
       "mode": "rootless",
       "status": "experimental",
-      "reason": "Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
       "alternatives": []
     },
     {
@@ -336,7 +336,7 @@
       "engine": "podman",
       "mode": "rootful",
       "status": "experimental",
-      "reason": "Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
       "alternatives": []
     },
     {
@@ -351,70 +351,25 @@
       "platform": "debian",
       "engine": "docker",
       "mode": "rootless",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on Debian.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "debian",
       "engine": "podman",
       "mode": "rootless",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on Debian.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "debian",
       "engine": "podman",
       "mode": "rootful",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on Debian.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "arch",
@@ -428,70 +383,25 @@
       "platform": "arch",
       "engine": "docker",
       "mode": "rootless",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on Arch.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "arch",
       "engine": "podman",
       "mode": "rootless",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on Arch.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "arch",
       "engine": "podman",
       "mode": "rootful",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on Arch.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "unraid",
@@ -552,70 +462,25 @@
       "platform": "other",
       "engine": "docker",
       "mode": "rootless",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on this distribution.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "other",
       "engine": "podman",
       "mode": "rootless",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on this distribution.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     },
     {
       "platform": "other",
       "engine": "podman",
       "mode": "rootful",
-      "status": "unsupported",
-      "reason": "No engine profile other than rootful Docker has been tested on this distribution.",
-      "alternatives": [
-        {
-          "engine": "docker",
-          "mode": "rootful"
-        },
-        {
-          "engine": "podman",
-          "mode": "rootless",
-          "platform": "fedora"
-        },
-        {
-          "engine": "docker",
-          "mode": "rootless",
-          "platform": "fedora"
-        }
-      ]
+      "status": "experimental",
+      "reason": "Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.",
+      "alternatives": []
     }
   ],
   "unknownEngine": {

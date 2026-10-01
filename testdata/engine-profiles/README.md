@@ -7,11 +7,12 @@ profiles to use instead. Decisions D4 and D5 in `docs/rh07/2026-09-28-decisions.
 statuses; the owner's rulings on #406 settle the rest:
 
 - Rootful Docker is supported on every platform, Unraid included, and is never blocked.
-- Docker rootless, Podman rootless and Podman rootful on Fedora and Ubuntu 24.04 are
-  experimental until the RH-07 acceptance map (#409) has evidence for them.
-- Everything else is unsupported, and so is an engine the agent cannot name
-  (`unknownEngine`). Unsupported blocks: the quick start generates nothing and enrollment
-  refuses the profile by name.
+- Docker rootless, Podman rootless and Podman rootful are experimental on every Linux
+  distribution (owner, 2026-10-01): Docker and Podman behave the same across
+  distributions, and testing has been on Fedora (uCore and Workstation).
+- Unraid ships only rootful Docker, so its other rows are unsupported, and so is an engine
+  the agent cannot name (`unknownEngine`). Unsupported blocks: the quick start generates
+  nothing and enrollment refuses the profile by name.
 
 Each reader is held to it by a test:
 

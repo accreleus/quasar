@@ -637,6 +637,12 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Rootless Docker and rootful or rootless Podman are experimental on any Linux.** They
+  were refused on Debian, Arch and unrecognised distributions; Docker and Podman behave the
+  same across distributions, so the quick start, the add-host command and the
+  `runtime_engine` readiness check now treat every Linux alike (tested on Fedora uCore and
+  Workstation). Unraid stays rootful-Docker only. The engine-profile page is one
+  four-row table.
 - **The documentation site is about 40% shorter.** Every page leads with what you need,
   what to do and how to know it worked; rationale, internals and repeated explanations are
   cut or linked. The engine-profile page is one platform-by-engine table, and the add-host
