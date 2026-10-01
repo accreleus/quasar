@@ -875,6 +875,10 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **Audio works on an unprepared rootful SELinux host.** The node agent gives its runtime
+  directory the container SELinux type at start (keeping user, role and level), so the
+  audio sidecar can create its socket there. Before, a rootful Podman host that had not
+  run host preparation failed `audio_probe` with "Permission denied".
 - **Release review fixes (PR #435).** The control plane builds on Go 1.26, which its
   dependencies now require; every Go pin (CI, both Dockerfiles, the dev tooling) moved with
   it. The recovery actor's database helpers run under bash, so a Debian-based
