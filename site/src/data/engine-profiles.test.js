@@ -23,16 +23,16 @@ test('rootful Docker is supported on every platform, Unraid included (D4)', () =
   }
 });
 
-test('the other Fedora and Ubuntu 24.04 profiles are experimental until proven (D5)', () => {
-  for (const platform of ['fedora', 'ubuntu']) {
+test('every other profile is experimental on any Linux, an unknown distribution included', () => {
+  for (const platform of ['fedora', 'ubuntu', 'debian', 'arch', 'other']) {
     for (const [engine, mode] of [['docker', 'rootless'], ['podman', 'rootless'], ['podman', 'rootful']]) {
       assert.equal(profileFor(platform, engine, mode).status, 'experimental', `${platform} ${engine} ${mode}`);
     }
   }
 });
 
-test('anything else is unsupported, and names alternatives that are not', () => {
-  for (const platform of ['debian', 'arch', 'unraid', 'other']) {
+test('Unraid has only rootful Docker: the rest is unsupported, with alternatives that are not', () => {
+  for (const platform of ['unraid']) {
     for (const [engine, mode] of [['docker', 'rootless'], ['podman', 'rootless'], ['podman', 'rootful']]) {
       const p = profileFor(platform, engine, mode);
       assert.equal(p.status, 'unsupported', `${platform} ${engine} ${mode}`);
@@ -59,7 +59,7 @@ test('an engine the table does not know is unsupported everywhere', () => {
 
 test('an unknown platform reads as the catch-all', () => {
   assert.equal(profileFor('gentoo', 'podman', 'rootless').platform, 'other');
-  assert.equal(profileFor('gentoo', 'podman', 'rootless').status, 'unsupported');
+  assert.equal(profileFor('gentoo', 'podman', 'rootless').status, 'experimental');
 });
 
 test('every platform the quick start offers has profiles', () => {

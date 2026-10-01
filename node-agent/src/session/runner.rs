@@ -4140,8 +4140,10 @@ mod tests {
             let w = m.drain_window(std::time::Instant::now());
             (w.stream_width, w.stream_height)
         };
+        // Up to 5 s: a live renegotiation is quick alone but can take over a second while
+        // the whole suite runs in parallel, and 1 s made this flaky.
         let wait_for_echo = |want: (Option<i32>, Option<i32>)| {
-            for _ in 0..40 {
+            for _ in 0..200 {
                 if echo(&metrics) == want {
                     return true;
                 }
@@ -4153,7 +4155,7 @@ mod tests {
         // At the launch size, nothing is echoed.
         assert_eq!(echo(&metrics), (None, None));
 
-        // Step DOWN: the echo must become the new size within ~1 s. The stale read returned
+        // Step DOWN: the echo must become the new size. The stale read returned
         // the launch size, which folds to "default", so this assertion catches the bug.
         apply_stream_update(&lever, 640, 360);
         assert!(

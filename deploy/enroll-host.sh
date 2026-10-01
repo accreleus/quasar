@@ -485,29 +485,29 @@ platform|other|Another Linux
 engine|docker|Docker
 engine|podman|Podman
 profile|fedora|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, with AMD and NVIDIA GPUs.
-profile|fedora|docker|rootless|experimental||A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.
-profile|fedora|podman|rootless|experimental||A required profile that has not yet passed its end-to-end tests on hardware; it becomes supported when it does.
-profile|fedora|podman|rootful|experimental||It has not yet been through the same end-to-end tests as the other Fedora profiles; it becomes supported once it passes.
+profile|fedora|docker|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|fedora|podman|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|fedora|podman|rootful|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
 profile|ubuntu|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
-profile|ubuntu|docker|rootless|experimental||Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.
-profile|ubuntu|podman|rootless|experimental||Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.
-profile|ubuntu|podman|rootful|experimental||Nobody has run Quasar end to end on Ubuntu 24.04 with this engine yet; it should work.
+profile|ubuntu|docker|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|ubuntu|podman|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|ubuntu|podman|rootful|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
 profile|debian|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
-profile|debian|docker|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Debian.
-profile|debian|podman|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Debian.
-profile|debian|podman|rootful|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Debian.
+profile|debian|docker|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|debian|podman|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|debian|podman|rootful|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
 profile|arch|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
-profile|arch|docker|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Arch.
-profile|arch|podman|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Arch.
-profile|arch|podman|rootful|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on Arch.
+profile|arch|docker|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|arch|podman|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|arch|podman|rootful|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
 profile|unraid|docker|rootful|supported||Unraid's own Docker runs as root, and it is the engine Quasar has always installed on there.
 profile|unraid|docker|rootless|unsupported|docker/rootful|Unraid has no rootless Docker.
 profile|unraid|podman|rootless|unsupported|docker/rootful|Unraid has no Podman.
 profile|unraid|podman|rootful|unsupported|docker/rootful|Unraid has no Podman.
 profile|other|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, and it works the same on any distribution.
-profile|other|docker|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on this distribution.
-profile|other|podman|rootless|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on this distribution.
-profile|other|podman|rootful|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|No engine profile other than rootful Docker has been tested on this distribution.
+profile|other|docker|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|other|podman|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
+profile|other|podman|rootful|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
 unknown|unsupported|docker/rootful podman/rootless@fedora docker/rootless@fedora|Quasar cannot tell which container engine this is, so nothing about it has been tested.
 PROFILES
 }

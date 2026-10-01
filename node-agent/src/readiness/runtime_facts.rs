@@ -618,16 +618,14 @@ fn is_ubuntu_2404(version: &str) -> bool {
 /// experimental until the RH-07 acceptance map proves them (#409 moves the Fedora rows to
 /// supported); anything else, or an engine this agent cannot name, is unsupported.
 pub fn engine_profile(facts: &EngineFacts, host_os: Option<&HostOs>) -> ProfileStatus {
+    // Docker and Podman behave the same across distributions, so every Linux gets the
+    // same verdict. Unraid ships only rootful Docker; anything else there is not Unraid's.
     let platform = ProfilePlatform::of(facts, host_os);
-    let known_os = matches!(
-        platform,
-        ProfilePlatform::Fedora | ProfilePlatform::Ubuntu2404
-    );
     match (facts.info.kind, facts.mode) {
         (EngineKind::Unknown, _) => ProfileStatus::Unsupported,
         (EngineKind::Docker, EngineMode::Rootful) => ProfileStatus::Supported,
-        (_, _) if known_os => ProfileStatus::Experimental,
-        (_, _) => ProfileStatus::Unsupported,
+        (_, _) if platform == ProfilePlatform::Unraid => ProfileStatus::Unsupported,
+        (_, _) => ProfileStatus::Experimental,
     }
 }
 
@@ -653,9 +651,9 @@ fn check_runtime_engine_inner(view: &RuntimeView, host_os: Option<&HostOs>) -> R
     let mode = facts.mode.wire();
     let named = engine_named(facts);
     let alternatives = "Docker rootful is the supported profile. Docker rootless, Podman \
-                        rootless and Podman rootful on Fedora (its image-based editions \
-                        included) or Ubuntu 24.04 are experimental until proven on hardware; \
-                        other combinations are unsupported (see the engine-profile docs).";
+                        rootless and Podman rootful are experimental on any Linux \
+                        distribution (tested on Fedora); Unraid has only rootful Docker \
+                        (see the engine-profile docs).";
     match engine_profile(facts, host_os) {
         ProfileStatus::Supported => super::pass(
             ENGINE_ID,
