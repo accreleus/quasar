@@ -4,7 +4,8 @@
 //! them, once, on a clean machine. One parser and one check serve both, so a seed never
 //! accepts inputs its actor would refuse.
 
-use crate::actor::OperatorInputs;
+use crate::actor::{repository_of, OperatorInputs};
+use crate::engine::{EngineError, PlatformEngine};
 use crate::recipe::{
     self, control, AppInputs, ControlInputs, DatabaseInputs, ImageRef, Inputs, TrustInputs,
 };
@@ -83,7 +84,97 @@ fn port(name: &str, raw: Option<&str>, default: u16) -> Result<u16, String> {
     }
 }
 
+/// Why an image input could not be pinned.
+#[derive(Debug)]
+pub enum ResolveError {
+    /// The engine could not pull or inspect the tag (registry down, no such tag): a
+    /// later look may succeed.
+    Engine {
+        variable: &'static str,
+        reference: String,
+        error: EngineError,
+    },
+    /// The input is not a reference this install can pin.
+    Invalid(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Engine {
+                variable,
+                reference,
+                error,
+            } => {
+                write!(f, "{variable} {reference} cannot be pulled ({error})")
+            }
+            ResolveError::Invalid(why) => f.write_str(why),
+        }
+    }
+}
+
+/// A tag reference (`repository:tag`) pulled now and named by the registry digest the
+/// engine reports for it; a reference that already names a digest is returned unchanged
+/// (and validated by [`Bootstrap::check`]). Pulling every time is the point: the digest is
+/// the tag's content at this install, and is what the machine records.
+fn pin(
+    engine: &dyn PlatformEngine,
+    variable: &'static str,
+    raw: &str,
+) -> Result<String, ResolveError> {
+    let reference = raw.trim();
+    if reference.contains('@') {
+        return Ok(raw.to_owned());
+    }
+    if reference.chars().any(char::is_whitespace) {
+        return Err(ResolveError::Invalid(format!(
+            "{variable}: {reference:?} is not an image reference"
+        )));
+    }
+    let engine_error = |error| ResolveError::Engine {
+        variable,
+        reference: reference.to_owned(),
+        error,
+    };
+    engine.pull(reference).map_err(engine_error)?;
+    let found = engine.inspect_image(reference).map_err(engine_error)?;
+    let repository = repository_of(reference);
+    found
+        .and_then(|image| {
+            image.repo_digests.into_iter().find(|d| {
+                d.split_once('@').is_some_and(|(repo, _)| repo == repository)
+            })
+        })
+        .ok_or_else(|| {
+            ResolveError::Invalid(format!(
+                "{variable}: {reference} has no registry digest to pin it by; name a registry image, or give repository@sha256:…"
+            ))
+        })
+}
+
 impl Bootstrap {
+    /// Replaces every tag-named image input with the digest the registry gives that tag
+    /// now, so an operator can write `…/quasar-node-agent:latest` and the machine still
+    /// records only digests (ADR 0001). Runs once, on a first install, before anything is
+    /// created or written: a failure leaves the machine untouched and the same inputs
+    /// are tried again. An installed machine never reads these inputs, so a moved tag
+    /// cannot change it.
+    pub fn pin_images(&mut self, engine: &dyn PlatformEngine) -> Result<(), ResolveError> {
+        let op = &mut self.operator;
+        for (variable, slot) in [
+            (AGENT_IMAGE, &mut op.agent_image),
+            (CONTROL_PLANE_IMAGE, &mut op.control_plane_image),
+            (POSTGRES_IMAGE, &mut op.postgres_image),
+            (ENROLL_SEED_IMAGE, &mut op.enroll_seed_override),
+            (ENROLL_AGENT_IMAGE, &mut op.enroll_agent_override),
+        ] {
+            if let Some(raw) = slot.as_deref() {
+                *slot = Some(pin(engine, variable, raw)?);
+            }
+        }
+        Ok(())
+    }
+
     /// From `KEY=value` pairs, as `Config.Env` holds them. Blank values are unset. Fails
     /// only on an unknown role; everything else is [`Bootstrap::check`]'s.
     pub fn from_env<S: AsRef<str>>(env: &[S]) -> Result<Bootstrap, String> {
@@ -178,7 +269,7 @@ impl Bootstrap {
             Some(raw) => Some(ImageRef::parse(raw).map_err(|e| format!("{AGENT_IMAGE}: {e}"))?),
             None if agent_here => {
                 return Err(format!(
-                    "{AGENT_IMAGE} is required, pinned by digest (repository@sha256:…)"
+                    "{AGENT_IMAGE} is required (an image reference; a tag is pinned to its digest at install)"
                 ))
             }
             None => None,

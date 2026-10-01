@@ -1008,7 +1008,7 @@ fn invalid_bootstrap_inputs_log_one_clear_line_and_leave_an_idle_seed_and_nothin
         (
             "QUASAR_AGENT_IMAGE",
             "QUASAR_AGENT_IMAGE",
-            Some("registry.example.invalid/quasar/quasar-node-agent:latest"),
+            Some("registry.example.invalid/quasar/not an image"),
         ),
         ("QUASAR_ROLE", "QUASAR_ROLE", Some("sideways")),
     ];
@@ -1041,6 +1041,89 @@ fn invalid_bootstrap_inputs_log_one_clear_line_and_leave_an_idle_seed_and_nothin
         );
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
+}
+
+const AGENT_TAG: &str = "registry.example.invalid/quasar/quasar-node-agent:latest";
+
+fn tagged_env() -> BTreeMap<String, String> {
+    let mut env = seed_env();
+    env.insert("QUASAR_AGENT_IMAGE".into(), AGENT_TAG.into());
+    env
+}
+
+#[test]
+fn a_tagged_image_input_installs_the_digest_the_tag_names_at_install_time() {
+    let _serial = serial();
+    let (engine, dir) = new_machine(tagged_env());
+    engine.with_state(|s| {
+        s.registry.insert(AGENT_TAG.into(), agent_image(Some("1")));
+    });
+    let created = seed(&engine, dir.path(), SEED_ID).step();
+    assert!(matches!(created, Outcome::Created { .. }), "{created:?}");
+    let id = actor_id(&engine.state());
+    seeded_actor(&engine, dir.path(), &id)
+        .resume()
+        .expect("the actor pins the tag and installs");
+    let state = engine.state();
+    assert_eq!(
+        state.container_named(names::NODE_AGENT).unwrap().spec.image,
+        AGENT_IMAGE,
+        "the agent runs the digest, never the tag"
+    );
+    let machine = std::fs::read_to_string(dir.path().join("machine.json")).unwrap();
+    let digest = AGENT_IMAGE.split_once('@').unwrap().1;
+    assert!(machine.contains(digest), "{machine}");
+    assert!(!machine.contains(":latest"), "{machine}");
+}
+
+#[test]
+fn a_tag_that_cannot_be_pulled_creates_nothing_and_is_tried_again() {
+    let _serial = serial();
+    let (engine, dir) = new_machine(tagged_env());
+    let before = engine.state();
+    let mut seed = seed(&engine, dir.path(), SEED_ID);
+    for _ in 0..2 {
+        let outcome = seed.step();
+        assert!(
+            matches!(&outcome, Outcome::Retry { token: "seed-agent-image-unavailable", why }
+                if why.contains("QUASAR_AGENT_IMAGE") && why.contains(AGENT_TAG)),
+            "{outcome:?}"
+        );
+        assert_eq!(engine.state(), before, "something was created");
+    }
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn a_moved_tag_does_not_change_an_installed_machine_when_its_seed_is_redeployed() {
+    let _serial = serial();
+    let (engine, dir) = new_machine(tagged_env());
+    engine.with_state(|s| {
+        s.registry.insert(AGENT_TAG.into(), agent_image(Some("1")));
+    });
+    seed(&engine, dir.path(), SEED_ID).step();
+    let id = actor_id(&engine.state());
+    seeded_actor(&engine, dir.path(), &id).resume().unwrap();
+    engine.with_state(|s| {
+        let mut moved = agent_image(Some("1"));
+        moved.repo_digests = vec![
+            "registry.example.invalid/quasar/quasar-node-agent@sha256:dd44000000000000000000000000000000000000000000000000000000000000".into(),
+        ];
+        s.registry.insert(AGENT_TAG.into(), moved);
+        let id = s.container_named(names::RECOVERY_ACTOR).unwrap().id.clone();
+        s.containers.remove(&id);
+    });
+    let outcome = seed(&engine, dir.path(), SEED_ID).step();
+    assert!(matches!(outcome, Outcome::Created { .. }), "{outcome:?}");
+    assert_eq!(
+        engine
+            .state()
+            .container_named(names::NODE_AGENT)
+            .unwrap()
+            .spec
+            .image,
+        AGENT_IMAGE
+    );
 }
 
 #[test]
