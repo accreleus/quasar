@@ -13,7 +13,7 @@ install](/quasar/install/legacy-compose/#back-up-and-restore) keeps its secrets 
 
 | Where | What | Losing it means |
 | --- | --- | --- |
-| The database (`quasar-postgres-data`, or your own) | Everything: users, apps, hosts, sessions, entitlements, settings, the apply history. | Total loss. |
+| The database (`quasar-postgres-data`, or your own) | Everything: users, apps, hosts, sessions, app access, settings, the apply history. | Total loss. |
 | The managed home root | Users' saves and installed content. | Users lose their saves. |
 | `quasar-machine`, on each machine | Generated secrets (`QUASAR_SECRET_KEY`, the database password), update records, pre-update dumps. | Stored credentials become unreadable; the recovery actor can't act on that machine. |
 | `quasar-control-data` | TLS certificate, artwork cache. | A new certificate; clients re-trust. |

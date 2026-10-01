@@ -9,9 +9,9 @@ It is on by default in `smooth` mode. Most deployments should leave it there.
 
 ## The two modes
 
-Set per host under **Admin ▸ Fleet ▸ Hosts ▸ Settings**. On a legacy Compose
-install or a source checkout, `QUASAR_ABR_MODE` in `deploy/.env` also sets it for
-the whole host. An owned install takes no agent environment of its own.
+Change it under **Admin ▸ Fleet ▸ Hosts ▸ Settings**. For a source checkout or an
+older Compose-managed agent, `QUASAR_ABR_MODE` in `deploy/.env` also sets the host
+default. Current managed installs use the host settings page.
 
 | Mode | Behaviour | Use it when |
 | --- | --- | --- |
@@ -19,17 +19,11 @@ the whole host. An owned install takes no agent environment of its own.
 | `protective` | The older governor. One hard step down on trouble, gradual ramp back up. | `smooth` behaves oddly on your hardware, especially the encoder speed ladder. |
 | `off` | Fixed bitrate at the tier's value. The congestion controller stays attached for telemetry only. | A dedicated wired LAN. Not WiFi. |
 
-## Turning it off
+## Environment override
 
-```bash
-QUASAR_ABR_MODE=off
-```
-
-The older alias still works:
-
-```bash
-QUASAR_ABR=0
-```
+For an environment-managed agent, `QUASAR_ABR_MODE=off` disables ABR. The older
+alias `QUASAR_ABR=0` is also accepted. Prefer the host settings page for a managed
+install.
 
 ## The floor
 

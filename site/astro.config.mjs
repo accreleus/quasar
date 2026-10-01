@@ -49,10 +49,10 @@ export default defineConfig({
 	// printed by released quick-start scripts and linked from outside, so each one
 	// keeps working. Keys omit the base; targets include it.
 	redirects: rebaseRedirects({
+		'/start/engine-profiles/': '/quasar/start/requirements/#container-engines',
 		'/install/install/': '/quasar/install/docker/',
 		'/install/prepare-host/': '/quasar/install/rootless/',
 		'/install/podman-quadlet/': '/quasar/install/podman/',
-		'/install/verify/': '/quasar/install/first-run/#check-your-install',
 		'/install/move-existing/': '/quasar/install/moving/#move-a-compose-install',
 		'/install/move-to-rootless/': '/quasar/install/moving/#move-to-rootless',
 	}, DOCS_ROOT, BASE),
@@ -150,34 +150,29 @@ export default defineConfig({
 						{ label: 'What Quasar is', slug: 'start/what-quasar-is' },
 						{ label: 'How it works', slug: 'start/how-it-works' },
 						{ label: 'Requirements', slug: 'start/requirements' },
-						{ label: 'Engine profiles', slug: 'start/engine-profiles' },
 					],
 				},
 				{
 					label: 'Install',
 					items: [
 						{ label: 'Quick start', slug: 'start/quickstart' },
+						{ label: 'NVIDIA setup', slug: 'install/nvidia' },
 						{ label: 'Docker', slug: 'install/docker' },
 						{ label: 'Podman', slug: 'install/podman' },
 						{ label: 'Rootless', slug: 'install/rootless' },
 						{ label: 'Unraid', slug: 'install/unraid' },
 						{ label: 'Device rules (udev)', slug: 'install/device-rules' },
-						{ label: 'First run and checks', slug: 'install/first-run' },
 						{ label: 'Add a GPU host', slug: 'install/second-host' },
-						{
-							label: 'Moving an install',
-							items: [
-								{ label: 'Move to a new install', slug: 'install/moving' },
-								{ label: 'Legacy Compose installs', slug: 'install/legacy-compose' },
-							],
-						},
+						{ label: 'Check your install', slug: 'install/verify' },
+
 					],
 				},
 				{
-					label: 'Playing',
+					label: 'Getting started',
 					items: [
-						{ label: 'Your library', slug: 'playing/library' },
-						{ label: 'In a session', slug: 'playing/in-session' },
+						{ label: 'Create your account', slug: 'install/first-run' },
+						{ label: 'Set up your game library', slug: 'playing/library' },
+						{ label: 'Play your first session', slug: 'playing/in-session' },
 						{ label: 'Browser support', slug: 'playing/browsers' },
 						{ label: 'Files and saves', slug: 'playing/storage' },
 					],

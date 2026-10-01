@@ -8,12 +8,13 @@
  * are docs/configuration.md "Seed" / "Recovery actor"; the GPU-host stack has the
  * same shape Admin -> Fleet -> Add host writes (web/src/lib/addHost.ts).
  *
- * Images: a static page cannot know the current digests, and the seed refuses a
- * tag for the agent and control-plane images. So the script resolves the stable
- * channel's `latest` tags (the newest release, or `main`, images.yml) to digests
- * on the host at run time, and the stack pane carries placeholders plus a
- * one-line command that prints the three pins. Publish the site only after the
- * release is cut: before it, `latest` names a build from before owned installs.
+ * Images: a static page cannot know the current digests, so the stack names the
+ * stable channel's `latest` tags (the newest release, or `main`, images.yml) and
+ * the seed pins the agent and control-plane tags to digests itself, on a first
+ * install, before it creates anything. The script resolves them up front on the
+ * host instead, so the Quadlet unit it writes carries digests. Publish the site
+ * only after the release is cut: before it, `latest` names a build from before
+ * owned installs.
  *
  * Engine and mode (RH07-14, #406). Which (platform, engine, mode) combinations
  * are offered at all is `testdata/engine-profiles/profiles.json` via
@@ -99,15 +100,15 @@ export function supportedProfile(a) {
 /** The docs page a rootless install follows instead of the quick start. */
 export const ROOTLESS_DOCS_URL = 'https://accreleus.github.io/quasar/install/rootless/';
 
-/** A digest placeholder in the one shape the seed accepts. */
-export function placeholderImage(name) {
-  return `${REGISTRY_NS}/${name}@sha256:<digest>`;
+/** A channel-tagged image. The seed pins it to a digest at install time. */
+export function taggedImage(name) {
+  return `${REGISTRY_NS}/${name}:${CHANNEL_TAG}`;
 }
 
-const PLACEHOLDERS = {
-  seed: placeholderImage(IMAGE_NAMES.seed),
-  control: placeholderImage(IMAGE_NAMES.control),
-  agent: placeholderImage(IMAGE_NAMES.agent),
+const TAGGED = {
+  seed: taggedImage(IMAGE_NAMES.seed),
+  control: taggedImage(IMAGE_NAMES.control),
+  agent: taggedImage(IMAGE_NAMES.agent),
 };
 
 /** Per-user home directories. This is the one that grows. */
@@ -148,12 +149,12 @@ const ENROLLMENT_PLACEHOLDER = 'qenr1.<paste the string from Admin, Fleet, Add h
 
 /**
  * The seed's inputs for these answers, in order, as [name, value]. `images` are
- * the three references (placeholders, or the script's resolved variables).
+ * the three references (the channel tags, or the script's resolved variables).
  * The operator's database password is never a value here: it is
  * `${QUASAR_DATABASE_PASSWORD}`, interpolated from the stack's own .env, or the
  * script's environment.
  */
-export function seedInputs(a, images = PLACEHOLDERS) {
+export function seedInputs(a, images = TAGGED) {
   const r = role(a.role);
   const out = [['QUASAR_ROLE', r.seedRole]];
   if (r.seedRole === 'gpu') out.push(['QUASAR_ENROLLMENT', ENROLLMENT_PLACEHOLDER]);
@@ -189,7 +190,7 @@ export function seedInputs(a, images = PLACEHOLDERS) {
  * `name:` matters: without it Compose names it `<project>_quasar-machine`, which
  * the seed refuses (`seed-self-invalid`).
  */
-export function seedStack(a, images = PLACEHOLDERS) {
+export function seedStack(a, images = TAGGED) {
   // Double-quoted (JSON is valid YAML): a port or a node name stays a string.
   const q = (v) => JSON.stringify(v);
   return [
@@ -221,15 +222,6 @@ export function stackEnv(a) {
     'QUASAR_DATABASE_PASSWORD=',
     '',
   ].join('\n');
-}
-
-/** Prints the three references to paste into the stack, resolved on the host. */
-export function pinsCommand(a) {
-  const names = role(a.role).control
-    ? [IMAGE_NAMES.seed, IMAGE_NAMES.control, IMAGE_NAMES.agent]
-    : [IMAGE_NAMES.seed, IMAGE_NAMES.agent];
-  const engineCli = a.engine === 'podman' ? 'podman' : 'docker';
-  return `for i in ${names.join(' ')}; do ${engineCli} pull -q ${REGISTRY_NS}/$i:${CHANNEL_TAG} >/dev/null && ${engineCli} image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' ${REGISTRY_NS}/$i:${CHANNEL_TAG} | grep -m1 "^${REGISTRY_NS}/$i@"; done`;
 }
 
 function shellQuote(value) {
@@ -342,9 +334,9 @@ function quadletEnvironmentLines(a, images) {
  * to `/var/run/docker.sock`, the one in-container path the seed accepts
  * (ADR 0007's RH07 amendment) — never the mockup's `/run/podman/podman.sock`,
  * which the seed refuses. The script itself writes and starts this same unit
- * with resolved image digests, not placeholders.
+ * with resolved image digests; the on-screen unit names tags, resolved by the seed.
  */
-export function quadletUnit(a, images = PLACEHOLDERS) {
+export function quadletUnit(a, images = TAGGED) {
   const external = role(a.role).control && a.database === 'external';
   const rootful = a.mode === 'rootful';
   const lines = [
@@ -374,7 +366,7 @@ export function quadletUnit(a, images = PLACEHOLDERS) {
  * disclosure in the Result step. Same socket mapping as the unit
  * (`/var/run/docker.sock` in-container, per ADR 0007's RH07 amendment).
  */
-export function podmanRunSeed(a, images = PLACEHOLDERS) {
+export function podmanRunSeed(a, images = TAGGED) {
   const rootful = a.mode === 'rootful';
   const sudo = rootful ? 'sudo ' : '';
   const sock = rootful ? '/run/podman/podman.sock' : '${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock';
@@ -776,7 +768,7 @@ function scriptText(a) {
  * a control-plane role on a rootful engine in a profile that is not unsupported.
  * A rootless engine follows the docs' rootless page instead (`ROOTLESS_DOCS_URL`).
  *
- * @returns {{stack: string, env: string|null, pins: string, hostSteps: string|null,
+ * @returns {{stack: string, env: string|null, hostSteps: string|null,
  *            quadlet: string|null, podmanRun: string|null, script: string|null,
  *            proxyConfig: {name: string, filename: string, language: string, body: string}|null}}
  */
@@ -793,7 +785,6 @@ export function generate(input = {}) {
   return {
     stack: seedStack(a),
     env: stackEnv(a),
-    pins: pinsCommand(a),
     // A GPU host joins from its control plane: Admin -> Fleet -> Add host prints the
     // one-line command, which checks the host too. Unraid needs no host steps.
     hostSteps: showInstall && !unraid ? hostSteps(a) : null,

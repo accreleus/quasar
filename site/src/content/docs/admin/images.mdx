@@ -30,10 +30,13 @@ entry is one of:
 
 ## Installing an image
 
-Press install. Each host pulls or builds on its own, and progress shows per host.
+1. Open **Admin ▸ Library ▸ Images** and choose an image.
+2. Press **Install** and check the progress for each host.
+3. When installation succeeds, [create an app](/quasar/admin/apps/) using the
+   new runtime preset.
 
-Installing also creates a **runtime preset** (image, environment, GPU access,
-mounts) that apps reference, so install the image before creating its app.
+Each host pulls or builds its own copy. The runtime preset stores the image,
+environment, GPU access and mounts for apps that use it.
 
 ## Where images get placed
 

@@ -29,19 +29,21 @@ Quasar behaves as on a LAN.
 
 ## On a LAN
 
-Nothing to configure beyond the certificate names.
+Use an address covered by the certificate, and allow the
+[required ports](/quasar/reference/ports/#firewall) between the client and host.
 
 ## Signaling through a proxy
 
-If you proxy the control plane, set `PUBLIC_BASE_URL` (when the proxy rewrites
-`Host`) and the allowed origins. See [Behind a reverse proxy](/quasar/network/reverse-proxy/).
+If you proxy the control plane, preserve the browser-facing address and configure
+allowed origins. The settings differ for current and legacy installs: see
+[Behind a reverse proxy](/quasar/network/reverse-proxy/).
 
 ## When login works but sessions do not
 
-It's the network path.
+Check the direct network path first:
 
-1. In **Admin ▸ Sessions**, a session stuck at starting, or running with a black
-   screen, means the connection failed.
+1. In **Admin ▸ Sessions**, check whether the session is still starting or is
+   running with a black screen.
 2. ICE stuck at `checking` in the browser console means no candidate pair worked.
 3. Check the selected candidate pair in the browser's WebRTC diagnostics and
    confirm the client can route to the GPU host.

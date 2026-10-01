@@ -5,10 +5,16 @@ description: Run Quasar as an ordinary account instead of root. The one-time roo
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-Rootless runs the whole of Quasar under one unprivileged account, `quasar`. If
-Quasar were ever compromised, it could not take over the machine. Both engines are
-**experimental** rootless: see [Engine profiles](/quasar/start/engine-profiles/).
+Rootless runs Quasar under an ordinary account, `quasar`, reducing its host privileges.
+Both engines are
+**experimental** rootless: see [Container engines](/quasar/start/requirements/#container-engines).
 For a rootful install, use the [quick start](/quasar/start/quickstart/) instead.
+
+<Aside type="caution" title="Local preview: compatible bootstrap images required">
+The tagged image examples on this page require the [#440 bootstrap fix](https://github.com/accreleus/quasar/commit/5c5f2d94e9fa3c858bf33db25ffbc7516c451589).
+Publication of compatible images has not been verified. Do not use these examples
+against older images. The fix resolves tags to immutable digests at first install.
+</Aside>
 
 ## What you need
 
@@ -18,8 +24,7 @@ For a rootful install, use the [quick start](/quasar/start/quickstart/) instead.
 - On SELinux (Fedora and its relatives): `semanage` and `restorecon`, from
   `policycoreutils-python-utils`. On an image-based system:
   `sudo rpm-ostree install policycoreutils-python-utils`, then reboot.
-- On NVIDIA: the driver and the [NVIDIA Container
-  Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+- On NVIDIA: complete [NVIDIA setup for rootless engines](/quasar/install/nvidia/#rootless-docker-or-podman).
 
 The examples keep homes in `/var/lib/quasar/homes` and templates beside them. Use a
 directory of its own, never `/home` or another system tree.
@@ -94,20 +99,8 @@ Run each step from an account with `sudo`. Every step is safe to repeat.
      'dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker'
    ```
 
-8. **NVIDIA only:** describe the GPU to the engine. Run it again after a driver
-   upgrade.
-
-   ```bash
-   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-   ```
-
-   On SELinux, also let containers open the NVIDIA devices:
-
-   ```bash
-   sudo setsebool -P container_use_xserver_devices on
-   echo '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' > quasar-nested-gpu.cil
-   sudo semodule -i quasar-nested-gpu.cil
-   ```
+8. **NVIDIA only:** complete [rootless NVIDIA setup](/quasar/install/nvidia/#rootless-docker-or-podman),
+   including CDI and any required SELinux policy.
 
 9. **Only for a port below 1024** (the defaults are 8080 and 8443): let
    unprivileged services bind from that port, here 443:
@@ -159,18 +152,7 @@ sudo machinectl shell quasar@
 
 <Steps>
 
-1. **Pin the images.** The seed refuses tags. This prints the three digests of the
-   current stable release (use `docker` for Docker):
-
-   ```bash
-   for i in quasar-recovery quasar-control-plane quasar-node-agent; do
-     podman pull -q ghcr.io/accreleus/quasar/$i:latest >/dev/null &&
-     podman image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-       ghcr.io/accreleus/quasar/$i:latest | grep -m1 "^ghcr.io/accreleus/quasar/$i@"
-   done
-   ```
-
-2. **Start the seed.** Fill in the digests and `QUASAR_PUBLIC_HOST`, the name or
+1. **Start the seed.** Fill in `QUASAR_PUBLIC_HOST`, the name or
    LAN address you type into the browser.
 
    Podman: write `~/.config/containers/systemd/quasar-seed.container`:
@@ -184,7 +166,8 @@ sudo machinectl shell quasar@
 
    [Container]
    ContainerName=quasar-seed
-   Image=ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest>
+   Image=ghcr.io/accreleus/quasar/quasar-recovery:latest
+   Pull=always
    Exec=seed
    SecurityLabelDisable=true
    Volume=%t/podman/podman.sock:/var/run/docker.sock
@@ -193,8 +176,8 @@ sudo machinectl shell quasar@
    Environment=QUASAR_PUBLIC_HOST="192.168.1.50"
    Environment=QUASAR_HOME_ROOT="/var/lib/quasar/homes"
    Environment=QUASAR_TEMPLATE_ROOT="/var/lib/quasar/templates"
-   Environment=QUASAR_CONTROL_PLANE_IMAGE="ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest>"
-   Environment=QUASAR_AGENT_IMAGE="ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>"
+   Environment=QUASAR_CONTROL_PLANE_IMAGE="ghcr.io/accreleus/quasar/quasar-control-plane:latest"
+   Environment=QUASAR_AGENT_IMAGE="ghcr.io/accreleus/quasar/quasar-node-agent:latest"
 
    [Service]
    Restart=always
@@ -211,7 +194,7 @@ sudo machinectl shell quasar@
    Docker:
 
    ```bash
-   docker run -d --name quasar-seed --restart unless-stopped \
+   docker run -d --name quasar-seed --restart unless-stopped --pull always \
      --security-opt label=disable \
      -v "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock:/var/run/docker.sock" \
      -v quasar-machine:/var/lib/quasar-machine:ro \
@@ -219,15 +202,15 @@ sudo machinectl shell quasar@
      -e QUASAR_PUBLIC_HOST=192.168.1.50 \
      -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
      -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
-     -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest> \
-     -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
-     ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
+     -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane:latest \
+     -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent:latest \
+     ghcr.io/accreleus/quasar/quasar-recovery:latest seed
    ```
 
    Other inputs (control-only, your own Postgres, ports) are the same as on
    [Docker](/quasar/install/docker/#install-the-first-machine).
 
-3. **Check it came up**, then claim it with the one-time setup token (`docker` for
+2. **Check it came up**, then claim it with the one-time setup token (`docker` for
    Docker):
 
    ```bash

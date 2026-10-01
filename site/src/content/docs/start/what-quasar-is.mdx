@@ -3,8 +3,7 @@ title: What Quasar is
 description: Quasar runs games on GPU servers you own and streams them to a browser.
 ---
 
-Quasar is a self-hostable cloud gaming platform: GeForce Now, but the servers and
-the library are yours. Games run in containers on your GPU machines, and you play
+Quasar runs games on computers you own and streams them to your browser. Games run in containers on your GPU machines, and you play
 them in a browser tab.
 
 You log in, pick a game and press play. Quasar starts it on a GPU host with room,
@@ -13,11 +12,11 @@ WebRTC. Close the tab and the session ends.
 
 ## What you get
 
-- **Many GPU hosts, one library.** Add a GPU machine and it joins the pool.
+- **Multiple computers, one library.** Add a GPU machine and it joins the pool.
   Sessions go wherever there is room.
 - **Many users.** Each user has their own home directory, saves and app access.
   Registration can be closed, invite-only or open.
-- **Hardware encoding** on AMD, NVIDIA (Vulkan Video) and Intel (VA-API).
+- **Hardware encoding** on verified AMD and NVIDIA GPUs; Intel VA-API remains untested.
 - **Adaptive bitrate**, on by default and tuned for smoothness.
 - **Nothing to install on the client.** Chrome or Chromium on desktop. Keyboard,
   mouse, touch and gamepads work.
@@ -28,7 +27,7 @@ WebRTC. Close the tab and the session ends.
 
 - **Not Moonlight or GameStream.** Moonlight clients can't connect, and never will.
 - **Not a game store.** Quasar launches container images; you bring the games.
-  Steam is supported as a library provider, so owned Steam titles show up as tiles.
+  Steam is supported as a library provider, so installed Steam titles show up as tiles.
 - **Not built to face the internet.** Play over a LAN or VPN. Quasar has not been
   security reviewed. See [Reaching Quasar remotely](/quasar/network/remote-access/).
 - **No native client yet.** The browser is the only client.

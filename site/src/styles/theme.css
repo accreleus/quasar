@@ -263,10 +263,48 @@ header.header {
 	color: var(--sl-color-white);
 }
 
-/* ---------- Asides keep the product's hairline language ---------- */
+/* ---------- Essential notices: labelled, theme-aware Starlight asides ---------- */
 .sl-markdown-content .starlight-aside {
-	border-radius: var(--q-r-md);
-	border-inline-start-width: 2px;
+ border-radius: var(--q-r-md);
+ border: 1px solid var(--q-line-2);
+ border-inline-start-width: 3px;
+ padding: 1rem 1.15rem;
+ box-shadow: none;
+}
+.sl-markdown-content .starlight-aside--note,
+.sl-markdown-content .starlight-aside--tip {
+ --sl-color-asides-text-accent: #c8beff;
+ background: #211e35;
+ color: #eceaf7;
+ border-inline-start-color: #c8beff;
+}
+.sl-markdown-content .starlight-aside--caution {
+ --sl-color-asides-text-accent: #f2cb7d;
+ background: #302817;
+ color: #f5eee0;
+ border-inline-start-color: #f2cb7d;
+}
+:root[data-theme='light'] .sl-markdown-content .starlight-aside--note,
+:root[data-theme='light'] .sl-markdown-content .starlight-aside--tip {
+ --sl-color-asides-text-accent: #55428e;
+ background: #f1edff;
+ color: #302a43;
+ border-inline-start-color: #55428e;
+}
+:root[data-theme='light'] .sl-markdown-content .starlight-aside--caution {
+ --sl-color-asides-text-accent: #775314;
+ background: #fff5dd;
+ color: #44341e;
+ border-inline-start-color: #775314;
+}
+.sl-markdown-content .starlight-aside__title {
+ color: var(--sl-color-asides-text-accent);
+ font-weight: 600;
+}
+.sl-markdown-content .starlight-aside a {
+ color: inherit;
+ text-decoration: underline;
+ text-underline-offset: .2em;
 }
 
 /* ---------- Inline code ---------- */

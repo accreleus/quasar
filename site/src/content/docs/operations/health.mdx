@@ -18,8 +18,9 @@ During an update, a stopped `quasar-node-agent.kept` may briefly appear: the old
 agent, kept until the new one is verified.
 
 On a [legacy Compose install](/quasar/install/legacy-compose/#health-and-logs),
-use `docker compose -f deploy/docker-compose.yml` in place of the `docker`
-commands below.
+use `docker compose -f deploy/docker-compose.yml logs <service>` and
+`docker compose -f deploy/docker-compose.yml exec <service> <command>` for logs
+and container commands. On Podman, use `podman` in place of `docker`.
 
 ## Health checks
 
@@ -49,10 +50,12 @@ docker exec quasar-recovery quasar-recovery status
 ## Logs
 
 ```bash
-docker logs -f quasar-control-plane
-docker logs -f quasar-node-agent
-docker logs -f quasar-recovery
+docker logs --tail 100 quasar-control-plane
+docker logs --tail 100 quasar-node-agent
+docker logs --tail 100 quasar-recovery
 ```
+
+Add `-f` when you want to follow new messages.
 
 Node agent errors only:
 

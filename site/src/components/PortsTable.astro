@@ -1,0 +1,5 @@
+---
+import { DEFAULT_PORTS } from '../data/default-ports.js';
+---
+<table><thead><tr><th>Port</th><th>Protocol</th><th>Purpose</th><th>Direction</th></tr></thead>
+<tbody>{DEFAULT_PORTS.map(row => <tr>{row.map(cell => <td>{cell}</td>)}</tr>)}</tbody></table>

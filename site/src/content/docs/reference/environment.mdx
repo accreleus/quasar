@@ -3,9 +3,8 @@ title: Environment variables
 description: The settings a self-hoster is likely to touch, grouped by what they do, with defaults.
 ---
 
-**An owned install takes only the [seed inputs](#seed-inputs).** Everything else
-it either runs with defaults or edits in the admin UI (allowed origins,
-registration, release channel, host policy, the catalog, stored secrets).
+**For a seed-managed installation, use the [seed inputs](#seed-inputs).** Manage
+registration, release channels, host policy, the library and stored secrets in the admin UI.
 
 The other sections are process settings for a [legacy Compose
 install](/quasar/install/legacy-compose/) or a source checkout, set in
@@ -28,7 +27,7 @@ can remove the enrollment string from the stack. See [Install with Docker](/quas
 | `QUASAR_HOME_ROOT` | required with an agent | Host path of the home root, mounted at the same path in the agent. If set on a control-only machine, every GPU host must use it. |
 | `QUASAR_TEMPLATE_ROOT` | `templates` beside the home root | Host path of the template root. |
 | `QUASAR_NODE_NAME` | the host name | The agent's node name. Must match a name bound into the enrollment string. |
-| `QUASAR_AGENT_IMAGE` | required with an agent | The node-agent image as `repository@sha256:<digest>`; tags are refused. On a control-only machine, optional: the agent Add host installs when no release names one. |
+| `QUASAR_AGENT_IMAGE` | required with an agent | The node-agent image: a tag (`…/quasar-node-agent:latest`, pinned to its digest at install) or `repository@sha256:<digest>`. On a control-only machine, optional: the agent Add host installs when no release names one. |
 | `QUASAR_APP_PUID`, `QUASAR_APP_PGID` | the image's user | Owner of game and save data (Unraid: `99` and `100`). |
 | `QUASAR_CONTAINER_NETWORK` | `none` | App container network: `none`, `bridge` or `host`. |
 
@@ -36,18 +35,18 @@ On the first machine (`combined` or `control-only`), also:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_CONTROL_PLANE_IMAGE` | required | The control-plane image as `repository@sha256:<digest>`. |
+| `QUASAR_CONTROL_PLANE_IMAGE` | required | The control-plane image: a tag (pinned at install) or `repository@sha256:<digest>`. |
 | `QUASAR_PUBLIC_HOST` | unset; set it | The console's name or LAN address. The certificate names it. |
 | `QUASAR_TLS_HOSTS` | unset | More certificate names, comma-separated. |
 | `QUASAR_TRUSTED_PROXIES` | unset | Reverse proxies in front of the console. `/0` or a malformed entry refuses the install. |
 | `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT` | `8080`, `8443` | Host ports for HTTP (agents, `/health`) and HTTPS (console). |
-| `QUASAR_POSTGRES_IMAGE` | built in | Quasar's own Postgres, by digest. Created once, never updated. |
+| `QUASAR_POSTGRES_IMAGE` | built in | Quasar's own Postgres, by tag (pinned at install) or digest. Created once, never updated. |
 | `QUASAR_DATABASE_HOST` | unset | Use your own database instead of creating one. |
 | `QUASAR_DATABASE_PORT`, `QUASAR_DATABASE_USER`, `QUASAR_DATABASE_NAME` | `5432`, `quasar`, `quasar` | Your database's connection. |
 | `QUASAR_DATABASE_SSLMODE` | `disable` | Use `require` or `verify-full` for a remote database. |
 | `QUASAR_DATABASE_PASSWORD` | required with `QUASAR_DATABASE_HOST` | Take it from the stack's `.env`. Read only at install. |
 | `QUASAR_AWAIT_RESTORE` | unset | `1` holds the new control plane until you load a Compose dump. Quasar's own database only. See [Move a Compose install](/quasar/install/moving/#move-a-compose-install). |
-| `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | the installed release's | Pins, by digest, the images Add host installs. |
+| `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | the installed release's | Overrides the images Add host installs, by tag (pinned at install) or digest. |
 
 The seed also needs two mounts: the engine socket, and the `quasar-machine` volume
 read-only at `/var/lib/quasar-machine`.

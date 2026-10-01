@@ -16,7 +16,7 @@ their own launchable tiles.
 	alt="The admin library sources page"
 />
 
-## Be clear about what this is
+## What discovery finds
 
 It finds **installed** games in the Steam container's library folder. Owned but
 uninstalled games don't appear; install them through the Steam launcher app and
@@ -31,11 +31,13 @@ It does not:
 
 ## Turning it on
 
-Use the switch under **Admin ▸ Settings**, or step four of the first-run wizard.
-This installs the Steam image on your hosts, creates its runtime preset, and adds a
-launcher app granted to everyone.
+1. Enable Steam library discovery under **Admin ▸ Settings**.
+2. Wait for Quasar to install the Steam image and create its launcher app.
+3. Open the launcher, sign in to Steam and install a game.
+4. Scan under **Admin ▸ Library ▸ Sources**, or wait for the scheduled scan.
 
-The Steam source shows under **Admin ▸ Library ▸ Sources** either way.
+The launcher is available to everyone. Installed games appear as separate tiles;
+see [Set up your game library](/quasar/playing/library/).
 
 ## Requirements
 
@@ -53,7 +55,7 @@ minutes; `0` disables scheduled scans). **Admin ▸ Library ▸ Sources** can sc
 ## Steam-derived apps
 
 Each game becomes a normal app using the Steam image, launched at that title.
-Entitlements, tiers and artwork work as for any app. Updating the Steam image
+App access, quality tiers and artwork work as for any app. Updating the Steam image
 affects all of them.
 
 ## Only Steam, for now

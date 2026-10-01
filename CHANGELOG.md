@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- Simplify documentation around an all-in-one quick start, early GPU preparation, persistent storage, direct networking and first play; retain honest engine status and identify the #440 bootstrap dependency for generated tag-based configuration.
+
 ### Added
 - **Device rules ship as plain files (RH-07).** Quasar's udev rules now live in
   `deploy/udev/`: `70-quasar.rules` (uinput, Quasar's virtual input devices, GPU render

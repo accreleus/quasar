@@ -1,54 +1,13 @@
 ---
 title: Quick start
-description: Answer a few questions and get one command, or one stack, that installs Quasar.
+description: Prepare one GPU server and generate your all-in-one Quasar configuration.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-import Shot from '../../../components/Shot.astro';
-import quickstart_engine from '../../../assets/shots/quickstart-engine.png';
 import QuickStart from '../../../components/QuickStart.astro';
 
-Answer a few questions and get one command to run, or one stack to paste into Dockge
-or Arcane. You need Linux, Docker or Podman, and about 20 GB of disk. See
-[requirements](/quasar/start/requirements/).
-
-## Pick your path
-
-| You run | Status | Read |
-| --- | --- | --- |
-| Docker, rootful | Supported | This wizard, or [Docker](/quasar/install/docker/) |
-| Podman (Quadlet), rootful | Experimental | This wizard, or [Podman](/quasar/install/podman/) |
-| Unraid | Supported | This wizard, or [Unraid](/quasar/install/unraid/) |
-| Docker or Podman, rootless | Experimental | [Install rootless](/quasar/install/rootless/) |
-| Quasar from the Compose files, or rootful and moving to rootless | | [Moving an install](/quasar/install/moving/) |
-| Quasar already, adding a machine | | [Add a GPU host](/quasar/install/second-host/) |
-
-Status per platform: [engine profiles](/quasar/start/engine-profiles/). The wizard
-below writes the same install those pages describe. Except on Unraid, the result
-starts with a few host commands you run yourself (the engine at boot, and NVIDIA
-if you have it), then the install: a script for Docker, or a Quadlet unit for
-Podman. Read the script before you run it.
-
-<Shot
-	label="Quick start, engine step"
-	sublabel="The engine step for Fedora: each engine with its profile status."
-	src={quickstart_engine}
-	alt="The quick start's engine step, with an engine profile badge per engine"
-/>
-
-The result installs the **seed**, which creates everything else and generates all
-secrets. When it finishes, continue with [First run and
-checks](/quasar/install/first-run/).
-
-<Aside type="note" title="Stable releases">
-The install is pinned to the current stable release and updates only from the admin
-console. An install made before the first stable release is on `edge`: see [Moving
-an edge install to stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
-</Aside>
-
-<Aside type="note" title="Already running Quasar from the Compose files?">
-The script stops if it finds one. To keep your data, follow [Move a Compose
-install](/quasar/install/moving/#move-a-compose-install) instead.
-</Aside>
+Install Quasar on one Linux GPU server with its own managed database. Check the
+[requirements](/quasar/start/requirements/), then choose your engine, GPU and storage.
+For a split control plane, follow [Docker installation](/quasar/install/docker/).
+To expand an existing instance, use its [Add GPU host command](/quasar/install/second-host/).
 
 <QuickStart />

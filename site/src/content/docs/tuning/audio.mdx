@@ -9,7 +9,7 @@ Audio comes from the session's PulseAudio sidecar, encoded as Opus, on its own
 peer connection separate from video. A struggling video stream doesn't drag audio
 down. Nothing to configure.
 
-## Fail loudly instead of silently
+## Make audio failure stop the session
 
 By default, if the audio sidecar is unavailable, the session continues without
 sound. A misconfiguration can then mute every session on a host with only a log
@@ -19,15 +19,15 @@ warning. To make the session fail instead:
 QUASAR_AUDIO_REQUIRED=1
 ```
 
-Recommended on anything you care about. **Admin ▸ Sessions**, session detail,
-shows whether audio degraded and why.
+Use this when sound is required. **Admin ▸ Sessions**, session detail, shows
+whether audio degraded and why.
 
 The PulseAudio sidecar must come from the same image family as the agent. A
 mismatched image can lack PulseAudio and the session runs silent.
 
 ## Microphone capture
 
-Three things must all be true:
+To use a microphone:
 
 1. **The administrator enables it** under **Admin ▸ Settings**. Off by default,
    enforced on the server. A launch that asks for a microphone while it's off

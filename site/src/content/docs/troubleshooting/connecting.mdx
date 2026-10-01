@@ -50,10 +50,11 @@ other clients.
 
 The control path works through a proxy; the media path doesn't. Check in order:
 
-1. **The client can reach the GPU host directly** (ping it). If not, use a VPN.
+1. **The client has a direct route to the host** and its UDP ports are allowed.
+   Ping can help check routing, but does not prove UDP media works. If needed, use a VPN.
    See [Reaching Quasar remotely](/quasar/network/remote-access/).
-2. **Allowed origins** (Admin ▸ Settings) list every browser origin. Set
-   `PUBLIC_BASE_URL` if the proxy rewrites `Host`.
+2. **Allowed origins** (Admin ▸ Settings) list every browser origin. Follow the
+   install-specific [proxy settings](/quasar/network/reverse-proxy/) for the public address.
 3. **The proxy forwards WebSocket upgrades** with a long read timeout.
 4. **Admin ▸ Sessions:** if the session is running but the user sees nothing, the
    problem is the connection, not the pipeline.
@@ -91,4 +92,6 @@ QUASAR_ALLOWED_ORIGINS=https://quasar.example.com,https://192.0.2.50:8443
 
 ## Invite links point at the wrong address
 
-Set `PUBLIC_BASE_URL` to the address people use.
+On legacy Compose, set `PUBLIC_BASE_URL` to the address people use. On a
+Quasar-owned install, make sure the proxy preserves `Host` and sends
+`X-Forwarded-Proto`: see [proxy settings](/quasar/network/reverse-proxy/).

@@ -3,22 +3,10 @@ title: Glossary
 description: The terms Quasar uses, defined once.
 ---
 
-**ABR.** Adaptive bitrate: moves the encoder's target bitrate to fit the
-connection. On by default, in `smooth` mode.
-
-**Admission.** The check that a GPU can take a new session: a free encode slot and
-enough free GPU memory.
-
-**Agent.** See node agent.
+## Everyday terms
 
 **App.** A catalog entry a user can launch: content, a container specification and
 a launch command. A game, a desktop or a launcher.
-
-**Attempt.** One target (the control plane or a host) moving to one set of images.
-Every apply records one, and it's the only record of what ran before.
-
-**AV1.** A modern codec using 40 to 50 percent less bitrate than H.264. Chrome
-decodes it everywhere.
 
 **Channel.** Which platform releases an instance is offered: `stable` (tagged
 releases), `beta` (plus prereleases) or `edge` (latest branch build). Switching
@@ -27,14 +15,53 @@ changes what's listed, not what's installed.
 **Console mode.** A host showing sessions on a screen plugged into it. See
 [Console mode](/quasar/admin/console/).
 
-**Constrained baseline.** The H.264 profile browser sessions use, because Chrome
-can't decode High profile over WebRTC.
-
-**Control plane.** The Go service for accounts, the API, signaling and scheduling,
+**Control plane.** The service for accounts, the API, signaling and scheduling,
 backed by Postgres. Holds no per-host GPU state.
 
 **Device.** A browser a user has logged in from, with its measured decode
 capabilities, so Quasar never sends a codec it can't play.
+
+**Home root.** The directory on a host holding managed homes. For saves to follow
+users between hosts it must be shared storage.
+
+**Host.** A machine running the node agent.
+
+**Launch profile.** An ordered list of stream profiles, best first. What "1080p60"
+means in the interface.
+
+**Library provider.** A source of automatically discovered games. Currently Steam only.
+
+**Managed home.** A user's persistent directory for one app. One writer at a time,
+so one session per user per app.
+
+**Node agent.** The service on each GPU host. Runs the compositor, encoder and
+app containers.
+
+**Readiness check.** One verdict about a host, with a fix when it fails. Some
+failing checks block launches until fixed or overridden.
+
+**Runtime preset.** A reusable container specification shared by apps.
+
+**Session.** One user, one app, one host, one connection.
+
+**Stream profile.** One encode rung: codec, resolution, frame rate, bitrate and
+eligibility thresholds. Users don't see these.
+
+## Advanced technical terms
+
+**ABR.** Adaptive bitrate: moves the encoder's target bitrate to fit the
+connection. On by default, in `smooth` mode.
+
+**Admission.** The check that a GPU can take a new session: a free encode slot and
+enough free GPU memory.
+
+**Attempt.** One target (the control plane or a host) moving to one set of images.
+Every apply records one, and it's the only record of what ran before.
+
+**AV1.** A modern codec using 40 to 50 percent less bitrate than H.264. Compatibility depends on your browser, device and GPU host; see [Codecs](/quasar/tuning/codecs/).
+
+**Constrained baseline.** The H.264 profile browser sessions use, because Chrome
+can't decode High profile over WebRTC.
 
 **Developer apply.** An admin applying unpublished image digests (such as a branch
 build) to one Quasar-owned machine. Never automatic; same safety rules as any update.
@@ -54,7 +81,7 @@ named users.
 ordinary account (**rootless**).
 
 **Engine profile.** A platform, container engine and engine mode combination, rated
-supported, experimental or unsupported. See [Engine profiles](/quasar/start/engine-profiles/).
+supported, experimental or unsupported. See [Container engines](/quasar/start/requirements/#container-engines).
 
 **Enrollment token.** A single-use secret from **Fleet ▸ Hosts ▸ Add host** that
 lets one agent enroll. Expires after an hour by default (up to 30 days); the agent
@@ -84,11 +111,6 @@ only with OS hardware support (macOS, Windows). The catalog says `hevc`, the wir
 launches on that host for that user. An admin can release the claim of a host
 that's gone for good.
 
-**Home root.** The directory on a host holding managed homes. For saves to follow
-users between hosts it must be shared storage.
-
-**Host.** A machine running the node agent.
-
 **Host preparation.** The few host commands an install needs, run once as root:
 the engine at boot and NVIDIA wiring for a rootful install
 ([Docker](/quasar/install/docker/#prepare-the-host)); the `quasar` account and its
@@ -104,20 +126,9 @@ from the console.
 **Intra refresh.** A rolling wave of intra-coded blocks instead of periodic
 keyframes. Vulkan only, patched image only.
 
-**Launch profile.** An ordered list of stream profiles, best first. What "1080p60"
-means in the interface.
-
-**Library provider.** A source of automatically discovered games. Currently Steam only.
-
 **Machine state.** The `quasar-machine` volume: the machine's inputs, secrets,
 update records and pre-update dumps. It lets recovery work while the control plane
 is down. Never delete it.
-
-**Managed home.** A user's persistent directory for one app. One writer at a time,
-so one session per user per app.
-
-**Node agent.** The Rust program on each GPU host. Runs the compositor, encoder and
-app containers.
 
 **NVENC.** NVIDIA's hardware encoder.
 
@@ -141,9 +152,6 @@ Your own database gets none; you confirm your backup instead.
 **Presentation interval variation.** Standard deviation of the gap between
 displayed frames; tracks perceived stutter. Below 12 ms is healthy, above 18 ms visible.
 
-**Readiness check.** One verdict about a host, with a fix when it fails. Some
-failing checks block launches until fixed or overridden.
-
 **Recovery actor.** The `quasar-recovery` container on each machine. It creates and
 replaces the machine's Quasar services, including the control plane.
 
@@ -158,25 +166,15 @@ then remove the old one, or restore it if verification fails.
 
 **Rung.** One stream profile inside a launch profile.
 
-**Runtime preset.** A reusable container specification shared by apps.
-
 **Seed.** The one container you declare for Quasar on a machine. It keeps the
 recovery actor running. Your stack manager updates it, not Quasar, and removing it
 never stops Quasar.
-
-**Session.** One user, one app, one host, one connection.
 
 **Signaling.** The exchange over `/v1/signal` that lets a browser and a node agent
 set up a direct connection.
 
 **STUN and TURN.** WebRTC NAT traversal and relaying. Quasar uses neither: media
 goes directly, over a LAN or VPN.
-
-**Stream profile.** One encode rung: codec, resolution, frame rate, bitrate and
-eligibility thresholds. Users don't see these.
-
-**Updater.** On a legacy Compose install, the per-host service that applies
-releases. Owned machines use the recovery actor instead.
 
 **VA-API.** The video acceleration interface for AMD and Intel encoding.
 

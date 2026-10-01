@@ -21,32 +21,16 @@ import { ENGINES, MODES, profileFor } from '../data/engine-profiles.js';
 const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
 const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
 
-// One row per engine and mode. Every Linux distribution reads the same, so the table
-// shows the general verdict (the catch-all platform); Unraid's exception is in the page.
-const rows = Object.keys(ENGINES).flatMap((engine) =>
-	MODES.map((mode) => ({ engine, mode, profile: profileFor('other', engine, mode) })),
-);
+// General profile verdicts; recognition does not establish distro validation.
+
 ---
 
 <table class="ep-table">
-	<thead>
-		<tr>
-			<th>Engine</th>
-			<th>Mode</th>
-			<th>Status</th>
-		</tr>
-	</thead>
-	<tbody>
-		{rows.map(({ engine, mode, profile }) => (
-			<tr>
-				<td>{ENGINES[engine].label}</td>
-				<td>{mode === 'rootful' ? 'Rootful' : 'Rootless'}</td>
-				<td title={profile.reason}>
-					<Badge size="small" variant={BADGE_VARIANT[profile.status]} text={BADGE_TEXT[profile.status]} />
-				</td>
-			</tr>
-		))}
-	</tbody>
+ <thead><tr><th>Engine</th><th>Rootful</th><th>Rootless</th></tr></thead>
+ <tbody>{Object.keys(ENGINES).map(engine => <tr>
+  <th scope="row">{ENGINES[engine].label}</th>
+  {MODES.map(mode => { const p = profileFor('other', engine, mode); return <td><Badge size="small" variant={BADGE_VARIANT[p.status]} text={BADGE_TEXT[p.status]} /></td>; })}
+ </tr>)}</tbody>
 </table>
 
 <style>

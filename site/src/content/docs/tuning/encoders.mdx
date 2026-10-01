@@ -17,16 +17,12 @@ the choice as `encoder resolved`:
 | Intel | VA-API |
 | None | openh264 |
 
-To override, set it in your `.env`. Values: `vulkan`, `va`, `nvenc`, `openh264`.
-
-```bash
-QUASAR_ENCODER=vulkan
-```
-
-Or override one machine from **Admin ▸ Fleet ▸ Hosts**, on that host's Settings
-page. It's a restart setting: it applies once approved and the host is idle, and
-never ends a running session. See
+To change it, open **Admin ▸ Fleet ▸ Hosts ▸ Settings**. It applies once approved
+and the host is idle, without ending a running session. See
 [Per-host settings](/quasar/admin/hosts/#per-host-settings).
+
+For an environment-managed agent, set `QUASAR_ENCODER` to `vulkan`, `va`, `nvenc`
+or `openh264` in its environment.
 
 An explicit value does not bypass a known codec compatibility restriction.
 
