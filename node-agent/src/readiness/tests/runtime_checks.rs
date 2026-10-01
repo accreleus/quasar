@@ -448,7 +448,7 @@ fn podman_goes_by_cdi_with_the_agents_own_nvidia_nodes_as_evidence() {
     let checks = probe(&nvidia_env(&root, f.clone(), vec![(0, true)]));
     let c = get(&checks, CDI_ID);
     assert_eq!(c.status, FAIL, "{c:?}");
-    assert!(c.remediation.contains("prepare-host.sh"), "{c:?}");
+    assert!(c.remediation.contains("nvidia-ctk cdi generate"), "{c:?}");
     assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
 
     root.file("dev/nvidiactl", "");
@@ -459,9 +459,9 @@ fn podman_goes_by_cdi_with_the_agents_own_nvidia_nodes_as_evidence() {
 }
 
 /// Amendment 17: an NVIDIA host whose engine can inject the GPU by neither CDI nor
-/// `--gpus` fails, names host preparation, and never suggests running as root.
+/// `--gpus` fails, names the CDI command, and never suggests running as root.
 #[test]
-fn nvidia_on_rootless_docker_without_cdi_fails_naming_host_preparation() {
+fn nvidia_on_rootless_docker_without_cdi_fails_naming_the_cdi_command() {
     let root = FakeRoot::new("runtime-cdi-none");
     let checks = probe(&nvidia_env(
         &root,
@@ -470,7 +470,7 @@ fn nvidia_on_rootless_docker_without_cdi_fails_naming_host_preparation() {
     ));
     let c = get(&checks, CDI_ID);
     assert_eq!(c.status, FAIL, "{c:?}");
-    assert!(c.remediation.contains("prepare-host.sh"), "{c:?}");
+    assert!(c.remediation.contains("nvidia-ctk cdi generate"), "{c:?}");
     assert!(c.remediation.contains("Never run Quasar as root"), "{c:?}");
     assert_eq!(c.blocks, Some(ReadinessBlocks::host("control_plane")));
     assert!(!checks.iter().any(|c| c.id.starts_with("runtime_cdi_gpu")));
