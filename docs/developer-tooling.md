@@ -38,6 +38,7 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `make test` | All unit suites | = test-go + test-rust + test-web |
 | `make test-go` | Go build/vet/test | DB integration tests SKIP without a database — green here ≠ DB-tested |
 | `make test-rust` | cargo fmt/clippy/test in the `quasar-agent-dev` container | Host has no GStreamer toolchain |
+| `make test-uinput` | Node-agent virtual input devices against this host's real `/dev/uinput`, read back through evdev | Needs a host with uinput (`sudo modprobe uinput`); the tests are `#[ignore]`d in `test-rust`. CI runs them on every PR |
 | `make test-web` | Web typecheck/test/build | |
 | `make test-db` | Go integration tests vs a FRESH ephemeral Postgres | Per-instance port + name; `-p 1` enforced; container always reaped |
 | `make docs-metrics-sync` | Copy `docs/session-trace/metrics.json` (the metric manifest) to its Go embed and web bundle copies | Both copies are byte-equality tested; a stale copy fails `go test ./...` |

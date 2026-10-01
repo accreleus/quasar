@@ -25,6 +25,12 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **CI tests the virtual keyboard, mouse and gamepad against a real kernel.** The node-agent
+  job now loads `uinput` on the runner, creates the session's devices for real and reads them
+  back through evdev: identity, key and axis sets, button and d-pad mapping, scroll sign.
+  The #348 `UI_SET_PHYS` bug, which failed every session launch while every unit test
+  passed, fails this suite. Run it locally with `make test-uinput` on a host with
+  `/dev/uinput`; `make test-rust` keeps them ignored.
 - **Device rules ship as plain files (RH-07).** Quasar's udev rules now live in
   `deploy/udev/`: `70-quasar.rules` (uinput, Quasar's virtual input devices, GPU render
   nodes), `71-quasar-console.rules` (console mode only) and the new `72-quasar-seat.rules`,
