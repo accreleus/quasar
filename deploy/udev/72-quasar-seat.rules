@@ -1,0 +1,7 @@
+# Quasar device rules: keep players' input off this machine's desktop.
+# Documented at https://accreleus.github.io/quasar/install/device-rules/
+# This file must sort after 70-uaccess.rules and before 73-seat-late.rules, which is
+# where systemd-logind gives the logged-in desktop user access to seat0's devices.
+
+# Quasar's virtual input devices: put them on a seat of their own and drop the uaccess tag, so a desktop user logged in on this machine gets no access to a player's controller, keyboard or mouse.
+SUBSYSTEM=="input", ATTRS{name}=="Quasar Virtual *", ENV{ID_SEAT}="seat-quasar", TAG-="uaccess"

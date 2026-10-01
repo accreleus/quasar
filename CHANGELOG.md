@@ -25,6 +25,16 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Device rules ship as plain files (RH-07).** Quasar's udev rules now live in
+  `deploy/udev/`: `70-quasar.rules` (uinput, Quasar's virtual input devices, GPU render
+  nodes), `71-quasar-console.rules` (console mode only) and the new `72-quasar-seat.rules`,
+  which moves Quasar's virtual input devices off the desktop's seat so a user logged into
+  the host desktop no longer gets a player's controller (the same issue as Wolf #451). The
+  new "Device rules (udev)" install page tables each rule and shows how to install, check
+  and remove them by hand. `prepare-host.sh` installs the same files byte for byte (its
+  test fails if they drift), removes the console rules when run without `--console`, and
+  now writes the SELinux label rule on every host rather than only where it detects
+  container SELinux.
 - **RH-07 acceptance map (#409).** `docs/rh07/acceptance-map.md` ties every RH-07 user
   story and required engine-profile row (Docker rootful, Docker rootless, Podman rootless
   on AMD and NVIDIA) to its evidence, with a Podman-rootful/Ubuntu-24.04 claimed vs
