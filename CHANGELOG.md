@@ -1123,6 +1123,25 @@ own; the two do not move together, and that is deliberate.
   the NVIDIA driver volume; the static `ENROLLMENT_TOKEN` is optional; each host may have its own
   home root; the Debian note asks for Compose 2.30; `make diagnose` is marked as needing a
   checkout. The site's compose snapshot is regenerated, so `npm run build` passes again.
+- **Game audio was resampled twice on its way to the browser (#351).** The session's
+  output sink started at PulseAudio's default 44.1 kHz and could never switch to the game's
+  48 kHz, because the stream capture holds it from session start. Game audio was converted
+  down to 44.1 kHz in 16-bit, then back up to 48 kHz for Opus. The sink is now pinned to
+  48 kHz stereo, and the Opus encoder input is pinned to the same format.
+- **Stream audio no longer turns robotic after about 40 minutes (#351).** The audio
+  pipeline ran on the session's shared system clock, and the game audio's sample count
+  gains on it by about 80 ppm. The timestamps crept ahead of the clock, and once they were
+  200 ms ahead the audio send path held every buffer long enough to overrun the capture:
+  the browser heard about 70 ms of every 270 ms. The audio pipeline now runs on the
+  capture's own clock, so there is no drift to accumulate.
+- **Stream audio that the host drops is now logged (#351).** The capture could skip audio
+  when it fell behind, and only said so with `GST_DEBUG` raised. The agent now logs a
+  minute-by-minute health line for each session's audio (`audio-capture-health`, or
+  `audio-capture-degraded` with the milliseconds lost and whether the capture thread was
+  starved of CPU), and the audio pipeline's own warnings (`audio-pipeline-message`).
+  Encoded audio now reaches the audio PeerConnection through a short leaky queue, so a
+  stall on the send side, including the wait for the browser's answer at every session
+  start, no longer stops the capture.
 - **Session charts with a small range drew duplicate y-axis ticks (#372).** A metric like
   `ladder_res_rung` (0–1) got ticks `0, 0, 1, 1, 1`: overlapping gridlines and a React
   duplicate-key warning. Ticks now take the fewest decimals that keep them distinct
