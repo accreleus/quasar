@@ -1,8 +1,8 @@
 ---
 /**
- * The published engine-profile table (RH07-14, #406): one row per platform,
- * one column per container engine and engine mode, a status badge in each cell
- * (the reason is the cell's tooltip).
+ * The published engine-profile table (RH07-14, #406): one row per container
+ * engine and mode with its status badge (the reason is the badge's tooltip).
+ * Every Linux distribution shares these verdicts; only Unraid differs.
  *
  * Reads testdata/engine-profiles/profiles.json through engine-profiles.js —
  * the same table the quick start's step 2 renders and the node agent's
@@ -16,38 +16,34 @@
  * invented for this page.
  */
 import { Badge } from '@astrojs/starlight/components';
-import { ENGINES, MODES, PLATFORMS, profileFor } from '../data/engine-profiles.js';
+import { ENGINES, MODES, profileFor } from '../data/engine-profiles.js';
 
 const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
 const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
 
-const platformIds = Object.keys(PLATFORMS);
-// One column per engine and mode: Docker rootful, Docker rootless, Podman rootful, Podman rootless.
-const columns = Object.keys(ENGINES).flatMap((engine) => MODES.map((mode) => ({ engine, mode })));
-const modeLabel = (mode) => (mode === 'rootful' ? 'rootful' : 'rootless');
+// One row per engine and mode. Every Linux distribution reads the same, so the table
+// shows the general verdict (the catch-all platform); Unraid's exception is in the page.
+const rows = Object.keys(ENGINES).flatMap((engine) =>
+	MODES.map((mode) => ({ engine, mode, profile: profileFor('other', engine, mode) })),
+);
 ---
 
 <table class="ep-table">
 	<thead>
 		<tr>
-			<th>Platform</th>
-			{columns.map(({ engine, mode }) => (
-				<th>{ENGINES[engine].label} {modeLabel(mode)}</th>
-			))}
+			<th>Engine</th>
+			<th>Mode</th>
+			<th>Status</th>
 		</tr>
 	</thead>
 	<tbody>
-		{platformIds.map((platformId) => (
+		{rows.map(({ engine, mode, profile }) => (
 			<tr>
-				<td>{PLATFORMS[platformId].label}</td>
-				{columns.map(({ engine, mode }) => {
-					const profile = profileFor(platformId, engine, mode);
-					return (
-						<td title={profile.reason}>
-							<Badge size="small" variant={BADGE_VARIANT[profile.status]} text={BADGE_TEXT[profile.status]} />
-						</td>
-					);
-				})}
+				<td>{ENGINES[engine].label}</td>
+				<td>{mode === 'rootful' ? 'Rootful' : 'Rootless'}</td>
+				<td title={profile.reason}>
+					<Badge size="small" variant={BADGE_VARIANT[profile.status]} text={BADGE_TEXT[profile.status]} />
+				</td>
 			</tr>
 		))}
 	</tbody>
@@ -67,7 +63,7 @@ const modeLabel = (mode) => (mode === 'rootful' ? 'rootful' : 'rootless');
 		vertical-align: top;
 	}
 	/* A status badge never wraps mid-word in a narrow column. */
-	.ep-table td:not(:first-child) {
+	.ep-table td:nth-child(3) {
 		white-space: nowrap;
 	}
 	.ep-table th {

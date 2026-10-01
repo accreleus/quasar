@@ -1,24 +1,23 @@
 ---
 title: Engine profiles
-description: Which container engine and mode Quasar supports on each platform.
+description: Which container engines and modes Quasar supports.
 ---
 
 import EngineProfiles from '../../../components/EngineProfiles.astro';
 
-An **engine profile** is a platform plus a container engine (Docker or Podman) in
-one mode: **rootful** (runs as root) or **rootless** (runs as an ordinary account).
-The quick start, the add-host command and each host's readiness card all use this
-table.
+Quasar runs on Docker or Podman, either **rootful** (the engine runs as root) or
+**rootless** (it runs as an ordinary account).
 
 <EngineProfiles />
 
 - **Supported**: tested end to end (sessions, input, audio, updates, reboot).
-- **Experimental**: expected to work, not yet fully tested. Allowed.
-- **Unsupported**: untested or known not to work. The quick start and the add-host
-  command refuse it and suggest an alternative.
+- **Experimental**: works, but not yet through every release check. Testing so far
+  is on Fedora (uCore and Workstation); Docker and Podman behave the same across
+  distributions, so any Linux should do.
 
-Hover a badge for the reason. Rootful Docker works everywhere, including Unraid.
-GPU support is separate: see [Requirements](/quasar/start/requirements/#gpu).
+**Unraid** has only rootful Docker. The quick start, the add-host command and each
+host's readiness card all use this table. GPU support is separate: see
+[Requirements](/quasar/start/requirements/#gpu).
 
 ## Root equivalence
 
@@ -38,4 +37,4 @@ harmless, and the `homes_root_writable` readiness check notes it. Rootless Podma
 maps them to `quasar`.
 
 Don't `chown -R` the homes to change this. To switch engines, see
-[Moving to rootless](/quasar/install/move-to-rootless/).
+[Moving to rootless](/quasar/install/moving/#move-to-rootless).

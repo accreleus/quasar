@@ -8,7 +8,7 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 A **legacy Compose install** is one started from `deploy/docker-compose.yml` and
 `deploy/.env`. Postgres, the control plane, the node agent and `quasar-updater`
 are services in your stack, and `.env` holds the secrets. New installs are owned
-by Quasar instead: see [Install Quasar](/quasar/install/install/).
+by Quasar instead: see [Install with Docker](/quasar/install/docker/).
 
 ## What happens to a legacy install
 
@@ -16,7 +16,7 @@ by Quasar instead: see [Install Quasar](/quasar/install/install/).
 - **It gets no further releases.** The console shows no new release (not an
   error). The `edge` channel also stops.
 - **Nothing converts it in place.** To replace it, do a fresh install and bring
-  your data across in a database dump: [Move a Compose install](/quasar/install/move-existing/).
+  your data across in a database dump: [Move a Compose install](/quasar/install/moving/#move-a-compose-install).
 
 ## The stack directory and `.env`
 
@@ -150,7 +150,7 @@ docker compose -f deploy/docker-compose.yml exec -T quasar-postgres \
   pg_dump -U quasar -Fc quasar > quasar-$(date +%Y%m%d-%H%M).dump
 ```
 
-The same dump is how you [move to an owned install](/quasar/install/move-existing/).
+The same dump is how you [move to an owned install](/quasar/install/moving/#move-a-compose-install).
 
 To restore into this stack:
 

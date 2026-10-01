@@ -42,10 +42,7 @@ sudo systemctl restart docker
 
 ### NVIDIA on Unraid
 
-- Install the NVIDIA driver plugin and check `nvidia-smi` lists the GPU.
-- RTX 50-series cards need the **open** kernel modules.
-- On the RTX 5090, driver 595.99.02 corrupts AV1; 610.57.04 is fine. If you can't
-  upgrade, use HEVC or H.264 ([details](/quasar/tuning/encoders/#av1-driver-compatibility)).
+See [Install on Unraid](/quasar/install/unraid/#nvidia).
 
 ### Kernel
 
@@ -66,7 +63,7 @@ echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
 sudo sysctl --system
 ```
 
-[Host preparation](/quasar/install/prepare-host/) and the quick start's scripts
+[Host preparation](/quasar/install/docker/#prepare-the-host) and the quick start's scripts
 do this and the `uinput` step for you.
 
 ### Firewall

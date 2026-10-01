@@ -86,7 +86,7 @@ export const PLATFORMS = {
     module: unraidModule,
     defaultUid: 99,
     defaultGid: 100,
-    defaultBasePath: '/mnt/user/appdata/quasar',
+    defaultBasePath: '/mnt/cache/appdata/quasar',
     ownerLabel: 'uid 99 and gid 100, the Unraid convention',
     label: 'Unraid',
     note:

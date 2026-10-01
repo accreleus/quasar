@@ -1,5 +1,5 @@
 ---
-title: Add a second GPU host
+title: Add a GPU host
 description: Enroll another GPU machine with one command from the admin console.
 ---
 
@@ -16,7 +16,7 @@ control plane.
 - On NVIDIA, the NVIDIA Container Toolkit.
 - A shell as the account that runs the engine: root (or passwordless `sudo`) for a
   rootful engine, the `quasar` account from
-  [host preparation](/quasar/install/prepare-host/) for a rootless one.
+  [host preparation](/quasar/install/docker/#prepare-the-host) for a rootless one.
 - Network access to the control plane's `https://` address.
 
 ## 2. Generate the command
@@ -41,7 +41,7 @@ check it matches the `fingerprint=` the control plane printed at startup.
 
 Paste the command on the new machine. On a rootless engine, get a proper session
 for the `quasar` account first (`machinectl shell quasar@`, see
-[Install with Podman](/quasar/install/podman-quadlet/#getting-a-rootless-session-as-the-quasar-account)).
+[Install with Podman](/quasar/install/podman/#getting-a-rootless-session-as-the-quasar-account)).
 
 The script checks the host, offers to fix anything missing, then pulls the images
 and starts Quasar. It's safe to run again.

@@ -637,9 +637,19 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The documentation's Install section is organised by platform.** Docker (rootful, and
+  experimental rootless), Podman (Quadlet) and a new Unraid page replace the per-mechanism
+  pages; first run and the install checks are one page, and the two moves (from Compose,
+  to rootless) are one. Every old URL redirects.
+- **Rootless Docker and rootful or rootless Podman are experimental on any Linux.** They
+  were refused on Debian, Arch and unrecognised distributions; Docker and Podman behave the
+  same across distributions, so the quick start, the add-host command and the
+  `runtime_engine` readiness check now treat every Linux alike (tested on Fedora uCore and
+  Workstation). Unraid stays rootful-Docker only. The engine-profile page is one
+  four-row table.
 - **The documentation site is about 40% shorter.** Every page leads with what you need,
   what to do and how to know it worked; rationale, internals and repeated explanations are
-  cut or linked. The engine-profile page is one platform-by-engine table, and the add-host
+  cut or linked. The add-host
   page follows prepare, generate, inspect, run, confirm. The RH-07 acceptance map is
   reconciled with the newest hardware reports.
 - **Dependencies updated (batch of 18 Dependabot PRs).** `node-agent`: the

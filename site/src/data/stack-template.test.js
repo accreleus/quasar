@@ -221,8 +221,8 @@ test('generated scripts parse for every platform, engine, mode, role and access 
 });
 
 test('an unsupported profile generates no install artifacts: the UI blocks it', () => {
-  // debian + rootless Docker is unsupported per testdata/engine-profiles/profiles.json.
-  const out = generate(full({ platform: 'debian', engine: 'docker', mode: 'rootless' }));
+  // Unraid + rootless Docker is unsupported per testdata/engine-profiles/profiles.json.
+  const out = generate(full({ platform: 'unraid', engine: 'docker', mode: 'rootless' }));
   assert.equal(out.script, null);
   assert.equal(out.prep, null);
   assert.equal(out.quadlet, null);

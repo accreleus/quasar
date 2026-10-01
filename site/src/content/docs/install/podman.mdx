@@ -1,6 +1,6 @@
 ---
-title: Install with Podman (Quadlet)
-description: "Run Quasar's seed under Podman as a Quadlet systemd unit, rootful or rootless, and check on it afterwards."
+title: Install with Podman
+description: "Run Quasar's seed under Podman as a Quadlet systemd unit, rootless or rootful (both experimental), and check on it afterwards."
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
@@ -8,18 +8,20 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 On Podman, Quasar's seed runs as a **Quadlet** unit: a small file that systemd
 runs like any other service. The [quick start](/quasar/start/quickstart/) writes
 and starts it for you. This page covers doing it by hand and working with it
-afterwards. Validated platforms: [Engine profiles](/quasar/start/engine-profiles/).
+afterwards. Inputs, roles and the recovery actor are the same as on
+[Docker](/quasar/install/docker/#what-gets-installed).
 
-## Rootful or rootless
+## Rootless or rootful
 
-The same unit file works in both modes:
+Both modes are **experimental**. Status per platform: [Engine
+profiles](/quasar/start/engine-profiles/). The same unit file works in both:
 
-| | Rootful | Rootless |
+| | Rootless | Rootful |
 | --- | --- | --- |
-| Unit file | `/etc/containers/systemd/quasar-seed.container` | `~/.config/containers/systemd/quasar-seed.container` |
-| Managed by | `systemctl` | `systemctl --user` |
-| Runs as | root | the `quasar` account |
-| Socket | `/run/podman/podman.sock` | `$XDG_RUNTIME_DIR/podman/podman.sock` |
+| Unit file | `~/.config/containers/systemd/quasar-seed.container` | `/etc/containers/systemd/quasar-seed.container` |
+| Managed by | `systemctl --user` | `systemctl` |
+| Runs as | the `quasar` account | root |
+| Socket | `$XDG_RUNTIME_DIR/podman/podman.sock` | `/run/podman/podman.sock` |
 
 Rootless is the [mode Quasar targets](/quasar/start/engine-profiles/#root-equivalence).
 
@@ -29,11 +31,21 @@ container. Use `Volume=%t/podman/podman.sock:/var/run/docker.sock`, which works 
 both modes.
 </Aside>
 
-## Installing
+## Prepare the host
 
-First run [host preparation](/quasar/install/prepare-host/)
-(`prepare-host.sh --mode rootless --engine podman`, or `--mode rootful`).
-Without it, nothing survives a reboot.
+Required in both modes. Without it, nothing survives a reboot. Read the script
+before you run it; the quick start prints this command with its checksum:
+
+```bash
+sudo sh prepare-host.sh --mode rootless --engine podman
+```
+
+Use `--mode rootful` for rootful. On Podman it also enables
+`podman-restart.service` (rootless: also the user's `podman.socket`). What else it
+changes, its options and console mode: [Prepare the
+host](/quasar/install/docker/#prepare-the-host).
+
+## Installing
 
 <Steps>
 
@@ -71,7 +83,7 @@ machinectl shell quasar@
 
 Exit normally when done; lingering keeps Quasar running.
 
-## Status and logs
+## Check it came up
 
 ```bash
 # rootless, as quasar
@@ -88,6 +100,8 @@ sudo podman exec quasar-recovery quasar-recovery status
 ```
 
 The recovery actor's `status` is the most useful: it reports the install itself.
+Then continue with [First run and checks](/quasar/install/first-run/), using
+`podman` where it says `docker`.
 
 ## Only trying it out
 

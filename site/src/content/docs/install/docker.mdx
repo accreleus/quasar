@@ -1,24 +1,21 @@
 ---
-title: Install Quasar
-description: One container per machine, the seed. Quasar creates and updates everything else from published images.
+title: Install with Docker
+description: Install Quasar on Docker, rootful (supported) or rootless (experimental). One container per machine, the seed.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
+The [quick start](/quasar/start/quickstart/) writes everything on this page for you.
 Read [Requirements](/quasar/start/requirements/) first. The install pulls published
-images (about 20 GB on a machine that runs the agent) and compiles nothing. The
-[quick start](/quasar/start/quickstart/) writes everything on this page for you.
+images (about 20 GB on a machine that runs the agent) and compiles nothing. On
+Unraid, follow [Unraid](/quasar/install/unraid/) instead.
 
-**Pick an engine and mode first.** This page shows rootful Docker. See
-[Engine profiles](/quasar/start/engine-profiles/) for what your platform supports.
+| Mode | Status | Runs as | Host preparation |
+| --- | --- | --- | --- |
+| Rootful | Supported | root | Recommended. Otherwise do the kernel steps in [Requirements](/quasar/start/requirements/) by hand. |
+| Rootless | Experimental | the `quasar` account | Required. Creates the account Quasar runs as. |
 
-- **Rootful Docker:** host preparation is the sysctl and container-toolkit steps in
-  [Requirements](/quasar/start/requirements/).
-- **Rootless or Podman:** also run `prepare-host.sh` once as root. See [Prepare the
-  host](/quasar/install/prepare-host/).
-- **Podman:** follow [Install with Podman (Quadlet)](/quasar/install/podman-quadlet/).
-  Replace `docker` with `podman`, run as the `quasar` account on rootless, and use a
-  Quadlet unit instead of `docker run`.
+Status per platform: [Engine profiles](/quasar/start/engine-profiles/).
 
 <Aside type="note" title="Stable releases">
 A new install starts on the **stable** channel, with images pinned by digest, so it
@@ -27,7 +24,7 @@ never moves on its own. An install made before the first stable release is on
 stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
 </Aside>
 
-## How an install is put together
+## What gets installed
 
 You declare **one container per machine: the seed**. The seed keeps the machine's
 **recovery actor** running. The recovery actor creates and updates the other
@@ -59,6 +56,92 @@ It holds the Docker socket. Its limits:
 - It keeps the old container stopped until the new one verifies, so a failed update
   can be rolled back.
 
+## Prepare the host
+
+Quasar never runs as root. The one exception is `prepare-host.sh`, run once on each
+machine before installing. The quick start prints the exact command for your
+[engine profile](/quasar/start/engine-profiles/), with the script's checksum. Read
+the script before you run it.
+
+```bash
+sudo sh prepare-host.sh --mode rootful --engine docker
+```
+
+Get it from `https://accreleus.github.io/quasar/prepare-host.sh`, or from any
+control plane at `/prepare-host.sh`. The same script prepares
+[Podman](/quasar/install/podman/) hosts.
+
+**Rootless:** use `--mode rootless`, then run `dockerd-rootless-setuptool.sh` as the
+`quasar` account. Run everything below as that account, with its socket as the
+seed's first mount:
+
+```bash
+-v "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock:/var/run/docker.sock"
+```
+
+### What it changes
+
+Each change is printed with its reason. It never changes device owners, re-owns
+existing files, writes under `/usr` (so image-based systems like Fedora Atomic,
+Bazzite and uCore work), or relaxes SELinux.
+
+| Area | Change |
+| --- | --- |
+| Account | Rootless: the `quasar` account, subordinate UID/GID ranges, and lingering so its engine runs at boot. Rootful: a `quasar` group only. |
+| Devices | A udev rule gives the `quasar` group `/dev/uinput`, Quasar's own virtual input devices and the GPU render nodes. No broad groups like `input` or `video`. |
+| Runtime directory | `/run/quasar-agent`, recreated at every boot. |
+| Kernel | Loads `uinput` now and at boot; sets the [UDP send buffer sysctl](/quasar/start/requirements/#one-sysctl). |
+| NVIDIA | Makes sure a CDI specification exists for the loaded driver. |
+| Boot | Podman: enables `podman-restart.service` (rootless: also the user's `podman.socket`). Rootful Docker: enables `docker.service`. Rootless Docker: tells you to run `dockerd-rootless-setuptool.sh` as `quasar`. |
+| SELinux | Labels the homes, templates and runtime directories `container_file_t` and Quasar's virtual input devices. On NVIDIA, enables `container_use_xserver_devices` and installs the `quasar-nested-gpu` module. |
+
+### Options
+
+| Option | What it does |
+| --- | --- |
+| `--mode rootless\|rootful` | Required. The engine mode. |
+| `--engine auto\|docker\|podman` | Default `auto`: detects the engine, or prepares both if both are installed. |
+| `--user NAME` | The Quasar account or group. Default `quasar`. |
+| `--homes DIR` | Rootless only: create the homes root, owned by the Quasar account. |
+| `--templates DIR` | The same for the templates root (Steam's prepared home). |
+| `--console` | Also grant what [console mode](/quasar/admin/console/) needs. See below. |
+| `--console-audio-user USER` | With `--console`: route console audio through `USER`'s PipeWire. |
+| `--allow-kernel-log` | Let Quasar read GPU faults from the kernel log (`kernel.dmesg_restrict=0`). Without it, the `xid_visibility` check reads *skipped*. |
+| `--unprivileged-port-start N` | Let unprivileged services bind ports from `N`. Only for a rootless console on a port below 1024. |
+| `--dry-run` | Print what would change; change nothing. |
+
+`--homes` refuses system trees, users' homes, and directories another account owns.
+
+### Console mode
+
+`--console` lets a host show sessions on its own screen. It grants:
+
+- display cards, sound devices and i2c buses (monitor power over DDC), and loads `i2c-dev`;
+- the machine's keyboards, mice and controllers, so console mode can grab them.
+  **The `quasar` group can then read what is typed on this keyboard;**
+- `tty8`, and masks `getty@tty8` and `autovt@tty8`. If you run your own
+  `getty@tty8`, it is left alone and console sessions refuse to start.
+
+`--console-audio-user USER` adds a Quasar-only PipeWire socket to that user's
+desktop session. Restart their `pipewire-pulse` (or log in again) afterwards.
+
+```bash
+sudo sh prepare-host.sh --mode rootless --engine podman --console --console-audio-user alex
+```
+
+### Running it again
+
+Safe to rerun at any time, for example to add `--console`. It changes only what is
+missing. If a step fails, fix the cause and rerun.
+
+A missing permission shows on the host's readiness card with this command as the
+fix ([Readiness checks](/quasar/troubleshooting/readiness/)).
+
+<Aside type="caution" title="Dropping an option doesn't undo it">
+Leaving out an option you gave before does not revoke what it granted. A sysctl
+stays in effect until reboot.
+</Aside>
+
 ## Before you start
 
 **Create the home root** on persistent storage on any machine that runs games. It
@@ -68,14 +151,8 @@ holds saves and installed games. The template root sits beside it:
 sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes /var/lib/quasar/templates
 ```
 
-Use the owner that suits your host (Unraid commonly uses 99:100, then set
-`QUASAR_APP_PUID=99` and `QUASAR_APP_PGID=100`).
-
-<Aside type="caution" title="On Unraid, use appdata">
-`/root` is a ramdisk. Put both roots under `/mnt/user/appdata/`, for example
-`/mnt/user/appdata/quasar/homes` and `/mnt/user/appdata/quasar/templates`, and keep
-Dockge's stacks directory there too.
-</Aside>
+Use the owner that suits your host. Rootless: let `prepare-host.sh --homes` and
+`--templates` create them instead.
 
 **Pin the images by digest.** The seed refuses tags. This prints all three digests
 for the current stable release:
@@ -153,7 +230,7 @@ volumes:
 
 You don't set a database password, secret key, enrollment string or admin account.
 The recovery actor generates the secrets, and you claim the instance in the browser:
-see [First-run setup](/quasar/install/first-run/).
+see [First run and checks](/quasar/install/first-run/).
 
 **Control-only machine:** set `QUASAR_ROLE=control-only`. It needs no GPU, no home
 root and no GPU preparation. `QUASAR_AGENT_IMAGE` is optional: if set, Add host
@@ -191,7 +268,7 @@ With `docker run`, export `QUASAR_DATABASE_PASSWORD` and pass
 
 ## Add a GPU host
 
-Use **Add host** in **Admin ▸ Fleet ▸ Hosts**: see [Add a second GPU
+Use **Add host** in **Admin ▸ Fleet ▸ Hosts**: see [Add a GPU
 host](/quasar/install/second-host/). To start the seed yourself instead, take the
 enrollment string from the same dialog under **Show the enrollment string**. It works
 once and expires after an hour by default (up to 30 days).
@@ -272,8 +349,8 @@ curl http://localhost:8080/health
 ```
 
 You want `{"status":"ok","db":"ok"}`. Then open `https://<QUASAR_PUBLIC_HOST>:8443`
-in Chrome, accept the self-signed certificate once, and continue with [First-run
-setup](/quasar/install/first-run/).
+in Chrome, accept the self-signed certificate once, and continue with [First run
+and checks](/quasar/install/first-run/).
 
 A GPU host appears under **Admin ▸ Fleet ▸ Hosts** within seconds. The first
 machine appears under **Admin ▸ Fleet ▸ Releases ▸ Installed** as **This machine**.
@@ -364,5 +441,6 @@ A source-built machine has no recovery actor and is never offered updates.
 ## Coming from a Compose install
 
 A Compose install keeps running but is not offered new releases. To move to an owned
-install with your data, see [Move a Compose install](/quasar/install/move-existing/).
-To stay, see [Legacy Compose installs](/quasar/install/legacy-compose/).
+install with your data, see [Move a Compose
+install](/quasar/install/moving/#move-a-compose-install). To stay, see [Legacy
+Compose installs](/quasar/install/legacy-compose/).
