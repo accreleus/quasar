@@ -99,7 +99,11 @@ mod tests {
     #[test]
     fn only_the_type_changes() {
         assert_eq!(
-            retype("system_u:object_r:container_var_run_t:s0", CONTAINER_FILE_TYPE).as_deref(),
+            retype(
+                "system_u:object_r:container_var_run_t:s0",
+                CONTAINER_FILE_TYPE
+            )
+            .as_deref(),
             Some("system_u:object_r:container_file_t:s0")
         );
         // An MLS level with categories survives whole.
