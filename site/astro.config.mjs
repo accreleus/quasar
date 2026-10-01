@@ -151,6 +151,7 @@ export default defineConfig({
 						{ label: 'Docker', slug: 'install/docker' },
 						{ label: 'Podman', slug: 'install/podman' },
 						{ label: 'Unraid', slug: 'install/unraid' },
+						{ label: 'Device rules (udev)', slug: 'install/device-rules' },
 						{ label: 'First run and checks', slug: 'install/first-run' },
 						{ label: 'Add a GPU host', slug: 'install/second-host' },
 						{

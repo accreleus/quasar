@@ -7,7 +7,8 @@
 #   1. a fresh run writes exactly the expected files, and nothing under /usr;
 #   2. a second run changes nothing;
 #   3. the device rules add access for the quasar group to Quasar's devices only,
-#      and change no device's owner, group or mode;
+#      and change no device's owner, group or mode; what it writes is, byte for
+#      byte, the rules files in deploy/udev/ that the docs tell people to copy;
 #   4. an optional setting is written only when asked for;
 #   5. rootful prepares the device and kernel parts, and no account;
 #   6. an existing CDI specification is used, not duplicated;
@@ -79,6 +80,7 @@ expected="./dev/nvidiactl
 ./etc/sysctl.d/99-quasar.conf
 ./etc/tmpfiles.d/quasar.conf
 ./etc/udev/rules.d/70-quasar.rules
+./etc/udev/rules.d/72-quasar-seat.rules
 ./home/quasar/.config/systemd/user/default.target.wants/podman-restart.service
 ./home/quasar/.config/systemd/user/sockets.target.wants/podman.socket
 ./proc/driver/nvidia/version
@@ -112,16 +114,16 @@ if printf '%s' "$out2" | grep -qE '^  (changed|would) '; then fail "second run r
 # ── 3. device rules grant only Quasar's devices, by ACL ─────────────────────
 rules="$r/etc/udev/rules.d/70-quasar.rules"
 if grep -qE 'GROUP=|MODE=|OWNER=' "$rules"; then fail "rules change no owner/group/mode" "$(grep -E 'GROUP=|MODE=|OWNER=' "$rules")"; else pass "rules change no device's owner, group or mode"; fi
-[ "$(grep -c 'ACTION!="remove", ENV{DEVNAME}=="?\*"' "$rules")" = 3 ] && pass "every rule skips remove events and devices without a node" || fail "udev guards" "$(grep -v '^#' "$rules")"
+[ "$(grep -c 'ACTION!="remove", ENV{DEVNAME}=="?\*"' "$rules")" = 4 ] && pass "every rule skips remove events and devices without a node" || fail "udev guards" "$(grep -v '^#' "$rules")"
 grep -q 'ATTRS{name}=="Quasar Virtual \*"' "$rules" && pass "input rule matches only Quasar's devices by name" || fail "input by name" ""
 [ "$(grep -c 'setfacl -m g:quasar:rw \$devnode' "$rules")" = 3 ] && pass "three device rules without --console (uinput, Quasar input, render nodes)" || fail "rule count" "$(grep -v '^#' "$rules")"
 if grep -qE 'card|sound|i2c' <(grep -v '^#' "$rules"); then fail "console devices only with --console" ""; else pass "no display, sound or i2c access without --console"; fi
 if grep -qiE 'g:(input|video|render|audio):' "$rules"; then fail "no broad group" ""; else pass "no broad group such as input or video is granted"; fi
 r3="$tmp/r3"; mk_root "$r3"
 out3="$(prep "$r3" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
-grep -q 'KERNEL=="card\[0-9\]\*"' "$r3/etc/udev/rules.d/70-quasar.rules" && grep -q 'i2c-dev' "$r3/etc/modules-load.d/quasar.conf" \
+grep -q 'KERNEL=="card\[0-9\]\*"' "$r3/etc/udev/rules.d/71-quasar-console.rules" && grep -q 'i2c-dev' "$r3/etc/modules-load.d/quasar.conf" \
   && pass "--console adds display, sound and i2c, and loads i2c-dev" || fail "--console" ""
-r3rules="$r3/etc/udev/rules.d/70-quasar.rules"
+r3rules="$r3/etc/udev/rules.d/71-quasar-console.rules"
 grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_KEYBOARD}=="1"' "$r3rules" \
   && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_MOUSE}=="1"' "$r3rules" \
   && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_JOYSTICK}=="1"' "$r3rules" \
@@ -131,13 +133,50 @@ printf '%s' "$out3" | grep -q "the quasar group can read what is typed on this m
 grep -q '^SUBSYSTEM=="tty", KERNEL=="tty8", ACTION!="remove", ENV{DEVNAME}=="?\*", RUN+="/usr/bin/setfacl -m g:quasar:rw \$devnode"$' "$r3rules" \
   && [ "$(grep -c 'SUBSYSTEM=="tty"' "$r3rules")" = 1 ] \
   && pass "--console grants tty8, and only tty8, by ACL" || fail "console VT rule" "$(grep tty "$r3rules")"
-if grep -q 'tty' <(grep -v '^#' "$r/etc/udev/rules.d/70-quasar.rules"); then fail "no terminal without --console" ""; else pass "no terminal access without --console"; fi
+if grep -q 'tty' <(grep -v '^#' "$r/etc/udev/rules.d/70-quasar.rules") || [ -e "$r/etc/udev/rules.d/71-quasar-console.rules" ]; then fail "no terminal without --console" ""; else pass "no terminal access without --console"; fi
 grep -q 'udevadm trigger .*--subsystem-match=tty' "$r3/.prepare-host-commands" \
   && pass "--console re-applies the rules to terminals" || fail "tty trigger" "$(grep udevadm "$r3/.prepare-host-commands")"
 [ "$(readlink "$r3/etc/systemd/system/getty@tty8.service")" = /dev/null ] && [ "$(readlink "$r3/etc/systemd/system/autovt@tty8.service")" = /dev/null ] \
   && grep -q 'systemctl mask getty@tty8.service' "$r3/.prepare-host-commands" && grep -q 'systemctl mask autovt@tty8.service' "$r3/.prepare-host-commands" \
   && pass "--console masks getty@tty8 and autovt@tty8" || fail "tty8 getty masked" "$(cat "$r3/.prepare-host-commands")"
 if grep -q -- '--now' "$r3/.prepare-host-commands"; then fail "nothing running is stopped" "$(grep -- --now "$r3/.prepare-host-commands")"; else pass "masking stops nothing that runs"; fi
+
+# The rules it writes are the repo's rules files, byte for byte: the device-rules page
+# tells people to copy deploy/udev/*.rules, and both routes must give the same machine.
+for f in 70-quasar.rules 72-quasar-seat.rules; do
+  cmp -s "$root/deploy/udev/$f" "$r/etc/udev/rules.d/$f" && pass "writes deploy/udev/$f byte for byte" \
+    || fail "deploy/udev/$f differs from what prepare-host.sh writes" "$(diff "$root/deploy/udev/$f" "$r/etc/udev/rules.d/$f" | head -20)"
+done
+for f in 70-quasar.rules 71-quasar-console.rules 72-quasar-seat.rules; do
+  cmp -s "$root/deploy/udev/$f" "$r3/etc/udev/rules.d/$f" && pass "--console writes deploy/udev/$f byte for byte" \
+    || fail "deploy/udev/$f differs from what prepare-host.sh --console writes" "$(diff "$root/deploy/udev/$f" "$r3/etc/udev/rules.d/$f" | head -20)"
+done
+[ "$(find "$root/deploy/udev" -name '*.rules' | wc -l)" = 3 ] && pass "deploy/udev holds exactly the three rules files prepare-host.sh writes" \
+  || fail "deploy/udev file set" "$(ls "$root/deploy/udev")"
+# Every rule is preceded by a one-line comment saying what it is for.
+for f in "$root"/deploy/udev/*.rules; do
+  if awk 'prev !~ /^#/ && $0 !~ /^#/ && $0 != "" {bad=1} {prev=$0} END {exit bad}' "$f"; then pass "every rule in $(basename "$f") has its comment"
+  else fail "uncommented rule in $(basename "$f")" ""; fi
+done
+# The seat rule: Quasar's virtual input devices leave seat0 and lose uaccess, so a
+# desktop user logged in on the host gets no ACL on a player's controller.
+seat="$r/etc/udev/rules.d/72-quasar-seat.rules"
+grep -q '^SUBSYSTEM=="input", ATTRS{name}=="Quasar Virtual \*", ENV{ID_SEAT}="seat-quasar", TAG-="uaccess"$' "$seat" \
+  && [ "$(grep -vc '^#\|^$' "$seat")" = 1 ] \
+  && pass "seat rule parks Quasar's virtual input on its own seat without uaccess" || fail "seat rule" "$(cat "$seat")"
+# Dropping --console on a later run takes the console grants away again.
+r3b="$tmp/r3b"; cp -a "$r3" "$r3b"
+out3b="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
+[ ! -e "$r3b/etc/udev/rules.d/71-quasar-console.rules" ] && printf '%s' "$out3b" | grep -q '71-quasar-console.rules removed' \
+  && grep -c 'udevadm trigger' "$r3b/.prepare-host-commands" | grep -qx 2 \
+  && pass "a run without --console removes the console rules and re-applies udev" || fail "console rules removed" "$out3b"
+# Another Quasar user (or setfacl under /bin) changes only the group and the path.
+ru="$tmp/ru"; mk_root "$ru"
+outu="$(prep "$ru" "$tmp/podman-only" --mode rootless --engine podman --user gamer --console 2>&1)" || fail "--user gamer run" "$outu"
+grep -q 'g:gamer:rw' "$ru/etc/udev/rules.d/70-quasar.rules" && grep -q 'g:gamer:rw' "$ru/etc/udev/rules.d/71-quasar-console.rules" \
+  && ! grep -q 'g:quasar:' "$ru/etc/udev/rules.d/70-quasar.rules" "$ru/etc/udev/rules.d/71-quasar-console.rules" \
+  && [ "$(diff "$root/deploy/udev/70-quasar.rules" "$ru/etc/udev/rules.d/70-quasar.rules" | grep -c '^>')" = 4 ] \
+  && pass "--user gamer grants the gamer group, and changes nothing else" || fail "--user tailoring" "$(diff "$root/deploy/udev/70-quasar.rules" "$ru/etc/udev/rules.d/70-quasar.rules")"
 [ ! -e "$r/etc/systemd/system/getty@tty8.service" ] && pass "no unit is masked without --console" || fail "mask without --console" ""
 before3="$(tree "$r3")"
 out3again="$(prep "$r3" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
@@ -284,9 +323,12 @@ r9c="$tmp/r9c"; mk_root "$r9c"; mkdir -p "$r9c/sys/fs/selinux"
 prep "$r9c" "$tmp/docker-only" --mode rootless --engine docker --homes /var/lib/quasar/homes >/dev/null 2>&1
 if grep -q semanage "$r9c/.prepare-host-commands" 2>/dev/null; then fail "no label for Docker" ""; else pass "Docker without SELinux: data roots are not relabelled"; fi
 grep 'Quasar Virtual' "$r9b/etc/udev/rules.d/70-quasar.rules" | grep -q 'SECLABEL{selinux}="system_u:object_r:container_file_t:s0"' \
-  && [ "$(grep -c SECLABEL "$r9b/etc/udev/rules.d/70-quasar.rules")" = 1 ] \
+  && [ "$(grep -c 'SECLABEL{' "$r9b/etc/udev/rules.d/70-quasar.rules")" = 1 ] \
   && pass "only Quasar's own input devices get the container label" || fail "input seclabel" "$(cat "$r9b/etc/udev/rules.d/70-quasar.rules")"
-if grep -q SECLABEL "$r9c/etc/udev/rules.d/70-quasar.rules"; then fail "no input label for Docker" ""; else pass "Docker without SELinux: the input rule carries no label"; fi
+# The label rule is in the shipped file on every host (byte-identical with deploy/udev);
+# it carries only the label, no access of its own.
+grep 'SECLABEL{' "$r9c/etc/udev/rules.d/70-quasar.rules" | grep -qv 'RUN+=' \
+  && pass "the label rule grants nothing, it only labels" || fail "label rule grants nothing" "$(grep SECLABEL "$r9c/etc/udev/rules.d/70-quasar.rules")"
 if prep "$tmp/none" "$tmp/podman-only" --mode rootless --templates 'relative' 2>/dev/null; then fail "--templates relative" "exit 0"; else pass "--templates must be absolute"; fi
 for bad in '/srv/q|/etc' '/srv/q[a]' '/var/lib' '/home'; do
   if prep "$tmp/none" "$tmp/podman-only" --mode rootless --homes "$bad" 2>/dev/null; then fail "refuse $bad" "exit 0"; else pass "--homes $bad is refused (regex or system tree)"; fi

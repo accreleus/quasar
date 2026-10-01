@@ -1,0 +1,13 @@
+# Quasar device rules: the devices every Quasar host uses.
+# Documented at https://accreleus.github.io/quasar/install/device-rules/
+# Each rule ADDS read/write for the 'quasar' group to one kind of device. It changes no
+# device's owner or mode, so every existing user of these devices keeps its access.
+
+# Creating virtual input devices (keyboard, mouse, gamepad, touch) through /dev/uinput.
+KERNEL=="uinput", SUBSYSTEM=="misc", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
+# The input devices Quasar itself creates, matched by name, and no others.
+SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{name}=="Quasar Virtual *", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
+# SELinux hosts only: give Quasar's own input devices the container file type, so a confined session container may open them.
+SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{name}=="Quasar Virtual *", ACTION!="remove", ENV{DEVNAME}=="?*", SECLABEL{selinux}="system_u:object_r:container_file_t:s0"
+# GPU render nodes: hardware encode and rendering.
+SUBSYSTEM=="drm", KERNEL=="renderD*", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
