@@ -65,6 +65,28 @@ so it shows up next to its effect in the bundle.
 There is no built-in comparison. Take a bundle for each and change exactly one
 thing: same app, tier, client, network and similar content.
 
+## GPU fault messages in session traces
+
+Optional. With it, the agent reads GPU fault messages from the kernel log and
+attaches them to running sessions' traces: NVIDIA Xid errors and AMD amdgpu ring
+timeouts (Intel isn't covered). Without it, the `xid_visibility` readiness check
+reads *skipped*, and you read `dmesg` yourself.
+
+It is off by default for a reason: it lets **every account on the machine read the
+whole kernel log**. Turn it on only where that's acceptable.
+
+**What to do,** on the GPU host:
+
+```bash
+echo 'kernel.dmesg_restrict=0' | sudo tee /etc/sysctl.d/99-quasar-kernel-log.conf
+sudo sysctl -w kernel.dmesg_restrict=0
+```
+
+**Check it worked:** `sysctl kernel.dmesg_restrict` prints `0`, and the host's
+`xid_visibility` check no longer reads *skipped*.
+
+**To turn it off:** delete that file and run `sudo sysctl -w kernel.dmesg_restrict=1`.
+
 ## What to attach to a bug report
 
 For a session problem, the diagnostic bundle. For install or startup problems,

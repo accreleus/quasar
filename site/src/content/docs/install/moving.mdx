@@ -168,14 +168,11 @@ An install can't be switched from rootful to rootless in place.
    Your own database (`QUASAR_DATABASE_HOST`) is not dumped. Restore it with your
    own tools before the new install first starts.
 
-3. **Prepare the new host for rootless**, with **new** homes and templates paths:
-
-   ```bash
-   sudo sh prepare-host.sh --mode rootless --engine podman \
-     --homes /var/lib/quasar/homes-rootless --templates /var/lib/quasar/templates-rootless
-   ```
-
-   On the same machine, run this after step 2.
+3. **Prepare the new host for rootless**, following [Prepare the host, once, as
+   root](/quasar/install/rootless/#prepare-the-host-once-as-root) with **new**
+   homes and templates paths: `/var/lib/quasar/homes-rootless` and
+   `/var/lib/quasar/templates-rootless` here. On the same machine, do this after
+   step 2.
 
 4. **Copy homes and templates**, setting the owner during the copy:
 
@@ -187,10 +184,10 @@ An install can't be switched from rootful to rootless in place.
    Don't `chown -R` or delete the old roots until the new install has played a
    real session.
 
-5. **Install fresh, held for the restore.** In the
-   [Quick start](/quasar/start/quickstart/), choose Podman, rootless, the old
-   install's role (combined or control-only) and the **new** homes root. Before
-   running the script, add to the Quadlet unit:
+5. **Install fresh, held for the restore**, as in [Install, as
+   `quasar`](/quasar/install/rootless/#install-as-quasar), with the old install's
+   role (combined or control-only) and the **new** homes and templates roots. Before
+   starting the seed, add to the Quadlet unit:
 
    ```bash
    Environment=QUASAR_AWAIT_RESTORE="1"
@@ -200,7 +197,7 @@ An install can't be switched from rootful to rootless in place.
    (`QUASAR_NODE_NAME` on a combined machine only. With `podman run`, use `-e`.)
    The seed installs Postgres and waits. As the `quasar` account,
    `podman logs quasar-seed` shows the restore command (no session yet? see
-   [getting a rootless session](/quasar/install/podman/#getting-a-rootless-session-as-the-quasar-account)).
+   [getting a rootless session](/quasar/install/podman/#rootless-a-session-as-the-quasar-account)).
 
 6. **Restore the dump**, on the new machine:
 

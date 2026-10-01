@@ -1,6 +1,6 @@
 ---
 title: Install with Podman
-description: "Run Quasar's seed under Podman as a Quadlet systemd unit, rootless or rootful (both experimental), and check on it afterwards."
+description: "Run Quasar's seed under rootful Podman as a Quadlet systemd unit (experimental), and check on it afterwards. Rootless has its own page."
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
@@ -11,19 +11,17 @@ and starts it for you. This page covers doing it by hand and working with it
 afterwards. Inputs, roles and the recovery actor are the same as on
 [Docker](/quasar/install/docker/#what-gets-installed).
 
-## Rootless or rootful
+## Rootful first
 
-Both modes are **experimental**. Status per platform: [Engine
-profiles](/quasar/start/engine-profiles/). The same unit file works in both:
+This page is **rootful** Podman (experimental): Podman runs as root. To run Quasar
+as an ordinary account instead, follow [Install rootless](/quasar/install/rootless/).
+Status per platform: [Engine profiles](/quasar/start/engine-profiles/).
 
-| | Rootless | Rootful |
+| | Rootful | Rootless |
 | --- | --- | --- |
-| Unit file | `~/.config/containers/systemd/quasar-seed.container` | `/etc/containers/systemd/quasar-seed.container` |
-| Managed by | `systemctl --user` | `systemctl` |
-| Runs as | the `quasar` account | root |
-| Socket | `$XDG_RUNTIME_DIR/podman/podman.sock` | `/run/podman/podman.sock` |
-
-Rootless is the [mode Quasar targets](/quasar/start/engine-profiles/#root-equivalence).
+| Unit file | `/etc/containers/systemd/quasar-seed.container` | `~/.config/containers/systemd/quasar-seed.container` |
+| Managed by | `systemctl` | `systemctl --user` |
+| Socket | `/run/podman/podman.sock` | `$XDG_RUNTIME_DIR/podman/podman.sock` |
 
 <Aside type="caution" title="Socket path, if you write the unit by hand">
 The seed only accepts the socket mounted at `/var/run/docker.sock` inside the
@@ -33,25 +31,53 @@ both modes.
 
 ## Prepare the host
 
-Required in both modes. Without it, nothing survives a reboot. Read the script
-before you run it; the quick start prints this command with its checksum:
+Once, from an account with `sudo`. The quick start shows the same commands.
 
 ```bash
-sudo sh prepare-host.sh --mode rootless --engine podman
+sudo systemctl enable --now podman.socket
+sudo systemctl enable podman-restart.service
+echo 'd /run/quasar-agent 0755 root root -' | sudo tee /etc/tmpfiles.d/quasar.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
 ```
 
-Use `--mode rootful` for rootful. On Podman it also enables
-`podman-restart.service` (rootless: also the user's `podman.socket`). What else it
-changes, its options and console mode: [Prepare the
-host](/quasar/install/docker/#prepare-the-host).
+| Command | Why |
+| --- | --- |
+| `podman.socket` | The API the seed talks to. |
+| `podman-restart.service` | Brings Quasar's containers back after a reboot: Podman has no daemon to do it. |
+| `/etc/tmpfiles.d/quasar.conf` | Makes the agent's runtime directory at every boot. `/run` is emptied on reboot and Podman, unlike Docker, never creates a missing mount source, so without it the agent can't start after a reboot. |
+
+**NVIDIA:** install the [NVIDIA Container
+Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+then describe the GPU to Podman. Run it again after a driver upgrade.
+
+```bash
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+On SELinux (Fedora and its relatives), also let containers open the NVIDIA
+devices. SELinux stays enforcing:
+
+```bash
+sudo setsebool -P container_use_xserver_devices on
+echo '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' > quasar-nested-gpu.cil
+sudo semodule -i quasar-nested-gpu.cil
+```
+
+**Check it worked:** `systemctl is-enabled podman.socket podman-restart.service`
+says `enabled` twice, `ls -ld /run/quasar-agent` shows the directory, and on
+NVIDIA `nvidia-ctk cdi list` lists the GPU.
+
+Optional: [console mode](/quasar/admin/console/) needs the console rules from
+[Device rules](/quasar/install/device-rules/), and the [UDP send
+buffer](/quasar/tuning/latency/#the-udp-send-buffer) makes streams smoother.
 
 ## Installing
 
 <Steps>
 
-1. **Quick start (recommended).** Pick Podman, rootful or rootless, and go to
-   **Result**. Run the script it shows as `quasar` (rootless) or root (rootful).
-   It resolves the image digests and installs the unit.
+1. **Quick start (recommended).** Pick Podman and go to **Result**. Run the
+   script it shows from an account with `sudo`. It resolves the image digests and
+   installs the unit.
 
 2. **Or by hand.** The Result step also shows the unit with placeholder digests.
    Resolve them with `podman pull` and `podman image inspect`, fill in the
@@ -59,41 +85,22 @@ host](/quasar/install/docker/#prepare-the-host).
    above, then:
 
    ```bash
-   # rootless, as the quasar account
-   systemctl --user daemon-reload
-   systemctl --user start quasar-seed
-   ```
-
-   ```bash
-   # rootful
    sudo systemctl daemon-reload
    sudo systemctl start quasar-seed
    ```
 
 </Steps>
 
-## Getting a rootless session as the quasar account
+## Adding a GPU host
 
-Rootless commands need a full systemd user session for `quasar`. `sudo -u quasar`
-is not enough.
-
-```bash
-machinectl shell quasar@
-```
-
-Exit normally when done; lingering keeps Quasar running.
+Run the [Add host](/quasar/install/second-host/) command **as root** (`sudo -i`,
+then paste it). Rootful Podman's socket is visible to root only, so from an
+ordinary account, even one with `sudo`, the command reports *no container engine
+found*.
 
 ## Check it came up
 
 ```bash
-# rootless, as quasar
-systemctl --user status quasar-seed
-podman logs quasar-seed
-podman exec quasar-recovery quasar-recovery status
-```
-
-```bash
-# rootful
 sudo systemctl status quasar-seed
 sudo podman logs quasar-seed
 sudo podman exec quasar-recovery quasar-recovery status
@@ -101,7 +108,7 @@ sudo podman exec quasar-recovery quasar-recovery status
 
 The recovery actor's `status` is the most useful: it reports the install itself.
 Then continue with [First run and checks](/quasar/install/first-run/), using
-`podman` where it says `docker`.
+`sudo podman` where it says `docker`.
 
 ## Only trying it out
 
@@ -109,9 +116,9 @@ For a quick look without Quadlet, the Result step's "only trying it out" section
 has a bare `podman run`:
 
 ```bash
-podman run -d --name quasar-seed --restart unless-stopped \
+sudo podman run -d --name quasar-seed --restart unless-stopped \
   --security-opt label=disable \
-  -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/docker.sock" \
+  -v "/run/podman/podman.sock:/var/run/docker.sock" \
   -v quasar-machine:/var/lib/quasar-machine:ro \
   ... \
   <seed image> seed
@@ -121,9 +128,22 @@ It is less reliable across reboots. Use the Quadlet unit for anything you keep.
 
 ## Boot behaviour
 
-- The Quadlet unit restarts under systemd. Rootless, it needs the `quasar`
-  account's lingering (host preparation enables it).
-- `podman-restart.service` brings containers back after Podman restarts. Host
-  preparation enables it.
-- If an install or update stalls waiting for health checks, the `quasar` account
-  has no user session yet. Run `machinectl shell quasar@` to start one.
+- The Quadlet unit starts the seed at boot.
+- `podman-restart.service` brings Quasar's other containers back. Without it they
+  stay stopped after a reboot.
+- `/etc/tmpfiles.d/quasar.conf` recreates `/run/quasar-agent`. Without it the agent
+  fails after a reboot with `cannot stat /run/quasar-agent`.
+
+## Rootless: a session as the quasar account
+
+Rootless commands need a full systemd user session for `quasar`. `sudo -u quasar`
+is not enough:
+
+```bash
+sudo machinectl shell quasar@
+```
+
+Then use `systemctl --user` and `podman` without `sudo`. Exit normally when done;
+lingering keeps Quasar running. If an install or update stalls waiting for health
+checks, the account has no user session yet: open one this way. Setup:
+[Install rootless](/quasar/install/rootless/).

@@ -39,11 +39,37 @@ path is worth more than a fast one.
 
 - **Wired, on both ends.** The biggest single improvement. WiFi jitter is the most
   common cause of a stream that feels bad on a connection that measures fine.
-- **The socket buffer sysctl** from [Requirements](/quasar/start/requirements/),
-  if you skipped it.
+- **A larger [UDP send buffer](#the-udp-send-buffer)** on each GPU host.
 - **A frame rate your GPU can hold.** A steady 60 beats an unsteady 90.
 - **ABR on `smooth`**, the default.
 - **A codec your client decodes in hardware**, where possible.
+
+## The UDP send buffer
+
+Recommended on every GPU host, not required. The kernel's default UDP send buffer
+is too small for a keyframe burst: the kernel drops the overflow, and the stream
+throttles as if the network were bad.
+
+**What to do,** once, from an account with `sudo`:
+
+```bash
+echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
+sudo sysctl --system
+```
+
+On Unraid (`/etc` is rebuilt at every boot, so persist it in the boot script):
+
+```bash
+sysctl -w net.core.wmem_default=2097152
+grep -q wmem_default /boot/config/go || echo 'sysctl -w net.core.wmem_default=2097152' >> /boot/config/go
+```
+
+It applies to sessions started afterwards.
+
+**Check it worked:** `sysctl net.core.wmem_default` prints `2097152` (or more).
+
+To undo: delete `/etc/sysctl.d/99-quasar.conf` (Unraid: the line in
+`/boot/config/go`) and reboot.
 
 ## Things that mostly don't
 

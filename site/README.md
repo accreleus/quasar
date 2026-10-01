@@ -42,7 +42,7 @@ site/
     data/
       stack-template.js     what the quick start generates: the seed stack and script
       stack-template.test.js  its tests (npm test)
-      platforms.js          per-platform host preparation for the script
+      platforms.js          per-platform defaults (paths, owner, sudo) for the script
       proxy-configs.js      the reverse-proxy snippets
       write-fixtures.mjs    writes every generated script out for shellcheck
     route-data.ts           corrects the titles starlight-openapi generates

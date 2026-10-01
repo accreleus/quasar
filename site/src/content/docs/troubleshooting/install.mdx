@@ -51,7 +51,7 @@ docker exec quasar-recovery quasar-recovery status   # services, blockers, last 
 | `actor-engine-config` | The engine endpoint is unusable. The actor exits. |
 | `actor-no-gpu`, `actor-gpu-probe-unreadable` | No usable GPU found. The agent is installed anyway; readiness reports the gap. |
 | `actor-gpus-served` | The agent gets the NVIDIA device setup. Normal. |
-| `actor-gpu-injection-unavailable` | An NVIDIA GPU was found but this engine can't pass it through. Run [host preparation](/quasar/install/docker/#prepare-the-host), restart the engine, then remove the agent container. |
+| `actor-gpu-injection-unavailable` | An NVIDIA GPU was found but this engine can't pass it through. Do the NVIDIA part of preparing the host ([Docker](/quasar/install/docker/#prepare-the-host), [Podman](/quasar/install/podman/#prepare-the-host)), restart the engine, then remove the agent container. |
 | `actor-gpus-refused` | The engine refused the GPU. Fix the NVIDIA Container Toolkit (or the CDI spec on Podman and rootless Docker), then remove the agent container. |
 | `actor-gpus-probe-retry` | The engine didn't answer the GPU probe. Asked up to three times. |
 | `actor-helper-name-taken` | A foreign container holds `quasar-gpu-probe` or `quasar-secrets-writer`. Remove it. |
@@ -167,17 +167,26 @@ For the RTX 5090 AV1 restriction, see [AV1 driver compatibility](/quasar/tuning/
 ls -l /dev/uinput
 ```
 
-If it's missing:
-
-```bash
-sudo modprobe uinput
-echo uinput | sudo tee /etc/modules-load.d/uinput.conf
-```
+It normally appears on demand. If it's missing, the kernel lacks the `uinput`
+module: `sudo modprobe uinput` shows why.
 
 If it exists, the agent must be able to open it for writing. The `uinput` and
-`input_probe` readiness checks test this. On a rootless engine, run [host
-preparation](/quasar/install/docker/#prepare-the-host) and restart the agent. See
+`input_probe` readiness checks test this. On a rootless engine, install the
+[device rules](/quasar/install/device-rules/) and restart the agent. See
 [Readiness checks](/quasar/troubleshooting/readiness/#input).
+
+## The agent does not start after a reboot (Podman)
+
+`cannot stat /run/quasar-agent: No such file or directory`: nothing recreates the
+agent's runtime directory at boot. Rootful:
+
+```bash
+echo 'd /run/quasar-agent 0755 root root -' | sudo tee /etc/tmpfiles.d/quasar.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
+```
+
+Then start the agent again (`sudo podman start quasar-node-agent`). Rootless: step 4
+of [Install rootless](/quasar/install/rootless/#prepare-the-host-once-as-root).
 
 ## A GPU-less host will not start
 

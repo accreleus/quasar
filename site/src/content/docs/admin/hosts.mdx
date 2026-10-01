@@ -25,9 +25,10 @@ claims. Each check and its fix is on
 
 Two checks behave differently:
 
-- `xid_visibility` reads *skipped* unless host preparation ran with
-  `--allow-kernel-log`. When allowed, GPU faults appear in the session trace;
-  otherwise read the host's `dmesg`.
+- `xid_visibility` reads *skipped* unless the host lets Quasar read the kernel log
+  ([optional](/quasar/operations/diagnostics/#gpu-fault-messages-in-session-traces)).
+  When allowed, GPU faults appear in the session trace; otherwise read the host's
+  `dmesg`.
 - `media_reachability` stays unknown until a browser on another machine tries a
   session. If that connection never arrives, it fails and names the firewall rule
   to add ([Ports and endpoints](/quasar/reference/ports/#firewall)).
@@ -207,8 +208,8 @@ was removed"); run `uninstall` on the machine.
 
 A host's **Local console** page turns on console mode: games shown on a screen
 plugged into the host. Turning it on replaces the node agent, which ends the host's
-live sessions. A rootless host needs host preparation with `--console` first. See
-[Console mode](/quasar/admin/console/).
+live sessions. A rootless host needs the console [device
+rules](/quasar/install/device-rules/) first. See [Console mode](/quasar/admin/console/).
 
 ## Storage
 

@@ -33,7 +33,7 @@ for (const platform of ["fedora", "ubuntu", "debian", "arch", "other", "unraid"]
             dbHost: "db.example.internal",
           };
           const { script } = generate(answers);
-          if (!script) continue; // unsupported: no output
+          if (!script) continue; // unsupported or rootless: no output
           writeFileSync(`${out}/${platform}-${engine}-${mode}-${role}-${access}-${database}.sh`, script);
           n++;
         }

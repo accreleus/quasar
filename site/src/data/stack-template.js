@@ -22,35 +22,20 @@
  * verdict the host's readiness card will give. An unsupported combination
  * generates no install artifacts; the UI is the thing that blocks it earlier.
  *
- * Host preparation (`deploy/prepare-host.sh`) is a separate root step ahead of
- * starting the seed: it creates the `quasar` account, udev rules, kernel
- * settings and (on Podman) the boot-restart wiring. It writes under /etc, so
- * it is skipped entirely on Unraid (a ramdisk there) — Unraid keeps its own
- * self-contained script, unchanged. Everywhere else, `generate()` also returns
- * `prep` (the curl/checksum/`sudo sh prepare-host.sh` block) and, for Podman,
- * `quadlet` (the unit for on-screen reference; the script itself resolves
- * digests and writes/starts the same unit).
+ * Rootful only. The quick start installs rootful Docker, rootful Podman and
+ * Unraid; a rootless engine needs a prepared `quasar` account first, which the
+ * docs write out step by step (install/rootless), so a rootless answer
+ * generates no install artifacts here. Nobody is told to download and run a
+ * script as root: the few host commands a rootful install needs are returned
+ * as `hostSteps`, visible commands the reader runs themselves (the engine at
+ * boot; Podman's socket and podman-restart.service; on NVIDIA the container
+ * toolkit wiring). Unraid needs none, and keeps its own self-contained script.
+ * For Podman, `quadlet` is the unit for on-screen reference; the script itself
+ * resolves digests and writes/starts the same unit.
  */
 import { proxyConfig } from './proxy-configs.js';
 import { platform } from './platforms.js';
 import { profileFor } from './engine-profiles.js';
-
-/**
- * `prepare-host-source.js` is Node-only (it reads `deploy/prepare-host.sh`
- * with `node:fs`) and must never be imported from here: this module is also
- * bundled into the quick start's browser `<script>`, and Vite externalizes
- * `node:fs` to a stub that throws on property access for that target — a
- * static import used to crash the whole wizard silently before any event
- * listener attached. `QuickStart.astro`'s frontmatter (SSR, safe) reads the
- * real checksum and calls `setPrepareHostSha256()`; the test file does the
- * same for its own assertions. Until called, `prepText()` falls back to a
- * placeholder rather than a stale or wrong digest.
- */
-let prepareHostSha256 = '<checksum unavailable — call setPrepareHostSha256()>';
-export function setPrepareHostSha256(value) {
-  prepareHostSha256 = value;
-}
-export const PREPARE_HOST_URL = 'https://accreleus.github.io/quasar/prepare-host.sh';
 
 // `process` itself is a Node global, undefined in the browser this module is
 // also bundled for (the quick start's client <script>) — `typeof` is the one
@@ -78,10 +63,8 @@ export const DEFAULTS = {
   platform: 'fedora', // see platforms.js
   role: 'combined', // see ROLES
   engine: 'docker', // 'docker' | 'podman'
-  mode: 'rootful', // 'rootful' | 'rootless'
-  console: false,
-  kernelLog: false,
-  lowPorts: false, // forced on below 1024 on a rootless engine regardless of this flag
+  mode: 'rootful', // 'rootful' only for install artifacts; 'rootless' is the docs' rootless page
+  nvidia: false, // the host steps add the NVIDIA container toolkit wiring
   basePath: '/var/lib/quasar',
   separateSaves: false,
   savesPath: '',
@@ -112,6 +95,9 @@ export function role(id) {
 export function supportedProfile(a) {
   return profileFor(a.platform, a.engine, a.mode).status !== 'unsupported';
 }
+
+/** The docs page a rootless install follows instead of the quick start. */
+export const ROOTLESS_DOCS_URL = 'https://accreleus.github.io/quasar/install/rootless/';
 
 /** A digest placeholder in the one shape the seed accepts. */
 export function placeholderImage(name) {
@@ -250,82 +236,89 @@ function shellQuote(value) {
   return "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 }
 
-// --- host preparation -------------------------------------------------------
+// --- host steps ---------------------------------------------------------------
+
+/** NVIDIA's own install guide for the container toolkit (packages differ per distribution). */
+export const NVIDIA_TOOLKIT_URL = 'https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html';
 
 /**
- * Whether the low-ports flag is in effect: either the operator turned it on,
- * or it must be, because a chosen port is below 1024 on a rootless engine
- * (which cannot bind one without it).
+ * The one SELinux rule sessions need on NVIDIA: they run as container_engine_t (Steam's
+ * nested sandbox), which the policy boolean below does not cover. Same rule as
+ * deploy/prepare-host.sh writes.
  */
-export function effectiveLowPorts(a) {
-  return Boolean(a.lowPorts) || (a.mode === 'rootless' && (Number(a.controlPort) < 1024 || Number(a.tlsPort) < 1024));
-}
-
-/** The lowest configured port under 1024, or a sane default if the toggle was set by hand. */
-function unprivilegedPortStart(a) {
-  const low = [Number(a.controlPort), Number(a.tlsPort)].filter((n) => Number.isFinite(n) && n > 0 && n < 1024);
-  return low.length ? Math.min(...low) : 80;
-}
-
-/** The flags `prepare-host.sh` needs for these answers, as a flat token list. */
-export function prepFlags(a) {
-  const r = role(a.role);
-  const tokens = ['--mode', a.mode, '--engine', a.engine];
-  if (a.mode === 'rootless' && r.agent) {
-    tokens.push('--homes', homePath(a));
-    tokens.push('--templates', templatePath(a));
-  }
-  if (a.console) tokens.push('--console');
-  if (a.kernelLog) tokens.push('--allow-kernel-log');
-  if (effectiveLowPorts(a)) tokens.push('--unprivileged-port-start', String(unprivilegedPortStart(a)));
-  return tokens;
-}
+export const NESTED_GPU_CIL = '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))';
 
 /**
- * The prep block: fetch `prepare-host.sh` from the docs site (the first
- * machine has no control plane yet to fetch it from), verify it, then run it
- * as root. This is the one step that needs root on every engine and mode —
- * it is what host preparation is for.
+ * The node agent's runtime directory on rootful Podman, made at every boot (the
+ * line deploy/prepare-host.sh writes for rootful). Docker recreates a missing bind
+ * source itself; Podman does not, so without it the agent fails after a reboot.
+ * Its SELinux label is the agent's own business.
  */
-export function prepText(a) {
-  const flags = prepFlags(a)
-    .map((t) => (t.startsWith('--') ? t : shellQuote(t)))
-    .join(' ');
-  return `curl -fsSL -o prepare-host.sh ${shellQuote(PREPARE_HOST_URL)}
-echo ${shellQuote(`${prepareHostSha256}  prepare-host.sh`)} | sha256sum -c
-sudo sh prepare-host.sh ${flags}`;
-}
+export const RUNTIME_DIR_TMPFILES = 'd /run/quasar-agent 0755 root root -';
 
-/**
- * The install scripts' host-preparation check. Preparation is the quick start's own
- * step 1, run once as root; the install script never runs it, because on a rootless
- * engine the script runs as the quasar account, which has no sudo (least privilege).
- * It only checks what preparation always leaves behind, and names step 1 if not.
- */
-export function prepCheck(a) {
-  const files = ['/etc/udev/rules.d/70-quasar.rules', '/etc/sysctl.d/99-quasar.conf'];
-  if (a.mode === 'rootless') files.push('/etc/tmpfiles.d/quasar.conf');
-  const lines = [
-    'echo "==> Checking host preparation"',
-    'unprepared=0',
-    '# QUASAR_PREP_ROOT is for tests only: the root the checked files live under.',
-    'pr="${QUASAR_PREP_ROOT:-}"',
-    `for f in ${files.join(' ')}; do`,
-    '  [ -e "$pr$f" ] || { echo "Missing $f." >&2; unprepared=1; }',
-    'done',
+/** NVIDIA's device nodes for SELinux-confined containers; SELinux stays enforcing. */
+function nvidiaSelinuxLines() {
+  return [
+    'sudo setsebool -P container_use_xserver_devices on',
+    `echo '${NESTED_GPU_CIL}' > quasar-nested-gpu.cil`,
+    'sudo semodule -i quasar-nested-gpu.cil',
   ];
-  if (a.mode === 'rootless') {
+}
+
+/**
+ * The host commands a rootful install needs, run once by the reader before the
+ * install script: visible, never a downloaded script. Unraid needs none.
+ * Mirrors what deploy/prepare-host.sh does for a rootful engine: the engine at
+ * boot (Podman: its API socket, podman-restart.service and the agent's runtime
+ * directory, recreated at every boot), and on NVIDIA the
+ * container toolkit (Docker: its runtime; Podman: a CDI specification), plus,
+ * on Fedora (SELinux), the boolean and the one rule NVIDIA's device nodes need.
+ */
+export function hostSteps(a) {
+  const r = role(a.role);
+  const nvidia = Boolean(a.nvidia) && r.agent;
+  const selinux = a.platform === 'fedora';
+  const lines = [];
+  if (a.engine === 'podman') {
     lines.push(
-      'grep -q "^$(id -un):" "$pr/etc/subuid" 2>/dev/null || { echo "No subordinate IDs for $(id -un) in /etc/subuid." >&2; unprepared=1; }',
-      '[ -e "$pr/var/lib/systemd/linger/$(id -un)" ] || { echo "Lingering is off for $(id -un)." >&2; unprepared=1; }',
+      "# Podman's API socket (the seed talks to it), and Quasar's containers back at boot.",
+      'sudo systemctl enable --now podman.socket',
+      'sudo systemctl enable podman-restart.service',
+      '',
+      "# The agent's runtime directory, made at every boot: /run is emptied on reboot,",
+      '# and Podman never creates a missing bind source.',
+      `echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf`,
+      'sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf',
     );
+    if (nvidia) {
+      lines.push(
+        '',
+        `# NVIDIA: install the NVIDIA Container Toolkit first (${NVIDIA_TOOLKIT_URL}),`,
+        '# then describe the GPU to Podman. Run this again after a driver upgrade.',
+        'sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml',
+      );
+      if (selinux) lines.push('', '# SELinux: let containers open the NVIDIA devices. SELinux stays enforcing.', ...nvidiaSelinuxLines());
+    }
+  } else {
+    lines.push('# Docker, now and at every boot (it brings Quasar\'s containers back).', 'sudo systemctl enable --now docker');
+    if (nvidia) {
+      lines.push(
+        '',
+        `# NVIDIA: install the NVIDIA Container Toolkit first (${NVIDIA_TOOLKIT_URL}),`,
+        '# then give Docker its runtime.',
+        'sudo nvidia-ctk runtime configure --runtime=docker',
+        'sudo systemctl restart docker',
+      );
+      if (selinux) {
+        lines.push(
+          '',
+          '# Only if Docker runs with SELinux on (uCore and Fedora CoreOS do; check with',
+          "# docker info --format '{{.SecurityOptions}}'): let containers open the NVIDIA devices.",
+          ...nvidiaSelinuxLines(),
+        );
+      }
+    }
   }
-  lines.push(
-    'if [ "$unprepared" != 0 ]; then',
-    '  echo "This host is not prepared for Quasar. Run step 1 (Prepare the machine) as root, then run this again." >&2',
-    '  exit 1',
-    'fi',
-  );
   return lines.join('\n');
 }
 
@@ -499,10 +492,9 @@ function envArgsFor(a, vars) {
 }
 
 /**
- * Docker rootful: today's script (D4), minus the sysctl/modprobe lines that
- * host preparation now does, plus the prep step and an engine/mode check.
- * `install -d` of homes stays: rootful preparation skips creating them
- * (`prepare-host.sh`'s `data_root`), same as before this change.
+ * Docker rootful: checks the engine and its mode, creates the homes and
+ * templates roots, pins the images and starts the seed. The host steps (the
+ * engine at boot, NVIDIA) are the reader's own, shown above the script.
  */
 function dockerRootfulScript(a, r, p) {
   const { uid, gid } = appUser(a);
@@ -514,8 +506,8 @@ function dockerRootfulScript(a, r, p) {
 # Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Docker rootful.
 # Generated in your browser; nothing was sent anywhere. Read it before you run it.
 #
-# It checks the host was prepared, then starts ONE container, the seed. The seed creates
-# Quasar's recovery actor, which generates every secret and creates the rest.
+# It checks the host, then starts ONE container, the seed. The seed creates Quasar's
+# recovery actor, which generates every secret and creates the rest.
 # Nothing here writes a Compose file or an .env.
 set -euo pipefail
 
@@ -527,7 +519,7 @@ ${preflightBlock({
   external,
 })}
 if command -v docker >/dev/null && docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
-  echo "This is Docker rootless, but this script installs rootful. Regenerate the quick start with Rootless selected." >&2
+  echo "This is Docker rootless, but this script installs rootful. For rootless, follow ${ROOTLESS_DOCS_URL}" >&2
   exit 1
 fi
 
@@ -548,8 +540,6 @@ if [ -n "$legacy" ]; then
   exit 1
 fi
 ${EXISTING_INSTALL_CHECK('docker', '')}
-
-${prepCheck(a)}
 
 ${imagesBlock('docker', '', r)}
 ${r.agent ? `
@@ -573,162 +563,89 @@ ${doneBlock(a, r, host, 'docker exec quasar-control-plane')}
 }
 
 /**
- * Docker rootless: no root at any point except the prep line. The seed's
- * socket mount is the user's own rootless socket, resolved the way the
- * daemon documents it (`$XDG_RUNTIME_DIR/docker.sock`, defaulting to
- * `/run/user/$(id -u)`); no directories are created here (`--homes`/
- * `--templates` on `prepare-host.sh` do that, owned correctly already).
- */
-function dockerRootlessScript(a, r, p) {
-  const external = r.control && a.database === 'external';
-  const vars = { seed: '$seed_image', control: '$control_image', agent: '$agent_image' };
-  const host = a.publicHost.trim() || '<this-host>';
-  const sockExpr = '${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock';
-
-  return `#!/usr/bin/env bash
-# Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Docker rootless.
-# Generated in your browser; nothing was sent anywhere. Read it before you run it.
-#
-# Runs entirely as the quasar account: the only root step is host preparation,
-# which creates that account and its rootless Docker service. Nothing here
-# writes a Compose file or an .env.
-set -euo pipefail
-
-if [ "$(id -u)" = 0 ]; then
-  echo "Run this as the quasar account, not root: rootless Docker is per-user." >&2
-  exit 1
-fi
-export DOCKER_HOST="unix://${sockExpr}"
-
-${preflightBlock({
-  tools: ['docker', 'curl'],
-  checkCmd: `command -v docker >/dev/null && ! docker info >/dev/null 2>&1`,
-  checkFailMsg: 'Docker is unavailable at $DOCKER_HOST. Check the rootless Docker service for this user.',
-  r,
-  external,
-})}
-
-echo "==> Existing installs"
-${EXISTING_INSTALL_CHECK('docker', '')}
-
-${prepCheck(a)}
-
-${imagesBlock('docker', '', r)}
-
-${portCheck(a, r)}echo "==> Starting the seed"
-docker run -d --name quasar-seed --restart unless-stopped \\
-  --security-opt label=disable \\
-  -v "${sockExpr}:/var/run/docker.sock" \\
-  -v quasar-machine:/var/lib/quasar-machine:ro \\
-${envArgsFor(a, vars)}
-  "$seed_image" seed >/dev/null
-
-${readyBlock(a, r, 'docker', '', 'docker exec quasar-recovery quasar-recovery status')}
-
-echo
-${doneBlock(a, r, host, 'docker exec quasar-control-plane')}
-`;
-}
-
-/**
- * Podman, rootful or rootless (D-g/owner decision 3): the copy block is a
- * script. It resolves the three image digests with `podman`, writes the
- * Quadlet unit with them substituted in, then starts it through systemd —
- * the same unit `quadlet` above returns for on-screen reference, with real
- * digests instead of placeholders. `--homes`/`--templates` on `prepare-host.sh`
- * create the directories when rootless; rootful keeps `install -d` here, same
- * as Docker rootful.
+ * Podman rootful (owner decision 3): the copy block is a script. It resolves the
+ * three image digests with `podman`, writes the Quadlet unit with them
+ * substituted in, then starts it through systemd — the same unit `quadlet`
+ * returns for on-screen reference, with real digests instead of placeholders.
+ * It refuses to start while a host step is missing: podman-restart.service off, or
+ * nothing making /run/quasar-agent at boot. Either way Quasar would not come back
+ * after a reboot.
  */
 function podmanScript(a, r, p) {
-  const rootful = a.mode === 'rootful';
   const { uid, gid } = appUser(a);
   const external = r.control && a.database === 'external';
-  const sudo = rootful ? 'sudo ' : '';
-  const svc = rootful ? 'systemctl' : 'systemctl --user';
-  const unitDir = rootful ? '/etc/containers/systemd' : '$HOME/.config/containers/systemd';
+  const unitDir = '/etc/containers/systemd';
   const vars = { seed: '$seed_image', control: '$control_image', agent: '$agent_image' };
   const host = a.publicHost.trim() || '<this-host>';
-
-  const unitLines = [
-    '[Unit]',
-    'Description=Quasar seed',
-    'Wants=network-online.target',
-    'Requires=podman.socket',
-    'After=network-online.target podman.socket',
-    '',
-    '[Container]',
-    'ContainerName=quasar-seed',
-    'Image=$seed_image',
-    'Exec=seed',
-    'SecurityLabelDisable=true',
-    'Volume=%t/podman/podman.sock:/var/run/docker.sock',
-    'Volume=quasar-machine:/var/lib/quasar-machine:ro',
-    ...quadletEnvironmentLines(a, vars),
-  ];
-  if (external) unitLines.push('Secret=quasar-db-password,type=env,target=QUASAR_DATABASE_PASSWORD');
-  unitLines.push('', '[Service]', 'Restart=always', '', '[Install]', `WantedBy=${rootful ? 'multi-user.target' : 'default.target'}`);
+  const unit = quadletUnit(a, vars).replace(/\n$/, '');
 
   return `#!/usr/bin/env bash
-# Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Podman ${rootful ? 'rootful' : 'rootless'}.
+# Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Podman rootful.
 # Generated in your browser; nothing was sent anywhere. Read it before you run it.
 #
-# It checks the host was prepared, resolves the three image digests, then writes and
-# starts a Quadlet unit for the seed. Nothing here writes a Compose file.
+# It checks the host, resolves the three image digests, then writes and starts a
+# Quadlet unit for the seed. Nothing here writes a Compose file.
 set -euo pipefail
 
-${rootful ? '' : `if [ "$(id -u)" = 0 ]; then
-  echo "Run this as the quasar account, not root: rootless Podman is per-user." >&2
-  exit 1
-fi
-`}${preflightBlock({
-  tools: ['podman', 'curl', 'sha256sum'],
-  checkCmd: `command -v podman >/dev/null && ! ${sudo}podman info >/dev/null 2>&1`,
+${preflightBlock({
+  tools: ['podman', 'curl'],
+  checkCmd: `command -v podman >/dev/null && ! sudo podman info >/dev/null 2>&1`,
   checkFailMsg: 'Podman is unavailable.',
   r,
   external,
 })}
+if ! systemctl is-enabled --quiet podman-restart.service 2>/dev/null; then
+  echo "podman-restart.service is off, so Quasar would not come back after a reboot. Run step 1 first:" >&2
+  echo "  sudo systemctl enable podman-restart.service" >&2
+  exit 1
+fi
+if ! systemd-tmpfiles --cat-config 2>/dev/null | grep -q '^d /run/quasar-agent '; then
+  echo "Nothing makes /run/quasar-agent at boot, so the agent would not start after a reboot. Run step 1 first:" >&2
+  echo "  echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf" >&2
+  echo "  sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf" >&2
+  exit 1
+fi
 
 echo "==> Existing installs"
-${EXISTING_INSTALL_CHECK('podman', sudo)}
+${EXISTING_INSTALL_CHECK('podman', 'sudo ')}
 
-${prepCheck(a)}
-
-${imagesBlock('podman', sudo, r)}
-${rootful && r.agent ? `
+${imagesBlock('podman', 'sudo ', r)}
+${r.agent ? `
 echo "==> Directories"
 sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
 sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(templatePath(a))}
 ` : ''}${external ? `
 echo "==> Database secret"
-if ! ${sudo}podman secret exists quasar-db-password 2>/dev/null; then
-  printf '%s' "$QUASAR_DATABASE_PASSWORD" | ${sudo}podman secret create quasar-db-password - >/dev/null
+if ! sudo podman secret exists quasar-db-password 2>/dev/null; then
+  printf '%s' "$QUASAR_DATABASE_PASSWORD" | sudo podman secret create quasar-db-password - >/dev/null
 fi
 ` : ''}
 echo "==> Writing the Quadlet unit"
-${sudo}mkdir -p "${unitDir}"
-${sudo}tee "${unitDir}/quasar-seed.container" >/dev/null <<'QUASAR_UNIT_HEADER'
+sudo mkdir -p "${unitDir}"
+sudo tee "${unitDir}/quasar-seed.container" >/dev/null <<'QUASAR_UNIT_HEADER'
 # Written by the Quasar quick start.
 QUASAR_UNIT_HEADER
-cat <<UNIT | ${sudo}tee -a "${unitDir}/quasar-seed.container" >/dev/null
-${unitLines.join('\n')}
+cat <<UNIT | sudo tee -a "${unitDir}/quasar-seed.container" >/dev/null
+${unit}
 UNIT
 
 ${portCheck(a, r)}echo "==> Starting the seed"
-${sudo}${svc} daemon-reload
-${sudo}${svc} start quasar-seed
+sudo systemctl daemon-reload
+sudo systemctl start quasar-seed
 
-${readyBlock(a, r, 'podman', sudo, `${sudo}podman exec quasar-recovery quasar-recovery status`)}
+${readyBlock(a, r, 'podman', 'sudo ', 'sudo podman exec quasar-recovery quasar-recovery status')}
 
 echo
-${doneBlock(a, r, host, `${sudo}podman exec quasar-control-plane`)}
+${doneBlock(a, r, host, 'sudo podman exec quasar-control-plane')}
 `;
 }
 
 /**
- * Unraid: unchanged (D-h). `prepare-host.sh` writes under /etc, a ramdisk on
- * Unraid, so it is skipped entirely; this script persists the sysctl and the
- * uinput module through `/boot/config/go` itself, exactly as before RH07-14.
- * Unraid's own Docker is always rootful, so `a.engine`/`a.mode` do not apply.
+ * Unraid: self-contained, with no host steps (Unraid's Docker is always rootful
+ * and already running, and its shell is root, so `a.engine`/`a.mode` do not
+ * apply). It sets no kernel setting and loads no module: /dev/uinput loads on
+ * demand, and the UDP send buffer is optional tuning (docs: tuning/latency),
+ * with its own Unraid recipe there.
  */
 function unraidScript(a, r, p) {
   const { uid, gid } = appUser(a);
@@ -741,9 +658,9 @@ function unraidScript(a, r, p) {
 # Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}. Generated in your
 # browser; nothing was sent anywhere. Read it before you run it.
 #
-# It checks the host, prepares it, and starts ONE container, the seed. The seed
-# creates Quasar's recovery actor, which generates every secret and creates the
-# rest. Nothing here writes a Compose file or an .env.
+# It checks the host and starts ONE container, the seed. The seed creates
+# Quasar's recovery actor, which generates every secret and creates the rest.
+# Nothing here writes a Compose file or an .env.
 set -euo pipefail
 
 echo "==> Host preflight"
@@ -811,16 +728,6 @@ ${r.agent ? `
 echo "==> Directories"
 ${p.sudo}install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
 ${p.sudo}install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(templatePath(a))}
-
-echo "==> UDP send buffer"
-# libnice never calls setsockopt(SO_SNDBUF), so media sockets inherit the kernel
-# default of 208 KB. A keyframe burst at 8 Mbps overflows it, the kernel drops
-# the overflow silently, and the bitrate estimator reads that as congestion.
-${p.sysctl()}
-
-echo "==> Virtual input"
-${p.module()}
-[ -c /dev/uinput ] || { echo "Virtual input device /dev/uinput is unavailable after loading uinput" >&2; exit 1; }
 ` : ''}
 echo "==> Starting the seed"
 docker run -d --name quasar-seed --restart unless-stopped \\
@@ -858,14 +765,17 @@ function scriptText(a) {
   const r = role(a.role);
   const p = platform(a.platform);
   if (a.platform === 'unraid') return unraidScript(a, r, p);
-  if (a.engine === 'podman') return podmanScript(a, r, p);
-  return a.mode === 'rootless' ? dockerRootlessScript(a, r, p) : dockerRootfulScript(a, r, p);
+  return a.engine === 'podman' ? podmanScript(a, r, p) : dockerRootfulScript(a, r, p);
 }
 
 /**
  * Turn wizard answers into every artifact the install needs.
  *
- * @returns {{stack: string, env: string|null, pins: string, prep: string|null,
+ * Install artifacts (`hostSteps`, `script`, `quadlet`, `podmanRun`) exist only for
+ * a control-plane role on a rootful engine in a profile that is not unsupported.
+ * A rootless engine follows the docs' rootless page instead (`ROOTLESS_DOCS_URL`).
+ *
+ * @returns {{stack: string, env: string|null, pins: string, hostSteps: string|null,
  *            quadlet: string|null, podmanRun: string|null, script: string|null,
  *            proxyConfig: {name: string, filename: string, language: string, body: string}|null}}
  */
@@ -875,16 +785,17 @@ export function generate(input = {}) {
     if (/[\r\n\0]/.test(String(a[key]))) throw new Error(`${key} must be a single line`);
   }
   const r = role(a.role);
-  const showInstall = r.control && supportedProfile(a);
-  const podman = showInstall && a.engine === 'podman';
+  const unraid = a.platform === 'unraid';
+  // Unraid's Docker is always rootful; elsewhere the quick start covers rootful only.
+  const showInstall = r.control && supportedProfile(a) && (unraid || a.mode === 'rootful');
+  const podman = showInstall && !unraid && a.engine === 'podman';
   return {
     stack: seedStack(a),
     env: stackEnv(a),
     pins: pinsCommand(a),
     // A GPU host joins from its control plane: Admin -> Fleet -> Add host prints the
-    // one-line command, which prepares the host too. Unraid needs no separate prep
-    // block: prepare-host.sh writes under /etc, a ramdisk there.
-    prep: showInstall && a.platform !== 'unraid' ? prepText(a) : null,
+    // one-line command, which checks the host too. Unraid needs no host steps.
+    hostSteps: showInstall && !unraid ? hostSteps(a) : null,
     quadlet: podman ? quadletUnit(a) : null,
     // "Only trying it out?" alternative to the Quadlet unit (owner decision 3):
     // never the installed path, so it is offered behind a closed disclosure.

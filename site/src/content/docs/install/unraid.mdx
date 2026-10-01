@@ -1,6 +1,6 @@
 ---
 title: Install on Unraid
-description: Install Quasar on Unraid with one docker run seed. No host preparation script; storage off the FUSE layer; NVIDIA driver notes.
+description: Install Quasar on Unraid with one docker run seed. No host preparation; storage off the FUSE layer; NVIDIA driver notes.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -45,20 +45,9 @@ templates root and any other Quasar data at a path that **bypasses** it:
 
 ## Host preparation
 
-`prepare-host.sh` is **not used** on Unraid: it writes under `/etc`, which Unraid
-recreates at every boot. Instead the quick start's script sets the
-[UDP send buffer](/quasar/start/requirements/#one-sysctl) and loads `uinput`, and
-persists both in `/boot/config/go`:
-
-```bash
-sysctl -w net.core.wmem_default=2097152 >/dev/null
-# /etc is a ramdisk on Unraid, so persist through the boot script instead.
-grep -q 'wmem_default' /boot/config/go || echo 'sysctl -w net.core.wmem_default=2097152' >> /boot/config/go
-modprobe uinput
-grep -q 'modprobe uinput' /boot/config/go || echo 'modprobe uinput' >> /boot/config/go
-```
-
-Re-running it adds nothing twice.
+None. Unraid's Docker is already running, and `/dev/uinput` appears on demand.
+For smoother streams, set the [UDP send buffer](/quasar/tuning/latency/#the-udp-send-buffer)
+(it has an Unraid recipe).
 
 ## Install
 
@@ -72,7 +61,6 @@ The script:
 - stops if a Compose-made Quasar stack or an existing seed is on the machine;
 - pins the current stable release's images by digest;
 - creates the homes and templates roots, owned by 99:100;
-- sets the sysctl and `uinput` as above;
 - starts **one container, the seed**, and waits up to ten minutes for Quasar.
 
 The seed it starts, with your values in place of the examples:
@@ -120,6 +108,7 @@ existing stack](/quasar/install/legacy-compose/#moving-an-existing-stack).
 
 ## Removing it
 
-Uninstall as on any host ([Uninstalling](/quasar/operations/uninstall/)), then remove
-the `sysctl -w net.core.wmem_default=2097152` and `modprobe uinput` lines from
+Uninstall as on any host ([Uninstalling](/quasar/operations/uninstall/)). If you
+set the UDP send buffer, or installed with an older quick start, also remove any
+`sysctl -w net.core.wmem_default=2097152` and `modprobe uinput` lines from
 `/boot/config/go`.
