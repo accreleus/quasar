@@ -55,6 +55,7 @@ pub mod session;
 pub mod vram;
 
 pub mod runtime;
+pub mod runtime_dir_label;
 pub mod source_policy;
 
 /// Lookup-closure builder for tests of env-reading pure cores.

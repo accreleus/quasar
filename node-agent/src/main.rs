@@ -408,8 +408,28 @@ async fn run_agent() {
     // #419: records the allocator A/B arm plus baseline RSS, so a soak artifact is
     // self-describing.
     memstat::log_startup();
+    label_runtime_dir();
 
     agent::run(cfg).await;
+}
+
+/// Give the runtime directory the container SELinux type, so the sessions and sidecars
+/// that share it may write there (see `runtime_dir_label`). Never fatal.
+fn label_runtime_dir() {
+    use quasar_node_agent::runtime_dir_label::{ensure, Outcome};
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".into());
+    match ensure(std::path::Path::new(&dir)) {
+        Ok(Outcome::Relabelled { from, to }) => tracing::info!(
+            token = "runtime-dir-relabelled",
+            "{dir}: SELinux label {from} -> {to}, so sessions and sidecars may use it"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            token = "runtime-dir-relabel-failed",
+            "{dir}: could not give it the container SELinux type ({e}); on an SELinux host \
+             the audio sidecar may then fail to start"
+        ),
+    }
 }
 
 async fn run_session(
