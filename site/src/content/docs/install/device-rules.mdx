@@ -74,6 +74,12 @@ The files use the group `quasar`, and `setfacl` from the `acl` package at
    sudo udevadm control --reload && sudo udevadm trigger
    ```
 
+3. Console mode only: keep login prompts off `tty8`, the terminal console mode uses:
+
+   ```bash
+   sudo systemctl mask getty@tty8.service autovt@tty8.service
+   ```
+
 </Steps>
 
 ## Check it worked

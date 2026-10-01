@@ -176,7 +176,7 @@ fn one_line(mut s: String) -> String {
 }
 
 const PREPARE_HOST_HINT: &str =
-    "run host preparation (deploy/prepare-host.sh --console) as root, then try again";
+    "install the console device rules (docs: Install, Device rules), then try again";
 
 fn run_with(probe: &dyn DisplayProbe, dri_root: &Path, host_run: &Path) -> Preflight {
     let cards = card_nodes(dri_root);
@@ -409,7 +409,7 @@ mod tests {
         assert!(!result.ok);
         let detail = result.detail.unwrap();
         assert!(detail.contains("not prepared"), "{detail}");
-        assert!(detail.contains("prepare-host.sh --console"), "{detail}");
+        assert!(detail.contains("console device rules"), "{detail}");
     }
 
     #[test]

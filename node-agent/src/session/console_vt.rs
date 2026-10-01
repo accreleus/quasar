@@ -58,7 +58,7 @@ pub(crate) const KD_GRAPHICS: i32 = 1;
 pub(crate) const K_UNICODE: i32 = 3;
 pub(crate) const K_OFF: i32 = 4;
 
-const PREPARE_HINT: &str = "run host preparation (deploy/prepare-host.sh --console) as root, \
+const PREPARE_HINT: &str = "install the console device rules (docs: Install, Device rules), \
      then turn console mode off and on again";
 
 /// The VT operations, behind a trait so the take/restore logic is tested without a VT.

@@ -90,8 +90,8 @@ pub fn check_display(v: &ConsoleView) -> ReadinessCheck {
             p.detail
                 .clone()
                 .unwrap_or_else(|| "the console display is not available".into()),
-            "Free the display, or run host preparation (deploy/prepare-host.sh --console) \
-             as root, then turn console mode off and back on to try again."
+            "Free the display, or install the console device rules (docs: Install, Device \
+             rules), then turn console mode off and back on to try again."
                 .into(),
         ),
     }

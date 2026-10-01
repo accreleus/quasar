@@ -380,9 +380,9 @@ fn wait_for_host_node(path: &Path, maj: u32, min: u32, within: std::time::Durati
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 return Err(anyhow!(
-                    "this agent cannot open its own input device {path:?}: run host \
-                     preparation (deploy/prepare-host.sh), which gives the Quasar user \
-                     Quasar's own input devices"
+                    "this agent cannot open its own input device {path:?}: install \
+                     Quasar's device rules (docs: Install, Device rules), which give the \
+                     Quasar user Quasar's own input devices"
                 ))
             }
             Err(e) => return Err(e).with_context(|| format!("open {path:?}")),

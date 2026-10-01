@@ -333,10 +333,10 @@ fn mixed(gpus: &[(i32, bool)]) -> bool {
     gpus.iter().any(|g| g.1) && gpus.iter().any(|g| !g.1)
 }
 
-const CDI_REMEDIATION: &str = "Run host preparation (deploy/prepare-host.sh) as root: it \
-    writes the NVIDIA CDI specification (nvidia-ctk cdi generate) that this engine needs to \
-    hand a GPU to a container. Then restart the engine so it discovers the specification. \
-    Never run Quasar as root to work around it.";
+const CDI_REMEDIATION: &str = "As root, write the NVIDIA CDI specification this engine \
+    needs to hand a GPU to a container (nvidia-ctk cdi generate \
+    --output=/etc/cdi/nvidia.yaml), then restart the engine so it discovers it. Never run \
+    Quasar as root to work around it.";
 
 /// `own_nodes`: the agent's own container has the NVIDIA device nodes. Podman's `/info`
 /// lists no CDI devices, so on Podman that is the only evidence the specification resolves.

@@ -24,7 +24,7 @@ import { IconRefresh } from "../../../../components/icons";
 import type { ConsoleAccess, Host } from "../../../../api/types";
 import { clockTime } from "../../../../lib/format/clockTime";
 import { shortId } from "../../../../lib/format/shortId";
-import { accessReasonText, consoleFailureCategory, liveSessionsNoun, prepareHostConsoleCommand } from "./access";
+import { accessReasonText, consoleFailureCategory, liveSessionsNoun, CONSOLE_RULES_COMMAND } from "./access";
 
 export function ConsoleAccessNote({
   access,
@@ -97,8 +97,8 @@ export function ConsoleAccessNote({
       );
     }
 
-    // The host was never prepared with `--console`: same lead, plus the
-    // mock's copyable fix and a nudge that it changes nothing else.
+    // The host lacks the console device rules: same lead, plus the mock's
+    // copyable fix.
     if (category === "unprepared") {
       return (
         <div className="note warn" role="alert">
@@ -108,16 +108,16 @@ export function ConsoleAccessNote({
                 Console mode did not turn {access.target ? "on" : "off"}: {hostName} is not
                 prepared for it.
               </strong>{" "}
-              {access.summary} Run host preparation again with console mode, then try again.
+              {access.summary} Install the console device rules, then try again.
               <Diag lines={diagLines} />
             </div>
             {tryAgainButton}
           </div>
           <Snippet
             caption={`Run on ${hostName} as root`}
-            text={prepareHostConsoleCommand(host)}
+            text={CONSOLE_RULES_COMMAND}
             testId="console-access-prepare-snippet"
-            label="Copy the host-preparation command"
+            label="Copy the console device-rules commands"
           />
         </div>
       );

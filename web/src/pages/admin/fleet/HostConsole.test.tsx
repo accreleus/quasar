@@ -493,13 +493,13 @@ describe("HostConsole console access (amendment 18)", () => {
     expect(screen.getByText("Details")).toBeTruthy();
   });
 
-  it("restored: host not prepared shows the copyable prepare-host snippet and Details", async () => {
+  it("restored: host not prepared shows the copyable device-rules snippet and Details", async () => {
     mockAccess(
       {
         state: "restored", target: true, request_id: "9c1a2b3c-6e1d-4f7a-9d55-8c1b0e2d44a2",
         reason: "unhealthy", started_at: "2026-09-29T14:12:03Z", finished_at: "2026-09-29T14:13:40Z",
-        summary: "host not prepared for console mode: no display device is visible to this agent; run " +
-          "host preparation (deploy/prepare-host.sh --console) as root, then try again Turning console " +
+        summary: "host not prepared for console mode: no display device is visible to this agent; " +
+          "install the console device rules (docs: Install, Device rules), then try again Turning console " +
           "mode on did not complete (unhealthy), so the recovery actor put the previous node agent back; " +
           "console mode is off.",
       },
@@ -509,9 +509,8 @@ describe("HostConsole console access (amendment 18)", () => {
 
     await screen.findByText(/is not prepared for it/);
     expect(screen.getByText("Run on Tower as root")).toBeTruthy();
-    // No reported engine facts on this host (BASE host mock): the generic form.
     expect(screen.getByTestId("console-access-prepare-snippet")).toHaveTextContent(
-      "sudo sh prepare-host.sh --console …",
+      "sudo cp deploy/udev/71-quasar-console.rules /etc/udev/rules.d/",
     );
     expect(screen.getByText("Details")).toBeTruthy();
 
@@ -521,7 +520,7 @@ describe("HostConsole console access (amendment 18)", () => {
     ));
   });
 
-  it("restored: host not prepared uses an engine/mode-aware command once the host has reported its engine", async () => {
+  it("restored: host not prepared shows the same device-rules command whatever the engine", async () => {
     vi.mocked(adminApi.getHost).mockResolvedValue({
       host: {
         id: "host-1", node_name: "Tower", status: "online", capacity: { active_sessions: 2 },
@@ -532,8 +531,8 @@ describe("HostConsole console access (amendment 18)", () => {
       {
         state: "restored", target: true, request_id: "9c1a2b3c-6e1d-4f7a-9d55-8c1b0e2d44a2",
         reason: "unhealthy", started_at: "2026-09-29T14:12:03Z", finished_at: "2026-09-29T14:13:40Z",
-        summary: "host not prepared for console mode: no display device is visible to this agent; run " +
-          "host preparation (deploy/prepare-host.sh --console) as root, then try again.",
+        summary: "host not prepared for console mode: no display device is visible to this agent; " +
+          "install the console device rules (docs: Install, Device rules), then try again.",
       },
       { enabled: false },
     );
@@ -541,7 +540,7 @@ describe("HostConsole console access (amendment 18)", () => {
 
     await screen.findByTestId("console-access-prepare-snippet");
     expect(screen.getByTestId("console-access-prepare-snippet")).toHaveTextContent(
-      "sudo sh prepare-host.sh --mode rootless --engine podman --console",
+      "sudo systemctl mask getty@tty8.service autovt@tty8.service",
     );
   });
 

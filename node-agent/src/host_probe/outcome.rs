@@ -115,8 +115,8 @@ pub fn remediation(kind: ProbeKind) -> String {
         ProbeKind::Media => "Check the render node is passed to the agent container, the \
             driver/driver volume, and the agent log for `token=\"host-probe-` lines."
             .into(),
-        ProbeKind::Input => "On a rootless engine, run host preparation \
-            (deploy/prepare-host.sh): it gives the Quasar user Quasar's own input devices. \
+        ProbeKind::Input => "On a rootless engine, install Quasar's device rules (docs: Install, Device \
+            rules): they give the Quasar user Quasar's own input devices. \
             On a rootful engine, check /dev/uinput and /dev/input are passed to the agent and \
             device_cgroup_rules allows `c 13:* rw`."
             .into(),
@@ -414,8 +414,8 @@ mod tests {
         );
         assert_eq!(
             remediation(ProbeKind::Input),
-            "On a rootless engine, run host preparation (deploy/prepare-host.sh): it gives \
-             the Quasar user Quasar's own input devices. On a rootful engine, check /dev/uinput \
+            "On a rootless engine, install Quasar's device rules (docs: Install, Device \
+             rules): they give the Quasar user Quasar's own input devices. On a rootful engine, check /dev/uinput \
              and /dev/input are passed to the agent and device_cgroup_rules allows `c 13:* rw`."
         );
         assert_eq!(

@@ -5,7 +5,7 @@
  * the component.
  */
 
-import type { ConsoleAccess, ConsoleCapabilities, Host } from "../../../../api/types";
+import type { ConsoleAccess, ConsoleCapabilities } from "../../../../api/types";
 import { failureText } from "../releasesCopy";
 
 type AudioSink = ConsoleCapabilities["audio_sinks"][number];
@@ -67,18 +67,15 @@ export function consoleFailureCategory(access: ConsoleAccess): ConsoleFailureCat
 }
 
 /**
- * The copyable "run this as root" command for the "unprepared" restored
- * state. Engine/mode-aware when the host has reported its engine facts
- * (amendment 17, `Host.engine` / `Host.engine_mode`); otherwise the generic
- * form the mock shows, since there is nothing truthful to fill in for a host
- * that has never registered them.
+ * The copyable "run this as root" fix for the "unprepared" restored state:
+ * install the console device rules from a checkout of the repository and keep
+ * login prompts off tty8 (docs: Install, Device rules). The same on every
+ * engine and mode; nothing is downloaded.
  */
-export function prepareHostConsoleCommand(host: Pick<Host, "engine" | "engine_mode"> | null | undefined): string {
-  const mode = host?.engine_mode;
-  if (!mode) return "sudo sh prepare-host.sh --console …";
-  const engine = host?.engine ? ` --engine ${host.engine}` : "";
-  return `sudo sh prepare-host.sh --mode ${mode}${engine} --console`;
-}
+export const CONSOLE_RULES_COMMAND =
+  "sudo cp deploy/udev/71-quasar-console.rules /etc/udev/rules.d/ && " +
+  "sudo udevadm control --reload && sudo udevadm trigger && " +
+  "sudo systemctl mask getty@tty8.service autovt@tty8.service";
 
 /**
  * Whether the "Local audio output" selector's reported sinks are the host's
