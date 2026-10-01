@@ -31,6 +31,8 @@ const ENGINE_OPTIONS = [
 ];
 const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
 const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
+// Links follow the build's base: the edge docs live under /quasar/edge/.
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 ---
 
 <div class="qs" data-quickstart>
@@ -87,7 +89,7 @@ const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsup
 		<p class="qs-note" data-engine-note></p>
 		<p class="qs-note">
 			Want Quasar to run as an ordinary account instead of root? That is
-			a rootless install: follow <a href="/quasar/install/rootless/">Rootless</a>.
+			a rootless install: follow <a href={`${base}/install/rootless/`}>Rootless</a>.
 		</p>
 	</section>
 
@@ -289,9 +291,9 @@ const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsup
 			<pre><code data-out="host"></code></pre>
 			<p class="qs-note">
 				Console mode (games on this machine's own screen) needs more device
-				access: see <a href="/quasar/install/device-rules/">Device rules</a>.
+				access: see <a href={`${base}/install/device-rules/`}>Device rules</a>.
 				For smoother streams, also set the{' '}
-				<a href="/quasar/tuning/latency/#the-udp-send-buffer">UDP send buffer</a>.
+				<a href={`${base}/tuning/latency/#the-udp-send-buffer`}>UDP send buffer</a>.
 			</p>
 		</div>
 
@@ -356,10 +358,10 @@ const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsup
 
 		<p class="qs-hint">
 			Then open Quasar and continue with{' '}
-			<a href="/quasar/install/first-run/">first run and checks</a>. Prefer to read
-			the whole thing instead? <a href="/quasar/install/docker/">Docker</a>,{' '}
-			<a href="/quasar/install/podman/">Podman</a> and{' '}
-			<a href="/quasar/install/unraid/">Unraid</a> cover the same ground as prose.
+			<a href={`${base}/install/first-run/`}>first run and checks</a>. Prefer to read
+			the whole thing instead? <a href={`${base}/install/docker/`}>Docker</a>,{' '}
+			<a href={`${base}/install/podman/`}>Podman</a> and{' '}
+			<a href={`${base}/install/unraid/`}>Unraid</a> cover the same ground as prose.
 		</p>
 	</section>
 
@@ -374,6 +376,9 @@ const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsup
 	import { DEFAULTS, generate, homePath, templatePath, role } from '../data/stack-template.js';
 	import { platform } from '../data/platforms.js';
 	import { profileFor } from '../data/engine-profiles.js';
+
+	// The build's base (the edge docs live under /quasar/edge/).
+	const profilesHref = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/start/engine-profiles/`;
 
 	// Kept in step with the frontmatter's own copy above (no default engine, D3).
 	const ENGINE_OPTIONS = [
@@ -460,7 +465,7 @@ const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsup
 			note.classList.remove('qs-warn');
 			if (!answers.engine || !answers.mode) {
 				note.innerHTML =
-					'On a rootful engine, whoever controls the engine’s socket controls the machine, and Quasar holds that socket. <a href="/quasar/start/engine-profiles/">Engine profiles</a> lists what each choice is tested on.';
+					'On a rootful engine, whoever controls the engine’s socket controls the machine, and Quasar holds that socket. <a href="' + profilesHref + '">Engine profiles</a> lists what each choice is tested on.';
 				return;
 			}
 			const p = profileFor(answers.platform, answers.engine, answers.mode);
@@ -468,10 +473,10 @@ const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsup
 			const badge = badgeHtml(p.status);
 			if (p.status === 'supported') {
 				const rootEquiv = ' The engine runs as root, so its socket is equivalent to root on this machine; a rootless engine avoids that.';
-				note.innerHTML = `${badge} <strong>${name}</strong>: ${p.reason}${rootEquiv} <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
+				note.innerHTML = `${badge} <strong>${name}</strong>: ${p.reason}${rootEquiv} <a href="${profilesHref}">Engine profiles</a>`;
 			} else if (p.status === 'experimental') {
 				note.classList.add('qs-warn');
-				note.innerHTML = `${badge} <strong>${name}</strong> is experimental. ${p.reason} You can install it; if something does not work, the host’s readiness card names it, and a report helps make this profile supported. <a href="/quasar/start/engine-profiles/">Engine profiles</a>`;
+				note.innerHTML = `${badge} <strong>${name}</strong> is experimental. ${p.reason} You can install it; if something does not work, the host’s readiness card names it, and a report helps make this profile supported. <a href="${profilesHref}">Engine profiles</a>`;
 			} else {
 				note.classList.add('qs-warn');
 				const alts = p.alternatives
