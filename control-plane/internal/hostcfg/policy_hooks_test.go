@@ -278,6 +278,40 @@ func TestHomeRootStaysInsideMountAndNeverStrandsExistingHomes(t *testing.T) {
 	}
 }
 
+// #418: after QUASAR_HOME_ROOT is reconfigured, the mount is the new
+// deployment root even while the agent still reports the old effective root,
+// and homes left under the old root strand nothing: both writers accept a
+// root under the new mount and still refuse one outside it.
+func TestHomeRootEditsFollowAReconfiguredMount(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	host := newTypedHost(t, pool, "home_root")
+	seedLocalHome(t, pool, host.id, "/srv/homes/u1/app")
+	moved := deploymentBaseline()
+	moved["home_root"] = "/data/homes"
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET deployment_settings=$2::jsonb,effective_settings='{"home_root":"/srv/homes"}'::jsonb WHERE id=$1::uuid`, host.id, mustJSON(t, moved)); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := &offerDispatcher{connection: host.connection, snapshots: host.snapshots}
+	mux := policyMux(NewHandler(store, dispatcher, stubCounter{}))
+	legacy := func(value string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/v1/admin/hosts/"+host.id+"/settings", strings.NewReader(fmt.Sprintf(`{"overrides":{"home_root":%q}}`, value))))
+		return rr
+	}
+	if rr := legacy("/srv/homes/u1"); rr.Code != http.StatusBadRequest || errorCode(t, rr) != "validation_failed" {
+		t.Fatalf("legacy root outside the new mount: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := legacy("/data/homes/players"); rr.Code != http.StatusOK {
+		t.Fatalf("legacy root under the new mount: %d %s", rr.Code, rr.Body.String())
+	}
+	rr := patchPolicy(t, mux, host.id, currentRevision(t, store, host.id), map[string]PolicyChoice{"home_root": {Source: "explicit", Value: "/data/homes/other"}})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("typed root under the new mount: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 // A first launch racing an operator root edit must become visible to the edit
 // before it validates existing homes. The saved root may not strand that home.
 func TestHomeRootEditRacingFirstHomeClaimIsRefused(t *testing.T) {
@@ -378,6 +412,65 @@ func TestNewBaselineRefreshesEveryDeploymentSourceGroup(t *testing.T) {
 	}
 	if offer := host.offers(t, store)["gop"]; offer == nil || offer.ResolvedSettings["gop"] != float64(240) {
 		t.Fatalf("changed baseline not offered: %+v", offer)
+	}
+}
+
+// #418: a homes-root reconfigure changes the deployment baseline of an owned
+// group the operator never saved. The agent keeps its latched seed until a
+// candidate is verified (agent-api.md §RH05), so the new baseline must make
+// that group pending work and reach the agent as a deployment offer. Groups
+// whose deployment value did not move, or whose choice is explicit, stay unsaved.
+func TestChangedDeploymentReachesAnUnsavedOwnedGroup(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	host := newTypedHost(t, pool, "gop", "home_root", "slices")
+	// A legacy override copied by 0087: an explicit choice with no group row.
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,explicit_value,revision) VALUES($1::uuid,'slices','explicit','4',0)`, host.id); err != nil {
+		t.Fatal(err)
+	}
+	host.connection = "33333333-3333-4333-8333-333333333333"
+	if err := store.ObserveDeploymentSettings(ctx, host.id, host.connection, mustJSON(t, deploymentBaseline())); err != nil {
+		t.Fatal(err)
+	}
+	if rows := policyRows(t, pool, host.id); rows != "||0" {
+		t.Fatalf("an unchanged baseline wrote policy rows: %s", rows)
+	}
+
+	moved := deploymentBaseline()
+	moved["home_root"] = "/data/homes"
+	moved["slices"] = float64(8)
+	host.connection = "44444444-4444-4444-8444-444444444444"
+	if err := store.ObserveDeploymentSettings(ctx, host.id, host.connection, mustJSON(t, moved)); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, host.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := view.Groups["home_root"]; !g.Saved || g.Status != "pending" || g.DesiredRevision != "0" || g.DesiredDigest == nil {
+		t.Fatalf("moved home_root = %+v", g)
+	}
+	for _, group := range []string{"gop", "slices"} {
+		if view.Groups[group].Saved {
+			t.Fatalf("%s gained a group record: %+v", group, view.Groups[group])
+		}
+	}
+	offers := host.offers(t, store)
+	offer := offers["home_root"]
+	if len(offers) != 1 || offer == nil || offer.Revision != "0" || offer.Settings["home_root"].Source != "deployment" || offer.ResolvedSettings["home_root"] != "/data/homes" {
+		t.Fatalf("reconfigure offers = %+v", offers)
+	}
+	if ok, err := store.ObservePolicyApplied(ctx, host.id, "home_root", offer.Revision, offer.ContentSHA256, "next_session", host.connection); err != nil || !ok {
+		t.Fatalf("observe home_root = %v %v", ok, err)
+	}
+	// The next reconfigure re-resolves the now-saved group like any other.
+	moved["home_root"] = "/data/other"
+	if err := store.ObserveDeploymentSettings(ctx, host.id, host.connection, mustJSON(t, moved)); err != nil {
+		t.Fatal(err)
+	}
+	if again := host.offers(t, store)["home_root"]; again == nil || again.Revision != "0" || again.ResolvedSettings["home_root"] != "/data/other" {
+		t.Fatalf("second reconfigure offer = %+v", again)
 	}
 }
 

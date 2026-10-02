@@ -77,6 +77,10 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER
 It replaces the affected services and rolls back if they don't verify. Database
 inputs and the node name need a reinstall.
 
+Changing `QUASAR_HOME_ROOT` doesn't move saves. Move the old root's contents
+into the new root first, or players start with fresh homes. It worked when the
+host's Settings show the new root as verified and an existing save loads.
+
 ## Required on a legacy Compose install
 
 | Variable | Notes |

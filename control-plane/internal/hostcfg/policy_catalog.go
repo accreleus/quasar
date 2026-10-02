@@ -224,9 +224,16 @@ func validateHomeRootChoice(candidate string, ctx PolicyEditContext) error {
 	}
 	var stranded []string
 	root := path.Clean(candidate)
+	mount := strings.TrimSpace(ctx.MountedHomeRoot)
 	for _, ref := range ctx.ExistingHomeRefs {
 		clean := path.Clean(ref)
-		if candidate == "" || (clean != root && !strings.HasPrefix(clean, root+"/")) {
+		// A home outside the mount was left behind by a reconfigured
+		// QUASAR_HOME_ROOT. No choice strands it further: its next launch
+		// re-points it under whichever root is then selected (#418).
+		if mount != "" && !pathWithin(clean, path.Clean(mount)) {
+			continue
+		}
+		if candidate == "" || !pathWithin(clean, root) {
 			stranded = append(stranded, ref)
 		}
 	}
@@ -236,4 +243,9 @@ func validateHomeRootChoice(candidate string, ctx PolicyEditContext) error {
 				"keep a root that contains them or move those homes first", candidate, len(stranded)), "home_root")
 	}
 	return nil
+}
+
+// pathWithin reports whether clean is root or beneath it, segment-aware.
+func pathWithin(clean, root string) bool {
+	return clean == root || root == "/" || strings.HasPrefix(clean, root+"/")
 }
