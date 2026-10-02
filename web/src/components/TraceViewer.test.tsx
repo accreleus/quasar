@@ -617,11 +617,20 @@ describe("TraceViewer", () => {
     it("holds the chart still while the pointer is over it", async () => {
       // A live poll that redraws under the cursor moves the sample the tooltip
       // is describing.
-      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      //
+      // #427: the live chip renders while the bundle is still loading, so waiting
+      // for it alone raced the chart's arrival. The test holds the bundle back,
+      // shows that, then releases it and waits for the chart it hovers.
+      let release: (b: DiagnosticBundle) => void = () => {};
+      mockGetDiagnosticBundle.mockReturnValue(new Promise<DiagnosticBundle>((r) => (release = r)));
       const { container } = render(
         <TraceViewer sessionId="sess-abc" token="tok" sessionState="running" />,
       );
-      await waitFor(() => expect(screen.getByText("live")).toBeTruthy());
+      expect(screen.getByText("live")).toBeTruthy();
+      expect(container.querySelector(".trace-body")).toBeNull();
+
+      await act(async () => release(BASE_BUNDLE));
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
 
       await act(async () => {
         fireEvent.mouseEnter(container.querySelector(".trace-body")!);
