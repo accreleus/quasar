@@ -769,3 +769,150 @@ fn a_writable_homes_root_warns_about_ownership_only_on_rootless_docker() {
         assert_eq!(homes_mapping(pass.clone(), &view(kind, mode)).status, PASS);
     }
 }
+
+// ── engine_restart_on_boot (amendment 17, #412) ──────────────────────────────
+
+const BOOT: i64 = 1_790_000_000;
+
+fn boot_engine(kind: EngineKind, mode: EngineMode) -> EngineFacts {
+    let mut f = facts(None);
+    f.info.kind = kind;
+    f.info.version = "5.8.4".into();
+    f.mode = mode;
+    f
+}
+
+fn restart_on_boot(f: EngineFacts, boot: BootView) -> crate::messages::ReadinessCheck {
+    let root = FakeRoot::new("restart-on-boot");
+    let env = ProbeEnv {
+        boot,
+        ..observed(&root, Ok(f))
+    };
+    let c = get(&probe(&env), RESTART_ON_BOOT_ID).clone();
+    assert!(c.blocks.is_none(), "a proxy never blocks: {c:?}");
+    c
+}
+
+fn seen(created: i64, started: i64) -> BootView {
+    BootView::Observed {
+        boot: BOOT,
+        created,
+        started,
+    }
+}
+
+#[test]
+fn restart_on_boot_is_skipped_on_rootful_docker() {
+    let c = restart_on_boot(
+        boot_engine(EngineKind::Docker, EngineMode::Rootful),
+        seen(BOOT - 100, BOOT + 30),
+    );
+    assert_eq!(c.status, SKIP, "{c:?}");
+}
+
+#[test]
+fn an_agent_from_before_the_boot_started_soon_after_it_passes() {
+    for (kind, mode) in [
+        (EngineKind::Podman, EngineMode::Rootful),
+        (EngineKind::Podman, EngineMode::Rootless),
+        (EngineKind::Docker, EngineMode::Rootless),
+    ] {
+        let c = restart_on_boot(boot_engine(kind, mode), seen(BOOT - 86_400, BOOT + 42));
+        assert_eq!(c.status, PASS, "{kind:?} {mode:?}: {c:?}");
+        assert!(c.summary.contains("42s after"), "{c:?}");
+    }
+}
+
+#[test]
+fn an_agent_started_long_after_the_boot_fails_naming_host_preparation() {
+    let c = restart_on_boot(
+        boot_engine(EngineKind::Podman, EngineMode::Rootful),
+        seen(BOOT - 86_400, BOOT + BOOT_RESTART_WINDOW_S + 600),
+    );
+    assert_eq!(c.status, FAIL, "{c:?}");
+    assert!(c.summary.contains("did not bring Quasar back"), "{c:?}");
+    assert!(
+        c.remediation
+            .contains("systemctl enable podman-restart.service"),
+        "{c:?}"
+    );
+    let c = restart_on_boot(
+        boot_engine(EngineKind::Podman, EngineMode::Rootless),
+        seen(BOOT - 86_400, BOOT + BOOT_RESTART_WINDOW_S + 600),
+    );
+    assert!(
+        c.remediation.contains("loginctl enable-linger")
+            && c.remediation
+                .contains("systemctl --user enable podman-restart.service"),
+        "{c:?}"
+    );
+    let c = restart_on_boot(
+        boot_engine(EngineKind::Docker, EngineMode::Rootless),
+        seen(BOOT - 86_400, BOOT + BOOT_RESTART_WINDOW_S + 600),
+    );
+    assert!(
+        c.remediation
+            .contains("systemctl --user enable docker.service"),
+        "{c:?}"
+    );
+}
+
+/// No boot since the container was made: no evidence yet, and the remediation says what
+/// brings it back.
+#[test]
+fn an_agent_created_since_the_boot_is_not_seen_yet() {
+    let c = restart_on_boot(
+        boot_engine(EngineKind::Podman, EngineMode::Rootful),
+        seen(BOOT + 3_600, BOOT + 3_601),
+    );
+    assert_eq!(c.status, UNKNOWN, "{c:?}");
+    assert!(c.summary.starts_with("Not seen yet"), "{c:?}");
+    assert!(c.remediation.contains("podman-restart.service"), "{c:?}");
+}
+
+#[test]
+fn unreadable_times_are_unknown_never_a_verdict() {
+    let c = restart_on_boot(
+        boot_engine(EngineKind::Podman, EngineMode::Rootful),
+        BootView::Unreadable("the engine did not say".into()),
+    );
+    assert_eq!(c.status, UNKNOWN, "{c:?}");
+    let c = restart_on_boot(
+        boot_engine(EngineKind::Podman, EngineMode::Rootful),
+        BootView::NotObserved,
+    );
+    assert_eq!(c.status, SKIP, "{c:?}");
+}
+
+#[test]
+fn boot_view_reads_the_engines_times_and_the_kernels_boot() {
+    assert_eq!(
+        boot_time("cpu  1 2 3\nbtime 1790000000\nprocesses 9\n"),
+        Some(BOOT)
+    );
+    assert_eq!(boot_time("cpu 1\n"), None);
+    assert_eq!(
+        BootView::from_times(
+            BOOT,
+            Some("2026-09-21T09:46:40.123456789Z"),
+            Some("2026-09-21T13:33:20+00:00")
+        ),
+        BootView::Observed {
+            boot: BOOT,
+            created: 1_789_984_000,
+            started: 1_789_997_600,
+        }
+    );
+    assert!(matches!(
+        BootView::from_times(
+            BOOT,
+            Some("0001-01-01T00:00:00Z"),
+            Some("2026-09-21T13:33:20Z")
+        ),
+        BootView::Unreadable(_)
+    ));
+    assert!(matches!(
+        BootView::from_times(BOOT, None, None),
+        BootView::Unreadable(_)
+    ));
+}
