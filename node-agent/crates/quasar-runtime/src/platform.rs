@@ -184,6 +184,10 @@ pub struct PlatformContainer {
     pub command: Vec<String>,
     /// `Config.Env` as `KEY=value`. May hold secrets: never log it.
     pub env: Vec<String>,
+    /// When the container was created and last started, as the engine writes them
+    /// (RFC 3339); `None` when it does not say.
+    pub created: Option<String>,
+    pub started_at: Option<String>,
 }
 
 impl std::fmt::Debug for PlatformContainer {
@@ -227,6 +231,8 @@ mod debug_tests {
             mounts: Vec::new(),
             command: Vec::new(),
             env: vec!["QUASAR_ENROLLMENT=qenr1.secret-token".into()],
+            created: None,
+            started_at: None,
         };
         let shown = format!("{c:?}");
         assert!(shown.contains("QUASAR_ENROLLMENT"), "{shown}");

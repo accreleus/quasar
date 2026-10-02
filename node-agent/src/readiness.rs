@@ -143,6 +143,8 @@ pub struct ProbeEnv {
     pub storage: storage::StorageView,
     /// The container engine as one inspection saw it (#254), read once per probe.
     pub runtime: runtime_facts::RuntimeView,
+    /// The agent's own container against the host's last boot (#412).
+    pub boot: runtime_facts::BootView,
     /// Capacity detection's GPUs, as `(index, is NVIDIA)`; empty until the caller hands
     /// them over with [`ProbeEnv::with_gpus`].
     pub gpus: Vec<(i32, bool)>,
@@ -272,6 +274,11 @@ impl ProbeEnv {
             },
             owner_conflicts: owned.map(|(_, conflicts)| conflicts),
             storage: storage::StorageView::live(engine_answered),
+            boot: if engine_answered && is_containerized() {
+                runtime_facts::BootView::live()
+            } else {
+                runtime_facts::BootView::NotObserved
+            },
             runtime,
             gpus: Vec::new(),
             nvidia_runtime: crate::session::container::ContainerRuntime::from_env().is_nvidia(),
@@ -540,6 +547,7 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         ),
         runtime_facts::check_runtime_engine(&env.runtime, detect_host_os(env).as_ref()),
         runtime_facts::check_engine_healthchecks(&env.runtime),
+        runtime_facts::check_engine_restart_on_boot(&env.runtime, &env.boot),
         // Runtime veto: files present but the stack not loading must never read green.
         veto_if_egl_broken(check_nvidia_egl_vendor(env, distro), env),
         veto_if_egl_broken(check_nvidia_eglcore(env, distro), env),
@@ -2015,6 +2023,7 @@ mod tests {
                 owner_conflicts: None,
                 storage: storage::StorageView::default(),
                 runtime: runtime_facts::RuntimeView::NotObserved,
+                boot: runtime_facts::BootView::NotObserved,
                 gpus: Vec::new(),
                 nvidia_runtime: false,
                 console: console::ConsoleView::default(),

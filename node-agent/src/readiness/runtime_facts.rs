@@ -19,6 +19,12 @@ pub const CDI_ID: &str = "runtime_cdi";
 pub const ENGINE_ID: &str = "runtime_engine";
 /// Amendment 17 (RH-07 #405): can this engine run container health checks?
 pub const HEALTHCHECKS_ID: &str = "engine_healthchecks";
+/// Amendment 17 (RH-07 #412): will the engine start Quasar's containers again at boot?
+pub const RESTART_ON_BOOT_ID: &str = "engine_restart_on_boot";
+/// How soon after a boot the node agent must have been started for that start to count
+/// as the engine bringing it back. Generous: a slow boot, an engine waiting on the
+/// network and the recovery actor starting the agent itself (#432) all fit.
+pub const BOOT_RESTART_WINDOW_S: i64 = 15 * 60;
 
 /// The `Unreachable` detail for [`ErrorKind::Timeout`]. A missing socket uses a
 /// different sentence, so `host_container_mounts` can tell "the client ran out of
@@ -778,6 +784,171 @@ fn check_engine_healthchecks_inner(view: &RuntimeView) -> ReadinessCheck {
                     manager set to systemd in containers.conf, then restart Podman's service."
                     .into(),
             },
+        ),
+    }
+}
+
+/// What the agent's own container says about the host's last boot (#412). The agent runs
+/// in a container and cannot ask the host's systemd whether a restart service is enabled,
+/// so the check reads evidence instead: a container that was created before the last boot
+/// and runs now was started again after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootView {
+    /// Not asked: the agent is not in a container, or the engine did not answer.
+    NotObserved,
+    /// Asked, and something could not be read (never evidence either way).
+    Unreadable(String),
+    /// The host's boot time and the agent container's creation and last start, as Unix
+    /// seconds.
+    Observed {
+        boot: i64,
+        created: i64,
+        started: i64,
+    },
+}
+
+impl BootView {
+    /// Production: the kernel's boot time (`btime` in `/proc/stat`, the host's: the kernel
+    /// is shared) and this container's own times from the engine.
+    pub fn live() -> Self {
+        let Some(id) = crate::nvidia_volume::self_container_id() else {
+            return BootView::Unreadable("the agent cannot identify its own container".into());
+        };
+        let boot = match std::fs::read_to_string("/proc/stat")
+            .ok()
+            .as_deref()
+            .and_then(boot_time)
+        {
+            Some(boot) => boot,
+            None => return BootView::Unreadable("the host's boot time is unreadable".into()),
+        };
+        let own = match crate::runtime::configured()
+            .map_err(|e| e.to_string())
+            .and_then(|c| {
+                c.inspect_platform_container(id)
+                    .wait()
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(Some(own)) => own,
+            Ok(None) => {
+                return BootView::Unreadable("the engine does not know this container".into())
+            }
+            Err(e) => return BootView::Unreadable(format!("the engine did not say ({e})")),
+        };
+        Self::from_times(boot, own.created.as_deref(), own.started_at.as_deref())
+    }
+
+    /// The view from the engine's RFC 3339 times; one it does not give, or gives as
+    /// Docker's zero time, is unreadable.
+    pub fn from_times(boot: i64, created: Option<&str>, started: Option<&str>) -> Self {
+        let unix = |t: Option<&str>| {
+            t.and_then(|t| {
+                time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok()
+            })
+            .map(|t| t.unix_timestamp())
+            .filter(|&t| t > 0)
+        };
+        match (unix(created), unix(started)) {
+            (Some(created), Some(started)) => BootView::Observed {
+                boot,
+                created,
+                started,
+            },
+            _ => BootView::Unreadable("the engine gave no usable creation or start time".into()),
+        }
+    }
+}
+
+/// `btime` from a `/proc/stat` body.
+pub fn boot_time(stat: &str) -> Option<i64> {
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+pub fn check_engine_restart_on_boot(view: &RuntimeView, boot: &BootView) -> ReadinessCheck {
+    check_engine_restart_on_boot_inner(view, boot).with_source("runtime")
+}
+
+/// What brings Quasar back at boot on this engine mode, as host preparation sets it up.
+fn restart_on_boot_fix(facts: &EngineFacts) -> String {
+    match (facts.info.kind, facts.mode) {
+        (EngineKind::Podman, EngineMode::Rootful) => "Enable Podman's restart at boot, as \
+            root: systemctl enable podman-restart.service (host preparation does this)."
+            .into(),
+        (EngineKind::Podman, EngineMode::Rootless) => "As root, keep the Quasar user's \
+            services running without a login: loginctl enable-linger quasar. Then, as that \
+            user: systemctl --user enable podman-restart.service. Host preparation does both."
+            .into(),
+        _ => "As root, keep the Quasar user's services running without a login: loginctl \
+            enable-linger quasar. Then, as that user: systemctl --user enable docker.service. \
+            Host preparation does both."
+            .into(),
+    }
+}
+
+/// Amendment 17: the engine will start Quasar's containers again at boot. Evidence, not a
+/// reading of unit files the agent cannot see: the node agent's container predates the
+/// last boot and was started within [`BOOT_RESTART_WINDOW_S`] of it. Before any boot since
+/// the container was created there is no evidence yet (`unknown`), and the remediation
+/// names what brings it back. Never blocks. `skip` on rootful Docker, whose system daemon
+/// applies restart policies itself.
+fn check_engine_restart_on_boot_inner(view: &RuntimeView, boot: &BootView) -> ReadinessCheck {
+    let RuntimeView::Observed { outcome, .. } = view else {
+        return super::skip(RESTART_ON_BOOT_ID, "The container engine was not asked");
+    };
+    let Ok(facts) = outcome else {
+        return super::skip(
+            RESTART_ON_BOOT_ID,
+            "Unknown: the engine could not be inspected",
+        );
+    };
+    if facts.info.kind == EngineKind::Docker && facts.mode == EngineMode::Rootful {
+        return super::skip(
+            RESTART_ON_BOOT_ID,
+            "Rootful Docker's system daemon starts Quasar's containers at boot itself",
+        );
+    }
+    let named = format!("{} {}", engine_named(facts), facts.mode.wire());
+    match boot {
+        BootView::NotObserved => super::skip(
+            RESTART_ON_BOOT_ID,
+            "The agent does not run in a container the engine started",
+        ),
+        BootView::Unreadable(why) => {
+            let mut c = super::unknown(RESTART_ON_BOOT_ID, &format!("Unknown: {why}"));
+            c.remediation = restart_on_boot_fix(facts);
+            c
+        }
+        BootView::Observed { boot, created, .. } if created >= boot => {
+            let mut c = super::unknown(
+                RESTART_ON_BOOT_ID,
+                &format!(
+                    "Not seen yet: this host has not restarted since the node agent was \
+                     created, so there is no evidence that {named} brings Quasar back at boot"
+                ),
+            );
+            c.remediation = restart_on_boot_fix(facts);
+            c
+        }
+        BootView::Observed { boot, started, .. } if *started - *boot <= BOOT_RESTART_WINDOW_S => {
+            super::pass(
+                RESTART_ON_BOOT_ID,
+                format!(
+                    "{named} brought Quasar back at the last boot: the node agent started {}s \
+                     after it",
+                    (started - boot).max(0)
+                ),
+            )
+        }
+        BootView::Observed { boot, started, .. } => super::fail(
+            RESTART_ON_BOOT_ID,
+            format!(
+                "{named} did not bring Quasar back at the last boot: the node agent started \
+                 only {} min after it",
+                (started - boot) / 60
+            ),
+            restart_on_boot_fix(facts),
         ),
     }
 }
