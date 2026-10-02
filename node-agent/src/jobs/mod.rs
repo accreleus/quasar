@@ -920,7 +920,7 @@ mod tests {
                 CpClient::new(
                     &crate::enrollment::TransportPolicy::Plaintext,
                     "http://127.0.0.1:1".into(),
-                    "tower".into(),
+                    "gpu-test".into(),
                     "secret".into(),
                 )
                 .unwrap(),

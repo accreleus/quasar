@@ -42,7 +42,7 @@ fixture works around it manually —
 > — followed by a manual `window.on_commit()` loop. The `move_mouse` pointer test passes
 > only because of that workaround.
 
-### Evidence (live, Quasar Tower host, 2026-07-19)
+### Evidence (live, Quasar gpu-test host, 2026-07-19)
 
 - Single fullscreen `wev` client + direct evdev injection into the compositor's libinput
   devices: keyboard = keymap/enter/keys all delivered; pointer = **zero** events, even

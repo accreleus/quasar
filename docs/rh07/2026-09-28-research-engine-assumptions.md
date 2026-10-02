@@ -190,14 +190,14 @@ The operator surface is mainly `docker exec quasar-recovery quasar-recovery stat
 - `site/src/content/docs/install/legacy-compose.mdx:70-74`: "Set `QUASAR_DOCKER_SOCKET=/run/user/<uid>/podman/podman.sock` … `label=disable`, without which an SELinux-enforcing host refuses every call to the mounted socket."
 - `docs/configuration.md:822-834` says there is no docker or podman executable and no CLI fallback. `:958-961`: "Podman operators may point `DOCKER_HOST` at Podman's Docker-compatible Unix socket, but that configuration is not certified." Journals record the endpoint, and changing it while a record is non-terminal blocks boot.
 - `docs/configuration.md:1000-1006`, the design constraint for a future rootless mode: "the API endpoint is the socket visible inside the agent, while bind-mount source paths belong to the daemon host. Socket access, subordinate UID/GID mappings, supplementary groups and persistent-home ownership must all agree; a successful connection proves none of the GPU/input/network requirements. Do not recursively change home ownership or relax device/security requirements merely to make a connection work."
-- `docs/runtime-api-recovery.md:168-171`: "Docker is the validated engine… Podman/rootless certification and running-session adoption remain separate work." The RH-01 reports repeat this (`docs/reports/2026-09-15-rh01-235-gpu-runtime-acceptance.md:65`, `…rh01-239…:222`, `…rh01-240-integrated-acceptance.md:186`).
+- `docs/runtime-api-recovery.md:168-171`: "Docker is the validated engine… Podman/rootless certification and running-session adoption remain separate work." The RH-01 acceptance reports repeated this (retired from the tree; see #235, #239, #240).
 
 **Planning documents:**
 - `docs/rh06/research/c-tracker-contracts-and-board.md:24-25`: "Docker API first behind a typed Quasar runtime interface; Podman and rootless are capability-tested profiles". `:35` excludes "universal rootless compatibility". `:251`: "#113 found rootless Podman needs `label=disable` + socket path; ownership design must not assume Docker-only".
 - `docs/rh06/2026-09-24-decisions.md:411,426` defers Podman and rootless to RH-07. `docs/rh06/2026-09-24-architecture.md:144` and `docs/rh06/designs/3-rust-runtime-reuse.md:990` note that RH-07 then has one engine client, for both agent and actor.
 - `docs/rh06/research/a-updater-and-self-update.md:713`: "Self-identification is Docker-layout specific (Podman … layout not verified)".
-- `docs/reports/2026-09-05-first-install-compose-audit.md:163,210-213` covers socket endpoint drift, a fresh `/run` tmpfs, and "explicit rootless/non-root modes".
-- The RH-02 plans put Podman out of scope (`docs/superpowers/plans/2026-09-17-rh02-probe-first-reconciliation.md:23`, `…2026-09-18-rh02-probe-first-spec.md:336`, which also says "Using CDI for injection" is out of scope).
+- The first-install Compose audit (retired from the tree) covered socket endpoint drift, a fresh `/run` tmpfs, and "explicit rootless/non-root modes".
+- The RH-02 probe-first plans (retired from the tree) put Podman out of scope, and also said "Using CDI for injection" is out of scope.
 
 **GitHub issues:**
 - **#220:** "Detect capability differences in devices/CDI, networking, labels, mounts, user namespaces, events and lifecycle semantics… no silent privileged fallback."

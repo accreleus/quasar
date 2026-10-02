@@ -74,7 +74,7 @@ func TestCertHistoryRecordAndOverride(t *testing.T) {
 //
 //   - a LEGACY row keyed (launch profile, codec) bans EVERY rung of that chain
 //     using that codec — precisely its pre-UI-P4 meaning. All 147 rows live on
-//     Tower are this shape, which is why no history migration is needed.
+//     gpu-test are this shape, which is why no history migration is needed.
 //   - a RUNG-LEVEL row keyed by rung id bans exactly that rung, and crucially
 //     NOT its sibling that shares a codec at a different resolution. A codec-only
 //     key cannot express that, and decode failure IS resolution-dependent.

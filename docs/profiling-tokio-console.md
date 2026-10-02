@@ -58,7 +58,7 @@ git apply /tmp/d4-tokio-console.patch
 git apply --check /tmp/d4-tokio-console.patch   # sanity: already-applied errors are expected here
 ```
 
-Verified 2026-07-31 on Tower (`quasar-agent-dev:latest`, `docker run --rm -v <scratch>:/src
+Verified 2026-07-31 on gpu-test (`quasar-agent-dev:latest`, `docker run --rm -v <scratch>:/src
 -w /src/node-agent <image> cargo check ...`):
 
 | build | command | result |
@@ -84,7 +84,7 @@ The dev-stack `quasar-node-agent` service execs the **workspace** build
 binary — that's the existing "no rebuild-the-image" override, reused here unchanged:
 
 ```bash
-# on the box (Tower/hermes), from the repo root, on the throwaway branch:
+# on the box (gpu-test/hermes), from the repo root, on the throwaway branch:
 docker run --rm -v "$PWD":/workspace -w /workspace/node-agent \
   -e RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes" \
   quasar-agent-dev:latest cargo build --release --features cuda,tokio-console
@@ -92,7 +92,7 @@ docker run --rm -v "$PWD":/workspace -w /workspace/node-agent \
 
 cd deploy
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
-  up -d --force-recreate quasar-node-agent   # Tower; drop the -vulkan overlay for hermes plain
+  up -d --force-recreate quasar-node-agent   # gpu-test; drop the -vulkan overlay for hermes plain
 ```
 
 No compose file changes needed — the existing `command:` always execs the workspace
@@ -110,7 +110,7 @@ docker logs --tail 20 deploy-quasar-node-agent-1 | grep -i console
 ## 3. Drive it under live streaming load
 
 Per the ticket: **a stalled task under idle conditions proves nothing.** Launch a real
-session and let it reach `state=running` before capturing, on both Tower (NVENC) and
+session and let it reach `state=running` before capturing, on both gpu-test (NVENC) and
 hermes (VA) — see `docs/profiling-rust.md` §3 for the same launch pattern
 (`qses run --stack=... --app 'Steam' --profile 1080p60 --secs N`). Capture for the
 duration of the session, not a snapshot.

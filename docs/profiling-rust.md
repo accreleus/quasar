@@ -13,7 +13,7 @@ off the shipped binary. What they cannot do is give line numbers — and, the pa
 actually misleads, **an inlined frame is attributed to whatever it was inlined into.**
 With `codegen-units = 1` plus thin LTO the inlining is aggressive.
 
-That is not a theoretical concern. Measured on a live 1080p60 Tower session
+That is not a theoretical concern. Measured on a live 1080p60 gpu-test session
 (2026-07-31, 25 s, 999 Hz): of the 106 sampled addresses inside the agent, **89 were
 inlined frames**, one of them collapsing **18 source frames into a single machine
 address**. A flamegraph off the release binary attributes that address to the outermost
@@ -65,7 +65,7 @@ The build asserts its own point: it fails unless the profiling binary contains
 cd deploy
 export QUASAR_PROFILING_IMAGE=quasar-profiling:20260730-2330
 
-# Tower (NVENC / Vulkan)
+# gpu-test (NVENC / Vulkan)
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
                -f docker-compose.profiling.yml up -d --force-recreate quasar-node-agent
 
@@ -79,11 +79,11 @@ important one is **not** the capability:
 
 - `security_opt: [seccomp:unconfined]` — Docker's **default seccomp profile denies
   `perf_event_open` outright**, at the syscall filter, before any capability check runs.
-  Tower's agent already holds `CAP_SYS_ADMIN` and every profiler in it still fails with
+  gpu-test's agent already holds `CAP_SYS_ADMIN` and every profiler in it still fails with
   `EPERM` without this. Capabilities cannot buy their way past a seccomp deny.
 - `cap_add: [PERFMON]` — satisfies the kernel's `perf_event_paranoid` gate, because
   `perfmon_capable()` short-circuits it. With PERFMON the host sysctl stops mattering:
-  Tower sits at `perf_event_paranoid = 2` and needed no change.
+  gpu-test sits at `perf_event_paranoid = 2` and needed no change.
 
 Confirm the swap took, and that the image really is a drop-in agent:
 
@@ -99,7 +99,7 @@ Start the session first and let it reach `running` — a capture taken against a
 agent is a profile of nothing, and it looks exactly like a successful one:
 
 ```bash
-.claude/skills/quasar-session/scripts/qses run --stack=tower --app 'Steam' \
+.claude/skills/quasar-session/scripts/qses run --stack=gpu-test --app 'Steam' \
     --profile 1080p60 --secs 200 &
 # poll until state=running before capturing
 ```
@@ -145,7 +145,7 @@ addr2line -f -i -C -e /usr/local/bin/quasar-node-agent -a @/tmp/agent-rvas.txt  
 addr2line -f -i -C -e /opt/agent/quasar-node-agent     -a @/tmp/agent-rvas.txt  # release
 ```
 
-Healthy result (the 2026-07-31 Tower run):
+Healthy result (the 2026-07-31 gpu-test run):
 
 | | profiling binary | release binary |
 |---|---|---|
@@ -181,8 +181,8 @@ explored. Same `perf_event_open` prerequisites; `perf` is in the image.
   capture still succeeds, and the flamegraph is all runtime bookkeeping. Poll for
   `state=running` first.
 - **`home_in_use` (HTTP 409) on launch.** A previous session still holds the app's
-  storage. Stop it (`qses stop --stack=tower <SID>`) before relaunching.
-- **Bench apps may not be enabled.** On Tower the reliable launch is `--app 'Steam'`;
+  storage. Stop it (`qses stop --stack=gpu-test <SID>`) before relaunching.
+- **Bench apps may not be enabled.** On gpu-test the reliable launch is `--app 'Steam'`;
   `GOW XFCE Desktop` exited with code 1 during the PROF-02 run. Check the catalog rather
   than assuming a bench tile exists.
 - **An un-spawned future is invisible to tokio-console, not slow in it (#532).** Tokio

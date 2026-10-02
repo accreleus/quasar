@@ -64,7 +64,7 @@ ALTER TABLE apps
     -- JSONB in, json.RawMessage through, opaque on the wire, serde at the agent),
     -- so a database CHECK is the only place this can live.
     --
-    -- IT EXISTS BECAUSE THE VALIDATED EXPERIMENT DID THE OTHER THING. The Tower
+    -- IT EXISTS BECAUSE THE VALIDATED EXPERIMENT DID THE OTHER THING. The gpu-test
     -- proof-of-concept that showed direct game launch working hardcoded a host
     -- path into one tile's runtime_spec.mounts. That is explicitly NOT the
     -- shipping mechanism — it freezes a host path into a fleet-wide catalogue row
