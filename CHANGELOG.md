@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
+  A reboot empties `/run`, and Podman would not start the agent without its runtime
+  directory. The recovery actor now has the engine make it at every start, then starts the
+  agent. The quick start and **Add host** no longer ask for a `tmpfiles.d` line.
 - **Read-only mounts stay read-only on Podman, all the way down (#410).** Podman made only
   the top of a read-only mount read-only, so a disk mounted inside it stayed writable. Quasar
   now asks Podman for a mount without the submounts and checks it. On Podman, a disk mounted

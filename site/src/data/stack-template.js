@@ -240,14 +240,6 @@ export const NVIDIA_TOOLKIT_URL = 'https://docs.nvidia.com/datacenter/cloud-nati
  */
 export const NESTED_GPU_CIL = '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))';
 
-/**
- * The node agent's runtime directory on rootful Podman, made at every boot (the
- * line deploy/prepare-host.sh writes for rootful). Docker recreates a missing bind
- * source itself; Podman does not, so without it the agent fails after a reboot.
- * Its SELinux label is the agent's own business.
- */
-export const RUNTIME_DIR_TMPFILES = 'd /run/quasar-agent 0755 root root -';
-
 /** NVIDIA's device nodes for SELinux-confined containers; SELinux stays enforcing. */
 function nvidiaSelinuxLines() {
   return [
@@ -261,8 +253,8 @@ function nvidiaSelinuxLines() {
  * The host commands a rootful install needs, run once by the reader before the
  * install script: visible, never a downloaded script. Unraid needs none.
  * Mirrors what deploy/prepare-host.sh does for a rootful engine: the engine at
- * boot (Podman: its API socket, podman-restart.service and the agent's runtime
- * directory, recreated at every boot), and on NVIDIA the
+ * boot (Podman: its API socket and podman-restart.service; the recovery actor makes
+ * the agent's runtime directory itself at every boot, #439), and on NVIDIA the
  * container toolkit (Docker: its runtime; Podman: a CDI specification), plus,
  * on Fedora (SELinux), the boolean and the one rule NVIDIA's device nodes need.
  */
@@ -276,11 +268,6 @@ export function hostSteps(a) {
       "# Podman's API socket (the seed talks to it), and Quasar's containers back at boot.",
       'sudo systemctl enable --now podman.socket',
       'sudo systemctl enable podman-restart.service',
-      '',
-      "# The agent's runtime directory, made at every boot: /run is emptied on reboot,",
-      '# and Podman never creates a missing bind source.',
-      `echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf`,
-      'sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf',
     );
     if (nvidia) {
       lines.push(
@@ -560,9 +547,8 @@ ${doneBlock(a, r, host, 'docker exec quasar-control-plane')}
  * substituted in, then starts it through systemd — the same unit `quadlet`
  * returns for on-screen reference, with real digests instead of placeholders.
  * It refuses a Podman older than the engine-profile table's minimum (#424: it cannot
- * change a restart policy), and refuses to start while a host step is missing:
- * podman-restart.service off, or nothing making /run/quasar-agent at boot. Either way
- * Quasar would not come back after a reboot.
+ * change a restart policy), and refuses to start while podman-restart.service is
+ * off: Quasar would not come back after a reboot.
  */
 function podmanScript(a, r, p) {
   const { uid, gid } = appUser(a);
@@ -598,12 +584,6 @@ fi
 if ! systemctl is-enabled --quiet podman-restart.service 2>/dev/null; then
   echo "podman-restart.service is off, so Quasar would not come back after a reboot. Run step 1 first:" >&2
   echo "  sudo systemctl enable podman-restart.service" >&2
-  exit 1
-fi
-if ! systemd-tmpfiles --cat-config 2>/dev/null | grep -q '^d /run/quasar-agent '; then
-  echo "Nothing makes /run/quasar-agent at boot, so the agent would not start after a reboot. Run step 1 first:" >&2
-  echo "  echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf" >&2
-  echo "  sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf" >&2
   exit 1
 fi
 

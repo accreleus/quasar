@@ -41,6 +41,9 @@ pub mod names {
     pub const NODE_AGENT_SECRETS_VOLUME: &str = "quasar-node-agent-secrets";
     /// The disposable GPU probe; always removed after its run.
     pub const GPU_PROBE: &str = "quasar-gpu-probe";
+    /// The never-started helper through which the engine makes the agent's runtime
+    /// directory at an actor start (#439).
+    pub const RUNTIME_DIR_HELPER: &str = "quasar-runtime-dir";
     /// The never-started helper through which a secrets volume is written.
     pub const SECRETS_WRITER: &str = "quasar-secrets-writer";
     /// The one-shot helper an `uninstall --purge` dumps a Quasar-owned database with.

@@ -36,15 +36,12 @@ Once, from an account with `sudo`. The quick start shows the same commands.
 ```bash
 sudo systemctl enable --now podman.socket
 sudo systemctl enable podman-restart.service
-echo 'd /run/quasar-agent 0755 root root -' | sudo tee /etc/tmpfiles.d/quasar.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
 ```
 
 | Command | Why |
 | --- | --- |
 | `podman.socket` | The API the seed talks to. |
 | `podman-restart.service` | Brings Quasar's containers back after a reboot: Podman has no daemon to do it. |
-| `/etc/tmpfiles.d/quasar.conf` | Makes the agent's runtime directory at every boot. `/run` is emptied on reboot and Podman, unlike Docker, never creates a missing mount source, so without it the agent can't start after a reboot. |
 
 **NVIDIA:** complete [NVIDIA setup for Podman](/quasar/install/nvidia/#podman-rootful)
 before deploying. It includes CDI device generation, verification and SELinux policy.
@@ -94,8 +91,8 @@ Then continue with [Create your account](/quasar/install/first-run/), using
 - The Quadlet unit starts the seed at boot.
 - `podman-restart.service` brings Quasar's other containers back. Without it they
   stay stopped after a reboot.
-- `/etc/tmpfiles.d/quasar.conf` recreates `/run/quasar-agent`. Without it the agent
-  fails after a reboot with `cannot stat /run/quasar-agent`.
+- The recovery actor makes `/run/quasar-agent` again (a reboot empties `/run`), then
+  starts the agent if it is not running.
 
 ## Rootless: a session as the quasar account
 
