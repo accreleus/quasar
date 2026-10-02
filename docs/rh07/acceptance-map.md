@@ -1,16 +1,16 @@
 # RH-07 acceptance map
 
-Written for #409 (D19); reconciled 2026-10-01 against the newest hardware reports. Sources:
+Written for #409 (D19); reconciled 2026-10-02 against the newest hardware reports. Sources:
 #393–#437 and their comments, `docs/rh07/2026-09-28-decisions.md` (D1–D23), the
 specification (#390) and `testdata/engine-profiles/profiles.json`. Citations are an issue
 comment or a commit. Hosts are named by role: the AMD test host, the NVIDIA test host, and
 the rootless lab VM (SELinux enforcing, read-only `/usr`, per D23), which ran with either the
 NVIDIA card or the host's AMD iGPU passed through.
 
-**Candidate coverage.** Every hardware row below predates the final candidate: the #429
-and #432 fixes, the dependency updates and the Go 1.26 toolchain landed afterwards. The rows
-are real evidence for the code paths they ran; they are not a hardware pass of the final
-build.
+**Candidate coverage.** The AMD rootful Docker rows (E8) ran on the release candidate
+itself, built from `develop` `a7c12b98`. NVIDIA rootful Docker had a fresh quick-start
+install on the near-final build (#440). The other rows predate it: they are real evidence
+for the code paths they ran, not a hardware pass of the final build.
 
 ## 1. Profile matrix (D19)
 
@@ -30,12 +30,13 @@ Evidence keys used in the tables:
 | E5 | #405 [5873588293](https://github.com/accreleus/quasar/issues/405#issuecomment-5873588293): rootless Podman install, update, reboot (NVIDIA) |
 | E6 | #409 [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346): microphone, rootless Podman (NVIDIA) |
 | E7 | #401 [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775): full per-button input replay, rootless Podman (NVIDIA) |
+| E8 | #409 [5949253849](https://github.com/accreleus/quasar/issues/409#issuecomment-5949253849): AMD rootful Docker on the release candidate: update, machine reboot, bench run `0f990801` |
 
 ### Docker rootful
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS (E1) | PASS: #402 [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916) | GAP | GAP | GAP |
+| AMD | PASS (E1) | PASS: #402 [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916); on the candidate (E8) | PASS (E8) | Not required: NVIDIA covers rootful Docker | PASS: run `0f990801`, "result: clean" (E8) |
 | NVIDIA | PASS over CDI (E1, E4); the `--gpus` fallback fails on a CUDA-only host (#413) | PASS (E4) | PASS (E4) | PASS: #395 [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398) | PASS: run `3e38e6e3` (E4) |
 
 ### Docker rootless
@@ -96,7 +97,7 @@ The AMD Podman bench is an XFCE soak, not a Steam game.
 | 27 | Docs say a rootful socket is root-equivalent | Met | #406 [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
 | 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run stayed `Enforcing`; sessions stay confined; the agent's `label=disable` per D17 |
 | 29 | One behavioural suite across every engine mode | Met | #408 [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059), in CI on all four modes; its Podman findings are open (#424, #425, #426) |
-| 30 | Each required profile proven on hardware before `main` | Partly met | Every NVIDIA row passes. AMD gaps: Docker rootful reboot, console, bench; Docker rootless update, reboot, console, bench; Podman rootless update |
+| 30 | Each required profile proven on hardware before `main` | Partly met | Every NVIDIA row and every AMD rootful Docker row passes (E8). AMD gaps: Docker rootless update, reboot, console, bench; Podman rootless update |
 
 Met: 1–11, 13, 15–19, 21–25, 27–29 (**23**). Partly met: 12, 14, 20, 26, 30 (**5**). Not
 evidenced: none.
@@ -105,12 +106,13 @@ evidenced: none.
 
 Each needs a run, or the owner's named acceptance under #409.
 
-1. **AMD, Docker rootful:** reboot, console mode, bench. (#409 asks for console on one host
-   per engine; NVIDIA covers that.)
+1. ~~**AMD, Docker rootful:** reboot, console mode, bench.~~ Closed by E8; console mode is
+   covered by NVIDIA.
 2. **AMD, Docker rootless:** update, machine reboot, console, bench.
 3. **AMD, Podman rootless:** update from the console; console run with a physical keyboard;
    a Steam bench with a baseline.
-4. **Final candidate:** no hardware run of the release build itself (see Candidate coverage).
+4. **Final candidate:** run on AMD rootful Docker (E8) only; the other profiles were not re-run
+   on it (see Candidate coverage).
 5. **#413:** the rootful `--gpus` fallback on a CUDA-only NVIDIA host (CDI works).
 6. **Known Podman defects, need a release decision:** #425 (a crash-looping service can
    restart after an explicit stop), #426 (Podman creates a missing bind source), #424
@@ -119,7 +121,8 @@ Each needs a run, or the owner's named acceptance under #409.
    crash.
 8. **Story 20:** no live Xid fault on the shown path.
 9. **Podman rootful and Ubuntu:** not required; labels stay experimental (#416).
-10. **#429 and #432:** fixed in code, not yet verified on hardware.
+10. **#432:** fixed in code, not yet verified on hardware (needs the lab VM). #429 was verified
+    and closed.
 
 **Open defects touching these rows:** #410, #412, #413, #414, #416, #418, #421, #422, #424,
-#425, #426, #429, #432, #433, #434.
+#425, #426, #432, #433, #434, #439.
