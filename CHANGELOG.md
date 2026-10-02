@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **Podman older than 5.1 is refused up front (#424).** Podman before 5.1 can't change a
+  container's restart policy, so updates failed on it. The quick start and **Add host** now
+  stop before pulling anything and name the version, and the host's `runtime_engine` check
+  reads it as unsupported. Ubuntu 24.04 ships Podman 4.9.
 - **Podman no longer starts a session with a missing bind source (#426).** Podman makes a
   missing bind source on the host instead of refusing the container. Quasar now checks the
   source first and refuses the launch, as Docker does, and nothing is created.

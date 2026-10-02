@@ -467,7 +467,7 @@ fi
 
 # ── engine profiles ──────────────────────────────────────────────────────────
 # testdata/engine-profiles/profiles.json as records, one per line, split on '|':
-#   platform|<id>|<label>        engine|<id>|<label>
+#   platform|<id>|<label>        engine|<id>|<label>|<minimum version>|<why>
 #   profile|<platform>|<engine>|<mode>|<status>|<alternatives>|<reason>
 #   unknown|<status>|<alternatives>|<reason>
 # An alternative is engine/mode on this machine, or engine/mode@platform. The block
@@ -482,8 +482,8 @@ platform|debian|Debian
 platform|arch|Arch
 platform|unraid|Unraid
 platform|other|Another Linux
-engine|docker|Docker
-engine|podman|Podman
+engine|docker|Docker||
+engine|podman|Podman|5.1|Podman 5.1 is the first Podman that can change a container's restart policy, which installing and updating Quasar need.
 profile|fedora|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, with AMD and NVIDIA GPUs.
 profile|fedora|docker|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
 profile|fedora|podman|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
@@ -726,6 +726,25 @@ if [ "$reported" != "$MODE" ]; then
   host_error "$ENGINE_SOCKET is where a $MODE $ENGINE_LABEL engine would be, but the engine behind it reports that it runs $reported. Name the socket of the engine Quasar should use with $host_var=unix://…, then re-run."
 fi
 ok "engine: $ENGINE_LABEL, $MODE ($ENGINE_SOCKET)"
+
+# The engine's own version against the table's minimum for it (#424): an older one is
+# refused by name, before anything is pulled. A version that does not read as
+# major.minor is not taken as old.
+engine_minimum="$(engine_profiles | awk -F'|' -v id="$ENGINE" '$1 == "engine" && $2 == id { print $4; exit }')"
+if [ -n "$engine_minimum" ]; then
+  if [ "$ENGINE" = podman ]; then
+    engine_version="$(dk info --format '{{.Version.Version}}' 2>/dev/null || true)"
+  else
+    engine_version="$(dk version --format '{{.Server.Version}}' 2>/dev/null || true)"
+  fi
+  if printf '%s %s\n' "$engine_version" "$engine_minimum" | awk '{
+       split($1, h, /[.+-]/); split($2, n, /[.+-]/)
+       if (h[1] !~ /^[0-9]+$/ || h[2] !~ /^[0-9]+$/) exit 1
+       exit !((h[1] + 0 < n[1] + 0) || (h[1] + 0 == n[1] + 0 && h[2] + 0 < n[2] + 0)) }'; then
+    engine_why="$(engine_profiles | awk -F'|' -v id="$ENGINE" '$1 == "engine" && $2 == id { print $5; exit }')"
+    host_error "$ENGINE_LABEL $engine_version is older than $engine_minimum, so this script does not install Quasar on it. $engine_why Upgrade $ENGINE_LABEL to $engine_minimum or later, or use Docker rootful. Nothing was pulled or started."
+  fi
+fi
 
 # The engine profile, before anything is pulled: unsupported is refused by name.
 row="$(profile_row "$platform" "$ENGINE" "$MODE")"

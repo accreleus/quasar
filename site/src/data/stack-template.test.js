@@ -367,6 +367,21 @@ test('rootful Podman with nothing making /run/quasar-agent at boot stops before 
   assert.ok(!/podman pull/.test(r.calls), 'nothing pulled');
 });
 
+test('a Podman older than 5.1 stops before anything is pulled, naming the version (#424)', () => {
+  for (const version of ['4.9.3', '5.0.3']) {
+    const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir({ podmanVersion: version }) });
+    assert.notEqual(r.status, 0, version);
+    assert.match(r.stderr, new RegExp(`Podman ${version.replaceAll('.', '\\.')} is older than 5\\.1`));
+    assert.match(r.stderr, /restart policy/);
+    assert.ok(!/podman pull/.test(r.calls), 'nothing pulled');
+  }
+});
+
+test('Podman 5.1 itself, the minimum, installs', () => {
+  const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir({ podmanVersion: '5.1.0' }) });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+});
+
 test('rootful Podman installs end to end against the fake engine', () => {
   const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir() });
   assert.equal(r.status, 0, r.stdout + r.stderr);

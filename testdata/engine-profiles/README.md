@@ -35,6 +35,9 @@ evidence that justifies it.
   each with sample hosts. A sample carries the host's `os-release` lines and what each
   engine reports about the OS in its `/info`: Docker's `OperatingSystem` is the host's
   `PRETTY_NAME`, Podman's is its `ID`, and both report `VERSION_ID` as `OSVersion`.
+- `engines`: each engine's label and, where there is one, its `minimumVersion` with
+  `minimumVersionReason`. An older version of that engine is unsupported on every platform,
+  whatever its row says (#424: Podman before 5.1 cannot change a restart policy).
 - `profiles`: one row per platform, engine and mode, with `status`, `reason` and
   `alternatives`. An alternative with no `platform` means the same machine.
 - `unknownEngine`: the row for an engine that is neither Docker nor Podman.

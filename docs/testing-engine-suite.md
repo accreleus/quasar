@@ -105,8 +105,11 @@ runner; `scripts/verify/ci-engine-target.sh` brings each engine up):
 CI's Podman jobs record two failures in `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known`
 matrix value) instead of hiding them:
 
-- `restart`: Podman 4.9's compatible container update refuses a restart policy
-  (`Engine`). Podman 5 accepts it.
+- `restart`: Podman 4.9 cannot change a restart policy (`Engine`): its compatible API has
+  no container update, and its native update has no restart policy. Podman 5.1 is the
+  first that can, so it is Quasar's minimum (`engines.podman.minimumVersion` in the
+  engine-profile table; #424). The case stays KNOWN here because the runner's Podman is
+  below that minimum.
 - `stop-crash-loop`: a product finding on Podman 4.9 and 5 alike. A crash-looping
   `unless-stopped` service keeps being restarted after a successful stop.
 
