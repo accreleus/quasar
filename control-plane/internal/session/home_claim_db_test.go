@@ -45,6 +45,10 @@ func TestLaunchRefusesHomeHeldByTerminalSession(t *testing.T) {
 	must(t, err)
 	_, err = store.Transition(ctx, first.ID, StateFailed, nil, nil)
 	must(t, err)
+	// Long past teardown: the qualified terminal is overdue, so this hold is
+	// stuck rather than settling (#434) and is refused without waiting.
+	_, err = pool.Exec(ctx, `UPDATE sessions SET ended_at=now()-interval '1 hour' WHERE id=$1::uuid`, first.ID)
+	must(t, err)
 	_, err = pool.Exec(ctx, `UPDATE managed_home_claims SET
 		pending_home_session_id=$3::uuid,pending_home_token=$4::uuid,pending_home_started_at=now()
 		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`,
