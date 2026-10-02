@@ -27,7 +27,7 @@ time. Each host has its own page: **Admin ▸ Fleet ▸** the host **▸ Local c
 | **Local audio output** | **Auto**, a sink the host reported, or **Quiet**. See [Local audio](#local-audio). |
 | **Grab local input**, **Input devices** | Takes the host's keyboards, mice and controllers for the session. See [Local input](#local-input). |
 | **Default app**, **Default user**, **Auto-start on display** | Launches that app as that user when a display comes on. See [Starting on its own](#starting-on-its-own). |
-| **Auto-connect controller** | Attaches a connected controller to the console session. |
+| **Auto-connect controller** | With a list of input devices, also attaches any controller plugged in. Auto already takes every controller. |
 
 The right-hand column lists the host's connectors and modes, audio sinks and
 input devices.
@@ -115,7 +115,9 @@ as root: `systemctl --user -M USER@ restart pipewire-pulse.service`.
 console session. **Input devices** picks what is passed in: by class, by device
 path, or none.
 
-Plug devices in before the session starts; a device plugged in later isn't grabbed.
+A device plugged in during a session is grabbed within about a second, and released
+when it is unplugged. With a list of device paths, a listed device is grabbed when it
+appears, and **Auto-connect controller** also grabs any controller that is plugged in.
 
 ## Starting on its own
 
