@@ -1,6 +1,7 @@
 package hostcfg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -550,6 +551,79 @@ func policyGroupUsesDeployment(group string, choices map[string]PolicyChoice) bo
 		}
 	}
 	return false
+}
+
+// movedDeploymentGroup is one unsaved group whose deployment values changed:
+// From and To hold only the deployment-sourced keys that moved.
+type movedDeploymentGroup struct {
+	Group    string
+	From, To map[string]any
+}
+
+// recordMovedDeploymentGroups gives a typed-owned next-session group that has
+// no saved record a pending one when a deployment value it resolves from moved
+// between the previous baseline report and this one (#418: a reconfigured
+// QUASAR_HOME_ROOT). The agent keeps that group's seeded snapshot latched
+// until a candidate is verified (agent-api.md §RH05), so without a record the
+// new deployment value would never be offered. The record is written at the
+// host's current policy revision with no digest; refreshDeploymentDigests
+// resolves it against this connection's baseline and arms its obligation.
+// A missing previous value is unknown, not moved.
+func recordMovedDeploymentGroups(ctx context.Context, tx pgx.Tx, hostID string, previous, current map[string]any) ([]movedDeploymentGroup, error) {
+	if previous == nil {
+		return nil, nil
+	}
+	var confirmedRaw, everRaw []byte
+	if err := tx.QueryRow(ctx, `SELECT config_policy_confirmed_groups,config_policy_ever_owned_groups FROM hosts WHERE id=$1::uuid`, hostID).Scan(&confirmedRaw, &everRaw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	owned := decodeGroupSet(confirmedRaw)
+	for group := range decodeGroupSet(everRaw) {
+		owned[group] = true
+	}
+	choices, err := loadPolicyChoices(ctx, tx, hostID)
+	if err != nil {
+		return nil, err
+	}
+	var moved []movedDeploymentGroup
+	for _, group := range NextSessionPolicyGroups() {
+		if !owned[group] {
+			continue
+		}
+		from, to := map[string]any{}, map[string]any{}
+		for _, key := range PolicyGroupKeys(group) {
+			if choice, ok := choices[key]; ok && choice.Source != "deployment" {
+				continue
+			}
+			before, known := previous[key]
+			after, reported := current[key]
+			if !known || !reported {
+				continue
+			}
+			a, errA := canonicalJSON(before)
+			b, errB := canonicalJSON(after)
+			if errA != nil || errB != nil || bytes.Equal(a, b) {
+				continue
+			}
+			from[key], to[key] = before, after
+		}
+		if len(to) == 0 {
+			continue
+		}
+		cmd, err := tx.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+			SELECT $1::uuid,$2,revision,'next_session','pending' FROM host_policy_revisions WHERE host_id=$1::uuid
+			ON CONFLICT(host_id,group_key) DO NOTHING`, hostID, group)
+		if err != nil {
+			return nil, err
+		}
+		if cmd.RowsAffected() == 1 {
+			moved = append(moved, movedDeploymentGroup{Group: group, From: from, To: to})
+		}
+	}
+	return moved, nil
 }
 
 // refreshDeploymentDigests re-resolves deployment-source next-session groups

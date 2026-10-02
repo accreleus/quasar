@@ -1230,8 +1230,11 @@ impl PolicyAgent {
             return Err("prerequisite_mismatch".into());
         }
         // Equal-revision deployment re-resolution may change only the
-        // resolved value and its baseline prerequisite, never the choice.
-        if revision == high_water {
+        // resolved value and its baseline prerequisite, never the choice. With
+        // no journaled revision for the group there is nothing to fence: the
+        // control plane offers a never-edited group at its policy revision,
+        // which may be "0" (#418).
+        if self.journal.high_water.contains_key(group) && revision == high_water {
             let same = self.journal.records.values().any(|r| {
                 r.group == offer.group
                     && r.revision == offer.revision
@@ -3035,5 +3038,52 @@ mod tests {
         );
         let reply = agent.accept(fresh, &mut runtime);
         assert_eq!(phase_of(&reply).0, "applied");
+    }
+
+    /// #418: a homes-root reconfigure restarts the agent on a new deployment
+    /// mount. The seeded snapshot stays latched (agent-api.md §RH05), and the
+    /// control plane's deployment re-offer at the host's current policy
+    /// revision — `"0"` on a host whose policy was never edited — moves the
+    /// next session onto the new root. No journaled candidate exists for the
+    /// group, so the equal-revision fence has nothing to compare against.
+    #[test]
+    fn a_reconfigured_home_root_applies_through_a_first_deployment_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounts = tempfile::tempdir().unwrap();
+        let old = mounts.path().join("old");
+        let new = mounts.path().join("new");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        runtime.home_root = old.to_str().unwrap().into();
+        drop(owned_agent(dir.path(), &["home_root"], &mut runtime));
+
+        let mut restarted = RuntimeSettings::baseline_with(&|_| None);
+        restarted.home_root = new.to_str().unwrap().into();
+        let mut agent = open_at(&dir.path().join("policy.json"), &mut restarted);
+        assert_eq!(
+            restarted.home_root,
+            old.to_str().unwrap(),
+            "seed is latched"
+        );
+
+        let reoffer = offer(
+            &agent,
+            "r",
+            "0",
+            "home_root",
+            json!({"source":"deployment"}),
+            json!(new.to_str().unwrap()),
+        );
+        let reply = agent.accept(reoffer, &mut restarted);
+        assert_eq!(phase_of(&reply), ("applied", None));
+        assert_eq!(restarted.home_root, new.to_str().unwrap());
+
+        // The fence still holds once a candidate is journaled at that revision.
+        let changed = explicit(&agent, "c", "0", "home_root", json!(new.join("x")));
+        assert_eq!(
+            phase_of(&agent.accept(changed, &mut restarted)),
+            ("failed", Some("revision_conflict"))
+        );
     }
 }
