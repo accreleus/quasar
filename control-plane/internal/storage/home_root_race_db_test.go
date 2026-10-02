@@ -106,3 +106,82 @@ func TestEnsureHomeSerializesRootResolutionAndCreationWithHostEdit(t *testing.T)
 		t.Fatalf("new home ref = %q", ref)
 	}
 }
+
+// #418: a reconfigured QUASAR_HOME_ROOT leaves existing homes under the old
+// root. Quasar does not move data: the next launch re-points the row to the same
+// <user>/<app> path under the current root, for EnsureHome and for a derived
+// tile's RequireHome alike. A ref whose place under the root cannot be derived,
+// or that would land on another home's path, is a home conflict, never reuse.
+func TestHomeOutsideAReconfiguredRootIsRepointedNeverReused(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	userID := seedUser(t, pool, "repoint@test.local")
+	appID := seedApp(t, pool, "Repoint")
+	hostID := seedHost(t, pool)
+	setRoot := func(root string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings=jsonb_build_object('home_root',$2::text) WHERE id=$1::uuid`, hostID, root); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readRef := func() (string, string) {
+		t.Helper()
+		var id, ref string
+		must(t, pool.QueryRow(ctx, `SELECT id::text,ref FROM user_homes WHERE user_id=$1::uuid AND app_id=$2::uuid AND host_id=$3::uuid`, userID, appID, hostID).Scan(&id, &ref))
+		return id, ref
+	}
+	mgr := New(pool, fixedProvider("local"), databaseHomeRoot{pool: pool})
+	setRoot("/srv/homes")
+	if _, err := mgr.EnsureHome(ctx, userID, appID, hostID, "/home/quasar"); err != nil {
+		t.Fatal(err)
+	}
+	homeID, oldRef := readRef()
+	relative := strings.TrimPrefix(oldRef, "/srv/homes/")
+
+	setRoot("/data/homes")
+	mount, err := mgr.EnsureHome(ctx, userID, appID, hostID, "/home/quasar")
+	if err != nil || mount != "/data/homes/"+relative+":/home/quasar:rw" {
+		t.Fatalf("launch after reconfigure: mount=%q err=%v", mount, err)
+	}
+	if id, ref := readRef(); id != homeID || ref != "/data/homes/"+relative {
+		t.Fatalf("row after reconfigure: id=%s ref=%s", id, ref)
+	}
+
+	setRoot("/data/other")
+	mount, err = mgr.RequireHome(ctx, userID, appID, hostID, "/home/quasar")
+	if err != nil || mount != "/data/other/"+relative+":/home/quasar:rw" {
+		t.Fatalf("derived launch after reconfigure: mount=%q err=%v", mount, err)
+	}
+
+	// Another home already holds the target path: refuse, keep the row.
+	otherUser := seedUser(t, pool, "repoint-other@test.local")
+	mustExec(t, pool, `INSERT INTO user_homes (user_id, app_id, host_id, provider, ref) VALUES ($1::uuid,$2::uuid,$3::uuid,'local',$4)`, otherUser, appID, hostID, "/data/next/"+relative)
+	setRoot("/data/next")
+	if _, err := mgr.EnsureHome(ctx, userID, appID, hostID, "/home/quasar"); !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("colliding re-point: err=%v", err)
+	}
+	if _, ref := readRef(); ref != "/data/other/"+relative {
+		t.Fatalf("refused re-point moved the row to %s", ref)
+	}
+
+	// No <user>/<app> path to carry over: refuse, keep the row.
+	mustExec(t, pool, `UPDATE user_homes SET ref='/legacy' WHERE id=$1::uuid`, homeID)
+	for _, launch := range []func() (string, error){
+		func() (string, error) { return mgr.EnsureHome(ctx, userID, appID, hostID, "/home/quasar") },
+		func() (string, error) { return mgr.RequireHome(ctx, userID, appID, hostID, "/home/quasar") },
+	} {
+		if _, err := launch(); !errors.Is(err, ErrHomeConflict) {
+			t.Fatalf("underivable re-point: err=%v", err)
+		}
+	}
+	if _, ref := readRef(); ref != "/legacy" {
+		t.Fatalf("refused re-point changed the row to %s", ref)
+	}
+}
+
+func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatal(err)
+	}
+}

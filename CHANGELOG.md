@@ -29,6 +29,10 @@ own; the two do not move together, and that is deliberate.
   when a database is restored into a fresh install, the artwork job now fetches the missing
   images again from the reference it already has. An admin's chosen art stays locked. An
   uploaded image can't be fetched again, so the log asks for it to be uploaded once more.
+- **A changed homes root takes effect (#418).** After `quasar-recovery reconfigure
+  QUASAR_HOME_ROOT=...`, the host switches to the new root and sessions start again. Existing
+  homes follow to the same path under the new root, so move their files there first or players
+  start with fresh homes.
 
 ## 0.4.0 — 2026-10-02
 

@@ -387,21 +387,19 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
 		return
 	}
-	// storage-root-constrained: home_root must be the agent-reported root or a
-	// subpath (see ValidateHomeRootUnder). A null (clear) never reaches the
-	// string case below.
+	// storage-root-constrained: home_root must be the agent's mounted root or
+	// a subpath (see ValidateHomeRootUnder). The mount is the deployment
+	// baseline's QUASAR_HOME_ROOT, not the effective root: an override or a
+	// root reconfigured since enrollment must not narrow it (#418). A null
+	// (clear) never reaches the string case below.
 	if v, ok := req.Overrides["home_root"]; ok {
 		if s, ok := v.(string); ok {
-			eff, err := h.store.GetEffective(r.Context(), hostID)
-			if err != nil {
-				httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load host effective settings")
+			policyCtx, err := h.store.PolicyEditContext(r.Context(), hostID)
+			if err != nil && !errors.Is(err, ErrHostNotFound) {
+				httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load host storage root")
 				return
 			}
-			agentRoot := ""
-			if eff != nil {
-				agentRoot = eff["home_root"]
-			}
-			if err := ValidateHomeRootUnder(s, agentRoot); err != nil {
+			if err := ValidateHomeRootUnder(s, policyCtx.MountedHomeRoot); err != nil {
 				httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
 				return
 			}

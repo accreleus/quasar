@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -69,7 +70,10 @@ func (s *Store) ObserveDeploymentSettings(ctx context.Context, hostID, connectio
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `SELECT id FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID); err != nil {
+	// The report this one replaces, from any connection: only to see which
+	// deployment values moved (#418), never to resolve a choice.
+	var previousRaw []byte
+	if err := tx.QueryRow(ctx, `SELECT deployment_settings FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&previousRaw); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
 	if parseErr != nil {
@@ -84,14 +88,31 @@ func (s *Store) ObserveDeploymentSettings(ctx context.Context, hostID, connectio
 	if err != nil {
 		return err
 	}
+	var moved []movedDeploymentGroup
 	if parseErr == nil {
 		// A new current-connection baseline re-resolves every deployment-source
 		// next-session group; a changed digest is a relevant condition change.
+		// A moved value also reaches an owned group nobody saved (#418).
+		var previous map[string]any
+		if len(previousRaw) > 0 {
+			previous, _ = ParseDeploymentSettings(previousRaw)
+		}
+		moved, err = recordMovedDeploymentGroups(ctx, tx, hostID, previous, values)
+		if err != nil {
+			return err
+		}
 		if err := refreshDeploymentDigests(ctx, tx, hostID, connectionID); err != nil {
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	for _, group := range moved {
+		slog.Info("host policy: deployment value changed for a group with no saved policy; offering the new value to the agent",
+			"host_id", hostID, "group", group.Group, "from", group.From, "to", group.To)
+	}
+	return nil
 }
 
 func digestJSON(value any) (string, error) {
