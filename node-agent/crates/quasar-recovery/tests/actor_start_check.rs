@@ -470,3 +470,85 @@ fn a_start_that_re_creates_the_agent_says_so_instead() {
         "{lines:#?}"
     );
 }
+
+impl Machine {
+    /// A Podman reboot (#439): `/run` emptied, so the agent's runtime directory is gone, and
+    /// the engine could not start the agent. Every other host directory a container binds is
+    /// still there.
+    fn rebooted_without_runtime_dir(&self) {
+        self.engine.with_state(|s| {
+            let dirs = s
+                .containers
+                .values()
+                .flat_map(|c| c.spec.binds.iter())
+                .filter(|b| !b.is_volume() && b.source != "/run/quasar-agent")
+                .map(|b| b.source.clone())
+                .chain(["/dev".to_string(), "/run".to_string()])
+                .collect();
+            s.host_dirs = Some(dirs);
+        });
+        self.agent_left_exited();
+    }
+
+    fn runtime_dir_exists(&self) -> bool {
+        self.engine
+            .state()
+            .host_dirs
+            .is_some_and(|d| d.contains("/run/quasar-agent"))
+    }
+}
+
+/// #439: after a reboot Podman cannot start the agent, its runtime directory being gone
+/// with the rest of `/run`. The actor has the engine make it before anything starts the
+/// agent, so the agent is simply started: the same container, nothing re-created, and
+/// the helper that made it is gone.
+#[test]
+fn the_runtime_directory_is_made_before_the_agent_is_started_after_a_reboot() {
+    let m = Machine::install(nvidia_cdi());
+    let before = m.agent();
+    m.rebooted_without_runtime_dir();
+    assert!(!m.runtime_dir_exists());
+
+    let actor = m.actor();
+    actor.make_agent_runtime_dir();
+    assert!(m.runtime_dir_exists(), "the engine made it");
+    assert!(
+        m.engine
+            .state()
+            .container_named(names::RUNTIME_DIR_HELPER)
+            .is_none(),
+        "the helper is removed"
+    );
+    drop(actor);
+    let (actor, attempt) = m.start();
+    assert_eq!(attempt, None, "nothing re-created");
+    let agent = m.agent();
+    assert_eq!(agent.id, before.id, "the same container");
+    assert_eq!(agent.status, "running");
+    assert!(actor.services_not_running().unwrap().is_empty());
+}
+
+/// Without it, the start check can only re-create the agent through a verified
+/// replacement, as #432 does for any agent the engine will not start.
+#[test]
+fn without_the_runtime_directory_the_agent_is_re_created_instead() {
+    let m = Machine::install(nvidia_cdi());
+    let before = m.agent();
+    m.rebooted_without_runtime_dir();
+    let (actor, attempt) = m.start();
+    succeeded(&actor, &attempt.expect("re-created"));
+    assert_ne!(m.agent().id, before.id);
+}
+
+/// A machine with no node agent has no runtime directory to make.
+#[test]
+fn a_machine_without_an_agent_makes_no_runtime_directory() {
+    let m = Machine::install(nvidia_cdi());
+    m.engine
+        .with_state(|s| s.host_dirs = Some(Default::default()));
+    m.engine
+        .with_state(|s| s.containers.retain(|_, c| c.spec.name != names::NODE_AGENT));
+    std::fs::remove_file(m.dir.path().join("services").join("node-agent.json")).ok();
+    m.actor().make_agent_runtime_dir();
+    assert!(!m.runtime_dir_exists(), "no helper was created");
+}

@@ -97,6 +97,11 @@ pub struct FakeState {
     pub host: EngineHost,
     /// Device nodes the host has; creating a container naming another fails.
     pub host_devices: BTreeSet<String>,
+    /// Podman's bind sources (#439), when simulated: the host directories that exist. A
+    /// create makes every missing host-path bind source, as Podman's compatible create
+    /// does, and a start whose host-path bind source is missing is refused, as Podman
+    /// refuses it after a reboot emptied `/run`. `None`: not simulated.
+    pub host_dirs: Option<BTreeSet<String>>,
     /// What a started GPU probe prints.
     pub probe_output: String,
     /// Whether the engine can start a container that requests GPUs (`--gpus all`); when
@@ -629,6 +634,11 @@ impl PlatformEngine for FakeEngine {
             for bind in spec.binds.iter().filter(|b| b.is_volume()) {
                 s.volumes.entry(bind.source.clone()).or_default();
             }
+            if let Some(dirs) = s.host_dirs.as_mut() {
+                for bind in spec.binds.iter().filter(|b| !b.is_volume()) {
+                    dirs.insert(bind.source.clone());
+                }
+            }
             s.next_id += 1;
             let id = format!("{:064x}", s.next_id);
             s.containers.insert(
@@ -664,9 +674,24 @@ impl PlatformEngine for FakeEngine {
                 .and_then(|c| s.behaviour.get(&c.spec.image))
                 .cloned();
             let ports_in_use = s.ports_in_use.clone();
+            let host_dirs = s.host_dirs.clone();
             let c = s.containers.get_mut(&id).unwrap();
             if c.status == "running" {
                 return Ok(());
+            }
+            if let Some(missing) = host_dirs.as_ref().and_then(|dirs| {
+                c.spec
+                    .binds
+                    .iter()
+                    .find(|b| !b.is_volume() && !dirs.contains(&b.source))
+            }) {
+                return Err(refused(
+                    500,
+                    &format!(
+                        "crun: cannot stat `{}`: No such file or directory: OCI runtime attempted to invoke a command that was not found",
+                        missing.source
+                    ),
+                ));
             }
             if !c.spec.gpus.is_empty() && !gpus_supported {
                 return Err(refused(500, &gpus_refusal));

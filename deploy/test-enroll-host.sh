@@ -1220,13 +1220,14 @@ if [ "$RC" -eq 1 ] && grep -qxF '    systemctl enable podman-restart.service' <<
 else
   fail "unprepared rootful podman" "rc=$RC out=$(tail -4 <<<"$OUT")"
 fi
+# #439: the recovery actor makes the agent's runtime directory at every boot, so rootful
+# Podman needs no tmpfiles line.
 mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; rm "$tmp/root/etc/tmpfiles.d/quasar.conf"; reset_engine
-run_installer unprepared-rootful-podman-rundir "${OK_ENV[@]}"
-if [ "$RC" -eq 1 ] && grep -q 'tmpfiles.d/quasar.conf' <<<"$OUT" \
-   && grep -qxF "    echo 'd /run/quasar-agent 0755 root root -' > /etc/tmpfiles.d/quasar.conf" <<<"$OUT" && nothing_started; then
-  pass "rootful Podman without the boot-time runtime directory: named with its tmpfiles line (Podman never creates a missing bind source), nothing started"
+run_installer rootful-podman-no-tmpfiles "${OK_ENV[@]}" MOCK_ROOTLESS=0
+if [ "$RC" -eq 0 ] && ! grep -q 'tmpfiles' <<<"$OUT" && grep -q 'engine: Podman, rootful' <<<"$OUT"; then
+  pass "rootful Podman without a tmpfiles line: installs, and no step asks for one (#439)"
 else
-  fail "unprepared rootful podman rundir" "rc=$RC out=$(tail -6 <<<"$OUT")"
+  fail "rootful podman no tmpfiles" "rc=$RC out=$(tail -6 <<<"$OUT")"
 fi
 
 # Rootless: a failing check's fix is printed as root's, never applied; AppArmor warns.

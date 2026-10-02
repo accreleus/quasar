@@ -18,6 +18,11 @@
 //!
 //! One look per start: an attempt that fails puts the previous agent back and is tried again
 //! only by the next start.
+//!
+//! Before any of that, and before `resume` (which may start the agent itself, #438), the
+//! agent's runtime directory is made through the engine ([`Actor::make_agent_runtime_dir`],
+//! #439): `/run` is emptied at every boot, and Podman will not start a container whose bind
+//! source is missing.
 
 use std::sync::Arc;
 
@@ -28,7 +33,7 @@ use crate::console::{ConsoleDevices, DEVICES_CHANGED};
 use crate::engine::{EngineError, RestartPolicy};
 use crate::machine::{Machine, ServiceRecord};
 use crate::probe::{self, ProbeReport};
-use crate::recipe::{names, GpuFacts, Inputs, Role};
+use crate::recipe::{labels, names, paths, GpuFacts, Inputs, Role};
 use crate::socket::MachineRole;
 
 /// The name the actor's own re-render for a changed GPU is recorded under in
@@ -38,6 +43,46 @@ pub const GPU_CHANGED: &str = "gpu";
 /// The name a re-creation of an agent the engine would not start is recorded under.
 pub const AGENT_UNSTARTABLE: &str = "agent-unstartable";
 
+/// The helper label of the container [`Actor::make_agent_runtime_dir`] creates.
+pub const RUNTIME_DIR_HELPER: &str = "runtime-dir";
+
+/// A container that binds the agent's runtime directory as the agent does, never started:
+/// creating it is the whole point. The agent's image, which is local, and no network.
+pub fn runtime_dir_spec(
+    image: &crate::recipe::ImageRef,
+) -> quasar_runtime::platform::ContainerSpec {
+    use quasar_runtime::platform::{Bind, ContainerSpec, Healthcheck};
+    ContainerSpec {
+        name: names::RUNTIME_DIR_HELPER.into(),
+        image: image.reference(),
+        entrypoint: Some(vec!["true".into()]),
+        cmd: None,
+        env: Default::default(),
+        labels: [(labels::HELPER.to_string(), RUNTIME_DIR_HELPER.to_string())].into(),
+        network_mode: Some("none".into()),
+        binds: vec![Bind {
+            source: paths::AGENT_RUNTIME_DIR.into(),
+            target: paths::AGENT_RUNTIME_DIR.into(),
+            read_only: true,
+        }],
+        devices: Vec::new(),
+        device_cgroup_rules: Vec::new(),
+        gpus: Vec::new(),
+        cap_add: Vec::new(),
+        security_opt: Vec::new(),
+        init: false,
+        restart: RestartPolicy::No,
+        ports: Vec::new(),
+        healthcheck: Some(Healthcheck {
+            test: vec!["NONE".into()],
+            interval_s: 0,
+            timeout_s: 0,
+            retries: 0,
+            start_period_s: 0,
+        }),
+    }
+}
+
 enum Agent {
     /// Running, missing (`resume` creates it), or stopped by Quasar: nothing to do.
     Fine,
@@ -46,6 +91,57 @@ enum Agent {
 }
 
 impl Actor {
+    /// At every start, before `resume` (#439). The node agent binds `/run/quasar-agent`
+    /// from the host, `/run` is emptied at every boot, and Podman refuses to start a
+    /// container whose bind source is missing (Docker makes it at the start). So the engine
+    /// is asked to create, and the actor removes unstarted, a container with that one bind:
+    /// Podman makes a missing bind source when it creates a container. Only that directory,
+    /// never a home or another source a missing disk could leave absent (#426). Nothing on
+    /// the host is changed by the actor itself, and a failure only logs: the start check
+    /// still re-creates an agent the engine will not start.
+    pub fn make_agent_runtime_dir(&self) {
+        let Some(machine) = self.dir.load_machine().ok().flatten() else {
+            return;
+        };
+        if machine.role == MachineRole::ControlOnly
+            || crate::uninstall::uninstalled(&self.dir).is_some()
+        {
+            return;
+        }
+        let Some(record) = self.dir.load_service(Role::NodeAgent).ok().flatten() else {
+            return;
+        };
+        if !record
+            .spec
+            .binds
+            .iter()
+            .any(|b| b.source == paths::AGENT_RUNTIME_DIR)
+        {
+            return;
+        }
+        // One left by a start that died between create and remove.
+        let _ = self.engine.remove_container(names::RUNTIME_DIR_HELPER);
+        match self
+            .engine
+            .create_container(&runtime_dir_spec(&record.image))
+        {
+            Ok(id) => {
+                if let Err(e) = self.engine.remove_container(&id) {
+                    warn!(
+                        token = "actor-runtime-dir-helper-left",
+                        "could not remove the runtime-directory helper ({e}); the next start removes it"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                token = "actor-runtime-dir-failed",
+                "could not have the engine make the node agent's runtime directory {} ({e}); \
+                 the agent may not start until it exists",
+                paths::AGENT_RUNTIME_DIR
+            ),
+        }
+    }
+
     /// The end of a start, after `resume`: [`Actor::recheck_on_start`], then one line
     /// saying what the engine reports running. Nothing says the services run before the
     /// check has looked (#432); `resumed` false (the error is already logged) says nothing.

@@ -485,6 +485,8 @@ fn actor() -> ExitCode {
     unbound(actor.serve());
     serve_operator(&actor);
 
+    // Before `resume`, which may start the node agent (#438): its runtime directory (#439).
+    actor.make_agent_runtime_dir();
     let resumed = actor.resume();
     if let Err(e) = &resumed {
         error!(
