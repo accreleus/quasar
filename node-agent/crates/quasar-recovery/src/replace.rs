@@ -593,7 +593,10 @@ impl Actor {
         Ok(())
     }
 
-    /// `old_kept`: stop, disable the restart policy, rename `.kept`. Idempotent.
+    /// `old_kept`: disable the restart policy, stop, rename `.kept`. Idempotent. The policy
+    /// goes first (ADR 0007): an old container that exited by itself may be restarted by
+    /// its policy at any moment, and an engine that finds it between two runs may not
+    /// record a stop (Podman, #425). So the stop is made whatever the inspect said.
     pub(crate) fn keep_old(&self, j: &Journal, i: usize) -> Result<(), Halt> {
         let Some(old_id) = j.steps[i].old_container.clone() else {
             return Ok(()); // nothing ran before: nothing to keep
@@ -605,11 +608,6 @@ impl Actor {
         else {
             return Ok(());
         };
-        if old.running {
-            let grace = self.config.timing.stop_grace;
-            self.retrying(|| self.engine.stop_container(&old_id, grace))
-                .map_err(|e| engine(e, Reason::RecreateFailed, "stop the old container"))?;
-        }
         if old.restart != Some(RestartPolicy::No) {
             self.retrying(|| self.engine.set_restart_policy(&old_id, RestartPolicy::No))
                 .map_err(|e| {
@@ -620,6 +618,9 @@ impl Actor {
                     )
                 })?;
         }
+        let grace = self.config.timing.stop_grace;
+        self.retrying(|| self.engine.stop_container(&old_id, grace))
+            .map_err(|e| engine(e, Reason::RecreateFailed, "stop the old container"))?;
         if old.name != kept {
             if let Some(stale) = self
                 .retrying(|| self.engine.inspect_container(&kept))

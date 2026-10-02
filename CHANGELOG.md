@@ -40,6 +40,9 @@ own; the two do not move together, and that is deliberate.
   when a database is restored into a fresh install, the artwork job now fetches the missing
   images again from the reference it already has. An admin's chosen art stays locked. An
   uploaded image can't be fetched again, so the log asks for it to be uploaded once more.
+- **A stopped Quasar service stays stopped on Podman (#425).** Podman restarted a
+  crash-looping service, such as a failed control plane, after Quasar had stopped it. Quasar
+  now disables a service's restart before stopping it and checks that every stop holds.
 
 ## 0.4.0 — 2026-10-02
 

@@ -346,11 +346,17 @@ impl RuntimeClient {
         )
     }
 
-    /// Stop with a grace period; an already stopped container is not an error.
+    /// Stop with a grace period; an already stopped container is not an error. `Ok` means
+    /// stopped and staying stopped, read back on every engine: a crash-looping container
+    /// under `unless-stopped` included, which a plain Podman stop leaves to be restarted
+    /// (#425). One the engine keeps running is `Engine` after
+    /// [`docker::platform::STOP_SETTLE`].
     pub fn stop_container(&self, id: impl Into<String>, grace: Duration) -> Operation<()> {
         let config = self.config().clone();
         let id = id.into();
-        let budget = self.deadline() + grace;
+        // The first stop, then the settle: its last round can start just before the settle
+        // ends and make a read-back, an `init` and a stop, then read back once more.
+        let budget = self.deadline() * 5 + grace * 2 + docker::platform::STOP_SETTLE;
         self.submit_owned(
             async move { docker::platform::stop(&config, &id, grace).await },
             budget,

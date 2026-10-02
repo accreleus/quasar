@@ -701,8 +701,11 @@ impl Actor {
     }
 
     /// `stopping`: the hold first, so nothing starts a control plane from here until the
-    /// restore finishes; then this machine's control plane and any kept one, stopped with
-    /// their restart disabled.
+    /// restore finishes; then this machine's control plane and any kept one, their restart
+    /// disabled, then stopped. The policy goes first (ADR 0007): a control plane that exited
+    /// by itself may be restarted by its policy at any moment, and an engine that finds it
+    /// between two runs may not record a stop (Podman, #425). So the stop is made whatever
+    /// the inspect said.
     fn stop_for_restore(&self, j: &Journal) -> Result<(), Halt> {
         let root = self.dir.root();
         let held = database::load_hold(root).ok().flatten();
@@ -731,13 +734,6 @@ impl Actor {
                     crate::replace::engine(e, Reason::RecreateFailed, "inspect the control plane")
                 })?;
             let Some(c) = found else { continue };
-            if c.running {
-                let grace = self.config.timing.stop_grace;
-                self.retrying(|| self.engine.stop_container(&c.id, grace))
-                    .map_err(|e| {
-                        crate::replace::engine(e, Reason::RecreateFailed, "stop the control plane")
-                    })?;
-            }
             if c.restart != Some(crate::engine::RestartPolicy::No) {
                 self.retrying(|| {
                     self.engine
@@ -751,6 +747,11 @@ impl Actor {
                     )
                 })?;
             }
+            let grace = self.config.timing.stop_grace;
+            self.retrying(|| self.engine.stop_container(&c.id, grace))
+                .map_err(|e| {
+                    crate::replace::engine(e, Reason::RecreateFailed, "stop the control plane")
+                })?;
         }
         Ok(())
     }

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use quasar_recovery::actor::{Actor, ActorConfig, OperatorInputs, ReplaceTiming, TrustConfig};
 use quasar_recovery::engine::{
-    dump_bytes, Behaviour, EngineError, FakeDatabase, FakeEngine, FakeState, Fault, Image,
-    RestartPolicy, When,
+    dump_bytes, Behaviour, CrashLoop, EngineError, FakeDatabase, FakeEngine, FakeState, Fault,
+    Image, PlatformEngine, RestartPolicy, When,
 };
 use quasar_recovery::journal::Phase;
 use quasar_recovery::recipe::names;
@@ -952,6 +952,93 @@ fn an_external_database_is_restored_by_the_operator_then_started_only_on_a_match
         "{}",
         refused.message
     );
+}
+
+/// #425: a failed migrating control plane on the operator's database that crash-loops, a
+/// stop between two of its runs not being recorded (as on Podman), is stopped for good:
+/// its restart is disabled before the stop, so it never runs again and never migrates the
+/// operator's restored backup.
+#[test]
+fn a_crash_looping_failed_control_plane_is_stopped_for_good() {
+    let m = Machine::install(external_env(), false);
+    m.engine.with_state(|s| {
+        s.behaviour.get_mut(&control_image(81)).unwrap().crash_loop = Some(u32::MAX);
+    });
+    let mut req = update(ID, 81);
+    req.external_backup_confirmed = true;
+    let failed = apply(&m.actor(), req);
+    assert_eq!(failed.state, State::Failed, "{failed:?}");
+    assert!(
+        failed.output.contains("stopped with its restart disabled"),
+        "{}",
+        failed.output
+    );
+    assert_eq!(
+        m.engine.state().restarted_after_stop,
+        Vec::<String>::new(),
+        "the engine started the failed control plane again after it was stopped"
+    );
+    let cp = m.control_plane();
+    assert_eq!(cp.spec.image, control_image(81));
+    assert_eq!(cp.status, "exited");
+    assert_eq!(cp.restart, RestartPolicy::No);
+    // The engine acts between calls: nothing starts it again.
+    for _ in 0..4 {
+        m.engine.host().unwrap();
+    }
+    assert_eq!(m.control_plane().starts, cp.starts, "it ran again");
+}
+
+/// #425: the control plane a restore stops exits by itself at every engine call of the
+/// restore in turn and its policy starts it again (a stop between two runs not recorded,
+/// as on Podman). Its restart is disabled before the stop, so no stop is undone and no
+/// control plane runs while the dump is loaded.
+#[test]
+fn a_control_plane_that_exits_at_any_call_of_a_restore_stays_down_for_the_load() {
+    let reference = Machine::install(combined_env(), false);
+    let dump = apply(&reference.actor(), update(ID, 81)).dump.unwrap();
+    let start = reference.engine.calls();
+    run_restore(
+        &reference.actor(),
+        restore_request(&nth_id(9), Some(&dump), Some("0.80.0")),
+    );
+    let total = reference.engine.calls() - start;
+    assert!(total > 10, "the sweep must not be vacuous ({total} calls)");
+
+    for offset in 0..total {
+        let at = format!("exits after call {offset}");
+        let m = Machine::install(combined_env(), false);
+        let dump = apply(&m.actor(), update(ID, 81)).dump.unwrap();
+        let failed = m.control_plane();
+        assert_eq!(failed.status, "running", "{at}");
+        let from_call = m.engine.calls() + offset;
+        m.engine.with_state(|s| {
+            s.crash_loops.insert(
+                failed.id.clone(),
+                CrashLoop {
+                    from_call,
+                    ..Default::default()
+                },
+            );
+        });
+        let result = run_restore(
+            &m.actor(),
+            restore_request(&nth_id(9), Some(&dump), Some("0.80.0")),
+        );
+        assert_eq!(
+            m.engine.state().restarted_after_stop,
+            Vec::<String>::new(),
+            "{at}: the engine started a control plane again after the restore stopped it"
+        );
+        assert_eq!(result.state, State::Succeeded, "{at}: {result:?}");
+        assert_eq!(m.db().schema_version, OLD_SCHEMA, "{at}");
+        assert_eq!(
+            m.control_plane().spec.image,
+            control_image(OLD_SCHEMA),
+            "{at}"
+        );
+        m.never_an_older_control_plane(&at);
+    }
 }
 
 #[test]
