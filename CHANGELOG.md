@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **Read-only mounts stay read-only on Podman, all the way down (#410).** Podman made only
+  the top of a read-only mount read-only, so a disk mounted inside it stayed writable. Quasar
+  now asks Podman for a mount without the submounts and checks it. On Podman, a disk mounted
+  inside a read-only catalog mount is therefore not shown in the app.
 - **Podman older than 5.1 is refused up front (#424).** Podman before 5.1 can't change a
   container's restart policy, so updates failed on it. The quick start and **Add host** now
   stop before pulling anything and name the version, and the host's `runtime_engine` check
