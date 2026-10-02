@@ -2,8 +2,8 @@
 // (#117). Renders nothing; the toast is the whole UI.
 //
 // The question is "would a reload fetch a different bundle?", and only the
-// hashed bundle name answers it. Comparing the baked SOURCE_REF against the
-// control plane's `source_commit` does not: a source-built stack rebuilds
+// hashed bundle name answers it. Comparing a build ref baked into the bundle
+// against the control plane's `source_commit` would not: a source-built stack rebuilds
 // web/dist and the control-plane image from different commits (a `redeploy.sh
 // … web` rebuilds only the SPA), so those differ permanently and the toast
 // would return after every reload, forever.

@@ -827,7 +827,6 @@ for role in "${ROLES[@]}"; do
   if [ "$DF_REL" = "deploy/Dockerfile.control.prod" ]; then
     ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
     ROLE_ARGS+=("SCHEMA_VERSION=$(highest_migration)")
-    [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
   fi
   # Both platform components use the same exact tag. Never stamp the shared
   # toolchain: its content and tag are independent of platform release versions.

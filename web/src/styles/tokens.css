@@ -209,7 +209,6 @@
   --overlay-shadow: oklch(0.05 0.01 267/.76);     /* modal, drawer */
   --modal-scrim: oklch(0.05 0.01 267/.6);
   --drawer-scrim: oklch(0.05 0.01 267/.52);
-  --mono-tile-ink: oklch(1 0 0/.85);
 
   /* ---------- LIGHT-THEME COMPONENT RULES ---------- */
   --light-btn-bg: oklch(1 0 0/.9);
