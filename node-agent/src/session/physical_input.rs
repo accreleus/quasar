@@ -950,12 +950,17 @@ mod tests {
         let held_elsewhere = |want: bool| {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
-                let probe = EvdevHandle::new(open_physical(&node).unwrap());
-                let grabbed_by_us = probe.grab(true).is_ok();
-                if grabbed_by_us {
-                    probe.grab(false).unwrap();
-                }
-                if grabbed_by_us != want {
+                // A fresh node can refuse its opener until the host's device
+                // rule lands (a rootless engine); that is "cannot tell yet".
+                let grabbed_by_us = open_physical(&node).ok().map(|f| {
+                    let probe = EvdevHandle::new(f);
+                    let ok = probe.grab(true).is_ok();
+                    if ok {
+                        probe.grab(false).unwrap();
+                    }
+                    ok
+                });
+                if grabbed_by_us.is_some_and(|ours| ours != want) {
                     return;
                 }
                 assert!(
