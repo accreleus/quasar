@@ -162,7 +162,7 @@ impl Actor {
             Err(Halt::Fail(failure)) if j.steps[i].migrating => self.fail_migrating(j, i, failure),
             Err(Halt::Fail(failure)) => {
                 warn!(
-                    token = "actor-verification-failed",
+                    token = "actor-verifying-restart-refused",
                     request = %j.request.request_id,
                     reason = %failure.reason,
                     "{}; restoring the kept container", failure.detail
