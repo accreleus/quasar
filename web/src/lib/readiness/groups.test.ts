@@ -6,9 +6,10 @@ function c(id: string, status = "pass", summary = id): ReadinessCheck {
   return { id, status, summary, remediation: "" } as ReadinessCheck;
 }
 
-// Every `const ID: &str = "…"` in node-agent/src/readiness.rs,
-// readiness/platform_update.rs, node-agent/src/host_probe.rs, and node-agent/src/diagnostic.rs. A check added
-// or renamed there must be placed here, or it lands in "Other" unnoticed.
+// Every `const ID: &str = "…"` in node-agent/src/readiness.rs, readiness/*.rs,
+// node-agent/src/host_probe.rs, and node-agent/src/diagnostic.rs, plus the RH07 ids of
+// amendment 17 (protocol/agent-api.md §readiness "RH07 checks"). A check added or renamed
+// there must be placed here, or it lands in "Other" unnoticed.
 const AGENT_CHECK_IDS = [
   "updater_socket",
   "health_addr_bindable",
@@ -47,6 +48,18 @@ const AGENT_CHECK_IDS = [
   // #261: host container mounts and NVIDIA driver mount.
   "host_container_mounts",
   "nvidia_driver_mount",
+  // Refresh warning (readiness/report.rs) and the owned-install preflight (readiness/owner_conflict.rs).
+  "readiness_probe",
+  "owner_conflict",
+  // #437: the RH07 engine checks (readiness/runtime_facts.rs), the input rule, and console mode
+  // (readiness/console.rs).
+  "runtime_engine",
+  "engine_restart_on_boot",
+  "engine_healthchecks",
+  "input_device_access",
+  "console_display",
+  "console_audio",
+  "console_ddc",
 ];
 
 describe("readiness groups (#102)", () => {
@@ -66,7 +79,19 @@ describe("readiness groups (#102)", () => {
   it("puts the container runtime checks first, endpoint before what it negotiated", () => {
     expect(READINESS_GROUPS[0].key).toBe("runtime");
     expect(READINESS_GROUPS[0].label).toBe("Container runtime");
-    expect(READINESS_GROUPS[0].ids).toEqual(["startup_cleanup", "policy_journal", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"]);
+    expect(READINESS_GROUPS[0].ids).toEqual([
+      "startup_cleanup",
+      "policy_journal",
+      "readiness_probe",
+      "runtime_endpoint",
+      "runtime_engine",
+      "runtime_api_version",
+      "runtime_capabilities",
+      "runtime_cdi",
+      "engine_restart_on_boot",
+      "engine_healthchecks",
+      "host_container_mounts",
+    ]);
   });
 
   // #256: diagnostic mode's safety check explains the refusal, so it leads the runtime group.
@@ -87,6 +112,36 @@ describe("readiness groups (#102)", () => {
     const { groups } = groupChecks([c("host_container_mounts"), c("render_node")]);
     const runtime = groups.find((g) => g.key === "runtime");
     expect(runtime?.checks.map((x) => x.id)).toContain("host_container_mounts");
+  });
+
+  // #437: RH07's engine checks read with the runtime they describe, as the approved RH07
+  // readiness mock draws them; console mode gets its own group.
+  it("files the RH07 engine checks under Container runtime, never Other", () => {
+    const { groups } = groupChecks([
+      c("engine_restart_on_boot", "fail"),
+      c("runtime_engine", "warn"),
+      c("engine_healthchecks"),
+      c("runtime_endpoint"),
+      c("runtime_cdi_gpu1", "fail"),
+    ]);
+    expect(groups.map((g) => g.key)).toEqual(["runtime"]);
+    expect(groups[0].checks.map((x) => x.id)).toEqual(["runtime_cdi_gpu1", "engine_restart_on_boot", "runtime_engine", "runtime_endpoint", "engine_healthchecks"]);
+  });
+
+  it("files the console mode checks under Console mode, never Other", () => {
+    const { groups } = groupChecks([c("console_ddc"), c("console_display", "fail"), c("console_audio"), c("audio_probe")]);
+    expect(groups.map((g) => [g.key, g.label])).toEqual([
+      ["audio", "Audio"],
+      ["console", "Console mode"],
+    ]);
+    expect(groups[1].checks.map((x) => x.id)).toEqual(["console_display", "console_audio", "console_ddc"]);
+  });
+
+  it("files input_device_access with uinput and the update preflight's owner_conflict under Updates", () => {
+    const { groups } = groupChecks([c("input_device_access"), c("uinput"), c("owner_conflict", "warn"), c("updater_socket")]);
+    expect(groups.find((g) => g.key === "input")?.checks.map((x) => x.id)).toEqual(["uinput", "input_device_access"]);
+    expect(groups.find((g) => g.key === "platform_update")?.checks.map((x) => x.id)).toEqual(["owner_conflict", "updater_socket"]);
+    expect(groups.find((g) => g.key === "other")).toBeUndefined();
   });
 
   it("places nvidia_driver_mount in the nvidia group", () => {
