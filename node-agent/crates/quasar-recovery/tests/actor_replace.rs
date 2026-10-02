@@ -1001,14 +1001,20 @@ fn reboot_mid_verification(
     let actor = Arc::new(Actor::new(engine.clone(), c));
     actor.submit(Caller::Agent, agent_request(ID)).unwrap();
     actor.wait_attempt();
-    assert_eq!(result_of(&actor.status_for(Some(ID))).state, State::Verifying);
+    assert_eq!(
+        result_of(&actor.status_for(Some(ID))).state,
+        State::Verifying
+    );
     drop(actor);
 
     // The reboot: every agent container stopped, and nothing restarts them.
     engine.with_state(|s| {
         for c in s.containers.values_mut() {
             if c.status == "running"
-                && c.spec.labels.get("io.quasar.platform-service").map(String::as_str)
+                && c.spec
+                    .labels
+                    .get("io.quasar.platform-service")
+                    .map(String::as_str)
                     == Some("node-agent")
             {
                 c.status = "exited".into();
@@ -1016,12 +1022,18 @@ fn reboot_mid_verification(
             }
         }
         let refuse = Behaviour {
-            refuse_start: Some("crun: cannot stat `/run/quasar-agent`: No such file or directory".into()),
+            refuse_start: Some(
+                "crun: cannot stat `/run/quasar-agent`: No such file or directory".into(),
+            ),
             ..Default::default()
         };
         s.behaviour.insert(
             NEW_AGENT.into(),
-            if new_starts { healthy() } else { refuse.clone() },
+            if new_starts {
+                healthy()
+            } else {
+                refuse.clone()
+            },
         );
         if !old_starts {
             s.behaviour.insert(AGENT_IMAGE.into(), refuse);
@@ -1031,7 +1043,9 @@ fn reboot_mid_verification(
     let (tx, rx) = std::sync::mpsc::channel();
     let (e, d) = (engine.clone(), dir.path().to_owned());
     std::thread::spawn(move || {
-        let r = actor_with(&e, &d, fast()).resume().map_err(|e| e.to_string());
+        let r = actor_with(&e, &d, fast())
+            .resume()
+            .map_err(|e| e.to_string());
         let _ = tx.send(r);
     });
     rx.recv_timeout(Duration::from_secs(10))
