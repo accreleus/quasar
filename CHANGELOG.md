@@ -54,6 +54,9 @@ own; the two do not move together, and that is deliberate.
   QUASAR_HOME_ROOT=...`, the host switches to the new root and sessions start again. Existing
   homes follow to the same path under the new root, so move their files there first or players
   start with fresh homes.
+- **A stopped Quasar service stays stopped on Podman (#425).** Podman restarted a
+  crash-looping service, such as a failed control plane, after Quasar had stopped it. Quasar
+  now disables a service's restart before stopping it and checks that every stop holds.
 
 ## 0.4.0 — 2026-10-02
 
