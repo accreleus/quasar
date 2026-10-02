@@ -165,12 +165,12 @@ single-host → small multi-host. Costs nothing to defer because the control-pla
 split has existed since Phase 1 — it is packaging, not re-architecture, when revived. See
 `docs/future/kubernetes-native.md`.
 
-> **Roadmap note (updated 2026-07-17 — see `docs/README.md` for the live status).**
+> **Roadmap note (updated 2026-07-17; live status is in the GitHub milestones).**
 > Phases 0–5 are complete (their execution records lived at `docs/completed/`, which
 > was deliberately not carried over to the public repository and is not public in this
 > repo); active work follows the roadmap-spec-v2 wave ladder — a library-provider model
 > + wave ladder, whose source document `docs/design/plans/2026-07-06-roadmap-spec-v2.html`
-> likewise is likewise not public — which supersedes the numbered-phase framing.
+> is likewise not public — which supersedes the numbered-phase framing.
 > Phases 6–8 remain **scope stubs** —
 > each gets thorough exploration + detailed design + tickets **at phase start**, not
 > before. The order of Phases 6–9 is provisional; Phase 8 in particular can be

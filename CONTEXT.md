@@ -284,13 +284,12 @@ phrase names the node agent's own image in `hosts.json` and in
 named for the job it does, never for the technology that happens to be inside
 it. `quasar-vulkan` broke this (it described an encoder path, so it went stale
 the moment a second encode path shipped in the same image and misled anyone
-choosing between it and `quasar-nv`). Current names:
+choosing between it and the since-retired `quasar-nv`). Current names:
 
 | Role | Image | What it is |
 | --- | --- | --- |
 | `control` | `quasar-control-plane` | Control-plane production image |
-| `runtime` | `quasar-node-agent` | Vendor-neutral node agent (AMD/Intel VA + Vulkan) |
-| `nv` | `quasar-nv` | `runtime` + NVIDIA CUDA runtime libs. **Deprecated pending #545** — being retired, not renamed |
+| `runtime` | `quasar-node-agent` | The universal node agent, every GPU vendor. CUDA-built; NVRTC is fetched at run time (#545) |
 | `dev` | `quasar-agent-dev` | Build/test environment; never deployed as an agent |
 | `toolchain` | `quasar-gst-toolchain` | Patched-GStreamer build artefact, tagged by content hash |
 | `profiling` | `quasar-profiling` | PROF-02 capture variant; never validated, never promoted |

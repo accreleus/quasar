@@ -517,11 +517,10 @@ components deep is refused outright.
 `vulkanh264enc` comes from the patched GStreamer 1.28.4 in `deploy/Dockerfile.vulkan`
 (Fedora 43, carrying `deploy/patches/vulkan/vkh264enc-rc-fix.patch` for a post-PLAYING
 rate-control rearm bug upstream hasn't fixed). Since W0 (#367) **every** image lineage
-— `quasar-node-agent`, `quasar-nv`, `dev`, `runtime` — is built from that one Dockerfile
-and shares the patched `/opt/gst`, so there is no separate "Vulkan image" to install:
-the `quasar-nv` CUDA image encodes Vulkan just as well (proven 16/16 sessions on a
-driver-volume NVIDIA host, 2026-08-12). The hostcfg catalog's `encoder` enum accepts
-`"vulkan"` (`control-plane/internal/hostcfg/catalog.go`), so it is also selectable
+— `runtime` (`quasar-node-agent`) and `dev` — is built from that one Dockerfile and
+shares the patched `/opt/gst`, so there is no separate "Vulkan image" to install. The
+`quasar-nv` image is retired (#545): the universal `quasar-node-agent` serves every
+vendor. The hostcfg catalog's `encoder` enum accepts `"vulkan"` (`control-plane/internal/hostcfg/catalog.go`), so it is also selectable
 per-host from the admin Settings page.
 
 #### NVIDIA hosts default to Vulkan
@@ -552,9 +551,11 @@ What this means in practice:
   unpatched build silently uses `nvcudaav1enc` instead of failing the session.
 - **`QUASAR_NVENC_DEFER_TEARDOWN` keys on the session's *effective* encoder**, so
   a session that fell back to NVENC keeps the #489 protection.
-- **This is why the NVIDIA overlay pins the CUDA-bearing `quasar-nv` image.**
-  `quasar-node-agent` is built `CUDA_ENABLE=0` and has no `cudaconvert`, so a session
-  that falls back to the CUDA arm on it would die at pipeline build.
+- **The NVENC fallback needs NVRTC, fetched at run time.** `quasar-node-agent` is
+  CUDA-built; the one library it lacks, `libnvrtc`, is provisioned by
+  `node-agent/src/cuda_runtime.rs` into the driver volume (see `QUASAR_CUDA_RUNTIME`).
+  Without it the `cuda*` elements are absent, the NVENC fallback is unavailable, and
+  Vulkan encode is unaffected.
 - **H.264 is the floor and cannot be removed.** Disabling it on a host with no
   vendor H.264 encoder logs an error and keeps `vulkanh264enc`.
 - **Opting back into NVENC** is `QUASAR_ENCODER=nvenc` in `deploy/.env`, or an admin
