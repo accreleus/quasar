@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-02
+
 Quasar 0.4.0 makes a first deployment much simpler. You paste the quick start's stack
 into Docker, Dockge, Arcane or Unraid, or run its command, and one seed container
 installs Quasar and keeps it running. From then on, updates are applied from the
