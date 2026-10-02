@@ -917,6 +917,12 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **An update interrupted by a reboot no longer leaves a host's agent down (#438).** A machine
+  that rebooted while an agent or control-plane update was verifying came back with the new
+  container stopped, and on Podman nothing starts it at boot. The recovery actor waited for it,
+  then tried to put the old one back, which could fail the same way. The actor now starts the new
+  container itself when it continues the update, verifies it as usual, and restores the old one
+  only if the new one cannot start.
 - **Two test-only fixes.** The site's rootful Podman script test writes its Quadlet unit
   into a temporary directory (`QUASAR_QUADLET_DIR`), never `/etc`; it failed in CI, where
   the tests do not run as root. A runtime client test's fake engine no longer panics when
