@@ -24,6 +24,12 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **Missing cover art is fetched again (#441).** If the artwork cache is lost, for example
+  when a database is restored into a fresh install, the artwork job now fetches the missing
+  images again from the reference it already has. An admin's chosen art stays locked. An
+  uploaded image can't be fetched again, so the log asks for it to be uploaded once more.
+
 ## 0.4.0 — 2026-10-02
 
 Quasar 0.4.0 makes a first deployment much simpler. You paste the quick start's stack

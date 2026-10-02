@@ -213,6 +213,31 @@ func (s *Store) AllApps(ctx context.Context) ([]appRef, error) {
 	return out, rows.Err()
 }
 
+// RecordsWithAssets lists every artwork row that names a cached image — the
+// sweep's check that each named file still exists (#441).
+func (s *Store) RecordsWithAssets(ctx context.Context) ([]Record, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT app_id::text, source, provider, provider_ref, matched_name,
+		       tile_asset, hero_asset, attribution, locked, updated_at
+		FROM app_artwork WHERE tile_asset <> '' OR hero_asset <> ''
+		ORDER BY updated_at
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("artwork: records with assets: %w", err)
+	}
+	defer rows.Close()
+	var out []Record
+	for rows.Next() {
+		var r Record
+		if err := rows.Scan(&r.AppID, &r.Source, &r.Provider, &r.ProviderRef, &r.MatchedName,
+			&r.TileAsset, &r.HeroAsset, &r.Attribution, &r.Locked, &r.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("artwork: scan record: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ReferencedAssets returns every blob name still named by an artwork row —
 // the keep-set for PruneOrphans.
 func (s *Store) ReferencedAssets(ctx context.Context) (map[string]struct{}, error) {
