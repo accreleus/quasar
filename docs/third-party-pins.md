@@ -203,7 +203,7 @@ pool-config leak — ever failed a unit test); an image that merely **builds** w
 contract validation in step 1 also passing; `git apply --check` succeeding for the vendored
 patches (that proves the patch still applies, not that it still does the right thing against the
 new code underneath it); or a bench run against the WRONG image — tag every bench run with the
-pin actually read off the deployed image (`docker inspect quasar-nv:latest --format
+pin actually read off the deployed image (`docker inspect quasar-node-agent:latest --format
 '{{index .Config.Labels "org.quasar.pins.gwd"}}'`), never off the git checkout, for the reason in
 the "Tag a bench run" note below.
 
@@ -236,7 +236,7 @@ the box now does.
 **Tag a bench run with the pin read off the deployed image, never off the git checkout.** In that
 same session a run submitted as `git_quasar=753e4cc9` was in fact measuring the previous build,
 because another agent had advanced the checkout while the containers still ran the earlier images.
-`docker inspect quasar-nv:latest --format '{{index .Config.Labels "org.quasar.pins.gwd"}}'` is the
+`docker inspect quasar-node-agent:latest --format '{{index .Config.Labels "org.quasar.pins.gwd"}}'` is the
 authoritative answer to "what is actually running".
 
 
@@ -268,9 +268,12 @@ truth for the pins, patches, and meson enable-set:
 
 | `--target` | Image tag | Built FROM | Role |
 |---|---|---|---|
-| `runtime` | `quasar-node-agent:latest` | `quasar-base` | vendor-neutral node-agent (AMD/Intel VA + Vulkan) |
+| `runtime` | `quasar-node-agent:latest` | `quasar-base` | the universal node agent, every GPU vendor |
 | `dev` | `quasar-agent-dev:latest` | `build` | build/test env + session app image; **never deployed** |
-| `nv` | `quasar-nv:latest` | **`runtime`** | `runtime` + the NVIDIA CUDA runtime libraries (~275 MB) |
+
+The `nv` target (`quasar-nv`, `runtime` + the CUDA runtime libraries) was **retired by #545
+(2026-08-26)**. The agent now fetches NVRTC at run time (`node-agent/src/cuda_runtime.rs`);
+`deploy/image-contract.json` `_retired_nv_role` records why. The `nv` notes below are history.
 
 **Restructured 2026-07-26** (spec: `docs/design/plans/2026-07-26-image-lineage-consolidation-spec.md`,
 which was deliberately not carried over to the public repository):
@@ -303,9 +306,9 @@ explicit `--target` (a bare build takes the LAST stage regardless of `-t`, which
 contract-validates the result before promoting `:latest`:
 
 ```bash
-deploy/build-images.sh runtime nv        # the two deployable images, validated
-deploy/build-images.sh all               # + dev + control
-deploy/build-images.sh nv --gwd-ref <sha>   # test a compositor re-pin
+deploy/build-images.sh runtime          # the deployable agent image, validated
+deploy/build-images.sh all              # + dev + control
+deploy/build-images.sh runtime --gwd-ref <sha>   # test a compositor re-pin
 ```
 
 The three consolidation ARGs (`CUDA_ENABLE`, `CUDA_PKG_VERSION`) join the existing pin ARGs
@@ -315,12 +318,11 @@ The three consolidation ARGs (`CUDA_ENABLE`, `CUDA_PKG_VERSION`) join the existi
 
 ### Legacy cutover — DONE (2026-07-17)
 
-`Dockerfile.dev` / `Dockerfile.nv` are **deleted**. The operator tags are unchanged —
-`quasar-agent-dev:latest` and `quasar-nv:latest` are now built FROM `Dockerfile.vulkan`
-(`--target dev` / `--target nv`) by `scripts/dev/dev.sh image` and `deploy/build-images.sh`,
-so compose defaults, skills, seed scripts, and existing app-catalog `runtime_spec.image`
-rows all kept working without changes. The `quasar-dev128`/`quasar-nv128` transitional
-names are retired.
+`Dockerfile.dev` / `Dockerfile.nv` are **deleted**. `quasar-agent-dev:latest` is built FROM
+`Dockerfile.vulkan` (`--target dev`) by `scripts/dev/dev.sh image` and `deploy/build-images.sh`.
+`quasar-nv` was built the same way (`--target nv`) until #545 retired it; the universal
+`quasar-node-agent` replaced it. The `quasar-dev128`/`quasar-nv128` transitional names are
+retired.
 
 The Quasar-authored `gst-wayland-display-vulkan-pts.patch` applies to the `43d4c25` checkout,
-i.e. every image on this lineage (`runtime`/`dev`/`nv`) — no longer vulkan-only.
+i.e. every image on this lineage (`runtime`/`dev`) — no longer vulkan-only.
