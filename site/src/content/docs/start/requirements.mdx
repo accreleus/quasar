@@ -13,7 +13,7 @@ import EngineProfiles from '../../../components/EngineProfiles.astro';
 | Component | Requirement |
 | --- | --- |
 | OS | Linux. |
-| Container engine | Docker Engine 20.10+ or Podman. See [Container engines](/quasar/start/requirements/#container-engines) for current support status. |
+| Container engine | Docker Engine 20.10+ or Podman 5.1+. See [Container engines](/quasar/start/requirements/#container-engines) for current support status. |
 | Disk | Allow about 20 GB for container images, then additional space for installed games, saves and user files. Check where your engine stores images as well as your homes disk. |
 | CPU and RAM | Quasar's services have modest overhead. Size the host for the games and number of simultaneous sessions you intend to run; the GPU handles video encoding. The 8 vCPU / 32 GB test host is a test configuration, not a minimum. |
 
@@ -23,6 +23,10 @@ Docker Desktop on macOS or Windows, and WSL, are unsupported.
 
 Quasar runs on Docker and Podman in rootful or rootless mode. Rootless modes and
 rootful Podman remain experimental.
+
+**Podman 5.1 or later.** Older Podman can't change a container's restart policy, which
+installing and updating Quasar need, so the quick start and **Add host** refuse it.
+Ubuntu 24.04 ships Podman 4.9: use Docker there, or a newer Podman.
 
 <EngineProfiles />
 

@@ -204,11 +204,11 @@ jobs:
         include:
           - target: podman-rootful
             known: >-
-              podman-rootful:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
+              podman-rootful:restart=Podman 4.9 has no restart-policy update (Engine); Quasar needs Podman 5.1 and refuses older (#424);
               podman-rootful:stop-crash-loop=a crash-looping unless-stopped service restarts after a stop on Podman (finding from #408)
           - target: podman-rootless
             known: >-
-              podman-rootless:restart=Podman 4.9 - the compat container update refuses a restart policy (Engine);
+              podman-rootless:restart=Podman 4.9 has no restart-policy update (Engine); Quasar needs Podman 5.1 and refuses older (#424);
               podman-rootless:stop-crash-loop=a crash-looping unless-stopped service restarts after a stop on Podman (finding from #408)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

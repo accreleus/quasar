@@ -611,6 +611,29 @@ fn is_ubuntu_2404(version: &str) -> bool {
     version == "24.04" || version.starts_with("24.04.")
 }
 
+/// The oldest Podman Quasar runs on: `engines.podman.minimumVersion` in
+/// `testdata/engine-profiles/profiles.json` (#424). Podman 5.1 is the first whose API can
+/// change a container's restart policy (its compatible update has no such field before, and
+/// 5.0 has no compatible update at all), which installs, updates and recovery rely on.
+pub const PODMAN_MINIMUM_VERSION: &str = "5.1";
+
+/// Is this a Podman older than [`PODMAN_MINIMUM_VERSION`]? A version that does not read as
+/// `major.minor` is not taken as old: the verdict is for what is known.
+fn podman_below_minimum(facts: &EngineFacts) -> bool {
+    fn major_minor(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version
+            .trim()
+            .trim_start_matches('v')
+            .split(['.', '-', '+']);
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    }
+    facts.info.kind == EngineKind::Podman
+        && matches!(
+            (major_minor(&facts.info.version), major_minor(PODMAN_MINIMUM_VERSION)),
+            (Some(have), Some(need)) if have < need
+        )
+}
+
 /// RH-07 decision D5, as far as evidence goes today; the published table is
 /// `testdata/engine-profiles/profiles.json`, and a test holds this function to it row by
 /// row. Rootful Docker is the validated profile on any platform, Unraid included. Docker
@@ -621,6 +644,9 @@ pub fn engine_profile(facts: &EngineFacts, host_os: Option<&HostOs>) -> ProfileS
     // Docker and Podman behave the same across distributions, so every Linux gets the
     // same verdict. Unraid ships only rootful Docker; anything else there is not Unraid's.
     let platform = ProfilePlatform::of(facts, host_os);
+    if podman_below_minimum(facts) {
+        return ProfileStatus::Unsupported;
+    }
     match (facts.info.kind, facts.mode) {
         (EngineKind::Unknown, _) => ProfileStatus::Unsupported,
         (EngineKind::Docker, EngineMode::Rootful) => ProfileStatus::Supported,
@@ -666,6 +692,19 @@ fn check_runtime_engine_inner(view: &RuntimeView, host_os: Option<&HostOs>) -> R
                  hardware; nothing is blocked"
             ),
             alternatives.into(),
+        ),
+        ProfileStatus::Unsupported if podman_below_minimum(facts) => super::warn_check(
+            ENGINE_ID,
+            format!(
+                "{named}, {mode}, on {os}: an unsupported engine profile: older than Podman \
+                 {PODMAN_MINIMUM_VERSION}, the first Podman that can change a container's \
+                 restart policy, which installing and updating Quasar need. Nothing is \
+                 blocked, but updates will fail"
+            ),
+            format!(
+                "Upgrade Podman to {PODMAN_MINIMUM_VERSION} or later (Ubuntu 24.04 ships 4.9), \
+                 or use Docker rootful, the supported profile."
+            ),
         ),
         ProfileStatus::Unsupported => super::warn_check(
             ENGINE_ID,
