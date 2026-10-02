@@ -162,6 +162,9 @@ func (c *Coordinator) resolveHomeSpec(ctx context.Context, app LaunchApp, userID
 		if errors.Is(err, storage.ErrHomeNotProvisioned) {
 			return nil, ErrHomeNotProvisioned
 		}
+		if errors.Is(err, storage.ErrHomeConflict) {
+			return nil, ErrHomeConflict
+		}
 		if err != nil {
 			return nil, fmt.Errorf("require home: %w", err)
 		}
