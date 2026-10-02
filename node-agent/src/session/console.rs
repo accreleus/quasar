@@ -123,6 +123,28 @@ fn weston_output_config(
     Ok(cfg)
 }
 
+/// The mode to write for a pinned `output_id` whose config carries no `mode` (#422):
+/// the output's active mode (what its CRTC runs now), else its DRM-preferred mode,
+/// else its first mode. `None` when the output is absent, disconnected or reports no
+/// modes; the caller then writes no config and weston behaves as before. The control
+/// plane sizes the session with the same rule (`console.ResolveSessionMode`).
+fn pinned_output_mode(
+    output_id: &str,
+    outputs: &[crate::messages::DrmOutputCapability],
+) -> Option<crate::messages::ConsoleModeSelection> {
+    let output = outputs.iter().find(|o| o.id == output_id && o.connected)?;
+    let mode = output
+        .active_mode
+        .as_ref()
+        .or_else(|| output.modes.iter().find(|m| m.preferred))
+        .or_else(|| output.modes.first())?;
+    Some(crate::messages::ConsoleModeSelection {
+        width: mode.width,
+        height: mode.height,
+        refresh_millihz: mode.refresh_millihz,
+    })
+}
+
 /// A running headless weston process + the Wayland socket name it created. Killed
 /// on Drop (every session exit path drops the owning [`super::pipeline::LocalDisplay`]
 /// first — see the runner's reverse-declaration-order teardown).
@@ -339,24 +361,36 @@ pub fn spawn_weston_console(
     // `fullscreen` (see `pipeline::build_local_display_pipeline`). Ships with stock
     // weston (9.0+).
     let config_path = config
-        .and_then(|c| c.output_id.as_deref().zip(c.mode.as_ref()))
-        .map(|(output_id, mode)| -> Result<std::path::PathBuf> {
+        .and_then(|c| c.output_id.as_deref().map(|id| (id, c.mode.clone())))
+        .map(|(output_id, mode)| -> Result<Option<std::path::PathBuf>> {
             // Gather every other connected connector so weston_output_config can
             // emit `mode=off` stanzas for them (see its doc). Uses the narrow
             // `detect_drm_outputs`, not `detect_console_capabilities` — the latter's
             // DDC/CI + audio + input enumeration would eat this fn's 15s budget.
+            let outputs = crate::capacity::detect_drm_outputs();
+            // #422: a pinned output with no configured mode runs at its physical
+            // mode; without a config weston would light every connected output.
+            let Some(mode) = mode.or_else(|| pinned_output_mode(output_id, &outputs)) else {
+                tracing::warn!(
+                    token = "console-pinned-output-mode-unknown",
+                    "console: pinned output {output_id} has no configured mode and no \
+                     detectable one; starting weston without an output config"
+                );
+                return Ok(None);
+            };
             let pinned_connector = output_id.split_once(':').map(|(_, c)| c);
-            let other_connected: Vec<String> = crate::capacity::detect_drm_outputs()
+            let other_connected: Vec<String> = outputs
                 .into_iter()
                 .filter(|o| o.connected && Some(o.connector.as_str()) != pinned_connector)
                 .map(|o| o.connector)
                 .collect();
             let path = Path::new(&xdg).join(format!("weston-console-{session_id}.ini"));
-            let body = weston_output_config(output_id, mode, &other_connected)?;
+            let body = weston_output_config(output_id, &mode, &other_connected)?;
             std::fs::write(&path, body).context("write session-owned Weston config")?;
-            Ok(path)
+            Ok(Some(path))
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
 
     let mut command = std::process::Command::new("weston");
     command.args([
@@ -564,6 +598,186 @@ mod tests {
         assert_eq!(cfg.matches("name=DP-4").count(), 1);
         assert!(!cfg.contains("name=DP-4\nmode=off"));
         assert!(cfg.contains("name=DP-5\nmode=off"));
+    }
+
+    fn drm_mode(
+        width: u16,
+        height: u16,
+        refresh_millihz: u32,
+        preferred: bool,
+    ) -> crate::messages::DrmModeCapability {
+        crate::messages::DrmModeCapability {
+            name: format!("{width}x{height}"),
+            width,
+            height,
+            refresh_millihz,
+            preferred,
+            interlaced: false,
+            clock_khz: 0,
+            htotal: 0,
+            vtotal: 0,
+        }
+    }
+
+    /// 42 modes as a 4K 240 Hz DisplayPort monitor reports them over DRM:
+    /// native 3840x2160 first (preferred at 60 Hz), then scaled and legacy modes.
+    fn four_k_240_modes() -> Vec<crate::messages::DrmModeCapability> {
+        let table: [(u16, u16, u32); 42] = [
+            (3840, 2160, 60_000),
+            (3840, 2160, 239_990),
+            (3840, 2160, 200_000),
+            (3840, 2160, 165_000),
+            (3840, 2160, 144_000),
+            (3840, 2160, 120_000),
+            (3840, 2160, 119_880),
+            (3840, 2160, 100_000),
+            (3840, 2160, 59_940),
+            (3840, 2160, 50_000),
+            (3840, 2160, 30_000),
+            (3840, 2160, 29_970),
+            (3840, 2160, 25_000),
+            (3840, 2160, 24_000),
+            (3840, 2160, 23_976),
+            (2560, 1440, 239_970),
+            (2560, 1440, 165_000),
+            (2560, 1440, 144_000),
+            (2560, 1440, 119_998),
+            (2560, 1440, 59_951),
+            (1920, 1080, 240_000),
+            (1920, 1080, 144_001),
+            (1920, 1080, 120_000),
+            (1920, 1080, 119_880),
+            (1920, 1080, 100_000),
+            (1920, 1080, 60_000),
+            (1920, 1080, 59_940),
+            (1920, 1080, 50_000),
+            (1920, 1080, 30_000),
+            (1920, 1080, 24_000),
+            (1680, 1050, 59_954),
+            (1600, 900, 60_000),
+            (1440, 900, 59_887),
+            (1280, 1024, 75_025),
+            (1280, 1024, 60_020),
+            (1280, 800, 59_810),
+            (1280, 720, 60_000),
+            (1280, 720, 59_940),
+            (1024, 768, 75_029),
+            (1024, 768, 60_004),
+            (800, 600, 60_317),
+            (640, 480, 59_940),
+        ];
+        table
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, h, r))| drm_mode(w, h, r, i == 0))
+            .collect()
+    }
+
+    fn drm_output(
+        id: &str,
+        connected: bool,
+        active_mode: Option<crate::messages::DrmModeCapability>,
+        modes: Vec<crate::messages::DrmModeCapability>,
+    ) -> crate::messages::DrmOutputCapability {
+        let (card, connector) = id.split_once(':').unwrap();
+        crate::messages::DrmOutputCapability {
+            id: id.to_string(),
+            card: card.to_string(),
+            render_node: None,
+            connector: connector.to_string(),
+            connected,
+            active_mode,
+            modes,
+        }
+    }
+
+    // #422: a pinned output with no configured mode resolves to its active mode,
+    // else its preferred one, else its first; absent/disconnected/mode-less -> None.
+    #[test]
+    fn pinned_output_mode_follows_the_physical_display() {
+        assert_eq!(four_k_240_modes().len(), 42);
+        let four_k_240 = drm_output(
+            "card0:DP-4",
+            true,
+            Some(drm_mode(3840, 2160, 239_990, false)),
+            four_k_240_modes(),
+        );
+        let four_k_idle = drm_output("card0:DP-4", true, None, four_k_240_modes());
+        let qhd_119879 = drm_output(
+            "card0:DP-5",
+            true,
+            Some(drm_mode(2560, 1440, 119_879, false)),
+            vec![drm_mode(2560, 1440, 119_879, false)],
+        );
+        let no_flags = drm_output(
+            "card0:DP-5",
+            true,
+            None,
+            vec![
+                drm_mode(2560, 1440, 119_879, false),
+                drm_mode(1920, 1080, 60_000, false),
+            ],
+        );
+        let unplugged = drm_output("card0:DP-4", false, None, four_k_240_modes());
+        let empty = drm_output("card0:DP-4", true, None, vec![]);
+
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            Vec<crate::messages::DrmOutputCapability>,
+            Option<(u16, u16, u32)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "active 4K@240 wins",
+                "card0:DP-4",
+                vec![qhd_119879.clone(), four_k_240.clone()],
+                Some((3840, 2160, 239_990)),
+            ),
+            (
+                "exact millihertz kept",
+                "card0:DP-5",
+                vec![four_k_240.clone(), qhd_119879.clone()],
+                Some((2560, 1440, 119_879)),
+            ),
+            (
+                "idle output -> preferred",
+                "card0:DP-4",
+                vec![four_k_idle],
+                Some((3840, 2160, 60_000)),
+            ),
+            (
+                "no active, no preferred -> first",
+                "card0:DP-5",
+                vec![no_flags],
+                Some((2560, 1440, 119_879)),
+            ),
+            ("absent output", "card1:DP-4", vec![four_k_240], None),
+            ("disconnected output", "card0:DP-4", vec![unplugged], None),
+            ("no modes", "card0:DP-4", vec![empty], None),
+        ];
+        for (name, id, outputs, want) in cases {
+            let got =
+                pinned_output_mode(id, &outputs).map(|m| (m.width, m.height, m.refresh_millihz));
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    // The resolved mode feeds the same weston ini as a configured one, rounded
+    // only at that boundary (119879 mHz -> @120).
+    #[test]
+    fn pinned_output_mode_writes_a_weston_ini() {
+        let outputs = vec![drm_output(
+            "card0:DP-5",
+            true,
+            Some(drm_mode(2560, 1440, 119_879, false)),
+            vec![drm_mode(2560, 1440, 119_879, false)],
+        )];
+        let mode = pinned_output_mode("card0:DP-5", &outputs).unwrap();
+        assert_eq!(
+            weston_output_config("card0:DP-5", &mode, &["DP-4".to_string()]).unwrap(),
+            "[output]\nname=DP-5\nmode=2560x1440@120\n\n[output]\nname=DP-4\nmode=off\n"
+        );
     }
 
     #[test]
