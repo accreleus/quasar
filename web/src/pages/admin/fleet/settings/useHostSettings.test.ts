@@ -26,7 +26,7 @@ import * as adminApi from "../../../../api/admin";
 import type { Host } from "../../../../api/types";
 import { useHostSettings } from "./useHostSettings";
 
-const HOST = { id: "host-1", node_name: "Tower" } as unknown as Host;
+const HOST = { id: "host-1", node_name: "lab-host" } as unknown as Host;
 
 function settingsResponse(overrides: Record<string, boolean | number | string> = {}) {
   return {

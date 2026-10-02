@@ -2518,7 +2518,7 @@ mod tests {
                 "--group-add",
             )
         };
-        // hermes: renderD128 root:render(991), card0 root:video(44).
+        // the aux host: renderD128 root:render(991), card0 root:video(44).
         assert_eq!(
             group_add(&[node("renderD128", 0o660, 991), node("card0", 0o660, 44)]),
             vec!["44", "991"],

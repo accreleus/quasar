@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """scripts/harness/lib/soak_report.py — PROF-03 soak CSV -> leak verdicts + HTML report.
 
-Stdlib only (no numpy/pandas — this has to run on a bare Tower/hermes host with
+Stdlib only (no numpy/pandas — this has to run on a bare lab or aux host with
 whatever python3 docker gives us, and on the operator's Mac with none of those
 installed either).
 
@@ -24,7 +24,7 @@ ever itself classified as a leak series (each climbs by construction between
 restarts). They exist purely to detect a CONTROL-PLANE or NODE-AGENT
 container restart mid-run: a restart resets that container's process uptime
 to ~0, and a restart is itself a leak-candidate signal, not noise to average
-over (issue #420: an agent-only restart — e.g. the Tower 04:01 backup
+over (issue #420: an agent-only restart — e.g. the lab host's 04:01 backup
 restarting the whole stack — used to be invisible, because only cp_uptime_s
 was ever sampled; agent fd/RSS baselines silently reset with no segmentation
 banner). When a restart on EITHER container (or a counter-column reset, e.g.
@@ -1118,7 +1118,7 @@ def _selftest_agent_restart_csv(tmpdir, n=60, restarts=(20, 40), slope=5000.0, s
     """Issue #420 scenario: the NODE-AGENT container restarts mid-run
     (agent_uptime_s decreases, TWICE) while the control plane never does
     (cp_uptime_s climbs monotonically throughout) — the exact D-5 case this
-    ticket fixes: a Tower backup restart of the whole stack, but the old
+    ticket fixes: a lab-host backup restart of the whole stack, but the old
     harness only ever watched cp_uptime_s, so an agent-only restart was
     invisible and agent_rss_kb baselines silently reset with no banner.
 

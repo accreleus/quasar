@@ -57,7 +57,7 @@ node_modules/
 .playwright-mcp/
 .understand-anything/
 
-# P4-07 troubleshooting harness results (generated on hermes, not committed)
+# P4-07 troubleshooting harness results (generated on the aux host, not committed)
 deploy/results/
 
 # make validate — Playwright's downloaded chromium cache (scripts/validate/package.json

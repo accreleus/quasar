@@ -661,7 +661,7 @@ volumes:
   # No `name:` override here (#448). Compose v5 rejects an empty `name:` value
   # outright at `up` — "invalid volume name or ID: value is empty" — for EVERY
   # service, because the volume is a project-level definition; older Compose
-  # (Tower/hermes at the time) treated it as a no-op, which is why this never
+  # (the lab host and the aux host at the time) treated it as a no-op, which is why this never
   # showed up before v5. Worse, `docker compose config` silently DROPS the
   # empty key instead of erroring, so config-based validation cannot catch it.
   # Compose names every volume <project>_<key>.

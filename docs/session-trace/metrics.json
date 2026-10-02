@@ -933,7 +933,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "RVFC",
-      "why": "Receiver-parameter proof that the abs-capture-time RTP header extension was negotiated (0/1). Proven live on Tower 2026-08-05 to be 1 on hosts where captureTime is still absent \u2014 which is why both keys exist."
+      "why": "Receiver-parameter proof that the abs-capture-time RTP header extension was negotiated (0/1). Proven live on the lab host 2026-08-05 to be 1 on hosts where captureTime is still absent \u2014 which is why both keys exist."
     },
     {
       "key": "glass_to_glass_ms",

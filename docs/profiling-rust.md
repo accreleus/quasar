@@ -69,7 +69,7 @@ export QUASAR_PROFILING_IMAGE=quasar-profiling:20260730-2330
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
                -f docker-compose.profiling.yml up -d --force-recreate quasar-node-agent
 
-# hermes (AMD / VA)
+# the aux host (AMD / VA)
 docker compose -f docker-compose.yml -f docker-compose.profiling.yml \
                up -d --force-recreate quasar-node-agent
 ```

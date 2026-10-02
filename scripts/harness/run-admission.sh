@@ -13,7 +13,7 @@
 # per the spec's review finding #18).
 #
 # Usage:
-#   scripts/harness/run-admission.sh [--stack=hermes|tower]
+#   scripts/harness/run-admission.sh [--stack=aux|lab]
 #
 # Env overrides:
 #   API=...                    override the derived control-plane base URL
@@ -52,7 +52,7 @@ source "$ROOT/scripts/harness/lib/harness.sh"
 source "$ROOT/scripts/harness/checks/vram-telemetry.sh"
 
 # ── Args ─────────────────────────────────────────────────────────────────────
-STACK="hermes"
+STACK="aux"
 for a in "$@"; do
   case "$a" in
     --stack=*) STACK="${a#*=}" ;;
@@ -67,10 +67,10 @@ for a in "$@"; do
   esac
 done
 case "$STACK" in
-  hermes) DEFAULT_TLS_PORT=8443 ;;
-  tower) DEFAULT_TLS_PORT=18443 ;;
+  aux) DEFAULT_TLS_PORT=8443 ;;
+  lab) DEFAULT_TLS_PORT=18443 ;;
   *)
-    echo "unknown --stack=$STACK (hermes|tower)" >&2
+    echo "unknown --stack=$STACK (aux|lab)" >&2
     exit 2
     ;;
 esac
@@ -293,11 +293,11 @@ login_test_user() {
 }
 
 # Provisioning the harness user is fiddlier than it looks, and getting it wrong
-# is how this harness failed its first two hermes runs:
+# is how this harness failed its first two aux-host runs:
 #   * /v1/auth/register is INVITE-GATED (W1 LP-SEC-01), so a bare register POST
 #     cannot work. qses gets away with one only because its harness user was
 #     registered by hand before invite-gating landed.
-#   * With registration_mode = `closed` — the default, and what hermes runs —
+#   * With registration_mode = `closed` — the default, and what the aux host runs —
 #     the invite system is off ENTIRELY: minting succeeds (201) but redeeming
 #     the code still returns 403 registration_closed.
 # So: log in if the user already exists (the repeat-run path); otherwise flip
@@ -489,12 +489,12 @@ fi
 # INFORMATIONAL ONLY, and an UPPER BOUND — this sums slots_available across
 # EVERY online GPU, but schedulableBindingSQL (control-plane scheduler)
 # restricts launch candidates to the GPU(s) matching the host's effective
-# encoder (e.g. a Tower running encoder=vulkan is only schedulable on GPU
+# encoder (e.g. a lab host running encoder=vulkan is only schedulable on GPU
 # index 0). So this number is routinely higher than the real number of
 # launches the exhaustion loop below can make before a 503 — it must NEVER be
 # used to predict how many launches "should" succeed (that miscount is what
 # made a real, expected 503 look like a harness setup failure on the first
-# live Tower run of this script).
+# live lab-host run of this script).
 echo "  total available encode slots across all online GPUs (upper bound, IGNORES per-host encoder->GPU binding): $TOTAL_AVAILABLE_SLOTS"
 echo "  max vram_mb_total across online GPUs: $MAX_VRAM_TOTAL"
 echo "  vram_mb_free/vram_sampled_at present in GET /v1/hosts/{id}/gpus: $VRAM_FIELDS_PRESENT"
@@ -648,7 +648,7 @@ else
   # `WHERE g.vram_sample_agent_ms IS NULL OR g.vram_sample_agent_ms < $5` — so
   # pinning it above any real agent timestamp makes every incoming heartbeat a
   # no-op for as long as the harness needs the mutation to hold. Without this,
-  # the <=5s agent heartbeat can (and on the first live Tower run, did)
+  # the <=5s agent heartbeat can (and on the first live lab-host run, did)
   # rewrite vram_mb_free/vram_sampled_at before or during the launch attempt
   # every single time — the window is not winnable by retrying, since one
   # `docker exec psql` round-trip alone can cost more than a second.
@@ -796,7 +796,7 @@ fi
 
 # Cleanly release capacity again before the final no-declared-VRAM check, and
 # WAIT for it to actually free rather than sleeping a fixed guess — on a
-# small fleet (Tower has 2 usable slots once encoder binding is accounted
+# small fleet (the lab host has 2 usable slots once encoder binding is accounted
 # for) a fixed sleep raced the DELETEs and assertion 7 ran against a still-
 # full box, which then misreported "declared VRAM still influences placement"
 # for what was really ordinary slot exhaustion. Poll admin/sessions until
@@ -805,7 +805,7 @@ fi
 # The veto mutation must also be undone here, not left to the cleanup trap: it
 # parks vram_mb_free below the floor on the ONLY schedulable GPU, so assertion 7
 # would launch into an actively-vetoed host and read the resulting
-# capacity_exhausted as "declared VRAM still binds". (Observed on Tower: 
+# capacity_exhausted as "declared VRAM still binds". (Observed on the lab host: 
 # assertion 7 skipped as inconclusive for exactly this reason.)
 if [ "$VRAM_MUTATED" = "1" ]; then
   restore_vram_snapshot

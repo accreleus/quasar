@@ -15,7 +15,7 @@
 # lifetime. See docs/profiling-soak.md for the full rationale and operator
 # procedure.
 #
-# Runs ON THE STACK HOST (Tower or hermes) with docker + psql + curl + wget
+# Runs ON THE STACK HOST (the lab host or the aux host) with docker + psql + curl + wget
 # reachable and python3 on PATH — it drives docker exec / curl against the
 # live compose stack directly. It does not ssh anywhere itself.
 #
@@ -114,7 +114,7 @@ if [ -n "$REPORT_ONLY_CSV" ]; then
   harness_report
 fi
 
-[ -n "$APP" ] || { echo "--app is required (e.g. --app Steam — Tower's known-good app)" >&2; exit 2; }
+[ -n "$APP" ] || { echo "--app is required (e.g. --app Steam — the lab host's known-good app)" >&2; exit 2; }
 
 if [ -z "$OUT_DIR" ]; then
   OUT_DIR="$ROOT/deploy/results/soak-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -278,14 +278,14 @@ login() {
 # the body with `body=$(api_curl ...)`, which runs api_curl in a SUBSHELL, so
 # a variable assigned inside it never reaches the caller. That exact bug made
 # get_app_id compare an empty status against 200 and report "app not found"
-# on a perfect 200 response (caught live on Tower, 2026-07-31 — both review
+# on a perfect 200 response (caught live on the lab host, 2026-07-31 — both review
 # passes missed it because it only bites through the $() boundary). Read the
 # status with api_code, never the variable.
 API_CURL_CODE=""
 API_CURL_CODE_FILE="$(mktemp "${TMPDIR:-/tmp}/soak-api-code.XXXXXX")"
 api_code() { cat "$API_CURL_CODE_FILE" 2>/dev/null; }
 
-# Same subshell-loss class, second instance (both caught live on Tower):
+# Same subshell-loss class, second instance (both caught live on the lab host):
 # launch_session is invoked as L2R=$(launch_session ...), so a CUR_SID assigned
 # inside it dies with the subshell — the caller then saw SID="" every cycle,
 # session_id was blank in the CSV, and teardown_session "" DELETEd /v1/sessions/
@@ -489,11 +489,11 @@ except Exception:
 }
 
 # sample_agent_uptime_s — same idea as sample_cp_uptime_s (finding #9) but
-# for AGENT_CONTAINER (issue #420): the D-5 chain showed a Tower 04:01 backup
+# for AGENT_CONTAINER (issue #420): the D-5 chain showed a lab-host 04:01 backup
 # restarting the whole stack silently reset agent fd/RSS baselines with no
 # segmentation banner, because only cp_uptime_s was ever sampled. Computed
 # the same way (docker inspect .State.StartedAt on the HARNESS host, whatever
-# host that is — Tower or hermes, reached the same way the agent's RSS/fd
+# host that is — the lab host or the aux host, reached the same way the agent's RSS/fd
 # samples already are, i.e. local docker exec/inspect against AGENT_CONTAINER,
 # no separate ssh hop). A DECREASE between consecutive samples means the
 # agent container restarted — soak_report.py segments on it exactly like

@@ -279,7 +279,7 @@ armed," so it reports missing rather than guessing).
 (gpu-test, NVENC) and falls back to summing
 `/sys/class/drm/card*/device/mem_info_vram_used` (AMD sysfs, bytes -> MiB)
 when `nvidia-smi` is unavailable. The AMD fallback path is implemented but
-**has not been exercised against a real AMD host** - hermes (the AMD/VA box)
-is currently off limits for testing (see the "No testing on hermes"
+**has not been exercised against a real AMD host** - the aux host (the AMD/VA box)
+is currently off limits for testing (see the "No testing on the aux host"
 standing note). Treat AMD VRAM numbers from this harness as unverified until
 someone runs it there.

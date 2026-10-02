@@ -18,7 +18,7 @@ function makeHome(overrides: Partial<AdminHome>): AdminHome {
     host_id: "host-1",
     username: "alice",
     app_name: "Steam",
-    host_name: "tower",
+    host_name: "lab-host",
     provider: "local",
     ref: "quasar-home-user-1-app-1",
     bytes_used: 0,

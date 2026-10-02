@@ -20,7 +20,7 @@ describe("HostConsole truthful topology", () => {
     vi.clearAllMocks();
     addToastMock.mockClear();
     vi.mocked(adminApi.getHost).mockResolvedValue({
-      host: { id: "host-1", node_name: "Tower", status: "online", capacity: { active_sessions: 1 } },
+      host: { id: "host-1", node_name: "lab-host", status: "online", capacity: { active_sessions: 1 } },
     } as never);
     vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
       config: {
@@ -77,7 +77,7 @@ describe("HostConsole truthful topology", () => {
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "Local console" })).toBeTruthy());
     expect(screen.getByText("Fleet")).toBeTruthy();
-    expect(screen.getByText(/Local display on Tower with an explicit per-session output topology/)).toBeTruthy();
+    expect(screen.getByText(/Local display on lab-host with an explicit per-session output topology/)).toBeTruthy();
   });
 
   it("disables Discard and Save changes while the draft is clean, and enables them once dirty", async () => {
@@ -288,7 +288,7 @@ describe("HostConsole console access (amendment 18)", () => {
     vi.clearAllMocks();
     addToastMock.mockClear();
     vi.mocked(adminApi.getHost).mockResolvedValue({
-      host: { id: "host-1", node_name: "Tower", status: "online", capacity: { active_sessions: 2 } },
+      host: { id: "host-1", node_name: "lab-host", status: "online", capacity: { active_sessions: 2 } },
     } as never);
     vi.mocked(adminApi.listAdminApps).mockResolvedValue({ items: [] } as never);
     vi.mocked(adminApi.listUsers).mockResolvedValue({ items: [] } as never);
@@ -316,7 +316,7 @@ describe("HostConsole console access (amendment 18)", () => {
     fireEvent.click(await screen.findByRole("switch", { name: "Enabled" }));
 
     expect(await screen.findByRole("dialog")).toBeTruthy();
-    expect(screen.getByText("Turn on console mode on Tower?")).toBeTruthy();
+    expect(screen.getByText("Turn on console mode on lab-host?")).toBeTruthy();
     expect(screen.getByText("2 live sessions")).toBeTruthy();
     expect(adminApi.updateConsoleConfig).not.toHaveBeenCalled();
 
@@ -508,7 +508,7 @@ describe("HostConsole console access (amendment 18)", () => {
     renderPage();
 
     await screen.findByText(/is not prepared for it/);
-    expect(screen.getByText("Run on Tower as root")).toBeTruthy();
+    expect(screen.getByText("Run on lab-host as root")).toBeTruthy();
     expect(screen.getByTestId("console-access-prepare-snippet")).toHaveTextContent(
       "sudo cp deploy/udev/71-quasar-console.rules /etc/udev/rules.d/",
     );
@@ -523,7 +523,7 @@ describe("HostConsole console access (amendment 18)", () => {
   it("restored: host not prepared shows the same device-rules command whatever the engine", async () => {
     vi.mocked(adminApi.getHost).mockResolvedValue({
       host: {
-        id: "host-1", node_name: "Tower", status: "online", capacity: { active_sessions: 2 },
+        id: "host-1", node_name: "lab-host", status: "online", capacity: { active_sessions: 2 },
         engine: "podman", engine_version: "5.6.2", engine_mode: "rootless",
       },
     } as never);

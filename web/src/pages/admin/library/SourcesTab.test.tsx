@@ -65,7 +65,7 @@ function libraryStatus(over: Partial<LibraryStatus> = {}): LibraryStatus {
 function recentScan(over: Partial<LibraryRecentScan> = {}): LibraryRecentScan {
   return {
     user: "alice",
-    host: "hermes",
+    host: "aux-host",
     state: "reported",
     completed_at: "2026-08-01T10:00:00Z",
     observed: 3,
@@ -405,8 +405,8 @@ describe("SourcesTab — scan health", () => {
     mocked.getLibraryStatus.mockResolvedValue(
       libraryStatus({
         recent_scans: [
-          recentScan({ user: "alice", host: "hermes", completed_at: "2026-08-01T12:00:00Z" }),
-          recentScan({ user: "bob", host: "tower", completed_at: "2026-08-01T09:00:00Z" }),
+          recentScan({ user: "alice", host: "aux-host", completed_at: "2026-08-01T12:00:00Z" }),
+          recentScan({ user: "bob", host: "lab-host", completed_at: "2026-08-01T09:00:00Z" }),
         ],
       }),
     );

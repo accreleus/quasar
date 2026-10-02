@@ -220,7 +220,7 @@ harness_note "app_id" "$APP_ID"
 # ── session id travels via a FILE (soak-harness lesson: launch_session was
 #    invoked as SID=$(launch_session ...); a variable set INSIDE that subshell
 #    never reaches the caller, which silently orphaned a session every cycle
-#    on Tower/2026-07-31. Same class as API_CURL_CODE_FILE above — never
+#    on the lab host, 2026-07-31. Same class as API_CURL_CODE_FILE above — never
 #    reintroduce a "capture the id via command substitution from a function
 #    that assigns a global" pattern in this file.) ──────────────────────────
 LAUNCH_SID_FILE="$(mktemp "${TMPDIR:-/tmp}/codec-validate-sid.XXXXXX")"

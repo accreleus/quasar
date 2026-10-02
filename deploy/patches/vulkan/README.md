@@ -180,7 +180,7 @@ landed in two stages:
    like the other encoders (verified live: encoder src caps carry
    `colorimetry=bt709, chroma-site=mpeg2`).
 
-Verified on Tower (RTX 5090): all-intra and 60-frame-GOP captures decode 120/120
+Verified on the lab host (RTX 5090): all-intra and 60-frame-GOP captures decode 120/120
 frames with 0 errors under jellyfin-ffmpeg strict decode (`-err_detect +explode`,
 versus 60/120 and 2/120 pre-fix), `sps_extension_present_flag=0`, all SPS NALs
 byte-identical, host-decode luma timeline flat, and the live node-agent HEVC path
@@ -191,7 +191,7 @@ browser (VideoToolbox) re-test remain outstanding.
 defect set that `vkh264enc-rc-fix.patch` fixes for H.264, and none of the fixes; the
 one node-agent diagnostic that should have caught it could not fire, because
 `rearm_vulkan_rc` warns when `bitrate` is not `GST_PARAM_MUTABLE_PLAYING` and this
-patch *does* set that flag, so everything host-side looked correct. Measured on Tower
+patch *does* set that flag, so everything host-side looked correct. Measured on the lab host
 with `vulkan_rc_retarget_probe.c` before the fix: an 8000 kbps CBR request
 produced **~550 Mbps** at 1080p60 snow (i.e. constant-QP), a retarget to 2000 changed
 nothing that tracked (ratio 0.67), and it emitted an extra key frame one frame after
@@ -256,7 +256,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   `gst_h264_encoder_reset()`, which zeroes `gop.cur_frame_index` — so the very
   next frame is an IDR that restarts the GOP. **This, not the Vulkan session
   reset below, is where the IDR-per-retarget actually came from**; measured on
-  Tower with `vulkan_rc_retarget_probe.c`, `idr-period=60` and a
+  the lab host with `vulkan_rc_retarget_probe.c`, `idr-period=60` and a
   retarget at frame 245 gave key frames at `0 60 120 180 240 246 306 366 426` —
   an extra key one frame after the retarget, with the GOP realigned to it, so
   under sustained ABR the keyframe interval collapses to the retarget interval.
@@ -265,7 +265,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   `_configure_rate_control()`'s rate half) and requests a reset-free re-apply,
   skipping the reconfigure entirely. A pre-`start()` write is unchanged. After:
   `0 60 120 180 240 300 360 420 480`, `RETARGET_VERDICT=PASS`. Confirmed live on
-  Tower under `qnetem` (H.264 1440p60, ABR `smooth`, `idr-period=60`), counting
+  the lab host under `qnetem` (H.264 1440p60, ABR `smooth`, `idr-period=60`), counting
   `gst_h264_encoder_print_gop_structure` — one per `configure()` — in the agent
   log: **11 GOP regenerations for 10 ABR retargets before, 1 for 17 after**.
 
@@ -289,7 +289,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   gave an identical `unexpected_keyframes_after_retarget=1`), and B1 alone would
   update `rc.bitrate` with nothing to deliver it to the driver.
 
-  Measured on Tower (RTX 5090, driver 595.80) with
+  Measured on the lab host (RTX 5090, driver 595.80) with
   `vkvideoencodeav1cbr.c`'s `rcupd-*-midgop`
   cases — the reset-free control path is codec-agnostic, so the AV1 harness
   exercises exactly the library code H.264/H.265 use. **The driver accepts it and
@@ -314,7 +314,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   limitation.
 
 Evidence: see the **G2 entry in `docs/reports/VULKAN-WORKLOG.md`** (probe:
-`g2_bitrate_probe.c`, run on hermes Renoir in
+`g2_bitrate_probe.c`, run on aux-host Renoir in
 `quasar-vulkan:latest`).
 
 **Upstream status:** unreported as of 2026-07-05 — issue to be filed against
@@ -328,7 +328,7 @@ can be the AMD default (issue #367). Stock `1.28.4` `vulkanh264enc` emits **one
 slice per frame** (the element hardcodes `naluSliceEntryCount = 1`; its own source
 carries a `TODO: + support multi-slices`). Over a bursty-loss WiFi path a single
 lost packet destroys the whole frame, and with `idr-period=60` that costs up to a
-full second of received frames — a real-client A/B on hermes Renoir measured the
+full second of received frames — a real-client A/B on aux-host Renoir measured the
 single-slice `vulkanh264enc` stream collapsing to **8-13 received fps** while the
 agent delivered 54-60, whereas `vah264enc` (which emits `num-slices=8`) rode at
 **~50 fps** on the identical path (see the `2026-07-05T14:00Z` SOAK FINDING entry
@@ -347,7 +347,7 @@ driver's `VkVideoEncodeH264CapabilitiesKHR.maxSliceCount` (a `GST_WARNING` is
 logged when clamping). It touches only `ext/vulkan/vkh264enc.c` (no encoder-library
 change — the slice split lives entirely in the element).
 
-Evidence (hermes Renoir, `quasar-vulkan:latest`, `--device /dev/dri`, mounted
+Evidence (aux-host Renoir, `quasar-vulkan:latest`, `--device /dev/dri`, mounted
 rebuilt `libgstvulkan.so`; probe `slice_count_probe.c` counts VCL NALs
 per encoder-src buffer): **Renoir `maxSliceCount = 128`**; `num-slices=1` → 1
 slice/frame (default preserved), `num-slices=8` → exactly 8 slices/frame across
@@ -365,8 +365,8 @@ upstreamable.
 **Diagnostic A/B arm; not an accepted production fix.** Stock GStreamer `1.28.4` stores the
 submission mutex in each `GstVulkanQueue` wrapper. Distinct wrappers can refer to the same raw
 `VkQueue`, so their mutexes would not satisfy Vulkan's external-synchronization rule for that
-handle. Tower normally selects distinct graphics/compute and VIDEO_ENCODE queue families, however,
-so the converter and encoder are expected to use different raw queues. Tower has produced
+handle. The lab host normally selects distinct graphics/compute and VIDEO_ENCODE queue families, however,
+so the converter and encoder are expected to use different raw queues. The lab host has produced
 stochastic Xid 32 failures during session pipeline bring-up, where both queues begin submitting.
 
 This patch changes `gst_vulkan_queue_submit_lock()` / `_unlock()` to use one process-global GLib
@@ -408,7 +408,7 @@ capability probe `intra_refresh_caps_probe.c`):** the two target GPUs expose *di
 mode families, so the shared encoder negotiates in `gst_vulkan_encoder_start()` against
 `VkVideoEncodeIntraRefreshCapabilitiesKHR`:
 
-- **Tower RTX 5090 (NVIDIA 595.80):** only `PER_PICTURE_PARTITION` (maxCycle 64). Chosen as the
+- **Lab-host RTX 5090 (NVIDIA 595.80):** only `PER_PICTURE_PARTITION` (maxCycle 64). Chosen as the
   primary mode; cycle duration = the coded slice count — i.e. the requested `num-slices` clamped to
   the macroblock-row count and `maxIntraRefreshCycleDuration` (the H.264 VU requires cycle ==
   slice count, so the element clamps the requested region hint to mb-rows before start and additionally
@@ -417,7 +417,7 @@ mode families, so the shared encoder negotiates in `gst_vulkan_encoder_start()` 
   among seven P-slices whose index rotates `0..7` with period 8; with `num-slices=50` at 720p the cycle
   clamps to 45 (mb-rows) and the I-slice sweeps `0..44` with period 45 — no extra IDRs, no driver
   rejection.
-- **hermes Renoir (RADV Mesa 25.3.6):** `BLOCK_BASED|BLOCK_ROW_BASED|BLOCK_COLUMN_BASED` (no
+- **Aux-host Renoir (RADV Mesa 25.3.6):** `BLOCK_BASED|BLOCK_ROW_BASED|BLOCK_COLUMN_BASED` (no
   per-picture-partition), `partitionIndependentIntraRefreshRegions=true`, maxCycle 256. Falls back to
   `BLOCK_ROW_BASED` (legal alongside multi-slice because regions are partition-independent); cycle =
   slice count clamped to mb-rows and `maxIntraRefreshCycleDuration` (or 8 when `num-slices=1`). Verified:
@@ -435,7 +435,7 @@ per frame and skips marking a frame as intra-refresh (logging a warning) if the 
 references, so a mis-set reference count degrades to plain P frames rather than a driver error.
 **Consumers that enable intra refresh must therefore run `num-ref-frames=1`** (the node-agent's
 low-latency default) — otherwise the driver's default multi-reference GOP disables intra refresh
-every frame (observed on Tower with the stock 3-reference default).
+every frame (observed on the lab host with the stock 3-reference default).
 
 **Known limitation:** on the per-picture-partition path, `intra-refresh` with `num-slices=1` yields a
 cycle duration of 1 — i.e. every frame is fully intra (all-I), which is not useful. Pair intra
@@ -817,7 +817,7 @@ path, not in GStreamer.
 > (`node-agent/src/session/pipeline/source_branch.rs::pin_vulkan_encode_ring`; resolution
 > spec §7 item 4). `RING=2`, not the single stable slot `RING=1`, is pinned — the single slot starves
 > under the G1 `ParentBufferMeta` buffer-reuse gate below (multi-session spec §2c; rung-2 validated
-> on Tower, 2026-07-25). Uniform encode-src tiling in the compositor would restore full RING
+> on the lab host, 2026-07-25). Uniform encode-src tiling in the compositor would restore full RING
 > parallelism and is worth including in the PR #37 upstream report.
 
 ### `gst-wayland-display-app-cadence.patch`
@@ -837,8 +837,8 @@ The patch applies to the pinned `43d4c25` checkout after the Vulkan PTS patch an
 
 ### `gst-wayland-display-vulkan-nvidia-sync.patch`
 
-**Tower stabilization candidate, pending live A/B validation.** The VulkanImage producer and
-`vulkanh264enc` share GStreamer Vulkan objects and queues. Two plausible causes of Tower's Xid
+**Lab-host stabilization candidate, pending live A/B validation.** The VulkanImage producer and
+`vulkanh264enc` share GStreamer Vulkan objects and queues. Two plausible causes of the lab host's Xid
 13/32 and `VK_ERROR_DEVICE_LOST` are an externally-unsynchronized producer `vkQueueSubmit` and a
 replacement compositor creating a different logical Vulkan device during launcher-to-app swaps.
 The node agent now enforces device continuity; this patch makes the producer participate in
@@ -866,7 +866,7 @@ The patch moves the existing render-fence wait immediately after `render_output(
 readback or `to_gs_buffer()` conversion. This gives the external-memory consumer a completed GLES
 producer without relying on undocumented driver serialization. It removes the now-redundant late
 wait from the caller. This is independent of gst-interpipe and the encoder: an idle compositor's
-first conversion can otherwise race its own GLES render. Tower exposed that race on an RTX 5090
+first conversion can otherwise race its own GLES render. The lab host exposed that race on an RTX 5090
 with NVIDIA 595.80 as Xid 13/32 followed by `VK_ERROR_DEVICE_LOST`; upstream's cited RTX 5080 tests
 used driver 610.43.02 and only about 170 frames, so they do not cover this environment or sustained
 operation.
@@ -887,7 +887,7 @@ Upstream's own `tests/fixture.rs` documents the same failure ("spent hours … w
 at (0,0)") and works around it by calling `on_commit()` manually; this patch applies that fix
 at the production map site. One added call: `window.on_commit()` after `space.map_element()`.
 Applies after the other gst-wayland-display patches (context-adjacent to app-cadence).
-Found 2026-07-19 (Tower Steam kb/mouse regression investigation).
+Found 2026-07-19 (lab-host Steam kb/mouse regression investigation).
 
 ### `gst-wayland-display-fail-closed-renderer.patch`
 
@@ -945,7 +945,7 @@ investigation (see `docs/design/plans/2026-07-19-378-multisession-fail-closed-sp
 
    **Condition, not a one-shot event.** A first design that bumped the counter once per
    failed import (rate-limited to ≤1/5s) turned out to be insufficient: live T6 testing on
-   Tower found that gamescope submits exactly **one** dmabuf, its rejected import makes it
+   the lab host found that gamescope submits exactly **one** dmabuf, its rejected import makes it
    back off permanently (no retry, ever), so exactly one marker was ever emitted — and the
    node-agent's 2-in-30s debounce then never fired, leaving a pure-black session `running`
    forever. `comp::State` now tracks `renderer_degraded_active: Option<Instant>` as a
@@ -1129,7 +1129,7 @@ three call sites + `start()` clone hand-off + `stop()` `clear()`).
 **Unit test (spec §4 rung 1, GPU-free half):** `vulkan_share::tests::
 shares_are_independent_per_element` asserts two `VulkanShare`s are distinct allocations, each
 starts with no device, and clearing one never touches the other. The full "two elements mint
-**distinct** `GstVulkanDevice` pointers" assertion needs a real GPU and is a Tower soak item
+**distinct** `GstVulkanDevice` pointers" assertion needs a real GPU and is a lab-host soak item
 (spec §4 rung 1 / §7 cross-session distinctness log) — `ensure_owned_device` opens a real
 `VkDevice`, so it cannot run headless.
 
@@ -1138,7 +1138,7 @@ starts with no device, and clearing one never touches the other. The full "two e
 | Origin | Quasar (this repo) — not vendored |
 | Patches | `games-on-whales/gst-wayland-display` (compositor core + gst element): `wayland-display-core/src/{utils/vulkan_share.rs,lib.rs,comp/mod.rs}`, `gst-plugin-wayland-display/src/waylandsrc/imp.rs` |
 | Authored against | `43d4c25`, on top of the other seven `gst-wayland-display-*` patches (applies **8th/last**; `nvidia-sync` + `linear-encsrc-fallback` also touch `vulkan_share.rs`) |
-| Verified | `cargo check --workspace` clean + unit test green in `quasar-dev:latest` on hermes (2026-07-25); Tower N-session soak is the spec §4 rung 2-4 gate |
+| Verified | `cargo check --workspace` clean + unit test green in `quasar-dev:latest` on the aux host (2026-07-25); the lab-host N-session soak is the spec §4 rung 2-4 gate |
 | Upstream status | offer as **contribution #6** on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) (spec §6) — the process-global slot blocks any multi-tenant Vulkan use of the element; vendor-neutral |
 
 If `GST_WAYLAND_DISPLAY_REF` moves, re-diff this against the new commit **with the other seven
@@ -1166,7 +1166,7 @@ header then reads as writable even though the memory is in use, so the slot gets
 the encoder — a GPU data hazard in the green-bars / device-loss family. (Michael's intermittent
 green bars on h264+h265 Vulkan sessions, which do **not** correlate with any GPU Xid/reset, are a
 candidate artifact this gate addresses — spec §2c green-bars hook; validated separately by a
-Tower strict-decode before/after capture, not gated on here.)
+lab-host strict-decode before/after capture, not gated on here.)
 
 **What it changes** (`encode_src` path only; VA / RGBx / DMABuf paths byte-identical):
 
@@ -1200,17 +1200,17 @@ and the encoder **sink** pad carries a warn-once probe (`attach_vulkan_parent_me
 flags if the meta was stripped anywhere on `interpipesink → interpipesrc → queue → encoder`
 (a silent gate regression otherwise).
 
-**Smoothness (mandatory Tower A/B, spec §4 rung 2):** the per-frame `parent.copy()` child + the
+**Smoothness (mandatory lab-host A/B, spec §4 rung 2):** the per-frame `parent.copy()` child + the
 drop-and-re-emit path may cost frame pacing; the gate is accepted only if `present_interval_sd_ms`
 and `present_fps` are **not worse** than develop's baseline on identical sessions (#108 present-σ
-rule). Runs on Tower.
+rule). Runs on the lab host.
 
 | Field | Value |
 |---|---|
 | Origin | Quasar (this repo) — not vendored; re-authored from `origin/fix/vulkan-ring-gate` G1 |
 | Patches | `games-on-whales/gst-wayland-display` (compositor core), file `wayland-display-core/src/utils/vulkan_nv12.rs` |
 | Authored against | `43d4c25`, on top of the other eight `gst-wayland-display-*` patches (applies **9th/last**; the `vulkan-pts` patch also touches `to_gst_buffer`) |
-| Verified | `cargo check -p wayland-display-core` clean + GPU-free unit test `parent_meta_tracks_shallow_header_copies_until_last_release` green in `quasar-dev` on hermes (2026-07-25); Tower smoothness A/B + green-bars before/after are the spec §4 rung 2/5 gates |
+| Verified | `cargo check -p wayland-display-core` clean + GPU-free unit test `parent_meta_tracks_shallow_header_copies_until_last_release` green in `quasar-dev` on the aux host (2026-07-25); the lab-host smoothness A/B + green-bars before/after are the spec §4 rung 2/5 gates |
 | Upstream status | offer alongside the vulkan-pts fix on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) — the bare-clone reuse hazard is in PR #37's vulkan output path |
 
 If `GST_WAYLAND_DISPLAY_REF` or the `vulkan-pts` patch moves, re-diff this against the new commit
@@ -1253,7 +1253,7 @@ pointer, so `from_glib_full` consumes a reference the element never owned, leavi
 negotiated caps one short for the rest of the session. Nothing visibly breaks while bug 1 is
 present, because the leaked config copy happens to hold a ref on that same caps. Fix bug 1
 alone and the caps drops below its true count: sessions still connect and decode, but buffers
-are never released and **every** session's pipelines are retained (Tower: VRAM 843 MiB, ~3000
+are never released and **every** session's pipelines are retained (the lab host: VRAM 843 MiB, ~3000
 `GstMemory` and 6 `GstPipeline`s alive after two sessions, plus
 `free_priv_data: object finalizing but still has 1 parents`). The two fixes are therefore a
 single unit; do not split them.
@@ -1261,7 +1261,7 @@ single unit; do not split them.
 **Why the leak resisted the earlier hunt.** With an application-injected per-session context
 (Quasar's ZC-02 zero-copy NVENC path, `node-agent/src/session/cuda_share.rs`) the leaked
 reference meant the session's `GstCudaContext` was never finalized: ~500 MiB VRAM plus one
-`cuda-EvtHandlr` driver thread per session, perfectly linear (Tower, measured 34 -> 542 -> 1000
+`cuda-EvtHandlr` driver thread per session, perfectly linear (the lab host, measured 34 -> 542 -> 1000
 MiB). Two properties hid it:
 
 - **The retaining chain is invisible to the leaks tracer as normally configured.** The repo's
@@ -1295,7 +1295,7 @@ context process-wide.
 | Origin | Quasar (this repo) — not vendored |
 | Patches | `games-on-whales/gst-wayland-display`: `wayland-display-core/src/utils/allocator/cuda/mod.rs`, `gst-plugin-wayland-display/src/waylandsrc/imp.rs` |
 | Authored against | `43d4c25`, on top of the other nine `gst-wayland-display-*` patches (applies **10th/last**; three of them also touch `imp.rs`) |
-| Verified | Tower RTX 5090, `quasar-nv` + `QUASAR_ENCODER=nvenc`, unfiltered `leaks` tracer. Before: +1 alive `GstCudaStream` and +1 `GstCudaContext` ref per session (1 session -> ref-count 2, 2 sessions -> 3). After, 3 sequential sessions: **0** alive `GstCudaStream`, `GstCudaContext` ref-count flat at **1** (the agent's own cached `GstContext`), VRAM flat at 544 MiB, zero GStreamer criticals, every session `DECODE OK` at 59-60 fps |
+| Verified | lab-host RTX 5090, `quasar-nv` + `QUASAR_ENCODER=nvenc`, unfiltered `leaks` tracer. Before: +1 alive `GstCudaStream` and +1 `GstCudaContext` ref per session (1 session -> ref-count 2, 2 sessions -> 3). After, 3 sequential sessions: **0** alive `GstCudaStream`, `GstCudaContext` ref-count flat at **1** (the agent's own cached `GstContext`), VRAM flat at 544 MiB, zero GStreamer criticals, every session `DECODE OK` at 59-60 fps |
 | Upstream status | offer as **finding #8** on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) — matters for any multi-tenant / multi-session CUDA use of `waylanddisplaysrc`, vendor-neutral within the CUDA path |
 
 **Known residual (not addressed here, not caused by this patch):** roughly one `GstCaps` per

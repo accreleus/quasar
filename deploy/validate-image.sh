@@ -6,7 +6,7 @@
 #
 # WHY THIS EXISTS
 #   On 2026-07-26 the production NVIDIA agent image was 7.33GB (84% build toolchain) AND
-#   was missing the pulseaudio daemon, so every Tower session ran with silent audio.
+#   was missing the pulseaudio daemon, so every lab-host session ran with silent audio.
 #   Neither problem was detectable by anything in the repo: that image's Dockerfile stage
 #   was a hand-copy of the `runtime` stage's package list, kept in step by discipline
 #   alone. (The lineage itself is gone — #545 — but the guarantees are not.)
@@ -194,7 +194,7 @@ if [ "$GPU_ON" = 1 ]; then
     nvidia) GPU_ARGS=(--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all) ;;
     dri)    GPU_ARGS=(--device /dev/dri --security-opt seccomp=unconfined) ;;
   esac
-  # A box can have both (Tower: RTX 5090 + AMD iGPU). Add /dev/dri when present.
+  # A box can have both (the lab host: RTX 5090 + AMD iGPU). Add /dev/dri when present.
   if [ "$GPU_KIND" = nvidia ] && [ -e /dev/dri ]; then
     GPU_ARGS+=(--device /dev/dri --security-opt seccomp=unconfined)
   fi

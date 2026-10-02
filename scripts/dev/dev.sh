@@ -91,7 +91,7 @@ case "$cmd" in
     image)
         # Delegates to the single build entrypoint (2026-07-26). This used to be its own
         # `docker build` with `CUDA_ENABLE=0` — a third set of build defaults alongside
-        # build-image.sh and build-agent-tower.sh, which is root cause RC-3 in
+        # build-image.sh and a per-host build-agent script, which is root cause RC-3 in
         # docs/design/plans/2026-07-26-image-lineage-consolidation-spec.md. CUDA_ENABLE is
         # no longer forced off here: the whole lineage is CUDA-built so one /opt/gst and
         # one agent binary serve both vendors, and `dev` shares the same `build` stage.

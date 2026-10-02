@@ -17,7 +17,7 @@
 #      container for /run/quasar/dev-agent-key
 # If none resolve, this fails with a clear message: the target stack needs
 # QUASAR_DEV_AGENT_AUTH=1 set (see docs/configuration.md). A remote/non-local
-# stack (e.g. Tower) has no local docker to exec into — fetch its key with
+# stack (e.g. the lab host) has no local docker to exec into — fetch its key with
 # `ssh <host> 'docker compose exec -T quasar-control-plane cat /run/quasar/dev-agent-key'`
 # (or the stack's own compose service name) and pass it via --key or
 # $QUASAR_DEV_AGENT_KEY.

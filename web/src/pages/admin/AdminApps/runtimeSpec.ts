@@ -6,7 +6,7 @@
 // that will grow — the form only edits the known fields, so every key it does
 // not recognize (e.g. no_new_privileges on GOW desktop images) must survive a
 // parse → edit → serialize round-trip untouched. Dropping unknown keys here is
-// what silently stripped no_new_privileges from the Tower catalog and broke
+// what silently stripped no_new_privileges from the lab host catalog and broke
 // every GOW desktop launch (sudo vs the hardened default).
 
 export interface RuntimeSpec {

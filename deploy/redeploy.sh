@@ -379,7 +379,7 @@ else
   # that was meant to hide the message also hides the cause. That is exactly the
   # bootstrap case this branch exists to handle, so a missing file must read as
   # "no POSTGRES_USER override" and fall through to the default below.
-  # (Never reproduced on Tower/hermes: both have always had a .env.)
+  # (Never reproduced on the lab host or the aux host: both have always had a .env.)
   PG_USER="$( { sed -nE 's/^[[:space:]]*POSTGRES_USER[[:space:]]*=[[:space:]]*([^[:space:]#]+).*/\1/p' "$ENV_FILE" 2>/dev/null || true; } | tail -1)"
   PG_USER="${PG_USER:-quasar}"
   # NOT `$DC ps`: loading the compose file needs the very `:?`-required vars
@@ -737,7 +737,7 @@ fi
 # postgres seconds after the control-plane up created it — under the control
 # plane's FIRST-BOOT migration run on a virgin database, killing the
 # connection mid-migration and leaving schema_migrations dirty (crash-loop:
-# "Dirty database version N. Fix and force version."). Tower/hermes never hit
+# "Dirty database version N. Fix and force version."). The lab host and the aux host never hit
 # it because an already-migrated database's boot migration run is a
 # milliseconds no-op; only a virgin database has a window wide enough.
 #
@@ -751,7 +751,7 @@ fi
 # "connection refused", and the CP --wait below aborts the whole deploy —
 # seconds before it would have succeeded (#467, caught by the first-run
 # acceptance loop). An already-initialized postgres passes this in
-# milliseconds, which is why Tower/hermes never saw it.
+# milliseconds, which is why the lab host and the aux host never saw it.
 # One-time volume ownership repair, for stacks that predate the two control
 # images agreeing on a uid. A named volume takes its ownership from whichever
 # image created it: a stack built from source used to run as ROOT, so
@@ -789,7 +789,7 @@ $DC up -d --force-recreate --no-deps --wait --wait-timeout 300 quasar-control-pl
 if [ "$SCOPE" = all ]; then
   # Recreate the node-agent from the freshly-built, self-contained Vulkan image.
   # `up -d` can return while a dependency-health wait has left the recreated
-  # agent in Docker's Created state (observed repeatedly on Tower). `--wait`
+  # agent in Docker's Created state (observed repeatedly on the lab host). `--wait`
   # makes the deployment contract require the new agent to be running/healthy.
   $DC up -d --force-recreate --no-deps --wait --wait-timeout 60 quasar-node-agent
 fi
@@ -908,7 +908,7 @@ fi
 # Agent must re-register after the recreate. Registration lands a few seconds
 # after the control-plane container comes up (agent reconnect backoff), so poll
 # up to 30s instead of a single grep — a one-shot check raced and false-FAILed
-# redeploy-all's hermes leg, aborting the Tower leg.
+# redeploy-all's aux-host leg, aborting the lab-host leg.
 agent=MISSING
 agent_cid="$($DC ps -q quasar-node-agent 2>/dev/null || true)"
 if [ -z "$agent_cid" ] || [ "$(docker inspect -f '{{.State.Running}}' "$agent_cid" 2>/dev/null || true)" != true ]; then
