@@ -166,16 +166,12 @@ If it exists, the agent must be able to open it for writing. The `uinput` and
 
 ## The agent does not start after a reboot (Podman)
 
-`cannot stat /run/quasar-agent: No such file or directory`: nothing recreates the
-agent's runtime directory at boot. Rootful:
+`cannot stat /run/quasar-agent: No such file or directory`: a reboot emptied `/run`.
 
-```bash
-echo 'd /run/quasar-agent 0755 root root -' | sudo tee /etc/tmpfiles.d/quasar.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
-```
-
-Then start the agent again (`sudo podman start quasar-node-agent`). Rootless: step 4
-of [Install rootless](/quasar/install/rootless/#prepare-the-host-once-as-root).
+| Mode | What to do |
+| --- | --- |
+| Rootful | Nothing. The recovery actor makes the directory and starts the agent when it starts. If it did not, check `sudo podman logs quasar-recovery` for `actor-runtime-dir-failed`, and that `podman-restart.service` is enabled. |
+| Rootless | Step 4 of [Install rootless](/quasar/install/rootless/#prepare-the-host-once-as-root), then `podman start quasar-node-agent` as `quasar`. |
 
 ## A GPU-less host will not start
 

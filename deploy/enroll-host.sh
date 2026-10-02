@@ -782,9 +782,8 @@ if [ "$MODE" = rootless ]; then
 elif [ "$ENGINE" = podman ]; then
   link=/etc/systemd/system/default.target.wants/podman-restart.service
   [ -e "$ROOT$link" ] || [ -L "$ROOT$link" ] || prep_need "Podman's restart at boot (podman-restart.service)"
-  # /run is a tmpfs, and Podman (unlike Docker) never creates a missing bind source:
-  # without this the agent cannot start after a reboot.
-  [ -e "$ROOT/etc/tmpfiles.d/quasar.conf" ] || prep_need "the agent's runtime directory at boot (/etc/tmpfiles.d/quasar.conf)"
+  # The agent's runtime directory needs no step: /run is emptied at every boot, and the
+  # recovery actor has the engine make it again before the agent starts (#439).
 fi
 if [ -n "$prep_missing" ]; then
   if [ "$MODE" = rootless ]; then
@@ -794,9 +793,7 @@ if [ -n "$prep_missing" ]; then
   else
     prep_text="this machine is not prepared for $ENGINE_LABEL rootful yet. Missing: $prep_missing.
   Run once, as root:
-    systemctl enable podman-restart.service
-    echo 'd /run/quasar-agent 0755 root root -' > /etc/tmpfiles.d/quasar.conf
-    systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf"
+    systemctl enable podman-restart.service"
   fi
   if [ "$DRY" = 1 ]; then
     warn "$prep_text"
