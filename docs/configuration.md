@@ -1734,7 +1734,10 @@ second disposable probe that requests the GPU the way the agent's recipe revisio
 before it, always `--gpus all`:
 - **by CDI** (`nvidia.com/gpu=all`) on Podman, and on a Docker that reports an NVIDIA CDI
   device;
-- **by `--gpus all`** on a rootful Docker that reports none;
+- **by `--gpus all`** on a rootful Docker that reports none. An app container asked this
+  way is also given `NVIDIA_DRIVER_CAPABILITIES=compute,utility,display` (#413): the
+  legacy hook behind `--gpus` adds `/dev/nvidia-modeset` only for `display`, and the
+  driver volume's Vulkan driver cannot start without it (CDI always injects it);
 - **not at all** on a rootless Docker that reports none: the agent is installed without the
   NVIDIA shape (`token="actor-gpu-injection-unavailable"`) and readiness `runtime_cdi`
   fails, naming host preparation (`deploy/prepare-host.sh` writes the CDI specification).

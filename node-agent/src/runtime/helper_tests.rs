@@ -2599,6 +2599,7 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         image_volume_identities: None,
         nvidia_params_repair: None,
         gpu_injection: None,
+        nvidia_driver_capabilities: None,
         keep_id: None,
         engine_groups: Vec::new(),
         group_add: None,

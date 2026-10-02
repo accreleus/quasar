@@ -421,19 +421,42 @@ fn group_add(intent: &ApplicationIntent) -> &Vec<String> {
         .unwrap_or(&intent.request.group_add)
 }
 
-/// The request's environment with the agent-owned engine-groups entry: a caller's value
-/// never reaches the image.
+/// What the legacy NVIDIA hook behind Docker's `--gpus` is asked to inject (#413): its
+/// default (`compute,utility`, what it grants a container whose environment names none)
+/// plus `display`, the one capability that adds `/dev/nvidia-modeset`. The NVIDIA Vulkan
+/// driver in the driver volume cannot start without that node; CDI injects it anyway. On
+/// a full-driver host `display` also mounts the host's own graphics libraries, the same
+/// driver version as the volume, which stays first on `LD_LIBRARY_PATH`.
+const GPUS_DRIVER_CAPABILITIES: &str = "compute,utility,display";
+const DRIVER_CAPABILITIES_ENV: &str = "NVIDIA_DRIVER_CAPABILITIES";
+
+/// The capabilities an app container created with `injection` asks the hook for. CDI runs
+/// no hook, so it asks for none.
+fn hook_driver_capabilities(injection: Option<GpuInjection>) -> Option<&'static str> {
+    (injection == Some(GpuInjection::DeviceRequest)).then_some(GPUS_DRIVER_CAPABILITIES)
+}
+
+/// The request's environment with the agent-owned entries (engine groups, and the
+/// `--gpus` driver capabilities): a caller's value for either never reaches the image.
 fn environment(intent: &ApplicationIntent) -> Vec<String> {
+    let capabilities = intent.nvidia_driver_capabilities.as_deref();
     let mut entries: Vec<String> = intent
         .request
         .environment
         .iter()
-        .filter(|e| e.split_once('=').map(|(k, _)| k) != Some(ENGINE_GROUPS_ENV))
+        .filter(|e| {
+            let key = e.split_once('=').map(|(k, _)| k);
+            key != Some(ENGINE_GROUPS_ENV)
+                && (capabilities.is_none() || key != Some(DRIVER_CAPABILITIES_ENV))
+        })
         .cloned()
         .collect();
     if !intent.engine_groups.is_empty() {
         let gids: Vec<String> = intent.engine_groups.iter().map(u32::to_string).collect();
         entries.push(format!("{ENGINE_GROUPS_ENV}={}", gids.join(",")));
+    }
+    if let Some(capabilities) = capabilities {
+        entries.push(format!("{DRIVER_CAPABILITIES_ENV}={capabilities}"));
     }
     canonical_env(&entries)
 }
@@ -1370,6 +1393,8 @@ pub(crate) async fn start(
                 image_volumes: image_config.volumes,
                 image_volume_identities: None,
                 nvidia_params_repair: None,
+                nvidia_driver_capabilities: hook_driver_capabilities(gpu_injection)
+                    .map(str::to_owned),
                 gpu_injection,
                 keep_id,
                 engine_groups: app.engine_groups,
@@ -2205,6 +2230,7 @@ mod app_identity_tests {
             image_volume_identities: None,
             nvidia_params_repair: None,
             gpu_injection: None,
+            nvidia_driver_capabilities: None,
             keep_id,
             engine_groups: Vec::new(),
             group_add: None,
@@ -2317,6 +2343,73 @@ mod app_identity_tests {
         let read: ApplicationIntent = serde_json::from_value(value).unwrap();
         assert!(read.engine_groups.is_empty());
         assert_eq!(group_add(&read), &request().group_add);
+    }
+
+    /// #413: Docker's `--gpus` runs the legacy NVIDIA hook, which grants only the
+    /// capabilities the container's environment names (`compute,utility` when it names
+    /// none, as app images do). Without `display` it leaves out `/dev/nvidia-modeset`, and
+    /// the NVIDIA Vulkan driver in the driver volume cannot start. CDI injects every node.
+    #[test]
+    fn a_gpus_launch_asks_the_legacy_hook_for_the_display_capability() {
+        assert_eq!(
+            hook_driver_capabilities(Some(GpuInjection::DeviceRequest)),
+            Some(GPUS_DRIVER_CAPABILITIES)
+        );
+        assert_eq!(GPUS_DRIVER_CAPABILITIES, "compute,utility,display");
+        assert_eq!(hook_driver_capabilities(Some(GpuInjection::Cdi)), None);
+        assert_eq!(hook_driver_capabilities(None), None);
+
+        let gpus = ApplicationIntent {
+            nvidia_driver_capabilities: Some(GPUS_DRIVER_CAPABILITIES.into()),
+            ..intent(request(), None)
+        };
+        let env = spec(&gpus)["Env"].clone();
+        assert_eq!(
+            env,
+            serde_json::json!([
+                "PUID=1000",
+                "PGID=1000",
+                "NVIDIA_DRIVER_CAPABILITIES=compute,utility,display"
+            ])
+        );
+    }
+
+    #[test]
+    fn the_capabilities_are_agent_owned() {
+        let mut request = request();
+        request
+            .environment
+            .push("NVIDIA_DRIVER_CAPABILITIES=compute".into());
+        let gpus = ApplicationIntent {
+            nvidia_driver_capabilities: Some(GPUS_DRIVER_CAPABILITIES.into()),
+            ..intent(request.clone(), None)
+        };
+        assert_eq!(
+            environment(&gpus)
+                .iter()
+                .filter(|e| e.starts_with("NVIDIA_DRIVER_CAPABILITIES="))
+                .collect::<Vec<_>>(),
+            ["NVIDIA_DRIVER_CAPABILITIES=compute,utility,display"]
+        );
+        // Not decided by the agent: the request's environment passes through untouched.
+        assert!(environment(&intent(request, None))
+            .contains(&"NVIDIA_DRIVER_CAPABILITIES=compute".to_string()));
+    }
+
+    /// A container created before #413 is read back against the environment it was
+    /// created with, so a running session survives the agent that made it.
+    #[test]
+    fn a_journal_from_before_413_asks_for_no_capabilities() {
+        let mut value = serde_json::to_value(ApplicationIntent {
+            gpu_injection: Some(GpuInjection::DeviceRequest),
+            ..intent(request(), None)
+        })
+        .unwrap();
+        assert!(value.get("nvidia_driver_capabilities").is_none());
+        value["phase"] = serde_json::json!("Running");
+        let read: ApplicationIntent = serde_json::from_value(value).unwrap();
+        assert_eq!(read.nvidia_driver_capabilities, None);
+        assert_eq!(environment(&read), ["PUID=1000", "PGID=1000"]);
     }
 }
 
