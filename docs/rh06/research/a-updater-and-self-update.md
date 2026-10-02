@@ -213,7 +213,7 @@ Confirmed facts
   `apply_runner.go:588-654`, `apply_store.go:160-196`. The run still stops `failed` at that host
   (ADR 0004 consequences, `docs/adr/0004-...md:58-60`).
 - If the restore itself fails, no `auto_revert` row; output says "apply the digests in `previous`
-  by hand" — `exec.go:148-151`; plan decision 12 (`docs/superpowers/plans/2026-09-11-185-self-update-hardening.md:26`).
+  by hand" — `exec.go:148-151`; plan decision 12 (the #185 plan, since retired from the tree).
 - Deadline with no agent back ⇒ `timeout` plus operator prose telling them to read the result on
   the host via `docker compose exec quasar-updater curl --unix-socket ...` —
   `apply_timeout.go:22-49`, `:54-57`, `:62-105`, `:110-138`.
@@ -647,7 +647,7 @@ Confirmed facts
   agent holds running sessions for 90 s and reconnects every ≤ 5 s while holding
   (`node-agent/src/agent.rs:2833-2867`, token `sessions-held-for-grace` at `:493`). Live evidence:
   1080p60 held through a 73 s CP outage (`docs/upgrading.md:579-584`) and through an unattended
-  non-migrating apply (`docs/superpowers/plans/2026-09-12-173-live-evidence.md:32-44`).
+  non-migrating apply (the #173 live-evidence record, since retired from the tree).
 - Drain/cordon is the CP's job only (owned admission restrictions) — `apply_runner.go:247-289`,
   `apply_fleet.go:674-809`; the agent "never checks, waits, or refuses" on sessions —
   `protocol/agent-api.md:1294-1296`.
@@ -667,14 +667,14 @@ Confirmed facts
 ## 8. Plans — what shipped, what remains
 
 Confirmed facts
-- **#128 sessions survive CP restart** (`docs/superpowers/plans/2026-09-08-128-sessions-survive-control-plane-restart.md`):
+- **#128 sessions survive CP restart** (the #128 plan, since retired from the tree):
   three phases (CP reconcile instead of reap, agent bounded grace, web mint retry) — `:5-9`. The
   checkboxes are unticked in the file, but the code shipped: `ReapHostExceptRunning`
   (`session/store.go:832`), `sweepStaleHosts` (`session/stale_sweep.go:30`), agent grace
   (`agent.rs:2841-2867`), config knob (`config.go:304`), `docs/configuration.md:69`, and the
   CHANGELOG entry (`CHANGELOG.md:873`); live gate recorded in `docs/upgrading.md:579-584` and the
   173 record.
-- **#185 self-update hardening** (`docs/superpowers/plans/2026-09-11-185-self-update-hardening.md`):
+- **#185 self-update hardening** (the #185 plan, since retired from the tree):
   preflight (#187), updater automatic agent restore (#188, ADR 0004), readiness conformance (#189),
   partial outcome + retry (#190), socket three-way (#184); amendment 9; migration 0083 — `:5-45`.
   Phase H landed: develop `2196ab2` (2026-09-12), amendment 9 on protocol `main` `8a6aed2`; #182
@@ -682,7 +682,7 @@ Confirmed facts
   defect that a restored agent left the attempt `verifying` (fixed by adoption) — `:413-437`
   (file lines 413+). Phases A–G checkboxes are unticked, but their code is present (preflight.go,
   `restoreWorthy`, `auto_revert`, `succeeded_partial`, `retry_of`).
-- **#173 live evidence** (`docs/superpowers/plans/2026-09-12-173-live-evidence.md`): PASS for
+- **#173 live evidence** (the #173 live-evidence record, since retired from the tree): PASS for
   unattended refusal of a migrating release, admin cordon preserved, session streams through an
   unattended non-migrating apply, skip-then-continue, failure with another host offline; deviations
   explained by #201 (timeout when no agent relays) and #200 (no fleet cordon when CP is current) —

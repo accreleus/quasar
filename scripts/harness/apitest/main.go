@@ -174,7 +174,7 @@ func main() {
 
 	// 7c. console-config (CM-01) — no host exists in the ephemeral stack (no agent), so
 	// validate routing + admin-gating + the 404 path + error-envelope schema. The 200
-	// resolved-config shape is covered by the drift test + gets live validation on Tower.
+	// resolved-config shape is covered by the drift test + gets live validation on the lab host.
 	randHost := "00000000-0000-0000-0000-0000000000aa"
 	h.step("console-config unknown host → 404", "GET", "/v1/admin/hosts/"+randHost+"/console-config", adminTok, nil, 404)
 	h.step("console-config PATCH unknown host → 404", "PATCH", "/v1/admin/hosts/"+randHost+"/console-config", adminTok, map[string]any{"enabled": true}, 404)

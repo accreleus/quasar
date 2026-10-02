@@ -12,9 +12,8 @@
    action and selection and says plainly that no surviving rule should
    paint violet-to-cyan, so the brand gradient here is single-hue too.
 
-   Two deliberate deviations from the product tokens, both noted inline:
-   long-form body text is 16px rather than the app's dense 15px, and the
-   screenshot placeholder uses a dot grid that has no app equivalent.
+   One deliberate deviation from the product tokens, noted inline:
+   long-form body text is 16px rather than the app's dense 15px.
    ============================================================ */
 
 /* Self-hosted fonts, same @fontsource packages the product uses. No CDN. */

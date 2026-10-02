@@ -551,7 +551,7 @@ index 4aaaf31..ffdbd6d 100644
 +    /// Per-element ownership, GPU-free half of spec §4 rung 1: two `VulkanShare`s are
 +    /// independent objects (distinct backing storage), each starts with no device, and
 +    /// clearing / mutating one never touches the other. The full "two elements mint **distinct**
-+    /// `GstVulkanDevice` pointers" assertion needs a real GPU and belongs to the Tower soak
++    /// `GstVulkanDevice` pointers" assertion needs a real GPU and belongs to the lab-host soak
 +    /// (§4 rung 1 / §7 cross-session distinctness log) — it cannot run in a headless unit test
 +    /// because `ensure_owned_device` opens a real `VkDevice`.
 +    #[test]

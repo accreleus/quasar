@@ -3,7 +3,7 @@
 # (via `go run`, no images needed), then runs the quasar-apitest validator which
 # drives the /v1 surface and validates every response against protocol/openapi.yaml.
 #
-# Requires only Docker. Nothing touches hermes/Tower. Self-cleans on exit.
+# Requires only Docker. Nothing touches the aux host or the lab host. Self-cleans on exit.
 #
 #   scripts/harness/run-apitest.sh            # boot, test, teardown
 #   KEEP=1 scripts/harness/run-apitest.sh     # leave the stack up for debugging

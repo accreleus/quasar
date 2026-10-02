@@ -2,14 +2,14 @@ package session
 
 // stream_profile_codec_change_test.go — the OTHER door onto the H.264 floor rule.
 //
-// THE INCIDENT THIS FILE EXISTS FOR (2026-07-29, Tower). `stream_profiles.
+// THE INCIDENT THIS FILE EXISTS FOR (2026-07-29, gpu-test). `stream_profiles.
 // 1440p60-h264` had its codec changed h264→hevc through the admin stream-profile
 // API. `1440p60` is the default launch profile for most apps and that rung was its
-// ONLY rung. Tower's host encoder set is [h264, av1]. resolveRung then walked the
+// ONLY rung. gpu-test's host encoder set is [h264, av1]. resolveRung then walked the
 // chain, correctly rejected the rung (`h265!host_encoder`), correctly fired the
 // unconditional floor... and dispatched HEVC anyway, because the TERMINAL rung
 // bypasses every clamp BY DESIGN and that rung was the terminal rung. Every
-// default-profile launch on Tower failed at dispatch.
+// default-profile launch on gpu-test failed at dispatch.
 //
 // The floor rule was enforced when editing a launch profile's rung LIST
 // (resolveRungWrite) and NOT when editing a rung's CODEC — same chains, other
@@ -245,7 +245,7 @@ func TestRungCodecChangeNamesOnlyTheBrokenChain(t *testing.T) {
 // TestRegression1440p60RungFlippedToHEVC reproduces the EXACT production
 // shape, against the SEEDED ladder rather than a synthetic chain: launch profile
 // `1440p60`, whose sole rung is `1440p60-h264`, with that rung's codec flipped
-// h264→hevc. This is the write that bricked Tower; it must now be refused.
+// h264→hevc. This is the write that bricked gpu-test; it must now be refused.
 func TestRegression1440p60RungFlippedToHEVC(t *testing.T) {
 	pool := testDB(t)
 	base, adminTok, _ := newProfileAdminServer(t, pool)
@@ -266,7 +266,7 @@ func TestRegression1440p60RungFlippedToHEVC(t *testing.T) {
 	resp := doJSON(t, "PATCH", base+"/v1/admin/stream-profiles/1440p60-h264", adminTok,
 		map[string]any{"codec": "hevc"})
 	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("the Tower incident write (1440p60-h264 h264→hevc) = %d, want 409 — "+
+		t.Fatalf("the gpu-test incident write (1440p60-h264 h264→hevc) = %d, want 409 — "+
 			"this is the write that made every default-profile launch fail at dispatch", resp.StatusCode)
 	}
 	_, msg := decodeErrorMessage(t, resp)

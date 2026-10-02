@@ -70,7 +70,7 @@ func createProviderApp(t *testing.T, pool *pgxpool.Pool, srv, admin, name string
 
 // TestDerivedTileRoundTripsThroughTheAdminEditor is the §13 Phase 3 requirement
 // that an admin can hand-create a tile through the existing app editor API —
-// "the validated Tower experiment made shippable", with no background job.
+// "the validated gpu-test experiment made shippable", with no background job.
 func TestDerivedTileRoundTripsThroughTheAdminEditor(t *testing.T) {
 	pool := testDB(t)
 	srv, authSvc := newTestServer(t, pool)
@@ -311,7 +311,7 @@ func TestOriginIsReadOnly(t *testing.T) {
 
 // TestDerivedShapeCheckRejectsARuntimeOfItsOwn is the load-bearing CHECK.
 //
-// A validated Tower experiment hardcoded a host path into one tile's
+// A validated gpu-test experiment hardcoded a host path into one tile's
 // runtime_spec.mounts. That is explicitly not the shipping mechanism — it freezes
 // a host path into a fleet-wide catalogue row and stops the tile tracking its
 // parent — and apps_derived_shape_ck exists so nobody can reproduce it. There is

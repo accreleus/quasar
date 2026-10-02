@@ -34,10 +34,10 @@
 #                        qses's own "peer==stack -> use the local API URL" path
 #                        (.claude/skills/quasar-session/scripts/qses) takes over.
 #                        `aux` restores the old default, QSES_PEER_ROLE=aux-infra
-#                        (today's hermes-over-WiFi peer). Changed 2026-08-19 on
+#                        (today's aux-host-over-WiFi peer). Changed 2026-08-19 on
 #                        the peer-path finding (docs/reports/2026-08-19-peer-path/
 #                        REPORT.md): a local peer measured 0.000% drops vs 2.7%
-#                        through hermes, on an otherwise identical cell — every
+#                        through the aux host, on an otherwise identical cell — every
 #                        pre-2026-08-19 browser-side drop number was measuring the
 #                        peer's network/CPU as much as Quasar's own pipeline.
 #                        `--peer aux` is required with --netem: netem shapes the
@@ -278,7 +278,7 @@ export QSES_PEER_ROLE
 
 # Resolve the peer ROLE to a canonical host NAME for tagging, via the same
 # DX_HOSTS_JSON qses itself reads (roles{} then a literal host name) — so old,
-# untagged runs (implicitly hermes) and new ones stay distinguishable by the
+# untagged runs (implicitly the aux host) and new ones stay distinguishable by the
 # `peer=<host>` tag rather than by role, which can rename hosts underneath it.
 # `local` (the DX_HOST sentinel, not a hosts.json entry) resolves to itself.
 dx_peer_host_name() { # dx_peer_host_name <role-or-host>
@@ -1166,7 +1166,7 @@ fi
 SUB=(--warmup-secs "$SETTLE" --dir "$OUT" --suite "$SUITE" --scenario "$SCENARIO" --host "$DX_HOST"
      --tag "launch_profile=$PROFILE" --tag "netem_level=${NETEM:-none}"
      # peer=<resolved host>, not the role: old, untagged runs implicitly ran
-     # against hermes (docs/reports/2026-08-19-peer-path/REPORT.md) — this makes
+     # against the aux host (docs/reports/2026-08-19-peer-path/REPORT.md) — this makes
      # every run from here on distinguishable by which host actually held the
      # WebRTC peer, which drops belong to Quasar's own pipeline.
      --tag "peer=$PEER_HOST")

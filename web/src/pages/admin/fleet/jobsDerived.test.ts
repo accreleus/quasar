@@ -4,7 +4,7 @@ import { hostLabel, rollupTargets, type DerivedTarget } from "./jobsDerived";
 function target(over: Partial<DerivedTarget> = {}): DerivedTarget {
   return {
     host_id: "b7c1e0f2-0000-0000-0000-000000000000",
-    node_name: "tower",
+    node_name: "lab-host",
     running: false,
     next_run_at: null,
     last_run: null,
@@ -24,7 +24,7 @@ function lastRun(finished: string | null, over: Partial<DerivedTarget["last_run"
 
 describe("hostLabel", () => {
   it("names the host by its node name", () => {
-    expect(hostLabel({ host_id: "b7c1e0f2-dead", node_name: "tower" })).toBe("tower");
+    expect(hostLabel({ host_id: "b7c1e0f2-dead", node_name: "lab-host" })).toBe("lab-host");
   });
 
   it("falls back to the short id when the name did not resolve", () => {
@@ -49,22 +49,22 @@ describe("rollupTargets", () => {
   });
 
   it("counts its targets", () => {
-    expect(rollupTargets([target(), target({ host_id: "x", node_name: "hermes" })]).targetCount).toBe(2);
+    expect(rollupTargets([target(), target({ host_id: "x", node_name: "aux-host" })]).targetCount).toBe(2);
   });
 
   it("takes the most recent finished run and names the host it ran on", () => {
     const roll = rollupTargets([
-      target({ node_name: "tower", last_run: lastRun("2026-08-12T02:00:11Z") }),
-      target({ node_name: "hermes", last_run: lastRun("2026-08-12T05:30:00Z", { duration_ms: 41 }) }),
+      target({ node_name: "lab-host", last_run: lastRun("2026-08-12T02:00:11Z") }),
+      target({ node_name: "aux-host", last_run: lastRun("2026-08-12T05:30:00Z", { duration_ms: 41 }) }),
     ]);
-    expect(roll.lastRun?.host).toBe("hermes");
+    expect(roll.lastRun?.host).toBe("aux-host");
     expect(roll.lastRun?.run.duration_ms).toBe(41);
   });
 
   it("ignores a run that has not finished, and a target that has never run", () => {
     const roll = rollupTargets([
-      target({ node_name: "tower", last_run: lastRun(null) }),
-      target({ node_name: "hermes", last_run: null }),
+      target({ node_name: "lab-host", last_run: lastRun(null) }),
+      target({ node_name: "aux-host", last_run: null }),
       target({ node_name: "aux", last_run: lastRun("2026-08-12T05:30:00Z") }),
     ]);
     expect(roll.lastRun?.host).toBe("aux");
@@ -72,10 +72,10 @@ describe("rollupTargets", () => {
 
   it("ignores an unparseable finished_at rather than ranking it first", () => {
     const roll = rollupTargets([
-      target({ node_name: "tower", last_run: lastRun("not a date") }),
-      target({ node_name: "hermes", last_run: lastRun("2026-08-12T05:30:00Z") }),
+      target({ node_name: "lab-host", last_run: lastRun("not a date") }),
+      target({ node_name: "aux-host", last_run: lastRun("2026-08-12T05:30:00Z") }),
     ]);
-    expect(roll.lastRun?.host).toBe("hermes");
+    expect(roll.lastRun?.host).toBe("aux-host");
   });
 
   it("has no last run when no target has finished one", () => {
@@ -84,11 +84,11 @@ describe("rollupTargets", () => {
 
   it("names the first host that is running", () => {
     const roll = rollupTargets([
-      target({ node_name: "tower" }),
-      target({ node_name: "hermes", running: true }),
+      target({ node_name: "lab-host" }),
+      target({ node_name: "aux-host", running: true }),
       target({ node_name: "aux", running: true }),
     ]);
-    expect(roll.runningOn).toBe("hermes");
+    expect(roll.runningOn).toBe("aux-host");
   });
 
   it("reports no running host when every target is idle", () => {
@@ -97,11 +97,11 @@ describe("rollupTargets", () => {
 
   it("takes the earliest queued next run and names its host", () => {
     const roll = rollupTargets([
-      target({ node_name: "tower", next_run_at: "2026-08-12T06:00:00Z" }),
-      target({ node_name: "hermes", next_run_at: "2026-08-12T03:00:00Z" }),
+      target({ node_name: "lab-host", next_run_at: "2026-08-12T06:00:00Z" }),
+      target({ node_name: "aux-host", next_run_at: "2026-08-12T03:00:00Z" }),
       target({ node_name: "aux", next_run_at: null }),
     ]);
-    expect(roll.nextRun).toEqual({ at: "2026-08-12T03:00:00Z", host: "hermes" });
+    expect(roll.nextRun).toEqual({ at: "2026-08-12T03:00:00Z", host: "aux-host" });
   });
 
   it("has no next run when nothing is queued on any host", () => {

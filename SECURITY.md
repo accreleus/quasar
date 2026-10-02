@@ -2,9 +2,14 @@
 
 ## Supported versions
 
-Quasar has no tagged releases yet. `main` is the only supported line, and it moves
-fast. There is no long-term-support branch. If you are running an older commit,
-update to the latest `main` before reporting a problem; it may already be fixed.
+| Line | Supported |
+| --- | --- |
+| The latest [GitHub Release](https://github.com/accreleus/quasar/releases/latest) (`stable`) | Yes |
+| Older releases | No. Update first; it may already be fixed. |
+| `edge` builds (`develop`) | No, but fixes land there first. |
+
+An owned install updates from **Admin ▸ Fleet ▸ Releases**, on the `stable` or `edge`
+channel. There is no long-term-support branch.
 
 ## Reporting a vulnerability
 
@@ -32,7 +37,7 @@ own deployment. Issues in that model still matter: authentication/authorization
 bypass, privilege escalation between users on a shared instance, remote code
 execution, and anything that could compromise a host running the node agent.
 
-Vendored/third-party components (`third_party/`, the pinned `gst-wayland-display`
-and `inputtino` forks, see `docs/third-party-pins.md`) should generally be reported
-upstream as well, but let us know if a Quasar-specific patch or configuration is
-involved.
+Third-party components (the pinned `gst-wayland-display`, `inputtino` and GStreamer
+builds and their patches, pinned in `deploy/Dockerfile.vulkan` and listed in
+`docs/third-party-pins.md`) should generally be reported upstream as well, but let
+us know if a Quasar-specific patch or configuration is involved.

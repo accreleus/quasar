@@ -80,7 +80,7 @@ function hostJob(over: Partial<Job> = {}): Job {
     targets: [
       {
         host_id: "b7c1",
-        node_name: "tower",
+        node_name: "lab-host",
         running: false,
         next_run_at: null,
         last_run: {
@@ -205,7 +205,7 @@ describe("JobsTab — table renders all three job shapes", () => {
     fireEvent.click(
       screen.getByRole("button", { name: /per-host breakdown for Golden-home template warm-up/i }),
     );
-    expect(await screen.findByText("tower")).toBeTruthy();
+    expect(await screen.findByText("lab-host")).toBeTruthy();
     expect(screen.getAllByText("Deferred").length).toBe(2);
   });
 
@@ -314,14 +314,14 @@ describe("JobsTab — a host-scoped job's row is derived from its targets", () =
       targets: [
         {
           host_id: "b7c1",
-          node_name: "tower",
+          node_name: "lab-host",
           running: false,
           next_run_at: "2126-08-12T06:00:00Z",
           last_run: older,
         },
         {
           host_id: "a2f0",
-          node_name: "hermes",
+          node_name: "aux-host",
           running: false,
           next_run_at: "2126-08-12T09:00:00Z",
           last_run: newer,
@@ -338,7 +338,7 @@ describe("JobsTab — a host-scoped job's row is derived from its targets", () =
     await screen.findByText("Golden-home template warm-up");
     // The title carries the host it came from and the exact instant.
     expect(
-      screen.getByTitle("Most recent across 2 hosts, on hermes · 2026-08-12T05:30:02Z"),
+      screen.getByTitle("Most recent across 2 hosts, on aux-host · 2026-08-12T05:30:02Z"),
     ).toBeTruthy();
   });
 
@@ -348,7 +348,7 @@ describe("JobsTab — a host-scoped job's row is derived from its targets", () =
 
     await screen.findByText("Golden-home template warm-up");
     // One in the roll-up row, one in the per-host breakdown once expanded.
-    const chip = screen.getByTitle("Most recent run, on hermes");
+    const chip = screen.getByTitle("Most recent run, on aux-host");
     expect(chip.textContent).toBe("Failed");
     expect(screen.queryByText("See hosts")).toBeNull();
     expect(screen.queryByText("Varies by host")).toBeNull();
@@ -359,7 +359,7 @@ describe("JobsTab — a host-scoped job's row is derived from its targets", () =
     renderPage();
 
     await screen.findByText("Golden-home template warm-up");
-    expect(screen.getByTitle("Soonest of 2 hosts, on tower")).toBeTruthy();
+    expect(screen.getByTitle("Soonest of 2 hosts, on lab-host")).toBeTruthy();
   });
 
   it("lets a running host outrank the most recent finished run", async () => {
@@ -367,8 +367,8 @@ describe("JobsTab — a host-scoped job's row is derived from its targets", () =
       jobsResponse([
         twoTargets({
           targets: [
-            { host_id: "b7c1", node_name: "tower", running: false, next_run_at: null, last_run: older },
-            { host_id: "a2f0", node_name: "hermes", running: true, next_run_at: null, last_run: newer },
+            { host_id: "b7c1", node_name: "lab-host", running: false, next_run_at: null, last_run: older },
+            { host_id: "a2f0", node_name: "aux-host", running: true, next_run_at: null, last_run: newer },
           ],
         }),
       ]),
@@ -376,7 +376,7 @@ describe("JobsTab — a host-scoped job's row is derived from its targets", () =
     renderPage();
 
     await screen.findByText("Golden-home template warm-up");
-    expect(screen.getByTitle("Running on hermes").textContent).toBe("Running");
+    expect(screen.getByTitle("Running on aux-host").textContent).toBe("Running");
   });
 
   it("says Never when no host has finished a run", async () => {
@@ -384,7 +384,7 @@ describe("JobsTab — a host-scoped job's row is derived from its targets", () =
       jobsResponse([
         twoTargets({
           targets: [
-            { host_id: "b7c1", node_name: "tower", running: false, next_run_at: null, last_run: null },
+            { host_id: "b7c1", node_name: "lab-host", running: false, next_run_at: null, last_run: null },
           ],
         }),
       ]),
@@ -472,7 +472,7 @@ describe("JobsTab — row affordances", () => {
     expect(expansion).toBeTruthy();
     // No nested table, so no second mono header row on another column axis.
     expect(expansion?.querySelector("table")).toBeNull();
-    expect(expansion?.querySelector(".eyebrow")?.textContent).toBe("tower");
+    expect(expansion?.querySelector(".eyebrow")?.textContent).toBe("lab-host");
     expect([...expansion!.querySelectorAll(".exp-fact > span:first-child")].map((n) => n.textContent))
       .toEqual(["Last run", "Result", "Next run"]);
     expect(within(expansion as HTMLElement).getByRole("button", { name: "Run now" })).toBeTruthy();

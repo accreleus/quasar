@@ -37,7 +37,6 @@ site/
       Landing.astro         the landing page, sections and its own CSS
       ArchDiagram.astro     the architecture diagram on "How it works"
       QuickStart.astro      the quick-start install generator
-      Placeholder.astro     the screenshot placeholder panel
       Shot.astro            figure wrapper used in docs pages
       VersionSelect.astro   the stable / edge switcher in the header
       SocialIcons.astro     Starlight slot override that renders the switcher

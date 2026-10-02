@@ -247,7 +247,7 @@ func TestVramSampleCappedAtReportedGPUCount(t *testing.T) {
 // attributed to a different physical GPU.
 //
 // A routine capacity report must NOT invalidate — see the sub-test below. That
-// distinction was learned the hard way on hermes.
+// distinction was learned the hard way on the aux host.
 func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 	pool := testPool(t)
 	s := storeWithMintedTokens(pool, nil)
@@ -305,7 +305,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 
 	// A capacity report for an UNCHANGED GPU must PRESERVE the sample. The agent
 	// re-sends capacity on console hotplug, on config_update, and after every
-	// session stop — hermes emits one roughly every 5 s. An earlier revision NULLed
+	// session stop — the aux host emits one roughly every 5 s. An earlier revision NULLed
 	// telemetry on this path too, which erased the sample as fast as the heartbeat
 	// could write it: the admission harness reported "vram_sampled_at is null
 	// (never sampled)" against a host that had been reporting fine minutes earlier.

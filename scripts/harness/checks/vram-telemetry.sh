@@ -17,7 +17,7 @@
 # telemetry" issue #383 claimed already existed, but did not).
 #
 # Usage (standalone):
-#   scripts/harness/checks/vram-telemetry.sh [--stack=hermes|tower] [--staleness=SECS]
+#   scripts/harness/checks/vram-telemetry.sh [--stack=aux|lab] [--staleness=SECS]
 #   API=https://localhost:8443 ADMIN_EMAIL=... ADMIN_PASS=... scripts/harness/checks/vram-telemetry.sh
 #
 # Sourceable: another harness (scripts/harness/run-admission.sh) can `source` this file
@@ -208,7 +208,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   # shellcheck source=scripts/harness/lib/harness.sh
   source "$ROOT/scripts/harness/lib/harness.sh"
 
-  STACK="hermes"
+  STACK="aux"
   VRAM_STALENESS_SECS="${VRAM_STALENESS_SECS:-20}"
   for a in "$@"; do
     case "$a" in
@@ -225,10 +225,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     esac
   done
   case "$STACK" in
-    hermes) DEFAULT_PORT=8080; DEFAULT_TLS_PORT=8443 ;;
-    tower) DEFAULT_PORT=18080; DEFAULT_TLS_PORT=18443 ;;
+    aux) DEFAULT_PORT=8080; DEFAULT_TLS_PORT=8443 ;;
+    lab) DEFAULT_PORT=18080; DEFAULT_TLS_PORT=18443 ;;
     *)
-      echo "unknown --stack=$STACK (hermes|tower)" >&2
+      echo "unknown --stack=$STACK (aux|lab)" >&2
       exit 2
       ;;
   esac

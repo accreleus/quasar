@@ -6004,7 +6004,7 @@ index 0000000..8c8367f
 +   * gst_h265_encoder_reconfigure(). The base class's configure() drains the
 +   * encoder and calls gst_h265_encoder_reset(), which zeroes
 +   * gop.cur_frame_index — so the very next frame is an IDR that restarts the
-+   * GOP. Measured on Tower with deploy/diag/vulkan_rc_retarget_probe.c: with the
++   * GOP. Measured on the lab host with deploy/diag/vulkan_rc_retarget_probe.c: with the
 +   * reconfigure, a retarget emits a key frame 0-1 frames later and realigns
 +   * idr-period to the retarget point, i.e. under sustained ABR the keyframe
 +   * interval collapses to the retarget interval. Removing the video-session

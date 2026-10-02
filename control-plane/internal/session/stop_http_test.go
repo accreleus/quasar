@@ -15,9 +15,9 @@ import (
 )
 
 // HTTP-level regression tests for DELETE /v1/sessions/{id}, pinned after the
-// 2026-07-25 Tower triage: three "DELETE returned 404 while the session was
+// 2026-07-25 gpu-test triage: three "DELETE returned 404 while the session was
 // running" reports turned out to be the qses harness deleting against the wrong
-// stack (hermes) — the server path itself is deterministic. These tests lock
+// stack (the aux host) — the server path itself is deterministic. These tests lock
 // that contract: the DELETE handler is DB-first (store.Get), so a 404 means the
 // row does not exist, full stop. There is no post-launch window where a live
 // session's DELETE can 404, because no in-memory registration is consulted

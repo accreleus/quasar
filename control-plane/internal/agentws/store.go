@@ -422,7 +422,7 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 			        -- the PRIMARY guard on the capacity path: markGPUsStaleSQL above
 			        -- deliberately preserves telemetry, because a capacity report is
 			        -- routine (console hotplug, config_update, every session stop —
-			        -- hermes emits one every ~5 s) and wiping the sample on each one
+			        -- the aux host emits one every ~5 s) and wiping the sample on each one
 			        -- erased it as fast as the heartbeat could write it. Only a real
 			        -- identity change at an index invalidates here; reconnect is
 			        -- handled by markGPUsStaleAndClearVramSQL.

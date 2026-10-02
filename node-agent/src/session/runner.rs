@@ -4491,12 +4491,12 @@ mod tests {
 
     /// The exact text three live sessions failed with. It must classify as a peer
     /// disconnect, NOT as a generic encode failure.
-    const TOWER_20260725_SCTP_ERROR: &str = "encode pipeline error: Could not write to resource. \
+    const GPU_TEST_20260725_SCTP_ERROR: &str = "encode pipeline error: Could not write to resource. \
          (gstsctpenc.c(898): on_sctp_association_state_changed: SCTP association went into error state)";
 
     #[test]
-    fn classifies_the_live_tower_sctp_association_error() {
-        assert!(is_sctp_association_error(TOWER_20260725_SCTP_ERROR));
+    fn classifies_the_live_gpu_test_sctp_association_error() {
+        assert!(is_sctp_association_error(GPU_TEST_20260725_SCTP_ERROR));
         // The GError message alone names nothing: only the debug half carries the
         // signature, so classification MUST run over `error` + `debug` concatenated.
         assert!(!is_sctp_association_error("Could not write to resource."));
@@ -4538,7 +4538,7 @@ mod tests {
     #[test]
     fn sctp_error_is_not_a_vulkan_device_loss() {
         assert!(!super::vulkan_fault::is_device_lost(
-            TOWER_20260725_SCTP_ERROR
+            GPU_TEST_20260725_SCTP_ERROR
         ));
     }
 

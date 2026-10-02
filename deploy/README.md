@@ -244,7 +244,7 @@ part of a normal deployment: it is the managed-certificate option covered under
 
 **`deploy/overlays/` is everything else** — situational and mostly for
 contributors: a laptop-only agentless stack, multi-agent scheduling tests,
-profiling, core dumps, and volume adoption. The one operator-facing member is
+profiling and core dumps. The one operator-facing member is
 `docker-compose.console.yml` (console mode: the GPU host drives its own monitor
 and speakers). [`deploy/overlays/README.md`](overlays/README.md) has the table.
 

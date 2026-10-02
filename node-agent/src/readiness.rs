@@ -1593,7 +1593,7 @@ fn check_host_render_node(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
 ///
 /// The app's supplementary groups are not a guess: the launcher hands it one `--group-add`
 /// per DRM-node group ([`crate::session::container::dri_group_granted`]), so this asks the
-/// question the app will actually face. Probing as root instead false-passed hermes, whose
+/// question the app will actually face. Probing as root instead false-passed the aux host, whose
 /// 0660 root:render node left RADV with permission denied and gamescope dead.
 fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck {
     const ID: &str = "dri_node_app_access";

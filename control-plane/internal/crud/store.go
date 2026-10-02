@@ -348,7 +348,7 @@ func (s *store) listApps(ctx context.Context, callerID, cursor string, limit int
 		-- the custom policy itself (migration 0036 narrowed the CHECK).
 		--
 		-- The COALESCE to apps.default_* is LOAD-BEARING, not vestigial: with no
-		-- global default set (Tower shipped state) an inherit app resolves no
+		-- global default set (gpu-test shipped state) an inherit app resolves no
 		-- profile at all, and the app defaults are the only thing left to display.
 		-- Dropping those columns would render the whole library as zeros.
 		LEFT JOIN stream_profile_policy spp ON true
@@ -441,7 +441,7 @@ func (s *store) getApp(ctx context.Context, callerID, id string) (App, error) {
 		-- the custom policy itself (migration 0036 narrowed the CHECK).
 		--
 		-- The COALESCE to apps.default_* is LOAD-BEARING, not vestigial: with no
-		-- global default set (Tower shipped state) an inherit app resolves no
+		-- global default set (gpu-test shipped state) an inherit app resolves no
 		-- profile at all, and the app defaults are the only thing left to display.
 		-- Dropping those columns would render the whole library as zeros.
 		LEFT JOIN stream_profile_policy spp ON true
@@ -1090,7 +1090,7 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 		-- the custom policy itself (migration 0036 narrowed the CHECK).
 		--
 		-- The COALESCE to apps.default_* is LOAD-BEARING, not vestigial: with no
-		-- global default set (Tower shipped state) an inherit app resolves no
+		-- global default set (gpu-test shipped state) an inherit app resolves no
 		-- profile at all, and the app defaults are the only thing left to display.
 		-- Dropping those columns would render the whole library as zeros.
 		LEFT JOIN stream_profile_policy spp ON true
@@ -1179,7 +1179,7 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 		-- the custom policy itself (migration 0036 narrowed the CHECK).
 		--
 		-- The COALESCE to apps.default_* is LOAD-BEARING, not vestigial: with no
-		-- global default set (Tower shipped state) an inherit app resolves no
+		-- global default set (gpu-test shipped state) an inherit app resolves no
 		-- profile at all, and the app defaults are the only thing left to display.
 		-- Dropping those columns would render the whole library as zeros.
 		LEFT JOIN stream_profile_policy spp ON true

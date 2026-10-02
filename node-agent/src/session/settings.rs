@@ -990,7 +990,7 @@ mod tests {
     fn effective_map_reports_configured_render_node_not_canonical() {
         // host-observability-2: simulate the case that matters — a by-path
         // override whose canonicalization actually resolved to a renderD*
-        // target (the normal Tower-side outcome). effective_map() must report
+        // target (the normal gpu-test-side outcome). effective_map() must report
         // the CONFIGURED (raw) value, not the canonical one, so it stays
         // comparable to the admin UI's resolved/overrides view.
         let mut s = RuntimeSettings::baseline_with(&|_| None);

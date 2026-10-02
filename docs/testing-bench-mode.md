@@ -226,15 +226,15 @@ make bench-run HOST=devbox ARGS="--app 'Quasar Benchapp' --profile 1080p60 \
   default** (changed 2026-08-19): `QSES_PEER_ROLE` is set to the same role/host
   `bench_run.sh` resolved for `HOST`, so `qses` puts the peer on the stack host
   itself. `--peer aux` restores the pre-2026-08-19 default,
-  `QSES_PEER_ROLE=aux-infra` (hermes). The switch is a direct result of a
+  `QSES_PEER_ROLE=aux-infra` (the aux host). The switch is a direct result of a
   2026-08-19 measurement (write-up `docs/reports/2026-08-19-peer-path/REPORT.md`, which
   was deliberately not carried over to the public repository): an otherwise identical cell
-  measured **0.000% missing indices with a local peer vs 2.7% through hermes**
-  — hermes is a WiFi NIC doing software H.264 decode on a weaker CPU, and its
+  measured **0.000% missing indices with a local peer vs 2.7% through the aux host**
+  — the aux host is a WiFi NIC doing software H.264 decode on a weaker CPU, and its
   RTT p95 (136-173 ms) alone is enough to blow the 50 ms jitter buffer, which
   looks exactly like a missing-index gap. **Every browser-side drop number in
   every bench/soak report dated before 2026-08-19 was measured through the
-  hermes peer** (the harness default at the time) and therefore carries the
+  the aux host peer** (the harness default at the time) and therefore carries the
   peer's own network/CPU headroom as well as Quasar's — they are not directly
   comparable to a run made with `--peer local` (the default from here on).
   `--netem` cells still need the peer on the aux-infra side of the shaped link
@@ -242,7 +242,7 @@ make bench-run HOST=devbox ARGS="--app 'Quasar Benchapp' --profile 1080p60 \
   peer never crosses): `bench_run.sh`/`bench_suite.sh` refuse `--netem` +
   `--peer local` outright rather than submit unshaped data under an
   `impaired` label. Every run is tagged `peer=<resolved host>` (and
-  `conditions.peer_host`), so old (implicitly hermes) and new runs stay
+  `conditions.peer_host`), so old (implicitly the aux host) and new runs stay
   distinguishable in `/v1/stats` queries. To reproduce the old peer:
   `make bench-run ARGS='--profile ... --peer aux'`.
 - `scripts/dx/bench_app_samples.py` then folds everything into the two files

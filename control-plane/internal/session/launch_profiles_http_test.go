@@ -333,7 +333,7 @@ func TestAdminDeleteRefusesInUse(t *testing.T) {
 // session body carries `stream_profile_id`, the RUNG the launch resolved to.
 //
 // The value was written to the database and used internally from the first cut,
-// but it never reached the wire: `sessionResp` had no such field, so a Tower gate
+// but it never reached the wire: `sessionResp` had no such field, so a gpu-test gate
 // run had to read Postgres directly to confirm which rung a session got. Phase 6
 // is built on this field. Asserted on BOTH the create response and the read-back,
 // because they are two different serialization paths through the same DTO and a

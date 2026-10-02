@@ -31,7 +31,7 @@
 #                    DX_CP_PORT — that port is what `docker-compose.local.yml`
 #                    (the persistent dev stack, `make up`) also binds, and the
 #                    two stacks can legitimately be up at the same time.
-#   <base-url>       validate a live stack, e.g. https://tower.local:18443.
+#   <base-url>       validate a live stack, e.g. https://<gpu-host>:18443.
 #                    Requires QUASAR_DEV_AGENT_AUTH=1 there and the dev key via
 #                    $QUASAR_DEV_AGENT_KEY (no local boot, no teardown, no
 #                    seeding — this harness does not own that stack's data).

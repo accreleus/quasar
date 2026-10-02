@@ -772,67 +772,6 @@
 
 /* `.mk` (the rail's live/fault marker) moved to shell.css — it is chrome. */
 
-/* Stream-tier badge (TierBadge). Not in the mock; retoken only — the
-   swatch reads accent, never the retired violet-to-cyan ramp. */
-.tier {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s2);
-  height: 26px;
-  padding: 0 var(--s3);
-  border-radius: var(--r-control);
-  font-family: var(--font-mono);
-  font-weight: 600;
-  font-size: var(--t-sm);
-  border: 1px solid var(--line-2);
-  background: var(--surf-raised);
-  color: var(--text);
-}
-
-.tier::before {
-  content: "";
-  width: 14px;
-  height: 11px;
-  border-radius: 2px;
-  background: var(--brand-grad);
-  flex: none;
-}
-
-.tier-hi {
-  border-color: var(--accent-soft-2);
-  background: var(--accent-soft);
-}
-
-.tier-low { color: var(--text-2); }
-.tier-low::before { background: var(--surf-control); }
-
-/* Monogram tile — app art fallback and user avatar (Avatar.tsx). */
-.mono-tile {
-  display: grid;
-  place-content: center;
-  border-radius: var(--r-control);
-  font-family: var(--font-display);
-  font-weight: 600;
-  color: var(--mono-tile-ink);
-  background: var(--brand-grad);
-  border: 1px solid var(--line-2);
-  overflow: hidden;
-  position: relative;
-  flex: none;
-}
-
-.mono-tile.grad { background: var(--brand-grad); }
-
-/* Avatar.tsx sets --avatar-fs from the tile size. */
-.mono-tile.avatar { font-size: var(--avatar-fs, 1em); }
-
-.mono-tile.avatar > img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  border-radius: inherit;
-}
-
 /* Capability pills on a device card. */
 .caps {
   display: flex;
@@ -2402,48 +2341,6 @@ td.cell-actions > * + * {
 /* Here, not admin.css: /styleguide renders KpiRow outside AdminLayout. */
 .kpi-meta.kpi-meta-danger {
   color: var(--danger-text);
-}
-
-/* Stat tile (Stat/StatGrid) — the non-clickable sibling of .kpi. */
-.stat {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s2);
-}
-
-.stat .k {
-  font-family: var(--font-mono);
-  font-size: var(--t-xs);
-  font-weight: 500;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: var(--text-3);
-}
-
-.stat .v {
-  font-family: var(--font-display);
-  font-size: 1.6rem;
-  font-weight: 600;
-  line-height: 1;
-  color: var(--text);
-}
-
-.stat .v small {
-  font-size: .95rem;
-  color: var(--text-2);
-  font-weight: 500;
-  margin-left: var(--s1);
-}
-
-.stat .meta {
-  font-size: var(--t-sm);
-  color: var(--text-3);
-}
-
-.stat-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: var(--s4);
 }
 
 /* Settings row: copy on the left, one control on the right. */

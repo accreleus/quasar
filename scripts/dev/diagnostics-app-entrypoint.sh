@@ -38,7 +38,7 @@ touch "$LOG_FILE" 2>/dev/null || LOG_FILE=/tmp/quasar-diagnostics-app.log
 # found ... Exiting GPU process") and Chromium crash-loops the GPU process, then
 # falls back to CPU rasterization (~12 fps). The ANGLE *desktop-GL* backend
 # (`--use-gl=angle --use-angle=gl`) keeps the GPU process alive on real hardware
-# on both AMD and NVIDIA hosts. Verified on Tower (RTX 5090 + AMD iGPU): with the
+# on both AMD and NVIDIA hosts. Verified on the lab host (RTX 5090 + AMD iGPU): with the
 # NVIDIA glvnd EGL vendor pinned below, ANGLE reports
 # "ANGLE (NVIDIA GeForce RTX 5090 ...)" and the GPU process stays up.
 # (History: prior fixes only toggled --use-gl while keeping the poisoned

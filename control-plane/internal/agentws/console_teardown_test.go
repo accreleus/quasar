@@ -37,7 +37,7 @@ func teardownHandler(t *testing.T, ev Events) *Handler {
 }
 
 // Disabling console mode while an auto-started console session is running must
-// stop that session (Tower console gap, 2026-07-14). A host with no
+// stop that session (gpu-test console gap, 2026-07-14). A host with no
 // console_configs row resolves to the defaults (enabled=false), which is
 // exactly the post-disable state handleConsoleAutoStart re-evaluates when the
 // agent re-sends capacity after the config_update push.

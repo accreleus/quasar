@@ -141,54 +141,22 @@ actual=$(agent_field "svc['environment']['QUASAR_ENCODER']" -- "${BASE[@]}")
 actual=$(QUASAR_ENCODER=nvenc agent_field "svc['environment']['QUASAR_ENCODER']" -- "${NVIDIA[@]}")
 [ "$actual" = "nvenc" ] || fail "operator QUASAR_ENCODER does not flow through the nvidia chain (got $actual)"
 
-# ── 7. Volume-name adoption ──────────────────────────────────────────────────
-# The base file itself must NEVER carry a `name:` override (#448: Compose v5
-# rejects an empty `name:` value at `up` — "invalid volume name or ID: value is
-# empty" — for every service, since the volume is a project-level definition;
-# `docker compose config` silently drops the empty key instead of erroring, so
-# this class of defect renders clean and only breaks at `up`). The override now
-# lives ONLY in the opt-in deploy/overlays/docker-compose.adopt-volumes.yml overlay.
+# ── 7. The base file carries no volume `name:` override ───────────────────────
+# #448: Compose v5 rejects an empty `name:` value at `up` — "invalid volume name
+# or ID: value is empty" — for every service, since the volume is a project-level
+# definition; `docker compose config` silently drops the empty key instead of
+# erroring, so this class of defect renders clean and only breaks at `up`.
 #
 # `config` always resolves a concrete `name` (Compose's own <project>_<key>
-# default), even with no override in the file — so "absent name key" is not a
-# thing to assert on the base chain. What must hold is that the base chain
-# IGNORES QUASAR_POSTGRES_VOLUME entirely: setting it must not change the
-# resolved name, proving the base file has no `${QUASAR_POSTGRES_VOLUME}`
-# reference left in it at all.
+# default), so "absent name key" is not a thing to assert. What must hold is that
+# the base chain IGNORES QUASAR_POSTGRES_VOLUME entirely: setting it must not
+# change the resolved name, proving the base file has no `${QUASAR_POSTGRES_VOLUME}`
+# reference in it at all.
 default_name=$(render "${BASE[@]}" | python3 -c "
 import json,sys; print(json.load(sys.stdin)['volumes']['quasar-postgres-data']['name'])")
 name=$(QUASAR_POSTGRES_VOLUME=should_be_ignored render "${BASE[@]}" | python3 -c "
 import json,sys; print(json.load(sys.stdin)['volumes']['quasar-postgres-data']['name'])")
-[ "$name" = "$default_name" ] || fail "base compose file still honours QUASAR_POSTGRES_VOLUME ($name) — the override belongs only in docker-compose.adopt-volumes.yml"
-
-# Applying the overlay without all three required vars must fail closed, not
-# fall back to defaults or adopt only some volumes — `:?` gives an actionable
-# per-var error rather than a silent partial adoption.
-ADOPT=("${BASE[@]}" -f deploy/overlays/docker-compose.adopt-volumes.yml)
-if POSTGRES_PASSWORD=test JWT_SECRET=test \
-    docker compose "${ADOPT[@]}" config --format json >/dev/null 2>&1; then
-  fail "adopt-volumes overlay rendered with no QUASAR_*_VOLUME vars set — should have failed on the ':?' required vars"
-fi
-
-# With all three set, every name must be used verbatim — this is what lets a
-# stack that was previously on a forked compose file keep its existing data
-# volumes instead of silently starting against an empty database.
-adopt_render() {
-  POSTGRES_PASSWORD=test JWT_SECRET=test \
-    QUASAR_POSTGRES_VOLUME=legacy_pg_volume \
-    QUASAR_AGENT_VOLUME=legacy_agent_volume \
-    QUASAR_CONTROL_VOLUME=legacy_tls_volume \
-    docker compose "${ADOPT[@]}" config --format json
-}
-name=$(adopt_render | python3 -c "
-import json,sys; print(json.load(sys.stdin)['volumes']['quasar-postgres-data']['name'])")
-[ "$name" = "legacy_pg_volume" ] || fail "QUASAR_POSTGRES_VOLUME was not honoured under the adopt overlay (got $name)"
-name=$(adopt_render | python3 -c "
-import json,sys; print(json.load(sys.stdin)['volumes']['quasar-agent-data']['name'])")
-[ "$name" = "legacy_agent_volume" ] || fail "QUASAR_AGENT_VOLUME was not honoured under the adopt overlay (got $name)"
-name=$(adopt_render | python3 -c "
-import json,sys; print(json.load(sys.stdin)['volumes']['quasar-control-tls']['name'])")
-[ "$name" = "legacy_tls_volume" ] || fail "QUASAR_CONTROL_VOLUME was not honoured under the adopt overlay (got $name)"
+[ "$name" = "$default_name" ] || fail "base compose file still honours QUASAR_POSTGRES_VOLUME ($name)"
 
 # ── 7b. The base file is the PRODUCTION shape ────────────────────────────────
 # docker-compose.release.yml was retired by making these properties true of the
@@ -349,17 +317,10 @@ if docker compose version --short 2>/dev/null | awk -F. '{exit !($1>2 || ($1==2 
     docker compose "${BASE[@]}" up --no-start --dry-run --pull never >/dev/null \
     || fail "BASE chain failed 'up --no-start --dry-run' (would have caught #448)"
 
-  POSTGRES_PASSWORD=test JWT_SECRET=test \
-    QUASAR_POSTGRES_VOLUME=legacy_pg_volume \
-    QUASAR_AGENT_VOLUME=legacy_agent_volume \
-    QUASAR_CONTROL_VOLUME=legacy_tls_volume \
-    docker compose "${ADOPT[@]}" up --no-start --dry-run --pull never >/dev/null \
-    || fail "ADOPT chain failed 'up --no-start --dry-run' with all three vars set"
-
-  echo "  dry-run: BASE and ADOPT chains pass 'up --no-start --dry-run'"
+  echo "  dry-run: BASE chain passes 'up --no-start --dry-run'"
 else
   echo "  note: docker compose < 2.20 (no --dry-run support) — skipping the up-dry-run check;" \
        "config-shape checks above still ran"
 fi
 
-echo "compose overlays — sidecar lineage, plugin path, no source mount, console scoping, seccomp, nvidia specifics, production base shape, healthcheck/image-flavor pairing, volume adoption, dry-run up: PASS"
+echo "compose overlays — sidecar lineage, plugin path, no source mount, console scoping, seccomp, nvidia specifics, production base shape, healthcheck/image-flavor pairing, no base volume name override, dry-run up: PASS"

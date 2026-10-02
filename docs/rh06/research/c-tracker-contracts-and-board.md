@@ -82,7 +82,7 @@ file + section). **[I]** = inference or recommendation.
   Decision 10: configuration recovery "does not replace platform images … Preserve ADR 0002
   release ordering and ADR 0004 updater authority." User story 41: "clear remaining enrollment and
   mount requirements, so that I know what RH05 automates and what RH06 still needs to deliver."
-- [F] `docs/rh05/operator-handoff.md` §"RH06 and other work still outside RH05": "RH06 owns
+- [F] The RH-05 operator hand-off (since retired from the tree; see #346), §"RH06 and other work still outside RH05": "RH06 owns
   first-host and additional-host enrollment automation, deployment identity, credentials,
   mount/device provisioning and Quasar platform-image replacement."
 - [F] #217 acceptance: "Keep bootstrap endpoint, credentials and recovery independent of mutable
@@ -121,7 +121,7 @@ file + section). **[I]** = inference or recommendation.
 - [F] Out of scope in #104: signatures, beta, unattended apply, notifications, app-image updates,
   applying to source-built hosts, automatic rollback. All of #120–#123 were later implemented
   (closed 2026-09-10); #155 and #156 remain open follow-ups.
-- [F] Live evidence: `docs/reports/2026-09-05-self-update-live-gate/`; #119 closing comment
+- [F] Live evidence: the self-update live-gate record (since retired from the tree); #119 closing comment
   (salty2011 2026-09-08) and board note: operator-confirmed stable 0.2.4 → 0.2.5 console update.
 - [F] "Every existing install … lacks the updater until an operator adds it once" (#104 Further
   Notes) — precedent for a one-time manual migration step.
@@ -129,8 +129,8 @@ file + section). **[I]** = inference or recommendation.
 ### #173 — Deployment and update reliability (CLOSED 2026-09-12, `bug,needs-triage`; board Shipped/Outcome/"Implementation + validation")
 
 - [F] Children #169, #170, #175, #176, #177, #185 (native sub-issues). Closing comment (salty2011
-  2026-09-12): all finish-line boxes checked; evidence `docs/superpowers/plans/2026-09-12-173-live-evidence.md`
-  on develop, and PR #196. Live on a **registry install on the edge channel**, images published by
+  2026-09-12): all finish-line boxes checked; evidence the #173 live-evidence record
+  (since retired from the tree), and PR #196. Live on a **registry install on the edge channel**, images published by
   the Images workflow, applied by digest: skip-then-continue (#169), failed run leaves offline host
   alone (#170), adoption across CP recreate, #153 session streaming through a non-migrating fleet
   apply at 60 fps, #122 unattended refusal of a migrating release.
