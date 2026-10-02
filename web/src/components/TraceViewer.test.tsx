@@ -481,12 +481,12 @@ describe("TraceViewer", () => {
       // a token directly.
       paint.forEach((v) => expect(v).toMatch(/^(var\(--|url\(#)/));
 
-      // Event marks and legend swatches are HTML, painted by inline background.
+      // Event marks and legend swatches are HTML, painted from an inline --swatch.
       const swatches = [
         ...container.querySelectorAll<HTMLElement>(
           ".trace-mark, .trace-legend-swatch, .trace-lane-swatch",
         ),
-      ].map((el) => el.style.background);
+      ].map((el) => el.style.getPropertyValue("--swatch"));
       expect(swatches.length).toBeGreaterThan(0);
       swatches.forEach((v) => expect(v).toMatch(/^var\(--/));
     });

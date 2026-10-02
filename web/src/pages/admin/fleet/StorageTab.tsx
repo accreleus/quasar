@@ -17,7 +17,7 @@
 import { useMemo, useState } from "react";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { AdminHome, StorageProvider } from "../../../api/types";
+import type { AdminHome, AdminHomeClaim, AdminHomeClaimsResponse, StorageProvider } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { ActionsMenu, type ActionsMenuItem } from "../../../components/ActionsMenu";
 import { Bar } from "../../../components/Bar";
@@ -44,8 +44,16 @@ import {
   NO_USER_KEY,
   type StorageUserGroup,
 } from "./storageGroups";
+import "../../../styles/admin/fleet.css";
 
 const HOME_GC_JOB_ID = "home.gc";
+
+const CLAIM_REASONS: Record<string, string> = {
+  legacy_location_uncertain: "Recorded locations disagree",
+  claim_owner_missing: "Claimed host was deleted",
+  location_mismatch: "Recorded location differs from claim",
+  gc_pending: "Home pending confirmed cleanup",
+};
 
 const PROVIDER_LABELS: Partial<Record<StorageProvider, string>> = {
   auto: "Automatic",
@@ -76,6 +84,21 @@ export function StorageTab() {
     },
   });
   const homes = res.data ?? [];
+  const [claimCursors, setClaimCursors] = useState<string[]>([""]);
+  const claimCursor = claimCursors[claimCursors.length - 1];
+  const claimsRes = useResource<AdminHomeClaimsResponse & { unsupported?: boolean }>({
+    label: "home ownership",
+    initialData: { items: [], next_cursor: null },
+    fetch: async (ctx) => {
+      try {
+        return await adminApi.listAdminHomeClaims(ctx.token, { limit: 100, cursor: claimCursor });
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) return { items: [], next_cursor: null, unsupported: true };
+        throw e;
+      }
+    },
+  }, [claimCursor]);
+  const claims = claimsRes.data;
   // Feeds the "allocated" KPI sub-line only, off the fleet poll above this page
   // (lib/fleet) rather than a second read that could disagree with it.
   const { hosts } = useFleetContext();
@@ -86,6 +109,10 @@ export function StorageTab() {
   const [tombstoning, setTombstoning] = useState<AdminHome | null>(null);
   const [tombstoneError, setTombstoneError] = useState<string | null>(null);
   const [tombstoneInFlight, setTombstoneInFlight] = useState(false);
+  const [releasing, setReleasing] = useState<AdminHomeClaim | null>(null);
+  const [releaseNote, setReleaseNote] = useState("");
+  const [releaseError, setReleaseError] = useState<string | null>(null);
+  const [releaseInFlight, setReleaseInFlight] = useState(false);
   const [reclaimOpen, setReclaimOpen] = useState(false);
   const [reclaiming, setReclaiming] = useState(false);
 
@@ -137,6 +164,7 @@ export function StorageTab() {
       await res.mutate((ctx) => adminApi.tombstoneHome(ctx.token, tombstoning.id));
       setTombstoning(null);
       await res.refresh({ silent: true });
+      await claimsRes.refresh({ silent: true });
     } catch (e: unknown) {
       if (e instanceof ApiError && e.code === "home_in_use") {
         setTombstoneError("Cannot delete. A live session is currently using this home.");
@@ -147,6 +175,40 @@ export function StorageTab() {
       setTombstoneInFlight(false);
     }
   };
+
+  // ── Release a claim whose host is gone (amendment 15, #379) ────────────
+  // The server decides releasability; the menu only offers it for the shape
+  // it can accept (a conflict with no owner and no recorded host).
+  const closeRelease = () => { setReleasing(null); setReleaseNote(""); setReleaseError(null); };
+  const confirmRelease = async () => {
+    if (!token || !releasing || !releasing.conflict_reason) return;
+    setReleaseInFlight(true);
+    setReleaseError(null);
+    try {
+      await claimsRes.mutate((ctx) => adminApi.releaseHomeClaim(ctx.token, {
+        user_id: releasing.user_id,
+        app_id: releasing.canonical_app_id,
+        expected_state: releasing.state,
+        expected_conflict_reason: releasing.conflict_reason!,
+        attestation: releaseNote.trim(),
+      }));
+      closeRelease();
+      await claimsRes.refresh({ silent: true });
+      await res.refresh({ silent: true });
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.code === "conflict") {
+        setReleaseError("This claim changed since the page loaded. Close this and check it again.");
+      } else if (e instanceof ApiError && e.code === "home_in_use") {
+        setReleaseError("A session or home operation is using this claim. Stop it first.");
+      } else {
+        setReleaseError(e instanceof ApiError ? e.message : "Release failed.");
+      }
+    } finally {
+      setReleaseInFlight(false);
+    }
+  };
+  const releasable = (c: AdminHomeClaim) =>
+    c.state === "conflict" && !c.host_id && c.recorded_host_ids.length === 0 && !c.pending_home_operation;
 
   // ── Reclaim pending — runs the home.gc job now, once per host that has a
   //    pending home (see the file banner for why this isn't tombstoneHome).
@@ -190,7 +252,7 @@ export function StorageTab() {
       render: (h) => (
         <div className="qtable-stack">
           {isHostOrphaned(h) ? (
-            <span className="sub" style={{ color: "var(--warning-text)" }}>Host deleted</span>
+            <span className="sub tone-warning">Host deleted</span>
           ) : (
             <span>{h.host_name}</span>
           )}
@@ -220,9 +282,10 @@ export function StorageTab() {
     },
     {
       key: "size",
-      header: <span style={{ display: "block", textAlign: "right" }}>Size</span>,
+      header: "Size",
       mobileLabel: "Size",
-      render: (h) => <span style={{ display: "block", textAlign: "right" }}>{bytes(h.bytes_used)}</span>,
+      align: "right",
+      render: (h) => bytes(h.bytes_used),
     },
     {
       key: "state",
@@ -288,9 +351,10 @@ export function StorageTab() {
     },
     {
       key: "size",
-      header: <span style={{ display: "block", textAlign: "right" }}>Size</span>,
+      header: "Size",
       mobileLabel: "Size",
-      render: (g) => <span style={{ display: "block", textAlign: "right" }}>{bytes(g.totalBytes)}</span>,
+      align: "right",
+      render: (g) => bytes(g.totalBytes),
     },
     {
       key: "state",
@@ -314,12 +378,48 @@ export function StorageTab() {
     <Table columns={homeColumns} rows={g.homes} rowKey={(h) => h.id} />
   );
 
+  const claimColumns: TableColumn<AdminHomeClaim>[] = [
+    { key: "user", header: "User", render: (c) => <span className="primary" title={c.user_id}>{c.username ?? c.user_id.slice(0, 8)}</span> },
+    { key: "app", header: "App", render: (c) => <span title={c.canonical_app_id}>{c.app_name ?? c.canonical_app_id.slice(0, 8)}</span> },
+    { key: "owner", header: "Claimed host", render: (c) => <span title={c.host_id ?? undefined}>{c.host_name ?? (c.host_id ? c.host_id.slice(0, 8) : "Unknown")}</span> },
+    { key: "state", header: "State", render: (c) => <Chip variant={c.state === "conflict" ? "warning" : c.state === "materialized" ? "success" : "neutral"}>{c.state}</Chip> },
+    { key: "evidence", header: "Evidence", render: (c) => (
+      <div className="qtable-stack">
+        <span>{c.conflict_reason ? CLAIM_REASONS[c.conflict_reason] ?? c.conflict_reason : c.state === "materialized" ? "Running mount observed" : "Ownership reserved"}</span>
+        {c.pending_home_operation && <span className="sub">Cleanup proof pending; this home remains protected</span>}
+        {c.legacy_unprotected_dispatch && <span className="sub">Earlier dispatch lacked cleanup proof</span>}
+        <span className="sub">Agent cleanup capability: {c.home_cleanup_capability ?? "unknown"}</span>
+        <span className="sub">Recorded hosts: {c.recorded_host_ids.length ? c.recorded_host_ids.join(", ") : "none"}</span>
+        {c.materialized_at && <span className="sub">Last mounted {relativeTime(c.materialized_at)}</span>}
+      </div>
+    ) },
+    {
+      key: "actions",
+      header: "",
+      mobileLabel: "",
+      render: (c) => (
+        <div className="cell-actions">
+          <ActionsMenu
+            items={[{
+              key: "release",
+              label: "Release claim",
+              variant: "danger",
+              disabled: !releasable(c),
+              onClick: () => { setReleaseNote(""); setReleaseError(null); setReleasing(c); },
+            }]}
+            label={`Actions for ${c.username ?? "this user"}'s ${c.app_name ?? "app"} claim`}
+          />
+        </div>
+      ),
+    },
+  ];
+
   // The head is the Fleet section's (../Fleet.tsx); this tab fills it in.
   useSectionHead({
     sub: `${homes.length} managed home${homes.length === 1 ? "" : "s"} · ${bytes(totalBytes)} provisioned`,
     actions: (
       <>
-        <Button variant="ghost" onClick={() => void res.refresh()}>Refresh</Button>
+        <Button variant="ghost" onClick={() => { void res.refresh(); void claimsRes.refresh(); }}>Refresh</Button>
         <Button
           onClick={() => setReclaimOpen(true)}
           disabled={pendingHostIds.length === 0}
@@ -344,27 +444,27 @@ export function StorageTab() {
 
       {!res.loading && (
         <>
-          <div className="grid g4" style={{ marginBottom: "var(--s5)" }}>
+          <div className="grid g4 mb5">
             <div className="card card-pad">
               <div className="eyebrow">Managed homes</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{homes.length}</div>
+              <div className="kpi-val mt2">{homes.length}</div>
               <div className="kpi-meta">across {hostsWithHomes} host{hostsWithHomes === 1 ? "" : "s"}</div>
             </div>
             <div className="card card-pad">
               <div className="eyebrow">Total size</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{bytes(totalBytes)}</div>
+              <div className="kpi-val mt2">{bytes(totalBytes)}</div>
               {allocatedMb > 0 && (
                 <div className="kpi-meta">of {bytesFromMb(allocatedMb)} allocated</div>
               )}
             </div>
             <div className="card card-pad">
               <div className="eyebrow">Active</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{activeCount}</div>
+              <div className="kpi-val mt2">{activeCount}</div>
               <div className="kpi-meta">attached to a user</div>
             </div>
             <div className="card card-pad">
               <div className="eyebrow">Pending cleanup</div>
-              <div className="kpi-val" style={{ marginTop: 8 }}>{pendingHomes.length}</div>
+              <div className="kpi-val mt2">{pendingHomes.length}</div>
               {pendingHomes.length > 0 && (
                 <div className="kpi-meta">{bytes(pendingBytes)} reclaimable</div>
               )}
@@ -413,6 +513,29 @@ export function StorageTab() {
             isExpanded={(g) => expandedKeys.has(g.key)}
             onToggleExpand={(g) => toggleExpand(g.key)}
           />
+          <div className="card mt5">
+            <div className="panel-head">
+              <span className="panel-title">Home ownership</span>
+              <span className="hint">Claims can remain after a failed launch. Recorded hosts are bookkeeping, not proof of files.</span>
+            </div>
+            {claims?.unsupported ? (
+              <p className="hint storage-pad">Ownership diagnosis is unavailable on this control plane.</p>
+            ) : (
+              <>
+                <ResourceStates loading={claimsRes.loading} error={claimsRes.errorMessage} />
+                {!claimsRes.loading && <Table columns={claimColumns} rows={claims?.items ?? []}
+                  rowKey={(c) => `${c.user_id}:${c.canonical_app_id}`}
+                  empty="No home ownership claims on this page." />}
+                <div className="row gap3 storage-pad">
+                  <Button variant="ghost" disabled={claimCursors.length === 1}
+                    onClick={() => setClaimCursors((current) => current.slice(0, -1))}>Previous</Button>
+                  <span className="hint">Page {claimCursors.length}</span>
+                  <Button variant="ghost" disabled={!claims?.next_cursor}
+                    onClick={() => { if (claims?.next_cursor) setClaimCursors((current) => [...current, claims.next_cursor!]); }}>Next</Button>
+                </div>
+              </>
+            )}
+          </div>
         </>
       )}
 
@@ -440,44 +563,89 @@ export function StorageTab() {
         }
       >
         {tombstoning && (
-          <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
-            <p style={{ color: "var(--text-2)" }}>
+          <div className="col gap4">
+            <p className="sec">
               Mark this home for deletion. The GC janitor will reap the backing store.
             </p>
-            <div
-              className="panel"
-              style={{ padding: "var(--s4)", display: "flex", flexDirection: "column", gap: "var(--s2)" }}
-            >
+            <div className="panel col gap2 storage-pad storage-facts">
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>User</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)" }} title={tombstoning.user_id ?? undefined}>
+                <span className="muted" style={{ minWidth: 64 }}>User</span>
+                <span className="mono" title={tombstoning.user_id ?? undefined}>
                   {tombstoning.username ?? "No linked user"}
                 </span>
               </div>
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>App</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)" }} title={tombstoning.app_id ?? undefined}>
+                <span className="muted" style={{ minWidth: 64 }}>App</span>
+                <span className="mono" title={tombstoning.app_id ?? undefined}>
                   {tombstoning.app_name ?? "App deleted"}
                 </span>
               </div>
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>Size</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)" }}>
+                <span className="muted" style={{ minWidth: 64 }}>Size</span>
+                <span className="mono">
                   {bytes(tombstoning.bytes_used)}
                 </span>
               </div>
               {/* Full home id: names are neither unique nor rename-stable, so
                   the operator sees the exact row being destroyed. */}
               <div className="row gap3">
-                <span className="muted" style={{ fontSize: "var(--t-sm)", minWidth: 64 }}>Home</span>
-                <span className="mono" style={{ fontSize: "var(--t-sm)", overflowWrap: "anywhere" }}>
+                <span className="muted" style={{ minWidth: 64 }}>Home</span>
+                <span className="mono storage-id">
                   {tombstoning.id}
                 </span>
               </div>
             </div>
             {tombstoneError && (
-              <p style={{ color: "var(--danger-text)", fontSize: "var(--t-sm)" }}>
+              <p className="form-error">
                 {tombstoneError}
+              </p>
+            )}
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={!!releasing}
+        onClose={closeRelease}
+        title="Release home claim"
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeRelease} disabled={releaseInFlight}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => void confirmRelease()}
+              disabled={releaseInFlight || releaseNote.trim() === ""}
+            >
+              {releaseInFlight ? "Releasing…" : "Release"}
+            </Button>
+          </>
+        }
+      >
+        {releasing && (
+          <div className="col gap4">
+            <p className="sec">
+              The host that held this home is gone. Releasing lets {releasing.username ?? "this user"} launch
+              {" "}{releasing.app_name ?? "this app"} again with a new home. No files are moved or deleted.
+              If the machine comes back with the same storage root, the old home is picked up again.
+            </p>
+            <label className="col gap2">
+              <span className="muted">What did you check? (kept in the activity log)</span>
+              <textarea
+                className="input"
+                aria-label="What did you check"
+                rows={3}
+                maxLength={500}
+                value={releaseNote}
+                onChange={(e) => setReleaseNote(e.target.value)}
+                disabled={releaseInFlight}
+                style={{ width: "100%" }}
+              />
+            </label>
+            {releaseError && (
+              <p className="form-error" role="alert">
+                {releaseError}
               </p>
             )}
           </div>
@@ -499,7 +667,7 @@ export function StorageTab() {
           </>
         }
       >
-        <p style={{ color: "var(--text-2)" }}>
+        <p className="sec">
           Runs the cleanup job now on {pendingHostIds.length} host{pendingHostIds.length === 1 ? "" : "s"}.
           Homes tombstoned less than 24 hours ago stay until their grace period ends.
         </p>

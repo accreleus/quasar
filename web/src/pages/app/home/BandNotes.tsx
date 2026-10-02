@@ -10,6 +10,7 @@ import { Button } from "../../../components/Button";
 import { IconInfo } from "../../../components/icons";
 import { reasonSentences } from "../launchOptions";
 import { UNEXPLAINED } from "./launchOptionRules";
+import type { WaitingReason } from "./useLaunch";
 
 export interface BandNotesProps {
   appName: string;
@@ -26,6 +27,9 @@ export interface BandNotesProps {
   liveSessionId: string | null;
   canDecodeH264: boolean;
   waitingForSlot: boolean;
+  /** "slot" (capacity_exhausted) vs "host" (no_host_available) — the latter
+   *  must not claim a slot is being freed. */
+  waitingReason?: WaitingReason | null;
   onRetryProfiles: () => void;
 }
 
@@ -41,6 +45,7 @@ export function BandNotes({
   liveSessionId,
   canDecodeH264,
   waitingForSlot,
+  waitingReason = "slot",
   onRetryProfiles,
 }: BandNotesProps) {
   return (
@@ -108,7 +113,11 @@ export function BandNotes({
       {waitingForSlot && (
         <div className="note" role="status">
           <IconInfo />
-          <div>All capacity is in use right now, waiting for a slot to free up…</div>
+          <div>
+            {waitingReason === "host"
+              ? "No host is available right now, waiting for one to come online…"
+              : "All capacity is in use right now, waiting for a slot to free up…"}
+          </div>
         </div>
       )}
     </>

@@ -1,0 +1,33 @@
+{
+  "shape": "result",
+  "about": "Terminal: the new container could not be created; the old one was put back.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "state": "failed",
+    "reason": "recreate_failed",
+    "components": [
+      {
+        "name": "node-agent",
+        "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+        "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "previous": [
+      {
+        "name": "node-agent",
+        "digest": "sha256:1b7e000000000000000000000000000000000000000000000000000000000def"
+      }
+    ],
+    "output": "create quasar-node-agent.next: port is already allocated\nrestored quasar-node-agent on the previous digest\n",
+    "started_at": "2026-09-25T11:04:02Z",
+    "updated_at": "2026-09-25T11:04:31Z",
+    "finished_at": "2026-09-25T11:04:31Z",
+    "restored": true,
+    "release": {
+      "id": "rel-0.3.0",
+      "version": "0.3.0",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "dump": null
+  }
+}

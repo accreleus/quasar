@@ -46,7 +46,7 @@ revisions differ: production `2ced17e28d1f`, GPU-test
 test remove that uncertainty from the encoder-plugin comparison.
 
 The supplied `~/code/quasar_development/gst-wayland-display` path was absent.
-The existing `/home/hermes/code/gst-wayland-display` has the expected `salty2011`
+The existing `<workspace>/gst-wayland-display` has the expected `salty2011`
 origin and `games-on-whales` upstream, but was at `64451ee`, not the deployed pin.
 It contains no copy of Quasar's AV1 patch and was inspected without modification.
 

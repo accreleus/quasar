@@ -232,12 +232,11 @@ func (s *Store) Seed(ctx context.Context, defaultMode string) error {
 	if !ValidMode(defaultMode) {
 		return fmt.Errorf("invalid REGISTRATION_MODE %q: must be closed|invite_only|open", defaultMode)
 	}
-	_, err := s.pool.Exec(ctx, `
+	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO instance_settings (id, registration_mode)
 		VALUES (true, $1)
 		ON CONFLICT (id) DO NOTHING
-	`, defaultMode)
-	if err != nil {
+	`, defaultMode); err != nil {
 		return fmt.Errorf("seed instance_settings: %w", err)
 	}
 	return nil

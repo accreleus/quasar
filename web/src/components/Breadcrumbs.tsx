@@ -31,7 +31,7 @@ export function Breadcrumbs({ items }: { items: Crumb[] }) {
       {items.map((c, i) => {
         const last = i === items.length - 1;
         return (
-          <span key={`${c.label}-${i}`} style={{ display: "contents" }}>
+          <span key={`${c.label}-${i}`} className="crumb">
             {i > 0 && <Sep />}
             {c.to && !last ? (
               <Link to={c.to} className={c.mono ? "mono" : undefined} title={c.title}>

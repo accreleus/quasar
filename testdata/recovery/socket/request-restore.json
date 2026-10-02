@@ -1,0 +1,19 @@
+{
+  "shape": "request",
+  "about": "The operator's restore (the operator socket): names the dump and the version it returns to, carries no components.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "kind": "restore",
+    "components": [],
+    "release": {
+      "id": "",
+      "version": "0.3.0",
+      "source_commit": ""
+    },
+    "migrates": false,
+    "schema_version": 80,
+    "external_backup_confirmed": false,
+    "dump": "20260925T100000Z-schema-80",
+    "purge": false
+  }
+}

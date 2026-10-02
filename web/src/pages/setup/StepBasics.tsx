@@ -88,14 +88,14 @@ export function StepBasics({ onNext }: StepBasicsProps) {
 
   return (
     <form
-      className="card login-card"
+      className="card login-card setup-basics-form"
       onSubmit={onSubmit}
       noValidate
-      style={{ width: "100%", maxWidth: 560, display: "flex", flexDirection: "column", gap: "var(--s5)" }}
+      style={{ width: "100%", maxWidth: 560 }}
     >
       <div>
-        <h2 style={{ margin: 0 }}>Instance basics</h2>
-        <p className="sub" style={{ marginTop: 6 }}>
+        <h2 className="m0">Instance basics</h2>
+        <p className="sub mt2">
           A couple of settings before this instance is ready for other people.
         </p>
       </div>
@@ -106,7 +106,7 @@ export function StepBasics({ onNext }: StepBasicsProps) {
 
       <div className="field">
         <span className="label">TLS / network posture</span>
-        <p className="field-hint" style={{ margin: 0 }}>
+        <p className="field-hint m0">
           {isHttps
             ? "Served over HTTPS. Remote media needs a reachable host or configured STUN/TURN; a reverse proxy alone does not relay video."
             : "Served over plain HTTP. Use HTTPS for browser streaming features. Remote media needs a reachable host or configured STUN/TURN."}
@@ -115,9 +115,8 @@ export function StepBasics({ onNext }: StepBasicsProps) {
 
       {loadError && (
         <div
-          className="login-error"
+          className="login-error row between gap3"
           role="alert"
-          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "var(--s3)" }}
         >
           <span>
             {loadError} The current registration mode is unknown — retry, or

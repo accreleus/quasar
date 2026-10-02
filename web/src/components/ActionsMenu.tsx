@@ -17,7 +17,7 @@
  * button.
  */
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 
 import { IconMore } from "./icons";
 
@@ -114,9 +114,6 @@ export function ActionsMenu({ items, label = "Actions" }: ActionsMenuProps) {
     }
   }, [open]);
 
-  const popStyle: CSSProperties =
-    placement === "below" ? { top: offset, right } : { bottom: offset, right };
-
   return (
     <div className="row-menu" ref={ref}>
       <button
@@ -134,7 +131,9 @@ export function ActionsMenu({ items, label = "Actions" }: ActionsMenuProps) {
         <IconMore className="" />
       </button>
       {open && (
-        <div className="row-menu-pop" role="menu" aria-label={label} ref={popRef} style={popStyle}>
+        <div className="row-menu-pop" role="menu" aria-label={label} ref={popRef}
+          style={placement === "below" ? { top: offset, right } : { bottom: offset, right }}
+        >
           {items.map((item) =>
             isSeparator(item) ? (
               <hr key={item.key} />

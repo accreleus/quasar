@@ -13,8 +13,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
+	"github.com/accreleus/quasar/control-plane/internal/readiness"
+	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
 // RegistryChecker avoids an agentws import here (agentws imports session, which
@@ -27,8 +30,29 @@ type RegistryChecker interface {
 type Handler struct {
 	store    *store
 	registry RegistryChecker // nil until SetRegistry is called
-	auditor  interface {
+	// A committed app or placement edit nudges the existing image Ensurer. The
+	// callback is advisory; its periodic/reconnect scan reads durable policy.
+	reconcileImages func(context.Context) error
+	imageEvidence   func(hostID, imageID string) (connected, observed, snapshot bool)
+	auditor         interface {
 		Record(context.Context, string, string, string, string, map[string]any) error
+	}
+}
+
+func (h *Handler) SetImageReconciler(reconcile func(context.Context) error) {
+	h.reconcileImages = reconcile
+}
+
+func (h *Handler) SetImageEvidence(read func(hostID, imageID string) (connected, observed, snapshot bool)) {
+	h.imageEvidence = read
+}
+
+func (h *Handler) nudgeImages(ctx context.Context) {
+	if h.reconcileImages == nil {
+		return
+	}
+	if err := h.reconcileImages(ctx); err != nil {
+		slog.Warn("image requirement reconcile deferred", "err", err)
 	}
 }
 
@@ -36,7 +60,7 @@ type Handler struct {
 func NewHandler(pool *pgxpool.Pool, auditors ...interface {
 	Record(context.Context, string, string, string, string, map[string]any) error
 }) *Handler {
-	h := &Handler{store: &store{pool: pool}}
+	h := &Handler{store: &store{pool: pool, gate: readinessgate.New(pool)}}
 	if len(auditors) > 0 {
 		h.auditor = auditors[0]
 	}
@@ -53,6 +77,15 @@ func (h *Handler) recordActivity(r *http.Request, action, targetType, targetID s
 	user, _ := auth.UserFromContext(r.Context())
 	if err := h.auditor.Record(r.Context(), user.ID, action, targetType, targetID, details); err != nil {
 		slog.Warn("record admin activity failed", "action", action, "err", err)
+	}
+}
+
+// SetReadinessStaleSecs gives the host read path the same freshness window the
+// session store gates on (QUASAR_READINESS_STALE_SECS). Call once after
+// NewHandler; <= 0 keeps the default.
+func (h *Handler) SetReadinessStaleSecs(n int) {
+	if n > 0 {
+		h.store.readinessStaleSecs = int32(n)
 	}
 }
 
@@ -75,6 +108,8 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 
 	// Admin app list — all apps including disabled, with runtime_spec (P2-08).
 	mux.Handle("GET /v1/admin/apps", admin(http.HandlerFunc(h.handleAdminListApps)))
+	mux.Handle("GET /v1/admin/apps/{id}/placement", admin(http.HandlerFunc(h.handleGetAppPlacement)))
+	mux.Handle("PATCH /v1/admin/apps/{id}/placement", admin(http.HandlerFunc(h.handlePatchAppPlacement)))
 
 	mux.Handle("POST /v1/apps", admin(http.HandlerFunc(h.handleCreateApp)))
 	mux.Handle("PATCH /v1/apps/{id}", admin(http.HandlerFunc(h.handleUpdateApp)))
@@ -82,6 +117,11 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 	mux.Handle("GET /v1/hosts", admin(http.HandlerFunc(h.handleListHosts)))
 	mux.Handle("GET /v1/hosts/{id}", admin(http.HandlerFunc(h.handleGetHost)))
 	mux.Handle("DELETE /v1/hosts/{id}", admin(http.HandlerFunc(h.handleDeleteHost)))
+
+	// Readiness override (control-api.md "Readiness override"): admin-gated at
+	// registration, before check_id validation or any host lookup.
+	mux.Handle("PUT /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleSetReadinessOverride)))
+	mux.Handle("DELETE /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleClearReadinessOverride)))
 
 	// Runtime presets (UI-P3). The admin UI's disabled Delete on an in-use preset
 	// is UX only; the 409 from DELETE is the enforcement (presets.go).
@@ -154,26 +194,31 @@ type streamDefaultsResp struct {
 }
 
 type hostResp struct {
-	ID             string  `json:"id"`
-	NodeName       string  `json:"node_name"`
-	Status         string  `json:"status"`
-	AgentVersion   *string `json:"agent_version"`
-	CPUCores       *int32  `json:"cpu_cores"`
-	MemMB          *int32  `json:"mem_mb"`
-	LastRegistered *string `json:"last_registered_at"`
-	LastHeartbeat  *string `json:"last_heartbeat_at"`
+	ID                    string                  `json:"id"`
+	NodeName              string                  `json:"node_name"`
+	Status                string                  `json:"status"`
+	AdmissionRestrictions []admission.Restriction `json:"admission_restrictions"`
+	AgentVersion          *string                 `json:"agent_version"`
+	CPUCores              *int32                  `json:"cpu_cores"`
+	MemMB                 *int32                  `json:"mem_mb"`
+	LastRegistered        *string                 `json:"last_registered_at"`
+	LastHeartbeat         *string                 `json:"last_heartbeat_at"`
 	// Storage, CPUModel: always serialized, null until an amendment-aware agent
 	// reports (openapi.yaml Host.storage/cpu_model, both required).
 	Storage  json.RawMessage `json:"storage"`
 	CPUModel *string         `json:"cpu_model"`
 	// Readiness (openapi.yaml Host.readiness, required): opaque array of
-	// {id, status, summary, remediation} the agent owns end to end. Advisory —
-	// a failing check never blocked registration.
+	// {id, status, summary, remediation} the agent owns end to end.
+	// Registration is never gated by it; a launch may be (amendment 11).
 	Readiness json.RawMessage `json:"readiness"`
 	// ReadinessReportedAt: freshness of that set, so the UI can flag it stale.
 	ReadinessReportedAt *string `json:"readiness_reported_at"`
-	CapacityDetection   string  `json:"capacity_detection"`
-	CapacityReason      *string `json:"capacity_reason"`
+	// ReadinessGate/ReadinessOverrides (openapi.yaml Host, both required):
+	// always serialized, and the arrays are never null.
+	ReadinessGate      ReadinessGate            `json:"readiness_gate"`
+	ReadinessOverrides []readinessgate.Override `json:"readiness_overrides"`
+	CapacityDetection  string                   `json:"capacity_detection"`
+	CapacityReason     *string                  `json:"capacity_reason"`
 	// AgentConnectedSince/AgentRestartCount/AgentLastRestartAt (#429 follow-on):
 	// not yet in protocol/openapi.yaml (see store.go's Host doc comment).
 	// null/0 until the host's first connect.
@@ -190,6 +235,14 @@ type hostResp struct {
 	BuiltAt        *string `json:"built_at"`
 	InstallMode    *string `json:"install_mode"`
 	UpdaterPresent *bool   `json:"updater_present"`
+	// Amendment 14: always serialized, null on every host that is not owned.
+	RecoveryActorVersion      *string `json:"recovery_actor_version"`
+	RecoveryActorSourceCommit *string `json:"recovery_actor_source_commit"`
+	SeedVersion               *string `json:"seed_version"`
+	// Amendment 17: always serialized, null until an amendment-aware agent reports.
+	Engine        *string `json:"engine"`
+	EngineVersion *string `json:"engine_version"`
+	EngineMode    *string `json:"engine_mode"`
 	// Capacity: always serialized, null when the host has no reported GPUs to sum.
 	Capacity *HostCapacity `json:"capacity"`
 }
@@ -305,6 +358,24 @@ func hostToResp(h Host) hostResp {
 		s := h.ReadinessReportedAt.Format("2006-01-02T15:04:05Z07:00")
 		readinessAt = &s
 	}
+	// A host built without the store's read path (a never-reported host, or a
+	// caller that did not go through getHost/listHosts) still serves the
+	// contract's shape rather than a null state and a null array.
+	gate := h.ReadinessGate
+	if gate.State == "" {
+		gate.State = readiness.StateAbstaining
+	}
+	if gate.Blocking == nil {
+		gate.Blocking = []readiness.Blocking{}
+	}
+	overrides := h.ReadinessOverrides
+	if overrides == nil {
+		overrides = []readinessgate.Override{}
+	}
+	restrictions := h.AdmissionRestrictions
+	if restrictions == nil {
+		restrictions = []admission.Restriction{}
+	}
 	// Identity's built_at is served UTC: the agent sends RFC3339, the column is
 	// timestamptz, and a client rendering "built 3 days ago" should not have to
 	// reason about the control plane's local zone.
@@ -314,28 +385,39 @@ func hostToResp(h Host) hostResp {
 		builtAt = &s
 	}
 	return hostResp{
-		ID:                  h.ID,
-		NodeName:            h.NodeName,
-		Status:              h.Status,
-		AgentVersion:        h.AgentVersion,
-		CPUCores:            h.CPUCores,
-		MemMB:               h.MemMB,
-		LastRegistered:      lastReg,
-		LastHeartbeat:       lastHb,
-		Storage:             h.Storage,
-		CPUModel:            h.CPUModel,
-		Readiness:           h.Readiness,
-		ReadinessReportedAt: readinessAt,
-		CapacityDetection:   h.CapacityDetection,
-		CapacityReason:      h.CapacityReason,
-		Capacity:            h.Capacity,
-		AgentConnectedSince: connectedSince,
-		AgentRestartCount:   h.AgentRestartCount,
-		AgentLastRestartAt:  lastRestart,
-		SourceCommit:        h.SourceCommit,
-		BuiltAt:             builtAt,
-		InstallMode:         h.InstallMode,
-		UpdaterPresent:      h.UpdaterPresent,
+		ID:                    h.ID,
+		NodeName:              h.NodeName,
+		Status:                h.Status,
+		AdmissionRestrictions: restrictions,
+		AgentVersion:          h.AgentVersion,
+		CPUCores:              h.CPUCores,
+		MemMB:                 h.MemMB,
+		LastRegistered:        lastReg,
+		LastHeartbeat:         lastHb,
+		Storage:               h.Storage,
+		CPUModel:              h.CPUModel,
+		Readiness:             h.Readiness,
+		ReadinessReportedAt:   readinessAt,
+		ReadinessGate:         gate,
+		ReadinessOverrides:    overrides,
+		CapacityDetection:     h.CapacityDetection,
+		CapacityReason:        h.CapacityReason,
+		Capacity:              h.Capacity,
+		AgentConnectedSince:   connectedSince,
+		AgentRestartCount:     h.AgentRestartCount,
+		AgentLastRestartAt:    lastRestart,
+		SourceCommit:          h.SourceCommit,
+		BuiltAt:               builtAt,
+		InstallMode:           h.InstallMode,
+		UpdaterPresent:        h.UpdaterPresent,
+
+		RecoveryActorVersion:      h.RecoveryActorVersion,
+		RecoveryActorSourceCommit: h.RecoveryActorSourceCommit,
+		SeedVersion:               h.SeedVersion,
+
+		Engine:        h.Engine,
+		EngineVersion: h.EngineVersion,
+		EngineMode:    h.EngineMode,
 	}
 }
 
@@ -594,6 +676,7 @@ func (h *Handler) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		app.LaunchableProfileIDs = allowList.ids
 	}
 
+	h.nudgeImages(r.Context())
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"app": appToAdminResp(app)})
 }
 
@@ -857,6 +940,7 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		app.LaunchableProfileIDs = nil
 	}
 
+	h.nudgeImages(r.Context())
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"app": appToAdminResp(app)})
 }
 
@@ -1135,6 +1219,7 @@ func (h *Handler) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	name, err := h.store.deleteApp(r.Context(), id, deleteDerived)
 	switch {
 	case err == nil:
+		h.nudgeImages(r.Context())
 		h.recordActivity(r, "app.delete", "app", id, map[string]any{
 			"name": name, "delete_derived": deleteDerived,
 		})
@@ -1143,6 +1228,8 @@ func (h *Handler) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "app not found")
 	case errors.Is(err, ErrAppHasActiveSessions):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "app is in use by an active session — stop it first")
+	case errors.Is(err, ErrHomeCleanupPending):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Managed home cleanup is pending")
 	case errors.Is(err, ErrAppHasDerivedTiles):
 		// List the tiles, not just a count, so the admin sees what they'd
 		// destroy. Nested in the error object, mirroring the restart_required /

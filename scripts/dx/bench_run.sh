@@ -34,10 +34,10 @@
 #                        qses's own "peer==stack -> use the local API URL" path
 #                        (.claude/skills/quasar-session/scripts/qses) takes over.
 #                        `aux` restores the old default, QSES_PEER_ROLE=aux-infra
-#                        (today's hermes-over-WiFi peer). Changed 2026-08-19 on
+#                        (today's aux-host-over-WiFi peer). Changed 2026-08-19 on
 #                        the peer-path finding (docs/reports/2026-08-19-peer-path/
 #                        REPORT.md): a local peer measured 0.000% drops vs 2.7%
-#                        through hermes, on an otherwise identical cell — every
+#                        through the aux host, on an otherwise identical cell — every
 #                        pre-2026-08-19 browser-side drop number was measuring the
 #                        peer's network/CPU as much as Quasar's own pipeline.
 #                        `--peer aux` is required with --netem: netem shapes the
@@ -50,6 +50,11 @@
 #   --scenario S         bench scenario (default: derived, e.g. 1080p120-h264-clean)
 #   --tag K=V            repeatable; passed through to bench_submit.py (wins over
 #                        every auto-derived tag)
+#   --commit SHA         the Quasar commit the HOST is running, posted as the run's
+#                        `commit` (default: a `--tag git_quasar=` value, else THIS
+#                        worktree's HEAD — right only when the host runs the same
+#                        commit). `qbench check` finds runs by repo + commit.
+#   --repo OWNER/NAME    the run's `repo` (default accreleus/quasar)
 #   --playout MS         pin the receiver playout target (?playout=MS on the peer's
 #                        session URL), which ALSO switches off the AS-05 adaptive
 #                        controller. Recorded as the tag `playout=MS`; when omitted
@@ -133,7 +138,7 @@ TARGET=bench-run
 
 dx_require_host_scope "$TARGET"
 
-usage() { sed -n '3,91p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,99p' "$0" | sed 's/^# \{0,1\}//'; }
 
 QSES="$DX_ROOT/.claude/skills/quasar-session/scripts/qses"
 
@@ -149,6 +154,8 @@ KEEP=0
 SUBMIT=1
 DRY=0
 TAGS=()
+RUN_COMMIT=""
+RUN_REPO=""
 APP_LOG_GLOB=""
 CODEC=""
 BENCH_MODE=0
@@ -176,6 +183,14 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || dx_guard "$TARGET" "--tag requires K=V"
       case "$2" in *=*) ;; *) dx_guard "$TARGET" "--tag must be K=V (got '$2')" ;; esac
       TAGS+=("$2"); shift 2 ;;
+    --commit)
+      [ $# -ge 2 ] || dx_guard "$TARGET" "--commit requires a sha"
+      dx_require_safe "$TARGET" "--commit" "$2" "$DX_RE_REF" "It is a commit sha or ref."
+      RUN_COMMIT="$2"; shift 2 ;;
+    --repo)
+      [ $# -ge 2 ] || dx_guard "$TARGET" "--repo requires OWNER/NAME"
+      dx_require_safe "$TARGET" "--repo" "$2" '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' "It is an OWNER/NAME slug."
+      RUN_REPO="$2"; shift 2 ;;
     --app-log-glob)
       [ $# -ge 2 ] || dx_guard "$TARGET" "--app-log-glob requires a glob"
       # Spliced into a remote `find . -path './$APP_LOG_GLOB'`. `*` and `?` are
@@ -263,7 +278,7 @@ export QSES_PEER_ROLE
 
 # Resolve the peer ROLE to a canonical host NAME for tagging, via the same
 # DX_HOSTS_JSON qses itself reads (roles{} then a literal host name) — so old,
-# untagged runs (implicitly hermes) and new ones stay distinguishable by the
+# untagged runs (implicitly the aux host) and new ones stay distinguishable by the
 # `peer=<host>` tag rather than by role, which can rename hosts underneath it.
 # `local` (the DX_HOST sentinel, not a hosts.json entry) resolves to itself.
 dx_peer_host_name() { # dx_peer_host_name <role-or-host>
@@ -344,7 +359,7 @@ if [ "$DRY" = 1 ]; then
   else
     dx_info "  would run: HOST=$DX_HOST $DX_DIR/session_soak.sh <SID> --profile observe --duration $OBSERVE_S --out $OUT"
   fi
-  dx_info "  would run: bench_submit.py --dir $OUT --suite $SUITE --scenario $SCENARIO"
+  dx_info "  would run: bench_submit.py --dir $OUT --suite $SUITE --scenario $SCENARIO${RUN_REPO:+ --repo $RUN_REPO}${RUN_COMMIT:+ --commit $RUN_COMMIT}"
   dx_pass plan "printed above; nothing was launched, shaped or posted"
   dx_result "$TARGET" "suite=$SUITE" "scenario=$SCENARIO" "dry_run=1"
 fi
@@ -1151,7 +1166,7 @@ fi
 SUB=(--warmup-secs "$SETTLE" --dir "$OUT" --suite "$SUITE" --scenario "$SCENARIO" --host "$DX_HOST"
      --tag "launch_profile=$PROFILE" --tag "netem_level=${NETEM:-none}"
      # peer=<resolved host>, not the role: old, untagged runs implicitly ran
-     # against hermes (docs/reports/2026-08-19-peer-path/REPORT.md) — this makes
+     # against the aux host (docs/reports/2026-08-19-peer-path/REPORT.md) — this makes
      # every run from here on distinguishable by which host actually held the
      # WebRTC peer, which drops belong to Quasar's own pipeline.
      --tag "peer=$PEER_HOST")
@@ -1173,6 +1188,10 @@ SUB+=(--tag "peer_unlock_fps=$PEER_UNLOCK_FPS")
 [ -s "$OUT/bench-windows.json" ] && SUB+=(--artifact "$OUT/bench-windows.json")
 [ -s "$OUT/bench-frames.json" ] && SUB+=(--artifact "$OUT/bench-frames.json")
 for t in ${TAGS[@]+"${TAGS[@]}"}; do SUB+=(--tag "$t"); done
+# repo + commit are what `qbench check` finds the run by (bench_submit.py
+# defaults them; these only override).
+[ -n "$RUN_COMMIT" ] && SUB+=(--commit "$RUN_COMMIT")
+[ -n "$RUN_REPO" ] && SUB+=(--repo "$RUN_REPO")
 
 SUB_RC=0
 SUB_OUT="$(python3 "$DX_DIR/bench_submit.py" "${SUB[@]}" 2>&1)" || SUB_RC=$?

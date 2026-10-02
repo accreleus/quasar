@@ -3,118 +3,79 @@ title: Picture, sound and input
 description: Black screens, silence, mouse and keyboard problems, and the Escape key.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+Judge picture problems from a visible browser tab: a hidden tab throttles
+presentation and skews every client-side number.
 
 ## Black screen, session says running
 
-The server marks a session running once the pipeline is up and media is being
-sent. It does not know whether your browser could decode any of it.
+Check the session detail in **Admin ▸ Sessions**:
 
-**Check the browser can decode what was sent.** Open the session detail in Admin,
-Sessions and look at the resolved codec. Quasar gates codecs on a decode
-measurement taken at login, so this should not happen, but a stale measurement
-can produce it. Log out and back in on that device to re-measure.
-
-**Check the app actually started.** A container that exits immediately leaves you
-looking at a bare compositor. Session detail carries the exit reason. See
-[Launching a game](/quasar/troubleshooting/launching/).
-
-**Check the host frame rate.** In the session detail. Zero means nothing is being
-produced and the problem is host-side, not client-side.
+| Check | Fix |
+| --- | --- |
+| Resolved codec | The browser may not decode it (stale decode measurement). Log out and back in on that device. |
+| Exit reason | The app exited. See [Launching a game](/quasar/troubleshooting/launching/). |
+| Host frame rate is 0 | Nothing is being produced; the problem is on the host. |
 
 ## The picture is corrupt or full of artefacts
 
-**Packet loss.** Look at the loss series in the session detail. If it is rising,
-the network is the problem, not the encoder.
-
-**RTX 5090, Vulkan AV1 and driver 595.99.02.** Repeatedly corrupted text or
-blocky pixels can occur even with no packet loss. Driver 610.57.04 produced clean
-output in comparison tests. Releases containing the compatibility protection
-exclude AV1 on the affected GPU/driver combination and use another eligible
-codec. On older releases, select HEVC or H.264 explicitly. Do not use NVENC AV1
-as the workaround; see [the compatibility
-policy](/quasar/tuning/encoders/#av1-driver-compatibility).
-
-**A Vulkan host with HEVC armed.** If one frame in four is black or torn, the
-compositor's encode ring depth is wrong. Arming `QUASAR_VULKAN_HEVC=1` pins it
-correctly. If you overrode the ring depth by hand, undo that.
+| Cause | Fix |
+| --- | --- |
+| Packet loss (rising loss series in session detail) | A network problem, not the encoder. |
+| NVIDIA Vulkan AV1 corruption | Use driver 610 or newer. Where a known codec restriction applies, use HEVC or H.264 if the profile and client support them. See [NVIDIA compatibility](/quasar/reference/nvidia-compatibility/). |
+| Vulkan host with HEVC, one frame in four black or torn | Undo any hand-set encode ring depth. `QUASAR_VULKAN_HEVC=1` sets it correctly. |
 
 ## No sound
 
-**Check the session detail** for degraded audio and the reason it gives.
+- Check the session detail for degraded audio and its reason.
+- Check the audio sidecar image comes from the same release as the agent image.
+- Sound in some apps only: the app chose another output device in its own settings.
 
-**Check the audio sidecar image matches the agent image lineage.** A mismatched
-image can be missing the PulseAudio binary entirely, and the session then runs
-silently with only a warning logged. This has muted a whole host for days.
-
-**Make failures loud** so it does not happen again:
+To fail the session instead of running silently:
 
 ```bash
 QUASAR_AUDIO_REQUIRED=1
 ```
 
-The session then fails instead of degrading to silence.
+## The microphone button is missing or does nothing
 
-**Sound in some apps and not others** is the application picking a different
-output device. That is inside the container and is the app's own configuration.
+| Symptom | Fix |
+| --- | --- |
+| Missing | Turn it on in **Admin ▸ Settings**. |
+| Greyed out | Release input capture first. |
+| Does nothing | Allow the browser permission, and use HTTPS. |
 
-## The microphone toggle is missing or does nothing
-
-Missing: the instance setting is off. Admin, Settings.
-
-Present but nothing happens: browser permission was denied, or the page is not on
-HTTPS. Microphone capture needs a secure context.
-
-A live microphone always shows an indicator that cannot be hidden. If you cannot
-see the indicator, it is not capturing.
+A live microphone always shows an indicator.
 
 ## The mouse does not move, or moves wrongly
 
-**Capture input first.** Until you do, the mouse belongs to the browser. The
-drawer's first item is the capture toggle.
-
-**Check `/dev/uinput`** on the host is present and writable by the agent. Read
-access succeeds even on a broken setup, which makes this easy to misdiagnose. The
-host readiness check tests writing.
-
-**Pointer offset in a desktop session** was a compositor focus problem that has
-been fixed. If you see it, you are on an older version.
+- Capture input (the first item in the drawer).
+- Check the host's `uinput` and `input_probe` readiness checks. Rootless: install
+  the [device rules](/quasar/install/device-rules/). See [Readiness checks](/quasar/troubleshooting/readiness/#input).
+- Pointer offset in a desktop session: update Quasar.
 
 ## Escape leaves fullscreen instead of reaching the game
 
-Escape needs three things at once: a Chromium-based browser, fullscreen, and a
-secure context.
-
-The drawer tells you which one is missing. In practice it is almost always HTTPS.
+Escape needs a Chromium browser, fullscreen and HTTPS. The drawer says which is
+missing; usually it's HTTPS.
 
 ## Keyboard input goes to the browser
 
-Capture input. Without capture, the browser keeps the keyboard.
-
-If capture is on and keys still do not reach the game, check `/dev/uinput` as
-above.
+Capture input. If keys still don't arrive, check `/dev/uinput` as for the mouse.
 
 ## Controllers not detected
 
-Browsers do not reveal a gamepad until it has sent input, so press a button.
+1. Press a button: browsers hide a gamepad until it sends input.
+2. Use HTTPS.
+3. Check the `uinput` and `input_probe` readiness checks.
+4. Rootless Docker, pad listed but ignored by the game: update the app's image.
 
-Then confirm the page is on HTTPS, since the Gamepad API needs a secure context.
+## Controller buttons are in the wrong places
 
-Then check `/dev/uinput` on the host is present and writable by the agent. A
-read-only open succeeds even on a broken setup, which is what makes this easy to
-misdiagnose. The agent's readiness check tests for write access and reports the
-result on the host detail page.
+Games see an Xbox 360 controller. Some pads (for example 8BitDo over Bluetooth)
+aren't reported in the standard layout, and the **Controller & input** pane says
+so. Switch the pad to XInput mode, or connect it by cable or USB receiver.
 
 ## Touch input on a tablet
 
-Touch is forwarded. The session drawer is reached with an on-screen button rather
-than the keyboard chord, because there is no keyboard.
-
-Whether a given game is playable by touch is a separate question and usually the
-answer is no without a controller.
-
-<Aside type="note" title="Frame drop counters in a hidden tab are meaningless">
-A backgrounded or occluded browser tab throttles presentation, which inflates
-every client-side smoothness number. Judge picture problems from a visible tab,
-and judge delivery from the host-side numbers in the session detail.
-</Aside>
+Touch is forwarded. Open the session drawer with the on-screen button. Most games
+still need a controller.

@@ -3,8 +3,11 @@ package session
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 )
 
 // JobReclaimer closes the background-job runs a host's agent was executing when
@@ -36,12 +39,9 @@ const (
 	drainStopBudget      = 8 * time.Second
 )
 
-// DrainHost cordons a host: online → draining, so the scheduler (which places
-// only on `online`) stops putting sessions on it. A stable administrative state —
-// an admin uncordons it, or an agent disconnect flips it offline; the agent's own
-// re-register does not lift it (#140). Race-safe by
-// construction: a launch that already read status='online' may complete, but any
-// pick after the status commits excludes the host.
+// DrainHost acquires the fixed manual owner under the host row lock. A
+// reservation either completes before the hold or sees it under its own host
+// row lock. Registration and disconnect preserve the durable owner.
 //
 // force=true additionally session_stops every non-terminal session, best-effort
 // with the reaper as backstop. Idempotent, still honouring force. Returns
@@ -54,43 +54,51 @@ func (c *Coordinator) DrainHost(ctx context.Context, hostID string, force bool) 
 	switch h.Status {
 	case "offline":
 		return Host{}, ErrHostNotDrainable
-	case "online":
-		if err := c.store.SetHostStatus(ctx, hostID, "draining"); err != nil {
-			return Host{}, err
-		}
-		h.Status = "draining"
-	case "draining":
-		// already cordoned; fall through to honour force
 	}
+	status, err := admission.NewStore(c.store.pool).AcquireOnline(ctx, hostID, admission.ManualOwner, "Manual drain")
+	if errors.Is(err, admission.ErrHostOffline) {
+		return Host{}, ErrHostNotDrainable
+	}
+	if err != nil {
+		return Host{}, err
+	}
+	h.Status = status
 
 	if force {
-		ids, err := c.store.NonTerminalSessionIDsOnHost(ctx, hostID)
-		if err != nil {
+		if err := c.StopHostSessions(ctx, hostID); err != nil {
 			return Host{}, err
 		}
-		// Best-effort: a stop that fails to dispatch is reconciled by the reaper,
-		// and the host is draining regardless.
-		dctx, cancel := context.WithTimeout(ctx, drainStopBudget)
-		defer cancel()
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, drainStopConcurrency)
-		for _, sid := range ids {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func() {
-				defer wg.Done()
-				defer func() { <-sem }()
-				if _, err := c.Stop(dctx, sid, "host_draining"); err != nil {
-					c.log.Warn("force-drain stop failed", "host_id", hostID, "session_id", sid, "err", err)
-				}
-			}()
-		}
-		wg.Wait()
-		c.log.Info("force-drained host", "host_id", hostID, "stopped", len(ids))
 	} else {
 		c.log.Info("drained host (graceful)", "host_id", hostID)
 	}
 	return h, nil
+}
+
+// StopHostSessions is the force half of a drain, without taking a manual
+// restriction. Platform apply calls it only after acquiring its own hold.
+func (c *Coordinator) StopHostSessions(ctx context.Context, hostID string) error {
+	ids, err := c.store.NonTerminalSessionIDsOnHost(ctx, hostID)
+	if err != nil {
+		return err
+	}
+	dctx, cancel := context.WithTimeout(ctx, drainStopBudget)
+	defer cancel()
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, drainStopConcurrency)
+	for _, sid := range ids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if _, err := c.Stop(dctx, sid, "host_draining"); err != nil {
+				c.log.Warn("force-drain stop failed", "host_id", hostID, "session_id", sid, "err", err)
+			}
+		}()
+	}
+	wg.Wait()
+	c.log.Info("force-drained host", "host_id", hostID, "stopped", len(ids))
+	return nil
 }
 
 // AgentConnectivity reports whether a host's agent websocket is connected on
@@ -117,9 +125,9 @@ func WithAgentConnectivity(a AgentConnectivity) CoordinatorOption {
 	return func(c *Coordinator) { c.agents = a }
 }
 
-// UncordonHost lifts an admin cordon so the scheduler may place on the host
-// again. Idempotent. Returns ErrNotFound or ErrHostNotResumable (offline; it
-// returns online on its agent's reconnect).
+// UncordonHost releases the manual and legacy owners only. A platform, idle or
+// recovery owner can keep the host draining. Idempotent. Returns ErrNotFound or
+// ErrHostNotResumable when the host is offline.
 //
 // `draining` is not proof the agent is connected: a control-plane restart drops
 // every connection while the column keeps its value. With no live connection the
@@ -131,10 +139,7 @@ func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, er
 		return Host{}, err
 	}
 	switch h.Status {
-	case "offline":
-		return Host{}, ErrHostNotResumable
-	case "online":
-	case "draining":
+	case "offline", "online", "draining":
 		// A nil seam means unwired, not disconnected: reading it as disconnected
 		// would strand a host whose agent is connected and so never reconnects to
 		// flip the row back.
@@ -142,12 +147,18 @@ func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, er
 		if c.agents != nil && !c.agents.IsConnected(hostID) {
 			next = "offline"
 		}
-		if err := c.store.SetHostStatus(ctx, hostID, next); err != nil {
+		status, err := admission.NewStore(c.store.pool).ReleaseManual(ctx, hostID, next == "online")
+		if errors.Is(err, admission.ErrHostOffline) {
+			return Host{}, ErrHostNotResumable
+		}
+		if err != nil {
 			return Host{}, err
 		}
-		h.Status = next
-		if next == "online" {
+		h.Status = status
+		if status == "online" {
 			c.log.Info("uncordoned host", "host_id", hostID)
+		} else if status == "draining" {
+			c.log.Info("manual hold released; another operation still restricts admission", "host_id", hostID)
 		} else {
 			c.log.Warn("uncordoned host with no connected agent; offline until it reconnects",
 				"host_id", hostID)

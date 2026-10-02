@@ -21,6 +21,7 @@ const (
 	CodeRateLimited            = "rate_limited"             // 429
 	CodeNoHostAvailable        = "no_host_available"        // 503, retryable
 	CodeCapacityExhausted      = "capacity_exhausted"       // 503, retryable
+	CodeHostNotReady           = "host_not_ready"           // 503, retryable, no Retry-After
 	CodeSessionQuota           = "session_quota_exceeded"   // 409
 	CodeSessionNotSwappable    = "session_not_swappable"    // 409
 	CodeSwapExceedsReservation = "swap_exceeds_reservation" // 409
@@ -30,6 +31,8 @@ const (
 	// command it was sent): the host encoder cannot change the encoded size live.
 	CodeExternalResizeUnsupported = "external_resize_unsupported" // 409
 	CodeHomeInUse                 = "home_in_use"                 // 409
+	CodeHomeConflict              = "home_conflict"               // 409
+	CodeClaimNotReleasable        = "claim_not_releasable"        // 409, amendment 15
 	// home_not_provisioned and parent_app_disabled are the only two refusals whose
 	// remedy lies outside the caller's reach; never fold either into `conflict`.
 	CodeHomeNotProvisioned   = "home_not_provisioned"           // 409

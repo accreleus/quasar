@@ -1,0 +1,8 @@
+{
+  "shape": "rejection",
+  "about": "400: the host cannot take console mode.",
+  "body": {
+    "reason": "invalid",
+    "message": "invalid machine inputs: console mode needs the host's /dev/dri, which this host lacks; console mode was not changed"
+  }
+}

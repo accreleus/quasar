@@ -1,7 +1,7 @@
 # Steam ACF manifest fixtures
 
 These 9 files are verbatim captures of the real `appmanifest_*.acf` files from
-the live Tower box (2026-07-29), used as the parser test corpus for the
+a live lab host (2026-07-29), used as the parser test corpus for the
 library-discovery scanner (`node-agent/src/session/library_scan.rs`).
 
 **One deliberate modification:** every `LastOwner` value has been replaced

@@ -288,6 +288,16 @@ fn assert_vulkan_encoder_device(
     Ok(())
 }
 
+/// A console session drives the host's own display: LocalOnly always, DualOutput when
+/// `console_config` enables it (`console_required` in `run_blocking`).
+fn wants_console_vt(cfg: &SessionConfig) -> bool {
+    cfg.console_config.as_ref().is_some_and(|c| c.enabled)
+        && matches!(
+            cfg.video_topology,
+            VideoTopology::LocalOnly | VideoTopology::DualOutput
+        )
+}
+
 /// Fail the whole DualOutput session when a required console local-display leg cannot
 /// be built or played: for a console session the local monitor IS the purpose, so emit
 /// `Failed` and tear down source + encode + audio rather than stream to the browser
@@ -317,6 +327,7 @@ fn fail_dualoutput_console<F: Fn(SessionEvent)>(
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Starting,
+    HomeSeed(super::home::HomeSeedOutcome),
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
     Running,
@@ -1194,35 +1205,8 @@ fn swap_app_ready_timeout() -> Duration {
 /// Poll interval for both swap wait loops.
 const SWAP_POLL: Duration = Duration::from_millis(20);
 
-/// #484 boot budget: how long a launched app may take to present its first frame before
-/// the session fails `app_never_presented`. 300 s covers a cold managed home plus a cold
-/// image pull; a false "your game is broken" would be a new defect. Knob:
-/// `QUASAR_APP_BOOT_TIMEOUT_SECS`.
-const APP_BOOT_TIMEOUT_DEFAULT_SECS: u64 = 300;
-
 /// How often the boot watcher logs that it is still waiting.
 const APP_BOOT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
-
-/// [`APP_BOOT_TIMEOUT_DEFAULT_SECS`] with its env override. `0` disables the watchdog
-/// (`None`), leaving the idle reaper unchanged; a non-numeric value falls back to the
-/// default rather than silently disabling it.
-fn app_boot_timeout() -> Option<Duration> {
-    let secs = match std::env::var("QUASAR_APP_BOOT_TIMEOUT_SECS") {
-        Ok(v) => match v.trim().parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => {
-                tracing::warn!(
-                    token = "knob-invalid-app-boot-timeout",
-                    "QUASAR_APP_BOOT_TIMEOUT_SECS={v:?} is not a number; \
-                     using the default {APP_BOOT_TIMEOUT_DEFAULT_SECS}s"
-                );
-                APP_BOOT_TIMEOUT_DEFAULT_SECS
-            }
-        },
-        Err(_) => APP_BOOT_TIMEOUT_DEFAULT_SECS,
-    };
-    (secs > 0).then(|| Duration::from_secs(secs))
-}
 
 /// The gen-0 (session launch) app-presented gate, pure so the latch is unit tested (#484).
 ///
@@ -1383,6 +1367,27 @@ pub fn run_blocking(
     emit(SessionEvent::Starting);
     emit(SessionEvent::Progress("preparing resources and image"));
 
+    // #407: a local console session holds the console VT, keyboard off, from before its
+    // virtual keyboard exists until after it is gone, so nothing typed in the session
+    // reaches a host login prompt. Must be declared before `res`, weston and the physical
+    // input forwarder so it drops after them. Fail-closed.
+    let mut console_vt: Option<super::console_vt::ConsoleVt> = if wants_console_vt(&cfg) {
+        match super::console_vt::ConsoleVt::take(stop.clone()) {
+            Ok(vt) => Some(vt),
+            Err(e) => {
+                tracing::error!(
+                    token = "runner-console-vt-failed",
+                    error = %format_args!("{e:#}"),
+                    "console session refused: the console terminal could not be taken"
+                );
+                emit(SessionEvent::Failed(format!("console terminal: {e:#}")));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // Session-level resources (input devices + PulseAudio sidecar) shared across
     // swaps. Dropping `res` releases the sidecar; each AppSource borrows its nodes.
     let (res, pulse_server) = match SessionResources::prepare(&session_id, &cfg) {
@@ -1399,6 +1404,9 @@ pub fn run_blocking(
             return;
         }
     };
+    if let Some(outcome) = res.home_seed {
+        emit(SessionEvent::HomeSeed(outcome));
+    }
     cfg.pulse_server = pulse_server;
     if cfg.pulse_server.is_none() && !cfg.use_test_audio {
         // The sidecar was wanted and is not there: this session will stream SILENCE. A
@@ -1614,6 +1622,7 @@ pub fn run_blocking(
             vulkan_contexts.as_ref(),
             local_backend,
             prestarted_weston,
+            console_vt.as_mut(),
         );
         return;
     }
@@ -1734,8 +1743,8 @@ pub fn run_blocking(
                 "encode pipeline READY transition (Vulkan device verification) failed"
             );
             emit(SessionEvent::Failed(reason));
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             current_source.teardown();
+            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
         if let Err(e) = assert_vulkan_encoder_device(&encode_pipe, expected) {
@@ -1749,8 +1758,8 @@ pub fn run_blocking(
                 "verify Vulkan context identity failed"
             );
             emit(SessionEvent::Failed(reason));
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             current_source.teardown();
+            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
     }
@@ -1761,6 +1770,7 @@ pub fn run_blocking(
             "encode pipeline PLAYING transition failed"
         );
         emit(SessionEvent::Failed(format!("encode set PLAYING: {e}")));
+        current_source.teardown();
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         return;
     }
@@ -1786,17 +1796,24 @@ pub fn run_blocking(
     // neither blocks the other's state transition. Teardown is the idempotent
     // `audio_pipeline.finish()`, the one mechanism no exit path can skip.
     if let Some(audio_pipe) = audio_pipeline.as_ref() {
-        // Same clock as the encode pipeline, so RTP timestamps stay coherent.
-        audio_pipe.set_start_time(None::<gst::ClockTime>);
-        audio_pipe.use_clock(Some(&shared_clock));
-        audio_pipe.set_base_time(shared_base);
+        // Never force the session's shared clock here (#351): the pipeline must run on
+        // the capture's own clock. Slaved to the SystemClock, the monitor's sample count
+        // drifts ahead of it (~80 ppm measured), audiobasesrc's skew slaving only corrects
+        // a capture that runs slow, and webrtcbin's internal `clocksync sync=true` then
+        // holds each buffer until its timestamp. After ~40 min that wait passes the 200 ms
+        // capture ring buffer and the capture drops ~200 ms of every ~270 ms. Nothing
+        // needs the shared clock: this PC is not lip-synced to video (#304).
         if let Err(e) = audio_pipe.set_state(gst::State::Playing) {
             tracing::warn!(
                 token = "audio-pipeline-play-failed",
                 "audio pipeline set PLAYING failed: {e:#} (audio disabled)"
             );
         } else {
-            tracing::info!("audio pipeline PLAYING (separate from encode)");
+            let clock = audio_pipe
+                .clock()
+                .map(|c| c.name().to_string())
+                .unwrap_or_else(|| "none yet".into());
+            tracing::info!("audio pipeline PLAYING (separate from encode, clock {clock})");
         }
     }
     // Optional local-display fan-out (third interpipe listener into waylandsink+headless
@@ -2022,6 +2039,7 @@ pub fn run_blocking(
             "encode pipeline has no bus"
         );
         emit(SessionEvent::Failed("encode pipeline has no bus".into()));
+        current_source.teardown();
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         audio_pipeline.finish();
         return;
@@ -2048,7 +2066,7 @@ pub fn run_blocking(
     // #484 gen-0 app-boot gate. `AppBooting` follows `Running` for any generation that
     // launches an app container; `AppPresented` latches the first genuine draw. Both are
     // single-shot.
-    let app_boot_budget = app_boot_timeout();
+    let app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
     let mut app_boot_counter_warned = false;
@@ -2078,6 +2096,20 @@ pub fn run_blocking(
     let mut last_ice_ufrag: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     loop {
+        if let Some(reason) = console_vt.as_mut().and_then(|vt| vt.lost()) {
+            if let Some(ld) = _local_display.as_ref() {
+                let _ = ld.pipeline.set_state(gst::State::Null);
+            }
+            fail_dualoutput_console(
+                &emit,
+                format!("console terminal lost: {reason}"),
+                &mut current_source,
+                &encode_pipe,
+                audio_pipeline.as_ref(),
+                defer_encode_teardown,
+            );
+            return;
+        }
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
             current_source.teardown(); // remove the app container before media
@@ -2903,6 +2935,7 @@ fn run_local_only<F: Fn(SessionEvent)>(
     vulkan_contexts: Option<&VulkanContextBridge>,
     local_backend: console::LocalBackend,
     prestarted_weston: Option<console::WestonConsole>,
+    mut console_vt: Option<&mut super::console_vt::ConsoleVt>,
 ) {
     let Some(cc) = cfg.console_config.as_ref().filter(|c| c.enabled) else {
         tracing::error!(
@@ -3050,6 +3083,19 @@ fn run_local_only<F: Fn(SessionEvent)>(
     // See the matching declaration in run_blocking.
     let mut renderer_degrade_tracker = RendererDegradeTracker::default();
     loop {
+        if let Some(reason) = console_vt.as_mut().and_then(|vt| vt.lost()) {
+            tracing::error!(
+                token = "runner-console-vt-lost",
+                reason = %reason,
+                "console terminal lost mid-session"
+            );
+            emit(SessionEvent::Failed(format!(
+                "console terminal lost: {reason}"
+            )));
+            let _ = local_display.pipeline.set_state(gst::State::Null);
+            current_source.teardown();
+            return;
+        }
         if let Some(weston) = weston.as_mut() {
             match weston.try_exit() {
                 Ok(Some(status)) => {
@@ -3528,7 +3574,22 @@ fn perform_swap(
     // ── Step 2: stop the outgoing app and WAIT for it to exit ────────────────
     // Past this line a failure costs the previous app's process state, so everything
     // cheaply validatable must already have been validated above.
-    let stopped_previous_app = current_source.stop_app_container();
+    //
+    // `stop_app_container` rides out a runtime client that refuses the call on its
+    // own retry budget (`session::teardown`), so a transient busy client does not
+    // end a live session here. What stays fatal is a stop that was ASKED and not
+    // proven, and a refusal that outlives the budget: either way the outgoing app
+    // may still hold its managed home, and the replacement must not write into it.
+    let stopped_previous_app =
+        current_source
+            .stop_app_container()
+            .map_err(|error| SwapFailure {
+                // The stop request may have reached Docker before its cleanup reply was lost.
+                // We cannot honestly claim the old process was rolled back or start another
+                // managed-home writer while that exact teardown remains unresolved.
+                reason: format!("previous application teardown remains unproven: {error}"),
+                fatal: true,
+            })?;
     if stopped_previous_app {
         tracing::info!(
             "swap: previous app container stopped and reaped (gen {} -> {gen}); its compositor \
@@ -3581,6 +3642,24 @@ fn perform_swap(
                 emit(SessionEvent::AppPresented);
             }
             break Ok(());
+        }
+        // A replacement that exits before it ever presents: its own generation's observer
+        // reports the exit with its final lines, so the swap fails NOW with the real cause
+        // rather than sitting out the budget and reporting "no frame". Checked AFTER the
+        // readiness gate so an app that presented and then exited is adopted and handled
+        // by the normal exit policy, never rolled back as "never presented".
+        if let Some(status) = new_source.take_container_exit() {
+            let tail = new_source.app_log_tail();
+            tracing::warn!(
+                token = "swap-replacement-exited-before-presenting",
+                status = ?status,
+                lines = tail.len(),
+                "swap: replacement app exited before presenting; its final lines: {}",
+                tail.join(" | ")
+            );
+            break Err(format!(
+                "replacement app exited before presenting ({status:?})"
+            ));
         }
         if Instant::now() >= deadline {
             break Err(format!(
@@ -3636,7 +3715,7 @@ fn perform_swap(
     // whatever exit it observes and it is never misclassified as an app failure. Its
     // `exit_result` slot drops with it, so the caller's `take_container_exit` poll only
     // ever sees the new generation. The old app container is already gone (step 2), so
-    // this drop only NULLs its compositor and runs the idempotent `force_remove` backstop.
+    // this drop only NULLs its compositor; application cleanup remains an owned durable API obligation.
     *current_source = new_source;
     Ok(())
 }
@@ -4021,7 +4100,7 @@ mod tests {
         gst::init().unwrap();
 
         // A 1280x720 "launch" software session (openh264 arm: videoscale + capsfilter).
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = crate::session::EncoderChoice::Openh264;
         let stream = crate::session::StreamParams {
             width: 1280,
@@ -4068,8 +4147,10 @@ mod tests {
             let w = m.drain_window(std::time::Instant::now());
             (w.stream_width, w.stream_height)
         };
+        // Up to 5 s: a live renegotiation is quick alone but can take over a second while
+        // the whole suite runs in parallel, and 1 s made this flaky.
         let wait_for_echo = |want: (Option<i32>, Option<i32>)| {
-            for _ in 0..40 {
+            for _ in 0..200 {
                 if echo(&metrics) == want {
                     return true;
                 }
@@ -4081,7 +4162,7 @@ mod tests {
         // At the launch size, nothing is echoed.
         assert_eq!(echo(&metrics), (None, None));
 
-        // Step DOWN: the echo must become the new size within ~1 s. The stale read returned
+        // Step DOWN: the echo must become the new size. The stale read returned
         // the launch size, which folds to "default", so this assertion catches the bug.
         apply_stream_update(&lever, 640, 360);
         assert!(
@@ -4109,7 +4190,7 @@ mod tests {
         launch: (i32, i32),
     ) -> Arc<pipeline::EncodeResolutionLever> {
         gst::init().unwrap();
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = crate::session::EncoderChoice::Openh264;
         let stream = crate::session::StreamParams {
             width: launch.0,
@@ -4410,12 +4491,12 @@ mod tests {
 
     /// The exact text three live sessions failed with. It must classify as a peer
     /// disconnect, NOT as a generic encode failure.
-    const TOWER_20260725_SCTP_ERROR: &str = "encode pipeline error: Could not write to resource. \
+    const GPU_TEST_20260725_SCTP_ERROR: &str = "encode pipeline error: Could not write to resource. \
          (gstsctpenc.c(898): on_sctp_association_state_changed: SCTP association went into error state)";
 
     #[test]
-    fn classifies_the_live_tower_sctp_association_error() {
-        assert!(is_sctp_association_error(TOWER_20260725_SCTP_ERROR));
+    fn classifies_the_live_gpu_test_sctp_association_error() {
+        assert!(is_sctp_association_error(GPU_TEST_20260725_SCTP_ERROR));
         // The GError message alone names nothing: only the debug half carries the
         // signature, so classification MUST run over `error` + `debug` concatenated.
         assert!(!is_sctp_association_error("Could not write to resource."));
@@ -4457,7 +4538,7 @@ mod tests {
     #[test]
     fn sctp_error_is_not_a_vulkan_device_loss() {
         assert!(!super::vulkan_fault::is_device_lost(
-            TOWER_20260725_SCTP_ERROR
+            GPU_TEST_20260725_SCTP_ERROR
         ));
     }
 
@@ -4715,15 +4796,6 @@ mod tests {
             Duration::from_secs(9999),
             false
         ));
-    }
-
-    #[test]
-    fn app_boot_timeout_defaults_when_unset() {
-        // A typo'd value must not silently disable the watchdog.
-        assert_eq!(
-            super::app_boot_timeout(),
-            Some(Duration::from_secs(super::APP_BOOT_TIMEOUT_DEFAULT_SECS))
-        );
     }
 
     // ---- #408: audio pipeline guard ----

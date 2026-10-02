@@ -91,41 +91,79 @@ pub struct LadderSettings {
 
 impl LadderSettings {
     pub fn from_env() -> Self {
-        let base = LadderConfig::new().with_env_overrides();
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`LadderSettings::from_env`]: `lookup` supplies each var's raw value
+    /// instead of reading process env directly.
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let base = LadderConfig::new().with_overrides_from(lookup);
         let p = ResolutionPolicy::new();
         Self {
             enabled: !matches!(
-                std::env::var("QUASAR_ABR_LADDER").ok().as_deref(),
+                lookup("QUASAR_ABR_LADDER").as_deref(),
                 Some("0") | Some("false") | Some("FALSE")
             ),
             max_bias: base.max_bias,
             engage_dwell: base.engage_dwell,
             recover_dwell: base.recover_dwell,
-            resolution_enabled: env_flag("QUASAR_ABR_LADDER_RESOLUTION"),
-            fps_enabled: env_flag("QUASAR_ABR_LADDER_FPS"),
-            floor_follows_rung: env_flag_default_true("QUASAR_ABR_LADDER_FLOOR_FOLLOWS_RUNG"),
-            order: std::env::var("QUASAR_ABR_LADDER_ORDER")
-                .ok()
+            resolution_enabled: env_flag("QUASAR_ABR_LADDER_RESOLUTION", lookup),
+            fps_enabled: env_flag("QUASAR_ABR_LADDER_FPS", lookup),
+            floor_follows_rung: env_flag_default_true(
+                "QUASAR_ABR_LADDER_FLOOR_FOLLOWS_RUNG",
+                lookup,
+            ),
+            order: lookup("QUASAR_ABR_LADDER_ORDER")
                 .and_then(|s| LadderOrder::parse(&s))
                 .unwrap_or(LadderOrder::Hybrid),
             res: ResolutionPolicy {
-                exponent: env_f64("QUASAR_ABR_LADDER_RES_EXPONENT", p.exponent, 0.5, 1.0),
+                exponent: env_f64(
+                    "QUASAR_ABR_LADDER_RES_EXPONENT",
+                    p.exponent,
+                    0.5,
+                    1.0,
+                    lookup,
+                ),
                 engage_frac: env_f64(
                     "QUASAR_ABR_LADDER_RES_ENGAGE_FRAC",
                     p.engage_frac,
                     0.2,
                     0.95,
+                    lookup,
                 ),
                 recover_frac: env_f64(
                     "QUASAR_ABR_LADDER_RES_RECOVER_FRAC",
                     p.recover_frac,
                     0.3,
                     1.0,
+                    lookup,
                 ),
-                engage_dwell: env_u8("QUASAR_ABR_LADDER_RES_ENGAGE_DWELL", p.engage_dwell, 1),
-                recover_dwell: env_u8("QUASAR_ABR_LADDER_RES_RECOVER_DWELL", p.recover_dwell, 1),
-                min_step_s: env_u64("QUASAR_ABR_LADDER_RES_MIN_STEP_S", p.min_step_s, 5, 120),
-                min_height: env_i32("QUASAR_ABR_LADDER_RES_MIN_HEIGHT", p.min_height, 360, 2160),
+                engage_dwell: env_u8(
+                    "QUASAR_ABR_LADDER_RES_ENGAGE_DWELL",
+                    p.engage_dwell,
+                    1,
+                    lookup,
+                ),
+                recover_dwell: env_u8(
+                    "QUASAR_ABR_LADDER_RES_RECOVER_DWELL",
+                    p.recover_dwell,
+                    1,
+                    lookup,
+                ),
+                min_step_s: env_u64(
+                    "QUASAR_ABR_LADDER_RES_MIN_STEP_S",
+                    p.min_step_s,
+                    5,
+                    120,
+                    lookup,
+                ),
+                min_height: env_i32(
+                    "QUASAR_ABR_LADDER_RES_MIN_HEIGHT",
+                    p.min_height,
+                    360,
+                    2160,
+                    lookup,
+                ),
                 settle_windows: p.settle_windows,
             },
         }
@@ -275,24 +313,30 @@ impl Default for LadderSettings {
     }
 }
 
-fn env_flag(var: &str) -> bool {
+fn env_flag(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
-        std::env::var(var).ok().as_deref(),
+        lookup(var).as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     )
 }
 
 /// A boolean env knob whose default is **on** — only an explicit `0`/`false` turns it off
 /// (the `QUASAR_ABR_LADDER` convention, not `env_flag`'s opt-in one).
-fn env_flag_default_true(var: &str) -> bool {
+fn env_flag_default_true(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     !matches!(
-        std::env::var(var).ok().as_deref(),
+        lookup(var).as_deref(),
         Some("0") | Some("false") | Some("FALSE")
     )
 }
 
-fn env_f64(var: &str, default: f64, lo: f64, hi: f64) -> f64 {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
+fn env_f64(
+    var: &str,
+    default: f64,
+    lo: f64,
+    hi: f64,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> f64 {
+    match lookup(var).as_deref().map(str::trim) {
         None | Some("") => default,
         Some(raw) => match raw.parse::<f64>() {
             Ok(v) if v.is_finite() && (lo..=hi).contains(&v) => v,
@@ -307,8 +351,14 @@ fn env_f64(var: &str, default: f64, lo: f64, hi: f64) -> f64 {
     }
 }
 
-fn env_u64(var: &str, default: u64, lo: u64, hi: u64) -> u64 {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
+fn env_u64(
+    var: &str,
+    default: u64,
+    lo: u64,
+    hi: u64,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> u64 {
+    match lookup(var).as_deref().map(str::trim) {
         None | Some("") => default,
         Some(raw) => match raw.parse::<u64>() {
             Ok(v) if (lo..=hi).contains(&v) => v,
@@ -323,8 +373,14 @@ fn env_u64(var: &str, default: u64, lo: u64, hi: u64) -> u64 {
     }
 }
 
-fn env_i32(var: &str, default: i32, lo: i32, hi: i32) -> i32 {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
+fn env_i32(
+    var: &str,
+    default: i32,
+    lo: i32,
+    hi: i32,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> i32 {
+    match lookup(var).as_deref().map(str::trim) {
         None | Some("") => default,
         Some(raw) => match raw.parse::<i32>() {
             Ok(v) if (lo..=hi).contains(&v) => v,
@@ -395,20 +451,36 @@ impl LadderConfig {
     /// Knobs: `QUASAR_ABR_LADDER_MAX_BIAS` [0,255] (0 = inert),
     /// `QUASAR_ABR_LADDER_ENGAGE_DWELL` [1,255], `QUASAR_ABR_LADDER_RECOVER_DWELL` [1,255].
     /// An unparseable value warns once and falls back to the default.
-    pub fn with_env_overrides(mut self) -> Self {
+    pub fn with_env_overrides(self) -> Self {
+        self.with_overrides_from(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`LadderConfig::with_env_overrides`]: `lookup` supplies each var's
+    /// raw value instead of reading process env directly.
+    pub fn with_overrides_from(mut self, lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         // max_bias may be 0 (a valid disable of the rung); engage/recover must be >= 1
         // (a 0 dwell would step every window, defeating the hysteresis).
-        self.max_bias = env_u8("QUASAR_ABR_LADDER_MAX_BIAS", self.max_bias, 0);
-        self.engage_dwell = env_u8("QUASAR_ABR_LADDER_ENGAGE_DWELL", self.engage_dwell, 1);
-        self.recover_dwell = env_u8("QUASAR_ABR_LADDER_RECOVER_DWELL", self.recover_dwell, 1);
+        self.max_bias = env_u8("QUASAR_ABR_LADDER_MAX_BIAS", self.max_bias, 0, lookup);
+        self.engage_dwell = env_u8(
+            "QUASAR_ABR_LADDER_ENGAGE_DWELL",
+            self.engage_dwell,
+            1,
+            lookup,
+        );
+        self.recover_dwell = env_u8(
+            "QUASAR_ABR_LADDER_RECOVER_DWELL",
+            self.recover_dwell,
+            1,
+            lookup,
+        );
         self
     }
 }
 
 /// Parse a `u8` env var that must be `>= min`. Junk / out-of-range (incl. > 255) WARNs
 /// once and returns `default`. A trimmed-empty value is treated as unset (silent).
-fn env_u8(var: &str, default: u8, min: u8) -> u8 {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
+fn env_u8(var: &str, default: u8, min: u8, lookup: &dyn Fn(&str) -> Option<String>) -> u8 {
+    match lookup(var).as_deref().map(str::trim) {
         None | Some("") => default,
         Some(raw) => match raw.parse::<u8>() {
             Ok(v) if v >= min => v,
@@ -1734,31 +1806,11 @@ mod tests {
     }
 
     // ---- config exposure: QUASAR_ABR_LADDER_* hysteresis knobs ----------------------
-    // Process-global env vars; all cases in ONE serialized snapshot/restore test (no
-    // serial_test dep, no other ladder test touches env vars).
-
-    fn restore(key: &str, prior: Option<String>) {
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
 
     #[test]
     fn env_overrides_default_to_the_old_constants_and_are_picked_up() {
-        let keys = [
-            "QUASAR_ABR_LADDER_MAX_BIAS",
-            "QUASAR_ABR_LADDER_ENGAGE_DWELL",
-            "QUASAR_ABR_LADDER_RECOVER_DWELL",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
         // (a) All unset ⇒ overlay is a no-op: fields EXACTLY equal the old constants.
-        let d = LadderConfig::new().with_env_overrides();
+        let d = LadderConfig::new().with_overrides_from(&crate::test_env::lookup(&[]));
         assert_eq!(d.max_bias, LadderConfig::DEFAULT_MAX_BIAS);
         assert_eq!(d.engage_dwell, LadderConfig::DEFAULT_ENGAGE_DWELL);
         assert_eq!(d.recover_dwell, LadderConfig::DEFAULT_RECOVER_DWELL);
@@ -1767,30 +1819,35 @@ mod tests {
         assert!(!d.resolution_enabled);
 
         // (b) Each var set to a valid value is picked up.
-        std::env::set_var("QUASAR_ABR_LADDER_MAX_BIAS", "3");
-        std::env::set_var("QUASAR_ABR_LADDER_ENGAGE_DWELL", "5");
-        std::env::set_var("QUASAR_ABR_LADDER_RECOVER_DWELL", "8");
-        let s = LadderConfig::new().with_env_overrides();
+        let s = LadderConfig::new().with_overrides_from(&crate::test_env::lookup(&[
+            ("QUASAR_ABR_LADDER_MAX_BIAS", "3"),
+            ("QUASAR_ABR_LADDER_ENGAGE_DWELL", "5"),
+            ("QUASAR_ABR_LADDER_RECOVER_DWELL", "8"),
+        ]));
         assert_eq!(s.max_bias, 3);
         assert_eq!(s.engage_dwell, 5);
         assert_eq!(s.recover_dwell, 8);
 
         // (c) max_bias=0 is VALID (disables the rung) — not a fall-back.
-        std::env::set_var("QUASAR_ABR_LADDER_MAX_BIAS", "0");
-        assert_eq!(LadderConfig::new().with_env_overrides().max_bias, 0);
+        assert_eq!(
+            LadderConfig::new()
+                .with_overrides_from(&crate::test_env::lookup(&[(
+                    "QUASAR_ABR_LADDER_MAX_BIAS",
+                    "0"
+                )]))
+                .max_bias,
+            0
+        );
 
         // (d) Invalid / out-of-range values fall back to the default.
-        std::env::set_var("QUASAR_ABR_LADDER_MAX_BIAS", "999"); // > u8::MAX
-        std::env::set_var("QUASAR_ABR_LADDER_ENGAGE_DWELL", "0"); // must be >= 1
-        std::env::set_var("QUASAR_ABR_LADDER_RECOVER_DWELL", "junk"); // unparseable
-        let f = LadderConfig::new().with_env_overrides();
+        let f = LadderConfig::new().with_overrides_from(&crate::test_env::lookup(&[
+            ("QUASAR_ABR_LADDER_MAX_BIAS", "999"),       // > u8::MAX
+            ("QUASAR_ABR_LADDER_ENGAGE_DWELL", "0"),     // must be >= 1
+            ("QUASAR_ABR_LADDER_RECOVER_DWELL", "junk"), // unparseable
+        ]));
         assert_eq!(f.max_bias, LadderConfig::DEFAULT_MAX_BIAS);
         assert_eq!(f.engage_dwell, LadderConfig::DEFAULT_ENGAGE_DWELL);
         assert_eq!(f.recover_dwell, LadderConfig::DEFAULT_RECOVER_DWELL);
-
-        for (k, prior) in saved {
-            restore(k, prior);
-        }
     }
 
     #[test]

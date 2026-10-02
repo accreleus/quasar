@@ -97,11 +97,10 @@ export function RungEditor({ rungs, availableToAdd, onMove, onRemove, onAdd, dis
         })
       )}
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
+      <div className="row gap2 mt3">
         <select
           id={addId}
-          className="select"
-          style={{ flex: 1 }}
+          className="select grow"
           aria-label="Add a stream profile"
           disabled={disabled || availableToAdd.length === 0}
           value={pendingAdd}
@@ -131,7 +130,7 @@ export function RungEditor({ rungs, availableToAdd, onMove, onRemove, onAdd, dis
         </button>
       </div>
 
-      <p className="hint" style={{ marginTop: 10 }}>
+      <p className="hint mt3">
         Falls through in order. The last rung must be H.264 because every browser can decode it.
       </p>
     </div>

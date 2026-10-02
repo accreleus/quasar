@@ -7,8 +7,19 @@ name: pages
 #
 # The published base is https://accreleus.github.io/quasar/ and it is not free
 # to change: the product UI ships that URL to operators
-# (web/src/pages/admin/fleet/EnrollHostModal.tsx). site/astro.config.mjs holds
+# (web/src/pages/admin/fleet/AddHostModal.tsx). site/astro.config.mjs holds
 # the matching `site` + `base`.
+#
+# Two versions of the docs, one Pages artifact (site/README.md "Deployment"):
+#
+#   /quasar/        stable: the latest release tag (non-prerelease), resolved
+#                   at run time, built with its own site config as it is
+#   /quasar/edge/   edge: the tip of `develop`, whichever ref dispatched this
+#
+# Each build is told which version it is through QUASAR_DOCS_CHANNEL and
+# QUASAR_DOCS_STABLE_LABEL (site/src/data/docs-version.js). A release tag cut
+# before the version switcher existed ignores them and builds at /quasar/
+# without a switcher, which is still the right stable site.
 
 on:
   workflow_dispatch:
@@ -24,28 +35,118 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # The API reference is generated from protocol/openapi.yaml, so the build
+      - name: Resolve the stable release
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # /releases/latest is the newest release that is neither a draft nor a
+        # prerelease: exactly what the stable docs describe.
+        run: |
+          tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [ -z "$tag" ]; then
+            echo "::error title=No stable release::No published non-prerelease release found, so there is no stable version to build."
+            exit 1
+          fi
+          echo "Stable docs from $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # The API reference is generated from protocol/openapi.yaml, so each build
       # fails without the submodule.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the stable release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ steps.stable.outputs.tag }}
+          path: stable
           submodules: true
+      - name: Check out develop (edge)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: develop
+          path: edge
+          submodules: true
+
+      # Publication guard (site/README.md "Before publishing"). Unfinished pages
+      # carry hidden MDX comments such as {/* TODO(#361): ... */}; they render
+      # nothing, so a green build would publish a draft. Refuse to deploy while
+      # any remain in the STABLE tree. Edge is develop by definition and is
+      # labelled as such on every page, so its markers are listed, not fatal.
+      - name: Refuse to publish unfinished drafts
+        # grep exits 0 when it finds a marker, 1 when it finds none, and 2 on any
+        # error (a missing directory, an unreadable file). Only 1 is clean: the
+        # guard must fail closed, never read an error as "no markers".
+        run: |
+          set +e
+          hits="$(grep -rnE 'TODO\((#|open)' stable/site/src/content stable/site/src/components)"
+          status=$?
+          set -e
+          case "$status" in
+            1) echo "No draft markers in stable: the site may publish." ;;
+            0)
+              printf '%s\n' "$hits"
+              echo "::error title=Unpublished drafts::The stable release's site still carries TODO(#N) / TODO(open …) draft markers (listed above). A released tree cannot be changed, so the fix lands in the next release. See site/README.md, Before publishing."
+              exit 1 ;;
+            *)
+              echo "::error title=Publication guard could not scan::grep exited $status while scanning the stable tree for draft markers, so the guard could not scan and refuses to publish. Fix the checkout, then dispatch pages again."
+              exit 1 ;;
+          esac
+          set +e
+          edge_hits="$(grep -rnE 'TODO\((#|open)' edge/site/src/content edge/site/src/components)"
+          set -e
+          if [ -n "$edge_hits" ]; then
+            printf '%s\n' "$edge_hits"
+            echo "::warning title=Draft markers on edge::develop's docs carry draft markers (listed above); edge publishes them as develop does."
+          fi
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: site/package-lock.json
-      - run: npm ci
-        working-directory: site
-      - run: npm test
-        working-directory: site
-      - run: npm run build
-        working-directory: site
+          cache-dependency-path: |
+            stable/site/package-lock.json
+            edge/site/package-lock.json
+
+      - name: Build stable at /quasar/
+        working-directory: stable/site
+        env:
+          QUASAR_DOCS_CHANNEL: stable
+          QUASAR_DOCS_STABLE_LABEL: ${{ steps.stable.outputs.tag }}
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Build edge at /quasar/edge/
+        working-directory: edge/site
+        env:
+          QUASAR_DOCS_CHANNEL: edge
+          QUASAR_DOCS_STABLE_LABEL: ${{ steps.stable.outputs.tag }}
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Assemble one artifact
+        run: |
+          if [ -e stable/site/dist/edge ]; then
+            echo "::error title=Path collision::The stable build already has an edge/ directory, which the edge docs would overwrite."
+            exit 1
+          fi
+          mkdir -p public
+          cp -a stable/site/dist/. public/
+          mkdir public/edge
+          cp -a edge/site/dist/. public/edge/
+
+      # Every edge link stays inside edge and resolves; stable is reported only,
+      # because a released tree cannot be fixed after the fact.
+      - name: Check links in both versions
+        run: node edge/site/scripts/check-versions.mjs public
+
       # Sets the Pages origin the artifact is expected to serve from; it does
       # not override astro.config.mjs.
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: site/dist
+          path: public
 
   deploy:
     needs: build

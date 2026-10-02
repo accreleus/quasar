@@ -166,9 +166,14 @@ type ghRelease struct {
 	} `json:"assets"`
 }
 
-// The asset a stable release carries. Distinct from
-// scripts/release/release-manifest.json, which is a different file.
-const ManifestAssetName = "platform-release-manifest.json"
+// The assets a stable release carries. Distinct from
+// scripts/release/release-manifest.json, which is a different file. Only the
+// format-2 asset is read: a release carrying only the format-1 one predates owned
+// installs and is not listed (control-api.md "RH06 contract step", item 4).
+const (
+	ManifestAssetName   = "platform-release-manifest.json"
+	ManifestAssetNameV2 = "platform-release-manifest.v2.json"
+)
 
 func (g *GitHubSource) List(ctx context.Context) ([]Listing, error) {
 	u := fmt.Sprintf("%s/repos/%s/releases?per_page=%d", g.apiBase, g.repo, releasePageSize)
@@ -203,9 +208,11 @@ func (g *GitHubSource) List(ctx context.Context) ([]Listing, error) {
 			PublishedAt: parseGitHubTime(r.PublishedAt, r.CreatedAt),
 		}
 		for _, a := range r.Assets {
-			if a.Name == ManifestAssetName {
-				l.ManifestURL = a.BrowserDownloadURL
-				break
+			switch {
+			case a.Name == ManifestAssetNameV2:
+				l.ManifestURL, l.ManifestFormat = a.BrowserDownloadURL, ManifestFormat2
+			case a.Name == ManifestAssetName && l.ManifestFormat != ManifestFormat2:
+				l.ManifestFormat = ManifestFormat1 // marked, never fetched
 			}
 		}
 		out = append(out, l)
@@ -215,7 +222,7 @@ func (g *GitHubSource) List(ctx context.Context) ([]Listing, error) {
 
 func (g *GitHubSource) FetchManifest(ctx context.Context, rawURL string) ([]byte, error) {
 	if strings.TrimSpace(rawURL) == "" {
-		return nil, fmt.Errorf("release carries no %s asset", ManifestAssetName)
+		return nil, fmt.Errorf("release carries no %s asset", ManifestAssetNameV2)
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {

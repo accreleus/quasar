@@ -1,14 +1,15 @@
 ---
 title: Images
-description: How container images get onto your GPU hosts, digest pinning, update policy, and why images are managed rather than typed in by hand.
+description: Installing app container images onto your GPU hosts, keeping them updated, and cleaning up.
 ---
 
 import Shot from '../../../components/Shot.astro';
 import admin_images from '../../../assets/shots/admin-images.png';
 import { Aside } from '@astrojs/starlight/components';
 
-Every app runs in a container image. Admin, Library, Images is where those
-images are installed onto your hosts and kept up to date.
+Every app runs in a container image. Admin, Library, Images installs images onto
+your hosts and keeps them up to date, pinned to exact versions so every host runs
+the same bits.
 
 <Shot
 	label="Admin images"
@@ -17,105 +18,81 @@ images are installed onto your hosts and kept up to date.
 	alt="The admin images page"
 />
 
-## Why this exists
-
-Before it did, images were pulled by hand and referenced by tag. That had two
-problems worth knowing about, because they explain the design.
-
-A tag is a moving target. Pulling `:latest` on host A on Tuesday and host B on
-Friday can give you two different images, and the resulting difference in
-behaviour is painful to track down.
-
-Worse, a routine `docker image prune` deleted hand-managed app images
-permanently, because there was no record of what they were or where they came
-from.
-
-So images are now a managed catalog. Quasar knows what should be installed, on
-which hosts, and at which exact version.
-
 ## Where images come from
 
-Quasar reads a catalog manifest published by the `quasar-images` project. That
-manifest lists the available images, what they are for, and the runtime settings
-each one needs.
+The list comes from the catalog published by the `quasar-images` project. Each
+entry is one of:
 
-Entries are one of two kinds.
-
-**Prebuilt** images are published to a container registry. Quasar resolves the
-tag to a content digest at sync time and then only ever dispatches the digest.
-Every host gets byte-identical bits, and a tag moving underneath you cannot
-change what is running.
-
-**Template** images are a Dockerfile plus build arguments. The node agent
-downloads the build context pinned to an exact commit and builds the image
-locally on the host. This is behind an explicit action, not something that
-happens on its own.
+- **Prebuilt**: pulled from a registry. The tag is resolved to a digest at sync
+  time, so a moving tag can't change what runs.
+- **Template**: a Dockerfile built on each host from a pinned commit, only when you
+  ask.
 
 ## Installing an image
 
-Install from the list. The control plane records the intent, and the node agents
-do the work: each host pulls or builds independently and reports back. Progress
-shows per host.
+1. Open **Admin ▸ Library ▸ Images** and choose an image.
+2. Press **Install** and check the progress for each host.
+3. When installation succeeds, [create an app](/quasar/admin/apps/) using the
+   new runtime preset.
 
-Installing an image also creates or updates a **runtime preset** from the
-manifest, which is the container specification (image, environment, GPU access,
-mounts) that apps can then reference. That is why you install an image before
-creating an app against it.
+Each host pulls or builds its own copy. The runtime preset stores the image,
+environment, GPU access and mounts for apps that use it.
 
 ## Where images get placed
 
-By default every host gets every installed image, so a session can be placed
-anywhere without waiting for a pull.
+An image is prepared on the hosts its apps may launch on, per each app's
+[Placement](/quasar/admin/apps/#placement) tab. By default that's every eligible
+host.
 
-Individual apps can opt into lazy placement instead, where the image is only
-fetched on the first launch attempt on that host. Worth it for large images you
-rarely use, at the cost of a slow first launch.
+With **Pull on first launch**, a host prepares the image at its first launch there
+instead. The player sees the loading screen meanwhile, which can take minutes for
+a large image. A failure fails only that launch. Use it for large, rarely used
+images.
+
+## Removing cached versions
+
+Uninstalling an image removes Quasar's record of it; its apps stop launching until
+it's reinstalled. Nothing is deleted from the hosts.
+
+On the image's page, **Cached versions** lists each version per host. **Remove this
+cached version** deletes it from that host. It's refused while anything still needs
+that version: an app, any container (even stopped), pending work, the last version
+that prepared successfully, or an incomplete host inventory. The page shows
+**Removal confirmed by the host inventory** when it's done. Managed homes are never
+touched.
 
 ## Updates
 
-Instance-wide policy under Admin, Settings:
+Set the policy under Admin, Settings:
 
 | Policy | Behaviour |
 | --- | --- |
 | `notify` | Default. Tells you an update exists and waits. |
-| `manual` | You update when you update. |
-| `auto` | Updates are applied as they appear. |
+| `manual` | You update when you choose. |
+| `auto` | Updates apply as they appear. |
 
-Any individual image can be **pinned**, which holds it at its current version
-regardless of the policy.
-
-Updates never disturb a running session. A new version takes effect at the next
-launch.
+**Pin** an image to hold it at its current version. Updates take effect at the next
+launch, never in a running session.
 
 <Aside type="caution" title="There is no rollback">
-Quasar does not keep the previous version. Going back means re-pulling or
-rebuilding an older catalog version. If a specific version works for you, pin it.
+The previous version isn't kept. To go back you re-pull or rebuild an older
+version. If a version works for you, pin it.
 </Aside>
 
 ## Registry allowlist
 
-`QUASAR_IMAGE_REGISTRY_HOSTS` limits which registries Quasar will resolve
-digests or fetch artwork from. It defaults to `ghcr.io`. This is a containment
-measure: it means a manifest cannot point your hosts at an arbitrary address.
-Widen it only if you are publishing your own images elsewhere.
+`QUASAR_IMAGE_REGISTRY_HOSTS` (default `ghcr.io`) limits which registries Quasar
+resolves digests and artwork from. Widen it only for your own registry.
 
 ## If an install stalls
 
-Open Admin, Fleet, Jobs and inspect the image job and its most recent run. The
-published Steam package is public; an unresolved digest now points to registry
-reachability, the registry allowlist, credentials for a different registry, or a
-malformed image reference rather than a private upstream package.
+Open Admin, Fleet, Jobs and check the image job's latest run. An unresolved digest
+usually means the registry is unreachable, not on the allowlist, needs credentials,
+or the image reference is malformed.
 
 ## Using your own image
 
-The image family is layered: a Fedora base, then a graphics layer carrying
-Vulkan, EGL, Wayland, audio and the NVIDIA runtime pieces, then app layers on
-top.
-
-**Every image in the app catalog must derive from the graphics layer.** That is
-what supplies GPU access and the Wayland plumbing the compositor expects. An
-arbitrary image from Docker Hub will not work.
-
-Images also carry contract labels that are validated when they enter Quasar. If
-you develop Quasar's image family itself, use the canonical image build and QA
-workflow described in [GPU and remote workflows](/quasar/developer/gpu-workflows/).
+**Every app image must derive from Quasar's graphics layer**, which supplies GPU
+access and the Wayland pieces the compositor needs. An arbitrary Docker Hub image
+won't work. Images also carry contract labels, validated on entry. To build images
+in the family, see [GPU and remote workflows](/quasar/developer/gpu-workflows/).

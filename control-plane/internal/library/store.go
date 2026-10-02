@@ -91,7 +91,7 @@ type ReportEntry struct {
 	// §16.1, was dropped). Stay in the allow-list anyway: narrowing buys nothing.
 	InstallDir string `json:"install_dir"`
 	SizeOnDisk int64  `json:"size_on_disk"`
-	// StateFlags is likewise unread: it was 4 for all five Valve tools on Tower and three of
+	// StateFlags is likewise unread: it was 4 for all five Valve tools on gpu-test and three of
 	// four real games, so it distinguishes nothing (denylist.go).
 	StateFlags int64 `json:"state_flags"`
 }
@@ -233,6 +233,10 @@ type ReconcileResult struct {
 	// Backfilled: existing discovered tiles of this parent whose blank description this scan
 	// filled in. See the backfill step at the end of Reconcile.
 	Backfilled int
+	// CreatedAppIDs are the apps.id of the tiles step 3 created — exactly Created of them, in
+	// creation order. The handler hands them to the artwork resolver once the transaction has
+	// committed (#384); an existing tile is never in it, so a re-scan resolves nothing.
+	CreatedAppIDs []string
 }
 
 // Candidate is one observed appid plus the decision the ladder reached for it.
@@ -353,9 +357,11 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 	//
 	// One insert per appid rather than a batched unnest(): N is bounded by scanMaxEntries
 	// (512), and per-row makes res.Created a true count rather than an aggregate that can't
-	// distinguish "created" from "already there".
+	// distinguish "created" from "already there". RETURNING yields a row only for an actual
+	// insert (DO NOTHING returns none), which is what makes CreatedAppIDs "new apps only".
 	for _, id := range publish {
-		tag, err := tx.Exec(ctx, `
+		var createdID string
+		err := tx.QueryRow(ctx, `
 			INSERT INTO apps (name, kind, parent_app_id, external_source, external_id,
 			                  origin, enabled, default_profile_id, profile_policy,
 			                  runtime_spec, managed_home, runtime_preset_id, library_provider)
@@ -375,11 +381,17 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 			ON CONFLICT (parent_app_id, external_source, external_id)
 			  WHERE parent_app_id IS NOT NULL
 			DO NOTHING
-		`, tileName(seen[id]), target.ParentID, SourceSteam, id, target.ProfileID, target.Policy)
+			RETURNING id::text
+		`, tileName(seen[id]), target.ParentID, SourceSteam, id, target.ProfileID, target.Policy).
+			Scan(&createdID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue // already there
+		}
 		if err != nil {
 			return res, fmt.Errorf("create derived tile: %w", err)
 		}
-		res.Created += int(tag.RowsAffected())
+		res.Created++
+		res.CreatedAppIDs = append(res.CreatedAppIDs, createdID)
 	}
 
 	// --- STEP 4: suppressed tiles that already exist -------------------------

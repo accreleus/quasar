@@ -4,7 +4,14 @@
 
 import type { AdminApp, AppKind, CatalogImage } from "../../../../api/types";
 
-export type EditorTabId = "identity" | "artwork" | "access" | "quality" | "runtime" | "library";
+export type EditorTabId =
+  | "identity"
+  | "artwork"
+  | "access"
+  | "quality"
+  | "runtime"
+  | "placement"
+  | "library";
 
 export interface EditorTab {
   id: EditorTabId;
@@ -15,7 +22,7 @@ export interface EditorTab {
 }
 
 export interface EditorTabInput {
-  /** null for /new: Artwork, Access and Library are all keyed on an app id. */
+  /** null for /new: Artwork, Access, Placement and Library are all keyed on an app id. */
   appId: string | null;
   /** Only a provider app owns a Library tab. A derived tile can never be one. */
   isProvider: boolean;
@@ -37,6 +44,9 @@ export function editorTabs({ appId, isProvider, grants, suppressed }: EditorTabI
   }
   tabs.push({ id: "quality", label: "Quality", to: `${base}/quality` });
   tabs.push({ id: "runtime", label: "Runtime", to: `${base}/runtime` });
+  // Saved apps only: placement is its own resource with its own revision, so
+  // there is nothing to place until the app exists.
+  if (appId) tabs.push({ id: "placement", label: "Placement", to: `${base}/placement` });
   if (appId && isProvider) {
     tabs.push({ id: "library", label: "Library", to: `${base}/library`, count: suppressed });
   }

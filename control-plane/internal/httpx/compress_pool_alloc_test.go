@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -47,9 +48,15 @@ func TestCompressPoolBoundsAllocationsPerRequest(t *testing.T) {
 		_, _ = io.Copy(io.Discard, rec.Result().Body)
 	}
 
+	// GC is off for the measured window: a collection empties the sync.Pool, and
+	// the next request then pays one fresh ~800KB compressor. That is GC timing,
+	// not a per-request cost, and on Go 1.26 under a parallel `go test ./...` it
+	// tipped the steady state over the bound. The regression this guards (a
+	// writer per request) allocates on every request, GC or not, so it still
+	// fails. 200 requests at the bound is ~26MB of uncollected heap.
 	const iterations = 200
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	var before, after runtime.MemStats
-	runtime.GC()
 	runtime.ReadMemStats(&before)
 	for i := 0; i < iterations; i++ {
 		rec := httptest.NewRecorder()
@@ -61,7 +68,6 @@ func TestCompressPoolBoundsAllocationsPerRequest(t *testing.T) {
 		_, _ = io.Copy(io.Discard, res.Body)
 	}
 	runtime.ReadMemStats(&after)
-
 	totalAlloc := after.TotalAlloc - before.TotalAlloc
 	perRequest := totalAlloc / iterations
 	const maxPerRequest = 128 * 1024 // 128KB, per #417's acceptance bound

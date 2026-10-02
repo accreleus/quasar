@@ -226,15 +226,15 @@ make bench-run HOST=devbox ARGS="--app 'Quasar Benchapp' --profile 1080p60 \
   default** (changed 2026-08-19): `QSES_PEER_ROLE` is set to the same role/host
   `bench_run.sh` resolved for `HOST`, so `qses` puts the peer on the stack host
   itself. `--peer aux` restores the pre-2026-08-19 default,
-  `QSES_PEER_ROLE=aux-infra` (hermes). The switch is a direct result of a
+  `QSES_PEER_ROLE=aux-infra` (the aux host). The switch is a direct result of a
   2026-08-19 measurement (write-up `docs/reports/2026-08-19-peer-path/REPORT.md`, which
   was deliberately not carried over to the public repository): an otherwise identical cell
-  measured **0.000% missing indices with a local peer vs 2.7% through hermes**
-  — hermes is a WiFi NIC doing software H.264 decode on a weaker CPU, and its
+  measured **0.000% missing indices with a local peer vs 2.7% through the aux host**
+  — the aux host is a WiFi NIC doing software H.264 decode on a weaker CPU, and its
   RTT p95 (136-173 ms) alone is enough to blow the 50 ms jitter buffer, which
   looks exactly like a missing-index gap. **Every browser-side drop number in
   every bench/soak report dated before 2026-08-19 was measured through the
-  hermes peer** (the harness default at the time) and therefore carries the
+  the aux host peer** (the harness default at the time) and therefore carries the
   peer's own network/CPU headroom as well as Quasar's — they are not directly
   comparable to a run made with `--peer local` (the default from here on).
   `--netem` cells still need the peer on the aux-infra side of the shaped link
@@ -242,7 +242,7 @@ make bench-run HOST=devbox ARGS="--app 'Quasar Benchapp' --profile 1080p60 \
   peer never crosses): `bench_run.sh`/`bench_suite.sh` refuse `--netem` +
   `--peer local` outright rather than submit unshaped data under an
   `impaired` label. Every run is tagged `peer=<resolved host>` (and
-  `conditions.peer_host`), so old (implicitly hermes) and new runs stay
+  `conditions.peer_host`), so old (implicitly the aux host) and new runs stay
   distinguishable in `/v1/stats` queries. To reproduce the old peer:
   `make bench-run ARGS='--profile ... --peer aux'`.
 - `scripts/dx/bench_app_samples.py` then folds everything into the two files
@@ -380,9 +380,9 @@ The instrument above is complete per-run; the standing cadence is a cron job on 
 
 **HOST=devbox-self, over a loopback ssh hop.** `bench_run.sh` always launches its session through `qses`, and `qses` always shells out over ssh to whatever `--stack` names — even when the target IS the machine the caller is already on, there is no "skip the hop, we're already here" path. So running the cron directly on the stack host still needs a working ssh hop back to itself. That host's own (untracked, machine-local) `.claude/skills/_shared/hosts.json` carries a self-entry — `ssh_host 127.0.0.1`, keyed by a **dedicated** keypair added to that host's own `authorized_keys`. Never reuse an interactive or agent-backed key for this. It is deliberately **not** named `local`: `common.sh`'s `DX_HOST=local` sentinel means "skip remote resolution entirely, this is the ephemeral `docker-compose.local.yml` dev stack" — `bench_run.sh`'s own admin-API calls fall back to that stack's port whenever `DX_HOST=local`, which silently pointed every one of them at the wrong stack the first time this ran live (the session itself launched and ran fine over the real ssh/`qses` path; `bench_run.sh`'s own poll for it just kept asking the wrong port whether it existed, and timed out). A real, resolvable host name routes `bench_run.sh` through its normal remote-host code path instead, which resolves correctly.
 
-**Skips cleanly, never crashes, never leaves anything behind.** Before launching anything, the script checks — in order — that it is not already mid-run (a portable mkdir-based lock, no `flock` dependency), that `BENCH_KEY` can actually be read (`$HOME/quasar-bench/deploy/.env`'s `BENCH_API_KEYS=harness:<secret>`, never copied into this repo), that the stack answers healthy (`GET /health` == 200), and that no session is already running (`qses ls --stack=local`, using the control plane's per-boot dev-agent key fetched fresh via `docker exec` every run, since it rotates on every restart). Any failure there is a clean `status=skipped reason=<...>`, not a partial run. When it does run, `bench_run.sh`'s own trap (session stop + host-setting restore on every exit path, `--keep` never passed) is what guarantees nothing is left running or overridden — the nightly wrapper adds no cleanup of its own beyond releasing its lock.
+**Skips cleanly, never crashes, never leaves anything behind.** Before launching anything, the script checks — in order — that it is not already mid-run (a portable mkdir-based lock, no `flock` dependency), that a bench server and key resolve (the cron user's `BENCH_URL`/`BENCH_KEY`, else its `~/.config/qbench/{url,key}` as `qbench doctor` checks them — no default server; `NIGHTLY_BENCH_ENV=<a co-located bench service's deploy/.env>` is an explicit opt-in key source, never a default, and nothing is copied into this repo), that the stack answers healthy (`GET /health` == 200), and that no session is already running (`qses ls --stack=local`, using the control plane's per-boot dev-agent key fetched fresh via `docker exec` every run, since it rotates on every restart). Any failure there is a clean `status=skipped reason=<...>`, not a partial run. When it does run, `bench_run.sh`'s own trap (session stop + host-setting restore on every exit path, `--keep` never passed) is what guarantees nothing is left running or overridden — the nightly wrapper adds no cleanup of its own beyond releasing its lock.
 
-**The alert is a log line, for now.** Every run appends exactly one `NIGHTLY-BUDGET status=ok|regression|skipped|error run_id=<id> suite=... scenario=... git_quasar=<sha> [reason=...]` line to `/home/quasar/quasar-nightly/<YYYY-MM-DD>.log` (30 daily files kept, older ones rotated out). On a regression, `/home/quasar/quasar-nightly/LAST_REGRESSION` is overwritten with the reconciled stage table — read either file over ssh, or via the Dozzle MCP (`CLAUDE.md` "Container logs on quasar-devbox"). There is no email/Slack wiring yet; the log line is the whole alerting surface.
+**The alert is a log line, for now.** Every run appends exactly one `NIGHTLY-BUDGET status=ok|regression|skipped|error run_id=<id> suite=... scenario=... git_quasar=<sha> [reason=...]` line to `$HOME/quasar-nightly/<YYYY-MM-DD>.log` (30 daily files kept, older ones rotated out). On a regression, `$HOME/quasar-nightly/LAST_REGRESSION` is overwritten with the reconciled stage table — read either file over ssh, or via the Dozzle MCP (`CLAUDE.md` "Container logs on quasar-devbox"). There is no email/Slack wiring yet; the log line is the whole alerting surface.
 
 **Bootstrap note:** `bench_budget.py`'s baseline lookup is keyed by `(suite, scenario, name)` — the pinned `latency-budget/1080p60-h264-local` baseline lives under suite `latency-budget`, so a run tagged suite `nightly-budget` would not find it without a matching baseline row for that suite too. A second baseline was pinned once, by hand, pointing at the same reference run (`640d5b00…`, the report's own `stages-local` cell) under `(suite=nightly-budget, scenario=1080p60-h264-local, name=latency-budget/1080p60-h264-local)` — the nightly cron reads that one. Re-baselining the nightly suite after a deliberate change follows the same policy as above, just pin it twice (once per suite) if both `latency-budget` and `nightly-budget` need to move together.
 

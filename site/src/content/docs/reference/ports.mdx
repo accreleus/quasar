@@ -4,86 +4,52 @@ description: What listens where, what needs to be reachable from where, and the 
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import PortsTable from '../../../components/PortsTable.astro';
 
 ## Ports
 
-| Port | Protocol | Who connects | Purpose |
-| --- | --- | --- | --- |
-| 8443 | TCP, HTTPS | Browsers | The web app and the API. This is the one people visit. |
-| 8080 | TCP, HTTP | Node agents, healthchecks | Agent enrollment, `/health`. Browser routes redirect to HTTPS. |
-| 9091 | TCP, HTTP | Localhost only | The node agent's own health endpoint. |
-| ephemeral | UDP | Browsers, direct to the GPU host | WebRTC media and input. Not proxied. |
+<PortsTable />
 
-Set the published HTTP and HTTPS ports with `CONTROL_PORT` and
-`QUASAR_TLS_PORT`.
-
-The hardened Compose overlay changes this: Caddy takes 443 and the control plane
-stops publishing ports at all, reachable only on the Docker bridge.
+Change the published ports with `CONTROL_PORT` and `QUASAR_TLS_PORT`. The hardened
+Compose overlay puts Caddy on 443 and publishes no control-plane ports.
 
 ## What has to reach what
 
-**Browser to control plane**, on 8443. Proxies fine.
-
-**Browser to GPU host**, on the ephemeral UDP range, directly. Does not proxy.
-This is the constraint that makes remote access hard. See
-[Reaching Quasar remotely](/quasar/network/remote-access/).
-
-**Node agent to control plane**, on 8080. Same machine or the same trusted
-network is fine.
+- **Browser to control plane** on 8443. Can be proxied.
+- **Browser to GPU host** on the ephemeral UDP range, directly. Can't be proxied.
+  See [Reaching Quasar remotely](/quasar/network/remote-access/).
+- **Node agent to control plane** on 8080.
 
 ## Firewall
 
-The answer splits by container, and getting it wrong is the most common cause of
-a session that launches but never shows video.
-
-**The control plane needs no rules.** Its ports are published through Docker,
-which DNATs them past the host firewall. That cuts both ways: opening those
-ports is unnecessary and closing them will not block anything.
-
-**The node agent does.** It runs with `network_mode: host`, which WebRTC ICE
-requires, so its UDP media is ordinary host traffic filtered by the host
-firewall's INPUT policy like any other process. A server distro that ships a
-default-deny firewall drops it silently, and nothing else complains: the UI, the
-API and session launch all keep working, because none of them travel that path.
+**The control plane needs no rules:** Docker-published ports bypass the host
+firewall. **The node agent does:** it uses host networking, so a default-deny
+firewall silently drops its media while login and launch still work.
 
 ### What has to be open
 
-Two things, both inbound to the GPU host from client devices on your LAN or VPN.
+Inbound to each GPU host, from your LAN or VPN clients:
 
 | What | Why |
 | --- | --- |
-| UDP, the ephemeral port range (Linux default `32768-60999`) | ICE and RTP both ride on it. Read your host's actual range with `cat /proc/sys/net/ipv4/ip_local_port_range`. |
-| UDP/5353, mDNS | Chrome sends `.local` hostnames as ICE candidates rather than IP addresses. Without mDNS there is no fallback. |
+| UDP, the ephemeral range (Linux default `32768-60999`; check `cat /proc/sys/net/ipv4/ip_local_port_range`) | WebRTC media. |
+| UDP/5353 (mDNS) | Chrome sends `.local` ICE candidates. |
 
 <Aside type="danger" title="Scope the rule to your subnet">
-Use the client LAN or VPN subnet, never `0.0.0.0/0`. Clients and GPU hosts need
-reachability to each other, not the host's entire ephemeral range exposed to the
-internet. A scoped rule preserves the rest of the host firewall policy.
+Use the client LAN or VPN subnet, never `0.0.0.0/0`.
 </Aside>
 
 ### How Quasar tells you
 
-The node agent's `media_reachability` readiness check probes the host firewall at
-startup and on reconnect, and surfaces its verdict in **Admin, Fleet, Hosts**.
-
-It reads the accept rules, not just the chain policy. A default-deny host whose
-rules already cover the ephemeral UDP range and UDP/5353 passes, quoting the
-matched rules. A host covering only one of the two warns and names the missing
-half. A host with no media rule at all gets the warning with the exact scoped
-rule for the firewall tool it detected.
-
-Two limits. The check cannot tell whether a rule's source scope reaches your
-clients, so a rule scoped to the wrong subnet still reads as covered. And
-detection degrades to no finding, not a failure, when no firewall client tool is
-reachable from inside the agent container, which is common on a stock image. Its
-silence is not proof the host is open.
+The `media_reachability` readiness check in **Admin ▸ Fleet ▸ Hosts** fails when a
+remote browser couldn't connect, and names the rule to add. A pass only covers the
+client that got through. See [Readiness checks](/quasar/troubleshooting/readiness/#network).
 
 ### Adding the rule
 
-Substitute `<lan-subnet>` (for example `192.168.1.0/24`) and `<port-range>` with
-your host's actual ephemeral range if it differs from `32768-60999`.
+Replace `<lan-subnet>` (for example `192.168.1.0/24`) and `<port-range>`.
 
-**firewalld**, the Fedora, RHEL and CentOS default:
+**firewalld:**
 
 ```bash
 sudo firewall-cmd --get-default-zone   # confirm <zone>
@@ -93,11 +59,7 @@ sudo firewall-cmd --permanent --zone=<zone> --add-service=mdns
 sudo firewall-cmd --reload
 ```
 
-On Fedora Server the default `FedoraServer` zone allows only ssh, cockpit and
-dhcpv6, so this is very likely the cause if you have not touched the firewall
-since install.
-
-**ufw**, the Debian and Ubuntu default when installed:
+**ufw:**
 
 ```bash
 sudo ufw allow proto udp from <lan-subnet> to any port <port-range>
@@ -105,19 +67,15 @@ sudo ufw allow from <lan-subnet> to any port 5353 proto udp
 sudo ufw reload
 ```
 
-**iptables**:
+**iptables** (insert ahead of your default-deny rule, then persist):
 
 ```bash
 sudo iptables -I INPUT -p udp -s <lan-subnet> --dport <port-range> -j ACCEPT
 sudo iptables -I INPUT -p udp -s <lan-subnet> --dport 5353 -j ACCEPT
 ```
 
-Insert both ahead of your existing default-deny rule, then persist them however
-your distro expects.
-
-**nftables**, with no firewalld or ufw layer on top: add INPUT accept rules for
-UDP `<port-range>` and `5353/udp`, scoped to `<lan-subnet>`, ahead of the
-default-deny or reject rule in your base input chain.
+**nftables:** add input accept rules for UDP `<port-range>` and `5353`, scoped to
+`<lan-subnet>`, ahead of the default-deny rule.
 
 ## Endpoints worth knowing
 
@@ -131,7 +89,7 @@ curl http://localhost:8080/health
 {"status":"ok","db":"ok"}
 ```
 
-Exempt from the HTTPS redirect by design.
+The control plane. Not redirected to HTTPS.
 
 ```bash
 curl http://127.0.0.1:9091/health
@@ -141,8 +99,7 @@ curl http://127.0.0.1:9091/health
 {"status":"ok","sessions":0,"connected":true}
 ```
 
-The node agent, on the host it runs on. `connected` is whether its link to the
-control plane is up.
+The node agent, on its own host. `connected` means its link to the control plane is up.
 
 ### The web app
 
@@ -151,16 +108,13 @@ control plane is up.
 | `/app` | The library and everything a player uses. |
 | `/app/account` | Profile, quality default, devices, sessions, storage. |
 | `/app/session/:id` | A live session. |
-| `/admin` | The admin area. Requires the admin role, enforced on the server. |
-| `/setup` | The first-run wizard. Only reachable before the instance is claimed. |
+| `/admin` | The admin area. Admin role enforced on the server. |
+| `/setup` | The first-run wizard, before the instance is claimed. |
 | `/login`, `/register` | Authentication. |
 
 ### API
 
-Everything under `/v1`. Bearer token authentication. Admin endpoints reject
-non-admin tokens regardless of which client is asking.
-
-A few that come up:
+Everything under `/v1`, with bearer tokens. Admin endpoints reject non-admin tokens.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -170,8 +124,7 @@ A few that come up:
 | `GET /v1/admin/sessions/{id}/metrics` | Raw metrics for a session. |
 | `POST /v1/sessions` | Launch a session. |
 
-Every endpoint is listed in the [Control-plane API](/quasar/developer/api/)
-reference, generated from the OpenAPI contract in the repository.
+Full list: [Control-plane API](/quasar/developer/api/).
 
 ### WebSockets
 
@@ -180,18 +133,44 @@ reference, generated from the OpenAPI contract in the repository.
 | `/v1/signal` | Browsers | WebRTC signaling. Gated by `QUASAR_ALLOWED_ORIGINS`. |
 | `/agent/ws` | Node agents | Registration, capacity, session commands, heartbeat. |
 
-<Aside type="caution" title="Both need upgrade forwarding and a long read timeout">
-A proxy that does not forward WebSocket upgrades breaks signaling entirely. A
-proxy that closes idle connections after a minute cuts sessions and drops agents.
-</Aside>
+A proxy in front must forward WebSocket upgrades and allow long idle connections.
 
 ## Volumes
+
+On a Quasar-owned machine:
+
+| Volume | Contents |
+| --- | --- |
+| `quasar-machine` | Machine state: inputs, generated secrets, update records, pre-update dumps, the seed's state. **Never delete it.** |
+| `quasar-recovery-agent` | The agent's socket to its recovery actor. |
+| `quasar-agent-data` | The agent's node secret and identity. |
+| `quasar-node-agent-secrets` | The agent's secrets, such as the enrollment string. Read-only. |
+| `quasar-nvidia-driver` | NVIDIA hosts only. Driver libraries built from the running kernel module. |
+| `quasar-postgres-data` | First machine, own database: the database. |
+| `quasar-postgres-secrets` | The database password, for Postgres. |
+| `quasar-control-data` | First machine: the TLS certificate and artwork cache. |
+| `quasar-control-plane-secrets` | The control plane's database password, secret key and (combined host) local enrollment token. |
+| `quasar-final-dump` | Only after `uninstall --purge` with Quasar's own database: the final dump. Never deleted by a purge. |
+| The managed home root | A host bind mount: user saves and installed content. |
+
+The first machine also has a `quasar-platform` bridge network.
+
+Removing the seed or a container never removes a volume. Uninstalling keeps the
+database, machine state, agent identity and homes. `uninstall --purge` removes this
+install's volumes after a final dump, but never the homes or a database you run
+yourself. See [Uninstalling](/quasar/operations/uninstall/).
+
+On a [legacy Compose install](/quasar/install/legacy-compose/):
 
 | Volume | Contents |
 | --- | --- |
 | `quasar-postgres-data` | The database. |
 | `quasar-control-tls` | TLS certificate and artwork cache. |
-| `quasar-agent-data` | The agent's per-node enrollment secret. |
-| The managed home root | A host bind mount, not a Compose volume. User saves and installed content. |
+| `quasar-agent-data` | The agent's enrollment secret. |
+| `quasar-updater-run` | The updater's socket and apply results. |
+| `quasar-nvidia-driver` | NVIDIA hosts only. Driver libraries built from the running kernel module. |
+| The managed home root | A host bind mount: user saves and installed content. |
 
-`docker compose down -v` destroys the first three and never touches the fourth.
+On disk, Compose prefixes names with the project (`deploy_quasar-postgres-data`
+for a `deploy` directory). `docker compose down -v` destroys every volume above,
+never the home root.

@@ -16,20 +16,24 @@ export function KnobControl({
   value,
   onChange,
   renderNodeOptions,
+  ariaLabel,
 }: {
   knob: ConfigKnob;
   value: SettingValue | undefined;
   onChange: (v: SettingValue) => void;
   /** Only read when `knob.key === "render_node"`. */
   renderNodeOptions: RenderNodeOption[];
+  /** Accessible name; defaults to the catalog key. */
+  ariaLabel?: string;
 }) {
+  const label = ariaLabel ?? knob.key;
   if (knob.type === "bool") {
     return (
       <button
         className="switch"
         role="switch"
         aria-checked={Boolean(value)}
-        aria-label={knob.key}
+        aria-label={label}
         onClick={() => onChange(!value)}
         type="button"
       />
@@ -40,7 +44,7 @@ export function KnobControl({
     return (
       <select
         className="select"
-        aria-label={knob.key}
+        aria-label={label}
         style={{ width: 260 }}
         value={String(value ?? "")}
         onChange={(e) => onChange(e.target.value)}
@@ -59,7 +63,7 @@ export function KnobControl({
     return (
       <select
         className="select"
-        aria-label={knob.key}
+        aria-label={label}
         style={{ width: 260 }}
         value={String(value ?? "")}
         onChange={(e) => onChange(e.target.value)}
@@ -79,7 +83,7 @@ export function KnobControl({
     <div className="row gap2 center">
       <input
         className={knob.key === "home_root" ? "input mono" : "input"}
-        aria-label={knob.key}
+        aria-label={label}
         style={{ width: knob.type === "string" ? 260 : 110 }}
         type={knob.type === "string" ? "text" : "number"}
         min={knob.min}

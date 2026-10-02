@@ -12,18 +12,16 @@ import (
 // not a mystery. These pin what the attempt says about where that verdict is.
 
 func TestApplyTimeoutOutput(t *testing.T) {
-	const socket = "/run/quasar-updater/updater.sock"
-
 	t.Run("the agent is on the wire, so nothing about the relay is broken", func(t *testing.T) {
-		if got := applyTimeoutOutput(true, reachSent, "req-1", socket); got != "" {
+		if got := applyTimeoutOutput(true, reachSent, "req-1"); got != "" {
 			t.Errorf("output = %q, want empty: a connected agent needs no relay hint", got)
 		}
 	})
 
 	t.Run("the agent never came back: name the request and how to read it", func(t *testing.T) {
-		got := applyTimeoutOutput(false, reachSent, "req-1", socket)
+		got := applyTimeoutOutput(false, reachSent, "req-1")
 		for _, want := range []string{
-			"req-1", socket, "/v1/results/", "quasar-updater", "restore",
+			"req-1", actorJournalDir, "docker exec quasar-recovery", "restore",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("output %q does not mention %q", got, want)
@@ -32,27 +30,27 @@ func TestApplyTimeoutOutput(t *testing.T) {
 	})
 
 	t.Run("nothing was sent, so there is no result to read", func(t *testing.T) {
-		got := applyTimeoutOutput(false, reachNotSent, "", socket)
+		got := applyTimeoutOutput(false, reachNotSent, "")
 		if got == "" {
 			t.Fatal("output is empty; an operator is owed the reason")
 		}
-		if strings.Contains(got, "/v1/results/") {
+		if strings.Contains(got, actorJournalDir) {
 			t.Errorf("output %q offers a read command for a request that was never sent", got)
 		}
 	})
 
 	t.Run("a request id with nothing sent still offers no command", func(t *testing.T) {
-		if got := applyTimeoutOutput(false, reachNotSent, "req-1", socket); strings.Contains(got, "/v1/results/") {
+		if got := applyTimeoutOutput(false, reachNotSent, "req-1"); strings.Contains(got, actorJournalDir) {
 			t.Errorf("output %q offers a read command for a request that was never sent", got)
 		}
 	})
 
-	// `pending` is ambiguous in BOTH directions — the updater's own first result
-	// state is `pending` too — so this text may claim neither history, and must
-	// hand over the one read that settles it, 404 included.
+	// `pending` is ambiguous in BOTH directions (the actor's own first result
+	// state is `pending` too), so this text may claim neither history, and must
+	// hand over the one read that settles it, a missing journal included.
 	t.Run("pending claims neither history and makes the host settle it", func(t *testing.T) {
-		got := applyTimeoutOutput(false, reachUnknown, "req-1", socket)
-		for _, want := range []string{"req-1", socket, "/v1/results/", "404"} {
+		got := applyTimeoutOutput(false, reachUnknown, "req-1")
+		for _, want := range []string{"req-1", actorJournalDir, "No such file"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("output %q does not mention %q", got, want)
 			}
@@ -61,7 +59,7 @@ func TestApplyTimeoutOutput(t *testing.T) {
 			t.Error("the ambiguous case renders the strong not-sent claim")
 		}
 		for _, banned := range []string{
-			"Nothing on this host was pulled, recreated or changed",
+			"Nothing on this host was pulled, replaced or changed",
 			"could not be relayed",
 		} {
 			if strings.Contains(got, banned) {
@@ -72,9 +70,9 @@ func TestApplyTimeoutOutput(t *testing.T) {
 
 	// The three texts are three, not two dressed differently.
 	t.Run("each reach says something different", func(t *testing.T) {
-		notSent := applyTimeoutOutput(false, reachNotSent, "req-1", socket)
-		unknown := applyTimeoutOutput(false, reachUnknown, "req-1", socket)
-		sent := applyTimeoutOutput(false, reachSent, "req-1", socket)
+		notSent := applyTimeoutOutput(false, reachNotSent, "req-1")
+		unknown := applyTimeoutOutput(false, reachUnknown, "req-1")
+		sent := applyTimeoutOutput(false, reachSent, "req-1")
 		if notSent == unknown || unknown == sent || notSent == sent {
 			t.Error("two reaches render the same text; the distinction is the point")
 		}
@@ -90,9 +88,9 @@ func TestAttemptReach(t *testing.T) {
 	}{
 		{AttemptQueued, "", reachNotSent},
 		{AttemptWaitingSessions, "", reachNotSent},
-		// Minted but not yet handed over: still nothing an updater can hold.
+		// Minted but not yet handed over: still nothing the actor can hold.
 		{AttemptQueued, "req-1", reachNotSent},
-		// MintRequestID wrote this before the send AND the updater's first
+		// MintRequestID wrote this before the send AND the actor's first
 		// relayed state is this — one state, two histories.
 		{AttemptPending, "req-1", reachUnknown},
 		{AttemptPulling, "req-1", reachSent},
@@ -111,7 +109,7 @@ func TestAttemptReach(t *testing.T) {
 // output over 8 KiB is refused by Postgres, and a refused FailAttempt would
 // leave the attempt non-terminal for ever.
 func TestJoinApplyOutputStaysWithinTheColumnCheck(t *testing.T) {
-	hint := applyTimeoutOutput(false, reachSent, "req-1", "/run/quasar-updater/updater.sock")
+	hint := applyTimeoutOutput(false, reachSent, "req-1")
 
 	t.Run("a short relay is kept whole", func(t *testing.T) {
 		got := joinApplyOutput("pulling: layer 1/4", hint)
@@ -154,10 +152,10 @@ func TestJoinApplyOutputStaysWithinTheColumnCheck(t *testing.T) {
 }
 
 // The live #173 G-B shape: the apply went out, the new agent failed its health
-// wait, the updater's automatic restore failed too, and no agent ever came back
+// wait, the actor's automatic restore failed too, and no agent ever came back
 // to relay the verdict. The deadline is all the control plane has — so it says
 // where the verdict is instead of failing with an empty output.
-func TestTimeoutWithNoAgentPointsAtTheUpdatersResult(t *testing.T) {
+func TestTimeoutWithNoAgentPointsAtTheActorsJournal(t *testing.T) {
 	a := queuedAttempt(true)
 	store := newFakeStore(a)
 	agent := &fakeAgent{ack: Ack{OK: true}}
@@ -187,7 +185,7 @@ func TestTimeoutWithNoAgentPointsAtTheUpdatersResult(t *testing.T) {
 		t.Fatal("output is empty: the operator is told 'timeout' and nothing else (#201)")
 	}
 	requestID := agent.sent[0].RequestID
-	for _, want := range []string{requestID, UpdaterSocketPath, "/v1/results/"} {
+	for _, want := range []string{requestID, actorJournalDir + requestID + ".json"} {
 		if !strings.Contains(final.Output, want) {
 			t.Errorf("output %q does not mention %q", final.Output, want)
 		}
@@ -246,7 +244,7 @@ func TestReadoptedPendingAttemptIsNotTreatedAsSent(t *testing.T) {
 		t.Errorf("output %q claims nothing was applied, which a `pending` row cannot establish", final.Output)
 	}
 	// And it carries the read that resolves it, with what a 404 there means.
-	for _, want := range []string{"req-orphan", "/v1/results/", "404"} {
+	for _, want := range []string{"req-orphan", actorJournalDir, "No such file"} {
 		if !strings.Contains(final.Output, want) {
 			t.Errorf("output %q does not mention %q", final.Output, want)
 		}
@@ -254,7 +252,7 @@ func TestReadoptedPendingAttemptIsNotTreatedAsSent(t *testing.T) {
 }
 
 // The genuinely-never-sent case keeps the strong claim: the attempt expired in
-// the connect wait with no request id minted, so no updater anywhere can hold a
+// the connect wait with no request id minted, so no recovery actor anywhere can hold a
 // result and naming the read command would send an operator after a 404.
 func TestTimeoutBeforeTheSendSaysNothingWasApplied(t *testing.T) {
 	for _, state := range []string{AttemptQueued, AttemptWaitingSessions} {
@@ -276,7 +274,7 @@ func TestTimeoutBeforeTheSendSaysNothingWasApplied(t *testing.T) {
 			if !strings.Contains(final.Output, applyNotSentOutput) {
 				t.Errorf("output %q does not say the apply was never sent", final.Output)
 			}
-			if strings.Contains(final.Output, "/v1/results/") {
+			if strings.Contains(final.Output, actorJournalDir) {
 				t.Errorf("output %q sends the operator after a result that cannot exist", final.Output)
 			}
 		})

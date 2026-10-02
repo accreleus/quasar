@@ -58,3 +58,12 @@ run "web schema.d.ts drift vs protocol/openapi.yaml" schema_drift_check
 run "web typecheck" npm run typecheck
 run "web unit tests" npm test -- run
 run "web production build" npm run build
+
+# The control plane serves the operator script from the SPA root (web/vite.config.ts
+# emits it): it must be in dist, byte for byte the file in deploy/. Host preparation
+# is never served (the docs write its steps out), so dist must not carry it.
+served_scripts_check() {
+  cmp -s dist/enroll-host.sh ../deploy/enroll-host.sh || { echo "web/dist/enroll-host.sh is missing or differs from deploy/enroll-host.sh" >&2; return 1; }
+  [ ! -e dist/prepare-host.sh ] || { echo "web/dist/prepare-host.sh must not be served" >&2; return 1; }
+}
+run "web build ships /enroll-host.sh and not /prepare-host.sh" served_scripts_check

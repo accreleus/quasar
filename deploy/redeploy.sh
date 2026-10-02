@@ -67,8 +67,7 @@
 #   REDEPLOY env=<> scope=<> ref=<> sha=<short> bundle=<index-hash.js> \
 #            health=<ok|FAIL> catalog=<code> agent=<registered|MISSING> \
 #            readiness=<ok|RETRYING|PROVISIONING|FAILED|unverified> \
-#            codecs=<ok|degraded|pending|unverified> \
-#            updater=<ok|FAIL|absent> result=<OK|WARN|FAIL>
+#            codecs=<ok|degraded|pending|unverified> result=<OK|WARN|FAIL>
 #
 # `unverified` is not a synonym for ok: it means this script found no verdict to
 # read, so nothing about the host was observed either way (#177). It degrades the
@@ -179,28 +178,6 @@ if [ "${QUASAR_CONSOLE:-0}" = "1" ]; then
   ENV="$ENV+console"
 fi
 
-# Volume adoption (#448). The QUASAR_*_VOLUME name overrides moved out of the
-# base compose file into the opt-in deploy/overlays/docker-compose.adopt-volumes.yml
-# overlay (Compose v5 rejects an empty `name:` default). A host that was
-# already using these vars — a stack migrated off a forked compose file —
-# must keep working on this script without edits, so the overlay is added
-# automatically whenever the vars are configured. Partial configuration is
-# refused rather than silently adopting only some volumes: the un-adopted
-# ones would come up empty, which reads as data loss.
-ADOPT_PG_VOL="${QUASAR_POSTGRES_VOLUME:-$(env_val QUASAR_POSTGRES_VOLUME)}"
-ADOPT_AGENT_VOL="${QUASAR_AGENT_VOLUME:-$(env_val QUASAR_AGENT_VOLUME)}"
-ADOPT_CTRL_VOL="${QUASAR_CONTROL_VOLUME:-$(env_val QUASAR_CONTROL_VOLUME)}"
-if [ -n "$ADOPT_PG_VOL$ADOPT_AGENT_VOL$ADOPT_CTRL_VOL" ]; then
-  if [ -z "$ADOPT_PG_VOL" ] || [ -z "$ADOPT_AGENT_VOL" ] || [ -z "$ADOPT_CTRL_VOL" ]; then
-    echo "!! Volume adoption needs all three of QUASAR_POSTGRES_VOLUME," >&2
-    echo "!! QUASAR_AGENT_VOLUME and QUASAR_CONTROL_VOLUME set together" >&2
-    echo "!! (scripts/dev/migrate-compose-volumes.sh prints the values)." >&2
-    exit 1
-  fi
-  COMPOSE_FILES+=(-f deploy/overlays/docker-compose.adopt-volumes.yml)
-  echo "volume adoption: using docker-compose.adopt-volumes.yml ($ADOPT_PG_VOL, $ADOPT_AGENT_VOL, $ADOPT_CTRL_VOL)"
-fi
-
 DC="docker compose ${COMPOSE_FILES[*]}"
 
 # Verification probes must hit the ports compose actually published, which are
@@ -284,18 +261,19 @@ echo "base image: $BASE"
 
 # ---------------------------------------------------------------------------
 step "[$ENV] 2/7 ensure required secrets"
-# Three vars are `:?`-required by docker-compose.yml interpolation: without
+# Two vars are `:?`-required by docker-compose.yml interpolation: without
 # them compose refuses to start at step 6/7 with "required variable X is
 # missing a value" — AFTER the ~15-minute image build at steps 4-5 (#447). This
-# step seeds the two that are safe to auto-generate (POSTGRES_PASSWORD,
-# ENROLLMENT_TOKEN) into a fresh deploy/.env, then fails fast, before any
-# build, if anything is still missing. BOOTSTRAP_ADMIN_* are deliberately NOT
+# step seeds POSTGRES_PASSWORD, which is safe to auto-generate, into a fresh
+# deploy/.env, then fails fast, before any build, if anything is still missing.
+# The agent's ENROLLMENT_TOKEN is not generated: only a token this control plane
+# minted enrolls (Admin -> Fleet -> Add host; deploy/.env.example). BOOTSTRAP_ADMIN_* are deliberately NOT
 # handled here — see deploy/.env.example: they are optional, and the first-run
 # setup wizard claims the founding admin when they are unset.
 #
 # The QUASAR_SECRET_KEY block below is the original, most delicate case (an
 # existing key can never be regenerated without destroying data) and its
-# refusal logic is untouched. The two new vars below are simpler — no data is
+# refusal logic is untouched. POSTGRES_PASSWORD below is simpler — no data is
 # ever sealed under them at generation time — but follow the SAME idempotence
 # discipline: an existing uncommented non-empty assignment is left untouched,
 # never overwritten.
@@ -308,6 +286,8 @@ ENV_FILE="deploy/.env"
 # without the export, loses database connectivity with nothing pointing here.
 # Refuse the ambiguity outright.
 for _secret_var in POSTGRES_PASSWORD ENROLLMENT_TOKEN QUASAR_SECRET_KEY; do
+  # ENROLLMENT_TOKEN stays in the list: an exported value would silently win
+  # over the one deploy/.env.example tells the operator to set.
   # printenv, not a value test: an exported EMPTY variable also takes
   # precedence over .env in Compose (and would fail the `:?` interpolation
   # only after the build), so mere presence in the environment is the defect.
@@ -351,7 +331,7 @@ env_file_has_value() { [ -n "$(env_file_value "$1")" ]; }
 # so Compose derives the project name "deploy" unless overridden.
 COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-$(env_val COMPOSE_PROJECT_NAME)}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-deploy}"
-PG_VOLUME_NAME="${ADOPT_PG_VOL:-${COMPOSE_PROJECT}_quasar-postgres-data}"
+PG_VOLUME_NAME="${COMPOSE_PROJECT}_quasar-postgres-data"
 
 # --- QUASAR_SECRET_KEY -------------------------------------------------------
 # The encrypted secret store (migration 0040) needs a 32-byte master key. Without
@@ -399,7 +379,7 @@ else
   # that was meant to hide the message also hides the cause. That is exactly the
   # bootstrap case this branch exists to handle, so a missing file must read as
   # "no POSTGRES_USER override" and fall through to the default below.
-  # (Never reproduced on Tower/hermes: both have always had a .env.)
+  # (Never reproduced on the lab host or the aux host: both have always had a .env.)
   PG_USER="$( { sed -nE 's/^[[:space:]]*POSTGRES_USER[[:space:]]*=[[:space:]]*([^[:space:]#]+).*/\1/p' "$ENV_FILE" 2>/dev/null || true; } | tail -1)"
   PG_USER="${PG_USER:-quasar}"
   # NOT `$DC ps`: loading the compose file needs the very `:?`-required vars
@@ -507,9 +487,6 @@ else
     --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
     --filter label=com.docker.compose.service=quasar-postgres | head -1 || true)"
   existing_pg_volume=""
-  # PG_VOLUME_NAME already resolves to the adopted name when adoption is
-  # configured, so one exact-name inspect covers both cases (a label filter
-  # could not see an adopted volume created by other tooling anyway).
   if docker volume inspect "$PG_VOLUME_NAME" >/dev/null 2>&1; then
     existing_pg_volume="$PG_VOLUME_NAME"
   fi
@@ -535,62 +512,6 @@ else
   } >> "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   echo "generated a new POSTGRES_PASSWORD into $ENV_FILE (mode 600)"
-fi
-
-# --- ENROLLMENT_TOKEN ---------------------------------------------------------
-# `:?`-required by docker-compose.yml. The node-agent presents this on first
-# contact to prove it's allowed to register; unlike POSTGRES_PASSWORD it is not
-# baked into any external state at creation time, so there is no "already
-# initialized" case to guard — only the standard idempotence rule.
-enrollment_token_line() { env_file_has_value ENROLLMENT_TOKEN; }
-
-if enrollment_token_line; then
-  echo "ENROLLMENT_TOKEN already set in $ENV_FILE — left untouched"
-else
-  NEW_ENROLLMENT_TOKEN="$(openssl rand -hex 32)"
-  umask 077
-  touch "$ENV_FILE"
-  {
-    echo ""
-    echo "# ENROLLMENT_TOKEN — pre-shared token the node-agent presents on first contact"
-    echo "# to prove it's allowed to register with the control plane."
-    echo "# Generated by deploy/redeploy.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ) because none was set."
-    echo "ENROLLMENT_TOKEN=$NEW_ENROLLMENT_TOKEN"
-  } >> "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  echo "generated a new ENROLLMENT_TOKEN into $ENV_FILE (mode 600)"
-fi
-
-# --- QUASAR_STACK_DIR --------------------------------------------------------
-# The absolute HOST path of the stack directory, which the updater
-# (deploy/docker-compose.yml `quasar-updater`) mounts at that same path. It has
-# to be the host's path, not a container path: the updater rebuilds its compose
-# invocation from its own container's compose labels, and those record host
-# paths. With this unset the updater refuses to serve and logs why.
-#
-# Seeded whenever it is absent (not fresh-install-only): nothing is stored under
-# it, so writing it can strand nothing. An existing value is never overwritten,
-# only flagged when it no longer matches -- which is what a moved checkout looks
-# like.
-QUASAR_STACK_DIR_NOW="$(cd deploy && pwd)"
-if env_file_has_value QUASAR_STACK_DIR; then
-  _cur="$(grep -E '^QUASAR_STACK_DIR=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
-  if [ "$_cur" != "$QUASAR_STACK_DIR_NOW" ]; then
-    echo "  !! QUASAR_STACK_DIR in $ENV_FILE is $_cur but this deploy runs from"
-    echo "  !! $QUASAR_STACK_DIR_NOW. The updater will not find the compose files."
-    echo "  !! Update it, or remove the line and re-run to have it re-seeded."
-  fi
-else
-  umask 077
-  touch "$ENV_FILE"
-  {
-    echo ""
-    echo "# QUASAR_STACK_DIR -- this stack directory's absolute HOST path, mounted"
-    echo "# into the updater at the same path. Seeded by deploy/redeploy.sh."
-    echo "QUASAR_STACK_DIR=$QUASAR_STACK_DIR_NOW"
-  } >> "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  echo "seeded QUASAR_STACK_DIR=$QUASAR_STACK_DIR_NOW into $ENV_FILE"
 fi
 
 # --- QUASAR_HOME_ROOT (fresh installs only) ----------------------------------
@@ -692,7 +613,6 @@ fi
 missing=""
 key_line || missing="$missing QUASAR_SECRET_KEY"
 pg_password_line || missing="$missing POSTGRES_PASSWORD"
-enrollment_token_line || missing="$missing ENROLLMENT_TOKEN"
 if [ -n "$missing" ]; then
   echo "!! $ENV_FILE is still missing a value for:$missing" >&2
   echo "!! These are required by docker-compose.yml interpolation — compose refuses" >&2
@@ -702,14 +622,12 @@ fi
 
 # The historical .env.example shipped ACTIVE placeholder assignments
 # (`change-me-...`), so a `cp .env.example .env` from an old checkout passes
-# every presence check above and deploys with publicly-known credentials —
-# the enrollment token is an authentication credential, so anyone reading the
-# repo could enroll a rogue node. The example now ships them commented out
-# (so the generation path runs), but old copies exist; refuse the values
-# themselves.
+# every presence check above and deploys with publicly-known credentials. The
+# example now ships them commented out (so the generation path runs), but old
+# copies exist; refuse the values themselves. (An old copy's ENROLLMENT_TOKEN
+# placeholder is harmless now: the control plane redeems only minted tokens.)
 for _pair in \
-  "POSTGRES_PASSWORD:change-me-strong-password" \
-  "ENROLLMENT_TOKEN:change-me-enrollment-token"; do
+  "POSTGRES_PASSWORD:change-me-strong-password"; do
   _k="${_pair%%:*}"; _placeholder="${_pair#*:}"
   if [ "$(env_file_value "$_k")" = "$_placeholder" ]; then
     echo "!! $ENV_FILE sets $_k to the public placeholder value from .env.example." >&2
@@ -751,11 +669,7 @@ if [ "$SCOPE" = control ]; then
 else
   step "[$ENV] 4/7 build web SPA ($WEB_IMAGE)"
   # web/dist is a bind mount into the control-plane container (see CLAUDE.md #131).
-  # QUASAR_SOURCE_REF: the container cannot see .git (a worktree's .git is a
-  # file), so the ref the bundle bakes in for the enroll-host one-liner (#100)
-  # is resolved here: the exact tag when on one, else the commit.
   docker run --rm -v "$PWD":/w -w /w/web \
-    -e QUASAR_SOURCE_REF="$(git describe --tags --exact-match 2>/dev/null || git rev-parse HEAD)" \
     "$WEB_IMAGE" sh -c "npm install --no-audit && npm run build"
   BUNDLE="$(bundle_on_disk)"
   echo "built web bundle: $BUNDLE"
@@ -792,17 +706,8 @@ if [ "$SCOPE" = all ]; then
     --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
     --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -t "$NA_IMAGE" .
-  # The updater ships in the same source deploy, and a host without it has no
-  # actor for a platform-release apply at all (updater_present=false forever).
-  # Built here rather than through build-images.sh so one `docker build` failure
-  # cannot be mistaken for a contract failure; the image name and the two
-  # provenance args are the same either way.
-  docker build -f deploy/Dockerfile.updater --target runtime \
-    --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
-    --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    -t quasar-updater:latest .
 else
-  step "[$ENV] 5/7 skip node-agent + updater build (scope=$SCOPE)"
+  step "[$ENV] 5/7 skip node-agent build (scope=$SCOPE)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -812,7 +717,7 @@ step "[$ENV] 6/7 recreate control-plane${SCOPE:+ (scope=$SCOPE)}"
 # re-mount the freshly-built dist by recreating the container (bind-mount inode
 # swap, #131). scope=control is the opposite case: the build IS the deploy.
 #
-# This build reads deploy/Dockerfile.control (a golang:1.25-alpine compile plus a
+# This build reads deploy/Dockerfile.control (a golang:1.26-alpine compile plus a
 # debian-slim runtime) and nothing from Dockerfile.vulkan — which is what makes
 # scope=control cheap. Do not "optimise" it by folding the control-plane into the
 # vulkan image lineage.
@@ -832,7 +737,7 @@ fi
 # postgres seconds after the control-plane up created it — under the control
 # plane's FIRST-BOOT migration run on a virgin database, killing the
 # connection mid-migration and leaving schema_migrations dirty (crash-loop:
-# "Dirty database version N. Fix and force version."). Tower/hermes never hit
+# "Dirty database version N. Fix and force version."). The lab host and the aux host never hit
 # it because an already-migrated database's boot migration run is a
 # milliseconds no-op; only a virgin database has a window wide enough.
 #
@@ -846,14 +751,15 @@ fi
 # "connection refused", and the CP --wait below aborts the whole deploy —
 # seconds before it would have succeeded (#467, caught by the first-run
 # acceptance loop). An already-initialized postgres passes this in
-# milliseconds, which is why Tower/hermes never saw it.
+# milliseconds, which is why the lab host and the aux host never saw it.
 # One-time volume ownership repair, for stacks that predate the two control
 # images agreeing on a uid. A named volume takes its ownership from whichever
 # image created it: a stack built from source used to run as ROOT, so
 # quasar-control-tls is root-owned there, and the first apply of a published
 # release (uid 1000) crash-looped for 15 minutes on "write TLS key
 # /var/lib/quasar-control/tls/key.pem: permission denied" — a started-then-failed
-# container, so the updater correctly reported `unhealthy` and did NOT restore.
+# container, so the Compose updater of the time reported `unhealthy` and did NOT
+# restore.
 #
 # Idempotent and cheap: a chown of an already-correct tree changes nothing, and
 # the volume holds a key pair and an artwork cache, never anything the numbers
@@ -862,7 +768,7 @@ fi
 # The name is derived from the compose project — never hardcoded `deploy_`,
 # which is only right when nothing set COMPOSE_PROJECT_NAME.
 if [ "$SCOPE" != web ]; then
-  CTRL_VOLUME_NAME="${ADOPT_CTRL_VOL:-${COMPOSE_PROJECT}_quasar-control-tls}"
+  CTRL_VOLUME_NAME="${COMPOSE_PROJECT}_quasar-control-tls"
   if docker volume inspect "$CTRL_VOLUME_NAME" >/dev/null 2>&1; then
     if docker run --rm -v "$CTRL_VOLUME_NAME":/t alpine \
          chown -R 1000:1000 /t >/dev/null 2>&1; then
@@ -881,16 +787,9 @@ $DC up -d --wait --wait-timeout 120 quasar-postgres
 # 300s: a virgin database runs the full migration chain on first boot.
 $DC up -d --force-recreate --no-deps --wait --wait-timeout 300 quasar-control-plane
 if [ "$SCOPE" = all ]; then
-  # THE UPDATER GOES UP BEFORE THE AGENT. The agent discovers updater presence
-  # once, at boot, by looking for the `quasar-updater` service in its own compose
-  # project (buildinfo.rs); started after it, the agent registers
-  # updater_present=false and stays that way until something recreates it. No
-  # --wait: the updater declares no healthcheck, so compose would only wait for
-  # `running`, which step 7/7's socket probe asserts far more usefully.
-  $DC up -d --force-recreate --no-deps quasar-updater
   # Recreate the node-agent from the freshly-built, self-contained Vulkan image.
   # `up -d` can return while a dependency-health wait has left the recreated
-  # agent in Docker's Created state (observed repeatedly on Tower). `--wait`
+  # agent in Docker's Created state (observed repeatedly on the lab host). `--wait`
   # makes the deployment contract require the new agent to be running/healthy.
   $DC up -d --force-recreate --no-deps --wait --wait-timeout 60 quasar-node-agent
 fi
@@ -961,46 +860,6 @@ else
   fi
 fi
 
-# The updater must be able to see the stack it sits beside, or a platform-release
-# apply has an actor that will refuse every request. The probe runs INSIDE the
-# updater container: it is the only one guaranteed to have a client that speaks a
-# unix socket (the control-plane image ships curl or wget depending on which
-# Dockerfile built it, and busybox wget cannot do it at all).
-#
-# Discovery being right is the whole check. A `working_dir` that is not
-# QUASAR_STACK_DIR means the compose labels and the bind mount disagree, which is
-# exactly the state in which every apply fails with a file-not-found the operator
-# would have to read compose labels to explain.
-updater=absent
-if [ -n "$($DC ps -q quasar-updater 2>/dev/null || true)" ]; then
-  self_json="$($DC exec -T quasar-updater curl -sf --max-time 10 \
-      --unix-socket /run/quasar-updater/updater.sock http://u/v1/self 2>/dev/null || true)"
-  # No jq on every fleet host; the value is a JSON string with no escapes.
-  self_wd="$(printf '%s' "$self_json" | sed -n 's/.*"working_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-  want_wd="$(cd deploy && pwd)"
-  if [ -z "$self_json" ]; then
-    echo "  FAIL: the updater is running but does not answer on its socket —"
-    echo "        check 'docker compose logs quasar-updater' (it fails closed when it"
-    echo "        cannot discover its own compose project)"
-    updater=FAIL
-    fail=1
-  elif [ "$self_wd" != "$want_wd" ]; then
-    echo "  FAIL: the updater discovered working_dir '$self_wd' but this stack is at"
-    echo "        '$want_wd' — set QUASAR_STACK_DIR=$want_wd in $ENV_FILE and redeploy"
-    updater=FAIL
-    fail=1
-  else
-    updater=ok
-    echo "  ok: updater reachable, stack dir $self_wd"
-  fi
-elif [ "$SCOPE" = all ]; then
-  echo "  FAIL: no quasar-updater container after a scope=all deploy"
-  updater=FAIL
-  fail=1
-else
-  echo "  note: no updater container (scope=$SCOPE does not create one) — probe skipped"
-fi
-
 # Catalog endpoint proves the control-plane binary is current: 401 = route
 # exists (auth required); 404/200-SPA-fallback = old binary without it.
 # NB: no -f here — we WANT the 401 status, and curl -f would exit non-zero on it.
@@ -1049,7 +908,7 @@ fi
 # Agent must re-register after the recreate. Registration lands a few seconds
 # after the control-plane container comes up (agent reconnect backoff), so poll
 # up to 30s instead of a single grep — a one-shot check raced and false-FAILed
-# redeploy-all's hermes leg, aborting the Tower leg.
+# redeploy-all's aux-host leg, aborting the lab-host leg.
 agent=MISSING
 agent_cid="$($DC ps -q quasar-node-agent 2>/dev/null || true)"
 if [ -z "$agent_cid" ] || [ "$(docker inspect -f '{{.State.Running}}' "$agent_cid" 2>/dev/null || true)" != true ]; then
@@ -1067,6 +926,8 @@ if [ "$agent" = registered ]; then
   echo "  ok: node-agent registered"
 else
   echo "  WARN: no 'agent registered' in control-plane logs after 30s"
+  echo "        A fresh stack enrolls only with a token this control plane minted:"
+  echo "        Admin -> Fleet -> Add host, then ENROLLMENT_TOKEN in $ENV_FILE (deploy/.env.example)."
   fail=1
 fi
 
@@ -1153,6 +1014,15 @@ else
     printf '%s\n' "$readiness_verdict" | sed 's/^/        /'
     echo "        Re-check once the provision completes."
     ;;
+  diagnostic)
+    echo "  FAIL: the node-agent is in DIAGNOSTIC MODE: its startup cleanup did not resolve, so"
+    echo "        it registers and reports but REFUSES EVERY LAUNCH on this host. Nothing was"
+    echo "        lost — managed homes, journals and any leftover containers are preserved:"
+    printf '%s\n' "$readiness_verdict" | sed 's/^/        /'
+    echo "        Usually the container runtime is not answering the agent. Once it does, the"
+    echo "        agent finishes the cleanup and resumes on its own — no restart needed. Watch:"
+    echo "          $DC logs -f quasar-node-agent | grep -E 'boot-diagnostic-(mode|retry-pending|resumed)'"
+    ;;
   render-node-missing)
     echo "  FAIL: the node-agent is exiting on purpose because it cannot see a /dev/dri render"
     echo "        node the host kernel HAS (#98). A device list is fixed at container creation,"
@@ -1234,5 +1104,5 @@ result=OK
 [ "${degraded:-0}" -eq 0 ] || result=WARN
 [ "$fail" -eq 0 ] || result=FAIL
 echo
-echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent readiness=$readiness codecs=$codecs updater=$updater result=$result"
+echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent readiness=$readiness codecs=$codecs result=$result"
 exit "$fail"

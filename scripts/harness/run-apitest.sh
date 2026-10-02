@@ -3,7 +3,7 @@
 # (via `go run`, no images needed), then runs the quasar-apitest validator which
 # drives the /v1 surface and validates every response against protocol/openapi.yaml.
 #
-# Requires only Docker. Nothing touches hermes/Tower. Self-cleans on exit.
+# Requires only Docker. Nothing touches the aux host or the lab host. Self-cleans on exit.
 #
 #   scripts/harness/run-apitest.sh            # boot, test, teardown
 #   KEEP=1 scripts/harness/run-apitest.sh     # leave the stack up for debugging
@@ -47,7 +47,6 @@ echo "=== [2/4] control-plane (go run) ==="
 docker run -d --name "$CP" --network "$NET" \
   -v "$REPO/control-plane":/w -w /w \
   -e DATABASE_URL="postgres://quasar:quasar@$PG:5432/quasar?sslmode=disable" \
-  -e ENROLLMENT_TOKEN=test-enroll-token \
   -e BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
   -e BOOTSTRAP_ADMIN_USERNAME=admin \
   -e BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PASS" \

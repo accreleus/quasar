@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -21,6 +22,43 @@ import (
 type ApplyComponentResolver interface {
 	NodeAgentComponent(ctx context.Context, release Release) (ComponentDigest, error)
 	ControlPlaneComponent(ctx context.Context, release Release) (ComponentDigest, error)
+	// RecoveryActorComponent: an error wrapping images.ErrRegistryNotFound means the
+	// build published no recovery-actor image, which is not a failure.
+	RecoveryActorComponent(ctx context.Context, release Release) (ComponentDigest, error)
+}
+
+// edgeWithActor is primary plus, when the build published one, its recovery actor
+// (amendment 14: an edge build names a recovery-actor component whenever one was
+// published for its commit). The ordering rules decide which a target is sent.
+func edgeWithActor(ctx context.Context, edge ApplyComponentResolver, release Release, primary ComponentDigest) ([]ComponentDigest, error) {
+	actor, err := edge.RecoveryActorComponent(ctx, release)
+	switch {
+	case errors.Is(err, images.ErrRegistryNotFound):
+		return []ComponentDigest{primary}, nil
+	case err != nil:
+		return nil, err
+	}
+	return []ComponentDigest{primary, actor}, nil
+}
+
+// EdgeHostComponents is what an edge build may send a host: its node agent, and its
+// recovery actor when published.
+func EdgeHostComponents(ctx context.Context, edge ApplyComponentResolver, release Release) ([]ComponentDigest, error) {
+	agent, err := edge.NodeAgentComponent(ctx, release)
+	if err != nil {
+		return nil, err
+	}
+	return edgeWithActor(ctx, edge, release, agent)
+}
+
+// EdgeControlPlaneComponents is what an edge build may move on the control plane's own
+// machine: its control plane, and its recovery actor when published.
+func EdgeControlPlaneComponents(ctx context.Context, edge ApplyComponentResolver, release Release) ([]ComponentDigest, error) {
+	cp, err := edge.ControlPlaneComponent(ctx, release)
+	if err != nil {
+		return nil, err
+	}
+	return edgeWithActor(ctx, edge, release, cp)
 }
 
 // EdgeApplyResolver reads the registry.
@@ -64,6 +102,11 @@ func (r *EdgeApplyResolver) NodeAgentComponent(ctx context.Context, release Rele
 // it is never sent to a host, only to this host's own updater.
 func (r *EdgeApplyResolver) ControlPlaneComponent(ctx context.Context, release Release) (ComponentDigest, error) {
 	return r.component(ctx, release, edgeComponents[0])
+}
+
+// RecoveryActorComponent resolves the release's recovery-actor image. Same rules.
+func (r *EdgeApplyResolver) RecoveryActorComponent(ctx context.Context, release Release) (ComponentDigest, error) {
+	return r.component(ctx, release, edgeRecovery)
 }
 
 // component refuses unless the image's own commit label agrees with the

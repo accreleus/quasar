@@ -15,7 +15,7 @@ therefore outlives the whole pipeline: after teardown the caps survives at
 ref-count 1 with no live GstObject holding it — invisible to a GstObject-filtered
 leaks tracer, and unbounded across sessions.
 
-Reproduced standalone on Tower (two-pipeline interpipe topology, listener attach
+Reproduced standalone on the lab host (two-pipeline interpipe topology, listener attach
 before sink caps): 8 leaks / 8 cycles unpatched, 0 / 8 patched.
 
 --- a/gst/interpipe/gstinterpipesink.c

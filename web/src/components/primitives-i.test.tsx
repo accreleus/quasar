@@ -1,8 +1,7 @@
 /**
  * UI-03 Shared Primitives I — render tests.
  * Covers: Button, SegmentedControl, TextField/SelectField/TextareaField,
- *         Switch, Checkbox, SearchInput, Chip, LiveDot, TierBadge,
- *         Card, Panel, Stat, StatGrid, Avatar.
+ *         Switch, Checkbox, SearchInput, Chip, LiveDot, Card, Panel.
  */
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
@@ -11,10 +10,7 @@ import { Button } from "./Button";
 import { SegmentedControl } from "./SegmentedControl";
 import { TextField, SelectField, TextareaField, Switch, Checkbox, SearchInput } from "./TextField";
 import { Chip, LiveDot } from "./Chip";
-import { TierBadge } from "./TierBadge";
 import { Card, Panel } from "./Card";
-import { Stat, StatGrid } from "./Stat";
-import { Avatar } from "./Avatar";
 
 /* ------------------------------------------------------------------ */
 /* Button                                                               */
@@ -423,34 +419,6 @@ describe("LiveDot", () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* TierBadge                                                            */
-/* ------------------------------------------------------------------ */
-describe("TierBadge", () => {
-  it("renders text", () => {
-    render(<TierBadge>1080p · 60</TierBadge>);
-    expect(screen.getByText("1080p · 60")).toBeInTheDocument();
-  });
-
-  it("applies tier-hi class for hi level", () => {
-    render(<TierBadge level="hi">1080p · 60</TierBadge>);
-    expect(screen.getByText("1080p · 60")).toHaveClass("tier-hi");
-  });
-
-  it("applies tier-low class for low level", () => {
-    render(<TierBadge level="low">720p · 30</TierBadge>);
-    expect(screen.getByText("720p · 30")).toHaveClass("tier-low");
-  });
-
-  it("has no extra class for mid (default)", () => {
-    render(<TierBadge>900p · 60</TierBadge>);
-    const el = screen.getByText("900p · 60");
-    expect(el).toHaveClass("tier");
-    expect(el).not.toHaveClass("tier-hi");
-    expect(el).not.toHaveClass("tier-low");
-  });
-});
-
-/* ------------------------------------------------------------------ */
 /* Card / Panel                                                         */
 /* ------------------------------------------------------------------ */
 describe("Card", () => {
@@ -471,70 +439,5 @@ describe("Panel", () => {
     const { container } = render(<Panel>Panel content</Panel>);
     expect(container.firstChild).toHaveClass("panel");
     expect(screen.getByText("Panel content")).toBeInTheDocument();
-  });
-});
-
-/* ------------------------------------------------------------------ */
-/* Stat / StatGrid                                                      */
-/* ------------------------------------------------------------------ */
-describe("Stat", () => {
-  it("renders label and value", () => {
-    render(<Stat label="FPS" value="59.8" />);
-    expect(screen.getByText("FPS")).toBeInTheDocument();
-    expect(screen.getByText("59.8")).toBeInTheDocument();
-  });
-
-  it("renders unit as <small>", () => {
-    const { container } = render(<Stat label="RTT" value="4" unit=" ms" />);
-    expect(container.querySelector("small")).toHaveTextContent("ms");
-  });
-
-  it("renders meta text", () => {
-    render(<Stat label="Bitrate" value="6347" meta="target 8000" />);
-    expect(screen.getByText("target 8000")).toBeInTheDocument();
-  });
-
-  it("uses .k for label and .v for value", () => {
-    const { container } = render(<Stat label="FPS" value="60" />);
-    expect(container.querySelector(".k")).toHaveTextContent("FPS");
-    expect(container.querySelector(".v")).toHaveTextContent("60");
-  });
-});
-
-describe("StatGrid", () => {
-  it("renders children inside .stat-grid", () => {
-    const { container } = render(
-      <StatGrid>
-        <Stat label="FPS" value="60" />
-        <Stat label="RTT" value="4" />
-      </StatGrid>
-    );
-    expect(container.querySelector(".stat-grid")).toBeInTheDocument();
-    expect(container.querySelectorAll(".stat")).toHaveLength(2);
-  });
-});
-
-/* ------------------------------------------------------------------ */
-/* Avatar                                                               */
-/* ------------------------------------------------------------------ */
-describe("Avatar", () => {
-  it("renders initials from name", () => {
-    render(<Avatar name="Admin User" />);
-    expect(screen.getByText("AU")).toBeInTheDocument();
-  });
-
-  it("renders single initial for single-word name", () => {
-    render(<Avatar name="Quasar" />);
-    expect(screen.getByText("Q")).toBeInTheDocument();
-  });
-
-  it("renders img when src is provided", () => {
-    render(<Avatar name="Test" src="https://example.com/avatar.png" />);
-    expect(screen.getByRole("img")).toHaveAttribute("src", "https://example.com/avatar.png");
-  });
-
-  it("has aria-label with the name", () => {
-    const { container } = render(<Avatar name="Michael" />);
-    expect(container.firstChild).toHaveAttribute("aria-label", "Michael");
   });
 });

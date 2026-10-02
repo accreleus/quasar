@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/telemetry"
@@ -23,7 +24,11 @@ var (
 	// not "everything is busy". 503 no_host_available.
 	ErrNoHostAvailable = errors.New("no host available")
 	// Totals suffice but derived availability does not. 503, retryable.
-	ErrCapacityExhausted    = errors.New("capacity exhausted")
+	ErrCapacityExhausted = errors.New("capacity exhausted")
+	// The evidence-gated readiness filter is the sole reason nothing could be
+	// placed (control-api.md "Evidence-gated readiness"). 503, retryable, with
+	// no Retry-After: it clears when an admin acts, not on a timer.
+	ErrHostNotReady         = errors.New("host not ready")
 	ErrSessionQuotaExceeded = errors.New("session quota exceeded") // 409, retryable
 	ErrProfileUnknown       = errors.New("unknown stream profile") // 400
 	// Hard eligibility failure, or a non-user-facing profile without an
@@ -44,6 +49,9 @@ var (
 	// host. A refusal, never a provision: creating one would mount an empty
 	// directory and reach `running` looking healthy.
 	ErrHomeNotProvisioned = errors.New("home not provisioned for this app")
+	// Known locations disagree or the canonical owner is uncertain. Operator
+	// repair is required; retrying elsewhere could create a second home.
+	ErrHomeConflict = errors.New("managed home location requires repair")
 	// A tile borrows the parent's image, runtime, mounts and home, so launching
 	// one IS running the parent and `enabled = false` must stop it.
 	ErrParentDisabled = errors.New("the provider app this tile launches through is disabled")
@@ -51,9 +59,9 @@ var (
 	// existence-leak: the caller already named a specific app. The authorization
 	// boundary — the filtered GET /v1/apps is UX, and no role skips this (§6.5).
 	ErrNotEntitled = errors.New("not entitled to this app")
-	// A stream.codec override naming a codec the placed host cannot produce. The
-	// client-decode clamp is overridable; host encoder capability is not, and a
-	// doomed assignment must fail at launch rather than late at the agent.
+	// A codec the placed GPU cannot produce. 409. Unreachable from a launch, where
+	// the codec constraint gates placement; kept as the invariant's backstop and
+	// for the cert bench's up-front check. Do not delete.
 	ErrCodecUnsupportedByHost = errors.New("codec not supported by host encoder")
 )
 
@@ -116,6 +124,9 @@ type Store struct {
 	// vram is the live free-VRAM veto tuning (#383). The zero value has the veto
 	// OFF, so a Store built without WithVramAdmission is fail-open, slots-only.
 	vram VramAdmission
+	// readiness is the evidence-gated readiness filter's freshness window.
+	// NewStore always defaults it: unlike the veto, the gate has no off switch.
+	readiness ReadinessAdmission
 	// tel is a separate module on the same pool: this Store owns the sessions
 	// table and the trust boundary, internal/telemetry owns observability storage
 	// and its retention.
@@ -132,6 +143,9 @@ func NewStore(pool *pgxpool.Pool, opts ...StoreOption) *Store {
 	// ordering's freshness gate reads the staleness window even with the veto off,
 	// and `make_interval(secs => 0)` would mark every sample stale.
 	s.vram = s.vram.normalize()
+	if !s.readiness.enabled() {
+		s.readiness = ReadinessAdmission{StaleSecs: defaultReadinessStaleSecs}
+	}
 	return s
 }
 
@@ -193,6 +207,7 @@ type Session struct {
 	// AppLogTail (migration 0062) is the app container's last ~100 log lines,
 	// newline-joined. The ONLY copy: app containers run with `--rm` (#463).
 	AppLogTail  *string
+	HomeSeed    json.RawMessage
 	Width       int32
 	Height      int32
 	FPS         int32
@@ -221,7 +236,12 @@ type Session struct {
 	NegotiatedCodec *string
 	// Mic is the GRANTED state (migration 0049): request AND instance setting at
 	// launch, sent as session_assign.stream.mic.
-	Mic           bool
+	Mic bool
+	// DeviceID is the user_devices row the launching token was bound to
+	// (migration 0020), nil for an unbound token or a clientless launch (console,
+	// cert bench). It scopes this session's later probe and history reads; it is
+	// no part of scheduling, the state machine or the agent wire.
+	DeviceID      *string
 	ReservedVram  int32
 	ReservedSlots int32
 	Playout0Ms    int32
@@ -600,6 +620,26 @@ func (s *Store) ListAll(ctx context.Context, cursor string, limit int32, filter 
 // failed. ErrInvalidTransition if the move is not permitted, ErrNotFound if the
 // row is gone; a same-state report is an idempotent no-op.
 func (s *Store) Transition(ctx context.Context, id string, to State, detail, errMsg *string) (Session, error) {
+	return s.transition(ctx, id, "", to, detail, errMsg)
+}
+
+// TransitionFromHost is the authenticated agent variant. It checks the
+// reporting host while the session row is locked, so a different agent cannot
+// supply lifecycle or managed-home materialization evidence for this session.
+func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to State, detail, errMsg *string) (Session, error) {
+	var sess Session
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		sess, err = s.transition(ctx, id, hostID, to, detail, errMsg)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+			return sess, err
+		}
+	}
+	return sess, err
+}
+
+func (s *Store) transition(ctx context.Context, id, reportHostID string, to State, detail, errMsg *string) (Session, error) {
 	if !isValidUUID(id) {
 		return Session{}, ErrNotFound
 	}
@@ -610,12 +650,29 @@ func (s *Store) Transition(ctx context.Context, id string, to State, detail, err
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var cur State
-	err = tx.QueryRow(ctx, `SELECT state FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).Scan(&cur)
+	var curDetail *string
+	var assignedHost *string
+	var sessionUser, sessionApp string
+	var boundHome, boundDigest *string
+	err = tx.QueryRow(ctx, `SELECT state,state_detail,host_id::text,user_id::text,app_id::text,
+		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
+		Scan(&cur, &curDetail, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
 	if err != nil {
 		return Session{}, fmt.Errorf("lock session: %w", err)
+	}
+	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
+		return Session{}, ErrNotFound
+	}
+	// A restart loses swapper.pendingSwaps but not this durable guard. A stop
+	// request or any nonterminal agent detail cannot clear it: the target may
+	// remain mounted through stopping while app_id still names the old app.
+	// Terminal reports release protection through the GC state predicate;
+	// explicit rollback/commit is handled by swapper while its target is known.
+	if curDetail != nil && *curDetail == swapDetailInProgress && !to.IsTerminal() {
+		detail = nil
 	}
 
 	// Teardown-race coercion (see CoerceReport): a `failed` report on an already
@@ -653,6 +710,11 @@ func (s *Store) Transition(ctx context.Context, id string, to State, detail, err
 		`, id, string(to), detail, errMsg)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state: %w", err)
+		}
+	}
+	if reportHostID != "" && cur != StateRunning && to == StateRunning {
+		if err := materializeRunningHome(ctx, tx, sessionUser, sessionApp, reportHostID, boundHome, boundDigest); err != nil {
+			return Session{}, err
 		}
 	}
 
@@ -796,6 +858,52 @@ func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string
 	return out, rows.Err()
 }
 
+// ReapHeartbeatMissing atomically terminalizes running rows and started stops
+// omitted by an explicit heartbeat; pre-running stops remain launch-in-flight.
+func (s *Store) ReapHeartbeatMissing(ctx context.Context, hostID string, running []string) ([]Session, error) {
+	if !isValidUUID(hostID) {
+		return nil, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin heartbeat-reap tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
+
+	rows, err := tx.Query(ctx, `
+		UPDATE sessions SET
+		    state = CASE WHEN state = 'stopping' THEN 'stopped' ELSE 'failed' END,
+		    state_detail = 'host_lost',
+		    error_message = CASE WHEN state = 'stopping' THEN NULL ELSE 'agent no longer running this session' END,
+		    ended_at = now()
+		WHERE host_id = $1::uuid
+		  AND (state = 'running' OR (state = 'stopping' AND started_at IS NOT NULL))
+		  AND NOT (id::text = ANY($2::text[]))
+		RETURNING `+sessionCols+`
+	`, hostID, running)
+	if err != nil {
+		return nil, fmt.Errorf("reap heartbeat-missing sessions: %w", err)
+	}
+	var out []Session
+	for rows.Next() {
+		sess, err := scanSessionRow(rows)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan heartbeat-reaped session: %w", err)
+		}
+		out = append(out, sess)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate heartbeat-reaped sessions: %w", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit heartbeat-reap tx: %w", err)
+	}
+	return out, nil
+}
+
 // RunningSessionIDsOnHost lists only the `running` rows — the exact set the
 // agent's heartbeat is authoritative over (#128).
 func (s *Store) RunningSessionIDsOnHost(ctx context.Context, hostID string) ([]string, error) {
@@ -887,7 +995,9 @@ func (s *Store) SetHostStatus(ctx context.Context, hostID, status string) error 
 		return nil // no such host row to update
 	}
 	if _, err := s.pool.Exec(ctx,
-		`UPDATE hosts SET status = $2 WHERE id = $1::uuid`, hostID, status,
+		`UPDATE hosts SET status = CASE WHEN $2='offline' AND EXISTS (
+			SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id=hosts.id
+		) THEN 'draining' ELSE $2 END WHERE id = $1::uuid`, hostID, status,
 	); err != nil {
 		return fmt.Errorf("set host status: %w", err)
 	}
@@ -944,7 +1054,7 @@ const liveHomeSessionSQL = `
 	WHERE s.user_id = $1::uuid
 	  AND COALESCE(a.parent_app_id, a.id) = $2::uuid
 	  AND ($3 = '' OR s.id != $3::uuid)
-	  AND s.state IN ('pending','assigned','starting','running')
+	  AND s.state IN ('pending','assigned','starting','running','stopping')
 	LIMIT 1`
 
 // HasLiveUserAppSession is the swap-path single-writer guard (P5-04): the id of
@@ -982,19 +1092,9 @@ func (s *Store) HasLiveUserAppSession(ctx context.Context, userID, homeAppID, ex
 	return conflictID, nil
 }
 
-// homeHostSQL resolves the host holding a user's live (non-tombstoned) home for
-// an app: §5's hard placement pin, and the same subquery policyOrderSQL uses for
-// locality ordering, tie-break included. `ORDER BY last_used_at DESC` is
-// load-bearing — after a locality miss a (user, app) can hold homes on two
-// hosts, and the tile must land on the one with the current install.
-const homeHostSQL = `
-	SELECT host_id::text FROM user_homes
-	WHERE user_id = $1::uuid AND app_id = $2::uuid AND gc_after IS NULL AND host_id IS NOT NULL
-	ORDER BY last_used_at DESC
-	LIMIT 1`
-
-// HomeHostForApp returns the host id holding userID's live home for homeAppID, or
-// "" when there is none.
+// HomeHostForApp returns the canonical owner for the pre-schedule tile pin, or
+// "" when no home was ever recorded. The reservation transaction repeats this
+// read; this first answer is only an early refusal/UX aid.
 //
 // It is the pre-schedule half of §5: a derived tile provisions nothing, so a host
 // with no home for (user, parent) has literally nothing to mount, and placing it
@@ -1002,15 +1102,40 @@ const homeHostSQL = `
 // the launch must be refused BEFORE placement with 409 home_not_provisioned —
 // never fall back to letting the scheduler pick.
 func (s *Store) HomeHostForApp(ctx context.Context, userID, homeAppID string) (string, error) {
-	var hostID string
-	err := s.pool.QueryRow(ctx, homeHostSQL, userID, homeAppID).Scan(&hostID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin home owner read: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	p := CreateParams{UserID: userID, AppID: homeAppID, ManagedHome: true}
+	owner, err := homeClaimOwner(ctx, tx, p)
+	if errors.Is(err, ErrHomeConflict) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+			return "", fmt.Errorf("rollback home owner read: %w", rollbackErr)
+		}
+		if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
+			return "", diagnosisErr
+		}
+	}
+	return owner, err
+}
+
+// CanonicalAppName resolves the caller's requested app to the parent whose
+// managed home it uses. Call only after the entitlement gate has passed.
+func (s *Store) CanonicalAppName(ctx context.Context, appID string) (string, error) {
+	if !isValidUUID(appID) {
+		return "", ErrNotFound
+	}
+	var name string
+	err := s.pool.QueryRow(ctx, `SELECT root.name FROM apps a JOIN apps root
+		ON root.id=COALESCE(a.parent_app_id,a.id) WHERE a.id=$1::uuid`, appID).Scan(&name)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
+		return "", ErrNotFound
 	}
 	if err != nil {
-		return "", fmt.Errorf("resolve home host: %w", err)
+		return "", fmt.Errorf("resolve canonical app name: %w", err)
 	}
-	return hostID, nil
+	return name, nil
 }
 
 // probeMaxAgeDays is the staleness cut for user_devices probes (AS-02). A probe
@@ -1038,26 +1163,10 @@ type DeviceProbe struct {
 	AV1  bool
 }
 
-// LatestProbe is the parsed probe from the user's most recently seen
-// user_devices row, or nil when none is fresh (measured_at within
-// probeMaxAgeDays). Missing, stale and unparseable all return (nil, nil); the
-// caller falls back to the default tier.
-func (s *Store) LatestProbe(ctx context.Context, userID string) (*DeviceProbe, error) {
-	var rawCaps []byte
-	err := s.pool.QueryRow(ctx, `
-		SELECT capabilities
-		FROM user_devices
-		WHERE user_id = $1::uuid
-		ORDER BY last_seen_at DESC
-		LIMIT 1
-	`, userID).Scan(&rawCaps)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil // no device row at all → no probe
-	}
-	if err != nil {
-		return nil, fmt.Errorf("query latest probe: %w", err)
-	}
-
+// parseDeviceProbe projects user_devices.capabilities onto DeviceProbe. Missing,
+// stale and unparseable all yield nil, an absent probe rather than an error: the
+// caller degrades to the default tier rather than refusing a launch.
+func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 	var caps struct {
 		BandwidthKbps   *float64 `json:"bandwidth_kbps"`
 		RTTMs           *float64 `json:"rtt_ms"`
@@ -1083,19 +1192,19 @@ func (s *Store) LatestProbe(ctx context.Context, userID string) (*DeviceProbe, e
 	}
 	if err := json.Unmarshal(rawCaps, &caps); err != nil {
 		// Malformed JSON: an absent probe, not an error worth propagating.
-		return nil, nil
+		return nil
 	}
 
 	// measured_at is server-stamped RFC3339; empty or unparseable counts as stale.
 	if caps.MeasuredAt == "" {
-		return nil, nil
+		return nil
 	}
 	measuredAt, err := time.Parse(time.RFC3339, caps.MeasuredAt)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 	if time.Since(measuredAt) > time.Duration(probeMaxAgeDays)*24*time.Hour {
-		return nil, nil // stale probe → no-op → default tier
+		return nil // stale probe → no-op → default tier
 	}
 
 	p := &DeviceProbe{}
@@ -1123,7 +1232,7 @@ func (s *Store) LatestProbe(ctx context.Context, userID string) (*DeviceProbe, e
 	p.H264DecodeProfiles = caps.Decode.H264.Profiles
 	p.HEVC = caps.Codecs.HEVC
 	p.AV1 = caps.Codecs.AV1
-	return p, nil
+	return p
 }
 
 // HostCodecs is the wire codec set the host's encoder path can produce
@@ -1146,6 +1255,33 @@ func (s *Store) HostCodecs(ctx context.Context, hostID string) ([]string, error)
 	}
 	var codecs []string
 	if err := json.Unmarshal(raw, &codecs); err != nil || len(codecs) == 0 {
+		return []string{wireCodecH264}, nil
+	}
+	return codecs, nil
+}
+
+// GPUCodecs is the wire codec set gpuCodecSetSQL resolves for one GPU (#296
+// amendment 12): its own reported set, or its host's when it reports none,
+// falling back to ["h264"] when neither ever has. Feeds the stream plan (#303);
+// SQL/Go twin is gpuCodecSetSQL/gpuCodecSet, guarded by TestGPUCodecSetMatchesSQL.
+func (s *Store) GPUCodecs(ctx context.Context, hostID string, gpuIndex int32) ([]string, error) {
+	if !isValidUUID(hostID) {
+		return []string{wireCodecH264}, nil
+	}
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT `+gpuCodecSetSQL("g", "h", true)+`
+		FROM gpus g JOIN hosts h ON h.id = g.host_id
+		WHERE g.host_id = $1::uuid AND g.index = $2
+	`, hostID, gpuIndex).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return []string{wireCodecH264}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query gpu codecs: %w", err)
+	}
+	var codecs []string
+	if err := json.Unmarshal(raw, &codecs); err != nil {
 		return []string{wireCodecH264}, nil
 	}
 	return codecs, nil
@@ -1274,13 +1410,14 @@ func (s *Store) UpdateSessionNegotiatedCodec(ctx context.Context, id, codec stri
 // RETURNING, kept in lockstep with scanSessionRow's Scan order.
 const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_id::text,
 	state, state_detail, error_message,
-	failure_code, app_log_tail,
+	failure_code, app_log_tail, home_seed,
 	width, height, fps, bitrate_kbps, h264_profile,
 	codec,
 	profile_id,
 	stream_profile_id,
 	codec_decision, negotiated_codec,
 	mic,
+	device_id::text,
 	reserved_vram_mb, reserved_encode_slots,
 	playout0_ms,
 	health_state, health_state_reason, health_state_changed_at,
@@ -1330,13 +1467,14 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 	dest := []any{
 		&s.ID, &s.UserID, &s.AppID, &s.HostID, &s.GPUID,
 		&st, &s.StateDetail, &s.ErrorMessage,
-		&s.FailureCode, &s.AppLogTail,
+		&s.FailureCode, &s.AppLogTail, &s.HomeSeed,
 		&s.Width, &s.Height, &s.FPS, &s.BitrateKbps, &s.H264Profile,
 		&s.Codec,
 		&s.ProfileID,
 		&s.StreamProfileID,
 		&s.CodecDecision, &s.NegotiatedCodec,
 		&s.Mic,
+		&s.DeviceID,
 		&s.ReservedVram, &s.ReservedSlots,
 		&s.Playout0Ms,
 		&hs, &s.HealthReason, &s.HealthChangedAt,

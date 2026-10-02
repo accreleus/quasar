@@ -1,33 +1,51 @@
 #!/usr/bin/env python3
-"""qbench — publish completion reports and evidence to quasar-bench.
+# VENDORED FILE — DO NOT EDIT HERE.
+#
+# Source: quasar-bench client/qbench (the qbench agent CLI)
+# Commit: d55c43808dbde9eb9140a01580b16eb848ee960f (2026-09-22)  qbench 1.7.0
+# Fetched: 2026-09-22, as qbench_cli.py inside the qbench 1.7.0 zipapp your bench
+#          server publishes (GET $BENCH_URL/cli/qbench); byte-identical to the
+#          file at the commit above (git blob 7c3b8c1f33a7).
+#
+# It imports bench.py from this directory, so the two are vendored as a pair and
+# must carry the same commit. Run it as `python3 scripts/dx/vendor/qbench …`.
+# scripts/dx/report.sh and scripts/dx/bench_check.sh prefer an installed `qbench`
+# (the server's install.sh puts one in ~/.local/bin) and fall back to this copy.
+#
+# Re-vendor with:
+#   cp ../quasar-bench/client/qbench scripts/dx/vendor/qbench
+# then re-add this header. Everything after the END-OF-HEADER line is the
+# upstream file verbatim (its own shebang included); run.sh checks that.
+# ── END-OF-HEADER ──
+#!/usr/bin/env python3
+"""qbench — the quasar-bench agent CLI.
 
-Stdlib only; it imports `bench.py` from the same directory, so the pair can be
-vendored together into any repo that wants to publish.
+Stdlib only (Python 3.9+). It imports `bench.py` from the same directory, so
+the pair can be vendored together; `make qbench` also builds a single-file
+zipapp, and a running bench serves one at /cli/qbench.
 
-    export BENCH_URL=http://bench.example.internal:9400 BENCH_KEY=…
+Setup, once:
 
-The publish flow, end to end, at land time:
+    curl -fsSL "$BENCH_URL/install.sh" | sh     # BENCH_URL = your bench server
+    install -m 600 /dev/null ~/.config/qbench/key   # then put the key in it
+    qbench doctor
 
-    # 1. publish the write-up against the merge commit (idempotent — re-running
-    #    replaces it in place and keeps the same URL)
-    URL=$(qbench report put \\
-            --repo accreleus/quasar \\
-            --commit "$(git rev-parse HEAD)" \\
-            --title "C11: reports and evidence" \\
-            --body docs/reports/c11.md \\
-            --summary "Reports live in quasar-bench; evidence has a home." \\
-            --issue 512 --run "$BEFORE_RUN" --run "$AFTER_RUN")
+Server: BENCH_URL, else ~/.config/qbench/url (the installer writes it). There
+is deliberately no built-in default, so no server name ships inside a copy of
+this file that gets vendored into a public repo. The key comes from BENCH_KEY, else
+~/.config/qbench/key (must be chmod 600). The key is never printed.
 
-    # 2. attach the evidence already gathered
-    qbench report attach --repo accreleus/quasar --commit "$(git rev-parse HEAD)" \\
-            --file after.png --role screenshot --caption "ladder at 720p"
+The commands most agents need:
 
-    # 3. paste $URL into the commit body, the issue, and memory
-    echo "$URL"
+    qbench check                       # did HEAD regress vs. the last benched commit?
+    qbench sprint put --repo accreleus/quasar --sprint c15 --title … --sections s.json
+    qbench sprint status --repo accreleus/quasar --sprint c15
+    qbench run new --suite abr-ladder --scenario 1080p120 --repo accreleus/quasar --commit "$SHA"
+    qbench evidence gaps
 
-Two linked runs make the report page draw a direction-aware before/after table
-from the same aggregates the compare page uses. `--pin` keeps the attachments
-out of the retention job's reach for good.
+Exit codes: 0 ok, 1 error, 2 usage, 3 check found a regression,
+4 check had nothing comparable, 5 key missing/unreadable/rejected.
+Every command takes --json; see docs/design/2026-09-22-c15-agent-skills-spec.md.
 """
 
 from __future__ import annotations
@@ -35,111 +53,1143 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
+import subprocess
 import sys
+import urllib.parse
+from typing import Any, Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bench import Bench, BenchError  # noqa: E402
+import bench  # noqa: E402
+from bench import Bench, BenchError, _read_records, _report_page, _sprint_page  # noqa: E402
 
+__version__ = bench.__version__
+
+EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
+EXIT_REGRESSED, EXIT_NO_COMPARABLE, EXIT_AUTH = 3, 4, 5
+
+ROLES = ["", "screenshot", "video", "log", "bundle", "other"]
+REVIEW_STATUSES = ["submitted", "approved", "changes_requested", "acknowledged"]
+
+
+class CredentialError(Exception):
+    """No usable key: exit 5 with a message that says what to do."""
+
+
+# ------------------------------------------------------------------ config
+
+def config_dir() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "qbench")
+
+
+def resolve_url(flag: str | None) -> tuple[str, str]:
+    """(url, where it came from)."""
+    if flag:
+        return flag.rstrip("/"), "--url"
+    if os.environ.get("BENCH_URL"):
+        return os.environ["BENCH_URL"].rstrip("/"), "BENCH_URL"
+    path = os.path.join(config_dir(), "url")
+    try:
+        with open(path) as fh:
+            val = fh.read().strip()
+        if val:
+            return val.rstrip("/"), path
+    except OSError:
+        pass
+    return "", "none"
+
+
+def key_file() -> str:
+    return os.path.join(config_dir(), "key")
+
+
+def resolve_key(flag: str | None) -> tuple[str, str]:
+    """(key, where it came from); ("", "none") when there is none.
+
+    Raises CredentialError when the key file exists but is readable by
+    group/other: a key that leaks through file mode is refused, not used.
+    """
+    if flag:
+        return flag, "--key"
+    if os.environ.get("BENCH_KEY"):
+        return os.environ["BENCH_KEY"], "BENCH_KEY"
+    path = key_file()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "", "none"
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        raise CredentialError(f"{path} has mode {mode:03o}; it must not be readable by others. "
+                              f"Run: chmod 600 {path}")
+    with open(path) as fh:
+        key = fh.read().strip()
+    if not key:
+        return "", "none"
+    return key, path
+
+
+class Ctx:
+    def __init__(self, args):
+        self.args = args
+        self.url, self.url_source = resolve_url(args.url)
+        self._key: tuple[str, str] | None = None
+
+    def key(self) -> tuple[str, str]:
+        if self._key is None:
+            self._key = resolve_key(self.args.key)
+        return self._key
+
+    def require_url(self) -> str:
+        if not self.url:
+            raise CredentialError('no bench server configured. Set BENCH_URL, or install from your bench server (curl -fsSL "$BENCH_URL/install.sh" | sh), which records it in {path}.'.format(path=os.path.join(config_dir(), "url")))
+        return self.url
+
+    def bench(self) -> Bench:
+        self.require_url()
+        key, _ = self.key()
+        if not key:
+            raise CredentialError(
+                f"no API key. Set BENCH_KEY, or put the key in {key_file()} (chmod 600). "
+                "Ask Michael for a key; a read-only key is enough for check/status/gaps.")
+        return Bench(self.url, key)
+
+
+# ------------------------------------------------------------------ output
+
+def out(args, data: Any, human: Callable[[Any], None] | None = None) -> None:
+    if getattr(args, "json", False) or human is None:
+        print(json.dumps(data, indent=2, sort_keys=False))
+    else:
+        human(data)
+
+
+def short(sha: str | None, n: int = 8) -> str:
+    return (sha or "")[:n]
+
+
+def ts(v: str | None) -> str:
+    """2026-09-22T10:11:12.123Z -> 2026-09-22 10:11."""
+    if not v:
+        return "-"
+    return v.replace("T", " ")[:16]
+
+
+def table(rows: list[list[str]], header: list[str]) -> None:
+    if not rows:
+        return
+    cols = [header] + rows
+    widths = [max(len(str(r[i])) for r in cols) for i in range(len(header))]
+    for r in cols:
+        print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip())
+
+
+def kv_pairs(items: list[str], flag: str) -> dict[str, str]:
+    res = {}
+    for item in items:
+        if "=" not in item:
+            raise BenchError(f"{flag} wants K=V, got {item!r}")
+        k, v = item.split("=", 1)
+        res[k] = v
+    return res
+
+
+def load_json_file(path: str) -> Any:
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except OSError as e:
+        raise BenchError(f"cannot read {path}: {e.strerror}") from None
+    except json.JSONDecodeError as e:
+        raise BenchError(f"{path} is not valid JSON: {e}") from None
+
+
+# ------------------------------------------------------------------ git
+
+def git(*argv: str) -> str | None:
+    try:
+        res = subprocess.run(["git", *argv], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout.strip()
+
+
+def git_ancestors(head: str, limit: int = 500) -> list[str] | None:
+    """Full shas of head's first-parent history, excluding head; None without git."""
+    listing = git("rev-list", "--first-parent", f"--max-count={limit + 1}", head)
+    if listing is None:
+        return None
+    shas = listing.split()
+    return shas[1:]
+
+
+def same_commit(a: str, b: str) -> bool:
+    a, b = a.lower(), b.lower()
+    return bool(a) and bool(b) and (a.startswith(b) or b.startswith(a))
+
+
+# ------------------------------------------------------------------ doctor
+
+def cmd_doctor(ctx: Ctx, args) -> int:
+    checks: list[dict] = []
+
+    def add(name: str, level: str, detail: str) -> None:
+        checks.append({"name": name, "level": level, "detail": detail})
+
+    if not ctx.url:
+        add("url", "fail", "not configured: set BENCH_URL or run the installer from your bench server")
+        out(args, {"ok": False, "url": "", "url_source": "none", "cli_version": __version__,
+                   "checks": checks},
+            lambda d: [print(f"{c['level']:<5} {c['name']:<10} {c['detail']}") for c in d["checks"]])
+        return EXIT_AUTH
+    add("url", "ok", f"{ctx.url} (from {ctx.url_source})")
+    key_source = "none"
+    try:
+        key, key_source = ctx.key()
+        if key:
+            add("key", "ok", f"found in {key_source}")
+        else:
+            add("key", "fail", f"no key: set BENCH_KEY or write it to {key_file()} and chmod 600")
+    except CredentialError as e:
+        key = ""
+        key_source = "refused"
+        add("key", "fail", str(e))
+
+    pub = Bench(ctx.url, "", timeout=15, require_key=False)
+    reachable = False
+    try:
+        h = pub.health()
+        reachable = True
+        add("reachable", "ok", f"{ctx.url}/v1/health: {h.get('status', '?')}")
+    except BenchError as e:
+        if e.status == 503:
+            reachable = True
+            add("reachable", "fail", "server is up but its database is unavailable (503)")
+        elif e.status:
+            reachable = True
+            add("reachable", "fail", f"/v1/health returned {e.status}: {e.server_message}")
+        else:
+            add("reachable", "fail", f"cannot reach {ctx.url}: {e}. Check BENCH_URL / the network.")
+
+    server_cli = ""
+    if reachable:
+        try:
+            v = pub._get("/cli/version")
+            server_cli = (v or {}).get("version", "") if isinstance(v, dict) else ""
+        except BenchError:
+            server_cli = ""
+        if not server_cli:
+            add("version", "warn", f"qbench {__version__}; the server does not publish a CLI version")
+        elif server_cli == __version__:
+            add("version", "ok", f"qbench {__version__} matches the server")
+        else:
+            add("version", "warn", f"qbench {__version__}, server ships {server_cli}. "
+                                   f"Update: curl -fsSL {ctx.url}/install.sh | sh")
+
+    if reachable and key:
+        try:
+            me = Bench(ctx.url, key, timeout=15).me()
+            if me.get("read_only"):
+                add("auth", "ok", f"key '{me.get('name')}' ({me.get('kind')})")
+                add("write", "warn", "read-only key: check/status/gaps work; publishing reports, "
+                                     "posting runs and comments need a read+write key")
+            else:
+                add("auth", "ok", f"key '{me.get('name')}' ({me.get('kind')})")
+                add("write", "ok", "read+write")
+        except BenchError as e:
+            if e.status == 401:
+                add("auth", "fail", f"the server rejected the key from {key_source} (401). "
+                                    "Ask Michael for a current key.")
+            else:
+                add("auth", "fail", f"GET /v1/me failed: {e}")
+        try:
+            links = Bench(ctx.url, key, timeout=15).config_links()
+            if links.get("board_configured"):
+                add("board", "ok", f"GitHub board synced; default repo {links.get('default_repo')}")
+            else:
+                add("board", "warn", "GitHub board not configured on the server: evidence gaps will be empty")
+        except BenchError:
+            pass
+
+    ok = not any(c["level"] == "fail" for c in checks)
+    auth_bad = any(c["name"] in ("key", "auth") and c["level"] == "fail" for c in checks)
+    reach_bad = any(c["name"] == "reachable" and c["level"] == "fail" for c in checks)
+    code = EXIT_OK if ok else (EXIT_ERROR if reach_bad else (EXIT_AUTH if auth_bad else EXIT_ERROR))
+    data = {"ok": ok, "url": ctx.url, "url_source": ctx.url_source, "key_source": key_source,
+            "cli_version": __version__, "server_cli_version": server_cli, "checks": checks}
+
+    def human(d):
+        for c in d["checks"]:
+            print(f"{c['level']:<5} {c['name']:<10} {c['detail']}")
+        if d["ok"]:
+            print("ready.")
+        else:
+            print("not ready: fix the fail lines above, then re-run qbench doctor.")
+
+    out(args, data, human)
+    return code
+
+
+# ------------------------------------------------------------------ check
+
+def default_repo(ctx: Ctx, b: Bench, flag: str) -> str:
+    if flag:
+        return flag
+    if os.environ.get("BENCH_REPO"):
+        return os.environ["BENCH_REPO"]
+    return b.config_links().get("default_repo") or "accreleus/quasar"
+
+
+def compare_url(ctx: Ctx, repo: str, base: str, head: str) -> str:
+    q = urllib.parse.urlencode({"repo": repo, "base": base, "head": head})
+    return f"{ctx.url}/commits/compare?{q}"
+
+
+def print_commit_compare(res: dict) -> None:
+    print((res.get("verdict") or {}).get("text") or "(no verdict text)")
+    for s in res.get("scenarios") or []:
+        if s.get("verdict") != "unchanged":
+            print(f"  {s.get('verdict'):<10} {s.get('suite')}/{s.get('scenario')}: {s.get('text', '')}")
+    for label, key in (("only at base", "only_base"), ("only at head", "only_head")):
+        items = res.get(key) or []
+        if items:
+            print(f"  {label}: " + ", ".join(f"{i.get('suite')}/{i.get('scenario')}" for i in items))
+    for x in res.get("excluded_invalid") or []:
+        print(f"  excluded ({x.get('which')}): run {short(x.get('run_id'))} "
+              f"{x.get('suite')}/{x.get('scenario')} is {x.get('validity')}")
+
+
+def cmd_check(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    repo = default_repo(ctx, b, args.repo)
+
+    head_arg = args.head or "HEAD"
+    head_full = git("rev-parse", "--verify", "--quiet", head_arg + "^{commit}") if head_arg else None
+    head = head_full or args.head
+    if not head:
+        raise BenchError("no --head given and `git rev-parse HEAD` failed: run inside the repo or pass --head SHA")
+
+    listing = b.commits(repo, 500)
+    bench_head = next((c["commit"] for c in listing if same_commit(c["commit"], head)), None)
+
+    data: dict[str, Any] = {"repo": repo, "base": None, "head": bench_head or head,
+                            "base_source": None, "exit_code": EXIT_NO_COMPARABLE,
+                            "result": "no_comparable_runs", "url": None, "compare": None,
+                            "message": ""}
+
+    def finish(message: str) -> int:
+        data["message"] = message
+        out(args, data, lambda d: print(d["message"]))
+        return data["exit_code"]
+
+    if not bench_head:
+        return finish(f"no runs at head {short(head, 12)} in {repo}. Run the bench at this commit first "
+                      f"(qbench run new … --commit {head}), or pass --head.")
+
+    base = None
+    if args.base:
+        base = next((c["commit"] for c in listing if same_commit(c["commit"], args.base)), args.base)
+        data["base_source"] = "flag"
+    else:
+        ancestors = git_ancestors(head_full) if head_full else None
+        if ancestors:
+            for sha in ancestors:
+                hit = next((c["commit"] for c in listing if same_commit(c["commit"], sha)), None)
+                if hit:
+                    base, data["base_source"] = hit, "git"
+                    break
+        if base is None and ancestors is None:
+            idx = next(i for i, c in enumerate(listing) if c["commit"] == bench_head)
+            if idx + 1 < len(listing):
+                base, data["base_source"] = listing[idx + 1]["commit"], "bench"
+    if not base:
+        return finish(f"no earlier commit with runs to compare {short(bench_head, 12)} against in {repo}. "
+                      "Pass --base SHA.")
+
+    data["base"] = base
+    keys = [k for k in args.keys.split(",") if k] if args.keys else None
+    res = b.compare_commits(base, bench_head, repo=repo, window=args.window, stat=args.stat, keys=keys)
+    data["compare"] = res
+    data["url"] = compare_url(ctx, repo, base, bench_head)
+    v = res.get("verdict") or {}
+    if not res.get("scenarios"):
+        data["exit_code"], data["result"] = EXIT_NO_COMPARABLE, "no_comparable_runs"
+    elif (v.get("regressed") or 0) + (v.get("mixed") or 0) > 0:
+        data["exit_code"], data["result"] = EXIT_REGRESSED, "regressed"
+    else:
+        data["exit_code"], data["result"] = EXIT_OK, "clean"
+
+    def human(d):
+        print(f"{d['repo']} {short(d['base'], 12)} (base, via {d['base_source']}) -> {short(d['head'], 12)} (head)")
+        print_commit_compare(d["compare"])
+        print(f"result: {d['result']}  {d['url']}")
+
+    out(args, data, human)
+    return data["exit_code"]
+
+
+# ------------------------------------------------------------------ runs / compare
+
+def run_row(r: dict) -> list[str]:
+    return [short(r.get("id")), ts(r.get("started_at")), f"{r.get('suite')}/{r.get('scenario')}",
+            r.get("status") or "", r.get("verdict") or "-", r.get("validity") or "valid",
+            short(r.get("commit")) or "-"]
+
+
+RUN_HEADER = ["id", "started", "suite/scenario", "status", "verdict", "validity", "commit"]
+
+
+def cmd_runs(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    if args.cmd == "list":
+        params = {"suite": args.suite, "scenario": args.scenario, "repo": args.repo,
+                  "commit": args.commit, "validity": args.validity, "since": args.since,
+                  "limit": args.limit, "latest": "1" if args.latest else ""}
+        params.update({f"tag.{k}": v for k, v in kv_pairs(args.tag, "--tag").items()})
+        res = b._get("/v1/runs", params)
+        out(args, res, lambda d: table([run_row(r) for r in d.get("runs") or []], RUN_HEADER)
+            if d.get("runs") else print("no runs match"))
+    elif args.cmd == "show":
+        res = b.run(args.run)
+
+        def human(r):
+            print(f"{r.get('id')}  {r.get('suite')}/{r.get('scenario')}  {r.get('status')}  "
+                  f"verdict={r.get('verdict') or '-'}  validity={r.get('validity')}")
+            print(f"repo={r.get('repo') or '-'} commit={r.get('commit') or '-'} host={r.get('host') or '-'} "
+                  f"started={ts(r.get('started_at'))}")
+            if r.get("tags"):
+                print("tags: " + " ".join(f"{k}={v}" for k, v in sorted(r["tags"].items())))
+            for m in r.get("mismatches") or []:
+                print(f"mismatch: {m.get('key')} intended={m.get('intended')} effective={m.get('effective')}")
+            if r.get("phases"):
+                print("phases: " + ", ".join(f"{p.get('phase')}({p.get('origin')})" for p in r["phases"]))
+            print(f"samples={r.get('sample_count')} events={r.get('event_count')} "
+                  f"sources={','.join(r.get('sources') or [])}")
+            for a in r.get("artifacts") or []:
+                print(f"artifact: {a.get('name')} ({a.get('role') or '?'}, {a.get('size')} B)")
+            print(f"{ctx.url}/runs/{r.get('id')}")
+        out(args, res, human)
+    elif args.cmd == "summary":
+        res = b.summary(args.run)
+
+        def human(s):
+            r = s.get("run") or {}
+            h = s.get("header") or {}
+            print(f"{r.get('id')}  {r.get('suite')}/{r.get('scenario')}  validity={h.get('validity')}"
+                  + (f" ({h.get('validity_reason')})" if h.get("validity_reason") else ""))
+            for m in h.get("mismatches") or []:
+                print(f"mismatch: {m.get('key')} intended={m.get('intended')} effective={m.get('effective')}")
+            bd = s.get("baseline_delta")
+            if bd:
+                print("vs baseline: " + ((bd.get("verdict") or {}).get("text") or ""))
+            else:
+                print("no pinned baseline for this scenario")
+            if s.get("phases"):
+                print("phases: " + ", ".join(s["phases"]))
+            for rep in s.get("reports") or []:
+                print(f"cited by: {rep.get('title')} {rep.get('url')}")
+        out(args, res, human)
+    return EXIT_OK
+
+
+def cmd_compare(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    keys = [k for k in args.keys.split(",") if k] if args.keys else None
+    params = {"runs": ",".join(args.runs), "keys": ",".join(keys) if keys else "",
+              "window": args.window, "align": args.align, "stat": args.stat,
+              "max_points": "" if args.json else 50}
+    res = b._get("/v1/compare", params)
+
+    def human(d):
+        v = d.get("verdict") or {}
+        print(v.get("text") or "(no verdict)")
+        print(f"{ctx.url}/compare?runs={','.join(args.runs)}")
+    out(args, res, human)
+    return EXIT_OK
+
+
+def cmd_commits(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    if args.cmd == "list":
+        repo = default_repo(ctx, b, args.repo)
+        res = b._get("/v1/commits", {"repo": repo, "limit": args.limit})
+
+        def human(d):
+            rows = [[short(c.get("commit"), 12), ts(c.get("last_run_at")), str(c.get("runs")),
+                     str(c.get("valid_runs")), str(len(c.get("scenarios") or [])),
+                     str(len(c.get("reports") or []))] for c in d.get("commits") or []]
+            if rows:
+                table(rows, ["commit", "last run", "runs", "valid", "scenarios", "reports"])
+            else:
+                print(f"no commits with runs in {repo}")
+        out(args, res, human)
+    else:
+        keys = [k for k in args.keys.split(",") if k] if args.keys else None
+        repo = args.repo
+        res = b.compare_commits(args.base, args.head, repo=repo, window=args.window,
+                                stat=args.stat, keys=keys)
+        out(args, res, print_commit_compare)
+    return EXIT_OK
+
+
+def cmd_regressions(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    res = b.regressions(args.suite, args.scenario, args.metric, args.agg, args.window,
+                        args.baseline, args.pct)
+
+    def human(d):
+        print(f"{d.get('metric')} ({d.get('better')}, {d.get('agg')}, window={d.get('window') or 'run'}) "
+              f"vs baseline run {short(d.get('baseline_run_id'))}")
+        rows = []
+        for r in d.get("runs") or []:
+            flag = "REGRESSED" if r.get("regressed") else ("improved" if r.get("improved") else "")
+            rows.append([short(r.get("run_id")), f"{r.get('value', 0):.4g}",
+                         f"{r.get('baseline_value', 0):.4g}", f"{r.get('delta_pct', 0):+.1f}%",
+                         f"{r.get('threshold_pct', 0):g}%", flag])
+        table(rows, ["run", "value", "baseline", "delta", "threshold", ""])
+    out(args, res, human)
+    return EXIT_OK
+
+
+def cmd_baseline(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    if args.cmd == "pin":
+        thresholds = {k: float(v) for k, v in kv_pairs(args.threshold, "--threshold").items()}
+        b.set_baseline(args.suite, args.scenario, args.run, args.name, thresholds or None)
+        res = {"suite": args.suite, "scenario": args.scenario, "name": args.name, "run_id": args.run}
+        out(args, res, lambda d: print(f"pinned {d['run_id']} as the '{d['name']}' baseline for "
+                                       f"{d['suite']}/{d['scenario']}"))
+    else:
+        res = b.baseline(args.suite, args.scenario, args.name)
+        out(args, res, lambda d: print(d.get("run_id")))
+    return EXIT_OK
+
+
+def cmd_metrics(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    if args.cmd == "register":
+        res = b.register_metric(args.key_name, args.better, args.unit, args.regression_pct)
+        out(args, res, lambda d: print(f"{args.key_name}: better={args.better}"))
+    else:
+        res = b._get("/v1/metrics")
+        out(args, res, lambda d: table([[m.get("key"), m.get("better"), m.get("unit") or "",
+                                         f"{m.get('regression_pct') or ''}",
+                                         "declared" if m.get("declared") else ""]
+                                        for m in d.get("metrics") or []],
+                                       ["key", "better", "unit", "regression_pct", ""]))
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------ harness runs
+
+def cmd_run(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    if args.cmd == "new":
+        commit = args.commit
+        if commit and not all(c in "0123456789abcdefABCDEF" for c in commit):
+            commit = git("rev-parse", "--verify", "--quiet", commit + "^{commit}") or commit
+        if not commit:
+            print("warning: no --commit; this run cannot be compared by commit (qbench check)",
+                  file=sys.stderr)
+        tags = kv_pairs(args.tag, "--tag")
+        body: dict[str, Any] = {"suite": args.suite, "scenario": args.scenario, "host": args.host,
+                                "tags": tags, "notes": args.notes}
+        if args.repo:
+            body["repo"] = args.repo
+        if commit:
+            body["commit"] = commit
+        if args.external_id:
+            body["external_id"] = args.external_id
+        if args.conditions:
+            body["conditions"] = load_json_file(args.conditions)
+        status, res = b._post_status("/v1/runs", body)
+        data = {"id": res["id"], "created": status == 201}
+        out(args, data, lambda d: print(d["id"]))
+    elif args.cmd == "samples":
+        records = json.load(sys.stdin) if args.file == "-" else _read_records(args.file)
+        if isinstance(records, dict):
+            records = records.get("samples", [])
+        expected = {k: int(v) for k, v in kv_pairs(args.expect, "--expect").items()}
+        n = b.samples(args.run, records, replace=args.replace, expected_count=expected or None)
+        out(args, {"written": n}, lambda d: print(f"wrote {d['written']} samples"))
+    elif args.cmd == "event":
+        if args.file:
+            evs = _read_records(args.file)
+        else:
+            if not args.type:
+                raise BenchError("event needs --type T (or --file)")
+            payload = json.loads(args.payload) if args.payload else {}
+            evs = [{"ts_unix_ms": args.ts_ms if args.ts_ms is not None else bench.now_ms(),
+                    "type": args.type, "payload": payload}]
+        n = b.events(args.run, evs)
+        out(args, {"written": n}, lambda d: print(f"wrote {d['written']} event(s)"))
+    elif args.cmd == "mark":
+        b.phase_mark(args.run, args.phase, args.edge, args.ts_ms)
+        out(args, {"written": 1}, lambda d: print(f"marked {args.phase} {args.edge}"))
+    elif args.cmd == "capture":
+        res = b.artifact(args.run, args.file, args.name, role=args.role, caption=args.caption,
+                         started_at_ms=args.started_at_ms)
+        out(args, res, lambda d: print(f"uploaded {d.get('name')} ({d.get('role') or args.role or 'inferred'}, "
+                                       f"{d.get('size')} B)"))
+    elif args.cmd == "finish":
+        summary = load_json_file(args.summary) if args.summary else None
+        conditions = load_json_file(args.conditions) if args.conditions else None
+        res = b.finish(args.run, args.status, args.verdict, summary, kv_pairs(args.tag, "--tag"),
+                       conditions)
+        out(args, res, lambda d: print(f"{args.run}: {d.get('status', args.status)}"
+                                       + (f" {d.get('verdict')}" if d.get("verdict") else "")))
+    elif args.cmd == "validity":
+        res = b.set_validity(args.run, args.validity, args.reason)
+        out(args, res, lambda d: print(f"{args.run}: {args.validity}"))
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------ reports & sprints
+
+class Target:
+    """A commit report (kind=commit, ref=sha) or a sprint report (kind=sprint, ref=slug)."""
+
+    def __init__(self, kind: str, repo: str, ref: str):
+        self.kind, self.repo, self.ref = kind, repo, ref
+
+    def get(self, b: Bench, agg: str = "") -> dict:
+        if self.kind == "sprint":
+            return b.sprint_get(self.repo, self.ref, agg)
+        return b.report_get(self.repo, self.ref, agg)
+
+    def page(self, base: str) -> str:
+        if self.kind == "sprint":
+            return base + _sprint_page(self.repo, self.ref)
+        return base + _report_page(self.repo, self.ref)
+
+
+def comment_line(c: dict) -> str:
+    anchor = f"[{c.get('anchor')}] " if c.get("anchor") else ""
+    state = "resolved" if c.get("resolved") else "open"
+    body = (c.get("body") or "").strip().replace("\n", " ")
+    return f"#{c.get('id')} {state} {anchor}{c.get('author')} (rev {c.get('revision')}): {body}"
+
+
+def status_data(t: Target, rep: dict, base_url: str) -> dict:
+    review = rep.get("review") or {"status": rep.get("review_status"), "by": rep.get("reviewed_by"),
+                                   "at": rep.get("reviewed_at"), "note": rep.get("review_note")}
+    unresolved = [c for c in rep.get("comments") or [] if not c.get("resolved")]
+    return {"kind": t.kind, "repo": t.repo, "ref": rep.get("sprint") or rep.get("commit") or t.ref,
+            "url": t.page(base_url), "title": rep.get("title"), "revision": rep.get("revision"),
+            "review": {k: review.get(k) for k in ("status", "by", "at", "note")},
+            "author": rep.get("author"), "unresolved": unresolved,
+            "unresolved_count": len(unresolved)}
+
+
+def print_status(d: dict) -> None:
+    r = d["review"]
+    by = f" by {r['by']}" if r.get("by") else ""
+    print(f"{d['kind']} {d['ref']} rev {d['revision']}: {r.get('status')}{by}")
+    if r.get("note"):
+        print(f"note: {r['note']}")
+    if d["unresolved"]:
+        print(f"{d['unresolved_count']} unresolved comment(s):")
+        for c in d["unresolved"]:
+            print("  " + comment_line(c))
+    else:
+        print("no unresolved comments")
+    print(d["url"])
+
+
+def print_report(rep: dict, base_url: str, t: Target) -> None:
+    print(f"{rep.get('title')}")
+    print(f"{t.kind} {rep.get('sprint') or rep.get('commit')} rev {rep.get('revision')}  "
+          f"review={rep.get('review_status')}  author={rep.get('author') or '-'}")
+    if rep.get("summary"):
+        print(rep["summary"])
+    gc, tc = rep.get("goal_counts"), rep.get("test_counts")
+    secs = rep.get("sections") or {}
+    if not gc and secs.get("goals"):
+        gc = {}
+        for g in secs["goals"]:
+            gc[g.get("status")] = gc.get(g.get("status"), 0) + 1
+    if not tc and secs.get("tests"):
+        tc = {}
+        for x in secs["tests"]:
+            tc[x.get("status")] = tc.get(x.get("status"), 0) + 1
+    if gc:
+        print("goals: " + ", ".join(f"{v} {k}" for k, v in sorted(gc.items())))
+    if tc:
+        print("tests: " + ", ".join(f"{v} {k}" for k, v in sorted(tc.items())))
+    for d in rep.get("run_deltas") or []:
+        if d.get("regressed") or d.get("improved"):
+            word = "regressed" if d.get("regressed") else "improved"
+            print(f"run delta: {d.get('metric')} {word} {d.get('delta_pct', 0):+.1f}%")
+    arts = [a for a in rep.get("artifacts") or [] if not a.get("deleted_at")]
+    if arts:
+        print("evidence: " + ", ".join(f"{a.get('name')} ({a.get('role')})" for a in arts))
+    open_c = [c for c in rep.get("comments") or [] if not c.get("resolved")]
+    print(f"open comments: {len(open_c)}")
+    print(t.page(base_url))
+
+
+def report_rows(reports: list[dict]) -> list[list[str]]:
+    return [[r.get("kind") or "commit", r.get("sprint") or short(r.get("commit"), 12),
+             r.get("review_status") or "", str(r.get("open_comments") or 0), ts(r.get("updated_at")),
+             (r.get("title") or "")[:60]] for r in reports]
+
+
+def load_sections(path: str) -> tuple[Any, Any]:
+    loaded = load_json_file(path)
+    # A bare sections object has none of a PUT body's other keys (title,
+    # branch, ...); a full body carries "sections" (and maybe "commits")
+    # alongside them. Either way only sections (and commits) come from the
+    # file: every other field is an explicit flag, so a --title on the
+    # command line is never silently overridden by a stale file.
+    other = {"title", "sprint_label", "branch", "summary", "body", "body_mime", "issues", "prs",
+             "runs", "tags", "pinned", "commit", "started_at", "ended_at", "author"}
+    if isinstance(loaded, dict) and (loaded.keys() & (other | {"sections"})):
+        return loaded.get("sections"), loaded.get("commits")
+    return loaded, None
+
+
+def cmd_reports(ctx: Ctx, args) -> int:
+    kind = "sprint" if args.group == "sprint" else "commit"
+    cmd = args.cmd
+
+    if cmd == "url":
+        t = Target(kind, args.repo, args.sprint if kind == "sprint" else args.commit)
+        print(t.page(ctx.url))
+        return EXIT_OK
+
+    b = ctx.bench()
+
+    if cmd == "list":
+        filters = {"repo": args.repo, "review_status": args.review_status, "since": args.since,
+                   "limit": args.limit, "kind": kind}
+        if kind == "commit":
+            filters.update({"branch": args.branch, "issue": args.issue, "tag": args.tag})
+        res = b._get("/v1/reports", filters)
+        out(args, res, lambda d: table(report_rows(d.get("reports") or []),
+                                       ["kind", "ref", "review", "open", "updated", "title"])
+            if d.get("reports") else print("no reports match"))
+        return EXIT_OK
+
+    ref = args.sprint if kind == "sprint" else args.commit
+    t = Target(kind, args.repo, ref)
+
+    if cmd == "put":
+        tags = kv_pairs(args.tag, "--tag") or None
+        if kind == "sprint":
+            sections, commits = load_sections(args.sections) if args.sections else (None, None)
+            rep = b.sprint_put(
+                args.repo, args.sprint, args.title, sprint_label=args.sprint_label,
+                branch=args.branch, summary=args.summary, body_path=args.body,
+                body_mime=args.body_mime, issues=args.issue or None, prs=args.pr or None,
+                runs=args.run or None, tags=tags, pinned=True if args.pin else None,
+                commit=args.commit, started_at=args.started_at, ended_at=args.ended_at,
+                commits=commits, sections=sections, author=args.author)
+            print(json.dumps(rep, indent=2) if args.json else b.sprint_url(args.repo, rep["sprint"]))
+        else:
+            rep = b.report_put(
+                args.repo, args.commit, args.title, branch=args.branch, summary=args.summary,
+                body_path=args.body, body_mime=args.body_mime,
+                issues=args.issue or None, prs=args.pr or None, runs=args.run or None,
+                tags=tags, pinned=True if args.pin else None)
+            print(json.dumps(rep, indent=2) if args.json else b.report_url(args.repo, rep["commit"]))
+    elif cmd == "get":
+        rep = t.get(b, args.agg)
+        out(args, rep, lambda d: print_report(d, ctx.url, t))
+    elif cmd == "status":
+        rep = t.get(b)
+        out(args, status_data(t, rep, ctx.url), print_status)
+    elif cmd == "attach":
+        if kind == "sprint":
+            res = b.sprint_attach(args.repo, args.sprint, args.file, role=args.role,
+                                  caption=args.caption, name=args.name)
+        else:
+            res = b.report_attach(args.repo, args.commit, args.file, role=args.role,
+                                  caption=args.caption, name=args.name)
+        out(args, res, lambda d: print(f"attached {d.get('name')} ({d.get('role') or 'inferred'}, "
+                                       f"{d.get('size')} B)"))
+    elif cmd == "pin":
+        if kind == "sprint":
+            rep = b.sprint_pin(args.repo, args.sprint, not args.off)
+            url = b.sprint_url(args.repo, rep["sprint"])
+        else:
+            rep = b.report_pin(args.repo, args.commit, not args.off)
+            url = b.report_url(args.repo, rep["commit"])
+        print(json.dumps({"pinned": rep["pinned"], "url": url}))
+    elif cmd == "review":
+        if args.status == "approved":
+            rep = t.get(b)
+            me = b.me()
+            if rep.get("author") and rep.get("author") == me.get("name"):
+                raise BenchError(f"refusing to approve: you ({me.get('name')}) wrote this report. "
+                                 "Approval is the reviewer's call; ask Michael to review it.")
+        res = b.review(args.repo, ref, args.status, args.note, kind=kind)
+        out(args, res, lambda d: print(f"{kind} {ref}: {args.status}"))
+    elif cmd == "comments":
+        if args.resolve is not None or args.reopen is not None:
+            cid = args.resolve if args.resolve is not None else args.reopen
+            res = b.comment_resolve(args.repo, ref, cid, args.resolve is not None, kind=kind)
+            out(args, res, lambda d: print(comment_line(d)))
+        elif args.add is not None:
+            res = b.comment(args.repo, ref, args.add, anchor=args.anchor, kind=kind)
+            out(args, res, lambda d: print(comment_line(d)))
+        else:
+            res = b._get(b._review_api(args.repo, ref, kind) + "/comments")
+            if args.unresolved:
+                res = dict(res, comments=[c for c in res.get("comments") or [] if not c.get("resolved")])
+            out(args, res, lambda d: [print(comment_line(c)) for c in d.get("comments") or []]
+                if d.get("comments") else print("no comments"))
+    elif cmd == "resolve":
+        results = [b.comment_resolve(args.repo, ref, cid, not args.reopen, kind=kind) for cid in args.ids]
+        out(args, {"comments": results}, lambda d: [print(comment_line(c)) for c in d["comments"]])
+    elif cmd == "snippet":
+        text = b.sprint_snippet(args.repo, args.sprint, args.agg) if kind == "sprint" \
+            else b.report_snippet(args.repo, args.commit, args.agg)
+        out(args, {"markdown": text}, lambda d: print(d["markdown"]))
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------ roadmap
+
+def gh_line(i: dict) -> str:
+    fields = " / ".join(x for x in (i.get("status"), i.get("evidence")) if x)
+    return f"#{i.get('number')} [{fields or 'no fields'}] {i.get('title')}"
+
+
+def cmd_evidence(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    res = b._get("/v1/evidence/gaps")
+
+    def human(d):
+        gaps = d.get("gaps") or []
+        if not gaps:
+            print("no evidence gaps (if that looks wrong: qbench doctor shows whether the board is configured)")
+            return
+        for g in gaps:
+            print(f"{gh_line(g)}: {g.get('reason')}")
+            print(f"    {g.get('url')}")
+            for c in g.get("cited_by") or []:
+                print(f"    cited by {c.get('title')} {c.get('url')}")
+    out(args, res, human)
+    return EXIT_OK
+
+
+def cmd_board(ctx: Ctx, args) -> int:
+    b = ctx.bench()
+    cited = None
+    if args.cited:
+        cited = "1"
+    elif args.uncited:
+        cited = "0"
+    res = b._get("/v1/github/items", {"repo": args.repo, "status": args.status,
+                                      "evidence": args.evidence, "level": args.level,
+                                      "state": args.state, "cited": cited})
+
+    def human(d):
+        items = d.get("items") or []
+        if not items:
+            print("no board items match")
+        for i in items:
+            n = len(i.get("cited_by") or [])
+            print(f"{gh_line(i)} ({i.get('state')}, cited by {n})")
+    out(args, res, human)
+    return EXIT_OK
+
+
+def cmd_version(ctx: Ctx, args) -> int:
+    out(args, {"version": __version__}, lambda d: print(d["version"]))
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------ parser
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="qbench", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--url", default=None, help="base URL (default $BENCH_URL)")
-    p.add_argument("--key", default=None, help="API key (default $BENCH_KEY)")
-    top = p.add_subparsers(dest="group", required=True)
+    p.add_argument("--url", default=None, help="base URL (default $BENCH_URL, then ~/.config/qbench/url)")
+    p.add_argument("--key", default=None, help="API key (prefer $BENCH_KEY or ~/.config/qbench/key)")
+    p.add_argument("--version", action="version", version=f"qbench {__version__}")
+    top = p.add_subparsers(dest="group", required=True, metavar="COMMAND")
 
-    reports = top.add_parser("report", help="publish and read completion reports")
-    sub = reports.add_subparsers(dest="cmd", required=True)
+    js = argparse.ArgumentParser(add_help=False)
+    js.add_argument("--json", action="store_true", help="print JSON (see the C15 spec for shapes)")
 
-    def key_args(sp, commit_help="full sha to publish, unique prefix to read"):
-        sp.add_argument("--repo", required=True, metavar="OWNER/NAME")
-        sp.add_argument("--commit", required=True, help=commit_help)
+    def add(sub, name, help_, **kw):
+        return sub.add_parser(name, help=help_, parents=[js], **kw)
 
-    put = sub.add_parser("put", help="create or replace a report; prints its URL")
-    key_args(put, "full merge sha (short shas are for reading)")
-    put.add_argument("--title", required=True)
-    put.add_argument("--branch", default="")
-    put.add_argument("--summary", default="", help="one plain-text paragraph for lists")
-    put.add_argument("--body", default=None, metavar="FILE",
-                     help="narrative file; .html/.md/.txt sets the mime")
-    put.add_argument("--body-mime", default=None, choices=["text/html", "text/markdown", "text/plain"])
-    put.add_argument("--issue", action="append", type=int, default=[], metavar="N")
-    put.add_argument("--pr", action="append", type=int, default=[], metavar="N")
-    put.add_argument("--run", action="append", default=[], metavar="RUN_ID",
-                     help="link a bench run; exactly two gives a before/after table")
-    put.add_argument("--tag", action="append", default=[], metavar="K=V")
-    put.add_argument("--pin", action="store_true", help="exempt attachments from pruning")
-    put.add_argument("--json", action="store_true", help="print the report JSON instead of the URL")
+    # setup
+    add(top, "doctor", "check URL, server health, key, permissions and CLI version")
+    add(top, "version", "print the CLI version")
 
-    get = sub.add_parser("get", help="one report with artifacts, linked runs and deltas")
-    key_args(get)
-    get.add_argument("--agg", default="", help="statistic for the delta table (default p50)")
+    # regressions
+    ck = add(top, "check", "did head regress vs. the previous benched commit? exit 0/3/4")
+    ck.add_argument("--head", default="", help="commit (default git HEAD)")
+    ck.add_argument("--base", default="", help="commit (default nearest ancestor with runs)")
+    ck.add_argument("--repo", default="", metavar="OWNER/NAME", help="default $BENCH_REPO, else the server's")
+    ck.add_argument("--window", default="", help="phase to judge, e.g. impaired")
+    ck.add_argument("--stat", default="", choices=["", "mean", "p50", "p95"])
+    ck.add_argument("--keys", default="", metavar="K1,K2")
 
-    ls = sub.add_parser("list", help="list reports, newest first")
-    ls.add_argument("--repo", default="")
-    ls.add_argument("--branch", default="")
-    ls.add_argument("--issue", default="")
-    ls.add_argument("--tag", default="", metavar="K=V")
-    ls.add_argument("--since", default="", metavar="30d")
-    ls.add_argument("--limit", default="50")
+    runs = top.add_parser("runs", help="list and inspect runs")
+    rsub = runs.add_subparsers(dest="cmd", required=True)
+    rl = add(rsub, "list", "list runs, newest first")
+    for f in ("suite", "scenario", "repo", "commit", "since"):
+        rl.add_argument(f"--{f}", default="")
+    rl.add_argument("--validity", default="", choices=["", "valid", "contaminated", "withdrawn"])
+    rl.add_argument("--tag", action="append", default=[], metavar="K=V")
+    rl.add_argument("--latest", action="store_true", help="newest valid run per suite/scenario")
+    rl.add_argument("--limit", default="20")
+    add(rsub, "show", "one run: tags, phases, mismatches, artifacts").add_argument("run")
+    add(rsub, "summary", "one run judged against its pinned baseline").add_argument("run")
 
-    at = sub.add_parser("attach", help="attach evidence to a report")
-    key_args(at)
-    at.add_argument("--file", required=True)
-    at.add_argument("--role", default="",
-                    choices=["", "screenshot", "video", "log", "bundle", "other"],
-                    help="drives prune order; inferred from the file when omitted")
-    at.add_argument("--caption", default="")
-    at.add_argument("--name", default=None, help="stored name (default the filename)")
+    cp = add(top, "compare", "judge 2-4 specific runs against each other")
+    cp.add_argument("runs", nargs="+", metavar="RUN")
+    cp.add_argument("--keys", default="", metavar="K1,K2")
+    cp.add_argument("--window", default="")
+    cp.add_argument("--align", default="")
+    cp.add_argument("--stat", default="", choices=["", "mean", "p50", "p95"])
 
-    pin = sub.add_parser("pin", help="pin a report so its attachments are never pruned")
-    key_args(pin)
-    pin.add_argument("--off", action="store_true", help="unpin instead")
+    commits = top.add_parser("commits", help="commit list and commit-to-commit compare")
+    csub = commits.add_subparsers(dest="cmd", required=True)
+    cl = add(csub, "list", "commits that have runs, newest first")
+    cl.add_argument("--repo", default="", metavar="OWNER/NAME")
+    cl.add_argument("--limit", default="50")
+    cc = add(csub, "compare", "judge every scenario that ran at both commits")
+    cc.add_argument("base")
+    cc.add_argument("head")
+    cc.add_argument("--repo", default="", metavar="OWNER/NAME", help="default BENCH_DEFAULT_REPO")
+    cc.add_argument("--window", default="")
+    cc.add_argument("--stat", default="")
+    cc.add_argument("--keys", default="", metavar="K1,K2")
 
-    url = sub.add_parser("url", help="print the stable page URL (no request made)")
-    key_args(url)
+    rg = add(top, "regressions", "every run of a scenario vs. its pinned baseline, one metric")
+    rg.add_argument("--suite", required=True)
+    rg.add_argument("--scenario", required=True)
+    rg.add_argument("--metric", required=True)
+    rg.add_argument("--agg", default="p50")
+    rg.add_argument("--window", default="")
+    rg.add_argument("--baseline", default="")
+    rg.add_argument("--pct", type=float, default=None)
+
+    bl = top.add_parser("baseline", help="pin or read a scenario's last-known-good run")
+    bsub = bl.add_subparsers(dest="cmd", required=True)
+    bp = add(bsub, "pin", "pin RUN as the baseline for suite/scenario")
+    bp.add_argument("run")
+    bs = add(bsub, "show", "print the pinned baseline run id")
+    for sp in (bp, bs):
+        sp.add_argument("--suite", required=True)
+        sp.add_argument("--scenario", required=True)
+        sp.add_argument("--name", default="default")
+    bp.add_argument("--threshold", action="append", default=[], metavar="METRIC=PCT")
+
+    # harness
+    run = top.add_parser("run", help="post a harness run: new, samples, event, mark, capture, finish, validity")
+    hsub = run.add_subparsers(dest="cmd", required=True)
+    rn = add(hsub, "new", "create a run; prints its id")
+    rn.add_argument("--suite", required=True)
+    rn.add_argument("--scenario", required=True)
+    rn.add_argument("--repo", default="", metavar="OWNER/NAME")
+    rn.add_argument("--commit", default="", help="sha the run measured (a git ref resolves locally)")
+    rn.add_argument("--host", default="")
+    rn.add_argument("--notes", default="")
+    rn.add_argument("--tag", action="append", default=[], metavar="K=V", help="intended configuration")
+    rn.add_argument("--conditions", default=None, metavar="FILE", help="JSON: what the host actually did")
+    rn.add_argument("--external-id", default=None, help="idempotency key: re-posting updates the run")
+    rs = add(hsub, "samples", "post samples from JSON/JSONL (- for stdin)")
+    rs.add_argument("run")
+    rs.add_argument("--file", required=True)
+    rs.add_argument("--replace", action="store_true", help="clear each source in the file first (re-folds)")
+    rs.add_argument("--expect", action="append", default=[], metavar="SOURCE=N",
+                    help="reject the write unless SOURCE ends up with N samples")
+    re_ = add(hsub, "event", "post one event (--type) or a file of them (--file)")
+    re_.add_argument("run")
+    re_.add_argument("--type", default="", help="e.g. netem.impair, netem.clear, abr.ladder.step")
+    re_.add_argument("--payload", default="", help="JSON object")
+    re_.add_argument("--ts-ms", type=int, default=None, help="wall-clock ms (default now)")
+    re_.add_argument("--file", default="")
+    rm = add(hsub, "mark", "explicit phase boundary (harness.mark)")
+    rm.add_argument("run")
+    rm.add_argument("phase")
+    rm.add_argument("edge", choices=["start", "end"])
+    rm.add_argument("--ts-ms", type=int, default=None)
+    rc = add(hsub, "capture", "upload a screen capture, screenshot, log or bundle")
+    rc.add_argument("run")
+    rc.add_argument("file")
+    rc.add_argument("--role", default="", choices=ROLES)
+    rc.add_argument("--caption", default="")
+    rc.add_argument("--name", default=None)
+    rc.add_argument("--started-at-ms", type=int, default=None, help="wall-clock ms of the first frame")
+    rf = add(hsub, "finish", "close the run out")
+    rf.add_argument("run")
+    rf.add_argument("--status", default="finished", choices=["finished", "failed", "aborted", "running"])
+    rf.add_argument("--verdict", default=None, choices=["PASS", "FAIL", "INFO"])
+    rf.add_argument("--summary", default=None, metavar="FILE")
+    rf.add_argument("--conditions", default=None, metavar="FILE")
+    rf.add_argument("--tag", action="append", default=[], metavar="K=V")
+    rv = add(hsub, "validity", "mark a run valid, contaminated or withdrawn")
+    rv.add_argument("run")
+    rv.add_argument("validity", choices=["valid", "contaminated", "withdrawn"])
+    rv.add_argument("--reason", default="")
+
+    # reports & sprints
+    for group in ("report", "sprint"):
+        is_sprint = group == "sprint"
+        g = top.add_parser(group, help=("sprint reports and their review" if is_sprint
+                                        else "commit reports and their review"))
+        sub = g.add_subparsers(dest="cmd", required=True)
+
+        def ident(sp, publish=False):
+            sp.add_argument("--repo", required=True, metavar="OWNER/NAME")
+            if is_sprint:
+                sp.add_argument("--sprint", required=True, metavar="SLUG", help="e.g. c12, 2026-w38")
+            else:
+                sp.add_argument("--commit", required=True,
+                                help="full sha to publish" if publish else "sha or unique prefix")
+
+        put = add(sub, "put", "create or replace; prints the page URL")
+        ident(put, publish=True)
+        put.add_argument("--title", required=True)
+        put.add_argument("--branch", default="")
+        put.add_argument("--summary", default="", help="one plain-text paragraph for lists")
+        put.add_argument("--body", default=None, metavar="FILE", help="narrative; .html/.md/.txt sets the mime")
+        put.add_argument("--body-mime", default=None, choices=["text/html", "text/markdown", "text/plain"])
+        put.add_argument("--issue", action="append", type=int, default=[], metavar="N")
+        put.add_argument("--pr", action="append", type=int, default=[], metavar="N")
+        put.add_argument("--run", action="append", default=[], metavar="RUN_ID",
+                         help="link a run; exactly two gives a before/after table")
+        put.add_argument("--tag", action="append", default=[], metavar="K=V")
+        put.add_argument("--pin", action="store_true", help="exempt attachments from pruning")
+        if is_sprint:
+            put.add_argument("--sprint-label", default="", help="display form, e.g. C12")
+            put.add_argument("--sections", default=None, metavar="FILE",
+                             help="JSON: the sections object, or a full PUT body (client/examples/sprint.json)")
+            put.add_argument("--commit", default="", help="head/merge sha, optional")
+            put.add_argument("--started-at", default=None)
+            put.add_argument("--ended-at", default=None)
+            put.add_argument("--author", default="", help="default the key's name")
+
+        gt = add(sub, "get", "the report: sections, evidence, deltas, comments")
+        ident(gt)
+        gt.add_argument("--agg", default="", help="statistic for the delta table (default p50)")
+
+        st = add(sub, "status", "review status and unresolved comments (poll this after submitting)")
+        ident(st)
+
+        ls = add(sub, "list", "list, newest first")
+        ls.add_argument("--repo", default="")
+        ls.add_argument("--review-status", default="", choices=[""] + REVIEW_STATUSES)
+        ls.add_argument("--since", default="", metavar="30d")
+        ls.add_argument("--limit", default="50")
+        if not is_sprint:
+            ls.add_argument("--branch", default="")
+            ls.add_argument("--issue", default="")
+            ls.add_argument("--tag", default="", metavar="K=V")
+
+        at = add(sub, "attach", "attach evidence (screenshot, video, log, bundle)")
+        ident(at)
+        at.add_argument("--file", required=True)
+        at.add_argument("--role", default="", choices=ROLES, help="inferred from the file when omitted")
+        at.add_argument("--caption", default="")
+        at.add_argument("--name", default=None)
+
+        pn = add(sub, "pin", "exempt attachments from pruning for good")
+        ident(pn)
+        pn.add_argument("--off", action="store_true", help="unpin instead")
+
+        ident(add(sub, "url", "print the stable page URL (no request)"))
+
+        rv = add(sub, "review", "set the review verdict (reviewers only; never approve your own)")
+        ident(rv)
+        rv.add_argument("status", choices=REVIEW_STATUSES)
+        rv.add_argument("--note", default="")
+
+        cm = add(sub, "comments", "list comments, or add one")
+        ident(cm)
+        cm.add_argument("--unresolved", action="store_true", help="only open comments")
+        cm.add_argument("--add", default=None, metavar="TEXT", help="add a comment instead of listing")
+        cm.add_argument("--anchor", default="", help='e.g. "goals.2"; "" is the whole report')
+        cm.add_argument("--resolve", type=int, default=None, metavar="ID")
+        cm.add_argument("--reopen", type=int, default=None, metavar="ID")
+
+        rs_ = add(sub, "resolve", "mark comments resolved after addressing them")
+        ident(rs_)
+        rs_.add_argument("ids", nargs="+", type=int, metavar="ID")
+        rs_.add_argument("--reopen", action="store_true")
+
+        sn = add(sub, "snippet", "markdown block for a GitHub issue/PR comment")
+        ident(sn)
+        sn.add_argument("--agg", default="")
+
+    # roadmap
+    ev = top.add_parser("evidence", help="roadmap items that still need bench evidence")
+    esub = ev.add_subparsers(dest="cmd", required=True)
+    add(esub, "gaps", "open board items not yet cited by an approved report")
+
+    bd = top.add_parser("board", help="the synced GitHub project board")
+    bdsub = bd.add_subparsers(dest="cmd", required=True)
+    bi = add(bdsub, "items", "board items with the reports citing them")
+    for f in ("repo", "status", "evidence", "level", "state"):
+        bi.add_argument(f"--{f}", default="")
+    grp = bi.add_mutually_exclusive_group()
+    grp.add_argument("--cited", action="store_true")
+    grp.add_argument("--uncited", action="store_true")
+
+    mt = top.add_parser("metrics", help="the metric direction registry")
+    msub = mt.add_subparsers(dest="cmd", required=True)
+    add(msub, "list", "registered metrics and their direction")
+    mr = add(msub, "register", "declare a metric's direction so deltas judge it")
+    mr.add_argument("key_name", metavar="KEY")
+    mr.add_argument("better", choices=["higher", "lower", "neutral"])
+    mr.add_argument("--unit", default="")
+    mr.add_argument("--regression-pct", type=float, default=0)
+
     return p
+
+
+HANDLERS: dict[str, Callable[[Ctx, Any], int]] = {
+    "doctor": cmd_doctor, "version": cmd_version, "check": cmd_check, "runs": cmd_runs,
+    "compare": cmd_compare, "commits": cmd_commits, "regressions": cmd_regressions,
+    "baseline": cmd_baseline, "run": cmd_run, "report": cmd_reports, "sprint": cmd_reports,
+    "evidence": cmd_evidence, "board": cmd_board, "metrics": cmd_metrics,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    ctx = Ctx(args)
+    as_json = getattr(args, "json", False)
+    try:
+        return HANDLERS[args.group](ctx, args)
+    except CredentialError as e:
+        if as_json:
+            print(json.dumps({"error": {"status": 0, "message": str(e), "method": "", "path": ""}}))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return EXIT_AUTH
+    except BenchError as e:
+        if as_json:
+            print(json.dumps({"error": {"status": getattr(e, "status", 0),
+                                        "message": getattr(e, "server_message", "") or str(e),
+                                        "method": getattr(e, "method", ""),
+                                        "path": getattr(e, "path", "")}}))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+            if getattr(e, "status", 0) == 403:
+                print("hint: a read-only key cannot write; qbench doctor shows the key's permissions",
+                      file=sys.stderr)
+        return EXIT_AUTH if getattr(e, "status", 0) == 401 else EXIT_ERROR
 
-    # `url` is pure string work, so it must not need a key.
-    if args.cmd == "url":
-        base = (args.url or os.environ.get("BENCH_URL") or "http://localhost:9400").rstrip("/")
-        from bench import _report_page
-        print(base + _report_page(args.repo, args.commit))
-        return 0
 
-    b = Bench(args.url, args.key)
-
-    if args.cmd == "put":
-        tags = dict(t.split("=", 1) for t in args.tag) if args.tag else None
-        rep = b.report_put(
-            args.repo, args.commit, args.title, branch=args.branch, summary=args.summary,
-            body_path=args.body, body_mime=args.body_mime,
-            issues=args.issue or None, prs=args.pr or None, runs=args.run or None,
-            tags=tags, pinned=True if args.pin else None)
-        print(json.dumps(rep, indent=2) if args.json else b.report_url(args.repo, rep["commit"]))
-    elif args.cmd == "get":
-        print(json.dumps(b.report_get(args.repo, args.commit, args.agg), indent=2))
-    elif args.cmd == "list":
-        print(json.dumps(b.report_list(repo=args.repo, branch=args.branch, issue=args.issue,
-                                       tag=args.tag, since=args.since, limit=args.limit), indent=2))
-    elif args.cmd == "attach":
-        print(json.dumps(b.report_attach(args.repo, args.commit, args.file,
-                                         role=args.role, caption=args.caption,
-                                         name=args.name), indent=2))
-    elif args.cmd == "pin":
-        rep = b.report_pin(args.repo, args.commit, not args.off)
-        print(json.dumps({"pinned": rep["pinned"], "url": b.report_url(args.repo, rep["commit"])}))
-    return 0
+def run() -> None:
+    """Entry point for the script and the zipapp."""
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except BenchError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    run()

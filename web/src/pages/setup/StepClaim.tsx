@@ -54,7 +54,7 @@ export function StepClaim({ onClaimed }: StepClaimProps) {
   return (
     <form className="card login-card" onSubmit={onSubmit} noValidate>
       {/* No wordmark here: the wizard's AuthCard already carries the lockup. */}
-      <p className="sub" style={{ textAlign: "center", margin: 0 }}>
+      <p className="sub setup-claim-lede m0">
         This is a fresh Quasar instance with no administrator yet. Paste the
         one-time setup token to create the first admin account.
       </p>
@@ -78,8 +78,11 @@ export function StepClaim({ onClaimed }: StepClaimProps) {
         />
         <span className="field-hint">
           Not printed to a log. Written to{" "}
-          <code>/run/quasar/setup-token</code> on the host when the instance
-          boots with no admin. Retrieve it with{" "}
+          <code>/run/quasar/setup-token</code> in the control plane’s container
+          when the instance boots with no admin. Retrieve it on that machine: an
+          install made with the seed,{" "}
+          <code>docker exec quasar-control-plane cat /run/quasar/setup-token</code>
+          ; a Compose install,{" "}
           <code>
             docker compose -f deploy/docker-compose.yml exec
             quasar-control-plane cat /run/quasar/setup-token
@@ -134,7 +137,7 @@ export function StepClaim({ onClaimed }: StepClaimProps) {
       )}
 
       {alreadyClaimed ? (
-        <Link to="/login" className="btn btn-primary btn-block" style={{ textDecoration: "none" }}>
+        <Link to="/login" className="btn btn-primary btn-block">
           Go to sign in
         </Link>
       ) : (

@@ -6,7 +6,7 @@
 //! This loop is outside the per-session tracing span (see `.claude/rules/agent-logging.md`),
 //! so lines here carry an explicit `session_id` field.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::capacity;
 use crate::config::Config;
 use crate::health::HealthState;
+use crate::host_probe;
 use crate::images::ImageManager;
 use crate::messages::{
     AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, StreamSpec, VideoTopology,
@@ -38,7 +39,7 @@ use crate::session::runner::{
 };
 use crate::session::signaling::SignalMsg;
 use crate::session::vulkan_fault::{self, GpuGlobalFaultDetector};
-use crate::session::{EncoderChoice, SessionConfig, StreamParams};
+use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 use crate::vram::{VramCache, VramTarget};
 
 const CRITICAL_EVENT_CAPACITY: usize = 256;
@@ -129,60 +130,56 @@ pub async fn run(cfg: Config) {
     if let Err(msg) = enrollment_reachable(&cfg) {
         error!(token = "boot-enrollment-unconfigured", "{msg}");
         sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-        std::process::exit(1);
+        crate::restart::exit_now(1);
     }
 
     if let Err(message) = crate::container_ownership::initialize(&cfg.node_secret_path) {
         error!(token = "boot-container-ownership-unavailable", "{message}");
         sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-        std::process::exit(1);
+        crate::restart::exit_now(1);
     }
 
-    // Startup orphan sweep (P2-06): `docker run --rm` survives a SIGKILL of the
-    // agent, so a prior run can leave session/pulse sibling containers behind.
-    // Best-effort — a sweep failure never blocks startup.
-    let (runtime, swept) = offload_probe(|| {
+    // Consume a restart journal marker once per process, before probes or
+    // session runtime initialization can observe the affected hardware group.
+    let policy_path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
+    // Consume any restart marker before loading runtime policy. A corrupt
+    // journal or a requested recovery restart is handled after the independent
+    // startup container and managed-home cleanup has run.
+    let policy_boot = crate::policy::PolicyAgent::bootstrap(&policy_path);
+
+    crate::runtime::initialize_image_state(
+        format!("{}.runtime-images", cfg.node_secret_path).into(),
+    );
+
+    // A prior process can leave an application holding a managed home after
+    // SIGKILL. Retire it through the durable API before audio/home GC or any
+    // control-plane registration. An unresolved pass enters diagnostic mode below.
+    let (runtime, first_cleanup) = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        let swept = runtime.sweep_orphans(&[
-            crate::session::container::SESSION_NAME_PREFIX,
-            crate::session::audio::PULSE_NAME_PREFIX,
-        ]);
-        (runtime, swept)
+        let attempt = crate::diagnostic::startup_cleanup_configured();
+        (runtime, attempt)
     })
     .await;
-    if swept > 0 {
-        info!("startup sweep removed {swept} orphaned container(s) from a prior run");
-    }
-
-    // Install mode + updater presence, for the startup identity banner;
-    // `connect_and_run` re-discovers before every register. Failure is
-    // silent-by-design — the fields go absent and the host reads as
-    // identity-unknown (agent-api.md §register).
-    let runtime = {
-        let (runtime, facts) = offload_probe(move || {
-            let facts =
-                crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime));
-            (runtime, facts)
-        })
-        .await;
-        crate::buildinfo::set_install_facts(facts.clone());
-        crate::buildinfo::log_startup_identity(&facts);
-        runtime
-    };
-
-    // #500 throwaway-home sweep. Only ever removes `agent-<8hex>-<8hex>` homes
-    // (the ephemeral-username shape) that no live container mounts and that are
-    // past the retention window — a real account's home is never a candidate.
-    // Process-level: it must run whether or not this agent reaches the control plane.
-    crate::session::homes_gc::spawn_sweeper();
 
     let health = HealthState::new();
+    // #407: this agent was created with console access — hold `/health` at
+    // not-ready BEFORE the endpoint is even bound, so no window exists where a
+    // fast prober reads healthy before the preflight below has run and been
+    // posted to the recovery actor (chunk 2's note: otherwise verification can
+    // pass on health alone).
+    let console_marker =
+        std::env::var(crate::release::console::MARKER_ENV).is_ok_and(|v| v.trim() == "1");
+    if console_marker {
+        health.set_not_ready(Some("console preflight pending (#407)".into()));
+    }
     // #152 — a health endpoint another process answers is worse than none. The
     // stack uses host networking, so agents on one machine share this port; the
     // loser of the bind used to carry on while its container HEALTHCHECK, and
     // any operator probing by hand, read the winner's status. Bind before
     // anything else starts, and treat failure like the other boot-fatal
     // conditions above — same throttled exit, so a restart loop is bounded.
+    // Also before the homes GC below, so diagnostic mode has an endpoint to be
+    // not-ready on.
     match crate::health::bind_if_enabled() {
         Ok(Some(listener)) => crate::health::spawn(listener, health.clone()),
         Ok(None) => {}
@@ -195,8 +192,67 @@ pub async fn run(cfg: Config) {
                  value to run without the endpoint."
             );
             sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-            std::process::exit(1);
+            crate::restart::exit_now(1);
         }
+    }
+
+    // #407: run the preflight and tell the recovery actor before anything else. A
+    // failed preflight leaves `/health` not-ready with the detail text as its reason;
+    // the actor's own verification of this agent (if it is mid-replacement) already
+    // failed the instant the POST landed, so this agent staying unhealthy locally is
+    // belt-and-suspenders for an operator who reads `/health` directly.
+    if console_marker {
+        let socket = crate::buildinfo::owned_socket();
+        let result = offload_probe(crate::session::console_preflight::run).await;
+        crate::session::console_preflight::post(socket.as_deref(), &result);
+        if result.ok {
+            health.set_ready();
+        } else {
+            warn!(
+                token = "console-preflight-startup-unhealthy",
+                detail = result.detail.as_deref().unwrap_or(""),
+                "console preflight failed at startup: {}",
+                result.detail.as_deref().unwrap_or("no detail")
+            );
+            health.set_not_ready(result.detail.clone());
+        }
+    } else if let Some(Err(why)) =
+        offload_probe(crate::session::console_vt::reconcile_if_given).await
+    {
+        // #407: a console agent killed holding the VT left the host's console switched
+        // away with its keyboard off, and this agent (console mode off) could not undo it.
+        warn!(
+            token = "console-vt-reconcile-failed",
+            "could not check the console terminal a console agent may have left: {why}"
+        );
+    }
+
+    // Returns only once the cleanup has succeeded; everything below is withheld until then.
+    if let Some(station) = crate::diagnostic::Station::enter(&first_cleanup) {
+        run_diagnostic_mode(&cfg, &health, &station, true, None).await;
+    }
+
+    // Install mode + updater presence, for the startup identity banner;
+    // `connect_and_run` re-discovers before every register. Failure is
+    // silent-by-design — the fields go absent and the host reads as
+    // identity-unknown (agent-api.md §register).
+    let runtime = {
+        let (runtime, facts) = offload_probe(move || {
+            let facts = crate::buildinfo::discover(&runtime);
+            (runtime, facts)
+        })
+        .await;
+        crate::buildinfo::set_install_facts(facts.clone());
+        crate::buildinfo::log_startup_identity(&facts);
+        runtime
+    };
+
+    // #500 throwaway-home sweep. Only ever removes `agent-<8hex>-<8hex>` homes
+    // (the ephemeral-username shape) that no live container mounts and that are
+    // past the retention window — a real account's home is never a candidate.
+    // Process-level: it must run whether or not this agent reaches the control plane.
+    if policy_boot.is_ok() && crate::diagnostic::may_start(crate::diagnostic::Work::HomesGc) {
+        crate::session::homes_gc::spawn_sweeper();
     }
 
     // Adopt an already-provisioned NVIDIA driver volume BEFORE anything can touch
@@ -204,7 +260,7 @@ pub async fn run(cfg: Config) {
     // here) and the steady state on a provisioned host.
     let (runtime, nvidia_lib32_probed) = offload_probe(move || {
         if runtime.is_nvidia() {
-            crate::nvidia_volume::adopt_current(runtime.bin());
+            crate::nvidia_volume::adopt_current();
             crate::nvidia_volume::apply_process_env();
             crate::cuda_runtime::adopt_current();
         }
@@ -258,13 +314,29 @@ pub async fn run(cfg: Config) {
     // Materialise a missing NVIDIA graphics userspace into the driver volume. The
     // trigger is the readiness check set itself, so what provisions and what the
     // admin card shows can never disagree.
-    spawn_nvidia_volume_provisioner(&runtime, &nvidia_lib32_probed);
+    if policy_boot.is_ok()
+        && crate::diagnostic::may_start(crate::diagnostic::Work::DriverVolumeProvisioner)
+    {
+        spawn_nvidia_volume_provisioner(&runtime, &nvidia_lib32_probed);
+    }
 
     // #545: the CUDA half. NOT chained onto the driver volume — that one returns
     // immediately on a CDI-injected host, and NVRTC is needed on those too. The two
     // share the volume and nothing else (separate lock, manifest, backoff), so
     // running them concurrently is safe.
-    spawn_cuda_runtime_provisioner(&runtime);
+    if policy_boot.is_ok()
+        && crate::diagnostic::may_start(crate::diagnostic::Work::CudaRuntimeProvisioner)
+    {
+        spawn_cuda_runtime_provisioner(&runtime);
+    }
+
+    // The host-probe input "agent image". A new image is a new process, which re-runs
+    // every probe anyway, so the build identity is enough and costs no engine call.
+    let agent_image_identity = format!(
+        "{}@{}",
+        crate::buildinfo::source_commit().unwrap_or(crate::buildinfo::version()),
+        crate::buildinfo::built_at().unwrap_or("unknown"),
+    );
 
     // #128: built ONCE, outside the reconnect loop. Everything a running session
     // needs lives here, so a control-plane restart no longer takes the stream
@@ -277,7 +349,134 @@ pub async fn run(cfg: Config) {
         image_mgr.clone(),
         release_mgr.clone(),
     );
+    sessions.mgr.console_access = crate::release::console::ConsoleAccessManager::from_env();
+    match crate::home_cleanup::verified_ledger_path(&cfg.node_secret_path) {
+        Some(path) => {
+            let result = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(path)
+                .and_then(|mut ledger| {
+                    ledger.recover_active(|id| {
+                        crate::runtime::configured()
+                            .map_err(std::io::Error::other)?
+                            .retire_session_applications(id)
+                            .wait()
+                            .map_err(std::io::Error::other)
+                    })?;
+                    Ok(ledger)
+                });
+            match result {
+                Ok(ledger) => sessions.mgr.home_cleanup = Some(ledger),
+                Err(_) => {
+                    error!(token = "home-cleanup-proof-unavailable",
+                        "persistent home cleanup state is uncertain; refusing agent admission");
+                    sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+                    crate::restart::exit_now(1);
+                }
+            }
+        }
+        None if !matches!(crate::home_cleanup::ledger_truly_absent(&cfg.node_secret_path), Ok(true)) => {
+            error!(token = "home-cleanup-existing-ledger-unverified",
+                "existing home cleanup ledger lacks verified persistence; refusing agent admission");
+            sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+            crate::restart::exit_now(1);
+        }
+        None => warn!(
+            token = "home-cleanup-ledger-unverified",
+            "node identity directory is not a verified persistent mount; cleanup proof capability withheld"
+        ),
+    }
     let grace = session_grace();
+
+    // Only records that already asked for terminal cleanup are eligible here.
+    // This task never adopts or stops a running application; boot retirement above
+    // remains the fail-closed policy for applications left by a previous agent.
+    let _application_cleanup_guard = spawn_application_cleanup_recovery();
+
+    let policy_boot = match policy_boot {
+        Ok(crate::policy::BootOutcome::Recovery(id)) => {
+            info!(token = "policy-recovery-restart", attempt_id = %id,
+                "restarting once to activate the last verified hardware configuration");
+            crate::restart::exit_now(0);
+        }
+        Ok(outcome) => outcome,
+        Err(crate::policy::BootError::Write(error)) => {
+            error!(token = "policy-journal-write-failed",
+                    "host configuration journal could not be updated after independent cleanup: {error}");
+            let station = crate::diagnostic::Station::policy_journal_write_failed();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+        Err(error) => {
+            error!(
+                token = "policy-journal-corrupt",
+                "host configuration journal cannot be loaded after independent cleanup: {error}"
+            );
+            let station = crate::diagnostic::Station::policy_journal_corrupt();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+    };
+    if matches!(
+        policy_boot,
+        crate::policy::BootOutcome::Candidate(_) | crate::policy::BootOutcome::RecoveryVerify(_)
+    ) {
+        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        seed_nvidia_lib32(&mut settings, &nvidia_lib32_probed);
+        let mut verifier = match crate::policy::PolicyAgent::open(
+            policy_path,
+            String::new(),
+            String::new(),
+            String::new(),
+            &mut settings,
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                error!(
+                    token = "policy-boot-open-failed",
+                    "cannot load policy for startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        };
+        let prepared = match verifier.prepare_boot(&policy_boot, &settings) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                error!(
+                    token = "policy-boot-prepare-failed",
+                    "cannot prepare startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        };
+        let result = match prepared {
+            crate::policy::BootPreparation::Complete(result) => Ok(result),
+            crate::policy::BootPreparation::Verify(readback) => {
+                let proved = verify_hardware_boot(readback.settings().clone()).await;
+                verifier.complete_boot(*readback, proved, &mut settings)
+            }
+        };
+        match result {
+            Ok(crate::policy::BootOutcome::Recovery(id)) => {
+                info!(token = "policy-recovery-restart", attempt_id = %id,
+                    "candidate failed startup verification; restarting once to restore the last verified hardware configuration");
+                crate::restart::exit_now(0);
+            }
+            Ok(crate::policy::BootOutcome::Uncertain(id)) => {
+                warn!(token = "policy-recovery-uncertain", attempt_id = %id,
+                    "hardware recovery is unverified; admission remains protected");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(
+                    token = "policy-boot-verification-failed",
+                    "cannot persist startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        }
+    }
 
     let mut backoff = Duration::from_secs(1);
     // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
@@ -287,6 +486,7 @@ pub async fn run(cfg: Config) {
             &cfg,
             &health,
             &nvidia_lib32_probed,
+            &agent_image_identity,
             &image_mgr,
             &release_mgr,
             &mut sessions,
@@ -298,12 +498,29 @@ pub async fn run(cfg: Config) {
                 // A clean shutdown IS the end of the agent, so nothing is coming
                 // back to reconcile against: stop the sessions rather than leave
                 // their containers behind.
+                if let Some(handle) = &sessions.mgr.probe_handle {
+                    handle.disconnected();
+                }
                 sessions.mgr.stop_all();
                 info!("agent exiting cleanly");
                 return;
             }
             Err(e) => {
+                if let Some(handle) = &sessions.mgr.probe_handle {
+                    handle.disconnected();
+                }
                 health.set_connected(false);
+                if e.downcast_ref::<PolicySeedReconnect>().is_some() {
+                    sessions.registered_this_connection = false;
+                    info!(token = "policy-seed-reconnect", "durable legacy seed applied; reconnecting once to negotiate typed ownership");
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                if e.downcast_ref::<ActorIdentityReconnect>().is_some() {
+                    sessions.registered_this_connection = false;
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 // #128: hold the running sessions instead of stopping them. The
                 // media path is agent-to-browser and needs nothing from the
                 // control plane while it is away, and on reconnect the control
@@ -371,8 +588,9 @@ pub async fn run(cfg: Config) {
                             token = "agent-registration-unhealthy",
                             "agent has failed to connect/register {failures} times in a row with no \
                              successful registration since; the health endpoint now reports \
-                             unhealthy so `docker compose ps` surfaces this — check ENROLLMENT_TOKEN \
-                             validity and control-plane reachability"
+                             unhealthy so the container engine surfaces this — check that the \
+                             enrollment token is one this control plane minted and not yet spent, \
+                             and control-plane reachability"
                         );
                     }
                 }
@@ -420,6 +638,10 @@ const NVIDIA_VOLUME_RESTART_GRACE: Duration = Duration::from_secs(10);
 /// defect itself.
 pub const PROVISION_QUIESCENCE_WAIT: Duration = Duration::from_secs(30 * 60);
 
+/// How long the CUDA-userspace restart waits for the agent to hold no sessions (#388).
+/// A host that is never idle for this long gets the `cuda*` elements on its next start.
+const CUDART_RESTART_IDLE_WAIT: Duration = Duration::from_secs(12 * 60 * 60);
+
 /// Kick off driver-volume auto-provisioning only when the readiness probe reports a
 /// real NVIDIA graphics gap.
 ///
@@ -431,7 +653,6 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
     if !runtime.is_nvidia() {
         return;
     }
-    let docker = runtime.bin().to_string();
     let nvidia_lib32_probed = nvidia_lib32_probed.to_string();
     std::thread::Builder::new()
         .name("quasar-nvvol".into())
@@ -443,7 +664,7 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
             if !gap.any() {
                 return;
             }
-            match crate::nvidia_volume::provision_blocking(true, gap, &docker) {
+            match crate::nvidia_volume::provision_blocking(true, gap) {
                 crate::nvidia_volume::Outcome::Provisioned {
                     restart_required: true,
                     ..
@@ -530,11 +751,26 @@ fn spawn_cuda_runtime_provisioner(runtime: &ContainerRuntime) {
                 );
                 return;
             }
+            // #388: the elements are optional, so this restart waits for the players.
+            // Sessions keep coming until the agent is idle; then it refuses new ones.
+            if !crate::restart::wait_until_idle_then_seal(
+                CUDART_RESTART_IDLE_WAIT,
+                Duration::from_secs(15),
+            ) {
+                warn!(
+                    token = "cudart-agent-restart-never-idle",
+                    waited_s = CUDART_RESTART_IDLE_WAIT.as_secs(),
+                    live_sessions = crate::restart::live_sessions(),
+                    "the agent was never idle — NOT restarting; cudaconvert & co will register \
+                     on the next agent start instead"
+                );
+                return;
+            }
             warn!(
                 token = "cudart-agent-restart-now",
                 "restarting node agent now"
             );
-            std::process::exit(0);
+            crate::restart::exit_now(0);
         })
         .map(|_| ())
         .unwrap_or_else(|e| {
@@ -729,7 +965,7 @@ async fn boot_sanity_gate(readiness: &[crate::messages::ReadinessCheck], gpu_pre
             },
             sleep: &std::thread::sleep,
             exit: &|code: i32| {
-                std::process::exit(code);
+                crate::restart::exit_now(code);
             },
         };
         run_boot_gate(&checks, gpu_present, has_node, prior_exits, &fx);
@@ -801,14 +1037,6 @@ pub(crate) struct HostCodecReport {
     throughput: BTreeMap<String, CodecThroughput>,
 }
 
-/// The `capacity.codecs` field for a (possibly failed) probe. `None` — the probe
-/// never ran or `gst::init` failed — is a real wire distinction: the control plane
-/// keeps whatever it last stored rather than clobbering it, and a host that has
-/// never reported reads back as h264-only.
-pub(crate) fn advertised_codecs(report: &Option<HostCodecReport>) -> Option<Vec<String>> {
-    report.as_ref().map(|r| r.codecs.clone())
-}
-
 /// The `capacity.codec_throughput` field for a (possibly failed) probe. A SUCCESSFUL
 /// probe that measured nothing must report `{}`, not `None`: the empty map clears the
 /// stored hints, which is what a host has to say once a `config_update` moved it off a
@@ -835,7 +1063,7 @@ fn register_prep_over_budget(elapsed: Duration) -> bool {
 /// worker polling the agent's control future.
 ///
 /// Everything this wraps forks subprocesses (`docker`, `nvidia-smi`, the EGL
-/// self-test, `firewall-cmd`) and reads tens of sysfs files. Inline it produced a
+/// self-test) and reads tens of sysfs files. Inline it produced a
 /// single 1311 ms poll of the future that also owns heartbeats, the signalling relay
 /// and `session_stop` — against a 20 s stale-host deadline. Ordering is unchanged
 /// (the result is awaited immediately) and a probe panic still reaches the caller.
@@ -853,6 +1081,45 @@ where
     }
 }
 
+/// What the readiness refresh task reports to the control loop.
+#[derive(Debug, PartialEq)]
+enum ReadinessRefresh {
+    /// The probe ended. `Err` is a panic.
+    Done(Result<Vec<crate::messages::ReadinessCheck>, String>),
+    /// The probe is past its deadline and still running. `Done` follows when it ends,
+    /// and the control loop must not start another refresh before then: a blocking
+    /// probe cannot be cancelled, so a second one would stack behind a hung first.
+    Overdue,
+}
+
+const READINESS_REFRESH_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often the connected agent re-probes host readiness. One capacity report leaves on
+/// each refresh, so this is also the report cadence — and the reason no engine call in a
+/// refresh may cost more than a small fraction of the control plane's staleness window
+/// (#274): a hung engine's failing check has to catch the very next report.
+pub(crate) const READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+async fn run_readiness_refresh<F>(
+    probe: F,
+    deadline: Duration,
+    sender: mpsc::Sender<ReadinessRefresh>,
+) where
+    F: FnOnce() -> Vec<crate::messages::ReadinessCheck> + Send + 'static,
+{
+    let mut probe = tokio::task::spawn_blocking(probe);
+    let result = match tokio::time::timeout(deadline, &mut probe).await {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = sender.send(ReadinessRefresh::Overdue).await;
+            probe.await
+        }
+    };
+    let _ = sender
+        .send(ReadinessRefresh::Done(result.map_err(|e| e.to_string())))
+        .await;
+}
+
 /// The blocking half of every capacity re-detect: `capacity::detect()` plus an
 /// unconditional warm of the memoized `nvidia-smi` row table.
 ///
@@ -860,11 +1127,82 @@ where
 /// from the synchronous `handle_control`, where the `OnceLock`ed `nvidia-smi` fork
 /// cannot be awaited. Paying it before any assignment arrives leaves that a cache read.
 fn detect_capacity_blocking() -> capacity::SystemCapacity {
-    let cap = capacity::detect();
+    let mut cap = capacity::detect();
+    // Amendment 18: every capacity carries the current console access (#395).
+    cap.console.access = crate::release::console::published();
     if cap.gpus.iter().any(|g| g.vendor == "nvidia") {
         capacity::prewarm_nvidia_smi_rows();
     }
     cap
+}
+
+/// A restart marker is proved before registration. This uses fresh device
+/// inventory and a bounded media child in the new process; prior connection
+/// probe results are deliberately not reused as startup proof.
+async fn verify_hardware_boot(settings: crate::session::settings::RuntimeSettings) -> bool {
+    if settings.render_node == "software" {
+        if settings.encoder != EncoderChoice::Openh264 {
+            return false;
+        }
+        let probed = offload_probe(move || probe_host_codecs(&settings)).await;
+        return probed.is_some_and(|report| report.codecs.iter().any(|codec| codec == "h264"));
+    }
+    let inventory = offload_probe(detect_capacity_blocking).await.gpus;
+    verify_boot_device_with(&settings, &inventory, |spec| async move {
+        let (_sender, preempt) = tokio::sync::watch::channel(false);
+        matches!(
+            crate::host_probe::media::run(None, spec, preempt).await,
+            Ok(crate::host_probe::outcome::ChildEnd::Exited { code: 0, .. })
+        )
+    })
+    .await
+}
+
+async fn verify_boot_device_with<F, Fut>(
+    settings: &crate::session::settings::RuntimeSettings,
+    inventory: &[crate::messages::GpuCapacity],
+    probe: F,
+) -> bool
+where
+    F: FnOnce(crate::host_probe::child::ChildSpec) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut matching = inventory.iter().filter(|gpu| {
+        (gpu.render_node.as_deref() == Some(settings.render_node_configured.as_str())
+            || gpu.render_node.as_deref() == Some(settings.render_node.as_str())
+            || gpu.device_path.as_deref() == Some(settings.render_node.as_str()))
+            && gpu.encode_slots_total > 0
+            && gpu
+                .driver_identity
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+    });
+    let Some(gpu) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    if std::fs::File::open(gpu.device_path.as_deref().unwrap_or(&settings.render_node)).is_err() {
+        return false;
+    }
+    let spec = match crate::host_probe::media::child_spec(
+        settings,
+        inventory,
+        gpu.index,
+        None,
+        Duration::from_secs(45),
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            warn!(
+                token = "policy-boot-probe-unavailable",
+                "cannot construct hardware startup probe: {error:#}"
+            );
+            return false;
+        }
+    };
+    probe(spec).await
 }
 
 /// Is a degraded vulkan codec plan the expected first-boot shape (driver volume still
@@ -886,8 +1224,8 @@ fn vulkan_plan_degradation_is_pending_driver_volume(
 }
 
 /// Probe the host's codec set and per-codec throughput hint. See [`HostCodecReport`]
-/// for why the two travel together. `None` ⇒ gst init failed, and the control plane
-/// then defaults the host to `["h264"]`. The effective encoder is not restart-class —
+/// for why the two travel together. `None` ⇒ gst init failed, and the host is then
+/// advertised as `["h264"]`. The effective encoder is not restart-class —
 /// a `config_update` can flip it live — so the connect loop re-probes on that flip,
 /// keeping `hosts.codecs` equal to what sessions actually build.
 fn probe_host_codecs(
@@ -904,7 +1242,8 @@ fn probe_host_codecs(
     // One of the `EncoderKnobs` ambient edges (see its doc): the knobs are read fresh
     // here and threaded as data from this point on.
     let knobs = crate::session::pipeline::EncoderKnobs::from_env();
-    let support = crate::session::pipeline::probe_codec_support(settings.encoder, knobs);
+    let support =
+        crate::session::pipeline::probe_codec_support(settings.encoder, knobs, "software");
     let codecs = support.codec_strings();
     let throughput: BTreeMap<String, CodecThroughput> = support
         .pixel_rates_mpix_s()
@@ -962,6 +1301,226 @@ fn probe_host_codecs(
     Some(HostCodecReport { codecs, throughput })
 }
 
+/// The render node whose registry plan (#301 layer 1) speaks for this GPU: the
+/// in-container `renderD*` form when reported (what makes a VA candidate
+/// device-prefixed), else the by-path identity, else `"software"`.
+fn gpu_render_node_for_plan(gpu: &crate::messages::GpuCapacity) -> &str {
+    gpu.device_path
+        .as_deref()
+        .or(gpu.render_node.as_deref())
+        .unwrap_or("software")
+}
+
+/// #301 layer 1 in production: what the registry builds on this render node. Needs
+/// `gst::init`, so it is only called once the host-level probe returned a report. A
+/// non-default VA GPU's plan may name the generic `va<codec>enc`, because a session on
+/// that GPU tries the same list; its codec probe, not the plan, is what admits a codec.
+fn registry_codec_plan(encoder: EncoderChoice, render_node: &str) -> BTreeSet<Codec> {
+    let knobs = crate::session::pipeline::EncoderKnobs::from_env();
+    crate::session::pipeline::probe_codec_support(encoder, knobs, render_node)
+        .codecs
+        .into_iter()
+        .collect()
+}
+
+/// #301 layer 2 in production: the driver-compatibility exclusion for this GPU.
+fn gpu_excluded_codecs(gpu: &crate::messages::GpuCapacity) -> BTreeSet<Codec> {
+    crate::encoder_compatibility::excluded_codecs(
+        std::path::Path::new("/"),
+        gpu_render_node_for_plan(gpu),
+    )
+}
+
+/// The registry and sysfs reads behind layers 1 and 2, as data so tests inject them.
+#[derive(Clone, Copy)]
+struct CodecLayers {
+    plan: fn(EncoderChoice, &str) -> BTreeSet<Codec>,
+    excluded: fn(&crate::messages::GpuCapacity) -> BTreeSet<Codec>,
+}
+
+impl Default for CodecLayers {
+    fn default() -> Self {
+        CodecLayers {
+            plan: registry_codec_plan,
+            excluded: gpu_excluded_codecs,
+        }
+    }
+}
+
+/// The current stack, as the codec advertisement and the probe scheduler both read it:
+/// one source for the probe inputs and for the stamps a codec pass is checked against.
+struct CodecStack<'a> {
+    agent_image: &'a str,
+    gpus: &'a [crate::messages::GpuCapacity],
+    settings: &'a crate::session::settings::RuntimeSettings,
+    /// `gst::init` succeeded (the host-level probe returned a report): without it there
+    /// is no registry to plan from, and every GPU is H.264-only.
+    registry: bool,
+    layers: CodecLayers,
+}
+
+impl CodecStack<'_> {
+    fn plan(&self, gpu: &crate::messages::GpuCapacity) -> BTreeSet<Codec> {
+        if !self.registry {
+            return BTreeSet::new();
+        }
+        (self.layers.plan)(self.settings.encoder, gpu_render_node_for_plan(gpu))
+    }
+
+    /// What decides whether a host probe's earlier result still applies.
+    fn probe_inputs(&self) -> crate::host_probe::decision::ProbeInputs {
+        let mut inputs = self.identity();
+        // Codec-probe targets: each GPU's own plan minus its exclusion, never gated on a
+        // verdict (the verdict is what a codec probe produces).
+        inputs.codecs = self
+            .gpus
+            .iter()
+            .filter_map(|g| {
+                let targets =
+                    crate::gpu_codecs::probeable_codecs(&self.plan(g), &(self.layers.excluded)(g));
+                (!targets.is_empty()).then_some((g.index, targets))
+            })
+            .collect();
+        inputs
+    }
+
+    /// [`Self::probe_inputs`] without the codec plan: all an evidence stamp reads.
+    fn identity(&self) -> crate::host_probe::decision::ProbeInputs {
+        let mut driver_parts: Vec<String> = self
+            .gpus
+            .iter()
+            .filter_map(|g| g.driver_identity.clone())
+            .collect();
+        if let Some(volume) = crate::nvidia_volume::current() {
+            driver_parts.push(format!(
+                "{}:{}",
+                volume.name.as_deref().unwrap_or(""),
+                volume.manifest.sha256
+            ));
+        }
+        let gpus = self
+            .gpus
+            .iter()
+            .map(|g| {
+                let identity = g
+                    .render_node
+                    .clone()
+                    .or_else(|| g.device_path.clone())
+                    .unwrap_or_else(|| format!("{} {}", g.vendor, g.model));
+                (g.index, identity)
+            })
+            .collect();
+        crate::host_probe::decision::ProbeInputs {
+            agent_image: self.agent_image.to_string(),
+            driver: driver_parts.join(","),
+            gpus,
+            settings: probe_relevant_settings(&self.settings.effective_map()),
+            codecs: BTreeMap::new(),
+        }
+    }
+}
+
+/// Per-GPU codec sets under the current stack, indexed like `stack.gpus` — the ONE
+/// computation both `capacity.gpus[].codecs` (#302, `apply_gpu_codecs`) and the
+/// host-level union `capacity.codecs` (#301, `host_codecs_from_sets`) derive from.
+/// Never recompute the rule a second time from the same stack.
+fn gpu_codec_sets(
+    stack: &CodecStack<'_>,
+    report: &crate::readiness::report::ReadinessReport,
+    evidence: &crate::host_probe::outcome::CodecEvidence,
+) -> Vec<(i32, BTreeSet<Codec>)> {
+    let identity = stack.identity();
+    stack
+        .gpus
+        .iter()
+        .map(|gpu| {
+            let current = identity.evidence_stamp(gpu.index);
+            let set = crate::gpu_codecs::gpu_codec_set(
+                &stack.plan(gpu),
+                &(stack.layers.excluded)(gpu),
+                |codec| {
+                    crate::host_probe::ProbeCodec::above_floor(codec).is_some_and(|probe| {
+                        evidence.proven(report, gpu.index, probe, current.as_ref())
+                    })
+                },
+                gpu.encode_slots_total > 0,
+            );
+            (gpu.index, set)
+        })
+        .collect()
+}
+
+/// A `session_assign` the codec belt refuses: the log line and the ack error, decided
+/// without I/O so tests assert on it rather than capture `tracing` events, whose
+/// process-global interest cache races parallel tests (#313).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignCodecRefusal {
+    log: String,
+    ack_error: String,
+}
+
+/// The #302 belt's decision: refuse `codec` on `gpu_index` unless that GPU's current
+/// set (from [`gpu_codec_sets`]) carries it. H.264 is exempt — it is the floor of
+/// every usable GPU's set by construction (`gpu_codecs::gpu_codec_set`) and never
+/// fails to resolve. A GPU absent from `sets` has an empty set.
+fn assign_codec_refusal(
+    session_id: &str,
+    gpu_index: i32,
+    codec: Codec,
+    sets: &[(i32, BTreeSet<Codec>)],
+) -> Option<AssignCodecRefusal> {
+    if codec == Codec::H264 {
+        return None;
+    }
+    let empty = BTreeSet::new();
+    let gpu_codecs = sets
+        .iter()
+        .find(|(index, _)| *index == gpu_index)
+        .map_or(&empty, |(_, set)| set);
+    if gpu_codecs.contains(&codec) {
+        return None;
+    }
+    Some(AssignCodecRefusal {
+        log: format!(
+            "session {session_id} assignment rejected: gpu={gpu_index} codec={} not in \
+             this GPU's current codec set {gpu_codecs:?}",
+            codec.as_str()
+        ),
+        ack_error: format!(
+            "gpu {gpu_index} cannot encode {}: not in its current codec set",
+            codec.as_str()
+        ),
+    })
+}
+
+/// The host union (`capacity.codecs`, #301, agent-api.md amendment 12) as wire strings,
+/// from already-computed per-GPU sets: H.264 plus every codec any usable GPU's set
+/// carries. Always non-empty.
+fn host_codecs_from_sets(sets: &[(i32, BTreeSet<Codec>)]) -> Vec<String> {
+    crate::gpu_codecs::host_codec_set(sets.iter().map(|(_, s)| s))
+        .into_iter()
+        .map(|c| c.as_str().to_string())
+        .collect()
+}
+
+/// `capacity.gpus[].codecs` (#302, agent-api.md amendment 12): stamps each GPU's own
+/// wire codec set from the SAME per-GPU sets the host union is derived from — never a
+/// second, possibly-diverging pass. A zero-slot (pinned-out) GPU's set is empty
+/// (`gpu_codec_set`'s unusable case) and is sent as `[]`, not omitted: the control
+/// plane stores an explicit `[]` as-is (never inherited), so this is the only way to
+/// tell an operator "this GPU encodes nothing" apart from "this GPU never reported,
+/// go by the host set". Omission is left to the case this stack never actually
+/// produces — a GPU present in inventory but absent from `sets` — rather than
+/// collapsed into the zero-slot case.
+fn apply_gpu_codecs(gpus: &mut [crate::messages::GpuCapacity], sets: &[(i32, BTreeSet<Codec>)]) {
+    for gpu in gpus.iter_mut() {
+        gpu.codecs = sets
+            .iter()
+            .find(|(index, _)| *index == gpu.index)
+            .map(|(_, set)| set.iter().map(|c| c.as_str().to_string()).collect());
+    }
+}
+
 /// Poll a `select!` arm's receiver without ever resolving `Ready(None)` twice (#530).
 /// An `mpsc::Receiver` whose senders have all dropped resolves `recv()` to
 /// `Ready(None)` immediately and forever, so a bare arm wins every poll and spins the
@@ -983,19 +1542,10 @@ async fn recv_or_disabled_unbounded<T>(rx: &mut Option<mpsc::UnboundedReceiver<T
     }
 }
 
-async fn connect_and_run(
-    cfg: &Config,
-    health: &Arc<HealthState>,
-    nvidia_lib32_probed: &str,
-    image_mgr: &Arc<ImageManager>,
-    release_mgr: &Arc<ReleaseManager>,
-    sessions: &mut HostSessions,
-    // #199: set for exactly one attempt, by a previous attempt this control plane
-    // refused with `host_not_found`. See `stale_identity`.
-    prefer_enrollment_token: bool,
-) -> anyhow::Result<()> {
-    let url = cfg.ws_url();
-    info!(policy = ?cfg.transport, "connecting to {url}");
+/// The two lines that say what this agent is about to connect to and how. Emitted
+/// before the register preparation, so a slow prep is visible as a gap after them.
+fn log_connect_intent(cfg: &Config) {
+    info!(policy = ?cfg.transport, "connecting to {}", cfg.ws_url());
     if cfg.webpki_from_blob {
         // `qenr1..` (a mispaste that dropped the fingerprint) and a real CA deployment
         // produce the same policy; only this line tells them apart in a log.
@@ -1005,6 +1555,387 @@ async fn connect_and_run(
              plane against the WebPKI roots, not a pin"
         );
     }
+}
+
+type CpSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+type CpStream = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+#[derive(Debug)]
+struct PolicySeedReconnect;
+
+impl std::fmt::Display for PolicySeedReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RH05 seed reconnect")
+    }
+}
+
+impl std::error::Error for PolicySeedReconnect {}
+
+/// The recovery actor was replaced, or its reported identity changed (the seed went
+/// missing or came back, the actor stopped or started answering), under this connection
+/// (agent-api.md §register, owned installs): reconnect once so `register` reports it. Not
+/// an enrollment, and it ends no session.
+#[derive(Debug)]
+struct ActorIdentityReconnect;
+
+impl std::fmt::Display for ActorIdentityReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the recovery actor's identity changed")
+    }
+}
+
+impl std::error::Error for ActorIdentityReconnect {}
+
+/// Open the control-plane socket and split it.
+///
+/// #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
+/// wss:// URL must not silently validate against the OS/bundled roots when a pin was
+/// configured, and a ws:// URL is explicitly Plain.
+/// A refused upgrade never reaches `register`, so its status is all the agent gets
+/// to explain the failure with (#199 follow-up); `upgrade_error` is where that
+/// explanation is attached.
+async fn dial(cfg: &Config) -> anyhow::Result<(CpSink, CpStream)> {
+    let (ws_stream, _) = connect_async_tls_with_config(
+        &cfg.ws_url(),
+        None,
+        false,
+        Some(crate::cp_tls::ws_connector(&cfg.transport)),
+    )
+    .await
+    .map_err(upgrade_error)?;
+    Ok(ws_stream.split())
+}
+
+/// The `register` this connection presents. `images` differs by caller: the normal path
+/// reconciles against the daemon first, diagnostic mode reads the state file.
+fn register_message(
+    cfg: &Config,
+    prefer_enrollment_token: bool,
+    images: Vec<crate::messages::RegisterImageEntry>,
+    install: &crate::buildinfo::InstallFacts,
+    home_cleanup_capable: bool,
+    policy_available: bool,
+    image_mgr: Option<&ImageManager>,
+) -> anyhow::Result<AgentMsg> {
+    let (image_versions_complete, image_versions) = image_mgr
+        .map(ImageManager::version_snapshot)
+        .unwrap_or((false, Vec::new()));
+    // Amendment 14: the actor's identity rides only beside `install_mode: "owned"`.
+    let owned = install.install_mode == Some(crate::buildinfo::InstallMode::Owned);
+    Ok(AgentMsg::Register {
+        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1, "template_publish_permit": 1})),
+        config_policy_versions: policy_available.then(||
+            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1,"idle_apply":1})),
+        config_policy_groups: policy_available.then(|| crate::policy::PolicyAgent::advertised_groups(
+            &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
+        terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
+        node_name: cfg.node_name.clone(),
+        agent_version: crate::buildinfo::version().to_string(),
+        auth: choose_auth(cfg, prefer_enrollment_token)?,
+        images,
+        image_cleanup_v1: image_mgr.is_some_and(ImageManager::cleanup_capable),
+        image_versions_complete,
+        image_versions,
+        source_commit: crate::buildinfo::source_commit().map(str::to_string),
+        built_at: crate::buildinfo::built_at().map(str::to_string),
+        install_mode: install.install_mode.map(|m| m.as_str().to_string()),
+        updater_present: install.updater_present,
+        recovery_actor_version: owned
+            .then(|| install.recovery_actor_version.clone())
+            .flatten(),
+        recovery_actor_source_commit: owned
+            .then(|| install.recovery_actor_source_commit.clone())
+            .flatten(),
+        seed_version: owned.then(|| install.seed_version.clone()).flatten(),
+        engine: install.engine.engine.clone(),
+        engine_version: install.engine.engine_version.clone(),
+        engine_mode: install.engine.engine_mode.clone(),
+    })
+}
+
+/// `register` + the `registered` reply, with the identity persistence a successful
+/// handshake owes. Shared by the normal connect loop and the diagnostic one; everything
+/// after it differs between them.
+async fn register_and_await_registered<S, R>(
+    cfg: &Config,
+    tx: &mut S,
+    rx: &mut R,
+    register_msg: AgentMsg,
+) -> anyhow::Result<(String, u64, Option<(String, String)>, Option<Vec<String>>)>
+where
+    S: SinkExt<Message, Error = tungstenite::Error> + Unpin,
+    R: StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
+{
+    // Which credential this attempt carries decides what a reject means (#199).
+    let presented_saved_secret = matches!(
+        &register_msg,
+        AgentMsg::Register {
+            auth: Auth::Reconnect { .. },
+            ..
+        }
+    );
+    send(tx, &register_msg).await?;
+    info!("sent register (node_name={})", cfg.node_name);
+
+    let raw = recv(rx).await?;
+    let ctrl_msg: ControlMsg = serde_json::from_str(&raw)?;
+    match ctrl_msg {
+        ControlMsg::Registered {
+            host_id,
+            node_secret,
+            heartbeat_interval_ms,
+            boot_incarnation,
+            connection_incarnation,
+            config_policy_groups,
+        } => {
+            // A returned node_secret IS the enrollment signal: reconnect never mints one.
+            let enrolled = node_secret.is_some();
+            if let Some(secret) = node_secret {
+                persist_node_secret(&cfg.node_secret_path, &secret)?;
+                info!(
+                    "enrolled as host {host_id}; node_secret saved to {}",
+                    cfg.node_secret_path
+                );
+            } else {
+                info!("reconnected as host {host_id}");
+            }
+            // #12: the pin that just verified this connection outlives the enrollment
+            // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
+            persist_pin_if_new(cfg, enrolled);
+            Ok((
+                host_id,
+                heartbeat_interval_ms,
+                boot_incarnation.zip(connection_incarnation),
+                config_policy_groups,
+            ))
+        }
+        ControlMsg::Error { code, message } => Err(register_reject_error(
+            cfg,
+            &code,
+            &message,
+            presented_saved_secret,
+        )),
+        _ => anyhow::bail!("unexpected message type before registered"),
+    }
+}
+
+/// How often a diagnostic connection re-detects capacity and re-probes readiness. Slower
+/// than the normal path's event-driven re-sends: nothing here can change but the host
+/// itself, and every pass forks the same probes a normal refresh does.
+const DIAGNOSTIC_CAPACITY_REFRESH: Duration = Duration::from_secs(60);
+
+/// Hold this process in diagnostic registration. Startup cleanup retries can
+/// resume normal startup; a corrupt policy journal remains here for operator repair.
+async fn run_diagnostic_mode(
+    cfg: &Config,
+    health: &Arc<HealthState>,
+    station: &Arc<crate::diagnostic::Station>,
+    cleanup_retry: bool,
+    image_mgr: Option<&Arc<ImageManager>>,
+) {
+    crate::diagnostic::install_process_wide(station);
+    let phase = station.phase();
+    let fault = match &phase {
+        crate::diagnostic::Phase::Diagnostic(fault) => fault.code(),
+        crate::diagnostic::Phase::Normal => "none",
+    };
+    if cleanup_retry {
+        error!(token = "boot-diagnostic-mode", fault,
+            "startup cleanup is unresolved; diagnostic registration refuses every launch and retries cleanup. {}",
+            phase.launch_refusal().unwrap_or_default());
+    } else {
+        error!(token = "boot-policy-journal-diagnostic", fault,
+            "host configuration journal is unreadable; diagnostic registration refuses every launch until operator repair and agent restart. {}",
+            phase.launch_refusal().unwrap_or_default());
+    }
+    health.set_not_ready(phase.launch_refusal());
+
+    // Independent of the control plane by construction: this task is what resumes the
+    // host, and it never reads a connection.
+    let retry = cleanup_retry.then(|| {
+        tokio::spawn(crate::diagnostic::retry_until_resumed(
+            station.clone(),
+            crate::diagnostic::startup_cleanup_configured,
+            crate::diagnostic::RetryPace::PRODUCTION,
+        ))
+    });
+
+    let mut backoff = Duration::from_secs(1);
+    // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
+    let mut enrollment_fallback = EnrollmentFallback::default();
+    loop {
+        let attempt = tokio::select! {
+            biased;
+            () = station.resumed() => break,
+            attempt = diagnostic_connection(
+                cfg, health, station, enrollment_fallback.take_for_attempt(), image_mgr,
+            ) => attempt,
+        };
+        let Err(error) = attempt else { break };
+        health.set_connected(false);
+        // Same predicate for the token and the counting gate, as in the normal loop.
+        let explained_refusal = error
+            .downcast_ref::<UpgradeRefused>()
+            .is_some_and(|r| describe_upgrade_refusal(r.status).is_some());
+        if explained_refusal {
+            warn!(
+                token = "cp-connect-rate-limited",
+                "agent connection failed: {error:#}"
+            );
+        } else {
+            error!(
+                token = "diagnostic-connection-failed",
+                "diagnostic connection failed: {error:#}"
+            );
+        }
+        enrollment_fallback.observe(&error);
+        if counts_as_registration_failure(explained_refusal, health.unhealthy()) {
+            health.record_registration_failure(&format!("{error:#}"));
+        }
+        let wait = backoff.min(Duration::from_secs(30));
+        info!("reconnecting in {wait:?}");
+        // A dead control plane must never delay the resume.
+        tokio::select! {
+            biased;
+            () = station.resumed() => break,
+            () = sleep(wait) => {}
+        }
+        backoff = (wait * 2).min(Duration::from_secs(30));
+    }
+    if let Some(retry) = retry {
+        retry.abort();
+    }
+    if cleanup_retry {
+        info!(
+            token = "boot-diagnostic-resumed",
+            "the startup cleanup succeeded; leaving diagnostic mode and continuing normal startup"
+        );
+        health.set_ready();
+        health.set_connected(false);
+    }
+}
+
+/// One diagnostic control-plane connection. Reads nothing from the container runtime it
+/// could mutate: the images come from the persisted state file and the install facts from
+/// read-only inspections that already degrade to `None` on a dead engine.
+async fn diagnostic_connection(
+    cfg: &Config,
+    health: &Arc<HealthState>,
+    station: &Arc<crate::diagnostic::Station>,
+    prefer_enrollment_token: bool,
+    image_mgr: Option<&Arc<ImageManager>>,
+) -> anyhow::Result<crate::diagnostic::ConnectionEnd> {
+    log_connect_intent(cfg);
+    let images = crate::images::register_images_from_state(&cfg.image_state_path());
+    let install = offload_probe(|| {
+        let runtime = ContainerRuntime::from_env();
+        crate::buildinfo::discover(&runtime)
+    })
+    .await;
+    crate::buildinfo::set_install_facts(install.clone());
+
+    let (mut tx, mut rx) = dial(cfg).await?;
+    let (_host_id, heartbeat_interval_ms, _policy_identity, _policy_groups) =
+        register_and_await_registered(
+            cfg,
+            &mut tx,
+            &mut rx,
+            register_message(
+                cfg,
+                prefer_enrollment_token,
+                images,
+                &install,
+                false,
+                station.phase().policy_available(),
+                None,
+            )?,
+        )
+        .await?;
+    health.set_connected(true);
+    // Clear the failure streak before a stale count can flip /health unhealthy; the
+    // diagnostic not-ready state is separate and stays.
+    health.record_registered();
+
+    crate::diagnostic::serve_registered(
+        &mut tx,
+        &mut rx,
+        heartbeat_interval_ms,
+        station,
+        {
+            let (health, station) = (health.clone(), station.clone());
+            move || {
+                // Keeps `/health`'s reason on the current fault; never re-arms after a resume.
+                if let Some(reason) = station.phase().launch_refusal() {
+                    health.set_not_ready(Some(reason));
+                }
+                diagnostic_observe()
+            }
+        },
+        DIAGNOSTIC_CAPACITY_REFRESH,
+        image_mgr,
+    )
+    .await
+}
+
+/// What a diagnostic capacity message reports: the host as detected, and the local
+/// readiness checks. No codec probe (it would initialise GStreamer) and no effective
+/// settings (no session may start). Blocking; the caller offloads it.
+fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
+    let cap = detect_capacity_blocking();
+    let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
+    let gpu_present = !cap.gpus.is_empty();
+    let checks = crate::readiness::probe(
+        &crate::readiness::ProbeEnv::live(nvidia_host, "")
+            .with_gpu_present(gpu_present)
+            .with_gpus(&cap.gpus)
+            .with_codec_probe(None),
+    )
+    .into_iter()
+    // Not observed in this mode, so not reported: the 32-bit GL path is resolved through
+    // the engine, and the codec probe would initialise GStreamer before the driver
+    // volume is adopted.
+    .filter(|check| !matches!(check.id.as_str(), "nvidia_lib32_gl" | "encoder_codecs"))
+    .collect();
+    (
+        AgentMsg::Capacity {
+            source_preparation: None,
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+            host: cap.host,
+            gpus: cap.gpus,
+            gpu_detection: cap.gpu_detection,
+            gpu_detection_reason: cap.gpu_detection_reason,
+            console_capabilities: Some(cap.console),
+            effective_settings: None,
+            codecs: None,
+            codec_throughput: None,
+            readiness: None,
+        },
+        checks,
+    )
+}
+
+// Each argument is a distinct process-lifetime handle.
+#[allow(clippy::too_many_arguments)]
+async fn connect_and_run(
+    cfg: &Config,
+    health: &Arc<HealthState>,
+    nvidia_lib32_probed: &str,
+    agent_image_identity: &str,
+    image_mgr: &Arc<ImageManager>,
+    release_mgr: &Arc<ReleaseManager>,
+    sessions: &mut HostSessions,
+    // #199: set for exactly one attempt, by a previous attempt this control plane
+    // refused with `host_not_found`. See `stale_identity`.
+    prefer_enrollment_token: bool,
+) -> anyhow::Result<()> {
+    log_connect_intent(cfg);
 
     // Everything `register` needs from the container runtime is gathered BEFORE the
     // socket is opened (#191). The control plane gives a fresh connection its
@@ -1015,6 +1946,7 @@ async fn connect_and_run(
     // agent wrote `register` into a dead connection, and every reconnect repeated
     // the same probes into the same wall.
     let prep_started = Instant::now();
+    image_mgr.begin_connection();
 
     // agent-api.md: recorded images are verified against the docker daemon on startup
     // AND reconnect — an image `docker rmi`'d out from under a long-lived agent must
@@ -1030,10 +1962,20 @@ async fn connect_and_run(
     // forever. Offloaded because it shells out to docker.
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+        crate::buildinfo::discover(&runtime)
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
+    // Before the first `capacity`, which carries `console_capabilities.access`.
+    let console_access = sessions.mgr.console_access.clone();
+    console_access.set_engine_mode(install.engine.engine_mode.as_deref());
+    crate::ddc::set_rootless(install.engine.engine_mode.as_deref() == Some("rootless"));
+    let mut console_access_rx = console_access.owned().then(|| console_access.subscribe());
+    {
+        let ca = console_access.clone();
+        offload_probe(move || ca.refresh()).await;
+    }
+    console_access.watch_if_applying();
 
     let prep = prep_started.elapsed();
     if register_prep_over_budget(prep) {
@@ -1046,21 +1988,7 @@ async fn connect_and_run(
         );
     }
 
-    // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
-    // wss:// URL must not silently validate against the OS/bundled roots when a pin was
-    // configured, and a ws:// URL is explicitly Plain.
-    // A refused upgrade never reaches `register`, so its status is all the agent gets
-    // to explain the failure with (#199 follow-up); `upgrade_error` is where that
-    // explanation is attached.
-    let (ws_stream, _) = connect_async_tls_with_config(
-        &url,
-        None,
-        false,
-        Some(crate::cp_tls::ws_connector(&cfg.transport)),
-    )
-    .await
-    .map_err(upgrade_error)?;
-    let (mut tx, mut rx) = ws_stream.split();
+    let (mut tx, mut rx) = dial(cfg).await?;
 
     // Attach this connection's upstream channel to the process-wide ImageManager.
     // Attaching also flushes every op-free record's current state (terminal states
@@ -1079,61 +2007,58 @@ async fn connect_and_run(
     let mut release_rx = Some(release_rx);
     let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
-    // --- Step 1: send register ---
-    let auth = choose_auth(cfg, prefer_enrollment_token)?;
-    // Which credential this attempt carries decides what a reject means (#199).
-    let presented_saved_secret = matches!(auth, Auth::Reconnect { .. });
-    let register_msg = AgentMsg::Register {
-        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
-        node_name: cfg.node_name.clone(),
-        agent_version: crate::buildinfo::version().to_string(),
-        auth,
-        images,
-        source_commit: crate::buildinfo::source_commit().map(str::to_string),
-        built_at: crate::buildinfo::built_at().map(str::to_string),
-        install_mode: install.install_mode.map(|m| m.as_str().to_string()),
-        updater_present: install.updater_present,
-    };
-    send(&mut tx, &register_msg).await?;
-    info!("sent register (node_name={})", cfg.node_name);
-
-    // --- Step 2: receive registered ---
-    let raw = recv(&mut rx).await?;
-    let ctrl_msg: ControlMsg = serde_json::from_str(&raw)?;
-    let (host_id, heartbeat_interval_ms) = match ctrl_msg {
-        ControlMsg::Registered {
-            host_id,
-            node_secret,
-            heartbeat_interval_ms,
-        } => {
-            // A returned node_secret IS the enrollment signal: reconnect never mints one.
-            let enrolled = node_secret.is_some();
-            if let Some(secret) = node_secret {
-                persist_node_secret(&cfg.node_secret_path, &secret)?;
-                info!(
-                    "enrolled as host {host_id}; node_secret saved to {}",
-                    cfg.node_secret_path
-                );
-            } else {
-                info!("reconnected as host {host_id}");
-            }
-            // #12: the pin that just verified this connection outlives the enrollment
-            // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
-            persist_pin_if_new(cfg, enrolled);
-            (host_id, heartbeat_interval_ms)
-        }
-        ControlMsg::Error { code, message } => {
-            return Err(register_reject_error(
+    // --- Steps 1 and 2: send register, receive registered ---
+    let (host_id, heartbeat_interval_ms, policy_identity, policy_groups) =
+        register_and_await_registered(
+            cfg,
+            &mut tx,
+            &mut rx,
+            register_message(
                 cfg,
-                &code,
-                &message,
-                presented_saved_secret,
-            ));
+                prefer_enrollment_token,
+                images,
+                &install,
+                sessions.mgr.home_cleanup.is_some(),
+                true,
+                Some(image_mgr),
+            )?,
+        )
+        .await?;
+    let path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
+    let advertised = crate::policy::PolicyAgent::advertised_groups(&path);
+    let mut baseline = crate::session::settings::RuntimeSettings::baseline();
+    seed_nvidia_lib32(&mut baseline, nvidia_lib32_probed);
+    sessions.mgr.deployment_baseline = baseline.clone();
+    sessions.mgr.runtime_settings = baseline;
+    let (boot, connection) = policy_identity.clone().unwrap_or_default();
+    let mut policy = crate::policy::PolicyAgent::open(
+        path,
+        host_id.clone(),
+        boot,
+        connection.clone(),
+        &mut sessions.mgr.runtime_settings,
+    )?;
+    if let Some(groups) = &policy_groups {
+        if let Err(code) = policy.confirm_groups(&advertised, groups) {
+            send(
+                &mut tx,
+                &AgentMsg::ConfigPolicyFeatureError {
+                    code,
+                    group: None,
+                    connection_incarnation: connection,
+                },
+            )
+            .await?;
+            anyhow::bail!("RH05 ownership echo invalid");
         }
-        _ => {
-            anyhow::bail!("unexpected message type before registered");
-        }
-    };
+    }
+    sessions.mgr.policy_session_ready = policy_identity.is_none()
+        && !policy.has_sticky_ownership()
+        && !policy.has_uncertain_restart();
+    sessions.mgr.policy_accepted_groups = policy_groups;
+    sessions.mgr.policy_delivery_ack = None;
+    sessions.mgr.policy_inventory_complete = false;
+    sessions.mgr.policy_agent = Some(policy);
     health.set_connected(true);
     // #128: the control plane is back, so the sessions held across the outage are
     // safe. Disarmed HERE rather than at the top of the reconnect loop: doing it
@@ -1163,7 +2088,7 @@ async fn connect_and_run(
     health.record_registered();
 
     // --- Step 3: send capacity ---
-    let cap = offload_probe(detect_capacity_blocking).await;
+    let mut cap = offload_probe(detect_capacity_blocking).await;
     info!(
         "detected capacity: {} cores, {} MB RAM, {} GPU(s)",
         cap.host.cpu_cores,
@@ -1195,8 +2120,7 @@ async fn connect_and_run(
     // The env baseline with the startup-probed lib32 path seeded in, so the very first
     // capacity report already carries the auto-detected value. Matches what
     // `SessionManager::new` seeds; the first config_update re-sends the overlay view.
-    let mut first_settings = crate::session::settings::RuntimeSettings::baseline();
-    seed_nvidia_lib32(&mut first_settings, nvidia_lib32_probed);
+    let first_settings = sessions.mgr.runtime_settings.clone();
     // Probed once (the gst registry is process-stable) and reused in every capacity
     // re-send below.
     let host_codec_report = {
@@ -1208,33 +2132,73 @@ async fn connect_and_run(
     // codec probe above), so nothing here re-probes or launches a container.
     let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
     let gpu_present = !cap.gpus.is_empty();
+    let readiness_gpus = cap.gpus.clone();
     let readiness = {
         let lib32 = first_settings.nvidia_lib32_path.clone();
         let probed_codecs = host_codec_report.as_ref().map(|r| r.codecs.clone());
+        let gpus = readiness_gpus.clone();
         offload_probe(move || {
             crate::readiness::probe(
                 &crate::readiness::ProbeEnv::live(nvidia_host, &lib32)
                     .with_gpu_present(gpu_present)
+                    .with_gpus(&gpus)
                     .with_codec_probe(probed_codecs.as_deref()),
             )
         })
         .await
     };
     crate::readiness::log_report(&readiness);
+    sessions
+        .mgr
+        .readiness
+        .refreshed(readiness.clone(), SystemTime::now());
+    // A host-probe result produced while disconnected: pure in-memory work, so it is
+    // safe inside the handshake window, unlike everything above it.
+    while let Ok(update) = sessions.probe_updates.try_recv() {
+        crate::host_probe::orchestrator::apply(
+            &mut sessions.mgr.readiness,
+            &mut sessions.mgr.codec_evidence,
+            update,
+        );
+    }
+    sessions.mgr.agent_image_identity = agent_image_identity.to_string();
+    // Not yet `mgr`'s stack (`begin_connection` adopts it below), so built from the same
+    // locals this message reports.
+    let first_gpu_codec_sets = gpu_codec_sets(
+        &CodecStack {
+            agent_image: agent_image_identity,
+            gpus: &gpu_inventory,
+            settings: &first_settings,
+            registry: host_codec_report.is_some(),
+            layers: sessions.mgr.codec_layers,
+        },
+        &sessions.mgr.readiness,
+        &sessions.mgr.codec_evidence,
+    );
+    let first_codecs = Some(host_codecs_from_sets(&first_gpu_codec_sets));
+    apply_gpu_codecs(&mut cap.gpus, &first_gpu_codec_sets);
     let capacity_msg = AgentMsg::Capacity {
         source_preparation: None,
+        deployment_settings: Some(sessions.mgr.deployment_baseline.deployment_map()),
+        config_policy_accepted_groups: sessions.mgr.policy_accepted_groups.clone(),
+        config_policy_legacy_map_applied_id: None,
         host: cap.host,
         gpus: cap.gpus,
         gpu_detection: cap.gpu_detection,
         gpu_detection_reason: cap.gpu_detection_reason,
         console_capabilities: Some(cap.console),
         effective_settings: Some(first_settings.effective_map()),
-        codecs: advertised_codecs(&host_codec_report),
+        codecs: first_codecs,
         codec_throughput: advertised_codec_throughput(&host_codec_report),
-        readiness: Some(readiness.clone()),
+        readiness: Some(sessions.mgr.readiness.merged()),
     };
     send(&mut tx, &capacity_msg).await?;
     info!("capacity report sent");
+    if let Some(ledger) = sessions.mgr.home_cleanup.as_mut() {
+        for session_id in ledger.take_recovered() {
+            send(&mut tx, &recovered_terminal(&session_id)).await?;
+        }
+    }
 
     // Sent first on purpose: the card carries the remediation, and the gate below may end
     // the process a few seconds later.
@@ -1265,6 +2229,7 @@ async fn connect_and_run(
         diagnostic_rx,
         diagnostic_dropped_interval,
         diagnostic_dropped_total,
+        probe_updates,
         registered_this_connection: _,
         grace_timer: _,
     } = sessions;
@@ -1277,7 +2242,6 @@ async fn connect_and_run(
     // Cached with the encoder it was probed for, so capacity re-sends reuse it unless
     // a config_update flips the effective encoder and marks it stale.
     mgr.host_codec_report = host_codec_report.clone();
-    mgr.readiness = readiness;
     mgr.probed_encoder = Some(first_settings.encoder);
 
     // #488: the golden-home warm-up. Scheduled by the control plane and claimed over
@@ -1288,6 +2252,12 @@ async fn connect_and_run(
     let warmup_store = crate::session::warmup::resolve_store(&mgr.runtime_settings.home_root);
     let warmup_activity = Arc::new(crate::session::warmup::HostActivity::new());
     let warmup_control = Arc::new(crate::session::warmup::WarmupControl::new());
+    image_mgr.track_warmup_control(&warmup_control);
+    if let Some(handle) = mgr.probe_handle.clone() {
+        // A probe's own release fires this too; the scheduler ignores it when
+        // nothing waits on the gate.
+        warmup_control.set_release_listener(move || handle.encode_gate_freed());
+    }
     let source_policy = crate::source_policy::SourcePolicy::new(
         &mgr.runtime_settings.home_root,
         warmup_control.clone(),
@@ -1295,23 +2265,30 @@ async fn connect_and_run(
     );
     let _source_policy_guard = crate::source_policy::ConnectionGuard(source_policy.clone());
     mgr.source_policy = Some(source_policy.clone());
-    let warmup_runner = Arc::new(
-        crate::session::warmup::WarmupJobRunner::new(
-            crate::session::warmup::WarmupConfig::from_env(),
-            warmup_store.clone(),
-            Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
-                ContainerRuntime::from_env(),
-                mgr.runtime_settings.clone(),
-            )),
-            warmup_control.clone(),
-            warmup_activity.clone(),
-            app_uid_gid(),
-        )
-        .with_policy(source_policy.clone()),
-    );
+    let warmup_runner = crate::session::warmup::WarmupJobRunner::new(
+        crate::session::warmup::WarmupConfig::from_env(),
+        warmup_store.clone(),
+        Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
+            ContainerRuntime::from_env(),
+            mgr.runtime_settings.clone(),
+        )),
+        warmup_control.clone(),
+        warmup_activity.clone(),
+        app_uid_gid(),
+    )
+    .with_policy(source_policy.clone());
     mgr.warmup_activity = Some(warmup_activity);
     mgr.warmup_control = Some(warmup_control.clone());
     mgr.note_session_count();
+    // Outside the registration handshake window (it closed with the capacity
+    // message sent above) and after `warmup_control` is set, so a `Start` the
+    // orchestrator issues right away sees this connection's real gate.
+    mgr.set_probe_context();
+    if let Some(handle) = mgr.probe_handle.clone() {
+        let inputs = probe_inputs(mgr);
+        mgr.notified_probe_inputs = Some(inputs.clone());
+        handle.registered(inputs);
+    }
     // The one image-lifecycle duty that stayed agent-side: drop a template whose image
     // was uninstalled. Detached on disconnect (the ImageManager is process-wide); the
     // guard also aborts a warm-up that would otherwise outlive its connection (#489).
@@ -1370,7 +2347,7 @@ async fn connect_and_run(
         }
         Some(Ok(cp)) => {
             let mut registry = crate::jobs::JobRegistry::new();
-            registry.register(warmup_runner);
+            registry.register(Arc::new(warmup_runner.with_publish_client(cp.clone())));
             registry.register(std::sync::Arc::new(
                 crate::session::gc::HomeGcJobRunner::new(cp.clone(), live_refs.clone()),
             ));
@@ -1388,44 +2365,71 @@ async fn connect_and_run(
 
     // Readiness observes filesystem and provisioning state, which can change while
     // connected. Keep probes off the WebSocket loop and allow only one in flight.
-    let mut readiness_timer = tokio::time::interval(Duration::from_secs(15));
+    let mut readiness_timer = tokio::time::interval(READINESS_REFRESH_INTERVAL);
     readiness_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (readiness_tx, mut readiness_rx) = tokio::sync::mpsc::channel(1);
     let mut readiness_busy = false;
 
     loop {
+        if policy_identity.is_some()
+            && !mgr.policy_seed_reconnect_used
+            && mgr.policy_delivery_ack.is_some()
+            && mgr
+                .policy_agent
+                .as_ref()
+                .is_some_and(|agent| agent.has_seed() && agent.has_unadvertised_groups(&advertised))
+            && mgr.pending.is_empty()
+            && mgr.running.is_empty()
+            && !mgr.warmup_reserved()
+        {
+            mgr.policy_seed_reconnect_used = true;
+            return Err(PolicySeedReconnect.into());
+        }
         tokio::select! {
             _ = readiness_timer.tick(), if !readiness_busy => {
                 readiness_busy = true;
                 let sender = readiness_tx.clone();
                 let lib32 = mgr.runtime_settings.nvidia_lib32_path.clone();
                 let codecs = mgr.host_codec_report.as_ref().map(|r| r.codecs.clone());
-                tokio::spawn(async move {
-                    let checks = tokio::task::spawn_blocking(move || crate::readiness::probe(
+                let gpus = readiness_gpus.clone();
+                tokio::spawn(run_readiness_refresh(
+                    move || crate::readiness::probe(
                         &crate::readiness::ProbeEnv::live(nvidia_host, &lib32)
                             .with_gpu_present(gpu_present)
+                            .with_gpus(&gpus)
                             .with_codec_probe(codecs.as_deref()),
-                    )).await;
-                    let _ = sender.send(checks).await;
-                });
+                    ),
+                    READINESS_REFRESH_DEADLINE,
+                    sender,
+                ));
             }
-            Some(checks) = readiness_rx.recv() => {
-                readiness_busy = false;
-                match checks {
-                    Ok(checks) => mgr.readiness = checks,
-                    Err(error) => {
+            Some(refresh) = readiness_rx.recv() => {
+                match refresh {
+                    ReadinessRefresh::Done(Ok(checks)) => {
+                        readiness_busy = false;
+                        mgr.readiness.refreshed(checks, SystemTime::now());
+                        if crate::buildinfo::owned_identity_changed() {
+                            info!(token = "owned-identity-redial", "the recovery actor now reports a different identity (actor, seed or whether it answers); reconnecting so register carries it");
+                            return Err(ActorIdentityReconnect.into());
+                        }
+                    }
+                    ReadinessRefresh::Done(Err(error)) => {
+                        readiness_busy = false;
                         warn!(token = "readiness-refresh-failed", "host readiness refresh failed: {error}");
-                        mgr.readiness = vec![crate::messages::ReadinessCheck {
-                            id: "readiness_probe".into(), status: "warn".into(),
-                            summary: "Host readiness could not be refreshed; previous results are no longer current".into(),
-                            remediation: "The agent will retry automatically. Check its logs if this persists.".into(),
-                        }];
+                        mgr.readiness.refresh_failed();
+                    }
+                    // Still busy: `Done` follows when the probe ends.
+                    ReadinessRefresh::Overdue => {
+                        warn!(token = "readiness-refresh-overdue", "host readiness refresh is past its {} s deadline and still running", READINESS_REFRESH_DEADLINE.as_secs());
+                        mgr.readiness.refresh_failed();
                     }
                 }
                 send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
 
             _ = hb_timer.tick() => {
+                image_mgr.flush_terminal_states();
+                image_mgr.maybe_refresh_version_inventory();
                 let ts_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1488,17 +2492,50 @@ async fn connect_and_run(
                         // Handled here, not in handle_control, so the ack flushes before
                         // the process exits. The restart policy brings us back.
                         if let ControlMsg::Restart { id } = &ctrl {
+                            if mgr.policy_agent.as_ref().is_some_and(|policy| policy.has_open_restart()) {
+                                send(&mut tx, &AgentMsg::Ack { id: id.clone(), ok: false,
+                                    error: Some("attempt_conflict".into()) }).await?;
+                                continue;
+                            }
                             info!("restart requested (cmd {id}); acking then exiting for config reload");
                             let reply = AgentMsg::Ack { id: id.clone(), ok: true, error: None };
                             let _ = send(&mut tx, &reply).await;
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                            std::process::exit(0);
+                            crate::restart::exit_now(0);
                         }
                         // A config_update changes the reported effective settings; check
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
                         if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
-                            send(&mut tx, &reply).await?;
+                            let restart_accepted = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, ..
+                            } if scope == "restart" && phase == "awaiting_startup");
+                            let restart_requires_reconcile = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, ..
+                            } if scope == "restart" && phase == "accepted");
+                            let journal_uncertain = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, error, ..
+                            } if scope == "restart" && phase == "failed" && error.as_deref() == Some("journal_write_failed"));
+                            let reply_result = send_control_reply(&mut tx, &mut *mgr, reply).await;
+                            if journal_uncertain {
+                                warn!(token = "policy-journal-write-uncertain", "journal write failed; restarting to reconcile durable execution before another offer");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                crate::restart::exit_now(1);
+                            }
+                            if restart_requires_reconcile {
+                                warn!(token = "policy-accepted-reconcile", "restart attempt is durably accepted without an activation marker; restarting for bounded reconciliation");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                crate::restart::exit_now(1);
+                            }
+                            if restart_accepted {
+                                info!(token = "policy-candidate-restart", "durable hardware candidate accepted; restarting for startup verification");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                crate::restart::exit_now(0);
+                            }
+                            reply_result?;
+                        }
+                        for report in mgr.home_cleanup_reports.drain(..) {
+                            send(&mut tx, &report).await?;
                         }
                         if was_config_update {
                             // The overlay may have flipped the effective encoder live, so
@@ -1516,17 +2553,23 @@ async fn connect_and_run(
                                 );
                             }
                             let cap = offload_probe(detect_capacity_blocking).await;
-                            mgr.gpu_inventory.clone_from(&cap.gpus);
-                            mgr.vram_targets = cap.vram_targets;
-            // Must ride every `vram_targets` reassignment — see `vram_cache`'s doc.
-            mgr.vram_cache.invalidate();
+                            mgr.adopt_inventory(cap.gpus.clone(), cap.vram_targets);
+                            // A `config_update` can move the encoder/render node/GPU set a
+                            // probe result depended on.
+                            mgr.notify_probe_inputs();
                             // Reported-copy only — see `send_fresh_capacity`.
                             let mut cap_gpus = cap.gpus;
                             crate::session::warmup::apply_encode_slot_reservation(
                                 &mut cap_gpus,
                                 mgr.warmup_reserved(),
                             );
+                            let gpu_sets = mgr.gpu_codec_sets();
+                            apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                             let capacity_msg = AgentMsg::Capacity {
+            deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+            config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+            config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
+
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                                 host: cap.host,
                                 gpus: cap_gpus,
@@ -1534,9 +2577,9 @@ async fn connect_and_run(
                                 gpu_detection_reason: cap.gpu_detection_reason,
                                 console_capabilities: Some(cap.console),
                                 effective_settings: Some(mgr.runtime_settings.effective_map()),
-                                codecs: advertised_codecs(&mgr.host_codec_report),
+                                codecs: Some(host_codecs_from_sets(&gpu_sets)),
                                 codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
-                                readiness: Some(mgr.readiness.clone()),
+                                readiness: Some(mgr.readiness.merged()),
                             };
                             send(&mut tx, &capacity_msg).await?;
                             info!("re-sent capacity after config_update (fresh effective_settings)");
@@ -1564,10 +2607,9 @@ async fn connect_and_run(
                 };
                 {
                     let cap = offload_probe(detect_capacity_blocking).await;
-                    mgr.gpu_inventory.clone_from(&cap.gpus);
-                    mgr.vram_targets = cap.vram_targets;
-            // Must ride every `vram_targets` reassignment — see `vram_cache`'s doc.
-            mgr.vram_cache.invalidate();
+                    mgr.adopt_inventory(cap.gpus.clone(), cap.vram_targets);
+                    // A hotplug can change the GPU set a probe result depended on.
+                    mgr.notify_probe_inputs();
                     info!(
                         "console hotplug: {reason}; re-sending capacity ({} connector(s), {} audio sink(s), {} input device(s))",
                         cap.console.connectors.len(),
@@ -1580,7 +2622,13 @@ async fn connect_and_run(
                         &mut cap_gpus,
                         mgr.warmup_reserved(),
                     );
+                    let gpu_sets = mgr.gpu_codec_sets();
+                    apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                     let capacity_msg = AgentMsg::Capacity {
+            deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+            config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+            config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
+
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                         host: cap.host,
                         gpus: cap_gpus,
@@ -1588,12 +2636,20 @@ async fn connect_and_run(
                         gpu_detection_reason: cap.gpu_detection_reason,
                         console_capabilities: Some(cap.console),
                         effective_settings: Some(mgr.runtime_settings.effective_map()),
-                        codecs: advertised_codecs(&mgr.host_codec_report),
+                        codecs: Some(host_codecs_from_sets(&gpu_sets)),
                         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
-                        readiness: Some(mgr.readiness.clone()),
+                        readiness: Some(mgr.readiness.merged()),
                     };
                     send(&mut tx, &capacity_msg).await?;
                 }
+            }
+            changed = recv_or_disabled(&mut console_access_rx) => {
+                if changed.is_none() {
+                    console_access_rx = None;
+                    continue;
+                }
+                info!("console access changed; re-sending capacity");
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
             evt = recv_or_disabled(&mut *evt_rx) => {
                 // `None` means every sender is gone — disable the arm.
@@ -1641,14 +2697,15 @@ async fn connect_and_run(
                             // #503: get pending trace events out before the terminal
                             // state — the control plane drops them afterwards.
                             flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
-                            let msg =
-                                mgr.on_event(&session_id, SessionEvent::Stopped { bytes_used, detail });
-                            send(&mut tx, &msg).await?;
-                            // Console auto-start is level-triggered by capacity, so
-                            // re-send immediately after a terminal state rather than
-                            // waiting on an unrelated connector/input/storage poll.
-                            send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                            info!("re-sent capacity after session stopped for console reconciliation");
+                            if let Some(msg) = mgr.prove_home_terminal(
+                                &session_id,
+                                SessionEvent::Stopped { bytes_used, detail },
+                            ) {
+                                send(&mut tx, &msg).await?;
+                                // Console auto-start is level-triggered by capacity.
+                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                                info!("re-sent capacity after session stopped for console reconciliation");
+                            }
                         }
                         SessionEvent::EffectiveMedia(payload) => {
                             let ts_unix_ms = SystemTime::now()
@@ -1703,17 +2760,47 @@ async fn connect_and_run(
                                 }
                                 _ => false,
                             };
+                            // Which host probes could explain this, and the GPU it ran
+                            // on — captured before `on_event` drops the `running` entry.
+                            let launch_failure = match &other {
+                                SessionEvent::Failed(reason) => Some((reason.clone(), false)),
+                                SessionEvent::AppFailed { reason, .. } => {
+                                    Some((reason.clone(), true))
+                                }
+                                _ => None,
+                            };
+                            let failed_on = mgr
+                                .running
+                                .get(&session_id)
+                                .map(|h| (h.gpu_index, h.codec));
                             // #503: same pre-terminal flush as the `Stopped` arm —
                             // `webrtc.remote_description_failed` is emitted by the
                             // runner immediately before this very event.
                             if terminal {
                                 flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
                             }
-                            let msg = mgr.on_event(&session_id, other);
-                            send(&mut tx, &msg).await?;
-                            if terminal {
-                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                                info!("re-sent capacity after session failure for console reconciliation");
+                            let msg = if terminal {
+                                mgr.prove_home_terminal(&session_id, other)
+                            } else {
+                                Some(mgr.on_event(&session_id, other))
+                            };
+                            if let Some(msg) = msg {
+                                send(&mut tx, &msg).await?;
+                                if terminal {
+                                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                                    info!("re-sent capacity after session failure for console reconciliation");
+                                }
+                            }
+                            if let (Some((reason, app_failed)), Some((gpu, codec))) =
+                                (launch_failure, failed_on)
+                            {
+                                let explains =
+                                    host_probe::launch_failure::explains(&reason, app_failed);
+                                if !explains.is_empty() {
+                                    if let Some(handle) = &mgr.probe_handle {
+                                        handle.launch_failed(gpu, explains, codec);
+                                    }
+                                }
                             }
                             if gpu_global && !mgr.draining {
                                 error!(
@@ -1734,7 +2821,7 @@ async fn connect_and_run(
                                         token = "gpu-fault-restart-now",
                                         "GPU-global drain window elapsed; restarting agent process now"
                                     );
-                                    std::process::exit(0);
+                                    crate::restart::exit_now(0);
                                 });
                             }
                         }
@@ -1815,6 +2902,18 @@ async fn connect_and_run(
                     continue;
                 };
                 send(&mut tx, &msg).await?;
+                let terminal = matches!(&msg, AgentMsg::ReleaseState { state, .. } if state == "succeeded" || state == "failed");
+                if terminal && release_mgr.take_redial() {
+                    info!(token = "release-actor-redial", "this host's recovery actor was replaced; reconnecting so register carries its identity");
+                    return Err(ActorIdentityReconnect.into());
+                }
+            }
+            // A host probe concluded, was deferred, or its check went not-applicable /
+            // forgotten. Applying is pure in-memory work; the result reaches the
+            // control plane on the next capacity message, per spec #252.
+            Some(update) = probe_updates.recv() => {
+                host_probe::orchestrator::apply(&mut mgr.readiness, &mut mgr.codec_evidence, update);
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
         }
     }
@@ -1879,8 +2978,13 @@ const HELD_SESSION_BACKOFF_CAP: Duration = Duration::from_secs(5);
 /// restoring the pre-#128 behaviour of stopping every session the moment the
 /// connection drops.
 fn session_grace() -> Duration {
-    let secs = std::env::var("QUASAR_SESSION_GRACE_SECS")
-        .ok()
+    session_grace_from(std::env::var("QUASAR_SESSION_GRACE_SECS").ok().as_deref())
+}
+
+/// Pure core of [`session_grace`]: `raw` is the `QUASAR_SESSION_GRACE_SECS` value as read
+/// from env, `None` for unset.
+fn session_grace_from(raw: Option<&str>) -> Duration {
+    let secs = raw
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SESSION_GRACE_SECS);
     Duration::from_secs(secs)
@@ -1920,6 +3024,10 @@ struct HostSessions {
     /// reset the window on every retry, so a control plane that never came back
     /// meant the sessions were held forever.
     grace_timer: Option<tokio::task::JoinHandle<()>>,
+    /// Host-probe results. Process lifetime, like the orchestrator that feeds
+    /// it — a result produced while disconnected is applied when the next
+    /// connection's loop runs.
+    probe_updates: mpsc::UnboundedReceiver<crate::host_probe::orchestrator::ReportUpdate>,
 }
 
 impl HostSessions {
@@ -1939,22 +3047,29 @@ impl HostSessions {
             diagnostic_dropped_interval.clone(),
             diagnostic_dropped_total.clone(),
         );
+        let probe_runner = Arc::new(crate::host_probe::runner::HostProbeRunner::new());
+        let (probe_handle, probe_updates) =
+            crate::host_probe::orchestrator::spawn(probe_runner.clone());
+        let mut mgr = SessionManager::new(
+            live_refs,
+            health,
+            Vec::new(),
+            Vec::new(),
+            nvidia_lib32_probed,
+            image_mgr,
+            release_mgr,
+        );
+        mgr.probe_handle = Some(probe_handle);
+        mgr.probe_runner = Some(probe_runner);
         Self {
-            mgr: SessionManager::new(
-                live_refs,
-                health,
-                Vec::new(),
-                Vec::new(),
-                nvidia_lib32_probed,
-                image_mgr,
-                release_mgr,
-            ),
+            mgr,
             evt_tx,
             evt_rx: Some(evt_rx),
             diagnostic_tx,
             diagnostic_rx: Some(diagnostic_rx),
             diagnostic_dropped_interval,
             diagnostic_dropped_total,
+            probe_updates,
             registered_this_connection: false,
             grace_timer: None,
         }
@@ -1970,6 +3085,8 @@ impl HostSessions {
     }
 }
 
+type HomeSourceRetire = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
@@ -1978,6 +3095,13 @@ struct SessionManager {
     /// Agent-local runtime knobs, starting at the env baseline and overlaid by
     /// `config_update` pushes. Read when building each session's SessionConfig.
     runtime_settings: crate::session::settings::RuntimeSettings,
+    deployment_baseline: crate::session::settings::RuntimeSettings,
+    policy_agent: Option<crate::policy::PolicyAgent>,
+    policy_accepted_groups: Option<Vec<String>>,
+    policy_session_ready: bool,
+    policy_delivery_ack: Option<String>,
+    policy_inventory_complete: bool,
+    policy_seed_reconnect_used: bool,
     /// Latest capacity inventory on this connection. An assignment's `gpu_index` is
     /// resolved against this exact inventory, never treated as an alias for a
     /// host-wide render/CUDA setting.
@@ -2001,21 +3125,23 @@ struct SessionManager {
     live_refs: LiveRefs,
     /// Shared with the health endpoint: the running-session count.
     health: Arc<HealthState>,
-    /// #375: the 32-bit NVIDIA driver-lib dir auto-detected at startup, seeded into
-    /// `runtime_settings.nvidia_lib32_path` whenever the configured value is empty.
-    /// Empty on non-NVIDIA hosts and when nothing was detected.
-    nvidia_lib32_probed: String,
     /// The codec set + throughput hint the host's active encoder path can produce.
     /// Re-probed whenever a `config_update` flips the effective encoder, since that
-    /// overlay is live-class. `None` ⇒ probe skipped/failed, so the control plane
-    /// defaults the host to `["h264"]`.
+    /// overlay is live-class. `None` ⇒ `gst::init` failed: no registry to plan from,
+    /// so `capacity.codecs` is `["h264"]`. Its flat `codecs` are never `capacity.codecs` (#301).
     host_codec_report: Option<HostCodecReport>,
-    /// The host readiness check set, computed once per CONNECTION and repeated
-    /// verbatim in every capacity re-send on it. Per connection because every input is
-    /// fixed for the container's life: driver libraries and device nodes are injected
-    /// at create time, and the 32-bit GL answer costs a throwaway container. Applying
-    /// a host fix means recreating the container anyway.
-    readiness: Vec<crate::messages::ReadinessCheck>,
+    /// The process's agent image identity, part of every probe input.
+    agent_image_identity: String,
+    /// #301 layers 1 and 2, read live from the current inventory at every send.
+    codec_layers: CodecLayers,
+    /// Which stack each held codec-probe pass was proven under; lives beside `readiness`.
+    codec_evidence: crate::host_probe::outcome::CodecEvidence,
+    /// What the scheduler was last told, so a refresh re-notifies only on a change.
+    notified_probe_inputs: Option<crate::host_probe::decision::ProbeInputs>,
+    /// Every capacity message carries `merged()`. Outlives a connection, so retained
+    /// checks survive a control-plane restart; registration and the 15 s refresh only
+    /// replace the locally computed set.
+    readiness: crate::readiness::report::ReadinessReport,
     /// The encoder `host_codec_report` was probed for; compared against
     /// `runtime_settings.encoder` to decide staleness.
     probed_encoder: Option<crate::session::EncoderChoice>,
@@ -2038,9 +3164,28 @@ struct SessionManager {
     /// `release_apply` dispatch target. Process-wide for the same reason as
     /// `image_mgr`: its poller outlives this connection.
     release_mgr: Arc<ReleaseManager>,
+    /// Console access on an owned install (amendment 18). Process-wide: its worker
+    /// watches an attempt that outlives this connection.
+    console_access: Arc<crate::release::console::ConsoleAccessManager>,
+    /// Present only after startup proved prior API-owned source cleanup and
+    /// opened the durable session-ID ledger. This is the advertised capability.
+    home_cleanup: Option<crate::home_cleanup::HomeCleanupLedger>,
+    /// Ack-less qualified terminals emitted after a repeated or never-recorded
+    /// session_stop. The control loop drains these after the command ack.
+    home_cleanup_reports: Vec<AgentMsg>,
+    /// A deterministic runtime seam for cleanup-proof tests. Production uses
+    /// the durable application journal adapter when this is absent.
+    home_source_retire: Option<HomeSourceRetire>,
     /// Connection-scoped source policy shared with workers and session seeding.
     /// Its authorization is invalidated on disconnect even if sessions retain an Arc.
     source_policy: Option<Arc<crate::source_policy::SourcePolicy>>,
+    /// Process-lifetime host-probe orchestrator handle. `None` only in tests
+    /// that build a `SessionManager` directly — every send on it is a non-blocking
+    /// unbounded-channel push, so nothing on the launch path can be delayed by it.
+    probe_handle: Option<crate::host_probe::orchestrator::ProbeHandle>,
+    /// The runner the orchestrator drives, so `set_context` can be refreshed before
+    /// `registered`/`inputs_observed` without threading it through every call site.
+    probe_runner: Option<Arc<crate::host_probe::runner::HostProbeRunner>>,
 }
 
 /// The uid/gid an app container's entrypoint drops to
@@ -2061,6 +3206,11 @@ pub(crate) fn app_uid_gid() -> Option<(u32, u32)> {
 struct PendingAssignment {
     cfg: SessionConfig,
     assigned_at: Instant,
+    preparation: Option<crate::runtime::ImageOperation<crate::runtime::ImageInfo>>,
+    /// Carried to `RunningHandle` at `session_start`: `LaunchArrived` needs the GPU a
+    /// probe might be running on, and a `session_start` cannot re-derive it (the wire
+    /// message carries no `gpu_index`).
+    gpu_index: i32,
 }
 
 /// The per-running-session handles the agent loop holds.
@@ -2096,9 +3246,45 @@ struct RunningHandle {
     /// [`RUNNER_REAP_GRACE`] past this so the ordinary terminal path is never mistaken
     /// for an abandoned slot.
     finished_seen_at: Option<Instant>,
+    /// The GPU this session is bound to, for the host-probe scheduler's live-GPU set
+    /// and a launch failure's `launch_failed(gpu, ..)`.
+    gpu_index: i32,
+    /// The assigned codec, before any `QUASAR_CODEC` diagnostic override (the runner
+    /// applies that later): a launch failure on it selects that GPU's codec probe.
+    codec: crate::session::Codec,
+    /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
+    /// probe starts.
+    reached_running: bool,
+    /// A runner-reported terminal waits here until its thread has exited and
+    /// every source generation has been retired and verified absent.
+    pending_home_terminal: Option<SessionEvent>,
 }
 
 impl SessionManager {
+    fn restart_idle(&self) -> bool {
+        if !self.policy_session_ready
+            || !self.policy_inventory_complete
+            || !self.pending.is_empty()
+            || !self.running.is_empty()
+            || self.warmup_reserved()
+            || self.image_mgr.has_in_flight_operations()
+        {
+            return false;
+        }
+        self.source_policy
+            .as_ref()
+            .and_then(|policy| policy.report())
+            .and_then(|report| report.pointer("/steam/images").cloned())
+            .and_then(|images| images.as_array().cloned())
+            .is_some_and(|images| {
+                images.iter().all(|image| {
+                    !matches!(
+                        image["state"].as_str(),
+                        Some("queued" | "preparing" | "waiting_image" | "deferred" | "failed")
+                    )
+                })
+            })
+    }
     fn new(
         live_refs: LiveRefs,
         health: Arc<HealthState>,
@@ -2110,19 +3296,30 @@ impl SessionManager {
     ) -> Self {
         let mut runtime_settings = crate::session::settings::RuntimeSettings::baseline();
         seed_nvidia_lib32(&mut runtime_settings, &nvidia_lib32_probed);
+        let deployment_baseline = runtime_settings.clone();
         SessionManager {
             pending: HashMap::new(),
             running: HashMap::new(),
             runtime_settings,
+            deployment_baseline,
+            policy_agent: None,
+            policy_accepted_groups: None,
+            policy_session_ready: true,
+            policy_delivery_ack: None,
+            policy_inventory_complete: false,
+            policy_seed_reconnect_used: false,
             gpu_inventory,
             vram_targets,
             vram_cache: Arc::new(VramCache::new()),
             console_config: None,
             live_refs,
             health,
-            nvidia_lib32_probed,
             host_codec_report: None,
-            readiness: Vec::new(),
+            agent_image_identity: String::new(),
+            codec_layers: CodecLayers::default(),
+            codec_evidence: Default::default(),
+            notified_probe_inputs: None,
+            readiness: Default::default(),
             probed_encoder: None,
             draining: false,
             runner: default_runner(),
@@ -2130,15 +3327,35 @@ impl SessionManager {
             warmup_control: None,
             image_mgr,
             release_mgr,
+            console_access: crate::release::console::ConsoleAccessManager::without_actor(),
+            home_cleanup: None,
+            home_cleanup_reports: Vec::new(),
+            home_source_retire: None,
             source_policy: None,
+            probe_handle: None,
+            probe_runner: None,
         }
     }
 
-    /// Publish the live-session count to the warm-up gate. Called from every site that
-    /// updates `/health`'s count, so the two can never disagree about host busyness.
+    /// Publish the live-session count to the warm-up gate, and the live-GPU set (every
+    /// pending-or-running assignment's GPU — the GPU is spoken for either way) to the
+    /// host-probe scheduler. Called from every site that changes `pending` or
+    /// `running`, so the two views can never disagree about host busyness.
     fn note_session_count(&self) {
+        crate::restart::note_sessions(self.pending.len() + self.running.len());
         if let Some(a) = &self.warmup_activity {
             a.set_live(self.running.len(), Instant::now());
+        }
+        if let Some(handle) = &self.probe_handle {
+            let live_gpus: std::collections::BTreeSet<i32> = self
+                .pending
+                .values()
+                .map(|p| p.gpu_index)
+                .chain(self.running.values().map(|h| h.gpu_index))
+                .collect();
+            let launching =
+                !self.pending.is_empty() || self.running.values().any(|h| !h.reached_running);
+            handle.sessions_changed(live_gpus, launching);
         }
     }
 
@@ -2150,11 +3367,83 @@ impl SessionManager {
             .unwrap_or(false)
     }
 
+    /// Refresh what a probe run reads. Called before every `registered`/
+    /// `inputs_observed` send so a `Start` the orchestrator issues right after always
+    /// sees the settings/inventory this exact message describes.
+    fn set_probe_context(&self) {
+        if let Some(runner) = &self.probe_runner {
+            runner.set_context(crate::host_probe::runner::ProbeContext {
+                settings: self.runtime_settings.clone(),
+                inventory: self.gpu_inventory.clone(),
+                warmup: self.warmup_control.clone(),
+            });
+        }
+    }
+
+    /// A probe input changed (capacity re-detection, a `config_update`): refresh the
+    /// context and tell the scheduler. A no-op with no probe handle wired (tests).
+    fn notify_probe_inputs(&mut self) {
+        self.set_probe_context();
+        if let Some(handle) = self.probe_handle.clone() {
+            let inputs = probe_inputs(self);
+            self.notified_probe_inputs = Some(inputs.clone());
+            handle.inputs_observed(inputs);
+        }
+    }
+
+    /// [`Self::notify_probe_inputs`] only when the inputs differ from the last ones sent.
+    fn notify_probe_inputs_if_changed(&mut self) {
+        if self.notified_probe_inputs.as_ref() != Some(&probe_inputs(self)) {
+            self.notify_probe_inputs();
+        }
+    }
+
+    /// Replace the true inventory after a capacity re-detection.
+    fn adopt_inventory(
+        &mut self,
+        gpus: Vec<crate::messages::GpuCapacity>,
+        vram_targets: Vec<VramTarget>,
+    ) {
+        self.gpu_inventory = gpus;
+        self.vram_targets = vram_targets;
+        // Must ride every `vram_targets` reassignment — see `vram_cache`'s doc.
+        self.vram_cache.invalidate();
+    }
+
+    fn codec_stack(&self) -> CodecStack<'_> {
+        CodecStack {
+            agent_image: &self.agent_image_identity,
+            gpus: &self.gpu_inventory,
+            settings: &self.runtime_settings,
+            registry: self.host_codec_report.is_some(),
+            layers: self.codec_layers,
+        }
+    }
+
+    /// Per-GPU codec sets for the current stack (#301/#302) — the one computation
+    /// `advertised_codecs` (the host union) and `apply_gpu_codecs` (the per-GPU wire
+    /// field) both derive from.
+    fn gpu_codec_sets(&self) -> Vec<(i32, BTreeSet<Codec>)> {
+        gpu_codec_sets(&self.codec_stack(), &self.readiness, &self.codec_evidence)
+    }
+
+    /// `capacity.codecs` for the current stack (#301). Test-only: a real capacity send
+    /// needs `gpu_codec_sets()` anyway (to stamp `apply_gpu_codecs`), so production call
+    /// sites derive the union from that same value with `host_codecs_from_sets` instead
+    /// of computing it twice through this wrapper.
+    #[cfg(test)]
+    fn advertised_codecs(&self) -> Option<Vec<String>> {
+        Some(host_codecs_from_sets(&self.gpu_codec_sets()))
+    }
+
     /// Built per assign/swap rather than cached: `settings.home_root` is a live-class
     /// setting a `config_update` can move under a long-lived connection, and a stale
     /// root would refuse the managed home it just relocated to.
     fn mount_policy(&self) -> MountPolicy {
-        MountPolicy::from_env(&self.runtime_settings.home_root)
+        MountPolicy::from_env_with_deployment_mount(
+            &self.runtime_settings.home_root,
+            &self.deployment_baseline.home_root,
+        )
     }
 
     /// A user launch always wins. Raised on `session_assign`, the earliest point the
@@ -2186,76 +3475,7 @@ impl SessionManager {
     }
 
     fn bind_assignment(&self, gpu_index: i32, cfg: &mut SessionConfig) -> anyhow::Result<()> {
-        let gpu = self
-            .gpu_inventory
-            .iter()
-            .find(|gpu| gpu.index == gpu_index)
-            .ok_or_else(|| anyhow::anyhow!(
-                "scheduled GPU index {gpu_index} is absent from the agent's latest capacity inventory"
-            ))?;
-
-        if cfg.encoder == EncoderChoice::Openh264 {
-            return Ok(());
-        }
-
-        // `app.gpu=false` is not invalid: a benchmark app may feed a hardware
-        // compositor without needing GPU access itself, and the app contract has no
-        // separate "this workload requires a GPU" signal to validate against.
-
-        let reported = gpu.render_node.as_deref().ok_or_else(|| anyhow::anyhow!(
-            "scheduled GPU {gpu_index} ({} {}) has no reported render node; hardware encode cannot be pinned safely",
-            gpu.vendor, gpu.model
-        ))?;
-        if cfg.render_node == "software" {
-            anyhow::bail!(
-                "hardware encoder {:?} cannot run with render_node=software; configure the reported node {reported}",
-                cfg.encoder
-            );
-        }
-        // Accept either exact identity capacity carries: the stable by-path
-        // `render_node` or the in-container `device_path`. Never resolve the host's
-        // by-path symlink here — it is not necessarily mounted even when the
-        // corresponding renderD node is. An empty render_node (QUASAR_RENDER_NODE
-        // unset) is unpinned: adopt the scheduled GPU's node below, matching the
-        // scheduler's schedulableBindingSQL — the two resolvers must not diverge.
-        let resolved_reported = gpu.device_path.as_deref().unwrap_or(reported);
-        if !cfg.render_node.is_empty()
-            && cfg.render_node != reported
-            && cfg.render_node != resolved_reported
-        {
-            anyhow::bail!(
-                "configured render node {} does not match scheduled GPU {gpu_index} node {reported} (resolved {resolved_reported})",
-                cfg.render_node
-            );
-        }
-
-        match cfg.encoder {
-            EncoderChoice::Va if !matches!(gpu.vendor.as_str(), "amd" | "intel") => {
-                anyhow::bail!(
-                    "VA encoder is incompatible with scheduled {} GPU {gpu_index}",
-                    gpu.vendor
-                )
-            }
-            EncoderChoice::Nvenc if gpu.vendor != "nvidia" => {
-                anyhow::bail!(
-                    "NVENC is incompatible with scheduled {} GPU {gpu_index}",
-                    gpu.vendor
-                )
-            }
-            EncoderChoice::Nvenc => {
-                cfg.cuda_device_id = capacity::nvidia_cuda_index_for_render_node(reported)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "cannot map scheduled NVIDIA GPU {gpu_index} node {reported} to a CUDA device by PCI identity"
-                    ))?;
-            }
-            // Vulkan is pinned by the compositor-created GstVulkanDevice —
-            // waylanddisplaysrc selects it from this render node and interpipe
-            // forwards the context query — so it needs no ordinal.
-            EncoderChoice::Vulkan => {}
-            _ => {}
-        }
-        cfg.render_node = resolved_reported.to_string();
-        Ok(())
+        bind_gpu(&self.gpu_inventory, gpu_index, cfg)
     }
 
     /// Home refs (volume names / host paths) for a session's container mounts.
@@ -2397,6 +3617,26 @@ impl SessionManager {
                 resources,
                 video_topology,
             } => {
+                if !self.policy_session_ready {
+                    return Some(ack(
+                        id,
+                        false,
+                        Some("settings delivery not yet applied".to_string()),
+                    ));
+                }
+                // #388: nor does one about to restart itself to finish host setup; the
+                // exit would take the new session with it.
+                if crate::restart::pending() {
+                    warn!(
+                        token = "session-assign-refused-restart-pending",
+                        "session {session_id} assignment rejected: agent restarting to finish host setup"
+                    );
+                    return Some(ack(
+                        id,
+                        false,
+                        Some(crate::restart::REFUSAL_REASON.to_string()),
+                    ));
+                }
                 // A draining agent accepts no new sessions.
                 if self.draining {
                     warn!(
@@ -2409,10 +3649,34 @@ impl SessionManager {
                         Some("agent draining for restart".to_string()),
                     ));
                 }
+                if let Some(refusal) = self.console_access.launch_refusal(video_topology) {
+                    warn!(
+                        token = "session-assign-rejected",
+                        "session {session_id} assignment rejected: {refusal}"
+                    );
+                    return Some(ack(id, false, Some(refusal)));
+                }
+                if self
+                    .home_cleanup
+                    .as_ref()
+                    .is_some_and(|ledger| ledger.has_record(&session_id))
+                {
+                    return Some(ack(
+                        id,
+                        false,
+                        Some("session id already recorded".to_string()),
+                    ));
+                }
                 // Raised BEFORE anything else in the assign path: a warm-up's NVENC
                 // teardown must never overlap the encoder this session is about to
                 // create (#489). The assign→start gap is the abort's budget.
                 self.abort_any_warmup();
+                // A probe running on this GPU must yield the moment a launch could
+                // need it, well before the config below can fail — never delayed by,
+                // or delaying, anything else in this arm (an unbounded channel send).
+                if let Some(handle) = &self.probe_handle {
+                    handle.launch_arrived(gpu_index);
+                }
                 let container = match app_to_container(app, &self.mount_policy()) {
                     Ok(c) => c,
                     Err(error) => {
@@ -2420,6 +3684,9 @@ impl SessionManager {
                             token = "session-assign-rejected",
                             "session {session_id} assignment rejected: {error:#}"
                         );
+                        // Nothing was inserted into `pending`: tell the probe scheduler
+                        // this GPU was never really claimed.
+                        self.note_session_count();
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
@@ -2430,6 +3697,7 @@ impl SessionManager {
                             token = "session-assign-rejected",
                             "session {session_id} assignment rejected: {error:#}"
                         );
+                        self.note_session_count();
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
@@ -2443,7 +3711,26 @@ impl SessionManager {
                         token = "session-assign-rejected",
                         "session {session_id} assignment rejected: {error:#}"
                     );
+                    self.note_session_count();
                     return Some(ack(id, false, Some(error.to_string())));
+                }
+                // #302 belt: the control plane guarantees `stream.codec` is in the
+                // assigned GPU's codec set (agent-api.md amendment 12), but this is the
+                // check behind that guarantee — a stale control-plane read of a GPU's set
+                // (it can shrink faster than a report reaches the control plane, e.g.
+                // right after an agent restart) must refuse here rather than let
+                // `pipeline::resolve_effective_encoder` build a pipeline that fails later.
+                // The decision (incl. the H.264 exemption) is `assign_codec_refusal`.
+                if let Some(refusal) = assign_codec_refusal(
+                    &session_id,
+                    gpu_index,
+                    cfg.stream.codec,
+                    &self.gpu_codec_sets(),
+                ) {
+                    // guarded by assign_refusal_logs_the_codec_not_in_gpu_set_token
+                    warn!(token = "assign-codec-not-in-gpu-set", "{}", refusal.log);
+                    self.note_session_count();
+                    return Some(ack(id, false, Some(refusal.ack_error)));
                 }
                 cfg.console_config = self.console_config.clone();
                 cfg.video_topology = video_topology;
@@ -2466,33 +3753,65 @@ impl SessionManager {
                      image={image}, reserved vram={vram}MB slots={slots}",
                     cfg.stream.width, cfg.stream.height, cfg.stream.fps
                 );
-                // Prepare step of reserve→prepare→go-live: pull now, off the agent
-                // loop, so session_start is fast.
-                if let Some(spec) = container {
-                    let runtime = ContainerRuntime::from_env();
-                    std::thread::spawn(move || {
-                        if let Err(e) = runtime.pull(&spec.image) {
-                            warn!(
-                                token = "assign-image-pull-failed",
-                                "assign-time pull of {} failed: {e:#}", spec.image
-                            );
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    match ledger.record_active(&session_id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Some(ack(
+                                id,
+                                false,
+                                Some("session id already recorded".to_string()),
+                            ))
                         }
-                    });
+                        Err(_) => {
+                            return Some(ack(
+                                id,
+                                false,
+                                Some("durable session admission unavailable".to_string()),
+                            ))
+                        }
+                    }
                 }
+                // Preparation belongs to the runtime executor, not this connection.
+                // Retain its observation so session_start cannot race or ignore it.
+                let preparation = if let Some(spec) = container {
+                    match crate::runtime::configured() {
+                        Ok(runtime) => {
+                            Some(runtime.ensure_image(spec.image, Duration::from_secs(600)))
+                        }
+                        Err(error) => {
+                            self.note_session_count();
+                            return Some(ack(id, false, Some(error.to_string())));
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.pending.insert(
                     session_id,
                     PendingAssignment {
                         cfg,
                         assigned_at: Instant::now(),
+                        preparation,
+                        gpu_index,
                     },
                 );
+                self.note_session_count();
                 Some(ack(id, true, None))
             }
             ControlMsg::SessionStart { id, session_id } => match self.pending.remove(&session_id) {
-                Some(PendingAssignment { cfg, .. }) => {
+                Some(PendingAssignment {
+                    mut cfg,
+                    preparation,
+                    gpu_index,
+                    ..
+                }) => {
                     // The assign already raised this, but a `session_start` for an
                     // assignment that landed on a previous connection would not have.
                     self.abort_any_warmup();
+                    if let Some(handle) = &self.probe_handle {
+                        handle.launch_arrived(gpu_index);
+                    }
                     let stop = Arc::new(AtomicBool::new(false));
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
                     let (swap_tx, swap_rx) = std::sync::mpsc::channel::<SwapRequest>();
@@ -2511,6 +3830,7 @@ impl SessionManager {
                     let home_refs = Self::home_refs_of(&cfg);
                     self.add_live_refs(&home_refs);
                     let video_topology = cfg.video_topology;
+                    let codec = cfg.stream.codec;
                     // Snapshotted before `cfg` moves into the runner thread, because the
                     // ack must be produced before the runner has built the encode
                     // pipeline that owns the real `ScaleStage`. Both sides go through
@@ -2532,8 +3852,39 @@ impl SessionManager {
                     let panic_tx = evt_tx.clone();
                     let panic_sid = session_id.clone();
                     let thread = std::thread::spawn(move || {
-                        let outcome =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || {
+                                if let Some(preparation) = preparation {
+                                    if let Err(error) = preparation
+                                        .wait_with_cancel(|_| {}, || stop.load(Ordering::Relaxed))
+                                    {
+                                        let event = if error.kind
+                                            == crate::runtime::ErrorKind::Cancelled
+                                        {
+                                            SessionEvent::Stopped {
+                                                bytes_used: None,
+                                                detail: None,
+                                            }
+                                        } else {
+                                            SessionEvent::Failed(format!("image preparation failed: {error}; reconcile engine state before retrying"))
+                                        };
+                                        let _ = evt_tx2.try_send((panic_sid.clone(), event));
+                                        return;
+                                    }
+                                    if let Some(container) = cfg.container.as_mut() {
+                                        container.require_local_image = true;
+                                    }
+                                }
+                                if stop.load(Ordering::Relaxed) {
+                                    let _ = evt_tx2.try_send((
+                                        panic_sid.clone(),
+                                        SessionEvent::Stopped {
+                                            bytes_used: None,
+                                            detail: None,
+                                        },
+                                    ));
+                                    return;
+                                }
                                 runner(
                                     panic_sid.clone(),
                                     cfg,
@@ -2546,7 +3897,8 @@ impl SessionManager {
                                     capture_rx,
                                     metrics,
                                 );
-                            }));
+                            },
+                        ));
                         if let Err(payload) = outcome {
                             let text = panic_payload_text(payload.as_ref());
                             error!(
@@ -2583,6 +3935,10 @@ impl SessionManager {
                             video_topology,
                             thread: Some(thread),
                             finished_seen_at: None,
+                            gpu_index,
+                            codec,
+                            reached_running: false,
+                            pending_home_terminal: None,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -2610,7 +3966,39 @@ impl SessionManager {
                 session_id,
                 reason,
             } => {
-                self.pending.remove(&session_id);
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    if let Some(terminal) = ledger.state(&session_id) {
+                        self.home_cleanup_reports
+                            .push(qualified_home_terminal(&session_id, terminal));
+                        return Some(ack(id, true, None));
+                    }
+                    if !self.running.contains_key(&session_id) {
+                        // No runner can still create a source. This includes a
+                        // lost assign frame and a never-recorded ID. Persist
+                        // retirement before reporting a terminal state.
+                        let terminal = match ledger
+                            .retire(&session_id, crate::home_cleanup::TerminalKind::Stopped)
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                return Some(ack(
+                                    id,
+                                    false,
+                                    Some("durable session retirement unavailable".to_string()),
+                                ))
+                            }
+                        };
+                        if self.pending.remove(&session_id).is_some() {
+                            self.note_session_count();
+                        }
+                        self.home_cleanup_reports
+                            .push(qualified_home_terminal(&session_id, terminal));
+                        return Some(ack(id, true, None));
+                    }
+                }
+                if self.pending.remove(&session_id).is_some() {
+                    self.note_session_count();
+                }
                 if let Some(h) = self.running.get(&session_id) {
                     h.stop.store(true, Ordering::Relaxed);
                     info!("session {session_id} stop requested (reason={reason})");
@@ -2622,6 +4010,11 @@ impl SessionManager {
                 session_id,
                 app,
             } => {
+                if self.home_cleanup.as_ref().is_some_and(|ledger| {
+                    ledger.state(&session_id).is_some() || !ledger.has_record(&session_id)
+                }) {
+                    return Some(ack(id, false, Some("session id is not active".to_string())));
+                }
                 // A rejected swap is a no-op: ack{ok:false} and the session keeps its
                 // previous app. Unlike assign/start, a rejected swap never fails the
                 // session (agent-api.md).
@@ -2865,9 +4258,11 @@ impl SessionManager {
             }
             ControlMsg::ConfigUpdate {
                 settings,
+                settings_delivery_id,
                 console_config,
                 source_policies,
             } => {
+                let mut feature_error = None;
                 if let (Some(policy), Some(snapshot)) =
                     (&self.source_policy, source_policies.as_ref())
                 {
@@ -2880,10 +4275,52 @@ impl SessionManager {
                 // A console-only PATCH sends settings as JSON null; that must NOT
                 // rebaseline and silently undo a persisted encoder override.
                 if !settings.is_null() {
-                    let mut next = crate::session::settings::RuntimeSettings::baseline();
-                    next.apply_json(&settings);
-                    seed_nvidia_lib32(&mut next, &self.nvidia_lib32_probed);
-                    self.runtime_settings = next;
+                    if let Some(policy) = self.policy_agent.as_mut() {
+                        let result = policy.apply_legacy_overlay(
+                            &self.deployment_baseline,
+                            &mut self.runtime_settings,
+                            &settings,
+                            settings_delivery_id.as_deref(),
+                        );
+                        match result {
+                            Ok(conflict) => {
+                                self.policy_delivery_ack = settings_delivery_id;
+                                self.policy_session_ready = match &self.policy_accepted_groups {
+                                    Some(groups) => {
+                                        self.policy_inventory_complete
+                                            && policy.sticky_groups_accepted(groups)
+                                            && (!groups.is_empty() || !policy.has_seed())
+                                            && !policy.has_uncertain_restart()
+                                    }
+                                    None => {
+                                        !policy.has_sticky_ownership()
+                                            && !policy.has_uncertain_restart()
+                                    }
+                                };
+                                if let Some(group) = conflict {
+                                    feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
+                                        code: "attempt_conflict".into(),
+                                        group: Some(group),
+                                        connection_incarnation: policy
+                                            .connection_incarnation()
+                                            .into(),
+                                    });
+                                }
+                            }
+                            Err(code) => {
+                                self.policy_session_ready = false;
+                                feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
+                                    code,
+                                    group: None,
+                                    connection_incarnation: policy.connection_incarnation().into(),
+                                });
+                            }
+                        }
+                    } else {
+                        let mut next = self.deployment_baseline.clone();
+                        next.apply_json(&settings);
+                        self.runtime_settings = next;
+                    }
                     if let Some(policy) = &self.source_policy {
                         policy.update_root(&self.runtime_settings.home_root);
                     }
@@ -2907,6 +4344,10 @@ impl SessionManager {
                     // on the 2 s hotplug poll, and nothing consumes a reading unless
                     // console mode is on — latch it so `ddc` can short-circuit.
                     crate::ddc::set_console_enabled(cc.enabled);
+                    crate::session::console_audio::set_configured_output(
+                        cc.audio_output.as_deref(),
+                    );
+                    self.console_access.request(cc.enabled);
                     // The control plane's capacity-report diff is the primary stop path
                     // for a local-only session, but its tracker is in-memory and lost on
                     // a control-plane restart. Stopping them here too means such a
@@ -2921,8 +4362,99 @@ impl SessionManager {
                     }
                     self.console_config = Some(cc);
                 }
-                None // fire-and-forget, no ack
+                feature_error // no ordinary config_update ack
             }
+            ControlMsg::ConfigPolicyOffer {
+                attempt_id,
+                host_id,
+                boot_incarnation,
+                connection_incarnation,
+                group,
+                revision,
+                content_sha256,
+                scope,
+                expires_at,
+                prerequisites_sha256,
+                prerequisites,
+                settings,
+                resolved_settings,
+            } => {
+                let offer = crate::policy::Offer {
+                    attempt_id,
+                    host_id,
+                    boot_incarnation,
+                    connection_incarnation,
+                    group,
+                    revision,
+                    content_sha256,
+                    scope,
+                    expires_at,
+                    prerequisites_sha256,
+                    prerequisites,
+                    settings,
+                    resolved_settings,
+                };
+                let restart_idle = self.restart_idle();
+                let readiness = self.readiness.merged();
+                let hardware = crate::policy::HardwareEvidence {
+                    gpus: &self.gpu_inventory,
+                    readiness: &readiness,
+                };
+                let reply = self.policy_agent.as_mut().map(|policy| {
+                    if offer.scope == "restart" {
+                        policy.accept_restart(
+                            offer,
+                            &self.runtime_settings,
+                            restart_idle,
+                            Some(hardware),
+                        )
+                    } else {
+                        policy.accept(offer, &mut self.runtime_settings)
+                    }
+                });
+                if matches!(&reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
+                {
+                    // The same launch boundary as the legacy map path: new homes
+                    // seed from the new root's templates, and a probe input
+                    // (`zerocopy`) withdraws its evidence until re-probed.
+                    if let Some(policy) = &self.source_policy {
+                        policy.update_root(&self.runtime_settings.home_root);
+                    }
+                    self.notify_probe_inputs_if_changed();
+                }
+                reply
+            }
+            ControlMsg::ConfigPolicyJournalInventoryRequest {
+                inventory_id,
+                boot_incarnation,
+                connection_incarnation,
+                cursor,
+            } => self.policy_agent.as_mut().map(|policy| {
+                match policy.inventory_page(
+                    &inventory_id,
+                    &boot_incarnation,
+                    &connection_incarnation,
+                    cursor.as_deref(),
+                ) {
+                    Ok(page) => {
+                        if matches!(
+                            &page,
+                            AgentMsg::ConfigPolicyJournalInventoryPage {
+                                next_cursor: None,
+                                ..
+                            }
+                        ) {
+                            self.policy_inventory_complete = true;
+                        }
+                        page
+                    }
+                    Err(code) => AgentMsg::ConfigPolicyFeatureError {
+                        code,
+                        group: None,
+                        connection_incarnation,
+                    },
+                }
+            }),
             // `restart` is intercepted in the receive loop (so the ack flushes
             // before the process exits); it never reaches here in practice.
             ControlMsg::Restart { .. } => None,
@@ -2939,6 +4471,40 @@ impl SessionManager {
             ControlMsg::ImageRemove { id, image_id } => {
                 Some(self.image_mgr.handle_remove(id, image_id))
             }
+            ControlMsg::ImageInventoryReconcile { id, identities } => {
+                self.image_mgr.handle_inventory_reconcile(id, identities)
+            }
+            ControlMsg::ImageCleanup {
+                id,
+                attempt_id,
+                image_id,
+                version,
+                image_ref,
+                runtime_image_id,
+                expected_generation,
+            } => self.image_mgr.handle_cleanup(
+                id,
+                crate::images::cleanup_attempt(
+                    attempt_id,
+                    image_id,
+                    version,
+                    image_ref,
+                    runtime_image_id,
+                    expected_generation,
+                ),
+            ),
+            ControlMsg::ImageCleanupJournalRequest { id, attempt_ids } => Some(
+                self.image_mgr
+                    .handle_cleanup_journal_request(id, attempt_ids),
+            ),
+            ControlMsg::ImageCleanupStateAck {
+                id,
+                attempt_id,
+                generation,
+            } => Some(
+                self.image_mgr
+                    .handle_cleanup_state_ack(id, attempt_id, generation),
+            ),
             // Same shape as ImageEnsure: acks immediately, then downloads the context
             // and runs `docker build` on its own thread.
             ControlMsg::ImageBuild {
@@ -2972,6 +4538,9 @@ impl SessionManager {
                 self.release_mgr
                     .handle_apply(id, request_id, release, components, force),
             ),
+            ControlMsg::HostRemove { id, request_id } => {
+                Some(crate::host_remove::handle(id, &request_id))
+            }
             ControlMsg::Registered { .. } => {
                 warn!(
                     token = "duplicate-registered",
@@ -3006,6 +4575,10 @@ impl SessionManager {
                 h.finished_seen_at = None;
                 continue;
             }
+            if self.home_cleanup.is_some() && h.pending_home_terminal.is_some() {
+                abandoned.push(sid.clone());
+                continue;
+            }
             match h.finished_seen_at {
                 None => h.finished_seen_at = Some(now),
                 Some(seen) => {
@@ -3017,6 +4590,21 @@ impl SessionManager {
         }
         let mut out = Vec::with_capacity(abandoned.len());
         for sid in abandoned {
+            if self.home_cleanup.is_some() {
+                let event = self
+                    .running
+                    .get_mut(&sid)
+                    .and_then(|h| h.pending_home_terminal.take())
+                    .unwrap_or_else(|| {
+                        SessionEvent::Failed(
+                            "runner thread ended without reporting a terminal state".to_string(),
+                        )
+                    });
+                if let Some(message) = self.prove_home_terminal(&sid, event) {
+                    out.push(message);
+                }
+                continue;
+            }
             error!(
                 token = "session-runner-no-terminal-event",
                 "session {sid}: runner thread ended without a terminal event \
@@ -3035,6 +4623,7 @@ impl SessionManager {
                 error: Some("runner thread ended without reporting a terminal state".to_string()),
                 reason_code: None,
                 app_log_tail: None,
+                home_seed: None,
             });
         }
         self.health.set_sessions(self.running.len());
@@ -3046,13 +4635,30 @@ impl SessionManager {
             .filter(|(_, p)| now.duration_since(p.assigned_at) >= pending_ttl)
             .map(|(sid, _)| sid.clone())
             .collect();
-        for sid in stale {
-            warn!(
-                token = "session-assign-never-started",
-                "session {sid}: assignment never started within {pending_ttl:?}; \
-                 dropping the orphaned pending config"
-            );
-            self.pending.remove(&sid);
+        if !stale.is_empty() {
+            for sid in &stale {
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    if ledger
+                        .retire(sid, crate::home_cleanup::TerminalKind::Failed)
+                        .is_err()
+                    {
+                        warn!(token = "home-pending-retirement-unavailable",
+                            "stale assignment retirement could not be persisted; terminal proof withheld");
+                        continue;
+                    }
+                    out.push(qualified_home_terminal(
+                        sid,
+                        crate::home_cleanup::TerminalKind::Failed,
+                    ));
+                }
+                warn!(
+                    token = "session-assign-never-started",
+                    "session {sid}: assignment never started within {pending_ttl:?}; \
+                     dropping the orphaned pending config"
+                );
+                self.pending.remove(sid);
+            }
+            self.note_session_count();
         }
         out
     }
@@ -3069,6 +4675,66 @@ impl SessionManager {
             // heap, otherwise the memory is genuinely still reachable.
             crate::memstat::on_session_teardown(session_id);
         }
+    }
+
+    /// A cleanup-capable terminal waits for its runner to finish, then uses
+    /// the runtime's durable operation journals to stop/remove every source
+    /// generation and verify absence. On any uncertainty the terminal stays
+    /// pending and home refs remain live for a later retry.
+    fn prove_home_terminal(&mut self, session_id: &str, event: SessionEvent) -> Option<AgentMsg> {
+        if self.home_cleanup.is_none() {
+            return Some(self.on_event(session_id, event));
+        }
+        let handle = self.running.get_mut(session_id)?;
+        if !handle
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            handle.pending_home_terminal = Some(event);
+            return None;
+        }
+        let cleaned = self.home_source_retire.as_ref().map_or_else(
+            || {
+                crate::runtime::configured()
+                    .and_then(|runtime| runtime.retire_session_applications(session_id).wait())
+                    .is_ok()
+            },
+            |retire| retire(session_id),
+        );
+        if !cleaned {
+            handle.pending_home_terminal = Some(event);
+            warn!(
+                token = "home-terminal-cleanup-unverified",
+                "session source cleanup could not be verified; terminal proof withheld"
+            );
+            return None;
+        }
+        let terminal = match &event {
+            SessionEvent::Stopped { .. } => crate::home_cleanup::TerminalKind::Stopped,
+            SessionEvent::Failed(_) | SessionEvent::AppFailed { .. } => {
+                crate::home_cleanup::TerminalKind::Failed
+            }
+            _ => return None,
+        };
+        if self
+            .home_cleanup
+            .as_mut()
+            .unwrap()
+            .retire(session_id, terminal)
+            .is_err()
+        {
+            handle.pending_home_terminal = Some(event);
+            warn!(
+                token = "home-terminal-retirement-unavailable",
+                "session identity retirement could not be persisted; terminal proof withheld"
+            );
+            return None;
+        }
+        if let Some(thread) = handle.thread.take() {
+            let _ = thread.join();
+        }
+        Some(self.on_event(session_id, event))
     }
 
     /// Map a runner lifecycle event onto a session_state message.
@@ -3091,16 +4757,29 @@ impl SessionManager {
                 // Omitted entirely when empty: an empty array renders as an empty
                 // log panel that reads as a broken feature rather than a silent app.
                 app_log_tail: (!app_log_tail.is_empty()).then(|| app_log_tail.join("\n")),
+                home_seed: None,
             };
         }
+        let home_seed = if let SessionEvent::HomeSeed(outcome) = &event {
+            Some(*outcome)
+        } else {
+            None
+        };
         let (state, detail, error) = match event {
             SessionEvent::Starting => ("starting", Some("building pipeline".to_string()), None),
+            SessionEvent::HomeSeed(_) => ("starting", None, None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
-            SessionEvent::Running => (
-                "running",
-                Some("pipeline live; offer ready".to_string()),
-                None,
-            ),
+            SessionEvent::Running => {
+                if let Some(handle) = self.running.get_mut(session_id) {
+                    handle.reached_running = true;
+                }
+                self.note_session_count();
+                (
+                    "running",
+                    Some("pipeline live; offer ready".to_string()),
+                    None,
+                )
+            }
             SessionEvent::Stopping => ("stopping", Some("tearing down".to_string()), None),
             // A clean stop never carries an `error_message`. `detail` carries a reason
             // on a peer disconnect, recorded as `state_detail`, so operators see why it
@@ -3144,6 +4823,7 @@ impl SessionManager {
             error,
             reason_code: None,
             app_log_tail: None,
+            home_seed,
         }
     }
 }
@@ -3154,6 +4834,30 @@ impl SessionManager {
 // ended every stream on the host (#128). The manager now outlives a connection,
 // and `run()` decides when to give up: sessions are held for a bounded grace
 // window and stopped only if the control plane does not come back within it.
+
+/// `RuntimeSettings::effective_map()` keys that select the media path a host probe
+/// exercises. Anything containing `vulkan` or `cuda` is included too (the Vulkan
+/// per-codec knobs are process env, not in this map, so today that adds only
+/// `cuda_device`; a future settings key needs no change here).
+const PROBE_SETTINGS_KEYS: &[&str] = &["encoder", "render_node", "zerocopy"];
+
+/// The media-relevant settings, as one comparable string (`host_probe::decision`'s
+/// `ProbeInputs::settings`): an unrelated setting (e.g. `home_root`) must not cause a
+/// probe re-run.
+fn probe_relevant_settings(map: &std::collections::BTreeMap<String, String>) -> String {
+    map.iter()
+        .filter(|(k, _)| {
+            PROBE_SETTINGS_KEYS.contains(&k.as_str()) || k.contains("vulkan") || k.contains("cuda")
+        })
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// What decides whether a host probe's earlier result still applies.
+fn probe_inputs(mgr: &SessionManager) -> crate::host_probe::decision::ProbeInputs {
+    mgr.codec_stack().probe_inputs()
+}
 
 /// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
 /// no image is set (a bare/compositor-only session).
@@ -3176,6 +4880,7 @@ fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option
         on_app_exit: app.on_app_exit,
         network: app.network,
         systempaths_unconfined: app.systempaths_unconfined,
+        require_local_image: false,
     }))
 }
 
@@ -3203,6 +4908,204 @@ fn stream_to_params(s: StreamSpec) -> anyhow::Result<StreamParams> {
 
 fn ack(id: String, ok: bool, error: Option<String>) -> AgentMsg {
     AgentMsg::Ack { id, ok, error }
+}
+
+/// `session_state.error` for a session the previous agent process was still running when it
+/// ended. No `reason_code` fits (agent-api.md defines only `app_exited_early`), so the prose
+/// field carries it: an agent update ends that host's sessions (#352 decision 9).
+const RECOVERED_SESSION_ERROR: &str = "the node agent restarted while this session was running \
+     (the agent was updated, replaced or stopped), so the session ended";
+
+/// The terminal report for a session found live in the previous agent process's ledger.
+fn recovered_terminal(session_id: &str) -> AgentMsg {
+    let mut msg = qualified_home_terminal(session_id, crate::home_cleanup::TerminalKind::Failed);
+    if let AgentMsg::SessionState { error, .. } = &mut msg {
+        *error = Some(RECOVERED_SESSION_ERROR.to_string());
+    }
+    msg
+}
+
+fn qualified_home_terminal(
+    session_id: &str,
+    terminal: crate::home_cleanup::TerminalKind,
+) -> AgentMsg {
+    AgentMsg::SessionState {
+        session_id: session_id.to_owned(),
+        state: terminal.as_str().to_owned(),
+        detail: None,
+        error: None,
+        reason_code: None,
+        app_log_tail: None,
+        home_seed: None,
+    }
+}
+
+/// Run startup work which is only safe after API-owned applications have retired.
+/// A failed retirement blocks this process before it can sweep legacy containers or
+/// register with the control plane, so a supervisor retries without releasing a home.
+pub(crate) fn post_application_retirement<F, G>(
+    applications_retired: bool,
+    retire_audio: F,
+    sweep_legacy: G,
+) -> Option<usize>
+where
+    F: FnOnce(),
+    G: FnOnce() -> usize,
+{
+    if !applications_retired {
+        return None;
+    }
+    retire_audio();
+    Some(sweep_legacy())
+}
+
+/// The boot-only legacy sweep: remove this agent's own pre-API `quasar-sess-*`
+/// siblings through the runtime API, and report how many were removed. Foreign,
+/// unlabelled and API-owned containers are preserved and only counted — they are
+/// somebody else's to reap. A listing failure is logged and the boot continues,
+/// exactly as the CLI sweep's `ps` failure did: a legacy container left behind is
+/// retried next boot, while refusing to start would strand the host.
+pub(crate) fn legacy_container_sweep(api: &crate::runtime::RuntimeClient) -> usize {
+    match api
+        .retire_legacy_containers(vec![
+            crate::session::container::SESSION_NAME_PREFIX.to_owned()
+        ])
+        .wait()
+    {
+        Ok(outcome) => {
+            if outcome.preserved > 0 || outcome.unresolved > 0 {
+                info!(
+                    token = "legacy-container-sweep-summary",
+                    removed = outcome.removed,
+                    preserved = outcome.preserved,
+                    unresolved = outcome.unresolved,
+                    "startup legacy sweep finished; preserved containers this agent cannot \
+                     prove it owns were left for operator review"
+                );
+            }
+            outcome.removed
+        }
+        Err(error) => {
+            warn!(
+                token = "legacy-container-list-failed",
+                %error,
+                "the startup legacy container listing failed; pre-API containers from an \
+                 older agent may remain and will be retried on the next boot"
+            );
+            0
+        }
+    }
+}
+
+/// Aborts the process-lifetime application cleanup maintenance task on orderly shutdown.
+struct ApplicationCleanupGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ApplicationCleanupGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One maintenance pass over every durable journal an interrupted teardown can leave
+/// behind: the caller's pending map, then the application, audio and diagnostic
+/// journals. Caller obligations run first because runtime recovery correctly skips
+/// `Running` records; a caller-map error never starves durable journal cleanup.
+///
+/// Each journal is recovered INDEPENDENTLY and its failure is aggregated, never
+/// propagated early: a wedged application record must not leave an audio sidecar
+/// running until the next agent restart, which is exactly the shape of the defect
+/// this pass exists to close. `audio` is the ROUTINE variant, which never stops a
+/// live sidecar — `runtime::helper_tests::ordinary_audio_recovery_preserves_live_work_but_boot_retirement_stops_it`.
+fn application_cleanup_maintenance_tick<F, G, H, I>(
+    pending: F,
+    journal: G,
+    audio: H,
+    diagnostics: I,
+) -> Result<(), crate::runtime::RuntimeError>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+    G: FnOnce() -> Result<(), crate::runtime::RuntimeError>,
+    H: FnOnce() -> Result<(), crate::runtime::RuntimeError>,
+    I: FnOnce() -> Result<(), crate::runtime::RuntimeError>,
+{
+    if let Err(error) = pending() {
+        tracing::warn!(
+            token = "application-pending-map-unavailable",
+            "caller application pending map could not be scanned: {error}"
+        );
+    }
+    let mut failure = journal().err();
+    if let Err(error) = audio() {
+        tracing::warn!(
+            token = "runtime-audio-cleanup-maintenance-pending",
+            "audio sidecar cleanup maintenance remains pending: {error}"
+        );
+        failure = failure.or(Some(error));
+    }
+    if let Err(error) = diagnostics() {
+        tracing::warn!(
+            token = "runtime-diagnostic-cleanup-maintenance-pending",
+            "diagnostic helper cleanup maintenance remains pending: {error}"
+        );
+        failure = failure.or(Some(error));
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// Retry every durable cleanup obligation a teardown can leave unproven: application,
+/// audio-sidecar and diagnostic-helper journals. A live workload has no cleanup intent
+/// and is therefore invisible to this pass; boot retirement, not this, ends prior work.
+fn spawn_application_cleanup_recovery() -> ApplicationCleanupGuard {
+    let handle = tokio::spawn(async move {
+        // Startup already performed a bounded pass. Delay the first maintenance retry
+        // so it cannot immediately duplicate that boot work, then keep the steady cadence.
+        sleep(Duration::from_secs(30)).await;
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.tick().await; // discard interval's immediate tick
+        loop {
+            let outcome = tokio::task::spawn_blocking(|| {
+                application_cleanup_maintenance_tick(
+                    || {
+                        crate::session::container::recover_pending_application_operations(
+                            |operation| {
+                                crate::runtime::configured()
+                                    .and_then(|api| {
+                                        api.abandon_application(operation.to_owned()).wait()
+                                    })
+                                    .map_err(|error| anyhow::anyhow!(error))
+                            },
+                        )
+                    },
+                    || {
+                        crate::runtime::configured()
+                            .and_then(|api| api.recover_application_cleanup().wait())
+                    },
+                    || {
+                        crate::runtime::configured()
+                            .and_then(|api| api.recover_audio_sidecars().wait())
+                    },
+                    || {
+                        crate::runtime::configured()
+                            .and_then(|api| api.recover_diagnostics().wait())
+                    },
+                )
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    token = "runtime-application-cleanup-maintenance-pending",
+                    "application cleanup maintenance remains pending: {error}"
+                ),
+                Err(error) => warn!(
+                    token = "runtime-application-cleanup-maintenance-join",
+                    "application cleanup maintenance task failed: {error}"
+                ),
+            }
+            ticker.tick().await;
+        }
+    });
+    ApplicationCleanupGuard(handle)
 }
 
 /// Aborts the library-scan task when this connection ends: a stale scanner must never
@@ -3275,7 +5178,7 @@ fn enrollment_reachable(cfg: &Config) -> Result<(), String> {
         _ => Err(format!(
             "no persisted node_secret at {} and neither QUASAR_ENROLLMENT nor ENROLLMENT_TOKEN \
              is set: this agent can never register as-is. Paste the enrollment string from \
-             Admin -> Fleet -> Enroll host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
+             Admin -> Fleet -> Add host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
              docs/configuration.md#enrollment_token), then restart the container.",
             cfg.node_secret_path
         )),
@@ -3454,7 +5357,7 @@ fn stale_identity_message(node_secret_path: &str, kind: StaleIdentity) -> String
         StaleIdentity::Unresolvable => format!(
             "{cause}, and no enrollment token is configured — every reconnect will be refused the \
              same way. Clear the saved identity and enroll again: the command from \
-             Admin -> Fleet -> Enroll host does the clearing with QUASAR_RESET_IDENTITY=1, or \
+             Admin -> Fleet -> Add host does the clearing with QUASAR_RESET_IDENTITY=1, or \
              stop this agent and delete {node_secret_path} yourself (in a container install that \
              file is inside the agent's data volume, so removing that volume is the same thing)."
         ),
@@ -3676,31 +5579,64 @@ where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let cap = offload_probe(detect_capacity_blocking).await;
-    mgr.gpu_inventory.clone_from(&cap.gpus);
-    mgr.vram_targets = cap.vram_targets;
-    // Must ride every `vram_targets` reassignment — see `vram_cache`'s doc.
-    mgr.vram_cache.invalidate();
+    mgr.adopt_inventory(cap.gpus.clone(), cap.vram_targets);
+    // Some inventory changes are only seen here (the 15 s refresh): without this their
+    // stale checks are never forgotten and the new GPU is never probed (#301).
+    mgr.notify_probe_inputs_if_changed();
     // A warm-up holds an encode slot for its duration. Applied to the REPORTED copy
     // only: `mgr.gpu_inventory` keeps the true inventory, so an assignment is still
     // validated against the hardware that exists.
     let mut cap_gpus = cap.gpus;
     crate::session::warmup::apply_encode_slot_reservation(&mut cap_gpus, mgr.warmup_reserved());
+    let gpu_sets = mgr.gpu_codec_sets();
+    apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
     let msg = AgentMsg::Capacity {
         source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
+        deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+        config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+        config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
         host: cap.host,
         gpus: cap_gpus,
         gpu_detection: cap.gpu_detection,
         gpu_detection_reason: cap.gpu_detection_reason,
         console_capabilities: Some(cap.console),
         effective_settings: Some(mgr.runtime_settings.effective_map()),
-        codecs: advertised_codecs(&mgr.host_codec_report),
+        codecs: Some(host_codecs_from_sets(&gpu_sets)),
         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
-        readiness: Some(mgr.readiness.clone()),
+        readiness: Some(mgr.readiness.merged()),
     };
     send(sink, &msg).await
 }
 
-async fn send<S>(sink: &mut S, msg: &AgentMsg) -> anyhow::Result<()>
+/// Send a `handle_control` reply with the capacity reports it needs.
+async fn send_control_reply<S>(
+    sink: &mut S,
+    mgr: &mut SessionManager,
+    reply: AgentMsg,
+) -> anyhow::Result<()>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let typed_applied =
+        matches!(&reply, AgentMsg::ConfigPolicyState { phase, .. } if phase == "applied");
+    // agent-api.md §RH05: the fresh baseline precedes a
+    // `deployment_baseline_changed` rejection on this ordered socket, so the
+    // control plane reads the rejection against current evidence.
+    if matches!(&reply, AgentMsg::ConfigPolicyState { error: Some(code), .. }
+        if code == "deployment_baseline_changed")
+    {
+        send_fresh_capacity(sink, mgr).await?;
+    }
+    send(sink, &reply).await?;
+    // A typed apply can withdraw probe-proven codecs (`zerocopy`); the control
+    // plane must not keep routing on the old set.
+    if typed_applied {
+        send_fresh_capacity(sink, mgr).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn send<S>(sink: &mut S, msg: &AgentMsg) -> anyhow::Result<()>
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
@@ -3709,7 +5645,7 @@ where
     Ok(())
 }
 
-async fn recv<S>(stream: &mut S) -> anyhow::Result<String>
+pub(crate) async fn recv<S>(stream: &mut S) -> anyhow::Result<String>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
@@ -3730,10 +5666,230 @@ where
     }
 }
 
+/// Validate the scheduled GPU against `inventory` and pin the session to it: render node,
+/// and the CUDA ordinal on the NVENC path. The media host probe binds through this same
+/// function (`host_probe::media`), so a probe exercises the binding a session gets.
+pub(crate) fn bind_gpu(
+    inventory: &[crate::messages::GpuCapacity],
+    gpu_index: i32,
+    cfg: &mut SessionConfig,
+) -> anyhow::Result<()> {
+    let gpu = inventory
+        .iter()
+        .find(|gpu| gpu.index == gpu_index)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+            "scheduled GPU index {gpu_index} is absent from the agent's latest capacity inventory"
+        )
+        })?;
+
+    if cfg.encoder == EncoderChoice::Openh264 {
+        return Ok(());
+    }
+
+    // `app.gpu=false` is not invalid: a benchmark app may feed a hardware
+    // compositor without needing GPU access itself, and the app contract has no
+    // separate "this workload requires a GPU" signal to validate against.
+
+    let reported = gpu.render_node.as_deref().ok_or_else(|| anyhow::anyhow!(
+        "scheduled GPU {gpu_index} ({} {}) has no reported render node; hardware encode cannot be pinned safely",
+        gpu.vendor, gpu.model
+    ))?;
+    if cfg.render_node == "software" {
+        anyhow::bail!(
+            "hardware encoder {:?} cannot run with render_node=software; configure the reported node {reported}",
+            cfg.encoder
+        );
+    }
+    // Accept either exact identity capacity carries: the stable by-path
+    // `render_node` or the in-container `device_path`. Never resolve the host's
+    // by-path symlink here — it is not necessarily mounted even when the
+    // corresponding renderD node is. An empty render_node (QUASAR_RENDER_NODE
+    // unset) is unpinned: adopt the scheduled GPU's node below, matching the
+    // scheduler's schedulableBindingSQL — the two resolvers must not diverge.
+    let resolved_reported = gpu.device_path.as_deref().unwrap_or(reported);
+    if !cfg.render_node.is_empty()
+        && cfg.render_node != reported
+        && cfg.render_node != resolved_reported
+    {
+        anyhow::bail!(
+            "configured render node {} does not match scheduled GPU {gpu_index} node {reported} (resolved {resolved_reported})",
+            cfg.render_node
+        );
+    }
+
+    match cfg.encoder {
+        EncoderChoice::Va if !matches!(gpu.vendor.as_str(), "amd" | "intel") => {
+            anyhow::bail!(
+                "VA encoder is incompatible with scheduled {} GPU {gpu_index}",
+                gpu.vendor
+            )
+        }
+        EncoderChoice::Nvenc if gpu.vendor != "nvidia" => {
+            anyhow::bail!(
+                "NVENC is incompatible with scheduled {} GPU {gpu_index}",
+                gpu.vendor
+            )
+        }
+        EncoderChoice::Nvenc => {
+            cfg.cuda_device_id = capacity::nvidia_cuda_index_for_render_node(reported)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "cannot map scheduled NVIDIA GPU {gpu_index} node {reported} to a CUDA device by PCI identity"
+                ))?;
+        }
+        // Vulkan is pinned by the compositor-created GstVulkanDevice —
+        // waylanddisplaysrc selects it from this render node and interpipe
+        // forwards the context query — so it needs no ordinal.
+        EncoderChoice::Vulkan => {}
+        _ => {}
+    }
+    cfg.render_node = resolved_reported.to_string();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::{AbrMode, EncoderChoice};
+
+    #[tokio::test]
+    async fn restart_readback_requires_open_device_and_fresh_passing_media_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("render-node");
+        std::fs::write(&device, b"device").unwrap();
+        let path = device.to_str().unwrap();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.apply_json(&serde_json::json!({"encoder":"va","render_node":path}));
+        let gpu = crate::messages::GpuCapacity {
+            index: 0,
+            vendor: "amd".into(),
+            model: "test".into(),
+            vram_mb_total: 1,
+            encode_slots_total: 1,
+            render_node: Some(path.into()),
+            device_path: Some(path.into()),
+            driver_identity: Some("driver:test".into()),
+            codecs: None,
+        };
+        let inventory = [gpu];
+        assert!(verify_boot_device_with(&settings, &inventory, |_| async { true }).await);
+        assert!(!verify_boot_device_with(&settings, &inventory, |_| async { false }).await);
+        std::fs::remove_file(device).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(
+            !verify_boot_device_with(&settings, &inventory, |_| {
+                called.set(true);
+                async { true }
+            })
+            .await
+        );
+        assert!(
+            !called.get(),
+            "an inaccessible device must not spawn a media child"
+        );
+    }
+
+    #[test]
+    fn failed_application_retirement_prevents_audio_and_legacy_sweep_before_admission() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            post_application_retirement(
+                false,
+                || calls.borrow_mut().push("audio"),
+                || {
+                    calls.borrow_mut().push("sweep");
+                    1
+                },
+            ),
+            None
+        );
+        assert!(calls.borrow().is_empty());
+        assert_eq!(
+            post_application_retirement(
+                true,
+                || calls.borrow_mut().push("audio"),
+                || {
+                    calls.borrow_mut().push("sweep");
+                    1
+                },
+            ),
+            Some(1)
+        );
+        assert_eq!(&*calls.borrow(), &["audio", "sweep"]);
+    }
+
+    #[test]
+    fn application_maintenance_runs_journal_recovery_after_a_pending_map_error() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        application_cleanup_maintenance_tick(
+            || {
+                calls.borrow_mut().push("pending");
+                anyhow::bail!("map poisoned")
+            },
+            || {
+                calls.borrow_mut().push("journal");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("audio");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("diagnostics");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &*calls.borrow(),
+            &["pending", "journal", "audio", "diagnostics"]
+        );
+    }
+
+    /// Every journal is its own obligation. An application record this agent cannot
+    /// finish must not leave a stopped-but-unremoved audio sidecar running until the
+    /// next restart — the live defect this pass closes — so one failure never skips
+    /// the journals after it, and the pass still reports that something is pending.
+    #[test]
+    fn a_failed_journal_never_starves_the_ones_after_it_and_the_tick_still_reports_it() {
+        for failing in ["journal", "audio", "diagnostics"] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let run = |name: &'static str| {
+                calls.borrow_mut().push(name);
+                if name == failing {
+                    Err(crate::runtime::RuntimeError::from(
+                        crate::runtime::ErrorKind::Unavailable,
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            let outcome = application_cleanup_maintenance_tick(
+                || {
+                    calls.borrow_mut().push("pending");
+                    anyhow::bail!("map poisoned")
+                },
+                || run("journal"),
+                || run("audio"),
+                || run("diagnostics"),
+            );
+            assert_eq!(
+                &*calls.borrow(),
+                &["pending", "journal", "audio", "diagnostics"],
+                "{failing} failing must not skip the journals after it"
+            );
+            assert_eq!(
+                outcome.unwrap_err().kind,
+                crate::runtime::ErrorKind::Unavailable,
+                "a pass with an unfinished obligation is not a clean pass"
+            );
+        }
+        // All clean is still clean.
+        assert!(
+            application_cleanup_maintenance_tick(|| Ok(()), || Ok(()), || Ok(()), || Ok(()))
+                .is_ok()
+        );
+    }
 
     /// A `Config` on a scratch `node_secret_path`, so these tests never touch a real
     /// `/tmp/quasar-*-secret` left by another test or a live agent.
@@ -3747,6 +5903,139 @@ mod tests {
             pin_source: None,
             webpki_from_blob: false,
             startup_warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn journal_diagnostics_register_without_policy_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let normal = register_message(
+            &cfg,
+            false,
+            Vec::new(),
+            &crate::buildinfo::InstallFacts::default(),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        let normal = serde_json::to_value(normal).unwrap();
+        for station in [
+            crate::diagnostic::Station::policy_journal_corrupt(),
+            crate::diagnostic::Station::policy_journal_write_failed(),
+        ] {
+            let diagnostic = register_message(
+                &cfg,
+                false,
+                Vec::new(),
+                &crate::buildinfo::InstallFacts::default(),
+                false,
+                station.phase().policy_available(),
+                None,
+            )
+            .unwrap();
+            let diagnostic = serde_json::to_value(diagnostic).unwrap();
+            assert!(diagnostic.get("config_policy_versions").is_none());
+            assert!(diagnostic.get("config_policy_groups").is_none());
+        }
+        assert!(normal.get("config_policy_versions").is_some());
+        assert!(normal.get("config_policy_groups").is_some());
+    }
+
+    /// Amendment 17 (#396): any install reports the engine it runs on; a host whose engine
+    /// could not be inspected sends none of the three, which the control plane stores as
+    /// unknown.
+    #[test]
+    fn register_carries_the_engine_facts_when_known_and_omits_them_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let register = |install: &crate::buildinfo::InstallFacts| {
+            serde_json::to_value(
+                register_message(&cfg, false, Vec::new(), install, true, true, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let known = crate::buildinfo::InstallFacts {
+            engine: crate::buildinfo::EngineIdentity {
+                engine: Some("podman".into()),
+                engine_version: Some("5.8.4".into()),
+                engine_mode: Some("rootless".into()),
+            },
+            ..Default::default()
+        };
+        let json = register(&known);
+        assert_eq!(json["engine"], "podman");
+        assert_eq!(json["engine_version"], "5.8.4");
+        assert_eq!(json["engine_mode"], "rootless");
+        let json = register(&crate::buildinfo::InstallFacts::default());
+        for key in ["engine", "engine_version", "engine_mode"] {
+            assert!(json.get(key).is_none(), "{key} sent while unknown");
+        }
+    }
+
+    /// Amendment 14: an owned install registers `install_mode: "owned"` with its recovery
+    /// actor's identity; every other install registers exactly as before, without the
+    /// three owned-only fields even if discovery somehow carried them.
+    #[test]
+    fn only_an_owned_install_registers_the_recovery_actor_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let register = |install: &crate::buildinfo::InstallFacts| {
+            serde_json::to_value(
+                register_message(&cfg, false, Vec::new(), install, true, true, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let owned_only = [
+            "recovery_actor_version",
+            "recovery_actor_source_commit",
+            "seed_version",
+        ];
+
+        let owned = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Owned),
+            updater_present: Some(true),
+            recovery_actor_version: Some("0.4.0".into()),
+            recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            seed_version: None,
+            engine: Default::default(),
+        });
+        assert_eq!(owned["install_mode"], "owned");
+        assert_eq!(owned["updater_present"], true);
+        assert_eq!(owned["recovery_actor_version"], "0.4.0");
+        assert_eq!(
+            owned["recovery_actor_source_commit"],
+            "cccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert!(
+            owned.get("seed_version").is_none(),
+            "absent, not null: {owned}"
+        );
+
+        let compose = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Registry),
+            updater_present: Some(true),
+            recovery_actor_version: Some("0.4.0".into()),
+            recovery_actor_source_commit: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            seed_version: Some("0.4.0".into()),
+            engine: Default::default(),
+        });
+        assert_eq!(compose["install_mode"], "registry");
+        let unknown = register(&crate::buildinfo::InstallFacts::default());
+        assert!(unknown.get("install_mode").is_none());
+        for key in owned_only {
+            assert!(
+                compose.get(key).is_none(),
+                "{key} beside a registry install"
+            );
+            assert!(
+                unknown.get(key).is_none(),
+                "{key} beside an unknown install"
+            );
         }
     }
 
@@ -3775,6 +6064,9 @@ mod tests {
             status: status.to_string(),
             summary: format!("{id} is {status}"),
             remediation: format!("fix {id}"),
+            observed_at: None,
+            source: None,
+            blocks: None,
         }
     }
 
@@ -4182,7 +6474,7 @@ mod tests {
         assert_offloadable(capacity::detect);
         assert_offloadable(crate::capacity::prewarm_nvidia_smi_rows);
 
-        let settings = crate::session::settings::RuntimeSettings::baseline();
+        let settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         assert_offloadable(move || probe_host_codecs(&settings));
 
         let lib32 = String::new();
@@ -4201,6 +6493,76 @@ mod tests {
     #[should_panic(expected = "probe exploded")]
     async fn offload_probe_repropagates_a_panic() {
         let _: () = offload_probe(|| panic!("probe exploded")).await;
+    }
+
+    fn refresh_check(id: &str) -> crate::messages::ReadinessCheck {
+        crate::messages::ReadinessCheck {
+            id: id.into(),
+            status: crate::readiness::PASS.into(),
+            summary: String::new(),
+            remediation: String::new(),
+            observed_at: None,
+            source: None,
+            blocks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_readiness_refresh_inside_its_deadline_reports_its_checks() {
+        let (tx, mut rx) = mpsc::channel(1);
+        run_readiness_refresh(|| vec![refresh_check("uinput")], Duration::from_secs(5), tx).await;
+
+        assert_eq!(
+            rx.recv().await,
+            Some(ReadinessRefresh::Done(Ok(vec![refresh_check("uinput")])))
+        );
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_readiness_refresh_that_panics_is_a_refresh_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        run_readiness_refresh(|| panic!("probe exploded"), Duration::from_secs(5), tx).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(ReadinessRefresh::Done(Err(_)))
+        ));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    /// Overdue first, so the report gains its warning while the probe is still hung;
+    /// then exactly one `Done` when it ends, which is what frees the next refresh.
+    #[tokio::test]
+    async fn a_readiness_refresh_past_its_deadline_is_overdue_then_done() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn(run_readiness_refresh(
+            move || {
+                let _ = held.recv();
+                vec![refresh_check("uinput")]
+            },
+            Duration::from_millis(20),
+            tx,
+        ));
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert_eq!(first, Ok(Some(ReadinessRefresh::Overdue)));
+        // Nothing more while the probe is still running.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "the refresh must stay in flight until its probe ends"
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(
+            rx.recv().await,
+            Some(ReadinessRefresh::Done(Ok(vec![refresh_check("uinput")])))
+        );
+        task.await.unwrap();
+        assert_eq!(rx.recv().await, None);
     }
 
     #[test]
@@ -4674,11 +7036,12 @@ mod tests {
             render_node: render_node.map(str::to_string),
             device_path: render_node.map(crate::session::settings::canonicalize_render_node),
             driver_identity: None,
+            codecs: None,
         }
     }
 
     fn assignment_config(encoder: EncoderChoice, render_node: &str) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = encoder;
         settings.render_node = render_node.to_string();
         SessionConfig::for_assignment_with(
@@ -4729,10 +7092,10 @@ mod tests {
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
     /// touches neither disk nor a docker daemon.
-    /// A ReleaseManager pointed at paths that do not exist: `present()` is false,
-    /// so nothing in these tests can reach a socket.
+    /// A ReleaseManager with no recovery actor: `present()` is false, so nothing in
+    /// these tests can reach a socket.
     fn test_release_mgr() -> Arc<ReleaseManager> {
-        ReleaseManager::new("/nonexistent/updater.sock", "/nonexistent/results")
+        ReleaseManager::without_actor()
     }
 
     fn test_image_mgr() -> Arc<ImageManager> {
@@ -4888,6 +7251,7 @@ mod tests {
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let msg = ControlMsg::ConfigUpdate {
             source_policies: None,
+            settings_delivery_id: None,
             settings: serde_json::json!({ "gop": 120, "abr_enabled": true, "encoder": "va" }),
             console_config: None,
         };
@@ -4923,6 +7287,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": "va", "gop": 120 }),
                 console_config: None,
             },
@@ -4936,6 +7301,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "gop": 90 }),
                 console_config: None,
             },
@@ -4952,6 +7318,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -4982,6 +7349,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -5010,6 +7378,10 @@ mod tests {
              explicit clear, not 'nothing to say'"
         );
         let json = serde_json::to_value(AgentMsg::Capacity {
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+
             source_preparation: None,
             host: crate::messages::HostCapacity {
                 cpu_cores: 1,
@@ -5022,7 +7394,7 @@ mod tests {
             gpu_detection_reason: None,
             console_capabilities: None,
             effective_settings: None,
-            codecs: advertised_codecs(&measured_nothing),
+            codecs: Some(vec!["h264".to_string()]),
             codec_throughput: advertised_codec_throughput(&measured_nothing),
             readiness: None,
         })
@@ -5035,6 +7407,478 @@ mod tests {
 
         // A FAILED probe reports nothing at all, which is keep-if-absent.
         assert_eq!(advertised_codec_throughput(&None), None);
+    }
+
+    // ---- #301: only a codec proven on the current stack is advertised above H.264 ----
+
+    fn plan_all(_: EncoderChoice, _: &str) -> BTreeSet<Codec> {
+        BTreeSet::from([Codec::H264, Codec::H265, Codec::Av1])
+    }
+
+    fn plan_none(_: EncoderChoice, _: &str) -> BTreeSet<Codec> {
+        BTreeSet::new()
+    }
+
+    fn exclude_none(_: &crate::messages::GpuCapacity) -> BTreeSet<Codec> {
+        BTreeSet::new()
+    }
+
+    /// A GPU host whose flat host-level probe says all three codecs: the flat set must
+    /// never reach the wire on its own.
+    fn codec_mgr(
+        gpus: Vec<crate::messages::GpuCapacity>,
+        plan: fn(EncoderChoice, &str) -> BTreeSet<Codec>,
+    ) -> SessionManager {
+        let mut mgr = manager_with(gpus);
+        mgr.agent_image_identity = "sha256:agent".into();
+        mgr.codec_layers = CodecLayers {
+            plan,
+            excluded: exclude_none,
+        };
+        mgr.host_codec_report = Some(HostCodecReport {
+            codecs: vec!["h264".into(), "h265".into(), "av1".into()],
+            throughput: BTreeMap::new(),
+        });
+        mgr
+    }
+
+    /// A codec-probe pass as the orchestrator reports it, stamped with the stack `mgr`
+    /// has right now.
+    fn prove(mgr: &mut SessionManager, gpu: i32, codec: crate::host_probe::ProbeCodec) {
+        let evidence = probe_inputs(mgr).evidence_stamp(gpu);
+        crate::host_probe::orchestrator::apply(
+            &mut mgr.readiness,
+            &mut mgr.codec_evidence,
+            crate::host_probe::orchestrator::ReportUpdate::Record {
+                target: crate::host_probe::ProbeTarget::codec(gpu, codec),
+                outcome: crate::host_probe::outcome::ProbeOutcome::Pass {
+                    summary: "ok".into(),
+                },
+                observed_at: SystemTime::now(),
+                evidence,
+            },
+        );
+    }
+
+    fn wire(codecs: &[&str]) -> Option<Vec<String>> {
+        Some(codecs.iter().map(|c| c.to_string()).collect())
+    }
+
+    #[test]
+    fn a_codec_pass_is_advertised_only_on_the_stack_it_was_proven_on() {
+        use crate::host_probe::ProbeCodec;
+        let gpus = vec![
+            gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+            gpu(1, "nvidia", Some("/dev/dri/renderD129")),
+        ];
+        let mut mgr = codec_mgr(gpus, plan_all);
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264"]),
+            "nothing proven yet"
+        );
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264", "h265"]));
+
+        // Settings: an encoder flip, before the scheduler's `Forget` has landed.
+        let proven_on = mgr.runtime_settings.encoder;
+        mgr.runtime_settings.encoder = if proven_on == EncoderChoice::Nvenc {
+            EncoderChoice::Vulkan
+        } else {
+            EncoderChoice::Nvenc
+        };
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]), "encoder");
+        mgr.runtime_settings.encoder = proven_on;
+        mgr.runtime_settings.zerocopy = !mgr.runtime_settings.zerocopy;
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]), "zerocopy");
+        mgr.runtime_settings.zerocopy = !mgr.runtime_settings.zerocopy;
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264", "h265"]),
+            "same stack"
+        );
+
+        // Driver identity.
+        mgr.gpu_inventory[0].driver_identity = Some("nvidia:610.57.04".into());
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]), "driver");
+        mgr.gpu_inventory[0].driver_identity = None;
+
+        // GPU identity under the same index.
+        mgr.gpu_inventory[0].render_node = Some("/dev/dri/renderD130".into());
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]), "GPU identity");
+    }
+
+    #[test]
+    fn a_reused_gpu_index_does_not_inherit_the_vanished_gpus_pass() {
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![
+                gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+                gpu(1, "nvidia", Some("/dev/dri/renderD129")),
+            ],
+            plan_all,
+        );
+        prove(&mut mgr, 0, ProbeCodec::Av1);
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264", "av1"]));
+        // GPU 0 vanishes; the old GPU 1 re-enumerates as index 0.
+        mgr.gpu_inventory = vec![gpu(0, "nvidia", Some("/dev/dri/renderD129"))];
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]));
+    }
+
+    #[test]
+    fn a_gpu_host_without_a_per_gpu_plan_never_falls_back_to_the_flat_set() {
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(vec![gpu(0, "amd", Some("/dev/dri/renderD128"))], plan_none);
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264"]),
+            "a GPU with no plan still has the floor, and nothing above it"
+        );
+        // No GPU at all: H.264 only, whatever the flat probe says.
+        mgr.gpu_inventory.clear();
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]));
+    }
+
+    #[test]
+    fn gst_init_failure_on_a_gpu_host_sends_h264_not_an_absent_field() {
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        mgr.host_codec_report = None;
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]));
+        // Per-GPU consistency (#302 review): gst-init failure is "no codec knowledge
+        // beyond the floor", not "no knowledge at all" — a usable GPU still gets an
+        // explicit ["h264"], never an omitted field.
+        let mut gpus = vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))];
+        apply_gpu_codecs(&mut gpus, &mgr.gpu_codec_sets());
+        assert_eq!(gpus[0].codecs, Some(vec!["h264".to_string()]));
+    }
+
+    #[test]
+    fn a_pinned_out_gpu_and_an_excluded_codec_drop_out_of_the_union() {
+        use crate::host_probe::ProbeCodec;
+        let mut pinned_out = gpu(1, "amd", Some("/dev/dri/renderD129"));
+        pinned_out.encode_slots_total = 0;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128")), pinned_out],
+            plan_all,
+        );
+        mgr.codec_layers.excluded = |_| BTreeSet::from([Codec::Av1]);
+        prove(&mut mgr, 0, ProbeCodec::Av1);
+        prove(&mut mgr, 1, ProbeCodec::H265);
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264"]));
+        let mut pinned_out_again = gpu(1, "amd", Some("/dev/dri/renderD129"));
+        pinned_out_again.encode_slots_total = 0;
+        let mut gpus = vec![
+            gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+            pinned_out_again,
+        ];
+        apply_gpu_codecs(&mut gpus, &mgr.gpu_codec_sets());
+        assert_eq!(
+            gpus[1].codecs,
+            Some(Vec::<String>::new()),
+            "the pinned-out GPU reports [] on the wire, not an omitted field"
+        );
+    }
+
+    // ---- #302: capacity.gpus[].codecs, and the assign-time belt ----
+
+    /// `apply_gpu_codecs` and the host union it derives from must read the SAME
+    /// per-GPU sets: a usable GPU's wire field always carries h264, a zero-slot GPU
+    /// reports an explicit `[]` (never omits the field), and the union is exactly
+    /// what the per-GPU fields say.
+    #[test]
+    fn apply_gpu_codecs_stamps_each_gpu_including_an_empty_set_for_a_zero_slot_gpu() {
+        let mut gpus = vec![
+            gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+            gpu(1, "amd", Some("/dev/dri/renderD129")),
+        ];
+        gpus[1].encode_slots_total = 0;
+        let sets = vec![
+            (0, BTreeSet::from([Codec::H264, Codec::H265])),
+            (1, BTreeSet::new()),
+        ];
+        apply_gpu_codecs(&mut gpus, &sets);
+        assert_eq!(
+            gpus[0].codecs,
+            Some(vec!["h264".to_string(), "h265".to_string()])
+        );
+        assert_eq!(
+            gpus[1].codecs,
+            Some(Vec::<String>::new()),
+            "a zero-slot GPU reports an explicit empty codec set, never an omitted field"
+        );
+        assert_eq!(
+            host_codecs_from_sets(&sets),
+            vec!["h264".to_string(), "h265".to_string()],
+            "the host union is derived from the same per-GPU sets, not recomputed"
+        );
+    }
+
+    /// `SessionManager::gpu_codec_sets` is the single computation `advertised_codecs`
+    /// (the host union) and a capacity send's `apply_gpu_codecs` (the per-GPU field)
+    /// both read — proving a codec on one GPU must not appear on the other's set even
+    /// though it appears in the union.
+    #[test]
+    fn gpu_codec_sets_are_per_gpu_and_the_union_matches_advertised_codecs() {
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![
+                gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+                gpu(1, "nvidia", Some("/dev/dri/renderD129")),
+            ],
+            plan_all,
+        );
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        prove(&mut mgr, 1, ProbeCodec::Av1);
+        let sets = mgr.gpu_codec_sets();
+        let gpu0 = sets.iter().find(|(i, _)| *i == 0).unwrap();
+        let gpu1 = sets.iter().find(|(i, _)| *i == 1).unwrap();
+        assert_eq!(gpu0.1, BTreeSet::from([Codec::H264, Codec::H265]));
+        assert_eq!(gpu1.1, BTreeSet::from([Codec::H264, Codec::Av1]));
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264", "h265", "av1"]),
+            "the host union is the per-GPU sets' union"
+        );
+    }
+
+    fn session_assign_msg_codec(session_id: &str, gpu_index: i32, codec: &str) -> ControlMsg {
+        serde_json::from_value(serde_json::json!({
+            "type": "session_assign",
+            "id": "c1",
+            "session_id": session_id,
+            "gpu_index": gpu_index,
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline",
+                "codec": codec}
+        }))
+        .unwrap()
+    }
+
+    /// The belt: `session_assign` must refuse a codec the bound GPU has not (yet, or
+    /// ever) proven, even though nothing upstream of it caught the mistake.
+    #[test]
+    fn assign_refuses_a_codec_outside_the_bound_gpus_set() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        // Nothing proven yet: GPU 0's set is h264-only, even though the flat probe
+        // and the plan both claim h265/av1.
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(
+            session_assign_msg_codec("s1", 0, "h265"),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        match reply {
+            Some(AgentMsg::Ack {
+                ok: false, error, ..
+            }) => {
+                assert!(
+                    error.unwrap().contains("h265"),
+                    "the ack error should name the refused codec"
+                );
+            }
+            other => panic!("expected ack{{ok:false}}, got {other:?}"),
+        }
+    }
+
+    /// The refusal decision: codec, GPU and session in the log line, the ack error
+    /// naming the codec; a GPU absent from the sets proves nothing.
+    #[test]
+    fn assign_codec_refusal_refuses_a_codec_outside_the_gpus_set() {
+        let h264_only = vec![(0, BTreeSet::from([Codec::H264]))];
+        let refusal = assign_codec_refusal("s1", 0, Codec::H265, &h264_only)
+            .expect("h265 is outside GPU 0's h264-only set");
+        assert!(refusal.log.contains("session s1 "), "{refusal:?}");
+        assert!(refusal.log.contains("gpu=0 codec=h265"), "{refusal:?}");
+        assert_eq!(
+            refusal.ack_error,
+            "gpu 0 cannot encode h265: not in its current codec set"
+        );
+        assert!(assign_codec_refusal("s1", 7, Codec::Av1, &h264_only).is_some());
+    }
+
+    /// H.264 is the floor, and a codec in the GPU's set passes.
+    #[test]
+    fn assign_codec_refusal_passes_h264_and_codecs_in_the_set() {
+        let sets = vec![(0, BTreeSet::from([Codec::H264, Codec::H265]))];
+        assert_eq!(assign_codec_refusal("s1", 0, Codec::H264, &sets), None);
+        assert_eq!(assign_codec_refusal("s1", 9, Codec::H264, &[]), None);
+        assert_eq!(assign_codec_refusal("s1", 0, Codec::H265, &sets), None);
+    }
+
+    /// The handler takes the refusal path: its ack{ok:false} error is exactly the
+    /// decision's, so the refusal's `warn!` (token checked below) is what it logged.
+    #[test]
+    fn assign_refusal_ack_is_the_refusal_decisions() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        let expected = assign_codec_refusal("s1", 0, Codec::H265, &mgr.gpu_codec_sets())
+            .expect("GPU 0 has proven nothing yet");
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        match mgr.handle_control(
+            session_assign_msg_codec("s1", 0, "h265"),
+            &evt_tx,
+            &diagnostic_sender(),
+        ) {
+            Some(AgentMsg::Ack {
+                ok: false, error, ..
+            }) => assert_eq!(error, Some(expected.ack_error)),
+            other => panic!("expected ack{{ok:false}}, got {other:?}"),
+        }
+    }
+
+    /// An operator greps the refusal by token (`.claude/rules/agent-logging.md`). The
+    /// token must be a literal (`tests/log_convention.rs`), so this checks the one
+    /// `warn!` that logs the refusal in source rather than capturing `tracing` events,
+    /// whose process-global interest cache made a capture flake under parallel tests.
+    #[test]
+    fn assign_refusal_logs_the_codec_not_in_gpu_set_token() {
+        // Split literals so this test's own text never matches what it searches for.
+        let logged = concat!("refusal.", "log);");
+        let site = concat!(
+            "warn!(token = \"assign-codec-not-in-gpu-set\", \"{}\", ",
+            "refusal.",
+            "log);"
+        );
+        let source = include_str!("agent.rs");
+        assert_eq!(
+            source.matches(logged).count(),
+            1,
+            "exactly one site logs the refusal"
+        );
+        assert!(
+            source.contains(site),
+            "the refusal's warn! must be `{site}`"
+        );
+    }
+
+    /// A codec-probe pass on the bound GPU lifts the belt.
+    #[test]
+    fn assign_accepts_a_codec_once_the_bound_gpu_has_proven_it() {
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(
+            session_assign_msg_codec("s1", 0, "h265"),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: true, .. })),
+            "{reply:?}"
+        );
+    }
+
+    /// H.264 is exempt from the belt: it is the floor of every usable GPU's set by
+    /// construction, so a plan/probe gap must never refuse it.
+    #[test]
+    fn assign_never_refuses_h264_even_with_no_plan_and_nothing_proven() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_none,
+        );
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(session_assign_msg("s1", 0), &evt_tx, &diagnostic_sender());
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: true, .. })),
+            "{reply:?}"
+        );
+    }
+
+    /// #395: on an owned host, an agent created without console access refuses a console
+    /// launch (fail closed); a stream-only launch is unaffected.
+    #[test]
+    fn an_owned_agent_without_console_access_refuses_a_console_launch() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_none,
+        );
+        mgr.console_access = crate::release::console::ConsoleAccessManager::owned_for_test(
+            "/nonexistent/agent.sock",
+            false,
+        );
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(4);
+        for topology in ["local_only", "dual_output"] {
+            let msg = serde_json::json!({
+                "type": "session_assign", "id": "c1", "session_id": topology, "gpu_index": 0,
+                "stream": {"width": 1920, "height": 1080, "fps": 60,
+                    "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"},
+                "video_topology": topology
+            });
+            let reply = mgr.handle_control(
+                serde_json::from_value(msg).unwrap(),
+                &evt_tx,
+                &diagnostic_sender(),
+            );
+            match reply {
+                Some(AgentMsg::Ack {
+                    ok: false,
+                    error: Some(e),
+                    ..
+                }) => assert!(e.contains("without console access"), "{topology}: {e}"),
+                other => panic!("{topology}: expected a refusal, got {other:?}"),
+            }
+        }
+        let reply = mgr.handle_control(session_assign_msg("s1", 0), &evt_tx, &diagnostic_sender());
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: true, .. })),
+            "{reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_capacity_refresh_notifies_the_scheduler_of_an_inventory_change() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        mgr.notify_probe_inputs();
+        next_probe_event(&mut rx).await;
+
+        mgr.adopt_inventory(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            Vec::new(),
+        );
+        mgr.notify_probe_inputs_if_changed();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), rx.recv())
+                .await
+                .is_err(),
+            "an unchanged inventory is not re-notified"
+        );
+
+        mgr.adopt_inventory(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD129"))],
+            Vec::new(),
+        );
+        mgr.notify_probe_inputs_if_changed();
+        match next_probe_event(&mut rx).await {
+            Event::InputsObserved(inputs) => {
+                assert_eq!(
+                    inputs.gpus.get(&0).map(String::as_str),
+                    Some("/dev/dri/renderD129")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -5063,6 +7907,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -5075,6 +7920,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -5092,6 +7938,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -5107,6 +7954,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -5138,6 +7986,10 @@ mod tests {
                 video_topology: topology,
                 thread: None,
                 finished_seen_at: None,
+                gpu_index: 0,
+                codec: crate::session::Codec::H264,
+                reached_running: true,
+                pending_home_terminal: None,
             },
             stop,
         )
@@ -5185,6 +8037,10 @@ mod tests {
                 video_topology: crate::messages::VideoTopology::StreamOnly,
                 thread: None,
                 finished_seen_at: None,
+                gpu_index: 0,
+                codec: crate::session::Codec::H264,
+                reached_running: true,
+                pending_home_terminal: None,
             },
             display_rx,
         )
@@ -5533,6 +8389,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": true })).unwrap(),
@@ -5548,6 +8405,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": false })).unwrap(),
@@ -5574,6 +8432,9 @@ mod tests {
             test_release_mgr(),
         );
         mgr.runner = runner;
+        // SessionManager::new seeds these from the process env; pin them so tests stay hermetic.
+        mgr.runtime_settings.encoder = crate::session::EncoderChoice::Openh264;
+        mgr.runtime_settings.render_node = "software".to_string();
         (mgr, live_refs)
     }
 
@@ -5588,6 +8449,8 @@ mod tests {
             PendingAssignment {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 0,
             },
         );
         mgr.handle_control(
@@ -5636,6 +8499,214 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capable_terminal_waits_for_source_absence_and_preserves_home_refs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, live_refs) = manager_with_runner(Arc::new(|_, _, _, _, _, _, _, _, _, _| {}));
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        assert!(ledger.record_active("held").unwrap());
+        mgr.home_cleanup = Some(ledger);
+        let clean = Arc::new(AtomicBool::new(false));
+        let observed = clean.clone();
+        mgr.home_source_retire = Some(Arc::new(move |_| observed.load(Ordering::SeqCst)));
+        let (tx, _rx) = mpsc::channel(8);
+        start_seam_session(&mut mgr, "held", &tx);
+        wait_for_finished_thread(&mgr, "held");
+        mgr.running
+            .get_mut("held")
+            .unwrap()
+            .home_refs
+            .push("managed-home".into());
+        mgr.add_live_refs(&["managed-home".into()]);
+        assert!(mgr
+            .prove_home_terminal("held", SessionEvent::Failed("runner failed".into()))
+            .is_none());
+        assert!(mgr.running.contains_key("held"));
+        assert!(live_refs.lock().unwrap().contains("managed-home"));
+        assert_eq!(mgr.home_cleanup.as_ref().unwrap().state("held"), None);
+        clean.store(true, Ordering::SeqCst);
+        let reports = mgr.reconcile(Instant::now(), Duration::ZERO, Duration::from_secs(60));
+        assert!(
+            matches!(reports.as_slice(), [AgentMsg::SessionState { state, .. }] if state == "failed")
+        );
+        assert!(!mgr.running.contains_key("held"));
+        assert!(!live_refs.lock().unwrap().contains("managed-home"));
+        assert_eq!(
+            mgr.home_cleanup.as_ref().unwrap().state("held"),
+            Some(crate::home_cleanup::TerminalKind::Failed)
+        );
+    }
+
+    #[test]
+    fn repeated_stop_retires_a_lost_assign_before_terminal_and_blocks_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut mgr = manager_with(Vec::new());
+        mgr.home_cleanup = Some(
+            crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+                directory.path().join("ledger"),
+            )
+            .unwrap(),
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        for _ in 0..2 {
+            let ack = mgr.handle_control(
+                ControlMsg::SessionStop {
+                    id: "stop".into(),
+                    session_id: "lost-assign".into(),
+                    reason: "error".into(),
+                },
+                &tx,
+                &diagnostic_sender(),
+            );
+            assert!(matches!(ack, Some(AgentMsg::Ack { ok: true, .. })));
+            assert!(matches!(mgr.home_cleanup_reports.pop(),
+                Some(AgentMsg::SessionState { state, .. }) if state == "stopped"));
+            assert_eq!(
+                mgr.home_cleanup.as_ref().unwrap().state("lost-assign"),
+                Some(crate::home_cleanup::TerminalKind::Stopped)
+            );
+        }
+        let refused = mgr.handle_control(
+            session_assign_msg("lost-assign", 0),
+            &tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(refused, Some(AgentMsg::Ack { ok: false, .. })));
+    }
+
+    #[test]
+    fn verified_assignment_preparation_requires_a_local_image_at_launch() {
+        use std::io::{Read, Write};
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let engine = std::thread::spawn(move || {
+            for (path, body) in [
+                (
+                    "/version",
+                    r#"{"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"}"#,
+                ),
+                (
+                    "/v1.48/images/test/json",
+                    r#"{"Id":"sha256:fixture","Size":100}"#,
+                ),
+            ] {
+                let until = Instant::now() + Duration::from_secs(3);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < until =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(e) => panic!("image preparation did not inspect: {e}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&request).starts_with(&format!("GET {path} HTTP/1.1"))
+                );
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut runtime_config = crate::runtime::RuntimeConfig::unix(socket_path);
+        runtime_config.image_state_path = Some(directory.path().join("operations"));
+        let runtime = crate::runtime::RuntimeClient::new(runtime_config).unwrap();
+        let observed = Arc::new(AtomicBool::new(false));
+        let result = observed.clone();
+        let (mut mgr, _refs) =
+            manager_with_runner(Arc::new(move |_, cfg, _, _, _, _, _, _, _, _| {
+                result.store(cfg.container.unwrap().require_local_image, Ordering::SeqCst);
+            }));
+        let mut cfg = assignment_config(EncoderChoice::Openh264, "software");
+        cfg.container = Some(ContainerSpec {
+            image: "test".into(),
+            ..Default::default()
+        });
+        mgr.pending.insert(
+            "prepared".into(),
+            PendingAssignment {
+                cfg,
+                assigned_at: Instant::now(),
+                preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
+                gpu_index: 0,
+            },
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: "start".into(),
+                session_id: "prepared".into(),
+            },
+            &tx,
+            &diagnostic_sender(),
+        );
+        wait_for_finished_thread(&mgr, "prepared");
+        engine.join().unwrap();
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "prepared assignment could implicitly pull through CLI"
+        );
+    }
+
+    #[test]
+    fn image_preparation_failure_prevents_the_session_runner_from_launching() {
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let (mut mgr, _refs) =
+            manager_with_runner(Arc::new(move |_, _, _, _, _, _, _, _, _, _| {
+                observed.store(true, Ordering::SeqCst);
+            }));
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::runtime::RuntimeClient::new(crate::runtime::RuntimeConfig::unix(
+            directory.path().join("missing.sock"),
+        ))
+        .unwrap();
+        mgr.pending.insert(
+            "preparing".into(),
+            PendingAssignment {
+                cfg: assignment_config(EncoderChoice::Openh264, "software"),
+                assigned_at: Instant::now(),
+                preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
+                gpu_index: 0,
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: "start".into(),
+                session_id: "preparing".into(),
+            },
+            &tx,
+            &diagnostic_sender(),
+        );
+        let event = recv_event_within(&mut rx, Duration::from_secs(3));
+        wait_for_finished_thread(&mgr, "preparing");
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(
+            matches!(event,Some((_,SessionEvent::Failed(message))) if message.contains("image preparation failed"))
+        );
+    }
+
     /// #128: a new connection must not disturb the sessions the agent carried
     /// across the outage, and must drop the assignments it did not.
     #[test]
@@ -5659,6 +8730,8 @@ mod tests {
             PendingAssignment {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 0,
             },
         );
         assert_eq!(mgr.pending.len(), 1, "setup: one pending assignment");
@@ -5679,31 +8752,23 @@ mod tests {
     /// behaviour rather than meaning "no wait at all by accident".
     #[test]
     fn session_grace_reads_its_knob() {
-        let prev = std::env::var("QUASAR_SESSION_GRACE_SECS").ok();
-
-        std::env::remove_var("QUASAR_SESSION_GRACE_SECS");
         assert_eq!(
-            session_grace(),
+            session_grace_from(None),
             Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
         );
 
-        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "5");
-        assert_eq!(session_grace(), Duration::from_secs(5));
+        assert_eq!(session_grace_from(Some("5")), Duration::from_secs(5));
 
-        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "0");
-        assert!(session_grace().is_zero(), "0 must disable the hold");
+        assert!(
+            session_grace_from(Some("0")).is_zero(),
+            "0 must disable the hold"
+        );
 
         // Garbage falls back rather than disabling the hold silently.
-        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "not-a-number");
         assert_eq!(
-            session_grace(),
+            session_grace_from(Some("not-a-number")),
             Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QUASAR_SESSION_GRACE_SECS", v),
-            None => std::env::remove_var("QUASAR_SESSION_GRACE_SECS"),
-        }
     }
 
     /// A panicking runner must produce a terminal `Failed` carrying the panic payload.
@@ -5827,6 +8892,8 @@ mod tests {
             PendingAssignment {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 0,
             },
         );
         mgr.reconcile(Instant::now(), RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL);
@@ -5864,6 +8931,10 @@ mod tests {
                 video_topology: topology,
                 thread: None,
                 finished_seen_at: None,
+                gpu_index: 0,
+                codec: crate::session::Codec::H264,
+                reached_running: true,
+                pending_home_terminal: None,
             },
             capture_rx,
         )
@@ -6118,5 +9189,435 @@ mod tests {
             "the closed-channel arm resolved more than once — it is being \
              re-polled instead of staying disabled, i.e. it is spinning (#530)"
         );
+    }
+
+    fn session_assign_msg(session_id: &str, gpu_index: i32) -> ControlMsg {
+        serde_json::from_value(serde_json::json!({
+            "type": "session_assign",
+            "id": "c1",
+            "session_id": session_id,
+            "gpu_index": gpu_index,
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+        }))
+        .unwrap()
+    }
+
+    async fn next_probe_event(
+        rx: &mut mpsc::UnboundedReceiver<crate::host_probe::decision::Event>,
+    ) -> crate::host_probe::decision::Event {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no probe event")
+            .expect("probe handle's forwarding task ended")
+    }
+
+    #[tokio::test]
+    async fn a_session_assign_sends_launch_arrived_and_a_rejection_corrects_the_live_set() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+
+        // gpu_index 9 is absent from this manager's (empty) inventory, so
+        // `bind_assignment` rejects it — after `abort_any_warmup`/`launch_arrived`,
+        // which is the point: a probe must be told the GPU is wanted before the
+        // config below can possibly fail.
+        let reply = mgr.handle_control(
+            session_assign_msg("rejected", 9),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(reply, Some(AgentMsg::Ack { ok: false, .. })));
+
+        assert_eq!(
+            next_probe_event(&mut rx).await,
+            Event::LaunchArrived { gpu: 9 }
+        );
+        match next_probe_event(&mut rx).await {
+            Event::SessionsChanged { live_gpus, .. } => {
+                assert!(
+                    !live_gpus.contains(&9),
+                    "a rejected assign must not leave the GPU marked live: {live_gpus:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_assign_marks_its_gpu_live() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+        use crate::messages::GpuCapacity;
+
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        mgr.gpu_inventory = vec![GpuCapacity {
+            index: 0,
+            vendor: "software".into(),
+            model: "test".into(),
+            vram_mb_total: 0,
+            encode_slots_total: 0,
+            render_node: None,
+            device_path: None,
+            driver_identity: None,
+            codecs: None,
+        }];
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+
+        // openh264 (this manager's default) never needs a render node, so
+        // `bind_assignment` accepts GPU 0 with no further configuration.
+        let reply = mgr.handle_control(
+            session_assign_msg("accepted", 0),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(reply, Some(AgentMsg::Ack { ok: true, .. })));
+
+        assert_eq!(
+            next_probe_event(&mut rx).await,
+            Event::LaunchArrived { gpu: 0 }
+        );
+        match next_probe_event(&mut rx).await {
+            Event::SessionsChanged { live_gpus, .. } => {
+                assert!(live_gpus.contains(&0), "{live_gpus:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_inputs_lists_every_gpu_and_reacts_only_to_media_relevant_settings() {
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        mgr.gpu_inventory = vec![
+            crate::messages::GpuCapacity {
+                index: 0,
+                vendor: "amd".into(),
+                model: "test".into(),
+                vram_mb_total: 0,
+                encode_slots_total: 0,
+                render_node: Some("/dev/dri/renderD128".into()),
+                device_path: None,
+                driver_identity: Some("amd:1.2.3".into()),
+                codecs: None,
+            },
+            crate::messages::GpuCapacity {
+                index: 1,
+                vendor: "amd".into(),
+                model: "test2".into(),
+                vram_mb_total: 0,
+                encode_slots_total: 0,
+                render_node: Some("/dev/dri/renderD129".into()),
+                device_path: None,
+                driver_identity: Some("amd:1.2.3".into()),
+                codecs: None,
+            },
+        ];
+        mgr.agent_image_identity = "sha256:agent".into();
+        let inputs = probe_inputs(&mgr);
+        assert_eq!(inputs.agent_image, "sha256:agent");
+        assert_eq!(inputs.gpus.len(), 2);
+        assert!(
+            inputs.codecs.is_empty(),
+            "no registry (gst::init never succeeded), no codec probes"
+        );
+
+        // #301: codec-probe targets come from each GPU's OWN registry plan, not a
+        // host-wide set — GPU 0 and GPU 1 get different plans here to prove it.
+        mgr.host_codec_report = Some(HostCodecReport::default());
+        mgr.codec_layers = CodecLayers {
+            plan: |_, node| match node {
+                "/dev/dri/renderD128" => BTreeSet::from([Codec::H264, Codec::H265, Codec::Av1]),
+                "/dev/dri/renderD129" => BTreeSet::from([Codec::H264, Codec::H265]),
+                _ => BTreeSet::new(),
+            },
+            excluded: exclude_none,
+        };
+        let with_codecs = probe_inputs(&mgr);
+        assert_eq!(
+            with_codecs.codecs.get(&0),
+            Some(&std::collections::BTreeSet::from([
+                crate::host_probe::ProbeCodec::H265,
+                crate::host_probe::ProbeCodec::Av1,
+            ]))
+        );
+        assert_eq!(
+            with_codecs.codecs.get(&1),
+            Some(&std::collections::BTreeSet::from([
+                crate::host_probe::ProbeCodec::H265
+            ]))
+        );
+
+        // An h264-only plan has no above-floor target.
+        mgr.codec_layers.plan = |_, _| BTreeSet::from([Codec::H264]);
+        assert!(probe_inputs(&mgr).codecs.is_empty());
+        mgr.host_codec_report = None;
+        assert_eq!(
+            inputs.gpus.get(&0).map(String::as_str),
+            Some("/dev/dri/renderD128")
+        );
+        assert_eq!(
+            inputs.gpus.get(&1).map(String::as_str),
+            Some("/dev/dri/renderD129")
+        );
+
+        let baseline = probe_inputs(&mgr).settings;
+        mgr.runtime_settings.encoder = EncoderChoice::Vulkan;
+        let after_encoder_change = probe_inputs(&mgr).settings;
+        assert_ne!(
+            baseline, after_encoder_change,
+            "an encoder change must be visible to the probe scheduler"
+        );
+
+        mgr.runtime_settings.home_root = "/mnt/unrelated".into();
+        let after_unrelated_change = probe_inputs(&mgr).settings;
+        assert_eq!(
+            after_encoder_change, after_unrelated_change,
+            "home_root does not select the media path and must not trigger a re-probe"
+        );
+    }
+
+    #[test]
+    fn a_probe_handle_of_none_leaves_session_assign_behaviour_unchanged() {
+        // Every pre-existing test builds a `SessionManager` with no probe
+        // wiring, so this is really a proof that `note_session_count` and the two
+        // `launch_arrived` call sites are no-ops rather than panics with no handle.
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        assert!(mgr.probe_handle.is_none());
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(
+            session_assign_msg("no-probe", 9),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(reply, Some(AgentMsg::Ack { ok: false, .. })));
+    }
+
+    // ---- RH05 #336: a typed next-session apply reaches the next launch ----
+
+    fn typed_offer_msg(offer: crate::policy::Offer) -> ControlMsg {
+        ControlMsg::ConfigPolicyOffer {
+            attempt_id: offer.attempt_id,
+            host_id: offer.host_id,
+            boot_incarnation: offer.boot_incarnation,
+            connection_incarnation: offer.connection_incarnation,
+            group: offer.group,
+            revision: offer.revision,
+            content_sha256: offer.content_sha256,
+            scope: offer.scope,
+            expires_at: offer.expires_at,
+            prerequisites_sha256: offer.prerequisites_sha256,
+            prerequisites: offer.prerequisites,
+            settings: offer.settings,
+            resolved_settings: offer.resolved_settings,
+        }
+    }
+
+    /// Owns `group` on a durable temp journal and applies `value` to it through
+    /// `handle_control`, as the connection loop does.
+    fn apply_typed(
+        mgr: &mut SessionManager,
+        dir: &std::path::Path,
+        group: &str,
+        value: serde_json::Value,
+    ) -> Option<AgentMsg> {
+        use crate::policy::test_support::{explicit, owned_agent};
+        let agent = owned_agent(dir, &[group], &mut mgr.runtime_settings);
+        let offer = explicit(&agent, "attempt", "1", group, value);
+        mgr.policy_agent = Some(agent);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        mgr.handle_control(typed_offer_msg(offer), &evt_tx, &diagnostic_sender())
+    }
+
+    /// agent-api.md §RH05: a `deployment_baseline_changed` rejection is
+    /// preceded on the same ordered socket by a fresh capacity baseline, so
+    /// the control plane never reads the rejection against stale evidence.
+    #[tokio::test]
+    async fn a_baseline_changed_rejection_follows_a_fresh_capacity_baseline() {
+        use crate::policy::test_support::{offer, owned_agent};
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        let dir = tempfile::tempdir().unwrap();
+        let agent = owned_agent(dir.path(), &["gop"], &mut mgr.runtime_settings);
+        let current = mgr.deployment_baseline.deployment_map()["gop"]
+            .as_u64()
+            .unwrap();
+        let stale = offer(
+            &agent,
+            "stale",
+            "1",
+            "gop",
+            serde_json::json!({"source":"deployment"}),
+            serde_json::json!(current + 30),
+        );
+        mgr.policy_agent = Some(agent);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr
+            .handle_control(typed_offer_msg(stale), &evt_tx, &diagnostic_sender())
+            .unwrap();
+
+        let mut wire: Vec<Message> = Vec::new();
+        let mut sink = (&mut wire).sink_map_err(
+            |never: std::convert::Infallible| -> tokio_tungstenite::tungstenite::Error {
+                match never {}
+            },
+        );
+        send_control_reply(&mut sink, &mut mgr, reply)
+            .await
+            .unwrap();
+        let sent: Vec<serde_json::Value> = wire
+            .iter()
+            .map(|m| serde_json::from_str(m.to_text().unwrap()).unwrap())
+            .collect();
+        let types: Vec<&str> = sent.iter().map(|m| m["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["capacity", "config_policy_state"], "{sent:?}");
+        assert_eq!(
+            sent[0]["deployment_settings"]["gop"],
+            serde_json::json!(current),
+            "the capacity carries the agent's current baseline"
+        );
+        assert_eq!(sent[1]["phase"], "failed");
+        assert_eq!(sent[1]["error"], "deployment_baseline_changed");
+    }
+
+    fn applied(reply: &Option<AgentMsg>) -> bool {
+        matches!(reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
+    }
+
+    /// `zerocopy` stays next-session, but it is a host-probe input: a typed
+    /// change must withdraw codecs proven under the old value and ask the
+    /// scheduler for a fresh probe, exactly as a legacy `config_update` does.
+    #[tokio::test]
+    async fn a_typed_zerocopy_apply_withdraws_probe_proven_codecs_and_requests_a_probe() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        mgr.notify_probe_inputs();
+        next_probe_event(&mut rx).await;
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264", "h265"]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let flipped = !mgr.runtime_settings.zerocopy;
+        let reply = apply_typed(&mut mgr, dir.path(), "zerocopy", serde_json::json!(flipped));
+        assert!(applied(&reply), "{reply:?}");
+        assert_eq!(mgr.runtime_settings.zerocopy, flipped);
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264"]),
+            "h265 was proven under the old zerocopy value"
+        );
+        match next_probe_event(&mut rx).await {
+            Event::InputsObserved(inputs) => {
+                assert!(
+                    inputs.settings.contains(&format!("zerocopy={flipped}")),
+                    "{}",
+                    inputs.settings
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The warm-up template store follows a typed `home_root` at the same
+    /// boundary the next launch does; existing homes stay where they are.
+    #[test]
+    fn a_typed_home_root_apply_rebinds_template_seeding_for_the_next_launch() {
+        let (fixture, source_policy) = crate::source_policy::tests::fixture();
+        let mount = fixture.path().join("homes");
+        let existing = mount.join("existing-user");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("save.dat"), "kept").unwrap();
+        let mut mgr = manager_with(Vec::new());
+        mgr.runtime_settings.home_root = mount.to_str().unwrap().into();
+        mgr.source_policy = Some(source_policy.clone());
+        assert_eq!(source_policy.store().unwrap().home_root(), mount.as_path());
+        let running = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+
+        let next_root = mount.join("v2");
+        let dir = tempfile::tempdir().unwrap();
+        let reply = apply_typed(
+            &mut mgr,
+            dir.path(),
+            "home_root",
+            serde_json::json!(next_root.to_str().unwrap()),
+        );
+        assert!(applied(&reply), "{reply:?}");
+        let next = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        assert_eq!(next.home_root, next_root.to_str().unwrap());
+        // `session::source` seeds only when the store's root equals the launch's.
+        assert_eq!(
+            source_policy.store().unwrap().home_root(),
+            std::path::Path::new(&next.home_root)
+        );
+        assert_eq!(
+            running.home_root,
+            mount.to_str().unwrap(),
+            "running session keeps its root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing.join("save.dat")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn a_typed_app_boot_timeout_apply_reaches_the_next_launch_only() {
+        let mut mgr = manager_with(Vec::new());
+        let running = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let reply = apply_typed(
+            &mut mgr,
+            dir.path(),
+            "app_boot_timeout_secs",
+            serde_json::json!(42),
+        );
+        assert!(applied(&reply), "{reply:?}");
+        let next = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        assert_eq!(next.app_boot_timeout, Some(Duration::from_secs(42)));
+        assert_ne!(running.app_boot_timeout, next.app_boot_timeout);
+    }
+
+    /// A session live when the previous agent process ended (an agent update ends that
+    /// host's sessions) is reported failed with a stated reason, not with every field null.
+    #[test]
+    fn a_session_the_previous_agent_process_ran_ends_failed_with_a_stated_reason() {
+        let json = serde_json::to_value(recovered_terminal("0b9f5d3a-0000-4000-8000-000000000001"))
+            .unwrap();
+        assert_eq!(json["type"], "session_state");
+        assert_eq!(json["state"], "failed");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("node agent restarted")),
+            "{json}"
+        );
+        assert!(json.get("reason_code").is_none(), "{json}");
     }
 }

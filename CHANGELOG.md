@@ -24,6 +24,59 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+Quasar 0.4.0 makes a first deployment much simpler. You paste the quick start's stack
+into Docker, Dockge, Arcane or Unraid, or run its command, and one seed container
+installs Quasar and keeps it running. From then on, updates are applied from the
+console, and one that fails its checks is rolled back automatically.
+
+Underneath, this is a major rearchitecture of how Quasar runs. Quasar no longer drives
+the Docker CLI or Compose: the control plane and node agent talk to the container engine
+through its API, and each machine's recovery actor owns its services. That is what lets
+one release run on Docker or Podman, rootful or rootless, with a least-privilege agent.
+
+### Upgrading
+- **v0.3.0 and earlier are not updated in place.** Install fresh with the quick start, then restore your old database dump into it (see Upgrading in the docs). From 0.4.0 on, updates are applied from the console.
+
+### Added
+- **Owned installs.** One seed container installs Quasar and keeps it running. Updates are applied from Fleet ▸ Releases, and an update that fails its checks is rolled back automatically (#358–#366).
+- **Docker and Podman, rootful and rootless (RH-07).** Rootful Docker and Unraid are supported. Rootless Docker and rootful or rootless Podman are experimental on any Linux (#390–#408).
+- **Least-privilege node agent.** NVIDIA GPUs are passed by CDI, input uses the host's own device nodes (no `mknod`), and the device rules ship as plain files you can read (#399, #401, #402).
+- **Console mode on owned installs.** Play on a monitor attached to the host, including on rootless engines with PipeWire audio (#395, #407).
+- **Add host in one line,** or as a seed stack for Dockge or Arcane (#359).
+- **Host readiness.** Probe-based checks say what is missing and how to fix it, and a failing check blocks only the launches it affects (#253–#264).
+- **Per-GPU codecs.** Each GPU advertises the H.264, HEVC and AV1 it has proven, and Auto picks the GPU with the best codec (#300–#306).
+- **App placement and managed images.** You choose where apps may run, Auto picks the hardware, Steam templates are prepared ahead of time, and image cleanup is explicit (#334–#346).
+- **Stable and edge documentation,** with a version switcher.
+
+### Changed
+- **New owned installs follow the stable release channel** (#409).
+- **The quick start names `:latest` image tags,** and the seed pins them to exact digests on the first install (#440).
+- **Installing never asks you to download and run a script as root.** The docs are organised by platform and are about 40% shorter.
+- **The node agent talks to the container engine through its API** and no longer needs a `docker` or `podman` executable (#239).
+- **Dependencies updated;** Go 1.26.
+
+### Fixed
+- **Stream audio no longer turns robotic after about 40 minutes,** and game audio is no longer resampled twice (#351).
+- **Steam no longer swaps the X and Y buttons,** an unrecognised controller is no longer scrambled silently, and mouse-wheel scrolling is no longer inverted (#348, #350).
+- **On rootless Docker, the gamepad reaches the game** (#428).
+- **An update interrupted by a reboot no longer leaves a host down** (#438), and an interrupted image pull can be retried (#429).
+- **The first session on a new NVIDIA host no longer crashes the node agent** (#388).
+- **AMD hosts get a clean picture on the default Vulkan encoder** (#272, #281).
+- **Many smaller fixes** to readiness, reconnects, removing and re-adding hosts, Steam preparation and artwork (#255–#292, #378–#389).
+
+### Security
+- **Session input stays inside the session.** The compositor takes the session's virtual keyboard and mouse exclusively, so the host no longer also receives a player's keys, and the virtual keyboard no longer offers keys the host acts on (power, sleep, SysRq).
+- **A console session owns its own virtual terminal,** so keys typed in it never reach the host's login prompt (#407).
+
+### Known limitations
+- **Podman (experimental):**
+  - Podman 4.9 (Ubuntu 24.04) can't change a restart policy in place (#424).
+  - A crash-looping service can restart after an explicit stop (#425).
+  - A missing bind source is created rather than refused (#426).
+  - Rootful Podman needs one `tmpfiles.d` line so `/run/quasar-agent` exists at boot (#439).
+- **NVIDIA without CDI:** the rootful `--gpus` fallback can't run Steam's Vulkan on a CUDA-only host. Use CDI (#413).
+- **Rootless Docker:** home files are owned by a subordinate UID on the host. This is harmless, and readiness notes it.
+
 ## 0.3.0 — 2026-09-13
 
 ### Added
@@ -480,7 +533,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.5 — 2026-09-07
 
 ### Fixed
-
 - `deploy/redeploy.sh`'s header no longer claims that running sessions survive a
   control-plane-only deploy. They do not, and have not: recreating the control
   plane ends every session on the host (#128). Drain first if the sessions
@@ -541,7 +593,6 @@ own; the two do not move together, and that is deliberate.
   preparation off preserves existing homes, templates and running sessions (#145).
 
 ### Fixed
-
 - Release publication waits for the updater image to be validated and promoted,
   so its installation instructions cannot advertise a missing updater tag.
 - Agent startup cleanup only removes its own session and audio containers;
@@ -574,7 +625,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.3 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update no longer re-cordons each host moments after it finishes (#140,
   second half).** The per-host apply inside a fleet run found the host already draining
   — the run's own cordon — took it for an admin's, and restored it a few milliseconds
@@ -584,7 +634,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.2 — 2026-09-06
 
 ### Fixed
-
 - **A fleet update from v0.2.0 no longer leaves every host `draining` when it
   finishes (#140).** The v0.2.0 control plane cordoned the fleet with nothing to record
   it in; when the new control plane picked the run up it found every host draining, took
@@ -599,7 +648,6 @@ own; the two do not move together, and that is deliberate.
 ## 0.2.1 — 2026-09-05
 
 ### Fixed
-
 - **A fleet update no longer fails on the first host right after the control plane
   updates itself (#117).** When the new control plane came back and picked the run up,
   it moved to the first host before the agents had reconnected, recorded the miss as
@@ -782,7 +830,6 @@ own; the two do not move together, and that is deliberate.
   The release view also gains an additive `source_repo` field.
 
 ### Fixed
-
 - **Installing a release no longer requires building it.** The documented quick start
   told self-hosters to run `deploy/redeploy.sh <profile> vX.Y.Z`, which compiles the web
   client and both runtime images from source — roughly 25 minutes and 25 GB of Docker

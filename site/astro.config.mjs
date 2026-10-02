@@ -6,10 +6,20 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightOpenAPI, { createOpenAPISidebarGroup } from 'starlight-openapi';
 
+import { DOCS_ROOT, docsVersion } from './src/data/docs-version.js';
+import { baseLinks, rebaseRedirects } from './src/data/base-links.js';
+
 // GitHub Pages project site. If the repo moves org, or the site later gets a
-// custom domain, these two constants are the only thing that has to change.
+// custom domain, SITE and DOCS_ROOT (src/data/docs-version.js) are the only
+// thing that has to change.
 const SITE = 'https://accreleus.github.io';
-const BASE = '/quasar';
+// Stable docs at DOCS_ROOT, edge (develop) docs under DOCS_ROOT/edge: the pages
+// workflow builds this config once per version and says which through the
+// environment (QUASAR_DOCS_CHANNEL; see docs-version.js). Content links are
+// written against DOCS_ROOT, and baseLinks moves them under BASE.
+const VERSION = docsVersion();
+const BASE = VERSION.base;
+const EDGE = VERSION.channel === 'edge';
 
 // The control-plane API reference is generated from the frozen contract itself
 // (`protocol/openapi.yaml`), not transcribed. That makes the spec the single
@@ -35,7 +45,31 @@ export default defineConfig({
 	site: SITE,
 	base: BASE,
 	trailingSlash: 'always',
+	// Install was reorganised by platform (Docker, Podman, Unraid). Old URLs are
+	// printed by released quick-start scripts and linked from outside, so each one
+	// keeps working. Keys omit the base; targets include it.
+	redirects: rebaseRedirects({
+		'/start/engine-profiles/': '/quasar/start/requirements/#container-engines',
+		'/install/install/': '/quasar/install/docker/',
+		'/install/prepare-host/': '/quasar/install/rootless/',
+		'/install/podman-quadlet/': '/quasar/install/podman/',
+		'/install/move-existing/': '/quasar/install/moving/#move-a-compose-install',
+		'/install/move-to-rootless/': '/quasar/install/moving/#move-to-rootless',
+	}, DOCS_ROOT, BASE),
+	// The quick start's engine-profiles.js (RH07-14, #406) reads
+	// testdata/engine-profiles/profiles.json, outside site/, so the single source
+	// of truth stays in the repo root rather than a copy drifting under site/. The
+	// dev server's default `server.fs.allow` is the project root, which would
+	// otherwise 403 that import.
+	vite: {
+		server: {
+			fs: {
+				allow: ['..'],
+			},
+		},
+	},
 	integrations: [
+		baseLinks({ root: DOCS_ROOT, base: BASE }),
 		starlight({
 			plugins: [
 				starlightOpenAPI([
@@ -73,6 +107,8 @@ export default defineConfig({
 				alt: 'Quasar',
 			},
 			customCss: ['./src/styles/theme.css'],
+			// The stable / edge switcher rides in the SocialIcons slot.
+			components: { SocialIcons: './src/components/SocialIcons.astro' },
 			// Corrects the titles starlight-openapi generates; see the file.
 			routeMiddleware: './src/route-data.ts',
 			head: [
@@ -84,6 +120,9 @@ export default defineConfig({
 					content:
 						"try{if(!localStorage.getItem('starlight-theme')){localStorage.setItem('starlight-theme','dark');document.documentElement.dataset.theme='dark'}}catch(e){}",
 				},
+				// Edge describes develop, not a release: keep it out of search
+				// engines so a search lands on the stable docs.
+				...(EDGE ? [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex' } }] : []),
 			],
 			social: [
 				{
@@ -93,7 +132,7 @@ export default defineConfig({
 				},
 			],
 			editLink: {
-				baseUrl: 'https://github.com/accreleus/quasar/edit/main/site/',
+				baseUrl: `https://github.com/accreleus/quasar/edit/${EDGE ? 'develop' : 'main'}/site/`,
 			},
 			lastUpdated: true,
 			expressiveCode: {
@@ -117,17 +156,23 @@ export default defineConfig({
 					label: 'Install',
 					items: [
 						{ label: 'Quick start', slug: 'start/quickstart' },
-						{ label: 'Install Quasar', slug: 'install/install' },
-						{ label: 'First-run setup', slug: 'install/first-run' },
+						{ label: 'NVIDIA setup', slug: 'install/nvidia' },
+						{ label: 'Docker', slug: 'install/docker' },
+						{ label: 'Podman', slug: 'install/podman' },
+						{ label: 'Rootless', slug: 'install/rootless' },
+						{ label: 'Unraid', slug: 'install/unraid' },
+						{ label: 'Device rules (udev)', slug: 'install/device-rules' },
+						{ label: 'Add a GPU host', slug: 'install/second-host' },
 						{ label: 'Check your install', slug: 'install/verify' },
-						{ label: 'Add a second GPU host', slug: 'install/second-host' },
+
 					],
 				},
 				{
-					label: 'Playing',
+					label: 'Getting started',
 					items: [
-						{ label: 'Your library', slug: 'playing/library' },
-						{ label: 'In a session', slug: 'playing/in-session' },
+						{ label: 'Create your account', slug: 'install/first-run' },
+						{ label: 'Set up your game library', slug: 'playing/library' },
+						{ label: 'Play your first session', slug: 'playing/in-session' },
 						{ label: 'Browser support', slug: 'playing/browsers' },
 						{ label: 'Files and saves', slug: 'playing/storage' },
 					],
@@ -142,6 +187,7 @@ export default defineConfig({
 						{ label: 'The Steam library', slug: 'admin/steam' },
 						{ label: 'Quality profiles', slug: 'admin/profiles' },
 						{ label: 'Hosts and GPUs', slug: 'admin/hosts' },
+						{ label: 'Console mode', slug: 'admin/console' },
 						{ label: 'Sessions and audit log', slug: 'admin/sessions' },
 						{ label: 'Jobs and schedules', slug: 'admin/jobs' },
 						{ label: 'Updating Quasar', slug: 'admin/releases' },
@@ -179,6 +225,7 @@ export default defineConfig({
 					label: 'Troubleshooting',
 					items: [
 						{ label: 'Install and startup', slug: 'troubleshooting/install' },
+						{ label: 'Readiness checks', slug: 'troubleshooting/readiness' },
 						{ label: 'Connecting and certificates', slug: 'troubleshooting/connecting' },
 						{ label: 'Launching a game', slug: 'troubleshooting/launching' },
 						{ label: 'Picture, sound and input', slug: 'troubleshooting/av' },
@@ -192,6 +239,7 @@ export default defineConfig({
 						{ label: 'Environment variables', slug: 'reference/environment' },
 						{ label: 'Ports and endpoints', slug: 'reference/ports' },
 						{ label: 'Glossary', slug: 'reference/glossary' },
+						{ label: 'NVIDIA compatibility', slug: 'reference/nvidia-compatibility' },
 					],
 				},
 				{

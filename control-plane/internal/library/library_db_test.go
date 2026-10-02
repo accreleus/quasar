@@ -150,7 +150,7 @@ func (f fixture) claimedScan(t *testing.T, user string) string {
 	return id
 }
 
-// report turns the Tower manifest fixture (denylist_test.go) into a scan report.
+// report turns the gpu-test manifest fixture (denylist_test.go) into a scan report.
 func observedEntries() []ReportEntry {
 	out := make([]ReportEntry, 0, len(observedManifests))
 	for _, m := range observedManifests {
@@ -206,10 +206,10 @@ func countT(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
 	return n
 }
 
-// --- §7.7 over the real Tower manifest set -----------------------------------
+// --- §7.7 over the real gpu-test manifest set -----------------------------------
 
 // TestReconcileObservedSet is Gate 4's headline acceptance: a scan of the live
-// Tower home observes 9 appids, auto-publishes the 4 games and suppresses the 5
+// gpu-test home observes 9 appids, auto-publishes the 4 games and suppresses the 5
 // Valve tools, and the tile's entitlement lands in the SAME transaction that
 // created it.
 func TestReconcileObservedSet(t *testing.T) {

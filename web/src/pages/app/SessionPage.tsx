@@ -37,6 +37,7 @@ import { playoutOverride } from "../../webrtc/playout";
 import type { TelemetrySnapshot } from "../../webrtc/telemetry";
 import { Button } from "../../components/Button";
 import { Hud, type HudHandle } from "./hud/Hud";
+import { NON_STANDARD_PAD_ADVICE, shortGamepadLabel } from "./hud/panes/InputPane";
 import { fallbackStreamRungs } from "./StreamResolutionControl";
 import { SessionSwapController } from "./SessionSwapController";
 import {
@@ -364,6 +365,17 @@ export function SessionPage() {
                 : "The browser refused to hand Esc to the game (Keyboard Lock), so " +
                   "pressing Esc releases input instead of reaching the game. " +
                   "Re-entering fullscreen usually restores it.",
+          });
+        },
+        // quasar#348: the browser didn't recognise this pad, so its raw
+        // button order is going out as if it were the standard layout. Say so
+        // once per pad; the Controller & input pane repeats it under the pad.
+        onNonStandardGamepad: (pad) => {
+          addToast({
+            variant: "info",
+            title: "Controller not recognised by your browser",
+            body: `${shortGamepadLabel(pad.id)}: ${NON_STANDARD_PAD_ADVICE}`,
+            duration: 10000,
           });
         },
         onDisconnectSuspected: () => void pollHostLost(),

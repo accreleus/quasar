@@ -16,8 +16,8 @@
   isolation: isolate;
   background:
     radial-gradient(circle at 50% 44%, var(--accent-soft), transparent 32%),
-    radial-gradient(circle at 84% 12%, oklch(0.5998 0.2179 273.21 / 7%), transparent 30%),
-    linear-gradient(150deg, var(--bg), oklch(0.13 0.012 267) 58%, var(--core));
+    radial-gradient(circle at 84% 12%, var(--loader-glow-corner), transparent 30%),
+    linear-gradient(150deg, var(--bg), var(--scene-mid) 58%, var(--core));
   transition: opacity 220ms cubic-bezier(0.2, 0, 0, 1);
 }
 
@@ -27,7 +27,7 @@
   top: clamp(1.5rem, 4vw, 2.5rem);
   left: clamp(1.5rem, 4vw, 3rem);
   display: flex;
-  gap: 0.85rem;
+  gap: var(--s3);
   align-items: center;
 }
 
@@ -62,9 +62,9 @@
   opacity: 0;
   background: linear-gradient(
     90deg,
-    #fff,
-    oklch(0.78 0.16 273) 9%,
-    oklch(0.5998 0.2179 273.21 / 60%) 38%,
+    var(--loader-hot),
+    var(--loader-glow-1) 9%,
+    var(--loader-jet-tail) 38%,
     transparent 100%
   );
   filter: blur(1px);
@@ -93,7 +93,7 @@
   position: absolute;
   top: 50%;
   left: 50%;
-  border: 1px solid oklch(0.5998 0.2179 273.21 / 34%);
+  border: 1px solid var(--loader-orbit);
   border-radius: 50%;
   transform: translate(-50%, -50%) rotate(-9deg);
 }
@@ -107,7 +107,7 @@
 .sl-quasar .orbit-b {
   width: 67%;
   height: 38%;
-  border-color: oklch(0.72 0.12 273 / 16%);
+  border-color: var(--loader-orbit-b);
   animation: sl-breathe 4.8s 0.18s ease-in-out infinite reverse;
 }
 
@@ -121,10 +121,10 @@
   background: radial-gradient(
     ellipse,
     transparent 0 19%,
-    #fff 20% 21%,
-    oklch(0.82 0.14 273) 23%,
+    var(--loader-hot) 20% 21%,
+    var(--loader-glow-2) 23%,
     var(--accent) 42%,
-    oklch(0.42 0.19 273) 60%,
+    var(--loader-disc-edge) 60%,
     transparent 72%
   );
   filter: blur(1.5px);
@@ -137,8 +137,8 @@
   position: absolute;
   inset: 13% -8%;
   content: "";
-  border-top: 2px solid oklch(1 0 0 / 70%);
-  border-bottom: 1px solid oklch(0.78 0.14 273 / 30%);
+  border-top: 2px solid var(--loader-disc-rim);
+  border-bottom: 1px solid var(--loader-disc-shade);
   border-radius: 50%;
   filter: blur(0.5px);
 }
@@ -157,12 +157,12 @@
   width: 8.5%;
   aspect-ratio: 1;
   border-radius: 50%;
-  background: #fff;
+  background: var(--loader-hot);
   box-shadow:
-    0 0 7px 2px #fff,
-    0 0 20px 7px oklch(0.78 0.16 273),
+    0 0 7px 2px var(--loader-hot),
+    0 0 20px 7px var(--loader-glow-1),
     0 0 52px 17px var(--accent),
-    0 0 100px 30px oklch(0.5998 0.2179 273.21 / 30%);
+    0 0 100px 30px var(--loader-halo);
   transform: translate(-50%, -50%);
   animation: sl-core-pulse 4.8s ease-in-out infinite;
 }
@@ -175,7 +175,7 @@
   width: 68%;
   height: 1px;
   opacity: 0;
-  background: linear-gradient(90deg, transparent, var(--accent), #fff, var(--accent), transparent);
+  background: linear-gradient(90deg, transparent, var(--accent), var(--loader-hot), var(--accent), transparent);
   transform: translate(-50%, -50%) rotate(-8deg);
   animation: sl-scan 4.8s ease-out infinite;
 }
@@ -223,13 +223,13 @@
 .sl-status-foot {
   display: flex;
   justify-content: center;
-  margin-top: 1.6rem;
+  margin-top: var(--s6);
 }
 
 /* ---- Glyph rail ---- */
 .sl-rail {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--s2);
   align-items: center;
   width: min(28rem, 100%);
   margin: 0 auto;
@@ -273,8 +273,8 @@
 /* A completed phase keeps its own glyph and gains a ring — a row of identical
    ticks would erase which phase finished. */
 .sl-step[data-state="done"] {
-  border-color: oklch(0.76 0.15 164 / 45%);
-  background: oklch(0.76 0.15 164 / 8%);
+  border-color: var(--loader-done-line);
+  background: var(--loader-done-bg);
   opacity: 1;
   color: var(--success);
 }
@@ -289,7 +289,7 @@
 }
 
 .sl-link[data-state="done"] {
-  background: oklch(0.76 0.15 164 / 50%);
+  background: var(--loader-done-link);
 }
 
 .sl-link[data-state="active"]::after {
@@ -333,14 +333,14 @@
    Small print under the phase word: the launch is still running, this only
    names what has stopped moving. */
 .sl-stall {
-  margin-top: 1.75rem;
+  margin-top: var(--s7);
   color: var(--text-3);
   font-size: var(--t-sm);
   line-height: 1.5;
 }
 
 .sl-stall-title {
-  margin: 0 0 0.25rem;
+  margin: 0 0 var(--s1);
   color: var(--text-2);
   font-weight: 500;
 }
@@ -394,9 +394,9 @@
   aspect-ratio: 1;
   border-radius: 50%;
   opacity: 0;
-  background: #fff;
+  background: var(--loader-hot);
   box-shadow:
-    0 0 30px 12px oklch(0.82 0.14 273),
+    0 0 30px 12px var(--loader-glow-2),
     0 0 100px 35px var(--accent);
   transform: translate(-50%, -56%) scale(0);
   pointer-events: none;

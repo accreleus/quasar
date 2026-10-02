@@ -126,6 +126,29 @@ func TestImageReadyEnqueuesTheWarmUp(t *testing.T) {
 	}
 }
 
+func TestUnselectedSteamImageDoesNotStartOptionalWarmup(t *testing.T) {
+	pool := ensureDB(t)
+	seedPreparationImage(t, pool, false)
+	hostID := seedHost(t, pool, "unselected-steam")
+	acknowledgePreparation(t, pool, hostID)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE app_placement SET mode='fixed' WHERE app_id=(SELECT id FROM apps WHERE name='ensure fixture managed app')`); err != nil {
+		t.Fatal(err)
+	}
+	e := NewEnsurer(pool, newFleet(hostID), testLog())
+	defer e.Close()
+	q := newEnqueuer()
+	e.SetJobEnqueuer(q)
+	e.AgentImageState(ctx, hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+	e.wg.Wait()
+	if q.count() != 0 {
+		t.Fatal("unselected Steam image triggered optional template production")
+	}
+	if _, err := e.WarmupParamsForHost(ctx, hostID); err == nil {
+		t.Fatal("manual warmup admitted an unselected Steam image")
+	}
+}
+
 func TestUnsupportedReadyImagesDoNotPrepareEvenWithHomeMetadata(t *testing.T) {
 	for _, kind := range []string{"custom-repository", "template"} {
 		t.Run(kind, func(t *testing.T) {
@@ -299,5 +322,51 @@ func TestNoEnqueuerWiredIsNotAnError(t *testing.T) {
 	}
 	if state != "ready" {
 		t.Fatalf("installation lost ready state without queue: %s", state)
+	}
+}
+
+// #378: a host whose image is ready before its row is live (an image already on
+// disk, or a re-added host still draining for a moment) fails both event
+// admissions. The minute reconcile offers it once the host is live, and never
+// again once any warm-up run exists.
+func TestReconcileWarmupsOffersANeverScheduledHostOnce(t *testing.T) {
+	pool := ensureDB(t)
+	seedPreparationImage(t, pool, true)
+	hostID := seedHost(t, pool, "late-live-steam")
+	revision := acknowledgePreparation(t, pool, hostID)
+	if _, err := pool.Exec(context.Background(), `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	e := NewEnsurer(pool, newFleet(hostID), testLog())
+	defer e.Close()
+	q := newEnqueuer()
+	e.SetJobEnqueuer(q)
+	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+	e.ReconcileWarmups(context.Background())
+	time.Sleep(300 * time.Millisecond)
+	if n := q.count(); n != 0 {
+		t.Fatalf("a draining host was offered the warm-up %d times", n)
+	}
+
+	if _, err := pool.Exec(context.Background(), `UPDATE hosts SET status='online' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	e.ReconcileWarmups(context.Background())
+	expectPreparationParams(t, q.wait(t), hostID, revision)
+
+	// Any run at all hands the retry to the jobs framework.
+	if _, err := pool.Exec(context.Background(), `INSERT INTO jobs (id, name, plane, scope, managed, enabled, schedule_kind)
+		VALUES ('template.warmup', 'warm-up', 'agent', 'host', true, true, 'event') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `INSERT INTO job_runs (job_id, host_id, state, trigger, attempt, scheduled_for)
+		VALUES ('template.warmup', $1::uuid, 'deferred', 'event', 1, now())`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	before := q.count()
+	e.ReconcileWarmups(context.Background())
+	time.Sleep(300 * time.Millisecond)
+	if q.count() != before {
+		t.Fatal("a host with a warm-up run was offered another by the reconcile")
 	}
 }

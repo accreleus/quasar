@@ -33,19 +33,16 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ .
-# vite copies ../deploy/enroll-host.sh into dist so the control plane serves it.
-COPY deploy/enroll-host.sh /deploy/enroll-host.sh
-# The ref this tree is at, baked into the bundle for the enroll-host one-liner
-# (#100); build-images.sh passes it, since the build context carries no .git.
-ARG QUASAR_SOURCE_REF=
-ENV QUASAR_SOURCE_REF=$QUASAR_SOURCE_REF
+# vite copies ../deploy/enroll-host.sh into dist so the control plane serves it
+# (/enroll-host.sh).
+COPY deploy/enroll-host.sh /deploy/
 RUN npm run build
 
 # ── Go build stage ────────────────────────────────────────────────────────────
-# golang:1.25.14-alpine. Must stay >= control-plane/go.mod's `go` directive
-# (currently 1.25.0) — the official golang images set GOTOOLCHAIN=local, so a
+# golang:1.26.8-alpine. Must stay >= control-plane/go.mod's `go` directive
+# (currently 1.26.0) — the official golang images set GOTOOLCHAIN=local, so a
 # lower pin fails the build instead of auto-downloading the newer toolchain.
-FROM golang@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS builder
+FROM golang@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS builder
 
 WORKDIR /src
 COPY control-plane/go.mod control-plane/go.sum ./

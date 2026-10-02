@@ -561,15 +561,15 @@ func (c *Coordinator) launchCertCell(
 		"codec", wire, "bitrate_kbps", bitrateKbps)
 
 	// The bench must stream the codec it labels (0041): refuse up front when
-	// the host can't encode it, rather than an opaque "never reached running".
-	hostCodecs, hcErr := c.store.HostCodecs(ctx, hostID)
-	if hcErr != nil {
-		c.log.Warn("SPT-06: host codec set load failed, assuming h264-only",
-			"host_id", hostID, "err", hcErr)
-		hostCodecs = nil
+	// the pinned GPU can't encode it, rather than an opaque "never reached running".
+	gpuCodecs, gcErr := c.store.GPUCodecs(ctx, hostID, int32(gpuIndex))
+	if gcErr != nil {
+		c.log.Warn("SPT-06: GPU codec set load failed, assuming h264-only",
+			"host_id", hostID, "gpu_index", gpuIndex, "err", gcErr)
+		gpuCodecs = nil
 	}
-	if !codecSet(hostCodecs)[wire] {
-		return certCellLaunchOut{}, fmt.Errorf("host cannot encode %s (rung %s): %w", wire, prof.ID, ErrCodecUnsupportedByHost)
+	if !codecSet(gpuCodecs)[wire] {
+		return certCellLaunchOut{}, fmt.Errorf("GPU %d cannot encode %s (rung %s): %w", gpuIndex, wire, prof.ID, ErrCodecUnsupportedByHost)
 	}
 
 	userID, err := c.store.EnsureBenchUser(ctx)
@@ -590,7 +590,33 @@ func (c *Coordinator) launchCertCell(
 		return certCellLaunchOut{}, fmt.Errorf("signaling token failed: %w", err)
 	}
 
-	p := CreateParams{
+	p := certCellParams(userID, diagAppID, hostID, gpuIndex, target, wire, bitrateKbps, tok)
+	sess, schedErr := c.store.ScheduleAndCreate(ctx, p)
+	if schedErr != nil {
+		c.logVramVetoRejection(userID, diagAppID, schedErr)
+		c.logHostNotReadyRejection(userID, diagAppID, schedErr)
+		return certCellLaunchOut{}, fmt.Errorf("schedule failed: %w", schedErr)
+	}
+	sessionID := sess.ID
+
+	go c.dispatchAssignStart(sess, nil, nil)
+
+	if !c.waitForRunning(ctx, sessionID, benchRunToRunningTimeout) {
+		c.teardownCertSession(sessionID)
+		return certCellLaunchOut{}, fmt.Errorf("session %s did not reach running", sessionID)
+	}
+
+	return certCellLaunchOut{sessionID: sessionID, signToken: tok.Plaintext}, nil
+}
+
+// certCellParams is the bench cell's placement request.
+func certCellParams(
+	userID, diagAppID, hostID string, gpuIndex int,
+	target CertTarget, wire string, bitrateKbps int, tok signalingToken,
+) CreateParams {
+	prof := target.Rung
+	pinGPU := int32(gpuIndex)
+	return CreateParams{
 		UserID:          userID,
 		AppID:           diagAppID,
 		Width:           prof.Width,
@@ -606,23 +632,11 @@ func (c *Coordinator) launchCertCell(
 		TokenHash:    tok.Hash,
 		TokenExpires: tok.ExpiresAt,
 		PinHostID:    hostID, // SPT-06: force to the host being certified
+		// The cert row is keyed on gpu_index, so the session must run on that GPU,
+		// and that GPU must encode the codec the row is filed under.
+		PinGPUIndex:  &pinGPU,
+		RequireCodec: wire,
 	}
-
-	sess, schedErr := c.store.ScheduleAndCreate(ctx, p)
-	if schedErr != nil {
-		c.logVramVetoRejection(userID, diagAppID, schedErr)
-		return certCellLaunchOut{}, fmt.Errorf("schedule failed: %w", schedErr)
-	}
-	sessionID := sess.ID
-
-	go c.dispatchAssignStart(sess, nil)
-
-	if !c.waitForRunning(ctx, sessionID, benchRunToRunningTimeout) {
-		c.teardownCertSession(sessionID)
-		return certCellLaunchOut{}, fmt.Errorf("session %s did not reach running", sessionID)
-	}
-
-	return certCellLaunchOut{sessionID: sessionID, signToken: tok.Plaintext}, nil
 }
 
 // finalizeCertCell reads the bench session's agent metrics, derives the

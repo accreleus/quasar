@@ -1,0 +1,18 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+index 2d1e1e6..46d2593 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+@@ -453,6 +453,13 @@ _derive_rc_targets (GstVulkanAV1Encoder * self,
+   self->rc.max_qp = (self->prop.max_qp > 0) ?
+       MIN (self->prop.max_qp, self->hw.max_qindex) : 0;
+ 
++  /* NVIDIA (driver 610, RTX 5090) writes corrupt tile data into a key frame
++   * coded at base_q_idx 1 (dav1d EINVAL, libaom "Failed to decode tile data"),
++   * and the decoder then stalls until the next resize. CBR reaches index 1 on
++   * flat content at up to 1366 wide; index 2 is visually identical (#294). */
++  if (self->rc.ratecontrol != VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR)
++    self->rc.min_qp = MAX (self->rc.min_qp, MAX (self->hw.min_qindex, 2));
++
+   if (self->rc.ratecontrol ==
+       VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR) {
+     self->rc.qp_i = CLAMP (self->prop.qp_i, self->hw.min_qindex,

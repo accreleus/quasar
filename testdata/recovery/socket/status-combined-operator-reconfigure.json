@@ -1,0 +1,59 @@
+{
+  "shape": "status",
+  "about": "The control socket asked for the control plane's own request while the operator's reconfigure replaces its agent: the machine is busy with an attempt the control plane did not submit, which it never sees as a result (#386).",
+  "body": {
+    "actor": {
+      "version": "0.4.0",
+      "commit": "cccccccccccccccccccccccccccccccccccccccc",
+      "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+      "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+    },
+    "seed": {
+      "version": "0.4.0",
+      "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+    },
+    "role": "combined",
+    "node_name": "living-room-pc",
+    "database": "owned",
+    "services": [
+      {
+        "role": "recovery-actor",
+        "container": "quasar-recovery",
+        "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+        "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000",
+        "state": "running",
+        "health": null
+      },
+      {
+        "role": "control-plane",
+        "container": "quasar-control-plane",
+        "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+        "digest": "sha256:aa11000000000000000000000000000000000000000000000000000000000000",
+        "state": "running",
+        "health": "healthy"
+      },
+      {
+        "role": "node-agent",
+        "container": "quasar-node-agent",
+        "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+        "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000",
+        "state": "created",
+        "health": null
+      },
+      {
+        "role": "postgres",
+        "container": "quasar-postgres",
+        "image": "docker.io/library/postgres",
+        "digest": "sha256:dd44000000000000000000000000000000000000000000000000000000000000",
+        "state": "running",
+        "health": "healthy"
+      }
+    ],
+    "conflicts": [],
+    "in_flight": "5b0e9d4c-7a21-4f3e-8c6d-2e1f0a9b8c7d",
+    "dumps": [],
+    "dump_free_bytes": 212000000000,
+    "result": null,
+    "stale": false
+  }
+}

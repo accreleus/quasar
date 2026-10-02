@@ -23,7 +23,7 @@
 # scripts/dx/tests/run.sh pins the two against each other, so they cannot drift
 # apart silently again.
 readiness_filter_re() {
-  printf '%s' 'boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: no failures;|host readiness: all checks passed or skipped'
+  printf '%s' 'boot-diagnostic-mode|boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: no failures;|host readiness: all checks passed or skipped'
 }
 
 # AGENT_START_RE marks one node-agent process start. main.rs logs it once, very
@@ -56,6 +56,9 @@ readiness_cause() {
   case "$1" in
   *'host readiness: all checks passed or skipped'*) echo passed ;;
   *'host readiness: no failures;'*) echo provisioning ;;
+  # #256. Superseded in log order by the normal startup's own verdict once the
+  # agent resumes, which is why `boot-diagnostic-resumed` is not a verdict line.
+  *boot-diagnostic-mode*) echo diagnostic ;;
   *boot-render-node-missing*) echo render-node-missing ;;
   *boot-render-node-retry-deferred*) echo retry-deferred ;;
   *boot-dri-modes-stale-cdi*) echo stale-cdi ;;
@@ -72,7 +75,7 @@ readiness_state() {
   passed) echo ok ;;
   provisioning) echo PROVISIONING ;;
   render-node-missing | retry-deferred) echo RETRYING ;;
-  stale-cdi | render-node-unopenable | sanity-failed | checks-failed) echo FAILED ;;
+  diagnostic | stale-cdi | render-node-unopenable | sanity-failed | checks-failed) echo FAILED ;;
   *) echo unverified ;;
   esac
 }
@@ -87,7 +90,7 @@ readiness_state() {
 readiness_severity() {
   case "$1" in
   passed) echo ok ;;
-  render-node-missing | stale-cdi | render-node-unopenable | sanity-failed) echo fail ;;
+  diagnostic | render-node-missing | stale-cdi | render-node-unopenable | sanity-failed) echo fail ;;
   *) echo warn ;;
   esac
 }

@@ -58,6 +58,15 @@ type Deps struct {
 	ControlPlanePreflight func(ctx context.Context) PreflightFacts
 	// ImageFor is the instance-wide registry check for one release. Optional.
 	ImageFor func(ctx context.Context, r Release) *ImageFact
+	// ControlPlaneMachine is this control plane's own machine identity
+	// (OwnMachineReader.Identity). Optional: nil serves all five fields null.
+	ControlPlaneMachine func(ctx context.Context) MachineIdentity
+	// ControlPlaneDatabaseBytes is this control plane's database size, read
+	// for preflight backup_space on an owned machine; nil is not read.
+	ControlPlaneDatabaseBytes func(ctx context.Context) (int64, error)
+	// MachineShape is this control plane's own machine shape, from its
+	// configuration. Zero: machine_role and machine_node_name serve null.
+	MachineShape MachineShape
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -89,12 +98,26 @@ func (h *Handler) Register(mux httpx.Router, admin func(http.Handler) http.Handl
 
 // The `{ "identity": … }` envelope openapi.yaml declares.
 type identityResponse struct {
-	Identity buildinfo.Identity `json:"identity"`
+	Identity PlatformIdentity `json:"identity"`
 }
 
 // No 404 shape: an unstamped build reports "dev" with two nulls, never fails.
-func (h *Handler) handleIdentity(w http.ResponseWriter, _ *http.Request) {
-	httpx.WriteJSON(w, http.StatusOK, identityResponse{Identity: buildinfo.Get()})
+func (h *Handler) handleIdentity(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteJSON(w, http.StatusOK, identityResponse{Identity: PlatformIdentity{
+		Identity:        buildinfo.Get(),
+		MachineIdentity: h.machine(r.Context()),
+	}})
+}
+
+func (h *Handler) machine(ctx context.Context) MachineIdentity {
+	if h.deps == nil {
+		return MachineIdentity{}
+	}
+	var m MachineIdentity
+	if h.deps.ControlPlaneMachine != nil {
+		m = h.deps.ControlPlaneMachine(ctx)
+	}
+	return h.deps.MachineShape.Apply(m)
 }
 
 // The whole Releases page in one read. READ ONLY: it writes nothing and never
@@ -182,6 +205,13 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	if h.deps.ControlPlanePreflight != nil {
 		cpPreflight = h.deps.ControlPlanePreflight(ctx)
 	}
+	if cpPreflight.OwnedActor != nil && h.deps.ControlPlaneDatabaseBytes != nil {
+		if n, err := h.deps.ControlPlaneDatabaseBytes(ctx); err == nil {
+			cpPreflight.DatabaseBytes = &n
+		} else {
+			h.log.Warn("platform: could not read the database size for backup_space", "err", err)
+		}
+	}
 	var imageFor func(Release) *ImageFact
 	if h.deps.ImageFor != nil {
 		imageFor = func(r Release) *ImageFact { return h.deps.ImageFor(ctx, r) }
@@ -193,6 +223,8 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 		ImageFor:              imageFor,
 		EdgeBranch:            edgeBranch,
 		ControlPlane:          buildinfo.Get(),
+		Floor:                 buildinfo.DeclaredFloor(),
+		ControlPlaneMachine:   h.machine(ctx),
 		Hosts:                 hosts,
 		Releases:              releases,
 		CheckedAt:             status.CheckedAt,

@@ -76,6 +76,15 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		// Mic unset: local_only console launches have no WebRTC pipeline
 		// (agent-api.md), so capture never applies regardless of the setting.
 	}
+	if app.ManagedHome {
+		owner, err := c.store.HomeHostForApp(ctx, userID, homeAppID(app))
+		if err != nil {
+			return "", fmt.Errorf("console home location: %w", err)
+		}
+		if (app.IsDerived() && owner == "") || (owner != "" && owner != hostID) {
+			return "", ErrHomeNotProvisioned
+		}
+	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	if err != nil {
@@ -107,7 +116,8 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		}
 	}
 
-	go c.dispatchAssignStartWithTopology(sess, dispatchSpec, videoTopology)
+	expectedHome := expectedHomeDispatch(app)
+	go c.dispatchAssignStartWithTopology(sess, dispatchSpec, videoTopology, &expectedHome)
 
 	return sess.ID, nil
 }

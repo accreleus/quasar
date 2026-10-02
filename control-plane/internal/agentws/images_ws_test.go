@@ -67,7 +67,7 @@ func imageWSAgent(t *testing.T, nodeName string, register map[string]any) (*webs
 	t.Helper()
 	pool := testPool(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := NewHandler(pool, "test-token", log, nil, nil, nil, nil, nil)
+	h := NewHandler(pool, log, nil, nil, nil, nil, nil)
 	rec := newRecorder()
 	h.SetImageEvents(rec)
 	t.Cleanup(h.Close)

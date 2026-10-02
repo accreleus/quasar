@@ -109,7 +109,7 @@ interface SwitchProps {
 export function Switch({ checked, onChange, label, id, disabled, "aria-label": ariaLabel }: SwitchProps) {
   const switchId = id ?? (label ? label.toLowerCase().replace(/\s+/g, "-") : undefined);
   return (
-    <label className="switch-row" style={{ display: "flex", alignItems: "center", gap: "var(--s3)", cursor: disabled ? "not-allowed" : "pointer" }}>
+    <label className={`switch-row${disabled ? " is-disabled" : ""}`}>
       <label className="switch">
         <input
           id={switchId}
@@ -122,7 +122,7 @@ export function Switch({ checked, onChange, label, id, disabled, "aria-label": a
         <span className="track" />
         <span className="thumb" />
       </label>
-      {label && <span style={{ fontSize: "var(--t-sm)", color: disabled ? "var(--text-4)" : "var(--text-2)" }}>{label}</span>}
+      {label && <span className="switch-label">{label}</span>}
     </label>
   );
 }
@@ -142,7 +142,11 @@ interface CheckboxProps {
 export function Checkbox({ checked, onChange, label, id, disabled }: CheckboxProps) {
   const checkId = id ?? label.toLowerCase().replace(/\s+/g, "-");
   return (
-    <label className="check" htmlFor={checkId} style={{ opacity: disabled ? 0.5 : 1, cursor: disabled ? "not-allowed" : "pointer" }}>
+    <label
+      className={`check${disabled ? " is-disabled" : ""}`}
+      htmlFor={checkId}
+      style={{ opacity: disabled ? 0.5 : 1 }}
+    >
       <input
         id={checkId}
         type="checkbox"

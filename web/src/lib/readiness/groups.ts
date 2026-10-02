@@ -4,10 +4,10 @@
  * operator would fix, skipped ones set aside as not applicable to the host —
  * the contract defines `skip` as exactly that, never "could not tell".
  *
- * The map is keyed on the agent's stable check ids (node-agent/src/readiness.rs);
- * groups.test.ts pins it against that list so a new or renamed check cannot
- * land in "Other" unnoticed. Other still exists so an unknown id is shown,
- * never dropped.
+ * The map is keyed on the agent's stable check ids (node-agent/src/readiness.rs,
+ * node-agent/src/diagnostic.rs); groups.test.ts pins it against that list so a
+ * new or renamed check cannot land in "Other" unnoticed. Other still exists so
+ * an unknown id is shown, never dropped.
  */
 import type { ReadinessCheck } from "../../api/types";
 
@@ -18,23 +18,30 @@ export interface ReadinessGroupDef {
 }
 
 export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
+  // #254: the runtime is the most basic fault, so it comes first; startup_cleanup is
+  // the agent's own safety state (#256).
+  { key: "runtime", label: "Container runtime", ids: ["startup_cleanup", "policy_journal", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"] },
   {
     key: "gpu",
     label: "GPU & display",
-    ids: ["render_node", "host_render_node", "dri_node_app_access", "xid_visibility", "encoder_codecs"],
+    ids: ["media_probe", "application_gpu_probe", "render_node", "host_render_node", "dri_node_app_access", "xid_visibility", "encoder_codecs"],
   },
   {
     key: "nvidia",
     label: "NVIDIA driver",
-    ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"],
+    ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility", "nvidia_driver_mount"],
   },
-  { key: "input", label: "Input & sandbox", ids: ["uinput", "user_namespaces", "app_apparmor_profile"] },
+  { key: "input", label: "Input & sandbox", ids: ["input_probe", "uinput", "user_namespaces", "app_apparmor_profile"] },
+  // #259: the audio sidecar host probe.
+  { key: "audio", label: "Audio", ids: ["audio_probe"] },
+  // #253: storage; homes first — the two that can block a launch later.
+  { key: "storage", label: "Storage", ids: ["homes_root_writable", "homes_free_space", "template_free_space", "image_free_space"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },
   // The update path (amendment 9): the same ids the Releases tab's preflight reads.
   {
     key: "platform_update",
     label: "Updates",
-    ids: ["updater_socket", "updater_stack_dir", "updater_overlays", "health_addr_bindable"],
+    ids: ["updater_socket", "health_addr_bindable"],
   },
 ];
 
@@ -42,8 +49,10 @@ export const OTHER_GROUP: ReadinessGroupDef = { key: "other", label: "Other", id
 
 export const KNOWN_CHECK_IDS: readonly string[] = READINESS_GROUPS.flatMap((g) => g.ids);
 
-/** fail → warn → provisioning/unknown → pass. Unknown statuses are advisory:
- *  shown with the actionable ones, never hidden as not applicable. */
+/** fail → warn → provisioning/unknown → pass/unsupported. Unknown statuses are
+ *  advisory: shown with the actionable ones, never hidden as not applicable.
+ *  `unsupported` (hardware lacks the capability, #311) needs no action, so it sorts
+ *  with the passes. */
 function rank(status: string): number {
   switch (status) {
     case "fail":
@@ -51,10 +60,18 @@ function rank(status: string): number {
     case "warn":
       return 1;
     case "pass":
+    case "unsupported":
       return 3;
     default:
       return 2;
   }
+}
+
+// Per-GPU host-probe ids (<base>_gpu<N>, and a codec probe's <base>_gpu<N>_<codec>;
+// node-agent/src/host_probe.rs) group under their base id.
+// The codec alternation mirrors the agent's `ProbeCodec` (node-agent/src/host_probe.rs).
+export function baseCheckId(id: string): string {
+  return id.replace(/_gpu\d+(?:_(?:h265|av1))?$/, "");
 }
 
 export interface ReadinessGroup {
@@ -78,7 +95,7 @@ export function groupChecks(checks: readonly ReadinessCheck[]): GroupedReadiness
 
   const buckets = new Map<string, ReadinessCheck[]>();
   for (const c of applicable) {
-    const g = groupOf.get(c.id) ?? OTHER_GROUP;
+    const g = groupOf.get(c.id) ?? groupOf.get(baseCheckId(c.id)) ?? OTHER_GROUP;
     const list = buckets.get(g.key) ?? [];
     list.push(c);
     buckets.set(g.key, list);
@@ -92,7 +109,9 @@ export function groupChecks(checks: readonly ReadinessCheck[]): GroupedReadiness
     const sorted = [...list].sort((a, b) => {
       const r = rank(a.status) - rank(b.status);
       if (r !== 0) return r;
-      return (order.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.id) ?? Number.MAX_SAFE_INTEGER);
+      const aOrder = order.get(a.id) ?? order.get(baseCheckId(a.id)) ?? Number.MAX_SAFE_INTEGER;
+      const bOrder = order.get(b.id) ?? order.get(baseCheckId(b.id)) ?? Number.MAX_SAFE_INTEGER;
+      return aOrder - bOrder;
     });
     groups.push({ key: g.key, label: g.label, checks: sorted });
   }

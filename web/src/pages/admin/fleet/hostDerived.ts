@@ -6,6 +6,9 @@
 
 import { needsAttention, type AttentionHost } from "../../../lib/fleet/deriveAlerts";
 
+/** control-api.md amendment 14 §"Preflight"; the warning itself is hostWarnings.ts. */
+const OWNER_CONFLICT = "owner_conflict";
+
 // ── Inputs ───────────────────────────────────────────────────────────────────
 
 // Inputs are structural rather than the generated API types, like
@@ -181,10 +184,17 @@ export function schedulingLabel(host: { status: string }): string {
  *
  * `status` alone would call a host with a failed capacity report or a failed
  * readiness check "online" — the row an operator most needs to spot. Same
- * predicate as the rail badge (`needsAttention`), so they cannot disagree.
+ * predicate as the rail badge (`needsAttention`), so they cannot disagree, with
+ * one exception: a failing `owner_conflict` blocks only this machine's updates,
+ * not its sessions, so the host stays "online" and its row carries the owner
+ * conflict chip instead (design_handoff_v3 screens/rh06 hosts, conflict).
  */
 export function hostStateLabel(host: HostLike): string {
-  return host.status === "online" && needsAttention(host) ? "degraded" : host.status;
+  const serving = {
+    ...host,
+    readiness: (host.readiness ?? []).filter((check) => check.id !== OWNER_CONFLICT),
+  };
+  return host.status === "online" && needsAttention(serving) ? "degraded" : host.status;
 }
 
 /** `.sdot` modifier for that state (mock: ok / warn / bad / off). */
@@ -203,4 +213,47 @@ export function hostStateChip(host: HostLike): "success" | "warning" | "danger" 
   if (state === "draining") return "warning";
   if (state === "offline" || state === "degraded") return "danger";
   return "neutral";
+}
+
+// ── GPU summary (row) ────────────────────────────────────────────────────────
+
+export interface GpuGroupInput {
+  vendor: string;
+  model: string;
+}
+
+/** One distinct vendor+model among a host's GPUs, and how many it has. */
+export interface GpuGroup {
+  vendor: string;
+  model: string;
+  count: number;
+}
+
+/**
+ * Groups a host's GPUs by vendor+model, first-seen order preserved. A `×N`
+ * count is only ever truthful within a group — a mixed host (#310, e.g. one
+ * RTX 5090 + one AMD iGPU) yields two one-count groups instead of collapsing
+ * into "<first model> ×<total>".
+ */
+export function groupGpusByModel(gpus: readonly GpuGroupInput[]): GpuGroup[] {
+  const groups: GpuGroup[] = [];
+  for (const g of gpus) {
+    const existing = groups.find((group) => group.vendor === g.vendor && group.model === g.model);
+    if (existing) {
+      existing.count++;
+    } else {
+      groups.push({ vendor: g.vendor, model: g.model, count: 1 });
+    }
+  }
+  return groups;
+}
+
+/** Distinct vendors across a host's GPUs, first-seen order preserved — the
+ *  row's vendor sub-line, truthful for a mixed-vendor host too. */
+export function distinctGpuVendors(groups: readonly GpuGroup[]): string[] {
+  const vendors: string[] = [];
+  for (const g of groups) {
+    if (!vendors.includes(g.vendor)) vendors.push(g.vendor);
+  }
+  return vendors;
 }

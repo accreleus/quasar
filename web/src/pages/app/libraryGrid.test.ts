@@ -320,6 +320,14 @@ describe("presentLaunchError", () => {
     expect(result.body).not.toContain("failed");
   });
 
+  it("home_conflict asks for operator repair without disclosing locations", () => {
+    const result = presentLaunchError(family, gameA, "home_conflict", "private server detail");
+    expect(result.title).toBe("Steam needs storage repair");
+    expect(result.body).toContain("operator");
+    expect(result.body).not.toContain("private server detail");
+    expect(result.body).not.toContain("host");
+  });
+
   it("falls back to the generic message for anything else", () => {
     const result = presentLaunchError(family, gameA, "profile_ineligible", "not eligible on this device");
     expect(result.title).toBe("Launch failed");
@@ -329,6 +337,40 @@ describe("presentLaunchError", () => {
   it("still renders the pre-existing capacity_unavailable copy", () => {
     const result = presentLaunchError(family, gameA, "capacity_unavailable", "raw message");
     expect(result.body).toBe("No host available right now — try again shortly.");
+  });
+
+  it("no_host_available gets its own final message once the client's retry budget is spent", () => {
+    const result = presentLaunchError(family, gameA, "no_host_available", "raw message");
+    expect(result.variant).toBe("danger");
+    expect(result.title).toBe("Launch failed");
+    expect(result.body).toBe(
+      "No host is available right now. Try again shortly; if it persists, ask your admin to check the host.",
+    );
+  });
+
+  it("host_not_ready returns the standard title and body", () => {
+    const result = presentLaunchError(family, gameA, "host_not_ready", "any message");
+    expect(result.variant).toBe("info");
+    expect(result.title).toBe("This host isn't ready");
+    expect(result.body).toBe(
+      "The host that would run this needs its administrator's attention. Ask your admin to check the host's readiness, then try again."
+    );
+  });
+
+  it("host_not_ready ignores the server message and does not name any check", () => {
+    const result = presentLaunchError(
+      family,
+      gameA,
+      "host_not_ready",
+      "media_probe_gpu1 failed: device not found"
+    );
+    expect(result.body).not.toContain("media_probe");
+    expect(result.body).not.toContain("gpu1");
+  });
+
+  it("host_not_ready omits sessionId", () => {
+    const result = presentLaunchError(family, gameA, "host_not_ready", "some message", "sess-1");
+    expect(result.sessionId).toBeUndefined();
   });
 });
 

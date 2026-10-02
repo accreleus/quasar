@@ -1,0 +1,11 @@
+{
+  "ghcr.io/accreleus/quasar/quasar-control-plane@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": 1,
+  "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": 2,
+  "ghcr.io/accreleus/quasar/quasar-recovery@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc": 1,
+  "ghcr.io/accreleus/quasar/quasar-control-plane@sha256:1111111111111111111111111111111111111111111111111111111111111111": 1,
+  "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:2222222222222222222222222222222222222222222222222222222222222222": 1,
+  "ghcr.io/accreleus/quasar/quasar-recovery@sha256:3333333333333333333333333333333333333333333333333333333333333333": 1,
+  "ghcr.io/accreleus/quasar/quasar-control-plane@sha256:4444444444444444444444444444444444444444444444444444444444444444": 1,
+  "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:5555555555555555555555555555555555555555555555555555555555555555": 2,
+  "ghcr.io/accreleus/quasar/quasar-recovery@sha256:6666666666666666666666666666666666666666666666666666666666666666": 1
+}

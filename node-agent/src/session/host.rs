@@ -43,6 +43,15 @@ pub struct SessionHost {
     /// `None` under `use_test_audio` or when start failed (socket timeout). The
     /// sidecar's `Drop` removes its container.
     pulse: Option<PulseSidecar>,
+    /// The sticky "a previous stop was unconfirmed" / "a mount may still be
+    /// live" pair, carried between this host's release calls.
+    release_state: super::teardown::ReleaseState,
+    /// Last container-stop outcome. See `SessionHost::finish_container_stop`.
+    ended: Option<super::teardown::StopAttempt>,
+    /// This session end's whole retry allowance. Deliberately much smaller than
+    /// the production session's: `Drop` runs on a Tokio worker (see
+    /// [`super::teardown::DEMO_STOP_RETRY_BUDGET`]).
+    budget: super::teardown::RetryBudget,
     /// Why there is no sidecar despite wanting one (session streams silence), or
     /// `None`. Mirrors `SessionResources::audio_degraded` (see source.rs).
     audio_degraded: Option<String>,
@@ -63,12 +72,11 @@ impl SessionHost {
             // Publish fake-udev records where the app container's /run/udev/data
             // bind-mount can see them (SDL/Steam discover via libudev). Best-effort:
             // a failure only degrades gamepad discovery, not the session.
-            let udev_dir = super::virtual_input::udev_export_dir(&cfg.runtime_dir, session_id);
-            if let Err(e) = d.export_udev_data(&udev_dir) {
+            if let Err(e) = d.export_udev_data(&cfg.runtime_dir, session_id) {
                 tracing::warn!(
                     token = "udev-export-failed",
-                    "udev export to {} failed: {e:#} — in-container gamepad discovery degraded",
-                    udev_dir.display()
+                    "udev export for session {session_id} failed: {e:#} — in-container gamepad \
+                     discovery degraded"
                 );
             }
             Some(d)
@@ -78,7 +86,7 @@ impl SessionHost {
 
         // Both no-sidecar outcomes are recorded with a reason (rationale:
         // `SessionResources::prepare` in source.rs): `Err` means it could not
-        // start at all, `Ok(None)` means its socket never appeared. Either way
+        // start at all, `Ok(None)` means its socket never became ready. Either way
         // the session streams silence, and that must not be invisible.
         let mut audio_degraded: Option<String> = None;
         let pulse = if cfg.use_test_audio {
@@ -88,7 +96,7 @@ impl SessionHost {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
                     audio_degraded = Some(
-                        "PulseAudio sidecar started but its socket never appeared".to_string(),
+                        "PulseAudio sidecar started but its socket never became ready".to_string(),
                     );
                     None
                 }
@@ -106,6 +114,12 @@ impl SessionHost {
             );
         }
         let pulse_server = pulse.as_ref().map(|p| p.server_uri());
+        // One allowance for this host's whole session end, shared with the sidecar.
+        let budget = super::teardown::RetryBudget::new(super::teardown::DEMO_STOP_RETRY_BUDGET);
+        let mut pulse = pulse;
+        if let Some(sidecar) = pulse.as_mut() {
+            sidecar.adopt_budget(budget.clone());
+        }
 
         Ok((
             SessionHost {
@@ -123,6 +137,9 @@ impl SessionHost {
                 container: None,
                 launched: false,
                 pulse,
+                release_state: super::teardown::ReleaseState::IDLE,
+                ended: None,
+                budget,
                 audio_degraded,
             },
             pulse_server,
@@ -216,6 +233,7 @@ impl SessionHost {
                     wl_display
                 );
                 self.container = Some(c);
+                self.release_state.mount_live = true;
             }
             Err(e) => tracing::error!(
                 token = "app-container-launch-failed",
@@ -224,21 +242,89 @@ impl SessionHost {
         }
     }
 
-    /// Tear everything down (idempotent). `Drop` is the backstop.
-    /// Order: app container first (stops producing audio), then PulseAudio sidecar.
+    /// Tear everything down (idempotent). `Drop` is the final chance.
+    /// Order: app container, then udev export, then PulseAudio sidecar — and the
+    /// sidecar is stopped even when the app stop is unconfirmed. A busy client
+    /// is retried; it is not treated as a failed stop.
     pub fn teardown(&mut self) {
-        if let Some(mut c) = self.container.take() {
-            c.stop();
+        self.release(false);
+    }
+
+    fn release(&mut self, final_chance: bool) {
+        let report = self.finish_container_stop(final_chance);
+        if final_chance {
+            // The observed attempt above replaces the container's blind `Drop`
+            // stop; see `RunningContainer::disarm_drop`. It also keeps this
+            // release's blocking on the Tokio worker no worse than the single
+            // stop+cleanup `SessionHost::teardown` already cost before #314.
+            if let Some(container) = self.container.as_mut() {
+                container.disarm_drop();
+            }
         }
-        if let Some(mut p) = self.pulse.take() {
-            p.stop();
+        self.release_state = super::teardown::settle_udev(
+            &self.session_id,
+            report,
+            self.release_state,
+            final_chance,
+            self.devices
+                .as_ref()
+                .map(|d| &**d as &dyn super::teardown::UdevExport),
+        );
+        if let Some(pulse) = self.pulse.as_mut() {
+            pulse.stop();
+        }
+    }
+
+    /// Same rule as `AppSource::finish_app_stop`: every engine attempt is
+    /// observed, a refused one may be asked again, and an unconfirmed one is
+    /// asked exactly once more — on the last chance, in place of the container's
+    /// blind `Drop`.
+    fn finish_container_stop(&mut self, last_chance: bool) -> super::teardown::StopAttempt {
+        use super::teardown::StopAttempt;
+        if let Some(report) = self.ended {
+            let ask_again = match report {
+                StopAttempt::Retryable => true,
+                StopAttempt::Unconfirmed => last_chance,
+                StopAttempt::Confirmed | StopAttempt::Absent => false,
+            };
+            if !ask_again {
+                return report;
+            }
+        }
+        let budget = self.budget.clone();
+        let report = super::teardown::retry_with_budget(|| self.stop_container_once(), &budget);
+        self.ended = Some(report);
+        report
+    }
+
+    fn stop_container_once(&mut self) -> super::teardown::StopAttempt {
+        if self.container.is_none() {
+            return super::teardown::StopAttempt::Absent;
+        }
+        let stopped = self.container.as_mut().unwrap().stop();
+        match stopped {
+            Ok(()) => {
+                self.container.take();
+                self.release_state.mount_live = false;
+                super::teardown::StopAttempt::Confirmed
+            }
+            Err(error) => {
+                let report = super::teardown::classify_stop(super::teardown::error_kind(&error));
+                if !matches!(report, super::teardown::StopAttempt::Retryable) {
+                    tracing::warn!(
+                        token = "application-host-teardown-pending",
+                        "application teardown remains durable: {error}"
+                    );
+                }
+                report
+            }
         }
     }
 }
 
 impl Drop for SessionHost {
     fn drop(&mut self) {
-        self.teardown();
+        self.release(true);
     }
 }
 

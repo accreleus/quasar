@@ -53,7 +53,7 @@ mod ffi {
 ///
 /// Why a singleton and not per-session: gst-wayland-display leaked one reference to the
 /// injected `GstCudaContext` per session, so a per-session context was never finalized —
-/// ~500 MiB VRAM + one cuda-EvtHandlr driver thread leaked per session (Tower, 2026-07-25).
+/// ~500 MiB VRAM + one cuda-EvtHandlr driver thread leaked per session (gpu-test, 2026-07-25).
 /// Root cause, fixed as the 10th vendored gwd patch
 /// (`deploy/patches/vulkan/gst-wayland-display-cuda-pool-config-leak.patch`, see its README):
 /// `CUDABufferPool::get_updated_size()` never freed the **(transfer full)** `GstStructure`

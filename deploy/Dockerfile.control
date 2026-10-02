@@ -10,11 +10,11 @@
 # No separate migration runner is needed in the image.
 
 # ── Build stage ───────────────────────────────────────────────────────────────
-# Must stay >= control-plane/go.mod's `go` directive (currently 1.25.0). The
+# Must stay >= control-plane/go.mod's `go` directive (currently 1.26.0). The
 # official golang images set GOTOOLCHAIN=local, so a lower pin does NOT silently
 # auto-download the newer toolchain — `go mod download` fails outright with
-# "go.mod requires go >= 1.25.0 (running go 1.24.x; GOTOOLCHAIN=local)".
-FROM golang:1.25-alpine AS builder
+# "go.mod requires go >= 1.26.0 (running go 1.25.x; GOTOOLCHAIN=local)".
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
 

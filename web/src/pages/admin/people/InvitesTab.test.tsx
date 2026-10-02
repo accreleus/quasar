@@ -164,7 +164,7 @@ describe("InvitesTab — non-pending rows have no Revoke, and expired dims the r
     // fmtDate always includes the 4-digit year regardless of locale (CI-safe —
     // see lib/format.test.ts's "locale-agnostic in CI" convention).
     const cell = screen.getByText(/2020/);
-    expect(cell).toHaveStyle({ color: "var(--danger-text)" });
+    expect(cell).toHaveClass("inv-expired");
   });
 });
 

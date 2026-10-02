@@ -14,7 +14,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
+	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
 var (
@@ -38,7 +40,7 @@ type agentStore struct {
 	isAgentConnected func(hostID string) bool
 	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
 	// so agentws does not import hostenroll (and so tests can supply a stub). Nil means
-	// minted tokens are unavailable: only the static token can enroll.
+	// minted tokens are unavailable, and then nothing enrolls.
 	redeemEnrollment func(ctx context.Context, db hostenroll.DBTX, plaintext, nodeName string) error
 }
 
@@ -87,23 +89,14 @@ type registerResult struct {
 // plane's own downtime to the agent.
 var agentRestartMinGap = 15 * time.Second
 
-// enrollHost creates or re-enrolls a host using the enrollment token.
-// If the host row already exists, the node_secret is rotated (idempotent re-enrollment).
-func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, token, configToken string) (registerResult, error) {
-	// Two credentials are accepted, minted first (#12/#96).
-	//
-	// A minted token is per-host, hashed, single-use and expiring; the static configToken
-	// is the fleet-wide value every deployment has today and must keep working across the
-	// upgrade. Redemption is deferred into the transaction below so that consuming a
-	// single-use token is atomic with the host row it creates: if the upsert fails, the
-	// use is given back with the rollback.
-	//
-	// Constant-time on the static compare: the enrollment token gates rogue-node
-	// enrollment, and /agent/ws is reachable pre-auth — don't leak a byte-by-byte timing
-	// oracle. A minted token needs no such care: it is looked up by hash, not compared.
-	staticOK := configToken != "" &&
-		subtle.ConstantTimeCompare([]byte(token), []byte(configToken)) == 1
-
+// enrollHost creates or re-enrolls a host using the enrollment token: a minted
+// token or a machine's single-use local one, and nothing else (control-api.md
+// §Host enrollment tokens; the static ENROLLMENT_TOKEN is retired). Redemption is
+// deferred into the transaction below so that consuming a single-use token is
+// atomic with the host row it creates: if the upsert fails, the use is given
+// back with the rollback. A minted token is looked up by hash, so it needs no
+// constant-time compare.
+func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, token string) (registerResult, error) {
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
 		return registerResult{}, fmt.Errorf("generate node secret: %w", err)
@@ -121,18 +114,16 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// Consume the credential inside the transaction (see the note above), and BEFORE the
 	// takeover guard below: /agent/ws is reachable pre-auth, and running the guard first
 	// told an unauthenticated caller whether a node_name exists with a live agent.
-	if !staticOK {
-		if s.redeemEnrollment == nil {
-			return registerResult{}, ErrInvalidEnrollmentToken // minted tokens unavailable
+	if s.redeemEnrollment == nil {
+		return registerResult{}, ErrInvalidEnrollmentToken // minted tokens unavailable
+	}
+	if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
+		// Only a genuinely unusable token is an auth failure. A DB outage reported as
+		// "authentication failed" sends the operator to rotate a token that was fine.
+		if errors.Is(err, hostenroll.ErrInvalidToken) {
+			return registerResult{}, ErrInvalidEnrollmentToken
 		}
-		if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
-			// Only a genuinely unusable token is an auth failure. A DB outage reported as
-			// "authentication failed" sends the operator to rotate a token that was fine.
-			if errors.Is(err, hostenroll.ErrInvalidToken) {
-				return registerResult{}, ErrInvalidEnrollmentToken
-			}
-			return registerResult{}, fmt.Errorf("redeem enrollment token: %w", err)
-		}
+		return registerResult{}, fmt.Errorf("redeem enrollment token: %w", err)
 	}
 
 	// #96: enrollment onto an EXISTING node_name replaces its node_secret. That is correct
@@ -149,6 +140,9 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		if dbLive || (s.isAgentConnected != nil && s.isAgentConnected(existingID)) {
 			return registerResult{}, ErrHostAgentConnected
 		}
+		if err := releaseRemovalDrain(ctx, tx, existingID); err != nil {
+			return registerResult{}, err
+		}
 	case errors.Is(err, pgx.ErrNoRows):
 		// A new node_name: nothing to take over, and nothing locked either — zero rows
 		// lock nothing. Concurrent first-enrollments of the same name serialize on the
@@ -161,6 +155,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// agent_disconnected_at is cleared so a re-enrolling node never carries a
 	// stale pending disconnect into its first reconnect.
 	var hostID string
+	var newlyCreated bool
 	err = tx.QueryRow(ctx, `
 		INSERT INTO hosts (node_name, agent_version, node_secret_hash, status, last_registered_at, capacity_detection, agent_process_started_at)
 		VALUES ($1, $2, $3, 'online', now(), 'unavailable', now())
@@ -176,10 +171,19 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		        ,agent_restart_count      = 0
 		        ,agent_last_restart_at    = NULL
 		        ,agent_disconnected_at    = NULL
-		RETURNING id::text
-	`, nodeName, agentVersion, secretHash).Scan(&hostID)
+		RETURNING id::text, (xmax = 0)
+	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated)
 	if err != nil {
 		return registerResult{}, fmt.Errorf("upsert host: %w", err)
+	}
+	if newlyCreated {
+		// Only a genuinely new installation carries this unedited marker.
+		// Automatic choices are inserted after this host proves RH05 hardware
+		// capability on its authenticated connection, never on enrollment alone.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+			VALUES ($1::uuid,'hardware',0,'restart','upgrade_required')`, hostID); err != nil {
+			return registerResult{}, fmt.Errorf("mark new host hardware initialization: %w", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, markGPUsStaleAndClearVramSQL, hostID); err != nil {
 		return registerResult{}, fmt.Errorf("mark enrollment inventory stale: %w", err)
@@ -188,6 +192,38 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		return registerResult{}, fmt.Errorf("commit enrollment: %w", err)
 	}
 	return registerResult{HostID: hostID, NodeSecret: secretHex}, nil
+}
+
+// removalDrainWindow bounds how long after taking its cordon the remove route records
+// `platform.remove.host`: the host_remove ack timeout (10 s) and a forced session stop.
+const removalDrainWindow = "60 seconds"
+
+// releaseRemovalDrain lifts, on a re-enrollment onto the row, only the drain a console
+// removal took for itself. The route takes the operator-drain owner only when none was held,
+// then audits, so its drain is the one created within removalDrainWindow before a
+// `platform.remove.host` record; an operator's older drain must stay (no distinct owner id is
+// possible: schema.md pins the manual owner). Guarded by
+// TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain.
+func releaseRemovalDrain(ctx context.Context, tx pgx.Tx, hostID string) error {
+	tag, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions r
+		WHERE r.host_id = $1::uuid AND r.owner_kind = 'manual'
+		  AND r.owner_id = '`+admission.ManualOwner.ID+`'::uuid
+		  AND EXISTS (SELECT 1 FROM admin_activity a
+		      WHERE a.action = 'platform.remove.host' AND a.target_type = 'host' AND lower(a.target_id) = r.host_id::text
+		        AND a.created_at >= r.created_at
+		        AND a.created_at < r.created_at + interval '`+removalDrainWindow+`')`, hostID)
+	if err != nil {
+		return fmt.Errorf("release the removal's drain: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET status = 'offline'
+		WHERE id = $1::uuid AND status = 'draining'
+		  AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions WHERE host_id = $1::uuid)`, hostID); err != nil {
+		return fmt.Errorf("project the host after its removal's drain: %w", err)
+	}
+	return nil
 }
 
 // hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees
@@ -245,7 +281,9 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, 
 // column keeps its value — still carries the admin's or a fleet run's intent.
 // session.UncordonHost is what lifts it, and it already handles a connected
 // draining host. A fresh INSERT has no prior status and starts 'online'.
-const registerStatusSQL = `CASE WHEN hosts.status = 'draining' THEN 'draining' ELSE 'online' END`
+const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
+    OR EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = hosts.id)
+    THEN 'draining' ELSE 'online' END`
 
 // Reconnect UPDATE with #429 restart classification (rationale at
 // agentRestartMinGap). The `old` CTE snapshots the pre-reconnect values under
@@ -356,9 +394,19 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 	reportedIndexes := make([]int, len(gpus))
 	for i, g := range gpus {
 		reportedIndexes[i] = g.Index
+		// nil Codecs marshals to a nil []byte, which pgx's JSON codec encodes as
+		// SQL NULL (never the JSON literal "null") — see gpuCodecSetSQL's
+		// NULL-means-inherit contract.
+		var codecsRaw []byte
+		if g.Codecs != nil {
+			codecsRaw, err = json.Marshal(g.Codecs)
+			if err != nil {
+				return fmt.Errorf("encode gpu %d codecs: %w", g.Index, err)
+			}
+		}
 		_, err = tx.Exec(ctx, `
-			INSERT INTO gpus (host_id, index, vendor, model, vram_mb_total, encode_slots_total, render_node, device_path, driver_identity, reported)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
+			INSERT INTO gpus (host_id, index, vendor, model, vram_mb_total, encode_slots_total, render_node, device_path, driver_identity, codecs, reported)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
 			ON CONFLICT (host_id, index) DO UPDATE
 			    SET vendor             = EXCLUDED.vendor,
 			        model              = EXCLUDED.model,
@@ -367,13 +415,14 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 			        render_node        = EXCLUDED.render_node,
 			        device_path        = EXCLUDED.device_path,
 			        driver_identity    = EXCLUDED.driver_identity,
+			        codecs             = EXCLUDED.codecs,
 			        reported           = true,
 			        -- Identity change at this index ⇒ the stored sample describes a
 			        -- DIFFERENT physical GPU (#383 §3.3, review finding #4). This is
 			        -- the PRIMARY guard on the capacity path: markGPUsStaleSQL above
 			        -- deliberately preserves telemetry, because a capacity report is
 			        -- routine (console hotplug, config_update, every session stop —
-			        -- hermes emits one every ~5 s) and wiping the sample on each one
+			        -- the aux host emits one every ~5 s) and wiping the sample on each one
 			        -- erased it as fast as the heartbeat could write it. Only a real
 			        -- identity change at an index invalidates here; reconnect is
 			        -- handled by markGPUsStaleAndClearVramSQL.
@@ -393,7 +442,7 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 			                                      OR gpus.model       IS DISTINCT FROM EXCLUDED.model
 			                                      OR gpus.render_node IS DISTINCT FROM EXCLUDED.render_node
 			                                    THEN NULL ELSE gpus.vram_sample_agent_ms END
-		`, hostID, g.Index, g.Vendor, g.Model, g.VRAMMBTotal, g.EncodeSlotsTotal, g.RenderNode, g.DevicePath, g.DriverIdentity)
+		`, hostID, g.Index, g.Vendor, g.Model, g.VRAMMBTotal, g.EncodeSlotsTotal, g.RenderNode, g.DevicePath, g.DriverIdentity, codecsRaw)
 		if err != nil {
 			return fmt.Errorf("upsert gpu %d: %w", g.Index, err)
 		}
@@ -409,11 +458,18 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 		return fmt.Errorf("remove stale gpus: %w", err)
 	}
 
+	// After the GPU set is settled: a GPU row that appears here starts
+	// readiness_blocked = false, and without this it would stay schedulable
+	// until the next readiness report even though the stored one names it.
+	if err := readinessgate.New(s.pool).Recompute(ctx, tx, hostID); err != nil {
+		return err
+	}
+
 	return tx.Commit(ctx)
 }
 
-// replaceHostIdentity writes the four platform-release identity columns
-// (schema.md `hosts`, migration 0074) from one `register` message.
+// replaceHostIdentity writes the platform-release identity columns (schema.md
+// `hosts`, migrations 0074 and 0095) from one `register` message.
 //
 // WHOLESALE REPLACE, not keep-if-absent, and that is the point: every column is
 // written from this message and an absent field becomes NULL. The columns
@@ -428,12 +484,20 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id HostIdentity) error {
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE hosts SET
-			source_commit   = $2,
-			built_at        = $3,
-			install_mode    = $4,
-			updater_present = $5
+			source_commit                = $2,
+			built_at                     = $3,
+			install_mode                 = $4,
+			updater_present              = $5,
+			recovery_actor_version       = $6,
+			recovery_actor_source_commit = $7,
+			seed_version                 = $8,
+			engine                       = $9,
+			engine_version               = $10,
+			engine_mode                  = $11
 		WHERE id = $1
-	`, hostID, id.SourceCommit, id.BuiltAt, id.InstallMode, id.UpdaterPresent); err != nil {
+	`, hostID, id.SourceCommit, id.BuiltAt, id.InstallMode, id.UpdaterPresent,
+		id.RecoveryActorVersion, id.RecoveryActorSourceCommit, id.SeedVersion,
+		id.Engine, id.EngineVersion, id.EngineMode); err != nil {
 		return fmt.Errorf("update host identity: %w", err)
 	}
 	return nil
@@ -444,7 +508,11 @@ func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id 
 // agent's raw bytes are stored verbatim, never re-encoded — re-encoding would
 // drop per-check fields a newer agent sends (see RegisterMsg.Readiness).
 // readiness_reported_at stamps every real report, not only changes, so a stale
-// set cannot present as live. Advisory; nothing schedules on it.
+// set cannot present as live.
+//
+// readinessgate.StoreReport writes it and derives the scheduling columns under
+// the host's row lock, so a report and an override change serialise. A
+// kept-if-absent or malformed report writes nothing and derives nothing.
 func (s *agentStore) upsertHostReadiness(ctx context.Context, hostID string, raw json.RawMessage) error {
 	if raw == nil {
 		return nil // keep-if-absent
@@ -452,12 +520,7 @@ func (s *agentStore) upsertHostReadiness(ctx context.Context, hostID string, raw
 	if _, ok := ValidReadiness(raw); !ok {
 		return fmt.Errorf("malformed readiness payload (%d bytes); not stored", len(raw))
 	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE hosts SET readiness = $2, readiness_reported_at = now() WHERE id = $1`,
-		hostID, []byte(raw)); err != nil {
-		return fmt.Errorf("update host readiness: %w", err)
-	}
-	return nil
+	return readinessgate.New(s.pool).StoreReport(ctx, hostID, raw)
 }
 
 // upsertHostCodecs writes hosts.codecs (multi-codec spec §3.1.2).
@@ -475,6 +538,35 @@ func (s *agentStore) upsertHostCodecs(ctx context.Context, hostID string, codecs
 		return fmt.Errorf("update host codecs: %w", err)
 	}
 	return nil
+}
+
+// withdrawStaleProbeCodecs drops every codec above the h264 floor from the host
+// and per-GPU claims when they were reported under a different value of a
+// host-probe input key (the agent's PROBE_SETTINGS_KEYS). The capacity that
+// reported them carried that value in effective_settings; the next capacity
+// report replaces both. Fail-closed: a missing effective value withdraws.
+func (s *agentStore) withdrawStaleProbeCodecs(ctx context.Context, hostID, key string, value any) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var stale bool
+	err = tx.QueryRow(ctx, `SELECT (effective_settings->>$2) IS DISTINCT FROM $3 FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID, key, fmt.Sprint(value)).Scan(&stale)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !stale) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	floor := `CASE WHEN codecs ? 'h264' THEN '["h264"]'::jsonb ELSE '[]'::jsonb END`
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET codecs=`+floor+` WHERE id=$1::uuid AND codecs IS NOT NULL`, hostID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE gpus SET codecs=`+floor+` WHERE host_id=$1::uuid AND codecs IS NOT NULL AND jsonb_typeof(codecs)='array'`, hostID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // upsertHostCodecPixelRates writes hosts.codec_pixel_rates (#506) verbatim,
@@ -586,13 +678,31 @@ func (s *agentStore) updateHeartbeat(ctx context.Context, hostID string) error {
 	return nil
 }
 
-// markOffline sets a host offline on WS disconnect (every path that ends the
-// read loop). Also stamps agent_disconnected_at = now(), the anchor for
+// markLive undoes a displaced connection's markOffline for the current one; it keeps
+// a drain exactly as registerStatusSQL does.
+func (s *agentStore) markLive(ctx context.Context, hostID string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE hosts SET status=`+registerStatusSQL+`, agent_disconnected_at=NULL
+		WHERE id=$1 AND (status='offline' OR agent_disconnected_at IS NOT NULL)
+	`, hostID)
+	if err != nil {
+		return fmt.Errorf("mark live: %w", err)
+	}
+	return nil
+}
+
+// markOffline stamps a WS disconnect (every path that ends the read loop).
+// An owned restriction keeps the compatibility status draining; the connection
+// stamp remains the source of liveness. Also stamps agent_disconnected_at =
+// now(), the anchor for
 // reconnectHost's blip-vs-restart classification — see agentRestartMinGap for
 // why a control-plane restart cannot misattribute its own downtime.
 func (s *agentStore) markOffline(ctx context.Context, hostID string) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE hosts SET status='offline', agent_disconnected_at=now() WHERE id=$1
+		UPDATE hosts SET status=CASE WHEN EXISTS (
+		    SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id=hosts.id
+		) THEN 'draining' ELSE 'offline' END,
+		agent_disconnected_at=now() WHERE id=$1
 	`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark offline: %w", err)

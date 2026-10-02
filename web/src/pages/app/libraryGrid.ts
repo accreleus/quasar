@@ -226,11 +226,34 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
       body: `Launch ${rootName} once on a host to set up your library, then try again.`,
     };
   }
+  if (code === "home_conflict") {
+    return {
+      variant: "danger",
+      title: `${rootName} needs storage repair`,
+      body: "Ask an operator to resolve the saved home location before launching again.",
+    };
+  }
   if (code === "capacity_unavailable") {
     return {
       variant: "danger",
       title: "Launch failed",
       body: "No host available right now — try again shortly.",
+    };
+  }
+  // Reached only once the client's own no_host_available retry budget
+  // (capacityRetry.ts) has run out — this is the final, not the transient, copy.
+  if (code === "no_host_available") {
+    return {
+      variant: "danger",
+      title: "Launch failed",
+      body: "No host is available right now. Try again shortly; if it persists, ask your admin to check the host.",
+    };
+  }
+  if (code === "host_not_ready") {
+    return {
+      variant: "info",
+      title: "This host isn't ready",
+      body: "The host that would run this needs its administrator's attention. Ask your admin to check the host's readiness, then try again.",
     };
   }
   // #525: fallback body must never be empty — a "" body renders a titled toast

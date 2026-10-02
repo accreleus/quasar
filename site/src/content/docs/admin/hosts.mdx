@@ -1,6 +1,6 @@
 ---
 title: Hosts and GPUs
-description: Reading host readiness, GPU capacity, admission control, per-host settings, and draining a machine.
+description: Host readiness, GPU capacity, per-host settings, and draining a machine.
 ---
 
 import Shot from '../../../components/Shot.astro';
@@ -11,138 +11,164 @@ Admin, Fleet, Hosts lists every machine running a node agent, with its GPUs.
 
 <Shot
 	label="Admin hosts"
-	sublabel="The fleet host list, with per-GPU slot use and VRAM, RAM and disk bars."
+	sublabel="The fleet host list, with per-GPU slot use and VRAM and disk bars, and one host expanded: its hardware, the services on the machine, its build, and the codecs its GPU has proven."
 	src={admin_hosts}
 	alt="The admin fleet page listing hosts and their GPUs"
 />
 
 ## Reading a host
 
-Each host shows its status, when it last sent a heartbeat, its CPU, its storage,
-and a set of readiness checks.
+Each host shows its status, last heartbeat, CPU, storage and readiness checks.
+Readiness reports what the agent actually **found**, not what the configuration
+claims. Each check and its fix is on
+[Readiness checks](/quasar/troubleshooting/readiness/).
 
-The readiness checks are the useful part, because they report what the agent
-**found**, not what the configuration claims. A host can be configured for NVENC
-and still have no working encoder.
+Two checks behave differently:
 
-Checks cover the render node, `/dev/uinput` write access, the managed home root,
-media reachability through the host firewall, whether GPU faults are visible, and
-on NVIDIA the presence of the EGL and 32-bit GL components that a CUDA-only driver
-install leaves out.
+- `xid_visibility` reads *skipped* unless the host lets Quasar read the kernel log
+  ([optional](/quasar/operations/diagnostics/#gpu-fault-messages-in-session-traces)).
+  When allowed, GPU faults appear in the session trace; otherwise read the host's
+  `dmesg`.
+- `media_reachability` stays unknown until a browser on another machine tries a
+  session. If that connection never arrives, it fails and names the firewall rule
+  to add ([Ports and endpoints](/quasar/reference/ports/#firewall)).
 
-`xid_visibility` is the odd one out: it reports whether the agent can read
-`/dev/kmsg`, which is where the kernel logs an NVIDIA Xid or an amdgpu fault. The
-generator makes this an optional diagnostics choice because some hosts do not
-provide that device. When enabled, it passes the device read-only and grants
-`SYSLOG`, allowing GPU faults to appear in the session trace. Otherwise, read the
-host’s `dmesg` when investigating a GPU fault.
-
-A `media_reachability` warning names the scoped firewall rule the host is
-missing, or the half of the media path an existing rule leaves closed. A
-default-deny host whose rules already cover the range passes, quoting them. See
-[Ports and endpoints](/quasar/reference/ports/#firewall).
-
-Driver provisioning is reported as work in progress, and readiness refreshes
-while the agent remains connected. A known AV1 driver restriction leaves the host
-usable with its other eligible codecs; see
+A known AV1 driver restriction leaves the host usable with its other codecs; see
 [AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
 
-<Aside type="note" title="Readiness and launch checks">
-The agent remains available for administration when a readiness check fails.
-Required driver, home, template or runtime mounts that cannot be resolved prevent
-an affected app launch. Warnings about optional diagnostics do not block it.
-</Aside>
+### When a check blocks launches
+
+A host always registers, however many checks fail. Most checks are advice. A check
+blocks launches only when it rests on real evidence (a probe of the real path, or
+something like an unwritable home root) **and** currently fails. Configuration-only
+checks, warnings and inconclusive probes never block.
+
+| Scope | What it blocks |
+| --- | --- |
+| Host | Every launch on the host. |
+| Homes | Every launch on the host that mounts a managed home. |
+| GPU | Every launch placed on that GPU. Other GPUs keep serving. |
+
+Only a report from the last minute counts. When readiness is the only reason no
+host can take a launch, the player sees `host_not_ready`; the check itself is named
+only on the host's readiness card. Game swaps in a running session are not affected.
+
+### Overriding a failing check
+
+**Launch anyway** on a blocking check lets the host launch despite it. The check
+stays on the card, marked overridden. An override:
+
+- applies to that check on that host only;
+- ends by itself the next time the check passes;
+- is written to the audit log with who set it;
+- is refused for checks the agent enforces itself.
+
+**Withdraw override** removes it. An override for a check the agent no longer
+reports is listed as inert.
 
 ## Build identity in the host drawer
 
-Expanding a host row shows a **Build** block: what that agent actually is, as it
-reported itself.
+Expanding a host row shows a **Build** block, as the agent reported it.
 
 | Row | What it says |
 | --- | --- |
 | Commit | The commit the agent was built from. |
 | Built | When that build was made. |
-| Install | **Registry** (published images) or **Built from source** (images compiled on the machine). A source-built host can be told about a release but never given one. |
-| Updater | **Present** or **None**. Whether a `quasar-updater` service sits beside this host's stack, which is what can recreate its agent. |
+| Install | **Owned by Quasar** (managed by its recovery actor), **Registry** (published images on a legacy Compose stack) or **Built from source**. A source-built host is never given a release. |
+| Updater | **Recovery actor** if it answered, **Not answering** if not (no release can be applied), or **None** on a host without one. An older Compose host may read **Present**. |
 
-Any of these can read **Unknown**, and on an agent from before the self-update
-feature they all will: it has no way to say what it is running. Such a host keeps
-working exactly as before — it simply cannot be updated from the console until it
-is upgraded once by hand, after which it reports its identity like any other. The
-Releases tab shows the recipe for it.
+**Unknown** means the agent is too old to report. It keeps working but must be
+upgraded by hand once; the Releases tab shows how.
 
-An agent **newer than the control plane** turns up as *Agent ahead of the control
-plane* under Needs attention. Nothing is broken, but it is the wrong way round —
-the control plane carries the migrations and always moves first. It is only
-reachable if something was rolled back by hand. See [Updating
-Quasar](/quasar/admin/releases/).
+### Services on this machine
+
+An owned host's page (and its expanded row) lists its services with version and
+owner:
+
+- **Seed**: owned by your external manager (Dockge, Arcane or `docker run`).
+  Quasar never updates it. *Not found* means no seed is running: start it again,
+  or a deleted recovery actor can't be re-created. *Unknown* means its version
+  couldn't be read.
+- **Recovery actor** and **node agent**: owned by the recovery actor.
+
+On a **combined host** the card also lists the database (*Quasar's own* or *Your
+own*) and the control plane. A **control-only** machine has no host row; see
+Admin, Fleet, Releases, Installed, **This machine**. An offline host shows its last
+report.
+
+Warnings:
+
+| Warning | What to do |
+| --- | --- |
+| **No seed found** | Start the seed again. |
+| **Another owner's container is in the way** | A Quasar-looking container this install didn't create (such as an old Compose stack). Updates are blocked until you remove it and whatever re-creates it. |
+| **Must update before it can be managed** | The agent or recovery actor is below the control plane's floor. Only the lifting update is offered; see [Updating Quasar](/quasar/admin/releases/). |
+| **Agent ahead of the control plane** | Something was rolled back by hand. The control plane must move first; see [Updating Quasar](/quasar/admin/releases/). |
+
+A GPU host's card has **Remove host** (see [Draining and
+removing](#draining-and-removing)). A combined host is removed with `uninstall` on
+the machine instead ([Uninstalling](/quasar/operations/uninstall/)).
 
 ## GPU capacity and admission
 
-Each GPU shows its encode slots and its VRAM, used and free.
+Each GPU shows its encode slots and VRAM. A session is admitted to a GPU when:
 
-A session is admitted to a GPU when two conditions hold.
+- it has a free **encode slot**, and
+- its latest sample shows at least `QUASAR_VRAM_MIN_FREE_MB` free VRAM (default
+  1024). Missing or implausible telemetry never blocks. Set `0` to admit on slots
+  alone.
 
-**Encode slots.** This is the real reservation, and it is race-safe. A GPU has a
-finite number of concurrent encodes it can sustain.
+### The three launch refusals
 
-**Free VRAM.** A veto, not a reservation. If the GPU's most recent memory sample
-shows less free than `QUASAR_VRAM_MIN_FREE_MB` (1024 MB by default), the GPU is
-skipped. Very recent launches the sample has not caught up with are debited from
-the figure.
+| Refusal | Meaning |
+| --- | --- |
+| `no_host_available` | Nothing online can serve it, usually every host offline. The web client retries for 20 seconds; if it persists, check the hosts. |
+| `capacity_exhausted` | Hosts are up but full. Retry once something ends. |
+| `host_not_ready` | A failing readiness check keeps the host out. Clears when you fix or override the check ([details](#when-a-check-blocks-launches)). |
 
-The veto abstains rather than blocking when the telemetry is missing, stale or
-structurally implausible. An integrated GPU whose entire memory carve-out sits
-below the floor would otherwise reject everything. Unknown telemetry is never
-allowed to reduce availability.
-
-Set `QUASAR_VRAM_MIN_FREE_MB=0` to turn the veto off and admit on slots alone.
-
-<Aside type="note" title="Declared per-app VRAM is gone">
-Apps used to carry a declared VRAM figure. It was never enforceable, because
-there is no VRAM cgroup controller to enforce it with, and in practice it was an
-admin-typed guess nothing reconciled. Live telemetry replaced it.
-</Aside>
-
-### The two capacity errors
-
-`no_host_available` means nothing in the fleet could ever serve the request.
-Usually every host is offline. Retrying does not help.
-
-`capacity_exhausted` means hosts are up but currently full. Retrying does help,
-once something ends.
+A codec the player explicitly picked that no GPU can encode is refused with one of
+the first two.
 
 ## Per-host settings
 
-Each host has a Settings page that overrides its environment configuration
-without editing `.env` and restarting anything by hand. Precedence runs: per-host
-override, then agent environment, then catalog default.
+Each host has a Settings page. Every setting has a **source**:
 
-Settings come in two classes.
+| Source | Where the value comes from |
+| --- | --- |
+| Deployment setting | The agent's environment and device detection. The default. |
+| Automatic choice | Quasar picks from what the host has proven. Encoder and render node only, when exactly one GPU passed its media probe. |
+| Explicit value | A value you type. |
 
-**Live** settings apply to the next session on that host. ABR mode, container
-knobs and most tuning are live.
+Each setting shows **Verified on the current connection** once the agent confirms
+it, or **Not yet verified**.
 
-**Restart** settings need the agent to restart, which drops any live sessions on
-that host. The encoder, the render node and the CUDA device are in this class.
-Quasar tells you before it does it.
+**Next-session** settings (ABR mode, container knobs, most tuning) apply to the
+next session once verified.
+
+**Restart** settings (encoder, render node, CUDA device) need an agent restart.
+Under **Restart configuration**, review the values and press **Approve idle
+apply**. The host takes no new sessions, and the agent restarts once existing
+sessions finish. **Running sessions are never ended.** An approval expires after an
+hour or a control-plane restart; changing settings after review also voids it. If
+the new configuration fails, the agent restores the last verified one.
+
+If an approval waits on preparation that isn't happening, turn off **Prepare Steam
+for faster first launch** (Admin, Library, Sources, Steam), let the apply finish,
+then turn it back on.
+
+Settings marked **upgrade required** can't be set here on an older agent; use the
+panels below until it's updated.
 
 ## Render node selection
 
-On a machine with more than one GPU, `QUASAR_RENDER_NODE` picks which one the
-compositor and encoder use.
+On a multi-GPU machine, `QUASAR_RENDER_NODE` picks the GPU. Use a
+`/dev/dri/by-path/` path, since `renderD128`-style names can change between
+reboots ([Encoders](/quasar/tuning/encoders/#picking-a-gpu-on-a-multi-gpu-host)).
+For NVENC, `QUASAR_CUDA_DEVICE` also selects the CUDA device index.
 
-Prefer a `/dev/dri/by-path/` path over `/dev/dri/renderD128`, because the
-numbered names can move between reboots. See
-[Encoders](/quasar/tuning/encoders/#picking-a-gpu-on-a-multi-gpu-host).
-
-For NVENC on a multi-GPU box, `QUASAR_CUDA_DEVICE` selects the CUDA device index
-as well.
-
-<Aside type="caution" title="Per-session GPU routing does not exist yet">
-Placement chooses a host, and the host's configuration chooses a GPU. You cannot
-currently route a specific session to a specific GPU on a multi-GPU host.
-</Aside>
+Left unset, every GPU that passes its probes takes sessions, and each is only
+picked for codecs it can encode. Setting a render node takes the other GPUs out of
+placement.
 
 ## Placement across hosts
 
@@ -150,39 +176,48 @@ currently route a specific session to a specific GPU on a multi-GPU host.
 
 | Value | Behaviour |
 | --- | --- |
-| `spread` | Default. Distributes sessions across hosts. |
-| `least-loaded` | Prefers the host with the most free capacity. |
-| `locality` | Prefers the host that already holds the user's home directory. |
+| `spread` | Default. Most free encode slots, then most free VRAM. `least-loaded` is the same. |
+| `locality` | The host with the user's most recent home for that app; falls back to `spread` when it's full, cordoned or offline. |
 
-Use `locality` if home directories are host-local instead of on shared storage.
-Otherwise a user's saves are on whichever host happened to run the session.
+Either way, once a user has a home for an app on a host, that app always launches
+there for them. If that host is offline or full, they can't launch it. An app's
+own [placement](/quasar/admin/apps/#placement) narrows this further.
+
+### Releasing a home claim
+
+If a host is gone for good, forget it, then open Admin, Fleet, Storage, **Home
+ownership** and use **Release claim** on the row. The user then gets a new, empty
+home. You must add a note of what you checked. Claims on a host that still exists
+can't be released. No files are moved or deleted; if the machine returns with the
+same storage root, the old home is picked up again.
 
 ## Draining and removing
 
-Drain stops a host accepting new sessions while letting existing ones finish.
-Do this before maintenance.
+**Drain** stops new sessions while existing ones finish. Use it before maintenance.
 
-Once it is empty, stop the agent on that machine and forget the host here.
+**Remove host** drains the host, waits for sessions to end, then removes the node
+agent and recovery actor. Forget the host once the page says it was removed. Homes
+and the seed stay on the machine ([Uninstalling](/quasar/operations/uninstall/)).
+Re-adding under the same name keeps its history and lifts the removal's drain (not
+one you set yourself).
+
+A host without a heartbeat for about a minute can't be removed from here ("nothing
+was removed"); run `uninstall` on the machine.
 
 ## The console
 
-Each host has a console page for local-display mode, where the host renders to a
-physically attached screen, not to a browser. It needs additional
-privileges and a separate compose overlay, and it is not part of the default
-deployment.
+A host's **Local console** page turns on console mode: games shown on a screen
+plugged into the host. Turning it on replaces the node agent, which ends the host's
+live sessions. A rootless host needs the console [device
+rules](/quasar/install/device-rules/) first. See [Console mode](/quasar/admin/console/).
 
 ## Storage
 
-Admin, Fleet, Storage shows the managed home directories across your fleet.
-
-Each host can have its own managed-home root. If you want saves to follow users
-between machines it must be real shared storage, not merely the same path on
-each host; otherwise use locality placement to keep a user near the host holding
-their files. The readiness check reports whether the root is visible and
-writable from the agent's namespace.
+Admin, Fleet, Storage shows managed home directories across the fleet. Each host
+has its own home root. For saves to follow users between machines it must be real
+shared storage, not just the same path; otherwise use `locality` placement.
 
 <Aside type="danger" title="Changing a storage root does not migrate data">
-Pointing a host at a different directory makes new launches use that directory.
-Existing homes remain at the old path until you move them. To a user, changing
-the root without migrating data looks like their saves vanished.
+New launches use the new directory; existing homes stay at the old path until you
+move them. To users, it looks like their saves vanished.
 </Aside>

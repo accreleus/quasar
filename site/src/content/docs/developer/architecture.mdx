@@ -3,88 +3,60 @@ title: Architecture and contracts
 description: The component boundaries and frozen interfaces a Quasar contributor must preserve.
 ---
 
-Three implementation components and one contract repository. Most of the rules
-below are a consequence of that split.
+Three components and one contract repository.
 
 ## Control plane
 
-The Go control plane owns accounts, authentication, the HTTP API, WebRTC
-signaling, scheduling, administrative state, and Postgres migrations. It decides
-where a session should run. It does not own a GPU, a media pipeline, or any
-per-host GPU state. That last part is what lets multi-host and Kubernetes fall
-out of the design instead of being retrofitted later. Do not collapse the split
-back into one process.
+Go. Accounts, authentication, the HTTP API, WebRTC signaling, scheduling, admin
+state and Postgres migrations. It decides where a session runs, and holds no GPU,
+media pipeline or per-host GPU state. Don't merge it with the node agent.
 
 ## Node agent
 
-The Rust node agent owns one GPU host. It reports capacity, launches app
-containers, creates virtual input devices, builds the compositor and encoder
-pipeline, and holds the WebRTC connection to the client. Media never routes
-through the control plane.
+Rust. Owns one GPU host: reports capacity, launches app containers, creates
+virtual input devices, runs the compositor and encoder, and holds the WebRTC
+connection to the client. Media never goes through the control plane.
 
 ## Web client
 
-The React client serves both `/app` and `/admin` from one codebase, and talks
-only to the control plane for API and signaling. Session media travels directly
-between the client and the selected node agent.
+One React app serving `/app` and `/admin`. It talks only to the control plane;
+media goes directly to the node agent.
 
-The `/admin` route gating in the client is presentation. Admin access is
-enforced by middleware on each admin endpoint, which rejects a non-admin bearer
-token whatever the client believes. A client-side role flag must never become
-the enforcement mechanism.
+Admin access is enforced by middleware on each admin endpoint. The `/admin` route
+gating in the client is presentation only; never make a client-side role flag the
+enforcement.
 
 ## Protocol submodule
 
-`protocol/` is a frozen interface, shared between the components here and with
-photon, the native client, which submodules the same repository. Changing it is
-not a routine refactor: it requires explicit human sign-off and the review level
-specified in `CLAUDE.md`. Generated client schemas must continue to match
-`protocol/openapi.yaml`.
+`protocol/` is a frozen interface, shared with photon, the native client. Changes
+need explicit human sign-off and the review level in `CLAUDE.md`. Generated client
+schemas must match `protocol/openapi.yaml`.
 
-Push a `protocol/` commit to its own remote before you push anything that pins
-it. A pushed `develop` pinning an unpushed protocol commit has broken fresh
-clones once already.
+Push a `protocol/` commit to its own remote before pushing anything that pins it.
 
 ## Control-plane API reference
 
-Every `/v1` endpoint is browsable under
-[Control-plane API](/quasar/developer/api/), with parameters, request and
-response schemas, status codes, and a request example in curl, fetch, or
-reqwest.
+[Control-plane API](/quasar/developer/api/) is generated from
+`protocol/openapi.yaml` at build time. A control-plane test fails if registered
+routes and the schema disagree.
 
-Those pages are generated from `protocol/openapi.yaml` at build time rather than
-written by hand, so they cannot drift from the contract. The contract in turn
-cannot drift from the server: a route-coverage test in the control plane fails
-when a registered route is missing from the schema, or the schema describes a
-route that is not registered.
+The reference doesn't show:
 
-Three things the reference will not tell you on its own:
-
-- **Which endpoints are admin-only.** Most of them are. The schema marks each
-  with `x-required-role: admin`, which the page renderer does not display.
-  The gate is server-enforced middleware, never a client-side check, and the
-  authoritative list is `protocol/control-api.md` under Authorization.
-- **That two tags are not for you.** `agent` is the node agent talking to the
-  control plane, and `dev` is registered only when `QUASAR_DEV_AGENT_AUTH=1`,
-  which production refuses to boot with. Neither is part of the operator-facing
-  API.
-- **A 403 does not imply admin.** A number of non-admin endpoints return 403
-  too, for ownership rather than role.
+- **Which endpoints are admin-only.** Most are, marked `x-required-role: admin`
+  in the schema. The authoritative list is `protocol/control-api.md` under Authorization.
+- **That `agent` and `dev` tags aren't operator API.** `agent` is the node agent's
+  channel; `dev` exists only with `QUASAR_DEV_AGENT_AUTH=1`, which production refuses.
+- **That a 403 doesn't mean admin-only.** Some endpoints return 403 for ownership.
 
 ## Load-bearing boundaries
 
-- The control plane schedules; the node agent realises sessions.
-- App containers are untrusted tenant workloads and do not become part of the
-  control plane.
-- WebRTC is one transport behind the media-pipeline seam, not an assumption that
-  should leak into the compositor or encoder.
-- Host identities, ports, container names, and storage roots are configuration,
-  not constants to copy into code.
-- Database migrations move forward. An older binary is not a rollback mechanism
-  after a newer migration has run. The control plane runs its embedded
-  migrations up at boot, so a binary that stops short of the applied version
-  crash-loops instead of degrading. Recovery is redeploying the commit that
-  embeds the migration. This has taken out two fleet stacks.
+- The control plane schedules; the node agent runs sessions.
+- App containers are untrusted workloads, never part of the control plane.
+- WebRTC is one transport behind the media-pipeline seam; keep it out of the
+  compositor and encoder.
+- Host identities, ports, container names and storage roots are configuration,
+  not constants.
+- Migrations only move forward. A binary older than the applied migration
+  crash-loops at boot; recover by redeploying the commit that has the migration.
 
-For the rationale and current phase context, read `CLAUDE.md` and
-`docs/architecture-and-plan.md` in the checkout.
+Rationale: `CLAUDE.md` and `docs/architecture-and-plan.md` in the checkout.

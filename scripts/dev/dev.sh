@@ -6,8 +6,8 @@
 # Usage:
 #   scripts/dev/dev.sh image                 Build the quasar-agent-dev:latest image.
 #   scripts/dev/dev.sh build [dir]           cargo build       (default dir: node-agent)
-#   scripts/dev/dev.sh test  [dir]           cargo test
-#   scripts/dev/dev.sh check [dir]           cargo fmt --check + clippy -D warnings
+#   scripts/dev/dev.sh test  [dir]           cargo test --workspace
+#   scripts/dev/dev.sh check [dir]           cargo fmt --all --check + clippy --workspace -D warnings
 #   scripts/dev/dev.sh cargo <args...>       arbitrary cargo invocation in node-agent
 #   scripts/dev/dev.sh go <args...>          go <args> in control-plane (golang image)
 #   scripts/dev/dev.sh go-check              go build + vet + test in control-plane
@@ -34,7 +34,7 @@
 #                                       whatever deploy/pins.env sets (currently the
 #                                       :latest channel quasar-images publishes from
 #                                       `stable`). Edit pins.env, never a copy of it.
-#   GO_IMAGE=golang:1.25                image for Go (control-plane); the host
+#   GO_IMAGE=golang:1.26                image for Go (control-plane); the host
 #                                       and quasar-agent-dev have no Go toolchain
 #   NET=host                            add --network host (needed for the
 #                                       browser WebRTC path on Linux)
@@ -45,7 +45,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${IMAGE:-quasar-agent-dev:latest}"
-GO_IMAGE="${GO_IMAGE:-golang:1.25}"
+GO_IMAGE="${GO_IMAGE:-golang:1.26}"
 
 # Postgres for control-plane DB integration tests (go-test-db). Defaults match
 # the long-running test container documented in CLAUDE.md; override either to
@@ -54,7 +54,12 @@ PG_NET="${PG_NET:-quasar-p3-test}"
 TEST_DATABASE_URL="${TEST_DATABASE_URL:-postgres://postgres:test@quasar-pg3:5432/quasar?sslmode=disable}"
 
 # Common docker-run flags: mount the repo, work from /workspace.
-docker_run_args=(--rm -v "$ROOT":/workspace)
+# core=0: the container runs as root over the bind-mounted repo, and tests that
+# crash a child on purpose (host_probe::child's `kill -SEGV $$`) otherwise drop a
+# root-owned, mode-0600 `core` into the working tree. git can stat it but not read
+# it, so any `git add -A` -- an editor/agent checkpoint, say -- dies with
+# "Permission denied ... fatal: adding files failed" and exit 128.
+docker_run_args=(--rm --ulimit core=0 -v "$ROOT":/workspace)
 [ -n "${NET:-}" ] && docker_run_args+=(--network "$NET")
 
 # Run a command inside the container at a given workdir.
@@ -75,7 +80,8 @@ in_go_container() {
         extra+=(--network "$GO_PG_NET" -e "TEST_DATABASE_URL=$TEST_DATABASE_URL")
     fi
     # ${extra[@]+...}: an empty array under `set -u` is "unbound" on bash 3.2 (macOS).
-    docker run --rm ${extra[@]+"${extra[@]}"} -v "$ROOT":/workspace -v quasar-go-mod:/go/pkg/mod \
+    # --ulimit core=0 for the same reason as docker_run_args above.
+    docker run --rm --ulimit core=0 ${extra[@]+"${extra[@]}"} -v "$ROOT":/workspace -v quasar-go-mod:/go/pkg/mod \
         -e GOFLAGS=-buildvcs=false -w /workspace/control-plane "$GO_IMAGE" "$@"
 }
 
@@ -85,7 +91,7 @@ case "$cmd" in
     image)
         # Delegates to the single build entrypoint (2026-07-26). This used to be its own
         # `docker build` with `CUDA_ENABLE=0` — a third set of build defaults alongside
-        # build-image.sh and build-agent-tower.sh, which is root cause RC-3 in
+        # build-image.sh and a per-host build-agent script, which is root cause RC-3 in
         # docs/design/plans/2026-07-26-image-lineage-consolidation-spec.md. CUDA_ENABLE is
         # no longer forced off here: the whole lineage is CUDA-built so one /opt/gst and
         # one agent binary serve both vendors, and `dev` shares the same `build` stage.
@@ -104,7 +110,7 @@ case "$cmd" in
         ;;
     test)
         dir="${1:-node-agent}"
-        in_container "/workspace/$dir" cargo test
+        in_container "/workspace/$dir" cargo test --workspace
         ;;
     bench)
         # SO-03: Criterion micro-benchmarks (e.g. node-agent encode-metrics hot path).
@@ -117,7 +123,7 @@ case "$cmd" in
     check)
         dir="${1:-node-agent}"
         in_container "/workspace/$dir" bash -lc \
-            'cargo fmt --check && cargo clippy --all-targets -- -D warnings'
+            'cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings'
         ;;
     cargo)
         in_container "/workspace/node-agent" cargo "$@"

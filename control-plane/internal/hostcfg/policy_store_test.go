@@ -1,0 +1,270 @@
+package hostcfg
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func confirmPolicyGroups(t *testing.T, pool *pgxpool.Pool, hostID string, groups ...string) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `UPDATE hosts SET config_policy_confirmed_groups=$2::jsonb,config_policy_ever_owned_groups=$2::jsonb WHERE id=$1::uuid`, hostID, mustJSON(t, groups))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestPolicySaveIdleTimeoutCASAndDurableObligation(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "idle_timeout_secs")
+	ctx := context.Background()
+	first, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{
+		"idle_timeout_secs": {Source: "explicit", Value: float64(900)},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Revision != "1" || first.Groups["idle_timeout_secs"].Status != "pending" {
+		t.Fatalf("saved policy = %+v", first)
+	}
+	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{
+		"idle_timeout_secs": {Source: "explicit", Value: float64(600)},
+	}, nil); err != ErrStaleRevision {
+		t.Fatalf("stale edit = %v", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM host_reconcile_obligations WHERE host_id=$1::uuid AND kind='setting' AND resource_key='idle_timeout_secs' AND revision=1`, hostID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("durable obligation count = %d", n)
+	}
+	reloaded, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Revision != "1" || reloaded.Choices["idle_timeout_secs"].Value != float64(900) {
+		t.Fatalf("reload = %+v", reloaded)
+	}
+}
+
+func TestExistingHostCanChooseAutomaticOnlyAfterTypedHardwareOwnership(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	before, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Choices["encoder"].Source != "deployment" || before.Groups["hardware"].Status != "upgrade_required" {
+		t.Fatalf("legacy hardware policy = %+v", before)
+	}
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	owned, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned.Groups["hardware"].Scope != "restart" || owned.Groups["hardware"].Status != "pending" {
+		t.Fatalf("typed hardware group missing before first edit: %+v", owned.Groups["hardware"])
+	}
+	saved, err := store.SavePolicy(ctx, hostID, owned.Revision, map[string]PolicyChoice{
+		"encoder": {Source: "automatic"}, "render_node": {Source: "automatic"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Choices["encoder"].Source != "automatic" || saved.Choices["render_node"].Source != "automatic" || saved.Groups["hardware"].Status != "pending" {
+		t.Fatalf("automatic hardware edit = %+v", saved)
+	}
+	if resolved := saved.Resolved["encoder"].(map[string]any); resolved["value"] != nil {
+		t.Fatalf("unobserved automatic candidate was presented as resolved: %+v", resolved)
+	}
+}
+
+func TestPolicyReadSeparatesObservedValueFromAutomaticHardwarePreview(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware", "gop")
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+		VALUES($1::uuid,'hardware',0,'restart','pending')`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,revision)
+		VALUES($1::uuid,'encoder','automatic',0),($1::uuid,'render_node','automatic',0)`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_approval_review_tokens(host_id,group_key,review_id)
+		VALUES($1::uuid,'hardware',gen_random_uuid())`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings='{"encoder":"va","gop":"90"}'::jsonb,
+		last_registered_at=now()-interval '1 minute' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveHardwareReport(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`[{"index":0,"vendor":"AMD","render_node":"/dev/dri/renderD129","driver_identity":"amdgpu:test","encode_slots_total":1}]`),
+		json.RawMessage(`[{"id":"media_probe_gpu0","status":"pass","source":"host_probe","observed_at":"2026-09-23T16:00:00Z"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`{"encoder":"va","render_node":"/dev/dri/renderD129"}`)); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noCandidate, _ := missing.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
+	if noCandidate != nil || missing.Groups["hardware"].Remedy == nil ||
+		!strings.Contains(*missing.Groups["hardware"].Remedy, "baseline_unavailable") ||
+		!strings.Contains(*missing.Groups["hardware"].Remedy, "cuda_device") {
+		t.Fatalf("missing current hardware baseline did not explain next action: %+v", missing.Groups["hardware"])
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`{"encoder":"va","render_node":"/dev/dri/renderD129","cuda_device":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed := view.Resolved["gop"].(map[string]any)["value"]; observed != "90" {
+		t.Fatalf("deployment-sourced setting lost observed value: %v", observed)
+	}
+	if current := view.Resolved["encoder"].(map[string]any)["value"]; current != nil {
+		t.Fatalf("unapproved Automatic candidate appeared effective: %v", current)
+	}
+	preview, ok := view.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
+	if !ok || !preview.Available || view.Revision != "0" || preview.Revision != "0" || preview.Resolved["encoder"] != "vulkan" {
+		t.Fatalf("Automatic candidate absent from review preview: %+v", view.Groups["hardware"].ApprovalPreview)
+	}
+	if view.Groups["hardware"].Remedy == nil || !strings.Contains(*view.Groups["hardware"].Remedy, "approve an idle restart") || strings.Contains(*view.Groups["hardware"].Remedy, "next-session") {
+		t.Fatalf("ready Automatic preview gave the wrong next action: %+v", view.Groups["hardware"])
+	}
+}
+
+func TestConcurrentPolicyEditsOnlyOneWins(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "idle_timeout_secs")
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	for _, secs := range []float64{600, 900} {
+		wg.Add(1)
+		go func(value float64) {
+			defer wg.Done()
+			_, err := store.SavePolicy(context.Background(), hostID, "0", map[string]PolicyChoice{"idle_timeout_secs": {Source: "explicit", Value: value}}, nil)
+			results <- err
+		}(secs)
+	}
+	wg.Wait()
+	close(results)
+	success, stale := 0, 0
+	for err := range results {
+		if err == nil {
+			success++
+		} else if err == ErrStaleRevision {
+			stale++
+		} else {
+			t.Fatalf("unexpected concurrent edit error: %v", err)
+		}
+	}
+	if success != 1 || stale != 1 {
+		t.Fatalf("concurrent edits: success=%d stale=%d", success, stale)
+	}
+}
+
+func TestPolicyRejectsAutomaticIdleTimeoutWithoutPartialSave(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "idle_timeout_secs")
+	_, err := store.SavePolicy(context.Background(), hostID, "0", map[string]PolicyChoice{
+		"idle_timeout_secs": {Source: "automatic"},
+	}, nil)
+	if err == nil {
+		t.Fatal("automatic idle timeout accepted")
+	}
+	view, err := store.GetPolicy(context.Background(), hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Revision != "0" {
+		t.Fatalf("invalid edit changed revision: %s", view.Revision)
+	}
+}
+
+func TestPolicyObservationRequiresCurrentRevisionAndDigest(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "idle_timeout_secs")
+	ctx := context.Background()
+	first, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{"idle_timeout_secs": {Source: "explicit", Value: float64(900)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.SavePolicy(ctx, hostID, "1", map[string]PolicyChoice{"idle_timeout_secs": {Source: "explicit", Value: float64(600)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := first.Groups["idle_timeout_secs"]
+	if ok, err := store.ObservePolicyApplied(ctx, hostID, "idle_timeout_secs", old.DesiredRevision, *old.DesiredDigest, "next_session", "00000000-0000-4000-8000-000000000001"); err != nil || ok {
+		t.Fatalf("old observation: ok=%v err=%v", ok, err)
+	}
+	current := second.Groups["idle_timeout_secs"]
+	if ok, err := store.ObservePolicyApplied(ctx, hostID, "idle_timeout_secs", current.DesiredRevision, *current.DesiredDigest, "next_session", "00000000-0000-4000-8000-000000000001"); err != nil || !ok {
+		t.Fatalf("current observation: ok=%v err=%v", ok, err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Groups["idle_timeout_secs"].Status != "applied" {
+		t.Fatalf("group state = %+v", view.Groups["idle_timeout_secs"])
+	}
+}
+
+func TestLegacyClearSelectsDeploymentAndSharesRevision(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware", "idle_timeout_secs")
+	ctx := context.Background()
+	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{"encoder": {Source: "automatic"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.SaveLegacyPatch(ctx, hostID, map[string]any{"encoder": nil}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Revision != "2" || view.Choices["encoder"].Source != "deployment" {
+		t.Fatalf("legacy clear = %+v", view)
+	}
+	if _, err := store.SavePolicy(ctx, hostID, "1", map[string]PolicyChoice{"idle_timeout_secs": {Source: "explicit", Value: float64(900)}}, nil); err != ErrStaleRevision {
+		t.Fatalf("stale typed edit after legacy write = %v", err)
+	}
+}

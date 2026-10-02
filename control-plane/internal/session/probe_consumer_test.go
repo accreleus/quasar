@@ -246,9 +246,9 @@ func TestProbeConsumerAppForcedProfileCaps(t *testing.T) {
 	}
 }
 
-// TestLatestProbeStoreMethod exercises Store.LatestProbe at the store layer:
+// TestUnboundProbeParsing exercises the probe an unbound caller resolves to:
 // absent row, stale measured_at, and fresh measured_at.
-func TestLatestProbeStoreMethod(t *testing.T) {
+func TestUnboundProbeParsing(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	ctx := context.Background()
@@ -258,9 +258,9 @@ func TestLatestProbeStoreMethod(t *testing.T) {
 		VALUES ('lp@test.local','lpuser','x') RETURNING id::text`).Scan(&userID))
 
 	t.Run("absent: no device row", func(t *testing.T) {
-		dp, err := store.LatestProbe(ctx, userID)
+		dp, err := unboundProbe(store, ctx, userID)
 		if err != nil {
-			t.Fatalf("LatestProbe: %v", err)
+			t.Fatalf("resolve device scope: %v", err)
 		}
 		if dp != nil {
 			t.Errorf("expected nil probe, got %+v", dp)
@@ -281,9 +281,9 @@ func TestLatestProbeStoreMethod(t *testing.T) {
 		`, userID, caps); err != nil {
 			t.Fatalf("seed stale device: %v", err)
 		}
-		dp, err := store.LatestProbe(ctx, userID)
+		dp, err := unboundProbe(store, ctx, userID)
 		if err != nil {
-			t.Fatalf("LatestProbe: %v", err)
+			t.Fatalf("resolve device scope: %v", err)
 		}
 		if dp != nil {
 			t.Errorf("expected nil probe for stale row, got %+v", dp)
@@ -308,9 +308,9 @@ func TestLatestProbeStoreMethod(t *testing.T) {
 		`, userID, caps); err != nil {
 			t.Fatalf("seed fresh device: %v", err)
 		}
-		dp, err := store.LatestProbe(ctx, userID)
+		dp, err := unboundProbe(store, ctx, userID)
 		if err != nil {
-			t.Fatalf("LatestProbe: %v", err)
+			t.Fatalf("resolve device scope: %v", err)
 		}
 		if dp == nil {
 			t.Fatal("expected non-nil probe for fresh row")
@@ -346,9 +346,9 @@ func TestLatestProbeStoreMethod(t *testing.T) {
 		`, userID, caps); err != nil {
 			t.Fatalf("seed bogus device: %v", err)
 		}
-		dp, err := store.LatestProbe(ctx, userID)
+		dp, err := unboundProbe(store, ctx, userID)
 		if err != nil {
-			t.Fatalf("LatestProbe: %v", err)
+			t.Fatalf("resolve device scope: %v", err)
 		}
 		if dp == nil {
 			t.Fatal("expected non-nil probe (row is fresh)")
@@ -357,4 +357,10 @@ func TestLatestProbeStoreMethod(t *testing.T) {
 			t.Errorf("bandwidth_kbps: got %d, want 0 (bogus value sanitized)", dp.BandwidthKbps)
 		}
 	})
+}
+
+// unboundProbe is the probe a caller with no device binding resolves to.
+func unboundProbe(store *Store, ctx context.Context, userID string) (*DeviceProbe, error) {
+	scope, err := store.ResolveDeviceScope(ctx, userID, "", scopeSiteProfiles)
+	return scope.Probe, err
 }

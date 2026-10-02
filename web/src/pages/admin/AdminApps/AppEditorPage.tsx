@@ -1,7 +1,8 @@
-// The app editor (handoff §A.10): six tabs over one draft and one save.
+// The app editor (handoff §A.10): tabs over one draft and one save.
 //
-// Every tab edits the same `AppDraft`, and appDraft.ts turns it into one PATCH
-// of the keys that moved. The page owns the reads, so the tab bar can carry the
+// Every draft tab edits the same `AppDraft`, and appDraft.ts turns it into one
+// PATCH of the keys that moved. Placement (RH05 #342) has its own revision and
+// Save, and never joins the draft. The page owns the reads, so the tab bar can carry the
 // Access and Library counts before either tab is opened. `enabled` writes
 // through immediately instead of joining the draft.
 
@@ -32,6 +33,7 @@ import { ArtworkTab } from "./editor/ArtworkTab";
 import { EditorRail } from "./editor/EditorRail";
 import { IdentityTab } from "./editor/IdentityTab";
 import { LibraryTab } from "./editor/LibraryTab";
+import { PlacementTab, type PlacementDraft } from "./editor/PlacementTab";
 import { QualityTab } from "./editor/QualityTab";
 import { RuntimeTab } from "./editor/RuntimeTab";
 import {
@@ -45,6 +47,7 @@ import {
   type DraftErrors,
 } from "./editor/appDraft";
 import { activeEditorTab, editorSubtitle, editorTabs, imagePresence } from "./editor/editorTabs";
+import { parseSpec } from "./runtimeSpec";
 
 const TAB_LABEL: Record<string, string> = {
   identity: "Identity",
@@ -141,6 +144,7 @@ export function AppEditorPage() {
   const [baseline, setBaseline] = useState<AdminApp | null>(null);
   const [errors, setErrors] = useState<DraftErrors>({});
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [placementDraft, setPlacementDraft] = useState<PlacementDraft | null>(null);
 
   // Re-seeded on a change of app, never on a refresh of the same one — a
   // reload after a write would discard what is being typed.
@@ -149,8 +153,19 @@ export function AppEditorPage() {
     setBaseline(app ?? null);
     setDraft(draftFromApp(app ?? null));
     setErrors({});
+    setPlacementDraft(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadedId]);
+
+  // A derived tile launches with its parent's runtime, so that is the image
+  // its hosts prepare; null until the parent is loaded.
+  const placementSource = parentId ? (parent.data ?? null) : app;
+  const placementImage = placementSource
+    ? {
+        ref: parseSpec(placementSource.runtime_spec ?? {}).image,
+        runtimePresetId: placementSource.runtime_preset_id ?? "",
+      }
+    : null;
 
   const grants = (entitlements.data ?? []).filter((e) => e.subject_type === "user");
   const tabs = editorTabs({
@@ -313,6 +328,15 @@ export function AppEditorPage() {
                 parent={parent.data ?? null}
                 presets={presets.data ?? []}
                 storageProvider={settings.data?.storage_provider ?? null}
+              />
+            )}
+            {active === "placement" && app && (
+              <PlacementTab
+                appId={app.id}
+                parent={parent.data ? { id: parent.data.id, name: parent.data.name } : null}
+                image={placementImage}
+                draft={placementDraft}
+                setDraft={setPlacementDraft}
               />
             )}
             {active === "library" && app && (

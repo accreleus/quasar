@@ -260,7 +260,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
     renderImagesTab();
 
     await waitFor(() => screen.getByText("Moonlit"));
-    fireEvent.click(screen.getByRole("button", { name: "Install on every host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install for selected apps" }));
 
     await waitFor(() => {
       expect(adminApi.installImage).toHaveBeenCalledWith("test-token", "moonlit", { lazy: false });
@@ -280,7 +280,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
     renderImagesTab();
 
     await waitFor(() => screen.getByText("Moonlit"));
-    fireEvent.click(screen.getByRole("button", { name: "Install on every host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install for selected apps" }));
 
     await waitFor(() => {
       expect(
@@ -297,7 +297,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
     renderImagesTab();
 
     await waitFor(() => screen.getByText("Moonlit"));
-    fireEvent.click(screen.getByRole("button", { name: "Install on every host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install for selected apps" }));
 
     await waitFor(() => {
       expect(screen.getByText(/digest unresolved for this image/)).toBeInTheDocument();
@@ -311,7 +311,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
     renderImagesTab();
 
     await waitFor(() => screen.getByText("Custom Template"));
-    const install = screen.getByRole("button", { name: "Install on every host" });
+    const install = screen.getByRole("button", { name: "Install for selected apps" });
     expect(install).toBeDisabled();
     expect(install).toHaveAttribute("title", expect.stringContaining("Not installable yet"));
     fireEvent.click(install);
@@ -407,7 +407,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
     });
   });
 
-  it("a pinned image never offers Update to X — the refresh gbtn falls back to Re-ensure (409 image is pinned)", async () => {
+  it("a pinned image never offers Update to X — the refresh gbtn offers status refresh without a fleetwide re-ensure", async () => {
     vi.mocked(adminApi.listImages).mockResolvedValue({
       ...baseCatalog,
       images: [{ ...installedImage, update_available: true, pinned: true }],
@@ -416,7 +416,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
 
     await waitFor(() => screen.getByText("Steam"));
     expect(screen.queryByRole("button", { name: /Update to/ })).not.toBeInTheDocument();
-    const reEnsure = screen.getByRole("button", { name: "Re-ensure on every host" });
+    const reEnsure = screen.getByRole("button", { name: "Refresh adoption status" });
     expect(reEnsure.className).not.toContain("todo");
   });
 
@@ -434,7 +434,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
 
     await waitFor(() => screen.getByText("Moonlit"));
     expect(screen.getByRole("button", { name: "Uninstall everywhere" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Install on every host" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Install for selected apps" })).not.toBeInTheDocument();
   });
 
   it("maps a 409 already_installed error to plain language and immediately refetches", async () => {
@@ -454,7 +454,7 @@ describe("ImagesTab — P3 install/uninstall/pin/update actions", () => {
     renderImagesTab();
 
     await waitFor(() => screen.getByText("Moonlit"));
-    fireEvent.click(screen.getByRole("button", { name: "Install on every host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install for selected apps" }));
 
     await waitFor(() => {
       expect(screen.getByText(/was just installed/i)).toBeInTheDocument();

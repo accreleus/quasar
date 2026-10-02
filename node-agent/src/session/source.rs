@@ -48,12 +48,13 @@ use gstreamer::prelude::*;
 use super::audio::PulseSidecar;
 use super::container::{
     AppDisplayMode, AppExitStatus, AppLogRing, ContainerRuntime, ContainerSpec, LaunchParams,
-    RunningContainer, APP_LOG_DRAIN_BUDGET,
+    RunningContainer,
 };
 use super::host::wayland_display_from_message;
 use super::input::InputState;
 use super::metrics::SessionMetrics;
 use super::pipeline;
+use super::teardown::{self, StopAttempt};
 use super::virtual_input::VirtualDevices;
 use super::SessionConfig;
 use crate::messages::AppExitPolicy;
@@ -81,11 +82,127 @@ fn source_commit_advanced(current: u64, previous: u64) -> u64 {
     u64::from(current > previous)
 }
 
+/// Runtime observation errors are not terminal application evidence. The observer
+/// keeps its own bounded retry loop for every error kind; only a verified
+/// `ApplicationResult` may publish an application exit.
+fn retry_application_observation(_kind: crate::runtime::ErrorKind) -> bool {
+    true
+}
+
+/// App container, pulse sidecar and udev export, shared by every [`AppSource`]
+/// generation so session end has one release path. The runner calls
+/// [`AppSource::teardown`] on every terminal exit; that calls [`SharedSessionRuntime::apply`]
+/// before the source pipeline is set to NULL.
+///
+/// The sidecar and the export are held behind [`teardown::Sidecar`] and
+/// [`teardown::UdevExport`] rather than as their concrete types, so the release
+/// is exercisable without a runtime client or a uinput device (see this module's
+/// tests). The production values are [`PulseSidecar`] and [`VirtualDevices`].
+struct SharedSessionRuntime {
+    session_id: String,
+    /// `teardown::ReleaseState::blocked`. An atomic because this value is shared
+    /// through an `Arc`, not because it is contended: every read and write is on
+    /// the session thread, which is also where every generation is dropped.
+    udev_blocked: AtomicBool,
+    /// Set when an app container is launched; cleared only when its stop is confirmed.
+    mount_live: AtomicBool,
+    /// The last container-stop outcome. `None` until a generation records one.
+    last_stop: Mutex<Option<StopAttempt>>,
+    pulse: Mutex<Option<Box<dyn teardown::Sidecar>>>,
+    udev: Option<Arc<dyn teardown::UdevExport + Send + Sync>>,
+    /// The whole session end's retry allowance, shared with the sidecar (see
+    /// [`teardown::STOP_RETRY_BUDGET`]).
+    budget: teardown::RetryBudget,
+}
+
+impl SharedSessionRuntime {
+    /// Take ownership of the session's sidecar and export, and join the sidecar
+    /// to this session end's shared retry allowance — so releasing the app
+    /// container and releasing the sidecar cannot each spend a full
+    /// [`teardown::STOP_RETRY_BUDGET`].
+    fn new(
+        session_id: &str,
+        pulse: Option<Box<dyn teardown::Sidecar>>,
+        udev: Option<Arc<dyn teardown::UdevExport + Send + Sync>>,
+        budget: teardown::RetryBudget,
+    ) -> Self {
+        let mut pulse = pulse;
+        if let Some(sidecar) = pulse.as_mut() {
+            sidecar.adopt_budget(budget.clone());
+        }
+        SharedSessionRuntime {
+            session_id: session_id.to_string(),
+            udev_blocked: AtomicBool::new(false),
+            mount_live: AtomicBool::new(false),
+            last_stop: Mutex::new(None),
+            pulse: Mutex::new(pulse),
+            udev,
+            budget,
+        }
+    }
+
+    fn state(&self) -> teardown::ReleaseState {
+        teardown::ReleaseState {
+            blocked: self.udev_blocked.load(Ordering::Relaxed),
+            mount_live: self.mount_live.load(Ordering::Relaxed),
+        }
+    }
+
+    fn store(&self, state: teardown::ReleaseState, report: StopAttempt) {
+        self.udev_blocked.store(state.blocked, Ordering::Relaxed);
+        self.mount_live.store(state.mount_live, Ordering::Relaxed);
+        *self
+            .last_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+    }
+
+    /// Record a container-stop outcome without touching the sidecar or the
+    /// udev export. A swap drops the outgoing [`AppSource`] while the session,
+    /// and the replacement generation, are still using both.
+    fn note_container_stop(&self, report: StopAttempt) {
+        let state = self.state();
+        self.store(
+            teardown::ReleaseState {
+                blocked: teardown::blocked_after(report, state.blocked),
+                mount_live: state.mount_live && !matches!(report, StopAttempt::Confirmed),
+            },
+            report,
+        );
+    }
+
+    fn apply(&self, report: StopAttempt, final_chance: bool) {
+        let next = teardown::settle_udev(
+            &self.session_id,
+            report,
+            self.state(),
+            final_chance,
+            self.udev
+                .as_ref()
+                .map(|u| &**u as &dyn teardown::UdevExport),
+        );
+        self.store(next, report);
+        // Leave the sidecar in place when a busy client could not start the stop:
+        // the next release, and the sidecar's own Drop, try again. Both draw on
+        // the same `budget`, so "try again" cannot become an unbounded wait.
+        let mut guard = self
+            .pulse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pulse) = guard.as_mut() {
+            pulse.stop();
+        }
+    }
+}
+
 /// Session-level resources shared across app swaps: the virtual input devices and the
 /// PulseAudio sidecar. Each [`AppSource`] borrows the device node paths and the pulse
 /// socket (mounted into its container; the encode pipeline's `pulsesrc` captures from the
-/// same sidecar). Dropping releases the sidecar.
+/// same sidecar). Session end releases the sidecar and the udev export through
+/// [`SharedSessionRuntime::apply`], not through a later `Drop` of this struct: pipeline
+/// teardown can block, and a busy runtime client must not latch the release off.
 pub struct SessionResources {
+    pub home_seed: Option<super::home::HomeSeedOutcome>,
     /// Shared with the encode pipeline's DataChannel input sink.
     pub devices: Option<Arc<VirtualDevices>>,
     /// Per-session controller-first pointer-nudge state (BPM focus heal), shared with the
@@ -93,7 +210,7 @@ pub struct SessionResources {
     /// the swap path can re-arm it per app process: the DataChannel persists across a
     /// swap, this state must not.
     pub input_state: Arc<InputState>,
-    pulse: Option<PulseSidecar>,
+    shared: Arc<SharedSessionRuntime>,
     runtime_dir: String,
     /// Set when the sidecar was WANTED but unusable, so the session is about to stream
     /// silence. `None` on the healthy path and under test audio — a caller must be able
@@ -120,12 +237,11 @@ impl SessionResources {
             // Publish the fake-udev records for the app container's /run/udev/data mount:
             // SDL/Steam discover controllers via libudev, so without these the gamepad
             // node is invisible to games. Best-effort.
-            let udev_dir = super::virtual_input::udev_export_dir(&cfg.runtime_dir, session_id);
-            if let Err(e) = d.export_udev_data(&udev_dir) {
+            if let Err(e) = d.export_udev_data(&cfg.runtime_dir, session_id) {
                 tracing::warn!(
                     token = "udev-export-failed",
-                    "udev export to {} failed: {e:#} — in-container gamepad discovery degraded",
-                    udev_dir.display()
+                    "udev export for session {session_id} failed: {e:#} — in-container gamepad \
+                     discovery degraded"
                 );
             }
             Some(d)
@@ -143,7 +259,7 @@ impl SessionResources {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
                     audio_degraded = Some(
-                        "PulseAudio sidecar started but its socket never appeared".to_string(),
+                        "PulseAudio sidecar started but its socket never became ready".to_string(),
                     );
                     None
                 }
@@ -160,12 +276,24 @@ impl SessionResources {
             );
         }
         let pulse_server = pulse.as_ref().map(|p| p.server_uri());
+        // One allowance for the whole session end: the app container's retries and
+        // the sidecar's draw down the same pool (see `teardown::STOP_RETRY_BUDGET`).
+        let shared = Arc::new(SharedSessionRuntime::new(
+            session_id,
+            pulse.map(|sidecar| Box::new(sidecar) as Box<dyn teardown::Sidecar>),
+            devices
+                .clone()
+                .map(|d| d as Arc<dyn teardown::UdevExport + Send + Sync>),
+            teardown::RetryBudget::new(teardown::STOP_RETRY_BUDGET),
+        ));
         // Pre-create any bind-mount host paths under QUASAR_HOME_ROOT so Docker does not
-        // create them root:root 755. No-op when unset or no mount matches; never fails
-        // the session.
+        // create them root:root 755. No-op when unset or no mount matches.
+        // Steam's managed-home path fails safely if destination or cleanup
+        // state is uncertain; ordinary non-Steam provisioning stays best-effort.
         //
         // An authoritative source policy and matching adopted template are both
         // required. Unknown/custom images and disconnected sessions launch cold.
+        let mut home_seed = None;
         if let Some(c) = cfg.container.as_ref() {
             let seed = cfg
                 .source_policy
@@ -180,13 +308,27 @@ impl SessionResources {
                         seed,
                         authorization: Some(authorization),
                     });
-            super::home::provision_home_dirs(&c.mounts, &cfg.home_root, template);
+            if crate::source_policy::is_official_steam_image(cfg.image_id.as_deref(), &c.image) {
+                let reason = cfg
+                    .source_policy
+                    .as_ref()
+                    .map_or("policy_unavailable", |policy| policy.seed_absence_reason());
+                home_seed = super::home::provision_home_dirs_with_result(
+                    &c.mounts,
+                    &cfg.home_root,
+                    template,
+                    reason,
+                )?;
+            } else {
+                super::home::provision_home_dirs(&c.mounts, &cfg.home_root, template);
+            }
         }
         Ok((
             SessionResources {
+                home_seed,
                 devices,
                 input_state: Arc::new(InputState::new()),
-                pulse,
+                shared,
                 runtime_dir: cfg.runtime_dir.clone(),
                 audio_degraded,
             },
@@ -215,17 +357,142 @@ impl SessionResources {
     /// `(pulse_server_uri, socket_dir)` to inject into an app container, or `None`
     /// when no sidecar is running.
     fn pulse_mount(&self) -> Option<(String, String)> {
-        self.pulse.as_ref().map(|p| {
-            (
-                p.server_uri(),
-                p.socket_dir().to_string_lossy().into_owned(),
-            )
-        })
+        self.shared
+            .pulse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|p| {
+                (
+                    p.server_uri(),
+                    p.socket_dir().to_string_lossy().into_owned(),
+                )
+            })
+    }
+}
+
+impl Drop for SessionResources {
+    /// Final chance. [`AppSource::teardown`] already applied a non-final release
+    /// on the normal paths; this catches an early return that never built a
+    /// source, and abandons an export whose container was never proved gone.
+    ///
+    /// It asks the engine nothing: the source's own `Drop` already spent this
+    /// session end's last observed app-container attempt and recorded what it
+    /// learned, so this reads that record. A refused stop is kept as a refused
+    /// stop and never rewritten into an unconfirmed one. What it may still do
+    /// is retry the SIDECAR, on whatever is left of the shared budget.
+    fn drop(&mut self) {
+        let report = self
+            .shared
+            .last_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(StopAttempt::Absent);
+        self.shared.apply(report, true);
     }
 }
 
 /// One generation of the swappable source: the source `gst::Pipeline`
 /// (`compositor → interpipesink`) plus the app container launched into its compositor.
+/// Observation state for ONE launch attempt: the terminal-exit slot the runner polls and
+/// the log ring the observer fills.
+///
+/// Transition rule: `AppSource::launch` installs a fresh record as the current one
+/// immediately before it asks the engine for a container, and the observer thread it
+/// spawns on success captures only that record's [`GenerationObserver`] handles. So an
+/// observer from a previous generation can never publish a late exit or a dying log line
+/// into the state the runner reads for the replacement; a launch attempt that fails
+/// exposes an empty tail and no exit rather than the retired generation's evidence. That
+/// matters on a rolled-back swap, where the previous app is relaunched into the SAME
+/// `AppSource`: a shared slot would report the old process's exit as the relaunched
+/// app's failure.
+pub(crate) struct GenerationObservation {
+    exit_result: Arc<Mutex<Option<AppExitStatus>>>,
+    logs: AppLogRing,
+    /// This generation's intentional-stop marker, once a container exists. Read again
+    /// at take time: the observer checks it before publishing, but a stop that begins
+    /// between that check and the write would otherwise reach the runner as an exit.
+    removed: Option<Arc<AtomicBool>>,
+}
+
+impl GenerationObservation {
+    pub(crate) fn new() -> Self {
+        GenerationObservation {
+            exit_result: Arc::new(Mutex::new(None)),
+            logs: AppLogRing::new(),
+            removed: None,
+        }
+    }
+
+    /// The handles an observer thread for this generation owns. `removed` is the
+    /// container's intentional-stop marker (`RunningContainer::removed_flag`).
+    pub(crate) fn observer(&mut self, removed: Arc<AtomicBool>) -> GenerationObserver {
+        self.removed = Some(removed.clone());
+        GenerationObserver {
+            exit_result: self.exit_result.clone(),
+            logs: self.logs.clone(),
+            removed,
+        }
+    }
+
+    /// Take semantics: the runner acts on a given exit exactly once. An exit is never
+    /// handed out once our own teardown of this generation has begun, whichever side
+    /// of the observer's marker check the stop landed on.
+    pub(crate) fn take_exit(&self) -> Option<AppExitStatus> {
+        let mut guard = match self.exit_result.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let status = guard.take()?;
+        if self
+            .removed
+            .as_ref()
+            .is_some_and(|removed| removed.load(Ordering::SeqCst))
+        {
+            return None;
+        }
+        Some(status)
+    }
+
+    pub(crate) fn log_tail(&self) -> Vec<String> {
+        self.logs.tail()
+    }
+}
+
+/// The observer-side handles of one [`GenerationObservation`].
+pub(crate) struct GenerationObserver {
+    exit_result: Arc<Mutex<Option<AppExitStatus>>>,
+    logs: AppLogRing,
+    removed: Arc<AtomicBool>,
+}
+
+impl GenerationObserver {
+    pub(crate) fn record_line(&self, line: String) {
+        self.logs.push(line);
+    }
+
+    /// Whether our own teardown (swap, session stop) has begun for this container. Set
+    /// BEFORE the engine sees a stop, so an exit observed afterwards is never an app
+    /// failure.
+    pub(crate) fn stopped_intentionally(&self) -> bool {
+        self.removed.load(Ordering::SeqCst)
+    }
+
+    /// Publish a terminal status for this generation unless the stop was ours. Returns
+    /// whether the status was published.
+    pub(crate) fn publish(&self, status: AppExitStatus) -> bool {
+        if self.stopped_intentionally() {
+            return false;
+        }
+        let mut guard = match self.exit_result.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(status);
+        true
+    }
+}
+
 /// Dropping it stops the pipeline and removes the container, so a rolled-back or
 /// superseded source leaves no orphan.
 pub struct AppSource {
@@ -270,20 +537,14 @@ pub struct AppSource {
     /// semantics via [`Self::take_launch_error`], so the caller fails the session exactly
     /// once per occurrence rather than on every poll.
     launch_error: Option<String>,
-    /// The app container's terminal exit status, written once by the `docker wait` thread
-    /// spawned in [`Self::launch`] and consumed by [`Self::take_container_exit`]. `None`
-    /// while still running. A legitimate teardown (swap, session stop) is filtered out
-    /// BEFORE this is written — see the waiter closure in `launch`.
-    exit_result: Arc<Mutex<Option<AppExitStatus>>>,
-    /// The app container's own last ~100 log lines, filled by the follower threads in
-    /// [`Self::launch`] and read only on the failure path ([`Self::app_log_tail`]).
-    /// #463: an app that exits before producing a frame surfaces as "media path
-    /// interrupted" unless its own final words travel with the failure.
-    app_logs: AppLogRing,
-    /// The log follower's supervising thread for the CURRENT container, retained so the
-    /// failure path can drain it before snapshotting the ring rather than racing it.
-    /// `None` before the first launch and once consumed by [`Self::app_log_tail`].
-    log_follower: Option<std::thread::JoinHandle<()>>,
+    /// The CURRENT container's exit slot and log ring, replaced on every launch. The
+    /// exit status is written once by the RuntimeClient observer spawned in
+    /// [`Self::launch`] and consumed by [`Self::take_container_exit`]; `None` while still
+    /// running. A legitimate teardown (swap, session stop) is filtered out BEFORE it is
+    /// written. The last ~100 log lines are read on the failure path
+    /// ([`Self::app_log_tail`]): #463, an app that exits before producing a frame surfaces
+    /// as "media path interrupted" unless its own final words travel with the failure.
+    observation: GenerationObservation,
     /// `app-surface-commits` as it stood immediately BEFORE the current container
     /// launched. The counter is a lifetime total on a compositor element that OUTLIVES
     /// its app container, so after a rollback or retry the previous container's commits
@@ -293,6 +554,13 @@ pub struct AppSource {
     ///
     /// `None` when nothing has launched yet, or the compositor build lacks the counter.
     app_commits_at_launch: Option<u64>,
+    /// Shared with [`SessionResources`]. Session end releases the sidecar and the
+    /// udev export from here, before this pipeline is set to NULL.
+    shared: Arc<SharedSessionRuntime>,
+    /// The last stop outcome this generation observed, and the one input to
+    /// "may the next release ask the engine again?" — see
+    /// [`AppSource::finish_app_stop`].
+    ended: Option<StopAttempt>,
 }
 
 impl AppSource {
@@ -354,10 +622,10 @@ impl AppSource {
             wl_display: None,
             metrics_probe: None,
             launch_error: None,
-            exit_result: Arc::new(Mutex::new(None)),
-            app_logs: AppLogRing::new(),
-            log_follower: None,
+            observation: GenerationObservation::new(),
             app_commits_at_launch: None,
+            shared: res.shared.clone(),
+            ended: None,
         })
     }
 
@@ -638,11 +906,7 @@ impl AppSource {
     /// [`Self::launch`] has observed one since the last call. Take semantics mirror
     /// [`Self::take_launch_error`]: the runner must act on a given exit exactly once.
     pub fn take_container_exit(&self) -> Option<AppExitStatus> {
-        let mut guard = match self.exit_result.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.take()
+        self.observation.take_exit()
     }
 
     /// Whether the CURRENT app container has presented a frame. Built on
@@ -665,16 +929,11 @@ impl AppSource {
     /// The app container's retained log lines, oldest first. Empty when nothing was
     /// captured (no container, follower failed to start, or a silent app).
     ///
-    /// Drains the follower first, within a bounded budget: the exit waiter and the log
-    /// follower are independent threads watching the same container, and `docker wait`
-    /// routinely returns before the log stream is fully read, so snapshotting immediately
-    /// would systematically drop the final lines — the only ones anybody reads. `&mut
-    /// self` because the handle is consumed and the drain happens exactly once.
+    /// RuntimeClient supplies this bounded ring from its owned API log reads. Terminal
+    /// observation replaces the running snapshot before it publishes an exit, preserving
+    /// the application's final lines even when cleanup follows immediately.
     pub fn app_log_tail(&mut self) -> Vec<String> {
-        if let Some(handle) = self.log_follower.take() {
-            ContainerRuntime::await_log_drain(handle, APP_LOG_DRAIN_BUDGET);
-        }
-        self.app_logs.tail()
+        self.observation.log_tail()
     }
 
     /// The app's configured exit policy. `fail` when no app is configured at all, where
@@ -737,9 +996,8 @@ impl AppSource {
     /// the split matters twice:
     ///  - the container must be GONE, not merely signalled, before the replacement
     ///    launches, because the exit is what releases the lock in the shared managed
-    ///    home. `RunningContainer::stop` → `ContainerRuntime::graceful_remove` issues
-    ///    `docker stop -t N`, which returns only once the container has exited or been
-    ///    killed, then `rm -f`. So this call is the wait-for-exit as well as the stop.
+    ///    home. `RunningContainer::stop` uses the owned RuntimeClient stop and cleanup
+    ///    operations; it returns only after that exact durable identity proves removal.
     ///  - the compositor keeps running, so the encode pipeline keeps being fed real (now
     ///    app-less) frames for the whole gap: the encoder never starves, PTS stay
     ///    continuous, and GCC never sees a dead media path. The user sees the empty
@@ -748,13 +1006,49 @@ impl AppSource {
     /// Returns `true` if a container was running and has now been reaped. The waiter
     /// thread's observation of this exit is discarded (the shared `removed` flag is set
     /// first), so it is never misreported as an app-liveness failure.
-    pub fn stop_app_container(&mut self) -> bool {
-        match self.container.take() {
-            Some(mut c) => {
-                c.stop();
-                true
+    ///
+    /// A refused stop is retried (on this swap's own budget, not the session
+    /// end's — see below): a transient busy client is not a reason to end a live
+    /// session, which is what it used to be. What is still fatal to the
+    /// swap is an UNCONFIRMED stop, and a refusal that outlives the budget —
+    /// the engine was never asked, so the outgoing app may still be running and
+    /// the replacement must not take its managed home. That fatality is also
+    /// what makes `teardown::blocked_after(Confirmed) == false` safe: a live
+    /// later generation implies every earlier one was proven gone.
+    pub fn stop_app_container(&mut self) -> Result<bool, String> {
+        if self.container.is_none() {
+            return Ok(false);
+        }
+        // A swap's OWN allowance, not the session end's. The session-end budget
+        // is armed the first time a release pauses and runs from there; a swap
+        // an hour earlier that shared it would leave the session end with
+        // nothing. One swap gets one `STOP_RETRY_BUDGET`.
+        let budget = teardown::RetryBudget::new(teardown::STOP_RETRY_BUDGET);
+        let mut last: Option<String> = None;
+        let report = teardown::retry_with_budget(
+            || {
+                let stopped = self.container.as_mut().unwrap().stop();
+                match stopped {
+                    Ok(()) => StopAttempt::Confirmed,
+                    Err(error) => {
+                        let report = teardown::classify_stop(teardown::error_kind(&error));
+                        last = Some(error.to_string());
+                        report
+                    }
+                }
+            },
+            &budget,
+        );
+        // A swap's outgoing generation: record the outcome and leave the sidecar
+        // and the export alone — the replacement still needs both.
+        self.shared.note_container_stop(report);
+        match report {
+            StopAttempt::Confirmed => {
+                self.container.take();
+                Ok(true)
             }
-            None => false,
+            StopAttempt::Absent => Ok(false),
+            _ => Err(last.unwrap_or_else(|| "app container stop was refused".to_string())),
         }
     }
 
@@ -834,6 +1128,14 @@ impl AppSource {
         // before `run`, never after: the app can commit its first surface while `docker
         // run` is still returning.
         self.app_commits_at_launch = self.app_surface_commits();
+        // A FRESH observation record per launch attempt, installed BEFORE the engine is
+        // asked for a container. `AppSource` outlives its container across a rollback
+        // relaunch, so a shared exit slot or log ring would report the previous
+        // container's exit or dying words as the replacement app's failure — and a
+        // launch that fails must not expose the retired generation's evidence either.
+        // The previous observer keeps only its own retired handles and publishes into
+        // them harmlessly.
+        self.observation = GenerationObservation::new();
         match self.runtime.run(&effective_spec, &params) {
             Ok(c) => {
                 tracing::info!(
@@ -842,19 +1144,13 @@ impl AppSource {
                     c.name(),
                     wl_display
                 );
-                // A FRESH ring per launch. `AppSource` outlives its container across a
-                // relaunch, so a shared ring would report the previous container's dying
-                // words as the replacement app's failure. The old follower keeps its own
-                // `Arc` to the retired ring and drains into it harmlessly.
-                self.app_logs = AppLogRing::new();
-                // Follow the app's log BEFORE spawning the exit waiter, so a container
-                // that dies immediately still has its final lines captured. Both are
-                // cheap and non-blocking.
-                self.log_follower = self
-                    .runtime
-                    .spawn_log_follower(c.container_id().to_string(), self.app_logs.clone());
-                self.spawn_exit_waiter(c.container_id().to_string(), c.removed_flag());
+                // The RuntimeClient observer fills final API log evidence before it
+                // publishes terminal status, including an application that dies immediately.
+                // It receives only THIS launch's observation handles.
+                let observer = self.observation.observer(c.removed_flag());
+                self.spawn_exit_waiter(c.application_id(), observer);
                 self.container = Some(c);
+                self.shared.mount_live.store(true, Ordering::Relaxed);
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -871,21 +1167,15 @@ impl AppSource {
         }
     }
 
-    /// Spawn the dedicated `docker wait` thread for a just-launched container. One thread
-    /// per container generation, named for diagnosability; it exits the moment `docker
-    /// wait` returns, so a session never accumulates more than one live waiter per
-    /// generation (a swap's old generation is dropped with its `AppSource`).
-    ///
-    /// Must not use `output_with_timeout` (see `ContainerRuntime::wait_for_exit`), which
-    /// is why this needs its own OS thread rather than running inline on the poll loop.
-    ///
-    /// Accepted leak: `docker wait` has no deadline, so if the container-runtime daemon
-    /// itself wedges, this thread parks forever inside the blocking `Command::output()`
-    /// and is never joined. Bounded at one leaked thread per session generation, and a
-    /// wedged daemon already fails every other container operation on the host.
-    fn spawn_exit_waiter(&self, container_id: String, removed_flag: Arc<AtomicBool>) {
-        let runtime = self.runtime.clone();
-        let slot = self.exit_result.clone();
+    /// Spawn the dedicated RuntimeClient observer for a just-launched container. One thread
+    /// per generation owns only observation: each request is bounded, the intentional-stop
+    /// marker ends the loop, and cancellation never asks the engine to stop the workload.
+    /// A verified terminal result supplies final logs before this thread publishes status.
+    fn spawn_exit_waiter(
+        &self,
+        application: crate::runtime::ApplicationId,
+        observer: GenerationObserver,
+    ) {
         let sink_name = self.sink_name.clone();
         let thread_sink_name = sink_name.clone();
         let builder = std::thread::Builder::new().name("quasar-app-wait".to_string());
@@ -894,24 +1184,22 @@ impl AppSource {
             // Re-enter the session span so this thread's lines carry session=<id>.
             let _log_span = log_span.enter();
             let sink_name = thread_sink_name;
-            let status = runtime.wait_for_exit(&container_id);
-            // A deliberate stop (swap teardown, session stop) sets the shared `removed`
-            // flag BEFORE issuing `docker stop`/`rm` (`RunningContainer::stop`), so if it
-            // is set here the exit just observed is our own teardown, not an app failure.
-            // Discard it.
-            if removed_flag.load(Ordering::SeqCst) {
-                tracing::debug!(
-                    "source '{sink_name}': app container exit observed after our own teardown \
-                     (status={status:?}) — ignoring, not a liveness failure"
-                );
-                return;
-            }
-            tracing::info!("source '{sink_name}': app container exited: {status:?}");
-            let mut guard = match slot.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *guard = Some(status);
+            let observed = application.clone();
+            let tailed = application;
+            observe_until_exit(
+                &observer,
+                &sink_name,
+                || {
+                    crate::runtime::configured()
+                        .and_then(|api| api.observe_application(observed.clone()).wait())
+                },
+                || {
+                    crate::runtime::configured()
+                        .and_then(|api| api.application_log_tail(tailed.clone()).wait())
+                        .ok()
+                },
+                || std::thread::sleep(OBSERVATION_RETRY_DELAY),
+            );
         }) {
             tracing::warn!(
                 token = "app-liveness-waiter-spawn-failed",
@@ -921,31 +1209,443 @@ impl AppSource {
         }
     }
 
-    /// Tear down (idempotent): remove the app container, then NULL the pipeline.
-    /// `Drop` is the backstop.
+    /// Tear down (idempotent): stop the app container, release the pulse sidecar
+    /// and the udev export, then NULL the pipeline. The release happens before
+    /// the state change so a pipeline NULL that blocks — the idle-reap case,
+    /// where the encode consumer is still PLAYING — cannot skip it.
+    ///
+    /// This is the session-end path. [`Drop`] stops this generation's container
+    /// only: a swap drops the outgoing source while the replacement still needs
+    /// the sidecar and the udev export.
     pub fn teardown(&mut self) {
-        if let Some(mut c) = self.container.take() {
-            c.stop();
-        }
-        // Orphan backstop: force-remove by the deterministic container name. The tracked
-        // handle above covers the normal case, but a mid-flight launch (a slow image pull
-        // racing the 20 s swap first-frame deadline) or a partial failure can leave an
-        // untracked `quasar-sess-*-g{n}` container. `force_remove` is idempotent and
-        // best-effort, so this is a safe no-op when the handle already removed it.
-        self.runtime.force_remove(&self.container_name);
+        let report = self.finish_app_stop(false);
+        self.shared.apply(report, false);
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+
+    /// Every engine attempt this source makes is OBSERVED, and there is at most
+    /// one settled outcome outstanding at a time.
+    ///
+    /// - A refused stop never reached the engine, so the next release may ask again.
+    /// - A confirmed or absent stop is final; nothing is re-asked.
+    /// - An unconfirmed stop is not spun — but `last_chance` (this source's own
+    ///   `Drop`) spends exactly one more attempt on it. That attempt is not an
+    ///   extra one: it REPLACES the blind stop `RunningContainer::drop` used to
+    ///   make while discarding its answer. Observing it is the point — a stop
+    ///   that finally proves the container gone has to retire the udev export
+    ///   and stop the sidecar, and a discarded success did neither (#314).
+    fn finish_app_stop(&mut self, last_chance: bool) -> StopAttempt {
+        if let Some(report) = self.ended {
+            let ask_again = match report {
+                StopAttempt::Retryable => true,
+                StopAttempt::Unconfirmed => last_chance,
+                StopAttempt::Confirmed | StopAttempt::Absent => false,
+            };
+            if !ask_again {
+                return report;
+            }
+        }
+        let budget = self.shared.budget.clone();
+        let report = teardown::retry_with_budget(|| self.stop_app_once(), &budget);
+        self.ended = Some(report);
+        report
+    }
+
+    fn stop_app_once(&mut self) -> StopAttempt {
+        if self.container.is_none() {
+            return StopAttempt::Absent;
+        }
+        let stopped = self.container.as_mut().unwrap().stop();
+        match stopped {
+            Ok(()) => {
+                self.container.take();
+                self.shared.mount_live.store(false, Ordering::Relaxed);
+                StopAttempt::Confirmed
+            }
+            Err(error) => {
+                let report = teardown::classify_stop(teardown::error_kind(&error));
+                if !matches!(report, StopAttempt::Retryable) {
+                    tracing::warn!(
+                        token = "application-teardown-pending",
+                        "runtime application teardown remains durable: {error}"
+                    );
+                }
+                report
+            }
+        }
+    }
+}
+
+/// How long the observer waits before re-inspecting after a non-terminal answer.
+/// The engine is polled by exact identity — there is no event stream to resubscribe
+/// to — so this is also the reconciliation interval after an engine gap.
+const OBSERVATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The observer loop for one generation, with its engine calls injected.
+///
+/// A bounded runtime observation is not terminal evidence: keep observing a silent,
+/// healthy game past its per-request deadline, and treat every error — including a
+/// daemon that has gone away entirely — as "ask again", never as an exit. Only a
+/// verified `ApplicationResult` ends the loop, and it publishes exactly once into this
+/// generation's slot, after its final logs are recorded.
+///
+/// `observe` and `log_tail` are the RuntimeClient calls in production. `stopped` is
+/// checked before every observation so our own teardown ends the loop without
+/// publishing anything. What this function cannot show — that no observation ever
+/// asks the engine to start or stop the workload — is proven engine-side by
+/// `runtime::helper_tests::application_observation_survives_an_engine_gap_and_reports_the_true_exit_once`.
+fn observe_until_exit(
+    observer: &GenerationObserver,
+    sink_name: &str,
+    mut observe: impl FnMut() -> Result<crate::runtime::ApplicationResult, crate::runtime::RuntimeError>,
+    mut log_tail: impl FnMut() -> Option<crate::runtime::ApplicationLogTail>,
+    mut backoff: impl FnMut(),
+) {
+    let status = loop {
+        if observer.stopped_intentionally() {
+            return;
+        }
+        match observe() {
+            Ok(result) => {
+                for line in result.stdout.lines().chain(result.stderr.lines()) {
+                    observer.record_line(line.to_owned());
+                }
+                if result.oom_killed == Some(true) {
+                    break AppExitStatus::OomKilled;
+                }
+                break result
+                    .exit_code
+                    .and_then(|code| i32::try_from(code).ok())
+                    .map(AppExitStatus::Code)
+                    .unwrap_or(AppExitStatus::Unknown);
+            }
+            Err(error) if retry_application_observation(error.kind) => {
+                // Readiness needs evidence while a game is still alive. This bounded
+                // read is observational and cannot alter its lifecycle; final logs
+                // replace it on terminal observe.
+                if let Some(tail) = log_tail() {
+                    for line in tail.stdout.lines().chain(tail.stderr.lines()) {
+                        observer.record_line(line.to_owned());
+                    }
+                }
+                backoff();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    token = "application-wait-failed",
+                    "runtime application wait failed: {error}"
+                );
+                backoff();
+            }
+        }
+    };
+    // A deliberate stop (swap teardown, session stop) sets the shared `removed` flag
+    // BEFORE the engine sees the stop (`RunningContainer::stop`), so if it is set here
+    // the exit just observed is our own teardown, not an app failure. `publish`
+    // discards it; and it can only ever reach THIS generation's slot.
+    if observer.publish(status) {
+        tracing::info!("source '{sink_name}': app container exited: {status:?}");
+    } else {
+        tracing::debug!(
+            "source '{sink_name}': app container exit observed after our own teardown \
+             (status={status:?}) — ignoring, not a liveness failure"
+        );
     }
 }
 
 impl Drop for AppSource {
     fn drop(&mut self) {
-        self.teardown();
+        let report = self.finish_app_stop(true);
+        // The container's own `Drop` is a blind stop whose result is thrown
+        // away. `finish_app_stop(true)` has just made that attempt for real and
+        // recorded what it learned, so letting the field drop repeat it would
+        // only spend another stop timeout and then throw away an answer the
+        // session needed — that discarded success is #314. Whatever is still
+        // unproven is a durable obligation `recover_application_cleanup` owns.
+        if let Some(container) = self.container.as_mut() {
+            container.disarm_drop();
+        }
+        // SessionResources plus this source is 2. A swap holds the outgoing and
+        // incoming generations at once; releasing the sidecar or the udev
+        // export from that drop would strand the replacement. `strong_count`
+        // is exact here: every clone is taken on this thread.
+        if Arc::strong_count(&self.shared) > 2 {
+            self.shared.note_container_stop(report);
+        } else {
+            // Before NULL. A source NULL can block while an interpipe listener
+            // is still PLAYING, and that must not skip the release. Covers
+            // terminal returns that never reached `teardown`.
+            self.shared.apply(report, false);
+        }
+        let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{app_presented_since_launch, source_commit_advanced};
+    use super::{
+        app_presented_since_launch, observe_until_exit, retry_application_observation,
+        source_commit_advanced, teardown, GenerationObservation, SharedSessionRuntime, StopAttempt,
+    };
+    use crate::runtime::{ApplicationResult, ErrorKind, RuntimeError};
+    use crate::session::container::AppExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// What the session end did to the fake-udev export.
+    #[derive(Default)]
+    struct SpyExport {
+        log: Mutex<Vec<&'static str>>,
+    }
+    impl teardown::UdevExport for SpyExport {
+        fn retire(&self) {
+            self.log.lock().unwrap().push("retire");
+        }
+        fn abandon(&self) {
+            self.log.lock().unwrap().push("abandon");
+        }
+    }
+    impl SpyExport {
+        fn log(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    /// A sidecar whose engine is permanently busy, so every release call spins
+    /// its retry loop exactly as `PulseSidecar::stop` does. It records what it
+    /// was handed, which is how the shared-budget wiring is observable.
+    #[derive(Default)]
+    struct SpySidecarLog {
+        stops: usize,
+        attempts: usize,
+    }
+    struct SpySidecar {
+        log: Arc<Mutex<SpySidecarLog>>,
+        now: Arc<Mutex<Duration>>,
+        budget: Option<teardown::RetryBudget>,
+    }
+    impl teardown::Sidecar for SpySidecar {
+        fn server_uri(&self) -> String {
+            "unix:/nonexistent/native".into()
+        }
+        fn socket_dir(&self) -> std::path::PathBuf {
+            std::path::PathBuf::from("/nonexistent")
+        }
+        fn adopt_budget(&mut self, budget: teardown::RetryBudget) {
+            self.budget = Some(budget);
+        }
+        fn stop(&mut self) {
+            self.log.lock().unwrap().stops += 1;
+            let budget = self
+                .budget
+                .clone()
+                .expect("the session must hand its sidecar the shared budget");
+            let log = self.log.clone();
+            let now = self.now.clone();
+            teardown::retry_retryable(
+                || {
+                    log.lock().unwrap().attempts += 1;
+                    StopAttempt::Retryable
+                },
+                || *now.lock().unwrap() += teardown::STOP_PAUSE,
+                teardown::STOP_ATTEMPTS,
+                || budget.live(),
+            );
+        }
+    }
+
+    struct Session {
+        shared: Arc<SharedSessionRuntime>,
+        export: Arc<SpyExport>,
+        sidecar: Arc<Mutex<SpySidecarLog>>,
+        now: Arc<Mutex<Duration>>,
+    }
+
+    impl Session {
+        /// A session that launched an app container, so its bind mount is live.
+        fn launched() -> Self {
+            let export = Arc::new(SpyExport::default());
+            let sidecar = Arc::new(Mutex::new(SpySidecarLog::default()));
+            let now = Arc::new(Mutex::new(Duration::ZERO));
+            let shared = Arc::new(SharedSessionRuntime::new(
+                "s1",
+                Some(Box::new(SpySidecar {
+                    log: sidecar.clone(),
+                    now: now.clone(),
+                    budget: None,
+                })),
+                Some(export.clone()),
+                teardown::RetryBudget::fake(teardown::STOP_RETRY_BUDGET, now.clone()),
+            ));
+            shared.mount_live.store(true, Ordering::Relaxed);
+            Session {
+                shared,
+                export,
+                sidecar,
+                now,
+            }
+        }
+
+        fn sidecar_stops(&self) -> usize {
+            self.sidecar.lock().unwrap().stops
+        }
+
+        fn sidecar_attempts(&self) -> usize {
+            self.sidecar.lock().unwrap().attempts
+        }
+    }
+
+    // #314, live: the idle reap raced a busy runtime client, and a later stop
+    // proved the app container gone. The refused attempt must change nothing,
+    // and the confirmed one must release everything.
+    #[test]
+    fn a_refused_stop_then_a_confirmed_one_retires_the_export_and_keeps_the_sidecar_stoppable() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Retryable, false);
+        assert_eq!(
+            session.export.log(),
+            Vec::<&str>::new(),
+            "a call the engine never saw must not disarm the export"
+        );
+        assert!(!session.shared.udev_blocked.load(Ordering::Relaxed));
+        assert_eq!(session.sidecar_stops(), 1, "the sidecar is asked anyway");
+
+        session.shared.apply(StopAttempt::Confirmed, false);
+        assert_eq!(session.export.log(), vec!["retire"]);
+        assert!(!session.shared.mount_live.load(Ordering::Relaxed));
+        assert_eq!(session.sidecar_stops(), 2);
+    }
+
+    // The drop-path hazard: teardown ended unconfirmed, then the source's own
+    // `Drop` made one more OBSERVED attempt and it succeeded. Before that
+    // attempt was observed its success was discarded, `last_stop` stayed
+    // unconfirmed, and `SessionResources::drop` abandoned a live export under a
+    // container that was genuinely gone.
+    #[test]
+    fn a_confirmed_drop_path_stop_retires_the_export_instead_of_abandoning_it() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Unconfirmed, false);
+        assert_eq!(
+            session.export.log(),
+            Vec::<&str>::new(),
+            "abandoning waits for the last chance"
+        );
+        assert!(session.shared.udev_blocked.load(Ordering::Relaxed));
+
+        // AppSource::drop, having spent its one extra attempt and observed it.
+        session.shared.apply(StopAttempt::Confirmed, false);
+        // SessionResources::drop reads the recorded outcome; nothing is re-asked.
+        let recorded = session
+            .shared
+            .last_stop
+            .lock()
+            .unwrap()
+            .expect("a release recorded its outcome");
+        assert_eq!(recorded, StopAttempt::Confirmed);
+        session.shared.apply(recorded, true);
+        // Retiring is idempotent (`VirtualDevices::retire_udev_export` takes the
+        // ids), so the last chance repeating it is harmless; abandoning is not.
+        let log = session.export.log();
+        assert!(log.contains(&"retire"), "{log:?}");
+        assert!(
+            !log.contains(&"abandon"),
+            "a proven-gone container must never leave its export to the boot sweep: {log:?}"
+        );
+        assert!(!session.shared.udev_blocked.load(Ordering::Relaxed));
+    }
+
+    // The same session end with the drop-path attempt still unproven: that is
+    // the case the boot sweep owns, and only then.
+    #[test]
+    fn an_unproven_stop_leaves_the_export_for_the_boot_sweep_on_the_last_chance() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Unconfirmed, false);
+        session.shared.apply(StopAttempt::Unconfirmed, true);
+        assert_eq!(session.export.log(), vec!["abandon"]);
+    }
+
+    // Finding 3: `apply` runs up to three times per session end (teardown,
+    // AppSource::drop, SessionResources::drop) and the sidecar's own Drop can
+    // add a fourth. They share one allowance, so the total wait is bounded once
+    // per session end rather than once per call.
+    #[test]
+    fn every_release_call_in_one_session_end_draws_on_the_same_budget() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Retryable, false);
+        let first = session.sidecar_attempts();
+        assert!(first > 1, "the first release does retry a refused stop");
+        session.shared.apply(StopAttempt::Retryable, false);
+        session.shared.apply(StopAttempt::Retryable, true);
+        let total = session.sidecar_attempts();
+        assert!(
+            total < 3 * first,
+            "later releases must inherit a drawn-down budget, not a fresh one: \
+             {first} then {total} attempts"
+        );
+        let waited = *session.now.lock().unwrap();
+        assert!(
+            waited < teardown::STOP_RETRY_BUDGET + teardown::STOP_PAUSE,
+            "one session end waited {waited:?}"
+        );
+    }
+
+    // One observation record per launched generation. The observer thread of a
+    // generation holds only that generation's handles, so nothing it publishes late can
+    // land in the state the runner polls for the replacement (a rolled-back swap
+    // relaunches into the same `AppSource`).
+
+    #[test]
+    fn a_previous_generations_late_exit_is_never_reported_for_the_replacement() {
+        let mut previous = GenerationObservation::new();
+        let previous_observer = previous.observer(Arc::new(AtomicBool::new(false)));
+        // The rollback relaunch replaces the observation record before it spawns a new
+        // observer, exactly as `AppSource::launch` does.
+        let replacement = GenerationObservation::new();
+        assert!(previous_observer.publish(AppExitStatus::Code(0)));
+        assert_eq!(replacement.take_exit(), None);
+        assert_eq!(previous.take_exit(), Some(AppExitStatus::Code(0)));
+        assert_eq!(previous.take_exit(), None, "take semantics: reported once");
+    }
+
+    #[test]
+    fn an_intentional_stop_suppresses_the_exit_publication() {
+        let mut generation = GenerationObservation::new();
+        let removed = Arc::new(AtomicBool::new(false));
+        let observer = generation.observer(removed.clone());
+        // `RunningContainer::stop_with` sets the marker BEFORE the engine sees a stop.
+        removed.store(true, Ordering::SeqCst);
+        assert!(observer.stopped_intentionally());
+        assert!(!observer.publish(AppExitStatus::OomKilled));
+        assert_eq!(generation.take_exit(), None);
+    }
+
+    #[test]
+    fn an_exit_published_just_before_the_stop_marker_is_discarded_at_read_time() {
+        // The observer checked the marker, found it clear, and published; the stop set the
+        // marker a moment later, before the runner polled. The runner must not see it.
+        let mut generation = GenerationObservation::new();
+        let removed = Arc::new(AtomicBool::new(false));
+        let observer = generation.observer(removed.clone());
+        assert!(observer.publish(AppExitStatus::Code(0)));
+        removed.store(true, Ordering::SeqCst);
+        assert_eq!(generation.take_exit(), None);
+    }
+
+    #[test]
+    fn a_previous_generations_log_lines_never_reach_the_replacement_tail() {
+        let mut previous = GenerationObservation::new();
+        let previous_observer = previous.observer(Arc::new(AtomicBool::new(false)));
+        let mut replacement = GenerationObservation::new();
+        let replacement_observer = replacement.observer(Arc::new(AtomicBool::new(false)));
+        previous_observer.record_line("Steam needs to be online to update".into());
+        replacement_observer.record_line("replacement booting".into());
+        assert_eq!(
+            previous.log_tail(),
+            vec!["Steam needs to be online to update"]
+        );
+        assert_eq!(replacement.log_tail(), vec!["replacement booting"]);
+    }
 
     // `app-surface-commits` is a LIFETIME total on a compositor that outlives its app
     // container. Scoping "did it ever draw?" to the current container is what keeps a
@@ -962,6 +1662,98 @@ mod tests {
         );
         // One frame past the baseline IS the replacement drawing.
         assert!(app_presented_since_launch(Some(400), 401));
+    }
+
+    #[test]
+    fn no_observation_error_is_published_as_an_application_exit() {
+        for kind in [
+            ErrorKind::Timeout,
+            ErrorKind::Unavailable,
+            ErrorKind::Busy,
+            ErrorKind::UnknownOutcome,
+            ErrorKind::Cancelled,
+            ErrorKind::Protocol,
+            ErrorKind::Engine,
+            ErrorKind::InvalidConfiguration,
+        ] {
+            assert!(
+                retry_application_observation(kind),
+                "{kind:?} is missing terminal evidence and must leave a live app alone"
+            );
+        }
+    }
+
+    /// The engine goes away mid-session and the application exits during the gap.
+    /// There is no event stream to resubscribe to, so the observer must keep asking
+    /// and reconcile the true exit from the first answer it gets back — publishing
+    /// nothing meanwhile, and exactly once afterwards. Nothing in this loop asks the
+    /// engine to start or stop anything; that half is proven engine-side by
+    /// `runtime::helper_tests::application_observation_survives_an_engine_gap_and_reports_the_true_exit_once`.
+    #[test]
+    fn the_observer_rides_out_an_engine_gap_and_publishes_the_true_exit_once() {
+        let mut generation = GenerationObservation::new();
+        let observer = generation.observer(Arc::new(AtomicBool::new(false)));
+        let observations = std::cell::Cell::new(0usize);
+        let gap = std::cell::Cell::new(0usize);
+        observe_until_exit(
+            &observer,
+            "gap-source",
+            || {
+                observations.set(observations.get() + 1);
+                if observations.get() <= 3 {
+                    // Each failed answer is also the runner's chance to see there is
+                    // still no exit: a published error would end the session here.
+                    assert_eq!(generation.take_exit(), None, "an engine gap is not an exit");
+                    return Err(RuntimeError::from(ErrorKind::Unavailable));
+                }
+                assert_eq!(observations.get(), 4, "observed after the terminal result");
+                Ok(ApplicationResult {
+                    exit_code: Some(7),
+                    oom_killed: Some(false),
+                    stdout: "last words".into(),
+                    stderr: String::new(),
+                })
+            },
+            || {
+                gap.set(gap.get() + 1);
+                None
+            },
+            || {},
+        );
+        assert_eq!(
+            observations.get(),
+            4,
+            "the terminal answer must end the loop"
+        );
+        assert_eq!(
+            gap.get(),
+            3,
+            "each gap observation still feeds readiness a tail"
+        );
+        assert_eq!(generation.take_exit(), Some(AppExitStatus::Code(7)));
+        assert_eq!(
+            generation.take_exit(),
+            None,
+            "take semantics: reported once"
+        );
+        assert_eq!(generation.log_tail(), vec!["last words"]);
+    }
+
+    /// The same loop against our OWN teardown: the marker is set before the engine
+    /// sees the stop, so the observer must leave without asking or publishing.
+    #[test]
+    fn the_observer_publishes_nothing_once_our_own_teardown_has_begun() {
+        let mut generation = GenerationObservation::new();
+        let removed = Arc::new(AtomicBool::new(true));
+        let observer = generation.observer(removed);
+        observe_until_exit(
+            &observer,
+            "stopped-source",
+            || panic!("an intentional stop must not observe again"),
+            || None,
+            || panic!("no backoff after an intentional stop"),
+        );
+        assert_eq!(generation.take_exit(), None);
     }
 
     #[test]

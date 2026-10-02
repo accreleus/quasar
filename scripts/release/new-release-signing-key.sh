@@ -26,7 +26,8 @@ usage: scripts/release/new-release-signing-key.sh --out PATH --key-id LABEL
 Writes an ed25519 private key (PKCS#8 PEM) to PATH, mode 0600, and prints:
 
   * the public key as `key-id:base64`, for QUASAR_UPDATER_TRUSTED_KEYS on every
-    host that should trust it, and
+    machine that should trust it (a seed input; an installed machine changes it
+    with `quasar-recovery reconfigure`), and
   * the exact `gh secret set` command for the release pipeline.
 
 PATH must be outside the repository. Pick a label that will still mean something
@@ -78,8 +79,10 @@ Wrote the private key to $out (mode 0600). Back it up somewhere you would be
 willing to restore a release from; there is no recovery from losing it, only a
 rotation to a new one.
 
-Public key — add to QUASAR_UPDATER_TRUSTED_KEYS on every host, comma-separated
-alongside any key you are rotating away from:
+Public key — add to QUASAR_UPDATER_TRUSTED_KEYS on every machine, comma-separated
+alongside any key you are rotating away from. It is a seed input; on an installed
+machine run, inside its recovery actor:
+  docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER_TRUSTED_KEYS=<keys>
 
   $key_id:$public_key
 

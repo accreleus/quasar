@@ -90,7 +90,7 @@ function KpiCard({ eyebrow, value, unit, meta, metaDanger, points, color, to }: 
           <Trend points={points} color={color} />
         </div>
       </div>
-      <div className="kpi-meta" style={metaDanger ? { color: "var(--danger-text)" } : undefined}>
+      <div className={metaDanger ? "kpi-meta kpi-meta-danger" : "kpi-meta"}>
         {meta}
       </div>
     </button>

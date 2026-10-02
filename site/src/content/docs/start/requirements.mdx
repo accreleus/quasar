@@ -1,131 +1,82 @@
 ---
 title: Requirements
-description: What the host machine needs before you install Quasar, and what your client device needs to play.
+description: Choose a Linux GPU host and check the direct network path before installing.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-## The host machine
+import PortsTable from '../../../components/PortsTable.astro';
+import EngineProfiles from '../../../components/EngineProfiles.astro';
 
-**Linux only.** The node agent runs with `network_mode: host`, because WebRTC
-has to send UDP from the host's own network namespace. Docker Desktop on macOS
-and Windows cannot do that, so media will not work there at all. Any systemd
-distribution with Docker should be fine. Fedora 44 is what the install is
-verified on.
+## Your server
 
-**Docker Engine with Compose v2.30 or newer.** The generated stack uses optional
-environment files, which require this version.
+| Component | Requirement |
+| --- | --- |
+| OS | Linux. |
+| Container engine | Docker Engine 20.10+ or Podman. See [Container engines](/quasar/start/requirements/#container-engines) for current support status. |
+| Disk | Allow about 20 GB for container images, then additional space for installed games, saves and user files. Check where your engine stores images as well as your homes disk. |
+| CPU and RAM | Quasar's services have modest overhead. Size the host for the games and number of simultaneous sessions you intend to run; the GPU handles video encoding. The 8 vCPU / 32 GB test host is a test configuration, not a minimum. |
 
-**About 20 GB of disk** for the images, plus room for game containers and save
-data.
+Docker Desktop on macOS or Windows, and WSL, are unsupported.
 
-<Aside type="caution" title="Fedora's default root volume is too small">
-A stock Fedora install gives the root logical volume 15 GB. Grow it first with
-`lvextend` and `xfs_growfs`.
+## Container engines
+
+Quasar runs on Docker and Podman in rootful or rootless mode. Rootless modes and
+rootful Podman remain experimental.
+
+<EngineProfiles />
+
+**Supported:** tested end to end. **Experimental:** tested, with release validation
+still incomplete. Tests cover rootful Docker with AMD/NVIDIA, and Podman/rootless
+on Fedora uCore and Workstation; this does not validate every distribution.
+
+### What’s the difference between rootful and rootless?
+
+<Aside type="note" title="Rootful and rootless">
+**Rootful** runs the engine as root; access to its socket gives control of the machine.
+**Rootless** runs under an ordinary account with reduced privileges and needs extra
+account and device setup. See [Rootless installation](/quasar/install/rootless/).
 </Aside>
 
-**CPU and RAM** matter less than you would think, because the GPU does the
-encoding. 8 vCPU and 32 GB is what the install is measured on. Less works.
+The documented [Podman](/quasar/install/podman/) and rootless installation paths
+require systemd; Quasar on rootful Docker does not. Run one Quasar installation per
+engine. Compose, Dockge and Arcane can manage its seed; Portainer and Kubernetes
+are unsupported.
 
-### GPU
+## GPU
 
-| Vendor | Encoder | Status |
+| Vendor | Encoder | Current validation |
 | --- | --- | --- |
-| AMD | Vulkan Video | Verified. |
-| NVIDIA | Vulkan Video | Verified. |
-| Intel | VA-API by default | Untested. VA-API is what detection picks; the Vulkan path exists too. Nobody has run either. |
-| None | openh264, in software | Proves the install. Too slow and too ugly to play on. |
+| NVIDIA | Vulkan Video | Verified |
+| AMD | Vulkan Video | Verified |
+| Intel | VA-API | Untested |
+| No GPU | Software H.264 | Too slow for practical play |
 
-NVIDIA hosts need the driver plus `nvidia-container-toolkit`, registered with
-Docker once:
-
-```bash
-sudo nvidia-ctk runtime configure
-sudo systemctl restart docker
-```
-
-<Aside type="caution" title="A CUDA-only NVIDIA install is not enough">
-The CUDA packages alone leave you without EGL and without 32-bit GL. The
-compositor needs EGL, and native 32-bit game binaries need the 32-bit libraries.
-Quasar can work around this by provisioning a driver volume, but installing the
-full driver stack is better. See
-[Install and startup problems](/quasar/troubleshooting/install/).
+<Aside type="note" title="NVIDIA prerequisites">
+NVIDIA requires the **full graphics driver, version 610 or newer, and NVIDIA Container Toolkit**.
+Follow [NVIDIA setup](/quasar/install/nvidia/) before installing.
 </Aside>
-
-### NVIDIA on Unraid
-
-Install the NVIDIA driver plugin and confirm `nvidia-smi` lists the GPU on the
-host before starting Quasar. RTX 50-series GPUs require NVIDIA’s **open kernel
-modules**. A driver version shown as installed is not enough if the GPU is absent.
-
-Available open-module packages depend on your Unraid kernel and plugin package
-feed. Selecting a newer proprietary package does not meet the open-module
-requirement. Quasar cannot install or replace this host kernel driver.
-
-RTX 5090 with driver 595.99.02 has a confirmed Vulkan AV1 corruption issue;
-610.57.04 produced clean output, including an operator-built open-module install
-on Unraid. This is a tested combination, not a universal minimum for all GPUs.
-Use HEVC or H.264 if a compatible open-module update is unavailable. See
-[AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
-
-### Kernel
-
-`/dev/uinput` has to exist and be writable. That is how Quasar creates the
-virtual keyboard, mouse and gamepads.
-
-```bash
-sudo modprobe uinput
-echo uinput | sudo tee /etc/modules-load.d/uinput.conf
-```
-
-The compose file declares the device and the input cgroup rule, so loading the
-module is all you do.
-
-### One sysctl
-
-Raise the default UDP send buffer on every machine that streams:
-
-```bash
-echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
-sudo sysctl --system
-```
-
-The quick-start script applies and persists this setting for your selected
-platform; a manual Compose install must configure it on the host. On Unraid, use
-the generated Unraid script, which persists the setting in `/boot/config/go`
-because `/etc` is recreated at boot. The media path sends
-through libnice, which never calls `setsockopt(SO_SNDBUF)`, so its UDP sockets
-inherit the kernel default of 208 KB. A keyframe burst at 8 Mbps overflows that,
-the kernel drops the overflow silently, and the bitrate estimator reads the loss
-as network congestion and throttles the stream. The symptom looks exactly like a
-bad network.
-
-### Firewall
-
-The control plane's ports are published through Docker, which routes them past
-the host firewall, so they need no rule. The node agent is different: it uses
-the host network directly, and a default-deny firewall will drop its WebRTC UDP.
-See [Ports and endpoints](/quasar/reference/ports/#firewall).
-
-SELinux can stay enforcing. That is verified, with no denials.
-
-## The client device
-
-Anything running a recent Chrome or Chromium browser that can reach the GPU host
-over the network.
-
-Chrome is what Quasar is validated against. Keyboard Lock, which is what lets
-Escape reach the game instead of leaving fullscreen, is Chromium-only. Firefox
-and Safari are untested. See [Browser support](/quasar/playing/browsers/).
-
-The page has to be served over HTTPS. Gamepads, Keyboard Lock and microphone
-capture all need a secure context, so a plain HTTP deployment loses all three.
-Quasar generates its own certificate on first boot, so this is handled for you.
-See [HTTPS and certificates](/quasar/network/https/).
 
 ## Network
 
-Your client needs to reach the GPU host directly, on the same LAN or over a VPN.
-Media is WebRTC between the browser and the host, and it does not travel through
-a reverse proxy. Putting the login page on the internet does not put the stream
-there. See [Reaching Quasar remotely](/quasar/network/remote-access/).
+**Your browser must reach each GPU host directly over your LAN or VPN.** A reverse
+proxy can carry the web app and API; it cannot carry the game stream.
+
+For a default install, allow these connections from the relevant LAN or VPN peers:
+
+<PortsTable />
+
+The UDP range is chosen by Linux: check `cat /proc/sys/net/ipv4/ip_local_port_range`
+on the GPU host. A default-deny firewall must allow it even when login works.
+See [Firewall rules and custom ports](/quasar/reference/ports/#firewall) and
+[Remote access](/quasar/network/remote-access/). Optional UDP buffer tuning is in
+[Latency](/quasar/tuning/latency/#the-udp-send-buffer).
+
+## Your client
+
+Use recent **Chrome or Chromium**. Firefox and Safari are untested; see
+[Browser support](/quasar/playing/browsers/).
+
+HTTPS is required for gamepads, keyboard lock and the microphone. The install
+steps configure Quasar's certificate; see [HTTPS and certificates](/quasar/network/https/)
+for trusting it or using a reverse proxy.

@@ -1,37 +1,30 @@
 ---
 title: Quality profiles
-description: Launch profiles are what users pick. Stream profiles are the rungs underneath. How the two fit together and when to change them.
+description: Launch profiles are what users pick; stream profiles are the rungs underneath.
 ---
 
 import Shot from '../../../components/Shot.astro';
 import admin_profiles from '../../../assets/shots/admin-profiles.png';
 import { Aside } from '@astrojs/starlight/components';
 
-There are two objects here and the distinction matters.
-
-A **stream profile** is one concrete encode rung: one codec, one resolution, one
-frame rate, one bitrate, plus the thresholds that decide whether a given client
-qualifies for it. Users never see these.
-
-A **launch profile** is an ordered list of stream profiles, best first. This is
-what a user picks, and it is what "1080p60" means in the interface.
+- A **stream profile** is one encode rung: codec, resolution, frame rate, bitrate,
+  and the thresholds a client must meet. Users never see these.
+- A **launch profile** is an ordered list of stream profiles, best first. Users
+  pick these (for example "1080p60").
 
 ## How a session resolves
 
-At launch, the server walks the chosen launch profile's rungs in order and takes
-the first one that survives four checks:
+At launch the server takes the first rung in the chosen launch profile that:
 
-1. **The host can encode it.**
-2. **The client can decode it**, as measured when the user logged in.
-3. **It has not failed for this client before.**
-4. **Hardware encode is available**, if the rung requires it.
+1. the host can encode,
+2. the client can decode (measured at login),
+3. has not failed for this client before,
+4. has hardware encode available, if the rung requires it.
 
-[Codecs](/quasar/tuning/codecs/#how-the-server-picks) covers what each check
-tests and why HEVC and AV1 are gated harder than H.264.
+See [Codecs](/quasar/tuning/codecs/#how-the-server-picks) for details.
 
-Every launch profile must contain at least one H.264 rung. The server rejects a
-profile that does not. H.264 decodes everywhere, so there is always a rung that
-works and a launch never fails because nothing was playable.
+Every launch profile must contain at least one H.264 rung, so a launch always has
+something playable. The server rejects a profile without one.
 
 <Shot
 	label="Admin launch profiles"
@@ -42,63 +35,40 @@ works and a launch never fails because nothing was playable.
 
 ## What ships by default
 
-Twelve launch profiles, covering 720p, 1080p, 1440p and 4K at 60, 90 and 120
-frames per second. **1080p60 is the recommended default.**
+Twelve launch profiles: 720p, 1080p, 1440p and 4K at 60, 90 and 120 fps.
+**1080p60 is the recommended default.**
 
-Within each tier the rungs are ordered AV1 first, then HEVC, then H.264. Why
-that order:
+Each tier's rungs go AV1, then HEVC, then H.264:
 
-- **AV1** saves roughly 40 to 50 percent of the bitrate of H.264 at equivalent
-  quality, and Chrome can decode it everywhere thanks to its software fallback.
-- **HEVC** saves roughly 30 to 40 percent, but Chrome only decodes it with
-  operating system hardware support, so macOS and Windows clients usually get it
-  and Linux clients never do.
-- **H.264** works everywhere and is the floor.
-
-The saving is bandwidth headroom, not latency. On a clean LAN with plenty of
-bandwidth, the codec makes very little difference to how the stream feels. On a
-constrained link it makes a great deal.
-
-## When to change any of this
-
-Mostly you should not. The defaults are a reasonable ladder for common hardware.
-
-Reasons you might:
-
-**Your GPU cannot encode something in the list.** Not a problem in itself,
-because unsupported rungs are skipped. It is only worth editing if you want the
-list to reflect reality for your own clarity.
-
-**You want to cap quality.** Removing high tiers or restricting apps to specific
-tiers is the way to stop one user occupying a whole GPU at 4K120.
-
-**Your bitrates do not suit your network.** The default bitrates target a
-reasonable LAN. If you are streaming over a constrained link, lowering them may
-give better results than letting adaptive bitrate discover the ceiling on every
-launch.
+Browser decode support is measured per device. See [Codecs](/quasar/tuning/codecs/)
+for compatibility and bitrate targets; an AV1 or HEVC rung is used only when the
+host and client support it.
 
 <Aside type="caution" title="4K120 does not work in a browser">
-The default catalog includes it, but browser decode does not keep up in
-practice. Treat it as a tier waiting on the native client.
+Browser decode can't keep up. Treat it as waiting on the native client.
 </Aside>
+
+## When to change profiles
+
+Keep the defaults unless you need to:
+
+- **Cap quality**: remove high tiers, or restrict apps to specific tiers, so one
+  user can't take a whole GPU at 4K120.
+- **Suit your network**: lower bitrates for a constrained link.
+
+Rungs your GPU can't encode are skipped automatically; no need to remove them.
 
 ## Instance default and user override
 
-Under Admin you can set the instance-wide default launch profile, and whether
-users are allowed to override it.
-
-If overrides are on, a user's own default from their account page wins. If they
-are off, everyone gets the instance default.
+Under Admin you set the instance default launch profile and whether users may
+override it. With overrides on, a user's own default (account page) wins.
 
 ## What the user sees
 
-A tier name and an indication of whether it suits their device. Not the codec,
-not the bitrate, not the rung list. If someone asks why they got HEVC instead of
-AV1, the answer is in the session detail under Admin, Sessions.
+A tier name and whether it suits their device. The codec, bitrate and rungs are in
+the session detail under **Admin ▸ Sessions**.
 
 ## Related tuning
 
-Codec behaviour and encoder selection are covered separately in
-[Codecs](/quasar/tuning/codecs/) and [Encoders](/quasar/tuning/encoders/). What
-the stream does with bitrate once a session is running is
+[Codecs](/quasar/tuning/codecs/), [Encoders](/quasar/tuning/encoders/),
 [Adaptive bitrate](/quasar/tuning/adaptive-bitrate/).

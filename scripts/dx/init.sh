@@ -38,7 +38,7 @@ if [ -f "$ENV_FILE" ]; then
 elif [ -f "$ENV_EXAMPLE" ]; then
   cp "$ENV_EXAMPLE" "$ENV_FILE"
   dx_pass env "created deploy/.env from deploy/.env.example"
-  dx_info "fill in the required values before any deploy (POSTGRES_PASSWORD, ENROLLMENT_TOKEN, BOOTSTRAP_ADMIN_*)"
+  dx_info "fill in the required values before any deploy (POSTGRES_PASSWORD, BOOTSTRAP_ADMIN_*; an agent's first ENROLLMENT_TOKEN is minted in the console)"
 else
   dx_warn env "no deploy/.env and no deploy/.env.example to seed it from"
 fi

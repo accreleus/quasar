@@ -11,15 +11,18 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/access"
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/artwork"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/config"
 	"github.com/accreleus/quasar/control-plane/internal/console"
 	"github.com/accreleus/quasar/control-plane/internal/crud"
 	"github.com/accreleus/quasar/control-plane/internal/devauth"
 	"github.com/accreleus/quasar/control-plane/internal/devices"
+	"github.com/accreleus/quasar/control-plane/internal/enrollscript"
 	"github.com/accreleus/quasar/control-plane/internal/health"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
@@ -85,9 +88,11 @@ type Services struct {
 	// The apply half (#116). Nil in a route-recorder build; Register only takes
 	// method values, so the drift test still sees the routes.
 	platformApply  *platform.ApplyHandler
+	platformRemove *platform.RemoveHandler
 	platformNotify *platform.NotifyHandler
 	applyRunner    *platform.Runner
 	fleetRunner    *platform.FleetRunner
+	selfDeveloper  *platform.SelfDeveloperRunner
 	auditHandler   *audit.Handler
 	artworkHandler *artwork.Handler
 	secretsHandler *secrets.Handler
@@ -100,6 +105,9 @@ type Services struct {
 	// claim list.
 	jobsAgentHandler *jobs.AgentHandler
 	pool             *pgxpool.Pool
+	// What /enroll-host.sh installs: the configured pins over the installed
+	// release's images. Nil serves the configured pins alone.
+	enrollPins enrollscript.PinSource
 
 	// authSvc: main.go wires the dev-only agent-auth endpoint (#399) to this same
 	// service so there is one hashing and token-issuance path. Unused by RegisterRoutes.
@@ -363,6 +371,22 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		log.Info("bootstrap admin", "action", bootRes.String(), "email", cfg.BootstrapAdminEmail)
 	}
 
+	// This machine's local enrollment token (control-api.md amendment 14 §"Enrollment").
+	if cfg.LocalEnrollmentToken != "" {
+		localCtx, localCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		inserted, err := hostenroll.EnsureLocal(localCtx, pool, cfg.LocalEnrollmentToken, cfg.LocalEnrollmentNodeName)
+		localCancel()
+		if err != nil {
+			janitorStop()
+			return nil, fmt.Errorf("local enrollment: %w", err)
+		}
+		state := "already present"
+		if inserted {
+			state = "inserted"
+		}
+		log.Info("local enrollment token", "state", state, "node_name", cfg.LocalEnrollmentNodeName)
+	}
+
 	// First-run setup wizard (Spec B W1). Mint the per-boot token only when no admin
 	// exists, so a fresh instance can be claimed via POST /v1/setup/claim; otherwise
 	// remove any stale token file. Token custody: a 0600 file only, never the log (a
@@ -420,9 +444,15 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		"staleness_secs", vramAdmission.StalenessSecs,
 		"enabled", vramAdmission.MinFreeMB > 0)
 
+	// The evidence-gated readiness filter (amendment 11). The window reaches the
+	// host read path too (crudHandler below): a host that reads `active` while
+	// admission abstains is a console that contradicts the scheduler.
+	log.Info("scheduler readiness gate", "stale_secs", cfg.ReadinessStaleSecs)
+
 	sessionStore := session.NewStore(pool,
 		session.WithPlacementPolicy(placementPolicy),
-		session.WithVramAdmission(vramAdmission))
+		session.WithVramAdmission(vramAdmission),
+		session.WithReadinessStaleSecs(int(cfg.ReadinessStaleSecs)))
 
 	// The only thing that deletes session telemetry. On the dispatcher rather than
 	// its own ticker so it is single-flight across control-plane instances.
@@ -460,6 +490,15 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	})
 	cfgStore := hostcfg.NewStore(pool)
+	// Fence unstarted RH05 approvals and journal inventory before HTTP admission
+	// or agent registration can observe this control-plane incarnation.
+	idleBootCtx, idleBootCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	idleBoot, bootErr := cfgStore.StartRH05Boot(idleBootCtx)
+	idleBootCancel()
+	if bootErr != nil {
+		janitorStop()
+		return nil, fmt.Errorf("start RH05 approval boot: %w", bootErr)
+	}
 	consoleStore := console.NewStore(pool)
 	auditStore := audit.NewStore(pool)
 	agentRegistry := agentws.NewRegistry(log)
@@ -470,9 +509,15 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// launch, so a UI flip needs no restart.
 	homeRootEnv := strings.TrimSpace(os.Getenv("QUASAR_HOME_ROOT"))
 	homeProvider := storage.New(pool, settingsStore,
-		storage.HostRootResolverFunc(func(ctx context.Context, hostID string) (string, error) {
-			return cfgStore.HomeRoot(ctx, hostID, homeRootEnv)
-		}))
+		storage.HostRootResolverFuncs{
+			Read: func(ctx context.Context, hostID string) (string, error) {
+				return cfgStore.HomeRoot(ctx, hostID, homeRootEnv)
+			},
+			Locked: func(ctx context.Context, tx pgx.Tx, hostID string) (string, error) {
+				return cfgStore.HomeRootTx(ctx, tx, hostID, homeRootEnv)
+			},
+		})
+	homeProvider.SetHomeCleanupCapability(agentRegistry.CurrentHomeCleanupCapability)
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          "storage.home_janitor",
 		Name:        "Home janitor",
@@ -537,6 +582,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		WithTrustedProxies(cfg.TrustedProxies)
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
+	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))
 	sessionHandler := session.NewHandler(coordinator, sessionStore, auditStore).
 		WithPublicBaseURL(cfg.PublicBaseURL).
 		WithICEServers(cfg.ICEServers)
@@ -564,8 +610,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	originResolver := origins.NewResolver(cfg.AllowedOrigins, cfg.AllowedOriginsSet, settingsStore, log)
 	signalHandler := signalpkg.NewHandler(sessionStore, agentRegistry, relayBus, log, originResolver).
 		WithTrustedProxies(cfg.TrustedProxies)
-	agentHandler := agentws.NewHandler(pool, cfg.EnrollmentToken, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore).
-		WithTrustedProxies(cfg.TrustedProxies)
+	agentHandler := agentws.NewHandler(pool, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore, idleBoot).
+		WithTrustedProxies(cfg.TrustedProxies).
+		WithAuditor(auditStore)
 	// CM-09 item 2: console re-eval hook, set after both exist. A plain func value
 	// because session must not import agentws.Handler, only its agentws.Events subset.
 	coordinator.ConsoleReeval = agentHandler.ConsoleSessionTerminated
@@ -695,6 +742,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	libraryJanitor := library.NewJanitor(libraryStore, settingsStore, libraryResolver, log)
 	libraryHandler := library.NewHandler(libraryStore, homeProvider, settingsStore,
 		appDetails, libraryResolver, log, auditStore)
+	if artErr == nil {
+		// A scan resolves artwork for the tiles it creates right after it commits (#384);
+		// artwork.sweep stays the backstop for anything that pass misses.
+		libraryHandler.SetArtwork(artworkSvc)
+	}
 
 	// jobs.interval_secs is seeded once from instance_settings.
 	// library_discovery_interval_minutes (design §8.2); after this boot an admin owns
@@ -764,11 +816,24 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesStore.SetProviderAllowlist(os.Getenv("QUASAR_LIBRARY_PROVIDERS"))
 	imagesHandler := images.NewHandler(imagesStore, auditStore)
 	imagesEnsurer := images.NewEnsurer(pool, agentRegistry, log)
+	coordinator.SetLazyImagePreparer(imagesEnsurer)
 	imagesStore.SetEnsurer(imagesEnsurer)
+	imagesHandler.SetRetryEnsurer(imagesEnsurer)
+	imagesCleanup := images.NewCleanupService(janitorCtx, pool, agentRegistry)
+	imagesCleanup.SetEnsurer(imagesEnsurer)
+	imagesCleanup.SetAuditor(auditStore)
+	imagesStore.SetCleanupService(imagesCleanup)
+	imagesEnsurer.SetCleanupService(imagesCleanup)
+	go imagesCleanup.RunRetention(janitorCtx)
+	imagesHandler.SetCleanupService(imagesCleanup)
+	crudHandler.SetImageReconciler(imagesEnsurer.EnsureAll)
+	crudHandler.SetImageEvidence(imagesEnsurer.CurrentImageEvidence)
+	go imagesEnsurer.RunRequirementReconcile(janitorCtx)
 	preparationStore := preparation.New(pool)
 	agentHandler.SetPreparation(preparationStore)
 	agentHandler.OnPreparationReport = imagesEnsurer.ReconcilePreparation
 	agentHandler.SetImageEvents(imagesEnsurer)
+	agentHandler.SetImageCleanupEvents(imagesCleanup)
 
 	// Provider reconciliation. semantics: control-api.md §"P5 side effect".
 	//
@@ -867,6 +932,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			return jobs.Succeeded(jobs.Summary{
 				"deleted":      rep.Deleted,
 				"in_session":   rep.InSession,
+				"pending_home": rep.PendingHome,
 				"failed":       rep.Failed,
 				"hosts_nudged": rep.HostsNudged,
 			}), nil
@@ -953,13 +1019,29 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// session, because the recreate does that and doing it twice can only fail
 	// halfway. Uncordon's ErrHostNotResumable on an offline host is expected —
 	// a host mid-recreate has no agent, and its register brings it back online.
+	admissionStore := admission.NewStore(pool)
+	// Developer apply (amendment 14): the namespaces checked up front, and where
+	// the images' build identity is read — the allowed namespaces' registries over
+	// the hardened client, plus any plain-HTTP test registry the operator names.
+	developerNamespaces := platform.ParseNamespaces(os.Getenv("QUASAR_UPDATER_ALLOWED_NAMESPACES"))
+	insecureRegistries := platform.ConfiguredInsecureRegistries()
+	developerImages := platform.NewRegistryDeveloperImages(platform.RoutedInspector{
+		Plain:      images.NewPlainHTTPRegistryResolver(insecureRegistries, 30*time.Second),
+		PlainHosts: insecureRegistries,
+		TLS: images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(
+			append(platform.NamespaceHosts(developerNamespaces), platform.ConfiguredPlatformRegistry())...)),
+	})
 	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
-		Cordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, false)
+		DeveloperCommit: developerImages.Commit,
+		AcquireOwned: func(ctx context.Context, attemptID, hostID string) error {
+			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
 			return err
 		},
-		Uncordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.UncordonHost(ctx, hostID)
+		ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
+			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, agentRegistry.IsConnected(hostID))
+			if errors.Is(err, admission.ErrHostNotFound) {
+				return nil
+			}
 			return err
 		},
 		Send: func(ctx context.Context, hostID string, cmd platform.ApplyCommand) (platform.Ack, error) {
@@ -994,18 +1076,46 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// Preflight's one network collector: do the release's digests resolve at
 	// the registry (amendment 9). Invalidated on "Check now" and before an apply.
 	imageResolver := platform.NewImageResolver(platformRegistryResolver, edgeApply, 0)
-	// The control plane applies ITSELF over the updater socket beside it, never
-	// over an agent connection (agent-api.md §release_apply).
-	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
-	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
+	// The control plane applies ITSELF through the recovery actor on its own
+	// machine, over the control socket, never over an agent connection
+	// (agent-api.md §release_apply). Without one, nothing can replace it.
+	var selfExecutor platform.UpdaterAPI
+	if cfg.RecoveryControlSocket != "" {
+		selfExecutor = platform.NewActorClient(cfg.RecoveryControlSocket)
+	}
+	// Two facts say "owned": the socket picks the executor, the machine shape
+	// the fleet run's owned rules. The recovery actor's recipe sets both; one
+	// without the other is a hand-edited configuration.
+	if owned, shaped := cfg.RecoveryControlSocket != "", applyMachineShape(cfg).Role != ""; owned != shaped {
+		log.Warn("owned-install configuration is half set: the control socket and the machine shape disagree",
+			"token", "owned-install-config-mismatch", "control_socket_set", owned, "machine_shape_set", shaped)
+	}
+	selfApplier := platform.NewSelfApplier(platformStore, selfExecutor, log)
+	selfApplier.DeveloperCommit = developerImages.Commit
+	selfApplier.DeveloperSchema = developerImages.SchemaOf
+	// The control plane's own machine on an owned install; nil otherwise, and
+	// then nothing below reads a socket.
+	ownMachine := platform.NewOwnMachineReader(cfg.RecoveryControlSocket)
 	// A stale preflight must not authorise a run: dropped before an apply
 	// decision and by "Check now".
-	refreshPreflight := func() { imageResolver.Invalidate(); selfApplier.InvalidateSelf() }
+	refreshPreflight := func() {
+		imageResolver.Invalidate()
+		ownMachine.Invalidate()
+	}
 
 	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
-	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
-	pDeps.ControlPlanePreflight = selfApplier.PreflightFacts
+	pDeps.ControlPlanePreflight = func(context.Context) platform.PreflightFacts {
+		return platform.PreflightFacts{NoRecoveryActor: true}
+	}
+	if ownMachine != nil {
+		ownMachine.Log = log
+		pDeps.ControlPlanePreflight = ownMachine.PreflightFacts
+		pDeps.ControlPlaneMachine = ownMachine.Identity
+		pDeps.ControlPlaneInstallMode = ownMachine.InstallMode
+		pDeps.ControlPlaneDatabaseBytes = platformStore.DatabaseBytes
+	}
+	pDeps.MachineShape = machineShape(cfg)
 	pDeps.ImageFor = imageResolver.Check
 	// #169: the live registry, not the `status` column, answers "is this host's
 	// agent there". The column is stale across every control-plane restart —
@@ -1018,19 +1128,20 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// it is about to be recreated at its own step. Whether the control-plane step
 	// also DRAINS is a per-release decision (#153) that lives in the sequencer.
 	fleetCordons := platform.FleetCordons{
-		Cordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, false)
+		AcquireOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply")
 			return err
 		},
-		Uncordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.UncordonHost(ctx, hostID)
+		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, agentRegistry.IsConnected(hostID))
+			if errors.Is(err, admission.ErrHostNotFound) {
+				return nil
+			}
 			return err
 		},
-		// force=true: stop the sessions, do not merely stop new placement. Used
-		// only by a migrating control-plane step under `force` (#153).
-		Drain: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, true)
-			return err
+		IsConnected: agentRegistry.IsConnected,
+		DrainOwned: func(ctx context.Context, _, hostID string) error {
+			return coordinator.StopHostSessions(ctx, hostID)
 		},
 	}
 	// Outbound release notification (#123). The webhook is resolved per pass and
@@ -1045,11 +1156,64 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		platformHandler.ReleaseView, webhookConfig, nil, auditStore, log)
 
 	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
-		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
+		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log).
+		WithMachineShape(applyMachineShape(cfg))
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
 		WithPreflightRefresh(refreshPreflight).
 		WithEdgeResolver(edgeApply).
-		WithFleet(fleetRunner)
+		WithFleet(fleetRunner).
+		WithDeveloperApply(developerImages, developerNamespaces)
+	// A developer apply to this control plane is a standalone control-plane
+	// attempt; it holds every host's admission for its duration (#363).
+	selfDeveloper := platform.NewSelfDeveloperRunner(platformStore, selfApplier, fleetCordons,
+		developerImages.Commit, log)
+	selfDeveloper.Migrates = developerImages.Migrates
+	platformApply.WithSelfDeveloper(selfDeveloper)
+	if ownMachine != nil {
+		platformApply.WithOwnMachine(ownMachine)
+		fleetRunner.WithOwnMachine(ownMachine)
+	}
+	platformApply.WithMachineShape(applyMachineShape(cfg))
+	// Remove host (amendment 14). "Cordon exactly as a per-host apply does" would use the
+	// attempt owner, but a removal writes no attempt row for that owner to belong to, so
+	// it takes the manual-drain owner: a removal that stops part-way then leaves a drain
+	// the operator can lift from the console.
+	platformRemove := platform.NewRemoveHandler(platform.RemoveDeps{
+		Store:     platformStore,
+		Connected: agentRegistry.IsConnected,
+		// The shape the recovery actor wrote into this control plane's configuration,
+		// known whether or not the actor answers (control-api.md, machine_node_name).
+		OwnNodeName: func(context.Context) (string, bool) {
+			return applyMachineShape(cfg).CombinedNodeName()
+		},
+		Cordon: func(ctx context.Context, hostID string) (func(context.Context), error) {
+			held, err := admissionStore.List(ctx, hostID)
+			if err != nil {
+				return nil, err
+			}
+			found := false
+			for _, r := range held {
+				found = found || r.OwnerKind == admission.Manual
+			}
+			if _, err := admissionStore.Acquire(ctx, hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+				return nil, err
+			}
+			return func(ctx context.Context) {
+				if found {
+					return
+				}
+				if _, err := admissionStore.Release(ctx, hostID, admission.ManualOwner, agentRegistry.IsConnected(hostID)); err != nil {
+					log.Warn("host removal: the cordon it took could not be lifted", "host_id", hostID, "err", err)
+				}
+			}, nil
+		},
+		StopSessions: coordinator.StopHostSessions,
+		Send: func(ctx context.Context, hostID, requestID string) (platform.Ack, error) {
+			ack, err := agentRegistry.SendHostRemove(ctx, hostID, requestID)
+			return platform.Ack{OK: ack.OK, Error: ack.Error}, err
+		},
+		Host: crudHandler.HostBody,
+	}, auditStore, log)
 	// Closed after construction: the view reports the active run, and the run's
 	// skips live on the sequencer the apply handler owns.
 	pDeps.ActiveRun = platformApply.ActiveRun
@@ -1069,7 +1233,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// into scheduling mid-update. Here, nothing is active in the database, no run
 	// has been started by this process, and the API is not serving yet.
 	fleetRunner.ResumeCordonRestores(context.Background())
+	// The three adopters partition the open attempts: applyRunner every host
+	// attempt, fleetRunner a run's control-plane attempt (run_id set), and
+	// selfDeveloper a standalone control-plane attempt (run_id NULL).
 	fleetRunner.Adopt(context.Background())
+	selfDeveloper.Adopt(context.Background())
 
 	// Unattended automatic apply (#122). Constructed here because it needs the
 	// fleet runner's Start and the view that reports the active run — it is a
@@ -1202,8 +1370,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		consoleHandler:   consoleHandler,
 		platformHandler:  platformHandler,
 		platformApply:    platformApply,
+		platformRemove:   platformRemove,
 		applyRunner:      applyRunner,
 		fleetRunner:      fleetRunner,
+		selfDeveloper:    selfDeveloper,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
 		platformNotify:   platformNotify,
@@ -1216,6 +1386,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		jobsAgentHandler: jobsAgentHandler,
 
 		pool:           pool,
+		enrollPins:     installedEnrollPins(cfg.EnrollPins, cfg.EnrollFallback, platformStore, buildinfo.Get().SourceCommit, ownMachineSource(ownMachine), log),
 		authSvc:        authSvc,
 		janitorStop:    janitorStop,
 		jobsDispatcher: jobsDispatcher,
@@ -1247,6 +1418,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	s.consoleHandler.Register(mux, admin)
 	s.platformHandler.Register(mux, admin)
 	s.platformApply.Register(mux, admin)
+	s.platformRemove.Register(mux, admin)
 	s.platformNotify.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)
@@ -1276,7 +1448,73 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	if s.cfg.WebRoot != "" {
 		s.log.Info("serving SPA", "root", s.cfg.WebRoot)
 		mux.Handle("/", httpx.SPAHandler(s.cfg.WebRoot))
+		pins := s.enrollPins
+		if pins == nil {
+			static := s.cfg.EnrollPins.Or(s.cfg.EnrollFallback)
+			pins = func(context.Context) enrollscript.Pins { return static }
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if p := pins(ctx); p.SeedImage == "" || p.AgentImage == "" {
+			s.log.Warn("Add host has no images to install: the installed release names none, this machine's " +
+				"recovery actor reports none it runs, and QUASAR_ENROLL_SEED_IMAGE / QUASAR_ENROLL_AGENT_IMAGE are unset")
+		}
+		cancel()
+		mux.Handle("/enroll-host.sh", enrollscript.HandlerFrom(s.cfg.WebRoot, pins, s.log))
 	}
+}
+
+// installedEnrollPins answers Add host's images per request, field by field: the
+// operator's QUASAR_ENROLL_* override, else the installed release's recovery-actor and
+// node-agent images, else the ones this control plane's own machine runs (#385: a
+// developer apply is no release), else the install-time QUASAR_ENROLL_FALLBACK_* images.
+// Read per request because detection or an apply can change the answer after boot.
+// commit is this build's (nil when unstamped: no release can be installed); own is nil
+// with no recovery actor.
+func installedEnrollPins(configured, fallback enrollscript.Pins, store *platform.Store, commit *string, own platform.OwnMachineSource, log *slog.Logger) enrollscript.PinSource {
+	return func(ctx context.Context) enrollscript.Pins {
+		if configured.SeedImage != "" && configured.AgentImage != "" {
+			return configured
+		}
+		release := enrollscript.Pins{}
+		if commit != nil && store != nil {
+			seed, agent, ok, err := store.InstalledEnrollImages(ctx, *commit)
+			if err != nil {
+				log.Warn("Add host: could not read the installed release's images", "err", err)
+			}
+			if ok {
+				release = enrollscript.Pins{SeedImage: seed, AgentImage: agent}
+			}
+		}
+		return configured.Or(release).Or(runningEnrollPins(ctx, own)).Or(fallback)
+	}
+}
+
+// runningEnrollPins is empty per field when the actor did not answer or named no
+// image Add host may serve.
+func runningEnrollPins(ctx context.Context, own platform.OwnMachineSource) enrollscript.Pins {
+	if own == nil {
+		return enrollscript.Pins{}
+	}
+	m, ok := own.Read(ctx)
+	if !ok {
+		return enrollscript.Pins{}
+	}
+	var out enrollscript.Pins
+	if enrollscript.ValidImage(m.Running.RecoveryActor) {
+		out.SeedImage = m.Running.RecoveryActor
+	}
+	if enrollscript.ValidImage(m.Running.NodeAgent) {
+		out.AgentImage = m.Running.NodeAgent
+	}
+	return out
+}
+
+// ownMachineSource never returns a typed nil.
+func ownMachineSource(reader *platform.OwnMachineReader) platform.OwnMachineSource {
+	if reader == nil {
+		return nil
+	}
+	return reader
 }
 
 // Stop cancels the background goroutines and the coordinator's lifecycle context.
@@ -1292,8 +1530,29 @@ func (s *Services) Stop() {
 	if s.fleetRunner != nil {
 		s.fleetRunner.Close()
 	}
+	if s.selfDeveloper != nil {
+		s.selfDeveloper.Close()
+	}
 	if s.applyRunner != nil {
 		s.applyRunner.Close()
 	}
 	s.coordinator.Close()
+}
+
+// machineShape is this control plane's own machine shape, as served in the
+// platform identity: only what the recipe configured (null otherwise, per
+// control-api.md "The control plane's own machine").
+func machineShape(cfg *config.Config) platform.MachineShape {
+	return platform.MachineShape{Role: cfg.MachineRole, NodeName: cfg.MachineNodeName}
+}
+
+// applyMachineShape is the shape every apply decides the combined host by: its
+// recovery actor moves only with the control plane. Fails closed: it also takes
+// the local enrollment token's node name as a combined host's, so a control
+// plane given that token without the shape variables still leaves it out.
+func applyMachineShape(cfg *config.Config) platform.MachineShape {
+	if cfg.MachineRole == "" && cfg.LocalEnrollmentNodeName != "" {
+		return platform.MachineShape{Role: platform.MachineRoleCombined, NodeName: cfg.LocalEnrollmentNodeName}
+	}
+	return machineShape(cfg)
 }

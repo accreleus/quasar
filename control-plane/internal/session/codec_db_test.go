@@ -224,9 +224,8 @@ func TestSessionCodecHistoryClamp(t *testing.T) {
 	enableChainCodecs(t, pool, "1080p60", "hevc", "h264")
 	setHostCodecs(t, pool, hostID, `["h264","h265"]`)
 	upsertCodecProbe(t, pool, userID, true, false)
-	// 'codec-device' is the latest (only) device — the same key the resolver's
-	// history lookup uses via LatestDeviceKey.
-	// Recorded at LAUNCH-PROFILE grain — the LEGACY row shape. RungFailures folds
+	// 'codec-device' is the only device, so an unbound launch resolves to it.
+	// Recorded at launch-profile grain — the LEGACY row shape. RungFailures folds
 	// it in as "ban every hevc rung of this chain", which is exactly its old
 	// meaning, so a pre-UI-P4 history row keeps working with no data migration.
 	if err := store.RecordProfileOutcome(ctx, userID, "codec-device", "1080p60", "h265", outcomeFail, strptr("client_unsupported")); err != nil {
@@ -286,9 +285,9 @@ func TestSessionCodecOverride(t *testing.T) {
 	}
 }
 
-// TestSessionCodecOverrideHostUnsupported: an override for a codec the placed
-// host cannot encode fails the launch cleanly (ErrCodecUnsupportedByHost) rather
-// than dispatching a doomed assignment.
+// TestSessionCodecOverrideHostUnsupported: an override for a codec no GPU can
+// encode is refused at placement (#304), no_host_available naming the codec,
+// rather than reserved and then failed with the old 409.
 func TestSessionCodecOverrideHostUnsupported(t *testing.T) {
 	pool := testDB(t)
 	userID, appID, hostID := seed1080pApp(t, pool)
@@ -302,8 +301,12 @@ func TestSessionCodecOverrideHostUnsupported(t *testing.T) {
 		AppID: appID, ProfileID: "1080p60", IsAdmin: true,
 		Override: StreamOverride{Codec: &av1},
 	})
-	if !errors.Is(err, ErrCodecUnsupportedByHost) {
-		t.Fatalf("override av1 on h264-only host: got err=%v, want ErrCodecUnsupportedByHost", err)
+	if !errors.Is(err, ErrNoHostAvailable) || constrainedCodec(err) != "av1" {
+		t.Fatalf("override av1 on h264-only host: got err=%v, want ErrNoHostAvailable naming av1", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a refused launch persisted %d session row(s) (err %v)", n, err)
 	}
 }
 

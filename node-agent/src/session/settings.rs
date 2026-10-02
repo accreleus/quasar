@@ -35,6 +35,8 @@ pub struct RuntimeSettings {
     /// `docs/superpowers/specs/2026-08-18-latency-probe-design.md`.
     pub latency_probe: bool,
     pub idle_timeout_secs: u64,
+    /// #484 app-boot watchdog (`QUASAR_APP_BOOT_TIMEOUT_SECS`); 0 disables it.
+    pub app_boot_timeout_secs: u64,
     /// SPT-02: ABR mode. The deprecated `abr_enabled` hostcfg key (bool) maps
     /// `false` to `Off`; `true` defers to the current/env-baseline mode (see
     /// `apply_json`) rather than forcing `Protective`. The 3-way `abr_mode`
@@ -98,6 +100,14 @@ fn parse_encoder_known(s: &str) -> Option<EncoderChoice> {
 
 /// Auto-detect default per vendor. `AMD_AUTO_DEFAULT` is the one-line flip point:
 /// Amd→Vulkan is being live-validated on an AMD host; set it to `Va` if that fails.
+///
+/// Live validation on a Granite Ridge iGPU (RADV, Mesa 25.3.6) did find Vulkan
+/// H.264/HEVC encode corrupt there (#272), and this constant was briefly flipped
+/// to `Va` for it. That flip is reverted by operator decision: Vulkan stays the
+/// AMD default by design and #272 is fixed in the compositor (#281), by picking
+/// the linear encode-src path. Until #281 lands, an affected host sets
+/// `QUASAR_ENCODER=va` (or the equivalent admin per-host override) — do not flip
+/// the default back here.
 const AMD_AUTO_DEFAULT: EncoderChoice = EncoderChoice::Vulkan;
 
 fn encoder_default_for_vendor(v: Option<GpuVendor>) -> EncoderChoice {
@@ -145,9 +155,19 @@ fn resolve_encoder_from(
 /// `SessionConfig::from_env`, and `capacity::vulkan_encode_slots_override` — the
 /// auto-detect must not diverge between them. Logs the choice once per process.
 pub(crate) fn resolve_encoder_choice() -> EncoderChoice {
-    let raw = std::env::var("QUASAR_ENCODER").unwrap_or_default();
+    resolve_encoder_choice_with(&|k| std::env::var(k).ok())
+}
+
+/// Pure core of [`resolve_encoder_choice`]: takes the `QUASAR_ENCODER` lookup as a
+/// parameter instead of reading process env, so a caller building its own lookup
+/// (`capacity::detect_gpus_at`) can resolve the same encoder choice without touching
+/// real env.
+pub(crate) fn resolve_encoder_choice_with(
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> EncoderChoice {
+    let raw = lookup("QUASAR_ENCODER").unwrap_or_default();
     let detected = if raw.trim().is_empty() {
-        crate::gpu_vendor::detect()
+        crate::gpu_vendor::detect_with(lookup)
     } else {
         None
     };
@@ -240,47 +260,51 @@ impl RuntimeSettings {
     /// Resolve from the environment (the historical defaults). This is the agent's
     /// starting point before any `config_update` arrives.
     pub fn baseline() -> Self {
+        Self::baseline_with(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`RuntimeSettings::baseline`]: `lookup` supplies every knob's raw
+    /// value instead of reading process env directly, so a caller (or a test) can
+    /// resolve the same baseline without touching real env.
+    pub fn baseline_with(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         let render_node_configured =
-            std::env::var("QUASAR_RENDER_NODE").unwrap_or_else(|_| "software".into());
+            lookup("QUASAR_RENDER_NODE").unwrap_or_else(|| "software".into());
         RuntimeSettings {
-            encoder: resolve_encoder_choice(),
+            encoder: resolve_encoder_choice_with(lookup),
             render_node: canonicalize_render_node(&render_node_configured),
             render_node_configured,
-            cuda_device_id: std::env::var("QUASAR_CUDA_DEVICE")
-                .ok()
+            cuda_device_id: lookup("QUASAR_CUDA_DEVICE")
                 .and_then(|s| s.parse().ok())
                 .filter(|&n| n >= 0)
                 .unwrap_or(0),
-            gop: env_pos_u32("QUASAR_GOP", 60),
-            num_slices: env_pos_u32("QUASAR_SLICES", 8),
-            target_usage: env_pos_u32("QUASAR_TARGET_USAGE", 6),
-            queue_buffers: env_pos_u32("QUASAR_QUEUE_BUFFERS", 3),
-            zerocopy: env_bool("QUASAR_ZEROCOPY"),
-            latency_probe: env_bool("QUASAR_LATENCY_PROBE"),
-            idle_timeout_secs: std::env::var("QUASAR_IDLE_TIMEOUT_SECS")
-                .ok()
+            gop: env_pos_u32("QUASAR_GOP", 60, lookup),
+            num_slices: env_pos_u32("QUASAR_SLICES", 8, lookup),
+            target_usage: env_pos_u32("QUASAR_TARGET_USAGE", 6, lookup),
+            queue_buffers: env_pos_u32("QUASAR_QUEUE_BUFFERS", 3, lookup),
+            zerocopy: env_bool("QUASAR_ZEROCOPY", lookup),
+            latency_probe: env_bool("QUASAR_LATENCY_PROBE", lookup),
+            idle_timeout_secs: lookup("QUASAR_IDLE_TIMEOUT_SECS")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
+            app_boot_timeout_secs: app_boot_timeout_from(lookup("QUASAR_APP_BOOT_TIMEOUT_SECS")),
             // SPT-02: ABR mode — resolved from QUASAR_ABR_MODE, legacy QUASAR_ABR /
-            // QUASAR_ABR_DISABLED, then default Protective. See AbrMode::from_env().
-            abr_mode: AbrMode::from_env(),
-            abr_floor_kbps: std::env::var("QUASAR_ABR_FLOOR_KBPS")
-                .ok()
+            // QUASAR_ABR_DISABLED, then default Protective. See AbrMode::from_lookup().
+            abr_mode: AbrMode::from_lookup(lookup),
+            abr_floor_kbps: lookup("QUASAR_ABR_FLOOR_KBPS")
                 .and_then(|s| s.parse::<u32>().ok())
                 .filter(|&n| n > 0),
-            abr_floor_ratio: std::env::var("QUASAR_ABR_FLOOR_RATIO")
-                .ok()
+            abr_floor_ratio: lookup("QUASAR_ABR_FLOOR_RATIO")
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|n| n.is_finite() && *n > 0.0)
                 .unwrap_or(0.3),
             // storage-config (#377): the localDriver home root. Empty default
             // (no env) ⇒ measurement disabled. Stored verbatim (see field doc).
-            home_root: std::env::var("QUASAR_HOME_ROOT").unwrap_or_default(),
+            home_root: lookup("QUASAR_HOME_ROOT").unwrap_or_default(),
             // #375: 32-bit NVIDIA driver-lib dir. Empty default ⇒ no explicit
             // override; the agent's startup probe seeds the auto-detected value.
-            nvidia_lib32_path: std::env::var("QUASAR_NV_LIB32_PATH").unwrap_or_default(),
-            ladder: super::ladder::LadderSettings::from_env(),
-            abr_governor: super::abr::AbrGovernorSettings::from_env(),
+            nvidia_lib32_path: lookup("QUASAR_NV_LIB32_PATH").unwrap_or_default(),
+            ladder: super::ladder::LadderSettings::from_lookup(lookup),
+            abr_governor: super::abr::AbrGovernorSettings::from_lookup(lookup),
         }
     }
 
@@ -318,6 +342,9 @@ impl RuntimeSettings {
         }
         if let Some(x) = v.get("idle_timeout_secs").and_then(|x| x.as_u64()) {
             self.idle_timeout_secs = x;
+        }
+        if let Some(x) = v.get("app_boot_timeout_secs").and_then(|x| x.as_u64()) {
+            self.app_boot_timeout_secs = x;
         }
         // `abr_enabled` (bool) is the DEPRECATED lossy projection kept for older
         // control planes: `false` forces `Off`; `true` must NOT force `Protective`
@@ -431,6 +458,10 @@ impl RuntimeSettings {
             "idle_timeout_secs".to_string(),
             self.idle_timeout_secs.to_string(),
         );
+        m.insert(
+            "app_boot_timeout_secs".to_string(),
+            self.app_boot_timeout_secs.to_string(),
+        );
         m.insert("encoder".to_string(), encoder_str(self.encoder).to_string());
         m.insert(
             "render_node".to_string(),
@@ -449,6 +480,25 @@ impl RuntimeSettings {
         );
         m
     }
+
+    /// RH05 pre-policy baseline, in catalog JSON types. Call this only on a
+    /// fresh env/device baseline before composing legacy or typed overlays.
+    pub fn deployment_map(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let mut values = std::collections::BTreeMap::new();
+        for (key, raw) in self.effective_map() {
+            let value = match key.as_str() {
+                "abr_mode" | "abr_ladder_order" | "encoder" | "render_node" | "home_root"
+                | "nvidia_lib32_path" => serde_json::Value::String(raw),
+                _ => serde_json::from_str(&raw)
+                    .expect("runtime settings serialize every catalog number and boolean"),
+            };
+            values.insert(key, value);
+        }
+        values
+            .entry("abr_floor_kbps".to_string())
+            .or_insert(serde_json::Value::Null);
+        values
+    }
 }
 
 /// The hostcfg catalog's `encoder` enum string for an `EncoderChoice`.
@@ -461,18 +511,40 @@ fn encoder_str(e: EncoderChoice) -> &'static str {
     }
 }
 
-fn env_pos_u32(var: &str, default: u32) -> u32 {
-    std::env::var(var)
-        .ok()
+/// Default #484 app-boot budget: 300 s covers a cold managed home plus a cold image
+/// pull. A non-numeric env value keeps it rather than silently disabling the watchdog.
+pub(crate) const APP_BOOT_TIMEOUT_DEFAULT_SECS: u64 = 300;
+
+pub(crate) fn app_boot_timeout_from(raw: Option<String>) -> u64 {
+    match raw {
+        Some(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                token = "knob-invalid-app-boot-timeout",
+                "QUASAR_APP_BOOT_TIMEOUT_SECS={v:?} is not a number; \
+                 using the default {APP_BOOT_TIMEOUT_DEFAULT_SECS}s"
+            );
+            APP_BOOT_TIMEOUT_DEFAULT_SECS
+        }),
+        None => APP_BOOT_TIMEOUT_DEFAULT_SECS,
+    }
+}
+
+/// The watchdog budget for a resolved `app_boot_timeout_secs`; 0 disables it.
+pub(crate) fn app_boot_budget(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+fn env_pos_u32(var: &str, default: u32, lookup: &dyn Fn(&str) -> Option<String>) -> u32 {
+    lookup(var)
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|&n| n > 0)
         .map(|n| n as u32)
         .unwrap_or(default)
 }
 
-fn env_bool(var: &str) -> bool {
+fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
-        std::env::var(var).ok().as_deref(),
+        lookup(var).as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     )
 }
@@ -555,9 +627,10 @@ mod tests {
         assert_eq!(encoder_default_for_vendor(None), EncoderChoice::Openh264);
     }
 
+    // An unconfigured host, independent of the ambient environment.
     #[test]
     fn default_matches_env_baseline() {
-        let s = RuntimeSettings::baseline();
+        let s = RuntimeSettings::baseline_with(&crate::test_env::lookup(&[]));
         assert_eq!(s.gop, 60);
         assert_eq!(s.target_usage, 6);
         assert!((s.abr_floor_ratio - 0.3).abs() < 1e-9);
@@ -570,7 +643,7 @@ mod tests {
 
     #[test]
     fn apply_overlays_known_keys() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         let json = serde_json::json!({
             "gop": 120, "abr_enabled": true, "encoder": "va",
             "abr_floor_kbps": 2500, "abr_floor_ratio": 0.5, "idle_timeout_secs": 0
@@ -589,7 +662,7 @@ mod tests {
     // like the other string knobs, verbatim, and shows up in effective_map.
     #[test]
     fn apply_overlays_home_root() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({ "home_root": "/data/homes" }));
         assert_eq!(s.home_root, "/data/homes");
         assert_eq!(
@@ -602,7 +675,7 @@ mod tests {
     // (sparse overlay — absent key ⇒ keep prior).
     #[test]
     fn apply_sparse_push_preserves_home_root() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.home_root = "/data/homes".to_string();
         s.apply_json(&serde_json::json!({ "gop": 90 }));
         assert_eq!(s.home_root, "/data/homes");
@@ -613,7 +686,7 @@ mod tests {
     // load-bearing and must be present even in the default case.
     #[test]
     fn effective_map_reports_empty_home_root_by_default() {
-        let s = RuntimeSettings::baseline();
+        let s = RuntimeSettings::baseline_with(&|_| None);
         assert_eq!(
             s.effective_map().get("home_root").map(String::as_str),
             Some("")
@@ -624,7 +697,7 @@ mod tests {
     // home_root, verbatim, and shows up in effective_map.
     #[test]
     fn apply_overlays_nvidia_lib32_path() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({ "nvidia_lib32_path": "/usr/lib" }));
         assert_eq!(s.nvidia_lib32_path, "/usr/lib");
         assert_eq!(
@@ -639,7 +712,7 @@ mod tests {
     // (sparse overlay — absent key ⇒ keep prior).
     #[test]
     fn apply_sparse_push_preserves_nvidia_lib32_path() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.nvidia_lib32_path = "/usr/lib".to_string();
         s.apply_json(&serde_json::json!({ "gop": 90 }));
         assert_eq!(s.nvidia_lib32_path, "/usr/lib");
@@ -649,7 +722,7 @@ mod tests {
     // so host observability shows the resolved value even in the default case.
     #[test]
     fn effective_map_reports_empty_nvidia_lib32_path_by_default() {
-        let s = RuntimeSettings::baseline();
+        let s = RuntimeSettings::baseline_with(&|_| None);
         assert_eq!(
             s.effective_map()
                 .get("nvidia_lib32_path")
@@ -662,14 +735,14 @@ mod tests {
     // RuntimeSettings overlay path as "va"/"nvenc" above.
     #[test]
     fn apply_overlay_encoder_vulkan() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({ "encoder": "vulkan" }));
         assert_eq!(s.encoder, EncoderChoice::Vulkan);
     }
 
     #[test]
     fn null_clears_abr_floor_kbps() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.abr_floor_kbps = Some(2500);
         s.apply_json(&serde_json::json!({ "abr_floor_kbps": null }));
         assert_eq!(s.abr_floor_kbps, None);
@@ -677,7 +750,7 @@ mod tests {
 
     #[test]
     fn apply_ignores_unknown_and_keeps_prior() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.gop = 90;
         s.apply_json(&serde_json::json!({ "bogus": 1 }));
         assert_eq!(s.gop, 90);
@@ -723,7 +796,7 @@ mod tests {
     // it WINS when both are present in one push.
     #[test]
     fn apply_json_abr_mode_selects_smooth() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({ "abr_mode": "smooth" }));
         assert_eq!(s.abr_mode, AbrMode::Smooth);
         s.apply_json(&serde_json::json!({ "abr_mode": "protective" }));
@@ -734,11 +807,11 @@ mod tests {
 
     #[test]
     fn abr_mode_wins_over_the_deprecated_abr_enabled() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({ "abr_enabled": true, "abr_mode": "smooth" }));
         assert_eq!(s.abr_mode, AbrMode::Smooth, "abr_mode is authoritative");
         // abr_enabled=false with no abr_mode still means Off (back-compat).
-        let mut s2 = RuntimeSettings::baseline();
+        let mut s2 = RuntimeSettings::baseline_with(&|_| None);
         s2.apply_json(&serde_json::json!({ "abr_enabled": false }));
         assert_eq!(s2.abr_mode, AbrMode::Off);
     }
@@ -747,7 +820,7 @@ mod tests {
     // Protective — must not silently downgrade a Smooth host and drop the ladder.
     #[test]
     fn abr_enabled_true_on_a_smooth_baseline_stays_smooth() {
-        let mut s = RuntimeSettings::baseline(); // QUASAR_ABR_MODE unset ⇒ Smooth
+        let mut s = RuntimeSettings::baseline_with(&|_| None); // QUASAR_ABR_MODE unset ⇒ Smooth
         assert_eq!(s.abr_mode, AbrMode::Smooth);
         s.apply_json(&serde_json::json!({ "abr_enabled": true }));
         assert_eq!(
@@ -759,7 +832,7 @@ mod tests {
 
     #[test]
     fn abr_enabled_false_then_true_returns_to_the_baseline_mode() {
-        let mut s = RuntimeSettings::baseline(); // baseline = Smooth
+        let mut s = RuntimeSettings::baseline_with(&|_| None); // baseline = Smooth
         s.apply_json(&serde_json::json!({ "abr_enabled": false }));
         assert_eq!(s.abr_mode, AbrMode::Off);
         s.apply_json(&serde_json::json!({ "abr_enabled": true }));
@@ -772,14 +845,14 @@ mod tests {
 
     #[test]
     fn abr_enabled_true_with_explicit_abr_mode_uses_the_explicit_mode() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({ "abr_enabled": true, "abr_mode": "protective" }));
         assert_eq!(s.abr_mode, AbrMode::Protective);
     }
 
     #[test]
     fn apply_json_ignores_a_junk_abr_mode() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.abr_mode = AbrMode::Smooth;
         s.apply_json(&serde_json::json!({ "abr_mode": "bogus" }));
         assert_eq!(s.abr_mode, AbrMode::Smooth, "junk must not change the mode");
@@ -789,7 +862,7 @@ mod tests {
     // admin UI's existing abr_enabled row does not go blank.
     #[test]
     fn effective_map_reports_abr_mode_and_the_legacy_bool() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.abr_mode = AbrMode::Smooth;
         let m = s.effective_map();
         assert_eq!(m.get("abr_mode").map(String::as_str), Some("smooth"));
@@ -799,7 +872,7 @@ mod tests {
     // ── D5: every ladder knob round-trips through a sparse push ──────────────
     #[test]
     fn apply_json_overlays_every_ladder_knob() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({
             "abr_ladder": false,
             "abr_ladder_max_bias": 3,
@@ -835,7 +908,7 @@ mod tests {
 
     #[test]
     fn ladder_defaults_are_the_ship_dark_posture() {
-        let l = RuntimeSettings::baseline().ladder;
+        let l = RuntimeSettings::baseline_with(&crate::test_env::lookup(&[])).ladder;
         assert!(l.enabled, "the speed-bias ladder is on by default");
         assert!(!l.resolution_enabled, "the resolution rung SHIPS DARK");
         assert!(!l.fps_enabled, "the fps rung SHIPS DARK");
@@ -847,7 +920,7 @@ mod tests {
 
     #[test]
     fn a_sparse_push_preserves_untouched_ladder_knobs() {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.ladder.resolution_enabled = true;
         s.apply_json(&serde_json::json!({ "gop": 90 }));
         assert!(s.ladder.resolution_enabled);
@@ -855,7 +928,7 @@ mod tests {
 
     #[test]
     fn effective_map_reports_every_ladder_knob() {
-        let s = RuntimeSettings::baseline();
+        let s = RuntimeSettings::baseline_with(&|_| None);
         let m = s.effective_map();
         for key in [
             "abr_ladder",
@@ -887,7 +960,7 @@ mod tests {
 
     #[test]
     fn effective_map_contains_encoder_and_render_node() {
-        let s = RuntimeSettings::baseline();
+        let s = RuntimeSettings::baseline_with(&crate::test_env::lookup(&[]));
         let m = s.effective_map();
         assert_eq!(m.get("encoder").map(String::as_str), Some("openh264"));
         assert_eq!(m.get("render_node").map(String::as_str), Some("software"));
@@ -903,7 +976,7 @@ mod tests {
         // the raw value too in that failure case, but render_node_configured
         // must ALWAYS be the verbatim override regardless of what canonicalize
         // did or didn't do.
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.apply_json(&serde_json::json!({
             "render_node": "/dev/dri/by-path/pci-0000:04:00.0-render"
         }));
@@ -917,10 +990,10 @@ mod tests {
     fn effective_map_reports_configured_render_node_not_canonical() {
         // host-observability-2: simulate the case that matters — a by-path
         // override whose canonicalization actually resolved to a renderD*
-        // target (the normal Tower-side outcome). effective_map() must report
+        // target (the normal gpu-test-side outcome). effective_map() must report
         // the CONFIGURED (raw) value, not the canonical one, so it stays
         // comparable to the admin UI's resolved/overrides view.
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.render_node = "/dev/dri/renderD128".to_string(); // what pipeline/VA pinning uses
         s.render_node_configured = "/dev/dri/by-path/pci-0000:04:00.0-render".to_string();
 
@@ -934,5 +1007,48 @@ mod tests {
             m.get("render_node").map(String::as_str),
             Some(s.render_node.as_str())
         );
+    }
+
+    #[test]
+    fn app_boot_timeout_is_a_runtime_setting() {
+        let base = RuntimeSettings::baseline_with(&|_| None);
+        assert_eq!(base.app_boot_timeout_secs, 300);
+        let env = RuntimeSettings::baseline_with(&|k| {
+            (k == "QUASAR_APP_BOOT_TIMEOUT_SECS").then(|| "0".to_string())
+        });
+        assert_eq!(env.app_boot_timeout_secs, 0, "0 disables the watchdog");
+        let typo = RuntimeSettings::baseline_with(&|k| {
+            (k == "QUASAR_APP_BOOT_TIMEOUT_SECS").then(|| "5m".to_string())
+        });
+        assert_eq!(
+            typo.app_boot_timeout_secs, 300,
+            "a typo must not disable it"
+        );
+
+        let mut pushed = base.clone();
+        pushed.apply_json(&serde_json::json!({"app_boot_timeout_secs": 45}));
+        assert_eq!(pushed.app_boot_timeout_secs, 45);
+        assert_eq!(
+            pushed
+                .effective_map()
+                .get("app_boot_timeout_secs")
+                .map(String::as_str),
+            Some("45")
+        );
+        assert_eq!(
+            base.deployment_map().get("app_boot_timeout_secs"),
+            Some(&serde_json::json!(300))
+        );
+    }
+
+    #[test]
+    fn deployment_map_covers_every_next_session_catalog_key() {
+        let map = RuntimeSettings::baseline_with(&|_| None).deployment_map();
+        for group in crate::policy_catalog::NEXT_SESSION_GROUPS {
+            assert!(
+                map.contains_key(*group),
+                "{group} missing from deployment_map"
+            );
+        }
     }
 }

@@ -1,17 +1,17 @@
 [
   {
     "number": 101,
-    "title": "stream fails on 10.1.1.7 after a restart",
+    "title": "stream fails on 203.0.113.77 after a restart",
     "body": "Reproduced on the gpu-test host.\n\nNothing sensitive on this line.\n",
     "comments": []
   },
   {
     "number": 102,
     "title": "a clean title",
-    "body": "Fetched the bundle from https://qdev.techanvil.net/assets/index.js and diffed it.\n",
+    "body": "Fetched the bundle from https://dev.standin.example.invalid/assets/index.js and diffed it.\n",
     "comments": [
       {
-        "body": "Harness lives at /home/someone/code/quasar/scripts and uses ~/.ssh/id_ed25519_loopback.\n"
+        "body": "Harness lives at /home/someone/code/quasar/scripts and uses ~/.ssh/id_ed25519_standin.\n"
       }
     ]
   },
@@ -28,10 +28,10 @@
   {
     "number": 104,
     "title": "encode stalls after resume",
-    "body": "Reproduced on Tower with the stack under /mnt/user/appdata/quasar.\n",
+    "body": "Reproduced on standin-nas with the stack under /mnt/user/appdata/quasar.\n",
     "comments": [
       {
-        "body": "Same on devbox; hermes and qdev unaffected.\n"
+        "body": "Same on standin-box; the other hosts are unaffected.\n"
       }
     ]
   }

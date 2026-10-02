@@ -32,6 +32,7 @@ vi.mock("../../api/admin", () => ({
   updateSettings: vi.fn(),
   listSecrets: vi.fn(),
   forceLibraryScan: vi.fn(),
+  getPlatformIdentity: vi.fn(() => Promise.reject(new Error("not an owned install"))),
 }));
 
 import * as adminApi from "../../api/admin";
@@ -385,5 +386,26 @@ describe("StepFinishing", () => {
 
     await waitFor(() => expect(screen.getByLabelText("SteamGridDB API key")).toBeInTheDocument());
     expect(screen.getByText(/secure context/i)).toBeInTheDocument();
+  });
+});
+
+describe("StepFinishing — where the secret key lives (#366)", () => {
+  beforeEach(() => {
+    vi.mocked(adminApi.getSettings).mockResolvedValue(settings());
+    vi.mocked(adminApi.listSecrets).mockResolvedValue(secretsEnvelope());
+  });
+
+  it("tells a Compose install to back up deploy/.env", async () => {
+    renderStep();
+    expect(await screen.findByText("Back up deploy/.env now.")).toBeTruthy();
+  });
+
+  it("tells an owned install to keep the quasar-machine volume", async () => {
+    vi.mocked(adminApi.getPlatformIdentity).mockResolvedValueOnce({
+      identity: { machine_role: "combined", machine_node_name: "living-room-pc" },
+    } as never);
+    renderStep();
+    expect(await screen.findByText("Keep the quasar-machine volume.")).toBeTruthy();
+    expect(screen.queryByText(/deploy\/\.env/)).toBeNull();
   });
 });

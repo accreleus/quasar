@@ -68,7 +68,7 @@ func releasesJSON(t *testing.T, assetHost string) string {
 		{
 			"tag_name": "v0.2.0", "draft": false, "prerelease": false,
 			"body": "### Fixed\n- a thing\n", "published_at": "2026-09-04T12:00:00Z",
-			"assets": []ghAsset{{Name: ManifestAssetName, URL: "https://" + assetHost + "/manifest.json"}},
+			"assets": []ghAsset{{Name: ManifestAssetNameV2, URL: "https://" + assetHost + "/manifest.v2.json"}},
 		},
 		{
 			"tag_name": "v0.3.0-rc.1", "draft": true, "prerelease": true,
@@ -123,14 +123,14 @@ func newGitHubHarness(t *testing.T, assetHost, redirectTo string, allow ...strin
 			http.Redirect(w, r, "https://"+redirectTo+"/presigned/manifest.json", http.StatusFound)
 			return
 		}
-		_, _ = w.Write([]byte(goodManifest))
+		_, _ = w.Write([]byte(v2Fixture(t)))
 	}))
 	t.Cleanup(asset.Close)
 	doer.rewriteTo[assetHost] = asset.URL
 
 	if redirectTo != "" {
 		cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte(goodManifest))
+			_, _ = w.Write([]byte(v2Fixture(t)))
 		}))
 		t.Cleanup(cdn.Close)
 		doer.rewriteTo[redirectTo] = cdn.URL

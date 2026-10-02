@@ -26,8 +26,8 @@ A run with no pinned baseline for its (suite, scenario, --baseline name) prints
 the table with every Δ column as "no baseline" and exits 0 — a budget run
 against a suite nobody has baselined yet is informative, not a failure.
 
-Environment: BENCH_URL, BENCH_KEY (never committed — pull the harness key from
-the stack's own deploy/.env at run time, per docs/testing-bench-mode.md).
+Environment: BENCH_URL / BENCH_KEY, else qbench's own config
+(~/.config/qbench/{url,key}); see scripts/dx/bench_config.py. Never committed.
 """
 
 from __future__ import annotations
@@ -39,7 +39,9 @@ import sys
 DX_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(DX_DIR, "vendor"))
 
+sys.path.insert(0, DX_DIR)  # bench_config.py, same directory
 from bench import Bench, BenchError  # noqa: E402
+from bench_config import bench_env, bench_url  # noqa: E402  (same directory)
 
 DEFAULT_BASELINE = "latency-budget/1080p60-h264-local"
 
@@ -122,7 +124,8 @@ def main(argv=None) -> int:
     p.add_argument("--json", action="store_true", help="also print the raw rows as JSON")
     args = p.parse_args(argv)
 
-    b = Bench(args.url, args.key)
+    bench_env()  # BENCH_URL / BENCH_KEY, else qbench's ~/.config/qbench
+    b = Bench(bench_url(args.url), args.key)
     try:
         run = resolve_run(b, args.run, args.suite)
     except BenchError as exc:

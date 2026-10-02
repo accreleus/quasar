@@ -16,10 +16,7 @@ const LABELS: Record<WizardVisibleStep, string> = {
 export function StepIndicator({ current }: { current: WizardVisibleStep }) {
   const steps: WizardVisibleStep[] = [1, 2, 3, 4, 5];
   return (
-    <div
-      className="row"
-      style={{ display: "flex", gap: "var(--s2)", flexWrap: "wrap", justifyContent: "center" }}
-    >
+    <div className="row gap2 wrap setup-steps">
       {steps.map((step) => (
         <Chip
           key={step}

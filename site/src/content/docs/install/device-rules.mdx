@@ -1,0 +1,110 @@
+---
+title: Device rules (udev)
+description: "The udev rules that give Quasar its devices, and only those: what each one is for, when you need it, how to install, check and remove them."
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Quasar needs a few devices on the host: `/dev/uinput` to create virtual
+controllers, the GPU render nodes, and in console mode the screen, sound and
+local input. Three udev rules files give the `quasar` group access to exactly
+those. They live in the repository under
+[`deploy/udev/`](https://github.com/accreleus/quasar/tree/main/deploy/udev).
+
+Each rule **adds** an access entry (an ACL, set with `setfacl`) for the `quasar`
+group. It never changes a device's owner or mode, so nothing that already uses
+these devices loses access. No broad group such as `input` or `video` is granted.
+
+[`prepare-host.sh`](/quasar/install/docker/#prepare-the-host) installs the same
+files, byte for byte. Use this page if you install them by hand, or want to know
+what they do.
+
+## The rules
+
+| File | Device | Why Quasar needs it | When needed |
+| --- | --- | --- | --- |
+| [`70-quasar.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/70-quasar.rules) | `/dev/uinput` | Creating virtual keyboards, mice, gamepads and touch devices for players. | Rootless installs |
+| | Input devices named `Quasar Virtual *` | Sessions open the virtual devices Quasar created. On an SELinux host they also get the container label, so a confined session can open them. | Rootless installs |
+| | GPU render nodes (`/dev/dri/renderD*`) | Hardware encoding and rendering. | Rootless installs |
+| [`71-quasar-console.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/71-quasar-console.rules) | Display cards (`/dev/dri/card*`) | Showing a session on the host's own screen. | Console mode |
+| | Sound devices | Playing the session's audio on the host. | Console mode |
+| | i2c buses (`/dev/i2c-*`) | Monitor control (DDC), such as switching the monitor's input. | Console mode |
+| | The host's keyboards, mice and game controllers | Taking them exclusively while a session runs, so input goes to the game only. | Console mode |
+| | `tty8` | Console mode's own terminal, so nothing typed reaches a login prompt. | Console mode |
+| [`72-quasar-seat.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/72-quasar-seat.rules) | Input devices named `Quasar Virtual *` | Moves them off the desktop's seat. See [below](#the-seat-rule). | Any host where someone logs into a desktop |
+
+`70-quasar.rules` does no harm on a rootful install; `prepare-host.sh` installs it
+in both modes.
+
+<Aside type="caution" title="Console mode can read the host's keyboard">
+With `71-quasar-console.rules`, the `quasar` group can read what is typed on the
+host's own keyboards. Install it only on a host that uses
+[console mode](/quasar/admin/console/).
+</Aside>
+
+### The seat rule
+
+When someone is logged into a desktop on the host, systemd-logind gives that user
+access to every input device on the seat, including a player's virtual
+controller. The player's input would then also drive the host desktop. The seat
+rule puts Quasar's virtual devices on a seat of their own, so the desktop user
+never gets them.
+
+There is no `uhid` rule: Quasar does not emulate a DualSense controller.
+
+## Install
+
+The files use the group `quasar`, and `setfacl` from the `acl` package at
+`/usr/bin/setfacl`. Create the group first if it does not exist
+(`prepare-host.sh` does).
+
+<Steps>
+
+1. Copy the files you need from a checkout of the repository:
+
+   ```bash
+   sudo cp deploy/udev/70-quasar.rules deploy/udev/72-quasar-seat.rules /etc/udev/rules.d/
+   # console mode only
+   sudo cp deploy/udev/71-quasar-console.rules /etc/udev/rules.d/
+   ```
+
+2. Apply them:
+
+   ```bash
+   sudo udevadm control --reload && sudo udevadm trigger
+   ```
+
+3. Console mode only: keep login prompts off `tty8`, the terminal console mode uses:
+
+   ```bash
+   sudo systemctl mask getty@tty8.service autovt@tty8.service
+   ```
+
+</Steps>
+
+## Check it worked
+
+```bash
+getfacl /dev/uinput
+```
+
+The output includes `group:quasar:rw-`. With a session running, a desktop user
+should not appear on Quasar's virtual devices:
+
+```bash
+for d in /sys/class/input/event*; do
+  grep -q '^Quasar Virtual' "$d/device/name" 2>/dev/null && getfacl -p "/dev/input/${d##*/}"
+done
+```
+
+Each shows `group:quasar:rw-` and no named-user line such as `user:alex:rw-`.
+
+## Remove
+
+```bash
+sudo rm -f /etc/udev/rules.d/70-quasar.rules /etc/udev/rules.d/71-quasar-console.rules /etc/udev/rules.d/72-quasar-seat.rules
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+Access entries already set stay until the device is recreated or the host
+reboots.

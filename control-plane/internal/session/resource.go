@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -47,6 +48,12 @@ type GPUAvailability struct {
 	// gpus.render_node); null until reported.
 	RenderNode *string
 	DevicePath *string
+
+	// Codecs (#296 amendment 12, gpuCodecSetNullable): this GPU's codec set, or
+	// its host's when it reports none. Nil only when neither has ever reported
+	// (openapi.yaml GPUAvailability.codecs) — not normalised to h264, since the
+	// admin surface needs to tell "never reported" from "reported h264 only".
+	Codecs []string
 }
 
 // GPUAvailability returns the per-GPU resource view, ordered by host then GPU
@@ -61,14 +68,15 @@ func (s *Store) GPUAvailability(ctx context.Context, hostID string) ([]GPUAvaila
 		       COALESCE(SUM(s.reserved_encode_slots), 0)::int,
 		       COUNT(s.id)::int,
 		       g.render_node, g.device_path,
-		       g.vram_mb_used, g.vram_mb_free, g.vram_sampled_at
+		       g.vram_mb_used, g.vram_mb_free, g.vram_sampled_at,
+		       `+gpuCodecSetSQL("g", "h", false)+`
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s
 		    ON s.gpu_id = g.id AND s.state IN `+activeStatesSQL+`
 		WHERE h.capacity_detection = 'ok' AND g.reported
 		  AND ($1 = '' OR g.host_id::text = $1)
-		GROUP BY g.id
+		GROUP BY g.id, h.codecs
 		ORDER BY g.host_id, g.index
 	`, hostID)
 	if err != nil {
@@ -79,6 +87,7 @@ func (s *Store) GPUAvailability(ctx context.Context, hostID string) ([]GPUAvaila
 	var out []GPUAvailability
 	for rows.Next() {
 		var a GPUAvailability
+		var codecsRaw []byte
 		if err := rows.Scan(
 			&a.HostID, &a.GPUID, &a.GPUIndex, &a.Vendor, &a.Model,
 			&a.VramMBTotal, &a.VramMBReserved,
@@ -86,11 +95,17 @@ func (s *Store) GPUAvailability(ctx context.Context, hostID string) ([]GPUAvaila
 			&a.ActiveSessions,
 			&a.RenderNode, &a.DevicePath,
 			&a.VramMBUsed, &a.VramMBFree, &a.VramSampledAt,
+			&codecsRaw,
 		); err != nil {
 			return nil, fmt.Errorf("scan gpu availability: %w", err)
 		}
 		a.VramMBAvailable = a.VramMBTotal - a.VramMBReserved
 		a.SlotsAvailable = a.SlotsTotal - a.SlotsReserved
+		if codecsRaw != nil {
+			if err := json.Unmarshal(codecsRaw, &a.Codecs); err != nil {
+				return nil, fmt.Errorf("decode gpu %s codecs: %w", a.GPUID, err)
+			}
+		}
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {

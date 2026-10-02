@@ -10,12 +10,17 @@
 //! host-side read is `/etc/os-release` (via `/host`), used purely to pick remediation wording;
 //! its absence degrades to generic wording, never a failed check.
 
+/// `console_display` / `console_audio` / `console_ddc` (RH-07 #407).
+pub mod console;
+/// `owner_conflict` on an owned install.
+pub mod owner_conflict;
 /// The update-path checks (preflight ids), with their collectors.
 pub mod platform_update;
+pub mod report;
+pub mod runtime_facts;
+pub mod storage;
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::messages::ReadinessCheck;
 use crate::session::container;
@@ -31,6 +36,13 @@ pub const PROVISIONING: &str = "provisioning";
 /// A named risk that is never `fail` (#483): detection can prove a default-deny posture is
 /// active, never that it actually drops the agent's ICE UDP.
 pub const WARN: &str = "warn";
+/// Indeterminate: a host probe could not be concluded. Never blocks, never clears a block
+/// (protocol/agent-api.md `readiness`).
+pub const UNKNOWN: &str = "unknown";
+/// The hardware does not provide this capability (#311, amendment 12 addendum): a codec
+/// the GPU has no encoder for. Not a fault, never blocks, and definitive — retained like
+/// `pass`/`fail`, never replaced by an indeterminate run.
+pub const UNSUPPORTED: &str = "unsupported";
 
 /// Where the host's `/etc/os-release` is bind-mounted in the agent container
 /// (reference compose). Absent ⇒ generic remediation wording.
@@ -65,60 +77,6 @@ pub enum CodecProbe {
     Failed,
     /// The probe ran; these are the codecs the host advertised (possibly none).
     Probed(Vec<String>),
-}
-
-/// What cheapest-first firewall detection could tell about this host's inbound posture.
-/// Deliberately coarse: a real "is UDP N allowed" answer would need a reachability probe or
-/// full rich-rule parsing, neither of which is cheap or reliable.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum FirewallPosture {
-    /// No detection tool answered at all. `nft` IS in the image, so this means the probe could
-    /// not run it (missing CAP_NET_ADMIN, a non-container build); "no signal" must never render
-    /// as a warning.
-    #[default]
-    Unknown,
-    /// A tool answered with a permissive (default-accept) posture.
-    Open,
-    /// A tool answered and found NO inbound filtering at all — no input-filtering chain exists
-    /// on this host (#103). Distinct from `Open` (a chain exists, its policy is accept) and from
-    /// `Unknown` (nothing answered): it is a positive finding for the media path.
-    Unfiltered { tool: FirewallTool, detail: String },
-    /// A tool answered with a default-deny/input-filtering posture. `tool` is which one
-    /// answered; [`firewall_remediation`] keys its command block on it, never on distro.
-    /// `media_allow` is that SAME tool's reading of its own accept rules — a default-deny
-    /// posture is only a finding when nothing lets the media through.
-    Filtering {
-        tool: FirewallTool,
-        detail: String,
-        media_allow: MediaAllow,
-    },
-}
-
-/// Whether the firewall's own accept rules already admit the media path, read from the rule
-/// listing the tool that produced the posture printed (#67).
-///
-/// Reading the chain policy alone makes every CORRECTLY configured default-deny host — the
-/// posture `deploy/README.md` actually prescribes — warn forever, which is how an operator
-/// learns to ignore the one check that catches "video never arrives".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MediaAllow {
-    /// Accept rules cover both the ICE UDP window and mDNS. `evidence` is the matching rule
-    /// text verbatim: whether a rule's SOURCE scope reaches the client is the one thing this
-    /// cannot judge, so the operator has to be able to read the rule.
-    Covered { evidence: String },
-    /// One half of the media path is admitted and the other is not; `gap` names the closed half.
-    Partial { evidence: String, gap: String },
-    /// The rules were enumerated and none of them admits the media path.
-    Absent,
-}
-
-/// Which firewall tool produced the [`FirewallPosture::Filtering`] verdict. The tool in play is
-/// ground truth; distro is only a hint (a Debian box can run firewalld, a Fedora box raw nft).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FirewallTool {
-    Firewalld,
-    Nftables,
-    Iptables,
 }
 
 /// Where the Quasar NVIDIA driver volume is mounted inside the agent container.
@@ -161,23 +119,38 @@ pub struct ProbeEnv {
     pub nvidia_volume: VolumeView,
     /// Can the runtime pass the provisioned driver into sibling app containers?
     pub driver_mount_error: Option<String>,
-    pub container_mount_error: Option<String>,
-    pub sibling_egl: crate::nvidia_volume::EglRuntime,
+    /// This refresh's sibling-mount inspection. Indeterminate is a busy or timed-out
+    /// client, not evidence the mounts are wrong.
+    pub container_mounts: MountObservation,
     /// Does the EGL stack this container loads actually WORK, as opposed to being present on
     /// disk? A file-presence pass that is green while the compositor cannot init EGL sends the
     /// operator elsewhere, so this runtime verdict VETOES it (loop-3 guard).
     pub egl_runtime: crate::nvidia_volume::EglRuntime,
     /// Firewall detection's answer, computed once at [`ProbeEnv::live`] so every reader sees
     /// the same instant and the subprocess cost is paid once, not per check.
-    pub firewall: FirewallPosture,
-    /// The update path's facts (platform_update.rs), collected once per probe.
-    pub updater: platform_update::UpdaterView,
-    /// Whether compose declares an updater service beside this agent (`register`'s
-    /// `updater_present`); `None` when discovery could not say.
-    pub updater_present: Option<bool>,
+    /// RH-07 #403: the latest real-traffic evidence of the WebRTC media path.
+    pub media: Option<crate::session::media_evidence::Evidence>,
+    /// On an owned install, what its recovery actor answered this refresh
+    /// (platform_update.rs); `None` on a host with no recovery actor.
+    pub recovery_actor: Option<platform_update::ActorView>,
     pub health: platform_update::HealthOwner,
     /// This agent's own `/health` identity, to compare against who answers.
     pub self_identity: platform_update::HealthIdentity,
+    /// On an owned install, the owner conflicts its recovery actor reported this refresh
+    /// (the inner `None`: it did not answer); `None` on any other install.
+    pub owner_conflicts: Option<owner_conflict::Observed>,
+    /// The storage roots and their free space (#253), read once per probe.
+    pub storage: storage::StorageView,
+    /// The container engine as one inspection saw it (#254), read once per probe.
+    pub runtime: runtime_facts::RuntimeView,
+    /// Capacity detection's GPUs, as `(index, is NVIDIA)`; empty until the caller hands
+    /// them over with [`ProbeEnv::with_gpus`].
+    pub gpus: Vec<(i32, bool)>,
+    /// The agent runs NVIDIA sessions (`ContainerRuntime::is_nvidia`), even when capacity
+    /// detection dropped the GPU, as it does when the engine injected none.
+    pub nvidia_runtime: bool,
+    /// `console_display` / `console_audio` / `console_ddc` inputs (RH-07 #407).
+    pub console: console::ConsoleView,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -223,10 +196,17 @@ impl ProbeEnv {
     /// Production environment: probe the agent's own filesystem, read
     /// `/host/etc/os-release` when the compose mount is present.
     pub fn live(nvidia: bool, nvidia_lib32_path: &str) -> Self {
-        if nvidia {
-            let docker =
-                std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
-            crate::nvidia_volume::retry_mount_resolution(&docker);
+        // #274: the engine is asked FIRST, and under its own small budget. It used to be
+        // the last field built, behind the self-mount inspection, the sibling EGL probe
+        // and the image-storage lookup — each bounded only by the 30 s client deadline,
+        // ~100 s serially on a hung daemon, which put the failing `runtime_endpoint` past
+        // the control plane's readiness staleness window. When the engine gave a
+        // definitive "not usable" answer, every one of those calls would pay its full
+        // deadline to report exactly what it reports when skipped, so they are skipped.
+        let runtime = runtime_facts::RuntimeView::live();
+        let engine_answered = runtime.engine_answered();
+        if nvidia && engine_answered {
+            crate::nvidia_volume::retry_mount_resolution();
         }
         let host_root =
             if is_containerized() || Path::new(HOST_ROOT).join("etc/os-release").exists() {
@@ -234,6 +214,18 @@ impl ProbeEnv {
             } else {
                 PathBuf::from("/")
             };
+        // One status read on an owned install: whether the actor answers, its owner
+        // conflicts, and whether its identity moved since `register`.
+        let owned = crate::buildinfo::owned_socket().map(|socket| {
+            let (facts, conflicts) = crate::buildinfo::observe_owned(&socket);
+            crate::buildinfo::note_observed(&facts);
+            let actor = platform_update::ActorView {
+                socket,
+                answered: facts.updater_present == Some(true),
+                version: facts.recovery_actor_version.clone(),
+            };
+            (actor, conflicts)
+        });
         ProbeEnv {
             root: PathBuf::from("/"),
             host_root,
@@ -248,8 +240,10 @@ impl ProbeEnv {
             host_codecs: CodecProbe::NotProbed,
             nvidia_lib32_path: nvidia_lib32_path.to_string(),
             nvidia_volume: VolumeView::live(),
-            container_mount_error: sibling_mount_error(),
-            sibling_egl: if nvidia { crate::nvidia_volume::probe_sibling_egl() } else { crate::nvidia_volume::EglRuntime::Unknown },
+            // A native (non-containerized) agent has no sibling mounts to validate and
+            // must keep passing this check whatever the engine is doing — the skip stands
+            // in for the inspection, never for `is_containerized`.
+            container_mounts: live_mount_observation(&runtime),
             driver_mount_error: crate::nvidia_volume::mount_resolution_error().or_else(|| crate::nvidia_volume::current().and_then(|info| {
                 if info.host.is_none() && info.name.is_none() {
                     Some(format!("The agent can read its NVIDIA driver volume but cannot resolve its Docker mount. App launches are blocked; check Docker socket and identity inspection, or set {} to the host directory already mounted at /opt/quasar/nvidia-driver.", crate::nvidia_volume::HOST_PATH_ENV))
@@ -257,21 +251,40 @@ impl ProbeEnv {
             })),
             // NVIDIA only: on AMD/Intel the EGL stack is Mesa's and none of this module's
             // remediation applies, so the subprocess (and a confusing red row) buys nothing.
-            egl_runtime: if nvidia {
-                crate::nvidia_volume::probe_egl_runtime(
+            egl_runtime: match (nvidia, engine_answered) {
+                (true, true) => crate::nvidia_volume::probe_egl_runtime(
                     crate::nvidia_volume::vendor_lib_for_selftest().as_deref(),
-                )
-            } else {
-                crate::nvidia_volume::EglRuntime::Unknown
+                ),
+                // The sibling probe needs the engine to launch a container; the engine
+                // just said it cannot. Same verdict it reaches the slow way.
+                (true, false) => crate::nvidia_volume::EglRuntime::Indeterminate {
+                    detail: "the container engine did not answer this refresh".into(),
+                },
+                (false, _) => crate::nvidia_volume::EglRuntime::Unknown,
             },
             // Vendor/GPU-independent: a firewall problem is as real on a GPU-less box.
-            firewall: detect_firewall_posture(),
-            updater: platform_update::collect_updater(&updater_socket_path()),
-            updater_present: crate::buildinfo::install_facts().updater_present,
+            media: crate::session::media_evidence::latest(),
+            recovery_actor: owned.as_ref().map(|(actor, _)| actor.clone()),
             health: platform_update::collect_health(crate::health::addr_from_env()),
             self_identity: platform_update::HealthIdentity {
                 node: crate::logging::host_name().to_string(),
                 pid: std::process::id(),
+            },
+            owner_conflicts: owned.map(|(_, conflicts)| conflicts),
+            storage: storage::StorageView::live(engine_answered),
+            runtime,
+            gpus: Vec::new(),
+            nvidia_runtime: crate::session::container::ContainerRuntime::from_env().is_nvidia(),
+            console: console::ConsoleView {
+                enabled: crate::ddc::is_console_enabled(),
+                has_access: std::env::var(crate::release::console::MARKER_ENV)
+                    .is_ok_and(|v| v.trim() == "1"),
+                preflight: crate::session::console_preflight::last(),
+                audio: console::AudioView::observe(
+                    &crate::session::console_audio::LiveHostAudio::live(),
+                    &crate::session::console_audio::configured_output(),
+                ),
+                ddc: crate::ddc::summary(),
             },
         }
     }
@@ -279,6 +292,15 @@ impl ProbeEnv {
     /// Hand the probe capacity detection's vendor-neutral GPU answer.
     pub fn with_gpu_present(mut self, gpu_present: bool) -> Self {
         self.gpu_present = gpu_present;
+        self
+    }
+
+    /// Hand the probe capacity detection's GPUs, for checks that block one GPU.
+    pub fn with_gpus(mut self, gpus: &[crate::messages::GpuCapacity]) -> Self {
+        self.gpus = gpus
+            .iter()
+            .map(|g| (g.index, g.vendor == "nvidia"))
+            .collect();
         self
     }
 
@@ -339,57 +361,139 @@ fn detect_distro(env: &ProbeEnv) -> Distro {
     }
 }
 
+/// The host's os-release identity, for the engine profile. `None` when the agent cannot
+/// read it (no `/host/etc/os-release` mount): the engine's own report is used instead.
+fn detect_host_os(env: &ProbeEnv) -> Option<runtime_facts::HostOs> {
+    std::fs::read_to_string(env.host_root.join("etc/os-release"))
+        .ok()
+        .and_then(|body| runtime_facts::HostOs::parse(&body))
+}
+
 fn is_containerized() -> bool {
     Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
 
-/// Docker resolves app bind sources in the host namespace, not the agent's.
-/// Validate that the directories the agent writes are the directories apps mount.
-pub(crate) fn sibling_mount_error() -> Option<String> {
+/// What `host_container_mounts` says when the engine refused the inspection for a
+/// reason that is evidence: permission denied, a missing socket, a bad endpoint.
+/// A busy client or a timeout is not this string.
+pub(crate) const ENGINE_MOUNT_INSPECTION_FAILED: &str =
+    "Docker could not inspect the agent's mounts; check socket access";
+
+const MOUNT_CHECK_REMEDIATION: &str = "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.";
+
+const MOUNT_INDETERMINATE_SUMMARY: &str =
+    "The runtime client was busy or timed out this refresh; the last mount result stands";
+
+/// One sibling-mount inspection. [`MountObservation::Indeterminate`] is not evidence
+/// the mounts are wrong, so a launch does not refuse on it (ADR 0005).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountObservation {
+    /// Mounts agree, or this agent is not a container.
+    Agree,
+    /// A mismatch, or an engine refusal that is evidence.
+    Fail(String),
+    /// Busy, cancelled, or timed out. Not evidence.
+    Indeterminate,
+}
+
+pub(crate) fn classify_mount_runtime(kind: crate::runtime::ErrorKind) -> MountObservation {
+    match kind {
+        crate::runtime::ErrorKind::Busy
+        | crate::runtime::ErrorKind::Cancelled
+        | crate::runtime::ErrorKind::Timeout => MountObservation::Indeterminate,
+        _ => MountObservation::Fail(ENGINE_MOUNT_INSPECTION_FAILED.into()),
+    }
+}
+
+fn live_mount_observation(runtime: &runtime_facts::RuntimeView) -> MountObservation {
     if !is_containerized() {
-        return None;
+        return MountObservation::Agree;
+    }
+    // The endpoint inspection already spent the budget. A timeout must not start
+    // another one, and it is not evidence the mounts are wrong.
+    if !runtime.engine_answered() {
+        return if runtime.is_inspection_timeout() {
+            MountObservation::Indeterminate
+        } else {
+            MountObservation::Fail(ENGINE_MOUNT_INSPECTION_FAILED.into())
+        };
+    }
+    sibling_mount_observation()
+}
+
+/// Docker resolves app bind sources in the host namespace, not the agent's.
+/// `Some` only when this inspection is evidence of a problem. A busy or timed-out
+/// client returns `None`, so a launch is not refused on it.
+pub(crate) fn sibling_mount_error() -> Option<String> {
+    match sibling_mount_observation() {
+        MountObservation::Fail(error) => Some(error),
+        MountObservation::Agree | MountObservation::Indeterminate => None,
+    }
+}
+
+fn sibling_mount_observation() -> MountObservation {
+    if !is_containerized() {
+        return MountObservation::Agree;
     }
     let Some(id) = crate::nvidia_volume::self_container_id() else {
-        return Some("Cannot identify the agent container to validate app mounts".into());
+        return MountObservation::Fail(
+            "Cannot identify the agent container to validate app mounts".into(),
+        );
     };
-    let docker = std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
-    let Some(body) = run_with_timeout(&docker, &["inspect", "--format", "{{json .Mounts}}", &id])
-    else {
-        return Some("Docker could not inspect the agent's mounts; check socket access".into());
+    let runtime = match crate::runtime::configured() {
+        Ok(runtime) => runtime,
+        Err(error) => return classify_mount_runtime(error.kind),
     };
-    let Ok(mounts) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
-        return Some("Docker returned invalid agent mount data".into());
+    let container = match runtime
+        .inspect_container_within(id, crate::runtime::ENGINE_INSPECTION_BUDGET)
+        .wait()
+    {
+        Ok(Some(container)) => container,
+        Ok(None) => return MountObservation::Fail(ENGINE_MOUNT_INSPECTION_FAILED.into()),
+        Err(error) => return classify_mount_runtime(error.kind),
     };
     let mut paths =
         vec![std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".into())];
     let home = std::env::var("QUASAR_HOME_ROOT").unwrap_or_default();
     if !home.is_empty() {
         paths.push(home.clone());
-        let template = std::env::var("QUASAR_TEMPLATE_ROOT")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| {
-                Path::new(&home)
-                    .parent()
-                    .unwrap_or(Path::new("/var/lib/quasar"))
-                    .join("templates")
-                    .to_string_lossy()
-                    .into_owned()
-            });
-        paths.push(template);
+        paths.push(
+            template_root_for(Path::new(&home))
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
-    validate_sibling_mounts(&mounts, &paths)
+    match validate_sibling_mounts(&container.mounts, &paths) {
+        None => MountObservation::Agree,
+        Some(error) => MountObservation::Fail(error),
+    }
 }
 
-fn validate_sibling_mounts(mounts: &[serde_json::Value], paths: &[String]) -> Option<String> {
+/// `QUASAR_TEMPLATE_ROOT`, or the sibling-of-homes default (`{home}/../templates`).
+pub(super) fn template_root_for(home: &Path) -> PathBuf {
+    std::env::var("QUASAR_TEMPLATE_ROOT")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.parent()
+                .unwrap_or(Path::new("/var/lib/quasar"))
+                .join("templates")
+        })
+}
+
+fn validate_sibling_mounts(mounts: &[crate::runtime::Mount], paths: &[String]) -> Option<String> {
     let broken: Vec<_> = paths
         .iter()
         .filter(|path| {
             !mounts.iter().any(|mount| {
-                mount["Type"].as_str() == Some("bind")
-                    && mount["Source"].as_str() == Some(path.as_str())
-                    && mount["Destination"].as_str() == Some(path.as_str())
-                    && mount["RW"].as_bool() == Some(true)
+                mount.kind == crate::runtime::MountKind::Bind
+                    && mount
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.0 == Path::new(path))
+                    && mount.destination == **path
+                    && mount.read_only == Some(false)
             })
         })
         .cloned()
@@ -401,11 +505,41 @@ fn validate_sibling_mounts(mounts: &[serde_json::Value], paths: &[String]) -> Op
     }
 }
 
+/// The agent's own container holds the NVIDIA control node: the engine injected the GPU.
+fn own_nvidia_nodes(env: &ProbeEnv) -> bool {
+    env.root.join("dev/nvidiactl").exists()
+}
+
 /// Run the full check set. Pure w.r.t. `env` (no global state, network, or container launches)
 /// so it is cheap to re-run on every capacity report.
 pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
+    let mut checks = probe_all(env);
+    checks.extend(runtime_facts::check_runtime_cdi_gpus(
+        &env.runtime,
+        &env.gpus,
+        own_nvidia_nodes(env),
+    ));
+    checks.extend(owner_conflict::check(
+        env.owner_conflicts.is_some(),
+        env.owner_conflicts.as_ref().unwrap_or(&None),
+    ));
+    checks
+}
+
+fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
     let distro = detect_distro(env);
     vec![
+        runtime_facts::check_runtime_endpoint(&env.runtime),
+        runtime_facts::check_runtime_api_version(&env.runtime),
+        runtime_facts::check_runtime_capabilities(&env.runtime),
+        runtime_facts::check_runtime_cdi(
+            &env.runtime,
+            env.nvidia || env.nvidia_runtime,
+            &env.gpus,
+            own_nvidia_nodes(env),
+        ),
+        runtime_facts::check_runtime_engine(&env.runtime, detect_host_os(env).as_ref()),
+        runtime_facts::check_engine_healthchecks(&env.runtime),
         // Runtime veto: files present but the stack not loading must never read green.
         veto_if_egl_broken(check_nvidia_egl_vendor(env, distro), env),
         veto_if_egl_broken(check_nvidia_eglcore(env, distro), env),
@@ -418,12 +552,6 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         check_host_render_node(env, distro),
         check_dri_node_app_access(env, distro),
         check_driver_volume_version(env, distro),
-        match &env.sibling_egl {
-            crate::nvidia_volume::EglRuntime::Ok { .. } => pass("nvidia_sibling_egl", "Provisioned NVIDIA driver loads in a sibling container".into()),
-            crate::nvidia_volume::EglRuntime::Broken { detail, .. } => fail("nvidia_sibling_egl", detail.clone(), "The agent's driver works locally but failed the sibling-container EGL test. Check the driver mount and libraries; the test retries automatically.".into()),
-            crate::nvidia_volume::EglRuntime::Indeterminate { detail } => warn_check("nvidia_sibling_egl", detail.clone(), "Driver loading in a sibling container is not confirmed. Check Docker runtime access; the test retries automatically.".into()),
-            crate::nvidia_volume::EglRuntime::Unknown => skip("nvidia_sibling_egl", "No provisioned driver requires a sibling-container test"),
-        },
         match &env.driver_mount_error {
             Some(error) => fail("nvidia_driver_mount", error.clone(), "Check Docker socket and container mount inspection, or set QUASAR_NVIDIA_DRIVER_HOST_PATH to the host directory already mounted at /opt/quasar/nvidia-driver. Explicit paths must pass the same-directory sibling check. Recreate the agent after changing environment settings; reinstalling drivers will not fix mount resolution.".to_string()),
             None => skip("nvidia_driver_mount", "No unresolved NVIDIA app driver mount"),
@@ -433,25 +561,21 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         check_xid_visibility(env),
         // Applies to every host, GPU or not — not part of the sanity family.
         check_media_reachability(env, distro),
-        match &env.container_mount_error {
-            Some(error) => fail("host_container_mounts", error.clone(), "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.".to_string()),
-            None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
-        },
+        host_container_mounts_check(&env.container_mounts),
+        runtime_facts::homes_mapping(
+            storage::check_homes_root_writable(&env.storage, storage::WriteIdentity::from_env_pair(env.app_uid, env.app_gid)),
+            &env.runtime,
+        ),
+        storage::check_homes_free_space(&env.storage),
+        storage::check_template_free_space(&env.storage),
+        storage::check_image_free_space(&env.storage),
         // The update path: what preflight reads about this host.
-        platform_update::check_updater_socket(&env.updater, env.updater_present),
-        platform_update::check_updater_stack_dir(&env.updater),
-        platform_update::check_updater_overlays(&env.updater),
+        platform_update::check_updater_socket(env.recovery_actor.as_ref()),
         platform_update::check_health_addr_bindable(&env.health, &env.self_identity),
+        console::check_display(&env.console),
+        console::check_audio(&env.console),
+        console::check_ddc(&env.console),
     ]
-}
-
-/// Twin of `release::ReleaseManager::from_env`'s socket resolution.
-fn updater_socket_path() -> PathBuf {
-    std::env::var("QUASAR_UPDATER_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(crate::release::DEFAULT_SOCKET))
 }
 
 fn check_vulkan_av1_compatibility(env: &ProbeEnv) -> ReadinessCheck {
@@ -488,26 +612,23 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
                 crate::gpu_kmsg::KMSG_PATH
             ),
         ),
+        // Amendment 17: an optional diagnostic the host was not prepared to grant. The
+        // summary names the setting; a skip asks nothing of the operator.
         Err(e) => ReadinessCheck {
             id: ID.to_string(),
             status: SKIP.to_string(),
             summary: format!(
-                "{} is not readable ({e}) — GPU faults will not appear in a session trace; \
-                 an Xid can only be found by hand in the host's dmesg",
+                "GPU fault messages are not collected: {} is not readable here ({e}). This \
+                 diagnostic is optional; a host that keeps the kernel log restricted \
+                 (kernel.dmesg_restrict=1, the usual default) does not grant it, and host \
+                 preparation's --allow-kernel-log does. Faults can still be read by hand \
+                 in the host's dmesg",
                 crate::gpu_kmsg::KMSG_PATH
             ),
-            remediation: format!(
-                "The shipped deploy/docker-compose.yml grants this, so a stack that cannot \
-                 read it predates that or has the entry removed. Under the node-agent \
-                 service add `{}:{}:r` to `devices:` — `:r` is the device-cgroup permission \
-                 set, a bind mount's `:ro` is rejected there — and `SYSLOG` to `cap_add:`, \
-                 which the device alone does not cover while kernel.dmesg_restrict=1 (the \
-                 distro default). Then recreate the agent container. Optional, and nothing \
-                 else changes — the tailer is read-only, off the media path, and reports \
-                 only NVRM Xid and amdgpu fault lines.",
-                crate::gpu_kmsg::KMSG_PATH,
-                crate::gpu_kmsg::KMSG_PATH
-            ),
+            remediation: String::new(),
+            observed_at: None,
+            source: Some("local".to_string()),
+            blocks: None,
         },
     }
 }
@@ -561,6 +682,16 @@ pub fn log_report(checks: &[ReadinessCheck]) -> usize {
             token = "readiness-check-warn",
             check = %c.id,
             "host readiness WARN: {} — remediation: {}",
+            c.summary,
+            c.remediation
+        );
+    }
+    // An indeterminate host probe is not a failure, but an operator should see it.
+    for c in checks.iter().filter(|c| c.status == UNKNOWN) {
+        tracing::warn!(
+            token = "readiness-check-unknown",
+            check = %c.id,
+            "host readiness UNKNOWN: {} — remediation: {}",
             c.summary,
             c.remediation
         );
@@ -757,12 +888,17 @@ pub fn boot_action(input: BootInputs<'_>) -> BootAction {
 
 // ── individual checks ────────────────────────────────────────────────────────
 
+/// These constructors make proxy checks: source `local`, never `blocks`. A check that
+/// rests on evidence adds its own after construction (runtime_facts, storage, host_probe).
 fn pass(id: &str, summary: String) -> ReadinessCheck {
     ReadinessCheck {
         id: id.to_string(),
         status: PASS.to_string(),
         summary,
         remediation: String::new(),
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -772,6 +908,9 @@ fn skip(id: &str, summary: &str) -> ReadinessCheck {
         status: SKIP.to_string(),
         summary: summary.to_string(),
         remediation: String::new(),
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -781,6 +920,45 @@ fn fail(id: &str, summary: String, remediation: String) -> ReadinessCheck {
         status: FAIL.to_string(),
         summary,
         remediation,
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
+    }
+}
+
+/// Advisory but actionable: carries a remediation, because the exact command is the whole
+/// point of a check whose finding is "look at this, but it might be fine".
+fn host_container_mounts_check(observation: &MountObservation) -> ReadinessCheck {
+    let check = match observation {
+        MountObservation::Agree => pass(
+            "host_container_mounts",
+            "Required sibling-container paths agree with their host bind mounts".to_string(),
+        ),
+        MountObservation::Fail(error) => fail(
+            "host_container_mounts",
+            error.clone(),
+            MOUNT_CHECK_REMEDIATION.to_string(),
+        ),
+        MountObservation::Indeterminate => {
+            unknown("host_container_mounts", MOUNT_INDETERMINATE_SUMMARY)
+        }
+    };
+    debug_assert!(
+        check.blocks.is_none(),
+        "host_container_mounts is a local check"
+    );
+    check
+}
+
+fn unknown(id: &str, summary: &str) -> ReadinessCheck {
+    ReadinessCheck {
+        id: id.to_string(),
+        status: UNKNOWN.to_string(),
+        summary: summary.to_string(),
+        remediation: "The agent retries on the next refresh.".to_string(),
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -792,6 +970,9 @@ fn warn_check(id: &str, summary: String, remediation: String) -> ReadinessCheck 
         status: WARN.to_string(),
         summary,
         remediation,
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -803,6 +984,9 @@ fn provisioning(id: &str, summary: String) -> ReadinessCheck {
         // Empty on purpose: a `dnf install` line next to "we are fixing this for you" is how
         // an operator ends up doing both.
         remediation: String::new(),
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -1409,7 +1593,7 @@ fn check_host_render_node(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
 ///
 /// The app's supplementary groups are not a guess: the launcher hands it one `--group-add`
 /// per DRM-node group ([`crate::session::container::dri_group_granted`]), so this asks the
-/// question the app will actually face. Probing as root instead false-passed hermes, whose
+/// question the app will actually face. Probing as root instead false-passed the aux host, whose
 /// 0660 root:render node left RADV with permission denied and gamescope dead.
 fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck {
     const ID: &str = "dri_node_app_access";
@@ -1624,176 +1808,98 @@ const ENCODER_CODECS_REMEDIATION: &str =
      `GST_REGISTRY` at a scratch path for that gst-inspect: the image's registry was built with no \
      GPU present, so device-probing elements are absent from it by construction.";
 
-// ── (#483) media reachability: host firewall vs WebRTC ICE UDP ─────────────────
+// ── (#483, RH-07 #403) media reachability: evidence from real traffic ───────────
 //
-// Mechanism: `network_mode: host` puts the agent's ICE sockets on the host's netfilter, while
-// the control plane's published ports are DNAT'd through docker's own ACCEPT chain and never
-// hit host input filtering. A restrictive zone therefore leaves UI/API/signaling/launch all
-// healthy while ICE UDP and mDNS (5353/udp, the fallback for Chrome's `.local` candidates) are
-// dropped; the only symptom is `WebRTC transport never established` ~2 min into a session.
-//
-// Detection is best-effort, not a reachability test: it degrades to `Unknown` (no finding,
-// never a failure) when no client tool answers. `nft` is baked into the image and sees the
-// HOST's real rules — netfilter state follows the network namespace, so no bind mount is
-// needed, only CAP_NET_ADMIN.
-//
-// Severity is `warn`, never `fail`: a filtering zone with a correct allow rule is fine and this
-// cannot cheaply tell the two apart.
+// The agent uses host networking, so a host firewall that drops its ICE UDP leaves every other
+// surface healthy while sessions never carry video. This used to be judged by reading the
+// firewall's rules, which needed NET_ADMIN in the host's network namespace (a rootless engine
+// cannot grant it) and was a proxy even then. It is now judged by real traffic: a remote peer's
+// connectivity checks arriving during a real session (`session::media_evidence`). Amendment 17
+// fixes the rules: `source: runtime`, never `blocks`, and an inconclusive or absent result is
+// `unknown` (never `warn`).
 
-/// Per-subprocess budget; a slower answer is discarded as `None`. Bounded because this runs
-/// inline in the connect/reconnect path and must never hang it.
-const FIREWALL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// mDNS: Chrome sends `.local` hostnames as ICE candidates and there is no fallback when this
-/// is unreachable, so it is half of "the media path is open", not a nicety.
+/// mDNS: Chrome sends `.local` hostnames as ICE candidates, so 5353/udp is half the media path.
 const MDNS_PORT: u32 = 5353;
 
 /// The kernel's own default ephemeral range — what the ICE sockets draw from when this host's
 /// `ip_local_port_range` cannot be read.
 const DEFAULT_MEDIA_PORTS: (u32, u32) = (32768, 60999);
 
-/// Would a host firewall silently drop the agent's ICE UDP while every other surface reports
-/// fine? Mechanism in the section comment above.
 fn check_media_reachability(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
+    use crate::session::media_evidence::Evidence;
     const ID: &str = "media_reachability";
-    match &env.firewall {
-        FirewallPosture::Unknown => skip(
-            ID,
-            "could not determine whether a host firewall would block WebRTC media — no \
-             firewalld or nft client tool answered from inside the agent container (nft is in \
-             the image and needs CAP_NET_ADMIN, which the compose file grants)",
-        ),
-        FirewallPosture::Unfiltered { detail, .. } => pass(
-            ID,
-            format!(
-                "no host firewall filters inbound traffic ({detail}) — nothing here would block \
-                 WebRTC media"
-            ),
-        ),
-        FirewallPosture::Open => pass(
-            ID,
-            "the detected host firewall reports a default-accept posture — no evidence it would \
-             block WebRTC media"
+    let observed = |at: &std::time::SystemTime| {
+        time::OffsetDateTime::from(*at)
+            .replace_nanosecond(0)
+            .ok()?
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    };
+    let mut check = match &env.media {
+        None => ReadinessCheck {
+            id: ID.to_string(),
+            status: UNKNOWN.to_string(),
+            summary: "No session has shown yet whether browsers on other machines can reach \
+                      this host's WebRTC media; the next session that connects, or fails to, \
+                      answers it"
                 .to_string(),
-        ),
-        FirewallPosture::Filtering {
-            tool,
-            detail,
-            media_allow,
-        } => filtering_check(ID, env, distro, *tool, detail, media_allow),
-    }
-}
-
-/// The filtering branch, split by what the tool's own accept rules say (#67). A filtering
-/// posture is the CORRECT configuration once the documented rules are in place, so `Covered`
-/// passes; the warning is reserved for a media path that really is closed.
-fn filtering_check(
-    id: &str,
-    env: &ProbeEnv,
-    distro: Distro,
-    tool: FirewallTool,
-    detail: &str,
-    media_allow: &MediaAllow,
-) -> ReadinessCheck {
-    let (lo, hi) = media_port_range(&env.root).unwrap_or(DEFAULT_MEDIA_PORTS);
-    // The symptom, shared by both warning shapes: it is the only way an operator recognises
-    // this from what they actually saw.
-    const SYMPTOM: &str = "The control plane's traffic is container-DNAT'd and unaffected by \
-         it, so every other readiness and health surface can look completely healthy while this \
-         silently drops the node agent's own WebRTC ICE UDP (host networking, no DNAT): sessions \
-         launch and appear to negotiate, then the agent reaps them about 2 minutes later logging \
-         \"WebRTC transport never established\" having delivered no video at all";
-    match media_allow {
-        MediaAllow::Covered { evidence } => pass(
-            id,
-            format!(
-                "a host firewall with a default-deny/input-filtering posture is active \
-                 ({detail}), and its own rules already accept the WebRTC media path — UDP \
-                 {lo}-{hi} and UDP/{MDNS_PORT} (mDNS) are both covered by: {evidence}. If video \
-                 still never arrives, check those rules' SOURCE scope covers the client's \
-                 subnet — that is the one thing this check cannot judge"
-            ),
-        ),
-        MediaAllow::Partial { evidence, gap } => warn_check(
-            id,
-            format!(
-                "a host firewall with a default-deny/input-filtering posture is active \
-                 ({detail}) and its rules accept only part of the WebRTC media path (matched: \
-                 {evidence}) — {gap}. {SYMPTOM}"
-            ),
-            firewall_remediation(env, tool, distro),
-        ),
-        MediaAllow::Absent => warn_check(
-            id,
-            format!(
-                "a host firewall with a default-deny/input-filtering posture is active \
-                 ({detail}), and no accept rule covering UDP {lo}-{hi} or UDP/{MDNS_PORT} \
-                 (mDNS) was found in its active rule set. {SYMPTOM}"
-            ),
-            firewall_remediation(env, tool, distro),
-        ),
-    }
-}
-
-/// Remediation for a filtering firewall, keyed on the TOOL that answered detection, never on
-/// `distro` — a distro-keyed command hands the operator a tool that is not the one filtering
-/// their traffic. `distro` is a secondary hint only, for wording that is genuinely
-/// distro-specific (the FedoraServer-zone sentence, shown only when firewalld and Fedora agree).
-/// Full writeup: `deploy/README.md` §"Host firewall blocking WebRTC media".
-fn firewall_remediation(env: &ProbeEnv, tool: FirewallTool, distro: Distro) -> String {
-    let probed = media_port_range(&env.root);
-    let (lo, hi) = probed.unwrap_or(DEFAULT_MEDIA_PORTS);
-    let port_range = format!("{lo}-{hi}");
-    let range_note = if probed.is_some() {
-        String::new()
-    } else {
-        " (this host's own net.ipv4.ip_local_port_range was not readable — this is the Linux \
-         kernel default, confirm the real range with `cat /proc/sys/net/ipv4/ip_local_port_range` \
-         on the host)"
-            .to_string()
-    };
-
-    let lead = format!(
-        "Two things must be reachable, inbound to this host, from client devices on your \
-         LAN/VPN subnet — never from `0.0.0.0/0`: UDP {port_range} (the node agent's WebRTC \
-         media port range — ICE and RTP both ride on it{range_note}) and UDP/5353 (mDNS — \
-         Chrome sends `.local` hostnames as ICE candidates, and without mDNS reachable there is \
-         no fallback). Full writeup: deploy/README.md §\"Host firewall blocking WebRTC media\"."
-    );
-
-    let command = match tool {
-        FirewallTool::Firewalld => {
-            let fedora_hint = if distro == Distro::Fedora {
-                " On Fedora Server specifically — the box this issue was first found on — the \
-                 default FedoraServer zone allows only ssh/cockpit/dhcpv6, so this is very \
-                 likely the cause if you haven't touched the firewall since install."
-            } else {
-                ""
-            };
-            format!(
-                "firewalld detected. Scope the exception to the LAN rather than opening the \
-                 host: `sudo firewall-cmd --permanent --zone=<zone> --add-rich-rule='rule \
-                 family=ipv4 source address=<lan-subnet> port port={port_range} protocol=udp \
-                 accept' && sudo firewall-cmd --permanent --zone=<zone> --add-service=mdns && \
-                 sudo firewall-cmd --reload`. Replace <zone> with the zone `firewall-cmd \
-                 --get-default-zone` reports and <lan-subnet> with your LAN, e.g. \
-                 192.168.1.0/24.{fedora_hint}"
-            )
+            remediation: String::new(),
+            observed_at: None,
+            source: None,
+            blocks: None,
+        },
+        Some(Evidence::Reached { at, peer }) => {
+            let mut c = pass(
+                ID,
+                format!(
+                    "A browser on another machine ({peer}) reached this host's WebRTC media in a \
+                     real session. That proves this peer's path, not that every port in the \
+                     media range is open"
+                ),
+            );
+            c.observed_at = observed(at);
+            c
         }
-        FirewallTool::Nftables => format!(
-            "nftables detected. Add an INPUT accept rule for UDP {port_range} and 5353/udp, \
-             scoped to <lan-subnet>, ahead of the default-deny/reject rule in the base input \
-             chain (`nft list ruleset` shows the current chain to edit)."
-        ),
-        FirewallTool::Iptables => format!(
-            "iptables detected: `sudo iptables -I INPUT -p udp -s <lan-subnet> --dport \
-             {port_range} -j ACCEPT && sudo iptables -I INPUT -p udp -s <lan-subnet> --dport \
-             5353 -j ACCEPT`, inserted ahead of your existing default-deny rule, then persist it \
-             however your distro expects (`iptables-save`, `netfilter-persistent`, etc.)."
-        ),
+        Some(Evidence::Blocked { at, offered }) => {
+            let (lo, hi) = media_port_range(&env.root).unwrap_or(DEFAULT_MEDIA_PORTS);
+            let mut c = fail(
+                ID,
+                format!(
+                    "The last session's browser offered {offered} network candidate(s) and none of \
+                     its traffic reached this host: WebRTC connection setup failed. A firewall on \
+                     this host (or in front of it) is dropping inbound UDP {lo}-{hi} or \
+                     UDP/{MDNS_PORT} (mDNS)"
+                ),
+                media_firewall_fix(distro, lo, hi),
+            );
+            c.observed_at = observed(at);
+            c
+        }
     };
+    check.source = Some("runtime".to_string());
+    check
+}
 
-    format!("{lead} {command}")
+/// The firewall fix for the media path, for the firewall the distribution ships by default.
+/// The agent no longer reads the host's firewall (that needed NET_ADMIN), so it names both
+/// common tools rather than guessing which one is active.
+fn media_firewall_fix(distro: Distro, lo: u32, hi: u32) -> String {
+    let firewalld = format!(
+        "sudo firewall-cmd --permanent --add-port={lo}-{hi}/udp && sudo firewall-cmd \
+         --permanent --add-service=mdns && sudo firewall-cmd --reload"
+    );
+    let ufw = format!("sudo ufw allow {lo}:{hi}/udp && sudo ufw allow 5353/udp");
+    match distro {
+        Distro::Debian => format!(
+            "Allow inbound UDP {lo}-{hi} and 5353 (mDNS) to this host. With ufw: {ufw}. With \
+             firewalld: {firewalld}. Restrict the source to your clients' network if you can."
+        ),
+        _ => format!(
+            "Allow inbound UDP {lo}-{hi} and 5353 (mDNS) to this host. With firewalld: \
+             {firewalld}. With ufw: {ufw}. Restrict the source to your clients' network if you \
+             can."
+        ),
+    }
 }
 
 /// `/proc/sys/net/ipv4/ip_local_port_range`'s body (`"32768\t60999\n"`) as an inclusive range.
@@ -1813,592 +1919,6 @@ fn media_port_range(root: &Path) -> Option<(u32, u32)> {
     std::fs::read_to_string(root.join("proc/sys/net/ipv4/ip_local_port_range"))
         .ok()
         .and_then(|body| parse_ip_local_port_range(&body))
-}
-
-/// Live, best-effort firewall detection: firewalld's CLI first, then nftables/iptables INPUT
-/// policy. Every step degrades to "no signal", never an error — a missing binary is the
-/// expected case on the stock image, and these probes must never hard-fail.
-fn detect_firewall_posture() -> FirewallPosture {
-    // A bridged container can have an empty local ruleset while the host filters
-    // every packet. Only host-networked agents may report this as host evidence.
-    if is_containerized() {
-        let docker = std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
-        let network = crate::nvidia_volume::self_container_id().and_then(|id| {
-            run_with_timeout(
-                &docker,
-                &["inspect", "--format", "{{.HostConfig.NetworkMode}}", &id],
-            )
-        });
-        if network.as_deref().map(str::trim) != Some("host") {
-            return FirewallPosture::Unknown;
-        }
-    }
-    // Live probe, so the real root: a fake one is only ever passed in tests, which drive the
-    // pure parsers directly.
-    let media = media_port_range(Path::new("/")).unwrap_or(DEFAULT_MEDIA_PORTS);
-    // Each tool's posture and its accept rules come from the SAME listing — reading one tool's
-    // policy against another's rules is how a host gets told the opposite of the truth.
-    let firewalld = firewalld_zone_listing().and_then(|listing| {
-        parse_firewalld_zone_target(&listing)
-            .map(|target| (target, firewalld_media_allow(&listing, media)))
-    });
-    let nft = run_with_timeout("nft", &["list", "ruleset"]).and_then(|ruleset| {
-        if let Some(policy) = parse_nft_input_policy(&ruleset) {
-            Some(NftSignal::Policy {
-                policy,
-                media_allow: nft_media_allow(&ruleset, media),
-            })
-        } else if !nft_has_input_base_chain(&ruleset) {
-            Some(NftSignal::NoInputChain)
-        } else {
-            // A base chain whose policy word could not be read: no signal, not a finding.
-            None
-        }
-    });
-    let iptables = iptables_input_listing().and_then(|out| {
-        parse_iptables_input_policy(&out).map(|policy| (policy, iptables_media_allow(&out, media)))
-    });
-    combine_firewall_signals(
-        firewalld.as_ref().map(|(t, m)| (t.as_str(), m.clone())),
-        nft,
-        iptables.as_ref().map(|(p, m)| (p.as_str(), m.clone())),
-    )
-}
-
-/// `iptables -S INPUT`, preferring whichever of the two front-ends actually answers with a
-/// chain listing. The full listing, not just the policy line: the accept RULES are in it.
-fn iptables_input_listing() -> Option<String> {
-    run_with_timeout("iptables", &["-S", "INPUT"])
-        .filter(|out| parse_iptables_input_policy(out).is_some())
-        .or_else(|| run_with_timeout("iptables-nft", &["-S", "INPUT"]))
-}
-
-/// The active zone's whole `--list-all` listing — target line, ports, services and rich rules
-/// in one read. `--state` first: querying zones against an absent daemon makes `firewall-cmd`
-/// wait on a D-Bus reply that never comes.
-fn firewalld_zone_listing() -> Option<String> {
-    let state = run_with_timeout("firewall-cmd", &["--state"])?;
-    if state.trim() != "running" {
-        return None;
-    }
-    let zone = run_with_timeout("firewall-cmd", &["--get-default-zone"])?;
-    let zone = zone.trim();
-    if zone.is_empty() {
-        return None;
-    }
-    let zone_arg = format!("--zone={zone}");
-    run_with_timeout("firewall-cmd", &[&zone_arg, "--list-all"])
-}
-
-/// stdout as UTF-8 iff the command spawns, exits within [`FIREWALL_PROBE_TIMEOUT`], and
-/// succeeds. Every other outcome is `None`. A `None` is a fact about the probe, never about the
-/// host, so callers must not distinguish "absent" from "errored".
-pub(crate) fn run_with_timeout(cmd: &str, args: &[&str]) -> Option<String> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + FIREWALL_PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Err(_) => return None,
-        }
-    }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    Some(out)
-}
-
-/// The zone's `target:` directive (`ACCEPT`, `DROP`, `REJECT`, `default`, ...).
-fn parse_firewalld_zone_target(list_all: &str) -> Option<String> {
-    list_all.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("target:")
-            .map(|v| v.trim().to_string())
-    })
-}
-
-/// Filtering unless explicitly `ACCEPT`. `default` (firewalld's own, and FedoraServer's) is
-/// reject-unless-listed, not permissive.
-fn firewalld_target_is_filtering(target: &str) -> bool {
-    !target.eq_ignore_ascii_case("ACCEPT")
-}
-
-/// The base input chain's posture as a policy WORD (`"accept"`, or a filtering word), or `None`
-/// when no `hook input` base chain exists. Two signals, in order:
-///
-///  1. The chain's own declared `policy` word — the hand-configured nftables case.
-///  2. An unconditional catch-all verdict in the chain body. firewalld's nftables backend
-///     (Fedora's default) always declares `policy accept` and enforces the zone target with a
-///     trailing `reject with icmpx admin-prohibited`, so reading only the declared word
-///     misreads every such host as `Open` (#527). A conditional rule like `ct state invalid
-///     drop` carries a leading match and must not trigger this.
-fn parse_nft_input_policy(ruleset: &str) -> Option<String> {
-    let body = nft_base_chain_body(ruleset, "hook input")?;
-    let declared = nft_chain_declared_policy(&body);
-    if let Some(policy) = &declared {
-        if policy != "accept" {
-            return Some(policy.clone());
-        }
-    }
-    if nft_has_unconditional_reject_or_drop(&body) {
-        return Some("reject".to_string());
-    }
-    declared
-}
-
-/// Does the ruleset declare ANY base chain on the input hook? A ruleset without one filters no
-/// inbound traffic at all — the common shape on a host where only Docker programs netfilter
-/// (nat/forward/raw tables, no input hook) — which is a finding, not a missing signal.
-fn nft_has_input_base_chain(ruleset: &str) -> bool {
-    nft_base_chain_body(ruleset, "hook input").is_some()
-}
-
-/// The declared `policy` word from the chain's `hook input` header line, lowercased.
-fn nft_chain_declared_policy(body: &str) -> Option<String> {
-    for line in body.lines() {
-        if !line.contains("hook input") {
-            continue;
-        }
-        let idx = line.find("policy")?;
-        let word = line[idx + "policy".len()..]
-            .trim()
-            .trim_end_matches(';')
-            .split_whitespace()
-            .next()?;
-        return Some(word.to_ascii_lowercase());
-    }
-    None
-}
-
-/// A rule line whose entire trimmed text IS the verdict — firewalld's catch-all pattern. A
-/// conditional drop like `ct state invalid drop` does not qualify.
-fn nft_has_unconditional_reject_or_drop(body: &str) -> bool {
-    body.lines().any(|line| {
-        let t = line.trim();
-        t.starts_with("reject") || t == "drop"
-    })
-}
-
-/// The full `chain NAME { ... }` block containing the first line matching `needle`. Counting
-/// every `{`/`}` character is safe: inline set literals (`ct state { established, related }
-/// accept`) print on one line and net to zero depth.
-fn nft_base_chain_body(ruleset: &str, needle: &str) -> Option<String> {
-    let lines: Vec<&str> = ruleset.lines().collect();
-    let needle_idx = lines.iter().position(|l| l.contains(needle))?;
-    let mut start = needle_idx;
-    while start > 0 && !lines[start].trim_start().starts_with("chain ") {
-        start -= 1;
-    }
-    if !lines[start].trim_start().starts_with("chain ") {
-        return None;
-    }
-    let mut depth: i32 = 0;
-    let mut out = String::new();
-    for line in &lines[start..] {
-        depth += line.matches('{').count() as i32;
-        depth -= line.matches('}').count() as i32;
-        out.push_str(line);
-        out.push('\n');
-        if depth <= 0 {
-            break;
-        }
-    }
-    Some(out)
-}
-
-/// The chain's default policy (`-P INPUT <POLICY>`), lowercased.
-fn parse_iptables_input_policy(output: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("-P INPUT ")
-            .map(|rest| rest.trim().to_ascii_lowercase())
-    })
-}
-
-/// A chain policy counts as filtering unless it is explicitly `accept`.
-fn policy_is_filtering(policy: &str) -> bool {
-    policy != "accept"
-}
-
-// ── (#67) the accept rules, not just the chain policy ─────────────────────────
-//
-// A default-deny INPUT chain is what `deploy/README.md` prescribes; the rules in front of it
-// are the configuration. Reading only the policy therefore warns forever at a host that is set
-// up correctly. Each parser below reduces its tool's own rule listing to the UDP intervals it
-// accepts inbound, and one shared verdict function judges them — so the three tools cannot
-// drift apart in what "the media path is open" means.
-//
-// Still best-effort, and still `warn` rather than `fail`: a rule's SOURCE scope may not reach
-// the client, which no rule listing can settle. That caveat rides in the pass summary.
-
-/// A UDP accept rule reduced to the inclusive port interval it opens, plus the rule text that
-/// produced it — the operator needs to read the real rule, not our summary of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UdpAccept {
-    lo: u32,
-    hi: u32,
-    rule: String,
-}
-
-/// Does the UNION of `accepts` cover every port in `lo..=hi`? Union, not rule-by-rule: two
-/// adjacent rules cover a window neither covers alone.
-fn accepts_cover(accepts: &[UdpAccept], lo: u32, hi: u32) -> bool {
-    let mut intervals: Vec<(u32, u32)> = accepts.iter().map(|a| (a.lo, a.hi)).collect();
-    intervals.sort_unstable();
-    let mut cursor = lo;
-    for (a, b) in intervals {
-        if a > cursor {
-            return false;
-        }
-        if b >= cursor {
-            cursor = b.saturating_add(1);
-        }
-        if cursor > hi {
-            return true;
-        }
-    }
-    cursor > hi
-}
-
-/// The shared verdict: the media path needs BOTH the ICE window and mDNS, so half a
-/// configuration is its own finding rather than a pass or a bare "firewall is on".
-fn media_allow_from_accepts(accepts: &[UdpAccept], media: (u32, u32)) -> MediaAllow {
-    let (lo, hi) = media;
-    let range_ok = accepts_cover(accepts, lo, hi);
-    let mdns_ok = accepts_cover(accepts, MDNS_PORT, MDNS_PORT);
-
-    // Only the rules that bear on the media path, deduped (an inline port set yields one entry
-    // per interval) and capped — this lands in an operator-facing summary line.
-    let mut evidence: Vec<&str> = Vec::new();
-    for a in accepts {
-        let touches_media = a.lo <= hi && a.hi >= lo;
-        let touches_mdns = a.lo <= MDNS_PORT && a.hi >= MDNS_PORT;
-        if (touches_media || touches_mdns) && !evidence.contains(&a.rule.as_str()) {
-            evidence.push(&a.rule);
-        }
-    }
-    evidence.truncate(4);
-    let evidence = evidence.join("; ");
-
-    match (range_ok, mdns_ok) {
-        (true, true) => MediaAllow::Covered { evidence },
-        (false, false) => MediaAllow::Absent,
-        (true, false) => MediaAllow::Partial {
-            evidence,
-            gap: format!(
-                "UDP/{MDNS_PORT} (mDNS) is not accepted, so Chrome's `.local` ICE candidates \
-                 have no fallback"
-            ),
-        },
-        (false, true) => MediaAllow::Partial {
-            evidence,
-            gap: format!("UDP {lo}-{hi} (the media window) is not fully accepted"),
-        },
-    }
-}
-
-/// `"5353"`, or a range written with `sep` (`-` in nft/firewalld, `:` in iptables). A port
-/// written as a service name does not parse, and is simply not counted as evidence.
-fn parse_port_interval(spec: &str, sep: char) -> Option<(u32, u32)> {
-    let spec = spec.trim();
-    match spec.split_once(sep) {
-        Some((a, b)) => {
-            let lo: u32 = a.trim().parse().ok()?;
-            let hi: u32 = b.trim().parse().ok()?;
-            (lo <= hi).then_some((lo, hi))
-        }
-        None => spec.parse().ok().map(|p| (p, p)),
-    }
-}
-
-/// The nft ruleset's reading of the media path.
-fn nft_media_allow(ruleset: &str, media: (u32, u32)) -> MediaAllow {
-    media_allow_from_accepts(&nft_udp_accepts(ruleset), media)
-}
-
-/// Every UDP accept on the INBOUND path. Chains declaring a non-input hook are skipped: an
-/// accept on the output or forward path says nothing about inbound media. A hookless chain
-/// counts — firewalld renders a zone's real allow rules into `filter_IN_<zone>_allow` and
-/// jumps to it from the base input chain.
-fn nft_udp_accepts(ruleset: &str) -> Vec<UdpAccept> {
-    let mut out = Vec::new();
-    let mut in_non_input_chain = false;
-    for line in ruleset.lines() {
-        let t = line.trim();
-        if t.starts_with("chain ") {
-            in_non_input_chain = false;
-        } else if let Some(header) = t.strip_prefix("type ") {
-            // `type filter hook output priority 0; policy accept;`
-            in_non_input_chain = header.contains("hook ") && !header.contains("hook input");
-        } else if !in_non_input_chain {
-            out.extend(nft_rule_udp_accepts(t));
-        }
-    }
-    out
-}
-
-/// One nft rule line into the UDP intervals it accepts. Empty unless the line matches
-/// `udp dport <spec>` and reaches an `accept` verdict after it — a negated match (`!=`), a
-/// jump, or a drop/reject is not an allow.
-fn nft_rule_udp_accepts(rule: &str) -> Vec<UdpAccept> {
-    let tokens: Vec<&str> = rule.split_whitespace().collect();
-    let Some(dport) = tokens.iter().position(|t| *t == "dport") else {
-        return Vec::new();
-    };
-    if dport == 0 || tokens[dport - 1] != "udp" {
-        return Vec::new();
-    }
-    let rest = &tokens[dport + 1..];
-    let Some((intervals, used)) = nft_port_spec(rest) else {
-        return Vec::new();
-    };
-    if !rest[used..].contains(&"accept") {
-        return Vec::new();
-    }
-    intervals
-        .into_iter()
-        .map(|(lo, hi)| UdpAccept {
-            lo,
-            hi,
-            rule: rule.trim().to_string(),
-        })
-        .collect()
-}
-
-/// nft prints a port match as one port, an inclusive `lo-hi` range, or an inline set
-/// (`{ 5353, 32768-60999 }`). Returns the intervals and how many tokens they consumed.
-fn nft_port_spec(tokens: &[&str]) -> Option<(Vec<(u32, u32)>, usize)> {
-    let first = *tokens.first()?;
-    if !first.starts_with('{') {
-        return parse_port_interval(first, '-').map(|iv| (vec![iv], 1));
-    }
-    let mut intervals = Vec::new();
-    for (n, tok) in tokens.iter().enumerate() {
-        let entry = tok
-            .trim_start_matches('{')
-            .trim_end_matches('}')
-            .trim_end_matches(',');
-        if let Some(iv) = parse_port_interval(entry, '-') {
-            intervals.push(iv);
-        }
-        if tok.ends_with('}') {
-            return Some((intervals, n + 1));
-        }
-    }
-    None
-}
-
-/// The firewalld zone listing's reading of the media path.
-fn firewalld_media_allow(list_all: &str, media: (u32, u32)) -> MediaAllow {
-    media_allow_from_accepts(&firewalld_udp_accepts(list_all), media)
-}
-
-/// A zone's UDP allow surface: `ports:`, a blanket `protocols:` entry, the `mdns` service, and
-/// the `rich rules:` block — the four ways `deploy/README.md`'s exception can be expressed.
-fn firewalld_udp_accepts(list_all: &str) -> Vec<UdpAccept> {
-    let mut out = Vec::new();
-    for line in list_all.lines() {
-        let t = line.trim();
-        if let Some(services) = t.strip_prefix("services:") {
-            if services.split_whitespace().any(|s| s == "mdns") {
-                out.push(UdpAccept {
-                    lo: MDNS_PORT,
-                    hi: MDNS_PORT,
-                    rule: format!("service mdns (udp/{MDNS_PORT})"),
-                });
-            }
-        } else if let Some(ports) = t.strip_prefix("ports:") {
-            for tok in ports.split_whitespace() {
-                let Some(spec) = tok.strip_suffix("/udp") else {
-                    continue;
-                };
-                if let Some((lo, hi)) = parse_port_interval(spec, '-') {
-                    out.push(UdpAccept {
-                        lo,
-                        hi,
-                        rule: format!("port {tok}"),
-                    });
-                }
-            }
-        } else if let Some(protocols) = t.strip_prefix("protocols:") {
-            if protocols.split_whitespace().any(|p| p == "udp") {
-                out.push(UdpAccept {
-                    lo: 1,
-                    hi: 65535,
-                    rule: "protocol udp (every port)".to_string(),
-                });
-            }
-        } else if t.starts_with("rule ") {
-            out.extend(firewalld_rich_rule_udp_accept(t));
-        }
-    }
-    out
-}
-
-/// One `rich rules:` entry. Only an `accept` action counts, and only a udp port match or the
-/// mdns service opens the media path.
-fn firewalld_rich_rule_udp_accept(rule: &str) -> Option<UdpAccept> {
-    if !rule.split_whitespace().any(|t| t == "accept") {
-        return None;
-    }
-    if rich_rule_attr(rule, "protocol=") == Some("udp") {
-        let (lo, hi) = parse_port_interval(rich_rule_attr(rule, "port=")?, '-')?;
-        return Some(UdpAccept {
-            lo,
-            hi,
-            rule: rule.to_string(),
-        });
-    }
-    if rich_rule_attr(rule, "name=") == Some("mdns") {
-        return Some(UdpAccept {
-            lo: MDNS_PORT,
-            hi: MDNS_PORT,
-            rule: rule.to_string(),
-        });
-    }
-    None
-}
-
-/// The value of a `key="value"` attribute in a rich rule.
-fn rich_rule_attr<'a>(rule: &'a str, key: &str) -> Option<&'a str> {
-    let idx = rule.find(key)?;
-    let rest = rule[idx + key.len()..].strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(&rest[..end])
-}
-
-/// The iptables INPUT listing's reading of the media path.
-fn iptables_media_allow(output: &str, media: (u32, u32)) -> MediaAllow {
-    media_allow_from_accepts(&iptables_udp_accepts(output), media)
-}
-
-/// `iptables -S INPUT` prints the rules as well as the policy; an
-/// `-A INPUT … -p udp … --dport … -j ACCEPT` line is exactly the evidence in question.
-fn iptables_udp_accepts(output: &str) -> Vec<UdpAccept> {
-    let mut out = Vec::new();
-    for line in output.lines() {
-        let t = line.trim();
-        if !t.starts_with("-A INPUT") || !t.ends_with("-j ACCEPT") {
-            continue;
-        }
-        let tokens: Vec<&str> = t.split_whitespace().collect();
-        let udp = tokens
-            .windows(2)
-            .any(|w| (w[0] == "-p" || w[0] == "--protocol") && w[1] == "udp");
-        // `!` inverts the match that follows it, which flips the rule's meaning entirely.
-        if !udp || tokens.contains(&"!") {
-            continue;
-        }
-        for (n, tok) in tokens.iter().enumerate() {
-            let specs = match *tok {
-                "--dport" | "--destination-port" | "--dports" => *tokens.get(n + 1).unwrap_or(&""),
-                _ => continue,
-            };
-            for spec in specs.split(',') {
-                if let Some((lo, hi)) = parse_port_interval(spec, ':') {
-                    out.push(UdpAccept {
-                        lo,
-                        hi,
-                        rule: t.to_string(),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-/// What `nft list ruleset` said. A ruleset with no input hook chain is NOT the same answer as
-/// nft never running: both once collapsed to `None` and rendered as `Unknown`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NftSignal {
-    Policy {
-        policy: String,
-        media_allow: MediaAllow,
-    },
-    NoInputChain,
-}
-
-/// Detail text for [`NftSignal::NoInputChain`]; reaches the operator inside the check summary.
-const NFT_NO_INPUT_CHAIN_DETAIL: &str = "nft answered: no input hook chain in the ruleset";
-
-/// The pure decision. Trust order: firewalld's zone target, then nft, then iptables INPUT
-/// policy — except that nft reporting no input chain yields to an iptables reading that IS
-/// filtering (both front-ends program the same netfilter). Takes already-parsed signals so
-/// it needs no exec and no filesystem to test.
-fn combine_firewall_signals(
-    firewalld: Option<(&str, MediaAllow)>,
-    nft: Option<NftSignal>,
-    iptables: Option<(&str, MediaAllow)>,
-) -> FirewallPosture {
-    if let Some((target, media_allow)) = firewalld {
-        return if firewalld_target_is_filtering(target) {
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Firewalld,
-                detail: format!("firewalld zone target={target}"),
-                media_allow,
-            }
-        } else {
-            FirewallPosture::Open
-        };
-    }
-    let iptables_filtering = matches!(&iptables, Some((policy, _)) if policy_is_filtering(policy));
-    match nft {
-        Some(NftSignal::Policy {
-            policy,
-            media_allow,
-        }) => {
-            return if policy_is_filtering(&policy) {
-                FirewallPosture::Filtering {
-                    tool: FirewallTool::Nftables,
-                    detail: format!("nftables input policy={policy}"),
-                    media_allow,
-                }
-            } else {
-                FirewallPosture::Open
-            };
-        }
-        // Both front-ends program the same netfilter, so a filtering iptables INPUT policy is
-        // the more specific reading of the same host and keeps its usual turn below.
-        Some(NftSignal::NoInputChain) if !iptables_filtering => {
-            return FirewallPosture::Unfiltered {
-                tool: FirewallTool::Nftables,
-                detail: NFT_NO_INPUT_CHAIN_DETAIL.to_string(),
-            };
-        }
-        _ => {}
-    }
-    if let Some((policy, media_allow)) = iptables {
-        return if policy_is_filtering(policy) {
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Iptables,
-                detail: format!("iptables INPUT policy={policy}"),
-                media_allow,
-            }
-        } else {
-            FirewallPosture::Open
-        };
-    }
-    FirewallPosture::Unknown
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -2482,18 +2002,22 @@ mod tests {
                 nvidia_lib32_path: lib32.to_string(),
                 nvidia_volume: VolumeView::None,
                 driver_mount_error: None,
-                container_mount_error: None,
-                sibling_egl: crate::nvidia_volume::EglRuntime::Unknown,
+                container_mounts: MountObservation::Agree,
                 // `Unknown` means "not probed" and must never influence a verdict on its own.
                 egl_runtime: crate::nvidia_volume::EglRuntime::Unknown,
-                firewall: FirewallPosture::Unknown,
-                updater: platform_update::UpdaterView::default(),
-                updater_present: None,
+                media: None,
+                recovery_actor: None,
                 health: platform_update::HealthOwner::default(),
                 self_identity: platform_update::HealthIdentity {
                     node: "test".to_string(),
                     pid: 1,
                 },
+                owner_conflicts: None,
+                storage: storage::StorageView::default(),
+                runtime: runtime_facts::RuntimeView::NotObserved,
+                gpus: Vec::new(),
+                nvidia_runtime: false,
+                console: console::ConsoleView::default(),
             }
         }
 
@@ -2501,13 +2025,6 @@ mod tests {
             ProbeEnv {
                 nvidia_volume: volume,
                 ..self.env(true, "")
-            }
-        }
-
-        fn env_firewall(&self, posture: FirewallPosture) -> ProbeEnv {
-            ProbeEnv {
-                firewall: posture,
-                ..self.env(false, "")
             }
         }
     }
@@ -2535,77 +2052,23 @@ mod tests {
     #[test]
     fn wrong_mount_source_is_not_treated_as_a_valid_app_path() {
         let paths = vec!["/run/quasar-agent".to_string()];
-        let good = serde_json::json!({"Type":"bind", "Source":"/run/quasar-agent", "Destination":"/run/quasar-agent", "RW":true});
+        let good = crate::runtime::Mount {
+            kind: crate::runtime::MountKind::Bind,
+            source: Some(crate::runtime::DaemonHostPath("/run/quasar-agent".into())),
+            name: None,
+            destination: "/run/quasar-agent".into(),
+            read_only: Some(false),
+        };
         assert!(validate_sibling_mounts(std::slice::from_ref(&good), &paths).is_none());
         let mut wrong = good.clone();
-        wrong["Source"] = serde_json::json!("/some/other/directory");
+        wrong.source = Some(crate::runtime::DaemonHostPath(
+            "/some/other/directory".into(),
+        ));
         assert!(validate_sibling_mounts(&[wrong], &paths).is_some());
         let mut readonly = good;
-        readonly["RW"] = serde_json::json!(false);
+        readonly.read_only = Some(true);
         assert!(validate_sibling_mounts(&[readonly], &paths).is_some());
         assert!(validate_sibling_mounts(&[], &paths).is_some());
-    }
-
-    /// A healthy NVIDIA host: every applicable check passes.
-    #[test]
-    fn healthy_nvidia_host_passes_every_check() {
-        let root = FakeRoot::new("healthy");
-        root.file("usr/share/glvnd/egl_vendor.d/10_nvidia.json", "{}")
-            .file("usr/lib64/libnvidia-eglcore.so.610.57.04", "")
-            .file("dev/dri/renderD128", "")
-            .file("dev/uinput", "")
-            .file("dev/kmsg", "")
-            .file("proc/sys/user/max_user_namespaces", "15000\n")
-            .file("sys/class/drm/renderD128/device/vendor", "0x10de\n")
-            .file("sys/class/drm/renderD128/device/device", "0x2b85\n")
-            .file("sys/module/nvidia/version", "610.57.04\n")
-            .file(
-                &format!("{NVIDIA_VOLUME_REL}/manifest.json"),
-                r#"{"driver_version":"610.57.04"}"#,
-            )
-            // A fully set-up host now includes the app-container AppArmor profile; without
-            // these two the check correctly reports `skip` and this loop rejects it.
-            .file("sys/module/apparmor/parameters/enabled", "Y\n")
-            .file(
-                "host/sys/kernel/security/apparmor/profiles",
-                "docker-default (enforce)\nquasar-app (enforce)\n",
-            )
-            .file("etc/os-release", "ID=fedora\nVERSION_ID=42\n");
-        // Explicit: the default `Unknown` would `skip`, not `pass`.
-        let checks = probe(&ProbeEnv {
-            firewall: FirewallPosture::Open,
-            ..root.env(true, "/usr/lib")
-        });
-        for c in &checks {
-            if matches!(c.id.as_str(), "nvidia_driver_mount" | "nvidia_sibling_egl") {
-                assert_eq!(
-                    c.status, SKIP,
-                    "native host needs no provisioned driver mount"
-                );
-                continue;
-            }
-            // The update-path checks read the fixture's empty collectors as not
-            // applicable (no updater service, health endpoint unprobed).
-            if matches!(
-                c.id.as_str(),
-                "updater_socket"
-                    | "updater_stack_dir"
-                    | "updater_overlays"
-                    | "health_addr_bindable"
-            ) {
-                assert_eq!(
-                    c.status, SKIP,
-                    "check {} should be not applicable here: {:?}",
-                    c.id, c
-                );
-                continue;
-            }
-            assert_eq!(c.status, PASS, "check {} should pass: {:?}", c.id, c);
-            assert!(
-                c.remediation.is_empty(),
-                "a passing check must carry no remediation: {c:?}"
-            );
-        }
     }
 
     /// A CUDA-only driver install (#462): EGL json, eglcore and 32-bit GL all missing, each
@@ -3406,7 +2869,11 @@ mod tests {
         for c in &checks {
             assert!(!c.id.is_empty() && !c.summary.is_empty(), "{c:?}");
             assert!(
-                matches!(c.status.as_str(), PASS | FAIL | SKIP | PROVISIONING | WARN),
+                // UNKNOWN: media_reachability before any session (amendment 17).
+                matches!(
+                    c.status.as_str(),
+                    PASS | FAIL | SKIP | PROVISIONING | WARN | UNKNOWN
+                ),
                 "unknown status: {c:?}"
             );
         }
@@ -3690,6 +3157,9 @@ mod tests {
             status: status.to_string(),
             summary: format!("{id} is {status}"),
             remediation: format!("fix {id}"),
+            observed_at: None,
+            source: None,
+            blocks: None,
         }
     }
 
@@ -3908,980 +3378,108 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_firewalld_zone_target_reads_the_target_line() {
-        let list_all = "FedoraServer (active)\n  target: default\n  icmp-block-inversion: no\n  \
-                         interfaces: eth0\n  sources:\n  services: cockpit dhcpv6-client ssh\n";
-        assert_eq!(
-            parse_firewalld_zone_target(list_all),
-            Some("default".to_string())
-        );
+    // ── RH-07 #403: media reachability from real traffic ─────────────────────────
 
-        let accept_zone = "trusted (active)\n  target: ACCEPT\n  services:\n";
-        assert_eq!(
-            parse_firewalld_zone_target(accept_zone),
-            Some("ACCEPT".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_firewalld_zone_target_absent_line_is_none() {
-        assert_eq!(parse_firewalld_zone_target("no target line here\n"), None);
-        assert_eq!(parse_firewalld_zone_target(""), None);
-    }
-
-    #[test]
-    fn firewalld_target_is_filtering_only_rejects_accept() {
-        assert!(!firewalld_target_is_filtering("ACCEPT"));
-        assert!(!firewalld_target_is_filtering("accept"), "case-insensitive");
-        assert!(firewalld_target_is_filtering("default"));
-        assert!(firewalld_target_is_filtering("DROP"));
-        assert!(firewalld_target_is_filtering("REJECT"));
-        assert!(firewalld_target_is_filtering("%%REJECT%%"));
-    }
-
-    #[test]
-    fn parse_nft_input_policy_finds_the_input_hook_line() {
-        let ruleset = "table inet filter {\n\tchain input {\n\t\ttype filter hook input \
-                        priority filter; policy drop;\n\t\tct state established,related accept\n\
-                        \t}\n\tchain forward {\n\t\ttype filter hook forward priority filter; \
-                        policy accept;\n\t}\n}\n";
-        assert_eq!(parse_nft_input_policy(ruleset), Some("drop".to_string()));
-    }
-
-    #[test]
-    fn parse_nft_input_policy_ignores_non_input_hooks() {
-        let ruleset = "table inet filter {\n\tchain forward {\n\t\ttype filter hook forward \
-                        priority filter; policy drop;\n\t}\n}\n";
-        assert_eq!(
-            parse_nft_input_policy(ruleset),
-            None,
-            "a DROP forward policy must not be read as an input policy"
-        );
-    }
-
-    #[test]
-    fn parse_nft_input_policy_accepts_accept_and_missing_ruleset() {
-        let accept = "table inet filter {\n\tchain input {\n\t\ttype filter hook input \
-                       priority filter; policy accept;\n\t}\n}\n";
-        assert_eq!(parse_nft_input_policy(accept), Some("accept".to_string()));
-        assert_eq!(parse_nft_input_policy(""), None);
-    }
-
-    /// The real firewalld-nftables shape (stock FedoraServer zone, target=default): declares
-    /// `policy accept;` yet enforces via a trailing catch-all `reject`. `ct state invalid drop`
-    /// is a decoy — conditional, and the sibling `_open` test keeps it without the catch-all.
-    #[test]
-    fn parse_nft_input_policy_detects_firewalld_nftables_catchall_reject() {
-        let ruleset = "table inet firewalld {\n\
-             \tchain filter_INPUT {\n\
-             \t\ttype filter hook input priority filter + 10; policy accept;\n\
-             \t\tct state { established, related } accept\n\
-             \t\tct status dnat accept\n\
-             \t\tiifname \"lo\" accept\n\
-             \t\tct state invalid drop\n\
-             \t\tjump filter_INPUT_POLICIES\n\
-             \t\treject with icmpx admin-prohibited\n\
-             \t}\n\
-             }\n";
-        assert_eq!(
-            parse_nft_input_policy(ruleset),
-            Some("reject".to_string()),
-            "a declared-accept base chain with a trailing unconditional reject must read as \
-             filtering, not Open — this is the firewalld-nftables backend shape"
-        );
-        assert!(policy_is_filtering("reject"));
-    }
-
-    /// Same shape, zone target=ACCEPT: no trailing catch-all. The conditional `ct state invalid
-    /// drop` that every zone carries must not be mistaken for one.
-    #[test]
-    fn parse_nft_input_policy_firewalld_nftables_open_zone_reads_accept() {
-        let ruleset = "table inet firewalld {\n\
-             \tchain filter_INPUT {\n\
-             \t\ttype filter hook input priority filter + 10; policy accept;\n\
-             \t\tct state { established, related } accept\n\
-             \t\tct status dnat accept\n\
-             \t\tiifname \"lo\" accept\n\
-             \t\tct state invalid drop\n\
-             \t\tjump filter_INPUT_POLICIES\n\
-             \t}\n\
-             }\n";
-        assert_eq!(parse_nft_input_policy(ruleset), Some("accept".to_string()));
-    }
-
-    /// A hand-configured chain policy of `drop` wins: the declared signal is checked first.
-    #[test]
-    fn parse_nft_input_policy_explicit_drop_policy_still_wins() {
-        let ruleset = "table inet filter {\n\tchain input {\n\t\ttype filter hook input \
-                        priority 0; policy drop;\n\t}\n}\n";
-        assert_eq!(parse_nft_input_policy(ruleset), Some("drop".to_string()));
-    }
-
-    /// What `nft list ruleset` prints on a host with no host firewall of its own: only Docker's
-    /// iptables-nft tables, so a `hook forward` chain with `policy drop` and no input hook.
-    const DOCKER_ONLY_RULESET: &str = r#"# Warning: table ip nat is managed by iptables-nft, do not touch!
-table ip nat {
-	chain DOCKER {
-		iifname "docker0" counter packets 0 bytes 0 return
-	}
-
-	chain POSTROUTING {
-		type nat hook postrouting priority srcnat; policy accept;
-		oifname != "docker0" ip saddr 192.0.2.0/24 counter packets 0 bytes 0 masquerade
-	}
-
-	chain PREROUTING {
-		type nat hook prerouting priority dstnat; policy accept;
-		fib daddr type local counter packets 0 bytes 0 jump DOCKER
-	}
-}
-# Warning: table ip filter is managed by iptables-nft, do not touch!
-table ip filter {
-	chain DOCKER {
-	}
-
-	chain DOCKER-ISOLATION-STAGE-1 {
-		counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-2
-	}
-
-	chain DOCKER-ISOLATION-STAGE-2 {
-		counter packets 0 bytes 0 return
-	}
-
-	chain DOCKER-USER {
-	}
-
-	chain FORWARD {
-		type filter hook forward priority filter; policy drop;
-		counter packets 0 bytes 0 jump DOCKER-USER
-		counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-1
-		oifname "docker0" ct state related,established counter packets 0 bytes 0 accept
-		iifname "docker0" oifname != "docker0" counter packets 0 bytes 0 accept
-	}
-}
-# Warning: table ip6 nat is managed by iptables-nft, do not touch!
-table ip6 nat {
-	chain POSTROUTING {
-		type nat hook postrouting priority srcnat; policy accept;
-	}
-}
-# Warning: table ip6 filter is managed by iptables-nft, do not touch!
-table ip6 filter {
-	chain FORWARD {
-		type filter hook forward priority filter; policy drop;
-	}
-}
-# Warning: table ip raw is managed by iptables-nft, do not touch!
-table ip raw {
-	chain PREROUTING {
-		type filter hook prerouting priority raw; policy accept;
-	}
-}
-"#;
-
-    /// A ruleset that answered and filters nothing inbound is a positive finding, not the
-    /// `None` of a tool that never ran.
-    #[test]
-    fn parse_nft_input_policy_docker_only_ruleset_has_no_input_chain() {
-        // An empty answer is the same finding: nothing hooks input.
-        assert!(!nft_has_input_base_chain(""));
-        assert!(
-            !nft_has_input_base_chain(DOCKER_ONLY_RULESET),
-            "Docker programs nat/filter/raw with no input hook — nothing filters inbound"
-        );
-        assert_eq!(
-            parse_nft_input_policy(DOCKER_ONLY_RULESET),
-            None,
-            "a DROP forward policy must not be read as an input policy"
-        );
-    }
-
-    #[test]
-    fn parse_iptables_input_policy_reads_the_dash_p_line() {
-        let out = "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-A INPUT -i lo -j ACCEPT\n";
-        assert_eq!(parse_iptables_input_policy(out), Some("drop".to_string()));
-        let out_accept = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
-        assert_eq!(
-            parse_iptables_input_policy(out_accept),
-            Some("accept".to_string())
-        );
-        assert_eq!(parse_iptables_input_policy(""), None);
-    }
-
-    #[test]
-    fn policy_is_filtering_only_rejects_accept() {
-        assert!(!policy_is_filtering("accept"));
-        assert!(policy_is_filtering("drop"));
-        assert!(policy_is_filtering("reject"));
-    }
-
-    /// An nft signal carrying a policy word, with no accept rules read.
-    fn nft_policy(policy: &str) -> NftSignal {
-        NftSignal::Policy {
-            policy: policy.to_string(),
-            media_allow: MediaAllow::Absent,
-        }
-    }
-
-    /// Trust order: firewalld beats nft beats iptables beats no signal.
-    #[test]
-    fn combine_firewall_signals_trust_order_and_verdicts() {
-        // No signal anywhere -> Unknown, never treated as a finding.
-        assert_eq!(
-            combine_firewall_signals(None, None, None),
-            FirewallPosture::Unknown
-        );
-
-        // firewalld alone, filtering.
-        assert_eq!(
-            combine_firewall_signals(Some(("default", MediaAllow::Absent)), None, None),
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Firewalld,
-                detail: "firewalld zone target=default".to_string(),
-                media_allow: MediaAllow::Absent,
-            }
-        );
-        // firewalld alone, open.
-        assert_eq!(
-            combine_firewall_signals(Some(("ACCEPT", MediaAllow::Absent)), None, None),
-            FirewallPosture::Open
-        );
-
-        // nft fallback used only when firewalld has no answer.
-        assert_eq!(
-            combine_firewall_signals(None, Some(nft_policy("drop")), None),
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Nftables,
-                detail: "nftables input policy=drop".to_string(),
-                media_allow: MediaAllow::Absent,
-            }
-        );
-        assert_eq!(
-            combine_firewall_signals(None, Some(nft_policy("accept")), None),
-            FirewallPosture::Open
-        );
-
-        // iptables fallback used only when neither of the above answered.
-        assert_eq!(
-            combine_firewall_signals(None, None, Some(("drop", MediaAllow::Absent))),
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Iptables,
-                detail: "iptables INPUT policy=drop".to_string(),
-                media_allow: MediaAllow::Absent,
-            }
-        );
-        assert_eq!(
-            combine_firewall_signals(None, None, Some(("accept", MediaAllow::Absent))),
-            FirewallPosture::Open
-        );
-
-        // firewalld wins over a conflicting nft/iptables signal.
-        assert_eq!(
-            combine_firewall_signals(
-                Some(("ACCEPT", MediaAllow::Absent)),
-                Some(nft_policy("drop")),
-                Some(("drop", MediaAllow::Absent)),
-            ),
-            FirewallPosture::Open
-        );
-        // nft wins over iptables when firewalld is silent.
-        assert_eq!(
-            combine_firewall_signals(
-                None,
-                Some(nft_policy("accept")),
-                Some(("drop", MediaAllow::Absent)),
-            ),
-            FirewallPosture::Open
-        );
-    }
-
-    /// "nft answered, this host has no input-filtering chain" is a verdict of its own; only a
-    /// tool that answered with a FILTERING policy outranks it.
-    #[test]
-    fn combine_firewall_signals_nft_no_input_chain_is_unfiltered() {
-        let unfiltered = FirewallPosture::Unfiltered {
-            tool: FirewallTool::Nftables,
-            detail: NFT_NO_INPUT_CHAIN_DETAIL.to_string(),
-        };
-        assert_eq!(
-            combine_firewall_signals(None, Some(NftSignal::NoInputChain), None),
-            unfiltered
-        );
-
-        assert_eq!(
-            combine_firewall_signals(
-                Some(("default", MediaAllow::Absent)),
-                Some(NftSignal::NoInputChain),
-                None,
-            ),
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Firewalld,
-                detail: "firewalld zone target=default".to_string(),
-                media_allow: MediaAllow::Absent,
-            },
-            "firewalld's zone target still wins the trust order"
-        );
-
-        assert_eq!(
-            combine_firewall_signals(
-                None,
-                Some(NftSignal::NoInputChain),
-                Some(("drop", MediaAllow::Absent)),
-            ),
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Iptables,
-                detail: "iptables INPUT policy=drop".to_string(),
-                media_allow: MediaAllow::Absent,
-            },
-            "both front-ends program the same netfilter: a filtering INPUT policy is the more \
-             specific reading"
-        );
-
-        assert_eq!(
-            combine_firewall_signals(
-                None,
-                Some(NftSignal::NoInputChain),
-                Some(("accept", MediaAllow::Absent)),
-            ),
-            unfiltered
-        );
-    }
-
-    /// A missing or failing detection binary must never crash the probe, and never surface as
-    /// anything but `Unknown`.
-    #[test]
-    fn run_with_timeout_absent_binary_is_none_not_a_panic() {
-        let out = run_with_timeout("quasar-definitely-not-a-real-binary-xyz123", &["--state"]);
-        assert_eq!(out, None);
-    }
-
-    #[test]
-    fn run_with_timeout_nonzero_exit_is_none() {
-        // `false` exits 1 on every POSIX system this agent ships on.
-        let out = run_with_timeout("false", &[]);
-        assert_eq!(out, None);
-    }
-
-    #[test]
-    fn run_with_timeout_captures_stdout_on_success() {
-        let out = run_with_timeout("echo", &["hello"]);
-        assert_eq!(out.as_deref(), Some("hello\n"));
-    }
-
-    #[test]
-    fn check_media_reachability_unknown_is_skip_never_a_warning() {
-        let root = FakeRoot::new("firewall-unknown");
-        let env = root.env_firewall(FirewallPosture::Unknown);
-        let c = check_media_reachability(&env, Distro::Fedora);
-        assert_eq!(c.status, SKIP);
-        assert_eq!(
-            c.summary,
-            "could not determine whether a host firewall would block WebRTC media — no \
-             firewalld or nft client tool answered from inside the agent container (nft is in \
-             the image and needs CAP_NET_ADMIN, which the compose file grants)"
-        );
-        assert!(c.remediation.is_empty());
-    }
-
-    /// A host whose ruleset filters nothing inbound is the best possible answer for the media
-    /// path — a pass, never the "not applicable" bucket a `skip` lands in.
-    #[test]
-    fn check_media_reachability_unfiltered_is_pass_with_the_positive_summary() {
-        let root = FakeRoot::new("firewall-unfiltered");
-        let env = root.env_firewall(FirewallPosture::Unfiltered {
-            tool: FirewallTool::Nftables,
-            detail: NFT_NO_INPUT_CHAIN_DETAIL.to_string(),
-        });
-        let c = check_media_reachability(&env, Distro::Debian);
-        assert_eq!(c.status, PASS);
-        assert_eq!(
-            c.summary,
-            "no host firewall filters inbound traffic (nft answered: no input hook chain in the \
-             ruleset) — nothing here would block WebRTC media"
-        );
-        assert!(c.remediation.is_empty());
-    }
-
-    #[test]
-    fn check_media_reachability_open_is_pass() {
-        let root = FakeRoot::new("firewall-open");
-        let env = root.env_firewall(FirewallPosture::Open);
-        let c = check_media_reachability(&env, Distro::Fedora);
-        assert_eq!(c.status, PASS);
-        assert!(c.remediation.is_empty());
-    }
-
-    /// A filtering firewall is `warn` with the symptom and a real command, NEVER `fail` — a
-    /// correct allow rule is fine and this check cannot tell.
-    #[test]
-    fn check_media_reachability_filtering_is_warn_with_remediation() {
-        let root = FakeRoot::new("firewall-filtering");
-        let env = root.env_firewall(FirewallPosture::Filtering {
-            tool: FirewallTool::Firewalld,
-            detail: "firewalld zone target=default".to_string(),
-            media_allow: MediaAllow::Absent,
-        });
-        let c = check_media_reachability(&env, Distro::Fedora);
-        assert_eq!(c.status, WARN);
-        assert_ne!(
-            c.status, FAIL,
-            "a filtering firewall must never hard-fail (#483)"
-        );
-        assert!(c.summary.contains("WebRTC transport never established"));
-        assert!(c.remediation.contains("firewall-cmd"));
-        assert!(
-            c.remediation.contains("mdns"),
-            "mDNS must be part of the fix too"
-        );
-    }
-
-    #[test]
-    fn check_media_reachability_remediation_uses_probed_port_range() {
-        let root = FakeRoot::new("firewall-portrange");
-        root.file("proc/sys/net/ipv4/ip_local_port_range", "40000\t45000\n");
-        let env = ProbeEnv {
-            firewall: FirewallPosture::Filtering {
-                tool: FirewallTool::Nftables,
-                detail: "nftables input policy=drop".to_string(),
-                media_allow: MediaAllow::Absent,
-            },
+    fn media_env(
+        root: &FakeRoot,
+        media: Option<crate::session::media_evidence::Evidence>,
+    ) -> ProbeEnv {
+        ProbeEnv {
+            media,
             ..root.env(false, "")
-        };
-        let c = check_media_reachability(&env, Distro::Debian);
-        assert_eq!(c.status, WARN);
-        assert!(
-            c.remediation.contains("40000-45000"),
-            "remediation must use the host's real port range, not the hardcoded default: {}",
-            c.remediation
-        );
-    }
-
-    #[test]
-    fn check_media_reachability_remediation_falls_back_when_port_range_unreadable() {
-        let root = FakeRoot::new("firewall-portrange-missing");
-        let env = ProbeEnv {
-            firewall: FirewallPosture::Filtering {
-                tool: FirewallTool::Iptables,
-                detail: "iptables INPUT policy=drop".to_string(),
-                media_allow: MediaAllow::Absent,
-            },
-            ..root.env(false, "")
-        };
-        let c = check_media_reachability(&env, Distro::Unknown);
-        assert!(
-            c.remediation.contains("32768-60999"),
-            "must fall back to the documented kernel default: {}",
-            c.remediation
-        );
-    }
-
-    /// Remediation keys on the TOOL, not the distro: firewalld on Debian still gets the
-    /// firewall-cmd/rich-rule command.
-    #[test]
-    fn check_media_reachability_firewalld_detected_on_debian_gets_rich_rule_text() {
-        let root = FakeRoot::new("firewall-firewalld-on-debian");
-        let env = root.env_firewall(FirewallPosture::Filtering {
-            tool: FirewallTool::Firewalld,
-            detail: "firewalld zone target=default".to_string(),
-            media_allow: MediaAllow::Absent,
-        });
-        let c = check_media_reachability(&env, Distro::Debian);
-        assert_eq!(c.status, WARN);
-        assert!(
-            c.remediation.contains("firewall-cmd") && c.remediation.contains("rich-rule"),
-            "firewalld was detected, so the command block must be firewall-cmd/rich-rule \
-             regardless of distro: {}",
-            c.remediation
-        );
-        assert!(
-            !c.remediation.contains("ufw"),
-            "must not hand a Debian host the old distro-keyed ufw text when firewalld actually \
-             answered: {}",
-            c.remediation
-        );
-    }
-
-    /// The inverse: nftables on Fedora gets the raw-nftables command, not the
-    /// FedoraServer-zone prose, which is gated on firewalld having answered.
-    #[test]
-    fn check_media_reachability_nftables_detected_on_fedora_gets_nft_text_not_zone_prose() {
-        let root = FakeRoot::new("firewall-nftables-on-fedora");
-        let env = root.env_firewall(FirewallPosture::Filtering {
-            tool: FirewallTool::Nftables,
-            detail: "nftables input policy=drop".to_string(),
-            media_allow: MediaAllow::Absent,
-        });
-        let c = check_media_reachability(&env, Distro::Fedora);
-        assert_eq!(c.status, WARN);
-        assert!(
-            c.remediation.contains("nft list ruleset")
-                && c.remediation.contains("base input chain"),
-            "nftables was detected, so the command block must be the raw-nftables text: {}",
-            c.remediation
-        );
-        assert!(
-            !c.remediation.contains("firewall-cmd") && !c.remediation.contains("FedoraServer"),
-            "must not hand a raw-nftables host the firewalld/FedoraServer-zone prose just \
-             because the distro is Fedora — that sentence is gated on firewalld actually \
-             answering: {}",
-            c.remediation
-        );
-    }
-
-    // ── (#67) media reachability: the accept rules, not just the chain policy ───
-    //
-    // A filtering posture WITH the documented scoped accepts in place is the correct
-    // configuration; warning about it forever is how an operator learns to ignore the one
-    // check that catches "video never arrives". The nft/firewalld fixtures below are the real
-    // (2026-09-01) devbox output — Fedora, firewalld on the nftables backend.
-
-    /// The media window these fixtures are judged against (the devbox's own
-    /// `ip_local_port_range`, and the Linux default).
-    const MEDIA: (u32, u32) = (32768, 60999);
-
-    /// firewalld's nftables backend with `deploy/README.md`'s rules applied: the mdns service
-    /// plus the LAN-scoped media rich rule, both rendered into the zone's allow chain. The
-    /// base input chain still ends in the catch-all reject, so the posture stays `Filtering`.
-    const NFT_FIREWALLD_MEDIA_ALLOWED: &str = concat!(
-        "table inet firewalld {\n",
-        "\tchain filter_INPUT {\n",
-        "\t\ttype filter hook input priority filter + 10; policy accept;\n",
-        "\t\tct state { established, related } accept\n",
-        "\t\tct status dnat accept\n",
-        "\t\tiifname \"lo\" accept\n",
-        "\t\tct state invalid drop\n",
-        "\t\tjump filter_INPUT_POLICIES\n",
-        "\t\treject with icmpx admin-prohibited\n",
-        "\t}\n",
-        "\tchain filter_IN_FedoraServer_allow {\n",
-        "\t\ttcp dport 22 accept\n",
-        "\t\tip6 daddr fe80::/64 udp dport 546 accept\n",
-        "\t\ttcp dport 9090 accept\n",
-        "\t\tip daddr 224.0.0.251 udp dport 5353 accept\n",
-        "\t\tip6 daddr ff02::fb udp dport 5353 accept\n",
-        "\t\tip saddr 192.0.2.0/24 udp dport 32768-60999 accept\n",
-        "\t}\n",
-        "}\n",
-    );
-
-    /// The same host before the media rules: stock FedoraServer zone, ssh/cockpit/dhcpv6 only.
-    /// This is the true positive the check exists to catch.
-    const NFT_FIREWALLD_NO_MEDIA: &str = concat!(
-        "table inet firewalld {\n",
-        "\tchain filter_INPUT {\n",
-        "\t\ttype filter hook input priority filter + 10; policy accept;\n",
-        "\t\tct state { established, related } accept\n",
-        "\t\tjump filter_INPUT_POLICIES\n",
-        "\t\treject with icmpx admin-prohibited\n",
-        "\t}\n",
-        "\tchain filter_IN_FedoraServer_allow {\n",
-        "\t\ttcp dport 22 accept\n",
-        "\t\tip6 daddr fe80::/64 udp dport 546 accept\n",
-        "\t\ttcp dport 9090 accept\n",
-        "\t}\n",
-        "}\n",
-    );
-
-    /// The devbox's `firewall-cmd --zone=FedoraServer --list-all`, verbatim in shape.
-    const FIREWALLD_LIST_ALL_MEDIA_ALLOWED: &str = concat!(
-        "FedoraServer (default, active)\n",
-        "  target: default\n",
-        "  interfaces: enp1s0\n",
-        "  sources:\n",
-        "  services: cockpit dhcpv6-client mdns ssh\n",
-        "  ports:\n",
-        "  protocols:\n",
-        "  rich rules:\n",
-        "\trule family=\"ipv4\" source address=\"192.0.2.0/24\" port port=\"32768-60999\" \
-         protocol=\"udp\" accept\n",
-    );
-
-    /// #67: the exact gpu-test host configuration — filtering posture, documented rules
-    /// present —
-    /// must read as covered, not as a finding.
-    #[test]
-    fn nft_media_allow_sees_the_documented_scoped_accepts() {
-        match nft_media_allow(NFT_FIREWALLD_MEDIA_ALLOWED, MEDIA) {
-            MediaAllow::Covered { evidence } => {
-                assert!(evidence.contains("32768-60999"), "{evidence}");
-                assert!(evidence.contains("5353"), "{evidence}");
-                assert!(
-                    evidence.contains("192.0.2.0/24"),
-                    "the rule's source scope must survive into the evidence — a rule scoped to \
-                     the wrong subnet is the one thing this cannot judge, so the operator has \
-                     to be able to read it: {evidence}"
-                );
-            }
-            other => panic!("the documented rules must read as covered, got {other:?}"),
         }
     }
 
-    #[test]
-    fn nft_media_allow_stock_zone_with_no_media_rules_is_absent() {
-        assert_eq!(
-            nft_media_allow(NFT_FIREWALLD_NO_MEDIA, MEDIA),
-            MediaAllow::Absent
-        );
-        assert_eq!(nft_media_allow("", MEDIA), MediaAllow::Absent);
+    fn at() -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000)
     }
 
-    /// Half a configuration is its own finding: mDNS open, media range still closed.
+    /// Before any session: `unknown`, never `warn`, never blocks (amendment 17).
     #[test]
-    fn nft_media_allow_mdns_only_is_partial_naming_the_media_range_as_the_gap() {
-        let ruleset = concat!(
-            "table inet firewalld {\n",
-            "\tchain filter_IN_FedoraServer_allow {\n",
-            "\t\tip daddr 224.0.0.251 udp dport 5353 accept\n",
-            "\t}\n",
-            "}\n",
-        );
-        match nft_media_allow(ruleset, MEDIA) {
-            MediaAllow::Partial { gap, evidence } => {
-                assert!(
-                    gap.contains("32768-60999"),
-                    "the gap must name what is missing: {gap}"
-                );
-                assert!(evidence.contains("5353"), "{evidence}");
-            }
-            other => panic!("mDNS-only must be partial, got {other:?}"),
-        }
+    fn media_reachability_is_unknown_until_a_session_answers_it() {
+        let root = FakeRoot::new("media-unknown");
+        let c = check_media_reachability(&media_env(&root, None), Distro::Fedora);
+        assert_eq!(c.status, UNKNOWN, "{c:?}");
+        assert!(c.blocks.is_none() && c.remediation.is_empty(), "{c:?}");
+        assert_eq!(c.source.as_deref(), Some("runtime"));
     }
 
-    /// The mirror case: media range open, mDNS closed.
+    /// A remote peer reached the host: pass, stamped with when, and never claiming the
+    /// whole port range is open.
     #[test]
-    fn nft_media_allow_media_range_without_mdns_is_partial() {
-        let ruleset = concat!(
-            "table inet filter {\n",
-            "\tchain input {\n",
-            "\t\ttype filter hook input priority 0; policy drop;\n",
-            "\t\tudp dport 32768-60999 accept\n",
-            "\t}\n",
-            "}\n",
-        );
-        match nft_media_allow(ruleset, MEDIA) {
-            MediaAllow::Partial { gap, .. } => {
-                assert!(gap.contains("5353"), "the gap must name mDNS: {gap}");
-            }
-            other => panic!("no-mDNS must be partial, got {other:?}"),
-        }
-    }
-
-    /// An accept in an output/forward base chain says nothing about inbound media.
-    #[test]
-    fn nft_media_allow_ignores_accepts_in_non_input_base_chains() {
-        let ruleset = concat!(
-            "table inet filter {\n",
-            "\tchain input {\n",
-            "\t\ttype filter hook input priority 0; policy drop;\n",
-            "\t}\n",
-            "\tchain output {\n",
-            "\t\ttype filter hook output priority 0; policy accept;\n",
-            "\t\tudp dport 32768-60999 accept\n",
-            "\t\tudp dport 5353 accept\n",
-            "\t}\n",
-            "\tchain forward {\n",
-            "\t\ttype filter hook forward priority 0; policy drop;\n",
-            "\t\tudp dport 32768-60999 accept\n",
-            "\t}\n",
-            "}\n",
-        );
-        assert_eq!(
-            nft_media_allow(ruleset, MEDIA),
-            MediaAllow::Absent,
-            "outbound and forwarded traffic are a different question"
-        );
-    }
-
-    /// Coverage is judged on the UNION: two adjacent rules cover the range one alone does not.
-    #[test]
-    fn nft_media_allow_unions_adjacent_ranges() {
-        let ruleset = concat!(
-            "table inet filter {\n",
-            "\tchain input {\n",
-            "\t\ttype filter hook input priority 0; policy drop;\n",
-            "\t\tudp dport 32768-45000 accept\n",
-            "\t\tudp dport 45001-60999 accept\n",
-            "\t\tudp dport 5353 accept\n",
-            "\t}\n",
-            "}\n",
-        );
-        assert!(matches!(
-            nft_media_allow(ruleset, MEDIA),
-            MediaAllow::Covered { .. }
-        ));
-    }
-
-    /// A rule opening only part of the window leaves most sessions broken — partial, not covered.
-    #[test]
-    fn nft_media_allow_subrange_of_the_media_window_is_partial() {
-        let ruleset = concat!(
-            "table inet filter {\n",
-            "\tchain input {\n",
-            "\t\ttype filter hook input priority 0; policy drop;\n",
-            "\t\tudp dport 40000-41000 accept\n",
-            "\t\tudp dport 5353 accept\n",
-            "\t}\n",
-            "}\n",
-        );
-        match nft_media_allow(ruleset, MEDIA) {
-            MediaAllow::Partial { gap, .. } => assert!(gap.contains("32768-60999"), "{gap}"),
-            other => panic!("a subrange must not read as covered, got {other:?}"),
-        }
-    }
-
-    /// nft prints multi-port rules as an inline set.
-    #[test]
-    fn nft_media_allow_reads_inline_port_sets() {
-        let ruleset = concat!(
-            "table inet filter {\n",
-            "\tchain input {\n",
-            "\t\ttype filter hook input priority 0; policy drop;\n",
-            "\t\tudp dport { 5353, 32768-60999 } accept\n",
-            "\t}\n",
-            "}\n",
-        );
-        assert!(matches!(
-            nft_media_allow(ruleset, MEDIA),
-            MediaAllow::Covered { .. }
-        ));
-    }
-
-    /// A negated or non-accept rule is not an allow.
-    #[test]
-    fn nft_media_allow_ignores_negations_and_non_accept_verdicts() {
-        let ruleset = concat!(
-            "table inet filter {\n",
-            "\tchain input {\n",
-            "\t\ttype filter hook input priority 0; policy drop;\n",
-            "\t\tudp dport != 32768-60999 accept\n",
-            "\t\tudp dport 5353 drop\n",
-            "\t\tudp dport 32768-60999 jump some_chain\n",
-            "\t}\n",
-            "}\n",
-        );
-        assert_eq!(nft_media_allow(ruleset, MEDIA), MediaAllow::Absent);
-    }
-
-    /// #67 as the operator sees it through firewalld's own CLI, when that client IS present.
-    #[test]
-    fn firewalld_media_allow_reads_the_rich_rule_and_the_mdns_service() {
-        match firewalld_media_allow(FIREWALLD_LIST_ALL_MEDIA_ALLOWED, MEDIA) {
-            MediaAllow::Covered { evidence } => {
-                assert!(evidence.contains("32768-60999"), "{evidence}");
-                assert!(evidence.contains("mdns"), "{evidence}");
-            }
-            other => panic!("the documented zone must read as covered, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn firewalld_media_allow_stock_zone_is_absent() {
-        let list_all = concat!(
-            "FedoraServer (default, active)\n",
-            "  target: default\n",
-            "  services: cockpit dhcpv6-client ssh\n",
-            "  ports:\n",
-            "  rich rules:\n",
-        );
-        assert_eq!(firewalld_media_allow(list_all, MEDIA), MediaAllow::Absent);
-    }
-
-    /// The plainer configuration: `--add-port` rather than a rich rule.
-    #[test]
-    fn firewalld_media_allow_reads_the_ports_line() {
-        let list_all = concat!(
-            "public (active)\n",
-            "  target: default\n",
-            "  services: ssh\n",
-            "  ports: 32768-60999/udp 5353/udp 8443/tcp\n",
-            "  rich rules:\n",
-        );
-        assert!(matches!(
-            firewalld_media_allow(list_all, MEDIA),
-            MediaAllow::Covered { .. }
-        ));
-    }
-
-    #[test]
-    fn iptables_media_allow_reads_accept_rules_not_just_the_policy() {
-        let out = concat!(
-            "-P INPUT DROP\n",
-            "-A INPUT -i lo -j ACCEPT\n",
-            "-A INPUT -s 192.0.2.0/24 -p udp -m udp --dport 32768:60999 -j ACCEPT\n",
-            "-A INPUT -p udp -m udp --dport 5353 -j ACCEPT\n",
-        );
-        match iptables_media_allow(out, MEDIA) {
-            MediaAllow::Covered { evidence } => {
-                assert!(evidence.contains("32768:60999"), "{evidence}")
-            }
-            other => panic!("iptables accept rules must count, got {other:?}"),
-        }
-        let policy_only = "-P INPUT DROP\n-A INPUT -i lo -j ACCEPT\n";
-        assert_eq!(iptables_media_allow(policy_only, MEDIA), MediaAllow::Absent);
-    }
-
-    /// #67, the whole point: a correctly-configured firewalld host must stop warning.
-    #[test]
-    fn check_media_reachability_covered_rules_is_pass_not_a_permanent_warning() {
-        let root = FakeRoot::new("firewall-covered");
-        let env = root.env_firewall(FirewallPosture::Filtering {
-            tool: FirewallTool::Nftables,
-            detail: "nftables input policy=reject".to_string(),
-            media_allow: MediaAllow::Covered {
-                evidence: "ip saddr 192.0.2.0/24 udp dport 32768-60999 accept".to_string(),
-            },
-        });
-        let c = check_media_reachability(&env, Distro::Fedora);
-        assert_eq!(
-            c.status, PASS,
-            "the documented rules are active and verified working — warning anyway is #67"
-        );
-        assert!(
-            c.summary.contains("32768-60999"),
-            "the matched rule is the evidence for the pass: {}",
-            c.summary
-        );
-        assert!(c.remediation.is_empty(), "nothing to remediate");
-    }
-
-    /// A half-open configuration keeps warning, and says which half is missing.
-    #[test]
-    fn check_media_reachability_partial_rules_warns_and_names_the_gap() {
-        let root = FakeRoot::new("firewall-partial");
-        let env = root.env_firewall(FirewallPosture::Filtering {
-            tool: FirewallTool::Firewalld,
-            detail: "firewalld zone target=default".to_string(),
-            media_allow: MediaAllow::Partial {
-                evidence: "service mdns (udp/5353)".to_string(),
-                gap: "UDP 32768-60999".to_string(),
-            },
-        });
-        let c = check_media_reachability(&env, Distro::Fedora);
-        assert_eq!(c.status, WARN);
-        assert!(c.summary.contains("32768-60999"), "{}", c.summary);
-        assert!(
-            c.remediation.contains("firewall-cmd"),
-            "a partial configuration still needs the command"
-        );
-    }
-
-    /// Detection carries each tool's own rule reading through to the posture it produced —
-    /// never the losing tool's.
-    #[test]
-    fn combine_firewall_signals_carries_the_winning_tools_media_allow() {
-        let covered = MediaAllow::Covered {
-            evidence: "udp dport 32768-60999 accept".to_string(),
-        };
-        assert_eq!(
-            combine_firewall_signals(
-                Some(("default", covered.clone())),
-                Some(nft_policy("reject")),
-                None,
+    fn media_reachability_passes_on_a_remote_peers_traffic() {
+        use crate::session::media_evidence::Evidence;
+        let root = FakeRoot::new("media-reached");
+        let c = check_media_reachability(
+            &media_env(
+                &root,
+                Some(Evidence::Reached {
+                    at: at(),
+                    peer: "198.51.100.7".into(),
+                }),
             ),
-            FirewallPosture::Filtering {
-                tool: FirewallTool::Firewalld,
-                detail: "firewalld zone target=default".to_string(),
-                media_allow: covered,
-            },
-            "firewalld won the posture, so its rule reading is the one that counts"
+            Distro::Fedora,
         );
+        assert_eq!(c.status, PASS, "{c:?}");
+        assert!(c.summary.contains("198.51.100.7"), "{c:?}");
+        assert!(c.summary.contains("not that every port"), "{c:?}");
+        assert_eq!(c.observed_at.as_deref(), Some("2026-09-21T14:13:20Z"));
+        assert!(c.blocks.is_none());
     }
 
-    /// Wired into `probe`, and a WARN must never be counted as a FAIL.
+    /// No traffic from a peer that offered candidates: fail with the firewall fix for the
+    /// host's own media range, and still never block (amendment 17).
     #[test]
-    fn media_reachability_is_wired_into_probe() {
-        let root = FakeRoot::new("firewall-in-probe");
-        root.file("dev/dri/renderD128", "")
-            .file("dev/uinput", "")
-            .file("proc/sys/user/max_user_namespaces", "15000\n");
-        let env = ProbeEnv {
-            firewall: FirewallPosture::Filtering {
-                tool: FirewallTool::Firewalld,
-                detail: "firewalld zone target=default".to_string(),
-                media_allow: MediaAllow::Absent,
-            },
-            ..root.env(false, "")
-        };
-        let checks = probe(&env);
-        let c = get(&checks, "media_reachability");
-        assert_eq!(c.status, WARN);
-        assert_eq!(
-            log_report(&checks),
-            0,
-            "a WARN-only host must not be reported as having FAILED checks: {checks:?}"
+    fn media_reachability_fails_with_the_firewall_fix_when_no_traffic_arrived() {
+        use crate::session::media_evidence::Evidence;
+        let root = FakeRoot::new("media-blocked");
+        root.file("proc/sys/net/ipv4/ip_local_port_range", "40000\t49999\n");
+        let c = check_media_reachability(
+            &media_env(
+                &root,
+                Some(Evidence::Blocked {
+                    at: at(),
+                    offered: 3,
+                }),
+            ),
+            Distro::Fedora,
         );
+        assert_eq!(c.status, FAIL, "{c:?}");
+        assert!(c.summary.contains("offered 3"), "{c:?}");
+        assert!(c.remediation.contains("40000-49999/udp"), "{c:?}");
+        assert!(c.remediation.contains("mdns"), "{c:?}");
+        assert!(c.blocks.is_none(), "media reachability never blocks: {c:?}");
+        assert!(!c.remediation.contains("NET_ADMIN"), "{c:?}");
     }
 
-    /// The remediation has to name the entry the shipped compose actually uses. `devices:`
-    /// takes a device-cgroup permission set (`r`/`w`/`m`), not a bind mount's `:ro` — Compose
-    /// rejects `:ro` there outright, so the old text sent operators to an error (#83). And
-    /// `dmesg_restrict=1` is the distro default, so the device without the capability is EPERM.
+    /// Amendment 17 (RH-07 #402): GPU fault messages are an optional diagnostic. Without
+    /// the kernel log the check skips, names the host setting that would allow it, asks
+    /// nothing (empty remediation) and never tells an operator to add a capability.
     #[test]
-    fn xid_visibility_remediation_matches_the_shipped_compose_entry() {
+    fn xid_visibility_skip_names_the_host_setting_and_asks_nothing() {
         let root = FakeRoot::new("xid-remediation");
         let c = check_xid_visibility(&root.env(true, ""));
         assert_eq!(
             c.status, SKIP,
             "no dev/kmsg fixture, so this is the skip arm"
         );
+        assert!(c.remediation.is_empty(), "a skip asks nothing: {c:?}");
+        assert!(c.summary.contains("dmesg_restrict"), "{c:?}");
+        assert!(c.summary.contains("--allow-kernel-log"), "{c:?}");
+        assert!(c.summary.contains("optional"), "{c:?}");
+        let text = format!("{} {}", c.summary, c.remediation);
         assert!(
-            c.remediation.contains("/dev/kmsg:/dev/kmsg:r"),
-            "remediation must name the device entry verbatim: {c:?}"
+            !text.contains("SYSLOG") && !text.contains("cap_add"),
+            "{c:?}"
         );
-        assert!(
-            !c.remediation.contains("/dev/kmsg:/dev/kmsg:ro"),
-            "must never hand out the `:ro` form — Compose rejects it under `devices:`: {c:?}"
-        );
-        assert!(
-            c.remediation.contains("SYSLOG"),
-            "the device alone is EPERM under dmesg_restrict=1: {c:?}"
-        );
+        assert!(c.blocks.is_none());
     }
 
-    /// Every operator-facing string is one normalised paragraph. A `format!` literal that lost
-    /// its `\` line continuations carries the source's own indentation into the summary the
-    /// agent reports (#82) — HTML collapses the run so the admin UI looks fine, while the JSON,
-    /// the log line and the copy-to-clipboard text all keep the gap.
-    #[test]
-    fn no_check_text_carries_a_run_of_spaces() {
-        let visible = FakeRoot::new("text-visible");
-        visible
-            .file("usr/share/glvnd/egl_vendor.d/10_nvidia.json", "{}")
-            .file("usr/lib64/libnvidia-eglcore.so.570.86", "")
-            .file("dev/dri/renderD128", "")
-            .file("dev/uinput", "")
-            // Present: the `pass` arm of xid_visibility.
-            .file("dev/kmsg", "")
-            .file("proc/sys/user/max_user_namespaces", "15000\n")
-            .file("sys/class/drm/renderD128", "")
-            .file("etc/os-release", "ID=fedora\n");
-        // Absent `dev/kmsg`: the `skip` arm, which is the one that carries a remediation.
-        let hidden = FakeRoot::new("text-hidden");
-        hidden
-            .file("dev/dri/renderD128", "")
-            .file("dev/uinput", "")
-            .file("proc/sys/user/max_user_namespaces", "15000\n")
-            .file("etc/os-release", "ID=fedora\n");
-
-        let mut checks = probe(&visible.env(true, "/usr/lib"));
-        checks.extend(probe(&ProbeEnv {
-            firewall: FirewallPosture::Filtering {
-                tool: FirewallTool::Nftables,
-                detail: "nftables input policy=drop".to_string(),
-                media_allow: MediaAllow::Absent,
-            },
-            ..hidden.env(true, "")
-        }));
-
-        for c in &checks {
-            for (field, text) in [("summary", &c.summary), ("remediation", &c.remediation)] {
-                assert!(
-                    !text.contains("  "),
-                    "{} {field} carries a run of spaces (a missing `\\` line continuation): {text:?}",
-                    c.id
-                );
-            }
-        }
-    }
+    mod engine_profiles;
+    mod host_probes;
+    mod mounts;
+    mod provenance;
+    mod report;
+    mod runtime_checks;
+    mod storage_checks;
 }

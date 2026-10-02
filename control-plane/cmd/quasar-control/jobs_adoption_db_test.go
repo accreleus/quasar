@@ -63,7 +63,6 @@ func jobsTestDB(t *testing.T) *pgxpool.Pool {
 func jobsTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	t.Setenv("DATABASE_URL", "postgres://unused/unused") // required by Load, never dialed (pool is passed separately)
-	t.Setenv("ENROLLMENT_TOKEN", "test-enrollment-token")
 	t.Setenv("QUASAR_ARTWORK_DIR", t.TempDir())
 	t.Setenv("QUASAR_SETUP_TOKEN_PATH", t.TempDir()+"/setup-token")
 	t.Setenv("QUASAR_JOBS_TICK_SECS", "1")

@@ -15,7 +15,10 @@
 # `bench_ext_id` and reuses the matching run on a re-run, so replaying the whole
 # manifest twice converges instead of duplicating.
 #
-# Needs BENCH_URL + BENCH_KEY in the environment (never committed).
+# Needs a bench server + key: BENCH_URL / BENCH_KEY, else qbench's own config
+# (~/.config/qbench/{url,key}); never committed. Each run is posted with repo +
+# commit, the commit being the entry's `git_quasar` tag (the sha the archived run
+# actually used), so `qbench check` can find it.
 #
 # Exit: 0 all entries submitted, 1 any failure, 2 usage.
 
@@ -31,7 +34,7 @@ TARGET=bench-retro
 
 dx_require_local "$TARGET"
 
-usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'; }
 
 MANIFEST="$DX_ROOT/docs/reports/2026-08-16-abr-ladder/bench-retro-manifest.json"
 DRY=0

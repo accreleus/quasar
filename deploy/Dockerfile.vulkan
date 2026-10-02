@@ -26,7 +26,7 @@
 # widened enable-set (see the meson invocation below) so every element the node-agent pipeline
 # actually calls `ElementFactory::make`/`find` on on this branch is present in the final image.
 #
-# Build host note: built on hermes (the AMD/VA dev box) and `docker save`/`docker load`d to Tower
+# Build host note: built on the aux host (the AMD/VA dev box) and `docker save`/`docker load`d to the lab host
 # for NVENC-path testing — this Dockerfile is GPU-vendor-agnostic at build time (no toolkit stage
 # split like Dockerfile.nv needs for its from-source nvcodec build); GPU choice is a runtime
 # concern (which encode element registers depends on what's plugged in and the stale-registry
@@ -38,7 +38,7 @@
 # not declare (Docker ignores those silently, which is how a pin can look applied when it
 # never was), and validates the result against deploy/image-contract.json BEFORE promoting
 # :latest or pushing. A bare `docker build` with no `--target` builds the LAST stage in the
-# file regardless of what you passed to -t — that mis-tagging hit a 2026-07-12 Tower deploy
+# file regardless of what you passed to -t — that mis-tagging hit a 2026-07-12 lab-host deploy
 # live and was caught only by reading `docker history`.
 #
 # IMAGE NAMES (2026-08-26 role rename): runtime → quasar-node-agent, dev → quasar-agent-dev,
@@ -109,7 +109,7 @@ ARG GST_VERSION=1.28.4
 ARG GST_PLUGINS_RS_REF=cee45224cb2d10e1523af4f256d0dd64c8b29491
 ARG GST_INTERPIPE_REF=0c454917
 ARG GST_WAYLAND_DISPLAY_REPO=https://github.com/salty2011/gst-wayland-display.git
-ARG GST_WAYLAND_DISPLAY_REF=310c03eca4b90b653885def4e3348034067c8c72
+ARG GST_WAYLAND_DISPLAY_REF=6638e07170c1c76018321024ebff272d7740fd2a
 ARG RUST_VERSION=1.94.0
 ARG CARGO_C_VERSION=0.10.23
 ARG RUSTUP_VERSION=1.29.0
@@ -303,7 +303,7 @@ RUN set -eux; \
 # Dockerfile.agent.prod pin (0.10.20+cargo-0.94.0) predates Rust 1.94; cargo-c's MSRV tracks cargo
 # closely, so we pin the version validated against RUST_VERSION above rather than take a moving
 # "latest". 0.10.23 is the version baked into the known-good quasar-vulkan image (verified in the
-# hermes build logs — see docs/third-party-pins.md). `--locked` uses cargo-c's committed Cargo.lock
+# the aux host build logs — see docs/third-party-pins.md). `--locked` uses cargo-c's committed Cargo.lock
 # so a transitive-dep bump on crates.io can't drift the build either.
 ARG CARGO_C_VERSION
 RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked
@@ -311,7 +311,7 @@ RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked
 # Patched GStreamer 1.28.4 -> /opt/gst. Ten vendored patches, applied in the order below; the
 # order is load-bearing (each was diffed against the tree with its predecessors applied) and is
 # documented per patch in deploy/patches/vulkan/README.md. The fifth is a diagnostic A/B arm for
-# Tower Xid 32: it serializes every GstVulkanQueue wrapper through one process-wide submit domain.
+# Lab-host Xid 32: it serializes every GstVulkanQueue wrapper through one process-wide submit domain.
 # The tenth (issue #507) recycles the per-frame Vulkan bitstream buffer and must apply LAST,
 # because it was diffed against gstvkencoder-private.c with all nine predecessors applied.
 # All ten must land after the clone and before Meson config/build.
@@ -338,7 +338,10 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     && git apply /tmp/gstreamer-vulkan-rc-retarget-no-reset.patch \
     && git apply /tmp/vulkanav1enc.patch \
     && git apply /tmp/vulkan-enc-output-state-on-resize.patch \
-    && git apply /tmp/vkenc-bitstream-buffer-pool.patch
+    && git apply /tmp/vkenc-bitstream-buffer-pool.patch \
+    && git apply /tmp/vulkanh265enc-radv-coded-height.patch \
+    && git apply /tmp/vulkanav1enc-exact-frame-size.patch \
+    && git apply /tmp/vulkanav1enc-min-qindex.patch
 
 # Upstream's docs/meson.build subdir_done() workaround (carried verbatim from
 # games-on-whales/gst-wayland-display's build recipe at the same pin) — with -Ddoc=disabled,
@@ -526,7 +529,7 @@ RUN git clone https://github.com/games-on-whales/gst-interpipe.git /opt/gst-inte
 # build time — an un-pinned input that makes the image non-reproducible. Clone the branch then
 # `checkout` the ref, exactly like GST_WAYLAND_DISPLAY_REF / GST_INTERPIPE_REF below.
 # GST_PLUGINS_RS_REF is the SHA baked into the known-good image (0.15.3-cee4522, 2026-07-03; verified
-# via `gst-inspect-1.0 rtpgccbwe` on the good image + the hermes build logs — see
+# via `gst-inspect-1.0 rtpgccbwe` on the good image + the aux host build logs — see
 # docs/third-party-pins.md). cargo uses the repo's committed Cargo.lock at this checkout by default,
 # so the transitive-dep set is also frozen with the SHA (no extra flag needed — the good build used
 # the same bare invocation, only the ref was unpinned).
@@ -633,7 +636,7 @@ ARG GST_WAYLAND_DISPLAY_REPO
 # map handler arms a flag AFTER its synthetic motion; the next real motion -- guarded
 # on surface-present / not-grabbed / no-active-constraint -- forces smithay's focus to
 # None so the following motion re-emits a genuine enter (serial newer than the forced
-# leave's). Human-validated on Tower 2026-08-05 (XFCE + Steam). Authored record:
+# leave's). Human-validated on the lab host 2026-08-05 (XFCE + Steam). Authored record:
 # deploy/patches/vulkan/gst-wayland-display-pointer-enter-refocus.patch.
 ARG GST_WAYLAND_DISPLAY_REF
 RUN git clone ${GST_WAYLAND_DISPLAY_REPO} /opt/gst-wayland-display \
@@ -708,7 +711,7 @@ FROM ${TOOLCHAIN_IMAGE} AS build
 #
 # Built WITH `--features cuda` whenever the toolkit is present (the default). Before
 # 2026-07-26 this line omitted the feature unconditionally, so the binary baked into the
-# `nv` image could not take the ZC-02 zero-copy CUDA path — which forced the Tower
+# `nv` image could not take the ZC-02 zero-copy CUDA path — which forced the lab-host
 # deployment to compile the agent INSIDE the container from a bind-mounted workspace,
 # which in turn is why 6.15 GB of Rust + C toolchain was baked into a production image.
 # Fixing this one flag is what lets the runtime images drop the toolchain entirely and
@@ -781,20 +784,6 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # install the daemon explicitly (weak deps remain disabled above).
     alsa-lib pulseaudio-libs pulseaudio \
     pciutils-libs libsrtp \
-    # #527: the #483 media-reachability readiness check (node-agent/src/readiness.rs
-    # detect_firewall_posture) needs a firewall client tool inside the container to read the
-    # HOST's firewall posture (network_mode: host + CAP_NET_ADMIN already grant the netlink
-    # access; nothing baked into this image ever gave it the CLIENT). `nftables` provides
-    # `nft`, which alone covers a modern firewalld-on-nftables host (Fedora's default backend
-    # since F32) as well as a raw nftables setup -- `nft list ruleset` reads the same kernel
-    # tables firewalld itself programs. iptables/iptables-nft is deliberately NOT added: it is
-    # a legacy-backend fallback the readiness code also tries, but every host this image
-    # targets (Fedora/RHEL family) is nftables-backed, and adding both client stacks for one
-    # probe is not worth the bytes. Without this package the check can only report
-    # FirewallPosture::Unknown (readiness.rs combine_firewall_signals falls through when
-    # firewall-cmd is unreachable AND nft is absent) and the #483 WARN never fires even on a
-    # filtering host.
-    nftables \
     # Console local-output runtime: weston drives atomic KMS and seatd provides
     # VT-unbound device access inside the agent container.
     weston seatd ddcutil pulseaudio-utils procps-ng iproute \
@@ -963,11 +952,10 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 
 # ── Agent-INDEPENDENT half of this stage ──────────────────────────────────────
 # Everything from here down to the agent-binary COPY is keyed on the toolchain and
-# on DOCKER_VERSION only. It is above the binary on purpose (2026-08-26 layer-key
-# audit): with the binary copied first, a one-character node-agent change re-ran the
-# gst-inspect sweep, the registry drop, the entrypoint write AND a fresh network
-# download of the static Docker CLI, every time. Keep agent-keyed steps below this
-# line and pin-keyed steps above it.
+# its pins. It is above the binary on purpose (2026-08-26 layer-key audit): with
+# the binary copied first, a one-character node-agent change re-ran the
+# gst-inspect sweep, the registry drop, and the entrypoint write every time. Keep
+# agent-keyed steps below this line and pin-keyed steps above it.
 #
 # `COPY --from=build /opt/gst` stays cached across agent changes on its own merits:
 # BuildKit keys a COPY on the CONTENT of what is copied, and `build` adds nothing to
@@ -1004,31 +992,6 @@ ENV QUASAR_HEALTH_ADDR=127.0.0.1:9091
 ENV NODE_SECRET_PATH=/var/lib/quasar-agent/node-secret
 ENV XDG_RUNTIME_DIR=/run/quasar-agent
 ENV NVIDIA_DRIVER_CAPABILITIES=all
-
-# Docker CLI — the agent launches sibling app containers via the mounted socket
-# (same static-binary install as Dockerfile.agent.prod).
-#
-# ABOVE the agent binary since 2026-08-26: this is a network download keyed on
-# DOCKER_VERSION alone, and it used to sit below the binary COPY, so every
-# node-agent edit re-fetched it. Nothing about it depends on the agent.
-ARG DOCKER_VERSION
-ARG DOCKER_CLI_SHA256_X86_64
-ARG DOCKER_CLI_SHA256_AARCH64
-# Checked before the tarball is unpacked: this binary drives the mounted host docker
-# socket, so a substituted payload is host-level code execution.
-RUN set -eux; \
-    arch="$(uname -m)"; \
-    case "$arch" in \
-      x86_64) darch=x86_64;  want="${DOCKER_CLI_SHA256_X86_64}" ;; \
-      aarch64) darch=aarch64; want="${DOCKER_CLI_SHA256_AARCH64}" ;; \
-      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_VERSION}.tgz" \
-      -o /tmp/docker.tgz; \
-    echo "${want}  /tmp/docker.tgz" | sha256sum -c -; \
-    tar -xzf /tmp/docker.tgz -C /tmp; \
-    install -m0755 /tmp/docker/docker /usr/local/bin/docker; \
-    rm -rf /tmp/docker /tmp/docker.tgz
 
 # Entrypoint wrapper — copied VERBATIM from Dockerfile.agent.prod (learned live during the
 # 2026-07-04 soak): compose deployments pass Mesa knobs as EMPTY-BUT-SET vars on the GPU path, and
@@ -1123,8 +1086,8 @@ RUN rm -rf /root/.cache/gstreamer-1.0 /home/quasar/.cache/gstreamer-1.0
 # string and would silently ship a real label key with an empty value.
 #
 # Until 2026-08-20 these repeated the build stage's defaults by hand instead, kept
-# in step by a Python guard in build-images.sh; DOCKER_VERSION and
-# CUDA_PKG_VERSION were repeated with no guard at all. Do not reintroduce a
+# in step by a Python guard in build-images.sh; CUDA_PKG_VERSION was repeated
+# with no guard at all. Do not reintroduce a
 # `=value` here — build-images.sh now REFUSES to build when a pin has more than
 # one default in this file.
 #
@@ -1134,8 +1097,7 @@ RUN rm -rf /root/.cache/gstreamer-1.0 /home/quasar/.cache/gstreamer-1.0
 # stage, and a LABEL creates a new build state, so everything below it inherited the
 # miss. Measured on devbox with an otherwise fully-cached tree: changing only
 # BUILT_AT re-ran runtime steps 6/9 through 9/9 — the gst-inspect sweep, the registry
-# drop, the Docker CLI download and the entrypoint write. Nothing that costs anything
-# may sit below this block.
+# drop, and the entrypoint write. Nothing that costs anything may sit below this block.
 ARG GST_WAYLAND_DISPLAY_REF
 ARG GST_VERSION
 ARG GST_PLUGINS_RS_REF
@@ -1184,7 +1146,8 @@ ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
 #      videotestsrc/waylandsink (in /opt/gst), wayland + pulse client libs.
 #   3. Base-compose agent-service image — runs the repo-built target/release binary with the repo
 #      mounted; needs the GPU runtime driver stacks + /dev/dri (freeworld VA/Vulkan, same as the
-#      runtime target) and the docker CLI to launch sibling app containers.
+#      runtime target). Its Docker CLI is developer tooling for compose and harness workflows,
+#      not a node-agent dependency.
 # Built with the same CUDA_ENABLE as every other stage — 1 by default since 2026-07-26 — so its
 # /opt/gst is identical to quasar-node-agent's, CUDA plugins included. (This line used to claim
 # CUDA_ENABLE=0; that was already false when it was written, and believing it is what made the
@@ -1194,8 +1157,8 @@ ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
 # option A). `build` is `COPY node-agent` + `cargo build --release`, so while `dev` was its child
 # EVERY one-character edit under node-agent/ invalidated the COPY, which invalidated the cargo
 # build, which invalidated every layer below — the rustup components, three dnf transactions
-# (RPM Fusion freeworld drivers, weston/seatd/ddcutil/vulkan-tools, avahi), and the docker CLI
-# download. Not one of those reads node-agent source; the dependency was stage ordering, not
+# (RPM Fusion freeworld drivers, weston/seatd/ddcutil/vulkan-tools, avahi), and the dev-only
+# Docker CLI download. Not one of those reads node-agent source; the dependency was stage ordering, not
 # content. `runtime` never had the defect because it is FROM the base and pulls the binary in with
 # a single trailing `COPY --from=build`. This stage now has that same shape: the environment is
 # built on the pin-keyed toolchain, and the one source-keyed thing it carries — the release binary
@@ -1254,8 +1217,8 @@ RUN dnf install -y --setopt=install_weak_deps=False avahi nss-mdns \
     && sed -i -e 's/^#*enable-dbus=.*/enable-dbus=no/' \
               -e 's/^#*disable-publishing=.*/disable-publishing=yes/' /etc/avahi/avahi-daemon.conf
 
-# Docker CLI — the agent launches sibling app containers via the mounted socket (same static-binary
-# install as the runtime stage / the retired Dockerfile.dev).
+# Docker CLI — dev-only tooling for compose and harness workflows. The runtime
+# image deliberately contains no engine CLI.
 ARG DOCKER_VERSION
 ARG DOCKER_CLI_SHA256_X86_64
 ARG DOCKER_CLI_SHA256_AARCH64
@@ -1331,8 +1294,8 @@ CMD ["bash"]
 # it. That is not the contract being weakened; it is this image never claiming to be a
 # shipped artifact.
 #
-# FROM `dev`, so it inherits the toolchain, both freeworld driver stacks, weston, the
-# docker CLI and mDNS — everything needed to run a real session and profile it.
+# FROM `dev`, so it inherits the toolchain, both freeworld driver stacks, weston,
+# dev-only Docker tooling and mDNS — everything needed to run a real session and profile it.
 #
 # Build:  deploy/build-images.sh profiling
 # Use:    docs/profiling-rust.md  (needs perf_event_paranoid <= 1 on the host,
@@ -1358,7 +1321,7 @@ RUN dnf install -y --setopt=install_weak_deps=False perf && dnf clean all
 # wrong flamegraph rather than a missing one.
 #
 # --features cuda mirrors the `build` stage: a profiling image that cannot take the
-# ZC-02 CUDA path would profile a different program than Tower runs.
+# ZC-02 CUDA path would profile a different program than the lab host runs.
 ARG CUDA_ENABLE
 # `dev` stopped being FROM `build` on 2026-08-26 (see its header), so this stage no longer
 # inherits the source tree it compiles from — it copies it in explicitly. Copied FROM `build`

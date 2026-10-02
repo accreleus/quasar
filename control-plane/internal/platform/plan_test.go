@@ -178,6 +178,7 @@ func host(id, name, commit string, opts ...func(*HostIdentity)) HostIdentity {
 }
 
 func sourceInstall(h *HostIdentity) { h.InstallMode = str(InstallSource) }
+func ownedInstall(h *HostIdentity)  { h.InstallMode = str(InstallOwned) }
 func noUpdater(h *HostIdentity)     { h.UpdaterPresent = boolp(false) }
 func offline(h *HostIdentity)       { h.Status = HostOffline }
 func draining(h *HostIdentity)      { h.Status = "draining" }
@@ -252,6 +253,32 @@ func TestTargetEligibilityReasons(t *testing.T) {
 			host:       host("h1", "gpu-01", commitA, sourceInstall),
 			wantCPRsn:  ReasonUpToDate,
 			wantHostRs: ReasonInstallModeSource,
+		},
+		{
+			name:       "an owned host behind the release is eligible exactly like a registry one",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, ownedInstall),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: "",
+		},
+		{
+			// A format-1 release names no recovery-actor component, so only the
+			// agent's commit is compared.
+			name:       "an owned host on the release is up_to_date",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitC, ownedInstall),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonUpToDate,
+		},
+		{
+			name:       "an owned host whose recovery actor did not answer is updater_absent",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, ownedInstall, noUpdater),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonUpdaterAbsent,
 		},
 		{
 			name:       "durable outranks transient: an offline source host still reports install_mode_source",
@@ -740,15 +767,15 @@ func TestPlanPreflightBlockedIsAnEligibilityReason(t *testing.T) {
 		},
 		Releases:                []Release{newest},
 		UpdaterPresent:          true,
-		ControlPlaneInstallMode: str(InstallRegistry),
+		ControlPlaneInstallMode: str(InstallOwned),
 		ControlPlanePreflight: PreflightFacts{
-			Socket: &SocketState{true, true}, Self: &UpdaterSelfFacts{Version: "x", StackDir: "/s", ConfigFiles: []string{"a"}}},
+			OwnedActor: &OwnedActorFact{Socket: "/s", Answered: true, Version: "x"}},
 	}
 	v := PlanRelease(in)
 	if got := *v.Targets[1].Reason; got != ReasonPreflightBlocked {
 		t.Fatalf("blocked host reason = %q, want preflight_blocked", got)
 	}
-	if !v.Targets[1].Preflight.Blocked() || v.Targets[1].Preflight.Checks[4].ID != CheckHealthAddrBindable {
+	if !v.Targets[1].Preflight.Blocked() || v.Targets[1].Preflight.Checks[2].ID != CheckHealthAddrBindable {
 		t.Fatalf("the blocked target must carry its preflight: %+v", v.Targets[1].Preflight)
 	}
 	if !v.Targets[2].Eligible {
@@ -772,11 +799,11 @@ func TestPlanPreflightBlockedIsAnEligibilityReason(t *testing.T) {
 		t.Fatalf("offline + blocked = %q, want host_offline", got)
 	}
 
-	// The control plane: a socket volume that is not mounted blocks it, and
+	// The control plane: a recovery actor that does not answer blocks it, and
 	// with it the whole fleet (nothing moves before the control plane).
 	cpBlocked := in
 	cpBlocked.ControlPlane = cp(commitA, 74)
-	cpBlocked.ControlPlanePreflight = PreflightFacts{Socket: &SocketState{}}
+	cpBlocked.ControlPlanePreflight = PreflightFacts{OwnedActor: &OwnedActorFact{Socket: "/s"}}
 	v = PlanRelease(cpBlocked)
 	if got := targetReason(v, TargetControlPlane); got != ReasonPreflightBlocked {
 		t.Fatalf("control plane reason = %q, want preflight_blocked", got)

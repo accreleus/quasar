@@ -33,16 +33,19 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `make help` | Lists all targets (default target) | Greppable; shows knobs + this worktree's instance/ports |
 | `make init` | First-time setup: protocol submodule, devtools image, doctor | Idempotent; **never overwrites `.env`** |
 | `make doctor` | Environment check: docker, go, node, submodule, disk, remote reachability | Remote check is ADVISORY → `degraded`, not failure |
-| `make config-check` | Parses every compose file set; diffs `.env` keys vs `docs/configuration.md` | Key diff is advisory WARN |
+| `make config-check` | Parses every compose file set (the contributor lane's); diffs `.env` keys vs `docs/configuration.md`; flags keys the retired Compose updater read | Key diff and retired keys are advisory WARN |
 | `make verify` | fmt + lint + build across components + shellcheck + DX self-tests | No DB, no network; the baseline for ANY change |
 | `make test` | All unit suites | = test-go + test-rust + test-web |
 | `make test-go` | Go build/vet/test | DB integration tests SKIP without a database — green here ≠ DB-tested |
 | `make test-rust` | cargo fmt/clippy/test in the `quasar-agent-dev` container | Host has no GStreamer toolchain |
+| `make test-uinput` | Node-agent virtual input devices against this host's real `/dev/uinput`, read back through evdev | Needs a host with uinput (`sudo modprobe uinput`); the tests are `#[ignore]`d in `test-rust`. CI runs them on every PR |
 | `make test-web` | Web typecheck/test/build | |
 | `make test-db` | Go integration tests vs a FRESH ephemeral Postgres | Per-instance port + name; `-p 1` enforced; container always reaped |
 | `make docs-metrics-sync` | Copy `docs/session-trace/metrics.json` (the metric manifest) to its Go embed and web bundle copies | Both copies are byte-equality tested; a stale copy fails `go test ./...` |
 | `make docs-trace` | Sync the manifest, then regenerate the `trace-format.md` §2 metric table from it | Edit the manifest, never the table; `make verify` fails if the table is stale |
 | `make preflight` | doctor + config-check + verify | The pre-merge-to-develop gate |
+| `make bench-check` | `qbench check`: HEAD vs the last benched ancestor — `[BASE=<sha> WINDOW=impaired]` | The streaming-path landing gate. Exit 0 clean, 3 regressed (blocks), 4 nothing comparable (**not a pass**), 5 key. Read-only |
+| `make bench-status` | Bench reports waiting on review — `[SPRINT=<slug>]` | Read-only; run it when resuming work. Server + key from `BENCH_URL`/`BENCH_KEY` or `~/.config/qbench/` |
 | `make up` / `down` / `restart` | Local agentless stack (postgres + control-plane + web) | No node-agent locally (needs a Linux GPU host); volumes survive `down` |
 | `make rebuild` | Local: compose build. Remote (`HOST=<role-or-host>`): delegates to `build-images.sh` + `redeploy.sh` | Remote requires typing `HOST=<role-or-host>`, e.g. `HOST=gpu-test` |
 | `make status` / `health` | Container state (healthy/degraded/stopped/failed) / endpoint probes | Read-only; safe with a remote `HOST=<role-or-host>` |
@@ -81,7 +84,8 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `scripts/dev/seed-*.sh` | Idempotent catalog seeds for development (benchmark apps, diagnostics app) |
 | `scripts/release/release-preflight.sh` · `generate-release-sbom.sh` · `scan-release-image.sh` | Release-evidence gates — deliberately separate artifacts, shared `release-supply-chain-lib.sh` |
 | `scripts/release/changelog-section.sh` | Prints one version's `CHANGELOG.md` section — the release notes. The tag-push workflow refuses a tag whose section is missing or empty, before any build |
-| `scripts/release/generate-platform-release-manifest.sh` · `validate-platform-release-manifest.sh` | Write and check `platform-release-manifest.json`, the GitHub Release asset naming each component image by digest ([schema](../scripts/release/platform-release-manifest.md)). Not `scripts/release/release-manifest.json`, which is the preflight's committed INPUTS file |
+| `scripts/release/generate-platform-release-manifest.sh` · `validate-platform-release-manifest.sh` | Write and check `platform-release-manifest.v2.json` (the validator also reads the format-1 `platform-release-manifest.json` of older releases), the GitHub Release asset naming each component image by digest and the floor ([schema](../scripts/release/platform-release-manifest.md)). Not `scripts/release/release-manifest.json`, which is the preflight's committed INPUTS file |
+| `scripts/release/check-release-compatibility.sh` · `collect-release-compatibility-inputs.sh` | The release-time check (#365, ADR 0008): refuses a release whose recovery actor cannot render its images' recipe revisions, whose recipe window does not reach the floor, or whose floor lies above the previous format-2 release. The collector gathers its inputs in the release job (published v2 manifests, `org.quasar.recipe` labels, `quasar-recovery recipes`) |
 | `scripts/release/new-release-signing-key.sh` · `sign-platform-release-manifest.sh` · `verify-platform-release-manifest.sh` | The optional detached release signature ([schema](../scripts/release/platform-release-signature.md), #120). Keygen refuses to write inside the repo; the signer takes its key from `$QUASAR_RELEASE_SIGNING_KEY` and verifies its own output before exiting 0. The normative verifier is the updater's Go one — this trio is the producer and the by-hand check |
 | `scripts/release/release-cut.sh` (`make release VERSION=x.y.z`) | Cuts a release in one command (#109): moves `## Unreleased` into a dated section, commits + tags `vX.Y.Z` on `main`, pushes both — the push is what fires the tag-push lane above. `--dry-run` previews; `--transform` is the pure changelog rewrite (fixture-testable, no git) |
 | `scripts/harness/lib/harness.sh` (+ `harness-selftest.sh`) | PASS/FAIL/SKIP/report core every `run-*.sh` harness builds on |
@@ -94,7 +98,7 @@ else moved out on 2026-08-27:
 
 | Directory | Holds |
 |---|---|
-| `deploy/overlays/` | Situational compose overlays, none of them part of a normal install: `dev` (the build-from-source shape — `redeploy.sh` applies it), `local`, `multiagent`, `cores`, `profiling`, `adopt-volumes`, and `console` (the one operator-facing member — local display). [`deploy/overlays/README.md`](../deploy/overlays/README.md) has the table |
+| `deploy/overlays/` | Situational compose overlays, none of them part of a normal install: `dev` (the build-from-source shape — `redeploy.sh` applies it), `local`, `multiagent`, `cores`, `profiling`, and `console` (the one operator-facing member — local display). [`deploy/overlays/README.md`](../deploy/overlays/README.md) has the table |
 | `scripts/dev/` | `dev.sh`, the compose-overlay test, the volume migrator, the local-audio validator, the dev seeders and the diagnostics-app image |
 | `scripts/verify/` | The verify stage scripts plus the devtools image they run on |
 | `scripts/harness/` | Acceptance harnesses (`run-*.sh`), `lib/`, `checks/`, `fixtures/`, the `apitest` Go module, and `peer-driver.mjs` (the headless WebRTC peer driver, formerly `p4-troubleshoot.mjs`) |
@@ -158,6 +162,8 @@ issue closes (precedent: 2026-07-17; recover any from git history). Current set:
 | `scripts/harness/run-st-trace.sh` | Session tracer end-to-end (Observability v2) |
 | `scripts/harness/run-spt06-certify.sh` | Encoder certification bench (rung × bitrate, real peer) |
 | `scripts/harness/run-soak-profile.sh` | Leak detection: session-cycle soak → CSV → verdicts (LEAK/SUSPECT/FLAT…); `scripts/harness/lib/soak_report.py` |
+| `scripts/harness/run-readiness-faults.sh` | RH-02 host-readiness fault injection (#264): runtime stopped, homes root unwritable / exhausted, input withheld, GPU path broken per vendor, proxy and indeterminate results, refusal classification, the override lifecycle including a launch that succeeds, host-local honesty. Runs **on a docker host** against a disposable stack it creates and owns (compose project and label `quasar.harness.owner=<run id>`, host paths under `/var/lib/<run id>`, and a root-read snapshot of the agent's fixed `/run/quasar-agent` runtime path so cleanup can catch leftovers a kill scenario drops there), never a shared stack: `--control-image=REF --agent-image=REF --role=ROLE [--only=…] [--keep]`. Results are `pass` / `fail` / `unperformed`; exit `0` only when everything passed, `1` on a fail, `4` when something was unperformed, `3` with no docker (so under `dev.sh run readiness-faults` every row is `unperformed`, never passed). Writes a sanitized `deploy/results/readiness-faults-<ts>.json` and `.md`. Matrix: `docs/superpowers/plans/2026-09-19-rh02-264-harness-matrix.md` |
+| `scripts/harness/readiness-fixture/` | Test-only Go module (relay rewriting agent readiness on wire, scripted host); never built into images; `make verify` guards this via `readiness-faults:*` checks |
 | `scripts/harness/checks/vram-telemetry.sh` | Live VRAM telemetry is flowing (read-only; sourceable) |
 | `scripts/harness/peer-driver.mjs` | The headless WebRTC peer the shell harnesses drive |
 | `scripts/dev/validate-local-audio.sh` | Console-mode Pulse sidecar audio |

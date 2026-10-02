@@ -96,13 +96,18 @@ pub(crate) struct EncoderKnobs {
 impl EncoderKnobs {
     /// Read all three knobs from the current process env.
     pub(crate) fn from_env() -> Self {
-        fn knob(var: &str) -> CodecKnob {
-            CodecKnob::parse(var, std::env::var(var).ok().as_deref())
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`EncoderKnobs::from_env`]: `lookup` supplies each var's raw value.
+    pub(crate) fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        fn knob(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> CodecKnob {
+            CodecKnob::parse(var, lookup(var).as_deref())
         }
         Self {
-            h264: knob("QUASAR_VULKAN_H264"),
-            hevc: knob("QUASAR_VULKAN_HEVC"),
-            av1: knob("QUASAR_VULKAN_AV1"),
+            h264: knob("QUASAR_VULKAN_H264", lookup),
+            hevc: knob("QUASAR_VULKAN_HEVC", lookup),
+            av1: knob("QUASAR_VULKAN_AV1", lookup),
         }
     }
 
@@ -519,15 +524,20 @@ impl CodecSupport {
     }
 }
 
-/// Probe the registry for the codecs `choice`'s encoder path can produce. Requires
-/// `gst::init` to have run against the runtime GPU's registry — the agent forces a
-/// fresh scan for hardware encoders (`session::init_gstreamer`), since a registry
-/// baked without a GPU carries no VA/HW encoder factories.
-pub fn probe_codec_support(choice: EncoderChoice, knobs: EncoderKnobs) -> CodecSupport {
+/// Probe the registry for the codecs `choice`'s encoder path can produce on
+/// `render_node` (`"software"` for the host-wide question; a GPU's own node for its
+/// #301 plan, where VA resolves device-prefixed names). Requires `gst::init` against the
+/// runtime GPU's registry (`session::init_gstreamer` forces a fresh scan). AV1 still
+/// honours the host-wide `av1_blocked()` here, as sessions are built.
+pub fn probe_codec_support(
+    choice: EncoderChoice,
+    knobs: EncoderKnobs,
+    render_node: &str,
+) -> CodecSupport {
     let (codecs, elements) = [Codec::H264, Codec::H265, Codec::Av1]
         .into_iter()
         .filter_map(|codec| {
-            let resolved = effective_encoder(choice, codec, knobs, "software")?;
+            let resolved = effective_encoder(choice, codec, knobs, render_node)?;
             gst::ElementFactory::find(codec.rtp_payloader())?;
             Some((codec, resolved.factory))
         })
@@ -1214,6 +1224,66 @@ mod tests {
         );
     }
 
+    // #301 layer 1: the per-GPU registry plan is `effective_encoder`/`probe_codec_support`
+    // evaluated on that GPU's own render node instead of the literal "software" — VA
+    // then resolves a device-prefixed factory per GPU, while Vulkan (device-agnostic in
+    // the registry) resolves the same factory regardless of which GPU asked.
+    #[test]
+    fn per_gpu_plan_names_va_by_device_but_not_vulkan() {
+        let knobs = EncoderKnobs::default();
+        let registered = |names: &[String]| {
+            names.iter().any(|n| {
+                matches!(
+                    n.as_str(),
+                    "varenderD128h264enc" | "varenderD129h264enc" | "vulkanh264enc"
+                )
+            })
+        };
+        let gpu0 = effective_encoder_with(
+            EncoderChoice::Va,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD128",
+            registered,
+        )
+        .unwrap();
+        let gpu1 = effective_encoder_with(
+            EncoderChoice::Va,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD129",
+            registered,
+        )
+        .unwrap();
+        assert_eq!(gpu0.factory, "varenderD128h264enc");
+        assert_eq!(gpu1.factory, "varenderD129h264enc");
+        assert_ne!(
+            gpu0.factory, gpu1.factory,
+            "VA must be device-prefixed per GPU"
+        );
+
+        let vk0 = effective_encoder_with(
+            EncoderChoice::Vulkan,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD128",
+            registered,
+        )
+        .unwrap();
+        let vk1 = effective_encoder_with(
+            EncoderChoice::Vulkan,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD129",
+            registered,
+        )
+        .unwrap();
+        assert_eq!(
+            vk0.factory, vk1.factory,
+            "Vulkan candidates are device-agnostic in the registry"
+        );
+    }
+
     #[test]
     fn vulkan_candidates_empty_only_for_the_disabled_codec() {
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
@@ -1591,41 +1661,23 @@ mod tests {
         }
     }
 
-    // The only test that touches these env vars, so save/restore needs no lock —
-    // every other knob test constructs `EncoderKnobs` directly. Keep it that way.
     #[test]
     fn encoder_knobs_from_env_reads_all_three_vars() {
-        const VARS: [&str; 3] = [
-            "QUASAR_VULKAN_H264",
-            "QUASAR_VULKAN_HEVC",
-            "QUASAR_VULKAN_AV1",
-        ];
-        let prior: Vec<_> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
-
-        for v in VARS {
-            std::env::remove_var(v);
-        }
         assert_eq!(
-            EncoderKnobs::from_env(),
+            EncoderKnobs::from_lookup(&crate::test_env::lookup(&[])),
             EncoderKnobs::default(),
             "unset ⇒ all three enabled from the default"
         );
 
-        std::env::set_var(VARS[0], "0");
-        std::env::set_var(VARS[1], "off");
-        std::env::set_var(VARS[2], "1");
-        let k = EncoderKnobs::from_env();
+        let k = EncoderKnobs::from_lookup(&crate::test_env::lookup(&[
+            ("QUASAR_VULKAN_H264", "0"),
+            ("QUASAR_VULKAN_HEVC", "off"),
+            ("QUASAR_VULKAN_AV1", "1"),
+        ]));
         assert!(!k.allows(Codec::H264));
         assert!(!k.allows(Codec::H265));
         assert!(k.allows(Codec::Av1));
         assert_eq!(k.knob(Codec::Av1).source(), "env");
-
-        for (v, was) in VARS.iter().zip(prior) {
-            match was {
-                Some(val) => std::env::set_var(v, val),
-                None => std::env::remove_var(v),
-            }
-        }
     }
 
     #[test]

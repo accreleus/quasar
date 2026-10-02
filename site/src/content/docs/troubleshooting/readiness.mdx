@@ -1,0 +1,90 @@
+---
+title: Readiness checks
+description: What each host readiness check means, which ones can block launches, and the fix for each, including the engine, device and console checks.
+---
+
+import Shot from '../../../components/Shot.astro';
+import host_readiness from '../../../assets/shots/host-readiness.png';
+
+Each host reports what its node agent actually found on the machine. The checks
+are on the host's page under **Admin ▸ Fleet** and in step 3 of the first-run
+wizard. Blocking and overrides: [Hosts and GPUs](/quasar/admin/hosts/#when-a-check-blocks-launches).
+
+<Shot
+	label="Host readiness"
+	sublabel="Part of a rootless Docker host's readiness card: a home-ownership warning, media reachability from a real session, the experimental engine profile, and the console checks."
+	src={host_readiness}
+	alt="A host's readiness card showing storage, network and engine checks"
+/>
+
+| Status | Meaning |
+| --- | --- |
+| Pass | Fine. |
+| Warn | Works, with a note. Never blocks. |
+| Fail | Broken. Blocks launches only when marked **Blocks launches**. |
+| Unknown | Not checked yet, or inconclusive. Never blocks. |
+| Skipped | Not applicable, or an optional diagnostic not enabled (it names the setting). |
+
+**Prepare the host** means the host steps for your engine:
+[Docker](/quasar/install/docker/#prepare-the-host),
+[Podman](/quasar/install/podman/#prepare-the-host) or
+[rootless](/quasar/install/rootless/#prepare-the-host-once-as-root). Each step is
+safe to repeat.
+
+## Container engine
+
+| Check | Meaning and fix |
+| --- | --- |
+| `runtime_endpoint` | The Docker or Podman socket answers. Failing blocks the host. If `DOCKER_HOST` and `CONTAINER_HOST` name different engines, unset one. |
+| `runtime_engine` | The engine and its [engine profile](/quasar/start/requirements/#container-engines). Experimental or unsupported profiles warn only. |
+| `runtime_cdi` | How NVIDIA GPUs reach containers (CDI or `--gpus`). If neither works, the host is blocked: follow [NVIDIA setup](/quasar/install/nvidia/) for your engine, then restart it. |
+| `runtime_cdi_gpu<N>` | The same, per NVIDIA GPU on a mixed-vendor host. Blocks only that GPU. |
+| `engine_healthchecks` | Podman only. Health checks need a systemd session, or installs time out. Rootless: enable lingering for the `quasar` account and restart the Podman service. Rootful: use the systemd cgroup manager. |
+
+## Input
+
+| Check | Meaning and fix |
+| --- | --- |
+| `uinput` | The agent can open `/dev/uinput` for writing. Rootless: install the [device rules](/quasar/install/device-rules/). |
+| `input_probe` | The agent creates a virtual device and opens it. Failing blocks the host. Rootless: install the [device rules](/quasar/install/device-rules/). Rootful: check `/dev/uinput` and `/dev/input` reach the agent. |
+
+## Storage
+
+| Check | Meaning and fix |
+| --- | --- |
+| `homes_root_writable` | A test home can be written. Failing blocks launches that need a home. On rootless Docker it warns: session files are owned by a subordinate ID. Sessions still work; use rootless Podman if you want files owned by the Quasar account. Never re-own existing homes recursively ([Moving to rootless](/quasar/install/moving/#move-to-rootless)). |
+| `homes_free_space` | Warns below 5 GiB free (`QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`); fails when full. |
+
+## Network
+
+`media_reachability` comes from real sessions from another machine, and never blocks.
+
+- **Unknown** until a remote browser has tried a session.
+- **Pass** once a remote browser's media reached the host (that browser's path only).
+- **Fail** when a remote browser's connection failed with no checks arriving. Open
+  the media port range: [Ports and endpoints](/quasar/reference/ports/#firewall).
+
+## GPU fault messages
+
+`xid_visibility`: whether the agent can read GPU fault messages from the kernel
+log for session traces. Optional and off by default: see [GPU fault messages in
+session traces](/quasar/operations/diagnostics/#gpu-fault-messages-in-session-traces),
+or read `dmesg` yourself.
+
+## Console mode
+
+`console_display`, `console_audio` and `console_ddc` are skipped while console mode
+is off, and never block streaming. See [Console mode](/quasar/admin/console/#readiness).
+
+| Failure | Fix |
+| --- | --- |
+| Agent not created with console access | Turn console mode on from the host's Local console page. |
+| Another process holds the display | Stop the desktop or login screen on that output, or pick another. Rootless: install the console [device rules](/quasar/install/device-rules/). Then toggle console mode off and on. |
+| No local audio sink | Check the host has a sound device, or set up [Host PipeWire](/quasar/admin/console/#local-audio). |
+| `ddcutil` missing, or no i2c bus for a connector | Every connected display counts as on. Check `/dev/i2c-*` exists (the console device rules grant it on rootless) and a monitor is connected. |
+
+## Owner conflict
+
+`owner_conflict`: a Quasar-like container not created by this install (usually an
+old Compose stack) is in the way. Updates to that machine are blocked until you
+remove it and whatever re-creates it.

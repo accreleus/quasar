@@ -12,9 +12,10 @@ const (
 // destructiveActions are the destructive actions whose names carry no suffix to
 // match on. Each takes something away from a user.
 var destructiveActions = map[string]bool{
-	"host.drain":             true,
-	"session.stop":           true,
-	"storage.home.tombstone": true,
+	"host.drain":                  true,
+	"session.stop":                true,
+	"storage.home.tombstone":      true,
+	"host.readiness_override.set": true,
 }
 
 // Severity classifies an action. DERIVED at read time, never stored and never

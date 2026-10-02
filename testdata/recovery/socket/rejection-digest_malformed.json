@@ -1,0 +1,9 @@
+{
+  "shape": "rejection",
+  "about": "Digest-only images: sha256: + 64 lowercase hex.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "reason": "digest_malformed",
+    "message": "component \"node-agent\": digest \"sha256:zz\" is not sha256: + 64 lowercase hex"
+  }
+}

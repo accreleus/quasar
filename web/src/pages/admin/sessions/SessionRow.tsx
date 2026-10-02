@@ -96,7 +96,7 @@ export function SessionRow({
           than filled with a guess. */}
       <td title={session.host_id ?? undefined}>{shortHost(session.host_name)}</td>
 
-      <td className="right num" style={degraded ? { color: "var(--warning-text)" } : undefined}>
+      <td className={degraded ? "right num td-warning" : "right num"}>
         {fps === undefined ? "—" : Math.round(fps)}
       </td>
 
@@ -106,10 +106,7 @@ export function SessionRow({
         {fps !== undefined && fps > 0 ? <Trend points={points} color={trendColor} /> : null}
       </td>
 
-      <td
-        className="right num"
-        style={rtt !== undefined && rtt > LATENCY_WARN_MS ? { color: "var(--danger-text)" } : undefined}
-      >
+      <td className={rtt !== undefined && rtt > LATENCY_WARN_MS ? "right num td-danger" : "right num"}>
         {rtt === undefined ? "—" : `${Math.round(rtt)} ms`}
       </td>
 

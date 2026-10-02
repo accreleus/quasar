@@ -12,7 +12,7 @@
 // container, so a "pass" there would be a lie about what got tested (per the
 // spec: "this journey must REFUSE to run when TARGET=local with a clear
 // message"). It is included in the file tree and wired behind LEVEL=session,
-// but is validated for real only against a live GPU stack (Tower/hermes).
+// but is validated for real only against a live GPU stack (the lab host or the aux host).
 const TOTAL_FRAMES_TIMEOUT_MS = 45000;
 // 120s, matching the loader's max-hold precedent elsewhere in the client
 // (MINOR 11a) — a cold host (image pull, compositor/agent warm-up) can take
@@ -80,7 +80,7 @@ export default {
       throw new Error(
         "session-launch refuses to run against TARGET=local — the self-booted ephemeral stack " +
           "has no GPU/compositor/encoder, so a decode verdict here would be meaningless. Run with " +
-          "LEVEL=session TARGET=<live-gpu-stack-base-url> (e.g. https://tower.local:18443).",
+          "LEVEL=session TARGET=<live-gpu-stack-base-url> (e.g. https://<gpu-host>:18443).",
       );
     }
 

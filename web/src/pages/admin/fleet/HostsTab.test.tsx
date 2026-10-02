@@ -8,7 +8,7 @@
  */
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
@@ -37,6 +37,7 @@ function host(over: Partial<Host> = {}): Host {
     id: "c2059601",
     node_name: "quasar-node-1",
     status: "online",
+    admission_restrictions: [],
     agent_version: "0.1.0",
     cpu_cores: 16,
     cpu_model: "AMD Ryzen 9 9950X3D",
@@ -114,6 +115,7 @@ beforeEach(() => {
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
   mocked.deleteHost.mockResolvedValue(undefined as never);
+  mocked.getPlatformIdentity.mockRejectedValue(new Error("not an owned install"));
 });
 
 describe("HostsTab — the table", () => {
@@ -125,7 +127,7 @@ describe("HostsTab — the table", () => {
       expect(screen.getByText("1 of 2 hosts online · 1 session running")).toBeTruthy(),
     );
     expect(screen.getByRole("button", { name: "Refresh" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Enroll host" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add host" })).toBeTruthy();
     expect(within(screen.getByRole("tab", { name: /Hosts/ })).getByText("2")).toBeTruthy();
   });
 
@@ -181,7 +183,7 @@ describe("HostsTab — the table", () => {
     renderTab();
 
     await waitFor(() => expect(screen.getByText("No hosts enrolled")).toBeTruthy());
-    expect(screen.getAllByRole("button", { name: "Enroll host" }).length).toBe(2);
+    expect(screen.getAllByRole("button", { name: "Add host" }).length).toBe(2);
   });
 });
 
@@ -357,13 +359,28 @@ describe("HostsTab — the row menu", () => {
     await waitFor(() => expect(reload).toHaveBeenCalled());
   });
 
-  it("offers resume scheduling instead of drain once the host is draining", async () => {
-    setFleet([host({ status: "draining" })]);
+  it("releases an operator drain without claiming every scheduling hold is gone", async () => {
+    setFleet([host({ status: "draining", admission_restrictions: [{
+      owner_kind: "manual", reason: "manual_drain", created_at: "2026-08-29T11:00:00Z",
+    }] })]);
     renderTab();
     await openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Resume scheduling" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Release operator drain" }));
 
     await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("explains a platform hold and offers only to add an operator drain", async () => {
+    setFleet([host({ status: "draining", admission_restrictions: [{
+      owner_kind: "platform", reason: "platform_apply", created_at: "2026-08-29T11:00:00Z",
+    }] })]);
+    renderTab();
+    await openMenu();
+    expect(screen.queryByRole("menuitem", { name: /Resume scheduling|Release operator drain/ })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add operator drain" }));
+    await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
+    fireEvent.click(screen.getByRole("button", { name: "Show capacity and storage for quasar-node-1" }));
+    expect(screen.getByText("Platform apply")).toBeTruthy();
   });
 
   it("reports a failed drain in the row's own drawer", async () => {
@@ -426,11 +443,11 @@ describe("HostsTab — the row menu", () => {
   });
 });
 
-describe("HostsTab — enroll", () => {
+describe("HostsTab — add host", () => {
   const openEnroll = async () => {
     renderTab();
     await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "Enroll host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add host" }));
   };
 
   // #12: the modal composes a wss:// enrollment string from the page origin. jsdom's
@@ -443,7 +460,7 @@ describe("HostsTab — enroll", () => {
     expect(screen.getByRole("dialog")).toBeTruthy();
     expect(screen.getByTestId("enroll-needs-https")).toBeTruthy();
     expect(screen.queryByText(/ws:\/\/localhost/)).toBeNull();
-    expect(screen.queryByRole("button", { name: "Mint enrollment string" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create command" })).toBeNull();
     expect(mocked.mintHostEnrollment).not.toHaveBeenCalled();
   });
 
@@ -457,3 +474,128 @@ describe("HostsTab — enroll", () => {
     expect(screen.queryByTestId("enroll-command")).toBeNull();
   });
 });
+
+describe("HostsTab — a host below the floor", () => {
+  const CP = "3f9a2c1e0c5a9d1b7a2f3e4d5c6b7a8901234567";
+  const releaseView = (belowFloor: boolean) =>
+    ({
+      faults: [],
+      available: [{ id: "rel", version: "0.5.2", source_commit: CP, manifest: null }],
+      installed: {
+        control_plane: { version: "0.5.2", source_commit: CP, built_at: null, schema_version: 88 },
+        hosts: [{ host_id: "c2059601", node_name: "quasar-node-1", identity_known: true, below_floor: belowFloor }],
+      },
+      targets: [{ kind: "host", host_id: "c2059601", node_name: "quasar-node-1", eligible: true, reason: null }],
+    }) as never;
+
+  it("chips the row and offers only the update, drain and removal", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(releaseView(true));
+    renderTab();
+    expect(await screen.findByText("must update")).toBeTruthy();
+    // It needs attention: its update.
+    expect(screen.getByRole("tab", { name: "Needs attention, 1" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    const items = screen.getAllByRole("menuitem").map((el) => el.textContent);
+    expect(items).toEqual(["Open host", "Update to v0.5.2", "Drain", "Remove host"]);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Update to v0.5.2" }));
+    expect(await screen.findByText("Update quasar-node-1")).toBeTruthy();
+    expect(screen.getByText("Update now — ends 2 live sessions")).toBeTruthy();
+  });
+
+  it("leaves a managed host's row and menu as they were", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(releaseView(false));
+    renderTab();
+    await waitFor(() => expect(mocked.getPlatformReleases).toHaveBeenCalled());
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for quasar-node-1" }));
+    expect(screen.queryByText("must update")).toBeNull();
+    expect(screen.getAllByRole("menuitem").map((el) => el.textContent)).toContain("Host settings");
+  });
+
+  it("stacks the floor before an owner's own warning, and still offers Remove host", async () => {
+    setFleet([
+      host({ install_mode: "owned", updater_present: true, seed_version: null } as Partial<Host>),
+    ]);
+    mocked.getPlatformReleases.mockResolvedValue(releaseView(true));
+    renderTab();
+    const row = (await screen.findByText("must update")).closest("tr") as HTMLElement;
+    const chips = [...row.querySelectorAll(".chip-sm")].map((el) => el.textContent);
+    expect(chips).toEqual(["must update", "no seed"]);
+    // One host, one attention count, whatever stacks on it.
+    expect(screen.getByRole("tab", { name: "Needs attention, 1" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    const items = screen.getAllByRole("menuitem").map((el) => el.textContent);
+    expect(items).toEqual(["Open host", "Update to v0.5.2", "Drain", "Remove host"]);
+  });
+});
+
+describe("HostsTab — owned hosts (#366)", () => {
+  const owned = { install_mode: "owned", updater_present: true, seed_version: "0.5.0" } as Partial<Host>;
+
+  it("labels each owned row with its machine shape, the control plane's own as the combined host", async () => {
+    setFleet([
+      host({ ...owned, id: "a1", node_name: "living-room-pc" }),
+      host({ ...owned, id: "b2", node_name: "gpu-host-2", status: "offline" }),
+      host({ id: "c3", node_name: "compose-host" }),
+    ]);
+    mocked.getPlatformIdentity.mockResolvedValue({
+      identity: { machine_role: "combined", machine_node_name: "living-room-pc" },
+    } as never);
+    renderTab();
+
+    await waitFor(() => expect(screen.getByText("a1 · Combined host")).toBeTruthy());
+    expect(screen.getByText("b2 · GPU host · offline")).toBeTruthy();
+    expect(screen.getByText("c3")).toBeTruthy();
+  });
+
+  it("chips a missing seed and, before it, an owner conflict", async () => {
+    setFleet([
+      host({ ...owned, id: "a1", node_name: "gpu-host-2", seed_version: null }),
+      host({
+        ...owned,
+        id: "b2",
+        node_name: "study-pc",
+        seed_version: null,
+        readiness: [{ id: "owner_conflict", status: "fail", summary: "x", remediation: "" }] as never,
+      }),
+    ]);
+    renderTab();
+
+    const seedRow = (await screen.findByText("gpu-host-2")).closest("tr") as HTMLElement;
+    expect(within(seedRow).getByText("no seed")).toBeTruthy();
+    const conflictRow = screen.getByText("study-pc").closest("tr") as HTMLElement;
+    expect(within(conflictRow).getByText("owner conflict")).toBeTruthy();
+    expect(within(conflictRow).queryByText("no seed")).toBeNull();
+    // Both rows need attention, and the conflicted one still reads online.
+    expect(within(conflictRow).queryByText(/degraded/)).toBeNull();
+    fireEvent.click(screen.getByRole("tab", { name: /Needs attention/ }));
+    expect(screen.getByText("gpu-host-2")).toBeTruthy();
+    expect(screen.getByText("study-pc")).toBeTruthy();
+  });
+
+  it("sends Remove host for an owned GPU host to its page, where its recovery actor removes it", async () => {
+    setFleet([host({ ...owned })]);
+    render(
+      <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
+        <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
+          <Routes>
+            <Route path="/admin/fleet/hosts" element={<HostsTab />} />
+            <Route path="/admin/fleet/hosts/:id" element={<LocationProbe />} />
+          </Routes>
+        </SectionHeadProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+    expect(await screen.findByText("/admin/fleet/hosts/c2059601?remove=1")).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+  });
+});
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div>{`${loc.pathname}${loc.search}`}</div>;
+}

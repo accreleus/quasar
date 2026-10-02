@@ -1,0 +1,135 @@
+---
+title: Console mode
+description: Show sessions on a screen plugged into the host, with local audio and input.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_console from '../../../assets/shots/admin-console.png';
+
+Console mode shows games on a screen plugged into the host, like a games console
+under the television. A console session can also stream to a browser at the same
+time. Each host has its own page: **Admin ▸ Fleet ▸** the host **▸ Local console**.
+
+<Shot
+	label="Local console"
+	sublabel="The console page of a host with console mode on: the physical output and its mode, the stream switches, and local audio through the desktop's PipeWire."
+	src={admin_console}
+	alt="The Local console page for a host, with console mode on"
+/>
+
+## What a console session is
+
+| Setting | What it does |
+| --- | --- |
+| **Physical output**, **Physical mode** | Which connector and timing to use. Both can stay automatic. |
+| **Also stream** | Off: local only, no encoder used. On: also streamed to a browser. |
+| **Stream audio** | With **Also stream**, the browser gets the sound too. |
+| **Local audio output** | **Auto**, a sink the host reported, or **Quiet**. See [Local audio](#local-audio). |
+| **Grab local input**, **Input devices** | Takes the host's keyboards, mice and controllers for the session. See [Local input](#local-input). |
+| **Default app**, **Default user**, **Auto-start on display** | Launches that app as that user when a display comes on. See [Starting on its own](#starting-on-its-own). |
+| **Auto-connect controller** | Attaches a connected controller to the console session. |
+
+The right-hand column lists the host's connectors and modes, audio sinks and
+input devices.
+
+## Turning it on
+
+Turning console mode on (or off) replaces the host's node agent with one that can
+reach the display, sound and monitor control. The page asks you to confirm,
+because this **ends the host's live sessions**.
+
+- While it runs, the page reads **Applying** and new sessions on the host wait.
+- If the new agent is unhealthy, the old one is put back and the page shows the
+  cause (for example, what holds the display, or the device access the host
+  still needs). **Try again** retries.
+- A host where console mode cannot work (no display device, for instance) reads as
+  not available, with the reason.
+
+A Compose or source install uses
+[`deploy/overlays/docker-compose.console.yml`](https://github.com/accreleus/quasar/blob/main/deploy/overlays/docker-compose.console.yml)
+instead.
+
+## Rootful and rootless hosts
+
+Console mode works in every engine mode. Install the console rules from [Device
+rules](/quasar/install/device-rules/) first; on a rootless host this is required.
+They grant the display cards, sound devices, i2c buses (monitor power over DDC),
+this machine's keyboards, mice and controllers (so console mode can grab them;
+**the `quasar` group can then read what is typed on this keyboard**), and `tty8`.
+
+On a rootless host:
+
+- **The display must be free.** If a desktop or login screen holds it, the attempt
+  fails and names what holds it. Stop the login screen on that output, or choose
+  another output.
+- **Devices are re-read** each time console mode is turned on and at every start.
+  If a reboot renumbers the i2c buses, the agent is replaced to pick them up.
+
+## The console terminal
+
+During a console session the agent switches to virtual terminal 8 (`tty8`) with
+the kernel keyboard off, so keys don't reach the host's login prompt. It switches
+back when the session ends.
+
+- The console device rules grant `tty8`; no login prompt may run there
+  (`getty@tty8` and `autovt@tty8` masked, see [Device
+  rules](/quasar/install/device-rules/)). If you run your own `getty@tty8`,
+  console sessions refuse to start.
+- If the terminal can't be taken, sessions fail with `console terminal:` and the
+  reason.
+- If the agent dies holding the terminal, its next start restores it.
+
+To get the screen back by hand, put `tty8` back in text mode, then `chvt` to the
+terminal you want.
+
+## Local audio
+
+**Local audio output** lists what the host reported:
+
+- **Host PipeWire**: when the host has a Quasar-only PipeWire socket on a desktop
+  user's session ([`deploy/prepare-host.sh`](https://github.com/accreleus/quasar/blob/main/deploy/prepare-host.sh)
+  `--console-audio-user USER` sets one up; read it first), sound
+  plays through that user's PipeWire, beside the desktop's own sound. Raw devices are hidden while PipeWire answers.
+- **Sound device (ALSA)**: used when no PipeWire answers and the device is free.
+  Listed as `hw:CARD=<id>,DEV=<n>`; an older `hw:N,M` setting still works.
+- Otherwise the console is quiet, and the `console_audio` readiness check names
+  what holds the device.
+
+PipeWire output is newer and less tested than ALSA.
+
+## Local input
+
+**Grab local input** takes the host's keyboards and mice exclusively for the
+console session. **Input devices** picks what is passed in: by class, by device
+path, or none.
+
+Plug devices in before the session starts; a device plugged in later isn't grabbed.
+
+## Starting on its own
+
+With **Auto-start on display** on and a **Default app** and **Default user** set,
+a display coming on launches that app as that user. The default user must have access to the app.
+
+Monitor power is read over DDC/CI. This needs the i2c buses (granted by
+the console device rules on rootless) and a monitor that answers DDC. Without them, every
+connected display counts as on. Set `QUASAR_CONSOLE_DDC=0` on the agent to turn
+the power reading off.
+
+## Readiness
+
+These checks read *skipped* while console mode is off, and never block a streamed
+session.
+
+| Check | What it reports |
+| --- | --- |
+| `console_display` | Whether the agent has console access and the display is free. Names what holds it. |
+| `console_audio` | The audio route (PipeWire or a named device), or why none is usable. |
+| `console_ddc` | Whether monitor power can be read (`ddcutil`, a mapped i2c bus, a reading). |
+
+See [Readiness checks](/quasar/troubleshooting/readiness/) for fixes.
+
+## Known limits
+
+- Not every monitor mode and refresh rate is offered yet.
+- With an NVIDIA GPU passed through to a virtual machine, the console picture can
+  stay black.

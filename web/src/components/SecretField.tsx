@@ -91,7 +91,7 @@ export function SecretField({
             {ORIGIN_LABEL[origin] ?? origin}
           </Chip>
           {stored && secret.hint && (
-            <span className="muted mono" style={{ fontSize: "var(--t-sm)" }}>
+            <span className="muted mono t-sm">
               stored key ends ····{secret.hint}
             </span>
           )}

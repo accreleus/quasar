@@ -100,6 +100,18 @@ type RegistryResolver struct {
 	// a real ref while HTTP lands on an httptest server. The digest ref RETURNED
 	// is always built from the parsed ref, never this override.
 	baseURL string
+	// plainHTTP: NewPlainHTTPRegistryResolver only.
+	plainHTTP bool
+}
+
+// NewPlainHTTPRegistryResolver reads registries over plain HTTP, private
+// addresses allowed, for exactly the operator-named hosts
+// (QUASAR_PLATFORM_INSECURE_REGISTRIES): a contributor's test registry, read
+// only by the developer apply's image-identity check. It follows no redirect
+// and bounds bodies like the production resolver; it is never the catalog's.
+func NewPlainHTTPRegistryResolver(hosts map[string]struct{}, timeout time.Duration) *RegistryResolver {
+	client := &http.Client{Timeout: timeout, CheckRedirect: outbound.NoRedirect}
+	return &RegistryResolver{client: client, allowHosts: hosts, plainHTTP: true}
 }
 
 // NewRegistryResolver builds the production resolver. A nil client gets the
@@ -257,6 +269,9 @@ func (p parsedRef) apiHost() string {
 func (r *RegistryResolver) base(p parsedRef) string {
 	if r.baseURL != "" {
 		return r.baseURL
+	}
+	if r.plainHTTP {
+		return "http://" + p.apiHost()
 	}
 	return "https://" + p.apiHost()
 }

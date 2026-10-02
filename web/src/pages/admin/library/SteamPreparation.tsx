@@ -16,14 +16,14 @@ export function SteamPreparation({ settings }: { settings: UseSettingsResult }) 
   }, []);
   const image = images.data?.[0];
   return (
-    <div className="col gap3" style={{ marginTop: "var(--s4)" }}>
+    <div className="col gap3 mt4">
       <div className="rowflex">
         <label htmlFor="steam-preparation-enabled" className="label">Prepare Steam for faster first launch</label>
         <Switch id="steam-preparation-enabled" aria-label="Prepare Steam for faster first launch"
           checked={enabled === true} disabled={typeof enabled !== "boolean" || settings.pending === "steam_preparation_enabled"}
           onChange={(next) => void settings.patch("steam_preparation_enabled", next)} />
       </div>
-      <p className="hint" style={{ margin: 0 }}>
+      <p className="hint m0">
         Prepare Steam in the background after installation or updates, then reuse the prepared files for new users’ first launches.
         Existing homes and running sessions are preserved. Discovery is controlled separately.
       </p>

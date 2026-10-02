@@ -1,8 +1,10 @@
+use anyhow::Context;
 use quasar_node_agent::{agent, config, memstat, session};
 
 use session::SessionConfig;
 
 /// What this invocation should do.
+#[derive(Debug)]
 enum Mode {
     /// The production role: connect to the control plane (register / capacity / heartbeat).
     Agent,
@@ -21,13 +23,30 @@ enum Mode {
     InjectSelfTest,
     /// Create the uinput devices, print their evdev nodes, emit events. Needs /dev/uinput.
     VirtualInputSelfTest,
+    /// The input host probe: [`Mode::VirtualInputSelfTest`] under the probe stdout
+    /// contract (one final line, exit 0 pass / 1 fail).
+    InputProbe,
+    /// The media host probe: composite + encode a few frames on one GPU, same stdout
+    /// contract. Spawned as a child of the agent (`host_probe::media`).
+    MediaProbe(session::probe_media::MediaProbeRequest),
     /// EGL dispatcher self-test. Spawned as a CHILD by the readiness probe
     /// (`nvidia_volume::probe_egl_runtime`) so a segfault in a broken vendor stack cannot
     /// take the agent down.
-    EglSelfTest { vendor_lib: Option<String> },
+    EglSelfTest {
+        vendor_lib: Option<String>,
+        /// `--open-device`: also open a GPU, which is what the application-GPU host
+        /// probe asks. Absent keeps the dispatcher-only stdout its other callers parse.
+        open_device: bool,
+        /// `--render-node <path>`: open that hardware device rather than the first
+        /// enumerated one.
+        render_node: Option<String>,
+    },
     /// #500: one throwaway-home sweep, then exit. Same knobs, guards and code path as the
     /// daily timer; `make homes-gc` execs it in the running agent container.
     HomesGc { dry_run: bool },
+    /// #407: holds or reconciles console mode's virtual terminal for the agent
+    /// (`session::console_vt`). Spawned as a child; one answer line on stdout.
+    ConsoleVt { args: Vec<String> },
     /// Builds the encoder branch through the same code a session uses. A hand-typed
     /// `gst-launch` probe shares no code with production and negotiated `profile=main-444`,
     /// which read as a driver regression.
@@ -61,15 +80,27 @@ fn parse_size(raw: Option<&str>) -> (i32, i32, i32) {
     (w, h, fps)
 }
 
+/// Refuses an unknown argv instead of falling through to agent mode: a probe container
+/// runs the agent's own image with a subcommand, and an image that does not know it would
+/// otherwise boot a second agent on the host (spec #252 "Host probes").
 fn parse_args() -> Mode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_mode(&args) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+}
 
-    match args.first().map(String::as_str) {
+fn parse_mode(args: &[String]) -> Result<Mode, String> {
+    let mode = match args.first().map(String::as_str) {
         Some("session") => {
-            let addr = arg_value(&args, "--addr").unwrap_or_else(|| "0.0.0.0:8443".to_string());
-            let stun = arg_value(&args, "--stun");
+            let addr = arg_value(args, "--addr").unwrap_or_else(|| "0.0.0.0:8443".to_string());
+            let stun = arg_value(args, "--stun");
             let use_test_src = args.iter().any(|a| a == "--test-src");
-            let image = arg_value(&args, "--image");
+            let image = arg_value(args, "--image");
             Mode::Session {
                 addr,
                 use_test_src,
@@ -87,27 +118,58 @@ fn parse_args() -> Mode {
         }
         Some(quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG) => Mode::EglSelfTest {
             vendor_lib: args.get(1).filter(|s| !s.starts_with("--")).cloned(),
+            open_device: args.iter().any(|a| a == "--open-device"),
+            render_node: arg_value(args, "--render-node"),
         },
         Some("homes-gc") => Mode::HomesGc {
             dry_run: args.iter().any(|a| a == "--dry-run"),
         },
         Some("probe-encoder") => {
-            let (width, height, fps) = parse_size(arg_value(&args, "--size").as_deref());
+            let (width, height, fps) = parse_size(arg_value(args, "--size").as_deref());
             Mode::ProbeEncoder {
-                codec: arg_value(&args, "--codec").unwrap_or_else(|| "h264".to_string()),
+                codec: arg_value(args, "--codec").unwrap_or_else(|| "h264".to_string()),
                 width,
                 height,
                 fps,
-                seconds: arg_value(&args, "--seconds")
+                seconds: arg_value(args, "--seconds")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2),
                 json: args.iter().any(|a| a == "--json"),
             }
         }
+        Some(session::console_vt::HELPER_ARG) => Mode::ConsoleVt {
+            args: args[1..].to_vec(),
+        },
         Some("inject-selftest") => Mode::InjectSelfTest,
         Some("vinput-selftest") => Mode::VirtualInputSelfTest,
-        _ => Mode::Agent,
-    }
+        Some("input-probe") => Mode::InputProbe,
+        Some("media-probe") => {
+            let d = session::probe_media::MediaProbeRequest::default();
+            let (width, height, fps) = match arg_value(args, "--size") {
+                Some(raw) => parse_size(Some(&raw)),
+                None => (d.width, d.height, d.fps),
+            };
+            Mode::MediaProbe(session::probe_media::MediaProbeRequest {
+                gpu: arg_value(args, "--gpu")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(d.gpu),
+                codec: arg_value(args, "--codec").unwrap_or(d.codec),
+                width,
+                height,
+                fps,
+                frames: arg_value(args, "--frames")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(d.frames),
+                budget: arg_value(args, "--budget-secs")
+                    .and_then(|s| s.parse().ok())
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(d.budget),
+            })
+        }
+        None => Mode::Agent,
+        Some(other) => return Err(format!("unknown subcommand: {other}")),
+    };
+    Ok(mode)
 }
 
 /// Fetch the value following `flag` (e.g. `--addr 0.0.0.0:8443`).
@@ -120,9 +182,16 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 async fn main() {
     // Must run before the subscriber and any other setup: its stdout contract is
     // `KEY=value` lines only, and it must observe the loader in a virgin process.
-    if let Mode::EglSelfTest { vendor_lib } = parse_args() {
+    if let Mode::EglSelfTest {
+        vendor_lib,
+        open_device,
+        render_node,
+    } = parse_args()
+    {
         std::process::exit(quasar_node_agent::nvidia_volume::egl_selftest_main(
             vendor_lib.as_deref(),
+            open_device,
+            render_node.as_deref(),
         ));
     }
 
@@ -143,7 +212,10 @@ async fn main() {
     install_sigusr1_fallback();
 
     match parse_args() {
-        Mode::Agent => spawn_agent().await,
+        Mode::Agent => {
+            install_shutdown_handler();
+            spawn_agent().await
+        }
         Mode::Session {
             addr,
             use_test_src,
@@ -152,6 +224,7 @@ async fn main() {
         } => run_session(addr, use_test_src, stun, image).await,
         Mode::SessionAnswerer { url } => run_session_answerer(url).await,
         Mode::HomesGc { dry_run } => run_homes_gc(dry_run),
+        Mode::ConsoleVt { args } => std::process::exit(session::console_vt::helper_main(&args)),
         Mode::ProbeEncoder {
             codec,
             width,
@@ -162,6 +235,8 @@ async fn main() {
         } => run_probe_encoder(&codec, width, height, fps, seconds, json),
         Mode::InjectSelfTest => run_inject_selftest(),
         Mode::VirtualInputSelfTest => run_vinput_selftest(),
+        Mode::InputProbe => run_input_probe(),
+        Mode::MediaProbe(request) => run_media_probe(request),
         // Handled above, before the subscriber is installed.
         Mode::EglSelfTest { .. } => unreachable!(),
     }
@@ -220,6 +295,40 @@ fn install_sigusr1_fallback() {
             token = "sigusr1-handler-install-failed",
             "could not install SIGUSR1 fallback handler: {e}"
         ),
+    }
+}
+
+/// #407: SIGTERM (an engine stop, the recovery actor replacing this agent) and SIGINT exit
+/// only once a console session's VT is back. The helper holding it cannot outlive this
+/// process: it dies with the container. Bounded well inside an engine's default stop grace
+/// (10 s); without a console session the exit is immediate, as it was.
+fn install_shutdown_handler() {
+    use tokio::signal::unix::{signal, SignalKind};
+    const SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    for (kind, name, code) in [
+        (SignalKind::terminate(), "SIGTERM", 143),
+        (SignalKind::interrupt(), "SIGINT", 130),
+    ] {
+        match signal(kind) {
+            Ok(mut sig) => {
+                tokio::spawn(async move {
+                    if sig.recv().await.is_some() {
+                        tracing::info!(token = "agent-shutdown-signal", "{name} received, exiting");
+                        let _ = tokio::task::spawn_blocking(|| {
+                            session::console_vt::release_for_shutdown(SESSION_WAIT, RELEASE_TIMEOUT)
+                        })
+                        .await;
+                        std::process::exit(code);
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(
+                token = "shutdown-handler-install-failed",
+                "could not install the {name} handler: {e}; a console session's terminal \
+                 is then left for the next start to restore"
+            ),
+        }
     }
 }
 
@@ -299,8 +408,28 @@ async fn run_agent() {
     // #419: records the allocator A/B arm plus baseline RSS, so a soak artifact is
     // self-describing.
     memstat::log_startup();
+    label_runtime_dir();
 
     agent::run(cfg).await;
+}
+
+/// Give the runtime directory the container SELinux type, so the sessions and sidecars
+/// that share it may write there (see `runtime_dir_label`). Never fatal.
+fn label_runtime_dir() {
+    use quasar_node_agent::runtime_dir_label::{ensure, Outcome};
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".into());
+    match ensure(std::path::Path::new(&dir)) {
+        Ok(Outcome::Relabelled { from, to }) => tracing::info!(
+            token = "runtime-dir-relabelled",
+            "{dir}: SELinux label {from} -> {to}, so sessions and sidecars may use it"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            token = "runtime-dir-relabel-failed",
+            "{dir}: could not give it the container SELinux type ({e}); on an SELinux host \
+             the audio sidecar may then fail to start"
+        ),
+    }
 }
 
 async fn run_session(
@@ -442,20 +571,34 @@ fn run_inject_selftest() {
     }
 }
 
+/// Runs `write` only if `grab` succeeded; on a grab failure `write` is never
+/// called and the grab error is returned instead. The seam that makes "grab
+/// failed ⇒ nothing written" unit-testable without a real uinput/evdev node —
+/// see `tests::grab_failure_skips_the_write` below.
+fn write_if_grabbed<T>(
+    grab: anyhow::Result<T>,
+    write: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // The grab must outlive the write: dropping it releases EVIOCGRAB.
+    let _grab = grab.context("exclusive grab")?;
+    write()
+}
+
 /// Proves the uinput path end-to-end (device creation, fake-udev node, event write) with no
 /// compositor, GPU or browser. Needs `/dev/uinput`.
-fn run_vinput_selftest() {
-    tracing::info!("quasar node-agent — virtual input self-test");
-    let devices = match session::virtual_input::VirtualDevices::create("selftest") {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(
-                token = "vinput-selftest-failed",
-                "virtual device creation failed: {e:#}"
-            );
-            std::process::exit(1);
-        }
-    };
+///
+/// The devices must be dropped (destroyed) before the caller exits, so no `exit` inside:
+/// each failure returns its one-line reason instead. Shared with `input-probe`.
+///
+/// Each write is gated on an exclusive `EVIOCGRAB` of that device's own node
+/// (`session::virtual_input::ExclusiveGrab`), taken and dropped around the
+/// write: nothing else holds these nodes at agent start, so an ungrabbed write
+/// here also reaches the host's VT console (keyboard) or any other reader.
+fn exercise_virtual_input() -> Result<(), String> {
+    use session::virtual_input::ExclusiveGrab;
+
+    let devices = session::virtual_input::VirtualDevices::create("selftest")
+        .map_err(|e| format!("virtual device creation failed: {e:#}"))?;
     tracing::info!(
         "created: keyboard={}, mouse={}, gamepad={}",
         devices.keyboard_path.display(),
@@ -463,30 +606,83 @@ fn run_vinput_selftest() {
         devices.gamepad_path.display()
     );
 
-    let report = |name: &str, result: anyhow::Result<()>| match result {
-        Ok(()) => tracing::info!("  ✅ {name}"),
-        Err(e) => {
-            tracing::error!(token = "selftest-check-failed", "  ❌ {name}: {e:#}");
-            std::process::exit(1);
+    let step = |name: &str, result: anyhow::Result<()>| -> Result<(), String> {
+        match result {
+            Ok(()) => {
+                tracing::info!("  ✅ {name}");
+                Ok(())
+            }
+            Err(e) => Err(format!("{name} failed: {e:#}")),
         }
     };
-    report(
+    step(
         "key A down+up",
-        devices.key(30, true).and_then(|_| devices.key(30, false)),
-    );
-    report(
+        write_if_grabbed(ExclusiveGrab::take(&devices.keyboard_path), || {
+            devices.key(30, true).and_then(|_| devices.key(30, false))
+        }),
+    )?;
+    step(
         "mouse move + left click",
-        devices
-            .mouse_move_rel(10.0, -5.0)
-            .and_then(|_| devices.mouse_button(0x110, true))
-            .and_then(|_| devices.mouse_button(0x110, false)),
-    );
-    report("scroll", devices.scroll(0.0, 120.0));
-    report(
+        write_if_grabbed(ExclusiveGrab::take(&devices.mouse_path), || {
+            devices
+                .mouse_move_rel(10.0, -5.0)
+                .and_then(|_| devices.mouse_button(0x110, true))
+                .and_then(|_| devices.mouse_button(0x110, false))
+        }),
+    )?;
+    step(
+        "scroll",
+        write_if_grabbed(ExclusiveGrab::take(&devices.mouse_path), || {
+            devices.scroll(0.0, 120.0)
+        }),
+    )?;
+    step(
         "gamepad A + left stick",
-        devices.gamepad(&[1.0], &[0.5, -0.5]),
-    );
+        write_if_grabbed(ExclusiveGrab::take(&devices.gamepad_path), || {
+            devices.gamepad(&[1.0], &[0.5, -0.5])
+        }),
+    )?;
+    Ok(())
+}
+
+fn run_vinput_selftest() {
+    tracing::info!("quasar node-agent — virtual input self-test");
+    if let Err(e) = exercise_virtual_input() {
+        tracing::error!(token = "vinput-selftest-failed", "{e}");
+        std::process::exit(1);
+    }
     tracing::info!("✅ virtual input self-test PASS");
+}
+
+/// `quasar-node-agent input-probe` — the input host probe. Stdout is exactly one line
+/// (the probe contract, `host_probe::outcome`); everything else goes to the log.
+fn run_input_probe() {
+    tracing::info!("quasar node-agent — input host probe");
+    match exercise_virtual_input() {
+        Ok(()) => println!("created keyboard, mouse and gamepad devices and wrote events"),
+        Err(e) => {
+            println!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `quasar-node-agent media-probe [--gpu N] [--codec h264|h265|av1] [--size WxH@FPS]
+/// [--frames N] [--budget-secs N]`. The GPU binding and encoder selection arrive as env
+/// from the parent (`host_probe::media`). One result line, preceded by a remediation line
+/// on a pixel mismatch; exit 0 pass, 1 fail, 2 usage, 3 indeterminate, 4 unsupported (a
+/// codec probe whose encoder cannot open on this device, #311).
+fn run_media_probe(request: session::probe_media::MediaProbeRequest) {
+    tracing::info!("quasar node-agent — media host probe");
+    let verdict = session::probe_media::run(&request);
+    if let Some(remediation) = verdict.remediation() {
+        println!(
+            "{}{remediation}",
+            quasar_node_agent::host_probe::child::REMEDIATION_PREFIX
+        );
+    }
+    println!("{}", verdict.line());
+    std::process::exit(verdict.exit_code());
 }
 
 #[cfg(test)]
@@ -495,6 +691,205 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `write_if_grabbed` is the seam behind the vinput self-test's fail-closed
+    /// rule: a grab failure must never be followed by a write. Exercised with a
+    /// plain `()` grab so it needs no real uinput/evdev node.
+    #[test]
+    fn grab_failure_skips_the_write() {
+        let wrote = Arc::new(AtomicBool::new(false));
+        let w = wrote.clone();
+        let result = write_if_grabbed(Err::<(), _>(anyhow::anyhow!("no such device")), move || {
+            w.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(
+            !wrote.load(Ordering::SeqCst),
+            "write ran after a failed grab"
+        );
+    }
+
+    #[test]
+    fn grab_success_runs_the_write() {
+        let wrote = Arc::new(AtomicBool::new(false));
+        let w = wrote.clone();
+        let result = write_if_grabbed(Ok::<_, anyhow::Error>(()), move || {
+            w.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(
+            wrote.load(Ordering::SeqCst),
+            "write did not run after a successful grab"
+        );
+    }
+
+    /// The grab is still held while the write runs, and released after it (a grab
+    /// dropped before the write let the self-test's key reach the host console).
+    #[test]
+    fn the_grab_is_held_for_the_whole_write() {
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let held = Arc::new(AtomicBool::new(true));
+        let seen_during_write = Arc::new(AtomicBool::new(false));
+        let (h, s) = (held.clone(), seen_during_write.clone());
+        write_if_grabbed(Ok::<_, anyhow::Error>(Guard(held.clone())), move || {
+            s.store(h.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            seen_during_write.load(Ordering::SeqCst),
+            "grab released before the write"
+        );
+        assert!(
+            !held.load(Ordering::SeqCst),
+            "grab not released after the write"
+        );
+    }
+
+    /// The write's own failure still propagates once the grab succeeded — the
+    /// gate only blocks the failed-grab case, not the write's own errors.
+    #[test]
+    fn write_failure_still_propagates_after_a_successful_grab() {
+        let result = write_if_grabbed(Ok::<_, anyhow::Error>(()), || {
+            Err(anyhow::anyhow!("write failed"))
+        });
+        assert!(result.is_err());
+    }
+
+    /// The production role: no arguments at all.
+    #[test]
+    fn no_arguments_is_agent_mode() {
+        assert!(matches!(parse_mode(&[]), Ok(Mode::Agent)));
+    }
+
+    /// Falling through to agent mode on an unrecognised argv would boot a second agent
+    /// inside a probe container (spec #252).
+    #[test]
+    fn an_unknown_first_argument_is_never_agent_mode() {
+        for args in [
+            vec!["media-probe-from-the-future"],
+            vec!["--gpu", "0"],
+            vec![""],
+            vec!["session-answerer-typo"],
+            vec!["Agent"],
+        ] {
+            let e = parse_mode(&argv(&args)).expect_err(&format!("{args:?} must be refused"));
+            assert!(e.starts_with("unknown subcommand: "), "{args:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn every_known_subcommand_still_parses() {
+        // The mode's Debug name, so one list covers "parses" and "parses as itself".
+        for (arg, expected) in [
+            ("session", "Session"),
+            ("session-answerer", "SessionAnswerer"),
+            (
+                quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG,
+                "EglSelfTest",
+            ),
+            ("homes-gc", "HomesGc"),
+            ("console-vt", "ConsoleVt"),
+            ("probe-encoder", "ProbeEncoder"),
+            ("inject-selftest", "InjectSelfTest"),
+            ("vinput-selftest", "VirtualInputSelfTest"),
+            ("input-probe", "InputProbe"),
+            ("media-probe", "MediaProbe"),
+        ] {
+            let mode = parse_mode(&argv(&[arg])).unwrap_or_else(|e| panic!("{arg}: {e}"));
+            assert!(
+                format!("{mode:?}").starts_with(expected),
+                "{arg} parsed as {mode:?}"
+            );
+        }
+    }
+
+    /// The readiness and launch-gate callers pass no flag and must keep the dispatcher
+    /// stdout contract; only the application-GPU probe asks for a device.
+    #[test]
+    fn egl_selftest_opens_a_device_only_when_asked() {
+        let egl = quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG;
+        let vendor = "/vendor/libEGL_nvidia.so.0";
+        for (args, expected) in [
+            (vec![egl], (None, false)),
+            (vec![egl, vendor], (Some(vendor), false)),
+            (vec![egl, "--open-device"], (None, true)),
+            (vec![egl, vendor, "--open-device"], (Some(vendor), true)),
+        ] {
+            let Ok(Mode::EglSelfTest {
+                vendor_lib,
+                open_device,
+                ..
+            }) = parse_mode(&argv(&args))
+            else {
+                panic!("{args:?} did not parse as the EGL self-test");
+            };
+            assert_eq!((vendor_lib.as_deref(), open_device), expected, "{args:?}");
+        }
+    }
+
+    /// The application-GPU probe pins the exact GPU it was placed on.
+    #[test]
+    fn egl_selftest_render_node_is_optional_and_travels_with_open_device() {
+        let egl = quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG;
+        let Ok(Mode::EglSelfTest {
+            open_device,
+            render_node,
+            ..
+        }) = parse_mode(&argv(&[
+            egl,
+            "--open-device",
+            "--render-node",
+            "/dev/dri/renderD129",
+        ]))
+        else {
+            panic!("did not parse as the EGL self-test");
+        };
+        assert!(open_device);
+        assert_eq!(render_node.as_deref(), Some("/dev/dri/renderD129"));
+
+        let Ok(Mode::EglSelfTest { render_node, .. }) = parse_mode(&argv(&[egl])) else {
+            panic!("did not parse as the EGL self-test");
+        };
+        assert_eq!(render_node, None);
+    }
+
+    #[test]
+    fn media_probe_flags_override_the_defaults_and_absent_ones_do_not() {
+        let Ok(Mode::MediaProbe(req)) = parse_mode(&argv(&[
+            "media-probe",
+            "--gpu",
+            "1",
+            "--size",
+            "640x360@30",
+            "--frames",
+            "5",
+            "--budget-secs",
+            "7",
+        ])) else {
+            panic!("media-probe did not parse");
+        };
+        assert_eq!((req.gpu, req.width, req.height, req.fps), (1, 640, 360, 30));
+        assert_eq!(req.frames, 5);
+        assert_eq!(req.budget, std::time::Duration::from_secs(7));
+        assert_eq!(req.codec, "h264");
+
+        let Ok(Mode::MediaProbe(bare)) = parse_mode(&argv(&["media-probe"])) else {
+            panic!("bare media-probe did not parse");
+        };
+        assert_eq!(bare, session::probe_media::MediaProbeRequest::default());
+    }
 
     /// #94 regression: a set-but-empty var is removed.
     #[test]

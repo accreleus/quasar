@@ -227,8 +227,8 @@ describe("Overview live sessions", () => {
     });
     renderOverview();
 
-    expect(screen.getByText("68 ms").getAttribute("style")).toContain("--danger-text");
-    expect(screen.getByText("14 ms").getAttribute("style") ?? "").not.toContain("--danger-text");
+    expect(screen.getByText("68 ms").classList.contains("td-danger")).toBe(true);
+    expect(screen.getByText("14 ms").classList.contains("td-danger")).toBe(false);
   });
 
   it("shows a dash for a session that has reported no metrics yet", () => {
@@ -391,9 +391,7 @@ describe("Overview recent activity", () => {
     expect(mocked.listAdminActivity).toHaveBeenCalledWith("tok", { limit: 6 });
     // A system action has no actor row to join.
     expect(within(recent).getByText("system")).toBeTruthy();
-    expect(within(recent).getByText("session.failed").getAttribute("style")).toContain(
-      "--danger-text",
-    );
+    expect(within(recent).getByText("session.failed").classList.contains("act-err")).toBe(true);
     expect(within(recent).getAllByText("host a4c7f210")).toHaveLength(6);
   });
 });

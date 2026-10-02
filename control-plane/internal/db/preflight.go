@@ -92,6 +92,7 @@ func Preflight(ctx context.Context, databaseURL string) error {
 // resolved to, so the message can point at specifics instead of quoting the
 // (possibly credential-bearing) URL back at the operator.
 func classifyConnectErr(cfg *pgx.ConnConfig, err error) error {
+	svc := databaseService(cfg)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
@@ -100,9 +101,9 @@ func classifyConnectErr(cfg *pgx.ConnConfig, err error) error {
 				Kind: PreflightAuthFailure,
 				Message: fmt.Sprintf(
 					"Postgres at %s:%d rejected the credentials in DATABASE_URL for user %q — "+
-						"check DATABASE_URL against the `postgres` compose service's actual "+
+						"check DATABASE_URL against %s's actual "+
 						"POSTGRES_USER/POSTGRES_PASSWORD",
-					cfg.Host, cfg.Port, cfg.User),
+					cfg.Host, cfg.Port, cfg.User, svc),
 				Cause: err,
 			}
 		case "3D000": // invalid_catalog_name (database does not exist)
@@ -110,9 +111,9 @@ func classifyConnectErr(cfg *pgx.ConnConfig, err error) error {
 				Kind: PreflightDatabaseMissing,
 				Message: fmt.Sprintf(
 					"database %q named by DATABASE_URL does not exist on the Postgres server at %s:%d — "+
-						"check the database name in DATABASE_URL, or that the `postgres` compose "+
-						"service finished creating it (POSTGRES_DB)",
-					cfg.Database, cfg.Host, cfg.Port),
+						"check the database name in DATABASE_URL, or that %s "+
+						"finished creating it (POSTGRES_DB)",
+					cfg.Database, cfg.Host, cfg.Port, svc),
 				Cause: err,
 			}
 		}
@@ -124,10 +125,10 @@ func classifyConnectErr(cfg *pgx.ConnConfig, err error) error {
 		return &PreflightError{
 			Kind: PreflightUnreachable,
 			Message: fmt.Sprintf(
-				"could not reach Postgres at %s:%d named by DATABASE_URL — check that the "+
-					"`postgres` compose service is running and reachable from the control-plane "+
+				"could not reach Postgres at %s:%d named by DATABASE_URL — check that "+
+					"%s is running and reachable from the control-plane "+
 					"container, and that the host/port in DATABASE_URL are correct",
-				cfg.Host, cfg.Port),
+				cfg.Host, cfg.Port, svc),
 			Cause: err,
 		}
 	}
@@ -136,8 +137,21 @@ func classifyConnectErr(cfg *pgx.ConnConfig, err error) error {
 		Kind: PreflightOther,
 		Message: fmt.Sprintf(
 			"could not connect to Postgres at %s:%d named by DATABASE_URL — check DATABASE_URL "+
-				"against the `postgres` compose service",
-			cfg.Host, cfg.Port),
+				"against %s",
+			cfg.Host, cfg.Port, svc),
 		Cause: err,
 	}
+}
+
+// ownedPostgresHost is the container name the recovery actor gives an owned
+// install's database (RH-06); the control plane it creates reaches it by name.
+const ownedPostgresHost = "quasar-postgres"
+
+// databaseService names the thing an operator should look at: on an owned
+// install there is no compose service, only the actor's container (#382).
+func databaseService(cfg *pgx.ConnConfig) string {
+	if cfg.Host == ownedPostgresHost {
+		return "the `quasar-postgres` container the recovery actor runs (`docker logs quasar-postgres`)"
+	}
+	return "the `postgres` compose service"
 }

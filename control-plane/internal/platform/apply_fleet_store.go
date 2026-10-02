@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -283,11 +284,15 @@ func (s *Store) RequestCancel(ctx context.Context, runID string) (ApplyRun, erro
 // host_id is always NULL; the zero uuid in the single-flight index is what
 // makes two open control-plane attempts impossible.
 type NewControlPlaneAttempt struct {
+	// Kind is KindApply when empty; a developer apply names no release.
+	Kind      string
 	RunID     *string
 	ReleaseID *string
 	Requested []ComponentDigest
 	Previous  []PreviousDigest
 	Actor     *string
+	// Force is a developer apply's; a fleet run's step reads the run's.
+	Force bool
 }
 
 // CreateControlPlaneAttempt inserts a `queued` control-plane attempt.
@@ -300,14 +305,18 @@ func (s *Store) CreateControlPlaneAttempt(ctx context.Context, in NewControlPlan
 	if err != nil {
 		return Attempt{}, fmt.Errorf("encode previous_digests: %w", err)
 	}
+	kind := in.Kind
+	if kind == "" {
+		kind = KindApply
+	}
 	var id string
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO platform_apply_attempts
 		    (run_id, kind, target, release_id, requested_digests, previous_digests,
-		     state, requested_by)
-		VALUES ($1::uuid, 'apply', 'control_plane', $2::uuid, $3::jsonb, $4::jsonb, 'queued', $5::uuid)
+		     state, requested_by, force)
+		VALUES ($1::uuid, $6, 'control_plane', $2::uuid, $3::jsonb, $4::jsonb, 'queued', $5::uuid, $7)
 		RETURNING id::text
-	`, in.RunID, in.ReleaseID, requested, previous, in.Actor).Scan(&id)
+	`, in.RunID, in.ReleaseID, requested, previous, in.Actor, kind, in.Force).Scan(&id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
@@ -335,7 +344,8 @@ func (s *Store) OpenControlPlaneAttempt(ctx context.Context) (Attempt, string, e
 		 ORDER BY a.created_at DESC LIMIT 1
 	`).Scan(&a.ID, &a.RunID, &a.Kind, &a.Target, &a.HostID, &a.NodeName,
 		&a.ReleaseID, &requested, &previous, &a.State, &a.Reason, &a.SessionsRemaining,
-		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt, &commit)
+		&a.Force, &a.Output, &a.RequestedBy, &a.CreatedAt, &a.StartedAt, &a.FinishedAt,
+		&a.PreUpdateDump, &commit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Attempt{}, "", ErrAttemptNotFound
 	}
@@ -382,6 +392,86 @@ func (s *Store) MarkCordonsRestored(ctx context.Context, runID string) error {
 		`UPDATE platform_apply_runs SET cordons_restored_at = now() WHERE id = $1::uuid`, runID)
 	if err != nil {
 		return fmt.Errorf("set cordons_restored_at: %w", err)
+	}
+	return nil
+}
+
+// RestoreOwnedCordons commits the run's restriction releases, host status
+// projections, and restore marker together. An error before commit rolls all
+// three back; an ambiguous commit result is safe to retry using the marker.
+func (s *Store) RestoreOwnedCordons(ctx context.Context, runID string, connected func(string) bool) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var state string
+	var restored bool
+	var raw []byte
+	err = tx.QueryRow(ctx, `SELECT state,cordons_restored_at IS NOT NULL,cordoned_hosts
+		FROM platform_apply_runs WHERE id=$1::uuid FOR UPDATE`, runID).Scan(&state, &restored, &raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrRunNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("lock platform run for restore: %w", err)
+	}
+	if restored {
+		return tx.Commit(ctx)
+	}
+	if !TerminalRunState(state) {
+		return fmt.Errorf("restore non-terminal platform run %s", runID)
+	}
+	var cordons []HostCordon
+	if err := json.Unmarshal(raw, &cordons); err != nil {
+		return fmt.Errorf("decode cordoned hosts for restore: %w", err)
+	}
+	hostIDs := make([]string, 0, len(cordons))
+	seen := make(map[string]bool, len(cordons))
+	for _, c := range cordons {
+		if !seen[c.HostID] {
+			hostIDs = append(hostIDs, c.HostID)
+			seen[c.HostID] = true
+		}
+	}
+	sort.Strings(hostIDs)
+	for _, hostID := range hostIDs {
+		var status string
+		err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue // a deleted host has no restriction to restore
+		}
+		if err != nil {
+			return fmt.Errorf("lock host for platform restore: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions
+			WHERE host_id=$1::uuid AND owner_kind='platform' AND owner_id=$2::uuid`, hostID, runID); err != nil {
+			return fmt.Errorf("release platform restriction: %w", err)
+		}
+		var held bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM host_admission_restrictions WHERE host_id=$1::uuid)`, hostID).Scan(&held); err != nil {
+			return fmt.Errorf("project platform restore status: %w", err)
+		}
+		next := status
+		if held && status == "online" {
+			next = "draining"
+		} else if !held && status == "draining" {
+			next = "offline"
+			if connected != nil && connected(hostID) {
+				next = "online"
+			}
+		}
+		if next != status {
+			if _, err := tx.Exec(ctx, `UPDATE hosts SET status=$2 WHERE id=$1::uuid`, hostID, next); err != nil {
+				return fmt.Errorf("write platform restore status: %w", err)
+			}
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE platform_apply_runs SET cordons_restored_at=now() WHERE id=$1::uuid`, runID); err != nil {
+		return fmt.Errorf("stamp platform cordon restore: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit platform cordon restore: %w", err)
 	}
 	return nil
 }

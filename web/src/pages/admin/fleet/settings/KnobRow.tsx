@@ -44,9 +44,9 @@ export function KnobRow({
           {changed && <Chip variant="accent" className="chip-sm">overridden</Chip>}
         </h3>
         <p className="hint">{knobHelp(knob)}</p>
-        <span className="cell-id" style={{ display: "inline-block", marginTop: 4 }}>{knob.env_var}</span>
+        <span className="cell-id knob-env">{knob.env_var}</span>
         {changed && (
-          <p className="hint" style={{ marginTop: 4 }}>
+          <p className="hint">
             Default <span className="mono">{valueLabel(defaultValue)}</span> ·{" "}
             <a href="#" onClick={(e) => { e.preventDefault(); onReset(); }}>reset to default</a>
           </p>
@@ -54,9 +54,9 @@ export function KnobRow({
       </div>
       <div>
         <KnobControl knob={knob} value={value} onChange={onChange} renderNodeOptions={renderNodeOptions} />
-        <p className="hint" style={{ marginTop: 6 }}>Current value is {valueLabel(currentValue)}</p>
+        <p className="hint knob-note">Current value is {valueLabel(currentValue)}</p>
         {showsStaleEffective && (
-          <p className="host-setting-effective" style={{ marginTop: 6 }}>
+          <p className="host-setting-effective knob-note">
             Agent is still running <strong>{valueLabel(effectiveValue)}</strong>. Restart pending.
           </p>
         )}

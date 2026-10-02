@@ -1,0 +1,110 @@
+---
+title: NVIDIA setup
+description: Prepare the NVIDIA graphics driver and container engine before installing Quasar.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Driver and toolkit
+
+Install the **full NVIDIA graphics driver, version 610 or newer**, for your Linux distribution and check
+`nvidia-smi` lists your GPU. Then install the **NVIDIA Container Toolkit** using
+[NVIDIA's package instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Choose the instructions for your distribution; Ubuntu/Debian and Fedora use different packages.
+On Unraid, use the [Unraid steps below](#unraid) instead.
+
+<Aside type="caution" title="Check driver compatibility">
+RTX 50-series cards need the open kernel modules as well as driver 610 or newer.
+Follow the [Unraid availability warning](#unraid) on that platform. Known codec
+restrictions and measured evidence are in the [NVIDIA compatibility reference](/quasar/reference/nvidia-compatibility/).
+</Aside>
+
+## Docker rootful
+
+Give Docker its NVIDIA runtime, then restart the daemon. Restarting Docker can
+interrupt running containers.
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+The restart command above is for systemd hosts; use your host's service manager otherwise.
+Check `docker info` lists `nvidia` under **Runtimes**. If Docker uses SELinux
+(`docker info` lists it under **Security Options**), apply the [SELinux steps](#selinux).
+Then return to [Docker installation](/quasar/install/docker/#before-you-start).
+
+## Podman rootful
+
+Podman uses a **CDI device description** to make the GPU available to containers.
+After installing the driver and toolkit:
+
+```bash
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+nvidia-ctk cdi list
+```
+
+The list should include your NVIDIA GPU. Regenerate the file after driver or GPU
+changes. Newer toolkit versions can also refresh CDI automatically; see
+[NVIDIA's CDI guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html).
+If SELinux is enabled, apply the [SELinux steps](#selinux).
+Then return to [Podman installation](/quasar/install/podman/#prepare-the-host),
+including its required systemd socket, restart service and runtime directory.
+
+## Rootless Docker or Podman
+
+Both rootless engines use CDI for Quasar's NVIDIA sessions. Generate and check the
+CDI description with the commands under [Podman rootful](#podman-rootful), as root.
+Rootless Docker must support and expose CDI; Quasar's readiness checks report a
+missing NVIDIA CDI device rather than falling back to the rootful runtime path.
+
+Follow [rootless host preparation](/quasar/install/rootless/#prepare-the-host-once-as-root)
+for the `quasar` account, device permissions, systemd user session and engine setup.
+Generating CDI alone does not grant that account access to the GPU devices.
+Apply the SELinux steps below when applicable. Rootless support remains experimental.
+
+## SELinux
+
+For Podman, or Docker with SELinux enabled, permit access to NVIDIA devices.
+These existing Quasar policy steps keep SELinux enforcing:
+
+```bash
+sudo setsebool -P container_use_xserver_devices on
+echo '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' > quasar-nested-gpu.cil
+sudo semodule -i quasar-nested-gpu.cil
+```
+
+## Unraid
+
+1. Install the **NVIDIA driver plugin** through Unraid. Use its plugin-managed driver and container runtime rather than the Linux package commands above.
+2. In the Unraid host shell, check the driver:
+
+```bash
+nvidia-smi
+```
+
+Your GPU should be listed.
+
+3. Check the container runtime:
+
+```bash
+docker info
+```
+
+**Runtimes** should include `nvidia`.
+
+<Aside type="caution" title="Warning: RTX 50-series drivers on Unraid">
+Blackwell / RTX 50-series requires [NVIDIA's open kernel modules](https://download.nvidia.com/XFree86/Linux-x86_64/610.57.04/README/kernel_open.html).
+The [6.18.52-Unraid plugin packages](https://github.com/unraid/unraid-nvidia-driver/releases/tag/6.18.52-Unraid)
+include open modules at 595.99.02, while newer packaged versions use proprietary modules.
+A higher version number alone does not make a package compatible with these cards.
+
+Meeting Quasar's **610+ supported baseline** with open modules on Unraid can
+require a compatible driver build outside the plugin's packaged choices. Quasar
+does not provide that build. HEVC or H.264 can avoid the known AV1 defect where
+the profile and client support them, but do not change the supported driver baseline.
+Alternatively, use a host with a compatible packaged driver. See the
+[NVIDIA compatibility reference](/quasar/reference/nvidia-compatibility/).
+</Aside>
+
+4. Continue with [Unraid installation](/quasar/install/unraid/) for persistent storage and deployment.

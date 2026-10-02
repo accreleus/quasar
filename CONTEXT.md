@@ -24,9 +24,10 @@ does not. _Avoid_: "stream profile" in prose (it is the table name, not the
 concept), "quality level".
 
 **Rung resolution** — the post-placement walk that picks which rung of the
-selected chain a placed session actually starts at, given the host's encoder
-set, the device's decode capability, and the failure history. Codec-blind
-placement is deliberate: the host is chosen first, the rung second.
+selected chain a placed session actually starts at, given the placed GPU's codec
+set, the device's decode capability, and the failure history. The GPU is still
+chosen first and the rung second; an explicit codec is a *codec constraint* on
+that choice, and an Auto launch's *codec preference* orders it.
 
 **Cert cap** — the encoder-certification downgrade. A host's measured verdict
 for the resolved rung can be `unsafe` (or `capped` without stable live writes),
@@ -47,13 +48,14 @@ chain and rung, whether the cap fired, the decision record, and exactly what to
 persist. Computed from gathered inputs with no I/O, so the decision is
 separable from the reads that feed it and the write that records it.
 
-**Probe** — a device-capability measurement reported by a client (bandwidth,
-RTT, max decode height, refresh rate, decode matrix). Per account, not per
-launching client: the latest probe may describe a different device than the one
-launching now, which is why the H.264 lift is keyed on the request's declared
-client type as well as the probe.
+**Device probe** — a device-capability measurement reported by a client
+(bandwidth, RTT, max decode height, refresh rate, decode matrix). Per account,
+not per launching client: the latest device probe may describe a different
+device than the one launching now, which is why the H.264 lift is keyed on the
+request's declared client type as well as the device probe. _Avoid_: bare
+"probe" in new prose (a *host probe* is a different thing, see Host readiness).
 
-**Envelope** — the conservative ceiling derived from a probe: a safe bitrate
+**Envelope** — the conservative ceiling derived from a device probe: a safe bitrate
 cap and a playout₀ bump. It only ever lowers. It is applied to the *final*
 rung's bitrate, not just the pre-placement one, or a fall-through to a lower
 rung would restore an unclamped number.
@@ -72,6 +74,45 @@ hard host pin rather than a locality preference.
 tile discovered inside a parent app's library. It inherits the parent's
 runtime, image, and resource demand; a handful of fields (default profile,
 profile policy) stay on the tile.
+
+**Generation** — one app container launched into one session: the gen-0
+container the session boots with, and each replacement a swap launches after
+it. Its container name carries the number (`quasar-sess-<sid>-g<n>`), and its
+exit slot, log ring, presented-baseline and intentional-stop marker belong to
+it alone, so nothing an earlier generation's observer reports late can be
+attributed to its replacement. The runtime API knows nothing of generations:
+each launch attempt is its own durable operation, and stop/cleanup act only on
+that exact identity. _Avoid_: "retry count" (a rolled-back swap relaunches the
+previous app under the previous generation's name; the counter is a name, not
+a tally of what is running), and the unrelated policy epoch in `source_policy`.
+
+**Intentional stop** — the agent's own teardown of a generation (a swap's step
+2, a session stop, a drop). The marker is set on the container handle BEFORE
+the engine sees the stop, so an exit the observer sees afterwards is discarded
+rather than reported as an app failure. It is not proof of removal: a stop or
+cleanup whose reply was lost keeps the handle and its durable operation pending
+until that exact identity is reconciled. _Avoid_: "user stop" (a user can only
+ask the control plane; the agent stops).
+
+**Scratch home** — the empty, throwaway directory a warm-up bind-mounts at the
+image's own home path so the app can populate it. It lives inside the staging
+tree, is never seeded from a template, and becomes the template only after the
+warm-up container's teardown has been proven; an unproven teardown fails the
+build and publishes nothing. _Avoid_: "throwaway home" (the `agent-…` per-user
+homes the homes GC reaps) and the `scratch_mount()` tempdir in the home tests.
+
+**Legacy container** — an app or audio sibling left behind by a *pre-API* agent,
+one that shell-launched `docker run --rm`. It carries this agent's owner label
+and an allowed name prefix but has no durable operation journal, so it can only
+be identified, never reconciled: the boot sweep re-inspects each candidate by
+its immutable ID and removes it only when the exact owner label AND an allowed
+prefix both hold. Everything else — a foreign owner, an unlabelled container, a
+name that merely contains the prefix, an API-owned application, an audio sidecar
+— is *preserved and counted* for operator review, and a removal this pass cannot
+prove is left to the next boot rather than retried immediately. Removal is
+boot-only, behind the persistent owner lease. _Avoid_: "orphan" (the old CLI
+sweep's word; it suggested anything unclaimed was ours to delete), and "adoption"
+— nothing here resumes or observes a prior session.
 
 ## Stream health
 
@@ -243,13 +284,12 @@ phrase names the node agent's own image in `hosts.json` and in
 named for the job it does, never for the technology that happens to be inside
 it. `quasar-vulkan` broke this (it described an encoder path, so it went stale
 the moment a second encode path shipped in the same image and misled anyone
-choosing between it and `quasar-nv`). Current names:
+choosing between it and the since-retired `quasar-nv`). Current names:
 
 | Role | Image | What it is |
 | --- | --- | --- |
 | `control` | `quasar-control-plane` | Control-plane production image |
-| `runtime` | `quasar-node-agent` | Vendor-neutral node agent (AMD/Intel VA + Vulkan) |
-| `nv` | `quasar-nv` | `runtime` + NVIDIA CUDA runtime libs. **Deprecated pending #545** — being retired, not renamed |
+| `runtime` | `quasar-node-agent` | The universal node agent, every GPU vendor. CUDA-built; NVRTC is fetched at run time (#545) |
 | `dev` | `quasar-agent-dev` | Build/test environment; never deployed as an agent |
 | `toolchain` | `quasar-gst-toolchain` | Patched-GStreamer build artefact, tagged by content hash |
 | `profiling` | `quasar-profiling` | PROF-02 capture variant; never validated, never promoted |
@@ -276,11 +316,141 @@ signature" and "manifest verification" (nothing is verified), "manifest digest"
 on its own when the ref/commit/URL are also meant (the digest is one field of
 the record).
 
+## Host management (RH05 proposal)
+
+**Setting source** — how a supported host setting is chosen: Automatic,
+deployment baseline or explicit value. Clearing a legacy override selects the
+deployment baseline; it does not request Automatic. _Avoid_: "default" without
+naming the source.
+
+**Configuration applied** — verified evidence that a requested setting group is
+active for its declared scope. A saved edit or accepted command is not application.
+Next-session application leaves existing sessions on their previous values.
+_Avoid_: "saved" or "received" as synonyms.
+
+**Idle apply** — an operator-approved disruptive setting group that bars new
+assignments, waits for active and local work to finish, then applies and verifies.
+Waiting never authorizes ending a session. _Avoid_: "automatic restart".
+
+**Admission restriction** — one named owner's reason a host cannot take new
+assignments. Several owners can restrict the same host; each releases only its
+own restriction. _Avoid_: "the cordon" when ownership matters.
+
+**Canonical home claim** — one user's location for a managed app home, keyed by
+the executable parent app when a derived tile is launched. It may be reserved,
+materialized or in conflict; uncertainty never licenses a second home. _Avoid_:
+"preferred host" (an existing home is a constraint).
+
+**App placement** — the operator's selection of hosts where a canonical app may
+run and be prepared. Derived tiles inherit it. A cached image does not grant
+eligibility. _Avoid_: "image cache policy".
+
+**App prepared** — required local image and preparation work have completed on a
+host. It does not establish placement, readiness or browser reachability.
+_Avoid_: "downloaded" when additional preparation is required.
+
+**Home template** — an authorized prepared app home from which a new empty user
+home can be initialized. Existing user homes are preserved. _Avoid_: "backup".
+
+## Host readiness
+
+**Host fact** — something observed about a host, carried with where the
+observation came from and when it was made. A fact states what is there; it
+never says what should be done about it. _Avoid_: "capability" (that is what a
+runtime or encoder advertises), "setting" (that is policy).
+
+**Readiness check** — a named verdict over one or more host facts, worded for
+the operator, with the fix when it fails. It is the unit the console shows and
+the only thing that can block a launch. _Avoid_: "health check" (the
+container's), "preflight check" (preflight is the release evaluation that reads
+some readiness checks).
+
+**Host probe** — a bounded, disposable job the host agent runs to exercise a
+real path (compositing and encoding, application GPU access, audio, virtual
+input) where that path really runs, producing host facts. Distinct from a
+*device probe*, which measures a client. _Avoid_: "preflight" (releases),
+"self-test" (that is one process checking itself), bare "probe".
+
+**Codec probe** — the media host probe run on one GPU for one codec above the H.264
+floor (HEVC, AV1), after that GPU's own media probe has passed on the current agent
+image, driver and media settings. Its pass is the evidence that admits the codec to the
+GPU's codec set. A failure never blocks the GPU. When the encoder cannot open at all
+(the encoder element's own open failure: the GPU has no encoder for that codec) the check
+reports `unsupported`, a hardware fact that asks for no attention; any other failure reports
+`fail`. `unsupported` is sticky by design: it is re-proven only when the agent image, driver,
+media settings or GPU identity change, or the agent restarts. Its check is
+`media_probe_gpu<N>_<codec>`. It is a host probe, not a device probe.
+
+**GPU codec set** — the codecs one usable GPU has been shown to encode: H.264 always
+(the floor), and every other codec only when its registry plan builds it (the
+encoder-candidate resolution run on that GPU's own render node), no driver-compatibility
+exclusion rules it out, and a codec probe on that GPU passed under the current agent
+image, driver, media settings and GPU identity. The AV1 exclusion is still host-wide in
+practice: one known-corrupt GPU keeps AV1 out of every GPU's Vulkan/NVENC plan, as
+sessions are built.
+The **host codec set** (`capacity.codecs`, `hosts.codecs`) is the union of every *usable*
+GPU's set (one with `encode_slots_total > 0` — a render-node pin zeroes every other GPU,
+dropping it from the union), and is never empty: H.264 with no usable GPU or no
+registry. Each GPU's set is reported as `capacity.gpus[].codecs` and stored as `gpus.codecs`;
+a GPU with none stored (an older agent) inherits its host's set. _Avoid_: "host codec set" for a single GPU's set, or
+vice versa.
+
+**Codec constraint** — an explicit codec on a launch (`stream.codec`), applied at
+placement as a candidacy gate: only a GPU whose codec set contains it is a candidate, in
+the pick, the re-check, the totals probe and every refusal diagnosis alike. All capable
+GPUs busy is `capacity_exhausted`; none online is `no_host_available`; nothing is ever
+downgraded to another codec. An Auto launch carries no constraint. _Avoid_: "codec
+override" for the placement meaning.
+
+**Codec preference** — what an Auto launch brings to placement instead of a constraint:
+the distinct codecs of the chain's rungs in chain order, keeping only rungs the launching
+device can take (decode capability, decode height, decode-failure history). It is the
+order rung resolution would follow if every GPU could encode everything. Placement uses it
+as a sort key only, after home locality and before load spread, so a free GPU that
+encodes a better codec beats a freer one that does not; it never excludes a GPU. A
+preference of H.264 alone (every usable GPU encodes it, and it is all a device with no
+probe can take) is empty, and an empty preference orders nothing. The legacy tier launch
+has none. It weighs only the device side: a GPU whose host clamps (hardware encoder
+required, encoder throughput) rule out its best codec still ranks by that codec, so the
+result can be a lesser codec than another GPU offered, never a failure. _Avoid_: "codec priority", or calling it a constraint.
+
+**Evidence** — a host fact that came from exercising the real path, or a
+definitive local observation such as an unreachable container runtime. Only
+evidence may block a launch; a *proxy* (a file that exists, a firewall rule
+that parses) informs the operator and never blocks.
+
+**Indeterminate** — the outcome of a host probe that could not be concluded: a
+deadline passed, a reply was lost, the runtime went away. It neither sets nor
+clears a block; the last definitive result stands, with its own observation
+time. _Avoid_: reporting it as a failure, or as "skip" (skip means not
+applicable to this host).
+
+**Readiness override** — an admin's recorded decision to launch on a host
+despite one named failing readiness check. It never hides the check, applies to
+that check only, and ends when the check next passes. _Avoid_: "ignore",
+"suppress", "acknowledge".
+
+**Readiness gate** — the control plane's use of a host's readiness report at
+admission: a failing check that carries `blocks` excludes the host, the launches
+that mount a home, or one GPU, and only while the report is fresh. On a stale or
+absent report the gate *abstains* and excludes nothing. The blocked scopes are
+derived once per report and per override change, never parsed at launch time.
+_Avoid_: "readiness check" for the gate (a check is one verdict; the gate is
+what admission does with them), "health gate".
+
+**Diagnostic registration** — a host that is connected and visible in the
+console while it refuses every launch, because its container runtime is
+unusable or its startup cleanup has not yet succeeded.
+
+**Host readiness vs browser reachability** — readiness is what the host can
+establish about itself. Whether a given browser can reach the host's media path
+is evidence only that browser can supply; no readiness check claims it.
+
 ## Platform releases
 
 **Platform release** — a matched set of Quasar's own images (control plane, which
-carries the web client, and node agent) built from one commit and published
-together. It is Quasar updating Quasar, and it never reaches the app catalog:
+carries the web client, and node agent; from RH06 also the recovery actor) built
+from one commit and published together. It is Quasar updating Quasar, and it never reaches the app catalog:
 catalog images have their own version and push machinery. _Avoid_: "update"
 (overloaded — catalog images are also "updated", and `redeploy.sh` "updates" a
 source checkout), "image version" (that is the catalog term), "build" (a build
@@ -316,27 +486,30 @@ people; any signature by any trusted key verifies. _Avoid_: "signing key" for
 the public half (the signing key is private and lives only in the release
 pipeline), "certificate" (there is no chain and no expiry).
 
-**Updater** — the per-host actor that pulls a platform release and recreates the
-containers it replaces, because a container cannot recreate itself. It acts only
-when told to, and only on the stack it sits beside. _Avoid_: "sidecar" in
-prose (that is how it is deployed, not what it is), "agent" (the agent asks; the
-updater acts).
+**Updater** — the contract's word for whatever replaces a target's containers,
+kept in `updater_present`, `updater_absent` and `updater_unreachable`: since the
+Compose updater retired with RH06-15 (#367) it is the machine's **recovery actor**.
+A pre-RH06 Compose install ran a `quasar-updater` service, which nothing ships any
+more. _Avoid_: "the updater" in new prose (say "recovery actor"), "sidecar".
 
-**Install mode** — how a host got its platform images: from the registry, or
-built from source on the host. A source-built host can be told about a release
-but not given one. _Avoid_: "dev host" (a source-built host may be production),
-"pinned" (a registry install is always pinned; the word adds nothing).
+**Install mode** — how a host got its platform images: from the registry, built
+from source on the host, or **owned** — created and replaced by the machine's
+recovery actor. A source-built host can be told about a release but not given one.
+_Avoid_: "dev host" (a source-built host may be production), "pinned" (a registry
+install is always pinned; the word adds nothing).
 
 **Attempt** — one target's move to one digest set: the control plane, or one
 host. Every apply produces one, whether it succeeded or failed, and it is the
-only durable record of what that target was on before. _Avoid_: "job" (an
-attempt is operator-initiated and rides no schedule), "task".
+only durable record of what that target was on before. Every attempt ends in one
+of two terminal states: succeeded, or failed (restored or not). A failure whose
+reason is `interrupted` means nothing changed. _Avoid_: "job" (an attempt is operator-initiated and rides no schedule),
+"task".
 
 **Preflight** — the per-target evaluation, on the release view, of whether the
-stack around a target is shaped so an apply can be carried out at all: the
-updater reachable, the stack directory and overlays it will act on the ones the
-target was started with, the health port the next agent start needs, the
-release's images resolvable. Distinct from *eligibility* (may this target take
+machinery around a target is shaped so an apply can be carried out at all: the
+recovery actor reachable, on an owned machine no conflicting container and room for
+a pre-update dump, the health port the next
+agent start needs, the release's images resolvable. Distinct from *eligibility* (may this target take
 the release) and from a host's *readiness* (can it run sessions); a host's own
 readiness checks are inputs to its preflight. A blocked preflight is one
 eligibility reason among the others. _Avoid_: "conformance check" (the checks
@@ -362,3 +535,169 @@ migration (`ReleaseRunsAMigration`): since #128 a recreate no longer ends a
 `running` session, so a non-migrating step lets live sessions ride through it and
 waits only for in-flight launches to settle (#153). Host steps drain as they
 always did — recreating an agent does end that host's sessions.
+
+## Deployment ownership (RH06, in shaping)
+
+These terms describe RH06 as specified (#352) and as the contract amendment (amendment 14,
+#353) spells it; its contract step is in force since RH06-15 (#367).
+
+**Platform service** — one long-running container that runs Quasar itself on a
+machine: the control plane, a node agent, Postgres, the recovery actor, and later
+an optional TURN relay. Distinct from a session's containers, which the node agent
+creates and owns. _Avoid_: "stack" for a single service (a stack is the set a
+manager groups together), "platform image" (that is what a service runs, not the
+service).
+
+**Service owner** — the one actor allowed to create, replace and remove a platform
+service's container and to decide what image it runs. Every platform service has
+exactly one at a time. A restart policy restarts a container; it is never an
+owner. _Avoid_: "manager" unqualified, "supervisor".
+
+**External manager** — software other than Quasar that starts containers from its
+own definitions: the Compose CLI with the operator's files, a stack UI, an
+appliance's container templates. On a Quasar-owned machine it holds exactly one
+definition, the seed; it never holds one for a Quasar service it could redeploy.
+Quasar never edits a manager's files. _Avoid_: "orchestrator" (implies scheduling
+Quasar does not delegate), "compose" as a synonym (Compose is one external
+manager).
+
+**Seed** — the one container an external manager (or a single `docker run`)
+declares for Quasar on a machine. It only ensures the recovery actor exists, and
+is built to be stable for years; the manager, not Quasar, updates it. _Avoid_:
+"installer" (that is a script run once), "bootstrap container" once the machine
+is running (bootstrap is what the seed does the first time).
+
+**Recovery actor** — the Quasar-owned container on each machine that creates and
+replaces that machine's other platform services, and replaces itself by handing
+over to a successor. It exists because a container cannot replace itself, and it
+is what keeps a control plane recoverable while the control plane is down.
+_Avoid_: "sidecar", "watchdog", "agent" (the node agent is a different service).
+
+**Enrollment** — a node agent joining a control plane for the first time, by
+redeeming an enrollment token for its host identity. Reconnecting with an
+existing identity is not enrollment. _Avoid_: "registration" for this (every
+connection registers; only the first enrolls), "bootstrap" (that is standing up
+the first control plane).
+
+**Enrollment token** — a secret an admin mints to let one agent enroll: single use
+by default, short-lived, optionally bound to one node name, revocable, stored only
+as a hash. A combined or control-only machine's own agent uses a single-use local
+enrollment token its recovery actor generates at install. The static
+deployment-wide token retired with RH06; it is no exception to keep. _Avoid_: "join token", "API key", "break-glass token".
+
+**Host identity** — the node name and node secret by which the control plane
+recognises a host across reconnects. The agent's local state beside the secret
+(its pinned control-plane certificate, container-ownership lease and
+configuration journal) belongs to the same identity and moves with it. A new
+node name is a new host. _Avoid_: "host id" (the database key), "hostname" (the
+machine's name, which the node name only defaults to).
+
+**Combined host** — one machine running the control plane, Postgres and a node
+agent. A **GPU host** runs a node agent (and its recovery actor) only; a
+**control-only host** runs the control plane and Postgres with no agent. Every
+owned machine also runs its recovery actor. _Avoid_: "all-in-one", "head node",
+"worker node".
+
+**Replacement** — moving one platform service to a new specification (usually a new
+image digest): stop the old container and keep it, start the new one, verify it, then
+discard the old one — or restore the old one if verification fails. An attempt may
+replace several services in order, the recovery actor first. _Avoid_: "recreate" (the
+Compose mechanism), "upgrade" (a replacement can also revert), "rollout".
+
+**Kept container** — the old container a replacement has stopped, with its restart
+policy disabled, and holds until the new one is verified. Restoring is starting it
+again, with no pull. It is the recovery actor's own, never an owner conflict.
+_Avoid_: "backup container", "previous container" when the kept one is meant.
+
+**Hand-over** — the recovery actor replacing itself: a successor starts beside it,
+takes the machine's single lease only when the current actor releases it, and
+verifies itself before the old actor is discarded. A successor that never verifies
+is removed and the previous actor re-enabled. _Avoid_: "self-update" (that names
+the whole platform feature), "restart".
+
+**Recipe** — the container shape for one role (control plane, node agent, Postgres,
+recovery actor) compiled into the recovery actor. A **recipe revision** numbers one
+shape; each platform image names the revision it needs, and an actor refuses a
+revision it does not carry before anything stops. Not the "manual recipe": that
+older phrase names the command block an operator copies (a failure's `previous`
+digests are "the restore recipe"), which is a different thing. _Avoid_: "template"
+(that was the rejected image-carried alternative), "compose service", bare "recipe"
+where the manual command block could be meant.
+
+**Machine inputs** — the few install-time facts a machine's recipes are rendered
+with: role, node name, home and template roots, public host, TLS hosts, trusted
+proxies, ports, control URL, detected GPU facts, database mode, release trust (the
+namespace allowlist, signature settings and insecure registries), the images Add host
+installs, and app-container defaults. They change only by a reconfigure, which is a
+replacement with the same image and new inputs. _Avoid_: "settings" (agent settings
+are host policy), "config".
+
+**Machine state** — what the recovery actor keeps on its machine and nowhere else:
+the machine inputs, the generated secrets, the attempt journal, the last verified
+specification of each service, the pre-update dumps and the seed's state file. It
+is what lets the actor act while the control plane is down. _Avoid_: "machine
+config", "the volume" unqualified.
+
+**Floor** — the oldest node-agent and recovery-actor release a control-plane release
+still manages, published with the release. A host **below the floor** is not failed:
+it is offered only an update. _Avoid_: "minimum version" (the floor is per release
+and per component), "compatibility level".
+
+**Developer apply** — an admin applying an arbitrary digest set, typically a branch
+build from an allowlisted registry namespace, to one owned target without it being
+published as a release. It is the product lane's way to test on the path users run;
+it is never offered, never unattended, and bound by the same digest, namespace and
+ordering rules as any apply. _Avoid_: "manual update" (that is the recipe a source or
+Compose install is shown), "custom release".
+
+**Pre-update dump** — the database dump the recovery actor takes before replacing
+the control plane with a migrating release, when the database is Quasar's own. It is
+the way back from a failed migration, through one printed `restore` command; the last
+three are kept on the machine. An operator's own database gets no dump: its backup
+is the operator's, confirmed before the update. _Avoid_: "backup" unqualified,
+"recovery bundle" (withdrawn with RH06's review).
+
+**Schema floor** — the lowest schema a machine's database may be at, recorded in machine state
+by the recovery actor before a migrating control plane starts and lowered only by a `restore`.
+No control plane whose image declares a lower schema is created, started or put back on that
+machine. _Avoid_: "floor" unqualified (that is the release floor above).
+
+**Owner conflict** — a container on an owned machine that looks like a Quasar
+platform service but lacks the installation's labels: a leftover Compose stack, a
+definition a manager still holds. The recovery actor never acts on it and says so.
+_Avoid_: "orphan", "foreign service".
+
+## Engines and privilege (RH07, in shaping)
+
+These terms describe RH07 as decided on 2026-09-28 (`docs/rh07/2026-09-28-decisions.md`).
+
+**Container engine** — the software whose API Quasar's recovery actor and node agent
+call to run containers: Docker Engine or Podman. Quasar speaks one API to both and
+tests each separately. _Avoid_: "runtime" for the engine (the runtime, runc or crun,
+is what the engine starts containers with), "daemon" (Podman has none).
+
+**Engine mode** — whether the container engine runs as root (**rootful**) or as an
+ordinary user (**rootless**). Rootless is the design target; rootful is the same
+recipe with fewer limits. _Avoid_: bare "rootless" in storage or setup code, where it
+already means a host with no storage root. Say "rootless engine" there.
+
+**Engine profile** — one tested combination of container engine, engine mode,
+operating system and GPU vendor, published with its evidence and limits. A
+combination with no evidence is experimental or unsupported, never implied
+supported.
+
+**Quasar user** — the dedicated, unprivileged Linux account a rootless install
+runs under. It owns the engine, the machine state and the homes on the host, and
+nothing else. _Avoid_: "service account" (sounds like the control plane's own users),
+"the operator's user".
+
+**Host preparation** — the one-time, repeatable root step that readies a machine
+for Quasar: kernel settings, device access rules, the GPU device description,
+subordinate ID ranges and, for rootless, lingering. It is the only thing that runs
+as root; Quasar itself never does. _Avoid_: "install" (the seed installs),
+"provisioning" (the agent provisions driver libraries at run time).
+
+**Least privilege** — the RH07 guiding rule: every Quasar container asks for the
+least access that does its job, in every engine mode, so that a compromised Quasar
+is not a compromised machine. A capability only some hosts can grant is optional
+and reports why it is missing; it is never obtained by escalation.

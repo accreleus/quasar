@@ -56,7 +56,7 @@ func TestParseManifestRejections(t *testing.T) {
 		wantSub string
 	}{
 		{"an unknown format_version is not guessed at",
-			func(s string) string { return strings.Replace(s, `"format_version": 1`, `"format_version": 2`, 1) },
+			func(s string) string { return strings.Replace(s, `"format_version": 1`, `"format_version": 3`, 1) },
 			"format_version"},
 		{"an unknown key at the object level",
 			func(s string) string {

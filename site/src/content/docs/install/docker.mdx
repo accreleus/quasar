@@ -1,0 +1,365 @@
+---
+title: Install with Docker
+description: Install Quasar on rootful Docker (supported). One container per machine, the seed. Rootless has its own page.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The [quick start](/quasar/start/quickstart/) writes everything on this page for you.
+Read [Requirements](/quasar/start/requirements/) first. The install pulls published
+images (about 20 GB on a machine that runs the agent) and compiles nothing. On
+Unraid, follow [Unraid](/quasar/install/unraid/) instead.
+
+This page is **rootful** Docker (supported): Docker runs as root. To run Quasar
+as an ordinary account instead, follow [Install rootless](/quasar/install/rootless/)
+(experimental). Status per platform: [Container engines](/quasar/start/requirements/#container-engines).
+
+<Aside type="note" title="Stable releases">
+A new install starts on the **stable** channel. The seed pins the images to digests
+when it installs, so the install never moves on its own. An install made before the first stable release is on
+`edge`: see [Moving an edge install to
+stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
+</Aside>
+
+## What gets installed
+
+You declare **one container per machine: the seed**. The seed keeps the machine's
+**recovery actor** running. The recovery actor creates and updates the other
+services, and generates and stores the machine's secrets. There is no compose file
+and no `.env` of secrets.
+
+| Machine | What the recovery actor creates |
+| --- | --- |
+| Combined host | Postgres, the control plane, the node agent |
+| Control-only host | Postgres and the control plane (no GPU needed) |
+| GPU host | The node agent |
+
+The containers are named `quasar-recovery`, `quasar-postgres`,
+`quasar-control-plane` and `quasar-node-agent`. A stack redeploy only touches the
+seed. Run one installation per container engine.
+
+### What the recovery actor will and will not do
+
+It holds the Docker socket. Its limits:
+
+- It runs images **only by digest**, and pulls only from the allowed registry namespaces
+  (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, the project's own by default). See [Release
+  signatures](/quasar/operations/upgrading/#release-signatures).
+- It acts only on containers it created. A look-alike it did not create, such as a
+  leftover Compose stack, is an **owner conflict**: it is left alone, updates to that
+  machine are blocked, and the console shows it on the host's **Services on this
+  machine** card.
+- It never touches your game containers or anything else.
+- It keeps the old container stopped until the new one verifies, so a failed update
+  can be rolled back.
+
+## Prepare the host
+
+Once, from an account with `sudo`. The quick start shows the same commands.
+
+```bash
+sudo systemctl enable --now docker
+```
+
+**NVIDIA:** complete [NVIDIA setup for rootful Docker](/quasar/install/nvidia/#docker-rootful)
+before deploying. It includes runtime configuration and any required SELinux policy.
+
+**Check it worked:** `systemctl is-enabled docker` says `enabled` on systemd hosts.
+
+Optional: [console mode](/quasar/admin/console/) needs the console rules from
+[Device rules](/quasar/install/device-rules/), and the [UDP send
+buffer](/quasar/tuning/latency/#the-udp-send-buffer) makes streams smoother.
+
+## Before you start
+
+**Create the home root** on persistent storage on any machine that runs games. It
+holds saves and installed games. The template root sits beside it:
+
+```bash
+sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes /var/lib/quasar/templates
+```
+
+Use the owner that suits your host.
+
+## Install the first machine
+
+The first machine runs the control plane. A combined host also runs a node agent,
+so one machine with a GPU is a complete install.
+
+<Tabs>
+<TabItem label="docker run">
+
+```bash
+docker run -d --name quasar-seed --restart unless-stopped --pull always \
+  --security-opt label=disable \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine:ro \
+  -e QUASAR_ROLE=combined \
+  -e QUASAR_PUBLIC_HOST=192.168.1.50 \
+  -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
+  -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
+  -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane:latest \
+  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent:latest \
+  ghcr.io/accreleus/quasar/quasar-recoveryseed
+```
+
+</TabItem>
+<TabItem label="Dockge or Arcane">
+
+```yaml
+services:
+  quasar-seed:
+    container_name: quasar-seed
+    image: "ghcr.io/accreleus/quasar/quasar-recovery:latest"
+    pull_policy: always
+    command: seed
+    restart: unless-stopped
+    security_opt: [label=disable]
+    environment:
+      QUASAR_ROLE: "combined"
+      QUASAR_PUBLIC_HOST: "192.168.1.50"
+      QUASAR_HOME_ROOT: "/var/lib/quasar/homes"
+      QUASAR_TEMPLATE_ROOT: "/var/lib/quasar/templates"
+      QUASAR_CONTROL_PLANE_IMAGE: "ghcr.io/accreleus/quasar/quasar-control-plane:latest"
+      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent:latest"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - quasar-machine:/var/lib/quasar-machine:ro
+volumes:
+  quasar-machine:
+    name: quasar-machine                  # required: not <project>_quasar-machine
+```
+
+</TabItem>
+</Tabs>
+
+- **`QUASAR_PUBLIC_HOST`** (required): the name or LAN address you type into the
+  browser. The certificate names it. Extra names go in `QUASAR_TLS_HOSTS`,
+  comma-separated.
+- **Ports:** 8443 (console) and 8080 (agents and `/health`). Change with
+  `QUASAR_TLS_PORT` and `QUASAR_HTTP_PORT`.
+- **Behind a reverse proxy:** add `QUASAR_TRUSTED_PROXIES`. See [Behind a reverse
+  proxy](/quasar/network/reverse-proxy/).
+- **Postgres:** `postgres:16-alpine`, pinned by the recovery actor.
+  `QUASAR_POSTGRES_IMAGE` names another (a tag is pinned at install). Quasar never updates it.
+
+You don't set a database password, secret key, enrollment string or admin account.
+The recovery actor generates the secrets, and you claim the instance in the browser:
+see [First run and checks](/quasar/install/first-run/).
+
+**Control-only machine:** set `QUASAR_ROLE=control-only`. It needs no GPU, no home
+root and no GPU preparation. `QUASAR_AGENT_IMAGE` is optional: if set, Add host
+installs it on new GPU hosts when no release names one. Set `QUASAR_HOME_ROOT` only
+if every GPU host will use that path.
+
+### Your own Postgres
+
+Add the database settings to the seed's environment. Keep the password in the
+stack's `.env`:
+
+```yaml
+      QUASAR_DATABASE_HOST: "db.example.internal"
+      QUASAR_DATABASE_PORT: "5432"          # default 5432
+      QUASAR_DATABASE_USER: "quasar"        # default quasar
+      QUASAR_DATABASE_NAME: "quasar"        # default quasar
+      QUASAR_DATABASE_SSLMODE: "require"
+      QUASAR_DATABASE_PASSWORD: "${QUASAR_DATABASE_PASSWORD}"
+```
+
+```bash
+# the stack's .env
+QUASAR_DATABASE_PASSWORD=<your database password>
+```
+
+With `docker run`, export `QUASAR_DATABASE_PASSWORD` and pass
+`-e QUASAR_DATABASE_PASSWORD` with no value, to keep it off the command line.
+
+- **Set `QUASAR_DATABASE_SSLMODE`** for a remote database: `require`, or
+  `verify-full`. The default, `disable`, sends the password in clear text.
+- The password is copied into the recovery actor's volume at first install. You can
+  then remove it from the stack.
+- Quasar never creates, backs up, restores or upgrades your database. Keep your own
+  backups; the console asks you to confirm one before a migrating update.
+
+## Add a GPU host
+
+Use **Add host** in **Admin ▸ Fleet ▸ Hosts**: see [Add a GPU
+host](/quasar/install/second-host/). To start the seed yourself instead, take the
+enrollment string from the same dialog under **Show the enrollment string**. It works
+once and expires after an hour by default (up to 30 days).
+
+<Tabs>
+<TabItem label="docker run">
+
+```bash
+docker run -d --name quasar-seed --restart unless-stopped --pull always \
+  --security-opt label=disable \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v quasar-machine:/var/lib/quasar-machine:ro \
+  -e QUASAR_ROLE=gpu \
+  -e QUASAR_ENROLLMENT='qenr1.…' \
+  -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
+  -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
+  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent:latest \
+  ghcr.io/accreleus/quasar/quasar-recoveryseed
+```
+
+</TabItem>
+<TabItem label="Dockge or Arcane">
+
+```yaml
+services:
+  quasar-seed:
+    container_name: quasar-seed
+    image: "ghcr.io/accreleus/quasar/quasar-recovery:latest"
+    pull_policy: always
+    command: seed
+    restart: unless-stopped
+    security_opt: [label=disable]
+    environment:
+      QUASAR_ROLE: "gpu"
+      QUASAR_ENROLLMENT: "qenr1.…"        # single use; may be deleted once enrolled
+      QUASAR_HOME_ROOT: "/var/lib/quasar/homes"
+      QUASAR_TEMPLATE_ROOT: "/var/lib/quasar/templates"
+      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent:latest"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - quasar-machine:/var/lib/quasar-machine:ro
+volumes:
+  quasar-machine:
+    name: quasar-machine                  # required: not <project>_quasar-machine
+```
+
+</TabItem>
+</Tabs>
+
+On every machine:
+
+- **Images.** Name the `:latest` tags as shown. The seed pulls them once, pins each to its
+  digest, and records only the digests; if a pull fails it creates nothing and tries again.
+  A moved tag never changes an installed machine, and redeploying the seed does not
+  update it: updates are the console's **Releases** page. You may also give
+  `repository@sha256:<digest>` to install an exact build.
+- **Both mounts.** The engine socket, and the `quasar-machine` volume read-only. In a
+  stack, keep the `name: quasar-machine` line, or the seed refuses to install
+  (`seed-self-invalid`).
+- **`label=disable`** is required on SELinux and harmless elsewhere.
+- **`QUASAR_ROLE`** defaults to `gpu`. **`QUASAR_NODE_NAME`** defaults to the host
+  name, and must match a name bound into the enrollment string.
+- **Inputs are read once**, on a clean machine. After that you can delete the
+  enrollment string from the stack. It enrolls nothing after first use.
+- **Host preparation is yours** when you start the seed yourself: see [Prepare the
+  host](#prepare-the-host). The host's readiness card lists anything missing.
+
+All inputs: [environment reference](/quasar/reference/environment/#seed-inputs).
+
+## Check it came up
+
+```bash
+docker exec quasar-seed quasar-recovery status
+docker exec quasar-recovery quasar-recovery status
+docker ps --filter label=io.quasar.installation   # the seed is not listed
+```
+
+On the first machine:
+
+```bash
+curl http://localhost:8080/health
+```
+
+You want `{"status":"ok","db":"ok"}`. Then open `https://<QUASAR_PUBLIC_HOST>:8443`
+in Chrome, accept the self-signed certificate once, and continue with [First run
+and checks](/quasar/install/first-run/).
+
+A GPU host appears under **Admin ▸ Fleet ▸ Hosts** within seconds. The first
+machine appears under **Admin ▸ Fleet ▸ Releases ▸ Installed** as **This machine**.
+
+### An install that did not complete
+
+A refused install writes nothing durable. Fix the stack or `docker run` line (the
+seed's log names the bad variable) and start the seed again. If the recovery actor
+was already created, fix the seed's inputs, then:
+
+```bash
+docker restart quasar-recovery
+```
+
+See [Install and startup
+problems](/quasar/troubleshooting/install/#the-seed-and-the-recovery-actor).
+
+## Keep the `quasar-machine` volume
+
+**Never delete it.** It holds the machine's generated secrets, the update history,
+the seed's state and, with Quasar's own database, the pre-update dumps. The recovery
+actor needs it while the control plane is down. For the database, use
+[backups](/quasar/operations/backup/).
+
+## Removing or redeploying the seed
+
+**Removing or redeploying the seed never stops Quasar.** But without a seed, a
+deleted recovery actor cannot be re-created. The console warns on the host's
+**Services on this machine** card. Start the seed again to clear it.
+
+To stop Quasar without removing anything, stop its containers, agent first (then the
+control plane and Postgres on the first machine):
+
+```bash
+docker stop quasar-node-agent
+```
+
+`docker start` brings each back. To remove Quasar, use **Remove host** in the console
+or the recovery image's `uninstall`: see [Uninstalling](/quasar/operations/uninstall/).
+
+## Updating and changing settings
+
+Updates come only from **Admin ▸ Fleet ▸ Releases**. A failed control-plane update
+rolls back automatically. See [Updating Quasar](/quasar/admin/releases/).
+
+Change install-time settings with `reconfigure`:
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --dry-run QUASAR_HOME_ROOT=/mnt/homes
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
+```
+
+It re-creates the affected services with the new settings and rolls back if they
+don't verify. Run `--dry-run` first: re-creating the agent ends that host's sessions,
+and a new HTTPS port disconnects GPU hosts until you add them again.
+
+The database and the node name can't be changed this way. To change them, back up,
+uninstall, install again with the new settings, and restore.
+
+### Cover artwork
+
+Set the SteamGridDB key in **Admin ▸ Library ▸ Sources**, SteamGridDB row. A fresh
+install has none, so tiles show a gradient until you add it.
+
+## Application memory and ownership
+
+Application containers get **1 GiB of shared memory** (`QUASAR_APP_SHM_SIZE`,
+not configurable in this release).
+
+`QUASAR_APP_PUID` and `QUASAR_APP_PGID` set who owns game and save data. They are
+seed inputs, and `reconfigure` changes them on a GPU host.
+
+## Ports
+
+| Port | Input | Purpose |
+| --- | --- | --- |
+| 8443 | `QUASAR_TLS_PORT` | HTTPS web app and API. |
+| 8080 | `QUASAR_HTTP_PORT` | Agent enrollment and `/health`. Browser routes redirect to HTTPS. |
+
+For Caddy or an existing ingress, see [Behind a reverse
+proxy](/quasar/network/reverse-proxy/).
+
+## Building from source
+
+For contributors only: see [Set up a checkout](/quasar/developer/getting-started/).
+A source-built machine has no recovery actor and is never offered updates.
+
+## Coming from a Compose install
+
+A Compose install keeps running but is not offered new releases. To move to an owned
+install with your data, see [Move a Compose
+install](/quasar/install/moving/#move-a-compose-install). To stay, see [Legacy
+Compose installs](/quasar/install/legacy-compose/).

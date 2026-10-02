@@ -42,6 +42,7 @@ use rtp_ext::{
     attach_abs_capture_time_verification_probe,
 };
 mod audio_branch;
+mod audio_health;
 use audio_branch::add_audio_chain;
 mod mic_branch;
 use mic_branch::add_mic_branch;
@@ -72,7 +73,9 @@ pub(crate) const VIDEO_ENCODER_NAME: &str = "quasar-video-encoder";
 /// the runner without threading a handle through every builder.
 pub(crate) const VIDEO_PAYLOADER_NAME: &str = "quasar-video-payloader";
 mod source_branch;
-use source_branch::{build_gpu_convert_stage, build_video_source};
+// Also the media host probe's source + convert stage (`session::probe_media`): the probe
+// must build the compositor arm production builds, not a stand-in.
+pub(crate) use source_branch::{build_gpu_convert_stage, build_video_source};
 mod scale_stage;
 use scale_stage::build_scale_stage;
 pub use scale_stage::ScaleStage;
@@ -455,7 +458,7 @@ pub fn build_session_pipeline(
     // and returns the tail capsfilter. Skipped under QUASAR_AUDIO_DISABLED.
     let audio_disabled = audio_disabled();
     let audio_rtp_capsfilter = if !audio_disabled {
-        Some(add_audio_chain(&pipeline, cfg)?)
+        Some(add_audio_chain(&pipeline, cfg, "standalone")?)
     } else {
         tracing::info!(
             "audio disabled (QUASAR_AUDIO_DISABLED=1) — video-only offer for #304 validation"
@@ -953,7 +956,8 @@ pub fn build_encode_pipeline(
         || cfg.console_config.as_ref().is_none_or(|c| c.stream_audio);
     let (audio_webrtc, audio_pipeline) = if !audio_disabled() && stream_audio_enabled {
         let audio_pipe = gst::Pipeline::new();
-        let audio_tail = add_audio_chain(&audio_pipe, cfg)?;
+        audio_health::watch_bus(&audio_pipe, &session_id);
+        let audio_tail = add_audio_chain(&audio_pipe, cfg, &session_id)?;
         let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
             .context("failed to create audio webrtcbin (encode pipeline)")?;
         // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video
@@ -1242,19 +1246,23 @@ fn selected_connector_id(cfg: &SessionConfig, drm_root: &std::path::Path) -> Opt
         .ok()
 }
 
-// Local-audio output (`pulsesrc` → host ALSA device).
+// Local-audio output (`pulsesrc` → the host's PipeWire, or a host ALSA device).
 //
 // Unlike `LocalDisplay` this does not tap the interpipe fan-out: it is a second,
 // independent `pulsesrc` client of the session's PulseAudio sidecar (the same one
 // `pipeline/audio_branch.rs` captures from; PulseAudio allows any number of monitor
 // clients). So there is no `listen-to` to re-point on an app swap — the sidecar is
 // session-scoped, not per-app, so this pipeline is built once and untouched until
-// teardown.
+// teardown. Where it plays is `console_audio::choose_route` (RH-07 #407, D13).
 
-/// A local-audio output pipeline: `pulsesrc → audioconvert → audioresample → alsasink`.
-/// Owns its own `gst::Pipeline`; `Drop` sets it to `Null`, as [`LocalDisplay`] does.
+/// A local-audio output pipeline: `pulsesrc → audioconvert → audioresample →` either
+/// `pulsesink` (the host's PipeWire) or `alsasink`. Owns its own `gst::Pipeline`; `Drop`
+/// sets it to `Null`, as [`LocalDisplay`] does.
 pub struct LocalAudio {
     pub pipeline: gst::Pipeline,
+    /// Counts an ALSA leg while it lives, so the `console_audio` readiness check does not
+    /// read our own open PCM as someone else's. Dropped after the pipeline is at `Null`.
+    _alsa_leg: Option<super::console_audio::AlsaLeg>,
 }
 
 impl Drop for LocalAudio {
@@ -1265,9 +1273,13 @@ impl Drop for LocalAudio {
 
 /// Build the [`LocalAudio`] leg for `cfg`, playing out `audio_output`.
 ///
-/// `audio_output` of `"auto"` sets no `device` on `alsasink`, so the operator's
-/// `/etc/asound.conf` / `default` PCM decides; any other string (`"hw:1,3"`) is set
-/// verbatim.
+/// `audio_output` is `"auto"`, `"pipewire:default"`, `"pipewire:<sink name>"` or an ALSA
+/// id (`"hw:1,3"`). While the host's PipeWire answers on the console-audio socket, `auto`
+/// and `pipewire:*` play through it (`pulsesink server=unix:/run/quasar-console-audio/native`,
+/// `device` unless default) and an ALSA id is refused; with no PipeWire answering, an ALSA
+/// id (or `auto`, the operator's `/etc/asound.conf` / `default` PCM) plays through
+/// `alsasink` only when the device is not already open. A refusal fails this leg with the
+/// named reason (logged under its token); the session runs on, console video quiet.
 ///
 /// The `pulsesrc` derivation mirrors `pipeline/audio_branch.rs`'s capture branch: `server`
 /// from `cfg.pulse_server` when present, and `device` pinned to
@@ -1276,6 +1288,19 @@ impl Drop for LocalAudio {
 /// remap-source, following its default source stopped being safe. Low-latency by
 /// construction — no RTP/jitter-buffer stage, this is a local device fan-out.
 pub fn build_local_audio_pipeline(cfg: &SessionConfig, audio_output: &str) -> Result<LocalAudio> {
+    use super::console_audio::{self, Route};
+
+    let route = console_audio::choose_route(audio_output, &console_audio::LiveHostAudio::live())
+        .map_err(|refusal| {
+            tracing::warn!(
+                token = "console-audio-refused",
+                reason = refusal.reason(),
+                "console audio will not play ({refusal}); console video runs quiet"
+            );
+            anyhow::anyhow!("{refusal}")
+        })?;
+    tracing::info!("console audio plays through {}", route.describe());
+
     let pipeline = gst::Pipeline::new();
 
     let monitor = super::audio::QUASAR_MONITOR_SOURCE_NAME;
@@ -1301,40 +1326,104 @@ pub fn build_local_audio_pipeline(cfg: &SessionConfig, audio_output: &str) -> Re
         .build()
         .context("audioresample not found (local audio)")?;
 
-    // Console-only playback pre-flight: an explicit `hw:*` sink opens that card, `auto`
-    // enumerates the cards visible inside the agent container. Streamed audio uses a
-    // separate WebRTC pipeline and never reaches here.
-    match super::audio::enable_iec958_playback_switches(audio_output) {
-        Ok(n) if n > 0 => {
-            tracing::info!(
-                "enabled {n} IEC958 playback switch(es) on {audio_output} for local audio"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(
-                token = "audio-iec958-enable-failed-batch",
-                "could not enable IEC958 playback switches for {audio_output}: {e:#}"
-            );
+    if let Route::Alsa { .. } = &route {
+        // Console-only playback pre-flight: an explicit `hw:*` sink opens that card, `auto`
+        // enumerates the cards visible inside the agent container. PipeWire owns its own
+        // mixer, so this is ALSA only. Streamed audio uses a separate WebRTC pipeline and
+        // never reaches here.
+        match super::audio::enable_iec958_playback_switches(audio_output) {
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    "enabled {n} IEC958 playback switch(es) on {audio_output} for local audio"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    token = "audio-iec958-enable-failed-batch",
+                    "could not enable IEC958 playback switches for {audio_output}: {e:#}"
+                );
+            }
         }
     }
 
-    let mut sink_builder = gst::ElementFactory::make("alsasink").name("local-audio");
-    if audio_output != "auto" {
-        tracing::info!("local audio sink: alsasink device={audio_output}");
-        sink_builder = sink_builder.property("device", audio_output);
-    } else {
-        tracing::info!("local audio sink: alsasink (default ALSA device)");
-    }
-    let alsa_sink = sink_builder
-        .build()
-        .context("alsasink not found — is the ALSA plugin (gst-plugins-good) in the image?")?;
+    let sink = local_audio_sink(&route)?;
 
-    pipeline.add_many([&pulse_src, &audio_convert, &audio_resample, &alsa_sink])?;
-    gst::Element::link_many([&pulse_src, &audio_convert, &audio_resample, &alsa_sink])
+    pipeline.add_many([&pulse_src, &audio_convert, &audio_resample, &sink])?;
+    gst::Element::link_many([&pulse_src, &audio_convert, &audio_resample, &sink])
         .context("failed to link local-audio chain")?;
 
-    Ok(LocalAudio { pipeline })
+    let alsa_leg = matches!(route, Route::Alsa { .. }).then(super::console_audio::AlsaLeg::open);
+    Ok(LocalAudio {
+        pipeline,
+        _alsa_leg: alsa_leg,
+    })
+}
+
+/// The sink element for a console audio route, named `local-audio`.
+fn local_audio_sink(route: &super::console_audio::Route) -> Result<gst::Element> {
+    use super::console_audio::{Route, PIPEWIRE_SERVER};
+    match route {
+        Route::PipeWire { device } => {
+            let mut b = gst::ElementFactory::make("pulsesink")
+                .name("local-audio")
+                .property("server", PIPEWIRE_SERVER)
+                .property("client-name", "Quasar console");
+            if let Some(d) = device {
+                b = b.property("device", d.as_str());
+            }
+            tracing::info!(
+                "local audio sink: pulsesink server={PIPEWIRE_SERVER} device={device:?}"
+            );
+            b.build().context(
+                "pulsesink not found — is the PulseAudio plugin (gst-plugins-good) in the image?",
+            )
+        }
+        Route::Alsa { device } => {
+            let mut b = gst::ElementFactory::make("alsasink").name("local-audio");
+            match device {
+                Some(d) => {
+                    tracing::info!("local audio sink: alsasink device={d}");
+                    b = b.property("device", d.as_str());
+                }
+                None => tracing::info!("local audio sink: alsasink (default ALSA device)"),
+            }
+            b.build()
+                .context("alsasink not found — is the ALSA plugin (gst-plugins-good) in the image?")
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_audio_sink_tests {
+    use super::local_audio_sink;
+    use crate::session::console_audio::{Route, PIPEWIRE_SERVER};
+    use gstreamer::prelude::*;
+
+    /// The PipeWire route is a `pulsesink` on the console-audio socket, `device` only for a
+    /// named sink (gst-plugins-good, which every image that runs these tests carries).
+    #[test]
+    fn the_pipewire_route_builds_a_pulsesink_on_the_console_audio_socket() {
+        gstreamer::init().unwrap();
+        let pw = local_audio_sink(&Route::PipeWire {
+            device: Some("alsa_output.hdmi".into()),
+        })
+        .unwrap();
+        assert_eq!(pw.factory().unwrap().name(), "pulsesink");
+        assert_eq!(
+            pw.property::<Option<String>>("server").as_deref(),
+            Some(PIPEWIRE_SERVER)
+        );
+        assert_eq!(
+            pw.property::<Option<String>>("device").as_deref(),
+            Some("alsa_output.hdmi")
+        );
+        let pw_default = local_audio_sink(&Route::PipeWire { device: None }).unwrap();
+        assert_eq!(pw_default.property::<Option<String>>("device"), None);
+
+        // The ALSA route builds the same `alsasink` as before this change; alsasink is
+        // gst-plugins-base's ALSA plugin, which the test image does not carry.
+    }
 }
 
 /// The transport-wide congestion control RTP header-extension URI Chrome negotiates.
@@ -1401,7 +1490,7 @@ mod source_interpipe_tests {
     use crate::session::{EncoderChoice, SessionConfig};
 
     fn cfg_for(encoder: EncoderChoice, codec: crate::session::Codec) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = encoder;
         let stream = crate::session::StreamParams {
             width: 1920,

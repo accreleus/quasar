@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,10 +37,13 @@ const (
 // actionsEnv is one wired P3 test environment: a Store with a real Ensurer over
 // a fake fleet, served behind the real admin gate.
 type actionsEnv struct {
-	pool  *pgxpool.Pool
-	store *Store
-	fleet *fakeFleet
-	ens   *Ensurer
+	pool        *pgxpool.Pool
+	store       *Store
+	fleet       *fakeFleet
+	ens         *Ensurer
+	cleanupWire *fakeCleanupWire
+	cleanup     *CleanupService
+	cleanupStop context.CancelFunc
 	// do performs an authenticated admin request and returns status + body.
 	do func(t *testing.T, method, path, body string) (int, []byte)
 }
@@ -76,7 +80,14 @@ func newActionsEnv(t *testing.T, hostNames ...string) (*actionsEnv, []string) {
 	mux := http.NewServeMux()
 	// Real audit store: the action routes were built without one, and
 	// images_audit_test.go reads the rows back out of admin_activity.
-	NewHandler(store, audit.NewStore(pool)).Register(mux, func(next http.Handler) http.Handler {
+	imageHandler := NewHandler(store, audit.NewStore(pool))
+	imageHandler.SetRetryEnsurer(ens)
+	cleanupWire := &fakeCleanupWire{snapshots: make(map[string]agentws.ImageCleanupSnapshot)}
+	cleanupCtx, cleanupStop := context.WithCancel(context.Background())
+	t.Cleanup(cleanupStop)
+	cleanup := NewCleanupService(cleanupCtx, pool, cleanupWire)
+	imageHandler.SetCleanupService(cleanup)
+	imageHandler.Register(mux, func(next http.Handler) http.Handler {
 		return authHandler.RequireAuth(authHandler.RequireAdmin(next))
 	})
 	srv := httptest.NewServer(mux)
@@ -98,7 +109,7 @@ func newActionsEnv(t *testing.T, hostNames ...string) (*actionsEnv, []string) {
 		return resp.StatusCode, buf.Bytes()
 	}
 
-	return &actionsEnv{pool: pool, store: store, fleet: fleet, ens: ens, do: do}, hostIDs
+	return &actionsEnv{pool: pool, store: store, fleet: fleet, ens: ens, cleanupWire: cleanupWire, cleanup: cleanup, cleanupStop: cleanupStop, do: do}, hostIDs
 }
 
 // seedCatalogDigest inserts/updates the catalog row at (version, digest).
@@ -110,6 +121,17 @@ func seedCatalogDigest(t *testing.T, pool *pgxpool.Pool, version, digest string)
 		ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, registry_digest = EXCLUDED.registry_digest
 	`, imgID, version, imgRef, digest); err != nil {
 		t.Fatalf("seed image_catalog: %v", err)
+	}
+	// RH05 dispatch follows a selected app, not a fleetwide installed-image
+	// row. This fixture app deliberately selects the test's current digest.
+	if _, err := pool.Exec(context.Background(), `INSERT INTO apps(name,runtime_spec)
+		SELECT 'image actions selected fixture',jsonb_build_object('image',$1::text)
+		WHERE NOT EXISTS (SELECT 1 FROM apps WHERE name='image actions selected fixture')`, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE apps SET runtime_spec=jsonb_build_object('image',$1::text)
+		WHERE name='image actions selected fixture'`, digest); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -296,6 +318,16 @@ func seedCatalogTemplate(t *testing.T, pool *pgxpool.Pool, version, contextSHA s
 	`, tplID, version, contextSHA); err != nil {
 		t.Fatalf("seed template image_catalog: %v", err)
 	}
+	ref := tplLocalTag(version)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO apps(name,runtime_spec)
+		SELECT 'template actions selected fixture',jsonb_build_object('image',$1::text)
+		WHERE NOT EXISTS (SELECT 1 FROM apps WHERE name='template actions selected fixture')`, ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE apps SET runtime_spec=jsonb_build_object('image',$1::text)
+		WHERE name='template actions selected fixture'`, ref); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // adoptedTemplate reads what installed_images actually holds for the P4
@@ -398,10 +430,10 @@ func TestPolicyAutoRebuildsUnpinnedTemplate(t *testing.T) {
 
 // --- uninstall ----------------------------------------------------------------
 
-// TestUninstallDispatchesRemoveAndCleansRows — P2's untested half: uninstall
-// sends image_remove to every connected host that has the image, deletes that
-// image's host_images rows, and drops the adoption row.
-func TestUninstallDispatchesRemoveAndCleansRows(t *testing.T) {
+// Legacy uninstall drops adoption while retaining cached bits for explicit
+// exact-version cleanup. An old/unknown agent's ID-only removal has no proof
+// that it is not removing the current or recovery version.
+func TestUninstallRetainsCacheWithoutLegacyRemove(t *testing.T) {
 	env, hostIDs := newActionsEnv(t, "host-a")
 	seedCatalogDigest(t, env.pool, imgVer, imgDigest)
 
@@ -421,10 +453,7 @@ func TestUninstallDispatchesRemoveAndCleansRows(t *testing.T) {
 		t.Fatalf("uninstall: status %d body %s, want 204", code, body)
 	}
 
-	rm := env.fleet.waitRemove(t)
-	if rm.HostID != hostIDs[0] || rm.ImageID != imgID {
-		t.Fatalf("image_remove dispatched to the wrong target: %+v", rm)
-	}
+	env.fleet.noMoreRemoves(t, 50*time.Millisecond)
 
 	var installed, hostRows int
 	if err := env.pool.QueryRow(context.Background(),
@@ -444,6 +473,25 @@ func TestUninstallDispatchesRemoveAndCleansRows(t *testing.T) {
 	if got := errCode(t, body2); got != "not_installed" {
 		t.Fatalf("error code: got %q want not_installed", got)
 	}
+}
+
+func TestUninstallDuringInflightEnsureNeverQueuesLegacyRemove(t *testing.T) {
+	env, _ := newActionsEnv(t, "uninstall-inflight-host")
+	seedCatalogDigest(t, env.pool, imgVer, imgDigest)
+	env.fleet.gate = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(env.fleet.gate) }) }
+	defer release()
+	if code, body := env.do(t, http.MethodPost, "/v1/admin/images/"+imgID+"/install", `{"lazy":false}`); code != http.StatusCreated {
+		t.Fatalf("install = %d %s", code, body)
+	}
+	env.fleet.waitEnsure(t)
+	if code, body := env.do(t, http.MethodDelete, "/v1/admin/images/"+imgID+"/install", ""); code != http.StatusNoContent {
+		t.Fatalf("uninstall = %d %s", code, body)
+	}
+	release()
+	env.ens.Wait()
+	env.fleet.noMoreRemoves(t, 50*time.Millisecond)
 }
 
 // --- pin / unpin --------------------------------------------------------------

@@ -22,15 +22,15 @@ describe("preflight phrasing", () => {
         state: "blocked",
         checked_at: null,
         checks: [
-          { id: "updater_socket", status: "pass", detail: "" },
-          { id: "updater_stack_dir", status: "fail", detail: "set QUASAR_STACK_DIR" },
+          { id: "agent_connected", status: "pass", detail: "" },
+          { id: "updater_socket", status: "fail", detail: "the recovery actor did not answer" },
           { id: "image_resolvable", status: "unknown", detail: "no release" },
         ],
       },
     });
-    expect(blockingChecks(t).map((c) => c.id)).toEqual(["updater_stack_dir"]);
+    expect(blockingChecks(t).map((c) => c.id)).toEqual(["updater_socket"]);
     expect(unknownChecks(t).map((c) => c.id)).toEqual(["image_resolvable"]);
-    expect(holdoutText(t)).toBe("Blocked: updater sees the stack directory");
+    expect(holdoutText(t)).toBe("Blocked: recovery actor reachable");
   });
 
   it("a fleet run will skip every ineligible host except an up-to-date one", () => {

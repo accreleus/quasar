@@ -6,7 +6,7 @@
  * Hosts tab's test stubs it: this page must not open a second sessions poll.
  */
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -21,6 +21,7 @@ vi.mock("../../lib/fleet/FleetContext", () => ({
 }));
 
 import * as adminApi from "../../api/admin";
+import { ApiError } from "../../api/client";
 import type { AdminSession, GPUAvailability, Host } from "../../api/types";
 import type { FleetContextValue } from "../../lib/fleet/FleetContext";
 import { HostDetail } from "./HostDetail";
@@ -40,6 +41,7 @@ function host(over: Partial<Host> = {}): Host {
     id: "c2059601",
     node_name: "quasar-node-1",
     status: "online",
+    admission_restrictions: [],
     agent_version: "0.1.0",
     cpu_cores: 16,
     cpu_model: "AMD Ryzen 9 9950X3D",
@@ -48,6 +50,8 @@ function host(over: Partial<Host> = {}): Host {
     capacity_reason: null,
     readiness: [],
     readiness_reported_at: null,
+    readiness_gate: { state: "active", blocking: [] },
+    readiness_overrides: [],
     last_registered_at: "2026-08-01T00:00:00Z",
     last_heartbeat_at: new Date(NOW - 4000).toISOString(),
     storage: [{ label: "agent-data", path: "/var/lib/quasar", total_mb: 122880, available_mb: 24576 }],
@@ -134,8 +138,11 @@ beforeEach(() => {
   mocked.getHost.mockResolvedValue({ host: host() } as never);
   mocked.getHostGPUs.mockResolvedValue({ items: [gpu()] } as never);
   mocked.getPlatformReleases.mockResolvedValue({ faults: [] } as never);
+  mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] } as never);
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
+  mocked.setReadinessOverride.mockResolvedValue({} as never);
+  mocked.clearReadinessOverride.mockResolvedValue(undefined as never);
 });
 
 afterEach(() => {
@@ -143,6 +150,37 @@ afterEach(() => {
 });
 
 describe("HostDetail — head and facts", () => {
+  it("opens managed cached versions from the host even when the catalog image was removed", async () => {
+    mocked.getHostImageCleanup.mockResolvedValue({
+      host_id: "c2059601", inventory_status: "current", observed_at: "2026-09-24T00:00:00Z", remedy: null,
+      images: [{ image_id: "retired-image", version: "old", image_ref: "example/retired@sha256:old",
+        runtime_image_id: "sha256:old", generation: "3", eligible: false,
+        reasons: ["retained_previous_success"], remedy: "Keep the last working version." }],
+    } as never);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage cached images" }));
+    expect(await screen.findByText("retired-image")).toBeTruthy();
+    expect(screen.getByText("Retained as the previous working version")).toBeTruthy();
+    expect(mocked.getHostImageCleanup).toHaveBeenCalledWith("tok", "c2059601", expect.any(AbortSignal));
+  });
+
+  it("shows a failed inventory read and recovers when the operator refreshes", async () => {
+    mocked.getHostImageCleanup.mockRejectedValueOnce(new Error("temporary read failure"));
+    mocked.getHostImageCleanup.mockResolvedValue({
+      host_id: "c2059601", inventory_status: "offline", observed_at: null,
+      remedy: "Reconnect the host before cleanup.", images: [],
+    } as never);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage cached images" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("could not load cached versions");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh inventory" }));
+    expect(await screen.findByText(/Reconnect the host before cleanup/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review removal" })).toBeNull();
+  });
+
   it("names the host, its hardware and where it came from", async () => {
     renderDetail();
 
@@ -388,12 +426,37 @@ describe("HostDetail — actions", () => {
     await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
-  it("offers to resume scheduling on a draining host", async () => {
-    mocked.getHost.mockResolvedValue({ host: host({ status: "draining" }) } as never);
+  it("releases only the operator's drain on a draining host", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "draining", admission_restrictions: [{
+      owner_kind: "manual", reason: "manual_drain", created_at: "2026-08-29T11:00:00Z",
+    }] }) } as never);
     renderDetail();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Resume scheduling" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Release operator drain" })).toBeTruthy());
 
-    fireEvent.click(screen.getByRole("button", { name: "Resume scheduling" }));
+    fireEvent.click(screen.getByRole("button", { name: "Release operator drain" }));
+    await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("explains a platform hold without a universal resume action", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "draining", admission_restrictions: [{
+      owner_kind: "platform", reason: "platform_apply", created_at: "2026-08-29T11:00:00Z",
+    }] }) } as never);
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("Platform apply")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /Resume scheduling|Release operator drain/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add operator drain" }));
+    await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("lets an offline host release its operator hold and renders future reasons safely", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "offline", admission_restrictions: [
+      { owner_kind: "legacy", reason: "legacy_drain", created_at: "2026-08-29T11:00:00Z" },
+      { owner_kind: "platform", reason: "future_reason" as never, created_at: "2026-08-29T11:01:00Z" },
+    ] }) } as never);
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("Admission hold")).toBeTruthy());
+    expect(screen.getByText(/recorded during upgrade/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Release operator drain" }));
     await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
@@ -415,6 +478,138 @@ describe("HostDetail — actions", () => {
 
     await waitFor(() => expect(screen.getByTestId("readiness-card")).toBeTruthy());
     expect(screen.getByTestId("readiness-check-nvidia_egl")).toBeTruthy();
+  });
+});
+
+describe("HostDetail — readiness override (#263)", () => {
+  const failingCheck = {
+    id: "audio_probe",
+    status: "fail",
+    summary: "No audio device detected",
+    remediation: "",
+    blocks: { scope: "host", enforced_by: "control_plane" },
+  };
+
+  it("passes the gate and overrides from the host body to the card", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: true },
+          ],
+        },
+        readiness_overrides: [
+          { check_id: "audio_probe", created_by: "u1", created_by_username: "alice", created_at: "2026-08-01T00:00:00Z", inert: false },
+        ],
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-overridden-audio_probe")).toBeTruthy());
+  });
+
+  it("confirms, then sets an override and refetches the host", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: false },
+          ],
+        },
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+    expect(mocked.setReadinessOverride).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Launch anyway" }));
+    });
+    expect(mocked.setReadinessOverride).toHaveBeenCalledWith("tok", "c2059601", "audio_probe");
+    await waitFor(() => expect(mocked.getHost).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not set an override when confirmation is declined", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: false },
+          ],
+        },
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(mocked.setReadinessOverride).not.toHaveBeenCalled();
+  });
+
+  it("withdraws an override and refetches the host", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: true },
+          ],
+        },
+        readiness_overrides: [
+          { check_id: "audio_probe", created_by: "u1", created_by_username: "alice", created_at: "2026-08-01T00:00:00Z", inert: false },
+        ],
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-clear-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-clear-audio_probe"));
+
+    await waitFor(() =>
+      expect(mocked.clearReadinessOverride).toHaveBeenCalledWith("tok", "c2059601", "audio_probe"),
+    );
+    await waitFor(() => expect(mocked.getHost).toHaveBeenCalledTimes(2));
+  });
+
+  it("shows the conflict copy on a 409 and leaves the page usable", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: false },
+          ],
+        },
+      }),
+    } as never);
+    mocked.setReadinessOverride.mockRejectedValue(
+      new ApiError(409, "conflict", "audio_probe is not currently blocking launches on this host"),
+    );
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+    const dialog = screen.getByRole("dialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Launch anyway" }));
+    });
+
+    await waitFor(() => expect(mocked.setReadinessOverride).toHaveBeenCalled());
+    // The page is still usable: the failing check and its button are still there.
+    expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy();
   });
 });
 
@@ -462,5 +657,241 @@ describe("HostDetail — platform-release faults", () => {
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "quasar-node-1" })).toBeTruthy());
     expect(document.querySelector(".note.warn")).toBeNull();
+  });
+});
+
+describe("HostDetail — services on this machine (#357)", () => {
+  const CP_COMMIT = "3f9a2c1e0c5a9d1b7a2f3e4d5c6b7a8901234567";
+  const owned = {
+    source_commit: CP_COMMIT,
+    built_at: new Date(NOW - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    install_mode: "owned" as const,
+    updater_present: true,
+    agent_version: "0.5.2",
+    recovery_actor_version: "0.5.2",
+    recovery_actor_source_commit: CP_COMMIT,
+    seed_version: null,
+  };
+
+  function releases(cpCommit: string | null = CP_COMMIT, faults: unknown[] = []) {
+    return {
+      faults,
+      installed: {
+        control_plane: { version: "0.5.2", source_commit: cpCommit, built_at: null, schema_version: 88 },
+        hosts: [],
+      },
+    } as never;
+  }
+
+  async function card(): Promise<HTMLElement> {
+    const title = await screen.findByText("Services on this machine");
+    return title.closest(".card") as HTMLElement;
+  }
+
+  function service(inCard: HTMLElement, name: string): HTMLElement {
+    return within(inCard).getByText(name).closest("tr") as HTMLElement;
+  }
+
+  beforeEach(() => {
+    mocked.getPlatformReleases.mockResolvedValue(releases());
+  });
+
+  it("shows an installed GPU host's recovery actor and node agent, owned by Quasar and running", async () => {
+    mocked.getHost.mockResolvedValue({ host: host(owned) } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).getByText("GPU host")).toBeTruthy();
+
+    const actor = service(c, "Recovery actor");
+    expect(within(actor).getByText("v0.5.2")).toBeTruthy();
+    expect(within(actor).getByText("Quasar")).toBeTruthy();
+    expect(within(actor).getByText("running")).toBeTruthy();
+
+    const agent = service(c, "Node agent");
+    expect(within(agent).getByText("v0.5.2")).toBeTruthy();
+    expect(within(agent).getByText("Quasar")).toBeTruthy();
+    expect(within(agent).getByText("running")).toBeTruthy();
+    expect(within(agent).queryByText(/older than the control plane/)).toBeNull();
+
+    expect(within(service(c, "Database")).getByText("none on this machine")).toBeTruthy();
+    expect(within(service(c, "Control plane")).getByText("not on this machine")).toBeTruthy();
+    expect(screen.getByText("GPU host · AMD Ryzen 9 9950X3D · 128 GB")).toBeTruthy();
+  });
+
+  // A branch-built actor reports version "dev", which the control plane stores
+  // NULL; `updater_present` is what says it answered (amendment 14).
+  it("reads an answering recovery actor with no version as installed, showing its commit", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, recovery_actor_version: null, agent_version: "dev" }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).queryByText(/has not reported its services yet/)).toBeNull();
+    expect(
+      within(c).getByText(
+        "Each Quasar service has one owner. On this machine every service but the seed is owned by its recovery actor.",
+      ),
+    ).toBeTruthy();
+
+    const actor = service(c, "Recovery actor");
+    expect(within(actor).getByText("version not reported · commit 3f9a2c1e0c5a")).toBeTruthy();
+    expect(within(actor).getByText("Quasar")).toBeTruthy();
+    expect(within(actor).getByText("running")).toBeTruthy();
+
+    const agent = service(c, "Node agent");
+    expect(within(agent).getByText("dev")).toBeTruthy();
+    expect(within(agent).getByText("running")).toBeTruthy();
+  });
+
+  it("says an agent on an older build than the control plane is older, and where to update it", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, agent_version: "0.5.1", source_commit: "9e8d7c6b5a4f" }),
+    } as never);
+    renderDetail();
+
+    const agent = service(await card(), "Node agent");
+    expect(within(agent).getByText("v0.5.1")).toBeTruthy();
+    expect(
+      within(agent).getByText("older than the control plane · update from Releases"),
+    ).toBeTruthy();
+  });
+
+  it("does not call an agent older when it is the one ahead of the control plane", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, source_commit: "9e8d7c6b5a4f" }),
+    } as never);
+    mocked.getPlatformReleases.mockResolvedValue(
+      releases(CP_COMMIT, [
+        { kind: "agent_ahead_of_control_plane", host_id: "c2059601", detail: "ahead" },
+      ]),
+    );
+    renderDetail();
+
+    const agent = service(await card(), "Node agent");
+    expect(within(agent).queryByText(/older than the control plane/)).toBeNull();
+  });
+
+  it("does not guess older when the control plane's build is unknown", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, source_commit: "9e8d7c6b5a4f" }),
+    } as never);
+    mocked.getPlatformReleases.mockRejectedValue(new Error("forbidden"));
+    renderDetail();
+
+    const agent = service(await card(), "Node agent");
+    expect(within(agent).queryByText(/older than the control plane/)).toBeNull();
+  });
+
+  it("shows every service as not reported until the recovery actor reports", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        ...owned,
+        node_name: "gpu-host-6",
+        updater_present: null,
+        recovery_actor_version: null,
+        recovery_actor_source_commit: null,
+        agent_connected_since: new Date(NOW - 20 * 1000).toISOString(),
+      }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(
+      within(c).getByText("Versions and owners appear once this machine’s recovery actor reports."),
+    ).toBeTruthy();
+    expect(
+      within(c).getByText(/gpu-host-6 connected 20 seconds ago and has not reported its services yet/),
+    ).toBeTruthy();
+    for (const name of ["Seed", "Recovery actor", "Node agent"]) {
+      const row = service(c, name);
+      expect(within(row).getByText("unknown")).toBeTruthy();
+      expect(within(row).queryByText(/^v\d/)).toBeNull();
+      expect(within(row).queryByText("Quasar")).toBeNull();
+    }
+  });
+
+  // An older server omits the amendment-14 fields altogether: absent reads as null.
+  it("treats absent actor fields as not reported", async () => {
+    const { recovery_actor_version: _a, recovery_actor_source_commit: _b, seed_version: _c, ...rest } =
+      owned;
+    mocked.getHost.mockResolvedValue({ host: host({ ...rest, updater_present: null }) } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(service(c, "Recovery actor")).getByText("unknown")).toBeTruthy();
+    expect(within(c).getByText(/has not reported its services yet/)).toBeTruthy();
+  });
+
+  it("says the recovery actor did not answer when the agent reports it absent", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, updater_present: false, recovery_actor_version: null }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).getByText("Could not read this machine’s services.")).toBeTruthy();
+    expect(within(c).queryByText(/has not reported its services yet/)).toBeNull();
+    expect(within(service(c, "Recovery actor")).getByText("unknown")).toBeTruthy();
+  });
+
+  it("marks an offline host's services with the time of their last report", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, status: "offline", last_registered_at: "2026-08-29T11:48:00Z" }),
+    } as never);
+    renderDetail();
+
+    const c = await card();
+    expect(within(c).getByText(/^Last report from \d\d:\d\d\.$/)).toBeTruthy();
+    for (const name of ["Recovery actor", "Node agent"]) {
+      const row = service(c, name);
+      expect(within(row).getByText(/^as of \d\d:\d\d$/)).toBeTruthy();
+      expect(within(row).queryByText("running")).toBeNull();
+    }
+  });
+
+  it("shows the seed the recovery actor found: its version, its external owner, running (#358)", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ ...owned, seed_version: "0.5.0" }) } as never);
+    renderDetail();
+
+    const seed = service(await card(), "Seed");
+    expect(within(seed).getByText("v0.5.0")).toBeTruthy();
+    expect(within(seed).getByText("External manager")).toBeTruthy();
+    expect(within(seed).getByText("running")).toBeTruthy();
+  });
+
+  it("says no seed was found when the answering recovery actor reports none (#358)", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ ...owned, seed_version: null }) } as never);
+    renderDetail();
+
+    const seed = service(await card(), "Seed");
+    expect(within(seed).getByText("not found")).toBeTruthy();
+    expect(within(seed).queryByText("External manager")).toBeNull();
+    expect(within(seed).queryByText("running")).toBeNull();
+    // The rest of the machine is unaffected.
+    expect(within(service(await card(), "Node agent")).getByText("running")).toBeTruthy();
+  });
+
+  it("does not call the seed missing while the recovery actor has not answered (#358)", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, updater_present: false, recovery_actor_version: null }),
+    } as never);
+    renderDetail();
+
+    const seed = service(await card(), "Seed");
+    expect(within(seed).getByText("unknown")).toBeTruthy();
+    expect(within(seed).queryByText("not found")).toBeNull();
+  });
+
+  it("draws no services card for a host that is not owned", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...owned, install_mode: "registry", recovery_actor_version: null }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "quasar-node-1" })).toBeTruthy());
+    expect(screen.queryByText("Services on this machine")).toBeNull();
+    expect(screen.getByText("AMD Ryzen 9 9950X3D · 128 GB")).toBeTruthy();
   });
 });

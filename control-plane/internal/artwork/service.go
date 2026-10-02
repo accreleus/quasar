@@ -668,9 +668,58 @@ func (s *Service) SweepOnce(ctx context.Context) SweepResult {
 		s.log.Warn("artwork: could not list apps needing artwork", "err", err)
 		return res
 	}
+	s.resolveEach(ctx, apps, &res)
+	return res
+}
+
+// ResolveApps resolves exactly the named apps now, under the sweep's rules —
+// it is the library scan's hook (#384), so a game a scan just added has its
+// art when an admin next opens the library rather than after the next sweep.
+// Same Resolve, so everything the sweep promises holds here too: by-appid
+// first, a "no match" is a stored decision, a provider error writes no row
+// (the sweep picks the app up later), and an app that already has ANY row —
+// a manual or locked choice included — is never touched.
+//
+// Ship-dark exactly as SweepOnce: the provider is resolved before anything
+// else and the call returns without a query, a request or a row when there is
+// none. That check must stay first — Resolve's desktop/launcher short-circuit
+// writes a row with no provider call, which would otherwise break "nothing
+// changes" on an unconfigured install.
+//
+// An id that no longer names an app (deleted between the scan's commit and
+// this call) is skipped, not an error.
+func (s *Service) ResolveApps(ctx context.Context, appIDs []string) SweepResult {
+	var res SweepResult
+	if len(appIDs) == 0 {
+		return res
+	}
+	if _, err := s.providerNow(ctx); err != nil {
+		return res
+	}
+	res.ProviderConfigured = true
+	apps := make([]appRef, 0, len(appIDs))
+	for _, id := range appIDs {
+		app, err := s.store.App(ctx, id)
+		if errors.Is(err, ErrAppNotFound) {
+			continue
+		}
+		if err != nil {
+			s.log.Warn("artwork: could not load app to resolve", "app_id", id, "err", err)
+			continue
+		}
+		apps = append(apps, app)
+	}
+	s.resolveEach(ctx, apps, &res)
+	return res
+}
+
+// resolveEach is the per-app loop SweepOnce and ResolveApps share. Per-app
+// failures are logged and skipped — one unmatchable app must never stall the
+// queue behind it.
+func (s *Service) resolveEach(ctx context.Context, apps []appRef, res *SweepResult) {
 	for _, app := range apps {
 		if ctx.Err() != nil {
-			return res
+			return
 		}
 		res.AppsConsidered++
 		if err := s.Resolve(ctx, app); err != nil {
@@ -683,7 +732,6 @@ func (s *Service) SweepOnce(ctx context.Context) SweepResult {
 			res.NoMatch++
 		}
 	}
-	return res
 }
 
 // PruneOrphans deletes cached blobs no artwork row references.

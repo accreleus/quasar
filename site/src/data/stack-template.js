@@ -1,49 +1,115 @@
-/** Install artifacts derived from the repository Compose files. */
-import { dump } from 'js-yaml';
-import templates from './compose-template.generated.js';
+/**
+ * What the quick start generates: the seed, for one machine.
+ *
+ * An owned install declares exactly one container per machine, the seed. The
+ * recovery actor it creates generates every secret and creates Postgres, the
+ * control plane and the node agent, so nothing here writes a Compose stack of
+ * Quasar services, an .env of secrets, or runs `openssl rand`. The seed's inputs
+ * are docs/configuration.md "Seed" / "Recovery actor"; the GPU-host stack has the
+ * same shape Admin -> Fleet -> Add host writes (web/src/lib/addHost.ts).
+ *
+ * Images: a static page cannot know the current digests, so the stack names the
+ * stable channel's `latest` tags (the newest release, or `main`, images.yml) and
+ * the seed pins the agent and control-plane tags to digests itself, on a first
+ * install, before it creates anything. The script resolves them up front on the
+ * host instead, so the Quadlet unit it writes carries digests. Publish the site
+ * only after the release is cut: before it, `latest` names a build from before
+ * owned installs.
+ *
+ * Engine and mode (RH07-14, #406). Which (platform, engine, mode) combinations
+ * are offered at all is `testdata/engine-profiles/profiles.json` via
+ * `engine-profiles.js` — the same table the node agent's `runtime_engine` check
+ * and the enrollment script read, so the badge the quick start shows is the
+ * verdict the host's readiness card will give. An unsupported combination
+ * generates no install artifacts; the UI is the thing that blocks it earlier.
+ *
+ * Rootful only. The quick start installs rootful Docker, rootful Podman and
+ * Unraid; a rootless engine needs a prepared `quasar` account first, which the
+ * docs write out step by step (install/rootless), so a rootless answer
+ * generates no install artifacts here. Nobody is told to download and run a
+ * script as root: the few host commands a rootful install needs are returned
+ * as `hostSteps`, visible commands the reader runs themselves (the engine at
+ * boot; Podman's socket and podman-restart.service; on NVIDIA the container
+ * toolkit wiring). Unraid needs none, and keeps its own self-contained script.
+ * For Podman, `quadlet` is the unit for on-screen reference; the script itself
+ * resolves digests and writes/starts the same unit.
+ */
 import { proxyConfig } from './proxy-configs.js';
 import { platform } from './platforms.js';
+import { profileFor } from './engine-profiles.js';
+
+// `process` itself is a Node global, undefined in the browser this module is
+// also bundled for (the quick start's client <script>) — `typeof` is the one
+// operator that can safely probe an undeclared identifier without throwing.
+const env = typeof process !== 'undefined' ? process.env : {};
+export const REGISTRY_NS = env.QUASAR_IMAGE_NAMESPACE || 'ghcr.io/accreleus/quasar';
+/** The stable channel's moving tag; `QUASAR_IMAGE_TAG=o2-develop` pins edge instead. */
+export const CHANNEL_TAG = env.QUASAR_IMAGE_TAG || 'latest';
+export const IMAGE_NAMES = {
+  seed: 'quasar-recovery',
+  control: 'quasar-control-plane',
+  agent: 'quasar-node-agent',
+};
+
+export const ROLES = {
+  combined: { label: 'Combined host', seedRole: 'combined', agent: true, control: true },
+  'control-only': { label: 'Control-only host', seedRole: 'control-only', agent: false, control: true },
+  gpu: { label: 'GPU host', seedRole: 'gpu', agent: true, control: false },
+};
+
+export const ENGINES = ['docker', 'podman'];
+export const MODES = ['rootful', 'rootless'];
 
 export const DEFAULTS = {
   platform: 'fedora', // see platforms.js
-  kernelLogs: false, // Optional host /dev/kmsg diagnostics.
-  gpu: 'amd-intel', // 'nvidia' | 'amd-intel'
+  role: 'combined', // see ROLES
+  engine: 'docker', // 'docker' | 'podman'
+  mode: 'rootful', // 'rootful' only for install artifacts; 'rootless' is the docs' rootless page
+  nvidia: false, // the host steps add the NVIDIA container toolkit wiring
   basePath: '/var/lib/quasar',
   separateSaves: false,
   savesPath: '',
-  owner: 'dedicated', // 'dedicated' | 'me' | 'custom'
+  owner: 'dedicated', // 'dedicated' | 'custom'
   uid: 1000,
   gid: 1000,
-  access: 'self-signed', // 'self-signed' | 'proxy' | 'own-cert'
+  access: 'self-signed', // 'self-signed' | 'proxy'
+  publicHost: '',
   tlsHosts: '',
   publicUrl: '',
   proxy: 'caddy',
-  certPath: '',
-  keyPath: '',
+  trustedProxies: '',
+  database: 'owned', // 'owned' | 'external'
+  dbHost: '',
+  dbPort: 5432,
+  dbUser: 'quasar',
+  dbName: 'quasar',
+  dbSslmode: 'require',
   controlPort: 8080,
   tlsPort: 8443,
 };
 
-/** Certificate, artwork cache and other control-plane state. */
-export function statePath(a) {
-  return `${a.basePath.replace(/\/+$/, '')}/control`;
+export function role(id) {
+  return ROLES[id] ?? ROLES.combined;
 }
 
-/**
- * The stack directory: docker-compose.yml and .env, including the only copy of
- * POSTGRES_PASSWORD, QUASAR_SECRET_KEY and the enrollment token.
- *
- * Derived from basePath and never from the operator's working directory (#148).
- * Unraid runs / from a ramdisk and its shell starts in /root, so a stack written
- * beside the invocation is gone at the next reboot, taking the credentials with
- * it. The containers restart against the surviving Postgres volume, so nothing
- * looks wrong until the first compose command or upgrade.
- *
- * Named `deploy` to match the layout every install page documents.
- */
-export function stackPath(a) {
-  return `${a.basePath.replace(/\/+$/, '')}/deploy`;
+/** Whether generate() should produce install artifacts for this platform/engine/mode at all. */
+export function supportedProfile(a) {
+  return profileFor(a.platform, a.engine, a.mode).status !== 'unsupported';
 }
+
+/** The docs page a rootless install follows instead of the quick start. */
+export const ROOTLESS_DOCS_URL = 'https://accreleus.github.io/quasar/install/rootless/';
+
+/** A channel-tagged image. The seed pins it to a digest at install time. */
+export function taggedImage(name) {
+  return `${REGISTRY_NS}/${name}:${CHANNEL_TAG}`;
+}
+
+const TAGGED = {
+  seed: taggedImage(IMAGE_NAMES.seed),
+  control: taggedImage(IMAGE_NAMES.control),
+  agent: taggedImage(IMAGE_NAMES.agent),
+};
 
 /** Per-user home directories. This is the one that grows. */
 export function homePath(a) {
@@ -51,403 +117,687 @@ export function homePath(a) {
   return `${a.basePath.replace(/\/+$/, '')}/homes`;
 }
 
+/** Always written out: the recovery actor and the agent default it differently. */
+export function templatePath(a) {
+  const home = homePath(a);
+  return `${home.slice(0, home.lastIndexOf('/'))}/templates`;
+}
+
 /**
- * Who owns save data, as {uid, gid}.
- *
- * This drives QUASAR_APP_PUID/PGID (the game container drops to it) and the
- * ownership of the created directories. It deliberately does NOT change the
- * control plane's own user: that image runs as uid 1000 and owns its files as
- * 1000 on its named volume; bind-storage overrides are a separate choice.
+ * Who owns save data, as {uid, gid}: QUASAR_APP_PUID/PGID, which the game
+ * containers drop to. It does not change what the platform services run as.
  */
 export function appUser(a) {
   const p = platform(a.platform);
   if (a.owner === 'custom') {
-    return { uid: Number(a.uid) ?? p.defaultUid, gid: Number(a.gid) ?? p.defaultGid };
+    return { uid: Number(a.uid), gid: Number(a.gid) };
   }
   return { uid: p.defaultUid, gid: p.defaultGid };
 }
 
-/** The -f list every generated docker compose command carries. */
-export function composeFiles() {
-  return ['docker-compose.yml'];
-}
-
-function composeYaml(a) {
-  const doc = structuredClone(templates['deploy/docker-compose.yml']);
-  const cp = doc.services['quasar-control-plane'];
-  const agent = doc.services['quasar-node-agent'];
-  if (a.gpu === 'nvidia') {
-    const overlay = templates['deploy/docker-compose.nvidia.yml'];
-    const nv = overlay.services['quasar-node-agent'];
-    Object.assign(agent, nv, {
-      environment: { ...agent.environment, ...nv.environment },
-      volumes: [...agent.volumes, ...nv.volumes],
-    });
-    Object.assign(doc.volumes, overlay.volumes);
-  }
-  if (!a.kernelLogs) {
-    agent.devices = agent.devices.filter(device => !String(device).startsWith('/dev/kmsg'));
-    agent.cap_add = agent.cap_add.filter(capability => capability !== 'SYSLOG');
-  }
-  // Installation policy is explicit; service wiring comes from the repo.
-  cp.image = '${QUASAR_CONTROL_IMAGE:?Select a published control-plane image}';
-  agent.image = '${QUASAR_AGENT_IMAGE:?Select a published node-agent image}';
-  doc.services['quasar-updater'].image = '${QUASAR_UPDATER_IMAGE:?Select a published updater image}';
-  doc.services['quasar-updater'].volumes = doc.services['quasar-updater'].volumes.map(mount =>
-    typeof mount === 'string' ? mount.replaceAll('${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}', '${QUASAR_STACK_DIR:?Set the absolute deploy directory in .env}') : mount);
-  delete cp.environment.DATABASE_URL;
-  Object.assign(cp.environment, {
-    QUASAR_DATABASE_HOST: 'quasar-postgres',
-    QUASAR_DATABASE_USER: '${POSTGRES_USER:-quasar}',
-    QUASAR_DATABASE_PASSWORD: '${POSTGRES_PASSWORD:?Run openssl rand -hex 24 and paste its output into POSTGRES_PASSWORD in .env}',
-    QUASAR_SECRET_KEY: '${QUASAR_SECRET_KEY:?Run openssl rand -base64 32 and paste its output into QUASAR_SECRET_KEY in .env}',
-  });
-  agent.environment.QUASAR_PULSE_IMAGE = '${QUASAR_PULSE_IMAGE:-${QUASAR_AGENT_IMAGE:?}}';
-  // These are established before exec by the image entrypoint.
-  for (const key of ['NODE_SECRET_PATH', 'XDG_RUNTIME_DIR', 'LD_LIBRARY_PATH', 'NVIDIA_DRIVER_CAPABILITIES']) {
-    delete agent.environment[key];
-  }
-  // Optional settings belong in a service-specific override file. Keeping them
-  // separate avoids exposing database credentials to the Docker-privileged agent.
-  // Empty passthroughs have no deployment meaning; preserve all nonempty defaults.
-  const choices = new Set([
-    'QUASAR_HOME_ROOT', 'QUASAR_TEMPLATE_ROOT', 'QUASAR_APP_PUID', 'QUASAR_APP_PGID',
-    'QUASAR_ENCODER', 'QUASAR_TLS_HOSTS', 'QUASAR_SECRET_KEY', 'PUBLIC_BASE_URL',
-    'QUASAR_ALLOWED_ORIGINS', 'QUASAR_TRUSTED_PROXIES',
-    // Release detection knobs retain the upstream install's .env interface.
-    'QUASAR_PLATFORM_RELEASE_REPO', 'QUASAR_PLATFORM_RELEASE_API',
-    'QUASAR_PLATFORM_RELEASE_ASSET_HOSTS', 'QUASAR_PLATFORM_RELEASE_TOKEN',
-    'QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL', 'QUASAR_PLATFORM_REGISTRY',
-    'QUASAR_IMAGE_REGISTRY_HOSTS',
-  ]);
-  for (const [service, file] of [[cp, 'control.env'], [agent, 'agent.env']]) {
-    for (const [key, value] of Object.entries(service.environment)) {
-      if ((value === null || value === '${' + key + ':-}') && !choices.has(key)) delete service.environment[key];
-    }
-    service.env_file = [{ path: file, required: false }];
-  }
-  if (a.access === 'own-cert') {
-    Object.assign(cp.environment, {
-      QUASAR_TLS_CERT: '/etc/quasar/tls/cert.pem',
-      QUASAR_TLS_KEY: '/etc/quasar/tls/key.pem',
-    });
-    cp.volumes.push(
-      { type: 'bind', source: '${QUASAR_TLS_CERT:?}', target: '/etc/quasar/tls/cert.pem', read_only: true, bind: { create_host_path: false } },
-      { type: 'bind', source: '${QUASAR_TLS_KEY:?}', target: '/etc/quasar/tls/key.pem', read_only: true, bind: { create_host_path: false } },
-    );
-  }
-  return '# Quasar generated install v2\n' + dump(doc, { lineWidth: -1, noRefs: true });
-}
-
-function envFile(a, installer = false) {
+/** The app-container user is passed only when it differs from the image's (1000). */
+function appUserInputs(a) {
   const { uid, gid } = appUser(a);
-  const lines = [
-    '# Replace ALL three blank values below before starting. Keep this file private.',
-    '# Run these commands in a terminal, then paste each OUTPUT after the matching =.',
-    '# Do not paste the command itself into a value; .env does not run shell commands.',
-    '# POSTGRES_PASSWORD: openssl rand -hex 24',
-    '# ENROLLMENT_TOKEN: openssl rand -hex 32',
-    '# QUASAR_SECRET_KEY: openssl rand -base64 32',
-    'POSTGRES_PASSWORD=',
-    'ENROLLMENT_TOKEN=',
-    'QUASAR_SECRET_KEY=',
-    '',
-    '# Where Quasar keeps things.',
-    `QUASAR_HOME_ROOT=${homePath(a)}`,
-    `QUASAR_TEMPLATE_ROOT=${homePath(a).replace(/\/[^/]*$/, '/templates')}`,
-    '',
-    '# This stack directory, at its absolute path on this host. The updater',
-    '# needs it to find the compose files it is asked to act on.',
-    '# Set this to the absolute directory where you save docker-compose.yml and .env.',
-    'QUASAR_STACK_DIR=',
-    '',
-    '# Who owns save data. Game containers drop to this user.',
-    `QUASAR_APP_PUID=${uid}`,
-    `QUASAR_APP_PGID=${gid}`,
-    '',
-    '# Optional encoder override; the agent detects the GPU when empty.',
-    'QUASAR_ENCODER=',
-    '# Pin all images to a published release before starting.',
-    `QUASAR_CONTROL_IMAGE=${a.controlImage || ''}`,
-    `QUASAR_AGENT_IMAGE=${a.agentImage || ''}`,
-    `QUASAR_UPDATER_IMAGE=${a.updaterImage || ''}`,
-    '',
-    '# Ports on the host.',
-    `CONTROL_PORT=${a.controlPort}`,
-    `QUASAR_TLS_PORT=${a.tlsPort}`,
+  if (uid === 1000 && gid === 1000) return [];
+  return [
+    ['QUASAR_APP_PUID', String(uid)],
+    ['QUASAR_APP_PGID', String(gid)],
   ];
-
-  if (a.access === 'self-signed') {
-    lines.push(
-      '',
-      '# Every address anyone will type into a browser. The certificate names',
-      '# these and is generated once, on first boot.',
-      `QUASAR_TLS_HOSTS=${a.tlsHosts.trim()}`
-    );
-  }
-
-  if (a.access === 'proxy') {
-    const origin = (a.publicUrl || '').trim().replace(/\/+$/, '');
-    lines.push(
-      '',
-      '# Fronted by your own reverse proxy.',
-      `PUBLIC_BASE_URL=${origin}`,
-      `QUASAR_ALLOWED_ORIGINS=${origin}`,
-      '# Only trust forwarded client addresses from the proxy you operate.',
-      'QUASAR_TRUSTED_PROXIES=',
-      '# Direct LAN access keeps working on the TLS port, so name those',
-      '# addresses too if you use them.',
-      `QUASAR_TLS_HOSTS=${a.tlsHosts.trim()}`
-    );
-  }
-
-  if (a.access === 'own-cert') {
-    lines.push('', '# Host paths; each file is mounted independently, read-only.',
-      `QUASAR_TLS_CERT=${a.certPath.trim()}`,
-      `QUASAR_TLS_KEY=${a.keyPath.trim()}`);
-  }
-
-  const resolvedByInstaller = new Set(['QUASAR_STACK_DIR', 'QUASAR_CONTROL_IMAGE', 'QUASAR_AGENT_IMAGE', 'QUASAR_UPDATER_IMAGE']);
-  return lines.filter(line => !installer || !resolvedByInstaller.has(line.split('=')[0])).map(line => {
-    if (line.startsWith('#') || !line.includes('=')) return line;
-    const index = line.indexOf('=');
-    const value = line.slice(index + 1);
-    return line.slice(0, index + 1) + envQuote(value);
-  }).join('\n') + '\n';
 }
 
-// The release manifest's two-component contract is shared with self-update.
-// The independently published updater is checked by pulling its matching version.
-function releaseSelection() {
-  return `
-# Fresh installations select the latest stable GitHub release, never a guessed
-# image tag or a prerelease. Existing .env files keep their image pins.
-echo "==> Published release"
-release=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 60 https://api.github.com/repos/accreleus/quasar/releases/latest) || {
-  echo "No stable release could be retrieved. Select a published release explicitly before installing." >&2
-  exit 1
-}
-manifest_url=$(printf '%s' "$release" | jq -er '.assets[] | select(.name == "platform-release-manifest.json") | .browser_download_url')
-case "$manifest_url" in
-  https://github.com/accreleus/quasar/releases/download/*/platform-release-manifest.json) ;;
-  *) echo "Release has no recognized platform manifest asset" >&2; exit 1 ;;
-esac
-manifest=$(curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 "$manifest_url")
-printf '%s' "$manifest" | jq -e '
-  .format_version == 1 and .prerelease == false and
-  (.version | test("^[0-9]+[.][0-9]+[.][0-9]+$")) and
-  (.components | length == 2) and
-  ([.components[].name] | sort == ["control-plane", "node-agent"]) and
-  all(.components[]; .image == ("ghcr.io/accreleus/quasar/quasar-" + .name) and
-    (.digest | test("^sha256:[a-f0-9]{64}$")))
-' >/dev/null || { echo "Invalid stable platform release manifest" >&2; exit 1; }
-control_image=$(printf '%s' "$manifest" | jq -r '.components[] | select(.name == "control-plane") | .image + "@" + .digest')
-agent_image=$(printf '%s' "$manifest" | jq -r '.components[] | select(.name == "node-agent") | .image + "@" + .digest')
-version=$(printf '%s' "$manifest" | jq -r '.version')
-updater_image="ghcr.io/accreleus/quasar/quasar-updater:$version"
-# Verify availability before writing credentials or creating stack services.
-docker pull "$control_image"
-docker pull "$agent_image"
-docker pull "$updater_image"
-entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$control_image")
-printf '%s' "$entrypoint" | jq -e '.[0] == "/usr/local/bin/quasar-control-entrypoint"' >/dev/null || {
-  echo "The latest stable release predates this installer configuration. Use the installation instructions shipped with that release, or wait for a compatible release." >&2
-  exit 1
-}
-`;
+const ENROLLMENT_PLACEHOLDER = 'qenr1.<paste the string from Admin, Fleet, Add host>';
+
+/**
+ * The seed's inputs for these answers, in order, as [name, value]. `images` are
+ * the three references (the channel tags, or the script's resolved variables).
+ * The operator's database password is never a value here: it is
+ * `${QUASAR_DATABASE_PASSWORD}`, interpolated from the stack's own .env, or the
+ * script's environment.
+ */
+export function seedInputs(a, images = TAGGED) {
+  const r = role(a.role);
+  const out = [['QUASAR_ROLE', r.seedRole]];
+  if (r.seedRole === 'gpu') out.push(['QUASAR_ENROLLMENT', ENROLLMENT_PLACEHOLDER]);
+  if (r.control) {
+    out.push(['QUASAR_PUBLIC_HOST', a.publicHost.trim() || '<the name or LAN address you browse to>']);
+    if (a.tlsHosts.trim()) out.push(['QUASAR_TLS_HOSTS', a.tlsHosts.trim()]);
+    if (a.access === 'proxy' && a.trustedProxies.trim()) {
+      out.push(['QUASAR_TRUSTED_PROXIES', a.trustedProxies.trim()]);
+    }
+    if (Number(a.controlPort) !== 8080) out.push(['QUASAR_HTTP_PORT', String(a.controlPort)]);
+    if (Number(a.tlsPort) !== 8443) out.push(['QUASAR_TLS_PORT', String(a.tlsPort)]);
+  }
+  if (r.agent) {
+    out.push(['QUASAR_HOME_ROOT', homePath(a)]);
+    out.push(['QUASAR_TEMPLATE_ROOT', templatePath(a)]);
+    out.push(...appUserInputs(a));
+  }
+  if (r.control) out.push(['QUASAR_CONTROL_PLANE_IMAGE', images.control]);
+  out.push(['QUASAR_AGENT_IMAGE', images.agent]);
+  if (r.control && a.database === 'external') {
+    out.push(['QUASAR_DATABASE_HOST', a.dbHost.trim() || '<your database host>']);
+    if (Number(a.dbPort) !== 5432) out.push(['QUASAR_DATABASE_PORT', String(a.dbPort)]);
+    if (a.dbUser.trim() && a.dbUser.trim() !== 'quasar') out.push(['QUASAR_DATABASE_USER', a.dbUser.trim()]);
+    if (a.dbName.trim() && a.dbName.trim() !== 'quasar') out.push(['QUASAR_DATABASE_NAME', a.dbName.trim()]);
+    out.push(['QUASAR_DATABASE_SSLMODE', a.dbSslmode]);
+    out.push(['QUASAR_DATABASE_PASSWORD', '${QUASAR_DATABASE_PASSWORD}']);
+  }
+  return out;
 }
 
 /**
- * Quote a value for Compose's dotenv parser.
- *
- * Unquoted, it expands `$VAR` and strips an inline ` #` comment, so a path
- * containing either reaches Compose as something else entirely.
+ * The seed alone, as a one-service stack for Dockge or Arcane. The volume's own
+ * `name:` matters: without it Compose names it `<project>_quasar-machine`, which
+ * the seed refuses (`seed-self-invalid`).
  */
-export function envQuote(value) {
-  if (/^[a-zA-Z0-9_./,:@%+-]*$/.test(value)) return value;
-  return "'" + value.replaceAll("\\", "\\\\").replaceAll("'", "\\'") + "'";
+export function seedStack(a, images = TAGGED) {
+  // Double-quoted (JSON is valid YAML): a port or a node name stays a string.
+  const q = (v) => JSON.stringify(v);
+  return [
+    'services:',
+    '  quasar-seed:',
+    '    container_name: quasar-seed',
+    `    image: ${q(images.seed)}`,
+    '    command: seed',
+    '    restart: unless-stopped',
+    '    security_opt: [label=disable]',
+    '    environment:',
+    ...seedInputs(a, images).map(([k, v]) => `      ${k}: ${q(v)}`),
+    '    volumes:',
+    '      - /var/run/docker.sock:/var/run/docker.sock',
+    '      - quasar-machine:/var/lib/quasar-machine:ro',
+    'volumes:',
+    '  quasar-machine:',
+    '    name: quasar-machine',
+    '',
+  ].join('\n');
+}
+
+/** The stack's .env, only for the operator's own database: the one secret it holds. */
+export function stackEnv(a) {
+  if (!role(a.role).control || a.database !== 'external') return null;
+  return [
+    '# Your own database password. The seed copies it into machine state at the first',
+    '# install; after that it can be removed from here. Never mounted into a container.',
+    'QUASAR_DATABASE_PASSWORD=',
+    '',
+  ].join('\n');
 }
 
 function shellQuote(value) {
-  return "'" + value.replaceAll("'", "'\"'\"'") + "'";
+  return "'" + String(value).replaceAll("'", "'\"'\"'") + "'";
 }
 
-function scriptText(a) {
-  const { uid, gid } = appUser(a);
-  const p = platform(a.platform);
-  const files = composeFiles(a)
-    .map((f) => `-f "$stack_dir/${f}"`)
-    .join(' ');
+// --- host steps ---------------------------------------------------------------
 
-  const nvidiaBlock = a.gpu === 'nvidia' ? `
-if command -v docker >/dev/null && command -v jq >/dev/null; then
-  if ! docker info --format '{{json .Runtimes}}' | jq -e 'has("nvidia")' >/dev/null; then
-    echo "NVIDIA Container Toolkit is not registered with Docker. Configure it on this host, then rerun this installer." >&2
-    preflight_failed=1
+/** NVIDIA's own install guide for the container toolkit (packages differ per distribution). */
+export const NVIDIA_TOOLKIT_URL = 'https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html';
+
+/**
+ * The one SELinux rule sessions need on NVIDIA: they run as container_engine_t (Steam's
+ * nested sandbox), which the policy boolean below does not cover. Same rule as
+ * deploy/prepare-host.sh writes.
+ */
+export const NESTED_GPU_CIL = '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))';
+
+/**
+ * The node agent's runtime directory on rootful Podman, made at every boot (the
+ * line deploy/prepare-host.sh writes for rootful). Docker recreates a missing bind
+ * source itself; Podman does not, so without it the agent fails after a reboot.
+ * Its SELinux label is the agent's own business.
+ */
+export const RUNTIME_DIR_TMPFILES = 'd /run/quasar-agent 0755 root root -';
+
+/** NVIDIA's device nodes for SELinux-confined containers; SELinux stays enforcing. */
+function nvidiaSelinuxLines() {
+  return [
+    'sudo setsebool -P container_use_xserver_devices on',
+    `echo '${NESTED_GPU_CIL}' > quasar-nested-gpu.cil`,
+    'sudo semodule -i quasar-nested-gpu.cil',
+  ];
+}
+
+/**
+ * The host commands a rootful install needs, run once by the reader before the
+ * install script: visible, never a downloaded script. Unraid needs none.
+ * Mirrors what deploy/prepare-host.sh does for a rootful engine: the engine at
+ * boot (Podman: its API socket, podman-restart.service and the agent's runtime
+ * directory, recreated at every boot), and on NVIDIA the
+ * container toolkit (Docker: its runtime; Podman: a CDI specification), plus,
+ * on Fedora (SELinux), the boolean and the one rule NVIDIA's device nodes need.
+ */
+export function hostSteps(a) {
+  const r = role(a.role);
+  const nvidia = Boolean(a.nvidia) && r.agent;
+  const selinux = a.platform === 'fedora';
+  const lines = [];
+  if (a.engine === 'podman') {
+    lines.push(
+      "# Podman's API socket (the seed talks to it), and Quasar's containers back at boot.",
+      'sudo systemctl enable --now podman.socket',
+      'sudo systemctl enable podman-restart.service',
+      '',
+      "# The agent's runtime directory, made at every boot: /run is emptied on reboot,",
+      '# and Podman never creates a missing bind source.',
+      `echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf`,
+      'sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf',
+    );
+    if (nvidia) {
+      lines.push(
+        '',
+        `# NVIDIA: install the NVIDIA Container Toolkit first (${NVIDIA_TOOLKIT_URL}),`,
+        '# then describe the GPU to Podman. Run this again after a driver upgrade.',
+        'sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml',
+      );
+      if (selinux) lines.push('', '# SELinux: let containers open the NVIDIA devices. SELinux stays enforcing.', ...nvidiaSelinuxLines());
+    }
+  } else {
+    lines.push('# Docker, now and at every boot (it brings Quasar\'s containers back).', 'sudo systemctl enable --now docker');
+    if (nvidia) {
+      lines.push(
+        '',
+        `# NVIDIA: install the NVIDIA Container Toolkit first (${NVIDIA_TOOLKIT_URL}),`,
+        '# then give Docker its runtime.',
+        'sudo nvidia-ctk runtime configure --runtime=docker',
+        'sudo systemctl restart docker',
+      );
+      if (selinux) {
+        lines.push(
+          '',
+          '# Only if Docker runs with SELinux on (uCore and Fedora CoreOS do; check with',
+          "# docker info --format '{{.SecurityOptions}}'): let containers open the NVIDIA devices.",
+          ...nvidiaSelinuxLines(),
+        );
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+// --- the Podman Quadlet unit -------------------------------------------------
+
+/**
+ * The seed's inputs as Quadlet `Environment=` lines: the operator's database
+ * password never appears here, even in its `${VAR}` form — a Quadlet unit has
+ * no shell, so it is instead a `Secret=`, resolved through Podman's own secret
+ * store, which the script creates alongside the unit.
+ */
+function quadletEnvironmentLines(a, images) {
+  return seedInputs(a, images)
+    .filter(([k]) => k !== 'QUASAR_DATABASE_PASSWORD')
+    .map(([k, v]) => `Environment=${k}=${JSON.stringify(v)}`);
+}
+
+/**
+ * The Quadlet unit, for on-screen reference. The socket is mapped at
+ * `%t/podman/podman.sock` (the rootless and rootful runtime directory alike)
+ * to `/var/run/docker.sock`, the one in-container path the seed accepts
+ * (ADR 0007's RH07 amendment) — never the mockup's `/run/podman/podman.sock`,
+ * which the seed refuses. The script itself writes and starts this same unit
+ * with resolved image digests; the on-screen unit names tags, resolved by the seed.
+ */
+export function quadletUnit(a, images = TAGGED) {
+  const external = role(a.role).control && a.database === 'external';
+  const rootful = a.mode === 'rootful';
+  const lines = [
+    '[Unit]',
+    'Description=Quasar seed',
+    'Wants=network-online.target',
+    'Requires=podman.socket',
+    'After=network-online.target podman.socket',
+    '',
+    '[Container]',
+    'ContainerName=quasar-seed',
+    `Image=${images.seed}`,
+    'Exec=seed',
+    'SecurityLabelDisable=true',
+    'Volume=%t/podman/podman.sock:/var/run/docker.sock',
+    'Volume=quasar-machine:/var/lib/quasar-machine:ro',
+    ...quadletEnvironmentLines(a, images),
+  ];
+  if (external) lines.push('Secret=quasar-db-password,type=env,target=QUASAR_DATABASE_PASSWORD');
+  lines.push('', '[Service]', 'Restart=always', '', '[Install]', `WantedBy=${rootful ? 'multi-user.target' : 'default.target'}`, '');
+  return lines.join('\n');
+}
+
+/**
+ * The seed as a bare `podman run`, for "only trying it out" — not the
+ * installed path (the Quadlet unit is), so it is offered behind a closed
+ * disclosure in the Result step. Same socket mapping as the unit
+ * (`/var/run/docker.sock` in-container, per ADR 0007's RH07 amendment).
+ */
+export function podmanRunSeed(a, images = TAGGED) {
+  const rootful = a.mode === 'rootful';
+  const sudo = rootful ? 'sudo ' : '';
+  const sock = rootful ? '/run/podman/podman.sock' : '${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock';
+  return `${sudo}podman run -d --name quasar-seed --restart unless-stopped \\
+  --security-opt label=disable \\
+  -v "${sock}:/var/run/docker.sock" \\
+  -v quasar-machine:/var/lib/quasar-machine:ro \\
+${envArgsFor(a, images)}
+  ${images.seed} seed`;
+}
+
+// --- the scripts, per engine and mode ---------------------------------------
+
+const EXISTING_INSTALL_CHECK = (cli, sudo) => `for name in quasar-seed quasar-recovery; do
+  if ${sudo}${cli} container inspect "$name" >/dev/null 2>&1; then
+    echo "Quasar is already installed on this machine ($name exists). Check it with:" >&2
+    echo "  ${sudo}${cli} exec quasar-recovery quasar-recovery status" >&2
+    exit 1
   fi
+done`;
+
+/**
+ * Before the seed starts: a control plane already answering on the port belongs to
+ * another install (this engine has none; the existing-install check passed), and the
+ * new one could never bind it, while the wait below would be answered by the other.
+ */
+function portCheck(a, r) {
+  if (!r.control) return '';
+  return `if curl -fsS -m 3 http://localhost:${a.controlPort}/health >/dev/null 2>&1; then
+  echo "Something already answers on port ${a.controlPort}: another Quasar install (on another engine?) or another service." >&2
+  echo "Stop it, or choose other ports under Change the ports, then run this again." >&2
+  exit 1
 fi
-if [ ! -r /sys/module/nvidia/version ]; then
-  echo "The NVIDIA kernel driver is not loaded. Install/enable the host graphics driver first." >&2
-  preflight_failed=1
-fi
-` : '';
+`;
+}
 
-
-  return `#!/usr/bin/env bash
-# Quasar quick start for ${p.label}. Generated in your browser; nothing was sent
-# anywhere. Read it before you run it.
-set -euo pipefail
-
-# Everything this installer writes lives here, at an absolute path. Never
-# relative to the working directory: on a host whose shell starts on a ramdisk
-# that loses the credentials at the next reboot (#148).
-# --- first-install guards ---
-stack_dir=${shellQuote(stackPath(a))}
-# The same path as Compose's dotenv parser must read it. Unquoted it would
-# expand a dollar-sign variable and drop an inline hash comment.
-stack_dir_env=${shellQuote(envQuote(stackPath(a)))}
-
-case "$stack_dir" in
-  /*) ;;
-  *) echo "The stack directory $stack_dir is not absolute. Re-run the wizard with an absolute base path." >&2; exit 1 ;;
-esac
-
-# Refuse to take over an existing install. Compose derives the project name from
-# the stack directory's NAME, which is deploy here and was deploy for every
-# earlier installer too. So an up -d from a new path drives the SAME project as
-# an existing stack: it would recreate those containers with the credentials
-# minted below, against a Postgres volume that ignores POSTGRES_PASSWORD once
-# initialised. The control plane would come back unable to open its own database,
-# and the containers holding the only copy of the old credentials would be gone.
-if command -v docker >/dev/null 2>&1; then
-  existing=$(docker ps -aq --filter 'label=com.docker.compose.service=quasar-control-plane' 2>/dev/null | head -n 1 || true)
-  if [ -n "\${existing:-}" ]; then
-    existing_dir=$(docker inspect "$existing" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' 2>/dev/null || true)
-    if [ "$existing_dir" != "$stack_dir" ]; then
-      echo "This host already runs a Quasar stack, deployed from \${existing_dir:-an unknown directory}." >&2
-      echo "This script performs first installs only. Starting a second stack would recreate" >&2
-      echo "that one's containers with new credentials against its existing database volume," >&2
-      echo "and the control plane would no longer be able to open it." >&2
-      echo "To move an existing stack, see \"Moving an existing stack\" in the install guide." >&2
-      exit 1
-    fi
+function readyBlock(a, r, cli, sudo, statusCmd) {
+  return `echo "==> Waiting for Quasar"
+ready=0
+for _ in $(seq 1 120); do
+  if ${statusCmd} >/dev/null 2>&1${r.control ? ` \\
+    && [ "$(${sudo}${cli} inspect -f '{{.State.Health.Status}}' quasar-control-plane 2>/dev/null)" = healthy ] \\
+    && curl -fsS http://localhost:${a.controlPort}/health >/dev/null 2>&1` : ''}; then
+    ready=1
+    break
   fi
-fi
-# --- end first-install guards ---
+  sleep 5
+done
+if [ "$ready" != 1 ]; then
+  echo "Quasar did not report ready within ten minutes. What the seed and the recovery actor say:" >&2
+  echo "  ${sudo}${cli} logs quasar-seed 2>/dev/null || true" >&2
+  echo "  ${statusCmd}" >&2
+  exit 1
+fi`;
+}
 
-echo "==> Host preflight"
+function doneBlock(a, r, host, recoveryExecPrefix) {
+  return r.control
+    ? `echo "Quasar is running. Open https://${host}:${a.tlsPort} and accept the certificate once."
+echo "Claim the first admin with the one-time setup token:"
+echo "  ${recoveryExecPrefix} cat /run/quasar/setup-token"`
+    : `echo "The recovery actor is running and will install the node agent."`;
+}
+
+function preflightBlock({ tools, checkCmd, checkFailMsg, r, external }) {
+  return `echo "==> Host preflight"
 preflight_failed=0
-for tool in docker openssl curl jq; do
+for tool in ${tools.join(' ')}; do
   if ! command -v "$tool" >/dev/null; then
     echo "Install required tool: $tool" >&2
     preflight_failed=1
   fi
 done
-if command -v docker >/dev/null; then
-  if ! docker info >/dev/null; then
-    echo "Docker is unavailable or this user cannot access its socket." >&2
-    preflight_failed=1
-  fi
-  compose_version=$(docker compose version --short 2>/dev/null || true)
-  if [[ ! "$compose_version" =~ ^v?([0-9]+)[.]([0-9]+) ]] ||
-     (( BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] < 30) )); then
-    echo "Install Docker Compose v2.30 or newer (found: $compose_version)." >&2
-    preflight_failed=1
-  fi
+${checkCmd ? `if ${checkCmd}; then
+  echo "${checkFailMsg}" >&2
+  preflight_failed=1
 fi
-if [ ! -d /dev/dri ]; then
+` : ''}${r.agent ? `if [ ! -d /dev/dri ]; then
   echo "GPU devices are unavailable under /dev/dri. Check the host graphics driver." >&2
   preflight_failed=1
 fi
-${nvidiaBlock}
-if [ "$preflight_failed" != 0 ]; then
+` : ''}${external ? `if [ -z "\${QUASAR_DATABASE_PASSWORD:-}" ]; then
+  echo "Set QUASAR_DATABASE_PASSWORD in this shell's environment (your database's password) and run again." >&2
+  preflight_failed=1
+fi
+` : ''}if [ "$preflight_failed" != 0 ]; then
+  echo "Correct the preflight problems above before starting Quasar." >&2
+  exit 1
+fi`;
+}
+
+function imagesBlock(cli, sudo, r) {
+  return `echo "==> Images"
+# The current stable release's images, pinned to their digests here:
+# the seed refuses a tag for the images it installs.
+resolve() {
+  local ref="${REGISTRY_NS}/$1:${CHANNEL_TAG}" pinned
+  ${sudo}${cli} pull -q "$ref" >/dev/null || { echo "Could not pull $ref." >&2; return 1; }
+  pinned=$(${sudo}${cli} image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" | grep -m1 "^${REGISTRY_NS}/$1@sha256:" || true)
+  [ -n "$pinned" ] || { echo "$ref has no registry digest." >&2; return 1; }
+  printf '%s\\n' "$pinned"
+}
+seed_image=$(resolve ${IMAGE_NAMES.seed})
+${r.control ? `control_image=$(resolve ${IMAGE_NAMES.control})\n` : ''}agent_image=$(resolve ${IMAGE_NAMES.agent})`;
+}
+
+function envArgsFor(a, vars) {
+  return seedInputs(a, vars)
+    .map(([k, v]) => {
+      if (k === 'QUASAR_DATABASE_PASSWORD') return '  -e QUASAR_DATABASE_PASSWORD \\';
+      const value = v.startsWith('$') && !v.startsWith('${') ? `"${v}"` : shellQuote(v);
+      return `  -e ${k}=${value} \\`;
+    })
+    .join('\n');
+}
+
+/**
+ * Docker rootful: checks the engine and its mode, creates the homes and
+ * templates roots, pins the images and starts the seed. The host steps (the
+ * engine at boot, NVIDIA) are the reader's own, shown above the script.
+ */
+function dockerRootfulScript(a, r, p) {
+  const { uid, gid } = appUser(a);
+  const external = r.control && a.database === 'external';
+  const vars = { seed: '$seed_image', control: '$control_image', agent: '$agent_image' };
+  const host = a.publicHost.trim() || '<this-host>';
+
+  return `#!/usr/bin/env bash
+# Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Docker rootful.
+# Generated in your browser; nothing was sent anywhere. Read it before you run it.
+#
+# It checks the host, then starts ONE container, the seed. The seed creates Quasar's
+# recovery actor, which generates every secret and creates the rest.
+# Nothing here writes a Compose file or an .env.
+set -euo pipefail
+
+${preflightBlock({
+  tools: ['docker', 'curl'],
+  checkCmd: `command -v docker >/dev/null && ! docker info >/dev/null 2>&1`,
+  checkFailMsg: 'Docker is unavailable or this user cannot access its socket.',
+  r,
+  external,
+})}
+if command -v docker >/dev/null && docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+  echo "This is Docker rootless, but this script installs rootful. For rootless, follow ${ROOTLESS_DOCS_URL}" >&2
+  exit 1
+fi
+
+echo "==> Existing installs"
+# A stack made from the Compose files would be an owner conflict the recovery actor
+# never acts on, and it holds the ports. Stop it first, keeping its volumes.
+legacy=""
+for svc in quasar-postgres quasar-control-plane quasar-node-agent quasar-updater; do
+  found=$(docker ps -aq --filter "label=com.docker.compose.service=$svc" 2>/dev/null | head -n 1 || true)
+  [ -z "$found" ] || legacy="$legacy $svc"
+done
+if [ -n "$legacy" ]; then
+  echo "This host still runs a Quasar stack made from the Compose files:$legacy." >&2
+  echo "To keep its accounts and library, follow https://accreleus.github.io/quasar/install/moving/#move-a-compose-install" >&2
+  echo "instead of this script: it dumps the old database before anything is stopped." >&2
+  echo "To start afresh, remove its containers without deleting its volumes" >&2
+  echo "(docker compose -f <its directory>/docker-compose.yml down) and run this again." >&2
+  exit 1
+fi
+${EXISTING_INSTALL_CHECK('docker', '')}
+
+${imagesBlock('docker', '', r)}
+${r.agent ? `
+echo "==> Directories"
+sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
+sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(templatePath(a))}
+` : ''}
+${portCheck(a, r)}echo "==> Starting the seed"
+docker run -d --name quasar-seed --restart unless-stopped \\
+  --security-opt label=disable \\
+  -v /var/run/docker.sock:/var/run/docker.sock \\
+  -v quasar-machine:/var/lib/quasar-machine:ro \\
+${envArgsFor(a, vars)}
+  "$seed_image" seed >/dev/null
+
+${readyBlock(a, r, 'docker', '', 'docker exec quasar-recovery quasar-recovery status')}
+
+echo
+${doneBlock(a, r, host, 'docker exec quasar-control-plane')}
+`;
+}
+
+/**
+ * Podman rootful (owner decision 3): the copy block is a script. It resolves the
+ * three image digests with `podman`, writes the Quadlet unit with them
+ * substituted in, then starts it through systemd — the same unit `quadlet`
+ * returns for on-screen reference, with real digests instead of placeholders.
+ * It refuses to start while a host step is missing: podman-restart.service off, or
+ * nothing making /run/quasar-agent at boot. Either way Quasar would not come back
+ * after a reboot.
+ */
+function podmanScript(a, r, p) {
+  const { uid, gid } = appUser(a);
+  const external = r.control && a.database === 'external';
+  const vars = { seed: '$seed_image', control: '$control_image', agent: '$agent_image' };
+  const host = a.publicHost.trim() || '<this-host>';
+  const unit = quadletUnit(a, vars).replace(/\n$/, '');
+
+  return `#!/usr/bin/env bash
+# Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}, Podman rootful.
+# Generated in your browser; nothing was sent anywhere. Read it before you run it.
+#
+# It checks the host, resolves the three image digests, then writes and starts a
+# Quadlet unit for the seed. Nothing here writes a Compose file.
+set -euo pipefail
+
+${preflightBlock({
+  tools: ['podman', 'curl'],
+  checkCmd: `command -v podman >/dev/null && ! sudo podman info >/dev/null 2>&1`,
+  checkFailMsg: 'Podman is unavailable.',
+  r,
+  external,
+})}
+if ! systemctl is-enabled --quiet podman-restart.service 2>/dev/null; then
+  echo "podman-restart.service is off, so Quasar would not come back after a reboot. Run step 1 first:" >&2
+  echo "  sudo systemctl enable podman-restart.service" >&2
+  exit 1
+fi
+if ! systemd-tmpfiles --cat-config 2>/dev/null | grep -q '^d /run/quasar-agent '; then
+  echo "Nothing makes /run/quasar-agent at boot, so the agent would not start after a reboot. Run step 1 first:" >&2
+  echo "  echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf" >&2
+  echo "  sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf" >&2
+  exit 1
+fi
+
+echo "==> Existing installs"
+${EXISTING_INSTALL_CHECK('podman', 'sudo ')}
+
+${imagesBlock('podman', 'sudo ', r)}
+${r.agent ? `
+echo "==> Directories"
+sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
+sudo install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(templatePath(a))}
+` : ''}${external ? `
+echo "==> Database secret"
+if ! sudo podman secret exists quasar-db-password 2>/dev/null; then
+  printf '%s' "$QUASAR_DATABASE_PASSWORD" | sudo podman secret create quasar-db-password - >/dev/null
+fi
+` : ''}
+echo "==> Writing the Quadlet unit"
+# QUASAR_QUADLET_DIR is for the site's own tests only (a temporary directory).
+unit_dir="\${QUASAR_QUADLET_DIR:-/etc/containers/systemd}"
+sudo mkdir -p "$unit_dir"
+sudo tee "$unit_dir/quasar-seed.container" >/dev/null <<'QUASAR_UNIT_HEADER'
+# Written by the Quasar quick start.
+QUASAR_UNIT_HEADER
+cat <<UNIT | sudo tee -a "$unit_dir/quasar-seed.container" >/dev/null
+${unit}
+UNIT
+
+${portCheck(a, r)}echo "==> Starting the seed"
+sudo systemctl daemon-reload
+sudo systemctl start quasar-seed
+
+${readyBlock(a, r, 'podman', 'sudo ', 'sudo podman exec quasar-recovery quasar-recovery status')}
+
+echo
+${doneBlock(a, r, host, 'sudo podman exec quasar-control-plane')}
+`;
+}
+
+/**
+ * Unraid: self-contained, with no host steps (Unraid's Docker is always rootful
+ * and already running, and its shell is root, so `a.engine`/`a.mode` do not
+ * apply). It sets no kernel setting and loads no module: /dev/uinput loads on
+ * demand, and the UDP send buffer is optional tuning (docs: tuning/latency),
+ * with its own Unraid recipe there.
+ */
+function unraidScript(a, r, p) {
+  const { uid, gid } = appUser(a);
+  const external = r.control && a.database === 'external';
+  const vars = { seed: '$seed_image', control: '$control_image', agent: '$agent_image' };
+  const envArgs = envArgsFor(a, vars);
+  const host = a.publicHost.trim() || '<this-host>';
+
+  return `#!/usr/bin/env bash
+# Quasar quick start: a ${r.label.toLowerCase()} on ${p.label}. Generated in your
+# browser; nothing was sent anywhere. Read it before you run it.
+#
+# It checks the host and starts ONE container, the seed. The seed creates
+# Quasar's recovery actor, which generates every secret and creates the rest.
+# Nothing here writes a Compose file or an .env.
+set -euo pipefail
+
+echo "==> Host preflight"
+preflight_failed=0
+for tool in docker curl; do
+  if ! command -v "$tool" >/dev/null; then
+    echo "Install required tool: $tool" >&2
+    preflight_failed=1
+  fi
+done
+if command -v docker >/dev/null && ! docker info >/dev/null; then
+  echo "Docker is unavailable or this user cannot access its socket." >&2
+  preflight_failed=1
+fi
+${r.agent ? `if [ ! -d /dev/dri ]; then
+  echo "GPU devices are unavailable under /dev/dri. Check the host graphics driver." >&2
+  preflight_failed=1
+fi
+` : ''}${external ? `if [ -z "\${QUASAR_DATABASE_PASSWORD:-}" ]; then
+  echo "Set QUASAR_DATABASE_PASSWORD in this shell's environment (your database's password) and run again." >&2
+  preflight_failed=1
+fi
+` : ''}if [ "$preflight_failed" != 0 ]; then
   echo "Correct the preflight problems above before starting Quasar." >&2
   exit 1
 fi
-if [ -e "$stack_dir/docker-compose.yml" ] && ! grep -q '^# Quasar generated install v2$' "$stack_dir/docker-compose.yml"; then
-  echo "$stack_dir contains an existing stack. Keep its deployment commands; this first-install script will not rewrite it." >&2
+
+echo "==> Existing installs"
+# A stack made from the Compose files would be an owner conflict the recovery actor
+# never acts on, and it holds the ports. Stop it first, keeping its volumes.
+legacy=""
+for svc in quasar-postgres quasar-control-plane quasar-node-agent quasar-updater; do
+  found=$(docker ps -aq --filter "label=com.docker.compose.service=$svc" 2>/dev/null | head -n 1 || true)
+  [ -z "$found" ] || legacy="$legacy $svc"
+done
+if [ -n "$legacy" ]; then
+  echo "This host still runs a Quasar stack made from the Compose files:$legacy." >&2
+  echo "To keep its accounts and library, follow https://accreleus.github.io/quasar/install/moving/#move-a-compose-install" >&2
+  echo "instead of this script: it dumps the old database before anything is stopped." >&2
+  echo "To start afresh, remove its containers without deleting its volumes" >&2
+  echo "(docker compose -f <its directory>/docker-compose.yml down) and run this again." >&2
   exit 1
 fi
-if [ ! -e "$stack_dir/.env" ]; then
-${releaseSelection()}fi
+for name in quasar-seed quasar-recovery; do
+  if docker container inspect "$name" >/dev/null 2>&1; then
+    echo "Quasar is already installed on this machine ($name exists). Check it with:" >&2
+    echo "  docker exec quasar-recovery quasar-recovery status" >&2
+    exit 1
+  fi
+done
 
+echo "==> Images"
+# The current stable release's images, pinned to their digests here:
+# the seed refuses a tag for the images it installs.
+resolve() {
+  local ref="${REGISTRY_NS}/$1:${CHANNEL_TAG}" pinned
+  docker pull -q "$ref" >/dev/null || { echo "Could not pull $ref." >&2; return 1; }
+  pinned=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" | grep -m1 "^${REGISTRY_NS}/$1@sha256:" || true)
+  [ -n "$pinned" ] || { echo "$ref has no registry digest." >&2; return 1; }
+  printf '%s\\n' "$pinned"
+}
+seed_image=$(resolve ${IMAGE_NAMES.seed})
+${r.control ? `control_image=$(resolve ${IMAGE_NAMES.control})\n` : ''}agent_image=$(resolve ${IMAGE_NAMES.agent})
+${r.agent ? `
 echo "==> Directories"
 ${p.sudo}install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
-# 0700 and owned by whoever runs this: the .env below holds every credential,
-# and the heredocs that follow are not privileged.
-${p.sudo}install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$stack_dir"
+${p.sudo}install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(templatePath(a))}
+` : ''}
+echo "==> Starting the seed"
+docker run -d --name quasar-seed --restart unless-stopped \\
+  --security-opt label=disable \\
+  -v /var/run/docker.sock:/var/run/docker.sock \\
+  -v quasar-machine:/var/lib/quasar-machine:ro \\
+${envArgs}
+  "$seed_image" seed >/dev/null
 
-echo "==> UDP send buffer"
-# libnice never calls setsockopt(SO_SNDBUF), so media sockets inherit the kernel
-# default of 208 KB. A keyframe burst at 8 Mbps overflows it, the kernel drops
-# the overflow silently, and the bitrate estimator reads that as congestion.
-${p.sysctl()}
-
-echo "==> Virtual input"
-${p.module()}
-[ -c /dev/uinput ] || { echo "Virtual input device /dev/uinput is unavailable after loading uinput" >&2; exit 1; }
-[ -d /dev/dri ] || { echo "GPU device directory /dev/dri is unavailable; check the host graphics driver" >&2; exit 1; }
-
-echo "==> Compose file"
-if [ ! -e "$stack_dir/docker-compose.yml" ]; then
-  cat > "$stack_dir/docker-compose.yml" <<'COMPOSE'
-${composeYaml(a)}COMPOSE
+echo "==> Waiting for Quasar"
+ready=0
+for _ in $(seq 1 120); do
+  if docker exec quasar-recovery quasar-recovery status >/dev/null 2>&1${r.control ? ` && curl -fsS http://localhost:${a.controlPort}/health >/dev/null 2>&1` : ''}; then
+    ready=1
+    break
+  fi
+  sleep 5
+done
+if [ "$ready" != 1 ]; then
+  echo "Quasar did not report ready within ten minutes. What the seed and the recovery actor say:" >&2
+  echo "  docker logs quasar-seed" >&2
+  echo "  docker exec quasar-recovery quasar-recovery status" >&2
+  exit 1
 fi
 
-echo "==> Environment file"
-umask 077
-if [ ! -e "$stack_dir/.env" ]; then
-  postgres=$(openssl rand -hex 24)
-  enrollment=$(openssl rand -hex 32)
-  secret=$(openssl rand -base64 32)
-  env_tmp=$(mktemp "$stack_dir/.env.XXXXXX")
-  trap 'rm -f "$env_tmp"' EXIT
-  cat > "$env_tmp" <<'ENV'
-${envFile(a, true)}ENV
-  sed -i "s|^POSTGRES_PASSWORD=$|POSTGRES_PASSWORD=$postgres|; s|^ENROLLMENT_TOKEN=$|ENROLLMENT_TOKEN=$enrollment|; s|^QUASAR_SECRET_KEY=$|QUASAR_SECRET_KEY=$secret|" "$env_tmp"
-  printf '\nQUASAR_STACK_DIR=%s\nQUASAR_CONTROL_IMAGE=%s\nQUASAR_AGENT_IMAGE=%s\nQUASAR_UPDATER_IMAGE=%s\n' "$stack_dir_env" "$control_image" "$agent_image" "$updater_image" >> "$env_tmp"
-  # noclobber refuses a concurrent installer instead of replacing its credentials.
-  (set -o noclobber; cat "$env_tmp" > "$stack_dir/.env")
-  rm -f "$env_tmp"
-  trap - EXIT
-fi
-umask 022
-
-docker compose ${files} config --quiet
-docker compose ${files} pull
-
-echo "==> Starting Quasar"
-docker compose ${files} up -d
-
 echo
-echo "Quasar is starting. Check it with:"
-echo "  curl http://localhost:${a.controlPort}/health"
-echo
-echo "Then open https://<this-host>:${a.tlsPort} and accept the certificate once."
+${r.control ? `echo "Quasar is running. Open https://${host}:${a.tlsPort} and accept the certificate once."
+echo "Claim the first admin with the one-time setup token:"
+echo "  docker exec quasar-control-plane cat /run/quasar/setup-token"` : `echo "The recovery actor is running and will install the node agent."`}
 `;
+}
+
+/** The host script: dispatches on platform, then engine and mode. */
+function scriptText(a) {
+  const r = role(a.role);
+  const p = platform(a.platform);
+  if (a.platform === 'unraid') return unraidScript(a, r, p);
+  return a.engine === 'podman' ? podmanScript(a, r, p) : dockerRootfulScript(a, r, p);
 }
 
 /**
  * Turn wizard answers into every artifact the install needs.
  *
- * @returns {{compose: string, nvidia: string|null, env: string, script: string,
+ * Install artifacts (`hostSteps`, `script`, `quadlet`, `podmanRun`) exist only for
+ * a control-plane role on a rootful engine in a profile that is not unsupported.
+ * A rootless engine follows the docs' rootless page instead (`ROOTLESS_DOCS_URL`).
+ *
+ * @returns {{stack: string, env: string|null, hostSteps: string|null,
+ *            quadlet: string|null, podmanRun: string|null, script: string|null,
  *            proxyConfig: {name: string, filename: string, language: string, body: string}|null}}
  */
 export function generate(input = {}) {
   const a = { ...DEFAULTS, ...input };
-  for (const key of ['basePath', 'savesPath', 'certPath', 'keyPath', 'tlsHosts', 'publicUrl']) {
-    if (/[\r\n\0]/.test(a[key])) throw new Error(`${key} must be a single line`);
+  for (const key of ['basePath', 'savesPath', 'publicHost', 'tlsHosts', 'publicUrl', 'trustedProxies', 'dbHost', 'dbUser', 'dbName']) {
+    if (/[\r\n\0]/.test(String(a[key]))) throw new Error(`${key} must be a single line`);
   }
+  const r = role(a.role);
+  const unraid = a.platform === 'unraid';
+  // Unraid's Docker is always rootful; elsewhere the quick start covers rootful only.
+  const showInstall = r.control && supportedProfile(a) && (unraid || a.mode === 'rootful');
+  const podman = showInstall && !unraid && a.engine === 'podman';
   return {
-    compose: composeYaml(a),
-    nvidia: null,
-    env: envFile(a),
-    script: scriptText(a),
+    stack: seedStack(a),
+    env: stackEnv(a),
+    // A GPU host joins from its control plane: Admin -> Fleet -> Add host prints the
+    // one-line command, which checks the host too. Unraid needs no host steps.
+    hostSteps: showInstall && !unraid ? hostSteps(a) : null,
+    quadlet: podman ? quadletUnit(a) : null,
+    // "Only trying it out?" alternative to the Quadlet unit (owner decision 3):
+    // never the installed path, so it is offered behind a closed disclosure.
+    podmanRun: podman ? podmanRunSeed(a) : null,
+    script: showInstall ? scriptText(a) : null,
     proxyConfig:
-      a.access === 'proxy'
+      r.control && a.access === 'proxy'
         ? proxyConfig(a.proxy, {
             publicUrl: (a.publicUrl || 'https://quasar.example.com').trim().replace(/\/+$/, ''),
-            host: 'quasar-host.lan',
+            host: a.publicHost.trim() || 'quasar-host.lan',
             port: a.controlPort,
           })
         : null,

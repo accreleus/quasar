@@ -4,15 +4,6 @@
    selectors that must win over a `.chip` variant still double up the class
    (`.chip.aud-action`) rather than depend on that ordering. */
 
-/* The mock pins true black for the expanded console readout in both
-   appearances — the one sanctioned hex on this page, behind a token so no
-   other rule needs its own literal. */
-:root,
-[data-theme="dark"],
-[data-theme="light"] {
-  --audit-readout-bg: #000;
-}
-
 /* ---------- table shape ---------- */
 /* Fixed layout so the unset (Detail) column actually gets the remaining
    width — required for its ellipsis truncation to take effect at all. */
@@ -101,9 +92,9 @@
 }
 .qtable.audit tbody tr.aud-detail > td.aud-cell {
   box-shadow:
-    inset 0 1px 0 oklch(0.9618 0.0086 247.91/.1),
-    inset 0 -1px 0 oklch(0.9618 0.0086 247.91/.1),
-    inset 0 14px 26px -20px oklch(0 0 0/.95);
+    inset 0 1px 0 var(--audit-detail-rule),
+    inset 0 -1px 0 var(--audit-detail-rule),
+    inset 0 14px 26px -20px var(--audit-detail-shadow);
 }
 
 .aud-det {
@@ -120,7 +111,7 @@
   font-family: var(--font-mono);
   font-size: var(--t-sm);
   line-height: 1.8;
-  color: oklch(0.985 0.004 247);
+  color: var(--fg-strong);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -128,13 +119,13 @@
 /* The readout is a console in both appearances: its controls stay
    light-on-black regardless of theme. */
 .aud-det .btn-ghost {
-  color: oklch(0.9 0.008 250);
+  color: var(--audit-btn-ink);
   border-color: transparent;
 }
 .aud-det .btn-ghost:hover {
-  background: oklch(1 0 0/.1);
-  color: oklch(1 0 0);
-  border-color: oklch(1 0 0/.18);
+  background: var(--audit-btn-hover-bg);
+  color: var(--audit-btn-hover-ink);
+  border-color: var(--audit-btn-hover-line);
 }
 
 .audit-more {

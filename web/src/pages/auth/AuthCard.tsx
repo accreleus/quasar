@@ -10,7 +10,7 @@
 // every page rendering an AuthCard must sit inside <ThemeProvider>. The lock's
 // streaming hint is off — nothing is playing behind a sign-in form.
 
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { QuasarMark } from "../../components/QuasarMark";
 import { useDarkLock } from "../../settings/ThemeContext";
 
@@ -22,11 +22,10 @@ interface AuthCardProps {
 
 export function AuthCard({ width, children }: AuthCardProps) {
   useDarkLock({ streaming: false });
-  const stackStyle: CSSProperties | undefined = width ? { width } : undefined;
 
   return (
     <div className="auth-scene">
-      <div className="stack" style={stackStyle}>
+      <div className="stack" style={width ? { width } : undefined}>
         <section className="card">
           <header className="lockup">
             <QuasarMark size={52} className="mark" />

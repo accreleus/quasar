@@ -37,14 +37,11 @@ export function ChartCard({ title, unit, series, color, precision = 0 }: ChartCa
 
   return (
     <div className="card card-pad">
-      <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+      <div className="sd-mini-head">
         <span className="eyebrow">{title}</span>
-        <span
-          className="num"
-          style={{ marginLeft: "auto", fontSize: "var(--t-lg)", color: "var(--text)" }}
-        >
+        <span className="num t-lg ml-auto text-1">
           {current === null ? "—" : current.toFixed(precision)}
-          <span style={{ fontSize: "var(--t-xs)", color: "var(--text-3)", marginLeft: 3 }}>
+          <span className="t-xs muted sd-mini-unit">
             {unit}
           </span>
         </span>
@@ -52,7 +49,8 @@ export function ChartCard({ title, unit, series, color, precision = 0 }: ChartCa
       <svg
         viewBox={`0 0 ${W} ${H}`}
         preserveAspectRatio="none"
-        style={{ width: "100%", height: 88, marginTop: 10, overflow: "visible" }}
+        className="mt3 sd-mini-svg"
+        style={{ width: "100%", height: 88 }}
         aria-hidden="true"
       >
         <defs>
@@ -92,7 +90,7 @@ export function ChartCard({ title, unit, series, color, precision = 0 }: ChartCa
  *  browser's RTT, and "Encode time" is the agent's encode p50. */
 export function SessionCharts({ series }: { series: SessionChartSeries }) {
   return (
-    <div className="grid g2" style={{ marginBottom: "var(--s4)" }}>
+    <div className="grid g2 mb4">
       <ChartCard title="Frame rate" unit="fps" series={series.fps} color="var(--success)" />
       <ChartCard title="Round-trip latency" unit="ms" series={series.latency} color="var(--info)" />
       <ChartCard title="Bitrate" unit="Mb/s" series={series.bitrate} color="var(--accent)" precision={1} />

@@ -21,6 +21,10 @@ What it models of the 1.1 contract, because bench_submit.py now depends on it:
   * `PATCH /v1/runs/{id}` takes validity / validity_reason / tags.
   * `GET /v1/runs/{id}/phases` derives windows from the posted marker events.
   * `GET /v1/stats` accepts (and echoes) `window=`.
+  * `repo` + `commit` on POST /v1/runs are stored on the run (and updated by an
+    upsert) — they are how `qbench check` finds a run, so the suite asserts the
+    client sends them.
+  * `GET /cli/version` answers like the real server's (the CLI version it ships).
 """
 
 from __future__ import annotations
@@ -141,6 +145,8 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
         if path == "/v1/health":
             return self._send(200, {"status": "ok", "service": "fake"})
+        if path == "/cli/version":
+            return self._send(200, {"version": "1.7.0"})
         if path == "/openapi.yaml":
             body = b'openapi: 3.1.0\ninfo:\n  title: fake\n  version: "1.1.0"\n'
             self.send_response(200)
@@ -228,12 +234,16 @@ class Handler(BaseHTTPRequestHandler):
                 run["tags"].update(body.get("tags") or {})
                 run["conditions"] = merge(run.get("conditions") or {},
                                           body.get("conditions") or {})
+                for k in ("repo", "commit"):
+                    if body.get(k):
+                        run[k] = body[k]
                 return self._send(200, dict(run, id=rid))
             rid = "fake-run-%d" % (len(RUNS) + 1)
             RUNS[rid] = {"tags": body.get("tags") or {},
                          "conditions": body.get("conditions") or {},
                          "external_id": ext, "validity": "valid",
-                         "suite": body.get("suite"), "scenario": body.get("scenario")}
+                         "suite": body.get("suite"), "scenario": body.get("scenario"),
+                         "repo": body.get("repo") or "", "commit": body.get("commit") or ""}
             if ext:
                 BY_EXT[ext] = rid
             return self._send(201, {"id": rid})

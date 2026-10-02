@@ -10,7 +10,12 @@ import type {
   PlatformPreflightCheck,
   PlatformReleaseTarget,
 } from "../../../api/types";
-import { eligibilityText, preflightCheckText, skipReasonPhrase } from "./releasesCopy";
+import {
+  eligibilityText,
+  holdoutCheckText,
+  preflightCheckText,
+  skipReasonPhrase,
+} from "./releasesCopy";
 
 /** A server predating the amendment sends no `preflight`; that reads as unknown. */
 export function preflightChecks(target: PlatformReleaseTarget): PlatformPreflightCheck[] {
@@ -30,7 +35,8 @@ export function unknownChecks(target: PlatformReleaseTarget): PlatformPreflightC
 /** One line for a holdout row: the first failing check's name, else the reason. */
 export function holdoutText(target: PlatformReleaseTarget): string {
   const first = blockingChecks(target)[0];
-  if (target.reason === "preflight_blocked" && first) return `Blocked: ${preflightCheckText(first.id)}`;
+  if (target.reason === "preflight_blocked" && first)
+    return holdoutCheckText(first.id) ?? `Blocked: ${preflightCheckText(first.id)}`;
   return eligibilityText(target.reason ?? null);
 }
 

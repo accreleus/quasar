@@ -175,7 +175,7 @@ describe("InputPane connected controllers", () => {
       inputMetrics: makeInputMetrics({
         gamepadCount: 1,
         pads: [
-          { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)" },
+          { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard" },
         ],
       }),
     });
@@ -193,8 +193,8 @@ describe("InputPane connected controllers", () => {
       inputMetrics: makeInputMetrics({
         gamepadCount: 2,
         pads: [
-          { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)" },
-          { index: 2, id: "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)" },
+          { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard" },
+          { index: 2, id: "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)", mapping: "standard" },
         ],
       }),
     });
@@ -206,6 +206,23 @@ describe("InputPane connected controllers", () => {
     // The count and the number of rows must agree.
     expect(screen.getByText("2")).toBeTruthy();
     expect(screen.getAllByText(/^Slot \d+$/)).toHaveLength(2);
+    expect(screen.queryByText(/doesn’t recognise this controller/)).toBeNull();
+  });
+
+  it("notes under a pad the browser doesn't recognise (quasar#348)", () => {
+    renderWithSnapshot({
+      ...EMPTY_SNAPSHOT,
+      inputMetrics: makeInputMetrics({
+        gamepadCount: 2,
+        pads: [
+          { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard" },
+          { index: 1, id: "8BitDo Pro 2 (Vendor: 2dc8 Product: 6006)", mapping: "" },
+        ],
+      }),
+    });
+    const notes = screen.getAllByText(/doesn’t recognise this controller/);
+    expect(notes).toHaveLength(1);
+    expect(notes[0].textContent).toMatch(/XInput mode/);
   });
 });
 

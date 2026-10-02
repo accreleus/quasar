@@ -349,8 +349,7 @@ func TestLocalityPrefersHomeHost(t *testing.T) {
 	}
 }
 
-// TestLocalityFallsBackWhenCordoned: home is on host A (draining); the launch
-// falls back to spread and lands on host B.
+// A drained owner cannot move a managed home to another host.
 func TestLocalityFallsBackWhenCordoned(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool, WithPlacementPolicy(PolicyLocality))
@@ -365,17 +364,13 @@ func TestLocalityFallsBackWhenCordoned(t *testing.T) {
 	// Drain host 1 (the home host).
 	must(t, pool.QueryRow(ctx, `UPDATE hosts SET status='draining' WHERE id::text=$1 RETURNING id::text`, s.hostID).Scan(new(string)))
 
-	sess, err := store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
-	if err != nil {
-		t.Fatalf("launch onto cordoned home: %v", err)
-	}
-	if sess.HostID == nil || *sess.HostID != h2 {
-		t.Fatalf("cordoned fallback: placed on %v, want host-2 (%s)", sess.HostID, h2)
+	_, err := store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
+	if !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("cordoned owner: %v, want no_host_available; %s must not get a new home", err, h2)
 	}
 }
 
-// TestLocalityFallsBackWhenFull: home is on host A but A has no encode capacity;
-// the launch falls back to host B.
+// A full owner reports capacity exhaustion rather than making a second home.
 func TestLocalityFallsBackWhenFull(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool, WithPlacementPolicy(PolicyLocality))
@@ -405,18 +400,13 @@ func TestLocalityFallsBackWhenFull(t *testing.T) {
 	`, filler, s.appID, s.hostID, s.gpuID)
 	must(t, err)
 
-	// Now the managed-app launch can't fit on the home host → falls back to h2.
-	sess, err := store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
-	if err != nil {
-		t.Fatalf("launch onto full home: %v", err)
-	}
-	if sess.HostID == nil || *sess.HostID != h2 {
-		t.Fatalf("full-home fallback: placed on %v, want host-2 (%s)", sess.HostID, h2)
+	_, err = store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
+	if !errors.Is(err, ErrCapacityExhausted) {
+		t.Fatalf("full owner: %v, want capacity_exhausted; %s must not get a new home", err, h2)
 	}
 }
 
-// TestLocalityFallsBackWhenOffline: home host is offline; falls back to the
-// online host.
+// An offline owner remains the only eligible home location.
 func TestLocalityFallsBackWhenOffline(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool, WithPlacementPolicy(PolicyLocality))
@@ -430,12 +420,9 @@ func TestLocalityFallsBackWhenOffline(t *testing.T) {
 
 	must(t, pool.QueryRow(ctx, `UPDATE hosts SET status='offline' WHERE id::text=$1 RETURNING id::text`, s.hostID).Scan(new(string)))
 
-	sess, err := store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
-	if err != nil {
-		t.Fatalf("launch onto offline home: %v", err)
-	}
-	if sess.HostID == nil || *sess.HostID != h2 {
-		t.Fatalf("offline fallback: placed on %v, want host-2 (%s)", sess.HostID, h2)
+	_, err := store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
+	if !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("offline owner: %v, want no_host_available; %s must not get a new home", err, h2)
 	}
 }
 
@@ -482,10 +469,8 @@ func TestLocalityNonManagedApp(t *testing.T) {
 	}
 }
 
-// TestLocalityTombstonedHome: a tombstoned home (gc_after IS NOT NULL) must NOT
-// attract placement. The test seeds a tombstoned home on host-1 and a live home
-// on host-2 for the same (user, app). The launch must go to host-2 (live home),
-// proving the tombstoned row on host-1 is ignored.
+// A tombstoned copy remains evidence until physical deletion is confirmed;
+// another live copy means the location is conflicted, never a placement hint.
 func TestLocalityTombstonedHome(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool, WithPlacementPolicy(PolicyLocality))
@@ -500,13 +485,8 @@ func TestLocalityTombstonedHome(t *testing.T) {
 	// Live home on host-2: the locality subquery (gc_after IS NULL) picks this one.
 	seedHome(t, pool, s.userID, managedApp, h2)
 
-	sess, err := store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
-	if err != nil {
-		t.Fatalf("tombstone launch: %v", err)
-	}
-	// Must land on host-2 (live home), not host-1 (tombstoned).
-	if sess.HostID == nil || *sess.HostID != h2 {
-		t.Fatalf("tombstoned home: placed on %v, want host-2 (%s); tombstone on host-1 must be ignored",
-			sess.HostID, h2)
+	_, err := store.ScheduleAndCreate(ctx, managedLaunchParams(s, managedApp))
+	if !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("tombstoned divergent home: %v, want home_conflict; live row on %s does not erase old copy", err, h2)
 	}
 }

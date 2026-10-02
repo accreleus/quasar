@@ -3,82 +3,45 @@ title: Audio and microphone
 description: How audio reaches you, how to enable microphone capture, and the settings that stop a silent session going unnoticed.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ## Game audio
 
-Audio is captured from the session's PulseAudio sidecar, encoded as Opus, and
-sent to your browser on its own peer connection, separate from video.
+Audio comes from the session's PulseAudio sidecar, encoded as Opus, on its own
+peer connection separate from video. A struggling video stream doesn't drag audio
+down. Nothing to configure.
 
-The separation is deliberate. Audio and video get their own clock, jitter buffer
-and congestion state, so a video stream in trouble does not drag audio down with
-it.
-
-There is nothing to configure for normal use.
-
-## Failing loudly instead of silently
+## Make audio failure stop the session
 
 By default, if the audio sidecar is unavailable, the session continues without
-sound. That is the right choice for most home setups, since silent play beats
-no play.
-
-It also means a misconfiguration can mute every session on a host for days with
-nothing but a warning in a log to show for it. That has happened.
-
-If you would rather know:
+sound. A misconfiguration can then mute every session on a host with only a log
+warning. To make the session fail instead:
 
 ```bash
 QUASAR_AUDIO_REQUIRED=1
 ```
 
-The session then fails instead of degrading. Worth setting on anything you care
-about.
-
-Check the current state per session in Admin, Sessions. The detail carries
+Use this when sound is required. **Admin ▸ Sessions**, session detail, shows
 whether audio degraded and why.
 
-<Aside type="caution" title="The sidecar image must match the agent image lineage">
-The PulseAudio sidecar has to come from the same image family as the agent. A
-mismatched image can lack the PulseAudio binary entirely, and the session then
-runs silently with only a warning logged.
-</Aside>
+The PulseAudio sidecar must come from the same image family as the agent. A
+mismatched image can lack PulseAudio and the session runs silent.
 
 ## Microphone capture
 
-Microphone works, and it needs three separate things to be true.
+To use a microphone:
 
-### 1. The administrator enables it
+1. **The administrator enables it** under **Admin ▸ Settings**. Off by default,
+   enforced on the server. A launch that asks for a microphone while it's off
+   still starts, just without one.
+2. **The user turns it on** with the microphone button on the session bar. It is
+   off at the start of every session; nothing makes it hot on connect.
+3. **The browser grants permission.** This needs HTTPS: plain HTTP can't use the
+   microphone.
 
-Under Admin, Settings. It is off by default and it is enforced on the server. A
-launch that asks for a microphone while the instance setting is off succeeds
-without one instead of failing, on the grounds that a policy decision should not
-cost you your session.
+A live microphone shows a persistent indicator that can't be dismissed or hidden.
 
-### 2. The user turns it on
-
-In the session drawer. Off at the start of every session, always. There is no
-setting that makes a microphone hot on connect.
-
-### 3. The browser grants permission
-
-The standard browser prompt. This requires a secure context, so plain HTTP
-deployments cannot use the microphone at all.
-
-## The indicator
-
-A live microphone shows a persistent indicator that cannot be dismissed or
-hidden. If the microphone is on, the user can see that it is on.
-
-## How it works, briefly
-
-The microphone is a second receive-only audio track on the existing audio
-connection, negotiated once when the session starts. Muting and unmuting toggles
-the track rather than renegotiating, so there is no session-level churn when you
-mute.
-
-Inside the container, a null sink and a remapped source present the microphone as
-a first-class capture device. This matters because Steam and many games hide
-monitor-class sources and would otherwise not offer it at all.
+Inside the container the microphone appears as a normal capture device, so Steam
+and games offer it. The format is fixed at stereo Opus, 48 kHz, because Chrome
+rejects anything else.
 
 ## The host kill switch
 
@@ -86,29 +49,13 @@ monitor-class sources and would otherwise not offer it at all.
 QUASAR_MIC_DISABLED=1
 ```
 
-Disables microphone capture at the agent, overriding everything above. For when
-you want a host that cannot capture audio regardless of what the instance
-settings say.
-
-## Chrome and the audio format
-
-Chrome requires the microphone track to be advertised as stereo Opus at 48 kHz.
-A mono declaration is rejected outright, and because the negotiation happens once
-at session start, there is no recovery within that session.
-
-This is documented here because it explains why the microphone format is not
-configurable.
+Disables microphone capture on this host's agent, overriding the instance setting.
 
 ## Troubleshooting
 
-**No sound at all.** Check the session detail for degraded audio. Then check the
-sidecar image matches the agent image lineage. Then set `QUASAR_AUDIO_REQUIRED=1`
-so the next occurrence fails visibly.
-
-**Microphone toggle missing.** The instance setting is off.
-
-**Microphone toggle present but does nothing.** Browser permission was denied, or
-the page is not on HTTPS.
-
-**Sound in some apps and not others.** The application is choosing a different
-output device. That is inside the container and is the app's own configuration.
+| Symptom | Check |
+| --- | --- |
+| No sound at all | Session detail for degraded audio, then that the sidecar image matches the agent image. Set `QUASAR_AUDIO_REQUIRED=1` so the next one fails visibly. |
+| Microphone button missing | The instance setting is off. |
+| Button present but does nothing | Browser permission denied, page not on HTTPS, or input is captured (release capture first). |
+| Sound in some apps only | The app picked a different output device inside the container. That's the app's own setting. |

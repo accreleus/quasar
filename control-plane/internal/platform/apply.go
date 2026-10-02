@@ -15,6 +15,9 @@ const (
 	// wait (ADR 0004). Recorded terminal on insert beside the failed apply;
 	// never driven over the wire.
 	KindAutoRevert = "auto_revert"
+	// An admin's arbitrary digest set on one owned target, release_id NULL
+	// (control-api.md §"Developer apply", migration 0096). Otherwise an apply.
+	KindDeveloperApply = "developer_apply"
 )
 
 // `ApplyAttemptState`. The six middle values are exactly agent-api.md
@@ -74,13 +77,18 @@ const (
 	ReasonTimeout              = "timeout"
 	ReasonUnsupported          = "unsupported"
 
-	// Emitted by an updater with QUASAR_UPDATER_SIGNATURE_MODE on, which is off
-	// by default. Not yet in openapi.yaml's `ApplyFailureReason` enum — adding
-	// them is an additive amendment, Opus + sign-off; until then they travel the
-	// contract's own path for an unrecognised identifier, stored and rendered
-	// verbatim. Client copy: web/src/pages/admin/fleet/releasesCopy.ts.
+	// Emitted with QUASAR_UPDATER_SIGNATURE_MODE on, which is off by default.
+	// Client copy: web/src/pages/admin/fleet/releasesCopy.ts.
 	ReasonSignatureMissing = "signature_missing"
 	ReasonSignatureInvalid = "signature_invalid"
+
+	// Amendment 14: only an owned machine's recovery actor emits these.
+	// `interrupted` is a failed attempt that changed nothing.
+	ReasonRecipeUnsupported = "recipe_unsupported"
+	ReasonOwnerConflict     = "owner_conflict"
+	ReasonBackupFailed      = "backup_failed"
+	ReasonBackupUnconfirmed = "backup_unconfirmed"
+	ReasonInterrupted       = "interrupted"
 )
 
 // KnownFailureReason reports whether reason is one this build recognises. An
@@ -91,7 +99,9 @@ func KnownFailureReason(reason string) bool {
 	case ReasonUpdaterAbsentFailure, ReasonBusy, ReasonInvalid, ReasonNamespaceRejected,
 		ReasonDigestMalformed, ReasonPullFailed, ReasonRecreateFailed, ReasonNeverStarted,
 		ReasonUnhealthy, ReasonUpdaterUnreachable, ReasonTimeout, ReasonUnsupported,
-		ReasonSignatureMissing, ReasonSignatureInvalid:
+		ReasonSignatureMissing, ReasonSignatureInvalid,
+		ReasonRecipeUnsupported, ReasonOwnerConflict, ReasonBackupFailed,
+		ReasonBackupUnconfirmed, ReasonInterrupted:
 		return true
 	}
 	return false
@@ -115,13 +125,13 @@ type PreviousDigest struct {
 }
 
 // The component the control plane is allowed to send to a host. The
-// control-plane component is applied by the updater beside IT and never over an
+// control-plane component is applied by the recovery actor beside IT, never over an
 // agent connection (agent-api.md §release_apply), so it is filtered out here
 // rather than trusted to be absent.
 const ComponentNodeAgent = "node-agent"
 
-// The component the control plane applies to ITSELF, over its own host's
-// updater socket. Never sent to a host.
+// The component the control plane applies to ITSELF, over its own machine's
+// control socket. Never sent to a host.
 const ComponentControlPlane = "control-plane"
 
 // Attempt is one `platform_apply_attempts` row and the `PlatformApplyAttempt`
@@ -141,10 +151,13 @@ type Attempt struct {
 	SessionsRemaining *int              `json:"sessions_remaining"`
 	Force             bool              `json:"force"`
 	Output            string            `json:"output"`
-	RequestedBy       *string           `json:"requested_by"`
-	CreatedAt         time.Time         `json:"created_at"`
-	StartedAt         *time.Time        `json:"started_at"`
-	FinishedAt        *time.Time        `json:"finished_at"`
+	// PreUpdateDump names the dump a migrating control-plane attempt's restore
+	// command takes (amendment 14); opaque, nil everywhere else.
+	PreUpdateDump *string    `json:"pre_update_dump"`
+	RequestedBy   *string    `json:"requested_by"`
+	CreatedAt     time.Time  `json:"created_at"`
+	StartedAt     *time.Time `json:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at"`
 }
 
 // ActiveApply is the view's `active_apply`: what is in flight right now. One
@@ -240,6 +253,10 @@ type FleetApplyRequest struct {
 	Force     bool   `json:"force"`
 	// RetryOf links a "Retry skipped hosts" run to the partial run it finishes.
 	RetryOf *string `json:"retry_of"`
+	// ExternalBackupConfirmed is the operator's word that their own database is
+	// backed up (amendment 14); read only for a migrating step on an external
+	// database, and stored on no row.
+	ExternalBackupConfirmed bool `json:"external_backup_confirmed"`
 }
 
 // RunEnvelope is the body of every run response.
@@ -307,18 +324,111 @@ func NodeAgentComponents(m Manifest) []ComponentDigest {
 	return out
 }
 
-// ControlPlaneComponents extracts the components the control plane may apply to
-// itself: today exactly the `control-plane` entry. Empty means the release
-// cannot move this control plane, which is a refusal and never an empty apply.
-func ControlPlaneComponents(m Manifest) []ComponentDigest {
-	out := make([]ComponentDigest, 0, 1)
+// HostComponentsOf extracts what a release may send a host: its node-agent entry
+// and, from a manifest that names one, its recovery-actor entry, in manifest order.
+// OrderHostComponents decides which of them a given host is sent.
+func HostComponentsOf(m Manifest) []ComponentDigest {
+	out := make([]ComponentDigest, 0, 2)
 	for _, c := range m.Components {
-		if c.Name != ComponentControlPlane {
+		if c.Name != ComponentNodeAgent && c.Name != ComponentRecovery {
 			continue
 		}
 		out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
 	}
 	return out
+}
+
+// OrderHostComponents is one host target's list, in replacement order
+// (control-api.md amendment 14, "Components of an apply on an owned machine"):
+// `[recovery-actor, node-agent]` when the host's actor is not on the release,
+// `[node-agent]` when it is, `[recovery-actor]` when only the actor is behind.
+// The actor is sent only to an owned host, and never in the host step of the
+// control plane's own machine, whose actor moves in the control-plane step.
+func OrderHostComponents(release []ComponentDigest, releaseCommit string, h HostIdentity, controlPlaneMachine bool) []ComponentDigest {
+	var agent, actor *ComponentDigest
+	for i := range release {
+		switch release[i].Name {
+		case ComponentNodeAgent:
+			agent = &release[i]
+		case ComponentRecovery:
+			actor = &release[i]
+		}
+	}
+	actorBehind := actor != nil && !controlPlaneMachine && actorBehindRelease(h, releaseCommit)
+	agentBehind := h.SourceCommit == nil || !commitsMatch(*h.SourceCommit, releaseCommit)
+	out := make([]ComponentDigest, 0, 2)
+	if actorBehind {
+		out = append(out, *actor)
+	}
+	if agent != nil && (agentBehind || !actorBehind) {
+		out = append(out, *agent)
+	}
+	return out
+}
+
+// releaseNamesActor: the release's manifest carries a recovery-actor component or,
+// for an edge row (no manifest), the registry check found one published for its
+// commit. Unresolved counts as none: an apply then has only the agent to send.
+func releaseNamesActor(r Release, image *ImageFact) bool {
+	if len(r.Manifest) == 0 {
+		return image != nil && image.EdgeActor != nil && *image.EdgeActor
+	}
+	for _, c := range releaseComponents(r) {
+		if c.Name == ComponentRecovery {
+			return true
+		}
+	}
+	return false
+}
+
+// actorBehindRelease: an owned host whose recovery actor does not report the
+// release's commit (a null commit is not on it).
+func actorBehindRelease(h HostIdentity, releaseCommit string) bool {
+	if h.InstallMode == nil || *h.InstallMode != InstallOwned {
+		return false
+	}
+	return h.RecoveryActorSourceCommit == nil || !commitsMatch(*h.RecoveryActorSourceCommit, releaseCommit)
+}
+
+// ControlPlaneComponents extracts what a release may move on the control
+// plane's own machine: its `control-plane` entry and, from a manifest that names
+// one, its `recovery-actor` entry. OrderControlPlaneComponents decides which of
+// them the step names. No control-plane entry means the release cannot move
+// this control plane, which is a refusal and never an empty apply.
+func ControlPlaneComponents(m Manifest) []ComponentDigest {
+	out := make([]ComponentDigest, 0, 2)
+	for _, c := range m.Components {
+		if c.Name != ComponentControlPlane && c.Name != ComponentRecovery {
+			continue
+		}
+		out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
+	}
+	return out
+}
+
+// OrderControlPlaneComponents is the control-plane step's list, in replacement
+// order (control-api.md amendment 14, "Components of an apply on an owned
+// machine"): `[recovery-actor, control-plane]` when the machine is owned and
+// its actor is not on the release, else `[control-plane]`. A Compose control
+// plane is never sent an actor. Empty when the release names no control plane.
+func OrderControlPlaneComponents(release []ComponentDigest, releaseCommit string, owned bool, actorCommit *string) []ComponentDigest {
+	var cp, actor *ComponentDigest
+	for i := range release {
+		switch release[i].Name {
+		case ComponentControlPlane:
+			cp = &release[i]
+		case ComponentRecovery:
+			actor = &release[i]
+		}
+	}
+	if cp == nil {
+		return nil
+	}
+	out := make([]ComponentDigest, 0, 2)
+	if owned && actor != nil && (actorCommit == nil || !commitsMatch(*actorCommit, releaseCommit)) {
+		out = append(out, *actor)
+	}
+	return append(out, *cp)
 }
 
 // unknownPrevious is what an attempt records for `previous_digests` before the

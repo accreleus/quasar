@@ -30,14 +30,18 @@ export function InputDevicesRow({
   value,
   devices,
   onChange,
+  disabled = false,
 }: {
   value: InputDevicesValue;
   devices: { path: string; label: string }[];
   onChange: (v: InputDevicesValue) => void;
+  /** Locks the whole row (segmented control, class chips, per-device
+   *  checkboxes) — a replacement `applying` through the recovery actor. */
+  disabled?: boolean;
 }) {
   const mode = modeOf(value);
   const passed = passedThroughPaths(value, devices);
-  const editable = mode === "specific";
+  const editable = mode === "specific" && !disabled;
   const current = Array.isArray(value) ? value : [];
 
   const setPaths = (paths: string[]) => onChange(paths);
@@ -57,7 +61,7 @@ export function InputDevicesRow({
   };
 
   return (
-    <div className="cset" style={{ gridTemplateColumns: "1fr", alignItems: "stretch" }}>
+    <div className="cset idev-row" style={{ gridTemplateColumns: "1fr" }}>
       <div>
         <h3>Input devices</h3>
         <p className="hint">
@@ -65,11 +69,12 @@ export function InputDevicesRow({
           classes to stay broad, or select individual devices.
         </p>
       </div>
-      <div style={{ marginTop: "var(--s3)" }}>
-        <div style={{ marginBottom: "var(--s4)" }}>
+      <div className="mt3">
+        <div className="mb4">
           <SegmentedControl<Mode>
             aria-label="Input device selection"
             value={mode}
+            disabled={disabled}
             onChange={(next) => {
               if (next === "auto") onChange("auto");
               else if (next === "none") onChange([]);
@@ -83,7 +88,7 @@ export function InputDevicesRow({
           />
         </div>
 
-        <div className="row gap2" style={{ flexWrap: "wrap", marginBottom: "var(--s4)" }}>
+        <div className="row gap2 wrap mb4">
           {CLASS_ORDER.map((cls) => {
             const paths = classDevices(cls).map((d) => d.path);
             const on = mode === "none" ? false : paths.length > 0 && paths.every((p) => passed.has(p));
@@ -91,8 +96,8 @@ export function InputDevicesRow({
               <button
                 key={cls}
                 type="button"
-                className={`chip${on ? " chip-accent" : ""}`}
-                style={{ height: 26, cursor: editable ? "pointer" : "default", opacity: editable || on ? 1 : 0.6 }}
+                className={`chip idev-class${on ? " chip-accent" : ""}`}
+                style={{ height: 26, opacity: editable || on ? 1 : 0.6 }}
                 disabled={!editable}
                 onClick={() => toggleClass(cls)}
               >
@@ -102,7 +107,7 @@ export function InputDevicesRow({
           })}
         </div>
 
-        <div className="table-wrap" style={{ border: "1px solid var(--line)", borderRadius: "var(--r-sm)" }}>
+        <div className="table-wrap idev-table">
           <table className="qtable">
             <thead>
               <tr>
@@ -146,7 +151,7 @@ export function InputDevicesRow({
             </tbody>
           </table>
         </div>
-        <p className="hint" style={{ marginTop: 9 }}>
+        <p className="hint idev-foot">
           Class rules follow hot-plug: a controller connected later is passed through
           automatically. Individually selected devices are pinned by path and will not follow a
           re-enumeration.

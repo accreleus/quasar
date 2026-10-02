@@ -2,7 +2,27 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE=(docker compose -f "$ROOT/scripts/verify/docker-compose.devtools.yml")
+
+# Sourced (not just read) for QUASAR_INSTANCE: the same per-worktree instance
+# id every other dx script uses to keep concurrent worktrees from colliding
+# (derived from a hash of the worktree root — see common.sh "Instance
+# identity"). Two worktrees running `make test-rust`/`verify.sh` at once used
+# to share both the compose project (containers could be reused between runs)
+# AND the cargo target dir (identical in-container source paths, so cargo's
+# mtime-based freshness check happily served one worktree's test binaries to
+# another — #417). QUASAR_INSTANCE fixes both: a per-worktree compose project
+# name, and a per-worktree subdirectory of the shared cargo-target volume
+# (downloads/registry caches stay shared; only build output is isolated).
+# shellcheck source=scripts/dx/common.sh
+source "$ROOT/scripts/dx/common.sh"
+
+# Suffixed so this never collides with the local dev stack's own
+# per-worktree project (dx_local_compose, scripts/dx/stack.sh), which uses
+# the bare $QUASAR_INSTANCE for docker-compose.local.yml — the same instance
+# id, two different compose files, must not share one project namespace.
+VERIFY_PROJECT="${QUASAR_INSTANCE}-verify"
+export QUASAR_INSTANCE
+COMPOSE=(docker compose -p "$VERIFY_PROJECT" -f "$ROOT/scripts/verify/docker-compose.devtools.yml")
 export DEVTOOLS_UID="${DEVTOOLS_UID:-$(id -u)}"
 export DEVTOOLS_GID="${DEVTOOLS_GID:-$(id -g)}"
 
@@ -64,11 +84,30 @@ case "$cmd" in
     trap '"${COMPOSE[@]}" stop postgres >/dev/null 2>&1 || true' EXIT
     "${COMPOSE[@]}" run --rm ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash "scripts/verify/$cmd.sh"
     ;;
-  quick|web|control|agent)
+  quick|web|control|agent|engine-suite-build)
     "${COMPOSE[@]}" run --rm --no-deps ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash "scripts/verify/$cmd.sh"
     ;;
+  uinput)
+    # The node-agent's real-kernel uinput tests (#[ignore]d in `make test-rust`).
+    # `compose run` cannot pass a device or a cgroup rule, so the binary is built
+    # through compose and run with plain `docker run`, as root: /dev/uinput, the
+    # fake-udev mknod and /run/udev/data all need it.
+    if [ ! -c /dev/uinput ]; then
+      echo "FAIL — /dev/uinput is absent on this host: sudo modprobe uinput, or run on a host that has it" >&2
+      exit 1
+    fi
+    bin="$("${COMPOSE[@]}" run --rm --no-deps -T ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash scripts/verify/uinput.sh | tail -n1)"
+    case "$bin" in
+      /cache/cargo-target/*) ;;
+      *) echo "FAIL — could not build the node-agent test binary (got '$bin')" >&2; exit 1 ;;
+    esac
+    docker run --rm --ulimit core=0 --user 0:0 \
+      --device /dev/uinput --device-cgroup-rule 'c 13:* rmw' \
+      -e QUASAR_REQUIRE_UINPUT=1 -v quasar-cargo-target:/cache/cargo-target:ro \
+      quasar-devtools:local "$bin" uinput_ --ignored --test-threads=1
+    ;;
   *)
-    echo "usage: $0 [quick|web|control|agent|db|full|versions|build|reset-db]" >&2
+    echo "usage: $0 [quick|web|control|agent|engine-suite-build|uinput|db|full|versions|build|reset-db]" >&2
     exit 2
     ;;
 esac

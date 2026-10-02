@@ -1,0 +1,9 @@
+{
+  "shape": "rejection",
+  "about": "Anything that stops the host establishing that these digests were signed, including a fetch that could not complete.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "reason": "signature_invalid",
+    "message": "the release signature could not be retrieved, so it could not be checked: https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig answered HTTP 503"
+  }
+}

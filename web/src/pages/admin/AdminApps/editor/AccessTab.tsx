@@ -168,8 +168,8 @@ export function AccessTab({
             </div>
           </div>
 
-          <div className="rowflex" style={{ alignItems: "flex-end", maxWidth: 560 }}>
-            <div style={{ flex: 1 }}>
+          <div className="rowflex ae-add-user">
+            <div className="grow">
               <SelectField
                 label="Add a user"
                 aria-label="Add a user"

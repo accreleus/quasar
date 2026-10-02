@@ -5,6 +5,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,39 @@ var wsRun = regexp.MustCompile(`\s+`)
 // numbering, not indentation. Indentation is cosmetic here — it only affects how
 // the statement reads in a log — while a changed `$N` is a behaviour change.
 func normSQL(s string) string { return strings.TrimSpace(wsRun.ReplaceAllString(s, " ")) }
+
+func withoutRH05Restriction(s string) string {
+	s = strings.ReplaceAll(s, normSQL(unrestrictedHostSQL), "")
+	// Amendment 18 (#395) adds the console-access placement hold beside the
+	// RH05 owner restriction, in the same unconditional position. The
+	// historical capture predates it.
+	s = strings.ReplaceAll(s, normSQL(consoleAccessHoldSQL), "")
+	// RH05 #345 adds a managed-image cleanup gate inside imageReadySQL. The
+	// historical SQL capture predates that gate; its exact predicate is checked
+	// separately below before removing it for the legacy comparison.
+	s = strings.ReplaceAll(s, normSQL(imageCleanupFencePredicate), "")
+	for idx := 1; idx <= 32; idx++ {
+		// #346 lets a lazy pinned digest reach the agent's on-demand pull. The
+		// historical capture predates that filter; the operator launch DB
+		// tests assert its behavior for eager, lazy digest and lazy template.
+		s = strings.ReplaceAll(s, normSQL(lazyOnDemandAdmissionSQL("g.host_id", "$"+strconv.Itoa(idx))), "")
+		s = strings.ReplaceAll(s, normSQL(imageCleanupIdentityFenceSQL(idx)), "")
+		s = strings.ReplaceAll(s, normSQL("AND NOT "+removedManagedImageUnreadySQL("g.host_id", "$"+strconv.Itoa(idx))), "")
+	}
+	return normSQL(placementAnchorGate.ReplaceAllString(s, ""))
+}
+
+const imageCleanupFencePredicate = `AND NOT EXISTS (
+	SELECT 1 FROM host_image_operation_fences f
+	WHERE f.host_id = hi.host_id
+	  AND f.image_id = hi.image_id
+	  AND f.state = 'removing'
+)`
+
+// 0091 adds a final canonical-app bind to each admission query. Strip exactly
+// that additive predicate when comparing with the pre-placement SQL capture;
+// its presence and bind value are asserted separately below.
+var placementAnchorGate = regexp.MustCompile(` AND EXISTS \( SELECT 1 FROM app_placement ap WHERE ap.app_id = \$[0-9]+::uuid AND \(ap.mode = 'all_eligible' OR EXISTS \( SELECT 1 FROM app_placement_hosts aph WHERE aph.app_id = ap.app_id AND aph.host_id = h.id\)\)\)`)
 
 // admissionMatrix renders every admission query across the full configuration
 // space, keyed by shape. Each entry is the normalized SQL.
@@ -39,25 +73,63 @@ func admissionMatrix() map[string][]string {
 	for _, veto := range []VramAdmission{vetoOff, vetoOn} {
 		for _, pin := range []string{"", host} {
 			for _, img := range []string{"", image} {
-				p := CreateParams{
-					UserID: user, AppID: app,
-					NeedEncodeSlots: 1,
-					PinHostID:       pin,
-					AppImage:        img,
+				for _, cons := range constraintVariants(pin) {
+					// Readiness on is the production default (NewStore), so the
+					// #304 anchors, captured from the DB suite, carry its clause.
+					for _, ready := range []ReadinessAdmission{{}, {StaleSecs: defaultReadinessStaleSecs}} {
+						// A managed home adds the readiness gate's homes term; the
+						// #305 locality anchor is a managed-home launch.
+						for _, home := range []bool{false, true} {
+							p := CreateParams{
+								UserID: user, AppID: app,
+								NeedEncodeSlots: 1,
+								PinHostID:       pin,
+								AppImage:        img,
+								PinGPUIndex:     cons.gpuPin,
+								RequireCodec:    cons.codec,
+								CodecPreference: cons.pref,
+								ManagedHome:     home,
+							}
+							c := candidacy{p: p, veto: veto, readiness: ready}
+							for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
+								sql, _ := c.candidateQuery(policy)
+								add("candidate", sql)
+							}
+							sql, _ := c.recheckQuery(gpuID)
+							add("recheck", sql)
+							sql, _ = c.totalsQuery()
+							add("totals", sql)
+							sql, _ = c.vetoDiagQuery()
+							add("vetodiag", sql)
+							if ready.enabled() {
+								sql, _ = c.readinessDiagQuery()
+								add("readinessdiag", sql)
+								sql, _ = c.readinessTotalsQuery()
+								add("readinesstotals", sql)
+							}
+						}
+					}
 				}
-				c := candidacy{p: p, veto: veto}
-				for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
-					sql, _ := c.candidateQuery(policy)
-					add("candidate", sql)
-				}
-				sql, _ := c.recheckQuery(gpuID)
-				add("recheck", sql)
-				sql, _ = c.totalsQuery()
-				add("totals", sql)
-				sql, _ = c.vetoDiagQuery()
-				add("vetodiag", sql)
 			}
 		}
+	}
+	return out
+}
+
+// constraint is one combination of the #304 gates (the codec constraint and the
+// GPU pin, which is only ever set beside a host pin) and the #305 codec
+// preference, which only an Auto launch carries, so never beside a codec.
+type constraint struct {
+	codec  string
+	gpuPin *int32
+	pref   []string
+}
+
+func constraintVariants(hostPin string) []constraint {
+	one := int32(1)
+	out := []constraint{{}, {codec: "av1"}, {pref: []string{"av1", "h265", "h264"}}}
+	if hostPin != "" {
+		out = append(out, constraint{gpuPin: &one}, constraint{codec: "av1", gpuPin: &one})
 	}
 	return out
 }
@@ -71,6 +143,32 @@ func admissionMatrix() map[string][]string {
 // distinct statements spanning veto on/off, host pin, managed-image readiness
 // and both placement policies. Every one of them must still be producible by the
 // new renderers, with identical placeholder numbering.
+//
+// One mechanical edit since the capture: #268 deleted ` AND g.index = 0` from
+// the Vulkan arm of schedulableBindingSQL, and that exact fragment — nothing
+// else — was removed from all 15 statements here. The file is therefore a
+// byte-pure pre-refactor capture except for that one condition.
+//
+// #304 appended 11 statements (lines 16-26) and changed none of the first 15.
+// The codec constraint and the GPU pin are new candidacy terms, so the new
+// anchors are the only statements that carry them: captured the same way, from
+// a `log_statement=all` run of this package's DB suite, filtered to statements
+// containing `? $n::text` (the codec gate) or `g.index = $n::int` (the GPU pin).
+// Because the terms render only when set and bind after every older parameter,
+// the original 15 are still produced byte for byte. The capture ran with the
+// readiness gate on (NewStore's default), which is why admissionMatrix has a
+// readiness dimension and the two readiness shapes.
+//
+// Lines 27-30 are the pinned totals probe, captured the same way. totalsQuery
+// gained the host/GPU pin (a pinned launch cannot be served by another host),
+// so a pinned launch's totals SQL is new; an unpinned one is byte-identical,
+// which is why every earlier totals anchor still matches.
+//
+// Lines 31-33 are #305's codec preference, captured the same way and filtered
+// to statements carrying `WITH ORDINALITY`: candidate queries only, since only
+// the pick orders (spread; spread with the veto; locality for a managed-home
+// launch, which is why admissionMatrix has a managed-home dimension). The key
+// renders and binds only when a preference is set, so lines 1-30 are unchanged.
 //
 // If this fails, the extraction changed what the scheduler asks Postgres. That
 // is the failure mode the whole exercise exists to prevent: the divergence class
@@ -100,7 +198,33 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 	for shape, sqls := range generated {
 		index[shape] = map[string]bool{}
 		for _, s := range sqls {
-			index[shape][s] = true
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, normSQL(imageCleanupFencePredicate)) {
+				t.Fatalf("%s managed-image query omitted the cleanup fence", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "FROM host_image_cleanup_attempts a") {
+				t.Fatalf("%s managed-image query omitted durable exact-ref cleanup fence", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "lf.state = 'removing'") {
+				t.Fatalf("%s managed-image query omitted the lazy on-demand digest gate", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "hi.updated_at>a.updated_at") {
+				t.Fatalf("%s managed-image query omitted verified re-ensure after terminal removal", shape)
+			}
+			if !strings.Contains(s, normSQL(unrestrictedHostSQL)) {
+				t.Fatalf("%s query omitted the RH05 owner restriction", shape)
+			}
+			if !strings.Contains(s, normSQL(consoleAccessHoldSQL)) {
+				t.Fatalf("%s query omitted the amendment 18 console-access placement hold", shape)
+			}
+			if !placementAnchorGate.MatchString(s) {
+				t.Fatalf("%s query omitted the app placement predicate", shape)
+			}
+			if !strings.Contains(s, "h.config_policy_gate_connection IS NULL") {
+				t.Fatalf("%s query omitted the RH05 settings delivery gate", shape)
+			}
+			// The captured statements predate RH05. Compare every other token
+			// while separately requiring the new restriction above.
+			index[shape][withoutRH05Restriction(s)] = true
 		}
 	}
 
@@ -116,6 +240,12 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 		if !ok {
 			t.Fatalf("anchor line %d is not <shape>\\t<sql>", line)
 		}
+		// RH05 adds an independent settings-delivery gate to every place a
+		// reported GPU can be admitted. Keep the historical capture intact and
+		// compare it after this single mechanical predicate insertion.
+		sql = strings.ReplaceAll(sql,
+			"AND h.capacity_detection = 'ok' AND g.reported",
+			"AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported")
 		seen[shape]++
 		if index[shape] == nil {
 			t.Errorf("anchor line %d names unknown shape %q", line, shape)
@@ -135,7 +265,8 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 	// pass while proving less than it claims. The counts are the capture's, and
 	// they only ever grow — if you re-capture and get fewer, something stopped
 	// being exercised by the DB suite and the proof got weaker without saying so.
-	want := map[string]int{"candidate": 8, "recheck": 3, "totals": 2, "vetodiag": 2}
+	want := map[string]int{"candidate": 14, "recheck": 5, "totals": 7, "vetodiag": 3,
+		"readinessdiag": 3, "readinesstotals": 1}
 	for shape, n := range want {
 		if seen[shape] != n {
 			t.Errorf("anchor file carries %d %s statements, expected %d — "+
@@ -166,6 +297,11 @@ func TestAdmissionArgValues(t *testing.T) {
 		PinHostID: host, AppImage: image,
 	}
 	c := candidacy{p: p, veto: veto}
+	gp := p
+	gpu := int32(3)
+	gp.PinGPUIndex, gp.RequireCodec = &gpu, "av1"
+	gated := candidacy{p: gp, veto: veto}
+	gatedReady := candidacy{p: gp, veto: veto, readiness: ReadinessAdmission{StaleSecs: 90}}
 
 	// Every value is distinct, so a swapped pair cannot coincidentally match.
 	cases := []struct {
@@ -193,11 +329,11 @@ func TestAdmissionArgValues(t *testing.T) {
 			want: []any{gpuID, int32(2), int32(20), int32(1024), int32(512), image},
 		},
 		{
-			// Slots-only plus the image gate: the veto is deliberately absent
-			// from the totals check (see totalsQuery).
+			// Slots, pin and image: the veto is deliberately absent from the
+			// totals check (see totalsQuery).
 			name: "totals",
 			args: argsOf(func() (string, []any) { return c.totalsQuery() }),
-			want: []any{int32(2), image},
+			want: []any{int32(2), host, image},
 		},
 		{
 			// Binds only what the statement references — the debit estimate is
@@ -206,10 +342,50 @@ func TestAdmissionArgValues(t *testing.T) {
 			args: argsOf(func() (string, []any) { return c.vetoDiagQuery() }),
 			want: []any{int32(2), int32(20), host, image},
 		},
+		// #304: the GPU index rides right after the host pin, the codec last.
+		{
+			name: "gated/candidate/spread",
+			args: argsOf(func() (string, []any) { return gated.candidateQuery(PolicySpread) }),
+			want: []any{int32(2), int32(20), int32(1024), int32(512), host, int32(3), image, "av1"},
+		},
+		{
+			name: "gated/candidate/locality",
+			args: argsOf(func() (string, []any) { return gated.candidateQuery(PolicyLocality) }),
+			want: []any{int32(2), int32(20), int32(1024), int32(512), user, app, host, int32(3), image, "av1"},
+		},
+		{
+			// No pin at all here, GPU or host: the re-check is keyed on one gpu.
+			name: "gated/recheck",
+			args: argsOf(func() (string, []any) { return gated.recheckQuery(gpuID) }),
+			want: []any{gpuID, int32(2), int32(20), int32(1024), int32(512), image, "av1"},
+		},
+		{
+			name: "gated/totals",
+			args: argsOf(func() (string, []any) { return gated.totalsQuery() }),
+			want: []any{int32(2), host, int32(3), image, "av1"},
+		},
+		{
+			name: "gated/vetodiag",
+			args: argsOf(func() (string, []any) { return gated.vetoDiagQuery() }),
+			want: []any{int32(2), int32(20), host, int32(3), image, "av1"},
+		},
+		{
+			name: "gated/readinessdiag",
+			args: argsOf(func() (string, []any) { return gatedReady.readinessDiagQuery() }),
+			want: []any{int32(2), int32(20), int32(1024), int32(512), host, int32(3), image, int32(90), "av1"},
+		},
+		{
+			name: "gated/readinesstotals",
+			args: argsOf(func() (string, []any) { return gatedReady.readinessTotalsQuery() }),
+			want: []any{int32(2), host, int32(3), image, int32(90), "av1"},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// The canonical parent app is bound last, leaving every historical
+			// gate's placeholder and value stable.
+			tc.want = append(tc.want, app)
 			if len(tc.args) != len(tc.want) {
 				t.Fatalf("bound %d args, want %d\n got: %#v\nwant: %#v",
 					len(tc.args), len(tc.want), tc.args, tc.want)
@@ -277,50 +453,60 @@ func TestAdmissionArgCountsMatchPlaceholders(t *testing.T) {
 	for _, veto := range []VramAdmission{vetoOff, vetoOn} {
 		for _, pin := range []string{"", host} {
 			for _, img := range []string{"", image} {
-				p := CreateParams{
-					UserID: "u", AppID: "a", NeedEncodeSlots: 1,
-					PinHostID: pin, AppImage: img,
-				}
-				c := candidacy{p: p, veto: veto}
-
-				type q struct {
-					name string
-					sql  string
-					args []any
-				}
-				var qs []q
-				for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
-					sql, args := c.candidateQuery(policy)
-					qs = append(qs, q{"candidate/" + policy.String(), sql, args})
-				}
-				sql, args := c.recheckQuery(gpuID)
-				qs = append(qs, q{"recheck", sql, args})
-				sql, args = c.totalsQuery()
-				qs = append(qs, q{"totals", sql, args})
-				sql, args = c.vetoDiagQuery()
-				qs = append(qs, q{"vetodiag", sql, args})
-
-				for _, tc := range qs {
-					used := map[int]bool{}
-					max := 0
-					for _, m := range placeholder.FindAllStringSubmatch(tc.sql, -1) {
-						n := 0
-						for _, r := range m[1] {
-							n = n*10 + int(r-'0')
-						}
-						used[n] = true
-						if n > max {
-							max = n
-						}
+				for _, cons := range constraintVariants(pin) {
+					p := CreateParams{
+						UserID: "u", AppID: "a", NeedEncodeSlots: 1,
+						PinHostID: pin, AppImage: img,
+						PinGPUIndex: cons.gpuPin, RequireCodec: cons.codec,
+						CodecPreference: cons.pref,
 					}
-					desc := tc.name + " veto=" + boolStr(veto.enabled()) +
-						" pin=" + boolStr(pin != "") + " image=" + boolStr(img != "")
-					if max != len(tc.args) {
-						t.Errorf("%s: highest placeholder $%d but %d args bound", desc, max, len(tc.args))
+					c := candidacy{p: p, veto: veto, readiness: ReadinessAdmission{StaleSecs: 60}}
+
+					type q struct {
+						name string
+						sql  string
+						args []any
 					}
-					for n := 1; n <= max; n++ {
-						if !used[n] {
-							t.Errorf("%s: $%d is never referenced — Postgres rejects a bind with a gap", desc, n)
+					var qs []q
+					for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
+						sql, args := c.candidateQuery(policy)
+						qs = append(qs, q{"candidate/" + policy.String(), sql, args})
+					}
+					sql, args := c.recheckQuery(gpuID)
+					qs = append(qs, q{"recheck", sql, args})
+					sql, args = c.totalsQuery()
+					qs = append(qs, q{"totals", sql, args})
+					sql, args = c.vetoDiagQuery()
+					qs = append(qs, q{"vetodiag", sql, args})
+					sql, args = c.readinessDiagQuery()
+					qs = append(qs, q{"readinessdiag", sql, args})
+					sql, args = c.readinessTotalsQuery()
+					qs = append(qs, q{"readinesstotals", sql, args})
+
+					for _, tc := range qs {
+						used := map[int]bool{}
+						max := 0
+						for _, m := range placeholder.FindAllStringSubmatch(tc.sql, -1) {
+							n := 0
+							for _, r := range m[1] {
+								n = n*10 + int(r-'0')
+							}
+							used[n] = true
+							if n > max {
+								max = n
+							}
+						}
+						desc := tc.name + " veto=" + boolStr(veto.enabled()) +
+							" pin=" + boolStr(pin != "") + " image=" + boolStr(img != "") +
+							" codec=" + cons.codec + " gpupin=" + boolStr(cons.gpuPin != nil) +
+							" pref=" + strings.Join(cons.pref, ",")
+						if max != len(tc.args) {
+							t.Errorf("%s: highest placeholder $%d but %d args bound", desc, max, len(tc.args))
+						}
+						for n := 1; n <= max; n++ {
+							if !used[n] {
+								t.Errorf("%s: $%d is never referenced — Postgres rejects a bind with a gap", desc, n)
+							}
 						}
 					}
 				}

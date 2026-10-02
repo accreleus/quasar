@@ -337,6 +337,7 @@ export function AppHomeNext() {
           codecCaps={codecCaps}
           launching={launch.launching}
           waitingForSlot={launch.waitingForSlot}
+          waitingReason={launch.waitingReason}
           profiles={detail.profilesFor(openApp.id)}
           optionsOpen={optionsOpen}
           optionsToggleRef={optionsToggleRef}

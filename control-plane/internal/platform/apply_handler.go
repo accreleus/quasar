@@ -50,6 +50,16 @@ type ApplyHandler struct {
 	fleet *FleetRunner
 	// Drops the preflight caches before an apply decision; nil is a no-op.
 	refreshPreflight func()
+	// The developer apply's image-identity reader and namespace allowlist
+	// (developer_apply.go); a nil reader refuses image_unresolvable.
+	dev               DeveloperImages
+	allowedNamespaces []string
+	// This control plane's own machine; nil is not owned.
+	ownMachine OwnMachineSource
+	// machineShape is this control plane's own machine shape, from its configuration.
+	machineShape MachineShape
+	// Drives a developer apply to this control plane (developer_apply_control.go).
+	selfDev controlPlaneDeveloper
 }
 
 // logger is the sliver of *slog.Logger this file uses.
@@ -62,7 +72,8 @@ type logger interface {
 // NewApplyHandler builds the apply endpoints. view is the same release view the
 // page reads, so eligibility is evaluated once and in one place.
 func NewApplyHandler(store *Store, runner *Runner, view func(ctx context.Context) (View, error), auditor audit.Recorder, log logger) *ApplyHandler {
-	return &ApplyHandler{store: store, runner: runner, view: view, auditor: auditor, log: log}
+	return &ApplyHandler{store: store, runner: runner, view: view, auditor: auditor, log: log,
+		allowedNamespaces: DefaultAllowedNamespaces}
 }
 
 // WithEdgeResolver wires registry resolution for manifest-less releases.
@@ -97,6 +108,7 @@ func (h *ApplyHandler) Register(mux httpx.Router, admin func(http.Handler) http.
 	mux.Handle("GET /v1/admin/platform/apply/runs", admin(http.HandlerFunc(h.handleRuns)))
 	mux.Handle("GET /v1/admin/platform/apply/runs/{id}", admin(http.HandlerFunc(h.handleRun)))
 	mux.Handle("POST /v1/admin/platform/apply/runs/{id}/cancel", admin(http.HandlerFunc(h.handleRunCancel)))
+	mux.Handle("POST /v1/admin/platform/developer-apply", admin(http.HandlerFunc(h.handleDeveloperApply)))
 }
 
 // notEligible is the `409 host_not_eligible` body: the envelope plus `reason`
@@ -110,9 +122,13 @@ type notEligible struct {
 }
 
 func writeNotEligible(w http.ResponseWriter, reason string) {
+	writeNotEligibleMessage(w, reason, "this host cannot take this release right now")
+}
+
+func writeNotEligibleMessage(w http.ResponseWriter, reason, message string) {
 	var body notEligible
 	body.Error.Code = CodeHostNotEligible
-	body.Error.Message = "this host cannot take this release right now"
+	body.Error.Message = message
 	body.Reason = reason
 	httpx.WriteJSON(w, http.StatusConflict, body)
 }
@@ -192,14 +208,14 @@ func (h *ApplyHandler) handleHostApply(w http.ResponseWriter, r *http.Request) {
 				"this release carries no manifest and this control plane cannot reach the registry to resolve one")
 			return
 		}
-		c, err := h.edge.NodeAgentComponent(ctx, release)
+		resolved, err := EdgeHostComponents(ctx, h.edge, release)
 		if err != nil {
-			h.log.Warn("platform apply: could not resolve the edge node-agent digest", "err", err)
+			h.log.Warn("platform apply: could not resolve the edge build's digests", "err", err)
 			httpx.WriteError(w, http.StatusConflict, CodeReleaseNotOffered,
-				"this release's node-agent image could not be resolved: "+err.Error())
+				"this release's images could not be resolved: "+err.Error())
 			return
 		}
-		components = []ComponentDigest{c}
+		components = resolved
 	}
 	switch reason := hostTargetReason(view, hostID); reason {
 	case "":
@@ -235,6 +251,13 @@ func (h *ApplyHandler) handleHostApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ADR 0008: the host's recovery actor first, when it is not on the release.
+	host := hostIdentity(view, hostID)
+	components = OrderHostComponents(components, release.SourceCommit, host, h.machineShape.SharesMachineWith(host.NodeName))
+	if len(components) == 0 {
+		writeNotEligible(w, ReasonUpToDate)
+		return
+	}
 	previous, err := h.previousDigests(ctx, hostID, components)
 	if err != nil {
 		h.internal(w, "read previous digests", err)
@@ -357,8 +380,8 @@ func hostTargetReason(v View, hostID string) string {
 	return ReasonIdentityUnknown
 }
 
-// releaseComponents is the node-agent component of a release's manifest, and
-// only that: the control-plane component is never sent to a host.
+// releaseComponents is what a release's manifest may send a host (the node agent,
+// and the recovery actor when the manifest names one), never the control plane.
 func releaseComponents(r Release) []ComponentDigest {
 	if len(r.Manifest) == 0 {
 		return nil
@@ -367,7 +390,17 @@ func releaseComponents(r Release) []ComponentDigest {
 	if err != nil {
 		return nil
 	}
-	return NodeAgentComponents(m)
+	return HostComponentsOf(m)
+}
+
+// hostIdentity is the view's identity of one host (zero when it lists none).
+func hostIdentity(v View, hostID string) HostIdentity {
+	for _, h := range v.Installed.Hosts {
+		if h.HostID == hostID {
+			return h
+		}
+	}
+	return HostIdentity{HostID: hostID}
 }
 
 func actorID(r *http.Request) string {

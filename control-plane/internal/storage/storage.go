@@ -144,6 +144,26 @@ type HostRootResolver interface {
 	HomeRoot(ctx context.Context, hostID string) (string, error)
 }
 
+// LockedHomeRootResolver reads the root on the home-claim transaction. A
+// resolver used for launches must implement this so the host lock and root
+// lookup share one connection and one database snapshot.
+type LockedHomeRootResolver interface {
+	HomeRootTx(ctx context.Context, tx pgx.Tx, hostID string) (string, error)
+}
+
+type HostRootResolverFuncs struct {
+	Read   func(context.Context, string) (string, error)
+	Locked func(context.Context, pgx.Tx, string) (string, error)
+}
+
+func (r HostRootResolverFuncs) HomeRoot(ctx context.Context, hostID string) (string, error) {
+	return r.Read(ctx, hostID)
+}
+
+func (r HostRootResolverFuncs) HomeRootTx(ctx context.Context, tx pgx.Tx, hostID string) (string, error) {
+	return r.Locked(ctx, tx, hostID)
+}
+
 // HostRootResolverFunc adapts a plain function to HostRootResolver — the wiring
 // point that binds hostcfg.Store.HomeRoot's env fallback (app.go).
 type HostRootResolverFunc func(ctx context.Context, hostID string) (string, error)
@@ -163,7 +183,8 @@ func (p fixedProvider) StorageProvider(context.Context) (string, error) { return
 // host — used by the env/test constructors (v1 uniform-root behaviour).
 type fixedRoot string
 
-func (r fixedRoot) HomeRoot(context.Context, string) (string, error) { return string(r), nil }
+func (r fixedRoot) HomeRoot(context.Context, string) (string, error)           { return string(r), nil }
+func (r fixedRoot) HomeRootTx(context.Context, pgx.Tx, string) (string, error) { return string(r), nil }
 
 // Manager synthesizes home mounts and owns the user_homes bookkeeping. The
 // managed-home provider is resolved PER EnsureHome call (not fixed at
@@ -171,9 +192,17 @@ func (r fixedRoot) HomeRoot(context.Context, string) (string, error) { return st
 // session host's effective home root (roots) — storage-config. This is what lets an
 // admin flip the provider in the UI and different hosts use different roots.
 type Manager struct {
-	pool     *pgxpool.Pool
-	settings SettingsReader
-	roots    HostRootResolver
+	pool                  *pgxpool.Pool
+	settings              SettingsReader
+	roots                 HostRootResolver
+	homeCleanupCapability func(string) string
+}
+
+// SetHomeCleanupCapability supplies the current authenticated agent-connection
+// capability for admin diagnosis. Without a live connection the answer remains
+// unknown; a past capable registration is never treated as current proof.
+func (m *Manager) SetHomeCleanupCapability(read func(string) string) {
+	m.homeCleanupCapability = read
 }
 
 // New builds the runtime Manager wired to the live settings + host-root resolvers
@@ -317,25 +346,73 @@ func validateMount(m string) error {
 }
 
 // EnsureHome synthesizes the home mount string for (user, app) on host and
-// upserts the bookkeeping row (clearing any pending tombstone — launching into
-// a home un-marks it for GC). Returns the validated mount string.
+// upserts the bookkeeping row. A pending tombstone is never revived under
+// RH05; it must be reaped or repaired before a new launch can use this home.
+// Returns the validated mount string.
 //
 // containerPath comes from apps.home_container_path and must be absolute.
 func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, containerPath string) (string, error) {
 	if !path.IsAbs(containerPath) {
 		return "", fmt.Errorf("home_container_path %q is not absolute", containerPath)
 	}
-	// Read fresh per launch so an admin PATCH / per-host home_root applies on
-	// the next launch with no restart.
-	drv, err := m.resolveDriver(ctx, hostID)
+	prov, err := m.settings.StorageProvider(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read storage_provider: %w", err)
+	}
+	if prov == "" {
+		prov = "auto"
+	}
+	// A host policy save takes this row lock before checking existing homes.
+	// Hold it through root resolution and insertion: otherwise a first launch
+	// can read the old root, let the edit validate an empty home set, then
+	// create a sticky home outside the newly selected root.
+	tx, err := m.pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
+	defer tx.Rollback(ctx)
+	var lockedHost, hostName string
+	if err := tx.QueryRow(ctx, `SELECT id::text, node_name FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&lockedHost, &hostName); err != nil {
+		return "", fmt.Errorf("lock home host: %w", err)
+	}
+	root := ""
+	if m.roots != nil {
+		locked, ok := m.roots.(LockedHomeRootResolver)
+		if !ok {
+			return "", fmt.Errorf("home root resolver has no transactional read")
+		}
+		root, err = locked.HomeRootTx(ctx, tx, hostID)
+		if err != nil {
+			return "", fmt.Errorf("resolve home root for host %s: %w", hostID, err)
+		}
+	}
+	root = strings.TrimSpace(root)
+	if root != "" && !path.IsAbs(root) {
+		return "", fmt.Errorf("effective home root %q for host %s is not absolute", root, hostID)
+	}
+	if prov == "volume" {
+		return "", ErrVolumeDriverRemoved
+	}
+	if prov != "auto" && prov != "local" {
+		return "", fmt.Errorf("unknown storage_provider %q (auto|local)", prov)
+	}
+	if root == "" {
+		label := hostID
+		if hostName != "" {
+			short := hostID
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			label = fmt.Sprintf("%q (%s)", hostName, short)
+		}
+		return "", fmt.Errorf("%w: no managed-home storage root is set for host %s, so its games have nowhere to keep their save data and the session cannot start. Set a storage root for this host under Admin → Hosts (or in the setup wizard's host-check step)", ErrNoHomeRoot, label)
+	}
+	drv := localDriver{root: path.Clean(root)}
 	key := homeKey{userID: userID, appID: appID, userSlug: userID, appSlug: appID}
 	// Resolve display names for the human-navigable local layout; a lookup miss
 	// (test fixtures, deleted rows) falls back to the UUIDs.
 	var uname, aname string
-	if err := m.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		SELECT COALESCE((SELECT username FROM users WHERE id = $1::uuid), ''),
 		       COALESCE((SELECT name     FROM apps  WHERE id = $2::uuid), '')
 	`, userID, appID).Scan(&uname, &aname); err == nil {
@@ -354,21 +431,28 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 	// invisible to bookkeeping (accepted: driver switches are rare, operator-
 	// initiated).
 	var provider, storedRef string
-	if err := m.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO user_homes (user_id, app_id, host_id, provider, ref)
 		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
 		ON CONFLICT (user_id, app_id, host_id) DO UPDATE
 		    SET provider = EXCLUDED.provider,
 		        ref = CASE WHEN user_homes.provider = EXCLUDED.provider
 		                   THEN user_homes.ref ELSE EXCLUDED.ref END,
-		        last_used_at = now(), gc_after = NULL
+		        last_used_at = now()
+		    WHERE user_homes.gc_after IS NULL
 		RETURNING provider, ref
 	`, userID, appID, hostID, drv.name(), ref).Scan(&provider, &storedRef); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrHomeConflict
+		}
 		return "", fmt.Errorf("upsert user_home: %w", err)
 	}
 	mount := fmt.Sprintf("%s:%s:rw", storedRef, path.Clean(containerPath))
 	if err := validateMount(mount); err != nil {
 		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit user_home: %w", err)
 	}
 	return mount, nil
 }
@@ -546,7 +630,44 @@ type TombstonedHome struct {
 // The UPDATE returns the owning username and app name via RETURNING, so the
 // caller can audit a destructive action without a second round trip.
 func (m *Manager) TombstoneHome(ctx context.Context, id string) (TombstonedHome, error) {
-	live, err := m.hasLiveSessionForHome(ctx, id)
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return TombstonedHome{}, fmt.Errorf("begin tombstone: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// The same user lock used by launch serializes the live-session check,
+	// tombstone and claim transition with a first home reservation.
+	var preUser, preApp, preHost *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text FROM user_homes WHERE id::text=$1`, id).
+		Scan(&preUser, &preApp, &preHost)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TombstonedHome{}, ErrHomeNotFound
+	}
+	if err != nil {
+		return TombstonedHome{}, fmt.Errorf("read home for tombstone: %w", err)
+	}
+	if preUser != nil {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(1,hashtext($1::text))`, *preUser); err != nil {
+			return TombstonedHome{}, fmt.Errorf("lock home user: %w", err)
+		}
+		if preApp != nil {
+			if err := lockClaimBeforeHome(ctx, tx, *preUser, *preApp, preHost, true); err != nil {
+				return TombstonedHome{}, err
+			}
+		}
+	}
+	var userID, appID, hostID *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text FROM user_homes WHERE id::text=$1 FOR UPDATE`, id).Scan(&userID, &appID, &hostID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TombstonedHome{}, ErrHomeNotFound
+	}
+	if err != nil {
+		return TombstonedHome{}, fmt.Errorf("lock home: %w", err)
+	}
+	if !sameHomeIdentity(userID, preUser) || !sameHomeIdentity(appID, preApp) || !sameHomeIdentity(hostID, preHost) {
+		return TombstonedHome{}, ErrHomeConflict
+	}
+	live, err := m.hasLiveSessionForHomeTx(ctx, tx, id)
 	if err != nil {
 		return TombstonedHome{}, err
 	}
@@ -555,20 +676,24 @@ func (m *Manager) TombstoneHome(ctx context.Context, id string) (TombstonedHome,
 	}
 	var out TombstonedHome
 	var appName *string
-	err = m.pool.QueryRow(ctx, `
-		UPDATE user_homes SET gc_after = now() WHERE id::text = $1
-		RETURNING
-			(SELECT username FROM users WHERE users.id = user_homes.user_id),
-			(SELECT name FROM apps WHERE apps.id = user_homes.app_id)
+	err = tx.QueryRow(ctx, `
+		UPDATE user_homes SET gc_after=now() WHERE id::text=$1
+		RETURNING COALESCE((SELECT username FROM users WHERE users.id=user_homes.user_id),''),
+		          (SELECT name FROM apps WHERE apps.id=user_homes.app_id)
 	`, id).Scan(&out.Username, &appName)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return TombstonedHome{}, ErrHomeNotFound
-	}
 	if err != nil {
 		return TombstonedHome{}, fmt.Errorf("tombstone home: %w", err)
 	}
+	if userID != nil && appID != nil {
+		if err := markTombstonedClaim(ctx, tx, *userID, *appID, hostID); err != nil {
+			return TombstonedHome{}, err
+		}
+	}
 	if appName != nil {
 		out.AppName = *appName
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TombstonedHome{}, fmt.Errorf("commit tombstone: %w", err)
 	}
 	return out, nil
 }
@@ -579,19 +704,33 @@ func (m *Manager) TombstoneHome(ctx context.Context, id string) (TombstonedHome,
 // COALESCE(parent_app_id, id): a derived-tile session has no home row of its
 // own, and joining on s.app_id once let an admin tombstone a live Steam
 // library mid-write. Any family member's session counts — they all mount it.
-func (m *Manager) hasLiveSessionForHome(ctx context.Context, homeID string) (bool, error) {
+func (m *Manager) hasLiveSessionForHomeTx(ctx context.Context, tx pgx.Tx, homeID string) (bool, error) {
 	var n int
-	err := m.pool.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM sessions s
 		JOIN apps a ON a.id = s.app_id
 		JOIN user_homes uh ON uh.user_id = s.user_id
 		                  AND uh.app_id  = COALESCE(a.parent_app_id, a.id)
 		WHERE uh.id::text = $1
-		  AND s.state IN ('pending','assigned','starting','running')
+		  AND s.state NOT IN ('stopped','failed')
 	`, homeID).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("check live session for home: %w", err)
+	}
+	if n > 0 {
+		return true, nil
+	}
+	// A managed-home swap keeps sessions.app_id on the old app until the agent
+	// confirms the target. GuardHomeForSwap stores this durable detail before
+	// mount resolution. With no durable target ID, protect every home on the
+	// same user and host until rejection, rollback, commit or terminal state.
+	err = tx.QueryRow(ctx, `SELECT COUNT(*) FROM sessions s JOIN user_homes uh
+		ON uh.user_id=s.user_id AND uh.host_id=s.host_id
+		WHERE uh.id::text=$1 AND s.state_detail='swapping'
+		  AND s.state NOT IN ('stopped','failed')`, homeID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check pending swap for home: %w", err)
 	}
 	return n > 0, nil
 }

@@ -52,7 +52,7 @@ function CodecCard({
       key: "floor",
       header: "ABR floor",
       align: "right",
-      render: (p) => <span className="mono" style={{ color: "var(--text-3)" }}>{formatMbps(p.abr_floor_kbps)} Mb/s</span>,
+      render: (p) => <span className="mono muted">{formatMbps(p.abr_floor_kbps)} Mb/s</span>,
     },
     {
       key: "enc",
@@ -100,10 +100,10 @@ function CodecCard({
           <Chip>{profiles.length} rung{profiles.length === 1 ? "" : "s"}</Chip>
         </div>
       </div>
-      <p className="hint" style={{ padding: "0 var(--card-pad)", marginTop: "var(--s3)" }}>
+      <p className="hint mt3 sp-group-note">
         {CODEC_GROUP_NOTE[codec]}
       </p>
-      <div style={{ padding: "var(--s3) 0 0" }}>
+      <div className="sp-group-table">
         <Table columns={columns} rows={profiles} rowKey={(p) => p.id} />
       </div>
     </div>

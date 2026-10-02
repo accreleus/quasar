@@ -280,7 +280,7 @@ func TestEnvelopeUnmeasuredProbe(t *testing.T) {
 }
 
 // TestEnvelopeStaleProbe (scenario c, stale): probe older than probeMaxAgeDays →
-// LatestProbe returns nil → envelope never built → session gets profile defaults.
+// the probe resolves to nil → envelope never built → session gets profile defaults.
 func TestEnvelopeStaleProbe(t *testing.T) {
 	pool := testDB(t)
 	userID, appID, _ := seed1080pApp(t, pool)
@@ -289,7 +289,7 @@ func TestEnvelopeStaleProbe(t *testing.T) {
 	ctx := context.Background()
 
 	// Low bw + hostile RTT that would trigger both envelope axes — but staleness
-	// makes LatestProbe return nil, so neither applies.
+	// makes the probe resolve to nil, so neither applies.
 	staleTime := time.Now().Add(-31 * 24 * time.Hour)
 	upsertProbe(t, pool, userID, 5000, 200, 1080, staleTime)
 

@@ -1,0 +1,46 @@
+---
+title: Install on Unraid
+description: Prepare persistent storage and your GPU, then use the shared quick start.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Prepare your server
+
+- Check your GPU driver is loaded: `ls /dev/dri` should show a `renderD*` device.
+- Allow about 20 GB for container images, plus space for games and saves.
+- Use the Unraid host shell for commands; it runs as root, so omit `sudo`.
+
+For NVIDIA, complete [NVIDIA setup on Unraid](/quasar/install/nvidia/#unraid)
+before deploying, including the driver compatibility check.
+
+## Storage paths
+
+<Aside type="caution" title="Warning: keep game and home data off the FUSE layer">
+Use a direct pool path such as `/mnt/<pool>/appdata/quasar` for homes and templates.
+Replace `<pool>` with your actual pool name. Ordinary `/mnt/user` shares go through
+Unraid's FUSE user-share layer; exclusive-access shares can bypass it. Confirm how
+your share is configured before using it for game data.
+</Aside>
+
+The quick start defaults to `/mnt/cache/appdata/quasar`. Change `cache` if your
+pool has another name. Saves, installed content and user files need persistent
+storage with enough space; do not put them under `/root`.
+
+A stack manager's configuration directory is separate from game data. Keep it
+on persistent storage too; it does not need the same direct pool path merely
+because it holds a Compose file.
+
+Quasar defaults game-file ownership to **UID 99 / GID 100** on Unraid.
+
+## Install Quasar
+
+Use the [quick start](/quasar/start/quickstart/) and select **Unraid**. It supplies
+the platform's paths and ownership defaults, then follows the normal Docker
+seed deployment. Review the generated configuration before starting it. Docker Compose, Dockge or Arcane can keep that configuration.
+
+Open `https://<your-host>:8443`, follow the
+[certificate steps](/quasar/network/https/) and [create your account](/quasar/install/first-run/).
+
+For maintenance, see [Backup and restore](/quasar/operations/backup/),
+[Upgrading](/quasar/operations/upgrading/) and [Uninstalling](/quasar/operations/uninstall/).

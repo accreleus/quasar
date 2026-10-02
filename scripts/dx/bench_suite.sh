@@ -38,6 +38,9 @@
 #                        resumed by re-running the identical command line.
 #   --out DIR            run root (default .diagnostics/bench-suite/<stamp>)
 #   --tag K=V            repeatable; added to every cell
+#   --commit SHA         forwarded to every cell's bench_run.sh --commit: the Quasar
+#                        commit the host runs, posted as each run's `commit` (default:
+#                        this worktree's HEAD). `qbench check` finds runs by it.
 #   --baseline           after the matrix, PUT /v1/baselines for every cell that ran
 #                        ok, pinning that cell's run as the baseline for its
 #                        suite+scenario (idempotent; re-running re-pins). Default OFF
@@ -78,7 +81,7 @@ TARGET=bench-suite
 
 dx_require_host_scope "$TARGET"
 
-usage() { sed -n '3,62p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,65p' "$0" | sed 's/^# \{0,1\}//'; }
 
 MATRIX=""
 PROFILES=""
@@ -98,6 +101,7 @@ OUT=""
 DRY=0
 BASELINE=0
 TAGS=()
+RUN_COMMIT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -129,6 +133,10 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || dx_guard "$TARGET" "--tag requires K=V"
       case "$2" in *=*) ;; *) dx_guard "$TARGET" "--tag must be K=V (got '$2')" ;; esac
       TAGS+=("$2"); shift 2 ;;
+    --commit)
+      [ $# -ge 2 ] || dx_guard "$TARGET" "--commit requires a sha"
+      dx_require_safe "$TARGET" "--commit" "$2" "$DX_RE_REF" "It is a commit sha or ref."
+      RUN_COMMIT="$2"; shift 2 ;;
     --baseline) BASELINE=1; shift ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -481,6 +489,7 @@ for c in "${CELLS[@]}"; do
   [ "$net" != none ] && RUN_ARGS+=(--netem "$net")
   [ -n "$CODEC" ] && RUN_ARGS+=(--codec "$CODEC" --tag "codec=$CODEC")
 RUN_ARGS+=(--peer "$PEER")
+  [ -n "$RUN_COMMIT" ] && RUN_ARGS+=(--commit "$RUN_COMMIT")
   for t in ${TAGS[@]+"${TAGS[@]}"}; do RUN_ARGS+=(--tag "$t"); done
 
   # tee'd, not swallowed: the run id and any mismatch verdict are in bench_run.sh's
@@ -519,8 +528,8 @@ PIN_N=0
 if [ "$BASELINE" = 1 ]; then
   printf '\n'
   dx_info "── pinning baselines (PUT /v1/baselines) for suite $SUITE"
-  if [ -z "${BENCH_URL:-}" ] || [ -z "${BENCH_KEY:-}" ]; then
-    dx_fail baseline "--baseline needs BENCH_URL and BENCH_KEY exported"
+  if ! dx_bench_env; then
+    dx_fail baseline "--baseline needs a bench server and key: BENCH_URL / BENCH_KEY, or qbench's ~/.config/qbench/{url,key} (\`qbench doctor\` checks them)"
   else
     while IFS=$'\t' read -r b_id b_state b_scen b_run; do
       [ "$b_state" = ok ] || continue

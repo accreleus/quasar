@@ -4,7 +4,8 @@
  * so every control inside it stops propagation.
  */
 
-import type { GPUAvailability, Host } from "../../../api/types";
+import { Fragment } from "react";
+import type { GPUAvailability, Host, PlatformIdentity } from "../../../api/types";
 import { ActionsMenu, type ActionsMenuEntry } from "../../../components/ActionsMenu";
 import { Bar } from "../../../components/Bar";
 import { Chip } from "../../../components/Chip";
@@ -13,8 +14,15 @@ import { bytesFromMb } from "../../../lib/format/bytes";
 import { relativeTime, relativeTimeCompact } from "../../../lib/format/relativeTime";
 import { shortId } from "../../../lib/format/shortId";
 import { primaryGpuLabel } from "../../../lib/gpu";
+import { admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./AdmissionReasons";
 import { HostExpansion } from "./HostExpansion";
+import type { FloorState } from "./hostFloor";
+import { hostFlag } from "./hostWarnings";
+import { isControlPlaneMachine, isOwned, versionLabel } from "./hostServices";
+import { releaseLabel } from "./releasesCopy";
 import {
+  distinctGpuVendors,
+  groupGpusByModel,
   heartbeatTone,
   hostStateDot,
   hostStateLabel,
@@ -39,13 +47,18 @@ export interface HostRowProps {
   actionPending: boolean;
   /** The last drain/uncordon on this row failed; shown in the drawer. */
   actionError?: string;
+  /** The control plane's own identity: which host shares its machine. */
+  controlPlane?: PlatformIdentity | null;
+  /** Below the floor, the row offers only an update (hostFloor.ts). */
+  floor?: FloorState | null;
+  onUpdate?: () => void;
   now: number;
 }
 
-const TONE_TEXT: Record<string, string> = {
-  success: "var(--success-text)",
-  warning: "var(--warning-text)",
-  danger: "var(--danger-text)",
+const TONE_CELL: Record<string, string> = {
+  success: "td-success",
+  warning: "td-warning",
+  danger: "td-danger",
 };
 
 export function HostRow(props: HostRowProps) {
@@ -54,6 +67,14 @@ export function HostRow(props: HostRowProps) {
   const state = hostStateLabel(host);
   const offline = host.status === "offline";
   const live = host.capacity?.active_sessions ?? 0;
+  const flag = hostFlag(host);
+  // The machine's shape, for an owned host (mock rh06/hosts): the control plane's own
+  // machine is the combined host, by the contract's rule; every other one is a GPU host.
+  const shape = isOwned(host)
+    ? isControlPlaneMachine(host, props.controlPlane)
+      ? "Combined host"
+      : "GPU host"
+    : null;
 
   return (
     <>
@@ -82,6 +103,17 @@ export function HostRow(props: HostRowProps) {
           <div className="rowflex">
             <i className={`sdot ${hostStateDot(host)}`} title={state} />
             <span className="primary">{host.node_name}</span>
+            {/* Stacked states: the floor governs what the row offers, so it reads first. */}
+            {props.floor?.kind === "below" && (
+              <Chip variant="warning" className="chip-sm" title="Must update before it can be managed">
+                must update
+              </Chip>
+            )}
+            {flag && (
+              <Chip variant="warning" className="chip-sm" title={flag.title}>
+                {flag.label}
+              </Chip>
+            )}
             {/* #429: an agent that keeps restarting is worth seeing without
                 opening the drawer, where the last-restart time lives. */}
             {host.agent_restart_count > 0 && (
@@ -103,6 +135,7 @@ export function HostRow(props: HostRowProps) {
           </div>
           <div className="sub mono host-row-id" title={host.id}>
             {shortId(host.id)}
+            {shape ? ` · ${shape}` : ""}
             {state !== "online" ? ` · ${state}` : ""}
           </div>
         </td>
@@ -155,7 +188,7 @@ export function HostRow(props: HostRowProps) {
 
         <td className="right num">{live}</td>
 
-        <td className="right num" style={{ color: TONE_TEXT[heartbeatTone(host)] }}>
+        <td className={`right num ${TONE_CELL[heartbeatTone(host)] ?? ""}`}>
           {host.last_heartbeat_at ? relativeTimeCompact(host.last_heartbeat_at, now) : "Never"}
         </td>
 
@@ -172,6 +205,8 @@ export function HostRow(props: HostRowProps) {
               gpus={gpus}
               gpuError={props.gpuError}
               actionError={props.actionError}
+              controlPlane={props.controlPlane}
+              belowFloor={props.floor?.kind === "below"}
               now={now}
             />
           </td>
@@ -181,45 +216,68 @@ export function HostRow(props: HostRowProps) {
   );
 }
 
-/** The first GPU names the host; the rest are a count, as the mock renders it.
- *  "Reading GPUs" and "no GPUs" are different facts, so they read differently. */
+/** Groups of the same model get the mock's `×N`; a mixed host (#310) names
+ *  each distinct model instead of the first GPU's model times the total
+ *  count. "Reading GPUs" and "no GPUs" are different facts, so they read
+ *  differently. */
 function GpuCell({ gpus }: { gpus: GPUAvailability[] | null | undefined }) {
   if (gpus === undefined) return <span className="sub">…</span>;
   if (gpus === null) return <span className="sub">n/a</span>;
   if (gpus.length === 0) return <span className="sub">No GPUs reported</span>;
-  const first = gpus[0];
+  const groups = groupGpusByModel(gpus);
+  const vendors = distinctGpuVendors(groups);
   return (
     <div className="stack">
       <span>
-        {primaryGpuLabel(first.vendor, first.model)}
-        {gpus.length > 1 && <span className="sub"> ×{gpus.length}</span>}
+        {groups.map((g, i) => (
+          <Fragment key={`${g.vendor}:${g.model}`}>
+            {i > 0 && " + "}
+            {primaryGpuLabel(g.vendor, g.model)}
+            {g.count > 1 && <span className="sub"> ×{g.count}</span>}
+          </Fragment>
+        ))}
       </span>
-      <span className="sub">{first.vendor}</span>
+      <span className="sub">{vendors.join(" + ")}</span>
     </div>
   );
 }
 
 function menuItems(props: HostRowProps): ActionsMenuEntry[] {
-  const { host, actionPending } = props;
-  const items: ActionsMenuEntry[] = [
-    { key: "open", label: "Open host", onClick: props.onOpen },
-    { key: "console", label: "Local console", onClick: props.onConsole },
-    { key: "settings", label: "Host settings", onClick: props.onSettings },
-    { key: "sep", separator: true },
-  ];
+  const { host, actionPending, floor } = props;
+  // Below the floor the only thing offered is an update (rh06 floor mock's row menu).
+  const items: ActionsMenuEntry[] =
+    floor?.kind === "below"
+      ? [
+          { key: "open", label: "Open host", onClick: props.onOpen },
+          {
+            key: "update",
+            label: floor.release
+              ? `Update to ${versionLabel(releaseLabel(floor.release))}`
+              : "Update",
+            disabled: !floor.release || !floor.target?.eligible || !props.onUpdate,
+            onClick: () => props.onUpdate?.(),
+          },
+          { key: "sep", separator: true },
+        ]
+      : [
+          { key: "open", label: "Open host", onClick: props.onOpen },
+          { key: "console", label: "Local console", onClick: props.onConsole },
+          { key: "settings", label: "Host settings", onClick: props.onSettings },
+          { key: "sep", separator: true },
+        ];
 
-  if (host.status === "draining") {
+  if (hasOperatorDrain(host)) {
     items.push({
       key: "resume",
-      label: "Resume scheduling",
+      label: admissionActionLabel(host),
       disabled: actionPending,
       onClick: props.onResume,
     });
   } else {
     items.push({
       key: "drain",
-      label: "Drain",
-      disabled: actionPending || host.status !== "online",
+      label: admissionActionLabel(host),
+      disabled: actionPending || !canChangeOperatorDrain(host),
       onClick: props.onDrain,
     });
   }

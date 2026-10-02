@@ -14,12 +14,14 @@
 # key replaces the body and keeps the attachments. The RESULT line carries the
 # stable URL so it can be pasted into the commit body, the issue and memory.
 #
-# Credentials, in order: $BENCH_URL + $BENCH_KEY if set; otherwise the bench
-# service's own deploy/.env on HOST (BENCH_API_KEYS=name:secret, first key),
-# read over ssh like nightly_budget.sh does. There is no built-in bench address:
-# export $QUASAR_BENCH_URL (a deployment's own stable DNS name) so published
-# report links survive — a LAN IP pasted into a commit body rots. With it unset,
-# or unreachable, the URL is derived as http://<host>:9400 with a WARN.
+# The server and key come from wherever qbench finds them: BENCH_URL / BENCH_KEY,
+# else qbench's own config (${XDG_CONFIG_HOME:-~/.config}/qbench/{url,key}, which
+# the bench server's install.sh writes). There is no built-in address and no
+# host-derived fallback; with neither set this stops and says to run
+# `qbench doctor`. HOST is not used.
+#
+# The CLI is an installed `qbench` when there is one, else the vendored copy
+# (scripts/dx/vendor/qbench); QBENCH=<path> overrides both.
 #
 # Exit: 0 ok, 1 failed (RESULT line names why), 2 usage.
 
@@ -31,9 +33,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 VERB="${1:-}"
 [ -n "$VERB" ] || dx_guard report "usage: report.sh publish|attach|url (see header)"
 
-DX="$DX_DIR"
 ROOT="$(cd "$DX_DIR/.." && pwd)"
-QBENCH="$DX/vendor/qbench"
 REPO="${REPO:-accreleus/quasar}"
 COMMIT="${COMMIT:-HEAD}"
 
@@ -52,47 +52,16 @@ resolve_commit() {
   fi
 }
 
-# bench_creds — exports BENCH_URL + BENCH_KEY or fails with the next step.
+# bench_creds — BENCH_URL + BENCH_KEY from the env or qbench's config, or stop.
+# `bench_creds url-only` needs just the server: `report url` makes no request.
 bench_creds() {
-  if [ -n "${BENCH_URL:-}" ] && [ -n "${BENCH_KEY:-}" ]; then
-    return 0
+  if [ "${1:-}" = url-only ]; then
+    dx_bench_env || true
+    [ -n "${BENCH_URL:-}" ] || dx_bench_require report
+  else
+    dx_bench_require report
   fi
-  [ "$DX_HOST" != "local" ] || dx_guard report \
-    "BENCH_URL + BENCH_KEY are unset and HOST=local has no bench service. Export them, or HOST=<role> to read the service's deploy/.env over ssh"
-  dx_resolve_remote "$DX_HOST" || dx_guard report "unknown host '$DX_HOST'"
-  local env_file="${BENCH_ENV_FILE:-\$HOME/quasar-bench/deploy/.env}"
-  # Spliced into the remote grep UNQUOTED — it has to be, so the remote shell
-  # expands the default's leading $HOME. That makes validation the only defence:
-  # allow that one expansion, refuse every other shell metacharacter.
-  dx_require_safe report "BENCH_ENV_FILE" "$env_file" "$DX_RE_REMOTE_PATH" \
-    "It is a path on $DX_HOST, optionally starting with a literal \$HOME."
-  local line
-  line="$(dx_ssh_remote "grep -h '^BENCH_API_KEYS=' $env_file 2>/dev/null | head -1" || true)"
-  [ -n "$line" ] || {
-    dx_fail bench-creds "no BENCH_API_KEYS in $env_file on $DX_HOST. Next: export BENCH_URL + BENCH_KEY"
-    dx_result report
-  }
-  local keys="${line#BENCH_API_KEYS=}"
-  keys="${keys%%,*}"
-  export BENCH_KEY="${keys#*:}"
-  if [ -z "${BENCH_URL:-}" ]; then
-    # No built-in address: the stable name is a per-deployment fact.
-    local stable="${QUASAR_BENCH_URL:-}"
-    if [ -n "$stable" ] && curl -fsS -m 5 -o /dev/null "$stable/v1/health" 2>/dev/null; then
-      export BENCH_URL="$stable"
-    else
-      # ssh_alias hosts resolve no DX_REMOTE_HOST; ask ssh what the alias points at.
-      local h="${DX_REMOTE_HOST:-}"
-      [ -n "$h" ] || h="$(ssh -G "${DX_REMOTE_SSH_ALIAS}" 2>/dev/null | awk '/^hostname /{print $2}')"
-      [ -n "$h" ] || dx_guard report "no QUASAR_BENCH_URL and cannot derive the bench host for $DX_HOST; export BENCH_URL"
-      if [ -n "$stable" ]; then
-        dx_warn bench-url "$stable is unreachable; falling back to the LAN address (published links will rot)"
-      else
-        dx_warn bench-url "QUASAR_BENCH_URL is unset; using the LAN address (published links will rot)"
-      fi
-      export BENCH_URL="http://${h}:${BENCH_PORT:-9400}"
-    fi
-  fi
+  dx_qbench
 }
 
 case "$VERB" in
@@ -119,7 +88,7 @@ case "$VERB" in
     for r in ${RUNS:-}; do args+=(--run "$r"); done
     for t in ${TAGS:-}; do args+=(--tag "$t"); done
     [ "${PIN:-0}" != 1 ] || args+=(--pin)
-    if URL="$(python3 "$QBENCH" "${args[@]}" 2>&1 | tail -n 1)"; then
+    if URL="$("${DX_QBENCH[@]}" "${args[@]}" 2>&1 | tail -n 1)"; then
       case "$URL" in
         http*) dx_pass report-publish "$URL" ;;
         *) dx_fail report-publish "$URL"; dx_result report-publish ;;
@@ -148,19 +117,19 @@ case "$VERB" in
     fi
     args=(report attach --repo "$REPO" --commit "$SHA" --file "$FILE" --role "$ROLE")
     [ -z "${CAPTION:-}" ] || args+=(--caption "$CAPTION")
-    if OUT="$(python3 "$QBENCH" "${args[@]}" 2>&1 | tail -n 1)"; then
+    if OUT="$("${DX_QBENCH[@]}" "${args[@]}" 2>&1 | tail -n 1)"; then
       dx_pass report-attach "$(basename "$FILE") role=$ROLE"
     else
       dx_fail report-attach "$OUT"
       dx_result report-attach
     fi
-    URL="$(python3 "$QBENCH" --url "${BENCH_URL}" report url --repo "$REPO" --commit "$SHA" 2>/dev/null || true)"
+    URL="$("${DX_QBENCH[@]}" report url --repo "$REPO" --commit "$SHA" 2>/dev/null || true)"
     dx_result report-attach "repo=$REPO" "commit=${SHA:0:8}" "role=$ROLE" "url=$URL"
     ;;
   url)
     resolve_commit
-    bench_creds
-    URL="$(python3 "$QBENCH" --url "${BENCH_URL}" report url --repo "$REPO" --commit "$SHA")"
+    bench_creds url-only
+    URL="$("${DX_QBENCH[@]}" report url --repo "$REPO" --commit "$SHA")"
     dx_pass report-url "$URL"
     dx_result report-url "url=$URL"
     ;;

@@ -413,13 +413,9 @@ func TestHomeRuleSite5ResolveHomeSpecRefusesWithoutAHome(t *testing.T) {
 	})
 }
 
-// TestHomeRuleSite5ConsoleLaunchIsGuardedByRequireHome drives the one production
-// caller with no §5 pin in front of it, so site 5 is load-bearing end to end
-// rather than only at the seam.
-//
-// MUTATION CHECK: RequireHome→EnsureHome makes this go red too — the launch
-// SUCCEEDS and a user_homes row appears.
-func TestHomeRuleSite5ConsoleLaunchIsGuardedByRequireHome(t *testing.T) {
+// A local derived launch checks its pinned host before reservation. It must not
+// leave a claim-only uncertainty for a home it was never allowed to provision.
+func TestConsoleDerivedLaunchRefusesBeforeClaimWithoutHome(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	s := seed(t, pool, 8)
@@ -437,15 +433,13 @@ func TestHomeRuleSite5ConsoleLaunchIsGuardedByRequireHome(t *testing.T) {
 		t.Fatalf("console-launching a tile with no home: err = %v, want ErrHomeNotProvisioned", err)
 	}
 	if after := homeRowCount(t, pool); after != before {
-		t.Fatalf("user_homes rows %d → %d: the console path PROVISIONED an empty Steam home.\n"+
-			"LaunchConsoleSession has no §5 pin, so RequireHome is the only guard here.", before, after)
+		t.Fatalf("user_homes rows %d → %d: local derived launch provisioned an empty home", before, after)
 	}
-	// The session it scheduled must be failed, not left assigned holding a slot.
-	var state string
-	must(t, pool.QueryRow(ctx, `SELECT state FROM sessions
-		WHERE user_id::text = $1 ORDER BY created_at DESC LIMIT 1`, s.userID).Scan(&state))
-	if state != "failed" {
-		t.Errorf("session state = %s, want failed (the reservation must be released)", state)
+	var sessions, claims int
+	must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sessions WHERE user_id=$1::uuid`, s.userID).Scan(&sessions))
+	must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, parent).Scan(&claims))
+	if sessions != 0 || claims != 0 {
+		t.Errorf("local derived refusal left sessions=%d claims=%d, want neither", sessions, claims)
 	}
 }
 
@@ -620,10 +614,9 @@ func TestLaunchByProfileRefusesATileWithNoHome(t *testing.T) {
 }
 
 // TestLaunchByProfileRefusesATileOntoATombstonedHome is the launch-level
-// tombstone case. Like the test above it is SHADOWED by the §5 pin — HomeHostForApp
-// requires gc_after IS NULL, so the pin refuses before resolveHomeSpec is reached
-// — and it therefore does not prove site 5 either. The seam-level tombstone
-// assertion lives in TestHomeRuleSite5ResolveHomeSpecRefusesWithoutAHome.
+// tombstone case. RH05 treats a known tombstone as a repair-required claim
+// conflict before the tile's no-live-home check. The direct resolveHomeSpec
+// seam above still verifies that a tile never provisions a missing home.
 //
 // Kept for the same reason: "an admin tombstones a home and launches still stop"
 // is a contract worth pinning at the launch level regardless of which guard
@@ -643,8 +636,8 @@ func TestLaunchByProfileRefusesATileOntoATombstonedHome(t *testing.T) {
 	disp := newCapturingDispatcher()
 	coord := newTestCoordinator(t, store, disp, testLogger(), WithHomeProvider(storage.NewLocal(pool, testHomeRoot)))
 
-	if _, err := coord.Launch(ctx, s.userID, hades, StreamOverride{}); !errors.Is(err, ErrHomeNotProvisioned) {
-		t.Fatalf("launching a tile onto a TOMBSTONED home: err = %v, want ErrHomeNotProvisioned", err)
+	if _, err := coord.Launch(ctx, s.userID, hades, StreamOverride{}); !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("launching a tile onto a TOMBSTONED home: err = %v, want ErrHomeConflict", err)
 	}
 	var stillTombstoned bool
 	must(t, pool.QueryRow(ctx, `SELECT gc_after IS NOT NULL FROM user_homes

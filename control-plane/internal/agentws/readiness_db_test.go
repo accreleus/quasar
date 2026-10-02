@@ -26,7 +26,7 @@ func rawReadiness(t *testing.T, pool *pgxpool.Pool, hostID string) ([]byte, *str
 // is the state this whole mechanism exists to replace.
 func TestUpsertHostReadinessStoresTheWholeCheckSet(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	if raw, at := rawReadiness(t, pool, hostID); raw != nil || at != nil {
@@ -79,7 +79,7 @@ func TestUpsertHostReadinessStoresTheWholeCheckSet(t *testing.T) {
 // validation must reject only that, never an unfamiliar vocabulary.
 func TestUpsertHostReadinessRejectsOnlyMalformedPayloads(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -129,7 +129,7 @@ func TestUpsertHostReadinessRejectsOnlyMalformedPayloads(t *testing.T) {
 // worse than a stale set that says so.
 func TestUpsertHostReadinessKeepsPriorValueWhenAbsent(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -159,7 +159,7 @@ func TestUpsertHostReadinessKeepsPriorValueWhenAbsent(t *testing.T) {
 // and must overwrite — distinct from the nil/absent case above.
 func TestUpsertHostReadinessEmptyArrayOverwrites(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -218,7 +218,7 @@ func TestCapacityWithoutReadinessDecodesToNil(t *testing.T) {
 // readiness_reported_at, which would present the destruction as fresh evidence.
 func TestReadinessNullDoesNotDestroyAStoredReport(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 

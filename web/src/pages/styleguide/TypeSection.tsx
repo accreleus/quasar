@@ -2,6 +2,7 @@
 // body text); IBM Plex Sans carries headings and UI; IBM Plex Mono carries
 // metrics, ids and code. QuasarMark + .wordmark are the real brand lockup
 // (shell/Topbar.tsx, shell/HomeShell.tsx), not a re-drawn copy.
+import type { CSSProperties } from "react";
 import { QuasarMark } from "../../components/QuasarMark";
 
 const SCALE: Array<{ tag: string; token: string; sample: string; heading?: boolean }> = [
@@ -24,9 +25,9 @@ export function TypeSection() {
       </p>
 
       <div className="sg-comp-label">Wordmark</div>
-      <div className="sg-comp-block sg-specimen" style={{ display: "flex", alignItems: "center", gap: "var(--s3)" }}>
+      <div className="sg-comp-block sg-specimen row">
         <QuasarMark size={32} />
-        <span className="wordmark" style={{ fontSize: "1.1rem" }}>Quasar</span>
+        <span className="wordmark sg-wordmark-sample">Quasar</span>
       </div>
 
       <div className="sg-comp-label">Plex scale</div>
@@ -35,12 +36,8 @@ export function TypeSection() {
           <div key={row.token} className="sg-type-row">
             <div className="sg-tag">{row.tag}</div>
             <div
-              style={{
-                fontFamily: "var(--font-display)",
-                fontSize: `var(${row.token})`,
-                fontWeight: row.heading ? 600 : 400,
-                letterSpacing: row.heading ? "-.01em" : undefined,
-              }}
+              className={row.heading ? "sg-type-sample is-heading" : "sg-type-sample"}
+              style={{ "--sg-size": `var(${row.token})` } as CSSProperties}
             >
               {row.sample}
             </div>
@@ -48,7 +45,7 @@ export function TypeSection() {
         ))}
         <div className="sg-type-row">
           <div className="sg-tag">mono · .8125rem</div>
-          <div className="mono" style={{ fontSize: "var(--t-sm)" }}>
+          <div className="mono t-sm">
             session 743a921f · 6347.1 kbps · RTT 5.0 ms · σ 0.42
           </div>
         </div>

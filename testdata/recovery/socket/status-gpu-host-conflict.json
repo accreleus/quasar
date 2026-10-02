@@ -1,0 +1,48 @@
+{
+  "shape": "status",
+  "about": "A GPU host with an owner conflict: a leftover Compose stack's node agent the actor never acts on, and no seed found.",
+  "body": {
+    "actor": {
+      "version": "0.4.0",
+      "commit": "cccccccccccccccccccccccccccccccccccccccc",
+      "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+      "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000"
+    },
+    "seed": null,
+    "role": "gpu",
+    "node_name": "study-pc",
+    "database": "none",
+    "services": [
+      {
+        "role": "recovery-actor",
+        "container": "quasar-recovery",
+        "image": "ghcr.io/accreleus/quasar/quasar-recovery",
+        "digest": "sha256:cc33000000000000000000000000000000000000000000000000000000000000",
+        "state": "running",
+        "health": "healthy"
+      },
+      {
+        "role": "node-agent",
+        "container": "quasar-node-agent",
+        "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+        "digest": "sha256:1b7e000000000000000000000000000000000000000000000000000000000def",
+        "state": "running",
+        "health": "healthy"
+      }
+    ],
+    "conflicts": [
+      {
+        "container": "quasar-quasar-node-agent-1",
+        "id": "3e8b0c91d2f4",
+        "image": "ghcr.io/accreleus/quasar/quasar-node-agent:0.3.0",
+        "role": "node-agent",
+        "why": "part of the Compose project quasar, probably left from an older Compose install"
+      }
+    ],
+    "in_flight": null,
+    "dumps": [],
+    "dump_free_bytes": null,
+    "result": null,
+    "stale": false
+  }
+}

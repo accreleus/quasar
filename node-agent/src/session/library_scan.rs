@@ -746,7 +746,7 @@ mod tests {
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading fixture {path}: {e}"))
     }
 
-    // ── Parser: real Tower manifests ────────────────────────────────────────
+    // ── Parser: real lab-host manifests ─────────────────────────────────────
 
     #[test]
     fn parses_the_five_allowlisted_keys() {

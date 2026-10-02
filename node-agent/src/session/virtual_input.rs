@@ -16,15 +16,14 @@
 //! `waylanddisplaysrc` opens input nodes via libinput's path backend (plain
 //! `open()`, no udev/seat). A container's `/dev` is a fresh tmpfs, so a
 //! freshly-created uinput device has no node there until something makes one.
-//! [`VirtualDevices::create`] `mknod`s each device's `/dev/input/eventN` from its
-//! sysfs `dev` (major:minor) if the kernel didn't; Docker `--device` then
-//! materializes the same node inside the container.
+//! The agent sees the host's `/dev/input` through a bind, so the node the kernel creates is
+//! already there; [`VirtualDevices::create`] waits for it and never `mknod`s. The engine's
+//! `--device` then passes the same host node into the session container.
 //!
 //! Requires `/dev/uinput` (root). Wire format: `protocol/input.md`.
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -225,6 +224,65 @@ fn device_name(kind: &str, tag: &str) -> String {
     format!("Quasar Virtual {kind} [{tag}]")
 }
 
+/// The gamepad's device name. Deliberately NOT session-tagged (the tag goes in
+/// `phys`, see `gamepad_phys`): SDL 2.26+ folds a CRC of the name into the
+/// controller GUID, so a per-session name would key any layout a user saves in
+/// Steam to that one session. It must keep the "Quasar Virtual" prefix, which
+/// `physical_input` uses to never grab a session's own virtual devices.
+const GAMEPAD_NAME: &str = "Quasar Virtual Gamepad";
+
+/// Per-session `phys` for the gamepad, carrying the tag `device_name` carries
+/// for the keyboard and mouse (visible in `/proc/bus/input/devices`).
+fn gamepad_phys(tag: &str) -> String {
+    format!("quasar/{tag}/input0")
+}
+
+/// The gamepad presents as a wired Xbox 360 controller (`xpad`, 045e:028e) on
+/// `BUS_USB`, not a synthetic `ab1e` ID. SDL, Steam and games that read evdev
+/// directly all know this device and apply the xpad layout to it; for an
+/// unknown ID SDL invents a mapping from button-code order, which reads the
+/// positional `BTN_WEST`/`BTN_NORTH` the wrong way round (issue #348). The
+/// capabilities in `create_gamepad` must therefore match what xpad exposes for
+/// this device exactly, or SDL's known mapping points at the wrong indices.
+fn gamepad_input_id() -> InputId {
+    InputId {
+        bustype: isys::BUS_USB,
+        vendor: 0x045e,
+        product: 0x028e,
+        version: 0x0114,
+    }
+}
+
+/// `UI_SET_PHYS` as the kernel defines it: `_IOW('U', 108, char *)`, so the
+/// size field is a POINTER's size. `input_linux`'s `set_phys` declares the
+/// argument as `c_char` (size 1), producing a request number the kernel does
+/// not recognise (EINVAL), which failed every session launch on the first
+/// #348 edge build. Direction/size/type/nr use the generic `_IOC` layout
+/// (x86-64, arm64).
+const UI_SET_PHYS: u64 = (1 << 30)
+    | ((std::mem::size_of::<*const libc::c_char>() as u64) << 16)
+    | ((b'U' as u64) << 8)
+    | 108;
+
+/// Set a uinput device's `phys` string (before `create`).
+fn set_phys(h: &UInputHandle<File>, phys: &str) -> Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let phys = std::ffi::CString::new(phys).context("phys contains a NUL byte")?;
+    // SAFETY: valid open uinput fd; the kernel copies the NUL-terminated
+    // string (strndup_user) before returning, so `phys` outlives the call.
+    let rc = unsafe {
+        libc::ioctl(
+            h.as_fd().as_raw_fd(),
+            UI_SET_PHYS as libc::Ioctl,
+            phys.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("UI_SET_PHYS");
+    }
+    Ok(())
+}
+
 /// Stable-ish synthetic IDs so the devices are recognizable in logs / udev.
 fn input_id(product: u16) -> InputId {
     InputId {
@@ -255,9 +313,10 @@ fn resolve_and_ensure_node(
 /// Host-shared directory holding this session's exported fake-udev records
 /// (`{runtime_dir}/udev-{session_id}`), bind-mounted by the app container at
 /// `/run/udev/data` so SDL/Steam (libudev discovery, not evdev scanning) see the
-/// `--device`-passed gamepad node.
+/// `--device`-passed gamepad node. Thin re-export of [`super::udev_export::export_dir`];
+/// see that module for the ownership-marker lifecycle around this path.
 pub fn udev_export_dir(runtime_dir: &str, session_id: &str) -> PathBuf {
-    PathBuf::from(runtime_dir).join(format!("udev-{session_id}"))
+    super::udev_export::export_dir(runtime_dir, session_id)
 }
 
 /// Read the `major:minor` of an input device's node from sysfs.
@@ -274,48 +333,61 @@ fn dev_major_minor(path: &Path) -> Result<(u32, u32)> {
         .ok_or_else(|| anyhow!("unexpected sysfs dev format '{dev}' for {name}"))
 }
 
-/// `mknod` `path` (e.g. `/dev/input/event7`) if missing. No-op when the node
-/// already exists AND is the expected char device (right major:minor) — this is
-/// what lets Docker `--device` and libinput's path backend open it in a tmpfs
-/// `/dev`.
-///
-/// #378: a prior session's `docker rm -f` can leave a bind-mount artifact (a
-/// regular file/dir, or a char device with a stale major:minor) at this exact
-/// path. A bare `path.exists()` treated any of those as "done" and every later
-/// launch failed opening it. Validate type + rdev and self-heal a stale/wrong
-/// artifact before falling through to `mknod`.
+/// How long the host's devtmpfs may take to show a node the kernel just created.
+const NODE_APPEAR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait for the host's node for a device this agent just created, through its `/dev/input`
+/// bind (RH-07 #401, D9: no `mknod`, no removal: the directory is the host's), then prove
+/// this agent can open it. On a rootless engine the agent is the Quasar user, and only the
+/// input rule host preparation writes gives it that access.
 fn ensure_dev_node(path: &Path, maj: u32, min: u32) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let expected = libc::makedev(maj, min);
-            let is_expected_char_device =
-                meta.file_type().is_char_device() && meta.rdev() == expected;
-            if is_expected_char_device {
-                return Ok(());
+    wait_for_host_node(path, maj, min, NODE_APPEAR)
+}
+
+fn wait_for_host_node(path: &Path, maj: u32, min: u32, within: std::time::Duration) -> Result<()> {
+    let expected = libc::makedev(maj, min);
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_char_device() && meta.rdev() == expected => break,
+            Ok(_) => {
+                return Err(anyhow!(
+                    "{path:?} is not the host's input node {maj}:{min}; /dev/input must be the \
+                     host's directory, bind-mounted into the agent"
+                ))
             }
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove stale artifact at {path:?}"))?;
-            tracing::info!(
-                token = "vinput-stale-artifact-removed",
-                "removed stale non-device artifact at {path:?} (expected char device {maj}:{min})"
-            );
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("stat {path:?}")),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("stat {path:?}")),
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "the host's node {path:?} ({maj}:{min}) did not appear within {within:?}; \
+                 /dev/input must be the host's directory, bind-mounted into the agent"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    // The node appears before udev has applied host preparation's rule (the ACL and label
+    // land milliseconds later), so a refusal is retried until the same deadline.
+    loop {
+        match File::open(path) {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(anyhow!(
+                    "this agent cannot open its own input device {path:?}: install \
+                     Quasar's device rules (docs: Install, Device rules), which give the \
+                     Quasar user Quasar's own input devices"
+                ))
+            }
+            Err(e) => return Err(e).with_context(|| format!("open {path:?}")),
+        }
     }
-    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    // Character device, rw for owner+group (root in the dev image).
-    let mode = libc::S_IFCHR | 0o660;
-    let rc = unsafe { libc::mknod(cpath.as_ptr(), mode, libc::makedev(maj, min)) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("mknod {path:?} (c {maj}:{min})"));
-    }
-    tracing::debug!("mknod {path:?} (c {maj}:{min})");
-    Ok(())
 }
 
 /// Write a minimal **fake-udev** database record at `/run/udev/data/c<maj>:<min>`.
@@ -371,7 +443,7 @@ struct HeldInputs {
     keys: std::collections::BTreeSet<u16>,
     mouse_buttons: std::collections::BTreeSet<u16>,
     pad_buttons: std::collections::BTreeSet<u16>,
-    /// True when any trigger or stick was last written nonzero, so
+    /// True when any trigger, stick or d-pad hat was last written nonzero, so
     /// `drain_releases` knows to zero them.
     pad_analog_active: bool,
 }
@@ -441,7 +513,10 @@ impl HeldInputs {
             for &(_, abs_code) in PAD_AXES {
                 gamepad.push(ev(isys::EV_ABS as u16, abs_code, 0));
             }
-            for &(_, abs_code, _) in PAD_TRIGGERS {
+            for &(_, abs_code) in PAD_TRIGGERS {
+                gamepad.push(ev(isys::EV_ABS as u16, abs_code, 0));
+            }
+            for &(_, _, abs_code) in PAD_HATS {
                 gamepad.push(ev(isys::EV_ABS as u16, abs_code, 0));
             }
             self.pad_analog_active = false;
@@ -470,11 +545,18 @@ pub struct VirtualDevices {
     /// The devices' fake-udev records (`(major, minor)` + serialized body),
     /// exported for the app container via `export_udev_data`.
     udev_records: Vec<((u32, u32), String)>,
-    /// Where `export_udev_data` published the records (removed on Drop).
-    udev_export_dir: Mutex<Option<PathBuf>>,
+    /// `(runtime_dir, session_id)` once `export_udev_data` has published the
+    /// records — enough to find both the directory and its ownership marker
+    /// (see [`super::udev_export`]). `None` until published, or when publish was
+    /// skipped (foreign/unreadable marker). Retired explicitly by
+    /// [`Self::retire_udev_export`]; `Drop` is only the backstop.
+    udev_export_ids: Mutex<Option<(String, String)>>,
     /// Last gamepad snapshot, for state-on-change diffing (`gp` arrives at frame
     /// rate; only transitions are emitted).
     last_pad: Mutex<PadSnapshot>,
+    /// Held `BTN_DPAD_*` of a forwarded physical pad, folded onto the hat
+    /// (see `DpadHat`).
+    forwarded_dpad: Mutex<DpadHat>,
     /// Last absolute pointer position (output pixels) so `ma` can emit a delta on
     /// the relative virtual mouse. `None` until the first `ma` seeds it.
     last_abs: Mutex<Option<(f64, f64)>>,
@@ -484,6 +566,8 @@ pub struct VirtualDevices {
     /// messages; only the integer part is emitted. Lock covers only the
     /// accumulate+split arithmetic, not the uinput write.
     rel_accum: Mutex<(f64, f64)>,
+    /// Wheel remainders (vertical, horizontal); see `WheelAxis`.
+    wheel: Mutex<(WheelAxis, WheelAxis)>,
     /// Moonlight-style relative-mouse batching state. `None` when
     /// `QUASAR_INPUT_BATCH_MS=0` (per-arrival writes, no flush thread).
     rel_flush: Option<Arc<RelFlushState>>,
@@ -497,6 +581,58 @@ pub struct VirtualDevices {
 #[derive(Default)]
 struct PadSnapshot {
     buttons: Vec<bool>,
+}
+
+/// Held d-pad buttons of a forwarded physical pad. The virtual pad has only a
+/// hat d-pad (xpad's shape), so a pad reporting its d-pad as `BTN_DPAD_*`
+/// would otherwise lose it: uinput drops codes the device didn't declare.
+#[derive(Default)]
+struct DpadHat {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+}
+
+impl DpadHat {
+    /// Rewrite `BTN_DPAD_*` key events in one frame to `ABS_HAT0X/Y`; every
+    /// other event passes through unchanged and in order.
+    fn translate(&mut self, events: &[isys::input_event]) -> Vec<isys::input_event> {
+        events
+            .iter()
+            .map(|e| {
+                if e.type_ != isys::EV_KEY as u16 {
+                    return *e;
+                }
+                let held = e.value != 0;
+                let (axis, value) = match e.code as i32 {
+                    isys::BTN_DPAD_UP => {
+                        self.up = held;
+                        (isys::ABS_HAT0Y, self.down as i32 - self.up as i32)
+                    }
+                    isys::BTN_DPAD_DOWN => {
+                        self.down = held;
+                        (isys::ABS_HAT0Y, self.down as i32 - self.up as i32)
+                    }
+                    isys::BTN_DPAD_LEFT => {
+                        self.left = held;
+                        (isys::ABS_HAT0X, self.right as i32 - self.left as i32)
+                    }
+                    isys::BTN_DPAD_RIGHT => {
+                        self.right = held;
+                        (isys::ABS_HAT0X, self.right as i32 - self.left as i32)
+                    }
+                    _ => return *e,
+                };
+                isys::input_event {
+                    type_: isys::EV_ABS as u16,
+                    code: axis as u16,
+                    value,
+                    ..*e
+                }
+            })
+            .collect()
+    }
 }
 
 impl VirtualDevices {
@@ -558,45 +694,85 @@ impl VirtualDevices {
             mouse_path,
             gamepad_path,
             udev_records,
-            udev_export_dir: Mutex::new(None),
+            udev_export_ids: Mutex::new(None),
             last_pad: Mutex::new(PadSnapshot::default()),
+            forwarded_dpad: Mutex::new(DpadHat::default()),
             last_abs: Mutex::new(None),
             rel_accum: Mutex::new((0.0, 0.0)),
+            wheel: Mutex::new((WheelAxis::default(), WheelAxis::default())),
             rel_flush,
             flush_thread,
             held: Mutex::new(HeldInputs::default()),
         })
     }
 
-    /// Publish this session's fake-udev records into `dir` (see `udev_export_dir`)
-    /// so the app container can bind-mount them at `/run/udev/data`: SDL/Steam
-    /// enumerate devices via libudev, not by scanning `/dev/input`, so without
-    /// this the `--device`-passed gamepad is silently absent in games.
-    /// World-readable (0755/0644): app containers run as arbitrary non-root UIDs.
-    pub fn export_udev_data(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("open perms on {}", dir.display()))?;
-        for ((maj, min), body) in &self.udev_records {
-            let path = dir.join(format!("c{maj}:{min}"));
-            std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-                .with_context(|| format!("open perms on {}", path.display()))?;
+    /// Publish this session's fake-udev records under `runtime_dir` (see
+    /// [`udev_export_dir`]) so the app container can bind-mount them at
+    /// `/run/udev/data`: SDL/Steam enumerate devices via libudev, not by scanning
+    /// `/dev/input`, so without this the `--device`-passed gamepad is silently
+    /// absent in games. World-readable (0755/0644): app containers run as
+    /// arbitrary non-root UIDs.
+    ///
+    /// Ownership-marked: records the export's `(runtime_dir, session_id)` only
+    /// once `publish` returns `Ok(Some(_))`. A publish that fails after its
+    /// marker/directory already exist on disk leaves both in place with no
+    /// in-process record to reclaim them — the boot sweep
+    /// ([`super::udev_export::retire_all_owned`]) is what cleans those up, not
+    /// [`Self::retire_udev_export`] / `Drop`.
+    pub fn export_udev_data(&self, runtime_dir: &str, session_id: &str) -> Result<()> {
+        let owner = crate::container_ownership::token().map_err(|e| anyhow!("owner token: {e}"))?;
+        let published =
+            super::udev_export::publish(runtime_dir, session_id, &owner, &self.udev_records)?;
+        if published.is_some() {
+            *self
+                .udev_export_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((runtime_dir.to_string(), session_id.to_string()));
         }
-        *self.udev_export_dir.lock().unwrap() = Some(dir.to_path_buf());
         Ok(())
+    }
+
+    /// Idempotent explicit retirement of this session's udev export, called from
+    /// session teardown once the app container's bind mount is confirmed gone —
+    /// see `session::host::SessionHost::teardown`. `Drop` calls the same path as
+    /// a backstop only: `VirtualDevices` is Arc-cloned into GStreamer signal
+    /// closures, so its `Drop` timing is not teardown timing.
+    pub fn retire_udev_export(&self) {
+        let ids = self
+            .udev_export_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((runtime_dir, session_id)) = ids {
+            if let Err(e) = super::udev_export::retire(&runtime_dir, &session_id) {
+                tracing::warn!(
+                    token = "udev-export-retire-failed",
+                    session = %session_id,
+                    "retire udev export dir failed: {e:#}"
+                );
+            }
+        }
+    }
+
+    /// Disarm the in-process retire when the app container's stop went unconfirmed: the
+    /// dir and its marker are then left for the boot sweep, and the `Drop` backstop must
+    /// not remove them early.
+    pub fn abandon_udev_export(&self) {
+        self.udev_export_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     fn create_keyboard(tag: &str) -> Result<UInputHandle<File>> {
         let h = open_uinput()?;
         h.set_evbit(EventKind::Key)?;
         h.set_evbit(EventKind::Synchronize)?;
-        // Every key, but NOT buttons: exposing BTN_GAMEPAD/BTN_MOUSE would
-        // misclassify this device in libinput.
-        for key in <Key as input_linux::enum_iterator::IterableEnum>::iter() {
-            if key.is_key() {
-                let _ = h.set_keybit(key);
-            }
+        // Every key, but NOT buttons (exposing BTN_GAMEPAD/BTN_MOUSE would
+        // misclassify this device in libinput), and never a key the HOST acts on.
+        for key in keyboard_keys() {
+            let _ = h.set_keybit(key);
         }
         let name = device_name("Keyboard", tag);
         h.create(&input_id(0x0001), name.as_bytes(), 0, &[])?;
@@ -639,15 +815,15 @@ impl VirtualDevices {
         h.set_evbit(EventKind::Key)?;
         h.set_evbit(EventKind::Absolute)?;
         h.set_evbit(EventKind::Synchronize)?;
+        // Exactly xpad's key set: no BTN_TL2/TR2 and no BTN_DPAD_*. SDL numbers
+        // buttons by key-code order, so any extra bit shifts the indices its
+        // Xbox 360 mapping expects (back/start/guide would land one off).
         for &(_, code) in PAD_BUTTONS.iter() {
             // set_keybit wants a typed Key; the codes are all valid BTN_* values.
             if let Some(key) = key_from_code(code) {
                 h.set_keybit(key)?;
             }
         }
-        // Trigger digital fallbacks (W3C exposes triggers as buttons 6/7).
-        h.set_keybit(Key::ButtonTL2)?;
-        h.set_keybit(Key::ButtonTR2)?;
 
         let stick = AbsoluteInfo {
             value: 0,
@@ -661,6 +837,14 @@ impl VirtualDevices {
             value: 0,
             minimum: TRIGGER_MIN,
             maximum: TRIGGER_MAX,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        };
+        let hat = AbsoluteInfo {
+            value: 0,
+            minimum: -1,
+            maximum: 1,
             fuzz: 0,
             flat: 0,
             resolution: 0,
@@ -690,12 +874,28 @@ impl VirtualDevices {
                 axis: AbsoluteAxis::RZ,
                 info: trigger,
             },
+            // D-pad as a hat, as xpad reports it (SDL's mapping reads `h0.*`).
+            AbsoluteInfoSetup {
+                axis: AbsoluteAxis::Hat0X,
+                info: hat,
+            },
+            AbsoluteInfoSetup {
+                axis: AbsoluteAxis::Hat0Y,
+                info: hat,
+            },
         ];
         for s in &abs {
             h.set_absbit(s.axis)?;
         }
-        let name = device_name("Gamepad", tag);
-        h.create(&input_id(0x0003), name.as_bytes(), 0, &abs)?;
+        // Best-effort: `phys` is only a label, and must never cost the session
+        // its input devices (`VirtualDevices::create` failing ends the launch).
+        if let Err(e) = set_phys(&h, &gamepad_phys(tag)) {
+            tracing::warn!(
+                token = "vinput-set-phys-failed",
+                "gamepad phys not set (device still created): {e:#}"
+            );
+        }
+        h.create(&gamepad_input_id(), GAMEPAD_NAME.as_bytes(), 0, &abs)?;
         Ok(h)
     }
 
@@ -819,39 +1019,21 @@ impl VirtualDevices {
         Ok(())
     }
 
-    /// Scroll (hi-res wheel units). `dy` is vertical, `dx` horizontal.
+    /// Scroll (hi-res wheel units, 120 per detent). `dy` is vertical, `dx`
+    /// horizontal, both in the browser's `WheelEvent` sense (`protocol/input.md`):
+    /// positive `dy` scrolls the content down. evdev's `REL_WHEEL` is the
+    /// opposite (positive = wheel rolled away from the user = scroll up), so
+    /// the vertical axis is negated here; forwarding it as-is inverted scrolling
+    /// in every app (issue #350). Horizontal already agrees (positive = right).
     pub fn scroll(&self, dx: f64, dy: f64) -> Result<()> {
-        let mut evs = Vec::with_capacity(5);
-        if dy != 0.0 {
-            // Hi-res wheel is in 1/120 of a detent; also emit a coarse notch so
-            // clients that only read REL_WHEEL still scroll.
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_WHEEL_HI_RES as u16,
-                dy.round() as i32,
-            ));
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_WHEEL as u16,
-                (dy / 120.0).round() as i32,
-            ));
-        }
-        if dx != 0.0 {
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_HWHEEL_HI_RES as u16,
-                dx.round() as i32,
-            ));
-            evs.push(ev(
-                isys::EV_REL as u16,
-                isys::REL_HWHEEL as u16,
-                (dx / 120.0).round() as i32,
-            ));
-        }
+        let evs = {
+            let mut wheel = self.wheel.lock().unwrap();
+            let (v, h) = &mut *wheel;
+            scroll_events(v, h, dx, dy)
+        };
         if evs.is_empty() {
             return Ok(());
         }
-        evs.push(syn());
         self.mouse.write(&evs).context("write scroll")?;
         Ok(())
     }
@@ -870,19 +1052,22 @@ impl VirtualDevices {
                 evs.push(ev(isys::EV_KEY as u16, code, pressed as i32));
             }
         }
-        // Triggers (W3C buttons 6/7) -> ABS_Z/ABS_RZ + digital fallback.
-        for &(idx, abs_code, btn_code) in PAD_TRIGGERS.iter() {
+        // Triggers (W3C buttons 6/7) -> ABS_Z/ABS_RZ (analog only, as xpad).
+        for &(idx, abs_code) in PAD_TRIGGERS.iter() {
             let v = buttons.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let was = last.buttons.get(idx).copied().unwrap_or(false);
-            let pressed = v >= 0.5;
             evs.push(ev(
                 isys::EV_ABS as u16,
                 abs_code,
                 (v * TRIGGER_MAX as f64).round() as i32,
             ));
-            if pressed != was {
-                evs.push(ev(isys::EV_KEY as u16, btn_code, pressed as i32));
-            }
+        }
+        // D-pad (W3C buttons 12-15) -> ABS_HAT0X/HAT0Y.
+        for &(neg, pos, abs_code) in PAD_HATS.iter() {
+            evs.push(ev(
+                isys::EV_ABS as u16,
+                abs_code,
+                hat_value(buttons, neg, pos),
+            ));
         }
         // Sticks (W3C axes 0..=3) -> ABS_X/Y/RX/RY, scaled to signed 16-bit.
         for &(idx, abs_code) in PAD_AXES.iter() {
@@ -905,20 +1090,16 @@ impl VirtualDevices {
                     held.note_pad_button(code, pressed);
                 }
             }
-            for &(idx, _, btn_code) in PAD_TRIGGERS.iter() {
-                let pressed = buttons.get(idx).copied().unwrap_or(0.0) >= 0.5;
-                let was = last.buttons.get(idx).copied().unwrap_or(false);
-                if pressed != was {
-                    held.note_pad_button(btn_code, pressed);
-                }
-            }
             let any_trigger = PAD_TRIGGERS
                 .iter()
-                .any(|&(idx, _, _)| buttons.get(idx).copied().unwrap_or(0.0) != 0.0);
+                .any(|&(idx, _)| buttons.get(idx).copied().unwrap_or(0.0) != 0.0);
             let any_stick = PAD_AXES
                 .iter()
                 .any(|&(idx, _)| axes.get(idx).copied().unwrap_or(0.0) != 0.0);
-            held.note_pad_analog(any_trigger || any_stick);
+            let any_hat = PAD_HATS
+                .iter()
+                .any(|&(neg, pos, _)| hat_value(buttons, neg, pos) != 0);
+            held.note_pad_analog(any_trigger || any_stick || any_hat);
         }
 
         last.buttons = (0..buttons.len()).map(|i| buttons[i] >= 0.5).collect();
@@ -961,9 +1142,13 @@ impl VirtualDevices {
     /// Forward a physical controller's already-framed evdev events into the
     /// session gamepad. Linux gamepads use the same BTN_*/ABS_* event ABI as the
     /// virtual Xbox-style device, so no Wayland/compositor path is involved.
+    ///
+    /// Codes the virtual pad doesn't declare are dropped by uinput; `BTN_DPAD_*`
+    /// is the one worth keeping, so it is folded onto the hat first.
     pub fn forward_gamepad_frame(&self, events: &[isys::input_event]) -> Result<()> {
+        let events = self.forwarded_dpad.lock().unwrap().translate(events);
         self.gamepad
-            .write(events)
+            .write(&events)
             .map(|_| ())
             .context("forward physical gamepad frame")
     }
@@ -998,8 +1183,52 @@ impl VirtualDevices {
         // Drop the fractional remainder so it doesn't bias motion in the next
         // app/session, then flush any pending batched motion so it isn't lost.
         *self.rel_accum.lock().unwrap() = (0.0, 0.0);
+        *self.wheel.lock().unwrap() = (WheelAxis::default(), WheelAxis::default());
         self.flush_pending_rel();
         Ok(())
+    }
+}
+
+/// Exclusive hold (`EVIOCGRAB`) on one of this process's own evdev nodes
+/// (a `VirtualDevices::{keyboard,mouse,gamepad}_path`). While held, the kernel
+/// delivers that device's events only to this fd — not to the host's VT
+/// keyboard handler or any other reader — which matters for callers that write
+/// real events outside a session (the vinput self-test / input probe run at
+/// agent start, with nothing else holding these nodes). Not used on the
+/// in-session path: there the compositor's own libinput open is the intended
+/// exclusive reader, and this would race it.
+///
+/// Grab is per-open-fd; dropping (closing the fd) releases it, so there is no
+/// explicit ungrab.
+// Held only for Drop's close(); never read directly (RAII holder, like
+// `session::console_hotplug::ConsoleHotplugWatcher`).
+#[allow(dead_code)]
+pub struct ExclusiveGrab(input_linux::EvdevHandle<File>);
+
+impl ExclusiveGrab {
+    /// Open `path` and take an exclusive `EVIOCGRAB`. Fails if the node can't
+    /// be opened or is already grabbed — callers must not write to the device
+    /// on error (see `write_if_grabbed` in `main.rs`).
+    pub fn take(path: &Path) -> Result<Self> {
+        let f = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .with_context(|| format!("open {} for exclusive grab", path.display()))?;
+        let handle = input_linux::EvdevHandle::new(f);
+        handle
+            .grab(true)
+            .with_context(|| format!("EVIOCGRAB {}", path.display()))?;
+        Ok(Self(handle))
+    }
+}
+
+impl super::teardown::UdevExport for VirtualDevices {
+    fn retire(&self) {
+        self.retire_udev_export();
+    }
+
+    fn abandon(&self) {
+        self.abandon_udev_export();
     }
 }
 
@@ -1014,10 +1243,78 @@ impl Drop for VirtualDevices {
         if let Some(thread) = self.flush_thread.take() {
             let _ = thread.join();
         }
-        if let Some(dir) = self.udev_export_dir.lock().unwrap().take() {
-            let _ = std::fs::remove_dir_all(dir);
+        // Reading a poisoned lock here is safer than aborting during unwinding.
+        self.retire_udev_export();
+    }
+}
+
+/// Hi-res wheel units per detent (the kernel's `REL_WHEEL_HI_RES` convention).
+const WHEEL_DETENT: i32 = 120;
+
+/// One wheel axis's carried state. uinput wheel values are integers, and a
+/// browser sends fractions of a detent (Firefox pixel mode is ~40-60 units a
+/// notch; touch scroll is fractional). `frac` carries the sub-unit remainder of
+/// the hi-res value; `partial` carries hi-res units not yet worth a whole
+/// `REL_WHEEL` detent, so the coarse axis always agrees with the hi-res sum
+/// (as the kernel expects) instead of rounding each message to 0 on its own.
+#[derive(Default)]
+struct WheelAxis {
+    frac: f64,
+    partial: i32,
+}
+
+impl WheelAxis {
+    /// Add `delta` (hi-res units, evdev sign) and return the `(hi_res,
+    /// detents)` to emit now. A direction change drops the partial detent, as
+    /// hid-input does, so a reversal never has to cancel the old direction first.
+    fn step(&mut self, delta: f64) -> (i32, i32) {
+        let total = self.frac + delta;
+        let hi = total.trunc() as i32;
+        self.frac = total - hi as f64;
+        if hi == 0 {
+            return (0, 0);
+        }
+        if self.partial != 0 && (self.partial > 0) != (hi > 0) {
+            self.partial = 0;
+        }
+        self.partial += hi;
+        let detents = self.partial / WHEEL_DETENT;
+        self.partial -= detents * WHEEL_DETENT;
+        (hi, detents)
+    }
+}
+
+/// The evdev frame for one `ms` message (wire sign → evdev sign, see
+/// [`VirtualDevices::scroll`]), `SYN_REPORT`-terminated; empty when the
+/// message adds up to less than one hi-res unit on both axes. Pure, so the
+/// sign and accumulation are unit-testable without uinput.
+fn scroll_events(
+    vertical: &mut WheelAxis,
+    horizontal: &mut WheelAxis,
+    dx: f64,
+    dy: f64,
+) -> Vec<isys::input_event> {
+    let mut evs = Vec::with_capacity(5);
+    let axes = [
+        (vertical.step(-dy), isys::REL_WHEEL_HI_RES, isys::REL_WHEEL),
+        (
+            horizontal.step(dx),
+            isys::REL_HWHEEL_HI_RES,
+            isys::REL_HWHEEL,
+        ),
+    ];
+    for ((hi, detents), hi_code, code) in axes {
+        if hi != 0 {
+            evs.push(ev(isys::EV_REL as u16, hi_code as u16, hi));
+        }
+        if detents != 0 {
+            evs.push(ev(isys::EV_REL as u16, code as u16, detents));
         }
     }
+    if !evs.is_empty() {
+        evs.push(syn());
+    }
+    evs
 }
 
 /// Scale a W3C axis value (-1.0..=1.0) onto signed 16-bit stick range.
@@ -1029,30 +1326,48 @@ fn scale_stick(v: f64) -> i32 {
     }
 }
 
-/// W3C Standard Gamepad button index → evdev BTN_* code (digital buttons).
+/// W3C Standard Gamepad button index → evdev BTN_* code (digital buttons),
+/// in the `xpad` convention the Xbox 360 identity promises (`gamepad_input_id`).
+/// xpad emits `BTN_X`/`BTN_Y` for the Xbox X/Y buttons, and those alias
+/// `BTN_NORTH`/`BTN_WEST`: the *positional* reading of the names
+/// (`Documentation/input/gamepad.rst`) is the opposite, and following it is
+/// what swapped X and Y in Steam (issue #348). Do not "correct" these two.
 const PAD_BUTTONS: &[(usize, u16)] = &[
-    (0, isys::BTN_SOUTH as u16),       // A
-    (1, isys::BTN_EAST as u16),        // B
-    (2, isys::BTN_WEST as u16),        // X
-    (3, isys::BTN_NORTH as u16),       // Y
-    (4, isys::BTN_TL as u16),          // LB
-    (5, isys::BTN_TR as u16),          // RB
-    (8, isys::BTN_SELECT as u16),      // Back/View
-    (9, isys::BTN_START as u16),       // Start/Menu
-    (10, isys::BTN_THUMBL as u16),     // L3
-    (11, isys::BTN_THUMBR as u16),     // R3
-    (12, isys::BTN_DPAD_UP as u16),    // Dpad up
-    (13, isys::BTN_DPAD_DOWN as u16),  // Dpad down
-    (14, isys::BTN_DPAD_LEFT as u16),  // Dpad left
-    (15, isys::BTN_DPAD_RIGHT as u16), // Dpad right
-    (16, isys::BTN_MODE as u16),       // Guide
+    (0, isys::BTN_SOUTH as u16),   // A     (BTN_A)
+    (1, isys::BTN_EAST as u16),    // B     (BTN_B)
+    (2, isys::BTN_NORTH as u16),   // X     (BTN_X, as xpad)
+    (3, isys::BTN_WEST as u16),    // Y     (BTN_Y, as xpad)
+    (4, isys::BTN_TL as u16),      // LB
+    (5, isys::BTN_TR as u16),      // RB
+    (8, isys::BTN_SELECT as u16),  // Back/View
+    (9, isys::BTN_START as u16),   // Start/Menu
+    (10, isys::BTN_THUMBL as u16), // L3
+    (11, isys::BTN_THUMBR as u16), // R3
+    (16, isys::BTN_MODE as u16),   // Guide
 ];
 
-/// W3C trigger button index → (ABS axis code, digital BTN_* fallback).
-const PAD_TRIGGERS: &[(usize, u16, u16)] = &[
-    (6, isys::ABS_Z as u16, isys::BTN_TL2 as u16),  // LT
-    (7, isys::ABS_RZ as u16, isys::BTN_TR2 as u16), // RT
+/// W3C trigger button index → ABS axis code. Analog only: xpad has no digital
+/// trigger buttons, and adding BTN_TL2/TR2 would shift SDL's button indices.
+const PAD_TRIGGERS: &[(usize, u16)] = &[
+    (6, isys::ABS_Z as u16),  // LT
+    (7, isys::ABS_RZ as u16), // RT
 ];
+
+/// D-pad: (W3C negative-direction button, positive-direction button, hat
+/// axis). xpad reports the d-pad as `ABS_HAT0X`/`HAT0Y` (-1/0/1), up and left
+/// negative.
+const PAD_HATS: &[(usize, usize, u16)] = &[
+    (14, 15, isys::ABS_HAT0X as u16), // left / right
+    (12, 13, isys::ABS_HAT0Y as u16), // up / down
+];
+
+/// Hat axis value from a pair of opposing W3C d-pad buttons. Both held (a
+/// worn pad, or a remapped keyboard) cancel to centred rather than favouring
+/// one side.
+fn hat_value(buttons: &[f64], neg: usize, pos: usize) -> i32 {
+    let held = |i: usize| buttons.get(i).is_some_and(|v| *v >= 0.5);
+    held(pos) as i32 - held(neg) as i32
+}
 
 /// W3C axis index → evdev ABS axis code (sticks).
 const PAD_AXES: &[(usize, u16)] = &[
@@ -1062,24 +1377,228 @@ const PAD_AXES: &[(usize, u16)] = &[
     (3, isys::ABS_RY as u16), // right stick Y
 ];
 
+/// Keys the virtual keyboard never declares, because the HOST acts on them. This
+/// device is a real keyboard to the host kernel: its console handlers (`kbd`,
+/// `sysrq`) and logind attach to every keyboard, so a declared SysRq would give a
+/// session the host's Magic SysRq (reboot, crash), and a power, sleep or radio key
+/// would reach logind and rfkill. The input core drops events for undeclared keys, so
+/// leaving them out closes that path whatever the client sends. No game needs them.
+const HOST_ONLY_KEYS: &[Key] = &[
+    Key::Sysrq,
+    Key::Power,
+    Key::Power2,
+    Key::Sleep,
+    Key::Suspend,
+    Key::Wakeup,
+    Key::Rfkill,
+    Key::WLAN,
+    Key::Bluetooth,
+    Key::WWAN,
+    Key::UWB,
+];
+
+/// The keys the virtual keyboard declares: every key, no buttons, no host-only key.
+fn keyboard_keys() -> impl Iterator<Item = Key> {
+    <Key as input_linux::enum_iterator::IterableEnum>::iter()
+        .filter(|k| k.is_key() && !HOST_ONLY_KEYS.contains(k))
+}
+
 /// Map a raw BTN_* code to the typed `Key` needed for `set_keybit`.
 fn key_from_code(code: u16) -> Option<Key> {
     <Key as input_linux::enum_iterator::IterableEnum>::iter().find(|k| *k as u16 == code)
 }
 
+/// Real-kernel uinput tests, `#[ignore]`d (`make test-uinput`).
+#[cfg(test)]
+mod uinput_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security: a session's keyboard never declares a key the host acts on (Magic
+    /// SysRq, power, sleep, radio), so the host kernel and logind never see one.
+    #[test]
+    fn the_virtual_keyboard_declares_no_key_the_host_acts_on() {
+        let declared: Vec<Key> = keyboard_keys().collect();
+        for key in HOST_ONLY_KEYS {
+            assert!(!declared.contains(key), "{key:?} is declared");
+        }
+        assert!(!declared.iter().any(|k| *k as u16 == 99), "KEY_SYSRQ");
+        assert!(declared.contains(&Key::A) && declared.contains(&Key::LeftAlt));
+        assert!(!declared.iter().any(|k| !k.is_key()), "no buttons");
+    }
+
+    /// #401: the host's node is waited for, never made or removed.
+    #[test]
+    fn a_host_node_is_waited_for_and_never_made_or_removed() {
+        let short = std::time::Duration::from_millis(60);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("event42");
+        let err = wait_for_host_node(&missing, 13, 106, short).unwrap_err();
+        assert!(err.to_string().contains("did not appear"), "{err}");
+        assert!(!missing.exists(), "nothing is created");
+
+        let artifact = dir.path().join("event43");
+        std::fs::write(&artifact, b"x").unwrap();
+        let err = wait_for_host_node(&artifact, 13, 107, short).unwrap_err();
+        assert!(
+            err.to_string().contains("not the host's input node"),
+            "{err}"
+        );
+        assert!(artifact.exists(), "nothing on the host's side is removed");
+
+        // A real character device with the right numbers: /dev/null stands in.
+        let null = Path::new("/dev/null");
+        let rdev = std::fs::metadata(null).unwrap().rdev();
+        let (maj, min) = (libc::major(rdev), libc::minor(rdev));
+        wait_for_host_node(null, maj, min, short).unwrap();
+        assert!(wait_for_host_node(null, maj, min + 1, short).is_err());
+    }
 
     #[test]
     fn device_names_are_session_tagged_and_unique() {
         let a = "sess-a";
         let b = "sess-b";
-        for kind in ["Keyboard", "Mouse", "Gamepad"] {
+        for kind in ["Keyboard", "Mouse"] {
             assert!(device_name(kind, a).contains(a));
             assert!(device_name(kind, a).contains(kind));
             assert_ne!(device_name(kind, a), device_name(kind, b));
         }
+        // The gamepad carries its tag in `phys` instead of the name.
+        assert!(gamepad_phys(a).contains(a));
+        assert_ne!(gamepad_phys(a), gamepad_phys(b));
+    }
+
+    /// uinput rejects a name of `UINPUT_MAX_NAME_SIZE` (80, NUL included) or
+    /// more, and the tag is a session UUID.
+    #[test]
+    fn session_tagged_device_names_fit_uinput() {
+        let tag = "00000000-0000-0000-0000-000000000000";
+        for kind in ["Keyboard", "Mouse"] {
+            assert!(device_name(kind, tag).len() < 80);
+        }
+        assert!(GAMEPAD_NAME.len() < 80);
+    }
+
+    /// The request number must be the kernel's `UI_SET_PHYS`
+    /// (`_IOW('U', 108, char *)`), not input_linux's 1-byte variant.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn ui_set_phys_matches_the_kernel_request_number() {
+        assert_eq!(UI_SET_PHYS, 0x4008_556c);
+        // input_linux's `ui_set_phys` sizes the argument as one byte.
+        assert_ne!(UI_SET_PHYS, 0x4001_556c);
+    }
+
+    /// The gamepad name is stable across sessions (SDL folds it into the
+    /// controller GUID) and keeps the prefix `physical_input` excludes by.
+    #[test]
+    fn gamepad_name_is_stable_and_excluded_from_physical_grab() {
+        assert!(GAMEPAD_NAME.contains("Quasar Virtual"));
+        assert!(!GAMEPAD_NAME.contains('['), "no session tag in the name");
+    }
+
+    /// Issue #348: each W3C button lands on the evdev code xpad emits for it.
+    /// X/Y in particular are BTN_NORTH/BTN_WEST (== BTN_X/BTN_Y), not the
+    /// positional reading, or SDL/Steam swap them.
+    #[test]
+    fn pad_buttons_follow_xpad_codes() {
+        let expect: &[(usize, u16)] = &[
+            (0, isys::BTN_A as u16),
+            (1, isys::BTN_B as u16),
+            (2, isys::BTN_X as u16),
+            (3, isys::BTN_Y as u16),
+            (4, isys::BTN_TL as u16),
+            (5, isys::BTN_TR as u16),
+            (8, isys::BTN_SELECT as u16),
+            (9, isys::BTN_START as u16),
+            (10, isys::BTN_THUMBL as u16),
+            (11, isys::BTN_THUMBR as u16),
+            (16, isys::BTN_MODE as u16),
+        ];
+        assert_eq!(PAD_BUTTONS, expect);
+        assert_eq!(isys::BTN_X, isys::BTN_NORTH);
+        assert_eq!(isys::BTN_Y, isys::BTN_WEST);
+        assert_eq!(
+            PAD_TRIGGERS,
+            &[(6, isys::ABS_Z as u16), (7, isys::ABS_RZ as u16)]
+        );
+        assert_eq!(
+            PAD_AXES,
+            &[
+                (0, isys::ABS_X as u16),
+                (1, isys::ABS_Y as u16),
+                (2, isys::ABS_RX as u16),
+                (3, isys::ABS_RY as u16),
+            ]
+        );
+    }
+
+    /// SDL numbers a Linux joystick's buttons in key-code order and its Xbox 360
+    /// mapping reads `a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,
+    /// back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10`. The key set the
+    /// device exposes must reproduce exactly that order.
+    #[test]
+    fn pad_key_order_matches_sdl_xbox360_mapping() {
+        let mut codes: Vec<(u16, usize)> = PAD_BUTTONS.iter().map(|&(i, c)| (c, i)).collect();
+        codes.sort();
+        let w3c_by_sdl_index: Vec<usize> = codes.into_iter().map(|(_, i)| i).collect();
+        // A, B, X, Y, LB, RB, Back, Start, Guide, L3, R3
+        assert_eq!(w3c_by_sdl_index, vec![0, 1, 2, 3, 4, 5, 8, 9, 16, 10, 11]);
+    }
+
+    /// A forwarded pad's `BTN_DPAD_*` become hat events carrying the combined
+    /// state of both directions on the axis; other events pass through.
+    #[test]
+    fn forwarded_dpad_buttons_become_hat_events() {
+        let key = |code: i32, value: i32| ev(isys::EV_KEY as u16, code as u16, value);
+        let mut d = DpadHat::default();
+
+        let out = d.translate(&[key(isys::BTN_DPAD_LEFT, 1), syn()]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            (out[0].type_, out[0].code, out[0].value),
+            (isys::EV_ABS as u16, isys::ABS_HAT0X as u16, -1)
+        );
+        assert_eq!(out[1].type_, isys::EV_SYN as u16, "SYN passes through");
+
+        let out = d.translate(&[key(isys::BTN_DPAD_RIGHT, 1)]);
+        assert_eq!(out[0].value, 0, "left+right cancel");
+        let out = d.translate(&[key(isys::BTN_DPAD_LEFT, 0)]);
+        assert_eq!(out[0].value, 1, "right alone after left released");
+
+        let out = d.translate(&[key(isys::BTN_DPAD_UP, 1)]);
+        assert_eq!((out[0].code, out[0].value), (isys::ABS_HAT0Y as u16, -1));
+
+        let out = d.translate(&[key(isys::BTN_SOUTH, 1)]);
+        assert_eq!(
+            (out[0].type_, out[0].code, out[0].value),
+            (isys::EV_KEY as u16, isys::BTN_SOUTH as u16, 1),
+            "non-dpad keys untouched"
+        );
+    }
+
+    /// D-pad buttons fold onto the hat: up/left negative, opposing presses
+    /// cancel, missing indices read as released.
+    #[test]
+    fn dpad_buttons_map_to_hat() {
+        let mut b = vec![0.0; 17];
+        assert_eq!(hat_value(&b, 12, 13), 0);
+        b[12] = 1.0;
+        assert_eq!(hat_value(&b, 12, 13), -1, "up");
+        b[13] = 1.0;
+        assert_eq!(hat_value(&b, 12, 13), 0, "up+down cancel");
+        b[12] = 0.0;
+        assert_eq!(hat_value(&b, 12, 13), 1, "down");
+        assert_eq!(hat_value(&[], 14, 15), 0, "short button array");
+        assert_eq!(
+            PAD_HATS,
+            &[
+                (14, 15, isys::ABS_HAT0X as u16),
+                (12, 13, isys::ABS_HAT0Y as u16),
+            ]
+        );
     }
 
     /// Press-then-release leaves nothing held; a second drain is empty.
@@ -1151,7 +1670,10 @@ mod tests {
             .iter()
             .filter(|e| e.type_ == isys::EV_ABS as u16)
             .collect();
-        assert_eq!(abs_zeros.len(), PAD_AXES.len() + PAD_TRIGGERS.len());
+        assert_eq!(
+            abs_zeros.len(),
+            PAD_AXES.len() + PAD_TRIGGERS.len() + PAD_HATS.len()
+        );
         assert!(abs_zeros.iter().all(|e| e.value == 0));
 
         let r2 = h.drain_releases();
@@ -1173,6 +1695,83 @@ mod tests {
         assert!(
             abs_events.is_empty(),
             "no ABS zeroes when analog was never active"
+        );
+    }
+
+    /// Collapse a scroll frame to `(code, value)` pairs, SYN excluded.
+    fn rel(evs: &[isys::input_event]) -> Vec<(i32, i32)> {
+        evs.iter()
+            .filter(|e| e.type_ == isys::EV_REL as u16)
+            .map(|e| (e.code as i32, e.value))
+            .collect()
+    }
+
+    /// Issue #350: a browser scroll-down (positive deltaY) must reach evdev as
+    /// a negative wheel value; horizontal keeps its sign.
+    #[test]
+    fn scroll_down_is_negative_wheel_and_horizontal_keeps_sign() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        let evs = scroll_events(&mut v, &mut h, 0.0, 120.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_WHEEL_HI_RES, -120), (isys::REL_WHEEL, -1)]
+        );
+        assert_eq!(evs.last().unwrap().type_, isys::EV_SYN as u16);
+
+        let evs = scroll_events(&mut v, &mut h, 0.0, -120.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_WHEEL_HI_RES, 120), (isys::REL_WHEEL, 1)],
+            "scroll up = wheel away from the user = positive"
+        );
+
+        let evs = scroll_events(&mut v, &mut h, 120.0, 0.0);
+        assert_eq!(
+            rel(&evs),
+            vec![(isys::REL_HWHEEL_HI_RES, 120), (isys::REL_HWHEEL, 1)]
+        );
+    }
+
+    /// Small deltas (Firefox pixel mode, ~48 a notch) accumulate into whole
+    /// detents instead of each rounding to 0, and REL_WHEEL always matches the
+    /// hi-res sum.
+    #[test]
+    fn small_scroll_deltas_accumulate_into_detents() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        let mut hi_sum = 0;
+        let mut detents = 0;
+        for _ in 0..5 {
+            for (code, value) in rel(&scroll_events(&mut v, &mut h, 0.0, 48.0)) {
+                if code == isys::REL_WHEEL_HI_RES {
+                    hi_sum += value;
+                } else if code == isys::REL_WHEEL {
+                    detents += value;
+                }
+            }
+        }
+        assert_eq!(hi_sum, -240);
+        assert_eq!(detents, -2, "240 hi-res units = 2 detents, none dropped");
+    }
+
+    /// Fractional deltas carry their remainder; reversing direction drops the
+    /// partial detent so the first notch the other way is not swallowed.
+    #[test]
+    fn scroll_carries_fractions_and_resets_on_reversal() {
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        assert!(scroll_events(&mut v, &mut h, 0.0, 0.4).is_empty());
+        assert!(scroll_events(&mut v, &mut h, 0.0, 0.4).is_empty());
+        assert_eq!(
+            rel(&scroll_events(&mut v, &mut h, 0.0, 0.4)),
+            vec![(isys::REL_WHEEL_HI_RES, -1)],
+            "0.4 x 3 reaches one hi-res unit"
+        );
+
+        let (mut v, mut h) = (WheelAxis::default(), WheelAxis::default());
+        scroll_events(&mut v, &mut h, 0.0, 100.0); // 100 down, no detent yet
+        assert_eq!(
+            rel(&scroll_events(&mut v, &mut h, 0.0, -120.0)),
+            vec![(isys::REL_WHEEL_HI_RES, 120), (isys::REL_WHEEL, 1)],
+            "a full notch up after a partial down is a full detent up"
         );
     }
 

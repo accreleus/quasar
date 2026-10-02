@@ -287,21 +287,24 @@ type Job struct {
 
 // Run is a `job_runs` row.
 type Run struct {
-	ID           string
-	JobID        string
-	HostID       string // "" when NULL
-	State        State
-	Trigger      Trigger
-	ActorUserID  string // "" when NULL
-	Attempt      int
-	ScheduledFor time.Time
-	ClaimedAt    *time.Time
-	StartedAt    *time.Time
-	FinishedAt   *time.Time
-	Params       json.RawMessage
-	Summary      json.RawMessage
-	Error        string
-	CreatedAt    time.Time
+	ID                      string
+	JobID                   string
+	HostID                  string // "" when NULL
+	State                   State
+	Trigger                 Trigger
+	ActorUserID             string // "" when NULL
+	Attempt                 int
+	ScheduledFor            time.Time
+	ClaimedAt               *time.Time
+	PublishClaimToken       *string
+	PublishConnectionID     *string
+	PublishPermitAcceptedAt *time.Time
+	StartedAt               *time.Time
+	FinishedAt              *time.Time
+	Params                  json.RawMessage
+	Summary                 json.RawMessage
+	Error                   string
+	CreatedAt               time.Time
 }
 
 // DurationMS is the wall time of a completed run, or nil while it is open.

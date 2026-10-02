@@ -32,10 +32,10 @@ export function EditorRail({
 }: EditorRailProps) {
   return (
     <div className="ae-rail">
-      <div className="card" style={{ overflow: "hidden" }}>
+      <div className="card ae-rail-card">
         <AppFrame name={app.name} url={app.hero_url ?? app.cover_url} variant="hero" flush />
-        <div className="card-pad" style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
-          <div className="rowflex" style={{ justifyContent: "space-between" }}>
+        <div className="card-pad col gap4">
+          <div className="rowflex between">
             <label className="label" htmlFor="app-enabled">
               Enabled for users
             </label>
@@ -69,7 +69,7 @@ export function EditorRail({
           </div>
         </div>
       </div>
-      <Button variant="danger" onClick={onDelete} style={{ width: "100%", justifyContent: "center" }}>
+      <Button variant="danger" className="btn-block" onClick={onDelete}>
         Delete app
       </Button>
       <p className="hint">

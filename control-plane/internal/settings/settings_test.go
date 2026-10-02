@@ -73,6 +73,18 @@ func TestSeedTakesEnvThenIdempotent(t *testing.T) {
 	}
 }
 
+func TestSeedStartsOnStable(t *testing.T) {
+	pool := testDB(t)
+	s := NewStore(pool)
+	ctx := context.Background()
+	if err := s.Seed(ctx, ""); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if ch, _, _ := s.ReleaseChannel(ctx); ch != ReleaseChannelStable {
+		t.Fatalf("first boot: got %q want stable", ch)
+	}
+}
+
 func TestSeedRejectsBadMode(t *testing.T) {
 	pool := testDB(t)
 	s := NewStore(pool)

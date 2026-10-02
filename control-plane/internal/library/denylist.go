@@ -25,11 +25,11 @@ const SourceSteam = "steam"
 
 // builtinDenyAppIDs: matching on appid catches a tool whose display name isn't Valve-shaped.
 var builtinDenyAppIDs = map[string]string{
-	"1493710": "Proton Experimental",                // Tower appmanifest_1493710.acf, StateFlags 4
-	"2180100": "Proton Hotfix",                      // Tower appmanifest_2180100.acf, StateFlags 4
-	"1628350": "Steam Linux Runtime 3.0 (sniper)",   // Tower appmanifest_1628350.acf, StateFlags 4
-	"4183110": "Steam Linux Runtime 4.0",            // Tower appmanifest_4183110.acf, StateFlags 4
-	"228980":  "Steamworks Common Redistributables", // Tower appmanifest_228980.acf,  StateFlags 4
+	"1493710": "Proton Experimental",                // gpu-test appmanifest_1493710.acf, StateFlags 4
+	"2180100": "Proton Hotfix",                      // gpu-test appmanifest_2180100.acf, StateFlags 4
+	"1628350": "Steam Linux Runtime 3.0 (sniper)",   // gpu-test appmanifest_1628350.acf, StateFlags 4
+	"4183110": "Steam Linux Runtime 4.0",            // gpu-test appmanifest_4183110.acf, StateFlags 4
+	"228980":  "Steamworks Common Redistributables", // gpu-test appmanifest_228980.acf,  StateFlags 4
 
 	// SteamVR matches neither the prefix list (one-word title, no shared prefix) nor a
 	// safer-length "steam" prefix (too broad, would eat real games); §8.4's accepted
@@ -46,9 +46,9 @@ var builtinDenyAppIDs = map[string]string{
 // residual (an unmatched new Valve tool auto-publishing; a real game like "Protonaut" caught by
 // the prefix) are accepted and asserted in TestNamePrefixDoesNotOverMatch.
 var builtinDenyNamePrefixes = []string{
-	"proton",                             // Proton Experimental, Proton Hotfix (Tower); covers future Proton N.N
-	"steam linux runtime",                // Steam Linux Runtime 3.0 (sniper), 4.0 (Tower)
-	"steamworks common redistributables", // Steamworks Common Redistributables (Tower)
+	"proton",                             // Proton Experimental, Proton Hotfix (gpu-test); covers future Proton N.N
+	"steam linux runtime",                // Steam Linux Runtime 3.0 (sniper), 4.0 (gpu-test)
+	"steamworks common redistributables", // Steamworks Common Redistributables (gpu-test)
 }
 
 // Layer names reported by Decide, for the admin "Seen, not published" read: a human decision

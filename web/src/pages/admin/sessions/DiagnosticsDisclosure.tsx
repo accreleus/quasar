@@ -90,21 +90,21 @@ export function EffectiveMediaCard({ media, stream }: { media: EffectiveMedia; s
         </div>
       </div>
       {app && (
-        <div data-testid="app-display" style={{ marginBottom: "0.75rem" }}>
+        <div data-testid="app-display" className="mb3">
           <div className="row between gap4">
             <dt className="muted">app display</dt>
-            <dd className="mono" style={{ textAlign: "right", overflowWrap: "anywhere" }}>
+            <dd className="mono right sd-wrap">
               {app.width}x{app.height}@{app.refresh_hz ?? "?"} ({app.source ?? "unknown"})
             </dd>
           </div>
-          {note && <p className="muted" style={{ margin: "0.25rem 0 0" }}>{note}</p>}
+          {note && <p className="muted m0 mt1">{note}</p>}
         </div>
       )}
       {typeof media.mic === "string" && (
-        <div data-testid="mic-state" style={{ marginBottom: "0.75rem" }}>
+        <div data-testid="mic-state" className="mb3">
           <div className="row between gap4">
             <dt className="muted">microphone</dt>
-            <dd className="mono" style={{ textAlign: "right", overflowWrap: "anywhere" }}>
+            <dd className="mono right sd-wrap">
               {media.mic}
             </dd>
           </div>
@@ -113,12 +113,12 @@ export function EffectiveMediaCard({ media, stream }: { media: EffectiveMedia; s
       <div className="sd-latest-grid">
         {(["configured", "resolved", "actual"] as const).map((stage) => (
           <div key={stage} className="sd-latest">
-            <h3 style={{ textTransform: "capitalize" }}>{stage}</h3>
+            <h3 className="sd-stage">{stage}</h3>
             <dl>
               {Object.entries(media[stage] ?? {}).map(([key, value]) => (
                 <div key={key} className="row between gap4">
                   <dt className="muted">{key.replaceAll("_", " ")}</dt>
-                  <dd className="mono" style={{ textAlign: "right", overflowWrap: "anywhere" }}>
+                  <dd className="mono right sd-wrap">
                     {mediaValue(value)}
                   </dd>
                 </div>
@@ -197,17 +197,17 @@ export function CodecDecisionCard({
         </div>
       </div>
 
-      <dl style={{ margin: 0 }}>
+      <dl className="m0">
         <div className="row between gap4">
           <dt className="muted">server resolved → client decoded</dt>
-          <dd style={{ margin: 0, textAlign: "right" }}>
+          <dd className="m0 right">
             <CodecPair resolved={resolvedCodec} negotiated={negotiatedCodec} />
           </dd>
         </div>
       </dl>
 
       {pair.agrees === false && (
-        <p className="note warn" data-testid="codec-disagreement" style={{ marginBottom: 0 }}>
+        <p className="note warn mb0" data-testid="codec-disagreement">
           <IconWarning />
           <span>
             The server resolved <b>{codecDisplayName(pair.resolved)}</b> but the client reports
@@ -218,13 +218,13 @@ export function CodecDecisionCard({
         </p>
       )}
       {pair.negotiated === null && (
-        <p className="muted" style={{ marginBottom: 0, fontSize: 12 }}>
+        <p className="muted mb0 sd-aside">
           The client has not reported a decoded codec yet, so there is nothing to compare against.
         </p>
       )}
 
       {!decision ? (
-        <p className="muted" style={{ marginBottom: 0, fontSize: 12 }}>
+        <p className="muted mb0 sd-aside">
           No resolution record — this session walked no rung chain (a console launch, a launch
           that forced a codec without naming a profile, or a session that predates
           codec-decision recording).
@@ -233,29 +233,27 @@ export function CodecDecisionCard({
         <>
           {summary && (
             <p
-              className={outcome === "merit" ? "muted" : "note warn"}
+              className={outcome === "merit" ? "muted mb0" : "note warn mb0"}
               data-testid="codec-outcome"
               data-outcome={outcome ?? ""}
-              style={{ marginBottom: 0 }}
             >
               {outcome !== "merit" && <IconWarning />}
               <span>{summary}</span>
             </p>
           )}
-          <dl style={{ marginBottom: 0 }} data-testid="codec-walk">
+          <dl className="mb0" data-testid="codec-walk">
             {decision.considered.map((rung) => {
               const reason = rungRejectionLabel(rung.rejected_by);
               return (
                 <div key={rung.rung_id} className="row between gap4">
-                  <dt className="mono" style={{ overflowWrap: "anywhere" }}>
+                  <dt className="mono sd-wrap">
                     {rung.rung_id}{" "}
                     <span className="chip chip-sm chip-neutral">
                       {codecDisplayName(rung.codec) ?? rung.codec}
                     </span>
                   </dt>
                   <dd
-                    className="muted"
-                    style={{ margin: 0, textAlign: "right", overflowWrap: "anywhere" }}
+                    className="muted m0 right sd-wrap"
                     data-testid={`codec-rung-${rung.rung_id}`}
                   >
                     {rung.selected && rung.clamps_bypassed && reason
@@ -445,7 +443,7 @@ const ChartCard = memo(function ChartCard({
         {hasData ? (
           <LineChart2 series={series} unit={unit} height={96} />
         ) : (
-          <div className="muted" style={{ fontSize: "var(--t-xs)", paddingTop: 8 }}>
+          <div className="muted sd-chart-empty">
             no data yet
           </div>
         )}
@@ -524,15 +522,15 @@ export function DiagnosticsDisclosure({
       <summary>
         <IconChevronRight className="sd-diag-caret" />
         <span className="panel-title">Diagnostics</span>
-        <span className="hint" style={{ marginLeft: "auto" }}>
+        <span className="hint ml-auto">
           Codec walk, effective media, adaptation, raw series and the trace
         </span>
       </summary>
 
-      <div style={{ display: "grid", gap: "var(--s4)", marginTop: "var(--s4)" }}>
+      <div className="grid mt4">
         {session?.health_state && (
           <div className="card card-pad">
-            <div className="rowflex" style={{ gap: "var(--s3)", flexWrap: "wrap" }}>
+            <div className="rowflex gap3 wrap">
               <span className="eyebrow">Health</span>
               <Chip variant={healthBadgeVariant(session.health_state)}>{session.health_state}</Chip>
               {isClientHealth(session.health_state) && (
@@ -674,9 +672,9 @@ export function DiagnosticsDisclosure({
             </div>
 
             <div className="card card-pad">
-              <div className="sd-chart-title" style={{ marginBottom: 12 }}>
+              <div className="sd-chart-title mb3">
                 Adaptation
-                <span className="hint" style={{ marginLeft: 8, fontWeight: 400 }}>
+                <span className="hint">
                   setpoint vs GCC, ladder rungs, classifier state
                 </span>
               </div>
@@ -728,9 +726,9 @@ export function DiagnosticsDisclosure({
 
             {stagedBudget && (
               <div className="card card-pad">
-                <div className="sd-chart-title" style={{ marginBottom: 12 }}>
+                <div className="sd-chart-title mb3">
                   RVFC capture-to-display breakdown (residual only)
-                  <span className="hint" style={{ marginLeft: 8, fontWeight: 400 }}>
+                  <span className="hint">
                     (latest sample)
                   </span>
                 </div>
@@ -739,9 +737,9 @@ export function DiagnosticsDisclosure({
             )}
 
             <div className="sd-legend">
-              <span style={{ color: COLOR_AGENT }}>—</span>
+              <span className="sd-key-agent">—</span>
               <span>agent</span>
-              <span style={{ color: COLOR_BROWSER, marginLeft: 12 }}>—</span>
+              <span className="sd-key-browser">—</span>
               <span>browser</span>
             </div>
           </>

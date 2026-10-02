@@ -1,0 +1,744 @@
+//! Container-runtime readiness (#254): what the engine really is, observed only. The facts
+//! come from one bounded engine inspection per probe ([`RuntimeView::live`]); the verdicts
+//! are the `check_*` functions, pure over the view. Nothing here mutates the engine.
+
+use crate::messages::{ReadinessBlocks, ReadinessCheck};
+// `API_FLOOR` is owned by the runtime module, which is the code that enforces it; the
+// checks below only render it (#266), so the wording cannot drift from what discovery
+// refuses.
+use crate::runtime::{
+    EngineFacts, EngineKind, EngineMode, ErrorKind, GpuInjection, RuntimeError, API_FLOOR,
+    NVIDIA_CDI_DEVICE,
+};
+
+pub const ENDPOINT_ID: &str = "runtime_endpoint";
+pub const API_VERSION_ID: &str = "runtime_api_version";
+pub const CAPABILITIES_ID: &str = "runtime_capabilities";
+pub const CDI_ID: &str = "runtime_cdi";
+/// Amendment 17 (RH-07 #396): the engine, its version and its engine mode, in words.
+pub const ENGINE_ID: &str = "runtime_engine";
+/// Amendment 17 (RH-07 #405): can this engine run container health checks?
+pub const HEALTHCHECKS_ID: &str = "engine_healthchecks";
+
+/// The `Unreachable` detail for [`ErrorKind::Timeout`]. A missing socket uses a
+/// different sentence, so `host_container_mounts` can tell "the client ran out of
+/// time" from "the socket is not there" without a second engine call.
+pub const INSPECTION_TIMEOUT_DETAIL: &str =
+    "the engine did not answer within the inspection budget";
+
+/// Why the engine could not be inspected, folded from the runtime layer's error kinds so
+/// the verdict reads the failure class, not the transport detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeFault {
+    /// Nothing answered: socket missing, connection refused or reset, or the request timed
+    /// out. A timeout reads as unreachable: an engine that cannot answer within the budget
+    /// cannot run a session either.
+    Unreachable(String),
+    /// The socket exists but this agent may not use it.
+    PermissionDenied(String),
+    /// The engine answered but its API range does not include a version this agent speaks.
+    IncompatibleApi(String),
+    /// The endpoint configuration itself is invalid (docs/configuration.md, DOCKER_HOST).
+    Unconfigured(String),
+    /// `DOCKER_HOST` and `CONTAINER_HOST` name two different endpoints (amendment 17):
+    /// refused by name, never resolved by picking one.
+    Ambiguous(String),
+    /// The runtime client could not ask this refresh (busy, cancelled) or the reply made no
+    /// sense; the verdict warns and the next refresh tries again.
+    Indeterminate(String),
+}
+
+impl From<RuntimeError> for RuntimeFault {
+    fn from(error: RuntimeError) -> Self {
+        match error.kind {
+            ErrorKind::Unavailable => RuntimeFault::Unreachable(
+                "no engine answered at the socket (missing, refused or reset)".into(),
+            ),
+            ErrorKind::Timeout => RuntimeFault::Unreachable(INSPECTION_TIMEOUT_DETAIL.into()),
+            ErrorKind::PermissionDenied => {
+                RuntimeFault::PermissionDenied("the socket refused this agent's identity".into())
+            }
+            ErrorKind::IncompatibleApi => RuntimeFault::IncompatibleApi(
+                "the engine's API range does not include a version this agent speaks".into(),
+            ),
+            ErrorKind::InvalidConfiguration => RuntimeFault::Unconfigured(
+                "the endpoint configuration was refused (DOCKER_HOST must be a unix:// socket; \
+                 DOCKER_CONTEXT, DOCKER_TLS*, DOCKER_API_VERSION must be unset)"
+                    .into(),
+            ),
+            ErrorKind::AmbiguousEndpoint => RuntimeFault::Ambiguous(
+                "DOCKER_HOST and CONTAINER_HOST are both set and name different endpoints".into(),
+            ),
+            ErrorKind::Busy | ErrorKind::Cancelled => {
+                RuntimeFault::Indeterminate("the runtime client was busy this refresh".into())
+            }
+            _ => RuntimeFault::Indeterminate(error.to_string()),
+        }
+    }
+}
+
+/// The runtime facts one probe sees. One value per probe, never held in bulk, so the
+/// variant size gap buys nothing to box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum RuntimeView {
+    /// The engine was not asked (test fixtures; never in production).
+    NotObserved,
+    /// One inspection of `endpoint` and what it returned.
+    Observed {
+        endpoint: String,
+        outcome: Result<EngineFacts, RuntimeFault>,
+    },
+}
+
+impl RuntimeView {
+    /// Production: one bounded `inspect_engine` on the configured client. The bound is
+    /// [`crate::runtime::ENGINE_INSPECTION_BUDGET`]; a daemon that accepted the connection
+    /// and will not answer only reveals itself when it expires (#274).
+    pub fn live() -> Self {
+        match crate::runtime::configured() {
+            Ok(client) => RuntimeView::observe(client),
+            Err(error) => RuntimeView::Observed {
+                endpoint: ["DOCKER_HOST", "CONTAINER_HOST"]
+                    .iter()
+                    .filter_map(|key| std::env::var(key).ok().filter(|s| !s.is_empty()))
+                    .next()
+                    .unwrap_or_else(|| format!("unix://{}", quasar_runtime::DOCKER_DEFAULT_SOCKET)),
+                outcome: Err(RuntimeFault::from(error)),
+            },
+        }
+    }
+
+    /// One bounded inspection of `client`. [`Self::live`] is this on the configured
+    /// client; tests drive it with a stub engine on a real socket.
+    pub fn observe(client: &crate::runtime::RuntimeClient) -> Self {
+        RuntimeView::Observed {
+            endpoint: client.endpoint(),
+            outcome: client.inspect_engine().wait().map_err(RuntimeFault::from),
+        }
+    }
+
+    /// A timeout is still [`RuntimeFault::Unreachable`], so `runtime_endpoint` fails
+    /// and the other collectors are skipped. The detail sentence is what separates
+    /// it from a missing socket for `host_container_mounts`.
+    pub fn is_inspection_timeout(&self) -> bool {
+        matches!(
+            self,
+            RuntimeView::Observed {
+                outcome: Err(RuntimeFault::Unreachable(reason)),
+                ..
+            } if reason == INSPECTION_TIMEOUT_DETAIL
+        )
+    }
+
+    /// Did the engine answer this refresh? `false` only for a **definitive** fault: nothing
+    /// answered, the socket refused this agent, or the endpoint configuration is invalid.
+    ///
+    /// #274: a hung daemon (socket accepts, nothing replies) makes every other engine call
+    /// in the same refresh spend its own full client deadline to reach the same verdict —
+    /// measured at ~100 s serially, which pushed the failing `runtime_endpoint` past the
+    /// control plane's readiness staleness window. Those collectors already degrade to
+    /// exactly what they report on an engine error, so skipping them changes no verdict; it
+    /// only stops the refresh paying for them. An incompatible API, a busy client or an
+    /// unparseable reply all mean the engine is there, so they keep the full refresh.
+    pub fn engine_answered(&self) -> bool {
+        match self {
+            // Fixtures never carry engine faults, and must not disable the other collectors.
+            RuntimeView::NotObserved => true,
+            RuntimeView::Observed { outcome, .. } => !matches!(
+                outcome,
+                Err(RuntimeFault::Unreachable(_)
+                    | RuntimeFault::PermissionDenied(_)
+                    | RuntimeFault::Unconfigured(_)
+                    | RuntimeFault::Ambiguous(_))
+            ),
+        }
+    }
+}
+
+pub fn check_runtime_endpoint(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_endpoint_inner(view)
+        .with_source("runtime")
+        // Agent-enforced: the agent refuses these launches itself, and no override lifts it.
+        .with_blocks(ReadinessBlocks::host("agent"))
+}
+
+fn check_runtime_endpoint_inner(view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed { endpoint, outcome } = view else {
+        return super::skip(ENDPOINT_ID, "The container engine was not asked");
+    };
+    match outcome {
+        Ok(facts) => super::pass(
+            ENDPOINT_ID,
+            format!("{} at {endpoint} answers", engine_named(facts)),
+        ),
+        Err(RuntimeFault::Unreachable(reason)) => super::fail(
+            ENDPOINT_ID,
+            format!("the container runtime at {endpoint} is unreachable: {reason}"),
+            format!(
+                "Check that the container engine (Docker or Podman) is running on the host and \
+                 that its socket is mounted into the agent container at {} (the DOCKER_HOST or \
+                 CONTAINER_HOST unix:// path when set; /var/run/docker.sock by default); \
+                 recreate the agent after changing the mount. On a rootless engine the socket \
+                 is the Quasar user's own and its engine runs only while lingering is enabled \
+                 (host preparation).",
+                endpoint.trim_start_matches("unix://")
+            ),
+        ),
+        Err(RuntimeFault::PermissionDenied(reason)) => super::fail(
+            ENDPOINT_ID,
+            format!("the container runtime at {endpoint} refused this agent: {reason}"),
+            format!(
+                "Give the agent access to the engine socket {}: on a rootful engine, the \
+                 agent's user must be in the group that owns it; on a rootless engine (Docker \
+                 or Podman) the agent must run under the Quasar user that owns the engine. \
+                 Recreate the agent afterwards. Never widen the socket's permissions.",
+                endpoint.trim_start_matches("unix://")
+            ),
+        ),
+        Err(RuntimeFault::IncompatibleApi(_)) => super::pass(
+            ENDPOINT_ID,
+            format!(
+                "the container runtime at {endpoint} answered; its API is incompatible \
+                 (see runtime_api_version)"
+            ),
+        ),
+        Err(RuntimeFault::Unconfigured(reason)) => super::fail(
+            ENDPOINT_ID,
+            format!("the container runtime endpoint configuration is invalid: {reason}"),
+            "Set DOCKER_HOST (or Podman's CONTAINER_HOST) to a unix:// socket, or leave both \
+             unset to use the engine socket found at the default paths, and unset \
+             DOCKER_CONTEXT, DOCKER_TLS, DOCKER_TLS_VERIFY and DOCKER_API_VERSION; the agent \
+             speaks to one explicit Unix endpoint (docs/configuration.md)."
+                .into(),
+        ),
+        Err(RuntimeFault::Ambiguous(reason)) => super::fail(
+            ENDPOINT_ID,
+            format!("the container runtime endpoint is ambiguous: {reason}"),
+            "Set only one of DOCKER_HOST and CONTAINER_HOST, or set both to the same unix:// \
+             socket of the engine Quasar should use (Docker or Podman); the agent never \
+             chooses between two engines itself."
+                .into(),
+        ),
+        Err(RuntimeFault::Indeterminate(reason)) => super::warn_check(
+            ENDPOINT_ID,
+            format!(
+                "the container runtime at {endpoint} could not be inspected this refresh: {reason}"
+            ),
+            "The agent retries on the next refresh; check its logs if this persists.".into(),
+        ),
+    }
+}
+
+pub fn check_runtime_api_version(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_api_version_inner(view).with_source("runtime")
+}
+
+fn check_runtime_api_version_inner(view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed { outcome, .. } = view else {
+        return super::skip(API_VERSION_ID, "The container engine was not asked");
+    };
+    match outcome {
+        Ok(facts) => super::pass(
+            API_VERSION_ID,
+            format!(
+                "API {} negotiated with {} {} (the engine offers {}-{}; this agent needs at \
+                 least {API_FLOOR})",
+                facts.info.api_version,
+                facts.info.name,
+                facts.info.version,
+                facts.info.server_min_api,
+                facts.info.server_max_api,
+            ),
+        ),
+        Err(RuntimeFault::IncompatibleApi(reason)) => super::fail(
+            API_VERSION_ID,
+            format!("{reason} (this agent needs at least API {API_FLOOR})"),
+            format!(
+                "Upgrade the container engine to a release offering API {API_FLOOR} or newer \
+                 (Docker Engine 19.03 or later)."
+            ),
+        ),
+        Err(_) => super::skip(
+            API_VERSION_ID,
+            "No API was negotiated: the engine could not be inspected",
+        ),
+    }
+}
+
+pub fn check_runtime_capabilities(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_capabilities_inner(view).with_source("runtime")
+}
+
+fn check_runtime_capabilities_inner(view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed { outcome, .. } = view else {
+        return super::skip(CAPABILITIES_ID, "The container engine was not asked");
+    };
+    match outcome {
+        Ok(facts) => {
+            let os = facts.operating_system.as_deref().unwrap_or("unknown");
+            let arch = facts.architecture.as_deref().unwrap_or("unknown");
+            let cgroup = facts
+                .cgroup_version
+                .as_deref()
+                .map(|v| format!("cgroup v{v}"))
+                .unwrap_or_else(|| "cgroup unknown".into());
+            let security = if facts.security_options.is_empty() {
+                "none reported".to_string()
+            } else {
+                facts.security_options.join(", ")
+            };
+            let runtimes = if facts.runtimes.is_empty() {
+                "none reported".to_string()
+            } else {
+                facts.runtimes.join(", ")
+            };
+            let default = facts.default_runtime.as_deref().unwrap_or("unknown");
+            super::pass(
+                CAPABILITIES_ID,
+                format!(
+                    "{} {} on {os} ({arch}), {cgroup}; security options: {security}; \
+                     runtimes: {runtimes} (default {default}); as stated by the engine, not exercised",
+                    facts.info.name, facts.info.version,
+                ),
+            )
+        }
+        Err(_) => super::skip(
+            CAPABILITIES_ID,
+            "The engine's capabilities are unknown: it could not be inspected",
+        ),
+    }
+}
+
+/// How this engine would inject an NVIDIA GPU, or `Err` with a skip reason when the engine
+/// was not seen.
+fn injection(view: &RuntimeView) -> Result<(&EngineFacts, Option<GpuInjection>), &'static str> {
+    match view {
+        RuntimeView::NotObserved => Err("The container engine was not asked"),
+        RuntimeView::Observed {
+            outcome: Err(_), ..
+        } => Err("GPU injection is unknown: the engine could not be inspected"),
+        RuntimeView::Observed {
+            outcome: Ok(facts), ..
+        } => Ok((
+            facts,
+            GpuInjection::for_engine(facts.info.kind, facts.mode, facts.cdi.as_ref()),
+        )),
+    }
+}
+
+/// A mixed host: NVIDIA beside another vendor. Its NVIDIA gap blocks those GPUs only,
+/// through `runtime_cdi_gpu<N>` (amendment 17).
+fn mixed(gpus: &[(i32, bool)]) -> bool {
+    gpus.iter().any(|g| g.1) && gpus.iter().any(|g| !g.1)
+}
+
+const CDI_REMEDIATION: &str = "As root, write the NVIDIA CDI specification this engine \
+    needs to hand a GPU to a container (nvidia-ctk cdi generate \
+    --output=/etc/cdi/nvidia.yaml), then restart the engine so it discovers it. Never run \
+    Quasar as root to work around it.";
+
+/// `own_nodes`: the agent's own container has the NVIDIA device nodes. Podman's `/info`
+/// lists no CDI devices, so on Podman that is the only evidence the specification resolves.
+fn cdi_verdict(
+    id: &str,
+    facts: &EngineFacts,
+    injection: Option<GpuInjection>,
+    own_nodes: bool,
+) -> ReadinessCheck {
+    let named = engine_named(facts);
+    let mode = facts.mode.wire();
+    if facts.info.kind == EngineKind::Podman && !own_nodes {
+        return super::fail(
+            id,
+            format!(
+                "{named}, {mode}: this agent's own container has no NVIDIA device, so Podman \
+                 resolved no NVIDIA CDI specification and no NVIDIA GPU can reach a session"
+            ),
+            CDI_REMEDIATION.into(),
+        );
+    }
+    match injection {
+        Some(GpuInjection::Cdi) => super::pass(
+            id,
+            format!("{named}, {mode}: NVIDIA GPUs reach containers by CDI ({NVIDIA_CDI_DEVICE})"),
+        ),
+        Some(GpuInjection::DeviceRequest) => super::pass(
+            id,
+            format!(
+                "{named}, {mode}: the engine reports no NVIDIA CDI device, so NVIDIA GPUs reach \
+                 containers by a --gpus device request"
+            ),
+        ),
+        None => super::fail(
+            id,
+            format!(
+                "{named}, {mode}: the engine reports no NVIDIA CDI device, and a {mode} engine \
+                 cannot use --gpus, so no NVIDIA GPU can reach a session"
+            ),
+            CDI_REMEDIATION.into(),
+        ),
+    }
+}
+
+/// `runtime_cdi` (amendment 17): how NVIDIA GPUs reach containers. On a host whose GPUs are
+/// all NVIDIA the engine's answer is evidence and the check carries `blocks` (`host`); a
+/// mixed host blocks per GPU instead ([`check_runtime_cdi_gpus`]).
+pub fn check_runtime_cdi(
+    view: &RuntimeView,
+    nvidia: bool,
+    gpus: &[(i32, bool)],
+    own_nodes: bool,
+) -> ReadinessCheck {
+    let check = match injection(view) {
+        Err(why) => super::skip(CDI_ID, why),
+        Ok((facts, _)) if !nvidia => {
+            let cdi = match &facts.cdi {
+                Some(cdi) if !cdi.spec_dirs.is_empty() => {
+                    format!("CDI is enabled (spec dirs: {})", cdi.spec_dirs.join(", "))
+                }
+                _ => "CDI is not reported".to_string(),
+            };
+            super::pass(
+                CDI_ID,
+                format!("No NVIDIA GPU: other GPUs reach containers as device nodes; {cdi}"),
+            )
+        }
+        Ok((facts, injection)) => cdi_verdict(CDI_ID, facts, injection, own_nodes),
+    };
+    let check = check.with_source("runtime");
+    if nvidia && !mixed(gpus) && matches!(view, RuntimeView::Observed { outcome: Ok(_), .. }) {
+        check.with_blocks(ReadinessBlocks::host("control_plane"))
+    } else {
+        check
+    }
+}
+
+/// `runtime_cdi_gpu<N>`: on a mixed host, the same verdict for each NVIDIA GPU, blocking only
+/// that GPU so the others stay schedulable. Nothing on any other host.
+pub fn check_runtime_cdi_gpus(
+    view: &RuntimeView,
+    gpus: &[(i32, bool)],
+    own_nodes: bool,
+) -> Vec<ReadinessCheck> {
+    if !mixed(gpus) {
+        return Vec::new();
+    }
+    let Ok((facts, injection)) = injection(view) else {
+        return Vec::new();
+    };
+    gpus.iter()
+        .filter(|(_, nvidia)| *nvidia)
+        .map(|(index, _)| {
+            cdi_verdict(&format!("{CDI_ID}_gpu{index}"), facts, injection, own_nodes)
+                .with_source("runtime")
+                .with_blocks(ReadinessBlocks::gpu(*index, "control_plane"))
+        })
+        .collect()
+}
+
+/// Owner decision on #404: rootless Docker has no per-container user mapping, so files a
+/// session writes are owned on the host by a subordinate ID, not the Quasar user. A
+/// writable homes root is then a warning that says so; nothing is blocked.
+pub fn homes_mapping(check: ReadinessCheck, view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed {
+        outcome: Ok(facts), ..
+    } = view
+    else {
+        return check;
+    };
+    if check.status != super::PASS
+        || facts.info.kind != EngineKind::Docker
+        || facts.mode != EngineMode::Rootless
+    {
+        return check;
+    }
+    let mut warned = super::warn_check(
+        &check.id,
+        format!(
+            "{}. On rootless Docker, files sessions write there are owned on the host by a \
+             subordinate ID, not the Quasar user: Docker cannot map a container's user onto it",
+            check.summary.trim_end_matches('.')
+        ),
+        "Nothing to fix for sessions to work. For home files owned by the Quasar user, use \
+         rootless Podman (keep-id). Never re-own existing homes recursively."
+            .into(),
+    );
+    warned.source = check.source;
+    warned.blocks = check.blocks;
+    warned.observed_at = check.observed_at;
+    warned
+}
+
+/// How far one engine profile is backed by evidence (CONTEXT.md "Engine profile").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileStatus {
+    Supported,
+    Experimental,
+    Unsupported,
+}
+
+/// The host's os-release identity: the three fields an engine profile is matched on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostOs {
+    /// `ID`, lowercased.
+    pub id: String,
+    /// `ID_LIKE`, lowercased, one entry per word.
+    pub id_like: Vec<String>,
+    pub version_id: Option<String>,
+}
+
+impl HostOs {
+    /// Parse an os-release body. `None` when it names no `ID`: the engine's own report is
+    /// then the better evidence.
+    pub fn parse(os_release: &str) -> Option<HostOs> {
+        let value = |key: &str| -> Option<String> {
+            os_release.lines().find_map(|line| {
+                let rest = line.trim().strip_prefix(key)?.strip_prefix('=')?;
+                let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                (!v.is_empty()).then(|| v.to_string())
+            })
+        };
+        let id = value("ID")?.to_ascii_lowercase();
+        let id_like = value("ID_LIKE")
+            .map(|v| {
+                v.to_ascii_lowercase()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(HostOs {
+            id,
+            id_like,
+            version_id: value("VERSION_ID"),
+        })
+    }
+
+    fn is(&self, name: &str) -> bool {
+        self.id == name || self.id_like.iter().any(|like| like == name)
+    }
+}
+
+/// The platform half of an engine profile: which rows of
+/// `testdata/engine-profiles/profiles.json` a host reads. Ubuntu means 24.04 only (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfilePlatform {
+    Fedora,
+    Ubuntu2404,
+    Debian,
+    Arch,
+    Unraid,
+    Other,
+}
+
+impl ProfilePlatform {
+    /// The platform key in `profiles.json`, and the site quick start's platform id.
+    pub fn wire(self) -> &'static str {
+        match self {
+            ProfilePlatform::Fedora => "fedora",
+            ProfilePlatform::Ubuntu2404 => "ubuntu",
+            ProfilePlatform::Debian => "debian",
+            ProfilePlatform::Arch => "arch",
+            ProfilePlatform::Unraid => "unraid",
+            ProfilePlatform::Other => "other",
+        }
+    }
+
+    /// The host's os-release when the agent can read it, the engine's report otherwise.
+    /// os-release is preferred because its `ID_LIKE` names the family: Podman reports only
+    /// `ID` (Bazzite says `bazzite`), and Docker reports `PRETTY_NAME`.
+    pub fn of(facts: &EngineFacts, host_os: Option<&HostOs>) -> ProfilePlatform {
+        match host_os {
+            Some(os) => Self::from_os_release(os),
+            None => Self::from_engine_report(
+                facts.operating_system.as_deref().unwrap_or(""),
+                facts.os_version.as_deref(),
+            ),
+        }
+    }
+
+    /// `ID` or `ID_LIKE`: Fedora's image-based editions (Silverblue, Bazzite, uCore) are
+    /// Fedora; Enterprise Linux, which also lists `fedora` in `ID_LIKE`, is not.
+    pub fn from_os_release(os: &HostOs) -> ProfilePlatform {
+        let enterprise = os.is("rhel") || os.is("centos");
+        if os.is("fedora") && !enterprise {
+            ProfilePlatform::Fedora
+        } else if os.is("ubuntu") {
+            if os.version_id.as_deref().is_some_and(is_ubuntu_2404) {
+                ProfilePlatform::Ubuntu2404
+            } else {
+                ProfilePlatform::Other
+            }
+        } else if os.id.starts_with("unraid") {
+            ProfilePlatform::Unraid
+        } else if os.is("debian") {
+            ProfilePlatform::Debian
+        } else if os.is("arch") || os.is("archlinux") {
+            ProfilePlatform::Arch
+        } else {
+            ProfilePlatform::Other
+        }
+    }
+
+    /// The engine's `OperatingSystem` and `OSVersion`, word by word. It cannot see a
+    /// derivative's family, so it is only the fallback.
+    fn from_engine_report(os: &str, version: Option<&str>) -> ProfilePlatform {
+        let os = os.to_ascii_lowercase();
+        let words: Vec<&str> = os.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+        let has = |w: &str| words.contains(&w);
+        if has("fedora") {
+            ProfilePlatform::Fedora
+        } else if has("ubuntu") {
+            if version.is_some_and(is_ubuntu_2404) || os.contains("24.04") {
+                ProfilePlatform::Ubuntu2404
+            } else {
+                ProfilePlatform::Other
+            }
+        } else if has("unraid") {
+            ProfilePlatform::Unraid
+        } else if has("debian") {
+            ProfilePlatform::Debian
+        } else if has("arch") || has("archlinux") {
+            ProfilePlatform::Arch
+        } else {
+            ProfilePlatform::Other
+        }
+    }
+}
+
+fn is_ubuntu_2404(version: &str) -> bool {
+    version == "24.04" || version.starts_with("24.04.")
+}
+
+/// RH-07 decision D5, as far as evidence goes today; the published table is
+/// `testdata/engine-profiles/profiles.json`, and a test holds this function to it row by
+/// row. Rootful Docker is the validated profile on any platform, Unraid included. Docker
+/// rootless, Podman rootless and Podman rootful on Fedora and Ubuntu 24.04 are
+/// experimental until the RH-07 acceptance map proves them (#409 moves the Fedora rows to
+/// supported); anything else, or an engine this agent cannot name, is unsupported.
+pub fn engine_profile(facts: &EngineFacts, host_os: Option<&HostOs>) -> ProfileStatus {
+    // Docker and Podman behave the same across distributions, so every Linux gets the
+    // same verdict. Unraid ships only rootful Docker; anything else there is not Unraid's.
+    let platform = ProfilePlatform::of(facts, host_os);
+    match (facts.info.kind, facts.mode) {
+        (EngineKind::Unknown, _) => ProfileStatus::Unsupported,
+        (EngineKind::Docker, EngineMode::Rootful) => ProfileStatus::Supported,
+        (_, _) if platform == ProfilePlatform::Unraid => ProfileStatus::Unsupported,
+        (_, _) => ProfileStatus::Experimental,
+    }
+}
+
+/// `host_os` is the host's os-release, when the agent can read it.
+pub fn check_runtime_engine(view: &RuntimeView, host_os: Option<&HostOs>) -> ReadinessCheck {
+    check_runtime_engine_inner(view, host_os).with_source("runtime")
+}
+
+fn check_runtime_engine_inner(view: &RuntimeView, host_os: Option<&HostOs>) -> ReadinessCheck {
+    let RuntimeView::Observed { outcome, .. } = view else {
+        return super::skip(ENGINE_ID, "The container engine was not asked");
+    };
+    let Ok(facts) = outcome else {
+        return super::skip(
+            ENGINE_ID,
+            "The engine is unknown: it could not be inspected",
+        );
+    };
+    let os = facts
+        .operating_system
+        .as_deref()
+        .unwrap_or("an unknown system");
+    let mode = facts.mode.wire();
+    let named = engine_named(facts);
+    let alternatives = "Docker rootful is the supported profile. Docker rootless, Podman \
+                        rootless and Podman rootful are experimental on any Linux \
+                        distribution (tested on Fedora); Unraid has only rootful Docker \
+                        (see the engine-profile docs).";
+    match engine_profile(facts, host_os) {
+        ProfileStatus::Supported => super::pass(
+            ENGINE_ID,
+            format!("{named}, {mode}, on {os}: a supported engine profile"),
+        ),
+        ProfileStatus::Experimental => super::warn_check(
+            ENGINE_ID,
+            format!(
+                "{named}, {mode}, on {os}: an experimental engine profile, not yet proven on \
+                 hardware; nothing is blocked"
+            ),
+            alternatives.into(),
+        ),
+        ProfileStatus::Unsupported => super::warn_check(
+            ENGINE_ID,
+            format!(
+                "{named}, {mode}, on {os}: an unsupported engine profile; nothing is blocked, \
+                 but it is untested"
+            ),
+            alternatives.into(),
+        ),
+    }
+}
+
+/// The engine as an operator reads it: Docker or Podman and its version; an engine this
+/// agent cannot name by what it calls itself, when it says anything.
+fn engine_named(facts: &EngineFacts) -> String {
+    match facts.info.kind {
+        EngineKind::Unknown
+            if facts.info.name.trim().is_empty() || facts.info.name == "unknown" =>
+        {
+            format!("an unrecognised container engine {}", facts.info.version)
+        }
+        EngineKind::Unknown => format!("{} {}", facts.info.name, facts.info.version),
+        kind => format!("{} {}", kind.label(), facts.info.version),
+    }
+}
+
+pub fn check_engine_healthchecks(view: &RuntimeView) -> ReadinessCheck {
+    check_engine_healthchecks_inner(view).with_source("runtime")
+}
+
+/// Podman runs container health checks through systemd timers, and installs and updates
+/// wait on them. A rootless Podman with no systemd user session for its user falls back
+/// to the `cgroupfs` driver and never runs one, so an install would wait out its whole
+/// timeout with nothing said. Docker runs its health checks itself. A proxy (the engine's
+/// cgroup driver), so it never blocks.
+fn check_engine_healthchecks_inner(view: &RuntimeView) -> ReadinessCheck {
+    let RuntimeView::Observed { outcome, .. } = view else {
+        return super::skip(HEALTHCHECKS_ID, "The container engine was not asked");
+    };
+    let Ok(facts) = outcome else {
+        return super::skip(
+            HEALTHCHECKS_ID,
+            "Unknown: the engine could not be inspected",
+        );
+    };
+    if facts.info.kind != EngineKind::Podman {
+        return super::skip(
+            HEALTHCHECKS_ID,
+            "This engine runs container health checks itself",
+        );
+    }
+    match facts.cgroup_driver.as_deref() {
+        Some("systemd") => super::pass(
+            HEALTHCHECKS_ID,
+            "Podman can run container health checks: it runs under systemd".into(),
+        ),
+        other => super::fail(
+            HEALTHCHECKS_ID,
+            format!(
+                "Podman cannot run container health checks: its cgroup driver is {} (no \
+                 systemd session for its user), so installs and updates wait out their \
+                 timeout",
+                other.unwrap_or("unreported")
+            ),
+            match facts.mode {
+                EngineMode::Rootless => "Enable lingering for the Quasar user so it has a \
+                    systemd user session (host preparation does this: loginctl enable-linger \
+                    quasar), then restart that user's Podman service."
+                    .into(),
+                EngineMode::Rootful => "Run Podman under systemd (as init) with its cgroup \
+                    manager set to systemd in containers.conf, then restart Podman's service."
+                    .into(),
+            },
+        ),
+    }
+}

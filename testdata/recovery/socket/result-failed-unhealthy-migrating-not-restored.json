@@ -1,0 +1,33 @@
+{
+  "shape": "result",
+  "about": "Terminal: a migrating control plane that never reported healthy. Not restored; names the pre-update dump, and the output ends with the one restore command.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "state": "failed",
+    "reason": "unhealthy",
+    "components": [
+      {
+        "name": "control-plane",
+        "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+        "digest": "sha256:aa11000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "previous": [
+      {
+        "name": "control-plane",
+        "digest": "sha256:1b7e000000000000000000000000000000000000000000000000000000000def"
+      }
+    ],
+    "output": "the new container was not running and healthy within 300s (state=running health=starting)\nThis release migrates the database, and its migration may have run, so the previous control plane was not put back: an older control plane never runs against a newer schema. The new one is left as it is.\nTo go back to 0.3.0, run this on this machine. It stops the control plane, loads the dump 20260925T100000Z-schema-80 taken before the update into Quasar's database, and starts 0.3.0 again; anything written since the dump is lost:\ndocker exec quasar-recovery quasar-recovery restore --dump 20260925T100000Z-schema-80 --to 0.3.0",
+    "started_at": "2026-09-25T10:00:00Z",
+    "updated_at": "2026-09-25T10:06:02Z",
+    "finished_at": "2026-09-25T10:06:02Z",
+    "restored": false,
+    "release": {
+      "id": "rel-0.4.0",
+      "version": "0.4.0",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "dump": "20260925T100000Z-schema-80"
+  }
+}

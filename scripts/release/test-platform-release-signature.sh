@@ -5,8 +5,9 @@
 # Every key here is generated INTO A TEMPORARY DIRECTORY at run time and removed
 # on exit. No key, public or private, is ever committed.
 #
-# The Go verifier (control-plane/internal/updater/signature_test.go) is the
-# normative one; this proves the shell producer writes what it accepts.
+# The recovery actor's verifier (node-agent/crates/quasar-recovery/src/trust/signature.rs, pinned by
+# testdata/recovery/trust-vectors) is the normative one; this proves the shell
+# producer writes what the shell verifier accepts.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

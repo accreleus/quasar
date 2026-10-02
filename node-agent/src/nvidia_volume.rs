@@ -261,8 +261,8 @@ pub fn mount_resolution_error() -> Option<String> {
 
 /// Recheck an explicit bind immediately before launching an app: a host directory
 /// replaced after startup must not silently become a different driver volume.
-pub fn validate_host_path_for_launch(docker: &str) -> Result<(), String> {
-    if let Some(result) = host_path::resolve(docker, true) {
+pub fn validate_host_path_for_launch() -> Result<(), String> {
+    if let Some(result) = host_path::resolve(true) {
         match result {
             Ok(_) => set_mount_error(None),
             Err(error) => {
@@ -303,7 +303,7 @@ fn set_current(info: Option<VolumeInfo>) {
 }
 
 /// Retry a transient Docker inspection failure without restarting or re-downloading.
-pub fn retry_mount_resolution(docker: &str) {
+pub fn retry_mount_resolution() {
     let explicit = host_path::configured();
     let info = current();
     if !explicit
@@ -313,7 +313,7 @@ pub fn retry_mount_resolution(docker: &str) {
     {
         return;
     }
-    let (host, name) = locate_host_path(docker);
+    let (host, name) = locate_host_path();
     let Some(info) = info else {
         return;
     };
@@ -342,8 +342,8 @@ pub fn enabled() -> bool {
 
 /// Prefer a validated explicit host bind when supplied. Otherwise discover the
 /// agent's structured Docker mount, preserving named-volume injection by default.
-pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
-    if let Some(result) = host_path::resolve(docker, false) {
+pub fn locate_host_path() -> (Option<PathBuf>, Option<String>) {
+    if let Some(result) = host_path::resolve(false) {
         return match result {
             Ok(host) => {
                 set_mount_error(None);
@@ -362,87 +362,61 @@ pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
     let Some(id) = self_container_id() else {
         return unresolved("could not identify the agent container");
     };
-    let Some(out) = crate::readiness::run_with_timeout(
-        docker,
-        &["inspect", "--format", "{{json .Mounts}}", &id],
-    ) else {
+    let Ok(runtime) = crate::runtime::configured() else {
         return unresolved("Docker could not inspect the agent's mounts");
     };
-    let Ok(mounts) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
-        return unresolved("Docker returned invalid mount data");
+    let Ok(Some(container)) = runtime.inspect_container(id).wait() else {
+        return unresolved("Docker could not inspect the agent's mounts");
     };
+    match driver_mount_location(container.mounts) {
+        Ok(location) => {
+            set_mount_error(None);
+            location
+        }
+        Err(detail) => unresolved(detail),
+    }
+}
+
+fn driver_mount_location(
+    mounts: Vec<crate::runtime::Mount>,
+) -> std::result::Result<(Option<PathBuf>, Option<String>), &'static str> {
     for mount in mounts {
-        if mount["Destination"].as_str() != Some(VOLUME_MOUNT) {
+        if mount.destination != VOLUME_MOUNT {
             continue;
         }
-        let host = mount["Source"]
-            .as_str()
-            .filter(|src| src.starts_with('/'))
-            .map(PathBuf::from);
-        let name = if mount["Type"].as_str() == Some("volume") {
-            mount["Name"]
-                .as_str()
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
+        if !matches!(
+            mount.kind,
+            crate::runtime::MountKind::Bind | crate::runtime::MountKind::Volume
+        ) {
+            return Err(
+                "the driver destination uses an unsupported mount type; use a bind or named volume",
+            );
+        }
+        if mount.kind == crate::runtime::MountKind::Volume
+            && mount.name.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("the driver volume has no usable name");
+        }
+        let host = mount.source.map(|source| source.0);
+        let name = if mount.kind == crate::runtime::MountKind::Volume {
+            mount.name
         } else {
             None
         };
-        if host.is_none() && name.is_none() {
-            return unresolved("the driver mount has no usable source or volume name");
+        if host.is_none() {
+            return Err("the driver mount has no usable source or volume name");
         }
-        set_mount_error(None);
-        return (host, name);
+        return Ok((host, name));
     }
-    unresolved("the agent mount list has no NVIDIA driver destination")
+    Err("the agent mount list has no NVIDIA driver destination")
 }
 
-/// Our own container id, from `/proc/self/mountinfo` with `$HOSTNAME` as fallback. Both
-/// best-effort; a miss blocks dependent app launches unless an explicit host path
-/// is validated. The agent remains available to explain the failed inspection.
-pub fn self_container_id() -> Option<String> {
-    if let Ok(body) = std::fs::read_to_string("/proc/self/mountinfo") {
-        if let Some(id) = parse_container_id_from_mountinfo(&body) {
-            return Some(id);
-        }
-    }
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|h| hostname_is_container_id(h))
-}
-
-/// Whether `$HOSTNAME` may stand in for the container id. A compose stack that
-/// sets `hostname:` makes it a DNS name (`quasar-dev.local`), which docker
-/// answers "No such object" for — so the shape is checked, never assumed.
-pub fn hostname_is_container_id(hostname: &str) -> bool {
-    hostname.len() >= 12 && hostname.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Pull the 64-hex container id out of a mountinfo body.
-pub fn parse_container_id_from_mountinfo(body: &str) -> Option<String> {
-    // Overlay lowerdir digests are also 64 hex characters. Only Docker's
-    // per-container identity-file mounts identify THIS container.
-    for line in body.lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 6
-            || !matches!(
-                fields[4],
-                "/etc/hosts" | "/etc/hostname" | "/etc/resolv.conf"
-            )
-        {
-            continue;
-        }
-        let parts: Vec<_> = fields[3].split('/').collect();
-        for pair in parts.windows(2) {
-            if pair[0] == "containers"
-                && pair[1].len() == 64
-                && pair[1].chars().all(|c| c.is_ascii_hexdigit())
-            {
-                return Some(pair[1].to_owned());
-            }
-        }
-    }
-    None
-}
+/// Our own container id, whether `$HOSTNAME` may stand in for it, and the mountinfo
+/// parse behind both: container self-inspection lives in the shared runtime crate
+/// (#355) and is re-exported here, where its callers have always found it.
+pub use quasar_runtime::self_inspection::{
+    hostname_is_container_id, parse_container_id_from_mountinfo, self_container_id,
+};
 
 // ── entry point ──────────────────────────────────────────────────────────────
 
@@ -510,12 +484,12 @@ pub fn decide(
     Ok(())
 }
 
-/// Adopt an already-provisioned volume at process start: one file read, one `docker
-/// inspect` on a hit, never a download.
+/// Adopt an already-provisioned volume at process start: one file read, one owned
+/// inspect on a hit, never a download.
 ///
 /// MUST run before `gst::init` — the fresh process has to set its EGL/Vulkan discovery
 /// env before anything touches EGL. Also the steady-state path on every later boot.
-pub fn adopt_current(docker: &str) -> Option<Manifest> {
+pub fn adopt_current() -> Option<Manifest> {
     let volume = PathBuf::from(VOLUME_MOUNT);
     if !volume.is_dir() {
         return None;
@@ -531,7 +505,7 @@ pub fn adopt_current(docker: &str) -> Option<Manifest> {
                 lib32 = m.lib32_count,
                 "adopting the Quasar-provisioned NVIDIA driver volume for this process"
             );
-            publish(&volume, m.clone(), docker);
+            publish(&volume, m.clone());
             set_status(Status::Provisioned(m.clone()));
             Some(m)
         }
@@ -560,11 +534,11 @@ pub fn adopt_current(docker: &str) -> Option<Manifest> {
 }
 
 /// Run the provisioner. Blocking — call it on a dedicated thread.
-pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outcome {
+pub fn provision_blocking(nvidia_present: bool, gap: Gap) -> Outcome {
     let volume = PathBuf::from(VOLUME_MOUNT);
     let volume_mounted = volume.is_dir();
     if nvidia_present && gap.any() && enabled() {
-        let (host, name) = locate_host_path(docker);
+        let (host, name) = locate_host_path();
         if host.is_none() && name.is_none() {
             let error = mount_resolution_error().unwrap_or_else(|| format!("Cannot verify a persistent NVIDIA driver mount. Check Docker socket and mount inspection, or set {HOST_PATH_ENV} to the host directory mounted at {VOLUME_MOUNT}; provisioning retries automatically."));
             set_status(Status::Failed(error.clone()));
@@ -586,7 +560,7 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
         tracing::debug!(target: T, "driver-volume provisioning not needed: {reason}");
         // Not provisioning still has to publish a CURRENT volume, so the agent and app
         // containers consume what a previous run created.
-        publish_if_current(&volume, &state, docker);
+        publish_if_current(&volume, &state);
         return Outcome::NotNeeded(reason);
     }
 
@@ -596,7 +570,7 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
             version = %m.driver_version,
             "driver volume already provisioned for the loaded kernel module — reusing it"
         );
-        publish_if_current(&volume, &state, docker);
+        publish_if_current(&volume, &state);
         return Outcome::AlreadyCurrent(m.clone());
     }
 
@@ -643,7 +617,7 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
                 "driver volume provisioned successfully"
             );
             set_status(Status::Provisioned(manifest.clone()));
-            publish(&volume, manifest.clone(), docker);
+            publish(&volume, manifest.clone());
             Outcome::Provisioned {
                 restart_required: gap.egl,
                 manifest,
@@ -664,15 +638,15 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
     }
 }
 
-fn publish_if_current(volume: &Path, state: &VolumeState, docker: &str) {
+fn publish_if_current(volume: &Path, state: &VolumeState) {
     if let Some(m) = state.usable() {
-        publish(volume, m.clone(), docker);
+        publish(volume, m.clone());
         set_status(Status::Provisioned(m.clone()));
     }
 }
 
-fn publish(volume: &Path, manifest: Manifest, docker: &str) {
-    let (host, name) = locate_host_path(docker);
+fn publish(volume: &Path, manifest: Manifest) {
+    let (host, name) = locate_host_path();
     match &host {
         Some(p) => tracing::info!(
             target: T,
@@ -1351,6 +1325,10 @@ const VENDOR_NEUTRAL_LIB_BASES: &[&str] = &[
     "libOpenCL",
 ];
 
+/// X.Org server modules. Only an X server loads them, from its module path; a session never
+/// does, and on a CUDA-only host (no X driver installed) they are nothing the host provides.
+const X_SERVER_MODULE_BASES: &[&str] = &["nvidia_drv", "libglxserver_nvidia"];
+
 /// The base name up to the first `.so`.
 fn so_base(name: &str) -> &str {
     name.split(".so").next().unwrap_or(name)
@@ -1381,6 +1359,10 @@ fn shared_objects(dir: &Path) -> Vec<String> {
                     "skipping a vendor-neutral dispatch library — the container image supplies it, \
                      and shadowing it via LD_LIBRARY_PATH breaks EGL"
                 );
+                return false;
+            }
+            if X_SERVER_MODULE_BASES.contains(&so_base(n)) {
+                tracing::debug!(target: T, lib = %n, "skipping an X.Org server module");
                 return false;
             }
             true
@@ -1860,11 +1842,56 @@ pub fn parse_egl_selftest(stdout: &str) -> EglRuntime {
     }
 }
 
+/// Parse the `--open-device` self-test. The dispatcher verdict comes first and still
+/// wins; on top of it, a run that reached no hardware GPU is `Broken` — that is the
+/// question the application-GPU host probe asks, and the one the dispatcher check cannot
+/// answer (a container with `/dev/dri` withheld still loads libEGL and finds Mesa's
+/// software device).
+pub fn parse_egl_device_open(stdout: &str) -> EglRuntime {
+    let dispatch = parse_egl_selftest(stdout);
+    let EglRuntime::Ok { loaded } = dispatch else {
+        return dispatch;
+    };
+    let field = |k: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(node) = field("OPENED=") {
+        return EglRuntime::Ok {
+            loaded: format!("{loaded} (opened {node})"),
+        };
+    }
+    if let Some(mismatch) = field("DEVICE_UNMATCHED=") {
+        return EglRuntime::Indeterminate {
+            detail: format!("the GPU could not be identified among the EGL devices: {mismatch}"),
+        };
+    }
+    if let Some(error) = field("DEVICE_ERROR=") {
+        return EglRuntime::Broken {
+            detail: format!("the EGL stack loads but no GPU could be opened: {error}"),
+            loaded: Some(loaded),
+        };
+    }
+    EglRuntime::Indeterminate {
+        detail: format!(
+            "the EGL device test produced no result (it crashed or was killed); loaded={loaded}"
+        ),
+    }
+}
+
 static SIBLING_EGL: Mutex<Option<(String, Instant, EglRuntime)>> = Mutex::new(None);
 
 /// Validate the driver through Docker's sibling-container namespace using the
 /// same mount/environment arguments as an app. Cached for one minute per image
 /// and driver digest; failures are retried without re-downloading the driver.
+///
+/// Every engine call is budgeted: the image lookup before the cache by
+/// [`crate::runtime::ENGINE_INSPECTION_BUDGET`] (#274), and the container lifecycle after
+/// a cache MISS by [`crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET`] end to end (#283). An
+/// outcome that only says the lifecycle could not run is not cached — a minute of
+/// answering "probe done" with a non-answer would outlast the freeze that caused it.
 pub fn probe_sibling_egl() -> EglRuntime {
     let Some(info) = current() else {
         return EglRuntime::Unknown;
@@ -1873,7 +1900,8 @@ pub fn probe_sibling_egl() -> EglRuntime {
         return EglRuntime::Unknown;
     }
     let runtime = crate::session::container::ContainerRuntime::from_env();
-    let image = match runtime.own_image() {
+    // Budgeted: this runs before the cache lookup below, on the readiness report path (#274).
+    let image = match runtime.own_image_within(crate::runtime::ENGINE_INSPECTION_BUDGET) {
         Ok(image) => image,
         Err(error) => {
             return EglRuntime::Indeterminate {
@@ -1899,47 +1927,92 @@ pub fn probe_sibling_egl() -> EglRuntime {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let name = format!("quasar-driver-probe-{}-{nonce}", std::process::id());
-    let mut args: Vec<String> = [
-        "run",
-        "--rm",
-        "--name",
-        &name,
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--gpus",
-        "all",
-        "--entrypoint",
-        "/usr/bin/timeout",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect();
-    args.extend(app_container_args(Some(&info), VOLUME_MOUNT, ""));
-    args.extend([
-        image,
-        "20s".into(),
-        "/usr/local/bin/quasar-node-agent".into(),
-        EGL_SELFTEST_ARG.into(),
-        format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
-    ]);
-    let output = runtime.run_raw(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    // Also clean up after a daemon/client timeout. The in-container timeout
-    // bounds the probe even if the agent itself is killed during this call.
-    runtime.force_remove(&name);
-    let result = match output {
-        Ok(body) => parse_egl_selftest(&body),
-        Err(error) => EglRuntime::Indeterminate {
-            detail: format!("sibling EGL test could not complete: {error}"),
-        },
+    let name = format!(
+        "{}egl-{}-{nonce}",
+        crate::container_ownership::PROBE_NAME_PREFIX,
+        std::process::id()
+    );
+    let run = crate::runtime::GpuProbeRun {
+        entrypoint: vec!["/usr/bin/timeout".into()],
+        command: vec![
+            // Same allowance the in-process self-test gets, and the number the probe's
+            // lifecycle budget is sized against (#283).
+            format!("{}s", EGL_SELFTEST_TIMEOUT.as_secs()),
+            "/usr/local/bin/quasar-node-agent".into(),
+            EGL_SELFTEST_ARG.into(),
+            format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
+        ],
+        // This launch gate reads the driver userspace, not a DRM node — unlike the
+        // application-GPU host probe, which takes the whole of `AppGpuAccess`.
+        devices: Vec::new(),
+        groups: Vec::new(),
+        // This gate only ever runs on an NVIDIA host, so it asks for the GPU exactly as
+        // a session's application container does.
+        nvidia_device_request: true,
+        nvidia: crate::session::container::nvidia_driver_access(&info),
     };
-    *cached = Some((key, Instant::now(), result.clone()));
+    let helper = crate::runtime::DiagnosticHelper {
+        operation: format!("nvidia-egl-{nonce}"),
+        name,
+        image,
+    };
+    // Budgeted end to end (#283): create, start, wait and remove used to carry one
+    // client deadline EACH, so a daemon that wedged after the cache missed could hold
+    // this call for five of them. `Indeterminate` on a spent budget is the same verdict
+    // the engine-did-not-answer arm reaches, just without the wait.
+    let output = crate::runtime::configured().and_then(|api| {
+        api.gpu_probe_within(helper, run, crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET)
+    });
+    let (result, cacheable) = sibling_egl_verdict(output);
+    if cacheable == SiblingEglCache::Keep {
+        *cached = Some((key, Instant::now(), result.clone()));
+    }
     result
+}
+
+/// Whether a sibling-probe outcome may be remembered for the cache's minute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiblingEglCache {
+    /// The probe ran and said something about this host.
+    Keep,
+    /// The probe never produced a verdict: a busy, unreachable or wedged engine, or a
+    /// spent lifecycle budget. Caching a non-answer for a minute would make the next
+    /// caller re-read it as "probe done" and hide a real answer behind it (#283).
+    Discard,
+}
+
+/// Fold one probe lifecycle outcome into a verdict, and say whether it is one. Pure so
+/// the cache rule is testable without an engine.
+fn sibling_egl_verdict(
+    output: Result<crate::runtime::HelperResult, crate::runtime::RuntimeError>,
+) -> (EglRuntime, SiblingEglCache) {
+    match output {
+        // The probe ran to a clean exit: whatever it printed is this host's answer,
+        // including a self-test that crashed before printing a verdict line.
+        Ok(body) if body.exit_code == Some(0) => {
+            (parse_egl_selftest(&body.stdout), SiblingEglCache::Keep)
+        }
+        // It ran and exited non-zero: also an observation of this host.
+        Ok(body) => (
+            EglRuntime::Indeterminate {
+                detail: format!(
+                    "sibling EGL test exited {:?}: {}",
+                    body.exit_code,
+                    body.stderr.trim()
+                ),
+            },
+            SiblingEglCache::Keep,
+        ),
+        // The lifecycle itself failed — nothing was learned about the driver.
+        Err(error) => (
+            EglRuntime::Indeterminate {
+                detail: format!(
+                    "sibling EGL test could not complete through owned runtime lifecycle: {error}"
+                ),
+            },
+            SiblingEglCache::Discard,
+        ),
+    }
 }
 
 /// Run the self-test as a CHILD of this binary (`/proc/self/exe egl-selftest`).
@@ -2035,7 +2108,17 @@ const EGL_SELFTEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// reports the resolved file, the client extension string, and optionally whether the
 /// NVIDIA vendor library dlopens. Prints `KEY=value` and always exits 0 — the parent
 /// reads the text, so a non-zero exit would only lose information.
-pub fn egl_selftest_main(vendor_lib: Option<&str>) -> i32 {
+///
+/// `open_device` adds the device lines [`parse_egl_device_open`] reads. Without it the
+/// stdout is byte-identical to what the readiness and launch-gate callers parse.
+/// `render_node` (only meaningful with `open_device`) pins which hardware device to open —
+/// the application-GPU host probe asks for the GPU it was placed on rather than whichever
+/// device EGL enumerates first.
+pub fn egl_selftest_main(
+    vendor_lib: Option<&str>,
+    open_device: bool,
+    render_node: Option<&str>,
+) -> i32 {
     // SAFETY: all four calls are plain libdl/EGL C entry points with the
     // documented signatures; every pointer handed in is either NULL or a
     // NUL-terminated CString that outlives the call, and every pointer read
@@ -2086,9 +2169,199 @@ pub fn egl_selftest_main(vendor_lib: Option<&str>) -> i32 {
                 }
             }
         }
+        if open_device {
+            report_device_open(handle, render_node);
+        }
         libc::dlclose(handle);
     }
     0
+}
+
+/// Resolve an EGL entry point. glvnd exports the core calls, but an extension entry
+/// point may only exist behind `eglGetProcAddress`, so a null dlsym is not yet an answer.
+///
+/// SAFETY: `handle` is a live `dlopen` handle; both lookups take a NUL-terminated name
+/// that outlives the call and return either NULL or a function pointer owned by the
+/// library, and every caller null-checks the result before transmuting it.
+unsafe fn egl_symbol(handle: *mut libc::c_void, name: &str) -> *mut libc::c_void {
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return std::ptr::null_mut();
+    };
+    let direct = libc::dlsym(handle, c.as_ptr());
+    if !direct.is_null() {
+        return direct;
+    }
+    let proc_address = std::ffi::CString::new("eglGetProcAddress").unwrap();
+    let f = libc::dlsym(handle, proc_address.as_ptr());
+    if f.is_null() {
+        return std::ptr::null_mut();
+    }
+    let get_proc: extern "C" fn(*const libc::c_char) -> *mut libc::c_void = std::mem::transmute(f);
+    get_proc(c.as_ptr())
+}
+
+/// `wanted` by exact render-node match, or the first hardware device when `None`.
+/// Every hardware device worth opening, in EGL's order. Two vendors can claim one render
+/// node (on NVIDIA, Mesa lists the same node and cannot initialize it), so a node is
+/// open when any device that names it opens.
+fn pick_devices(hardware: &[String], wanted: Option<&str>) -> Result<Vec<usize>, DevicePick> {
+    if hardware.is_empty() {
+        return Err(DevicePick::NoHardware);
+    }
+    let Some(node) = wanted else {
+        return Ok((0..hardware.len()).collect());
+    };
+    let matching: Vec<usize> = hardware
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| (n == node).then_some(i))
+        .collect();
+    if matching.is_empty() {
+        return Err(DevicePick::Unmatched(node.to_string()));
+    }
+    Ok(matching)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DevicePick {
+    /// Only software rendering: the container cannot reach a GPU.
+    NoHardware,
+    /// EGL names its devices differently from the capacity report (a driver without
+    /// `EGL_DRM_RENDER_NODE_FILE_EXT` answers `cardN`). Says nothing about GPU access.
+    Unmatched(String),
+}
+
+/// Open the GPU the way a session's application will, and say which node it was.
+///
+/// The client extension string alone proves nothing about GPU access: with `/dev/dri`
+/// withheld a container still loads libEGL and still enumerates Mesa's software device,
+/// so the application-GPU host probe needs a device actually initialized.
+///
+/// SAFETY: every symbol is null-checked before it is transmuted to its documented EGL
+/// signature; the device pointers come from `eglQueryDevicesEXT` and are read back only
+/// within the count it reported; every string pointer is null-checked before
+/// `CStr::from_ptr`; the display is terminated on the success path and never used after.
+unsafe fn report_device_open(handle: *mut libc::c_void, wanted: Option<&str>) {
+    const EGL_PLATFORM_DEVICE_EXT: u32 = 0x313F;
+    const EGL_DRM_DEVICE_FILE_EXT: i32 = 0x3233;
+    const EGL_DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
+    const MAX_DEVICES: i32 = 32;
+
+    let devices_sym = egl_symbol(handle, "eglQueryDevicesEXT");
+    let device_string_sym = egl_symbol(handle, "eglQueryDeviceStringEXT");
+    let mut display_sym = egl_symbol(handle, "eglGetPlatformDisplayEXT");
+    if display_sym.is_null() {
+        display_sym = egl_symbol(handle, "eglGetPlatformDisplay");
+    }
+    let initialize_sym = egl_symbol(handle, "eglInitialize");
+    let terminate_sym = egl_symbol(handle, "eglTerminate");
+    let error_sym = egl_symbol(handle, "eglGetError");
+    for (name, symbol) in [
+        ("eglQueryDevicesEXT", devices_sym),
+        ("eglQueryDeviceStringEXT", device_string_sym),
+        ("eglGetPlatformDisplay", display_sym),
+        ("eglInitialize", initialize_sym),
+        ("eglTerminate", terminate_sym),
+        ("eglGetError", error_sym),
+    ] {
+        if symbol.is_null() {
+            println!("DEVICE_ERROR=libEGL.so.1 resolves no {name}");
+            return;
+        }
+    }
+    let query_devices: extern "C" fn(i32, *mut *mut libc::c_void, *mut i32) -> u32 =
+        std::mem::transmute(devices_sym);
+    let query_device_string: extern "C" fn(*mut libc::c_void, i32) -> *const libc::c_char =
+        std::mem::transmute(device_string_sym);
+    let get_platform_display: extern "C" fn(
+        u32,
+        *mut libc::c_void,
+        *const isize,
+    ) -> *mut libc::c_void = std::mem::transmute(display_sym);
+    let initialize: extern "C" fn(*mut libc::c_void, *mut i32, *mut i32) -> u32 =
+        std::mem::transmute(initialize_sym);
+    let terminate: extern "C" fn(*mut libc::c_void) -> u32 = std::mem::transmute(terminate_sym);
+    let get_error: extern "C" fn() -> i32 = std::mem::transmute(error_sym);
+    let last_error = || format!("0x{:04x}", get_error());
+
+    let mut devices = [std::ptr::null_mut::<libc::c_void>(); MAX_DEVICES as usize];
+    let mut found = 0i32;
+    if query_devices(MAX_DEVICES, devices.as_mut_ptr(), &mut found) == 0 || found <= 0 {
+        println!(
+            "DEVICES=0\nDEVICE_ERROR=eglQueryDevicesEXT enumerated no EGL device (egl error {})",
+            last_error()
+        );
+        return;
+    }
+    println!("DEVICES={found}");
+    // A device with no DRM file is a software device: Mesa's llvmpipe answers every
+    // query but is not GPU access.
+    let hardware: Vec<(*mut libc::c_void, String)> = devices[..found.min(MAX_DEVICES) as usize]
+        .iter()
+        .filter_map(|device| {
+            let mut file = query_device_string(*device, EGL_DRM_RENDER_NODE_FILE_EXT);
+            if file.is_null() {
+                file = query_device_string(*device, EGL_DRM_DEVICE_FILE_EXT);
+            }
+            (!file.is_null()).then(|| {
+                (
+                    *device,
+                    std::ffi::CStr::from_ptr(file)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+        })
+        .collect();
+    println!(
+        "RENDER_NODES={}",
+        hardware
+            .iter()
+            .map(|(_, node)| node.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let candidates = match pick_devices(
+        &hardware
+            .iter()
+            .map(|(_, node)| node.clone())
+            .collect::<Vec<_>>(),
+        wanted,
+    ) {
+        Ok(candidates) => candidates,
+        Err(DevicePick::NoHardware) => {
+            println!("DEVICE_ERROR=no hardware EGL device (only software rendering is available)");
+            return;
+        }
+        Err(DevicePick::Unmatched(node)) => {
+            println!("DEVICE_UNMATCHED={node} is not among the EGL device names listed above");
+            return;
+        }
+    };
+    let mut last_failure = String::new();
+    for index in candidates {
+        let (device, node) = &hardware[index];
+        // Querying a software device's DRM file, or a failed attempt above, leaves an
+        // error latched: clear it or this attempt reports the wrong code.
+        get_error();
+        let display = get_platform_display(EGL_PLATFORM_DEVICE_EXT, *device, std::ptr::null());
+        if display.is_null() {
+            last_failure = format!("no EGL display for {node} (egl error {})", last_error());
+            continue;
+        }
+        let (mut major, mut minor) = (0, 0);
+        if initialize(display, &mut major, &mut minor) == 0 {
+            last_failure = format!(
+                "eglInitialize failed for {node} (egl error {})",
+                last_error()
+            );
+            continue;
+        }
+        println!("OPENED={node}");
+        terminate(display);
+        return;
+    }
+    println!("DEVICE_ERROR={last_failure}");
 }
 
 /// SAFETY: `dlerror` returns either NULL or a pointer to a NUL-terminated
@@ -2169,6 +2442,10 @@ pub fn app_container_args(
             "VK_ADD_DRIVER_FILES={}",
             dst.join(layout::VULKAN_ICD_JSON).display()
         ),
+        // With the NVIDIA ICD present, a failure to load it must surface, not fall back
+        // to lavapipe and run the game in software (the agent image sets the same).
+        "-e".into(),
+        "VK_LOADER_DRIVERS_DISABLE=*lvp_icd*".into(),
     ];
 
     // GBM_BACKENDS_PATH REPLACES Mesa's backend directory, so it is emitted only when
@@ -2226,6 +2503,9 @@ pub fn restart_for_egl(grace: Duration) {
         }
         *done = true;
     }
+    // #388: from here on this process is going away, so it takes no new session. The
+    // EGL stack it would run on is the one this restart replaces.
+    crate::restart::mark_pending();
     std::thread::spawn(move || {
         std::thread::sleep(grace);
         // #66: symmetric with the cudart path — never exit while any provision is still
@@ -2237,10 +2517,11 @@ pub fn restart_for_egl(grace: Duration) {
                 "another provision is still in flight — NOT restarting; the EGL stack will \
                  re-initialise on the next agent start instead"
             );
+            crate::restart::clear_pending();
             return;
         }
         tracing::warn!(target: T, token = "drvvol-agent-restart-now", "restarting node agent now");
-        std::process::exit(0);
+        crate::restart::exit_now(0);
     });
 }
 
@@ -2276,6 +2557,40 @@ pub fn debug_map() -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn driver_mount_rejects_unknown_semantics_and_preserves_named_volumes() {
+        use crate::runtime::{DaemonHostPath, Mount, MountKind};
+        let mount = |kind, name| Mount {
+            kind,
+            source: Some(DaemonHostPath("/daemon/driver".into())),
+            name,
+            destination: super::VOLUME_MOUNT.into(),
+            read_only: Some(false),
+        };
+        assert!(
+            super::driver_mount_location(vec![mount(MountKind::Other("opaque".into()), None)])
+                .is_err()
+        );
+        assert!(super::driver_mount_location(vec![mount(MountKind::Tmpfs, None)]).is_err());
+        assert_eq!(
+            super::driver_mount_location(vec![mount(MountKind::Bind, Some("unrelated".into()))])
+                .unwrap(),
+            (Some(std::path::PathBuf::from("/daemon/driver")), None)
+        );
+        assert_eq!(
+            super::driver_mount_location(vec![mount(
+                MountKind::Volume,
+                Some("driver-volume".into())
+            )])
+            .unwrap(),
+            (
+                Some(std::path::PathBuf::from("/daemon/driver")),
+                Some("driver-volume".into())
+            )
+        );
+        assert!(super::driver_mount_location(vec![mount(MountKind::Volume, None)]).is_err());
+    }
+
     use super::*;
     use std::fs;
 
@@ -2564,6 +2879,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn x_server_modules_never_enter_the_volume() {
+        let t = fake_extract("xorg");
+        t.file("nvidia_drv.so", "x");
+        t.file("libglxserver_nvidia.so.610.57.04", "x");
+        let pop = classify_extract_tree(&t.0).unwrap();
+        assert_eq!(pop.lib64.len(), 10, "{:?}", pop.lib64);
+    }
+
     /// The volume must carry vendor libraries only: the installer's glvnd dispatch
     /// layer on `LD_LIBRARY_PATH` shadows the image's libglvnd, and NVIDIA's legacy
     /// `libEGL.so.<ver>` then wins `libEGL.so.1` and panics the compositor. See
@@ -2748,6 +3072,98 @@ mod tests {
         assert!(!matches!(parse_egl_selftest(""), EglRuntime::Ok { .. }));
     }
 
+    /// `--open-device` asks the harder question the dispatcher check cannot: with the
+    /// GPU withheld, a container still loads libEGL and still finds Mesa's software
+    /// device.
+    #[test]
+    fn egl_device_open_verdicts() {
+        const DISPATCH_OK: &str = "LOADED=/usr/lib64/libEGL.so.1.1.0\n\
+             EXTENSIONS=EGL_EXT_device_base EGL_EXT_device_enumeration\n";
+
+        let opened = parse_egl_device_open(&format!(
+            "{DISPATCH_OK}DEVICES=2\nRENDER_NODES=/dev/dri/renderD128\n\
+             OPENED=/dev/dri/renderD128\n"
+        ));
+        assert!(
+            matches!(&opened, EglRuntime::Ok { loaded } if loaded.contains("renderD128")),
+            "{opened:?}"
+        );
+
+        let failed = parse_egl_device_open(&format!(
+            "{DISPATCH_OK}DEVICES=1\nRENDER_NODES=/dev/dri/renderD128\n\
+             DEVICE_ERROR=eglInitialize failed (0x3003)\n"
+        ));
+        assert!(
+            matches!(&failed, EglRuntime::Broken { detail, .. } if detail.contains("0x3003")),
+            "{failed:?}"
+        );
+
+        // The withheld-GPU case the hardware acceptance injects.
+        let software = parse_egl_device_open(&format!(
+            "{DISPATCH_OK}DEVICES=1\nRENDER_NODES=\n\
+             DEVICE_ERROR=no hardware EGL device (only software rendering is available)\n"
+        ));
+        assert!(
+            matches!(&software, EglRuntime::Broken { detail, .. } if detail.contains("software")),
+            "{software:?}"
+        );
+
+        // Killed between the extension string and any device line: no information.
+        let truncated = parse_egl_device_open(&format!("{DISPATCH_OK}DEVICES=2\n"));
+        assert!(truncated.is_indeterminate(), "{truncated:?}");
+
+        // A dispatcher failure is still the diagnosis, whatever follows it.
+        let dispatch =
+            parse_egl_device_open("DISPATCH_ERROR=no such file\nOPENED=/dev/dri/renderD128\n");
+        assert!(
+            matches!(&dispatch, EglRuntime::Broken { detail, .. } if detail.contains("libEGL")),
+            "{dispatch:?}"
+        );
+    }
+
+    /// The application-GPU host probe pins the exact GPU it was placed on; unpinned
+    /// stays "first hardware device", byte-identical to every other caller.
+    #[test]
+    fn every_device_naming_the_wanted_node_is_a_candidate_in_egl_order() {
+        // As enumerated on an NVIDIA host: Mesa and NVIDIA both claim renderD128.
+        let hardware = vec![
+            "/dev/dri/renderD128".to_string(),
+            "/dev/dri/renderD129".to_string(),
+            "/dev/dri/renderD128".to_string(),
+        ];
+        assert_eq!(
+            pick_devices(&hardware, Some("/dev/dri/renderD128")),
+            Ok(vec![0, 2])
+        );
+        assert_eq!(
+            pick_devices(&hardware, Some("/dev/dri/renderD129")),
+            Ok(vec![1])
+        );
+        assert_eq!(pick_devices(&hardware, None), Ok(vec![0, 1, 2]));
+        assert_eq!(
+            pick_devices(&hardware, Some("/dev/dri/renderD130")),
+            Err(DevicePick::Unmatched("/dev/dri/renderD130".into()))
+        );
+        // No hardware device is evidence whatever was asked for.
+        assert_eq!(pick_devices(&[], None), Err(DevicePick::NoHardware));
+        assert_eq!(
+            pick_devices(&[], Some("/dev/dri/renderD128")),
+            Err(DevicePick::NoHardware)
+        );
+    }
+
+    /// A driver that names its device `card0` is not a GPU the container cannot open.
+    #[test]
+    fn a_device_name_mismatch_is_indeterminate_not_broken() {
+        let verdict = parse_egl_device_open(
+            "LOADED=/usr/lib64/libEGL.so.1\n\
+             EXTENSIONS=EGL_EXT_device_base EGL_EXT_device_enumeration\n\
+             DEVICES=1\nRENDER_NODES=/dev/dri/card0\n\
+             DEVICE_UNMATCHED=/dev/dri/renderD128 is not among the EGL device names listed above\n",
+        );
+        assert!(verdict.is_indeterminate(), "{verdict:?}");
+    }
+
     /// An infrastructure failure of the self-test (crashed child, no verdict line, and
     /// in production the 20s timeout) must be `Indeterminate`, never `Broken`. `Broken`
     /// is what the veto acts on: it becomes a provisioning gap, a 350 MB download and a
@@ -2789,6 +3205,87 @@ mod tests {
             v.is_indeterminate(),
             "a self-test child that produces no verdict must be Indeterminate, got {v:?}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly prepared NVIDIA candidate container, disposable driver volume, and Docker socket"]
+    fn live_owned_gpu_helpers_cover_provisioned_driver_volume() {
+        if std::env::var("QUASAR_TEST_NVIDIA_GPU_HELPERS").as_deref() != Ok("1") {
+            eprintln!("SKIP: set QUASAR_TEST_NVIDIA_GPU_HELPERS=1 after mounting a disposable provisioned driver volume");
+            return;
+        }
+        assert_eq!(
+            std::env::var("QUASAR_TEST_NVIDIA_TEST_IDENTITY").as_deref(),
+            Ok("1"),
+            "set QUASAR_TEST_NVIDIA_TEST_IDENTITY=1 to acknowledge the test-only ownership lease"
+        );
+        let secret = std::env::var("NODE_SECRET_PATH")
+            .expect("set a unique test NODE_SECRET_PATH; never share the running agent lease");
+        assert!(
+            secret.starts_with("/tmp/quasar-gpu-helper-"),
+            "NODE_SECRET_PATH must be a unique /tmp/quasar-gpu-helper-* test path"
+        );
+        let name = std::env::var("QUASAR_TEST_NVIDIA_DRIVER_VOLUME")
+            .expect("set the uniquely owned disposable Docker volume name");
+        let version =
+            kernel_driver_version(Path::new("/")).expect("NVIDIA kernel driver must be loaded");
+        let manifest = match volume_state(Path::new(VOLUME_MOUNT), &version) {
+            VolumeState::Current(manifest) => manifest,
+            other => panic!(
+                "mounted disposable volume is not a current provisioned driver volume: {other:?}"
+            ),
+        };
+        set_current(Some(VolumeInfo {
+            local: VOLUME_MOUNT.into(),
+            host: None,
+            name: Some(name),
+            manifest,
+        }));
+        let runtime = crate::session::container::ContainerRuntime::from_env();
+        // A CUDA-only host deliberately has no compatible host `/usr` lib32
+        // directory. The migrated public probe must report that absence so
+        // session launch uses the provisioned named volume instead; mutating
+        // host `/usr` would not prove the fallback and is forbidden here.
+        assert!(
+            runtime.probe_nvidia_lib32_path().is_none(),
+            "CUDA-only host lib32 probe must leave volume fallback selected"
+        );
+        let helper_journals = PathBuf::from(format!("{secret}.runtime-images/helpers"));
+        let terminal_absence = std::fs::read_dir(helper_journals)
+            .expect("owned lib32 helper journal must be present")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .filter_map(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .any(|intent| {
+                intent["operation"]
+                    .as_str()
+                    .is_some_and(|op| op.starts_with("nvidia-lib32-"))
+                    && intent["phase"] == "Completed"
+                    && intent["result"]["exit_code"] == 1
+            });
+        assert!(
+            terminal_absence,
+            "lib32 None must record owned terminal exit 1, not a runtime failure"
+        );
+        let current = current().expect("test installed the disposable volume state");
+        assert!(
+            current.manifest.lib32_count > 0,
+            "fresh provision must contain lib32 libraries"
+        );
+        let lib = std::fs::read_dir(current.local.join(layout::LIB32))
+            .expect("provisioned lib32 directory must be readable")
+            .filter_map(Result::ok)
+            .find_map(|entry| std::fs::read(entry.path()).ok())
+            .expect("provisioned lib32 directory must contain a library");
+        assert!(
+            lib.starts_with(b"\x7fELF\x01"),
+            "provisioned driver volume must contain ELF32 userspace"
+        );
+        assert!(
+            matches!(probe_sibling_egl(), EglRuntime::Ok { .. }),
+            "owned GPU helper must load the provisioned NVIDIA EGL stack"
+        );
+        set_current(None);
     }
 
     // ── installer integrity (#476) ──────────────────────────────────────────
@@ -3398,38 +3895,10 @@ mod tests {
     // ── misc ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn overlay_digests_are_not_container_ids() {
-        let layer = "b".repeat(64);
-        let id = "a".repeat(64);
-        let body = format!("1 0 0:1 / / rw - overlay overlay rw,lowerdir=/layers/{layer}/diff\n2 1 8:1 /var/lib/docker/containers/{id}/hosts /etc/hosts rw - ext4 /dev/sda rw\n");
-        assert_eq!(parse_container_id_from_mountinfo(&body), Some(id));
-        assert_eq!(
-            parse_container_id_from_mountinfo(&format!(
-                "1 0 0:1 /layers/{layer}/diff /opt/data rw - ext4 /dev/sda rw"
-            )),
-            None
-        );
-    }
-
-    #[test]
     fn unreadable_pin_store_does_not_reset_trust() {
         let dir = Tmp::new("pins-is-directory");
         std::fs::create_dir_all(dir.0.join(layout::DIGESTS)).unwrap();
         assert!(read_digest_pins(&dir.0).is_err());
-    }
-
-    #[test]
-    fn container_id_is_recovered_from_mountinfo() {
-        let id = "a".repeat(64);
-        let body = format!(
-            "1234 1200 0:59 / / rw - overlay overlay rw\n\
-             1240 1234 0:60 /var/lib/docker/containers/{id}/resolv.conf /etc/resolv.conf rw - ext4 /dev/sda1 rw\n"
-        );
-        assert_eq!(
-            parse_container_id_from_mountinfo(&body).as_deref(),
-            Some(id.as_str())
-        );
-        assert_eq!(parse_container_id_from_mountinfo("1 2 0:1 / / rw\n"), None);
     }
 
     #[test]
@@ -3445,5 +3914,101 @@ mod tests {
         let d = describe(&manifest("610.57.04"));
         assert!(d.contains("driver volume"));
         assert!(d.contains("610.57.04"));
+    }
+
+    // ── sibling EGL probe: budget and cache (#283) ───────────────────────────
+
+    /// A lifecycle that could not run is `Indeterminate` — never `Broken`, which would
+    /// refuse launches — and it is NOT remembered. The cache exists to stop a healthy
+    /// host paying for a container every minute; holding a spent budget or a busy client
+    /// in it for a minute would answer "probe done" with a non-answer long after the
+    /// engine recovered.
+    #[test]
+    fn a_lifecycle_that_could_not_run_is_indeterminate_and_is_not_cached() {
+        use crate::runtime::{ErrorKind, RuntimeError};
+        for kind in [
+            ErrorKind::Timeout,
+            ErrorKind::UnknownOutcome,
+            ErrorKind::Busy,
+            ErrorKind::Cancelled,
+            ErrorKind::Unavailable,
+        ] {
+            let (verdict, cacheable) = sibling_egl_verdict(Err(RuntimeError::from(kind)));
+            assert!(
+                verdict.is_indeterminate() && !verdict.is_broken(),
+                "{kind:?}: a probe that never ran says nothing about the driver: {verdict:?}"
+            );
+            assert_eq!(
+                cacheable,
+                SiblingEglCache::Discard,
+                "{kind:?}: a non-answer must not be cached as a verdict"
+            );
+        }
+    }
+
+    /// What the probe actually reports is still cached, including a bad verdict: that is
+    /// the minute of relief the cache is for.
+    #[test]
+    fn an_answer_from_a_probe_that_ran_is_cached() {
+        use crate::runtime::HelperResult;
+        let ran = |exit, stdout: &str| HelperResult {
+            exit_code: Some(exit),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        };
+        let (ok, cacheable) = sibling_egl_verdict(Ok(ran(
+            0,
+            "LOADED=/usr/lib64/libEGL.so.1\nEXTENSIONS=EGL_EXT_device_base EGL_EXT_device_enumeration\n",
+        )));
+        assert!(matches!(ok, EglRuntime::Ok { .. }), "{ok:?}");
+        assert_eq!(cacheable, SiblingEglCache::Keep);
+
+        let (broken, cacheable) = sibling_egl_verdict(Ok(ran(0, "EXTENSIONS=\n")));
+        assert!(broken.is_broken(), "{broken:?}");
+        assert_eq!(cacheable, SiblingEglCache::Keep);
+
+        let (exited, cacheable) = sibling_egl_verdict(Ok(ran(1, "")));
+        assert!(exited.is_indeterminate(), "{exited:?}");
+        assert_eq!(
+            cacheable,
+            SiblingEglCache::Keep,
+            "a probe that ran and exited non-zero observed this host"
+        );
+    }
+
+    /// The budget may not be tight enough to turn a HEALTHY probe indeterminate. The
+    /// probe container self-limits with `timeout 20s`; everything else in the lifecycle
+    /// is one engine round-trip, for which `ENGINE_INSPECTION_BUDGET` is already the
+    /// agreed allowance (#274). The budget must clear both with room to spare.
+    #[test]
+    fn the_probe_budget_cannot_trip_a_healthy_probe() {
+        let ceiling = EGL_SELFTEST_TIMEOUT + crate::runtime::ENGINE_INSPECTION_BUDGET;
+        assert!(
+            crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET >= ceiling,
+            "a healthy probe costs at most the container's own {EGL_SELFTEST_TIMEOUT:?} \
+             self-limit plus engine round-trips: {:?} vs {ceiling:?}",
+            crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET
+        );
+    }
+
+    /// The probe runs from the launch gate today (#259), but the budget is sized so that a
+    /// whole refresh's engine work would still land inside the agent's readiness-refresh
+    /// deadline if the probe ever returned to that path: a refresh that straddles a freeze
+    /// must report a verdict rather than be abandoned as `readiness-refresh-overdue` (#283).
+    /// The five budgeted reads #274 left on that path, plus one probe lifecycle.
+    #[test]
+    fn a_probe_and_the_refresh_paths_engine_reads_fit_inside_the_refresh_deadline() {
+        /// `READINESS_REFRESH_DEADLINE` in `agent.rs`.
+        const REFRESH_DEADLINE: Duration = Duration::from_secs(60);
+        /// Budgeted engine reads on the refresh path after #274: the engine inspection,
+        /// the agent's own mount inspection, the firewall read, the image-root lookup and
+        /// the probe's own image lookup.
+        const BUDGETED_READS: u32 = 5;
+        let worst = crate::runtime::ENGINE_INSPECTION_BUDGET * BUDGETED_READS
+            + crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET;
+        assert!(
+            worst < REFRESH_DEADLINE,
+            "{worst:?} of engine work in one refresh does not fit in {REFRESH_DEADLINE:?}"
+        );
     }
 }

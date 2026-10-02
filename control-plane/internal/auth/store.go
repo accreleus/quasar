@@ -28,6 +28,18 @@ var ErrLastAdmin = errors.New("cannot demote the last admin")
 // non-terminal session. Stop the session first; only terminal history cascades.
 var ErrUserHasActiveSessions = errors.New("user has active sessions")
 
+// ErrHomeCleanupPending is a privacy-safe refusal of deletion while a
+// cleanup-capable agent may still have mounted the user's managed home.
+var ErrHomeCleanupPending = errors.New("managed home cleanup is pending")
+
+func homeCleanupDeleteError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "QH001" {
+		return ErrHomeCleanupPending
+	}
+	return err
+}
+
 // ErrSetupAlreadyComplete: the first-run claim found an admin already exists
 // (409 setup_already_complete). Claim-side twin of ensureBootstrapAdmin's
 // BootstrapSkipped — both decide under the same advisory lock, so the two
@@ -666,15 +678,53 @@ func (s *store) deleteUser(ctx context.Context, id string) ([]string, string, er
 		}
 	}
 
+	// Lock historical held-session rows as well as active rows before claims,
+	// in the same order as qualified terminal reconciliation.
+	sessionRows, err := tx.Query(ctx, `SELECT id::text,state FROM sessions
+		WHERE user_id=$1::uuid ORDER BY id FOR UPDATE`, id)
+	if err != nil {
+		return nil, "", fmt.Errorf("lock user sessions: %w", err)
+	}
 	var active int
-	if err := tx.QueryRow(ctx, `
-		SELECT COUNT(*) FROM sessions
-		WHERE user_id::text = $1 AND state NOT IN ('stopped','failed')
-	`, id).Scan(&active); err != nil {
-		return nil, "", fmt.Errorf("count active sessions: %w", err)
+	for sessionRows.Next() {
+		var sid, state string
+		if err := sessionRows.Scan(&sid, &state); err != nil {
+			sessionRows.Close()
+			return nil, "", err
+		}
+		if state != "stopped" && state != "failed" {
+			active++
+		}
+	}
+	err = sessionRows.Err()
+	sessionRows.Close()
+	if err != nil {
+		return nil, "", fmt.Errorf("read user sessions: %w", err)
 	}
 	if active > 0 {
 		return nil, "", ErrUserHasActiveSessions
+	}
+	claimRows, err := tx.Query(ctx, `SELECT pending_home_token IS NOT NULL FROM managed_home_claims
+		WHERE user_id=$1::uuid ORDER BY user_id,canonical_app_id FOR UPDATE`, id)
+	if err != nil {
+		return nil, "", fmt.Errorf("lock user home claims: %w", err)
+	}
+	var held bool
+	for claimRows.Next() {
+		var pending bool
+		if err := claimRows.Scan(&pending); err != nil {
+			claimRows.Close()
+			return nil, "", err
+		}
+		held = held || pending
+	}
+	err = claimRows.Err()
+	claimRows.Close()
+	if err != nil {
+		return nil, "", fmt.Errorf("read user home claims: %w", err)
+	}
+	if held {
+		return nil, "", ErrHomeCleanupPending
 	}
 
 	// Tombstone all of the user's homes before deleting the user row (P5-05).
@@ -698,7 +748,7 @@ func (s *store) deleteUser(ctx context.Context, id string) ([]string, string, er
 	}
 
 	if _, err := tx.Exec(ctx, `DELETE FROM users WHERE id::text = $1`, id); err != nil {
-		return nil, "", fmt.Errorf("delete user: %w", err)
+		return nil, "", fmt.Errorf("delete user: %w", homeCleanupDeleteError(err))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, "", err

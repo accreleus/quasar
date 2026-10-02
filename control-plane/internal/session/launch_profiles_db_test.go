@@ -272,7 +272,7 @@ func TestDeleteStreamProfileInUseIs409(t *testing.T) {
 // clause, i.e. NO ACTION. Counting only `launch_profile_rungs` therefore produced
 // an empty `used_by`, an ENABLED Delete button, and — the moment the operator
 // clicked it on a rung that any session had ever resolved to — a raw
-// `sessions_stream_profile_id_fkey` violation mapped to `500 internal`. Tower
+// `sessions_stream_profile_id_fkey` violation mapped to `500 internal`. gpu-test
 // carries 823 session rows, so this was reachable as soon as anyone did the
 // per-rung tuning the restructure exists to enable.
 //
@@ -411,7 +411,7 @@ func TestDeleteLaunchProfileInUseIs409(t *testing.T) {
 //
 // user_profile_preferences.default_profile_id is the THIRD foreign key migration
 // 0036 repointed, and it is the most dangerous omission in the phase because of
-// HOW it fails: the table has 0 rows on Tower, so a missed repoint leaves the
+// HOW it fails: the table has 0 rows on gpu-test, so a missed repoint leaves the
 // migration green, the tests green and the deploy clean — and then the first
 // user who sets a quality preference against a launch profile that has no legacy
 // stream_profiles row gets a 500 from an FK violation.

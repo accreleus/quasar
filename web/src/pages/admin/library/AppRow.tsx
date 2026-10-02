@@ -54,14 +54,14 @@ export function AppRow({
       <td>
         <div className="rowflex">
           <span
-            className={`cover ${coverClass}`}
+            className={`cover lib-app-cover ${coverClass}`}
             aria-hidden="true"
-            style={{ width: 26, height: 26, flex: "none", borderRadius: "var(--r-xs)" }}
+            style={{ width: 26, height: 26 }}
           >
             {app.cover_url ? (
               <img src={app.cover_url} alt="" className="cover-img" />
             ) : (
-              <span className="glyph" style={{ fontSize: 11 }}>
+              <span className="glyph">
                 {appGlyph(app.name)}
               </span>
             )}

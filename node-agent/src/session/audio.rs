@@ -2,8 +2,8 @@
 //!
 //! Each session gets a dedicated PulseAudio process owning a Unix socket (Wolf's
 //! pattern). The app container sends audio to it (`PULSE_SERVER=unix:…`); the host
-//! pipeline captures via `pulsesrc`. `Drop` removes the container, so no orphans remain
-//! after any terminal transition.
+//! pipeline captures via `pulsesrc`. Explicit stop and Drop request journalled
+//! cleanup; unreachable engines leave a durable obligation for recovery.
 //!
 //! The socket directory is `{runtime_dir}/pulse-{session_id}`: deterministic, per-session,
 //! and safe as a Docker bind-mount source because the same path applies on the host (where
@@ -12,11 +12,11 @@
 //! `PULSE_RUNTIME_PATH` — that must stay private, because PulseAudio force-chmods its
 //! runtime dir 0700 and locks out non-root app-container clients.
 //!
-//! Image: `QUASAR_PULSE_IMAGE`, defaulting to `quasar-agent-dev:latest`. It already ships
+//! Image: `QUASAR_PULSE_IMAGE`, otherwise the running agent image. It ships
 //! the `pulseaudio` binary, so no extra pull is needed; the sidecar uses no GStreamer,
 //! Wayland, or GPU facilities from it.
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -25,8 +25,7 @@ use anyhow::{anyhow, Context, Result};
 
 use super::container::ContainerRuntime;
 
-/// Name prefix for PulseAudio sidecar containers. Public so the agent's startup orphan
-/// sweep can target stale sidecars from a previous crashed run.
+/// Name prefix for PulseAudio sidecars; CLI orphan cleanup must preserve these.
 pub const PULSE_NAME_PREFIX: &str = "quasar-pulse-";
 
 /// The session's single PulseAudio sink, baked into the daemon args
@@ -71,95 +70,123 @@ pub fn pulse_socket_dir(runtime_dir: &str, session_id: &str) -> PathBuf {
 }
 
 /// How long to wait for the socket file to appear before giving up.
-const PULSE_WAIT_TOTAL: Duration = Duration::from_secs(2);
+pub(crate) const PULSE_WAIT_TOTAL: Duration = Duration::from_secs(2);
 const PULSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A per-session PulseAudio sidecar container owning a Unix socket (`{dir}/native`) that
-/// the app container connects to and `pulsesrc` captures from. `Drop` removes it.
+/// the app container connects to and `pulsesrc` captures from. Drop requests cleanup.
 pub struct PulseSidecar {
-    /// Directory holding the socket, bind-mounted identically on host and in the agent
-    /// container so docker-out-of-docker bind mounts resolve correctly.
     socket_dir: PathBuf,
-    runtime: ContainerRuntime,
-    container_name: String,
+    runtime: crate::runtime::RuntimeClient,
+    operation: String,
     removed: bool,
+    cleanup_attempted: bool,
+    /// The session end's shared retry allowance (`teardown::RetryBudget`). A
+    /// sidecar starts with its own so a failed start can still release it; the
+    /// session replaces it with the shared one via [`Self::adopt_budget`], so
+    /// the sidecar's retries and the app container's draw down one pool.
+    budget: super::teardown::RetryBudget,
+}
+
+/// `QUASAR_PULSE_IMAGE`, or the running agent's own image. Shared by the per-session
+/// sidecar and the audio host probe, so a probe proves the exact image a session
+/// would use.
+pub(crate) fn sidecar_image(runtime: &ContainerRuntime) -> Result<String> {
+    match std::env::var("QUASAR_PULSE_IMAGE").ok().filter(|v| !v.is_empty()) {
+        Some(image) => Ok(image),
+        None => runtime.own_image().context(
+            "cannot select audio sidecar image; set QUASAR_PULSE_IMAGE when running outside a container",
+        ),
+    }
 }
 
 impl PulseSidecar {
-    /// Start the sidecar for `session_id`, blocking until the Unix socket appears (up to
-    /// 2 s). `Ok(None)` with a warning if it never does: audio degrades to the caller's
-    /// fallback rather than crashing the session.
-    ///
-    /// `runtime_dir` must already be bind-mounted into the agent container at the same
-    /// path as on the host (`$XDG_RUNTIME_DIR`). The socket dir is a subdirectory of it,
-    /// so the Docker daemon (resolving bind-mount sources on the host) and the agent
-    /// (polling inside the container) see the same path.
+    /// Start the fixed audio profile and wait up to two seconds for a live Unix
+    /// socket. A readiness timeout preserves the intentional silent fallback.
+    /// The runtime owns directory creation and cleanup; unknown outcomes retain
+    /// their original operation instead of granting another launch authority.
     pub fn start(
         session_id: &str,
         runtime: &ContainerRuntime,
         runtime_dir: &str,
     ) -> Result<Option<Self>> {
         let socket_dir = pulse_socket_dir(runtime_dir, session_id);
-        let socket_path = socket_dir.join("native");
-        let container_name = pulse_container_name(session_id);
-        let image = match std::env::var("QUASAR_PULSE_IMAGE")
-            .ok()
-            .filter(|v| !v.is_empty())
-        {
-            Some(image) => image,
-            None => runtime.own_image().context("cannot select audio sidecar image; set QUASAR_PULSE_IMAGE when running outside a container")?,
+        let image = sidecar_image(runtime)?;
+        let api = crate::runtime::configured()?.clone();
+        if let Err(error) = api.recover_audio_sidecars().wait() {
+            tracing::warn!(token = "audio-pulse-recovery-pending", %error,
+                "prior audio cleanup remains pending; a conflicting launch will be refused");
+        }
+        let mut entropy = [0u8; 24];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+        let operation = format!(
+            "audio-{}",
+            entropy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let helper = crate::runtime::DiagnosticHelper {
+            operation: operation.clone(),
+            name: pulse_container_name(session_id),
+            image,
         };
-
-        // Idempotent clean of any stale container from a prior crashed run.
-        let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
-        runtime.remove_owned_container(&container_name)?;
-
-        let socket_dir_s = socket_dir.to_string_lossy();
-        let args = pulse_run_args(&container_name, &socket_dir_s, &image, &owner);
-
-        // Create the socket dir before Docker uses it as a bind-mount source: Docker
-        // creates missing ones as root, which would leave it root-owned and unwritable by
-        // the PulseAudio process.
-        std::fs::create_dir_all(&socket_dir)
-            .with_context(|| format!("create pulse socket dir {socket_dir_s}"))?;
-        // Must be world-traversable: app containers run as arbitrary non-root UIDs (the
-        // Steam console image is 99:100) and reach the socket through this directory.
-        // `create_dir_all` honours the umask, so set the mode explicitly. The daemon never
-        // chmods this dir — its PULSE_RUNTIME_PATH points at the private `.runtime`
-        // subdir, which PulseAudio is free to force to 0700.
-        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("make pulse socket dir traversable {socket_dir_s}"))?;
-
-        let args_str: Vec<&str> = args.iter().map(String::as_str).collect();
-        tracing::info!("starting PulseAudio sidecar: {}", args_str.join(" "));
-        runtime
-            .run_raw(&args_str)
-            .context("pulseaudio sidecar start failed")?;
-
-        // PulseAudio writes the socket shortly after the daemon is up (usually < 300 ms).
-        if !wait_for_socket(&socket_path) {
-            tracing::warn!(
-                token = "audio-pulse-socket-timeout",
-                "pulseaudio socket '{}' did not appear within {}s — \
-                 falling back to silent audio",
-                socket_path.display(),
-                PULSE_WAIT_TOTAL.as_secs()
-            );
-            // Best-effort cleanup: the container started but the socket never appeared.
-            runtime.force_remove(&container_name);
-            let _ = std::fs::remove_dir_all(&socket_dir);
+        let request = crate::runtime::AudioRun {
+            socket_dir: socket_dir.clone(),
+            entrypoint: vec!["pulseaudio".into()],
+            command: pulse_command(&socket_dir.to_string_lossy()),
+        };
+        // Construct the cleanup backstop before submission: a lost create/start
+        // response must not leave the caller without an explicit stop request.
+        let mut sidecar = Self {
+            socket_dir,
+            runtime: api,
+            operation,
+            removed: false,
+            cleanup_attempted: false,
+            budget: super::teardown::RetryBudget::new(super::teardown::STOP_RETRY_BUDGET),
+        };
+        let id = match sidecar.runtime.run_audio_sidecar(helper, request).wait() {
+            Ok(id) => id,
+            Err(error) => {
+                sidecar.stop();
+                return Err(anyhow!(error).context("pulseaudio sidecar start failed"));
+            }
+        };
+        if !wait_for_socket(&sidecar.socket_dir.join("native")) {
+            // #411: say why. The daemon's own words, once it is stopped, are the reason.
+            let why = match sidecar.runtime.stop_audio_sidecar(id.clone()).wait() {
+                Ok(()) => match sidecar.runtime.observe_audio_sidecar(id).wait() {
+                    Ok(result) => format!(
+                        "exit {:?}; output: {}",
+                        result.exit_code,
+                        output_tail(&result.stdout, &result.stderr)
+                    ),
+                    Err(error) => format!("its output could not be read ({:?})", error.kind),
+                },
+                Err(error) => format!(
+                    "it could not be stopped to read its output ({:?})",
+                    error.kind
+                ),
+            };
+            tracing::warn!(token = "audio-pulse-socket-timeout",
+                "pulseaudio socket '{}' did not become ready within {}s — falling back to silent audio; the sidecar: {why}",
+                sidecar.socket_dir.join("native").display(), PULSE_WAIT_TOTAL.as_secs());
+            sidecar.stop();
             return Ok(None);
         }
+        tracing::info!(
+            "PulseAudio sidecar ready: socket={}",
+            sidecar.socket_dir.join("native").display()
+        );
+        Ok(Some(sidecar))
+    }
 
-        // No cookie step: the socket grants anonymous auth (`pulse_run_args`).
-        tracing::info!("PulseAudio sidecar ready: socket={}", socket_path.display());
-
-        Ok(Some(PulseSidecar {
-            socket_dir,
-            runtime: runtime.clone(),
-            container_name,
-            removed: false,
-        }))
+    /// Join this sidecar's retries to the session end's shared allowance, so
+    /// releasing the app container and releasing the sidecar cannot each spend a
+    /// full [`super::teardown::STOP_RETRY_BUDGET`].
+    pub fn adopt_budget(&mut self, budget: super::teardown::RetryBudget) {
+        self.budget = budget;
     }
 
     /// The `unix:…` URI pulsesrc and PULSE_SERVER clients use to connect.
@@ -173,69 +200,84 @@ impl PulseSidecar {
     }
 
     /// Tear the sidecar container down (idempotent). `Drop` is the backstop.
+    ///
+    /// A busy or cancelled client never wrote a stop into the journal, so it
+    /// does not latch: routine audio recovery ignores a sidecar still in
+    /// `Running`, and latching here would leave `quasar-pulse-<sid>` up for
+    /// the life of the agent. An unconfirmed stop did write durable intent
+    /// and must not be repeated on the way down.
     pub fn stop(&mut self) {
-        if !self.removed {
-            self.runtime.force_remove(&self.container_name);
-            let _ = std::fs::remove_dir_all(&self.socket_dir);
-            self.removed = true;
+        if self.removed || self.cleanup_attempted {
+            return;
         }
+        // Cloned out first: the attempt closure borrows `self` mutably.
+        let budget = self.budget.clone();
+        let report = super::teardown::retry_with_budget(
+            || match self
+                .runtime
+                .abandon_audio_sidecar(self.operation.clone())
+                .wait()
+            {
+                Ok(()) => {
+                    self.removed = true;
+                    self.cleanup_attempted = true;
+                    super::teardown::StopAttempt::Confirmed
+                }
+                Err(error) if !super::teardown::pulse_stop_latches(error.kind) => {
+                    super::teardown::StopAttempt::Retryable
+                }
+                Err(error) => {
+                    self.cleanup_attempted = true;
+                    tracing::warn!(token = "audio-pulse-cleanup-pending", %error,
+                        operation = %self.operation,
+                        "audio cleanup could not be confirmed; preserve its socket directory and inspect runtime recovery state");
+                    super::teardown::StopAttempt::Unconfirmed
+                }
+            },
+            &budget,
+        );
+        if matches!(report, super::teardown::StopAttempt::Retryable) {
+            tracing::warn!(
+                token = "audio-pulse-cleanup-busy",
+                operation = %self.operation,
+                "audio cleanup could not start; the runtime client stayed busy"
+            );
+        }
+    }
+}
+
+impl super::teardown::Sidecar for PulseSidecar {
+    fn server_uri(&self) -> String {
+        PulseSidecar::server_uri(self)
+    }
+
+    fn socket_dir(&self) -> PathBuf {
+        PulseSidecar::socket_dir(self).to_path_buf()
+    }
+
+    fn adopt_budget(&mut self, budget: super::teardown::RetryBudget) {
+        PulseSidecar::adopt_budget(self, budget)
+    }
+
+    fn stop(&mut self) {
+        PulseSidecar::stop(self)
     }
 }
 
 impl Drop for PulseSidecar {
     fn drop(&mut self) {
-        self.stop();
+        // An explicit failed stop already left durable intent. Do not double
+        // the caller's deadline by immediately repeating it while unwinding.
+        if !self.cleanup_attempted {
+            self.stop();
+        }
     }
 }
 
-fn pulse_run_args(container_name: &str, socket_dir: &str, image: &str, owner: &str) -> Vec<String> {
+pub(crate) fn pulse_command(socket_dir: &str) -> Vec<String> {
+    // Runtime profile owns Docker settings, HOME and private PULSE_RUNTIME_PATH.
+    // Only the Pulse daemon command and device topology belong to this caller.
     vec![
-        "run".into(),
-        "-d".into(),
-        "--rm".into(),
-        "--name".into(),
-        container_name.into(),
-        "--label".into(),
-        format!("{}={owner}", crate::container_ownership::LABEL),
-        "--network".into(),
-        "none".into(),
-        // The sidecar only needs its per-session Unix socket, so match the app
-        // container's baseline privilege reduction rather than take Docker defaults.
-        "--cap-drop".into(),
-        "ALL".into(),
-        "--security-opt".into(),
-        "no-new-privileges:true".into(),
-        "--pids-limit".into(),
-        "512".into(),
-        // No `--read-only`: PulseAudio needs a writable per-session runtime bind and the
-        // shared image is not qualified for a read-only root. Add it only with a
-        // purpose-built image or explicit writable tmpfs/state paths.
-        //
-        // The image's healthcheck probes the node-agent HTTP endpoint, which this
-        // Pulse-only sibling does not run.
-        "--no-healthcheck".into(),
-        "-v".into(),
-        format!("{socket_dir}:{socket_dir}"),
-        // The sidecar runs as root and the image provides no /root/.config, so PulseAudio
-        // exits before creating the socket unless HOME points at the session-private
-        // writable mount. Keeping HOME there also avoids persisting Pulse state or
-        // credentials in the image layer.
-        "-e".into(),
-        format!("HOME={socket_dir}"),
-        // PULSE_RUNTIME_PATH must NOT be the shared socket dir: PulseAudio force-chmods
-        // its runtime path to 0700 (`pa_make_secure_dir`) and re-asserts it while
-        // running, locking every non-root app-container client out of the directory
-        // holding the socket. Root clients survive via SO_PEERCRED same-uid auth, which
-        // is why this only surfaced with the first non-root app image (Steam at 99:100).
-        // So: private subdir here, socket pinned at the shared 0755 dir by module arg.
-        "-e".into(),
-        format!("PULSE_RUNTIME_PATH={socket_dir}/.runtime"),
-        // The image has a node-agent ENTRYPOINT; replace it so this sibling starts
-        // PulseAudio itself.
-        "--entrypoint".into(),
-        "pulseaudio".into(),
-        // Disable shared memory: sibling containers do not share /dev/shm.
-        image.into(),
         "--daemonize=no".into(),
         "--system=no".into(),
         "--disable-shm=true".into(),
@@ -260,8 +302,13 @@ fn pulse_run_args(container_name: &str, socket_dir: &str, image: &str, owner: &s
         // pickers. Baked into the daemon args so it lives as long as the sidecar: a live
         // `pactl load-module` does not survive a restart. First sink loaded == default
         // sink, so a default-source capture lands on its monitor.
+        //
+        // rate/channels are pinned to the Opus wire format. Unpinned, the sink starts at the
+        // daemon default 44100 and can only change rate while its monitor is idle, which it
+        // never is: pulsesrc captures it from session start (#351).
         format!(
             "--load=module-null-sink sink_name={QUASAR_SINK_NAME} \
+             rate=48000 channels=2 \
              sink_properties=\"device.class='sound' device.description='Quasar Output'\""
         ),
         // Microphone capture (client → host). These two loads MUST stay AFTER the
@@ -298,16 +345,55 @@ fn pulse_run_args(container_name: &str, socket_dir: &str, image: &str, owner: &s
     ]
 }
 
-/// Poll for the socket file with 100 ms intervals up to `PULSE_WAIT_TOTAL`.
-fn wait_for_socket(path: &Path) -> bool {
+/// Probe without blocking on a saturated listener backlog.
+fn socket_accepts_connection(path: &Path) -> bool {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    };
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: zero is a valid initial representation of sockaddr_un.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return false;
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    // SAFETY: socket has no pointer arguments. OwnedFd closes a successful descriptor.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: this newly created descriptor has exactly one owner.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: address is initialized and remains live for the stated size.
+    unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        ) == 0
+    }
+}
+
+/// Poll for a connectable socket at 100 ms intervals up to `PULSE_WAIT_TOTAL`.
+pub(crate) fn wait_for_socket(path: &Path) -> bool {
     let steps = (PULSE_WAIT_TOTAL.as_millis() / PULSE_POLL_INTERVAL.as_millis()) as u32;
     for _ in 0..steps {
-        if path.exists() {
+        if socket_accepts_connection(path) {
             return true;
         }
         thread::sleep(PULSE_POLL_INTERVAL);
     }
-    path.exists()
+    socket_accepts_connection(path)
 }
 
 /// The ALSA mixer control gating the HDA codec's digital converter (`AC_DIG1_ENABLE`). On
@@ -449,8 +535,52 @@ fn card_spec_from_device(device: &str) -> Option<String> {
     Some(format!("hw:{card}"))
 }
 
+/// The last lines a daemon wrote, bounded for one log line.
+fn output_tail(stdout: &str, stderr: &str) -> String {
+    const MAX: usize = 600;
+    let joined = format!("{stdout}{stderr}");
+    let text = joined.trim();
+    if text.is_empty() {
+        return "(none)".into();
+    }
+    let start = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| text.len() - i <= MAX)
+        .unwrap_or(0);
+    text[start..].replace('\n', " | ")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::teardown::RetryBudget;
+    use crate::runtime::{RuntimeClient, RuntimeConfig};
+    use sha2::{Digest, Sha256};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    #[test]
+    fn socket_readiness_is_bounded_when_the_listener_backlog_is_full() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native");
+        let listener = UnixListener::bind(&path).unwrap();
+        // SAFETY: the listener owns a valid listening descriptor.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let connection = UnixStream::connect(&path).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = send.send(super::wait_for_socket(&path));
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(3));
+        // Release a blocked pre-fix probe before reporting the failure.
+        drop(connection);
+        drop(listener);
+        worker.join().unwrap();
+        assert!(!result.expect("readiness exceeded its bound"));
+    }
+
     use super::*;
 
     #[test]
@@ -476,12 +606,7 @@ mod tests {
             QUASAR_MONITOR_SOURCE_NAME,
             format!("{QUASAR_SINK_NAME}.monitor")
         );
-        let args = pulse_run_args(
-            "quasar-pulse-test",
-            "/run/quasar-agent/pulse-test",
-            "img",
-            "owner",
-        );
+        let args = pulse_command("/run/quasar-agent/pulse-test");
         assert!(args
             .iter()
             .any(|arg| arg.contains(&format!("master={QUASAR_MIC_SINK_NAME}.monitor"))));
@@ -509,51 +634,115 @@ mod tests {
             .contains(&format!("pulse-{a}")));
     }
 
+    /// A runtime client bounded to ONE in-flight call, talking to a socket that
+    /// accepts and never answers, with a journal root of our own. No Docker, no
+    /// process env: the two things the release path needs to be driven through
+    /// are a refused admission and a journal that already says `Completed`.
+    struct Bench {
+        _dir: tempfile::TempDir,
+        _listener: UnixListener,
+        client: RuntimeClient,
+        state: std::path::PathBuf,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("engine.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let mut config = RuntimeConfig::unix(&socket);
+            config.deadline = Duration::from_secs(2);
+            config.max_in_flight = 1;
+            config.image_state_path = Some(state.clone());
+            let client = RuntimeClient::new(config).unwrap();
+            Bench {
+                _dir: dir,
+                _listener: listener,
+                client,
+                state,
+            }
+        }
+
+        /// A helper journal whose audio operation is already proven terminal, so
+        /// `abandon_audio_sidecar` answers `Ok` without opening Docker.
+        fn completed_audio_journal(&self, operation: &str) {
+            let key = Sha256::digest(operation.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let helpers = self.state.join("helpers");
+            std::fs::create_dir_all(&helpers).unwrap();
+            let intent = serde_json::json!({
+                "operation": operation,
+                "name": pulse_container_name("wiring"),
+                "image": "quasar-node-agent:test",
+                "owner": "wiring-owner",
+                "socket": "/run/quasar-agent/engine.sock",
+                "id": null,
+                "profile": "Audio",
+                "phase": "Completed",
+            });
+            std::fs::write(helpers.join(key), serde_json::to_vec(&intent).unwrap()).unwrap();
+        }
+
+        fn sidecar(&self, operation: &str) -> PulseSidecar {
+            PulseSidecar {
+                socket_dir: self.state.join("pulse-wiring"),
+                runtime: self.client.clone(),
+                operation: operation.to_string(),
+                removed: false,
+                cleanup_attempted: false,
+                budget: RetryBudget::spent(),
+            }
+        }
+    }
+
+    // #314 as it actually happened: the idle reap raced a busy runtime client.
+    // The refused call wrote nothing, so it must leave the sidecar stoppable —
+    // the pre-fix code latched `cleanup_attempted` before ever calling, and
+    // routine audio recovery will not remove a sidecar whose journal still says
+    // `Running`, so `quasar-pulse-<sid>` survived until the agent restarted.
     #[test]
-    fn pulse_run_replaces_image_entrypoint() {
-        let args = pulse_run_args(
-            "quasar-pulse-test",
-            "/run/quasar-agent/pulse-test",
-            "quasar-node-agent:latest",
-            "owner",
-        );
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--label", "io.quasar.agent-owner=owner"]));
-        let entrypoint = args.iter().position(|arg| arg == "--entrypoint").unwrap();
-        let no_healthcheck = args
-            .iter()
-            .position(|arg| arg == "--no-healthcheck")
-            .unwrap();
-        let cap_drop = args.iter().position(|arg| arg == "--cap-drop").unwrap();
-        let security_opt = args.iter().position(|arg| arg == "--security-opt").unwrap();
-        let pids_limit = args.iter().position(|arg| arg == "--pids-limit").unwrap();
-        let image = args
-            .iter()
-            .position(|arg| arg == "quasar-node-agent:latest")
-            .unwrap();
+    fn a_busy_client_does_not_latch_the_sidecar_and_a_later_stop_removes_it() {
+        let bench = Bench::new();
+        let operation = "audio-wiring-busy-then-confirmed";
+        bench.completed_audio_journal(operation);
+        let mut sidecar = bench.sidecar(operation);
 
-        assert!(args
-            .iter()
-            .any(|arg| arg == "HOME=/run/quasar-agent/pulse-test"));
+        // `submit_owned` takes the admission permit on the CALLING thread, so the
+        // slot is held the moment this returns — no sleep, no race.
+        let hold = bench.client.discover();
+        sidecar.stop();
+        assert!(
+            !sidecar.cleanup_attempted,
+            "a refused call left no durable intent, so it must not disarm the retry"
+        );
+        assert!(!sidecar.removed, "and it certainly did not remove anything");
 
-        assert_eq!(args[entrypoint + 1], "pulseaudio");
-        assert!(entrypoint < image, "Docker options must precede the image");
+        hold.cancel();
+        let _ = hold.wait();
+        // The real budget: cancellation releases admission a moment after the
+        // caller's wait returns, and the retry loop is what rides that out.
+        sidecar.adopt_budget(RetryBudget::new(Duration::from_secs(5)));
+        sidecar.stop();
+        assert!(sidecar.removed, "the sidecar container is released");
+        assert!(sidecar.cleanup_attempted);
+    }
+
+    #[test]
+    fn an_unconfirmed_pulse_stop_latches_so_the_way_down_does_not_repeat_it() {
+        // No journal for this operation: the acquire fails before Docker is
+        // opened, which is an unconfirmed stop, which DID record durable intent.
+        let bench = Bench::new();
+        let mut sidecar = bench.sidecar("audio-wiring-unconfirmed");
+        sidecar.stop();
+        assert!(!sidecar.removed);
         assert!(
-            no_healthcheck < image,
-            "healthcheck override must precede the image"
+            sidecar.cleanup_attempted,
+            "an unconfirmed stop must not be spun on the way down"
         );
-        assert_eq!(args[cap_drop + 1], "ALL");
-        assert_eq!(args[security_opt + 1], "no-new-privileges:true");
-        assert_eq!(args[pids_limit + 1], "512");
-        assert!(cap_drop < image, "capability drop must precede the image");
-        assert!(
-            security_opt < image,
-            "security option must precede the image"
-        );
-        assert!(pids_limit < image, "PID limit must precede the image");
-        assert_eq!(args[image + 1], "--daemonize=no");
-        assert!(!args[image + 1..].iter().any(|arg| arg == "pulseaudio"));
     }
 
     // The daemon's runtime path must be a PRIVATE subdir (PulseAudio force-chmods it
@@ -562,16 +751,7 @@ mod tests {
     #[test]
     fn pulse_run_pins_shared_paths_outside_private_runtime_dir() {
         let dir = "/run/quasar-agent/pulse-test";
-        let args = pulse_run_args(
-            "quasar-pulse-test",
-            dir,
-            "quasar-node-agent:latest",
-            "owner",
-        );
-
-        assert!(args
-            .iter()
-            .any(|arg| arg == &format!("PULSE_RUNTIME_PATH={dir}/.runtime")));
+        let args = pulse_command(dir);
         assert!(args.iter().any(|arg| arg == "-n"));
         let native = args
             .iter()
@@ -599,6 +779,10 @@ mod tests {
         assert_eq!(null_sinks.len(), 2, "output sink + microphone feed sink");
         assert!(null_sinks[0].contains("sink_name=quasar_output"));
         assert!(null_sinks[0].contains("device.class='sound'"));
+        // Pinned to the Opus wire format: the capture pulsesrc holds the monitor from
+        // session start, so the sink cannot switch rate once a game connects.
+        assert!(null_sinks[0].contains("rate=48000"));
+        assert!(null_sinks[0].contains("channels=2"));
         assert!(null_sinks[1].contains("sink_name=quasar_mic"));
         assert!(null_sinks[1].contains("device.class='sound'"));
         assert!(null_sinks[1].contains("device.description='Quasar Microphone Feed'"));
@@ -635,12 +819,19 @@ mod tests {
             "quasar_output must load first so it stays the default sink"
         );
         assert!(mic_sink_at < remap_at, "remap master must exist first");
+    }
+}
 
-        // Daemon options must follow the image: they are pulseaudio argv, not docker argv.
-        let image = args
-            .iter()
-            .position(|arg| arg == "quasar-node-agent:latest")
-            .unwrap();
-        assert!(args.iter().position(|a| a == "-n").unwrap() > image);
+#[cfg(test)]
+mod output_tail_tests {
+    #[test]
+    fn a_daemons_last_words_are_bounded_and_on_one_line() {
+        assert_eq!(super::output_tail("", "  "), "(none)");
+        assert_eq!(
+            super::output_tail("a\n", "E: bind failed\n"),
+            "a | E: bind failed"
+        );
+        let long = "x".repeat(2000);
+        assert!(super::output_tail(&long, "").len() <= 600);
     }
 }

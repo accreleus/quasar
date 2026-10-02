@@ -1,0 +1,75 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+index fb56a30..2d1e1e6 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+@@ -91,7 +91,8 @@ struct _GstVulkanAV1Encoder
+ 
+   gint coded_width;
+   gint coded_height;
+-  /* the input video info with the coded (aligned) size, handed to
++  /* the input video info at the coded size (display size rounded to the
++   * input-picture granularity), handed to
+    * gst_vulkan_encoder_encode() */
+   GstVideoInfo coded_info;
+ 
+@@ -566,9 +567,7 @@ gst_vulkan_av1_encoder_init_sequence_header (GstVulkanAV1Encoder * self,
+     .seq_profile = STD_VIDEO_AV1_PROFILE_MAIN,
+     .frame_width_bits_minus_1 = _av1_helper_msb (self->coded_width),
+     .frame_height_bits_minus_1 = _av1_helper_msb (self->coded_height),
+-    /* trap 4: the sequence header carries the CODED (aligned) size; the
+-     * per-frame render_width/height signal the true display size so
+-     * decoders crop. */
++    /* must equal the encode's codedExtent (VUID-vkCmdEncodeVideoKHR-flags-10323/10324) */
+     .max_frame_width_minus_1 = self->coded_width - 1,
+     .max_frame_height_minus_1 = self->coded_height - 1,
+     /* values from vk_video_samples, matching the upstream conformance
+@@ -806,7 +805,6 @@ gst_vulkan_av1_encoder_new_sequence (GstAV1Encoder * encoder,
+   VkVideoEncodeAV1CapabilitiesKHR *vk_av1_caps;
+   GstVulkanEncoderQualityProperties quality_props;
+   StdVideoAV1Level level;
+-  guint align_w, align_h;
+ 
+   if (!self->encoder) {
+     GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+@@ -998,23 +996,24 @@ gst_vulkan_av1_encoder_new_sequence (GstAV1Encoder * encoder,
+   /* low latency: no output delay */
+   gst_av1_encoder_set_preferred_output_delay (encoder, 0);
+ 
+-  /* trap 4: AV1 codedPictureAlignment is 8x8 (the 64 in early probes was
+-   * the generic pictureAccessGranularity), so 1080 lines need no 1088
+-   * padding. Still honour whatever the driver reports: code at the aligned
+-   * size and signal the true size via render_width/height so decoders
+-   * crop. Note h26x's 16-pixel macroblock granularity means the sibling
+-   * elements never exercise this. */
+-  align_w = MAX (vk_av1_caps->codedPictureAlignment.width, 1);
+-  align_h = MAX (vk_av1_caps->codedPictureAlignment.height, 1);
+-  self->coded_width = GST_ROUND_UP_N (GST_VIDEO_INFO_WIDTH (in_info), align_w);
+-  self->coded_height =
+-      GST_ROUND_UP_N (GST_VIDEO_INFO_HEIGHT (in_info), align_h);
+-
+-  /* also align to the input-picture granularity for the upstream pool */
+-  self->coded_width = GST_ROUND_UP_N (self->coded_width,
+-      MAX (vk_caps.encoder.caps.encodeInputPictureGranularity.width, 1));
+-  self->coded_height = GST_ROUND_UP_N (self->coded_height,
+-      MAX (vk_caps.encoder.caps.encodeInputPictureGranularity.height, 1));
++  /* Code the frame at the display size, rounded only to the input-picture
++   * granularity (2x2 on NVIDIA; at least 2 so NV12 stays even). AV1 has no
++   * crop: render_width/height is advisory and Chrome displays the whole
++   * frame, so rounding to codedPictureAlignment showed 900 -> 904 padding
++   * rows (#294). That alignment is not a valid-usage constraint: at 8x8 the
++   * driver never overrides the size; a coarser alignment (RADV VCN4 64x16,
++   * equal to its granularity) is overridden in the driver's own sequence
++   * header ("AV1 Encode Parameter Overrides"). */
++  self->coded_width = GST_ROUND_UP_N (GST_VIDEO_INFO_WIDTH (in_info),
++      MAX (vk_caps.encoder.caps.encodeInputPictureGranularity.width, 2));
++  self->coded_height = GST_ROUND_UP_N (GST_VIDEO_INFO_HEIGHT (in_info),
++      MAX (vk_caps.encoder.caps.encodeInputPictureGranularity.height, 2));
++  if (self->coded_width != GST_VIDEO_INFO_WIDTH (in_info)
++      || self->coded_height != GST_VIDEO_INFO_HEIGHT (in_info))
++    GST_WARNING_OBJECT (self, "coding %ux%u for display %ux%u: the padding "
++        "will be visible, AV1 decoders do not crop to render_size",
++        self->coded_width, self->coded_height, GST_VIDEO_INFO_WIDTH (in_info),
++        GST_VIDEO_INFO_HEIGHT (in_info));
+ 
+   /* the video info handed to gst_vulkan_encoder_encode(): coded size, and
+    * an explicit framerate -- the rate-control layer's

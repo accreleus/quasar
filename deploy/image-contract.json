@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "_purpose": "Declarative, machine-checked contract for every Quasar image role. Consumed by deploy/validate-image.sh and enforced by deploy/build-images.sh before any :latest promotion or push. Spec: docs/design/plans/2026-07-26-image-lineage-consolidation-spec.md",
-  "_why_this_file_exists": "On 2026-07-26 the production quasar-nv image was found to be 7.33GB (84% build toolchain) AND missing the pulseaudio daemon, so every Tower session ran with silent audio. Nothing detected either problem: the nv stage was a hand-copy of the runtime stage's package list, kept in step by discipline alone. Issues #111 and #272 had both been CLOSED as having solved exactly these problems. A closed issue is not a guarantee. Every lesson below is a line here so it is re-checked on every build, forever.",
+  "_why_this_file_exists": "On 2026-07-26 the production quasar-nv image was found to be 7.33GB (84% build toolchain) AND missing the pulseaudio daemon, so every lab-host session ran with silent audio. Nothing detected either problem: the nv stage was a hand-copy of the runtime stage's package list, kept in step by discipline alone. Issues #111 and #272 had both been CLOSED as having solved exactly these problems. A closed issue is not a guarantee. Every lesson below is a line here so it is re-checked on every build, forever.",
   "_maintenance": "Adding a lesson means adding an assertion here, not a paragraph in a doc. Never relax an assertion to make a build pass -- fix the image.",
 
   "roles": {
@@ -9,7 +9,7 @@
     "runtime": {
       "_role": "Vendor-neutral node-agent runtime (quasar-node-agent tag; quasar-vulkan before the 2026-08-26 role rename, still written as a transition alias). AMD/Intel VA + Vulkan encode. Also serves as the per-session PulseAudio sidecar image and the default app image on some stacks.",
       "size_max_mb": 2000,
-      "_size_note": "quasar-nv:prev (the same lineage built --target runtime) measured 1.57GB on 2026-07-26. 2000MB leaves headroom for the docker CLI + entrypoint moving into this stage per spec 5.3. If a legitimate addition breaks the ceiling, raise it deliberately in a commit that says why -- do not raise it to make a red build green.",
+      "_size_note": "quasar-nv:prev (the same lineage built --target runtime) measured 1.57GB on 2026-07-26. 2000MB leaves headroom for the runtime's media, GPU and diagnostic dependencies. If a legitimate addition breaks the ceiling, raise it deliberately in a commit that says why -- do not raise it to make a red build green.",
 
       "packages": {
         "required": [
@@ -27,11 +27,10 @@
           "weston", "seatd", "ddcutil", "procps-ng", "iproute",
           "hwdata",
           "avahi", "nss-mdns",
-          "openh264",
-          "nftables"
+          "openh264"
         ],
         "_required_notes": {
-          "pulseaudio": "THE DAEMON, not just pulseaudio-libs/-utils. QUASAR_PULSE_IMAGE points at this image; without the daemon binary the agent logs 'silent audio fallback' and every session is mute. This exact package was the 2026-07-26 Tower audio outage.",
+          "pulseaudio": "THE DAEMON, not just pulseaudio-libs/-utils. QUASAR_PULSE_IMAGE points at this image; without the daemon binary the agent logs 'silent audio fallback' and every session is mute. This exact package was the 2026-07-26 lab-host audio outage.",
           "mesa-vulkan-drivers-freeworld": "Stock Fedora Mesa strips the patent-encumbered encode entrypoints. Without freeworld, RADV has NO Vulkan encode queue and vulkanh264enc registers but cannot encode.",
           "mesa-va-drivers-freeworld": "Same, for the VA encode entrypoints (vah264enc/vah264lpenc).",
           "intel-media-driver": "iHD, the VA driver for Intel Gen9+, from rpmfusion-NONFREE. #126: mesa-va-drivers is GALLIUM ONLY (radeonsi/nouveau/virtio/d3d12), so before this an Intel host had NO VA driver at all -- vaInitialize failed, vah264lpenc never registered, and the codec probe reported an empty set. That is the DEFAULT path on Intel (settings.rs encoder_default_for_vendor maps Intel to VA), so the documented default was unreachable on every Intel host. The NONFREE build is the one asserted, not Fedora's in-distro libva-intel-media-driver: both are MIT and BSD, Fedora's source RPM is named intel-media-driver-free, and measured on fc43 Fedora's build is 11.6 MB with 123 AVC/HEVC encode symbol references against this one's 40.5 MB and 516 -- the same patent split already accepted for AMD via mesa-va-drivers-freeworld, on identically licensed code. libva needs no wiring to prefer it: Fedora's libva has /usr/lib64/dri-nonfree:/usr/lib64/dri-freeworld:/usr/lib64/dri compiled in as its search path. Do not drop this assertion to make a build green.",
@@ -39,8 +38,7 @@
           "ddcutil": "Console local-output mode (CM-08).",
           "hwdata": "Ships /usr/share/hwdata/pci.ids -- the vendor/device id database host-observability GPU model detection falls back to.",
           "avahi": "Chrome sends .local mDNS ICE candidates; libnice resolves them via getaddrinfo INSIDE this container. The resolver stack is container-local even under network_mode:host, so a host-side avahi never reaches the agent.",
-          "vulkan-tools": "vulkaninfo -- the first diagnostic run on any 'no encoder found' report.",
-          "nftables": "#527: provides the `nft` client the #483 media-reachability readiness check (readiness.rs detect_firewall_posture) uses to read the HOST's firewall posture over the shared (network_mode:host) netlink socket. Without it the runtime image had no firewalld/nft/iptables client at all and the check could only report FirewallPosture::Unknown, never the WARN a filtering host should produce."
+          "vulkan-tools": "vulkaninfo -- the first diagnostic run on any 'no encoder found' report."
         },
         "forbidden": [
           "gcc", "gcc-c++", "cmake", "meson", "ninja-build",
@@ -58,15 +56,16 @@
           "curl", "gst-inspect-1.0", "gst-launch-1.0",
           "pulseaudio", "pactl",
           "avahi-daemon", "weston", "seatd",
-          "docker", "nft",
           "quasar-node-agent", "quasar-node-agent-entrypoint"
         ],
         "_required_notes": {
-          "docker": "Static docker CLI -- the agent launches sibling app containers over the mounted socket.",
-          "nft": "#527: the nftables client readiness.rs's detect_firewall_posture shells out to. See the nftables package note above.",
           "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container."
         },
-        "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja"]
+        "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja", "docker", "podman"],
+        "_forbidden_notes": {
+          "docker": "#239: the agent talks to the engine only through its Unix-socket API; a CLI in the image would be an un-owned mutation path.",
+          "podman": "#239: the agent talks to the engine only through its Unix-socket API; a CLI in the image would be an un-owned mutation path."
+        }
       },
 
       "paths": {
@@ -159,18 +158,20 @@
           "org.quasar.pins.plugins-rs",
           "org.quasar.pins.base",
           "org.quasar.source.commit",
-          "org.quasar.built.at"
+          "org.quasar.built.at",
+          "org.quasar.recipe"
         ],
-        "_notes": "Provenance. Without these, an image pulled from GHCR or built on another box is opaque and `qimg status` cannot say which pins produced it — which is how Tower and hermes drifted under one tag undetected (2026-07-26). The build report is the richer local record; these labels are what make ANY image self-describing."
+        "_recipe_note": "org.quasar.recipe (ADR 0008): the recipe revision this agent image needs, stamped by build-images.sh from node-agent/src/recipe.rs. A recovery actor refuses to install an image without it (recipe_unsupported).",
+        "_notes": "Provenance. Without these, an image pulled from GHCR or built on another box is opaque and `qimg status` cannot say which pins produced it — which is how the lab host and the aux host drifted under one tag undetected (2026-07-26). The build report is the richer local record; these labels are what make ANY image self-describing."
       }
     },
 
-    "_retired_nv_role": "The 'nv' role (quasar-nv) was removed on 2026-08-26 by #545, which retired the separate NVIDIA lineage rather than renaming it. quasar-node-agent (role 'runtime') is now the universal agent image and is what an NVIDIA host runs; the CUDA userspace that lineage existed to carry is fetched at run time into the driver volume (node-agent/src/cuda_runtime.rs). This is a role REMOVAL, not a relaxed assertion: nothing the runtime role promises was weakened, and the runtime role has always been validated on NVIDIA hardware too. Four lessons that lived in the deleted role are recorded here so they are not re-learned. (1) THE UNVERSIONED SYMLINK: gst-cuda dlopens libnvrtc.so by unversioned name and NVIDIA ships only .so.<ver>; without that link NVRTC silently fails to load, cudaconvert is skipped at plugin registration, and an AV1/NVENC session dies with 'cudaconvert not found' (the trap Dockerfile.nv documented and #384 rediscovered). The link is now made by cuda_runtime::link_unversioned and is asserted by its unit tests, since no image contains the library any more. (2) LIBNPP WAS NEVER NEEDED: this role required libnpp-13-2 (161MB, its largest package) on the stated belief that cudaconvert uses NPP for colour conversion. Measured false on 2026-08-20 -- no libnpp string, no NPP API symbol and no NPP DT_NEEDED anywhere in /opt/gst or the agent binary; upstream gst-plugins-bad compiles those kernels with NVRTC and the NPP converters are DeepStream. libcudart was the same kind of dead weight and went with it. Neither is fetched at run time either. (3) NEVER A PARALLEL PACKAGE LIST: this role inherited every runtime assertion, which is the structural fix for the 2026-07-26 divergence where a hand-copied package list silently lost pulseaudio and every Tower session ran with silent audio. With one lineage there is nothing left to diverge. (4) NVIDIA-ONLY ELEMENT ASSERTIONS (nvautogpuh264enc, nvav1enc, cudaconvert, cudascale) are host-dependent, not role-dependent -- the runtime role is validated on AMD and Intel hosts too, where they are correctly absent. Assert them on an NVIDIA host with `deploy/validate-image.sh --gpu --require-element nvav1enc ...`, the same way vah264enc/vah264lpenc are already handled. nvav1enc in particular is the AV1 path whenever the Vulkan AV1 encoder is unavailable, and its absence is exactly how Tower lost AV1 (#384). NOTE that cudaconvert/cudascale now register only once the agent has provisioned NVRTC into the driver volume, so a freshly-built image on a fresh host does not have them until the first agent start completes.",
+    "_retired_nv_role": "The 'nv' role (quasar-nv) was removed on 2026-08-26 by #545, which retired the separate NVIDIA lineage rather than renaming it. quasar-node-agent (role 'runtime') is now the universal agent image and is what an NVIDIA host runs; the CUDA userspace that lineage existed to carry is fetched at run time into the driver volume (node-agent/src/cuda_runtime.rs). This is a role REMOVAL, not a relaxed assertion: nothing the runtime role promises was weakened, and the runtime role has always been validated on NVIDIA hardware too. Four lessons that lived in the deleted role are recorded here so they are not re-learned. (1) THE UNVERSIONED SYMLINK: gst-cuda dlopens libnvrtc.so by unversioned name and NVIDIA ships only .so.<ver>; without that link NVRTC silently fails to load, cudaconvert is skipped at plugin registration, and an AV1/NVENC session dies with 'cudaconvert not found' (the trap Dockerfile.nv documented and #384 rediscovered). The link is now made by cuda_runtime::link_unversioned and is asserted by its unit tests, since no image contains the library any more. (2) LIBNPP WAS NEVER NEEDED: this role required libnpp-13-2 (161MB, its largest package) on the stated belief that cudaconvert uses NPP for colour conversion. Measured false on 2026-08-20 -- no libnpp string, no NPP API symbol and no NPP DT_NEEDED anywhere in /opt/gst or the agent binary; upstream gst-plugins-bad compiles those kernels with NVRTC and the NPP converters are DeepStream. libcudart was the same kind of dead weight and went with it. Neither is fetched at run time either. (3) NEVER A PARALLEL PACKAGE LIST: this role inherited every runtime assertion, which is the structural fix for the 2026-07-26 divergence where a hand-copied package list silently lost pulseaudio and every lab-host session ran with silent audio. With one lineage there is nothing left to diverge. (4) NVIDIA-ONLY ELEMENT ASSERTIONS (nvautogpuh264enc, nvav1enc, cudaconvert, cudascale) are host-dependent, not role-dependent -- the runtime role is validated on AMD and Intel hosts too, where they are correctly absent. Assert them on an NVIDIA host with `deploy/validate-image.sh --gpu --require-element nvav1enc ...`, the same way vah264enc/vah264lpenc are already handled. nvav1enc in particular is the AV1 path whenever the Vulkan AV1 encoder is unavailable, and its absence is exactly how the lab host lost AV1 (#384). NOTE that cudaconvert/cudascale now register only once the agent has provisioned NVRTC into the driver volume, so a freshly-built image on a fresh host does not have them until the first agent start completes.",
 
     "dev": {
       "_role": "Build/test environment ONLY. Never deployed as a node-agent. Carries the full toolchain by design.",
       "size_max_mb": 11500,
-      "_size_note": "Measured 8.73GB on Tower 2026-07-26 when built with CUDA_ENABLE=0. Once the builder is always CUDA-enabled (spec 4.3) this stage inherits the CUDA toolkit too, so the ceiling allows for that. Re-measure on the first build-images.sh run and tighten.",
+      "_size_note": "Measured 8.73GB on the lab host 2026-07-26 when built with CUDA_ENABLE=0. Once the builder is always CUDA-enabled (spec 4.3) this stage inherits the CUDA toolkit too, so the ceiling allows for that. Re-measure on the first build-images.sh run and tighten.",
       "packages": {
         "required": ["gcc", "cmake", "meson", "ninja-build", "clang", "weston"],
         "forbidden": []
@@ -190,50 +191,52 @@
       "_deployment_ban_note": "build-images.sh refuses to write the quasar-node-agent or quasar-nv tag from this role."
     },
 
-    "updater": {
-      "_role": "Per-host updater (Dockerfile.updater). Static Go binary on docker:29-cli. NOT part of a platform release -- it is what APPLIES one, so it cannot be one of the images an apply moves by digest (docs/upgrading.md).",
-      "size_max_mb": 200,
-      "_size_note": "docker:29-cli is ~120MB (alpine + docker CLI + buildx/compose plugins) and the updater binary is ~8MB. If this ceiling breaks, the base moved -- do not raise it to make a red build green.",
+    "recovery": {
+      "_role": "The RH-06 recovery actor (Dockerfile.recovery): one static musl binary, quasar-recovery, on alpine. Creates and replaces a machine's platform services through the mounted engine socket. NOT on the Dockerfile.vulkan lineage.",
+      "size_max_mb": 40,
+      "_size_note": "alpine:3.22 is ~8MB and the binary ~10-15MB. A GStreamer, CUDA or toolchain leak would blow far past this; if the ceiling breaks, find out what grew before raising it in a commit that says why.",
 
       "binaries": {
-        "required": ["docker", "quasar-updater", "curl"],
-        "_required_notes": {
-          "docker": "The CLI this program exists to drive. Its compose plugin is asserted separately below, because a docker CLI WITHOUT the compose plugin passes this line and can do nothing the updater needs.",
-          "curl": "The post-deploy `/v1/self` probe (deploy/redeploy.sh step 7/7) runs INSIDE this container, because it is the only one guaranteed to have a client that speaks a unix socket: the control-plane image ships curl or wget depending on which Dockerfile built it, and busybox wget cannot do it at all.",
-          "quasar-updater": "The baked binary. Alpine base, so no rpm/package assertions apply to this role."
-        },
-        "forbidden": ["go", "gcc", "cargo"]
-      },
-
-      "commands": {
-        "must_succeed": {
-          "docker compose version": "The compose plugin, pinned IN THE IMAGE so the invocation is independent of the host's compose version (prototype finding 4). Its absence is invisible to a `docker` binary check and turns every apply into a `recreate_failed`."
+        "required": ["quasar-recovery"],
+        "forbidden": ["gst-inspect-1.0", "gst-launch-1.0", "docker", "podman", "cargo", "rustc", "gcc", "cc"],
+        "_forbidden_notes": {
+          "gst-inspect-1.0": "The actor never touches media: no GStreamer may reach this image (the crate is GStreamer-free by test).",
+          "docker": "The actor talks to the engine only through its Unix-socket API, as the agent does (#239)."
         }
       },
 
       "paths": {
-        "required": ["/usr/local/bin/quasar-updater", "/etc/ssl/certs/ca-certificates.crt"],
-        "_required_notes": {
-          "/etc/ssl/certs/ca-certificates.crt": "Go's x509 reads this. With QUASAR_UPDATER_SIGNATURE_MODE on, the updater fetches a release's signed manifest over HTTPS; with no CA bundle every fetch fails and the gate reports signature_invalid, so nothing applies at all."
-        },
-        "forbidden": ["/go", "/usr/local/go", "/src"]
+        "required": ["/usr/local/bin/quasar-recovery"],
+        "forbidden": ["/opt/gst", "/usr/lib/gstreamer-1.0", "/usr/lib64/gstreamer-1.0", "/usr/local/cargo", "/src"]
+      },
+
+      "commands": {
+        "must_succeed": {
+          "quasar-recovery version": "The binary starts in the image it ships in.",
+          "! tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | grep -q FakeEngine": "The in-memory test engine (feature test-support) never ships: a build that enabled it would carry an engine that answers anything.",
+          "! tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | grep -q '^libc[.]musl-'": "Statically linked: the binary does not need the base image's libc (a dynamic alpine binary names libc.musl-<arch>.so.1 as DT_NEEDED; this check finds it in /sbin/apk and /bin/busybox and not in a static build), so it would run on scratch. NULs become newlines because busybox grep stops a line at a NUL."
+        }
       },
 
       "labels": {
         "required": [
-          "org.quasar.image.role",
+          "org.quasar.image.role=recovery",
           "org.quasar.source.commit",
-          "org.quasar.built.at"
+          "org.quasar.built.at",
+          "org.quasar.recipe",
+          "org.quasar.version"
         ],
-        "_notes": "No org.quasar.pins.base: this role is the one image not built on the quasar-base family, so there is no base pin to record."
+        "_notes": "No org.quasar.pins.base: not built on the quasar-base family. org.quasar.recipe is the revision of the actor's own container shape (node-agent/crates/quasar-recovery/src/recipe/revision.rs), which the seed and a hand-over render (ADR 0007/0008). org.quasar.version is the release version (dev on a branch build): a recovery actor reads it off the seed's image to report the seed's version (agent-api.md amendment 14 seed_version)."
       },
 
       "image_config": {
-        "healthcheck_required": false,
+        "entrypoint_or_cmd_contains": "quasar-recovery",
+        "healthcheck_required": true,
         "must_not_run_as_root": false,
-        "_root_note": "Root is REQUIRED here: the updater talks to the mounted docker socket and writes the stack's .env at its host path. Documented in deploy/Dockerfile.updater."
+        "_root_note": "Root is required: the actor drives the container engine through the mounted socket."
       }
     },
+
     "control": {
       "_role": "Control-plane production image (Dockerfile.control.prod). Static Go binary + embedded web SPA on quasar-base.",
       "size_max_mb": 400,
@@ -247,7 +250,9 @@
         "forbidden": ["go", "node", "npm", "cargo", "gcc"]
       },
       "paths": {
-        "forbidden": ["/root/.npm", "/go", "/usr/local/go"]
+        "required": ["/app/web/index.html", "/app/web/enroll-host.sh"],
+        "_required_note": "The web root the control plane serves: the SPA, and the operator script a host fetches from it (/enroll-host.sh, #100). web/vite.config.ts fails the build when deploy/ lacks it; this catches a Dockerfile that stops copying it into the web build. /prepare-host.sh is forbidden below: host preparation is written out in the docs, never served for download.",
+        "forbidden": ["/root/.npm", "/go", "/usr/local/go", "/app/web/prepare-host.sh"]
       },
       "labels": {
         "required": [
@@ -255,13 +260,17 @@
           "org.quasar.pins.base",
           "org.quasar.source.commit",
           "org.quasar.built.at",
-          "org.quasar.schema.version"
+          "org.quasar.schema.version",
+          "org.quasar.recipe"
         ],
+        "_recipe_note": "org.quasar.recipe (ADR 0008): the recipe revision this control-plane image needs, stamped by build-images.sh from control-plane/internal/buildinfo/recipe.go.",
         "_notes": "Provenance, the same assertion the runtime role carries. org.quasar.schema.version is the control role's alone: the edge release channel reads the highest embedded migration off the published image, since a branch build ships no release manifest, and a control-plane image without it is unorderable and never offered as an update (#111). The control plane also SERVES its identity (GET /v1/admin/platform/identity) from linker stamps passed by the same build args, so a missing label here means the served identity is unstamped too."
       },
       "image_config": {
         "healthcheck_required": true,
-        "must_not_run_as_root": true
+        "must_not_run_as_root": true,
+        "run_as_uid": 1000,
+        "_uid_note": "The recovery actor delivers the control plane's secret files (database password, secret key, local enrollment token) owned by uid 1000, mode 0400 (#361, CONTROL_PLANE_UID in node-agent/crates/quasar-recovery). An image running as any other uid cannot read them and the control plane cannot start on an owned install."
       }
     }
   }

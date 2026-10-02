@@ -56,7 +56,7 @@ func testDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func newTestServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *auth.Service) {
+func newTestServer(t *testing.T, pool *pgxpool.Pool, evidence ...func(string, string) (bool, bool, bool)) (*httptest.Server, *auth.Service) {
 	t.Helper()
 
 	authSvc, err := auth.NewService(pool, auth.DefaultParams(), time.Hour)
@@ -68,6 +68,9 @@ func newTestServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *auth.Se
 	authHandler := auth.NewHandler(authSvc)
 	authHandler.Register(mux)
 	crudHandler := NewHandler(pool)
+	if len(evidence) > 0 {
+		crudHandler.SetImageEvidence(evidence[0])
+	}
 	crudHandler.Register(mux, authHandler.RequireAuth, authHandler.RequireAdmin)
 
 	srv := httptest.NewServer(mux)
@@ -526,7 +529,7 @@ func TestHostsCRUD(t *testing.T) {
 }
 
 // An app created without resource fields must inherit the SCHEMA defaults, not Go zero
-// values. Regression for the live Tower data bug (2026-07-26): the create request struct
+// values. Regression for the live gpu-test data bug (2026-07-26): the create request struct
 // took plain int32s, so an omitted `default_encode_slots` decoded to 0 and the app was
 // admitted onto a GPU with no free encode slots — admission control silently bypassed.
 func TestCreateAppResourceDefaults(t *testing.T) {

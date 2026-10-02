@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -42,6 +43,25 @@ func TestStaleSweepMeasuresFromBoot(t *testing.T) {
 	}
 	if slots := reservedSlots(t, pool, s.gpuID); slots != 0 {
 		t.Fatalf("sweep left %d reserved slots; the backstop must release them", slots)
+	}
+}
+
+// A stale sweep can read an online host just before a platform hold commits.
+// Its late offline projection must not erase the newly acquired restriction.
+func TestStaleSweepStatusProjectionKeepsNewRestriction(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	if _, err := admission.NewStore(pool).Acquire(ctx, s.hostID,
+		admission.Owner{Kind: admission.Platform, ID: "00000000-0000-0000-0000-000000000123"}, "Platform apply"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetHostStatus(ctx, s.hostID, "offline"); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostStatus(t, pool, s.hostID); got != "draining" {
+		t.Fatalf("stale sweep projected %q, want draining while owner holds", got)
 	}
 }
 

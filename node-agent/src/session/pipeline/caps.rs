@@ -516,7 +516,7 @@ mod tests {
     /// A real `SessionConfig` for the Vulkan encoder at `topology`.
     /// `use_test_src`/experimental-dmabuf envs stay unset, so the plain paths run.
     fn vulkan_cfg(topology: VideoTopology) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = EncoderChoice::Vulkan;
         let stream = StreamParams {
             width: 1920,

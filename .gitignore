@@ -43,6 +43,7 @@ control-plane/bin/
 # OPERATOR CONFIG — real host addresses, ssh aliases and key paths. NEVER committed.
 # Every skill reads it locally; hosts.example.json is the tracked schema template.
 .claude/skills/_shared/hosts.json
+.claude/skills/_shared/leak-patterns.local
 
 # Repo-scoped MCP wiring is operator-local tooling (endpoints on the operator's
 # own network), not a property of the project. Keep it working, don't publish it.
@@ -56,7 +57,7 @@ node_modules/
 .playwright-mcp/
 .understand-anything/
 
-# P4-07 troubleshooting harness results (generated on hermes, not committed)
+# P4-07 troubleshooting harness results (generated on the aux host, not committed)
 deploy/results/
 
 # make validate — Playwright's downloaded chromium cache (scripts/validate/package.json
@@ -109,3 +110,6 @@ deploy/.build-report.json
 # Agent worktrees. Untracked by convention until now; an unscoped `git add -A`
 # in the superproject would otherwise stage a whole nested checkout.
 .claude/worktrees/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

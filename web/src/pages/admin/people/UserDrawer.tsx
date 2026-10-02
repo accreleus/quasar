@@ -1,6 +1,6 @@
 // Session-history drawer for a single user, opened from the UsersTab table.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { Link } from "react-router-dom";
 import * as adminApi from "../../../api/admin";
 import type { AdminSession, AdminUser, Entitlement } from "../../../api/types";
@@ -78,13 +78,13 @@ export function UserDrawer({
     <Drawer open onClose={onClose} title={user.username} width={440}>
       {/* User identity */}
       <div className="drawer-user-head">
-        <span className="u-avatar u-avatar-lg" style={{ background: avatarGradient(user.username) }}>
+        <span className="u-avatar u-avatar-lg u-grad" style={{ "--avatar-bg": avatarGradient(user.username) } as CSSProperties}>
           {user.username[0].toUpperCase()}
         </span>
         <div>
-          <div className="u-name" style={{ fontSize: "1.1rem" }}>{user.username}</div>
+          <div className="u-name">{user.username}</div>
           <div className="u-email">{user.email}</div>
-          <div style={{ display: "flex", gap: "var(--s2)", marginTop: "var(--s2)" }}>
+          <div className="drawer-inline mt2">
             <Chip variant={user.role === "admin" ? "accent" : "neutral"}>
               {user.role === "admin" ? "Admin" : "User"}
             </Chip>
@@ -125,26 +125,26 @@ export function UserDrawer({
           'all' rows that also cover this user. Said explicitly, twice: once as
           a standing caption, once in the empty state, because the failure mode
           is an admin reading "no rows" as "this user can see nothing". */}
-      <div className="eyebrow" style={{ marginTop: "var(--s6)", marginBottom: "var(--s3)" }}>
+      <div className="eyebrow drawer-block mb3">
         Personal library grants
       </div>
-      <p className="muted" style={{ fontSize: "var(--t-xs)", marginTop: "-6px", marginBottom: "var(--s3)" }}>
+      <p className="muted t-xs mb3 drawer-grants-note">
         Individual grants only — not apps this user can see because they are marked
         “Everyone”. Manage those from each app’s Access section.
       </p>
 
       {entitlementsLoading && (
-        <p className="muted" style={{ fontSize: "var(--t-sm)" }}>Loading…</p>
+        <p className="muted t-sm">Loading…</p>
       )}
       {!entitlementsLoading && entitlements.length === 0 && (
-        <p className="muted" style={{ fontSize: "var(--t-sm)" }}>
+        <p className="muted t-sm">
           No personal grants. This user may still see apps marked “Everyone”.
         </p>
       )}
       {!entitlementsLoading &&
         entitlements.map((e) => (
           <div key={e.id} className="hist-item">
-            <div style={{ flex: 1 }}>
+            <div className="grow">
               <div className="hi-app">
                 <Link to={`/admin/library/apps/${e.app_id}`}>{e.app_name}</Link>
               </div>
@@ -154,19 +154,19 @@ export function UserDrawer({
         ))}
 
       {/* Session history */}
-      <div className="eyebrow" style={{ marginTop: "var(--s6)", marginBottom: "var(--s3)" }}>
+      <div className="eyebrow drawer-block mb3">
         Session history
       </div>
 
-      {loading && <p className="muted" style={{ fontSize: "var(--t-sm)" }}>Loading…</p>}
+      {loading && <p className="muted t-sm">Loading…</p>}
       {!loading && sessions.length === 0 && (
-        <p className="muted" style={{ fontSize: "var(--t-sm)" }}>No sessions yet.</p>
+        <p className="muted t-sm">No sessions yet.</p>
       )}
       {!loading &&
         sessions.map((s) => (
           <div key={s.id} className="hist-item">
-            <span className="hist-dot" style={{ background: sessionStateDot(s.state) }} />
-            <div style={{ flex: 1 }}>
+            <span className="hist-dot" style={{ "--hist-dot": sessionStateDot(s.state) } as CSSProperties} />
+            <div className="grow">
               <div className="hi-app">{s.app_id.slice(0, 12)}</div>
               <div className="hi-meta">
                 {s.id.slice(0, 8)} · {s.state}
@@ -178,12 +178,12 @@ export function UserDrawer({
         ))}
 
       {/* Actions */}
-      <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)", marginTop: "var(--s6)" }}>
-        <div style={{ display: "flex", gap: "var(--s2)" }}>
-          <Button variant="secondary" style={{ flex: 1 }} onClick={() => onRoleClick(user)}>
+      <div className="col gap2 drawer-block">
+        <div className="drawer-inline">
+          <Button variant="secondary" className="grow" onClick={() => onRoleClick(user)}>
             {user.role === "admin" ? "Demote" : "Promote"}
           </Button>
-          <Button variant="secondary" style={{ flex: 1 }} onClick={() => onDisableClick(user)}>
+          <Button variant="secondary" className="grow" onClick={() => onDisableClick(user)}>
             {user.disabled ? "Enable" : "Disable"}
           </Button>
         </div>

@@ -1,0 +1,43 @@
+{
+  "name": "quasar-recovery",
+  "image": "registry.example.invalid/quasar/quasar-recovery@sha256:cc33000000000000000000000000000000000000000000000000000000000000",
+  "entrypoint": null,
+  "cmd": [
+    "actor"
+  ],
+  "env": {
+    "QUASAR_SEED_CONTAINER": "5eed000000000000000000000000000000000000000000000000000000000000",
+    "RUST_LOG": "info"
+  },
+  "labels": {
+    "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
+    "io.quasar.platform-service": "recovery-actor"
+  },
+  "network_mode": null,
+  "binds": [
+    {
+      "source": "quasar-recovery-agent",
+      "target": "/run/quasar-recovery",
+      "read_only": false
+    },
+    {
+      "source": "quasar-machine",
+      "target": "/var/lib/quasar-machine",
+      "read_only": false
+    },
+    {
+      "source": "/run/user-docker/docker.sock",
+      "target": "/var/run/docker.sock",
+      "read_only": false
+    }
+  ],
+  "devices": [],
+  "device_cgroup_rules": [],
+  "gpus": [],
+  "cap_add": [],
+  "security_opt": [
+    "label=disable"
+  ],
+  "init": false,
+  "restart": "unless-stopped"
+}

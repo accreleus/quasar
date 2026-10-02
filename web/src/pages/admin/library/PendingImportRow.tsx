@@ -30,24 +30,13 @@ export function PendingImportRow({ row, importing, onImport, onIgnore }: Pending
     : [{ key: "ignore", label: "Ignore", onClick: onIgnore }];
 
   return (
-    <tr style={{ background: "var(--accent-soft)" }}>
+    <tr className="lib-pending-row">
       <td>
         <div className="rowflex">
           <span
             aria-hidden="true"
-            style={{
-              width: 26,
-              height: 26,
-              flex: "none",
-              borderRadius: "var(--r-xs)",
-              border: "1px dashed var(--line-3)",
-              display: "grid",
-              placeContent: "center",
-              fontFamily: "var(--font-display)",
-              fontSize: 11,
-              fontWeight: 700,
-              color: "var(--text-3)",
-            }}
+            className="lib-pending-glyph"
+            style={{ width: 26, height: 26 }}
           >
             {appGlyph(label)}
           </span>
@@ -61,7 +50,7 @@ export function PendingImportRow({ row, importing, onImport, onIgnore }: Pending
         <Chip variant="accent">Game</Chip>
       </td>
       <td>Steam</td>
-      <td colSpan={3} style={{ color: "var(--text-3)" }}>
+      <td colSpan={3} className="lib-pending-note">
         Not imported. Importing applies the provider preset.
       </td>
       <td className="right">

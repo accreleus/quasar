@@ -1,10 +1,10 @@
 // Package hostenroll owns per-host enrollment tokens (#12/#96): admin-minted, hashed at
 // rest, single-use by default, expiring, and optionally bound to one node_name.
 //
-// Why this exists rather than the single static ENROLLMENT_TOKEN: that value is shared by
-// the whole fleet, cannot be rotated without a control-plane restart, and — because
-// enrollment upserts on node_name — carries the authority to BECOME an already-enrolled
-// host, not merely to add a new one. A token minted for one machine, good once, expiring,
+// These and a machine's single-use local token are the only enrollment credentials (the
+// fleet-wide static ENROLLMENT_TOKEN is retired, control-api.md "RH06 contract step"):
+// because enrollment upserts on node_name, a shared value would carry the authority to
+// BECOME an already-enrolled host. A token minted for one machine, good once, expiring,
 // is the credential the operator thinks they are handing out.
 //
 // The redemption model is deliberately the same one `invites` uses (single
@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -180,6 +181,34 @@ func (s *Store) List(ctx context.Context, pendingOnly bool) ([]Enrollment, error
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// LocalNote marks a machine's local enrollment token in the admin list.
+const LocalNote = "this machine's local enrollment token (created by its recovery actor for its own node agent)"
+
+// Execer is the subset of pgx EnsureLocal needs.
+type Execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// EnsureLocal inserts a combined or control-only machine's single-use local
+// enrollment token, bound to nodeName and never expiring. A row with the same
+// hash is left exactly as it is, so a restart neither duplicates nor revives a
+// spent token (schema.md amendment 14 §host_enrollments). inserted reports
+// whether this call wrote the row.
+func EnsureLocal(ctx context.Context, db Execer, plaintext, nodeName string) (inserted bool, err error) {
+	if plaintext == "" || nodeName == "" {
+		return false, errors.New("local enrollment needs a token and a node name")
+	}
+	tag, err := db.Exec(ctx, `
+		INSERT INTO host_enrollments (token_hash, created_by, node_name, max_uses, expires_at, note)
+		VALUES ($1, NULL, $2, 1, NULL, $3)
+		ON CONFLICT (token_hash) DO NOTHING
+	`, hashToken(plaintext), nodeName, LocalNote)
+	if err != nil {
+		return false, fmt.Errorf("insert local host enrollment: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // Revoke makes a token unusable. Idempotent: revoking twice keeps the first timestamp.

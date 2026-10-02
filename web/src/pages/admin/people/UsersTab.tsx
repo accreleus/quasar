@@ -2,7 +2,7 @@
 // toolbar, bulk-select, row checkboxes, kebab row menu, session history drawer.
 // Authorization is server-enforced — this UI is UX only (CLAUDE.md invariant #6).
 
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 import { useNavigate } from "react-router-dom";
 import type { AdminUser } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
@@ -135,7 +135,7 @@ export function UsersTab() {
       header: "User",
       render: (u) => (
         <div className="rowflex">
-          <span className="u-ava" style={{ background: avatarGradient(u.username) }}>
+          <span className="u-ava u-grad" style={{ "--avatar-bg": avatarGradient(u.username) } as CSSProperties}>
             {u.username[0].toUpperCase()}
           </span>
           <div className="stack">
@@ -314,7 +314,7 @@ export function UsersTab() {
           { label: "Delete", onClick: () => setBulkDeleteConfirm(true), variant: "danger" },
         ]}
       />
-      {bulkBusy && <p className="muted" style={{ marginTop: 8 }}>Processing…</p>}
+      {bulkBusy && <p className="muted mt2">Processing…</p>}
 
       {/* Bulk role-change modal */}
       {bulkRoleOpen && (
@@ -488,7 +488,7 @@ export function UsersTab() {
             This permanently removes <strong>{deleteTarget.username}</strong>, ends any active
             sessions, and frees their GPU slots. This cannot be undone.
           </p>
-          <div style={{ marginTop: "var(--s5)" }}>
+          <div className="mt5">
             <TextField
               label={`Type "${deleteTarget.username}" to confirm`}
               value={deleteConfirmText}

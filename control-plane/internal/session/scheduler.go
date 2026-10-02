@@ -27,6 +27,10 @@ type CreateParams struct {
 	// The GRANTED mic state, resolved by the caller before it reaches here.
 	// Console/local_only launches never set it: no WebRTC pipeline.
 	Mic bool
+	// DeviceID is the user_devices id the caller's token is bound to, "" for an
+	// unbound token or a clientless launch (console, cert bench). Persisted as
+	// NULL when empty; read back as Session.DeviceID.
+	DeviceID string
 	// The selected launch-profile id, "" for a legacy/tier/override launch.
 	// Persisted as NULL when empty.
 	ProfileID  string
@@ -60,6 +64,18 @@ type CreateParams struct {
 	// PinHostID restricts the scheduler to one host's GPUs. Placement policy and
 	// capacity within it are unchanged.
 	PinHostID string
+	// PinGPUIndex narrows PinHostID to one GPU (the cert bench); ignored without
+	// a host pin, since an index is per host.
+	PinGPUIndex *int32
+	// RequireCodec is the codec constraint (#304; control-api.md "Admission
+	// control" gate (c)), wire vocabulary, "" for none. Not what the row is
+	// inserted with; that is Codec.
+	RequireCodec string
+	// CodecPreference is an Auto launch's codec preference (#305;
+	// codecPreference in rung.go), wire vocabulary, best first. An ORDER BY key
+	// in the candidate query only: never a filter, never in the re-check, the
+	// totals probe or a diagnostic. Empty renders nothing.
+	CodecPreference []string
 }
 
 // homeAppID is the storage key for this launch. Every storage-keyed site on this
@@ -84,6 +100,11 @@ const maxPlacementAttempts = 50
 // unset) means unpinned — any vendor-compatible GPU — and the agent adopts the
 // scheduled GPU's node; the two resolvers must not diverge. A non-empty value
 // exact-matches, so 'software' stays unschedulable for hardware encoders.
+// The vulkan arm resolves by render node alone (#268): bind_gpu sets no ordinal
+// for Vulkan — the compositor creates the GstVulkanDevice from the bound render
+// node — and every vendor with a Vulkan encoder qualifies, so it tests neither
+// g.index nor g.vendor. The agent numbers GPUs by DRM card position, so a host
+// whose only usable GPU sits at index 1 must still schedule.
 const schedulableBindingSQL = ` AND (
 	COALESCE(h.effective_settings->>'encoder', '') = ''
 	OR h.effective_settings->>'encoder' = 'openh264'
@@ -98,7 +119,6 @@ const schedulableBindingSQL = ` AND (
 			OR g.render_node = h.effective_settings->>'render_node'
 			OR g.device_path = h.effective_settings->>'render_node'))
 	OR (h.effective_settings->>'encoder' = 'vulkan'
-		AND g.index = 0
 		AND (COALESCE(h.effective_settings->>'render_node', '') = ''
 			OR g.render_node = h.effective_settings->>'render_node'
 			OR g.device_path = h.effective_settings->>'render_node'))
@@ -141,12 +161,17 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 		}
 		sess, retry, err := s.scheduleAttempt(ctx, p)
 		if !retry {
+			if p.ManagedHome && errors.Is(err, ErrHomeConflict) {
+				if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
+					return Session{}, diagnosisErr
+				}
+			}
 			return sess, err
 		}
 	}
 	// Retry budget exhausted under sustained same-GPU contention: report the
 	// retryable "busy" code.
-	return Session{}, ErrCapacityExhausted
+	return Session{}, withCodecConstraint(p, ErrCapacityExhausted)
 }
 
 // scheduleAttempt runs one placement transaction. It returns retry=true (with a
@@ -165,6 +190,20 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		`SELECT pg_advisory_xact_lock($1, hashtext($2::text))`, lockNamespaceUser, p.UserID,
 	); err != nil {
 		return Session{}, false, fmt.Errorf("lock user: %w", err)
+	}
+
+	// Keep the parent and launched tile alive through entitlement and
+	// reservation. Parent first prevents an app-delete cascade from reversing
+	// the lock order against an entitlement held FOR SHARE below.
+	appIDs := []string{p.homeAppID()}
+	if p.AppID != p.homeAppID() {
+		appIDs = append(appIDs, p.AppID)
+	}
+	for _, appID := range appIDs {
+		var lockedID string
+		if err := tx.QueryRow(ctx, `SELECT id::text FROM apps WHERE id=$1::uuid FOR KEY SHARE`, appID).Scan(&lockedID); err != nil {
+			return Session{}, false, fmt.Errorf("lock launch app: %w", err)
+		}
 	}
 
 	// (1b) Entitlement: the authorization boundary. A hand-copy of entitledSQL
@@ -203,6 +242,31 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if err != nil {
 		return Session{}, false, fmt.Errorf("check entitlement: %w", err)
+	}
+	if p.ManagedHome {
+		owner, err := homeClaimOwner(ctx, tx, p)
+		if err != nil {
+			return Session{}, false, err
+		}
+		if owner != "" {
+			if p.PinHostID != "" && p.PinHostID != owner {
+				return Session{}, false, ErrHomeConflict
+			}
+			// A fixed selection that excludes the only safe home location needs
+			// the repair-required home explanation, rather than a generic empty
+			// fleet message. The final placement lock below still decides the race.
+			var selected bool
+			if err := tx.QueryRow(ctx, `SELECT mode='all_eligible' OR EXISTS (
+				SELECT 1 FROM app_placement_hosts
+				WHERE app_id=ap.app_id AND host_id=$2::uuid)
+				FROM app_placement ap WHERE app_id=$1::uuid`, p.homeAppID(), owner).Scan(&selected); err != nil {
+				return Session{}, false, fmt.Errorf("check home owner placement: %w", err)
+			}
+			if !selected {
+				return Session{}, false, ErrHomeConflict
+			}
+			p.PinHostID = owner
+		}
 	}
 
 	// (2) Per-user concurrent-session quota (contract gate #1, before capacity).
@@ -253,7 +317,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	// indices come from `candidacy` (admission_query.go), the same object the
 	// under-lock re-check and the rejection classifier use.
 	veto := s.vramVeto(p)
-	cand := candidacy{p: p, veto: veto}
+	cand := candidacy{p: p, veto: veto, readiness: s.readiness}
 
 	candidateSQL, candidateArgs := cand.candidateQuery(s.policy)
 	var gpuID, hostID string
@@ -292,6 +356,33 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	if !fits {
 		return Session{}, true, nil // raced; retry from scratch
 	}
+	// A placement edit takes this same row FOR UPDATE. Holding FOR SHARE through
+	// reservation means removal can commit either before this check (and we
+	// refuse) or after this session commits (already accepted sessions finish).
+	placementAllowed, err := placementSelectedForHost(ctx, tx, p.homeAppID(), hostID)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !placementAllowed) {
+		return Session{}, true, nil
+	}
+	if err != nil {
+		return Session{}, false, fmt.Errorf("lock app placement: %w", err)
+	}
+	imageAvailable, err := lockRequiredImageFence(ctx, tx, hostID, p.AppImage)
+	if err != nil {
+		return Session{}, false, err
+	}
+	if !imageAvailable {
+		return Session{}, true, nil
+	}
+	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
+		return Session{}, false, err
+	}
+
+	// A malformed device id is dropped, not fatal: it scopes later reads and is
+	// never an authorization input, but the ::uuid cast below would 500 on it.
+	deviceID := p.DeviceID
+	if !isValidUUID(deviceID) {
+		deviceID = ""
+	}
 
 	// (6) Insert placed + reserved, as `assigned`: the reservation exists by this
 	// row's active state being counted in the availability sums above, and the
@@ -309,6 +400,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    reserved_encode_slots,
 		    signaling_token_hash, signaling_token_expires_at,
 		    mic,
+		    device_id,
 		    assigned_at
 		) VALUES (
 		    $1, $2, $3, $4, 'assigned',
@@ -319,6 +411,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    $11,
 		    NULLIF($12, ''), $13,
 		    $16,
+		    NULLIF($17, '')::uuid,
 		    now()
 		)
 		RETURNING `+sessionCols,
@@ -330,6 +423,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		p.ProfileID,
 		p.Codec,
 		p.Mic,
+		deviceID,
 	))
 	if err != nil {
 		return Session{}, false, fmt.Errorf("insert session: %w", err)
@@ -363,16 +457,46 @@ func (s *Store) vramVeto(p CreateParams) VramAdmission {
 	return s.vram
 }
 
-// classifyReject splits the contract's two 503s: no online GPU whose TOTALS fit
+// CodecConstraintRejection lets a codec-constrained no_host_available or
+// capacity_exhausted name its codec. It unwraps to the refusal it wraps, so
+// errors.Is/As and the status mapping are unchanged.
+type CodecConstraintRejection struct {
+	err   error
+	Codec string // wire vocabulary
+}
+
+func (e *CodecConstraintRejection) Error() string {
+	return fmt.Sprintf("%v (codec constraint %s)", e.err, e.Codec)
+}
+
+func (e *CodecConstraintRejection) Unwrap() error { return e.err }
+
+// withCodecConstraint wraps only the two refusals that name the codec; a
+// readiness refusal must name nothing (control-api.md "Evidence-gated readiness").
+func withCodecConstraint(p CreateParams, err error) error {
+	if p.RequireCodec == "" ||
+		!(errors.Is(err, ErrNoHostAvailable) || errors.Is(err, ErrCapacityExhausted)) {
+		return err
+	}
+	return &CodecConstraintRejection{err: err, Codec: p.RequireCodec}
+}
+
+func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
+	return withCodecConstraint(cand.p, classifyRejectPlain(ctx, tx, cand))
+}
+
+// classifyRejectPlain splits the contract's two 503s: no online GPU whose TOTALS fit
 // ⇒ ErrNoHostAvailable, vs totals fit but availability does not ⇒
-// ErrCapacityExhausted (retryable).
+// ErrCapacityExhausted (retryable). The codec constraint is in the totals probe,
+// so every capable GPU busy is capacity_exhausted and none at all is
+// no_host_available.
 //
 // The totals check must stay slots-only. The VRAM floor here contradicts §4.1's
 // structural abstain (a GPU with vram_mb_total <= floor is never vetoed, so it
 // is servable) and was proved wrong live on an APU host reporting a 512 MB UMA
 // carve-out against the 1024 MB default floor: ordinary slot exhaustion came
 // back as a non-retryable no_host_available.
-func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
+func classifyRejectPlain(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 	// The image gate DOES belong here, unlike the VRAM floor: a fleet where no
 	// host has the app's managed image ready genuinely cannot serve the launch.
 	// totalsQuery encodes both that inclusion and the veto's exclusion.
@@ -382,7 +506,16 @@ func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 		return fmt.Errorf("classify rejection: %w", err)
 	}
 	if !totalsFit {
-		return ErrNoHostAvailable
+		return noHostRejection(ctx, tx, cand.p.AppImage)
+	}
+	// Readiness is diagnosed here, in the position of the veto diagnostic and
+	// never inside totalsQuery, and only claims the refusal when it is the sole
+	// reason: a ready host that is full is capacity_exhausted even when some
+	// other host is blocked, because the caller's remedy is still to retry.
+	if cand.readiness.enabled() {
+		if err := readinessRejection(ctx, tx, cand); err != nil {
+			return err
+		}
 	}
 	// Totals fit, so something transient refused it. If the veto did, attach the
 	// numbers: otherwise a misconfigured floor is indistinguishable from plain
@@ -393,6 +526,119 @@ func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 		}
 	}
 	return ErrCapacityExhausted
+}
+
+// ReadinessBlockedCandidate is one GPU the readiness gate excluded that would
+// otherwise have been picked, with which scope did it.
+type ReadinessBlockedCandidate struct {
+	GPUID      string
+	HostID     string
+	GPUIndex   int32
+	BlockHost  bool
+	BlockHomes bool
+	GPUBlocked bool
+}
+
+// NoHostRejection carries fleet counts for a no_host_available refusal (#288):
+// the window right after an agent (re)connects, where its host is registered
+// but not yet placeable (agentws/store.go marks capacity_detection='unavailable'
+// and gpus.reported=false on register/reconnect, cleared by the agent's first
+// capacity report). It unwraps to ErrNoHostAvailable, so errors.Is and the HTTP
+// status mapping are unchanged; the detail is for the launcher's structured log
+// only — the response must still name no host.
+type NoHostRejection struct {
+	err                     error
+	OnlineHosts             int
+	HostsCapacityNotOK      int // online hosts with capacity_detection != 'ok'
+	GPUsUnreported          int // online hosts' GPUs with reported = false
+	HostsRecentlyRegistered int // online hosts with last_registered_at within 15s
+	// Online hosts whose managed image for this launch reports `failed`; the
+	// cause is that host_images row's error (GET /v1/admin/images hosts[].error).
+	HostsImageFailed int
+}
+
+func (e *NoHostRejection) Error() string {
+	return fmt.Sprintf("%v (%d online host(s), %d awaiting capacity, %d unreported GPU(s), %d registered <15s ago, %d with the app image failed)",
+		e.err, e.OnlineHosts, e.HostsCapacityNotOK, e.GPUsUnreported, e.HostsRecentlyRegistered, e.HostsImageFailed)
+}
+
+func (e *NoHostRejection) Unwrap() error { return e.err }
+
+// noHostRejection attaches fleet counts to ErrNoHostAvailable so the launcher
+// can log why nothing fit. Fail-open on its own query failure: a wrong log
+// beats a wrong refusal, so a query error falls back to the plain error.
+func noHostRejection(ctx context.Context, tx pgx.Tx, appImage string) error {
+	rej := &NoHostRejection{err: ErrNoHostAvailable}
+	err := tx.QueryRow(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM hosts WHERE status = 'online'),
+			(SELECT COUNT(*) FROM hosts WHERE status = 'online' AND capacity_detection != 'ok'),
+			(SELECT COUNT(*) FROM gpus g JOIN hosts h ON h.id = g.host_id
+			  WHERE h.status = 'online' AND NOT g.reported),
+			(SELECT COUNT(*) FROM hosts
+			  WHERE status = 'online' AND last_registered_at > now() - interval '15 seconds'),
+			(SELECT COUNT(DISTINCT hi.host_id) FROM host_images hi
+			   JOIN installed_images ii ON ii.image_id = hi.image_id
+			   JOIN hosts h ON h.id = hi.host_id
+			  WHERE h.status = 'online' AND hi.state = 'failed'
+			    AND $1::text <> '' AND (ii.registry_ref = $1::text OR ii.local_tag = $1::text))
+	`, appImage).Scan(&rej.OnlineHosts, &rej.HostsCapacityNotOK, &rej.GPUsUnreported, &rej.HostsRecentlyRegistered, &rej.HostsImageFailed)
+	if err != nil {
+		return ErrNoHostAvailable
+	}
+	return rej
+}
+
+// HostNotReadyRejection carries the per-GPU evidence for a readiness refusal. It
+// unwraps to ErrHostNotReady, so the status mapping is unchanged; the detail is
+// for the launcher's structured log and never for the response, which must name
+// no check, scope, GPU or host.
+type HostNotReadyRejection struct {
+	err        error
+	Candidates []ReadinessBlockedCandidate
+}
+
+func (e *HostNotReadyRejection) Error() string {
+	return fmt.Sprintf("%v (the readiness gate excluded %d otherwise-eligible GPU(s))", e.err, len(e.Candidates))
+}
+
+func (e *HostNotReadyRejection) Unwrap() error { return e.err }
+
+// readinessRejection returns the host_not_ready refusal when readiness is the
+// sole reason nothing was placed, and nil otherwise — including on its own
+// query failure, where falling through to the existing classification is the
+// fail-open choice: a wrong code is worse than a coarse one.
+//
+// Two facts decide it. The gate excluded a GPU that would otherwise have been
+// picked (readinessDiagQuery), and no GPU the gate leaves eligible could serve
+// the request at all (readinessTotalsQuery). The second is what keeps "a ready
+// host is full while another is blocked" at capacity_exhausted.
+func readinessRejection(ctx context.Context, tx pgx.Tx, cand candidacy) error {
+	diagSQL, diagArgs := cand.readinessDiagQuery()
+	rows, err := tx.Query(ctx, diagSQL, diagArgs...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var blocked []ReadinessBlockedCandidate
+	for rows.Next() {
+		var c ReadinessBlockedCandidate
+		if err := rows.Scan(&c.GPUID, &c.HostID, &c.GPUIndex,
+			&c.BlockHost, &c.BlockHomes, &c.GPUBlocked); err != nil {
+			return nil
+		}
+		blocked = append(blocked, c)
+	}
+	if rows.Err() != nil || len(blocked) == 0 {
+		return nil
+	}
+
+	totalsSQL, totalsArgs := cand.readinessTotalsQuery()
+	var eligibleFit bool
+	if err := tx.QueryRow(ctx, totalsSQL, totalsArgs...).Scan(&eligibleFit); err != nil || eligibleFit {
+		return nil
+	}
+	return &HostNotReadyRejection{err: ErrHostNotReady, Candidates: blocked}
 }
 
 // VramVetoCandidate is one GPU that had free encode slots and was refused by the

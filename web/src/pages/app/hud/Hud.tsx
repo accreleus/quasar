@@ -12,7 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { useOverlayPreferences } from "../../../settings/OverlayPreferencesContext";
 import type { ScalingMode } from "../../../settings/displayPreferences";
 import { dockLayout, hudShellPin } from "./hudDock";
@@ -420,11 +420,11 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
         className={`hud${hidden ? " hidden" : ""}`}
         ref={hudRef}
         style={{
-          flexDirection: layout.direction,
+          "--hud-dir": layout.direction,
           width: layout.width,
           height: layout.height,
-          borderRadius: layout.radius,
-        }}
+          "--hud-radius": layout.radius,
+        } as CSSProperties}
       >
         <HudBar
           barRef={barRef}

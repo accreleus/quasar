@@ -1,17 +1,17 @@
 ---
 title: Sessions and audit log
-description: Watching live sessions, reading session detail and metrics, and what the audit log records.
+description: Watch live sessions, read session detail and metrics, and check the audit log.
 ---
 
 import Shot from '../../../components/Shot.astro';
 import admin_sessions from '../../../assets/shots/admin-sessions.png';
 import { Aside } from '@astrojs/starlight/components';
 
-Admin, Sessions lists live and recent sessions.
+**Admin ▸ Sessions** lists live and recent sessions.
 
 <Shot
 	label="Admin sessions"
-	sublabel="The sessions list: one live session at the top, then recent ones, with host, user, frame rate, latency, bitrate and codec."
+	sublabel="The sessions list: live sessions at the top, including a console session on the living-room host, then recent ones, with host, user, frame rate, latency, bitrate and codec."
 	src={admin_sessions}
 	alt="The admin sessions list"
 />
@@ -20,79 +20,60 @@ Admin, Sessions lists live and recent sessions.
 
 | State | Meaning |
 | --- | --- |
-| `assigned` | A host has been chosen. Nothing has started yet. |
-| `starting` | The container is coming up and the pipeline is being built. |
+| `assigned` | A host was chosen. Nothing started yet. |
+| `starting` | Container and pipeline coming up. |
 | `running` | Media is flowing. |
-| `stopped` | It ended cleanly. |
-| `failed` | It ended badly. The detail says why. |
+| `stopped` | Ended cleanly. |
+| `failed` | Ended badly. The detail says why. |
 
-A companion detail field carries the substate, which is where the useful
-information is. `host_lost` and `building pipeline` are examples.
+The detail field holds the substate, such as `host_lost` or `building pipeline`.
 
 <Aside type="caution" title="`running` does not mean the user can see anything">
-The server marks a session running when the pipeline is up and media is being
-sent. If the client cannot decode what is arriving, the state is still running
-and the user is looking at black. Never treat the state as proof.
+If the client can't decode the stream, the session is still `running` and the
+user sees black.
 </Aside>
 
 ## Session detail
 
-Opening a session gives you the host it landed on, the user, the resolved codec,
-resolution and frame rate, and time series for the session.
-
-The series worth knowing:
+Opening a session shows the host, user, codec, resolution, frame rate, and time
+series:
 
 | Series | What it tells you |
 | --- | --- |
-| `encoder.encode_ms` | How long the GPU takes per frame. Above roughly 16 ms at 60 fps, the encoder is the bottleneck. |
-| `encoder.fps` | What the host is actually producing. |
-| `abr.setpoint_kbps` | What the bitrate controller has settled on. |
+| `encoder.encode_ms` | GPU time per frame. Above about 16 ms at 60 fps, the encoder is the bottleneck. |
+| `encoder.fps` | What the host actually produces. |
+| `abr.setpoint_kbps` | The bitrate the controller settled on. |
 | `transport.rtt_ms` | Round trip time. |
 | `transport.packets_lost` | Cumulative loss. |
-| `client.present_interval_sd_ms` | How consistent frame presentation is on the client. This is the number that matches perceived stutter. |
+| `client.present_interval_sd_ms` | Client frame presentation consistency. This matches perceived stutter. |
 
-<Aside type="note" title="Judge delivery from the host, smoothness from the client">
-Frame rate and encode time from the agent describe what was produced. Presentation
-interval variation from the client describes what the user saw. The two answer
-different questions and confusing them wastes a lot of time.
-</Aside>
+Host series describe what was produced; client series describe what the user saw.
 
 ## Diagnostic bundles
 
-Each session can produce a diagnostic bundle: a bounded window, five minutes by
-default, containing the metrics, the discrete events, clock alignment between
-host and browser, and an automated verdict.
-
-This is the thing to attach to a bug report. See
-[Diagnostics](/quasar/operations/diagnostics/) for what is in one and how to read
-the verdict.
+A session can produce a diagnostic bundle: a five-minute window (by default) of
+metrics, events, host/browser clock alignment and an automated verdict. Attach it
+to bug reports. See [Diagnostics](/quasar/operations/diagnostics/).
 
 ## Annotations
 
-You can drop a marker on a session's timeline with a note. Useful when you are
-changing something mid-session and want the change visible next to its effect.
+Drop a note on a session's timeline to mark a change next to its effect.
 
 ## Ending a session
 
-You can stop any session from here. The user sees it end.
+You can stop any session here. The user sees it end.
 
 ## What happens when a host disappears
 
-If a host stops heartbeating, its sessions move to a lost state. The control
-plane does not silently reassign them to another host, because the game process
-and the user's writes to their home directory were on the machine that went away.
-The user is told and relaunches.
+A host that stops heartbeating leaves its sessions lost. They are not moved to
+another host; the user relaunches.
 
 ## Retention
 
-Session metrics are kept on a rolling window of about an hour and are pruned when
-the session reaches a terminal state. This is live diagnosis, not long-term
-history. If you want a record of a problem, take a diagnostic bundle while it is
-happening.
+Session metrics keep about an hour and are pruned when the session ends. To keep a
+record of a problem, take a diagnostic bundle while it happens.
 
 ## The audit log
 
-Admin, Audit log records admin actions: settings changes, user and role changes,
-app and entitlement changes, invites minted and revoked, host actions.
-
-Check it when something changed and nobody remembers changing it.
+**Admin ▸ Audit log** records admin actions: settings, users and roles, apps and
+app access, invites, host actions.

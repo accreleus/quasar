@@ -2,7 +2,10 @@
 // takes the first that survives every clamp. A rung carries its own resolution
 // and bitrate, so falling through one changes resolution as well as codec.
 //
-// Placement is codec-blind; the rung resolves POST-placement. In launcher.go:
+// The GPU is chosen first and the rung second. Placement sees the codec only as a
+// gate (an explicit stream.codec, codec_constraint.go) or, on Auto, as an
+// ordering key (codecPreference); the rung itself resolves POST-placement. In
+// launcher.go:
 //
 //	pre-schedule : the session is created from the chain's TOP rung, so admission
 //	               is evaluated against the worst case and can never admit a
@@ -140,11 +143,12 @@ type hostEncoderCaps struct {
 // first that survives every clamp.
 //
 //	clamp 0 : stream.codec override — takes the FIRST rung with that codec; none
-//	          ⇒ ErrRungCodecNotAvailable (400); host cannot encode it ⇒
+//	          ⇒ ErrRungCodecNotAvailable (400); the placed GPU cannot encode it ⇒
 //	          ErrCodecUnsupportedByHost (409, never overridable). It bypasses
 //	          clamps 2/3, 4, 5 and 6, honouring only clamp 1 — that is the forced
 //	          re-test path for a previously-failed codec on a since-fixed encoder.
-//	clamp 1 : host encoder set (an agent reporting nothing is h264-only).
+//	clamp 1 : the placed GPU's codec set (Store.GPUCodecs; h264-only when nothing is
+//	          reported). Its reason string stays host_encoder.
 //	clamp 2/3: client decode probe — h265/av1 need an explicit true (stale or
 //	          absent probe means no); also rejects a rung whose MinDecodeHeight
 //	          exceeds the probe's measured decode height, since a chain may hold
@@ -175,7 +179,7 @@ type hostEncoderCaps struct {
 // rather than bypassing it.
 func resolveRung(
 	rungs []profile.Profile,
-	hostCodecs []string,
+	gpuCodecs []string,
 	host hostEncoderCaps,
 	dp *DeviceProbe,
 	failedRungs map[string]bool,
@@ -185,7 +189,7 @@ func resolveRung(
 		return profile.Profile{}, rungDecision{}, ErrLaunchProfileEmpty
 	}
 	override := ov.codecOverride()
-	hostSet := codecSet(hostCodecs)
+	gpuSet := codecSet(gpuCodecs)
 	dec := rungDecision{Override: override, Considered: make([]rungVerdict, 0, len(rungs))}
 
 	// --- clamp 0: explicit admin/diagnostic codec override -------------------
@@ -195,7 +199,7 @@ func resolveRung(
 			if !ok || wire != override {
 				continue
 			}
-			if !hostSet[wire] {
+			if !gpuSet[wire] {
 				dec.Considered = append(dec.Considered, rungVerdict{ID: r.ID, Codec: wire, Reject: rejectHostEncoder})
 				return profile.Profile{}, dec, ErrCodecUnsupportedByHost
 			}
@@ -215,15 +219,11 @@ func resolveRung(
 			continue
 		}
 		v := rungVerdict{ID: r.ID, Codec: wire}
-		switch {
-		case !hostSet[wire]:
+		switch client := clientClampReject(wire, r, dp, failedRungs); {
+		case !gpuSet[wire]:
 			v.Reject = rejectHostEncoder
-		case !deviceAccepts(wire, dp):
-			v.Reject = rejectClientDecode
-		case dp != nil && dp.MaxDecodeHeight > 0 && r.MinDecodeHeight > dp.MaxDecodeHeight:
-			v.Reject = rejectDecodeHeight
-		case failedRungs[r.ID]:
-			v.Reject = rejectDecodeHistory
+		case client != "":
+			v.Reject = client
 		case r.HardwareEncoderRequired && host.Known && !host.HardwareEncoder:
 			v.Reject = rejectHardwareEncoder
 		case encoderTooSlow(wire, r, host, ov):
@@ -257,6 +257,49 @@ func resolveRung(
 	dec.ResultRung, dec.Result = rungs[last].ID, wire
 	markFloorSelected(&dec, last)
 	return rungs[last], dec, nil
+}
+
+// clientClampReject is clamps 2/3 and 4, the one copy shared by resolveRung and
+// codecPreference so the two cannot disagree. "" means the rung survives.
+func clientClampReject(wire string, r profile.Profile, dp *DeviceProbe, failedRungs map[string]bool) string {
+	switch {
+	case !deviceAccepts(wire, dp):
+		return rejectClientDecode
+	case dp != nil && dp.MaxDecodeHeight > 0 && r.MinDecodeHeight > dp.MaxDecodeHeight:
+		return rejectDecodeHeight
+	case failedRungs[r.ID]:
+		return rejectDecodeHistory
+	}
+	return ""
+}
+
+// codecPreference is an Auto launch's codec preference (#305; control-api.md
+// "Admission control", amendment 12): the distinct wire codecs of the chain's
+// rungs in chain order, keeping only rungs that survive clientClampReject. It is
+// the order the walk would take if the placed GPU could encode everything
+// (guarded by TestCodecPreferenceAgreesWithTheWalk).
+//
+// A preference of h264 alone is returned empty: h264 is on every usable GPU
+// (agent-api.md `gpus[].codecs`), so it could order nothing, and empty keeps the
+// candidate SQL unchanged. An absent probe lands here, since clamp 2/3 then
+// admits only h264.
+func codecPreference(rungs []profile.Profile, dp *DeviceProbe, failedRungs map[string]bool) []string {
+	var pref []string
+	seen := map[string]bool{}
+	for _, r := range rungs {
+		wire, ok := catalogToWire(r.Codec)
+		if !ok || seen[wire] || clientClampReject(wire, r, dp, failedRungs) != "" {
+			continue
+		}
+		// Marked only on survival: a codec whose first rung fails the decode
+		// height can still be preferred through a later, smaller rung.
+		seen[wire] = true
+		pref = append(pref, wire)
+	}
+	if len(pref) == 1 && pref[0] == wireCodecH264 {
+		return nil
+	}
+	return pref
 }
 
 // markFloorSelected stamps the floor-dispatched rung selected-and-bypassed

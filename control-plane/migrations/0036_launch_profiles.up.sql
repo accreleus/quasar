@@ -18,7 +18,7 @@
 -- NOT delete the legacy (non-rung) stream_profiles rows, does NOT make
 -- `stream_profiles.codec` NOT NULL, and does NOT populate
 -- `stream_profile_policy.global_default_profile_id`. All of that belongs to a
--- separate CONTRACT migration, after a Tower soak. The split is the cheapest
+-- separate CONTRACT migration, after a gpu-test soak. The split is the cheapest
 -- risk reduction on this phase: a code-level revert (redeploy the previous
 -- control-plane build) still finds its data, because the legacy rows and the
 -- `codecs` column are exactly what the old binary reads.
@@ -38,7 +38,7 @@
 -- ─────────────────── EDITED IN PLACE AFTER FIRST DEPLOYMENT ──────────────────
 --
 -- The fan-out rule below was CORRECTED after this file had already been applied
--- to at least one deployment (Tower, `schema_migrations` = 36). golang-migrate
+-- to at least one deployment (gpu-test, `schema_migrations` = 36). golang-migrate
 -- never re-runs an applied version, so on those databases the rule that actually
 -- ran is the PRE-correction one. Editing an applied migration in place is only
 -- ever defensible when the correction is a provable no-op for the data the
@@ -57,7 +57,7 @@
 -- for that shape. For every input the pre-correction version handled, the
 -- filtered list either was empty (clause 1, unchanged) or already contained
 -- h264 (clause 2 does not fire), so both versions emit byte-identical rungs.
--- Verified read-only against Tower's live database on 2026-07-28: all 8 launch
+-- Verified read-only against gpu-test's live database on 2026-07-28: all 8 launch
 -- profiles carry exactly one h264 rung, none is rung-less, and the only
 -- multi-rung chain (1080p60) is `av1 -> hevc -> h264` with the floor LAST, i.e.
 -- exactly what the corrected rule produces. The corrective case is empty there.
@@ -172,7 +172,7 @@ CREATE INDEX launch_profile_rungs_stream_profile_id_idx
 --   * `codecs IS NULL` resolves to the IN-CODE DEFAULT, not to "no codecs". The
 --     default is [h264 launchable, hevc future, av1 future], and only
 --     `launchable` becomes a rung, so a NULL column yields exactly ONE h264
---     rung. That is the state of every row on Tower today (SHIP-DARK), so in
+--     rung. That is the state of every row on gpu-test today (SHIP-DARK), so in
 --     practice almost every launch profile comes out single-rung — which is
 --     correct: it is what those profiles stream today.
 --
@@ -297,7 +297,7 @@ END $$;
 -- ── (6) The three foreign-key repoints. ─────────────────────────────────────
 -- THREE, not two. `user_profile_preferences.default_profile_id` is the one the
 -- original spec missed, and it is the most dangerous omission in the phase
--- because of HOW it fails: the table has 0 rows on Tower, so the migration
+-- because of HOW it fails: the table has 0 rows on gpu-test, so the migration
 -- succeeds, the tests stay green, the deploy looks clean, and the FIRST user who
 -- sets a quality preference against a genuinely new launch profile gets a 500
 -- from an FK violation. (For migrated ids it would even work, because the legacy
@@ -337,7 +337,7 @@ ALTER TABLE user_profile_preferences
     FOREIGN KEY (default_profile_id) REFERENCES launch_profiles(id);
 
 -- NOTE: stream_profile_policy.global_default_profile_id is deliberately NOT
--- given a value. It is NULL on Tower, so ResolveDefaultProfile falls through to
+-- given a value. It is NULL on gpu-test, so ResolveDefaultProfile falls through to
 -- the per-user recommendation. Setting it here — even to the "obviously right"
 -- 1080p60 — would change the effective resolution of every `inherit` app for
 -- every user in one invisible step.

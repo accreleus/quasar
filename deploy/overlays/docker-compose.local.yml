@@ -8,7 +8,7 @@
 #
 # What this is NOT: a streaming stack. There is deliberately NO node-agent here.
 # The agent needs network_mode: host for WebRTC ICE, which Docker Desktop on
-# macOS/Windows cannot provide, plus a GPU. Sessions are exercised on Tower.
+# macOS/Windows cannot provide, plus a GPU. Sessions are exercised on the lab host.
 # For the real single-host stack use deploy/docker-compose.yml; for the fleet
 # use docker-compose.yml + docker-compose.nvidia.yml.
 #
@@ -61,8 +61,6 @@ services:
       # the Gamepad API work without a cert warning on every fresh worktree.
       QUASAR_TLS: ${QUASAR_TLS:-off}
       QUASAR_HTTP_REDIRECT: ${QUASAR_HTTP_REDIRECT:-off}
-      # No node-agent enrolls against this stack; the value is inert.
-      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:-local-dev-no-agent}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-24h}
       # Dev-only agent auth (#399) — same passthrough as docker-compose.yml:

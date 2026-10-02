@@ -11,7 +11,6 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 run_control() {
     local database_url="$1" port="$2" log="$3"
     DATABASE_URL="$database_url" \
-    ENROLLMENT_TOKEN="db-rehearsal-only-token" \
     LISTEN_ADDR="127.0.0.1:${port}" \
     /tmp/quasar-control >"$log" 2>&1 &
     CONTROL_PID=$!

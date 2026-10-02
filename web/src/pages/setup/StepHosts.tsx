@@ -100,19 +100,16 @@ export function StepHosts({ onNext }: StepHostsProps) {
     (rows.length === 0 || rows.some((r) => r.host.status !== "online" || r.host.capacity_detection !== "ok"));
 
   return (
-    <div
-      className="card login-card"
-      style={{ width: "100%", maxWidth: 640, display: "flex", flexDirection: "column", gap: "var(--s5)" }}
-    >
+    <div className="card login-card" style={{ width: "100%", maxWidth: 640 }}>
       <div>
-        <h2 style={{ margin: 0 }}>Host &amp; GPU check</h2>
-        <p className="sub" style={{ marginTop: 6 }}>
+        <h2 className="m0">Host &amp; GPU check</h2>
+        <p className="sub mt2">
           What the control plane has actually heard from your node agents —
           not what was declared.
         </p>
       </div>
 
-      <p className="login-error" role="note" style={{ color: "var(--info-text)", background: "var(--info-bg)", borderColor: "var(--info-line)" }}>
+      <p className="login-error is-info" role="note">
         Media (WebRTC) needs a reachable host. For remote players, configure
         STUN/TURN or use a shared VPN. A reverse proxy carries signaling but
         does not relay video.
@@ -127,7 +124,7 @@ export function StepHosts({ onNext }: StepHostsProps) {
       {rows === null && <p className="muted">Checking registered hosts…</p>}
 
       {rows !== null && rows.length === 0 && !loadError && (
-        <p className="login-error" role="alert" style={{ color: "var(--warning-text)", background: "var(--warning-bg)", borderColor: "var(--warning-line)" }}>
+        <p className="login-error is-warning" role="alert">
           No hosts have registered with this control plane yet. Bring up a
           node agent and point it at this instance, then check{" "}
           <Link to="/admin/fleet/hosts">Admin → Hosts</Link>.
@@ -135,20 +132,10 @@ export function StepHosts({ onNext }: StepHostsProps) {
       )}
 
       {rows !== null && rows.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
+        <div className="col gap4">
           {rows.map(({ host, gpus, settings }) => (
-            <div
-              key={host.id}
-              style={{
-                border: "1px solid var(--line-2)",
-                borderRadius: "var(--r-sm)",
-                padding: "var(--s4)",
-                display: "flex",
-                flexDirection: "column",
-                gap: "var(--s2)",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "var(--s3)" }}>
+            <div key={host.id} className="setup-host col gap2">
+              <div className="row between">
                 <strong>{host.node_name}</strong>
                 <StatusChip status={hostStatusKey(host)} config={HOST_STATUS_CHIP_CONFIG} />
               </div>
@@ -159,23 +146,23 @@ export function StepHosts({ onNext }: StepHostsProps) {
               </span>
 
               {host.capacity_detection !== "ok" && (
-                <p className="login-error" role="alert" style={{ margin: 0 }}>
+                <p className="login-error m0" role="alert">
                   {host.capacity_reason ?? `Capacity detection ${host.capacity_detection}.`}
                 </p>
               )}
 
               {gpus === null && (
-                <p className="login-error" role="alert" style={{ margin: 0 }}>
+                <p className="login-error m0" role="alert">
                   Could not read GPU/encoder detail for this host.
                 </p>
               )}
               {gpus !== null && gpus.length === 0 && (
-                <p className="login-error" role="alert" style={{ margin: 0 }}>
+                <p className="login-error m0" role="alert">
                   No GPU/encoder detected on this host — sessions cannot launch here.
                 </p>
               )}
               {gpus !== null && gpus.length > 0 && (
-                <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
+                <ul className="setup-gpu-list">
                   {gpus.map((g) => (
                     <li key={g.gpu_id} className="field-hint">
                       {g.vendor} {g.model} — {g.slots_total} encode slot{g.slots_total === 1 ? "" : "s"},{" "}
@@ -216,7 +203,7 @@ export function StepHosts({ onNext }: StepHostsProps) {
       )}
 
       {anyIssue && (
-        <p className="login-error" role="alert" style={{ color: "var(--warning-text)", background: "var(--warning-bg)", borderColor: "var(--warning-line)" }}>
+        <p className="login-error is-warning" role="alert">
           Something above needs attention, but that does not have to happen
           now — finish setup and fix it later from{" "}
           <Link to="/admin/fleet/hosts">Admin → Hosts</Link>.
@@ -230,20 +217,6 @@ export function StepHosts({ onNext }: StepHostsProps) {
   );
 }
 
-const warningBoxStyle = {
-  color: "var(--warning-text)",
-  background: "var(--warning-bg)",
-  borderColor: "var(--warning-line)",
-  margin: 0,
-} as const;
-
-const dangerBoxStyle = {
-  color: "var(--danger-text)",
-  background: "var(--danger-bg)",
-  borderColor: "var(--danger-line)",
-  margin: 0,
-} as const;
-
 /** §S5 codec truth-telling; no control ever ("tell the truth, do not add a
  *  toggle"). Three states kept distinct: settings unreadable → say so;
  *  `codecs` null (pre-multi-codec agent — the API deliberately does not
@@ -252,7 +225,7 @@ const dangerBoxStyle = {
 function CodecSection({ settings, readiness }: { settings: HostSettingsResponse | null; readiness: Host["readiness"] }) {
   if (!settings) {
     return (
-      <p className="field-hint" style={{ margin: 0 }}>
+      <p className="field-hint m0">
         Codecs: could not read this host's settings.
       </p>
     );
@@ -262,7 +235,7 @@ function CodecSection({ settings, readiness }: { settings: HostSettingsResponse 
 
   if (codecs === null || codecs.length === 0) {
     return (
-      <p className="field-hint" style={{ margin: 0 }}>
+      <p className="field-hint m0">
         Codecs: this host's agent has not reported a codec set yet, so sessions placed here will be
         treated as H.264-only until it does. That normally means an older node-agent — restart it
         from <Link to="/admin/fleet/hosts">Admin → Hosts</Link> once setup is finished and this fills in.
@@ -277,8 +250,8 @@ function CodecSection({ settings, readiness }: { settings: HostSettingsResponse 
   const gap = explainCodecGap(codecs, encoder, readiness);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "var(--s2)", flexWrap: "wrap" }}>
+    <div className="col gap2">
+      <div className="row gap2 wrap">
         <span className="field-hint">Codecs this host reports:</span>
         {codecs.map((c) => (
           <Chip key={c} variant="success">
@@ -287,7 +260,7 @@ function CodecSection({ settings, readiness }: { settings: HostSettingsResponse 
         ))}
       </div>
       {gap && (
-        <p className="login-error" role="note" style={warningBoxStyle}>
+        <p className="login-error is-warning m0" role="note">
           {gap.reason}
         </p>
       )}
@@ -313,7 +286,7 @@ function HomeStorageSection({
 }) {
   if (!settings) {
     return (
-      <p className="field-hint" style={{ margin: 0 }}>
+      <p className="field-hint m0">
         Storage: could not read this host's settings.
       </p>
     );
@@ -324,7 +297,7 @@ function HomeStorageSection({
 
   if (!storageProvider) {
     return (
-      <p className="field-hint" style={{ margin: 0 }}>
+      <p className="field-hint m0">
         Storage: effective root {effectiveRoot || "not set"} (driver unknown — could not read the
         instance storage provider).
       </p>
@@ -334,17 +307,17 @@ function HomeStorageSection({
   const { driver } = resolveHomeDriver(storageProvider, currentRoot);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)" }}>
+    <div className="col gap2">
       {/* Danger, not warning: every session placed on a rootless host fails.
           resolveHomeDriver can no longer return "volume" (#473). */}
-      <div style={{ display: "flex", alignItems: "center", gap: "var(--s2)", flexWrap: "wrap" }}>
+      <div className="row gap2 wrap">
         <span className="field-hint">Managed-home storage:</span>
         {driver === "local" && <Chip variant="success">Local — {currentRoot}</Chip>}
         {driver === "misconfigured" && <Chip variant="danger">No storage root</Chip>}
       </div>
 
       {driver === "misconfigured" && (
-        <p className="login-error" role="alert" style={dangerBoxStyle}>
+        <p className="login-error m0" role="alert">
           {MISCONFIGURED_LOCAL_IMPACT}
         </p>
       )}
@@ -426,7 +399,7 @@ function HomeRootControl({
 
   if (effectiveRoot === "") {
     return (
-      <p className="field-hint" style={{ margin: 0 }}>
+      <p className="field-hint m0">
         This host's agent has not reported a storage root yet (its QUASAR_HOME_ROOT env is unset),
         so there is nothing to set a subdirectory of. Set QUASAR_HOME_ROOT in deploy/.env for this
         host and redeploy, then a root will be offered here.
@@ -435,7 +408,7 @@ function HomeRootControl({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)" }}>
+    <div className="col gap2">
       {recommendedAvailable && (
         <Button type="button" variant="secondary" size="sm" disabled={pending} onClick={() => save(effectiveRoot)}>
           Use this host's reported path: <code>{effectiveRoot}</code>
@@ -444,38 +417,28 @@ function HomeRootControl({
 
       <button
         type="button"
+        className="setup-link-btn"
         onClick={() => setAdvancedOpen((o) => !o)}
-        style={{
-          alignSelf: "flex-start",
-          background: "none",
-          border: "none",
-          color: "var(--accent-text)",
-          textDecoration: "underline",
-          cursor: "pointer",
-          padding: 0,
-          font: "inherit",
-        }}
       >
         {advancedOpen ? "Hide advanced" : "Advanced: set a different path"}
       </button>
 
       {advancedOpen && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)" }}>
-          <p className="field-hint" style={{ margin: 0 }}>
+        <div className="col gap2">
+          <p className="field-hint m0">
             A storage root can only be this host's reported root or a subdirectory of it — that is
             the only path guaranteed to be inside the agent's bind mount. Want a genuinely different
             root? Set QUASAR_HOME_ROOT in deploy/.env for this host and redeploy — the bind mount has
             to move with it, which is not something this page can do.
           </p>
-          <div style={{ display: "flex", alignItems: "center", gap: "var(--s1, 4px)" }}>
+          <div className="row gap1">
             <span className="field-hint mono">{rootPrefix}/</span>
             <input
-              className="input mono"
+              className="input mono grow"
               type="text"
               value={subpath}
               onChange={(e) => setSubpath(e.target.value)}
               placeholder="a subdirectory, e.g. instance-a"
-              style={{ flex: 1 }}
             />
           </div>
           <Button
@@ -491,12 +454,12 @@ function HomeRootControl({
       )}
 
       {error && (
-        <p className="login-error" role="alert" style={{ margin: 0 }}>
+        <p className="login-error m0" role="alert">
           {error}
         </p>
       )}
       {savedRoot && !error && (
-        <p className="field-hint" style={{ margin: 0 }}>
+        <p className="field-hint m0">
           Saved {savedRoot}. It takes effect for the next home this host provisions — no restart
           needed.
         </p>

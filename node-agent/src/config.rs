@@ -1,6 +1,7 @@
 use std::env;
 
 use crate::enrollment::{self, TransportPolicy};
+use quasar_runtime::owned_install::{ENROLLMENT_FILE_ENV, ENROLLMENT_TOKEN_FILE_ENV};
 
 pub struct Config {
     /// WebSocket base URL of the control plane; `/agent/ws` is appended automatically.
@@ -42,10 +43,20 @@ impl Config {
         // #12: the one-paste enrollment string, the manual pin, the plaintext opt-in, and
         // the pin persisted at first verified connect all feed one resolver. #519's rule
         // that an empty-but-set ENROLLMENT_TOKEN folds to None is preserved by trimming.
-        let blob = env::var("QUASAR_ENROLLMENT").ok();
+        let blob = enrollment_blob(
+            env::var("QUASAR_ENROLLMENT").ok(),
+            env::var(ENROLLMENT_FILE_ENV).ok(),
+            |path| std::fs::read_to_string(path),
+        )?;
         let url = env::var("CONTROL_PLANE_URL").ok();
         let fingerprint = env::var("CONTROL_PLANE_FINGERPRINT").ok();
-        let token = normalize_enrollment_token(env::var("ENROLLMENT_TOKEN").ok());
+        let token = normalize_enrollment_token(value_or_file(
+            "ENROLLMENT_TOKEN",
+            ENROLLMENT_TOKEN_FILE_ENV,
+            env::var("ENROLLMENT_TOKEN").ok(),
+            env::var(ENROLLMENT_TOKEN_FILE_ENV).ok(),
+            |path| std::fs::read_to_string(path),
+        )?);
         let allow_plaintext =
             enrollment::is_truthy(env::var("QUASAR_ALLOW_PLAINTEXT_AGENT").ok().as_deref());
         let persisted_pin = std::fs::read_to_string(enrollment::pin_path(&node_secret_path)).ok();
@@ -95,6 +106,41 @@ impl Config {
     }
 }
 
+/// `QUASAR_ENROLLMENT`, or the contents of the file `QUASAR_ENROLLMENT_FILE` names (a
+/// recovery actor delivers the string as a read-only secret file). Unset
+/// `QUASAR_ENROLLMENT_FILE` leaves `QUASAR_ENROLLMENT` exactly as it always was; setting
+/// both is refused. An error never quotes the file's contents.
+fn enrollment_blob(
+    value: Option<String>,
+    file: Option<String>,
+    read: impl Fn(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, String> {
+    value_or_file("QUASAR_ENROLLMENT", ENROLLMENT_FILE_ENV, value, file, read)
+}
+
+/// `value_name`'s value, or the contents of the file `file_name` names (its file twin, which
+/// a recovery actor delivers as a read-only secret). An unset file leaves the value exactly as
+/// it was; setting both is refused. An error never quotes the file's contents.
+fn value_or_file(
+    value_name: &str,
+    file_name: &str,
+    value: Option<String>,
+    file: Option<String>,
+    read: impl Fn(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, String> {
+    let Some(path) = file.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()) else {
+        return Ok(value);
+    };
+    if value.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+        return Err(format!(
+            "set {value_name} or {file_name}, not both: they name the same input"
+        ));
+    }
+    let contents = read(&path).map_err(|e| format!("{file_name}={path}: {e}"))?;
+    let contents = contents.trim().to_string();
+    Ok((!contents.is_empty()).then_some(contents))
+}
+
 /// #519: fold an empty/whitespace-only `ENROLLMENT_TOKEN` to `None`, same as unset.
 fn normalize_enrollment_token(raw: Option<String>) -> Option<String> {
     raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
@@ -133,7 +179,81 @@ pub(crate) fn detect_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{http_base_from_ws, normalize_enrollment_token};
+    use super::{enrollment_blob, http_base_from_ws, normalize_enrollment_token, value_or_file};
+
+    #[test]
+    fn the_enrollment_token_file_is_its_twin_and_never_both() {
+        let read = |p: &str| {
+            assert_eq!(p, "/run/quasar-secrets/local-enrollment");
+            Ok("tok-local\n".to_string())
+        };
+        let token = value_or_file(
+            "ENROLLMENT_TOKEN",
+            "ENROLLMENT_TOKEN_FILE",
+            None,
+            Some("/run/quasar-secrets/local-enrollment".into()),
+            read,
+        );
+        assert_eq!(token, Ok(Some("tok-local".into())));
+        let both = value_or_file(
+            "ENROLLMENT_TOKEN",
+            "ENROLLMENT_TOKEN_FILE",
+            Some("tok".into()),
+            Some("/f".into()),
+            |_| Ok("secret-in-file".into()),
+        )
+        .unwrap_err();
+        assert!(both.contains("ENROLLMENT_TOKEN_FILE") && !both.contains("secret-in-file"));
+    }
+
+    const BLOB: &str = "qenr1..d3NzOi8vY3AuZXhhbXBsZS5pbnZhbGlkOjg0NDM.tok";
+
+    fn never(_: &str) -> std::io::Result<String> {
+        panic!("the file must not be read")
+    }
+
+    #[test]
+    fn without_a_file_quasar_enrollment_passes_through_untouched() {
+        assert_eq!(enrollment_blob(None, None, never), Ok(None));
+        assert_eq!(
+            enrollment_blob(Some(BLOB.into()), None, never),
+            Ok(Some(BLOB.into()))
+        );
+        assert_eq!(
+            enrollment_blob(Some(String::new()), Some("  ".into()), never),
+            Ok(Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn the_file_supplies_the_enrollment_string_trimmed() {
+        let read = |path: &str| {
+            assert_eq!(path, "/run/quasar-secrets/enrollment");
+            Ok(format!("{BLOB}\n"))
+        };
+        assert_eq!(
+            enrollment_blob(None, Some("/run/quasar-secrets/enrollment".into()), read),
+            Ok(Some(BLOB.into()))
+        );
+        assert_eq!(
+            enrollment_blob(Some("  ".into()), Some("/f".into()), |_| Ok("\n".into())),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn both_inputs_or_an_unreadable_file_are_refused_without_quoting_a_secret() {
+        let both = enrollment_blob(Some(BLOB.into()), Some("/f".into()), never).unwrap_err();
+        assert!(!both.contains(BLOB), "{both}");
+        let missing = enrollment_blob(None, Some("/absent".into()), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert!(
+            missing.contains("QUASAR_ENROLLMENT_FILE=/absent"),
+            "{missing}"
+        );
+    }
 
     #[test]
     fn normalize_enrollment_token_folds_empty_and_whitespace_to_none() {

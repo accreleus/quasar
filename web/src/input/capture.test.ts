@@ -458,9 +458,9 @@ describe("CaptureMetrics — pads identity list (sparse getGamepads array)", () 
     // later one connects into a different slot.
     Object.defineProperty(navigator, "getGamepads", {
       value: () => [
-        { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", buttons: [], axes: [] },
+        { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard", buttons: [], axes: [] },
         null,
-        { index: 2, id: "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)", buttons: [], axes: [] },
+        { index: 2, id: "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)", mapping: "", buttons: [], axes: [] },
       ],
       configurable: true,
     });
@@ -470,8 +470,8 @@ describe("CaptureMetrics — pads identity list (sparse getGamepads array)", () 
     });
     const m = getMetrics();
     expect(m.pads).toEqual([
-      { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)" },
-      { index: 2, id: "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)" },
+      { index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard" },
+      { index: 2, id: "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)", mapping: "" },
     ]);
     cleanup();
   });
@@ -492,7 +492,7 @@ describe("CaptureMetrics — pads identity list (sparse getGamepads array)", () 
 
   it("gamepadCount and pads.length always agree — one pad", () => {
     Object.defineProperty(navigator, "getGamepads", {
-      value: () => [{ index: 0, id: "Generic USB Gamepad", buttons: [], axes: [] }],
+      value: () => [{ index: 0, id: "Generic USB Gamepad", mapping: "", buttons: [], axes: [] }],
       configurable: true,
     });
 
@@ -502,7 +502,7 @@ describe("CaptureMetrics — pads identity list (sparse getGamepads array)", () 
     const m = getMetrics();
     expect(m.gamepadCount).toBe(1);
     expect(m.pads).toHaveLength(1);
-    expect(m.pads[0]).toEqual({ index: 0, id: "Generic USB Gamepad" });
+    expect(m.pads[0]).toEqual({ index: 0, id: "Generic USB Gamepad", mapping: "" });
     cleanup();
   });
 
@@ -947,6 +947,59 @@ describe("gamepad — capture gating and reset on unlock", () => {
     lockPointer(video);
     if (rafHolder.cb) rafHolder.cb(1);
     expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: [1], axes: [0.5] });
+
+    cleanup();
+    unlockPointer();
+  });
+
+  // quasar#348: an 8BitDo pad over Bluetooth reports mapping "" — buttons in
+  // HID order and the d-pad as a hat on an axis. It is still forwarded, but
+  // never silently: the page is told once per pad.
+  it("reports a non-standard pad once, still forwarding it", () => {
+    const rafHolder = withRaf();
+    const standard = {
+      index: 0, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)",
+      mapping: "standard", buttons: [{ value: 1 }], axes: [0, 0, 0, 0],
+    };
+    // Raw HID order, hat axis at index 9 (≈3.29 = centred on Chromium).
+    const hid = {
+      index: 1, id: "8BitDo Pro 2 (Vendor: 2dc8 Product: 6006)", mapping: "",
+      buttons: [{ value: 0 }, { value: 0 }, { value: 0 }, { value: 0 }, { value: 1 }],
+      axes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 3.286],
+    };
+    const pads = [standard, hid];
+    Object.defineProperty(navigator, "getGamepads", { value: () => pads, configurable: true });
+
+    const video = makeVideo();
+    const send = vi.fn();
+    const onNonStandardGamepad = vi.fn();
+    const { cleanup, getMetrics } = setupCapture({
+      videoEl: video, sendInput: send, onCaptureChange: vi.fn(), channel: makeChannel(),
+      onNonStandardGamepad,
+    });
+
+    // Not captured yet: nothing is forwarded, so nothing to warn about.
+    if (rafHolder.cb) rafHolder.cb(0);
+    expect(onNonStandardGamepad).not.toHaveBeenCalled();
+
+    lockPointer(video);
+    if (rafHolder.cb) rafHolder.cb(1);
+    expect(onNonStandardGamepad).toHaveBeenCalledTimes(1);
+    expect(onNonStandardGamepad).toHaveBeenCalledWith({
+      index: 1, id: "8BitDo Pro 2 (Vendor: 2dc8 Product: 6006)", mapping: "",
+    });
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ t: "gp", i: 1 }));
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ t: "gp", i: 0 }));
+
+    // More input, and a release/re-capture cycle: still one notice for this pad.
+    hid.buttons[0] = { value: 1 };
+    if (rafHolder.cb) rafHolder.cb(2);
+    unlockPointer();
+    lockPointer(video);
+    if (rafHolder.cb) rafHolder.cb(3);
+    expect(onNonStandardGamepad).toHaveBeenCalledTimes(1);
+
+    expect(getMetrics().pads.map((p) => p.mapping)).toEqual(["standard", ""]);
 
     cleanup();
     unlockPointer();

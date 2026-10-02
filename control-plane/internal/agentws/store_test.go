@@ -37,9 +37,22 @@ func testPool(t *testing.T) *pgxpool.Pool {
 		pool.Close()
 		t.Fatalf("truncate: %v", err)
 	}
+	// The static ENROLLMENT_TOKEN is retired: every enrollment redeems a minted token,
+	// so the fixtures share one unbound, practically unlimited one.
+	sum := sha256.Sum256([]byte(testEnrollmentToken))
+	if _, err := pool.Exec(ctx, `INSERT INTO host_enrollments (token_hash, created_by, node_name, max_uses, expires_at, note)
+		VALUES ($1, NULL, NULL, 1000000, NULL, 'test fixture')
+		ON CONFLICT (token_hash) DO UPDATE SET used_count = 0, revoked_at = NULL, expires_at = NULL,
+		    node_name = NULL, max_uses = 1000000`, hex.EncodeToString(sum[:])); err != nil {
+		pool.Close()
+		t.Fatalf("seed the test enrollment token: %v", err)
+	}
 	t.Cleanup(pool.Close)
 	return pool
 }
+
+// testEnrollmentToken is the minted token testPool seeds.
+const testEnrollmentToken = "test-token"
 
 func seedHost(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
@@ -99,7 +112,7 @@ func strPtr(s string) *string { return &s }
 // codecs slice leaves the prior value untouched.
 func TestUpsertHostCodecs(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	// Absent on a fresh host ⇒ NULL column.
@@ -149,7 +162,7 @@ func rawCodecPixelRates(t *testing.T, pool *pgxpool.Pool, hostID string) []byte 
 // explicit `{}` really does clear it.
 func TestUpsertHostCodecPixelRates(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -207,7 +220,7 @@ func TestUpsertHostCodecPixelRates(t *testing.T) {
 // report with no "storage" key must not clobber a previously stored value.
 func TestUpsertCapacityStorageAbsentKeepsPriorValue(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	first := HostCapacity{CPUCores: 8, MemMB: 16000, Storage: []StorageVolume{
@@ -239,7 +252,7 @@ func TestUpsertCapacityStorageAbsentKeepsPriorValue(t *testing.T) {
 // (as opposed to an absent key) is a real overwrite, not a no-op.
 func TestUpsertCapacityStorageEmptyArrayOverwrites(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	first := HostCapacity{Storage: []StorageVolume{{Label: "a", Path: "/a", TotalMB: 1, AvailableMB: 1}}}
@@ -264,7 +277,7 @@ func TestUpsertCapacityStorageEmptyArrayOverwrites(t *testing.T) {
 // case for effective_settings (agent-api.md capacity §effective_settings).
 func TestUpsertCapacityEffectiveSettingsAbsentKeepsPriorValue(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	if err := s.upsertCapacity(context.Background(), hostID, HostCapacity{}, map[string]string{"encoder": "va"}, nil); err != nil {
@@ -287,7 +300,7 @@ func TestUpsertCapacityEffectiveSettingsAbsentKeepsPriorValue(t *testing.T) {
 // (host-observability-2, agent-api.md capacity §host.cpu_model).
 func TestUpsertCapacityCPUModelAbsentKeepsPriorValue(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	first := HostCapacity{CPUModel: strPtr("AMD Ryzen 9 7950X 16-Core Processor")}
@@ -311,7 +324,7 @@ func TestUpsertCapacityCPUModelAbsentKeepsPriorValue(t *testing.T) {
 // §gpus[].render_node).
 func TestUpsertCapacityGPURenderNodePersists(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	gpus := []GPUCapacity{
@@ -368,7 +381,7 @@ func TestUpsertCapacityGPURenderNodePersists(t *testing.T) {
 // running — unknown is what makes certification matching fail open.
 func TestUpsertCapacityGPUDriverIdentityPersists(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 
@@ -419,9 +432,90 @@ func TestUpsertCapacityGPUDriverIdentityPersists(t *testing.T) {
 	}
 }
 
+// rawGPUCodecs reads gpus.codecs by (host, index) as stored — nil is the
+// column's SQL NULL, distinct from a scanned empty JSON array.
+func rawGPUCodecs(t *testing.T, pool *pgxpool.Pool, hostID string, index int) []byte {
+	t.Helper()
+	var raw []byte
+	if err := pool.QueryRow(context.Background(),
+		`SELECT codecs FROM gpus WHERE host_id::text = $1 AND index = $2`, hostID, index).Scan(&raw); err != nil {
+		t.Fatalf("query gpu codecs: %v", err)
+	}
+	return raw
+}
+
+// TestUpsertCapacityGPUCodecsPersists (#296 amendment 12): gpus.codecs rides
+// the same wholesale-replace GPU upsert as render_node/driver_identity. A GPU
+// that omits the field stores NULL (inherit hosts.codecs), never a keep-if-
+// absent read of a prior report — the whole gpus set is wholesale-replaced.
+func TestUpsertCapacityGPUCodecsPersists(t *testing.T) {
+	pool := testPool(t)
+	s := storeWithMintedTokens(pool, nil)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+
+	gpus := []GPUCapacity{
+		{Index: 0, Vendor: "nvidia", Model: "RTX 5090", VRAMMBTotal: 32768, EncodeSlotsTotal: 3,
+			Codecs: []string{"h264", "h265", "av1"}},
+		{Index: 1, Vendor: "amd", Model: "Radeon Pro V520", VRAMMBTotal: 16384, EncodeSlotsTotal: 2},
+	}
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	var got []string
+	if err := json.Unmarshal(rawGPUCodecs(t, pool, hostID, 0), &got); err != nil {
+		t.Fatalf("unmarshal gpu 0 codecs: %v", err)
+	}
+	if len(got) != 3 || got[0] != "h264" || got[1] != "h265" || got[2] != "av1" {
+		t.Fatalf("gpu 0 codecs: got %v, want [h264 h265 av1]", got)
+	}
+	if raw := rawGPUCodecs(t, pool, hostID, 1); raw != nil {
+		t.Errorf("gpu 1 codecs = %s, want NULL (not reported)", raw)
+	}
+
+	// A re-report that stops carrying a set clears it — wholesale replace, not
+	// keep-if-absent, exactly like driver_identity above.
+	gpus[0].Codecs = nil
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if raw := rawGPUCodecs(t, pool, hostID, 0); raw != nil {
+		t.Errorf("gpu 0 codecs = %s after a report without one, want NULL", raw)
+	}
+}
+
+// TestUpsertCapacityGPUCodecsEmptyArrayStoredAsIs: an explicit `[]` (a
+// zero-slot GPU may report one, agent-api.md) is a real report and is NOT the
+// same as NULL — it must not inherit the host's set.
+func TestUpsertCapacityGPUCodecsEmptyArrayStoredAsIs(t *testing.T) {
+	pool := testPool(t)
+	s := storeWithMintedTokens(pool, nil)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+
+	gpus := []GPUCapacity{
+		{Index: 0, Vendor: "amd", Model: "iGPU", VRAMMBTotal: 512, EncodeSlotsTotal: 0, Codecs: []string{}},
+	}
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	raw := rawGPUCodecs(t, pool, hostID, 0)
+	if raw == nil {
+		t.Fatal("gpu 0 codecs = NULL, want the stored empty array")
+	}
+	var got []string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal gpu 0 codecs: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("gpu 0 codecs: got %v, want []", got)
+	}
+}
+
 func TestFailedCapacityReportRetainsHistoryButUnschedulesGPU(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 	gpus := []GPUCapacity{{Index: 0, Vendor: "nvidia", Model: "RTX 5090", VRAMMBTotal: 32607, EncodeSlotsTotal: 3}}
 	if err := s.upsertCapacityWithDetection(context.Background(), hostID, HostCapacity{}, nil, gpus, "ok", ""); err != nil {
@@ -477,7 +571,7 @@ func rawPendingRestart(t *testing.T, pool *pgxpool.Pool, hostID string) bool {
 // reconnects").
 func TestReconnectHostClearsPendingRestart(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
 	secret := "test-node-secret"
 	h := sha256.Sum256([]byte(secret))
@@ -517,7 +611,7 @@ func TestReconnectHostClearsPendingRestart(t *testing.T) {
 // already-known node_name re-enrolling, e.g. after a lost node_secret).
 func TestEnrollHostClearsPendingRestart(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
 	var hostID string
 	err := pool.QueryRow(context.Background(), `
@@ -535,8 +629,7 @@ func TestEnrollHostClearsPendingRestart(t *testing.T) {
 		t.Fatalf("seed gpu: %v", err)
 	}
 
-	const token = "shared-enrollment-token"
-	if _, err := s.enrollHost(context.Background(), "enroll-host", "0.2.0", token, token); err != nil {
+	if _, err := s.enrollHost(context.Background(), "enroll-host", "0.2.0", testEnrollmentToken); err != nil {
 		t.Fatalf("enrollHost: %v", err)
 	}
 
@@ -625,7 +718,7 @@ func withRestartGap(t *testing.T, gap time.Duration) {
 func TestReconnectHostBlipDoesNotCountAsRestart(t *testing.T) {
 	pool := testPool(t)
 	withRestartGap(t, 2*time.Second)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
 	hostID := seedHostWithSecret(t, pool, "blip-host", "secret-1")
 	// Truncate to microseconds: timestamptz stores microseconds, so a
@@ -665,7 +758,7 @@ func TestReconnectHostBlipDoesNotCountAsRestart(t *testing.T) {
 func TestReconnectHostGenuineRestartIsCounted(t *testing.T) {
 	pool := testPool(t)
 	withRestartGap(t, 200*time.Millisecond)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
 	hostID := seedHostWithSecret(t, pool, "restart-host", "secret-2")
 	// Truncation matters for the NEGATIVE assertion too: an untruncated
@@ -723,7 +816,7 @@ func TestReconnectHostGenuineRestartIsCounted(t *testing.T) {
 func TestReconnectHostNullDisconnectedAtNeverCountsAsRestart(t *testing.T) {
 	pool := testPool(t)
 	withRestartGap(t, 200*time.Millisecond)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
 	hostID := seedHostWithSecret(t, pool, "cp-restart-host", "secret-3")
 	// Microsecond truncation as above — timestamptz has no nanoseconds.
@@ -758,7 +851,7 @@ func TestReconnectHostNullDisconnectedAtNeverCountsAsRestart(t *testing.T) {
 func TestReconnectHostSeedsProcessStartedAtWhenNull(t *testing.T) {
 	pool := testPool(t)
 	withRestartGap(t, 200*time.Millisecond)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
 	hostID := seedHostWithSecret(t, pool, "legacy-host", "secret-4")
 	// agent_process_started_at and agent_disconnected_at both left NULL
@@ -784,7 +877,7 @@ func TestReconnectHostSeedsProcessStartedAtWhenNull(t *testing.T) {
 // disconnect instant reconnectHost's classification measures against.
 func TestMarkOfflineStampsDisconnectedAt(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 	hostID := seedHost(t, pool)
 
 	before := time.Now()
@@ -815,10 +908,9 @@ func TestMarkOfflineStampsDisconnectedAt(t *testing.T) {
 // can never leak into this identity's first reconnect classification.
 func TestEnrollHostResetsRestartState(t *testing.T) {
 	pool := testPool(t)
-	s := &agentStore{pool: pool}
+	s := storeWithMintedTokens(pool, nil)
 
-	const token = "shared-enrollment-token-2"
-	result, err := s.enrollHost(context.Background(), "re-enroll-host", "0.3.0", token, token)
+	result, err := s.enrollHost(context.Background(), "re-enroll-host", "0.3.0", testEnrollmentToken)
 	if err != nil {
 		t.Fatalf("initial enroll: %v", err)
 	}
@@ -833,7 +925,7 @@ func TestEnrollHostResetsRestartState(t *testing.T) {
 		t.Fatalf("seed restart history: %v", err)
 	}
 
-	if _, err := s.enrollHost(context.Background(), "re-enroll-host", "0.3.1", token, token); err != nil {
+	if _, err := s.enrollHost(context.Background(), "re-enroll-host", "0.3.1", testEnrollmentToken); err != nil {
 		t.Fatalf("re-enroll: %v", err)
 	}
 

@@ -316,13 +316,16 @@ func (s *Store) HostIDs(ctx context.Context) ([]string, error) {
 const runColumns = `
 	id::text, job_id, COALESCE(host_id::text, ''), state, trigger,
 	COALESCE(actor_user_id::text, ''), attempt, scheduled_for, claimed_at,
-	started_at, finished_at, params, summary, COALESCE(error, ''), created_at`
+	started_at, finished_at, params, summary, COALESCE(error, ''), created_at,
+	template_publish_claim_token::text, template_publish_connection_id,
+	publish_permit_accepted_at`
 
 func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	err := row.Scan(&r.ID, &r.JobID, &r.HostID, &r.State, &r.Trigger, &r.ActorUserID,
 		&r.Attempt, &r.ScheduledFor, &r.ClaimedAt, &r.StartedAt, &r.FinishedAt,
-		&r.Params, &r.Summary, &r.Error, &r.CreatedAt)
+		&r.Params, &r.Summary, &r.Error, &r.CreatedAt,
+		&r.PublishClaimToken, &r.PublishConnectionID, &r.PublishPermitAcceptedAt)
 	return r, err
 }
 
@@ -696,7 +699,41 @@ func (s *Store) ClaimDue(ctx context.Context, o ClaimOptions) ([]Run, error) {
 	if o.Plane == PlaneAgent && o.HostID == "" {
 		return nil, ErrHostRequired
 	}
-	rows, err := s.pool.Query(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin due claim: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// Acquire host fences before taking the claim statement's READ COMMITTED
+	// snapshot. An idle offer may have committed while this transaction waited;
+	// the following statement must see it before deciding to run a job.
+	locks, err := tx.Query(ctx, `SELECT candidate.host_id::text,
+		pg_try_advisory_xact_lock(hashtextextended(candidate.host_id::text,339))
+		FROM (SELECT DISTINCT r.host_id FROM job_runs r JOIN jobs j ON j.id=r.job_id
+			WHERE r.state='pending' AND r.scheduled_for<=$1 AND r.host_id IS NOT NULL
+			AND j.enabled AND j.managed AND j.plane=$2
+			AND ($3='' OR r.host_id=$3::uuid)) candidate`, o.Now, string(o.Plane), o.HostID)
+	if err != nil {
+		return nil, fmt.Errorf("lock due hosts: %w", err)
+	}
+	lockedHosts := []string{}
+	for locks.Next() {
+		var hostID string
+		var locked bool
+		if err := locks.Scan(&hostID, &locked); err != nil {
+			locks.Close()
+			return nil, err
+		}
+		if locked {
+			lockedHosts = append(lockedHosts, hostID)
+		}
+	}
+	if err := locks.Err(); err != nil {
+		locks.Close()
+		return nil, err
+	}
+	locks.Close()
+	rows, err := tx.Query(ctx, `
 		WITH due AS (
 			SELECT r.id
 			FROM job_runs r
@@ -706,26 +743,54 @@ func (s *Store) ClaimDue(ctx context.Context, o ClaimOptions) ([]Run, error) {
 			  AND j.enabled AND j.managed
 			  AND j.plane = $2
 			  AND ($3 = '' OR r.host_id = $3::uuid)
+			  AND (r.host_id IS NULL OR r.host_id=ANY($5::uuid[]))
+			  -- An offered attempt may have reached the agent even without an ack.
+			  -- Hold conflicting jobs until journal reconciliation or cancellation
+			  -- proves it did not start. A merely approved request does not hold
+			  -- jobs, so a due job can finish and unblock admission.
+			  AND NOT EXISTS (SELECT 1 FROM host_config_attempts a
+			      WHERE a.host_id=r.host_id AND a.scope='restart'
+			      AND (a.terminal_at IS NULL OR (a.phase='uncertain' AND EXISTS (
+			          SELECT 1 FROM host_admission_restrictions ar
+			          WHERE ar.host_id=a.host_id AND ar.owner_id=a.id
+			            AND ar.owner_kind='recovery'))))
 			ORDER BY r.scheduled_for
 			LIMIT $4
 			FOR UPDATE OF r SKIP LOCKED
 		)
-		UPDATE job_runs SET state = 'running', claimed_at = now(), started_at = now()
-		WHERE id IN (SELECT id FROM due)
-		RETURNING`+runColumns, o.Now, string(o.Plane), o.HostID, o.Limit)
+		UPDATE job_runs r SET state = 'running', claimed_at = now(), started_at = now(),
+		    template_publish_claim_token = CASE WHEN r.job_id='template.warmup'
+		      AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=r.host_id
+		        AND h.source_policy_versions->>'template_publish_permit'='1')
+		      THEN gen_random_uuid() ELSE NULL END,
+		    template_publish_connection_id = CASE WHEN r.job_id='template.warmup'
+		      THEN (SELECT h.source_preparation_connection_id FROM hosts h
+		        WHERE h.id=r.host_id AND h.source_policy_versions->>'template_publish_permit'='1')
+		      ELSE NULL END,
+		    publish_permit_accepted_at=NULL
+		WHERE r.id IN (SELECT id FROM due)
+		RETURNING`+runColumns, o.Now, string(o.Plane), o.HostID, o.Limit, lockedHosts)
 	if err != nil {
 		return nil, fmt.Errorf("claim due runs: %w", err)
 	}
-	defer rows.Close()
 	var out []Run
 	for rows.Next() {
 		r, err := scanRun(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit due claims: %w", err)
+	}
+	return out, nil
 }
 
 // Report closes a running run.
@@ -735,6 +800,16 @@ func (s *Store) ClaimDue(ctx context.Context, o ClaimOptions) ([]Run, error) {
 // a 409 the agent cannot act on — would turn a successful run into a permanent
 // error in the operator's face.
 func (s *Store) Report(ctx context.Context, runID string, state State, summary any, errText string) (Run, bool, error) {
+	return s.report(ctx, runID, state, summary, errText, nil, true)
+}
+
+// ReportAgent binds a capable warmup outcome to its current claim token in the
+// same UPDATE that closes the run. Internal dispatcher reports use Report.
+func (s *Store) ReportAgent(ctx context.Context, runID string, state State, summary any, errText string, token *string) (Run, bool, error) {
+	return s.report(ctx, runID, state, summary, errText, token, false)
+}
+
+func (s *Store) report(ctx context.Context, runID string, state State, summary any, errText string, token *string, internal bool) (Run, bool, error) {
 	if !state.Terminal() {
 		return Run{}, false, fmt.Errorf("jobs: %q is not a terminal state", state)
 	}
@@ -747,7 +822,8 @@ func (s *Store) Report(ctx context.Context, runID string, state State, summary a
 		SET state = $2, finished_at = now(), summary = $3, error = NULLIF($4, ''),
 		    started_at = COALESCE(started_at, claimed_at, now())
 		WHERE id = $1::uuid AND state = 'running'
-		RETURNING`+runColumns, runID, string(state), sum, errText))
+		  AND ($5::boolean OR template_publish_claim_token IS NULL OR template_publish_claim_token::text=$6)
+		RETURNING`+runColumns, runID, string(state), sum, errText, internal, token))
 	if err == nil {
 		return r, true, nil
 	}
@@ -762,6 +838,9 @@ func (s *Store) Report(ctx context.Context, runID string, state State, summary a
 		return Run{}, false, fmt.Errorf("report run %s: %w", runID, err)
 	}
 	if cur.State.Terminal() {
+		if !internal && cur.PublishClaimToken != nil && (token == nil || *token != *cur.PublishClaimToken) {
+			return cur, false, fmt.Errorf("jobs: reported claim token is not current")
+		}
 		return cur, false, nil
 	}
 	// Pending: a report for a run nobody claimed. Refuse rather than close it —

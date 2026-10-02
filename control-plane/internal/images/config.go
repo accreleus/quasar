@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,15 @@ type ImageConfig struct {
 
 // Label returns one trimmed label value, "" when absent.
 func (c ImageConfig) Label(name string) string { return strings.TrimSpace(c.Labels[name]) }
+
+// ErrDigestMismatch: a manifest or config blob did not hash to the digest that
+// named it. Never retried into a success.
+var ErrDigestMismatch = errors.New("registry content does not match its digest")
+
+// ErrRegistryNotFound: the registry answered 404, so the reference names nothing
+// there (an image that was never published under that tag). Any other failure is
+// not this: an outage never reads as "not published".
+var ErrRegistryNotFound = errors.New("not found at the registry")
 
 // ImageInspector is what a caller depends on; RegistryResolver implements it.
 type ImageInspector interface {
@@ -103,6 +113,12 @@ func (r *RegistryResolver) InspectConfig(ctx context.Context, ref string) (Image
 	if err != nil {
 		return ImageConfig{}, err
 	}
+	// Content addressing is the whole trust: each document must hash to the digest
+	// that named it, so no registry or transport (plain HTTP included) can swap the
+	// labels a digest carries.
+	if p.Digest != "" && digest != p.Digest {
+		return ImageConfig{}, fmt.Errorf("%w: %s answered a manifest whose digest is %s", ErrDigestMismatch, ref, digest)
+	}
 	var doc manifestDoc
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return ImageConfig{}, fmt.Errorf("decode manifest of %s: %w", ref, err)
@@ -113,9 +129,13 @@ func (r *RegistryResolver) InspectConfig(ctx context.Context, ref string) (Image
 		if err != nil {
 			return ImageConfig{}, fmt.Errorf("%s: %w", ref, err)
 		}
-		body, _, err = r.getManifest(ctx, p, child, &token)
+		var childDigest string
+		body, childDigest, err = r.getManifest(ctx, p, child, &token)
 		if err != nil {
 			return ImageConfig{}, err
+		}
+		if childDigest != child {
+			return ImageConfig{}, fmt.Errorf("%w: %s: manifest %s hashes to %s", ErrDigestMismatch, ref, child, childDigest)
 		}
 		doc = manifestDoc{}
 		if err := json.Unmarshal(body, &doc); err != nil {
@@ -132,6 +152,9 @@ func (r *RegistryResolver) InspectConfig(ctx context.Context, ref string) (Image
 	blob, err := r.getBlob(ctx, p, doc.Config.Digest, &token)
 	if err != nil {
 		return ImageConfig{}, err
+	}
+	if sum := sha256.Sum256(blob); "sha256:"+hex.EncodeToString(sum[:]) != doc.Config.Digest {
+		return ImageConfig{}, fmt.Errorf("%w: %s: config blob does not hash to %s", ErrDigestMismatch, ref, doc.Config.Digest)
 	}
 	var cfg configBlob
 	if err := json.Unmarshal(blob, &cfg); err != nil {
@@ -246,6 +269,9 @@ func (r *RegistryResolver) tryGet(ctx context.Context, url, accept, token string
 			return nil, ch, nil
 		}
 		return nil, "", fmt.Errorf("get %s: unauthorized", url)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, "", fmt.Errorf("get %s: status 404: %w", url, ErrRegistryNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("get %s: status %d", url, resp.StatusCode)

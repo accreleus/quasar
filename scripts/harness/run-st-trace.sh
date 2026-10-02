@@ -27,7 +27,7 @@
 #   --shape moderate  — 40ms delay ±10ms, 1% loss, 3.5Mbps rate
 #   --shape clean     — no shaping (ABR/playout events may not fire → warnings only)
 #
-# Prerequisites (all on hermes):
+# Prerequisites (all on the aux host):
 #   - Live stack up: qstack up
 #   - Colour Ripple app seeded: qstack p4-bench (seeds "Quasar Bench: Colour Ripple")
 #   - Chrome-for-Testing at /tmp/cft/chrome-linux64/chrome (T8 dep, already present)

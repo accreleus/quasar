@@ -217,7 +217,8 @@ type sessionResp struct {
 	// The app container's last ~100 log lines, oldest first, captured while it
 	// ran: containers use `--rm`, so the daemon has discarded them by the time
 	// anyone looks (#463).
-	AppLogTail *string `json:"app_log_tail"`
+	AppLogTail *string         `json:"app_log_tail"`
+	HomeSeed   json.RawMessage `json:"home_seed"`
 	// The launch profile the session came from, null for a legacy/tier/override
 	// launch. Resolved values are in Stream; metadata at GET /v1/me/profiles.
 	ProfileID *string `json:"profile_id"`
@@ -331,6 +332,7 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		ErrorMessage:    s.ErrorMessage,
 		FailureCode:     s.FailureCode,
 		AppLogTail:      s.AppLogTail,
+		HomeSeed:        s.HomeSeed,
 		ProfileID:       s.ProfileID,
 		StreamProfileID: s.StreamProfileID,
 		CodecDecision:   s.CodecDecision,
@@ -415,6 +417,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	if req.ClientType != nil {
 		lp.ClientType = *req.ClientType
 	}
+	// The device this token was minted for: it scopes everything the launch reads
+	// about the client, and is stamped on the session row for later reads.
+	lp.DeviceID, _ = auth.TokenDeviceIDFromContext(r.Context())
 	lp.Mic = req.Mic
 
 	res, err := h.coord.LaunchByProfile(r.Context(), user.ID, lp)
@@ -430,6 +435,14 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeProfileIneligible,
 			"the selected stream profile is not eligible for this device")
 		return
+	// Verbatim on a positive sentinel match: only text this package composed
+	// reaches ErrRungCodecNotAvailable (the codec from rung.go, the launch
+	// profile id from launcher.go), so the message leaks nothing.
+	case errors.Is(err, ErrRungCodecNotAvailable):
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
+		return
+	// Unreachable while the codec constraint gates placement; kept as the
+	// invariant's backstop.
 	case errors.Is(err, ErrCodecUnsupportedByHost):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict,
 			"the requested codec is not supported by the assigned host's encoder")
@@ -463,6 +476,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrHomeInUse):
 		writeHomeInUse(w, err, "you already have a live session backed by this app's storage; go to it or stop it before launching another")
 		return
+	case errors.Is(err, ErrHomeConflict):
+		h.writeHomeConflict(w, r.Context(), req.AppID)
+		return
 	// Names the PARENT app and the one action that fixes it. 409 rather than 503:
 	// nothing is busy, and retrying changes nothing.
 	case errors.Is(err, ErrHomeNotProvisioned):
@@ -475,9 +491,18 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrParentDisabled):
 		writeParentDisabled(w, err)
 		return
+	// A codec-constrained refusal names the codec, and nothing else.
+	// semantics: control-api.md §Admission control
 	case errors.Is(err, ErrNoHostAvailable):
 		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
-			"no host is available to serve this launch")
+			refusalMessage(err, "no host is available to serve this launch",
+				"no host has a GPU that can encode %s"))
+		return
+	// Names no check, scope, GPU or host: readiness detail is admin-only and
+	// lives on the host body. No Retry-After — an admin, not time, clears it.
+	case errors.Is(err, ErrHostNotReady):
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeHostNotReady,
+			"the host that would run this needs its administrator's attention; try again once they have looked at it")
 		return
 	case errors.Is(err, ErrCapacityExhausted):
 		// The encode-slot reservation holds through `stopping` (#489 overlap
@@ -486,7 +511,8 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		// takes. Retry-After lets a polling client wait rather than error (#494).
 		w.Header().Set("Retry-After", capacityExhaustedRetryAfterSeconds)
 		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted,
-			"all capacity is in use; try again shortly")
+			refusalMessage(err, "all capacity is in use; try again shortly",
+				"no free GPU can encode %s; try again shortly"))
 		return
 	case err != nil:
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not launch session")
@@ -682,6 +708,13 @@ func (h *Handler) handleSwap(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrHomeInUse):
 		writeHomeInUse(w, err, "you already have a live session backed by that app's storage; stop it before swapping")
 		return
+	case errors.Is(err, ErrHomeConflict):
+		h.writeHomeConflict(w, r.Context(), req.AppID)
+		return
+	case errors.Is(err, ErrNoHostAvailable):
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
+			"this app is not selected for the current session's host")
+		return
 	// A swap is pinned to the LIVE session's host with no placement step to
 	// re-pin it, so swapping into a tile whose library lives elsewhere is an
 	// ordinary user-correctable condition, not a 500.
@@ -791,6 +824,16 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 		body["session_id"] = id
 	}
 	httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": body})
+}
+
+func (h *Handler) writeHomeConflict(w http.ResponseWriter, ctx context.Context, appID string) {
+	name, err := h.store.CanonicalAppName(ctx, appID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not resolve managed home app")
+		return
+	}
+	httpx.WriteError(w, http.StatusConflict, httpx.CodeHomeConflict,
+		fmt.Sprintf("Managed home for %s needs operator review", name))
 }
 
 // writeParentDisabled emits the 409 parent_app_disabled envelope, naming the
@@ -907,6 +950,10 @@ func (h *Handler) handleHostGPUs(w http.ResponseWriter, r *http.Request) {
 		ActiveSessions int32   `json:"active_sessions"`
 		RenderNode     *string `json:"render_node"`
 		DevicePath     *string `json:"device_path"`
+		// Codecs (#296 amendment 12): this GPU's codec set, or its host's when it
+		// reports none. Null only when neither has ever reported — deliberately
+		// not normalised to ["h264"] (openapi.yaml GPUAvailability.codecs).
+		Codecs []string `json:"codecs"`
 	}
 	items := make([]gpuResp, 0, len(avail))
 	for _, g := range avail {
@@ -924,6 +971,7 @@ func (h *Handler) handleHostGPUs(w http.ResponseWriter, r *http.Request) {
 			ActiveSessions: g.ActiveSessions,
 			RenderNode:     g.RenderNode,
 			DevicePath:     g.DevicePath,
+			Codecs:         g.Codecs,
 		})
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items})

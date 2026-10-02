@@ -46,6 +46,9 @@ export interface ApiErrorBody {
      *  the session is not (steam-library-discovery spec §2.2). */
     session_id?: string;
   };
+  /** On `409 host_not_eligible`: the host's `EligibilityReason`, a top-level
+   *  sibling of `error` (control-api.md §"Platform-release apply"). */
+  reason?: string;
 }
 
 // ── Invites + instance settings (LP-SEC-01) ──────────────────────────────────
@@ -97,6 +100,9 @@ export type PlatformApplyAttemptsResponse = Schemas["PlatformApplyAttemptsRespon
 export type PlatformApplyRun = Schemas["PlatformApplyRun"];
 export type PlatformApplySkip = Schemas["PlatformApplySkip"];
 export type PlatformApplyRequest = Schemas["PlatformApplyRequest"];
+export type PlatformDeveloperApplyRequest = Schemas["PlatformDeveloperApplyRequest"];
+export type PlatformHostRemoveRequest = Schemas["PlatformHostRemoveRequest"];
+export type ApplyComponentDigest = Schemas["ApplyComponentDigest"];
 export type PlatformApplyRunEnvelope = Schemas["PlatformApplyRunEnvelope"];
 export type PlatformApplyRunsResponse = Schemas["PlatformApplyRunsResponse"];
 export type ApplyAttemptState = Schemas["ApplyAttemptState"];
@@ -392,6 +398,16 @@ export type ProviderEntitlementModeSet = Schemas["ProviderEntitlementModeSet"];
 /** Replaces the whole entitlement set — `items` is the result, not a delta. */
 export type ProviderEntitlementModeEnvelope = Schemas["ProviderEntitlementModeEnvelope"];
 
+// ── App placement (RH05 #342, control-api.md "App placement, homes and explicit image cleanup") ──
+// Which hosts may run a canonical app. A derived tile has no placement of its
+// own: GET answers with the parent's, `inherited_from` set.
+
+export type AppPlacement = Schemas["AppPlacement"];
+export type AppPlacementMode = AppPlacement["mode"];
+/** Selected, prepared and ready are three separate observations; null = unknown. */
+export type AppPlacementHost = Schemas["AppPlacementHost"];
+export type AppPlacementPatch = Schemas["AppPlacementPatch"];
+
 // ── Library discovery (steam-library-discovery §7/§8/§11, Phase 4) ───────────
 
 /** `"other"` means rungs 1-4 would have published the appid yet no enabled tile
@@ -461,6 +477,10 @@ export type AdminHome = Schemas["AdminHome"];
 
 export type AdminHomesResponse = Schemas["AdminHomesResponse"];
 
+export type AdminHomeClaim = Schemas["AdminHomeClaim"];
+
+export type AdminHomeClaimsResponse = Schemas["AdminHomeClaimsResponse"];
+
 export type MyStorageItem = Schemas["MyStorageItem"];
 
 export type MyStorageResponse = Schemas["MyStorageResponse"];
@@ -492,6 +512,14 @@ export type HostsResponse = Omit<Schemas["HostList"], "items"> & { items: Host[]
  *  neutrally, never be rejected. */
 export type ReadinessCheck = Schemas["ReadinessCheck"];
 
+/** Amendment 11 (#260/#263, control-api.md "Readiness override — admin"). The
+ *  control plane's current verdict, always serialized on `Host`. */
+export type ReadinessGate = Schemas["ReadinessGate"];
+
+/** One admin override; `inert: true` means the host no longer reports this
+ *  check id, so the override currently excludes nothing. */
+export type ReadinessOverride = Schemas["ReadinessOverride"];
+
 // ── App-image catalog (Spec A P1: read + sync only) ───────────────────────────
 
 export type CatalogImage = Schemas["CatalogImage"];
@@ -516,6 +544,11 @@ export type ImageInstallRequest = Schemas["ImageInstallRequest"];
 
 /** `applied:false` (still 200) means a no-op, not an error. */
 export type ImageUpdateResult = Schemas["ImageUpdateResult"];
+
+export type HostImageCleanupView = Schemas["HostImageCleanupView"];
+export type HostImageCleanupCandidate = Schemas["HostImageCleanupCandidate"];
+export type HostImageCleanupRequest = Schemas["HostImageCleanupRequest"];
+export type HostImageCleanupAttempt = Schemas["HostImageCleanupAttempt"];
 
 /** `render_node` is a local addition, null until the agent reports it. The #383
  *  live-VRAM fields are generated and nullable — null means UNKNOWN, never zero. */
@@ -646,6 +679,11 @@ export type ConsoleConfig = Schemas["ConsoleConfig"];
 export type ConsoleCapabilities = Schemas["ConsoleCapabilities"];
 
 export type ConsoleConfigEnvelope = Schemas["ConsoleConfigEnvelope"];
+
+/** Amendment 18. "Has access" (`control-api.md` §Console mode, `agent-api.md`
+ *  `capacity.console_capabilities.access`): `state` is `on`, or `restored` with
+ *  `target` false. An unrecognised `state` reads as `off`. */
+export type ConsoleAccess = Schemas["ConsoleAccess"];
 
 // ── Session trace types (ST-07) ───────────────────────────────────────────────
 

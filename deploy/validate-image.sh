@@ -6,7 +6,7 @@
 #
 # WHY THIS EXISTS
 #   On 2026-07-26 the production NVIDIA agent image was 7.33GB (84% build toolchain) AND
-#   was missing the pulseaudio daemon, so every Tower session ran with silent audio.
+#   was missing the pulseaudio daemon, so every lab-host session ran with silent audio.
 #   Neither problem was detectable by anything in the repo: that image's Dockerfile stage
 #   was a hand-copy of the `runtime` stage's package list, kept in step by discipline
 #   alone. (The lineage itself is gone — #545 — but the guarantees are not.)
@@ -173,7 +173,15 @@ detect_gpu() {
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     printf 'nvidia'; return
   fi
-  if [ -e /dev/dri/renderD128 ]; then printf 'dri'; return; fi
+  # Render-node numbering is not stable across hosts. In particular, a host
+  # exposing only renderD129 still has a usable GPU. Check an accessible device
+  # node, not a sysfs entry that may be visible without device access.
+  local node
+  for node in /dev/dri/renderD*; do
+    if [ -c "$node" ] && [ -r "$node" ] && [ -w "$node" ]; then
+      printf 'dri'; return
+    fi
+  done
   printf 'none'
 }
 case "$GPU_MODE" in
@@ -186,7 +194,7 @@ if [ "$GPU_ON" = 1 ]; then
     nvidia) GPU_ARGS=(--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all) ;;
     dri)    GPU_ARGS=(--device /dev/dri --security-opt seccomp=unconfined) ;;
   esac
-  # A box can have both (Tower: RTX 5090 + AMD iGPU). Add /dev/dri when present.
+  # A box can have both (the lab host: RTX 5090 + AMD iGPU). Add /dev/dri when present.
   if [ "$GPU_KIND" = nvidia ] && [ -e /dev/dri ]; then
     GPU_ARGS+=(--device /dev/dri --security-opt seccomp=unconfined)
   fi
@@ -526,6 +534,14 @@ if [ "$(scalar '.image_config.must_not_run_as_root')" = "true" ]; then
   U="$(docker image inspect --format '{{.Config.User}}' "$IMAGE")"
   if [ -n "$U" ] && [ "$U" != "root" ] && [ "$U" != "0" ]; then hemit PASS "image.user" "runs as '$U'"
   else hemit FAIL "image.user" "runs as root (User='${U:-<empty>}')"; fi
+fi
+
+UID_WANT="$(scalar '.image_config.run_as_uid')"
+if [ -n "$UID_WANT" ]; then
+  # The numeric uid the image's USER resolves to, which Config.User (a name) does not say.
+  UID_GOT="$(docker run --rm --network none --entrypoint id "$IMAGE" -u 2>/dev/null || true)"
+  if [ "$UID_GOT" = "$UID_WANT" ]; then hemit PASS "image.uid" "runs as uid $UID_GOT"
+  else hemit FAIL "image.uid" "runs as uid '${UID_GOT:-<unknown>}', want $UID_WANT"; fi
 fi
 
 if [ "$(scalar '._deployment_ban')" = "not_a_runtime_role" ]; then

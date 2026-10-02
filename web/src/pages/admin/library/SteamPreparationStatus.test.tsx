@@ -6,6 +6,7 @@ import { SteamPreparationStatus } from "./SteamPreparationStatus";
 const status = (over: Partial<Status> = {}): Status => ({
   eligible: true, supported: true, desired_enabled: true, desired_revision: "2", applied_revision: "2",
   policy_pending: false, preparation_enabled: true, consumption_enabled: true,
+  publication_protection: "limited_protection",
   state: "preparing", reason: "none", detail: "", template: null, clone_mode: null, clone_reason: null, reported_at: "2026-09-06T12:00:00Z", ...over,
 });
 
@@ -41,6 +42,11 @@ describe("SteamPreparationStatus", () => {
     expect(screen.getByText(/Home cloning: full copy/)).toHaveTextContent("Full copies use more storage");
     expect(screen.getByText("Cloning details")).toBeInTheDocument();
     expect(screen.queryByText("Failed")).not.toBeInTheDocument();
+    expect(screen.getByText(/publication check is unverified/)).toBeInTheDocument();
+  });
+  it("shows verified publication only after the server proves the capable run", () => {
+    render(<SteamPreparationStatus status={status({ state: "ready", template: { version: "v1", registry_ref: "image@sha256:abc" }, publication_protection: "verified" })} />);
+    expect(screen.getByText(/publication check verified/)).toBeInTheDocument();
   });
   it("does not present an old effective report as confirmation of a changed policy", () => {
     render(<SteamPreparationStatus status={status({ policy_pending: true, desired_enabled: false, applied_revision: "1", state: "ready", template: { version: "v1", registry_ref: "image@sha256:abc" }, clone_mode: "reflink" })} />);

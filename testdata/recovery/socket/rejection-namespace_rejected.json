@@ -1,0 +1,9 @@
+{
+  "shape": "rejection",
+  "about": "The allowlist, on a path-segment boundary.",
+  "body": {
+    "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+    "reason": "namespace_rejected",
+    "message": "component \"node-agent\": image \"ghcr.io/accreleus/quasar-evil/quasar-node-agent\" is outside this host's platform-image namespaces (ghcr.io/accreleus/quasar)"
+  }
+}

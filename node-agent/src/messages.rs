@@ -72,6 +72,9 @@ pub enum AgentMsg {
         /// the state file must still report `[]`, or the host reads falsely
         /// `ready` forever (agent-api.md `register`).
         images: Vec<RegisterImageEntry>,
+        image_cleanup_v1: bool,
+        image_versions_complete: bool,
+        image_versions: Vec<ImageVersionEntry>,
         /// Platform-release identity (amendment 1, agent-api.md `register`):
         /// four OPTIONAL flat fields. Omitted when unknown — the control plane
         /// stores absent as NULL, and a wrong stamp is worse than none, since
@@ -85,10 +88,67 @@ pub enum AgentMsg {
         install_mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         updater_present: Option<bool>,
+        /// Owned installs (amendment 14): sent only beside `install_mode: "owned"`, each
+        /// omitted when the recovery actor did not say.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_actor_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_actor_source_commit: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seed_version: Option<String>,
+        /// Amendment 17 (RH-07 #396): the container engine and engine mode this agent
+        /// drives, from any install; each omitted when the engine could not be inspected.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine_mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source_policy_versions: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_versions: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_groups: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_home_cleanup_v1: Option<bool>,
+    },
+    ConfigPolicyState {
+        attempt_id: String,
+        host_id: String,
+        group: String,
+        revision: String,
+        content_sha256: String,
+        scope: String,
+        grant_boot_incarnation: String,
+        grant_connection_incarnation: String,
+        journal_sequence: String,
+        phase: String,
+        active_scope: Option<String>,
+        evidence: Option<serde_json::Value>,
+        error: Option<String>,
+    },
+    ConfigPolicyJournalInventoryPage {
+        inventory_id: String,
+        snapshot_id: String,
+        cursor: Option<String>,
+        next_cursor: Option<String>,
+        revision_high_water: std::collections::BTreeMap<String, String>,
+        active_snapshots: std::collections::BTreeMap<String, serde_json::Value>,
+        entries: Vec<serde_json::Value>,
+    },
+    ConfigPolicyFeatureError {
+        code: String,
+        group: Option<String>,
+        connection_incarnation: String,
     },
     Capacity {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deployment_settings: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_accepted_groups: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_legacy_map_applied_id: Option<String>,
         host: HostCapacity,
         gpus: Vec<GpuCapacity>,
         gpu_detection: String,
@@ -162,6 +222,9 @@ pub enum AgentMsg {
         /// with the `--rm` container and are unrecoverable.
         #[serde(skip_serializing_if = "Option::is_none")]
         app_log_tail: Option<String>,
+        /// Actual initial Steam managed-home provisioning outcome, when known.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        home_seed: Option<crate::session::home::HomeSeedOutcome>,
     },
     /// P1-7 signaling relay: wrap a Phase 0 inner message (offer/ice/…) for the
     /// control-plane relay, which unwraps and forwards it to the browser.
@@ -308,6 +371,26 @@ pub enum AgentMsg {
         /// cause, never a raw docker error blob (`images::errors`).
         error: String,
     },
+    ImageVersionsState {
+        inventory_revision: String,
+        image_versions_complete: bool,
+        image_versions: Vec<ImageVersionEntry>,
+    },
+    ImageCleanupState {
+        attempt_id: String,
+        image_id: String,
+        version: String,
+        image_ref: String,
+        runtime_image_id: String,
+        generation: String,
+        state: String,
+        reason: Option<String>,
+    },
+    ImageCleanupJournal {
+        request_id: String,
+        retired_attempt_ids: Vec<String>,
+        attempts: Vec<ImageCleanupJournalEntry>,
+    },
     /// Progress and outcome of one platform-release apply on this host
     /// (agent-api.md `release_state`). Fire-and-forget like `image_state`.
     ///
@@ -397,6 +480,37 @@ pub struct RegisterImageEntry {
     pub state: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ImageVersionEntry {
+    pub image_id: String,
+    pub version: String,
+    pub image_ref: String,
+    pub runtime_image_id: String,
+    pub state: String,
+    /// Point-in-time result of the same complete all-container scan as absence.
+    /// Only present entries may carry this field; no container identity crosses the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_referenced: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ImageCleanupJournalEntry {
+    pub attempt_id: String,
+    pub image_id: String,
+    pub version: String,
+    pub image_ref: String,
+    pub runtime_image_id: String,
+    pub generation: String,
+    pub state: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ImageIdentity {
+    pub image_id: String,
+    pub version: String,
+    pub image_ref: String,
+}
+
 /// One codec's entry in `capacity.codec_throughput` (#506): sustained encode
 /// throughput of the encoder element this host would actually build for it. An
 /// OBJECT rather than a bare number so a future measured probe can add fields
@@ -416,18 +530,83 @@ pub struct CodecThroughput {
 /// (`hosts.readiness` JSONB) and the admin UI renders it generically, so adding
 /// a check is agent-only. `id` is the stable key the UI may special-case;
 /// `summary`/`remediation` are operator-facing prose.
+///
+/// `observed_at`/`source`/`blocks` are protocol amendment 11 (#261): optional so a
+/// check with none of them serialises byte-for-byte as before.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ReadinessCheck {
     /// Stable machine key, e.g. `"nvidia_egl_vendor_json"`.
     pub id: String,
-    /// `"pass" | "fail" | "skip"`. `skip` means "not applicable to this host"
-    /// (an NVIDIA check on an AMD box) — never "we could not tell".
+    /// `"pass" | "fail" | "skip" | "warn" | "provisioning" | "unknown"`. `skip` means
+    /// "not applicable to this host" (an NVIDIA check on an AMD box) — never "we could
+    /// not tell"; `unknown` is that case (an indeterminate host probe).
     pub status: String,
     /// One sentence an operator can act on, in plain language.
     pub summary: String,
     /// Exact commands to fix it, distro-aware where cheaply knowable. Empty
     /// for `pass`/`skip`.
     pub remediation: String,
+    /// RFC3339 UTC, when the observation behind this check was made. Absent ⇒ the
+    /// consumer may assume the report's own time (`protocol/agent-api.md` `readiness`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// `"host_probe" | "local" | "runtime" | "operator"` — open string, per the contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Present only on a check that rests on evidence, whatever its current status;
+    /// declares what a `fail` on it blocks. Never present on a proxy check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<ReadinessBlocks>,
+}
+
+/// What a failing evidence-backed [`ReadinessCheck`] blocks (protocol amendment 11,
+/// ADR 0005). Known scopes: `host`, `homes`, `gpu` (with `gpu_index` set).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReadinessBlocks {
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_index: Option<i32>,
+    /// `"control_plane" | "agent"`. `agent` marks the agent's own safety states: it
+    /// refuses those launches itself and no readiness override lifts them.
+    pub enforced_by: String,
+}
+
+impl ReadinessBlocks {
+    pub fn host(enforced_by: &str) -> Self {
+        ReadinessBlocks {
+            scope: "host".into(),
+            gpu_index: None,
+            enforced_by: enforced_by.into(),
+        }
+    }
+
+    pub fn homes(enforced_by: &str) -> Self {
+        ReadinessBlocks {
+            scope: "homes".into(),
+            gpu_index: None,
+            enforced_by: enforced_by.into(),
+        }
+    }
+
+    pub fn gpu(index: i32, enforced_by: &str) -> Self {
+        ReadinessBlocks {
+            scope: "gpu".into(),
+            gpu_index: Some(index),
+            enforced_by: enforced_by.into(),
+        }
+    }
+}
+
+impl ReadinessCheck {
+    pub fn with_source(mut self, source: &str) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_blocks(mut self, blocks: ReadinessBlocks) -> Self {
+        self.blocks = Some(blocks);
+        self
+    }
 }
 
 /// The auth credential in a `register` message.
@@ -484,6 +663,19 @@ pub struct GpuCapacity {
     /// one. Additive — absent means unknown, and matching then fails open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub driver_identity: Option<String>,
+    /// The GPU codec set (`agent-api.md` amendment 12, #302): wire codecs this GPU has
+    /// been shown to encode, `h264` always present when the GPU is usable
+    /// (`encode_slots_total > 0`). Sorted deterministically (wire vocabulary order).
+    /// Stamped by `crate::agent::apply_gpu_codecs` from the same per-GPU computation
+    /// `capacity.codecs` (the host union) derives from — never a second pass. A
+    /// zero-slot (pinned-out) GPU sends an explicit `[]` (it encodes nothing usable);
+    /// the control plane stores `[]` as-is, never inheriting the host set for it.
+    /// `None` is reserved for a GPU this agent has no codec knowledge of at all, which
+    /// the control plane reads as "inherits the host set" — replaced wholesale with the
+    /// `gpus` set, like `render_node` and `driver_identity`, no keep-if-absent rule of
+    /// its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codecs: Option<Vec<String>>,
 }
 
 /// Per-session stream parameters in a `session_assign` (mirrors the sessions
@@ -790,6 +982,39 @@ pub struct ConsoleCapabilities {
     pub outputs: Vec<DrmOutputCapability>,
     pub audio_sinks: Vec<AudioSink>,
     pub input_devices: Vec<InputDeviceInfo>,
+    /// Amendment 18 (RH-07 #395): whether this agent can run console mode, on an owned
+    /// host whose recovery actor replaces the agent to grant it. Absent on a host with no
+    /// recovery actor. Filled in by the capacity sender, never by the hotplug snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<ConsoleAccess>,
+}
+
+/// `capacity.console_capabilities.access` (agent-api.md amendment 18). Every field is
+/// always present, `null` where the contract says so.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleAccess {
+    pub state: ConsoleAccessState,
+    /// The console access the current or last attempt moves to.
+    pub target: Option<bool>,
+    /// The recovery actor's attempt.
+    pub request_id: Option<String>,
+    /// Set exactly when `state` is `restored`: a `release_state` failure identifier.
+    pub reason: Option<String>,
+    /// RFC 3339.
+    pub started_at: Option<String>,
+    /// RFC 3339; `null` while `applying`.
+    pub finished_at: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleAccessState {
+    Off,
+    Applying,
+    On,
+    Restored,
+    Unsupported,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -836,6 +1061,12 @@ pub enum ControlMsg {
         host_id: String,
         node_secret: Option<String>,
         heartbeat_interval_ms: u64,
+        #[serde(default)]
+        boot_incarnation: Option<String>,
+        #[serde(default)]
+        connection_incarnation: Option<String>,
+        #[serde(default)]
+        config_policy_groups: Option<Vec<String>>,
     },
     /// Reserve + prepare a placed session (P1-6).
     SessionAssign {
@@ -942,12 +1173,35 @@ pub enum ControlMsg {
     ConfigUpdate {
         #[serde(default)]
         settings: serde_json::Value,
+        #[serde(default)]
+        settings_delivery_id: Option<String>,
         /// Host's resolved console-mode config. Absent ⇒ console mode disabled
         /// (falls back to `QUASAR_LOCAL_DISPLAY` for dev).
         #[serde(default)]
         console_config: Option<ConsoleConfig>,
         #[serde(default)]
         source_policies: Option<serde_json::Value>,
+    },
+    ConfigPolicyOffer {
+        attempt_id: String,
+        host_id: String,
+        boot_incarnation: String,
+        connection_incarnation: String,
+        group: String,
+        revision: String,
+        content_sha256: String,
+        scope: String,
+        expires_at: String,
+        prerequisites_sha256: String,
+        prerequisites: Vec<serde_json::Value>,
+        settings: serde_json::Value,
+        resolved_settings: serde_json::Value,
+    },
+    ConfigPolicyJournalInventoryRequest {
+        inventory_id: String,
+        boot_incarnation: String,
+        connection_incarnation: String,
+        cursor: Option<String>,
     },
     /// Restart request: ack, then exit so the container restart policy
     /// restarts us with fresh config.
@@ -968,6 +1222,28 @@ pub enum ControlMsg {
     ImageRemove {
         id: String,
         image_id: String,
+    },
+    ImageInventoryReconcile {
+        id: String,
+        identities: Vec<ImageIdentity>,
+    },
+    ImageCleanup {
+        id: String,
+        attempt_id: String,
+        image_id: String,
+        version: String,
+        image_ref: String,
+        runtime_image_id: String,
+        expected_generation: String,
+    },
+    ImageCleanupJournalRequest {
+        id: String,
+        attempt_ids: Vec<String>,
+    },
+    ImageCleanupStateAck {
+        id: String,
+        attempt_id: String,
+        generation: String,
     },
     /// Build a `kind:"template"` catalog image locally on this host — the
     /// template analogue of `image_ensure`: ack immediately, fetch the build
@@ -1002,6 +1278,13 @@ pub enum ControlMsg {
         components: Vec<ReleaseComponent>,
         #[serde(default)]
         force: bool,
+    },
+    /// Remove this owned GPU host's node agent and recovery actor (agent-api.md
+    /// `host_remove`, amendment 14): handed to the recovery actor, acked on acceptance, and
+    /// followed by nothing, since this agent is the first thing removed.
+    HostRemove {
+        id: String,
+        request_id: String,
     },
     /// Future additions land here until handled.
     #[serde(other)]
@@ -1290,6 +1573,10 @@ mod tests {
     #[test]
     fn capacity_json_omits_absent_additive_fields() {
         let msg = AgentMsg::Capacity {
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+
             source_preparation: None,
             host: HostCapacity {
                 cpu_cores: 16,
@@ -1306,6 +1593,7 @@ mod tests {
                 render_node: None,
                 device_path: None,
                 driver_identity: None,
+                codecs: None,
             }],
             gpu_detection: "ok".to_string(),
             gpu_detection_reason: None,
@@ -1322,6 +1610,7 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("render_node"));
+        assert!(!json["gpus"][0].as_object().unwrap().contains_key("codecs"));
         assert!(!json
             .as_object()
             .unwrap()
@@ -1335,6 +1624,10 @@ mod tests {
     #[test]
     fn capacity_json_includes_present_additive_fields() {
         let msg = AgentMsg::Capacity {
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+
             source_preparation: None,
             host: HostCapacity {
                 cpu_cores: 16,
@@ -1356,6 +1649,7 @@ mod tests {
                 render_node: Some("/dev/dri/by-path/pci-0000:04:00.0-render".to_string()),
                 device_path: Some("/dev/dri/renderD128".to_string()),
                 driver_identity: None,
+                codecs: Some(vec!["h264".to_string(), "h265".to_string()]),
             }],
             gpu_detection: "ok".to_string(),
             gpu_detection_reason: None,
@@ -1389,6 +1683,9 @@ mod tests {
                 status: "fail".to_string(),
                 summary: "no 32-bit NVIDIA GL libraries on the host".to_string(),
                 remediation: "sudo dnf install -y nvidia-driver-libs.i686".to_string(),
+                observed_at: None,
+                source: None,
+                blocks: None,
             }]),
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -1401,6 +1698,7 @@ mod tests {
             json["gpus"][0]["render_node"],
             "/dev/dri/by-path/pci-0000:04:00.0-render"
         );
+        assert_eq!(json["gpus"][0]["codecs"][1], "h265");
         assert_eq!(json["effective_settings"]["encoder"], "nvenc");
         assert_eq!(json["codecs"][1], "h265");
         // #506: the hint is an OBJECT per codec, extensible without a second amendment.
@@ -1422,6 +1720,33 @@ mod tests {
         );
     }
 
+    /// #302 review: a zero-slot GPU's `codecs` is `Some(vec![])` (from
+    /// `crate::agent::apply_gpu_codecs`), which must serialize as the JSON array
+    /// `[]` and stay present — not vanish under `skip_serializing_if`, which only
+    /// applies to `None`. Distinguishing `[]` (this GPU encodes nothing) from an
+    /// absent field (no codec knowledge, inherit the host set) is the whole point
+    /// of the fix.
+    #[test]
+    fn a_zero_slot_gpus_empty_codec_set_serializes_present_not_omitted() {
+        let gpu = GpuCapacity {
+            index: 1,
+            vendor: "amd".to_string(),
+            model: "Radeon Pro V520".to_string(),
+            vram_mb_total: 16384,
+            encode_slots_total: 0,
+            render_node: None,
+            device_path: None,
+            driver_identity: None,
+            codecs: Some(vec![]),
+        };
+        let json = serde_json::to_value(&gpu).unwrap();
+        assert!(
+            json.as_object().unwrap().contains_key("codecs"),
+            "an explicit empty codec set must not be omitted like None is"
+        );
+        assert_eq!(json["codecs"], serde_json::json!([]));
+    }
+
     /// `reason_code`/`app_log_tail` must be ABSENT (not null) on every ordinary
     /// session_state.
     #[test]
@@ -1433,12 +1758,35 @@ mod tests {
             error: None,
             reason_code: None,
             app_log_tail: None,
+            home_seed: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         let obj = json.as_object().unwrap();
         assert!(!obj.contains_key("reason_code"));
         assert!(!obj.contains_key("app_log_tail"));
         assert!(!obj.contains_key("error"));
+        assert!(!obj.contains_key("home_seed"));
+    }
+
+    #[test]
+    fn initial_home_seed_uses_only_closed_codes_on_the_wire() {
+        let msg = AgentMsg::SessionState {
+            session_id: "s1".to_string(),
+            state: "starting".to_string(),
+            detail: None,
+            error: None,
+            reason_code: None,
+            app_log_tail: None,
+            home_seed: Some(crate::session::home::HomeSeedOutcome {
+                mode: "copy",
+                reason: "seeded",
+            }),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json["home_seed"],
+            serde_json::json!({"mode":"copy","reason":"seeded"})
+        );
     }
 
     #[test]
@@ -1450,6 +1798,7 @@ mod tests {
             error: Some("the app exited with code 0 before producing any video.".to_string()),
             reason_code: Some("app_exited_early".to_string()),
             app_log_tail: Some("Steam needs to be online to update\nexiting".to_string()),
+            home_seed: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["reason_code"], "app_exited_early");
@@ -1555,6 +1904,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cleanup_wire_examples_use_exact_frozen_fields() {
+        let command = serde_json::json!({"type":"image_cleanup","id":"cmd","attempt_id":"attempt","image_id":"steam","version":"v1","image_ref":"ghcr.io/x/steam:sha-1234567","runtime_image_id":"sha256:one","expected_generation":"7"});
+        assert!(
+            matches!(serde_json::from_value::<ControlMsg>(command).unwrap(), ControlMsg::ImageCleanup { expected_generation, .. } if expected_generation == "7")
+        );
+        let report = AgentMsg::ImageCleanupState {
+            attempt_id: "attempt".into(),
+            image_id: "steam".into(),
+            version: "v1".into(),
+            image_ref: "ghcr.io/x/steam:sha-1234567".into(),
+            runtime_image_id: "sha256:one".into(),
+            generation: "7".into(),
+            state: "removed".into(),
+            reason: None,
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["type"], "image_cleanup_state");
+        assert_eq!(json["generation"], "7");
+        assert!(json.get("expected_generation").is_none());
+        assert!(json["reason"].is_null());
+        let journal_request = serde_json::json!({"type":"image_cleanup_journal_request","id":"j","attempt_ids":["attempt"]});
+        assert!(
+            matches!(serde_json::from_value::<ControlMsg>(journal_request).unwrap(), ControlMsg::ImageCleanupJournalRequest { attempt_ids, .. } if attempt_ids == ["attempt"])
+        );
+    }
+
     // A future control plane sending an unknown type must degrade to Unknown,
     // not fail the whole connection.
     #[test]
@@ -1653,16 +2029,28 @@ mod tests {
         // pre-amendment agent, so the control plane never demotes stale rows.
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
                 enrollment_token: "tok".to_string(),
             },
             images: Vec::new(),
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: None,
             built_at: None,
             install_mode: None,
             updater_present: None,
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"], serde_json::json!([]));
@@ -1675,16 +2063,28 @@ mod tests {
     fn register_omits_every_unknown_identity_field() {
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
                 node_secret: "secret".to_string(),
             },
             images: Vec::new(),
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: None,
             built_at: None,
             install_mode: None,
             updater_present: None,
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         for key in [
@@ -1692,6 +2092,9 @@ mod tests {
             "built_at",
             "install_mode",
             "updater_present",
+            "recovery_actor_version",
+            "recovery_actor_source_commit",
+            "seed_version",
         ] {
             assert!(json.get(key).is_none(), "{key} must be absent, got {json}");
         }
@@ -1701,17 +2104,29 @@ mod tests {
     fn register_sends_identity_flat_beside_agent_version() {
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
                 node_secret: "secret".to_string(),
             },
             images: Vec::new(),
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: Some("1f0c1e0e0c5a9d1b7a2f3e4d5c6b7a8901234567".to_string()),
             built_at: Some("2026-09-04T12:00:00Z".to_string()),
             install_mode: Some("registry".to_string()),
             // `false` is a real answer and must reach the wire.
             updater_present: Some(false),
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -1727,6 +2142,9 @@ mod tests {
     fn register_includes_images_when_present() {
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -1737,10 +2155,19 @@ mod tests {
                 version: "2026.08.07".to_string(),
                 state: "ready".to_string(),
             }],
+            image_cleanup_v1: true,
+            image_versions_complete: false,
+            image_versions: Vec::new(),
             source_commit: None,
             built_at: None,
             install_mode: None,
             updater_present: None,
+            recovery_actor_version: None,
+            recovery_actor_source_commit: None,
+            seed_version: None,
+            engine: None,
+            engine_version: None,
+            engine_mode: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"][0]["image_id"], "steam");

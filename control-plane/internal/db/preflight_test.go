@@ -214,3 +214,22 @@ func TestPreflight_DBIntegration_Unreachable(t *testing.T) {
 		t.Errorf("connection failure must not read as a migration failure: %q", err.Error())
 	}
 }
+
+// An owned install has no compose service (#382): name the actor's container.
+func TestClassifyConnectErr_OwnedInstallNamesTheActorsContainer(t *testing.T) {
+	owned, err := pgx.ParseConfig("postgres://quasar:s3cret@quasar-postgres:5432/quasar")
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	opErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	var pfErr *PreflightError
+	if !errors.As(classifyConnectErr(owned, opErr), &pfErr) {
+		t.Fatal("expected *PreflightError")
+	}
+	if strings.Contains(pfErr.Message, "compose") || !strings.Contains(pfErr.Message, "quasar-postgres") {
+		t.Errorf("owned message = %q", pfErr.Message)
+	}
+	if !errors.As(classifyConnectErr(testConnCfg(t), opErr), &pfErr) || !strings.Contains(pfErr.Message, "`postgres` compose service") {
+		t.Errorf("compose message = %q", pfErr.Message)
+	}
+}

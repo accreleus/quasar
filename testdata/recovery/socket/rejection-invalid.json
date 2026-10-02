@@ -1,0 +1,8 @@
+{
+  "shape": "rejection",
+  "about": "A malformed body carries no request id, so request_id is omitted.",
+  "body": {
+    "reason": "invalid",
+    "message": "malformed request: json: unknown field \"kind2\""
+  }
+}

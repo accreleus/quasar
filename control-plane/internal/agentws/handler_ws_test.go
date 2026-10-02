@@ -17,7 +17,7 @@ import (
 func websocketTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := NewHandler(nil, "test-token", log, nil, nil, nil, nil, nil)
+	h := NewHandler(nil, log, nil, nil, nil, nil, nil)
 	// #401/#406: a Handler owns two drain goroutines. Without Close every test
 	// that builds one leaks them for the life of the test binary, which is what
 	// the package's goleak ignores were papering over.
@@ -130,7 +130,7 @@ func TestEnrollmentFailuresAreRateLimitedPreUpgradeAndIgnoreXFF(t *testing.T) {
 func TestSuccessfulEnrollmentClearsPriorFailures(t *testing.T) {
 	pool := testPool(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := NewHandler(pool, "test-token", log, nil, nil, nil, nil, nil)
+	h := NewHandler(pool, log, nil, nil, nil, nil, nil)
 	t.Cleanup(h.Close) // #401/#406: stop the drain goroutines with the Handler.
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -210,7 +210,7 @@ func registerWithNodeSecret(t *testing.T, url, nodeName, secret string) map[stri
 func TestUnknownNodeSecretIsRefusedByCredentialAndStillCounted(t *testing.T) {
 	pool := testPool(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := NewHandler(pool, "test-token", log, nil, nil, nil, nil, nil)
+	h := NewHandler(pool, log, nil, nil, nil, nil, nil)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -249,7 +249,7 @@ func TestUnknownNodeSecretIsRefusedByCredentialAndStillCounted(t *testing.T) {
 func TestWrongNodeSecretForAKnownHostStillSpendsTheBudget(t *testing.T) {
 	pool := testPool(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := NewHandler(pool, "test-token", log, nil, nil, nil, nil, nil)
+	h := NewHandler(pool, log, nil, nil, nil, nil, nil)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

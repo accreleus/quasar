@@ -2,39 +2,31 @@
 /**
  * A framed screenshot slot for use inside docs pages.
  *
- * Today it renders <Placeholder>. When the real screenshot lands, drop the
- * image into src/assets/shots/ and pass `src`. The frame does not change, so
- * nothing reflows.
+ * Import the image from src/assets/shots/ and pass it as `src`, with `alt`.
+ * `sublabel`, when given, renders as the caption.
  *
  * Every <Shot> in the docs must have a matching row in site/SCREENSHOTS.md
- * describing exactly what to capture.
+ * recording where the image came from.
  */
 import { Image } from 'astro:assets';
-import Placeholder from './Placeholder.astro';
 
 interface Props {
-	/** Short uppercase label naming the surface, e.g. "ADMIN HOSTS". */
+	/** Short label naming the surface in the page source, e.g. "Admin hosts". Not rendered. */
 	label: string;
-	/** One plain sentence of context. Shown under the placeholder label, or as the caption once a real image exists. */
+	/** One plain sentence of context, shown as the caption. */
 	sublabel?: string;
-	/** Imported image. When present, the real screenshot renders instead of the placeholder. */
-	src?: ImageMetadata;
-	/** Alt text. Required when `src` is set. */
-	alt?: string;
+	/** The imported screenshot. */
+	src: ImageMetadata;
+	/** Alt text for the screenshot. */
+	alt: string;
 }
 
-const { label, sublabel, src, alt } = Astro.props;
+const { sublabel, src, alt } = Astro.props;
 ---
 
 <figure class="q-shot">
-	{
-		src ? (
-			<Image src={src} alt={alt ?? label} class="q-shot-img" />
-		) : (
-			<Placeholder label={label} sublabel={sublabel} />
-		)
-	}
-	{src && sublabel && <figcaption>{sublabel}</figcaption>}
+	<Image src={src} alt={alt} class="q-shot-img" />
+	{sublabel && <figcaption>{sublabel}</figcaption>}
 </figure>
 
 <style>

@@ -1,31 +1,13 @@
 ---
 title: Quick start
-description: Answer five questions and get one command that installs Quasar.
+description: Prepare one GPU server and generate your all-in-one Quasar configuration.
 ---
 
 import QuickStart from '../../../components/QuickStart.astro';
 
-Five questions, then one command to run on the machine with the GPU. You need
-Linux, Docker and about 20 GB of disk; the
-[requirements](/quasar/start/requirements/) have the detail.
-
-Everything here runs in your browser. The script makes its own secrets on the
-target machine, so nothing sensitive exists on this page to leak.
-
-The stack it writes has four services: Postgres, the control plane, the node
-agent, and `quasar-updater`, which is what lets Quasar update itself from the
-admin console later. The updater holds the Docker socket, so it is worth saying
-what it cannot do: it pulls only digests inside the allow-listed registry
-namespace and recreates only the two Quasar services in this stack. The script
-fills in `QUASAR_STACK_DIR` — this directory's absolute path on the machine —
-which the updater needs to find those compose files. On Podman, also set
-`QUASAR_DOCKER_SOCKET` to your own socket path.
-
-The installer selects a stable release, pins its control-plane and agent image
-digests, and checks the matching updater image before starting anything. If the
-stable release predates this installer configuration, it stops with instructions
-to use that release’s installation guide or wait for a compatible release.
-Development changes described here are not available merely because they have
-merged into `develop`.
+Install Quasar on one Linux GPU server with its own managed database. Check the
+[requirements](/quasar/start/requirements/), then choose your engine, GPU and storage.
+For a split control plane, follow [Docker installation](/quasar/install/docker/).
+To expand an existing instance, use its [Add GPU host command](/quasar/install/second-host/).
 
 <QuickStart />

@@ -4,6 +4,11 @@
 # NO key the schema does not name, so the format cannot drift silently into
 # something the control plane's release detection cannot read.
 #
+# Dispatches on `format_version`: 1 (platform-release-manifest.json, two
+# components; already-published releases carry it) or 2
+# (platform-release-manifest.v2.json, three components and a floor;
+# protocol/control-api.md "Release manifest format 2").
+#
 # Run twice on every release: once by the generator on its own output, once by
 # the `release` job in .github/workflows/images.yml (with the --expect-* flags,
 # which tie the manifest to the digests the build jobs actually produced) before
@@ -16,19 +21,26 @@
 set -euo pipefail
 
 path=""
+expect_format=""
 expect_version=""
 expect_control=""
 expect_agent=""
+expect_recovery=""
 
 usage() {
   cat <<'EOF'
 usage: scripts/release/validate-platform-release-manifest.sh PATH \
-         [--expect-version V] [--expect-control-digest D] [--expect-agent-digest D]
+         [--expect-format N] [--expect-version V] \
+         [--expect-control-digest D] [--expect-agent-digest D] \
+         [--expect-recovery-digest D]
 
-Validates a platform-release-manifest.json. The optional --expect-* flags assert
-equality against values the caller already knows (the workflow passes the tag's
-version and the two build-job digests), which is what proves the manifest
-describes THIS run's artifacts and not a stale file.
+Validates a platform release manifest, format 1 (platform-release-manifest.json)
+or format 2 (platform-release-manifest.v2.json), by its format_version. The
+optional --expect-* flags assert equality against values the caller already
+knows (the workflow passes the format, the tag's version and the three
+build-job digests), which is what proves the manifest describes THIS run's
+artifacts and not a stale file. --expect-recovery-digest on a format-1 manifest
+is an error: format 1 has no recovery-actor component.
 
 Prints every error on stderr and exits 1; prints PASS and exits 0 when valid.
 Schema: scripts/release/platform-release-manifest.md
@@ -37,9 +49,11 @@ EOF
 
 while (($#)); do
   case "$1" in
+    --expect-format) expect_format=${2:?--expect-format needs a value}; shift 2 ;;
     --expect-version) expect_version=${2:?--expect-version needs a value}; shift 2 ;;
     --expect-control-digest) expect_control=${2:?--expect-control-digest needs a value}; shift 2 ;;
     --expect-agent-digest) expect_agent=${2:?--expect-agent-digest needs a value}; shift 2 ;;
+    --expect-recovery-digest) expect_recovery=${2:?--expect-recovery-digest needs a value}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     -*) usage >&2; exit 2 ;;
     *)
@@ -49,8 +63,14 @@ while (($#)); do
 done
 
 [[ -n "$path" ]] || { usage >&2; exit 2; }
+case "$expect_format" in
+  ''|1|2) ;;
+  *) echo "validate-platform-release-manifest: --expect-format must be 1 or 2, got '$expect_format'" >&2
+     exit 2 ;;
+esac
 
-python3 - "$path" "$expect_version" "$expect_control" "$expect_agent" <<'PY'
+python3 - "$path" "$expect_format" "$expect_version" "$expect_control" "$expect_agent" \
+  "$expect_recovery" <<'PY'
 import datetime as dt
 import json
 import re
@@ -58,19 +78,33 @@ import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-expect_version, expect_control, expect_agent = sys.argv[2:5]
+(expect_format, expect_version, expect_control, expect_agent,
+ expect_recovery) = sys.argv[2:7]
 errors = []
 
-# The two components, in this order, with the image name each one must carry.
-# Exactly these: a manifest naming a third artifact is a format change and needs
-# a format_version bump, not a lenient validator.
-COMPONENTS = (
-    ("control-plane", "quasar-control-plane"),
-    ("node-agent", "quasar-node-agent"),
-)
-TOP_KEYS = ["format_version", "version", "prerelease", "source_commit",
-            "built_at", "schema_version", "components"]
+# Per format, in order: component name and the last path element of its image.
+# Another artifact is a format_version bump, not a lenient validator.
+COMPONENTS = {
+    1: (
+        ("control-plane", "quasar-control-plane"),
+        ("node-agent", "quasar-node-agent"),
+    ),
+    2: (
+        ("control-plane", "quasar-control-plane"),
+        ("node-agent", "quasar-node-agent"),
+        ("recovery-actor", "quasar-recovery"),
+    ),
+}
+TOP_KEYS = {
+    1: ["format_version", "version", "prerelease", "source_commit",
+        "built_at", "schema_version", "components"],
+    2: ["format_version", "version", "prerelease", "source_commit",
+        "built_at", "schema_version", "components", "floor"],
+}
 COMPONENT_KEYS = ["name", "image", "digest"]
+# Format 2's floor entries, in order.
+FLOOR = ("node-agent", "recovery-actor")
+FLOOR_KEYS = ["name", "version"]
 
 # semver.org 2.0.0, prerelease part optional, build metadata deliberately NOT
 # accepted: `+` is not a legal character in a Docker tag, so a version carrying
@@ -98,6 +132,16 @@ def is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def semver_key(match):
+    """Sort key with SemVer 2.0.0 precedence (semver.org section 11)."""
+    core = tuple(int(part) for part in match.group("core").split("."))
+    pre = match.group("pre")
+    if pre is None:
+        return core, (1,)
+    ids = tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+    return core, (0, ids)
+
+
 def report():
     if errors:
         for error in errors:
@@ -123,16 +167,26 @@ if not isinstance(doc, dict):
     errors.append(f"{path} is not a JSON object")
     report()
 
-for key in TOP_KEYS:
+# An unknown format_version is reported, and the rest is checked as format 1 so
+# every other error is reported with it.
+format_version = doc.get("format_version")
+if is_int(format_version) and format_version in COMPONENTS:
+    fmt = format_version
+else:
+    fmt = 1
+    if "format_version" in doc:
+        errors.append(f"format_version must be the integer 1 or 2, got {format_version!r}")
+
+if expect_format and format_version != int(expect_format):
+    errors.append(f"expected format_version {int(expect_format)}, manifest has {format_version!r}")
+
+for key in TOP_KEYS[fmt]:
     if key not in doc:
         errors.append(f"missing top-level key: {key}")
 for key in doc:
-    if key not in TOP_KEYS:
+    if key not in TOP_KEYS[fmt]:
         errors.append(f"unknown top-level key: {key} "
                       "(adding a key is a format_version bump, not a new key)")
-
-if "format_version" in doc and doc["format_version"] != 1:
-    errors.append(f"format_version must be the integer 1, got {doc['format_version']!r}")
 
 version = doc.get("version")
 parsed = None
@@ -173,15 +227,16 @@ if not is_int(schema_version) or schema_version < 1:
     )
 
 components = doc.get("components")
+want_components = COMPONENTS[fmt]
 if not isinstance(components, list):
     errors.append(f"components must be an array, got {components!r}")
-elif len(components) != len(COMPONENTS):
+elif len(components) != len(want_components):
     errors.append(
-        f"components must hold exactly {len(COMPONENTS)} components "
-        f"({', '.join(name for name, _ in COMPONENTS)}), got {len(components)}"
+        f"components must hold exactly {len(want_components)} components "
+        f"({', '.join(name for name, _ in want_components)}), got {len(components)}"
     )
 else:
-    for index, (component, (want_name, want_image)) in enumerate(zip(components, COMPONENTS)):
+    for index, (component, (want_name, want_image)) in enumerate(zip(components, want_components)):
         where = f"components[{index}]"
         if not isinstance(component, dict):
             errors.append(f"{where} must be an object, got {component!r}")
@@ -196,7 +251,7 @@ else:
         name = component.get("name")
         if name != want_name:
             errors.append(f"{where}.name must be {want_name!r}, got {name!r} "
-                          "(the two components are fixed, in this order)")
+                          f"(the {len(want_components)} components are fixed, in this order)")
 
         image = component.get("image")
         if not isinstance(image, str) or not IMAGE.fullmatch(image):
@@ -214,6 +269,51 @@ else:
                 f"got {digest!r}"
             )
 
+# A floor has the top-level version's grammar and must not order above it.
+if fmt == 2 and "floor" in doc:
+    floor = doc["floor"]
+    if not isinstance(floor, list):
+        errors.append(f"floor must be an array, got {floor!r}")
+    elif len(floor) != len(FLOOR):
+        errors.append(
+            f"floor must hold exactly {len(FLOOR)} entries "
+            f"({', '.join(FLOOR)}), got {len(floor)}"
+        )
+    else:
+        for index, (entry, want_name) in enumerate(zip(floor, FLOOR)):
+            where = f"floor[{index}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{where} must be an object, got {entry!r}")
+                continue
+            for key in FLOOR_KEYS:
+                if key not in entry:
+                    errors.append(f"{where} missing key: {key}")
+            for key in entry:
+                if key not in FLOOR_KEYS:
+                    errors.append(f"{where} unknown key: {key}")
+
+            name = entry.get("name")
+            if name != want_name:
+                errors.append(f"{where}.name must be {want_name!r}, got {name!r} "
+                              "(the floor names node-agent, then recovery-actor)")
+
+            floor_version = entry.get("version")
+            floor_parsed = None
+            if not isinstance(floor_version, str):
+                errors.append(f"{where}.version must be a string, got {floor_version!r}")
+            elif "+" in floor_version:
+                errors.append(f"{where}.version must not carry semver build metadata: "
+                              f"{floor_version!r}")
+            elif not (floor_parsed := SEMVER.fullmatch(floor_version)):
+                errors.append(f"{where}.version must be strict semver X.Y.Z[-prerelease], "
+                              f"got {floor_version!r}")
+            if (floor_parsed is not None and parsed is not None
+                    and semver_key(floor_parsed) > semver_key(parsed)):
+                errors.append(
+                    f"{where}.version {floor_version!r} orders above the release version "
+                    f"{version!r} (a floor may not be newer than the release declaring it)"
+                )
+
 # The --expect-* assertions: the caller already knows these, so a mismatch means
 # the manifest describes something other than what this run built.
 if expect_version and version != expect_version:
@@ -221,7 +321,8 @@ if expect_version and version != expect_version:
 
 if isinstance(components, list):
     by_name = {c.get("name"): c for c in components if isinstance(c, dict)}
-    for flag, name in ((expect_control, "control-plane"), (expect_agent, "node-agent")):
+    for flag, name in ((expect_control, "control-plane"), (expect_agent, "node-agent"),
+                       (expect_recovery, "recovery-actor")):
         if not flag:
             continue
         got = (by_name.get(name) or {}).get("digest")

@@ -31,7 +31,7 @@
 #                    DX_CP_PORT — that port is what `docker-compose.local.yml`
 #                    (the persistent dev stack, `make up`) also binds, and the
 #                    two stacks can legitimately be up at the same time.
-#   <base-url>       validate a live stack, e.g. https://tower.local:18443.
+#   <base-url>       validate a live stack, e.g. https://<gpu-host>:18443.
 #                    Requires QUASAR_DEV_AGENT_AUTH=1 there and the dev key via
 #                    $QUASAR_DEV_AGENT_KEY (no local boot, no teardown, no
 #                    seeding — this harness does not own that stack's data).
@@ -93,7 +93,9 @@ PG="qval-pg-${QUASAR_INSTANCE}"
 CP="qval-cp-${QUASAR_INSTANCE}"
 GO_IMAGE="golang:1.26"
 ADMIN_EMAIL="admin@quasar.local"
-ADMIN_PASS="adminpassword123"
+# Bootstrap policy rejects passwords containing the username; mint a fresh
+# throwaway credential for this isolated run instead of using a fixed literal.
+ADMIN_PASS="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
 # Set the instant the network exists — every resource created after this point
 # (postgres, the control-plane container) must be torn down on any exit path,
 # INCLUDING one that fails mid-boot before that resource itself is confirmed
@@ -217,7 +219,6 @@ boot_local_stack() {
     -v "$RUN_STATE_DIR":/run/quasar \
     -w /w \
     -e DATABASE_URL="postgres://quasar:quasar@$PG:5432/quasar?sslmode=disable" \
-    -e ENROLLMENT_TOKEN=validate-enroll-token \
     -e BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
     -e BOOTSTRAP_ADMIN_USERNAME=admin \
     -e BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PASS" \
@@ -450,7 +451,9 @@ if [ "$LEVEL" = ui ] || [ "$LEVEL" = session ] || [ "$LEVEL" = all ]; then
     IS_LOCAL=1
     boot_local_stack
     BASE_URL="http://127.0.0.1:${CP_PORT}"
-    KEY="$(tr -d '\r\n' < "$RUN_STATE_DIR/dev-agent-key")"
+    # The container creates its key mode 0600 as root; read it inside that
+    # container rather than weakening file permissions on the host.
+    KEY="$(docker exec "$CP" cat /run/quasar/dev-agent-key | tr -d '\r\n')"
   else
     BASE_URL="${TARGET%/}"
     KEY="${QUASAR_DEV_AGENT_KEY:-}"

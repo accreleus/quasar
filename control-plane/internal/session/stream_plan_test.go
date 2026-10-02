@@ -64,7 +64,7 @@ func TestPlanStreamShippedSingleRungChain(t *testing.T) {
 		H264Profile: "high",
 		Codec:       "h264",
 		Chain:       chain("1080p60", rung("1080p60-h264", profile.CodecH264, 1920, 1080, 60, 8000)),
-		HostCodecs:  []string{"h264"},
+		GPUCodecs:   []string{"h264"},
 		Now:         fixedNow,
 		CertMaxAge:  CertStaleness,
 	}
@@ -112,7 +112,7 @@ func TestPlanStreamMultiCodecRejectsUnprovenAV1(t *testing.T) {
 		HostID:     strptr("host-1"),
 		GPUIndex:   i32(0),
 		Chain:      chain("high", r("2160p60-av1", profile.CodecAV1, 2160), r("1080p60-h264", profile.CodecH264, 1080)),
-		HostCodecs: []string{"h264", "av1"},
+		GPUCodecs:  []string{"h264", "av1"},
 		Probe:      probe(true, false), // hevc irrelevant here; av1 unproven
 		Now:        fixedNow,
 		CertMaxAge: CertStaleness,
@@ -143,7 +143,7 @@ func TestPlanStreamCertCapHopsToLowerChain(t *testing.T) {
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChain: lower, LowerChainID: lower.ID,
-		HostCodecs: []string{"h264"},
+		GPUCodecs: []string{"h264"},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictUnsafe, MeasuredAt: fixedNow},
 		},
@@ -197,7 +197,7 @@ func TestPlanStreamCertCappedButLiveWriteStableIsNotCapped(t *testing.T) {
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChain: lower, LowerChainID: lower.ID,
-		HostCodecs: []string{"h264"},
+		GPUCodecs: []string{"h264"},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictCapped, LiveWriteStable: true, MeasuredAt: fixedNow},
 		},
@@ -227,7 +227,7 @@ func TestPlanStreamCertCappedWithoutLiveWriteIsCapped(t *testing.T) {
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChain: lower, LowerChainID: lower.ID,
-		HostCodecs: []string{"h264"},
+		GPUCodecs: []string{"h264"},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictCapped, LiveWriteStable: false, MeasuredAt: fixedNow},
 		},
@@ -255,8 +255,8 @@ func TestPlanStreamCertUnsafeNoLowerChainNamed(t *testing.T) {
 	top, _ := certCapFixture()
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
-		Chain:      top, // LowerChain/LowerChainID left zero.
-		HostCodecs: []string{"h264"},
+		Chain:     top, // LowerChain/LowerChainID left zero.
+		GPUCodecs: []string{"h264"},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictUnsafe, MeasuredAt: fixedNow},
 		},
@@ -288,7 +288,7 @@ func TestPlanStreamCertUnsafeLowerChainFailedToLoad(t *testing.T) {
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChainID: "720p60", // named, but LowerChain never loaded.
-		HostCodecs: []string{"h264"},
+		GPUCodecs: []string{"h264"},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictUnsafe, MeasuredAt: fixedNow},
 		},
@@ -321,7 +321,7 @@ func TestPlanStreamCertUnsafeLowerChainHasNoRungs(t *testing.T) {
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChainID: "720p60",
 		LowerChain: profile.LaunchProfile{ID: "720p60", DisplayName: "720p60"}, // no Rungs
-		HostCodecs: []string{"h264"},
+		GPUCodecs:  []string{"h264"},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictUnsafe, MeasuredAt: fixedNow},
 		},
@@ -349,8 +349,8 @@ func TestPlanStreamAdminBypassesCap(t *testing.T) {
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChain: lower, LowerChainID: lower.ID,
-		HostCodecs: []string{"h264"},
-		Params:     LaunchParams{IsAdmin: true},
+		GPUCodecs: []string{"h264"},
+		Params:    LaunchParams{IsAdmin: true},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictUnsafe, MeasuredAt: fixedNow},
 		},
@@ -378,8 +378,8 @@ func TestPlanStreamExplicitOverrideBypassesCap(t *testing.T) {
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChain: lower, LowerChainID: lower.ID,
-		HostCodecs: []string{"h264"},
-		Override:   StreamOverride{BitrateKbps: i32(6000)},
+		GPUCodecs: []string{"h264"},
+		Override:  StreamOverride{BitrateKbps: i32(6000)},
 		Certs: []EncoderCertRow{
 			{StreamProfileID: "1080p60-h264", BitrateKbps: 8000, Verdict: VerdictUnsafe, MeasuredAt: fixedNow},
 		},
@@ -400,12 +400,12 @@ func TestPlanStreamExplicitOverrideBypassesCap(t *testing.T) {
 // TestPlanStreamNoHostBypassesCapButStillResolves: placement produced no host
 // (nil HostID/GPUIndex) — the cap has nothing to consult, but the walk must
 // still run: an unplaced session is not a broken one. Also exercises clamp 1's
-// other edge: nil HostCodecs is an h264-only host, not a host that accepts
+// other edge: nil GPUCodecs is an h264-only GPU, not a host that accepts
 // nothing.
 func TestPlanStreamNoHostBypassesCapButStillResolves(t *testing.T) {
 	in := StreamInputs{
 		Chain: chain("high", r("2160p60-av1", profile.CodecAV1, 2160), r("1080p60-h264", profile.CodecH264, 1080)),
-		// HostID/GPUIndex/HostCodecs all left zero.
+		// HostID/GPUIndex/GPUCodecs all left zero.
 		Probe:      probe(true, true),
 		Now:        fixedNow,
 		CertMaxAge: CertStaleness,
@@ -418,7 +418,7 @@ func TestPlanStreamNoHostBypassesCapButStillResolves(t *testing.T) {
 		t.Errorf("CapOutcome = %q, want %q", plan.CapOutcome, capNotEligible)
 	}
 	if plan.RungID != "1080p60-h264" {
-		t.Errorf("RungID = %q, want the h264 rung — nil HostCodecs must clamp av1 like an h264-only host", plan.RungID)
+		t.Errorf("RungID = %q, want the h264 rung — nil GPUCodecs must clamp av1 like an h264-only GPU", plan.RungID)
 	}
 }
 
@@ -442,8 +442,8 @@ func TestPlanStreamEnvelopeReappliedAfterCapHop(t *testing.T) {
 	in := StreamInputs{
 		HostID: strptr("host-1"), GPUIndex: i32(0),
 		Chain: top, LowerChain: lower, LowerChainID: lower.ID,
-		HostCodecs: []string{"h264"},
-		Envelope:   ProbeEnvelope{SafeCeilingKbps: 2500},
+		GPUCodecs: []string{"h264"},
+		Envelope:  ProbeEnvelope{SafeCeilingKbps: 2500},
 		Certs: []EncoderCertRow{
 			// Matched against the TOP rung's POST-envelope dispatch bitrate
 			// (2500, not its raw 8000) — that's what applyCertCap's pickCert
@@ -474,10 +474,10 @@ func TestPlanStreamEnvelopeReappliedAfterCapHop(t *testing.T) {
 func TestPlanStreamExplicitCodecOverrideNotInChain(t *testing.T) {
 	single := chain("1080p60", rung("1080p60-h264", profile.CodecH264, 1920, 1080, 60, 8000))
 	in := StreamInputs{
-		Chain:      single,
-		HostCodecs: []string{"h264", "av1"},
-		Override:   StreamOverride{Codec: strptr("av1")},
-		Now:        fixedNow, CertMaxAge: CertStaleness,
+		Chain:     single,
+		GPUCodecs: []string{"h264", "av1"},
+		Override:  StreamOverride{Codec: strptr("av1")},
+		Now:       fixedNow, CertMaxAge: CertStaleness,
 	}
 	plan, err := planStream(in)
 	if !errors.Is(err, ErrRungCodecNotAvailable) {
@@ -498,10 +498,10 @@ func TestPlanStreamExplicitCodecOverrideNotInChain(t *testing.T) {
 func TestPlanStreamExplicitCodecOverrideHostCannotEncode(t *testing.T) {
 	high := chain("high", r("2160p60-av1", profile.CodecAV1, 2160), r("1080p60-h264", profile.CodecH264, 1080))
 	in := StreamInputs{
-		Chain:      high,
-		HostCodecs: []string{"h264"}, // no av1
-		Override:   StreamOverride{Codec: strptr("av1")},
-		Now:        fixedNow, CertMaxAge: CertStaleness,
+		Chain:     high,
+		GPUCodecs: []string{"h264"}, // no av1
+		Override:  StreamOverride{Codec: strptr("av1")},
+		Now:       fixedNow, CertMaxAge: CertStaleness,
 	}
 	_, err := planStream(in)
 	if !errors.Is(err, ErrCodecUnsupportedByHost) {
@@ -520,7 +520,7 @@ func TestPlanStreamFloorKeepsSelectedAndRejectReason(t *testing.T) {
 	floor := hwRung("4k60-h264", profile.CodecH264, 2160)
 	in := StreamInputs{
 		Chain:       chain("4k-chain", r("4k60-av1", profile.CodecAV1, 2160), floor),
-		HostCodecs:  []string{"h265"},                                     // clamp 1: can't even encode h264
+		GPUCodecs:   []string{"h265"},                                     // clamp 1: can't even encode h264
 		HostEncoder: hostEncoderCaps{Known: true, HardwareEncoder: false}, // clamp 5
 		Probe:       probeAt(false, false, 720),                           // clamp 2/3
 		FailedRungs: map[string]bool{"4k60-av1": true, "4k60-h264": true}, // clamp 4
@@ -548,6 +548,88 @@ func TestPlanStreamFloorKeepsSelectedAndRejectReason(t *testing.T) {
 	}
 	if !got.Selected || !got.Bypassed || got.Reject == "" {
 		t.Errorf("floor verdict = %+v, want Selected=true Bypassed=true and a NON-EMPTY Reject (kept, not cleared)", *got)
+	}
+}
+
+// --- clamp 1 reads the placed GPU's codec set (#303) -------------------------
+
+// gpuNarrowerInputs: a mixed host whose union advertises all three codecs, placed
+// on a GPU that encodes only H.264 and HEVC, for a client that decodes all three.
+func gpuNarrowerInputs() StreamInputs {
+	return StreamInputs{
+		SessionID:   "sess-303",
+		HostID:      strptr("host-mixed"),
+		GPUIndex:    i32(1),
+		H264Profile: "high",
+		Codec:       "h264",
+		Chain: chain("high",
+			r("1440p60-av1", profile.CodecAV1, 1440),
+			r("1440p60-hevc", profile.CodecHEVC, 1440),
+			r("1080p60-h264", profile.CodecH264, 1080)),
+		HostCodecs: []string{"h264", "h265", "av1"},
+		GPUCodecs:  []string{"h264", "h265"},
+		Probe:      probeAt(true, true, 2160),
+		Now:        fixedNow,
+		CertMaxAge: CertStaleness,
+	}
+}
+
+// TestPlanStreamAutoOnGPUNarrowerThanHostLandsOnHEVC is the reported defect: Auto
+// spread onto the iGPU must not resolve AV1 because a sibling GPU encodes it.
+func TestPlanStreamAutoOnGPUNarrowerThanHostLandsOnHEVC(t *testing.T) {
+	plan, err := planStream(gpuNarrowerInputs())
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if plan.RungID != "1440p60-hevc" || plan.Update.Codec != "h265" {
+		t.Fatalf("rung/codec = %q/%q, want 1440p60-hevc/h265", plan.RungID, plan.Update.Codec)
+	}
+	if v := plan.Decision.Considered[0]; v.ID != "1440p60-av1" || v.Reject != rejectHostEncoder {
+		t.Errorf("av1 verdict = %+v, want rejected_by %q", v, rejectHostEncoder)
+	}
+	if plan.Decision.Floor {
+		t.Error("Decision.Floor = true, want false")
+	}
+}
+
+// TestPlanStreamHostSetDoesNotDecide: HostCodecs is carried for the log line only.
+func TestPlanStreamHostSetDoesNotDecide(t *testing.T) {
+	in := gpuNarrowerInputs()
+	in.HostCodecs = []string{"h264"}
+	in.GPUCodecs = []string{"h264", "h265", "av1"}
+	plan, err := planStream(in)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if plan.Update.Codec != "av1" {
+		t.Errorf("codec = %q, want av1 (clamp 1 reads the GPU set)", plan.Update.Codec)
+	}
+}
+
+func TestPlanStreamExplicitAV1OnCapableGPUPassesClamp0(t *testing.T) {
+	in := gpuNarrowerInputs()
+	in.GPUIndex = i32(0)
+	in.GPUCodecs = []string{"h264", "h265", "av1"}
+	in.Override = codecOv("av1")
+	plan, err := planStream(in)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if plan.RungID != "1440p60-av1" || plan.Update.Codec != "av1" {
+		t.Fatalf("rung/codec = %q/%q, want 1440p60-av1/av1", plan.RungID, plan.Update.Codec)
+	}
+	if v := plan.Decision.Considered[0]; !v.Selected || !v.Bypassed {
+		t.Errorf("av1 verdict = %+v, want Selected and Bypassed", v)
+	}
+}
+
+// TestPlanStreamExplicitAV1OnNarrowerGPUStill409s: until the codec constraint gates
+// placement (#304), an explicit codec the placed GPU cannot encode stays a 409.
+func TestPlanStreamExplicitAV1OnNarrowerGPUStill409s(t *testing.T) {
+	in := gpuNarrowerInputs()
+	in.Override = codecOv("av1")
+	if _, err := planStream(in); !errors.Is(err, ErrCodecUnsupportedByHost) {
+		t.Fatalf("err = %v, want ErrCodecUnsupportedByHost", err)
 	}
 }
 
@@ -825,7 +907,7 @@ func throughputInputs(ch profile.LaunchProfile, rates map[string]float64) Stream
 		H264Profile: "high",
 		Codec:       "h264",
 		Chain:       ch,
-		HostCodecs:  []string{"h264", "h265", "av1"},
+		GPUCodecs:   []string{"h264", "h265", "av1"},
 		HostEncoder: hostEncoderCaps{Known: true, HardwareEncoder: true, PixelRates: rates},
 		// Proven decode for both gated codecs, and a 4K decode ceiling, so nothing
 		// but clamp 6 can move these cases.

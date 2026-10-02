@@ -62,7 +62,7 @@ function InfoIcon() {
   return (
     <svg className="ic" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <circle cx="8" cy="8" r="8" fill="var(--info)" />
-      <path d="M8 7v4M8 5v.5" stroke="#08080c" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="M8 7v4M8 5v.5" stroke="var(--status-glyph-ink)" strokeWidth="1.8" strokeLinecap="round" />
     </svg>
   );
 }

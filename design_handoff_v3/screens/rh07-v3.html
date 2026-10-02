@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quasar — Engines, host preparation and console mode (RH-07 reference)</title>
+<link rel="stylesheet" href="assets/console-v3.css">
+<!--
+  RH-07 (#394) surfaces. AWAITING THE OWNER'S APPROVAL (#394). No RH-07 UI
+  ticket builds against this file until the owner approves it (D21).
+
+  Structure copies fleet-rh06-v3.html: a standalone reference page that renders
+  section renderers (assets/pages-rh07.js) into a gallery, one specimen per
+  surface and state.
+
+  Two styles live on this page, because the surfaces live in two places:
+
+  A. The quick start (specimens qs-*) is on the documentation site, which is
+     Starlight with its own theme (site/src/styles/theme.css, --q-* tokens) and
+     the wizard's own qs-* classes (site/src/components/QuickStart.astro). Those
+     specimens are drawn in the site's style, not console-v3. Blocks S1-S3 below
+     copy the site's values so they render here.
+  B. The admin console surfaces (console-*, rd-*) use console-v3.css and the
+     ui.js helpers, like every other v3 mock.
+
+  CSS added below, and why. Every value is an existing token, or a value the
+  file it is copied from already uses.
+   1. Page framing, gallery captions, the stand-in scrim: copied unchanged from
+      fleet-rh06-v3.html. Mock only. Do not port.
+   2. .modal*, .snippet, .diag, .rel-fact: copied unchanged from
+      fleet-rh06-v3.html (approved in #354).
+   3. Readiness card: .sec-card/.sec-head from web/src/styles/primitives.css and
+      .readiness-*, .rdy-*, .host-setting-copy from web/src/styles/components.css,
+      copied unchanged. The handoff has no readiness surface; the product's
+      ReadinessCard is the existing pattern (it says so in its own header).
+  S1. .site: the site's dark --q-* tokens and Starlight's --sl-* mapping, copied
+      from site/src/styles/theme.css, scoped to the specimen. The frame's padding
+      and border are mock only.
+  S2. .qs*: copied unchanged from QuickStart.astro's <style>.
+  S3. .sl-badge: Starlight's own <Badge> component (@astrojs/starlight
+      user-components/Badge.astro), small size, with Starlight's default dark
+      hues. The quick start has no badge today; this is the site framework's
+      built-in one, not a new style. theme.css does not re-point Starlight's
+      green/orange/red to Quasar's state colours: see rh07/README.md.
+-->
+<style>
+ /* 1. framing, as fleet-rh06-v3.html */
+ body{padding:40px;max-width:1160px;margin:0 auto}
+ h1.ref{font-size:var(--t-h2);margin:0 0 6px}
+ .intro{color:var(--text-3);font-size:var(--t-sm);margin:0 0 24px;line-height:1.6;max-width:90ch}
+ .intro code{font-family:var(--font-mono);font-size:.85em;color:var(--text-2)}
+ .spec{margin:0 0 var(--s9);padding-top:var(--s5);border-top:1px solid var(--line)}
+ .spec-cap{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:var(--s5)}
+ .spec-cap .t{font-family:var(--font-display);font-weight:600;font-size:var(--t-base);color:var(--text)}
+ .spec-cap .hint{flex-basis:100%}
+ .spec>.page{max-width:none}
+ .toc{columns:2;column-gap:var(--s8);font-size:var(--t-sm);margin:0 0 var(--s7);padding-left:18px;color:var(--text-3)}
+ .stage{display:flex;justify-content:center;align-items:flex-start;padding:var(--s8) var(--s5);border-radius:var(--r-panel);background:oklch(0.05 0.01 267/.52);border:1px solid var(--line)} /* .dscrim's own scrim colour */
+ /* 2. from fleet-rh06-v3.html, unchanged */
+ .modal{background:color-mix(in oklch,var(--surf-panel) 94%,transparent);backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);border:1px solid var(--glass-border);border-radius:var(--r-feature);box-shadow:inset 0 1px 0 var(--glass-highlight),0 2rem 6rem oklch(0.05 0.01 267/.76);width:100%;max-width:460px}
+ .modal-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s4);padding:var(--s5) var(--s6);border-bottom:1px solid var(--line)}
+ .modal-head h3{font-size:var(--t-h3)}
+ .modal-body{padding:var(--s6)}
+ .modal-foot{display:flex;align-items:center;justify-content:flex-end;gap:var(--s3);padding:var(--s4) var(--s6);border-top:1px solid var(--line)}
+ .snippet{display:flex;gap:var(--s3);align-items:flex-start;background:color-mix(in oklch,var(--surf-inset) 82%,transparent);border:1px solid var(--line);border-radius:var(--r-control);padding:9px 11px}
+ .snippet pre{flex:1;min-width:0;margin:0;font-family:var(--font-mono);font-size:var(--t-xs);line-height:1.6;color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere}
+ .diag{margin-top:10px}
+ .diag>summary{display:inline-flex;align-items:center;gap:5px;cursor:pointer;list-style:none;font-size:var(--t-xs);color:var(--text-3)}
+ .diag>summary::-webkit-details-marker{display:none}
+ .diag>summary:hover{color:var(--text)}
+ .diag>summary svg{width:11px;height:11px;transition:transform .15s}
+ .diag[open]>summary svg{transform:rotate(90deg)}
+ .diag pre{margin:8px 0 0;font-family:var(--font-mono);font-size:var(--t-xs);line-height:1.7;color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere;background:color-mix(in oklch,var(--surf-inset) 82%,transparent);border:1px solid var(--line);border-radius:var(--r-control);padding:9px 11px}
+ .rel-fact{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid var(--line);font-size:var(--t-sm)}
+ .rel-fact:first-of-type{border-top:0}
+ .rel-fact>span:first-child{color:var(--text-3)}
+ .rel-fact>span:last-child{text-align:right}
+ /* 3. readiness card: web/src/styles/primitives.css + components.css, unchanged */
+ .sec-card{padding:var(--card-pad)}
+ .sec-head{display:flex;align-items:flex-start;gap:var(--s4);margin-bottom:var(--s5)}
+ .sec-head h3{font-family:var(--font-display);font-size:var(--t-h3)}
+ .sec-head .desc{color:var(--text-3);font-size:var(--t-sm);margin-top:var(--s1);max-width:68ch}
+ .readiness-group .eyebrow{margin-bottom:var(--s2)}
+ .readiness-more{margin-top:var(--s4)}
+ .readiness-more>summary{cursor:pointer;font-size:var(--t-sm);color:var(--text-2);list-style:none}
+ .readiness-more>summary::-webkit-details-marker{display:none}
+ .readiness-more>summary::before{content:"▸ "}
+ .readiness-more[open]>summary::before{content:"▾ "}
+ .readiness-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:var(--s3)}
+ .rdy-glyph{flex:none;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;border:1.5px solid currentColor;font-size:11px;line-height:1}
+ .rdy-glyph svg{width:11px;height:11px;stroke-width:2.2}
+ .rdy-ok{color:var(--success);background:var(--success-bg)}
+ .rdy-bad{color:var(--danger);background:var(--danger-bg)}
+ .rdy-warn{color:var(--warning);background:var(--warning-bg)}
+ .rdy-off{color:var(--text-3);border-style:dashed}
+ .readiness-check{display:flex;gap:var(--s3);padding:var(--s3) var(--s3);border:1px solid var(--line);border-radius:var(--r-control);background:var(--surf-inset);min-width:0}
+ .host-setting-copy{min-width:0}
+ .host-setting-copy h3{margin:0;font-size:var(--t-base)}
+ .host-setting-copy p{margin:var(--s2) 0;color:var(--text-2);font-size:var(--t-sm);overflow-wrap:anywhere}
+ .host-setting-copy .rdy-title{font-size:var(--t-sm)}
+ .host-setting-copy .rdy-provenance{font-size:var(--t-xs);color:var(--text-3)}
+
+ /* S1. the documentation site: theme.css dark tokens + Starlight mapping */
+ .site{
+  --q-ink-0:oklch(0.105 0.01 267);--q-ink-1:oklch(0.115 0.012 267);--q-ink-2:oklch(0.163 0.018 268);--q-ink-3:oklch(0.208 0.02 268);--q-ink-4:oklch(0.252 0.022 267);--q-ink-5:oklch(0.292 0.022 265);
+  --q-line:oklch(0.9618 0.0086 247.91/.09);--q-line-2:oklch(0.9618 0.0086 247.91/.12);--q-line-3:oklch(0.6605 0.0265 259.81/.46);
+  --q-text:oklch(0.9618 0.0086 247.91);--q-text-2:oklch(0.76 0.022 258);--q-text-3:oklch(0.6605 0.0265 259.81);--q-text-4:oklch(0.56 0.024 259);
+  --q-font-display:'IBM Plex Sans',Inter,ui-sans-serif,system-ui,sans-serif;--q-font-mono:'IBM Plex Mono','SFMono-Regular',Consolas,monospace;
+  --q-r-sm:4px;--q-r-md:8px;--q-r-lg:12px;
+  --sl-color-accent:oklch(0.5998 0.2179 273.21);--sl-color-text-accent:oklch(0.78 0.13 273.21);--sl-color-bg-inline-code:var(--q-ink-4);
+  --sl-color-orange:hsl(41,82%,63%);--sl-color-orange-low:hsl(41,39%,22%);--sl-color-green:hsl(101,82%,63%);--sl-color-green-low:hsl(101,39%,22%);--sl-color-red:hsl(339,82%,63%);--sl-color-red-low:hsl(339,39%,22%); /* Starlight props.css defaults */
+  background:var(--q-ink-1);color:var(--q-text-2);border:1px solid var(--line);border-radius:var(--r-panel);padding:var(--s6) var(--s7); /* frame: mock only */
+  font-family:var(--q-font-display);font-size:1rem;line-height:1.65}
+ .site .sl-content{max-width:50rem;margin:0 auto}
+ .site h2{font-weight:700;letter-spacing:-.02em;color:var(--q-text)}
+ .site h3,.site h4{font-weight:600;letter-spacing:-.02em;color:var(--q-text)}
+ .site a{color:var(--sl-color-text-accent);text-decoration:underline}
+ .site :not(pre)>code{font-family:var(--q-font-mono);font-size:.875em;border-radius:5px;padding:.15em .4em;background:var(--sl-color-bg-inline-code)}
+ .site pre,.site pre code{font-family:var(--q-font-mono)}
+ .site pre{white-space:pre;color:var(--q-text-2)}
+ /* S2. QuickStart.astro's <style>, unchanged */
+ .qs{border:1px solid var(--q-line-2);border-radius:var(--q-r-lg);background:var(--q-ink-2);padding:1.5rem;margin:0}
+ .qs-progress{display:flex;gap:.5rem;list-style:none;margin:0 0 1.75rem;padding:0;font-family:var(--q-font-mono);font-size:.6875rem;letter-spacing:.12em;text-transform:uppercase}
+ .qs-progress li{flex:1;padding-top:.5rem;border-top:2px solid var(--q-line-2);color:var(--q-text-4)}
+ .qs-progress li.on{border-top-color:var(--sl-color-accent);color:var(--q-text-2)}
+ .qs-step h2{margin:0 0 .35rem;font-size:1.25rem}
+ .qs-hint{color:var(--q-text-3);font-size:.875rem;margin:0 0 1rem}
+ .qs-choices{display:grid;gap:.5rem;margin-bottom:1rem}
+ .qs-choices label{display:flex;gap:.75rem;align-items:baseline;padding:.75rem .9rem;border:1px solid var(--q-line-2);border-radius:var(--q-r-md);cursor:pointer}
+ .qs-choices label:has(input:checked){border-color:var(--sl-color-accent);background:color-mix(in srgb,var(--sl-color-accent) 8%,transparent)}
+ .qs-choices span{display:flex;flex-direction:column;gap:.15rem}
+ .qs-choices em{font-style:normal;font-size:.8125rem;color:var(--q-text-3)}
+ .qs-check{display:flex;gap:.5rem;align-items:center;font-size:.875rem;margin-bottom:.9rem}
+ .qs-note{font-size:.8125rem;color:var(--q-text-3);border-left:2px solid var(--q-line-2);padding-left:.75rem;margin:.75rem 0}
+ .qs-warn{border-left-color:var(--sl-color-orange)}
+ .qs-summary{margin:0 0 1.5rem;border:1px solid var(--q-line-2);border-radius:var(--q-r-md);overflow:hidden}
+ .qs-sum-row{display:grid;grid-template-columns:11rem 1fr;gap:1rem;align-items:baseline;padding:.5rem .9rem;font-size:.875rem}
+ .qs-sum-row+.qs-sum-row{border-top:1px solid var(--q-line-2)}
+ .qs-summary dt{color:var(--q-text-3);margin:0}
+ .qs-summary dd{margin:0;font-family:var(--q-font-mono);word-break:break-all}
+ .qs-out{margin:1.25rem 0}
+ .qs-out-head{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:.35rem}
+ .qs-out-head h3,.qs-out-head h4{margin:0;font-size:1rem}
+ .qs pre{max-height:26rem;overflow:auto;background:var(--q-ink-3);border:1px solid var(--q-line-2);border-radius:var(--q-r-md);padding:.9rem;font-size:.8125rem;line-height:1.5;margin:0 0 .75rem}
+ .qs-adv{margin:1rem 0;font-size:.9375rem}
+ .qs-adv summary{cursor:pointer;color:var(--q-text-2)}
+ .qs-nav{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-top:1.75rem;padding-top:1.25rem;border-top:1px solid var(--q-line-2)}
+ .qs-count{font-family:var(--q-font-mono);font-size:.75rem;color:var(--q-text-3)}
+ .qs button{padding:.5rem 1.1rem;border-radius:var(--q-r-md);border:1px solid var(--q-line-2);background:var(--q-ink-3);color:inherit;font:inherit;font-size:.875rem;cursor:pointer}
+ .qs [data-next]{background:var(--sl-color-accent);border-color:transparent;color:#fff}
+ .qs button:disabled{opacity:.4;cursor:not-allowed}
+ /* S3. Starlight <Badge size="small">, unchanged */
+ .sl-badge{display:inline-block;border:1px solid var(--sl-color-border-badge);border-radius:.25rem;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;line-height:normal;color:var(--sl-color-text-badge);background-color:var(--sl-color-bg-badge);overflow-wrap:anywhere}
+ .sl-badge.small{font-size:.8125rem;padding:.125rem .25rem}
+ .sl-badge.success{--sl-color-bg-badge:var(--sl-color-green-low);--sl-color-border-badge:var(--sl-color-green);--sl-color-text-badge:#fff}
+ .sl-badge.caution{--sl-color-bg-badge:var(--sl-color-orange-low);--sl-color-border-badge:var(--sl-color-orange);--sl-color-text-badge:#fff}
+ .sl-badge.danger{--sl-color-bg-badge:var(--sl-color-red-low);--sl-color-border-badge:var(--sl-color-red);--sl-color-text-badge:#fff}
+</style>
+</head>
+<body>
+<h1 class="ref">Engines, host preparation and console mode (RH-07)</h1>
+<p class="intro">Reference for the RH-07 surfaces (#394), <strong>approved by the owner on 2026-09-29</strong>, on condition that the build follows the v3 tokens and components. Specimens marked <em>site</em> are the documentation site’s quick start, drawn in the site’s own style (Starlight and the wizard’s <code>qs-*</code> classes), not console-v3. The rest are admin console surfaces, drawn with the console-v3 classes and <code>ui.js</code> helpers, as in <code>fleet-rh06-v3.html</code>. Machine names, versions and digests are placeholders. Wording follows <code>CONTEXT.md</code> “Engines and privilege”. The state list, the surface-to-ticket table and the open questions are in <code>rh07/README.md</code>.</p>
+<ol class="toc" id="toc"></ol>
+<div id="mount"></div>
+<script src="assets/ui.js"></script>
+<script src="assets/pages-rh06.js"></script>
+<script src="assets/pages-rh07.js"></script>
+<script>
+// [id, surface, state, note, render]
+const SPECS=[
+ ['qs-host','Site · Quick start: Host','normal · amended platform list','Context. Fedora names its image-based editions; “Debian or Ubuntu” splits, because only Ubuntu 24.04 has a profile (experimental). See open question 2.',()=>qsHost()],
+ ['qs-engine-none','Site · Quick start: Engine','empty · nothing chosen yet','A new step 2. There is no default engine yet (D3), so nothing is preselected and Next waits. The page cannot see the machine; the one-liner tells the reader what is installed, and the script checks again on the machine.',()=>qsEngine('fedora',null)],
+ ['qs-engine-supported','Site · Quick start: Engine','normal · supported profile','Fedora, Podman rootless.',()=>qsEngine('fedora','podman-rootless')],
+ ['qs-engine-rootful','Site · Quick start: Engine','normal · supported, rootful','A rootful engine says plainly that its socket is equivalent to root (D17).',()=>qsEngine('fedora','docker-rootful')],
+ ['qs-engine-experimental','Site · Quick start: Engine','variant · experimental profile','Ubuntu 24.04, Docker rootless. Allowed, and says what that means.',()=>qsEngine('ubuntu','docker-rootless')],
+ ['qs-engine-unsupported','Site · Quick start: Engine','error · unsupported profile','Unraid, Podman rootless. The reason is named, the alternative offered, and Next waits. See open question 1.',()=>qsEngine('unraid','podman-rootless')],
+ ['qs-result-podman','Site · Quick start: Result','normal · Podman rootless: host preparation + Quadlet unit','Step 1 is the one root step, with its optional toggles. Step 2 is the seed as a Quadlet unit for the quasar account (D15).',()=>qsResult('podman-rootless')],
+ ['qs-prep-output','Site · Quick start: Result','normal · “What host preparation changes” open','The printed lines, word for word from deploy/prepare-host.sh, on a first run.',()=>qsPrepOutput('first')],
+ ['qs-prep-rerun','Site · Quick start: Result','normal · host preparation run again','Nothing left to change: every line reads ok.',()=>qsPrepOutput('rerun')],
+ ['qs-result-docker','Site · Quick start: Result','normal · Docker rootful: host preparation + seed by docker run','Docker keeps today’s script and the Dockge or Arcane stack. The script no longer prepares the host itself; it checks the engine and stops on a mismatch.',()=>qsResult('docker-rootful')],
+ ['qs-result-docker-rootless','Site · Quick start: Result','variant · Docker rootless: the seed runs as the quasar account','The same seed, talking to the quasar account’s Docker socket.',()=>qsResult('docker-rootless')],
+ ['console-off','Console mode: Fleet ▸ host ▸ Local console','normal · off','An owned host. Turning it on replaces the node agent through the recovery actor, so the page says what that ends.',()=>pageR7Console('off')],
+ ['console-confirm','Console mode','normal · confirm turning on','Save asks first, because the replacement ends the host’s sessions.',()=>stage(r7ConsoleConfirm())],
+ ['console-applying','Console mode','normal · applying','The setting does not claim success until the new node agent is healthy. Settings are locked meanwhile.',()=>pageR7Console('applying')],
+ ['console-on','Console mode','normal · on, host PipeWire','Local audio goes to the host’s PipeWire when it runs one (D13).',()=>pageR7Console('on')],
+ ['console-on-alsa','Console mode','variant · on, no PipeWire on the host','Local audio goes to the sound device directly (ALSA).',()=>pageR7Console('alsa')],
+ ['console-failed','Console mode','error · failed and restored','The recovery actor put the previous node agent back. The named cause is a display another process holds.',()=>pageR7Console('failed')],
+ ['console-unprepared','Console mode','error · host not prepared for console mode','Host preparation ran without --console, so the agent cannot open the display, sound or monitor-control devices. The fix is host preparation, never more privilege.',()=>pageR7Console('unprepared')],
+ ['rd-rootless','Readiness card: host page','normal · Podman rootless, optional diagnostics skipped','Engine facts head the card. Skipped checks sit in their disclosure, shown open, each saying why. A skip is never a fault.',()=>pageR7Readiness('rootless')],
+ ['rd-rootful','Readiness card','normal · Docker rootful','Checks that do not apply to rootful Docker are skipped, with the reason.',()=>pageR7Readiness('rootful')],
+ ['rd-experimental','Readiness card','variant · experimental engine profile','runtime_engine warns and names the profile. It never blocks.',()=>pageR7Readiness('experimental')],
+ ['rd-fail','Readiness card','error · host preparation missing','A failure beside a skip, for contrast: the failure has a fix and can block; the skip has neither.',()=>pageR7Readiness('fail')],
+ ['rd-unknown','Readiness card','unknown · engine not reported','An agent from before amendment 17 reports no engine facts.',()=>pageR7Readiness('unknown')]];
+document.getElementById('toc').innerHTML=SPECS.map(([id,s,st])=>`<li><a href="#s-${id}">${s}</a> — ${st}</li>`).join('');
+document.getElementById('mount').innerHTML=SPECS.map(([id,s,st,note,fn])=>`<section class="spec" id="s-${id}">
+ <div class="spec-cap"><span class="t">${s}</span><span class="chip${/^error/.test(st)?' chip-danger':/^unknown|^empty/.test(st)?'':/^variant/.test(st)?' chip-warning':' chip-accent'}">${st}</span>${note?`<span class="hint">${note}</span>`:''}</div>
+ ${fn()}</section>`).join('');
+</script>
+</body>
+</html>

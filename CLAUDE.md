@@ -51,8 +51,8 @@ renumbered to their public issues.
 
 ## Repo map
 - `protocol/`     shared wire definitions (frozen interfaces) — **a git submodule of `quasar-protocol`** (the canonical contracts repo, also submoduled by `photon`, the native client — renamed from `quasar-client` in the 2026-08-20 org move). Run `git submodule update --init` after cloning/pulling. **Contract changes now happen in `quasar-protocol`** (Opus + sign-off as before), then bump the submodule pin here and in `photon`. Builds don't read `protocol/` (it's docs), so a deploy box with an un-init'd submodule still builds/runs — but **`go test ./...` does**: `TestOpenAPIDrift` reads `protocol/openapi.yaml` and fails with "no such file or directory" in a fresh worktree until you `git submodule update --init protocol`.
-- `node-agent/`   (Rust) real home; graduated out of the Phase-0 spike in Phase 1 (the `spike/` tree was retired 2026-07-17 — git history). **`session/pipeline.rs` is now a ~620-line facade over a `session/pipeline/` submodule tree** (`caps`/`encoders`/`source_branch`/`abr_glue`/`webrtc`/`rtp_ext`/`audio_branch`/`probes`.rs) — the gst-graph construction split (TD-01, review #5). Locate pipeline code by submodule, not one giant file.
-- `control-plane/`(Go) real home; Phase 1 service exists (auth, CRUD, session lifecycle, signaling relay). **`internal/session/coordinator.go` is now a ~255-line facade** (implements `agentws.Events`) over per-concern files (`launcher`/`swapper`/`health_evaluator`/`host_lifecycle`/`profile_resolver`/`agent_state`.go); `swapper` + `healthEvaluator` own their state+mutex (TD-02, review #7). **The post-placement stream decision is `internal/session/stream_plan.go`** — `gatherStreamInputs` (launcher.go) does every read, `planStream` decides with no I/O, the caller logs + writes once + `applyTo`s the session. Rung/codec/cert-cap behaviour changes go in the pure function, not back into the launch path; its cert ranking (`pickCert`) is guarded against its SQL twin by `TestCertForRungMatchesPickCert`. **Self-update lives in `internal/platform`** (2026-09-05, #104): `buildinfo` (the control plane's own identity), `plan.go` (`PlanRelease` — the pure release decision: ordering by schema version then build time, per-target eligibility reasons, faults; every ADR 0002 rule lives here, not in handlers), the stable/edge release sources + the `platform.release_detect` job, and the apply machines (`apply_runner.go` per host, `apply_fleet.go` + `apply_self.go` for the fleet run and the control plane's own recreate, `apply_revert.go`). **The updater is `internal/updater` + `cmd/quasar-updater`** (image `deploy/Dockerfile.updater`, compose service `quasar-updater`): `Plan()` is the pure accept/reject + env-rewrite + command decision, the executor runs docker/compose; its unix-socket API is host-local and NOT a frozen contract.
+- `node-agent/`   (Rust) real home; graduated out of the Phase-0 spike in Phase 1 (the `spike/` tree was retired 2026-07-17 — git history). **`session/pipeline.rs` is now a ~620-line facade over a `session/pipeline/` submodule tree** (`caps`/`encoders`/`source_branch`/`abr_glue`/`webrtc`/`rtp_ext`/`audio_branch`/`probes`.rs) — the gst-graph construction split (TD-01, review #5). Locate pipeline code by submodule, not one giant file. **`node-agent/` is a Cargo workspace (#355):** the agent package plus `crates/quasar-runtime`, the GStreamer/CUDA-free engine facade, ownership label, self-inspection and `DurableFile`/`StateLease` primitives that the agent (and the RH-06 recovery actor) link; `node-agent/src/runtime.rs` re-exports it and keeps the agent's own lifecycles. `crates/quasar-recovery` (#356, also GStreamer-free) is the recovery actor's library and binary (seed, actor, `restore`, `uninstall`, `reconfigure`, `status`): `trust`, the release trust gates ported from the retired Go updater, and `socket`, the control-socket shapes. **The trust gates are defined by `testdata/recovery/trust-vectors`**, the Go updater's answers frozen when it retired (#367): a trust change edits the vectors and the Rust port together, under security review. The socket shapes are pinned by `testdata/recovery/socket`, read by both the Go and the Rust suites (the top-level `testdata/` holds fixtures both read).
+- `control-plane/`(Go) real home; Phase 1 service exists (auth, CRUD, session lifecycle, signaling relay). **`internal/session/coordinator.go` is now a ~255-line facade** (implements `agentws.Events`) over per-concern files (`launcher`/`swapper`/`health_evaluator`/`host_lifecycle`/`profile_resolver`/`agent_state`.go); `swapper` + `healthEvaluator` own their state+mutex (TD-02, review #7). **The post-placement stream decision is `internal/session/stream_plan.go`** — `gatherStreamInputs` (launcher.go) does every read, `planStream` decides with no I/O, the caller logs + writes once + `applyTo`s the session. Rung/codec/cert-cap behaviour changes go in the pure function, not back into the launch path; its cert ranking (`pickCert`) is guarded against its SQL twin by `TestCertForRungMatchesPickCert`. **Self-update lives in `internal/platform`** (2026-09-05, #104): `buildinfo` (the control plane's own identity), `plan.go` (`PlanRelease` — the pure release decision: ordering by schema version then build time, per-target eligibility reasons, faults; every ADR 0002 rule lives here, not in handlers), the stable/edge release sources + the `platform.release_detect` job, and the apply machines (`apply_runner.go` per host, `apply_fleet.go` + `apply_self.go` for the fleet run and the control plane's own recreate, `apply_revert.go`). **The control plane applies itself through the recovery actor on its own machine** (`internal/platform/actor_client.go`, over the control socket; the Compose updater, `internal/updater` + `cmd/quasar-updater`, retired with RH06-15 #367): a control plane with no recovery actor reads `updater_absent`, and nothing in the tree ships a Compose updater any more.
 - `web/`          unified TypeScript + React + Vite SPA; scaffolded in Phase 1 (ports the Phase-0 spike client's signaling/input logic).
   **The admin data cycle lives in `web/src/lib/resource/` (2026-08-20) — use it, don't hand-roll another loader.**
   `useResource({label, fetch, pollMs?, initialData?})` for reads, `useAdminAction` for writes,
@@ -67,13 +67,15 @@ renumbered to their public issues.
   `npx tsc -b --noEmit` in a tree with no `node_modules` (every agent worktree) reports success for
   a tsc it never ran. `make test-web` runs it in the devtools container and has caught a real type
   error both of those passed.
+  **The design lint (`npm run lint:design`) checks spacing, colours and inline styles, and its
+  baseline (`web/src/styles/design-lint.baseline.json`) only ever goes down.**
 - `deploy/`       compose now, k8s manifests later. **Build images with `deploy/build-images.sh`, never a hand-typed `docker build`** — it forces an explicit `--target` (a bare build takes the LAST stage regardless of `-t`), rejects a `--build-arg` for an undeclared ARG (Docker ignores those silently), and validates every artifact against `deploy/image-contract.json` before promoting `:latest`. The contract is the durable form of every image defect that reached production; **never relax an assertion to make a build green.** **`deploy/` is the OPERATOR front door: it holds only what someone installing Quasar needs.** Contributor tooling lives under `scripts/` — `dev/` (the dev container wrapper and dev seeders), `verify/` (verify stages + the devtools image), `harness/` (acceptance harnesses, `lib/`, `checks/`, the `apitest` module, `peer-driver.mjs`), `release/` (release-evidence gates), `dx/` (the Makefile's orchestration) — and non-operator compose overlays live in `deploy/overlays/`. Don't add a new development script to `deploy/`.
-- `third_party/`  vendored forks — **currently only a README**; gst-wayland-display/inputtino are built from upstream pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime/nv targets on the `quasar-base` family), vendored only when modification is needed. Don't go looking for source here. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `310c03ec` (upstream base `43d4c25`), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.4` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
-- `CONTEXT.md`    the domain glossary (chain, rung, cert cap, stream plan, probe, envelope, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
+- **Third-party pins** — nothing is vendored as source: gst-wayland-display/inputtino/gst-interpipe/GStreamer are built from pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime targets on the `quasar-base` family) plus patches in `deploy/patches/`. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `6638e07` (upstream base `43d4c25`, upstream `stable` `016b4fc` merged), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.4` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
+- `CONTEXT.md`    the domain glossary (chain, rung, cert cap, stream plan, device probe, envelope, host probe, readiness check, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
 - `docs/`         design docs (config knobs: `docs/configuration.md` — every env var, default, accepted values). The scoped backlog of still-open review findings (all low/subjective or a future spike — none are bugs) and the executed TD-01/TD-02 refactor plans lived at `docs/tech-debt/REVIEW-REMAINING.md` and `docs/completed/tech-debt/`; both were deliberately not carried over to the public repository. **The finding numbers this bullet used to list were review-finding IDs from the pre-move tracker, not issues on this repo** — several of them collide with unrelated public issues, so they have been removed rather than left to mislead.
 
 ## Conventions
-- Rust: 2021 edition, `cargo fmt` + `cargo clippy -- -D warnings` clean before done.
+- Rust: 2021 edition, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean before done.
 - Go: `gofmt` + `go vet` clean; module path is `github.com/accreleus/quasar/control-plane`.
 - Commits: conventional-commits style (`feat:`, `fix:`, `docs:`, `chore:`).
 - No secrets in the repo. **`accreleus/quasar` is PUBLIC** — no keys, tokens or `.env` committed, and no real hostname, ssh alias, IP, or absolute path containing the operator's username in code, docs, commit messages, or the issue tracker. Speak in roles (`gpu-test`/`aux-infra`/`deploy-only`). `scripts/dev/leak-scan.sh` enforces it; `--issues` scans the tracker.
@@ -81,7 +83,7 @@ renumbered to their public issues.
 ## Git branching & environments (operator policy — 2026-07-07)
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
 - **`develop` = persistent, unstable integration branch.** All day-to-day work targets it.
-- **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`.
+- **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`. **A streaming-path change runs `make bench-check` before that merge** and closes out by publishing or updating its bench report (`make report-publish`, or `qbench sprint put` at sprint end) — see "Performance evidence (quasar-bench)" below and the landing sequence in `AGENTS.md`.
 - **Push branches to origin as you go — "no PR required" does not mean "no push".** Origin is
   how concurrent agents and other machines see in-flight work; a local-only branch is invisible
   to all of them. The 2026-08-31 develop merge is the cautionary tale: a multi-day local-only
@@ -124,7 +126,7 @@ mount the repo and work in it:
 bash scripts/dev/dev.sh image
 docker run --rm -v "$PWD":/workspace -w /workspace/node-agent quasar-agent-dev:latest cargo build
 ```
-- Rust:  `cargo build` / `cargo test` (in `node-agent`); `cargo fmt` + `cargo clippy -- -D warnings` clean before done. (`make test-rust`)
+- Rust:  `cargo build` / `cargo test --workspace` (in `node-agent`); `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean before done. A bare `cargo test`/`clippy` there covers only the agent package and skips `quasar-runtime`. (`make test-rust`)
 - Go:    `go build ./...` / `go test ./...` in `control-plane`. (`make test-go`; DB-backed: `make test-db`)
 - **Control-plane DB tests need a real Postgres — and silently skip without one.** The
   `internal/{auth,crud,session,signal}` integration tests `t.Skip()` unless `TEST_DATABASE_URL`
@@ -152,27 +154,50 @@ docker run --rm -v "$PWD":/workspace -w /workspace/node-agent quasar-agent-dev:l
   to main on merge (main then embeds the migration), it cannot be reverted to main beforehand
   without running the down-migration and resetting `schema_migrations` first.
 
+## Performance evidence (quasar-bench)
+quasar-bench (your bench server, `$BENCH_URL`) holds harness runs, commit verdicts and the
+sprint reports the operator reviews; `qbench` is its CLI and the `quasar-bench*` skills
+cover how to use it. `AGENTS.md` "Performance evidence (quasar-bench)" is the
+harness-neutral statement of these rules; keep the two identical in meaning.
+- **Before landing a streaming-path change** (encoder, capture, ABR/ladder, transport,
+  client presentation): runs for the new commit are posted, then `make bench-check`
+  (`qbench check`). Exit 3 blocks landing until each regressed metric is explained or
+  fixed. Exit 4 (nothing comparable) is not a pass and is said so in the summary.
+- **Every harness run carries `--repo accreleus/quasar --commit <sha>`** (the repo's
+  bench scripts send both). Mark a bad run `contaminated` with a reason; never delete it.
+- **At sprint end**, publish a sprint report (`qbench sprint put`) with before/after runs,
+  evidence and the board issues it closes; cite it in the final commit body and the issue
+  by report path ("bench sprint accreleus/quasar c15"), never by host name.
+- **When resuming work**, `make bench-status` (`qbench sprint status`) first; address every
+  open comment on a `changes_requested` report before new work. Never set a review status.
+- **Quote bench verdicts verbatim**; don't restate numbers from memory.
+- The server and key come from `BENCH_URL` / `BENCH_KEY` or qbench's `~/.config/qbench/`
+  — never write the address anywhere in this public repo. `qbench doctor` checks setup.
+
 ## GStreamer / WebRTC / encoder gotchas — moved to path-scoped rules
 Load-bearing gotchas now live in `.claude/rules/` and auto-load when working with matching files:
 - `.claude/rules/gstreamer-gotchas.md` — GStreamer-rs + encoder-property gotchas (loads for `node-agent/**`, `deploy/**`)
 - `.claude/rules/webrtc-testing.md` — WebRTC / browser testing gotchas (loads for `node-agent/**`, `web/**`, `deploy/**`)
 If you are doing pipeline, encoder, WebRTC, or browser-testing work purely over ssh without touching those paths locally, read the relevant rule file explicitly first.
 
-## UI work — the design handoff is the spec
+## UI work — DESIGN.md is the spec
 Any change touching `web/` rendering or a user-visible surface MUST start by
-reading **`design_handoff_v3/`** (README + `screens/assets/console-v3.css` — the
-token contract — + the matching `screens/*.html` mock: `login-v3`, `home`,
-`loading-v3`, `loading-to-stream-v3`, `session-overlay-v3`, `admin-console-v3`
-with its `assets/pages-*.js` section renderers), and MUST be visually verified
-against it (designer agent / `visual-verdict` skill) before being presented as
-done. v3 supersedes the earlier `design_handoff_quasar` / `design_handoff_v2`
-packages (removed 2026-08-28; git history has them) — where they differ, v3 wins.
+reading **`DESIGN.md`** (the rules, and where Quasar overrides the mocks), then the
+matching mock in **`design_handoff_v3/`** for composition (README +
+`screens/*.html`: `login-v3`, `home`, `loading-v3`, `loading-to-stream-v3`,
+`session-overlay-v3`, `admin-console-v3` with its `assets/pages-*.js` section
+renderers, `releases-v3`). Values live in `web/src/styles/tokens.css`. Where
+`DESIGN.md` and a mock disagree, `DESIGN.md` wins; the mocks carry flaws baked in by
+the design tool, and each known one is listed in its override table. A newly found
+flaw is added there in the same change that fixes it. The change MUST be visually
+verified (designer agent / `visual-verdict` skill) before being presented as done.
+v3 supersedes the earlier `design_handoff_quasar` / `design_handoff_v2` packages
+(removed 2026-08-28; git history has them).
 
-The rule that outlives either reference: **do not invent a style guide or
-restyle from taste.** One exists. If no mockup covers the surface being changed,
-say so explicitly and ask before styling. If you cannot reach the handoff at
-all, stop and ask rather than improvising. (History: a milestone run that
-skipped the handoff produced a full UI that had to be redone.)
+The rule that outlives any reference: **do not invent a style guide or restyle from
+taste.** If neither `DESIGN.md` nor a mock covers the surface being changed, say so
+explicitly and ask before styling. (History: a milestone run that skipped the handoff
+produced a full UI that had to be redone.)
 
 ## Model tiering (per-ticket tiers ride on each issue's `needs:*` label / kickoff doc)
 - Opus 4.8: architecture, interface/schema design, WebRTC negotiation, the latency path, security/concurrency, integration debugging, writing tickets, reviewing seams.
@@ -194,11 +219,13 @@ session memory `current-focus.md`, not this file.**
 
 **Standing operational defaults (knobs, not history):**
 - **Self-update (2026-09-05, #104):** admins see and apply *platform releases* from Fleet ▸
-  Releases. Channel defaults to `stable` (GitHub Releases + `platform-release-manifest.json`);
-  `edge` follows a branch tag (default `develop`). Detection is the `platform.release_detect`
+  Releases. Channel defaults to `stable` (GitHub Releases + `platform-release-manifest.v2.json`;
+  amendment 16's `edge` start for owned installs was withdrawn with the first stable owned release);
+  `edge` follows a branch tag (default `develop`; RH06-era builds publish `o2-<branch>`). Detection is the `platform.release_detect`
   job, weekly, Monday 02:00 UTC (editable in the Jobs tab; run-now = "Check now"). Applying goes
-  through the per-host **updater** (`quasar-updater` in every compose stack), which only accepts
-  digests under `QUASAR_UPDATER_ALLOWED_NAMESPACES` (default the org's GHCR namespace). Control
+  through each machine's **recovery actor** (an owned install, made with the seed), which only accepts
+  digests under `QUASAR_UPDATER_ALLOWED_NAMESPACES` (default the org's GHCR namespace); a Compose
+  or source stack has none and is never updated from the console. Control
   plane first, then hosts, never below the DB's migration (ADR 0002). The fleet run **cordons**
   the whole fleet for its whole life, but since #128/#153 it **drains before the control-plane
   step only when the release carries a migration** — otherwise live sessions ride straight
@@ -208,8 +235,8 @@ session memory `current-focus.md`, not this file.**
   `apply_fleet.go prepareFleet` carries the argument. Host steps drain as they always did — a
   node-agent recreate genuinely ends that host's sessions. A **source-built host or control
   plane is never offered a release** — it shows
-  the manual `redeploy.sh` recipe instead. Existing installs add the updater once
-  (`docs/upgrading.md` "The updater"). **Publishing a release** (exercised live: 0.2.0 → 0.2.3, 2026-09-05/06) is
+  the manual `redeploy.sh` recipe instead. A pre-RH06 Compose install is replaced by a fresh seed
+  install (`docs/upgrading.md`). **Publishing a release** (exercised live: 0.2.0 → 0.2.3, 2026-09-05/06) is
   `make release VERSION=x.y.z` on a clean `main` — recipe and refusals in `docs/upgrading.md`
   "Cutting a release". Two disciplines make it work: (1) **every change that lands on `develop`
   adds its line to `CHANGELOG.md` `## Unreleased` in the same landing** — the cut refuses an
@@ -217,8 +244,9 @@ session memory `current-focus.md`, not this file.**
   headings; the Releases tab parses them); (2) the develop→main promotion is a PR merged only
   with the operator's sign-off, and only THEN is the cut run. After the tag push, watch the
   Images run to success, verify `gh release view vX.Y.Z` (manifest asset, not prerelease), merge
-  `main` back into `develop` (the changelog cut), then run the live update on gpu-test from
-  Fleet ▸ Releases ("Check now" → apply) before calling the release done.
+  `main` back into `develop` (the changelog cut), then run the live update from Fleet ▸ Releases
+  ("Check now" → apply) on an owned install (made with the seed) on gpu-test before calling the
+  release done: a Compose or source stack is never offered it.
 - **ABR is ON by default, mode `smooth`** (SPT-10 #346, 2026-06-27). `smooth` is
   encoder-aware + smoothness-biased (under congestion: present σ p95 ~69→19 ms,
   freezes 14→2 vs `protective`; identical on a clean path; preserves the #68 emergency

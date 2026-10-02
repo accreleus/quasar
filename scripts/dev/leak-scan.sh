@@ -50,66 +50,129 @@ case "${1:-}" in
     ;;
 esac
 
-# --- the fingerprint patterns ------------------------------------------------
+# --- the generic patterns ----------------------------------------------------
 #
-# Deliberately specific. A blanket "any RFC1918 address" rule would fire on the
-# coturn deny-range examples in deploy/README.md, which are correct and must
-# stay literal; the operator's own /24 is what must never appear.
+# Shapes that identify ANYONE's machine, with no operator-specific value in
+# them. A blanket "any RFC1918 address" rule would fire on the coturn deny-range
+# examples in deploy/README.md, which are correct and must stay literal, so an
+# operator's own address range belongs in the operator patterns loaded below.
 PATTERNS=(
-  # The operator LAN. Any host in it, with or without a port.
-  '10\.1\.1\.[0-9]{1,3}'
   # Absolute home paths from any developer's machine (macOS and Linux shapes).
   '/Users/[A-Za-z0-9._-]+/'
   '/home/[A-Za-z0-9._-]+/(code|src|dev|projects)/'
-  # The operator's personal domain, in any subdomain.
-  '[A-Za-z0-9.-]*techanvil\.net'
-  # ssh private-key names that identify a specific box or account.
-  'unraid_root'
-  'id_ed25519_loopback'
-  # A key path pinned to a named developer rather than resolved from config.
-  # [~] not ~ — a literal tilde in a regex, never a shell home expansion.
-  '[~]/\.ssh/[A-Za-z0-9._-]*(unraid|tower|hermes|devbox)'
 )
 
-# Bare hostnames of the operator machines. ISSUE-TRACKER MODE ONLY, and a
-# deliberate exception to the note above: tracked source still carries these in
-# code comments and Makefile help text (a separate cleanup), but the tracker is
-# where NEW prose lands, and on 2026-09-04 four freshly filed issues named a
-# machine by its hostname while every address-shaped pattern stayed quiet.
-# `qdev` is the gpu-test host's local alias; the appdata path is the unraid
-# stack directory. `Tower` is also an English word: a false positive costs a
-# glance, a false negative is permanent.
-ISSUE_PATTERNS=(
-  '\b[Tt]ower\b'
-  '\bdevbox\b'
-  '\b[Hh]ermes\b'
-  '\bqdev\b'
-  # An Unraid appdata path is only a fingerprint when it names one of the operator's
-  # machines or users; `/mnt/user/appdata/<app>` alone is every Unraid user's path
-  # and appears legitimately in install-help comments (#126, 2026-09-06).
-  '/mnt/user/appdata/[A-Za-z0-9._/-]*(qdev|devbox|[Hh]ermes|[Tt]ower)'
-)
+# --- the operator's own patterns ----------------------------------------------
+#
+# The literal values that identify ONE operator's network — an address range, a
+# domain, key and host names — are deliberately NOT in this file. A public
+# repository that lists them has published the very inventory it is guarding.
+# They are loaded at run time; only the generic shapes above live here.
+#
+#   LEAK_SCAN_OPERATOR_PATTERNS  newline-separated patterns. CI sets it from the
+#                                repository secret of the same name.
+#   LEAK_SCAN_PATTERNS_FILE      a file in the same format. Defaults to
+#                                .claude/skills/_shared/leak-patterns.local in the
+#                                MAIN checkout (untracked, beside hosts.json), so
+#                                a worktree finds the same file.
+#
+# Format: one extended regex per line. `tree:` (or no prefix) applies to every
+# mode; `issues:` applies to the issue tracker only — bare host names, which
+# tracked prose may still carry. Blank lines and `#` comments are ignored.
+#
+# With neither source the scan runs the generic shapes only and says so on
+# stderr. LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1 turns that into exit 2; CI sets it
+# wherever the secret is available, so a missing or broken secret can never read
+# as a clean run. Pattern TEXT is never printed: in CI it is a secret.
+OPERATOR_TREE_PATTERNS=()
+OPERATOR_ISSUE_PATTERNS=()
+operator_raw=""
+operator_source=""
+if [ -n "${LEAK_SCAN_OPERATOR_PATTERNS:-}" ]; then
+  operator_raw="$LEAK_SCAN_OPERATOR_PATTERNS"
+  operator_source="LEAK_SCAN_OPERATOR_PATTERNS"
+else
+  if [ -z "${LEAK_SCAN_PATTERNS_FILE:-}" ]; then
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -n "$common" ]; then
+      LEAK_SCAN_PATTERNS_FILE="$(dirname "$common")/.claude/skills/_shared/leak-patterns.local"
+    else
+      LEAK_SCAN_PATTERNS_FILE="$(cd "$(dirname "$0")/../.." && pwd)/.claude/skills/_shared/leak-patterns.local"
+    fi
+  fi
+  if [ -r "$LEAK_SCAN_PATTERNS_FILE" ]; then
+    operator_raw="$(cat "$LEAK_SCAN_PATTERNS_FILE")"
+    operator_source="$LEAK_SCAN_PATTERNS_FILE"
+  fi
+fi
+
+line_no=0
+while IFS= read -r line || [ -n "$line" ]; do
+  line_no=$((line_no + 1))
+  line="${line%$'\r'}"
+  case "$line" in '' | '#'*) continue ;; esac
+  case "$line" in
+    issues:*) pat="${line#issues:}" kind=issues ;;
+    tree:*) pat="${line#tree:}" kind=tree ;;
+    *) pat="$line" kind=tree ;;
+  esac
+  [ -n "$pat" ] || continue
+  # Validate before use, and report only the line number: the text may be secret.
+  set +e
+  printf '' | grep -E -e "$pat" >/dev/null 2>&1
+  prc=$?
+  set -e
+  if [ "$prc" -gt 1 ]; then
+    echo "leak-scan: operator pattern on line $line_no of $operator_source is not a valid extended regex." >&2
+    exit 2
+  fi
+  if [ "$kind" = issues ]; then
+    OPERATOR_ISSUE_PATTERNS+=("$pat")
+  else
+    OPERATOR_TREE_PATTERNS+=("$pat")
+  fi
+done <<<"$operator_raw"
+
+# --- the bench server, from qbench's own config --------------------------------
+#
+# The quasar-bench server's address is operator-local too: qbench keeps it in
+# ${XDG_CONFIG_HOME:-~/.config}/qbench/url, outside every repository, and the
+# repo's scripts only ever read BENCH_URL or that file. When the file exists at
+# scan time, its host — and, for a dotted name of three or more labels, the
+# parent domain — join the operator patterns, so a commit or an issue that pastes
+# the real bench address fails. Loopback is skipped (test fixtures use it). The
+# value is never printed. LEAK_SCAN_BENCH_URL_FILE points elsewhere (tests).
+bench_url_file="${LEAK_SCAN_BENCH_URL_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/qbench/url}"
+if [ -r "$bench_url_file" ]; then
+  bench_host="$(sed -n '1{s#^[A-Za-z][A-Za-z0-9+.-]*://##;s#^[^@/]*@##;s#[:/?].*$##;p;}' "$bench_url_file" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+  case "$bench_host" in
+    '' | localhost | 127.* | '[::1]') ;;
+    *)
+      bench_names=("$bench_host")
+      if ! [[ "$bench_host" =~ ^[0-9.]+$ ]]; then
+        IFS=. read -r -a bench_labels <<<"$bench_host"
+        if [ "${#bench_labels[@]}" -ge 3 ]; then
+          bench_names+=("${bench_host#*.}")
+        fi
+      fi
+      for bench_name in "${bench_names[@]}"; do
+        OPERATOR_TREE_PATTERNS+=("$(printf '%s' "$bench_name" | sed 's/[][\.*^$()+?{}|]/\\&/g')")
+      done
+      ;;
+  esac
+fi
+
+if [ $((${#OPERATOR_TREE_PATTERNS[@]} + ${#OPERATOR_ISSUE_PATTERNS[@]})) -eq 0 ]; then
+  if [ "${LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS:-0}" = 1 ]; then
+    echo "leak-scan: operator patterns are required (LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1) but none were loaded — refusing to report a generic-only scan as clean." >&2
+    exit 2
+  fi
+  echo "leak-scan: note — no operator patterns loaded; running the generic checks only." >&2
+fi
 
 # --- exclusions --------------------------------------------------------------
 #
-# PHASE 1 ONLY. These directories are bound for the PRIVATE internal repo and
-# never reach the public mirror, so their historical run logs, evidence bundles
-# and kickoff prompts are not scrubbed. When those trees leave this repo in
-# Phase 2, DELETE this list rather than letting it rot into a general amnesty.
-INTERNAL_BOUND=(
-  ':(exclude)docs/completed/**'
-  ':(exclude)docs/design/**'
-  ':(exclude)docs/reports/**'
-  ':(exclude)docs/research/**'
-  ':(exclude)docs/superpowers/**'
-  ':(exclude)docs/tech-debt/**'
-  ':(exclude)docs/phase6/**'
-  ':(exclude)docs/phase7/**'
-  ':(exclude)docs/phase8/**'
-  ':(exclude)docs/phase9/**'
-)
-
-# This script names every pattern it hunts for, so it always matches itself.
+# This script describes the shapes it hunts for, so it can match itself.
 SELF=':(exclude)scripts/dev/leak-scan.sh'
 
 # Same reason, one level out: the negative-test corpus for --issues has to CONTAIN
@@ -125,19 +188,21 @@ ALLOWLIST=(
   ':(exclude).claude/skills/_shared/hosts.example.json'
 )
 
+ALL_TREE_PATTERNS=("${PATTERNS[@]}" "${OPERATOR_TREE_PATTERNS[@]}")
+ALL_ISSUE_PATTERNS=("${ALL_TREE_PATTERNS[@]}" "${OPERATOR_ISSUE_PATTERNS[@]}")
 ALTERNATION="$(
   IFS='|'
-  echo "${PATTERNS[*]}"
+  echo "${ALL_TREE_PATTERNS[*]}"
 )"
 ISSUE_ALTERNATION="$(
   IFS='|'
-  echo "${PATTERNS[*]}|${ISSUE_PATTERNS[*]}"
+  echo "${ALL_ISSUE_PATTERNS[*]}"
 )"
 
 # --- issue-tracker mode -------------------------------------------------------
 #
-# Same patterns, other public surface — PLUS the bare hostnames in
-# ISSUE_PATTERNS, because an issue body has no code-comment excuse for one.
+# Same patterns, other public surface — PLUS the operator's issue-only patterns
+# (bare host names), because an issue body has no code-comment excuse for one.
 if [ "$MODE" = issues ]; then
   if [ -z "${LEAK_SCAN_ISSUES_JSON:-}" ]; then
     command -v gh >/dev/null 2>&1 || {
@@ -227,7 +292,7 @@ grep_args=(--line-number --extended-regexp --no-color -I -e "$ALTERNATION")
 [ "$MODE" = "staged" ] && grep_args=(--cached "${grep_args[@]}")
 
 set +e
-HITS="$(git grep "${grep_args[@]}" -- . "${INTERNAL_BOUND[@]}" "${ALLOWLIST[@]}" "$SELF" \
+HITS="$(git grep "${grep_args[@]}" -- . "${ALLOWLIST[@]}" "$SELF" \
   "$ISSUES_TEST_CORPUS" 2>/dev/null)"
 rc=$?
 set -e
@@ -254,7 +319,8 @@ network. Fix the file — do not weaken this script:
   LAN address     -> a role name, or an RFC 5737 documentation address
                      (192.0.2.x / 198.51.100.x / 203.0.113.x), or <your-host-ip>
   absolute path   -> a repo-relative path
-  personal domain -> an env var (BENCH_URL / QUASAR_BENCH_URL) with no default
+  personal domain -> an env var with no default (the bench server: BENCH_URL,
+                     else qbench's own ~/.config/qbench/url)
   ssh key / alias -> a lookup in .claude/skills/_shared/hosts.json (untracked)
 
 Real addresses and keys belong in .claude/skills/_shared/hosts.json, which is

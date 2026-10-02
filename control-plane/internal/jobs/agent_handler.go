@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
@@ -54,6 +57,7 @@ func NewAgentHandler(store *Store, disp *Dispatcher, agents AgentAuthenticator, 
 func (h *AgentHandler) Register(mux httpx.Router) {
 	mux.Handle("GET /v1/agent/jobs/pending", http.HandlerFunc(h.handlePending))
 	mux.Handle("POST /v1/agent/jobs/report", http.HandlerFunc(h.handleReport))
+	mux.Handle("POST /v1/agent/jobs/template.warmup/{run_id}/publish-permit", http.HandlerFunc(h.handleSteamPublishPermit))
 }
 
 // maxReportBytes bounds a report body. A summary is CHECK-constrained to 4096
@@ -92,8 +96,9 @@ func (h *AgentHandler) authAgent(w http.ResponseWriter, r *http.Request) (hostID
 
 // pendingRun is one claimed run as the agent sees it (design §3.6, verbatim).
 type pendingRun struct {
-	RunID string `json:"run_id"`
-	JobID string `json:"job_id"`
+	RunID             string  `json:"run_id"`
+	JobID             string  `json:"job_id"`
+	PublishClaimToken *string `json:"publish_claim_token,omitempty"`
 	// Params is the opaque blob the control plane stored when it materialized the
 	// run. The framework never interprets it; the agent hands it to the runner.
 	Params json.RawMessage `json:"params"`
@@ -150,10 +155,11 @@ func (h *AgentHandler) handlePending(w http.ResponseWriter, r *http.Request) {
 			params = json.RawMessage(`{}`)
 		}
 		out = append(out, pendingRun{
-			RunID:        run.ID,
-			JobID:        run.JobID,
-			Params:       params,
-			DeadlineSecs: deadline,
+			RunID:             run.ID,
+			JobID:             run.JobID,
+			PublishClaimToken: run.PublishClaimToken,
+			Params:            params,
+			DeadlineSecs:      deadline,
 		})
 		// The same "run started" line the in-process executor logs, with the same
 		// fields, so one `grep 'job: '` across both containers reconstructs a run
@@ -167,10 +173,11 @@ func (h *AgentHandler) handlePending(w http.ResponseWriter, r *http.Request) {
 
 // reportRequest is the POST /v1/agent/jobs/report body (design §3.6, verbatim).
 type reportRequest struct {
-	RunID   string         `json:"run_id"`
-	State   string         `json:"state"`
-	Summary map[string]any `json:"summary"`
-	Error   *string        `json:"error"`
+	RunID             string         `json:"run_id"`
+	PublishClaimToken *string        `json:"publish_claim_token,omitempty"`
+	State             string         `json:"state"`
+	Summary           map[string]any `json:"summary"`
+	Error             *string        `json:"error"`
 }
 
 // agentReportable is the closed set of states a HOST may report. `aborted` is
@@ -227,6 +234,10 @@ func (h *AgentHandler) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if run.State.Terminal() {
+		if run.PublishClaimToken != nil && (req.PublishClaimToken == nil || *req.PublishClaimToken != *run.PublishClaimToken) {
+			httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "could not record job report")
+			return
+		}
 		// The retry-after-a-blip case. Nothing to do and nothing to say.
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
@@ -243,7 +254,7 @@ func (h *AgentHandler) handleReport(w http.ResponseWriter, r *http.Request) {
 	// Dispatcher.Report, NOT Store.Report: the deferral ladder, the run-finished /
 	// run-deferred log lines and the follow-up pending row all live there, and an
 	// agent-plane run must get exactly what a control-plane run gets.
-	if _, err := h.disp.Report(r.Context(), req.RunID, state, summary, errText); err != nil {
+	if _, err := h.disp.ReportAgent(r.Context(), req.RunID, state, summary, errText, req.PublishClaimToken); err != nil {
 		// A run that moved under us (reaped between the read above and here) or a
 		// summary that blew the 4096-byte ceiling. Neither is the agent's fault to
 		// fix by retrying differently, but both are conflicts with the stored row.
@@ -253,4 +264,59 @@ func (h *AgentHandler) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+var steamDigestRef = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+var canonicalUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+type steamPublishPermitRequest struct {
+	PublishClaimToken string `json:"publish_claim_token"`
+	ImageID           string `json:"image_id"`
+	RegistryRef       string `json:"registry_ref"`
+	Version           string `json:"version"`
+	PolicyRevision    string `json:"policy_revision"`
+}
+
+func (h *AgentHandler) handleSteamPublishPermit(w http.ResponseWriter, r *http.Request) {
+	hostID, ok := h.authAgent(w, r)
+	if !ok {
+		return
+	}
+	var req steamPublishPermitRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid request body")
+		return
+	}
+	var extra any
+	if !errors.Is(dec.Decode(&extra), io.EOF) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid request body")
+		return
+	}
+	if req.ImageID != "steam" || !canonicalUUID.MatchString(req.PublishClaimToken) || !steamDigestRef.MatchString(req.RegistryRef) || req.Version == "" || len(req.Version) > 256 || req.PolicyRevision == "" {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid publication identity")
+		return
+	}
+	rev, err := strconv.ParseUint(req.PolicyRevision, 10, 63)
+	if err != nil || rev == 0 || strconv.FormatUint(rev, 10) != req.PolicyRevision {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid publication identity")
+		return
+	}
+	runID := r.PathValue("run_id")
+	if !canonicalUUID.MatchString(runID) {
+		httpx.WriteError(w, http.StatusConflict, "publication_not_authorized", "publication is not current")
+		return
+	}
+	accepted, err := h.store.SteamPublishPermit(r.Context(), runID, hostID, req.PublishClaimToken, req.ImageID, req.RegistryRef, req.Version, req.PolicyRevision, h.disp.Config().ClaimTimeout)
+	if err != nil {
+		h.log.Warn("job: Steam publish permit failed", "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "publication check unavailable")
+		return
+	}
+	if !accepted {
+		httpx.WriteError(w, http.StatusConflict, "publication_not_authorized", "publication is not current")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]bool{"authorized": true})
 }

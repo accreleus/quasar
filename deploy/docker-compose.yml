@@ -1,7 +1,14 @@
-# Quasar single-host stack — THE base compose file, and a complete deployment.
+# Quasar single-host stack — THE base compose file of the CONTRIBUTOR LANE.
 #
-# This file IS the production deployment. It pulls published images, bakes in no
-# development bind mounts, and needs exactly one overlay, on NVIDIA hosts only:
+# CONTRIBUTOR TOOLING, NOT A SUPPORTED INSTALL. Operators install Quasar with the
+# seed (docs/configuration.md "Seed"; the site's Install pages): one container per
+# machine, and Quasar's recovery actor creates, updates and recovers the rest. A
+# stack started from this file has no recovery actor, so it is never updated from
+# the console: a source build moves with deploy/redeploy.sh (`make redeploy-cp`,
+# `make rebuild`). docs/rh06/2026-09-24-decisions.md D15.
+#
+# It pulls or builds images, bakes in no development bind mounts, and needs
+# exactly one overlay, on NVIDIA hosts only:
 #
 #   AMD / Intel (VA-API), the default:
 #     docker compose -f deploy/docker-compose.yml up -d
@@ -10,12 +17,10 @@
 #     docker compose -f deploy/docker-compose.yml \
 #                    -f deploy/docker-compose.nvidia.yml up -d
 #
-# INSTALLING A RELEASE IS TWO ENV VARS, NOT AN OVERLAY. Set QUASAR_CONTROL_IMAGE
-# and QUASAR_AGENT_IMAGE in deploy/.env to the digests from the release body and
-# this file is digest-pinned. That replaced docker-compose.release.yml, which
-# existed only to substitute those two image refs and strip a development mount
-# this file no longer carries — and which had to rewrite the control-plane's
-# volume list to do it, a rewrite that twice dropped the load-bearing TLS volume.
+# PINNING IMAGES IS TWO ENV VARS, NOT AN OVERLAY. Set QUASAR_CONTROL_IMAGE and
+# QUASAR_AGENT_IMAGE in deploy/.env to digests and this file is digest-pinned. A
+# release overlay that rewrote the control plane's volume list twice dropped the
+# load-bearing TLS volume; there is none.
 #
 # Contributors building from source add deploy/overlays/docker-compose.dev.yml
 # (the `build:` keys, the web/dist bind mount, the wget healthcheck).
@@ -23,7 +28,7 @@
 #
 # Other overlays: hardened.yml (Caddy TLS ingress, an optional managed-cert
 # path), plus everything situational in overlays/ (console, local, multiagent,
-# profiling, cores, adopt-volumes). deploy/README.md Part 2 has the rule; every
+# profiling, cores). deploy/README.md Part 2 has the rule; every
 # knob below is documented in docs/configuration.md.
 #
 # Prerequisites (Linux host with a GPU + Docker):
@@ -110,7 +115,6 @@ services:
       QUASAR_PUBLIC_HOST: ${QUASAR_PUBLIC_HOST:-}
       QUASAR_TLS_CERT: ${QUASAR_TLS_CERT:-}
       QUASAR_TLS_KEY: ${QUASAR_TLS_KEY:-}
-      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:?Set ENROLLMENT_TOKEN in deploy/.env}
       # P5-02 storage provider: local | volume; unset = auto (local when
       # QUASAR_HOME_ROOT is set, volume otherwise). local needs QUASAR_HOME_ROOT
       # to be the same host path on the control-plane and every node-agent host.
@@ -177,6 +181,9 @@ services:
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       # SPA: mount web/dist at QUASAR_WEB_ROOT so the CP serves it from /.
       QUASAR_WEB_ROOT: /app/web
+      # Add host: the seed and node-agent images, by digest, a new GPU host installs.
+      QUASAR_ENROLL_SEED_IMAGE: ${QUASAR_ENROLL_SEED_IMAGE:-}
+      QUASAR_ENROLL_AGENT_IMAGE: ${QUASAR_ENROLL_AGENT_IMAGE:-}
       # Cover artwork (UI-P7). SHIPS OFF: with no API key nothing is fetched,
       # no third party is contacted, and every app renders its gradient tile.
       # The default QUASAR_ARTWORK_DIR (/var/lib/quasar-control/artwork) already
@@ -222,6 +229,11 @@ services:
       # allowlist every registry read passes.
       QUASAR_PLATFORM_REGISTRY: ${QUASAR_PLATFORM_REGISTRY:-}
       QUASAR_IMAGE_REGISTRY_HOSTS: ${QUASAR_IMAGE_REGISTRY_HOSTS:-}
+      # Developer apply (#360): the platform-image namespaces the control plane checks a
+      # developer apply against (empty = the org's own), and the plain-HTTP registries it
+      # may read a developer apply's image identity from.
+      QUASAR_UPDATER_ALLOWED_NAMESPACES: ${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
+      QUASAR_PLATFORM_INSECURE_REGISTRIES: ${QUASAR_PLATFORM_INSECURE_REGISTRIES:-}
       # --- Debug / profiling listener (PROF-01, #388) -------------------------
       # SHIPS ENABLED, ON LOOPBACK. Diagnosing a box that has been up for three
       # weeks on somebody else's hardware is the whole point. 6060 is DELIBERATELY
@@ -253,10 +265,6 @@ services:
       # (Dockerfile.control.prod). The dev overlay bind-mounts ../web/dist for the
       # source path, where Dockerfile.control does not bake it.
       - quasar-control-tls:/var/lib/quasar-control
-      # The updater's socket + result files. Read-write because connecting to a
-      # unix socket needs write permission on it; the results directory is
-      # root-owned 0755, so this uid (1000) can read a result and write nothing.
-      - quasar-updater-run:/run/quasar-updater
     depends_on:
       quasar-postgres:
         condition: service_healthy
@@ -297,17 +305,9 @@ services:
     # agent-less on 2026-07-26.
     entrypoint: ["/usr/local/bin/quasar-node-agent-entrypoint"]
     network_mode: host
-    # #483 readiness firewall-posture probe (node-agent/src/readiness.rs
-    # media_reachability check) reads `nft list ruleset` / `iptables -S INPUT`
-    # to detect a default-deny host firewall that would silently drop the
-    # agent's WebRTC ICE UDP. Reading netfilter rule state needs
-    # CAP_NET_ADMIN even for the container's root user; without it both
-    # tools fail `Operation not permitted` and the check degrades to `skip`
-    # (never a false negative, but it can never detect anything either).
-    # This grants READ of the existing ruleset only — it adds no new network
-    # reach: the container already sees the host's real netfilter state
-    # because of `network_mode: host` above (shared network namespace), this
-    # capability only lets it ask for it.
+    # NET_ADMIN: the agent no longer uses it (media_reachability reads real session
+    # traffic, not the firewall, since RH-07 #403). It stays only because this file
+    # mirrors recipe revision 2 (guarded by recipe_compose_parity); revision 3 drops it.
     # SYSLOG: read `/dev/kmsg` (the device below). `kernel.dmesg_restrict=1` is the
     # default on Fedora and Ubuntu, and the container's root user does not carry
     # CAP_SYSLOG by default, so without this the open fails EPERM and the agent
@@ -323,7 +323,10 @@ services:
     environment:
       # The agent connects to the CP via localhost because both share host network.
       CONTROL_PLANE_URL: ws://localhost:${CONTROL_PORT:-8080}
-      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:?}
+      # First enrollment only: the token part of an Add host string (Admin -> Fleet
+      # -> Add host), minted by this control plane. Once enrolled the saved node
+      # secret reconnects and the token is spent; unset is normal then.
+      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:-}
       NODE_NAME: ${NODE_NAME:-quasar-node-1}
       NODE_SECRET_PATH: /var/lib/quasar-agent/node-secret
       RUST_LOG: ${RUST_LOG:-info}
@@ -351,6 +354,7 @@ services:
       QUASAR_HOMES_GC: ${QUASAR_HOMES_GC:-}
       QUASAR_HOMES_GC_RETENTION_HOURS: ${QUASAR_HOMES_GC_RETENTION_HOURS:-}
       QUASAR_HOMES_GC_DRY_RUN: ${QUASAR_HOMES_GC_DRY_RUN:-}
+      QUASAR_HOMES_FREE_SPACE_FLOOR_GIB: ${QUASAR_HOMES_FREE_SPACE_FLOOR_GIB:-}
       # #145 Steam preparation defaults on for explicitly supported images.
       # The Steam source policy controls both activities; host permissions
       # below can opt out independently. Missing flags retain the default.
@@ -548,8 +552,8 @@ services:
       # --shm-size for app containers (tmpfs, allocated on use; Chromium/Steam
       # need >64MB, and big Steam titles benefit from more).
       QUASAR_APP_SHM_SIZE: ${QUASAR_APP_SHM_SIZE:-1g}
-      # Graceful-stop window (docker stop -t N) before the rm -f backstop on
-      # session teardown; 0 = kill-only. See docs/configuration.md.
+      # Graceful-stop window for the runtime-API stop before the force-remove
+      # backstop on session teardown; 0 = kill-only. See docs/configuration.md.
       QUASAR_APP_STOP_TIMEOUT_SECS: ${QUASAR_APP_STOP_TIMEOUT_SECS:-10}
       # App-container network mode (docker `--network`). Default `none` keeps
       # tenant apps isolated; set `bridge` in deploy/.env for titles that need
@@ -562,8 +566,8 @@ services:
       QUASAR_APP_PGID: ${QUASAR_APP_PGID:-}
     volumes:
       # Docker socket: required for sibling-container launches (game containers,
-      # PulseAudio sidecar). The agent never dials Docker on the network;
-      # it shells out to the docker CLI via this socket.
+      # PulseAudio sidecar). The agent never dials Docker on the network; it
+      # uses the Unix-socket Engine API through this mount.
       - /var/run/docker.sock:/var/run/docker.sock
       # XDG_RUNTIME_DIR: Wayland compositor + PulseAudio sockets land here.
       # MUST be a host bind-mount (not a named volume) so that docker-out-of-docker
@@ -618,10 +622,6 @@ services:
       - /sys/kernel:/host/sys/kernel:ro
       # Persistent agent state: the per-node secret issued at enrollment.
       - quasar-agent-data:/var/lib/quasar-agent
-      # Same volume the updater and the control plane share: the agent POSTs
-      # `release_apply` here and reads the result file back (agent-api.md
-      # `release_state`).
-      - quasar-updater-run:/run/quasar-updater
     # Docker's default seccomp profile is intentional and deliberately NOT
     # overridden here: a disposable AMD VA driver initialization and a 720p60
     # vah264enc run both passed under it on 2026-07-13, superseding the historical
@@ -645,69 +645,26 @@ services:
       # reports `xid_visibility: skip`, which fails nothing.
       - /dev/kmsg:/dev/kmsg:r
     device_cgroup_rules:
-      # Allow r/w/mknod for Linux input event devices (char major 13).
-      # uinput creates /dev/input/eventN nodes on the host at session start;
-      # the fake-udev mknod mirrors them inside the container, but without this
-      # rule the container's cgroup blocks reads — libinput silently fails to
-      # open the keyboard/mouse paths and the compositor receives no events.
+      # Input event devices (char major 13): uinput creates /dev/input/eventN on
+      # the host at session start and the agent opens it through the /dev/input
+      # bind above; without this rule the cgroup blocks the open and the
+      # compositor receives no events. Nothing is mknod'ed any more (#401); the
+      # `m` stays only because this file mirrors recipe revision 2, while
+      # revision 3 grants `rw`.
       - 'c 13:* rmw'
     depends_on:
       quasar-control-plane:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Updater ───────────────────────────────────────────────────────────────────
-  # The per-host actor that pulls a platform release and recreates the containers
-  # it replaces, because a container cannot recreate itself (CONTEXT.md
-  # "Updater"). It acts only when told to, over the unix socket in
-  # quasar-updater-run, and only on the stack it sits beside.
-  #
-  # IT IS NOT PART OF A RELEASE, and its image is therefore a TAG, not a digest:
-  # it is what applies a release, so it cannot be one of the images an apply
-  # moves. Updating it is a separate, manual step (docs/upgrading.md).
-  quasar-updater:
-    image: ${QUASAR_UPDATER_IMAGE:-quasar-updater:latest}
-    environment:
-      # Registry namespaces this host will pull platform images from. Empty =
-      # the org's own. docs/configuration.md.
-      QUASAR_UPDATER_ALLOWED_NAMESPACES: ${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
-      QUASAR_UPDATER_WAIT_TIMEOUT_S: ${QUASAR_UPDATER_WAIT_TIMEOUT_S:-}
-      # Release-signature verification. Empty = off, the default: nothing is
-      # fetched and trust is the pinned digest (ADR 0001). docs/configuration.md.
-      QUASAR_UPDATER_SIGNATURE_MODE: ${QUASAR_UPDATER_SIGNATURE_MODE:-}
-      QUASAR_UPDATER_TRUSTED_KEYS: ${QUASAR_UPDATER_TRUSTED_KEYS:-}
-      QUASAR_UPDATER_MANIFEST_BASE_URL: ${QUASAR_UPDATER_MANIFEST_BASE_URL:-}
-      QUASAR_UPDATER_MANIFEST_TIMEOUT_S: ${QUASAR_UPDATER_MANIFEST_TIMEOUT_S:-}
-    volumes:
-      # Podman: point QUASAR_DOCKER_SOCKET at /run/user/<uid>/podman/podman.sock.
-      - ${QUASAR_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
-      # THE STACK DIRECTORY AT ITS OWN HOST PATH. The updater reconstructs its
-      # compose invocation from its own container labels
-      # (com.docker.compose.project.working_dir / .config_files), and those are
-      # HOST paths — so the same absolute path must resolve inside this
-      # container or every compose call reads a file that is not there. The
-      # updater refuses to serve and says so when it does not (fail closed).
-      # deploy/redeploy.sh seeds QUASAR_STACK_DIR; set it by hand for a compose
-      # invocation that does not go through redeploy.sh.
-      - ${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}:${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}
-      - quasar-updater-run:/run/quasar-updater
-    # SELinux-enforcing hosts refuse every call to the mounted socket without
-    # this (Podman; Docker was unaffected). Prototype finding 1.
-    security_opt: ["label=disable"]
-    restart: unless-stopped
-
 volumes:
   # No `name:` override here (#448). Compose v5 rejects an empty `name:` value
   # outright at `up` — "invalid volume name or ID: value is empty" — for EVERY
   # service, because the volume is a project-level definition; older Compose
-  # (Tower/hermes at the time) treated it as a no-op, which is why this never
+  # (the lab host and the aux host at the time) treated it as a no-op, which is why this never
   # showed up before v5. Worse, `docker compose config` silently DROPS the
   # empty key instead of erroring, so config-based validation cannot catch it.
-  # Volume-name overrides (to adopt a pre-existing volume under a different
-  # name — e.g. a stack migrating off a forked compose file) now live in the
-  # opt-in overlay deploy/overlays/docker-compose.adopt-volumes.yml. Normal deploys
-  # never apply it, so Compose falls back to its usual <project>_<key> naming.
+  # Compose names every volume <project>_<key>.
   quasar-postgres-data:
   quasar-agent-data:
   quasar-control-tls: # #376 TLS pair + UI-P7 artwork cache (/var/lib/quasar-control)
-  quasar-updater-run: # the updater's socket (0666) + one result file per apply

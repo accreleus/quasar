@@ -1,0 +1,1340 @@
+{
+  "kind": "verify_signature",
+  "about": "signature.go VerifyManifestSignature: the detached document parsed exactly as Go's encoding/json parses it, ed25519 over the manifest bytes, any entry under any trusted key.",
+  "vectors": [
+    {
+      "name": "a genuine signature verifies",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureAcceptsAGoodSignature",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2026"
+      }
+    },
+    {
+      "name": "a tampered manifest does not verify",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsATamperedManifest",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no signature was made by a key this host trusts (release-2026)"
+      }
+    },
+    {
+      "name": "an untrusted key wearing a trusted label",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsTheWrongKey",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"NfmU7cZT9nIzTqinus+4lzCs13+KoA/GnAGIIDqDfGA84q+fHWqLarG1FOWlVcxc/6lqbw7UWvxdfWY0cl8uDw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no signature was made by a key this host trusts (release-2026)"
+      }
+    },
+    {
+      "name": "rotation: dual-signed, host trusts the old key only",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRotationOverlap/old only",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2025\",\"signature\":\"MuhVfp65GoDm8GTglfetifKP02q7LZm3V6ZjXGvWp8yEw1zAUqsmlt5YwLjO7frY0Yg7Ln52Tpz6pwzoOa0mBQ==\"},{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2025",
+          "public_key_of": "release-2025"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2025"
+      }
+    },
+    {
+      "name": "rotation: dual-signed, host trusts the new key only",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRotationOverlap/new only",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2025\",\"signature\":\"MuhVfp65GoDm8GTglfetifKP02q7LZm3V6ZjXGvWp8yEw1zAUqsmlt5YwLjO7frY0Yg7Ln52Tpz6pwzoOa0mBQ==\"},{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2026"
+      }
+    },
+    {
+      "name": "rotation: dual-signed, host trusts both",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRotationOverlap/both",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2025\",\"signature\":\"MuhVfp65GoDm8GTglfetifKP02q7LZm3V6ZjXGvWp8yEw1zAUqsmlt5YwLjO7frY0Yg7Ln52Tpz6pwzoOa0mBQ==\"},{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2025",
+          "public_key_of": "release-2025"
+        },
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2025"
+      }
+    },
+    {
+      "name": "rotation: dual-signed, host trusts both, new first",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRotationOverlap/new first",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2025\",\"signature\":\"MuhVfp65GoDm8GTglfetifKP02q7LZm3V6ZjXGvWp8yEw1zAUqsmlt5YwLjO7frY0Yg7Ln52Tpz6pwzoOa0mBQ==\"},{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        },
+        {
+          "id": "release-2025",
+          "public_key_of": "release-2025"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2025"
+      }
+    },
+    {
+      "name": "rotation: signed by the new key only, host trusts the old",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRotationOverlap",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2025",
+          "public_key_of": "release-2025"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no signature was made by a key this host trusts (release-2025)"
+      }
+    },
+    {
+      "name": "malformed: not json",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/not json",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "malformed: unknown field",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/unknown field",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[],\"extra\":1}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "malformed: future format",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/future format",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":2,\"signatures\":[]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "signature document format_version 2 is not understood by this build (want 1)"
+      }
+    },
+    {
+      "name": "malformed: no signatures",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/no signatures",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "the signature document carries no signatures"
+      }
+    },
+    {
+      "name": "malformed: unknown algorithm only",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/unknown algorithm",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"rsa\",\"key_id\":\"k\",\"signature\":\"AA==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "malformed: truncated signature",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/truncated signature",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"AA==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "malformed: not base64",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/not base64",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"!!!\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "malformed: trailing content",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureRejectsMalformedDocuments/trailing content",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}{\"format_version\":1}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "the signature document carries trailing content after the object"
+      }
+    },
+    {
+      "name": "an unknown algorithm is skipped, not fatal",
+      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyManifestSignatureSkipsPastAnUnknownAlgorithm",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"pq-whatever-2031\",\"key_id\":\"future\",\"signature\":\"AAAA\"},{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "no trusted keys",
+      "source": "added: VerifyManifestSignature with an empty key list",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [],
+      "expect": {
+        "verified": false,
+        "error": "no trusted keys"
+      }
+    },
+    {
+      "name": "the label is only a hint: another trusted key verifies",
+      "source": "added: signature.go orderKeys tries every key",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2025\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2025",
+          "public_key_of": "release-2025"
+        },
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2026"
+      }
+    },
+    {
+      "name": "a label matching no trusted key still tries them all",
+      "source": "added: signature.go orderKeys",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"nobody\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2026"
+      }
+    },
+    {
+      "name": "an empty label tries every key",
+      "source": "added: signature.go orderKeys",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "release-2026",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "release-2026"
+      }
+    },
+    {
+      "name": "an unlabelled trusted key verifies with an empty id",
+      "source": "added: TrustedKey.ID is optional",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "",
+          "public_key_of": "release-2026"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": ""
+      }
+    },
+    {
+      "name": "an unlabelled trusted key is named in the refusal",
+      "source": "added: SignaturePolicy.KeyIDs",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "",
+          "public_key_of": "attacker"
+        },
+        {
+          "id": "old",
+          "public_key_of": "release-2025"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no signature was made by a key this host trusts ((unlabelled), old)"
+      }
+    },
+    {
+      "name": "a malformed entry before a good one",
+      "source": "added: signature.go skips an unreadable entry",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"!!!\"},{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "a signature with surrounding space",
+      "source": "added: signature.go trims the signature",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\" oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg== \"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "a signature with an embedded newline",
+      "source": "added: Go base64 ignores CR and LF",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhV\\npYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "a signature without its padding",
+      "source": "added: StdEncoding requires padding",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "a signature with a non-canonical scalar",
+      "source": "added: RFC 8032 S < L",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmD99JmtegMSjj03QO7glmhbNyB/AuOkpmmfUF12EHxFg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no signature was made by a key this host trusts (k)"
+      }
+    },
+    {
+      "name": "a 63-byte signature",
+      "source": "added: ed25519.SignatureSize",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "a 65-byte signature",
+      "source": "added: ed25519.SignatureSize",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "the algorithm name is case-sensitive",
+      "source": "added: signature.go compares the algorithm exactly",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"Ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "json: field names match case-insensitively",
+      "source": "added: Go encoding/json",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"FORMAT_VERSION\":1,\"Signatures\":[{\"ALGORITHM\":\"ed25519\",\"Key_Id\":\"k\",\"SIGNATURE\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: the Kelvin sign and the long s fold to k and s",
+      "source": "added: Go encoding/json folds with unicode.SimpleFold",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"ſignatures\":[{\"algorithm\":\"ed25519\",\"Key_id\":\"k\",\"ſignature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a null key id is an empty one",
+      "source": "added: Go encoding/json null handling",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":null,\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: null signatures are none",
+      "source": "added: Go encoding/json null handling",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":null}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "the signature document carries no signatures"
+      }
+    },
+    {
+      "name": "json: a missing format version is zero",
+      "source": "added: Go encoding/json leaves absent fields zero",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "signature document format_version 0 is not understood by this build (want 1)"
+      }
+    },
+    {
+      "name": "json: a null document is the zero document",
+      "source": "added: Go encoding/json null handling",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "null"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "signature document format_version 0 is not understood by this build (want 1)"
+      }
+    },
+    {
+      "name": "json: a null document may be followed by a close brace",
+      "source": "added: json.Decoder ends a scalar at its last byte",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "null}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "signature document format_version 0 is not understood by this build (want 1)"
+      }
+    },
+    {
+      "name": "json: a null document followed by a word is trailing content",
+      "source": "added: json.Decoder.More",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "nullx"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "the signature document carries trailing content after the object"
+      }
+    },
+    {
+      "name": "json: a string document",
+      "source": "added: Go encoding/json into a struct",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "\"a\"x"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: a repeated format version takes the last",
+      "source": "added: Go encoding/json",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":2,\"FORMAT_VERSION\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a negative-zero format version is zero",
+      "source": "added: strconv.ParseInt",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":-0,\"signatures\":[]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "signature document format_version 0 is not understood by this build (want 1)"
+      }
+    },
+    {
+      "name": "json: a fractional format version",
+      "source": "added: Go encoding/json into int",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1.0,\"signatures\":[]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: a quoted format version",
+      "source": "added: Go encoding/json into int",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":\"1\",\"signatures\":[]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: an array document",
+      "source": "added: Go encoding/json into a struct",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "[]"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: an empty document",
+      "source": "added: Go encoding/json Decoder at EOF",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": ""
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: a byte-order mark",
+      "source": "added: Go encoding/json has no BOM rule",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "﻿{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: leading space",
+      "source": "added: Go encoding/json",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": " \n\t{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a raw tab inside a string",
+      "source": "added: Go encoding/json rejects control characters in strings",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\t\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: a repeated signatures key merges into the earlier entries",
+      "source": "added: Go encoding/json decodes a repeated array into the existing elements",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}],\"signatures\":[{\"key_id\":\"k\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: an empty repeat discards the earlier entries",
+      "source": "added: Go encoding/json replaces a slice with a fresh one for []",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}],\"signatures\":[],\"signatures\":[{\"key_id\":\"k\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "json: a shorter repeat re-exposes a stale entry when it grows again",
+      "source": "added: Go encoding/json reuses slice capacity",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"x\"},{\"algorithm\":\"ed25519\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}],\"signatures\":[{}],\"signatures\":[{},{}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a null repeat discards the earlier entries",
+      "source": "added: Go encoding/json sets a slice to nil for null",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"x\"},{\"algorithm\":\"ed25519\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}],\"signatures\":null,\"signatures\":[{},{}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "no ed25519 signature in the document is well-formed"
+      }
+    },
+    {
+      "name": "json: a null entry keeps its slot",
+      "source": "added: Go encoding/json null into a struct element",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[null,{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a trailing close brace is not trailing content",
+      "source": "added: json.Decoder.More reports false before ] and }",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a trailing close bracket is not trailing content",
+      "source": "added: json.Decoder.More",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]} ]]"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: trailing space is not trailing content",
+      "source": "added: json.Decoder.More",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]} \n"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a trailing word is trailing content",
+      "source": "added: json.Decoder.More",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]} x"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error": "the signature document carries trailing content after the object"
+      }
+    },
+    {
+      "name": "json: invalid UTF-8 in a label is replaced, not refused",
+      "source": "added: Go encoding/json coerces strings to UTF-8",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "base64": "eyJmb3JtYXRfdmVyc2lvbiI6MSwic2lnbmF0dXJlcyI6W3siYWxnb3JpdGhtIjoiZWQyNTUxOSIsImtleV9pZCI6Imv/4oIiLCJzaWduYXR1cmUiOiJvUWJjSlhUK2h6dWlwWkhlZHZlZkwvY21wWXhjeDM4ME8wMFAwVmhWcFltV0k5MEptNFg2OFdGWDVtRGNpSHFNYk55Qi9BdU9rcG1tZlVGMTJFSHhCZz09In1dfQ=="
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: a lone surrogate in a label is replaced, not refused",
+      "source": "added: Go encoding/json",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"\\ud800\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\"}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": true,
+        "key_id": "k"
+      }
+    },
+    {
+      "name": "json: an unknown field nested in an entry",
+      "source": "added: DisallowUnknownFields applies at every level",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"k\",\"signature\":\"oQbcJXT+hzuipZHedvefL/cmpYxcx380O00P0VhVpYmWI90Jm4X68WFX5mDciHqMbNyB/AuOkpmmfUF12EHxBg==\",\"x\":1}]}"
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: nesting past Go's depth limit",
+      "source": "added: Go encoding/json refuses more than 10000 levels",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "segments": [
+          {
+            "text": "{\"format_version\":1,\"signatures\":",
+            "count": 1
+          },
+          {
+            "text": "[",
+            "count": 10001
+          },
+          {
+            "text": "]",
+            "count": 10001
+          },
+          {
+            "text": "}",
+            "count": 1
+          }
+        ]
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: nesting at Go's depth limit is a type error",
+      "source": "added: Go encoding/json",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "segments": [
+          {
+            "text": "{\"format_version\":1,\"signatures\":",
+            "count": 1
+          },
+          {
+            "text": "[",
+            "count": 9999
+          },
+          {
+            "text": "]",
+            "count": 9999
+          },
+          {
+            "text": "}",
+            "count": 1
+          }
+        ]
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    },
+    {
+      "name": "json: a million open brackets",
+      "source": "added: the scan must not recurse on attacker-shaped input",
+      "manifest": {
+        "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+      },
+      "document": {
+        "segments": [
+          {
+            "text": "{\"format_version\":1,\"signatures\":",
+            "count": 1
+          },
+          {
+            "text": "[",
+            "count": 1048576
+          }
+        ]
+      },
+      "trusted_keys": [
+        {
+          "id": "k",
+          "public_key_of": "k"
+        }
+      ],
+      "expect": {
+        "verified": false,
+        "error_prefix": "the signature document is not valid JSON in the documented shape: "
+      }
+    }
+  ]
+}

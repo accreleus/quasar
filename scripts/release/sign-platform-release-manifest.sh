@@ -4,7 +4,7 @@
 # second GitHub Release asset.
 #
 # Schema and rationale: scripts/release/platform-release-signature.md.
-# The verifier is the updater (control-plane/internal/updater/signature.go);
+# The verifier is the recovery actor (node-agent/crates/quasar-recovery/src/trust/signature.rs);
 # this script and that file are the two halves of one format.
 #
 # THE PRIVATE KEY NEVER TOUCHES THE REPOSITORY. It is read from the environment

@@ -2,9 +2,12 @@
 // RequireAdmin; hiding a call from a non-admin UI is not the access control.
 
 import { ApiError, apiFetch } from "./client";
+import type { components } from "./schema";
 import type {
   AdminAppsResponse,
   AdminApp,
+  AppPlacement,
+  AppPlacementPatch,
   CreateAppRequest,
   UpdateAppRequest,
   HostsResponse,
@@ -14,6 +17,7 @@ import type {
   AdminUser,
   MetricsResponse,
   AdminHomesResponse,
+  AdminHomeClaimsResponse,
   ConfigCatalogResponse,
   HostSettingsResponse,
   UpdateHostSettingsResponse,
@@ -21,6 +25,7 @@ import type {
   ConsoleConfigEnvelope,
   HostRestartResponse,
   Host,
+  ReadinessOverride,
   ProfilePolicyResponse,
   AdminStreamProfilesResponse,
   StreamProfile,
@@ -35,6 +40,7 @@ import type {
   PlatformApplyAttemptEnvelope,
   PlatformApplyAttemptsResponse,
   PlatformApplyRequest,
+  PlatformDeveloperApplyRequest,
   PlatformApplyRunEnvelope,
   PlatformApplyRunsResponse,
   PlatformIdentity,
@@ -72,6 +78,9 @@ import type {
   CatalogImage,
   ImageInstallRequest,
   ImageUpdateResult,
+  HostImageCleanupView,
+  HostImageCleanupRequest,
+  HostImageCleanupAttempt,
   ImageUpdatePolicy,
   Job,
   JobsResponse,
@@ -277,8 +286,8 @@ export function revokeHostEnrollment(token: string, id: string): Promise<void> {
 /** This request's reachability. The enroll-host flow reads the certificate
  *  fingerprint from here, so the value it pins is the one THIS browser session
  *  was served — and tells the operator to compare it against the startup log. */
-export function accessCheck(token: string): Promise<AccessCheck> {
-  return apiFetch<AccessCheck>("/admin/access-check", { token });
+export function accessCheck(token: string, signal?: AbortSignal): Promise<AccessCheck> {
+  return apiFetch<AccessCheck>("/admin/access-check", { token, signal });
 }
 
 // ── App catalog (P2-08) ───────────────────────────────────────────────────────
@@ -307,6 +316,34 @@ export function updateApp(
 // ── Entitlements (steam-library-discovery spec §6.6, Phase 2) ────────────────
 
 /** 'all' rows first. */
+/** RH05 #342. A derived tile's id answers with its parent's placement. */
+export function getAppPlacement(token: string, appId: string): Promise<AppPlacement> {
+  return apiFetch<AppPlacement>(`/admin/apps/${appId}/placement`, { token });
+}
+
+/** Replaces the whole selection at `expected_revision`. `409 stale_revision`
+ *  when another edit landed first; `409 inherited_placement` on a derived tile.
+ *  The 409's `current` body is not surfaced by ApiError, so callers re-read. */
+export function updateAppPlacement(
+  token: string,
+  appId: string,
+  body: AppPlacementPatch,
+): Promise<AppPlacement> {
+  return apiFetch<AppPlacement>(`/admin/apps/${appId}/placement`, { token, method: "PATCH", body });
+}
+
+/** Every host, following `next_cursor`: the placement read carries host ids only. */
+export async function listAllHosts(token: string): Promise<Host[]> {
+  const items: Host[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await listHosts(token, cursor);
+    items.push(...page.items);
+    cursor = page.next_cursor ?? undefined;
+  } while (cursor);
+  return items;
+}
+
 export function listAppEntitlements(token: string, appId: string): Promise<EntitlementsResponse> {
   return apiFetch<EntitlementsResponse>(`/admin/apps/${appId}/entitlements`, { token });
 }
@@ -498,12 +535,30 @@ export function installImage(
   });
 }
 
-/** Best-effort `image_remove` to every host that has it, then drops the adoption row. */
+/** Drops the adoption row; cached versions remain until explicit host cleanup. */
 export function uninstallImage(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/admin/images/${encodeURIComponent(id)}/install`, {
     method: "DELETE",
     token,
   });
+}
+
+export function getHostImageCleanup(token: string, hostID: string, signal?: AbortSignal): Promise<HostImageCleanupView> {
+  return apiFetch<HostImageCleanupView>(`/admin/hosts/${encodeURIComponent(hostID)}/images/cleanup`, { token, signal });
+}
+
+export function requestHostImageCleanup(token: string, hostID: string, req: HostImageCleanupRequest): Promise<HostImageCleanupAttempt> {
+  return apiFetch<HostImageCleanupAttempt>(`/admin/hosts/${encodeURIComponent(hostID)}/images/cleanup`, {
+    method: "POST", body: req, token,
+  });
+}
+
+/** Reads the persisted outcome of one exact-version cleanup request. */
+export function getHostImageCleanupAttempt(token: string, hostID: string, attemptID: string, signal?: AbortSignal): Promise<HostImageCleanupAttempt> {
+  return apiFetch<HostImageCleanupAttempt>(
+    `/admin/hosts/${encodeURIComponent(hostID)}/images/cleanup/attempts/${encodeURIComponent(attemptID)}`,
+    { token, signal },
+  );
 }
 
 export function pinImage(token: string, id: string): Promise<void> {
@@ -525,6 +580,14 @@ export function unpinImage(token: string, id: string): Promise<void> {
  *  error. 409 when the image is pinned. */
 export function updateImage(token: string, id: string): Promise<ImageUpdateResult> {
   return apiFetch<ImageUpdateResult>(`/admin/images/${encodeURIComponent(id)}/update`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** Re-arm one selected host's failed adopted image; 202 means scheduled. */
+export function retryHostImage(token: string, hostId: string, imageId: string): Promise<void> {
+  return apiFetch<void>(`/admin/hosts/${encodeURIComponent(hostId)}/images/${encodeURIComponent(imageId)}/retry`, {
     method: "POST",
     token,
   });
@@ -562,6 +625,33 @@ export function uncordonHost(token: string, id: string): Promise<{ host: import(
     method: "POST",
     token,
   });
+}
+
+/** control-api.md "Readiness override — admin". Idempotent: repeating it
+ *  returns the existing override and writes no second audit row. `409
+ *  conflict` when the check is not currently blocking (agent-enforced, or
+ *  not reported as a failing `blocks` check); the server message says which. */
+export function setReadinessOverride(
+  token: string,
+  hostId: string,
+  checkId: string,
+): Promise<ReadinessOverride> {
+  return apiFetch<ReadinessOverride>(
+    `/admin/hosts/${encodeURIComponent(hostId)}/readiness-overrides/${encodeURIComponent(checkId)}`,
+    { method: "PUT", token },
+  );
+}
+
+/** `204`, idempotent (also `204` when no override exists). */
+export function clearReadinessOverride(
+  token: string,
+  hostId: string,
+  checkId: string,
+): Promise<void> {
+  return apiFetch<void>(
+    `/admin/hosts/${encodeURIComponent(hostId)}/readiness-overrides/${encodeURIComponent(checkId)}`,
+    { method: "DELETE", token },
+  );
 }
 
 // ── Session oversight (P2-10) ─────────────────────────────────────────────────
@@ -646,6 +736,21 @@ export function listAdminHomes(
   return apiFetch<AdminHomesResponse>(`/admin/storage/homes${qs ? `?${qs}` : ""}`, { token });
 }
 
+export function listAdminHomeClaims(
+  token: string,
+  opts: { userId?: string; appId?: string; hostId?: string; state?: string; limit?: number; cursor?: string } = {},
+): Promise<AdminHomeClaimsResponse> {
+  const params = new URLSearchParams();
+  if (opts.userId) params.set("user_id", opts.userId);
+  if (opts.appId) params.set("app_id", opts.appId);
+  if (opts.hostId) params.set("host_id", opts.hostId);
+  if (opts.state) params.set("state", opts.state);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  const qs = params.toString();
+  return apiFetch<AdminHomeClaimsResponse>(`/admin/storage/home-claims${qs ? `?${qs}` : ""}`, { token });
+}
+
 // ── Host runtime settings (host-settings admin UI) ────────────────────────────
 
 export function getConfigCatalog(token: string): Promise<ConfigCatalogResponse> {
@@ -654,6 +759,39 @@ export function getConfigCatalog(token: string): Promise<ConfigCatalogResponse> 
 
 export function getHostSettings(token: string, hostId: string): Promise<HostSettingsResponse> {
   return apiFetch<HostSettingsResponse>(`/admin/hosts/${hostId}/settings`, { token });
+}
+
+export type HostPolicyView = components["schemas"]["HostPolicy"];
+export function getHostPolicy(token: string, hostId: string): Promise<HostPolicyView> {
+  return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy`, { token });
+}
+export function updateHostPolicy(token: string, hostId: string, expectedRevision: string, changes: Record<string, components["schemas"]["HostPolicyChoice"]>): Promise<HostPolicyView> {
+  return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy`, { token, method: "PATCH", body: { expected_revision: expectedRevision, changes } });
+}
+export type IdleApplyPreview = components["schemas"]["HostPolicyApprovalPreview"] & {
+  approval_boot_incarnation: string;
+  approval_review_id: string;
+};
+export type IdleApplyAttempt = components["schemas"]["IdleApplyAttempt"];
+export function approveHostIdleApply(token: string, hostId: string, group: string, preview: IdleApplyPreview, expiresAt: string): Promise<IdleApplyAttempt> {
+  return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply`, { token, method: "POST", body: {
+    group, expected_revision: preview.revision, content_sha256: preview.content_sha256,
+    prerequisites_sha256: preview.prerequisites_sha256, prerequisites: preview.prerequisites,
+    approval_boot_incarnation: preview.approval_boot_incarnation,
+    approval_review_id: preview.approval_review_id, expires_at: expiresAt,
+  } });
+}
+export function getHostIdleApply(token: string, hostId: string, attemptId: string): Promise<IdleApplyAttempt> {
+  return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply/${attemptId}`, { token });
+}
+export function cancelHostIdleApply(token: string, hostId: string, attemptId: string): Promise<IdleApplyAttempt> {
+  return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply/${attemptId}/cancel`, { token, method: "POST" });
+}
+/** Re-arm one next-session group whose transient retry budget is exhausted.
+ *  A control plane that does not serve the route yet answers 404. */
+export function retryHostPolicyGroup(token: string, hostId: string, group: string): Promise<HostPolicyView> {
+  const body: components["schemas"]["HostPolicyRetryRequest"] = { group };
+  return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy/retry`, { token, method: "POST", body });
 }
 
 /** A null value clears that key back to the catalog default. 409
@@ -788,6 +926,21 @@ export function deleteLaunchProfile(token: string, id: string): Promise<void> {
 /** Tombstones the home for GC (202). semantics: control-api.md §errors */
 export function tombstoneHome(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/admin/storage/homes/${id}`, { method: "DELETE", token });
+}
+
+// Amendment 15 (#379): release a conflicting claim whose host is gone. The
+// expected state and reason are the values the admin read (compare-and-swap).
+export function releaseHomeClaim(
+  token: string,
+  req: {
+    user_id: string;
+    app_id: string;
+    expected_state: string;
+    expected_conflict_reason: string;
+    attestation: string;
+  },
+): Promise<void> {
+  return apiFetch<void>(`/admin/storage/home-claims/release`, { method: "POST", body: req, token });
 }
 
 // ── Session trace (ST-06/ST-07) ───────────────────────────────────────────────
@@ -943,6 +1096,33 @@ export function applyPlatformReleaseToHost(
   req: { release_id: string; force?: boolean },
 ): Promise<PlatformApplyAttemptEnvelope> {
   return apiFetch<PlatformApplyAttemptEnvelope>(`/admin/platform/hosts/${hostId}/apply`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Apply an arbitrary digest set to one owned target. 202 with a
+ *  `developer_apply` attempt, watched through active_apply like any other. */
+/** Remove an owned GPU host's node agent and recovery actor (control-api.md amendment
+ *  14, "Removing an owned GPU host"). `202` once its recovery actor accepts. */
+export function removePlatformHost(
+  token: string,
+  id: string,
+  req: import("./types").PlatformHostRemoveRequest = {},
+): Promise<{ host: import("./types").Host }> {
+  return apiFetch<{ host: import("./types").Host }>(`/admin/platform/hosts/${id}/remove`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+export function developerApply(
+  token: string,
+  req: PlatformDeveloperApplyRequest,
+): Promise<PlatformApplyAttemptEnvelope> {
+  return apiFetch<PlatformApplyAttemptEnvelope>("/admin/platform/developer-apply", {
     method: "POST",
     body: req,
     token,

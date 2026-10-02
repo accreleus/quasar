@@ -36,11 +36,19 @@ pub fn detect() -> SystemCapacity {
     let allow_synthetic = std::env::var("QUASAR_SYNTHETIC_GPU_CAPACITY")
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let mem_mb = detect_mem_mb();
-    let (gpus, vram_targets, gpu_detection, gpu_detection_reason) = detect_gpus_at(
+    let (gpus, vram_targets, gpu_detection, gpu_detection_reason) = detect_gpus_at_with_access(
         std::path::Path::new("/sys/class/drm"),
         allow_synthetic,
         mem_mb,
         &DriverIdentities::detect(std::path::Path::new("/")),
+        &|k| std::env::var(k).ok(),
+        &|node| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(node)
+                .is_ok()
+        },
     );
     SystemCapacity {
         host: HostCapacity {
@@ -156,6 +164,7 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
         outputs,
         audio_sinks: detect_audio_sinks(),
         input_devices: detect_input_devices(),
+        access: None,
     }
 }
 
@@ -216,6 +225,12 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
     let mut outputs = Vec::new();
     for entry in cards {
         let card_name = entry.file_name().to_string_lossy().into_owned();
+        // #407: opening a primary node read-write can make the opener DRM master
+        // automatically when the display is free, racing spawn_weston_console's own
+        // open for it — see session::console::drm_open_lock. Held for this card only.
+        let _drm_open_guard = crate::session::console::drm_open_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -324,52 +339,54 @@ fn detect_drm_connectors() -> Vec<String> {
     crate::ddc::powered_connectors(out)
 }
 
-/// Host audio sinks from `/proc/asound` or the host bind at `/host-proc/asound`. A card name
-/// alone is insufficient for HDMI/DP: the active output is often `hw:<card>,<device>`, not
-/// the non-existent device zero.
-fn detect_audio_sinks() -> Vec<AudioSink> {
-    // Docker creates an empty `/proc/asound` even with no host ALSA metadata visible, so
-    // pick the first root that actually has `cards` or the explicit host bind is shadowed.
-    let asound = ["/proc/asound", "/host-proc/asound"]
-        .into_iter()
-        .find(|root| std::path::Path::new(root).join("cards").is_file())
-        .unwrap_or("/proc/asound");
-    let cards = std::fs::read_to_string(format!("{asound}/cards")).unwrap_or_default();
-    let pcm = std::fs::read_to_string(format!("{asound}/pcm")).unwrap_or_default();
-    parse_audio_sinks(&cards, &pcm)
+/// Console audio sinks: the host PipeWire's while its console-audio socket answers (the
+/// `hw:*` ones hidden then, never fought for), otherwise the host's ALSA playback PCMs
+/// (`session::console_audio`, RH-07 #407 D13).
+pub(crate) fn detect_audio_sinks() -> Vec<AudioSink> {
+    crate::session::console_audio::sinks(&crate::session::console_audio::LiveHostAudio::live())
+}
+
+/// ALSA playback sinks from an asound root (`/proc/asound` or the host bind at
+/// `/host-proc/asound`). A card name alone is insufficient for HDMI/DP: the active output
+/// is often device 3 or 7, not the non-existent device zero. Ids name the card by its id
+/// (`hw:CARD=<id>,DEV=<device>`), which a driver reload does not move (#407 live).
+pub(crate) fn alsa_sinks_at(asound: &std::path::Path, dev_snd: &std::path::Path) -> Vec<AudioSink> {
+    let cards = std::fs::read_to_string(asound.join("cards")).unwrap_or_default();
+    let pcm = std::fs::read_to_string(asound.join("pcm")).unwrap_or_default();
+    let ids = crate::session::console_audio::read_card_ids(asound);
+    parse_audio_sinks(&cards, &pcm, &ids)
         .into_iter()
         // Compose may expose only one sound device; advertising the rest of the host's
         // inventory hands an operator a sink whose ALSA node the pipeline cannot open.
-        .filter(|sink| audio_sink_device_visible(&sink.id))
+        // Card-level fallbacks name a controller, not a playback PCM; still useful on a
+        // host that exposes no pcm data.
+        .filter(|(pcm, _)| {
+            pcm.is_none_or(|(card, device)| pcm_device_path(dev_snd, card, device).exists())
+        })
+        .map(|(_, sink)| sink)
         .collect()
 }
 
-fn audio_sink_device_visible(id: &str) -> bool {
-    audio_sink_device_path(id).is_none_or(|path| path.exists())
+fn pcm_device_path(dev_snd: &std::path::Path, card: u32, device: u32) -> std::path::PathBuf {
+    dev_snd.join(format!("pcmC{card}D{device}p"))
 }
 
-fn audio_sink_device_path(id: &str) -> Option<std::path::PathBuf> {
-    let Some((card, device)) = id
-        .strip_prefix("hw:")
-        .and_then(|address| address.split_once(','))
-    else {
-        // Card-level fallbacks name a controller, not a playback PCM; still useful on a
-        // host that exposes no pcm data.
-        return None;
-    };
-    Some(std::path::PathBuf::from(format!(
-        "/dev/snd/pcmC{card}D{device}p"
-    )))
-}
-
-fn parse_audio_sinks(cards: &str, pcm: &str) -> Vec<AudioSink> {
+/// Each playback sink with the `(card index, device)` it is at now (`None` for a
+/// card-level fallback). `ids` maps a card index to its id; a card with none keeps the
+/// index form.
+fn parse_audio_sinks(
+    cards: &str,
+    pcm: &str,
+    ids: &std::collections::BTreeMap<u32, String>,
+) -> Vec<(Option<(u32, u32)>, AudioSink)> {
+    use crate::session::console_audio::{alsa_card_sink_id, alsa_sink_id};
     let mut labels = std::collections::BTreeMap::new();
     for line in cards.lines() {
         let trimmed = line.trim_start();
         let Some((idx_str, rest)) = trimmed.split_once(' ') else {
             continue;
         };
-        let Ok(idx) = idx_str.trim().parse::<i32>() else {
+        let Ok(idx) = idx_str.trim().parse::<u32>() else {
             continue;
         };
         let label = rest
@@ -393,7 +410,7 @@ fn parse_audio_sinks(cards: &str, pcm: &str) -> Vec<AudioSink> {
         let Some((card, device)) = address.trim().split_once('-') else {
             continue;
         };
-        let (Ok(card), Ok(device)) = (card.parse::<i32>(), device.parse::<i32>()) else {
+        let (Ok(card), Ok(device)) = (card.parse::<u32>(), device.parse::<u32>()) else {
             continue;
         };
         let endpoint = detail
@@ -406,17 +423,27 @@ fn parse_audio_sinks(cards: &str, pcm: &str) -> Vec<AudioSink> {
             .get(&card)
             .cloned()
             .unwrap_or_else(|| format!("card {card}"));
-        out.push(AudioSink {
-            id: format!("hw:{card},{device}"),
-            label: format!("{card_label} — {endpoint}"),
-        });
+        let id = match ids.get(&card) {
+            Some(card_id) => alsa_sink_id(card_id, device),
+            None => format!("hw:{card},{device}"),
+        };
+        out.push((
+            Some((card, device)),
+            AudioSink {
+                id,
+                label: format!("{card_label} — {endpoint}"),
+            },
+        ));
     }
 
     // A card with no PCM detail yet (a USB DAC still initializing) keeps a card-level option.
     if out.is_empty() {
-        out.extend(labels.into_iter().map(|(idx, label)| AudioSink {
-            id: format!("hw:{idx}"),
-            label,
+        out.extend(labels.into_iter().map(|(idx, label)| {
+            let id = match ids.get(&idx) {
+                Some(card_id) => alsa_card_sink_id(card_id),
+                None => format!("hw:{idx}"),
+            };
+            (None, AudioSink { id, label })
         }));
     }
     out
@@ -474,11 +501,24 @@ fn detect_mem_mb() -> i32 {
     0
 }
 
+#[cfg(test)]
 fn detect_gpus_at(
     root: &std::path::Path,
     allow_synthetic: bool,
     mem_mb: i32,
     identities: &DriverIdentities,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<GpuCapacity>, Vec<VramTarget>, String, Option<String>) {
+    detect_gpus_at_with_access(root, allow_synthetic, mem_mb, identities, lookup, &|_| true)
+}
+
+fn detect_gpus_at_with_access(
+    root: &std::path::Path,
+    allow_synthetic: bool,
+    mem_mb: i32,
+    identities: &DriverIdentities,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    render_node_accessible: &dyn Fn(&std::path::Path) -> bool,
 ) -> (Vec<GpuCapacity>, Vec<VramTarget>, String, Option<String>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -508,7 +548,7 @@ fn detect_gpus_at(
 
     // Resolved once per detect(), not per GPU, so a multi-GPU host does not re-warn on a bad
     // knob value once per card.
-    let vulkan_slots = vulkan_encode_slots_override();
+    let vulkan_slots = vulkan_encode_slots_override(lookup);
 
     let mut gpus = Vec::new();
     let mut vram_targets = Vec::new();
@@ -528,6 +568,26 @@ fn detect_gpus_at(
             "0x8086" => "intel",
             _ => continue,
         };
+
+        // /sys/class/drm can include cards from the host that are not exposed to this
+        // container. A render-node name alone is not evidence that this agent can use it.
+        // Check the same read/write access needed for a real DRM render-node open before
+        // probing the vendor or advertising capacity.
+        // The stable by-path identity does not itself need to be mounted in the container.
+        let (render_node, resolved_device_path) = pci_address(&device_path)
+            .and_then(|addr| {
+                renderd_node_for_pci_addr_root(&addr, root)
+                    .map(|device| (format!("/dev/dri/by-path/pci-{addr}-render"), device))
+            })
+            .map_or((None, None), |(stable, device)| {
+                (Some(stable), Some(device))
+            });
+        if !resolved_device_path
+            .as_deref()
+            .is_some_and(|node| render_node_accessible(std::path::Path::new(node)))
+        {
+            continue;
+        }
 
         let model = read_model(&device_path, vendor);
         let vram_mb_total = if vendor == "intel" {
@@ -550,18 +610,6 @@ fn detect_gpus_at(
             "intel" => 2,
             _ => 1,
         };
-
-        // The by-path form is constructed, not read off disk, so it survives a container
-        // with no /dev/dri/by-path bind — but only when this GPU has a render node at all
-        // (a display-only iGPU may not).
-        let (render_node, resolved_device_path) = pci_address(&device_path)
-            .and_then(|addr| {
-                renderd_node_for_pci_addr_root(&addr, root)
-                    .map(|device| (format!("/dev/dri/by-path/pci-{addr}-render"), device))
-            })
-            .map_or((None, None), |(stable, device)| {
-                (Some(stable), Some(device))
-            });
 
         // `pci_addr` matters only on the NVIDIA path; the AMD sampler reads `sysfs_device`
         // directly and never matches by bus id.
@@ -597,19 +645,30 @@ fn detect_gpus_at(
             render_node,
             device_path: resolved_device_path,
             driver_identity,
+            // Stamped later from the codec-probe evidence (`agent::apply_gpu_codecs`);
+            // this detection pass only builds the base inventory.
+            codecs: None,
         });
     }
 
     if let Some(slots) = vulkan_slots {
-        apply_vulkan_override(&mut gpus, slots);
+        apply_vulkan_override(&mut gpus, slots, lookup);
     }
 
     // #489: the NVIDIA driver has a UAF that SIGSEGVs the whole agent when one session's
     // NVENC teardown overlaps another live NVENC session. Setting the ceiling to 1 makes
     // that overlap unschedulable, since admission enforces encode_slots_total.
-    if let Some(slots) = nvenc_max_sessions_override() {
+    if let Some(slots) = nvenc_max_sessions_override(lookup) {
         apply_nvenc_override_to(&mut gpus, slots);
     }
+
+    // #276: `schedulableBindingSQL` (control-plane) denies placement on any GPU whose
+    // render_node/device_path does not match a configured `QUASAR_RENDER_NODE`, for every
+    // hardware encoder branch (va, nvenc, vulkan alike) — openh264 is the only branch that
+    // does not pin. Advertised capacity must agree, or the console counts encode slots on a
+    // GPU admission will never schedule onto. Runs last so it has the final say over the
+    // vendor stub and the nvenc/vulkan ceilings above, which know nothing of pinning.
+    apply_render_node_pin(&mut gpus, lookup);
 
     if gpus.is_empty() {
         detection_failure(
@@ -625,9 +684,9 @@ fn detect_gpus_at(
 /// `Some(n)` only when the resolved encoder (explicit `QUASAR_ENCODER` or the
 /// vendor auto-detect) is vulkan; `n` is the `QUASAR_VULKAN_MAX_SESSIONS` ceiling
 /// replacing the vendor stub. Every other encoder leaves the stub untouched.
-fn vulkan_encode_slots_override() -> Option<i32> {
-    let choice = crate::session::settings::resolve_encoder_choice();
-    (choice == EncoderChoice::Vulkan).then(vulkan_max_sessions)
+fn vulkan_encode_slots_override(lookup: &dyn Fn(&str) -> Option<String>) -> Option<i32> {
+    let choice = crate::session::settings::resolve_encoder_choice_with(lookup);
+    (choice == EncoderChoice::Vulkan).then(|| vulkan_max_sessions(lookup))
 }
 
 /// Scopes the `QUASAR_VULKAN_MAX_SESSIONS` override to the one GPU vulkan renders through,
@@ -637,11 +696,15 @@ fn vulkan_encode_slots_override() -> Option<i32> {
 ///
 /// Fails open: an unresolvable or unmatched render node applies the override to every GPU
 /// with a warn, since a vulkan host must never advertise zero vulkan capacity.
-fn apply_vulkan_override(gpus: &mut [GpuCapacity], slots: i32) {
+fn apply_vulkan_override(
+    gpus: &mut [GpuCapacity],
+    slots: i32,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) {
     if gpus.is_empty() {
         return;
     }
-    let configured = configured_vulkan_render_node();
+    let configured = configured_vulkan_render_node(lookup);
     apply_vulkan_override_to(gpus, slots, configured.as_deref());
 }
 
@@ -683,12 +746,62 @@ fn apply_vulkan_override_to(gpus: &mut [GpuCapacity], slots: i32, configured: Op
     }
 }
 
+/// #276: zero the encode slots of every detected GPU that a configured `QUASAR_RENDER_NODE`
+/// pin excludes from placement, for any hardware encoder (va/nvenc/vulkan all bind by render
+/// node — see `schedulableBindingSQL`). `openh264` never pins (any vendor-compatible GPU is
+/// schedulable), so it is skipped entirely: zeroing there would under-advertise a host that
+/// admission can in fact use.
+///
+/// Unmatched or unconfigured is left alone here exactly as in
+/// [`apply_vulkan_override_to`]'s fail-open branch — this pass only ever narrows an already
+/// resolved pin, never guesses at one.
+fn apply_render_node_pin(gpus: &mut [GpuCapacity], lookup: &dyn Fn(&str) -> Option<String>) {
+    if gpus.len() < 2 {
+        return;
+    }
+    if crate::session::settings::resolve_encoder_choice_with(lookup) == EncoderChoice::Openh264 {
+        return;
+    }
+    let Some(configured) = configured_vulkan_render_node(lookup) else {
+        return;
+    };
+    let Some(idx) = gpus
+        .iter()
+        .position(|g| g.device_path.as_deref() == Some(configured.as_str()))
+    else {
+        tracing::warn!(
+            token = "render-node-pin-unmatched",
+            configured_render_node = %configured,
+            "QUASAR_RENDER_NODE did not match any detected GPU's device_path; leaving \
+             advertised capacity as-is (fail-open — never advertise zero capacity on a \
+             pinned host we cannot positively identify)"
+        );
+        return;
+    };
+    for (i, g) in gpus.iter_mut().enumerate() {
+        if i != idx && g.encode_slots_total != 0 {
+            // Detection runs on every capacity report; say this once per process.
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    token = "gpu-slots-zeroed-render-node-pin",
+                    gpu_index = g.index,
+                    vendor = %g.vendor,
+                    "GPU excluded from encode capacity: host is pinned to {configured}, so this \
+                     GPU is never placed onto"
+                )
+            });
+            g.encode_slots_total = 0;
+        }
+    }
+}
+
 /// `QUASAR_NVENC_MAX_SESSIONS`, `Some(n)` only for a positive integer. No encoder gating,
 /// unlike the vulkan knob: NVENC is also the per-session vendor fallback on a vulkan host,
 /// so the ceiling applies to every NVIDIA GPU whenever it is set. Malformed or non-positive
 /// values warn and are ignored — never a silently zero or negative advertised capacity.
-fn nvenc_max_sessions_override() -> Option<i32> {
-    let raw = std::env::var("QUASAR_NVENC_MAX_SESSIONS").ok()?;
+fn nvenc_max_sessions_override(lookup: &dyn Fn(&str) -> Option<String>) -> Option<i32> {
+    let raw = lookup("QUASAR_NVENC_MAX_SESSIONS")?;
     match raw.trim().parse::<i32>() {
         Ok(n) if n > 0 => Some(n),
         Ok(n) => {
@@ -724,8 +837,8 @@ fn apply_nvenc_override_to(gpus: &mut [GpuCapacity], slots: i32) {
 /// `GpuCapacity::device_path`, via `session::settings::canonicalize_render_node` — never a
 /// second render-node resolution. `None` for the `"software"` default or anything outside
 /// `/dev/dri/`, which callers read as "no specific GPU configured".
-fn configured_vulkan_render_node() -> Option<String> {
-    let raw = std::env::var("QUASAR_RENDER_NODE").unwrap_or_else(|_| "software".to_string());
+fn configured_vulkan_render_node(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let raw = lookup("QUASAR_RENDER_NODE").unwrap_or_else(|| "software".to_string());
     if !raw.starts_with("/dev/dri/") {
         return None;
     }
@@ -737,11 +850,11 @@ fn configured_vulkan_render_node() -> Option<String> {
 /// ~710 MiB VRAM/session), and a deeper soak gates raising the default. Spec
 /// `docs/design/plans/2026-07-25-vulkan-multisession-spec.md` §2d/§4. Non-numeric, zero and
 /// negative all warn and fall back: a malformed knob must never advertise zero capacity.
-fn vulkan_max_sessions() -> i32 {
+fn vulkan_max_sessions(lookup: &dyn Fn(&str) -> Option<String>) -> i32 {
     const DEFAULT: i32 = 2;
-    match std::env::var("QUASAR_VULKAN_MAX_SESSIONS") {
-        Err(_) => DEFAULT,
-        Ok(raw) => match raw.trim().parse::<i32>() {
+    match lookup("QUASAR_VULKAN_MAX_SESSIONS") {
+        None => DEFAULT,
+        Some(raw) => match raw.trim().parse::<i32>() {
             Ok(n) if n > 0 => n,
             Ok(n) => {
                 tracing::warn!(
@@ -1156,6 +1269,7 @@ fn detection_failure(
             render_node: None,
             device_path: None,
             driver_identity: None,
+            codecs: None,
         }],
         vec![VramTarget {
             index: 0,
@@ -1192,6 +1306,7 @@ mod tests {
             false,
             16384,
             &test_identities(),
+            &empty_lookup,
         );
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
@@ -1203,7 +1318,7 @@ mod tests {
     fn empty_drm_inventory_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let (gpus, vram_targets, status, _) =
-            detect_gpus_at(dir.path(), false, 16384, &test_identities());
+            detect_gpus_at(dir.path(), false, 16384, &test_identities(), &empty_lookup);
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
         assert_eq!(status, "unavailable");
@@ -1213,7 +1328,7 @@ mod tests {
     fn synthetic_capacity_requires_explicit_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         let (gpus, vram_targets, status, reason) =
-            detect_gpus_at(dir.path(), true, 16384, &test_identities());
+            detect_gpus_at(dir.path(), true, 16384, &test_identities(), &empty_lookup);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, "unknown");
         assert_eq!(vram_targets.len(), 1);
@@ -1326,44 +1441,93 @@ mod tests {
 00-07: HDMI 1 : HDMI 1 : playback 1
 01-00: ALC1220 Analog : ALC1220 Analog : playback 1 : capture 1
 ";
+        let ids = std::collections::BTreeMap::from([
+            (0, "NVidia".to_string()),
+            (1, "Generic".to_string()),
+        ]);
         assert_eq!(
-            parse_audio_sinks(cards, pcm),
+            parse_audio_sinks(cards, pcm, &ids),
             vec![
-                AudioSink {
-                    id: "hw:0,3".to_string(),
-                    label: "HDA NVidia — HDMI 0".to_string(),
-                },
-                AudioSink {
-                    id: "hw:0,7".to_string(),
-                    label: "HDA NVidia — HDMI 1".to_string(),
-                },
-                AudioSink {
-                    id: "hw:1,0".to_string(),
-                    label: "HD-Audio Generic — ALC1220 Analog".to_string(),
-                },
+                (
+                    Some((0, 3)),
+                    AudioSink {
+                        id: "hw:CARD=NVidia,DEV=3".to_string(),
+                        label: "HDA NVidia — HDMI 0".to_string(),
+                    }
+                ),
+                (
+                    Some((0, 7)),
+                    AudioSink {
+                        id: "hw:CARD=NVidia,DEV=7".to_string(),
+                        label: "HDA NVidia — HDMI 1".to_string(),
+                    }
+                ),
+                (
+                    Some((1, 0)),
+                    AudioSink {
+                        id: "hw:CARD=Generic,DEV=0".to_string(),
+                        label: "HD-Audio Generic — ALC1220 Analog".to_string(),
+                    }
+                ),
             ]
+        );
+        // A card whose id cannot be read keeps the index form.
+        assert_eq!(
+            parse_audio_sinks(cards, pcm, &Default::default())[2].1.id,
+            "hw:1,0"
+        );
+    }
+
+    /// Through a temporary asound root: the id is the card's, wherever its index moved.
+    #[test]
+    fn alsa_sinks_name_the_card_id_and_keep_only_openable_pcms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asound, dev_snd) = (dir.path().join("asound"), dir.path().join("snd"));
+        std::fs::create_dir_all(asound.join("card1")).unwrap();
+        std::fs::create_dir_all(&dev_snd).unwrap();
+        std::fs::write(
+            asound.join("cards"),
+            " 0 [Generic        ]: HDA-Intel - HD-Audio Generic\n 1 [NVidia         ]: HDA-Intel - HDA NVidia\n",
+        )
+        .unwrap();
+        std::fs::write(asound.join("card1/id"), "NVidia\n").unwrap();
+        std::fs::write(
+            asound.join("pcm"),
+            "00-00: ALC1220 Analog : ALC1220 Analog : playback 1\n01-03: HDMI 0 : HDMI 0 : playback 1\n",
+        )
+        .unwrap();
+        std::fs::write(dev_snd.join("pcmC1D3p"), "").unwrap();
+        assert_eq!(
+            alsa_sinks_at(&asound, &dev_snd),
+            vec![AudioSink {
+                id: "hw:CARD=NVidia,DEV=3".to_string(),
+                label: "HDA NVidia — HDMI 0".to_string(),
+            }]
         );
     }
 
     #[test]
     fn audio_sinks_fall_back_to_card_when_pcm_is_unavailable() {
         let cards = " 0 [NVidia ]: HDA-Intel - HDA NVidia\n";
+        let ids = std::collections::BTreeMap::from([(0, "NVidia".to_string())]);
         assert_eq!(
-            parse_audio_sinks(cards, ""),
-            vec![AudioSink {
-                id: "hw:0".to_string(),
-                label: "HDA NVidia".to_string(),
-            }]
+            parse_audio_sinks(cards, "", &ids),
+            vec![(
+                None,
+                AudioSink {
+                    id: "hw:CARD=NVidia".to_string(),
+                    label: "HDA NVidia".to_string(),
+                }
+            )]
         );
     }
 
     #[test]
     fn audio_sink_pcm_path_matches_alsa_endpoint() {
         assert_eq!(
-            audio_sink_device_path("hw:0,3").as_deref(),
-            Some(std::path::Path::new("/dev/snd/pcmC0D3p"))
+            pcm_device_path(std::path::Path::new("/dev/snd"), 0, 3),
+            std::path::Path::new("/dev/snd/pcmC0D3p")
         );
-        assert!(audio_sink_device_path("hw:0").is_none());
     }
 
     #[test]
@@ -1550,11 +1714,28 @@ stepping\t: 2
         DriverIdentities::with(None, Vec::new())
     }
 
+    /// Every key unset: the case must not depend on the process environment.
+    fn empty_lookup(_: &str) -> Option<String> {
+        None
+    }
+
     fn fake_amd_card(root: &std::path::Path, card_name: &str) {
         let device_dir = root.join(card_name).join("device");
         std::fs::create_dir_all(&device_dir).unwrap();
         std::fs::write(device_dir.join("vendor"), "0x1002\n").unwrap();
         std::fs::write(device_dir.join("mem_info_vram_total"), "8589934592\n").unwrap();
+        let card_index: u32 = card_name.strip_prefix("card").unwrap().parse().unwrap();
+        fake_render_node_for_card(root, card_name, &format!("renderD{}", 128 + card_index));
+    }
+
+    fn fake_render_node_for_card(root: &std::path::Path, card_name: &str, render_name: &str) {
+        let render_dir = root.join(render_name);
+        std::fs::create_dir_all(&render_dir).unwrap();
+        std::os::unix::fs::symlink(
+            root.join(card_name).join("device"),
+            render_dir.join("device"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1565,6 +1746,7 @@ stepping\t: 2
         std::fs::write(device.join("vendor"), "0x1002\n").unwrap();
         std::fs::write(device.join("device"), "0x1636\n").unwrap();
         std::fs::write(device.join("mem_info_vram_total"), "8589934592\n").unwrap();
+        fake_render_node_for_card(dir.path(), "card0", "renderD128");
 
         let matched = crate::gpu_identity::VulkanDriver {
             vendor_id: 0x1002,
@@ -1577,6 +1759,7 @@ stepping\t: 2
             false,
             16384,
             &DriverIdentities::with(None, vec![matched]),
+            &empty_lookup,
         );
         assert_eq!(
             gpus[0].driver_identity.as_deref(),
@@ -1585,7 +1768,8 @@ stepping\t: 2
 
         // No source can name this GPU's driver: the field is omitted rather than
         // filled with a placeholder, and the control plane's matching fails open.
-        let (gpus, _, _, _) = detect_gpus_at(dir.path(), false, 16384, &test_identities());
+        let (gpus, _, _, _) =
+            detect_gpus_at(dir.path(), false, 16384, &test_identities(), &empty_lookup);
         assert_eq!(gpus[0].driver_identity, None);
     }
 
@@ -1596,9 +1780,10 @@ stepping\t: 2
         std::fs::create_dir_all(&device).unwrap();
         std::fs::write(device.join("vendor"), "0x8086\n").unwrap();
         std::fs::write(device.join("device"), "0x4692\n").unwrap();
+        fake_render_node_for_card(dir.path(), "card0", "renderD128");
 
         let (gpus, targets, status, reason) =
-            detect_gpus_at(dir.path(), false, 16384, &test_identities());
+            detect_gpus_at(dir.path(), false, 16384, &test_identities(), &empty_lookup);
         assert_eq!(status, "ok", "Intel iGPU discarded: {reason:?}");
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, "intel");
@@ -1682,13 +1867,19 @@ stepping\t: 2
             let card = dir.path().join("card0");
             std::fs::create_dir_all(card.join("device")).unwrap();
             std::fs::write(card.join("device/vendor"), "0x8086").unwrap();
+            fake_render_node_for_card(dir.path(), "card0", "renderD128");
             for (path, value) in *files {
                 let path = card.join(path);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(path, value).unwrap();
             }
-            let (gpus, targets, status, _) =
-                detect_gpus_at(dir.path(), false, *mem_mb, &test_identities());
+            let (gpus, targets, status, _) = detect_gpus_at(
+                dir.path(),
+                false,
+                *mem_mb,
+                &test_identities(),
+                &empty_lookup,
+            );
             assert_eq!(gpus.first().map(|g| g.vram_mb_total), *expected, "{name}");
             assert_eq!(
                 status,
@@ -1712,7 +1903,7 @@ stepping\t: 2
         std::fs::remove_file(device.join("mem_info_vram_total")).unwrap();
         fake_amd_card(dir.path(), "card1");
         let (gpus, targets, status, _) =
-            detect_gpus_at(dir.path(), false, 8192, &test_identities());
+            detect_gpus_at(dir.path(), false, 8192, &test_identities(), &empty_lookup);
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].vendor, "intel");
@@ -1744,7 +1935,7 @@ stepping\t: 2
         fake_amd_card(&drm_root, "card0");
 
         let (gpus, vram_targets, status, _) =
-            detect_gpus_at(&drm_root, false, 16384, &test_identities());
+            detect_gpus_at(&drm_root, false, 16384, &test_identities(), &empty_lookup);
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 1);
         assert_eq!(vram_targets.len(), 1);
@@ -1761,32 +1952,16 @@ stepping\t: 2
         );
     }
 
-    fn restore_env(key: &str, prior: Option<String>) {
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
-
-    // These two vars are process-global env, so every case must live in ONE test that saves
-    // and restores them: there is no `serial_test` dep in this crate.
     #[test]
     fn vulkan_capacity_knob_env_gating() {
-        let keys = ["QUASAR_ENCODER", "QUASAR_VULKAN_MAX_SESSIONS"];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let drm_root = dir.path().join("class-drm");
         std::fs::create_dir_all(&drm_root).unwrap();
         fake_amd_card(&drm_root, "card0");
 
         // Non-vulkan host: the knob is inert off the vulkan path.
-        std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[("QUASAR_VULKAN_MAX_SESSIONS", "5")]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert_eq!(gpus.len(), 1);
         assert_eq!(
             gpus[0].encode_slots_total, 2,
@@ -1794,16 +1969,18 @@ stepping\t: 2
         );
 
         // Vulkan host honors the knob.
-        std::env::set_var("QUASAR_ENCODER", "vulkan");
-        std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "vulkan"),
+            ("QUASAR_VULKAN_MAX_SESSIONS", "5"),
+        ]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert_eq!(
             gpus[0].encode_slots_total, 5,
             "vulkan host honors QUASAR_VULKAN_MAX_SESSIONS"
         );
 
-        std::env::remove_var("QUASAR_VULKAN_MAX_SESSIONS");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[("QUASAR_ENCODER", "vulkan")]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert_eq!(
             gpus[0].encode_slots_total, 2,
             "vulkan host with the knob unset defaults to 2"
@@ -1811,16 +1988,16 @@ stepping\t: 2
 
         // Malformed or non-positive values must never advertise a zero or negative capacity.
         for bad in ["0", "-1", "not-a-number", ""] {
-            std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", bad);
-            let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+            let lookup = crate::test_env::lookup(&[
+                ("QUASAR_ENCODER", "vulkan"),
+                ("QUASAR_VULKAN_MAX_SESSIONS", bad),
+            ]);
+            let (gpus, _, _, _) =
+                detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
             assert_eq!(
                 gpus[0].encode_slots_total, 2,
                 "invalid QUASAR_VULKAN_MAX_SESSIONS={bad:?} falls back to default 2"
             );
-        }
-
-        for (k, v) in saved {
-            restore_env(k, v);
         }
     }
 
@@ -1836,6 +2013,7 @@ stepping\t: 2
             render_node: None,
             device_path: None,
             driver_identity: None,
+            codecs: None,
         }
     }
 
@@ -1849,31 +2027,35 @@ stepping\t: 2
     }
 
     /// Unset ⇒ None and the stub stands; malformed or non-positive ⇒ None, never a zero or
-    /// negative advertised capacity. One test, because the var is process-global env.
+    /// negative advertised capacity.
     #[test]
     fn nvenc_max_sessions_env_parsing() {
         let key = "QUASAR_NVENC_MAX_SESSIONS";
-        let saved = std::env::var(key).ok();
 
-        std::env::remove_var(key);
-        assert_eq!(nvenc_max_sessions_override(), None, "unset ⇒ stub stands");
+        assert_eq!(
+            nvenc_max_sessions_override(&empty_lookup),
+            None,
+            "unset ⇒ stub stands"
+        );
 
-        std::env::set_var(key, "1");
-        assert_eq!(nvenc_max_sessions_override(), Some(1));
+        assert_eq!(
+            nvenc_max_sessions_override(&crate::test_env::lookup(&[(key, "1")])),
+            Some(1)
+        );
 
-        std::env::set_var(key, " 2 ");
-        assert_eq!(nvenc_max_sessions_override(), Some(2), "whitespace trimmed");
+        assert_eq!(
+            nvenc_max_sessions_override(&crate::test_env::lookup(&[(key, " 2 ")])),
+            Some(2),
+            "whitespace trimmed"
+        );
 
         for bad in ["0", "-1", "not-a-number", ""] {
-            std::env::set_var(key, bad);
             assert_eq!(
-                nvenc_max_sessions_override(),
+                nvenc_max_sessions_override(&crate::test_env::lookup(&[(key, bad)])),
                 None,
                 "invalid QUASAR_NVENC_MAX_SESSIONS={bad:?} is ignored"
             );
         }
-
-        restore_env(key, saved);
     }
 
     /// Adds the symlink chain `fake_amd_card` lacks, so `GpuCapacity::device_path` is
@@ -1898,11 +2080,119 @@ stepping\t: 2
         std::os::unix::fs::symlink(&device_target, render_dir.join("device")).unwrap();
     }
 
-    /// Must not touch `QUASAR_RENDER_NODE`/`QUASAR_ENCODER` or call `detect_gpus_at`: both
-    /// would race `session::settings`' unguarded readers and the sibling env test under the
-    /// default parallel runner. It resolves `device_path` through the same root-scoped sysfs
-    /// walk and drives the pure `apply_vulkan_override_to` with the render node as an
-    /// argument instead.
+    #[test]
+    fn host_inventory_omits_sysfs_gpu_without_accessible_render_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let drm_root = dir.path().join("class-drm");
+        std::fs::create_dir_all(&drm_root).unwrap();
+        fake_amd_card_with_render_node(&drm_root, "card0", "renderD128", "0000:01:00.0");
+        fake_amd_card_with_render_node(&drm_root, "card1", "renderD129", "0000:04:00.0");
+
+        // Both cards exist in the shared sysfs view. This agent can open only one
+        // render node in its private /dev, as on the GPU test containers.
+        let (gpus, targets, status, reason) = detect_gpus_at_with_access(
+            &drm_root,
+            false,
+            16384,
+            &test_identities(),
+            &empty_lookup,
+            &|node| node == std::path::Path::new("/dev/dri/renderD128"),
+        );
+        assert_eq!(status, "ok", "{reason:?}");
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].device_path.as_deref(), Some("/dev/dri/renderD128"));
+        assert_eq!(
+            targets.len(),
+            1,
+            "VRAM sampling must use the same accessible inventory"
+        );
+
+        let (gpus, targets, status, _) = detect_gpus_at_with_access(
+            &drm_root,
+            false,
+            16384,
+            &test_identities(),
+            &empty_lookup,
+            &|_| false,
+        );
+        assert_eq!(status, "unavailable");
+        assert!(gpus.is_empty());
+        assert!(targets.is_empty());
+    }
+
+    /// #276: a host pinned to one render node must not advertise encode slots on a second
+    /// GPU it can never place a session onto — `schedulableBindingSQL` denies it for every
+    /// hardware encoder branch. The permissive test access seam isolates pin behavior;
+    /// production inventory filters inaccessible render nodes before pinning.
+    #[test]
+    fn render_node_pin_zeroes_the_excluded_gpu_and_keeps_indices_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let drm_root = dir.path().join("class-drm");
+        std::fs::create_dir_all(&drm_root).unwrap();
+        fake_amd_card_with_render_node(&drm_root, "card0", "renderD128", "0000:01:00.0");
+        fake_amd_card_with_render_node(&drm_root, "card1", "renderD129", "0000:04:00.0");
+
+        // Pinned to card0's render node, on a hardware encoder branch (va): card1 is
+        // globally unschedulable under `schedulableBindingSQL` and must advertise 0 slots.
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "va"),
+            ("QUASAR_RENDER_NODE", "/dev/dri/renderD128"),
+        ]);
+        let (gpus, _, status, _) =
+            detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
+        assert_eq!(status, "ok");
+        assert_eq!(gpus.len(), 2);
+        let card0 = gpus
+            .iter()
+            .find(|g| g.device_path.as_deref() == Some("/dev/dri/renderD128"))
+            .unwrap();
+        let card1 = gpus
+            .iter()
+            .find(|g| g.device_path.as_deref() == Some("/dev/dri/renderD129"))
+            .unwrap();
+        assert_eq!(card0.index, 0, "pinned GPU keeps its detection-order index");
+        assert_eq!(
+            card1.index, 1,
+            "excluded GPU keeps its detection-order index"
+        );
+        assert_eq!(
+            card0.encode_slots_total, 2,
+            "pinned GPU keeps its vendor stub — it is still schedulable"
+        );
+        assert_eq!(
+            card1.encode_slots_total, 0,
+            "GPU excluded by the render-node pin advertises zero encode slots, matching \
+             admission's schedulableBindingSQL"
+        );
+
+        // openh264 never pins (schedulableBindingSQL's first branch matches any vendor GPU),
+        // so the same configured render node must NOT zero out card1 here.
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "openh264"),
+            ("QUASAR_RENDER_NODE", "/dev/dri/renderD128"),
+        ]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
+        assert!(
+            gpus.iter().all(|g| g.encode_slots_total == 2),
+            "openh264 does not pin by render node; both GPUs keep their vendor stub"
+        );
+
+        // A configured render node that matches no detected GPU (e.g. a stale by-path)
+        // fails open rather than zeroing every GPU's capacity down to nothing.
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "va"),
+            ("QUASAR_RENDER_NODE", "/dev/dri/renderD999"),
+        ]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
+        assert!(
+            gpus.iter().all(|g| g.encode_slots_total == 2),
+            "an unmatched render-node pin fails open rather than advertising zero capacity"
+        );
+    }
+
+    /// Exercises the render-node matching without `detect_gpus_at`: resolves `device_path`
+    /// through the same root-scoped sysfs walk and drives the pure `apply_vulkan_override_to`
+    /// with the render node as an argument instead.
     #[test]
     fn vulkan_capacity_override_scoped_to_configured_render_node() {
         let dir = tempfile::tempdir().unwrap();
@@ -1929,6 +2219,7 @@ stepping\t: 2
             render_node: None,
             device_path: Some(device_path),
             driver_identity: None,
+            codecs: None,
         };
         let base_gpus = vec![amd_gpu(card0_path), amd_gpu(card1_path)];
 

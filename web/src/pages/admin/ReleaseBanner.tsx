@@ -32,9 +32,8 @@ export function ReleaseBanner() {
 
   return (
     <div
-      className="note mb6"
+      className="note mb6 center between"
       role="status"
-      style={{ alignItems: "center", justifyContent: "space-between" }}
     >
       <div>
         <b>Quasar {releaseLabel(newest)} is available.</b> This instance is on{" "}

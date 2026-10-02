@@ -45,9 +45,15 @@
 # role/host for tests.
 #
 # Preflight (each one that fails makes this a clean SKIP, never a crash):
-#   * BENCH_KEY readable  — from $NIGHTLY_BENCH_ENV's BENCH_API_KEYS=name:secret
-#                            (default: $HOME/quasar-bench/deploy/.env,
-#                            "harness" entry). Never copied into this repo.
+#   * bench server + key  — resolved the way qbench does: NIGHTLY_BENCH_URL /
+#                            NIGHTLY_BENCH_KEY, else BENCH_URL / BENCH_KEY, else
+#                            the cron user's ${XDG_CONFIG_HOME:-~/.config}/qbench/
+#                            {url,key} (key file mode 600). There is NO default
+#                            server and none is derived. One opt-in for a stack
+#                            host that ALSO runs the bench service:
+#                            NIGHTLY_BENCH_ENV=<that service's deploy/.env>
+#                            supplies the key (first BENCH_API_KEYS pair) — only
+#                            the key, only when set. Never copied into this repo.
 #   * the stack is healthy — GET $NIGHTLY_HEALTH_URL/health == 200
 #   * no session already running — `qses ls --stack=$NIGHTLY_HOST` (using the
 #     stack's own per-boot dev-agent key, docker-exec'd fresh every run since
@@ -80,8 +86,10 @@
 #   NIGHTLY_SECS            default: 150
 #   NIGHTLY_CODEC           default: h264
 #   NIGHTLY_BASELINE        default: latency-budget/1080p60-h264-local
-#   NIGHTLY_BENCH_ENV       default: $HOME/quasar-bench/deploy/.env
-#   NIGHTLY_BENCH_URL       default: derived from BENCH_PORT in that file (or 9400)
+#   NIGHTLY_BENCH_URL       default: BENCH_URL, else ~/.config/qbench/url (no default)
+#   NIGHTLY_BENCH_KEY       default: BENCH_KEY, else ~/.config/qbench/key
+#   NIGHTLY_BENCH_ENV       unset by default. Opt-in: a co-located bench service's
+#                           deploy/.env to read the key from (BENCH_API_KEYS)
 #   NIGHTLY_HEALTH_URL      default: https://localhost:8443/health
 #   NIGHTLY_API_URL         default: derived from NIGHTLY_HEALTH_URL (strip /health)
 #   NIGHTLY_DEV_KEY         skip the docker-exec fetch and use this key verbatim
@@ -104,7 +112,7 @@ DX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/dx/common.sh
 source "$DX_DIR/common.sh"
 
-usage() { sed -n '3,84p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,107p' "$0" | sed 's/^# \{0,1\}//'; }
 
 DRY=0
 while [ $# -gt 0 ]; do
@@ -125,7 +133,7 @@ NIGHTLY_APP="${NIGHTLY_APP:-Quasar Benchapp}"
 NIGHTLY_SECS="${NIGHTLY_SECS:-150}"
 NIGHTLY_CODEC="${NIGHTLY_CODEC:-h264}"
 NIGHTLY_BASELINE="${NIGHTLY_BASELINE:-latency-budget/1080p60-h264-local}"
-NIGHTLY_BENCH_ENV="${NIGHTLY_BENCH_ENV:-$HOME/quasar-bench/deploy/.env}"
+NIGHTLY_BENCH_ENV="${NIGHTLY_BENCH_ENV:-}"
 NIGHTLY_HEALTH_URL="${NIGHTLY_HEALTH_URL:-https://localhost:8443/health}"
 NIGHTLY_API_URL="${NIGHTLY_API_URL:-${NIGHTLY_HEALTH_URL%/health}}"
 NIGHTLY_BENCH_RUN="${NIGHTLY_BENCH_RUN:-$DX_DIR/bench_run.sh}"
@@ -165,30 +173,30 @@ fi
 
 log "start host=$NIGHTLY_HOST suite=$NIGHTLY_SUITE scenario=$NIGHTLY_SCENARIO git_quasar=$SHA dry_run=$DRY"
 
-# ── preflight 1: BENCH_KEY readable ──────────────────────────────────────────
-BENCH_KEY=""
-if [ -n "${NIGHTLY_BENCH_KEY:-}" ]; then
-  BENCH_KEY="$NIGHTLY_BENCH_KEY"
-elif [ -r "$NIGHTLY_BENCH_ENV" ]; then
-  # BENCH_API_KEYS=name:secret[,name2:secret2,...] — take the first pair's
-  # secret half (bench_run.sh/bench_submit.py tolerate the raw name:secret
-  # form too, but resolving it here means the preflight itself can tell
-  # "file present but no key" apart from "key present").
+# ── preflight 1: bench server + key ──────────────────────────────────────────
+# BENCH_URL_SRC names where the server came from; the URL itself is never logged.
+[ -z "${NIGHTLY_BENCH_URL:-}" ] || BENCH_URL="$NIGHTLY_BENCH_URL"
+if [ -n "${NIGHTLY_BENCH_URL:-}" ]; then BENCH_URL_SRC=NIGHTLY_BENCH_URL
+elif [ -n "${BENCH_URL:-}" ]; then BENCH_URL_SRC=BENCH_URL
+else BENCH_URL_SRC="qbench config"; fi
+[ -z "${NIGHTLY_BENCH_KEY:-}" ] || BENCH_KEY="$NIGHTLY_BENCH_KEY"
+if [ -z "${BENCH_KEY:-}" ] && [ -n "$NIGHTLY_BENCH_ENV" ] && [ -r "$NIGHTLY_BENCH_ENV" ]; then
+  # Opt-in only. BENCH_API_KEYS=name:secret[,name2:secret2,...] — take the first
+  # pair's secret half (bench_submit.py tolerates the raw name:secret form too,
+  # but resolving it here lets the preflight tell "no key" from "key present").
   raw="$(sed -n 's/^BENCH_API_KEYS=//p' "$NIGHTLY_BENCH_ENV" | head -1)"
   raw="${raw%%,*}"
   BENCH_KEY="${raw#*:}"
 fi
-if [ -z "$BENCH_KEY" ]; then
-  log "skip: reason=bench-key-unavailable ($NIGHTLY_BENCH_ENV BENCH_API_KEYS unreadable or empty)"
+dx_bench_env || true   # anything still unset: qbench's own config, never a default
+if [ -z "${BENCH_KEY:-}" ]; then
+  log "skip: reason=bench-key-unavailable (no NIGHTLY_BENCH_KEY/BENCH_KEY, no mode-600 qbench key file${NIGHTLY_BENCH_ENV:+, no BENCH_API_KEYS in NIGHTLY_BENCH_ENV})"
   finish skipped "reason=bench-key-unavailable"
 fi
-
-BENCH_URL="${NIGHTLY_BENCH_URL:-}"
-if [ -z "$BENCH_URL" ] && [ -r "$NIGHTLY_BENCH_ENV" ]; then
-  port="$(sed -n 's/^BENCH_PORT=//p' "$NIGHTLY_BENCH_ENV" | head -1)"
-  BENCH_URL="http://localhost:${port:-9400}"
+if [ -z "${BENCH_URL:-}" ]; then
+  log "skip: reason=bench-url-unavailable (no NIGHTLY_BENCH_URL/BENCH_URL and no qbench url file — run qbench doctor as the cron user)"
+  finish skipped "reason=bench-url-unavailable"
 fi
-BENCH_URL="${BENCH_URL:-http://localhost:9400}"
 
 # ── preflight 2: stack healthy ───────────────────────────────────────────────
 if [ "$DRY" != 1 ]; then
@@ -254,7 +262,7 @@ plan
   codec     $NIGHTLY_CODEC
   secs      $NIGHTLY_SECS
   baseline  $NIGHTLY_BASELINE
-  bench_url $BENCH_URL
+  bench_url (from $BENCH_URL_SRC)
   log       $LOG
   would run: HOST=$NIGHTLY_HOST $NIGHTLY_BENCH_RUN --app '$NIGHTLY_APP' --profile $NIGHTLY_PROFILE --secs $NIGHTLY_SECS --bench-mode --codec $NIGHTLY_CODEC --peer local --suite $NIGHTLY_SUITE --scenario $NIGHTLY_SCENARIO --tag nightly=1 --tag git_quasar=$SHA
   would run: $NIGHTLY_BENCH_BUDGET --run <id> --suite $NIGHTLY_SUITE --scenario $NIGHTLY_SCENARIO --baseline '$NIGHTLY_BASELINE'

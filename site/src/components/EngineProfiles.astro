@@ -1,0 +1,57 @@
+---
+/**
+ * The published engine-profile table (RH07-14, #406): one row per container
+ * engine and mode with its status badge (the reason is the badge's tooltip).
+ * Every Linux distribution shares these verdicts; only Unraid differs.
+ *
+ * Reads testdata/engine-profiles/profiles.json through engine-profiles.js —
+ * the same table the quick start's step 2 renders and the node agent's
+ * runtime_engine readiness check is held to, so this page can never show a
+ * status the host's own readiness card would disagree with. Nothing here
+ * decides a status; see that file to change one.
+ *
+ * Design: Starlight's own <Badge>, in the product's state colours (theme.css
+ * "Starlight badges in the product's state colours") — the same component and
+ * variant map the quick start's step 2 uses server-side. No new styling is
+ * invented for this page.
+ */
+import { Badge } from '@astrojs/starlight/components';
+import { ENGINES, MODES, profileFor } from '../data/engine-profiles.js';
+
+const BADGE_VARIANT = { supported: 'success', experimental: 'caution', unsupported: 'danger' };
+const BADGE_TEXT = { supported: 'Supported', experimental: 'Experimental', unsupported: 'Unsupported' };
+
+// General profile verdicts; recognition does not establish distro validation.
+
+---
+
+<table class="ep-table">
+ <thead><tr><th>Engine</th><th>Rootful</th><th>Rootless</th></tr></thead>
+ <tbody>{Object.keys(ENGINES).map(engine => <tr>
+  <th scope="row">{ENGINES[engine].label}</th>
+  {MODES.map(mode => { const p = profileFor('other', engine, mode); return <td><Badge size="small" variant={BADGE_VARIANT[p.status]} text={BADGE_TEXT[p.status]} /></td>; })}
+ </tr>)}</tbody>
+</table>
+
+<style>
+	.ep-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.875rem;
+	}
+	.ep-table th,
+	.ep-table td {
+		text-align: left;
+		padding: 0.5rem 0.75rem;
+		border-bottom: 1px solid var(--sl-color-hairline, var(--q-line-2));
+		vertical-align: top;
+	}
+	/* A status badge never wraps mid-word in a narrow column. */
+	.ep-table td:nth-child(3) {
+		white-space: nowrap;
+	}
+	.ep-table th {
+		color: var(--sl-color-gray-2, inherit);
+		font-weight: 600;
+	}
+</style>

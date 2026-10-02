@@ -91,7 +91,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// Narrow BEFORE evaluating, or the implicit path resolves profiles the
 		// explicit path is rejected for and the allow-list binds only clients that
 		// bother to name a profile.
-		ev := profile.EvaluateLaunchProfiles(restriction.Filter(catalog), c.probeEvalInput(ctx, userID))
+		ev := profile.EvaluateLaunchProfiles(restriction.Filter(catalog), c.probeEvalInput(ctx, userID, lp.DeviceID))
 		resolved, err := c.store.ResolveDefaultProfile(ctx, userID, app, ev.RecommendedID, restriction)
 		if err != nil {
 			return LaunchResult{}, err
@@ -137,19 +137,17 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// on VA and NVENC), so the rung's preference is negotiated down for the
 		// browser transport. An explicit override wins.
 		//
-		// The lift back needs BOTH the launching client declaring itself native AND
-		// this account's latest native probe decoding it. Keying on the launching
-		// client is the identity binding: LatestProbe is per-account and returns
-		// whichever device was seen last, so a native session otherwise poisons a
-		// later browser launch into a black stream. It sets no StreamOverride
-		// field, so the envelope and cert-cap blocks below still run.
+		// The lift needs both the launching client declaring itself native and the
+		// launching device's own probe decoding it: the declaration is a claim, the
+		// probe is a measurement. It sets no StreamOverride field, so the envelope
+		// and cert-cap blocks below still run.
 		h264 = pickProfile(ov.H264Profile)
 		if !ov.any() && lp.isNativeClient() {
-			dp, err := c.store.LatestProbe(ctx, userID)
+			scope, err := c.store.ResolveDeviceScope(ctx, userID, lp.DeviceID, scopeSiteH264Lift)
 			if err != nil {
 				// A probe read failure must never block a launch; keep the floor.
 				c.log.Warn("SPT Path-B: probe load failed, keeping H.264 floor", "user_id", userID, "err", err)
-			} else if nativeHighEligible(dp, top.H264Profile) {
+			} else if nativeHighEligible(scope.Probe, top.H264Profile) {
 				h264 = top.H264Profile
 				c.log.Info("SPT Path-B: native high-eligible, lifting H.264 profile",
 					"user_id", userID, "profile_id", resolved.ID,
@@ -164,7 +162,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// apps.default_width/height/fps/bitrate_kbps are load-bearing here, not
 		// dead columns: any app reaches this path via a stream override with no
 		// profile_id, and it is in the frozen contract.
-		selected := c.selectTier(ctx, userID)
+		selected := c.selectTier(ctx, userID, lp.DeviceID)
 		width = capAndPick(ov.Width, selected.Width, app.DefaultWidth)
 		height = capAndPick(ov.Height, selected.Height, app.DefaultHeight)
 		fps = capAndPick(ov.FPS, selected.FPS, app.DefaultFPS)
@@ -181,11 +179,12 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// resolved rung's bitrate.
 	env := ProbeEnvelope{}
 	if !lp.IsAdmin && !ov.any() {
-		dp, err := c.store.LatestProbe(ctx, userID)
+		scope, err := c.store.ResolveDeviceScope(ctx, userID, lp.DeviceID, scopeSiteEnvelope)
 		if err != nil {
 			// A probe read failure must never block a launch; proceed with defaults.
 			c.log.Warn("SPT-07: probe load failed, launching without envelope", "user_id", userID, "err", err)
 		} else {
+			dp := scope.Probe
 			env = buildProbeEnvelope(dp)
 			if env.SafeCeilingKbps > 0 {
 				newBitrate := applyEnvelopeToBitrate(bitrateKbps, env)
@@ -217,7 +216,10 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	micGranted := c.resolveMicGrant(ctx, lp)
 
 	p := CreateParams{
-		UserID:      userID,
+		UserID: userID,
+		// Persisted so post-placement and in-session reads resolve against the same
+		// client the launch was gated on.
+		DeviceID:    lp.DeviceID,
 		AppID:       app.ID,
 		Width:       width,
 		Height:      height,
@@ -242,6 +244,12 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// The effective runtime app's image; engages the placement filter only when
 		// it is an installed catalog entry.
 		AppImage: app.Image(),
+	}
+	if p.RequireCodec, err = codecConstraint(launchProfile, ov); err != nil {
+		return LaunchResult{}, err
+	}
+	if p.RequireCodec == "" {
+		p.CodecPreference = c.launchCodecPreference(ctx, userID, lp.DeviceID, launchProfile)
 	}
 
 	// §5: a derived tile is placed with a HARD host pin, not an affinity. Locality
@@ -269,19 +277,22 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	if err != nil {
 		c.logVramVetoRejection(userID, app.ID, err)
+		c.logHostNotReadyRejection(userID, app.ID, err)
+		c.logNoHostRejection(userID, app.ID, err)
 		return LaunchResult{}, err
 	}
 	c.log.Info("session assigned", "session_id", sess.ID, "host_id", deref(sess.HostID), "gpu_index", derefI32(sess.GPUIndex),
 		"reserved_encode_slots", sess.ReservedSlots,
-		"stream_source", source, "playout0_ms", playout0Ms)
+		"stream_source", source, "playout0_ms", playout0Ms,
+		"codec_preference", p.CodecPreference)
 	c.health.logGPUUtilization(ctx, deref(sess.HostID), deref(sess.GPUID))
 
 	// Post-placement: rung resolution, cert cap, re-resolve, one write. Placement
-	// is codec-blind (§3.1), so the rung resolves here, where the host is known.
+	// picks the GPU, not the rung, so the rung resolves here, where the GPU is known.
 	if err := c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
-		// A stream.codec override named a codec no rung uses, or one the placed
-		// host cannot encode. Fail the session, releasing its reservation, rather
-		// than dispatching a doomed assignment.
+		// The codec constraint pre-empts both codec refusals; this stays the
+		// backstop. Fail the session, releasing its reservation, rather than
+		// dispatching a doomed assignment.
 		c.failSession(sess.ID, fmt.Sprintf("rung resolution failed: %v", err))
 		return LaunchResult{}, err
 	}
@@ -307,9 +318,66 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 
 	// Async, so the HTTP response returns immediately with the assigned session.
-	go c.dispatchAssignStart(sess, dispatchSpec)
+	expectedHome := expectedHomeDispatch(app)
+	go c.prepareAndDispatch(sess, dispatchSpec, app.Image(), &expectedHome)
 
 	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt}, nil
+}
+
+func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {
+	if c.lazyImages == nil && imageRef != "" {
+		// Placement admits a lazy template before any host built it. Without a
+		// preparer nothing would build it, so fail closed rather than assign an
+		// unbuilt local tag.
+		var lazyTemplate bool
+		err := c.store.pool.QueryRow(c.ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
+			WHERE lazy AND registry_ref = '' AND local_tag = $1)`, imageRef).Scan(&lazyTemplate)
+		if err != nil || lazyTemplate {
+			c.failSession(sess.ID, "image preparation unavailable for lazy template")
+			return
+		}
+	}
+	if c.lazyImages != nil && sess.HostID != nil {
+		// A template build may take minutes. It is owned by the coordinator's
+		// lifecycle, not the HTTP request which has already returned 201.
+		ctx, cancel := context.WithCancel(c.ctx)
+		finished := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-finished:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					current, err := c.store.Get(ctx, sess.ID)
+					if err == nil && current.State != StateAssigned {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+		err := c.lazyImages.PrepareLazyImage(ctx, *sess.HostID, imageRef)
+		close(finished)
+		cancel()
+		if err != nil {
+			// A stop or reconnect reap that ended the wait already owns the
+			// session's outcome; only a still-assigned launch fails here.
+			if current, getErr := c.store.Get(c.ctx, sess.ID); getErr == nil && current.State == StateAssigned {
+				c.failSession(sess.ID, fmt.Sprintf("image preparation failed: %v", err))
+			}
+			return
+		}
+	}
+	// An operator may have stopped the session while preparation was pending.
+	current, err := c.store.Get(c.ctx, sess.ID)
+	if err != nil || current.State != StateAssigned {
+		return
+	}
+	c.dispatchAssignStart(sess, runtimeSpec, expected)
 }
 
 // applyPostPlacement resolves which rung a placed session starts at and writes
@@ -319,7 +387,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 // Gather, plan, apply: reads first (gatherStreamInputs), a pure decision
 // (planStream, stream_plan.go), then log, write once, apply. Hoisting the reads
 // is load-bearing — when the cert cap fires the decision walks a second chain,
-// and re-reading would let one launch's two walks see different LatestProbe rows.
+// and re-reading would let one launch's two walks see different probe rows.
 //
 // On the legacy/tier path there are no rungs; only a codec override can change
 // anything, handled with the host clamp alone.
@@ -340,6 +408,11 @@ func (c *Coordinator) applyPostPlacement(
 	plan, err := planStream(in)
 	c.logStreamPlan(in, plan)
 	if err != nil {
+		// Wrap ErrRungCodecNotAvailable with profile context so the handler can
+		// report it back with the profile name in the message.
+		if errors.Is(err, ErrRungCodecNotAvailable) {
+			return fmt.Errorf("%w (launch profile %q)", err, launchProfile.ID)
+		}
 		return err
 	}
 
@@ -353,6 +426,28 @@ func (c *Coordinator) applyPostPlacement(
 	}
 	plan.applyTo(sess)
 	return nil
+}
+
+// launchCodecPreference reads the device scope for an Auto launch's codec
+// preference (codecPreference). A failed scope read is an empty preference,
+// never a refusal; a failed history read resolves without history, as
+// gatherStreamInputs does. No chain (the legacy tier path) is no preference.
+func (c *Coordinator) launchCodecPreference(ctx context.Context, userID, deviceID string, chain profile.LaunchProfile) []string {
+	if len(chain.Rungs) == 0 {
+		return nil
+	}
+	scope, err := c.store.ResolveDeviceScope(ctx, userID, deviceID, scopeSitePreference)
+	if err != nil {
+		c.log.Warn("codec preference: device scope load failed, placing without one", "user_id", userID, "err", err)
+		return nil
+	}
+	failed, err := c.store.RungFailures(ctx, userID, scope.DeviceKey, chain)
+	if err != nil {
+		c.log.Warn("codec preference: decode-failure history load failed, ranking without it",
+			"user_id", userID, "profile_id", chain.ID, "err", err)
+		failed = nil
+	}
+	return codecPreference(chain.Rungs, scope.Probe, failed)
 }
 
 // gatherStreamInputs performs every read the post-placement decision needs and
@@ -393,11 +488,22 @@ func (c *Coordinator) gatherStreamInputs(
 	if sess.HostID != nil {
 		hc, err := c.store.HostCodecs(ctx, *sess.HostID)
 		if err != nil {
-			c.log.Warn("rung: host codec set load failed, assuming h264-only",
+			c.log.Warn("rung: host codec set load failed, logging it as h264-only",
 				"host_id", *sess.HostID, "err", err)
 			in.HostCodecs = []string{wireCodecH264}
 		} else {
 			in.HostCodecs = hc
+		}
+		// Clamp 1's set. A failed read floors at h264, never the host union: the
+		// union is what dispatched AV1 to a GPU that cannot encode it (#303).
+		in.GPUCodecs = []string{wireCodecH264}
+		if sess.GPUIndex != nil {
+			if gc, err := c.store.GPUCodecs(ctx, *sess.HostID, *sess.GPUIndex); err != nil {
+				c.log.Warn("rung: GPU codec set load failed, assuming h264-only",
+					"host_id", *sess.HostID, "gpu_index", *sess.GPUIndex, "err", err)
+			} else {
+				in.GPUCodecs = gc
+			}
 		}
 		known, hw, encName, err := c.store.HostHardwareEncoder(ctx, *sess.HostID)
 		if err != nil {
@@ -418,26 +524,22 @@ func (c *Coordinator) gatherStreamInputs(
 		}
 	}
 
-	// Device decode probe. A read error or absent/stale probe is non-fatal: HEVC
-	// and AV1 stay hard-gated off and the decode-height clamp is skipped.
-	dp, err := c.store.LatestProbe(ctx, sess.UserID)
-	if err != nil {
-		c.log.Warn("rung: probe load failed, gating without decode capabilities",
-			"user_id", sess.UserID, "err", err)
-		dp = nil
-	}
-	in.Probe = dp
-
-	// Clamp 4 at rung grain (§4.4). RungFailures unions rung-level rows with the
-	// legacy launch-profile-level ones, keyed on the same device the probe above
-	// came from (LatestProbe and LatestDeviceKey share the last_seen_at ordering).
-	// A read error skips the clamp.
-	deviceKey, _ := c.store.LatestDeviceKey(ctx, sess.UserID)
-	if fr, err := c.store.RungFailures(ctx, sess.UserID, deviceKey, chain); err != nil {
-		c.log.Warn("rung: decode-failure history load failed, resolving without it",
-			"user_id", sess.UserID, "profile_id", chain.ID, "err", err)
+	// The launching device's decode probe and its clamp-4 history (§4.4), from the
+	// one scope so both describe the same client. An unresolved scope is non-fatal:
+	// HEVC and AV1 stay hard-gated off, the decode-height clamp and clamp 4 are
+	// skipped, and no coarse per-user history stands in.
+	scope, scopeErr := c.store.ResolveDeviceScope(ctx, sess.UserID, deref(sess.DeviceID), scopeSiteRung)
+	if scopeErr != nil {
+		c.log.Warn("rung: device scope load failed, resolving without decode capabilities or history",
+			"user_id", sess.UserID, "err", scopeErr)
 	} else {
-		in.FailedRungs = fr
+		in.Probe = scope.Probe
+		if fr, err := c.store.RungFailures(ctx, sess.UserID, scope.DeviceKey, chain); err != nil {
+			c.log.Warn("rung: decode-failure history load failed, resolving without it",
+				"user_id", sess.UserID, "profile_id", chain.ID, "err", err)
+		} else {
+			in.FailedRungs = fr
+		}
 	}
 
 	if !in.capEligible() {
@@ -456,11 +558,13 @@ func (c *Coordinator) gatherStreamInputs(
 		} else {
 			in.LowerChain = lower
 			rungIDs = append(rungIDs, rungIDsOf(lower)...)
-			if fr, err := c.store.RungFailures(ctx, sess.UserID, deviceKey, lower); err != nil {
-				c.log.Warn("rung: decode-failure history load failed for the cap target, resolving without it",
-					"user_id", sess.UserID, "profile_id", lower.ID, "err", err)
-			} else {
-				in.LowerFailed = fr
+			if scopeErr == nil {
+				if fr, err := c.store.RungFailures(ctx, sess.UserID, scope.DeviceKey, lower); err != nil {
+					c.log.Warn("rung: decode-failure history load failed for the cap target, resolving without it",
+						"user_id", sess.UserID, "profile_id", lower.ID, "err", err)
+				} else {
+					in.LowerFailed = fr
+				}
 			}
 		}
 	}
@@ -509,6 +613,7 @@ func (c *Coordinator) logStreamPlan(in StreamInputs, plan StreamPlan) {
 			"override", w.Decision.Override,
 			"considered", formatRungVerdicts(w.Decision.Considered),
 			"host_codecs", in.HostCodecs,
+			"gpu_codecs", in.GPUCodecs,
 			"host_hw_encoder_known", in.HostEncoder.Known,
 			"host_hw_encoder", in.HostEncoder.HardwareEncoder,
 			// Raw map, so a clamp-6 rejection can be read against the number that
@@ -561,16 +666,16 @@ func (c *Coordinator) applyLegacyCodecOverride(ctx context.Context, sess *Sessio
 	if override == "" || override == sess.Codec {
 		return nil
 	}
-	hostCodecs := []string{wireCodecH264}
-	if sess.HostID != nil {
-		if hc, err := c.store.HostCodecs(ctx, *sess.HostID); err != nil {
-			c.log.Warn("codec: host codec set load failed, assuming h264-only",
-				"host_id", *sess.HostID, "err", err)
+	gpuCodecs := []string{wireCodecH264}
+	if sess.HostID != nil && sess.GPUIndex != nil {
+		if gc, err := c.store.GPUCodecs(ctx, *sess.HostID, *sess.GPUIndex); err != nil {
+			c.log.Warn("codec: GPU codec set load failed, assuming h264-only",
+				"host_id", *sess.HostID, "gpu_index", *sess.GPUIndex, "err", err)
 		} else {
-			hostCodecs = hc
+			gpuCodecs = gc
 		}
 	}
-	if !codecSet(hostCodecs)[override] {
+	if !codecSet(gpuCodecs)[override] {
 		return ErrCodecUnsupportedByHost
 	}
 	c.log.Info("codec resolved", "session_source", source, "override", override, "result", override)
@@ -629,14 +734,53 @@ func (c *Coordinator) logVramVetoRejection(userID, appID string, err error) {
 	}
 }
 
+// logHostNotReadyRejection makes a readiness refusal diagnosable: the response
+// names nothing, so this is the only place the excluded GPUs and
+// the scope that excluded them appear. A nil or non-readiness error is a no-op.
+func (c *Coordinator) logHostNotReadyRejection(userID, appID string, err error) {
+	var rej *HostNotReadyRejection
+	if !errors.As(err, &rej) {
+		return
+	}
+	for _, g := range rej.Candidates {
+		c.log.Warn("admission: the readiness gate excluded a GPU that would otherwise have been picked",
+			"user_id", userID,
+			"app_id", appID,
+			"gpu_id", g.GPUID,
+			"host_id", g.HostID,
+			"gpu_index", g.GPUIndex,
+			"readiness_block_host", g.BlockHost,
+			"readiness_block_homes", g.BlockHomes,
+			"readiness_blocked_gpu", g.GPUBlocked)
+	}
+}
+
+// logNoHostRejection makes a no_host_available refusal diagnosable: the
+// response names no host, so this is the only place the fleet counts behind
+// it appear. A nil or non-NoHostRejection error is a no-op.
+func (c *Coordinator) logNoHostRejection(userID, appID string, err error) {
+	var rej *NoHostRejection
+	if !errors.As(err, &rej) {
+		return
+	}
+	c.log.Info("launch refused: no host available",
+		"user_id", userID,
+		"app_id", appID,
+		"online_hosts", rej.OnlineHosts,
+		"hosts_capacity_not_ok", rej.HostsCapacityNotOK,
+		"gpus_unreported", rej.GPUsUnreported,
+		"hosts_recently_registered", rej.HostsRecentlyRegistered,
+		"hosts_image_failed", rej.HostsImageFailed)
+}
+
 // dispatchAssignStart performs the two-step agent handshake: assign, then start.
 // Either step failing (reject, timeout, agent not connected) fails the session
 // and releases its reservation. starting→running then arrives via AgentState.
-func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte) {
-	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only")
+func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte, expected *homeDispatchExpectation) {
+	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only", expected)
 }
 
-func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string) {
+func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string, expected *homeDispatchExpectation) {
 	if sess.HostID == nil || sess.GPUIndex == nil {
 		c.failSession(sess.ID, "session missing host/gpu placement")
 		return
@@ -646,7 +790,6 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	if len(app) == 0 {
 		app = []byte("{}")
 	}
-
 	// The resolved RUNG's ABR floor, for the agent's in-session governor. It must
 	// read the rung, not the launch profile: a chain has no single floor, and one
 	// that fell through to a lower rung has a lower floor. No rung resolved ⇒ 0,
@@ -682,7 +825,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Resources:     agentws.ResourceSpec{VRAMMB: sess.ReservedVram, EncodeSlots: sess.ReservedSlots},
 		VideoTopology: videoTopology,
 	}
-	if !c.commandOK(hostID, assign.ID, assign, assignAckTimeout, sess.ID, "assign") {
+	if !c.sendHomeBoundAssign(hostID, sess.ID, app, assign, expected) {
 		return
 	}
 
@@ -695,6 +838,61 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	// stuck-start watchdog: the agent acked start, so it must reach running
 	// within the window or be reaped.
 	go c.watchStartToRunning(sess.ID, hostID)
+}
+
+// sendHomeBoundAssign uses the exact authenticated command epoch for both the
+// cleanup-capability decision and socket queue handoff. An epoch replaced
+// before enqueue causes a fresh decision; an enqueued frame remains uncertain.
+func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, assign agentws.SessionAssignCmd, expected *homeDispatchExpectation) bool {
+	provider, epochAware := c.dispatcher.(interface {
+		CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+	})
+	for attempt := 0; attempt < 3; attempt++ {
+		var epoch agentws.HomeCommandEpoch
+		if epochAware {
+			var ok bool
+			epoch, ok = provider.CurrentHomeCommandEpoch(hostID)
+			if !ok {
+				c.failSession(sessionID, "assign dispatch failed: agent not connected")
+				return false
+			}
+		}
+		capable := epoch != nil && epoch.SupportsHomeCleanup()
+		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
+		if err != nil {
+			c.log.Error("managed home dispatch binding failed", "session_id", sessionID, "err", err)
+			c.failSession(sessionID, "managed home dispatch binding failed")
+			return false
+		}
+		if epoch == nil {
+			return c.commandOK(hostID, assign.ID, assign, assignAckTimeout, sessionID, "assign")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), assignAckTimeout)
+		res, queued, sendErr := epoch.SendWithAck(ctx, assign.ID, assign)
+		cancel()
+		if sendErr != nil && !queued {
+			if clearErr := c.store.ClearNewHomeHold(c.ctx, hold); clearErr != nil {
+				c.log.Error("unstarted home hold release failed", "err", clearErr)
+			}
+			// The chosen epoch vanished before enqueue. Re-read its capability
+			// and bind a new decision; do not send under the stale one.
+			continue
+		}
+		if sendErr == nil && !res.OK {
+			if clearErr := c.store.ClearNewHomeHold(c.ctx, hold); clearErr != nil {
+				c.log.Error("rejected home hold release failed", "err", clearErr)
+			}
+			c.failSession(sessionID, fmt.Sprintf("agent rejected assign: %s", res.Error))
+			return false
+		}
+		if sendErr != nil {
+			c.failSession(sessionID, fmt.Sprintf("assign dispatch failed: %v", sendErr))
+			return false
+		}
+		return true
+	}
+	c.failSession(sessionID, "assign dispatch failed: connection changed")
+	return false
 }
 
 // watchStartToRunning is the stuck-start watchdog (P2-06). A session still
@@ -736,15 +934,16 @@ func (c *Coordinator) watchStartToRunning(sessionID, hostID string) {
 	}
 }
 
-// selectTier intersects the user's most-recent device probe against the tier
-// ladder, falling back to Default() on any error or missing probe. A probe read
-// failure must never be fatal to a launch, so errors are logged, not propagated.
-func (c *Coordinator) selectTier(ctx context.Context, userID string) tier.Tier {
-	dp, err := c.store.LatestProbe(ctx, userID)
+// selectTier intersects the launching device's probe against the tier ladder,
+// falling back to Default() on any error or missing probe. A probe read failure
+// must never be fatal to a launch, so errors are logged, not propagated.
+func (c *Coordinator) selectTier(ctx context.Context, userID, deviceID string) tier.Tier {
+	scope, err := c.store.ResolveDeviceScope(ctx, userID, deviceID, scopeSiteTier)
 	if err != nil {
 		c.log.Warn("AS-02: probe load failed, using default tier", "user_id", userID, "err", err)
 		return tier.Default()
 	}
+	dp := scope.Probe
 	if dp == nil {
 		return tier.Default()
 	}

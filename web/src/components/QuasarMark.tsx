@@ -23,8 +23,11 @@ export function QuasarMark({ size = 26, className }: { size?: number; className?
     >
       <defs>
         <linearGradient id={gradId} x1="0" y1="0" x2="1" y2="1">
+          {/* design-lint-allow raw-colour-tsx: fixed brand-mark colour, identical in every theme */}
           <stop offset="0" stopColor="#6A45F5" />
+          {/* design-lint-allow raw-colour-tsx: fixed brand-mark colour, identical in every theme */}
           <stop offset=".5" stopColor="#5B6BFF" />
+          {/* design-lint-allow raw-colour-tsx: fixed brand-mark colour, identical in every theme */}
           <stop offset="1" stopColor="#00C0FF" />
         </linearGradient>
       </defs>
@@ -39,6 +42,7 @@ export function QuasarMark({ size = 26, className }: { size?: number; className?
         opacity=".75"
       />
       <circle cx="16" cy="16" r="6.2" fill={`url(#${gradId})`} />
+      {/* design-lint-allow raw-colour-tsx: fixed brand-mark colour, identical in every theme */}
       <circle cx="16" cy="16" r="2.1" fill="#fff" />
     </svg>
   );

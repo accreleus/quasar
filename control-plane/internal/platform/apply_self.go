@@ -1,243 +1,100 @@
 package platform
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
-	"github.com/accreleus/quasar/control-plane/internal/updater"
 )
 
-// The control plane applying ITSELF, over the updater socket beside it on its
-// own host — never over an agent connection (agent-api.md §release_apply: "the
-// control plane NEVER asks an agent to update the control plane").
+// The control plane applying ITSELF, through the recovery actor on its own
+// machine over the control socket, never over an agent connection (agent-api.md
+// §release_apply: "the control plane NEVER asks an agent to update the control
+// plane"). A control plane with no recovery actor has nothing that can replace
+// it: its target reads `updater_absent`.
 //
-// The rule the whole file is shaped by: this process cannot report its own
-// success, because carrying the apply out destroys it. So the request id is
-// persisted BEFORE the socket call, and the evidence of success is this
-// binary's own liveness on the release's commit after it reboots — whatever a
-// late result file says (control-api.md §"The shape of an apply, once").
+// This process cannot report its own success, because carrying the apply out
+// destroys it. So the request id is persisted BEFORE the socket call, and the
+// actor's terminal result, read again by the next boot, is the verdict
+// (control-api.md §"The shape of an apply, once"; ADR 0004 amendment).
 
-// UpdaterSocketPath is where the updater's socket is mounted in this container.
-// Twin of the agent's release::DEFAULT_SOCKET and of the compose mount.
-const UpdaterSocketPath = "/run/quasar-updater/updater.sock"
-
-// DefaultInstallModeTTL bounds how stale this control plane's own install mode
-// may be. Seconds, not a boot-time read: the stack can be re-composed under it.
-const DefaultInstallModeTTL = 30 * time.Second
-
-// ConfiguredUpdaterSocket resolves the socket path; docs/configuration.md.
-func ConfiguredUpdaterSocket() string {
-	if v := os.Getenv("QUASAR_UPDATER_SOCKET"); v != "" {
-		return v
-	}
-	return UpdaterSocketPath
+// SelfRequest is one control-plane apply as the self-applier hands it to the
+// recovery actor (actor_client.go). Components are in replacement order.
+type SelfRequest struct {
+	RequestID  string
+	Components []ComponentDigest
+	Release    ReleaseRef
+	// Migrates is the release's schema above this binary's; SchemaVersion is the
+	// schema it moves to, 0 when unknown.
+	Migrates                bool
+	SchemaVersion           int
+	ExternalBackupConfirmed bool
+	// FromVersion is this control plane's own version: what a migrating
+	// failure's restore command returns to.
+	FromVersion string
 }
 
-// UpdaterAPI is the sliver of the local socket this package uses, as an
-// interface so the self-apply is testable over a temp socket or a fake.
+// SelfAccepted is the actor's 202 for a control-plane step.
+type SelfAccepted struct {
+	RequestID string
+	Previous  []PreviousDigest
+}
+
+// SelfResult is one control-plane attempt as the actor reports it, in
+// `release_state`'s spellings.
+type SelfResult struct {
+	RequestID  string
+	State      string
+	Reason     *string
+	Components []ComponentDigest
+	Previous   []PreviousDigest
+	Output     string
+	StartedAt  string
+	UpdatedAt  string
+	FinishedAt *string
+	// Restored: the actor put the previous control plane back.
+	Restored bool
+	Release  ReleaseRef
+	// PreUpdateDump is the dump a migrating attempt took, when it took one.
+	PreUpdateDump *string
+}
+
+// UpdaterAPI is the sliver of the control socket this package uses, as an
+// interface so the self-apply is testable over a temp socket or a fake. The
+// contract keeps "updater" in `updater_absent` / `updater_present`; it means the
+// recovery actor.
 type UpdaterAPI interface {
-	// Present reports whether an updater is installed beside this control
-	// plane. False makes the control-plane target ineligible (`updater_absent`)
-	// rather than an apply that fails halfway.
+	// Present reports whether the actor's socket is there. False makes the
+	// control-plane target ineligible (`updater_absent`) rather than an apply
+	// that fails halfway.
 	Present() bool
-	// SocketState is the three-way #184 diagnosis behind Present.
+	// SocketState is the #184 diagnosis behind Present.
 	SocketState() SocketState
-	// Self is what the updater discovered about the stack it sits beside.
-	Self(ctx context.Context) (UpdaterSelf, error)
-	Apply(ctx context.Context, req updater.ApplyRequest) (updater.Accepted, error)
-	Result(ctx context.Context, requestID string) (updater.Result, error)
+	Apply(ctx context.Context, req SelfRequest) (SelfAccepted, error)
+	Result(ctx context.Context, requestID string) (SelfResult, error)
+	// SocketPath names the socket in an operator-facing failure.
+	SocketPath() string
 }
 
-// UpdaterSelf is the sliver of `GET /v1/self` this package reads. Declared here
-// rather than imported so an older updater, whose answer carries no `images`,
-// decodes to "unknown" instead of failing.
-type UpdaterSelf struct {
-	Version     string   `json:"version"`
-	WorkingDir  string   `json:"working_dir"`
-	ConfigFiles []string `json:"config_files"`
-	// Per compose service, the compose-file set its running container carries
-	// in its own labels (preflight `updater_overlays`). Absent on an older
-	// updater, which preflight reads as unknown.
-	ServiceConfigFiles map[string][]string `json:"service_config_files"`
-	// Component name → the effective image reference compose would use for its
-	// service, defaults included.
-	Images map[string]string `json:"images"`
-}
-
-// ClassifyImageRef is the Go twin of node-agent buildinfo::classify_image_ref:
-// registry when the reference names a registry host or pins a digest, source
-// when it is a bare local tag like `quasar-control-plane:latest`. "" when
-// nothing can be said.
-//
-// The host test is docker's own: the first path segment is a registry only if
-// it contains a `.` or a `:`, or is exactly `localhost`.
-func ClassifyImageRef(ref string) string {
-	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		return ""
-	}
-	// A digest pin can only have come from a registry (ADR 0001).
-	if strings.Contains(ref, "@sha256:") {
-		return InstallRegistry
-	}
-	first, _, hasSlash := strings.Cut(ref, "/")
-	if hasSlash && (first == "localhost" || strings.ContainsAny(first, ".:")) {
-		return InstallRegistry
-	}
-	return InstallSource
-}
-
-// UpdaterClient speaks the local socket. Its request body and result file are
-// NOT a frozen interface (schema.md §"Not frozen: the updater's local socket");
-// both ends ship in the same release, which is why the types are imported from
-// internal/updater rather than re-declared.
-type UpdaterClient struct {
-	socket string
-	http   *http.Client
-}
-
-// NewUpdaterClient dials the unix socket. The host in the URL is a placeholder:
-// the transport ignores it.
-func NewUpdaterClient(socket string) *UpdaterClient {
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	return &UpdaterClient{
-		socket: socket,
-		http: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					return dialer.DialContext(ctx, "unix", socket)
-				},
-			},
-		},
-	}
-}
-
-func (c *UpdaterClient) Present() bool {
-	return c.SocketState().SocketExists
-}
-
-// SocketState stats the mount directory and then the socket, so "volume not
-// mounted" and "updater not running" are told apart (#184).
-func (c *UpdaterClient) SocketState() SocketState {
-	if c == nil || c.socket == "" {
-		return SocketState{}
-	}
-	var st SocketState
-	if _, err := os.Stat(filepath.Dir(c.socket)); err == nil {
-		st.DirExists = true
-	}
-	if _, err := os.Stat(c.socket); err == nil {
-		st.SocketExists = true
-	}
-	return st
-}
-
-// updaterError carries the socket's rejection identifier, which is already the
+// actorRefusal carries the socket's rejection identifier, which is already the
 // closed `release_state.reason` vocabulary.
-type updaterError struct {
-	Reason  string `json:"reason"`
-	Message string `json:"message"`
+type actorRefusal struct {
+	Reason  string
+	Message string
 }
 
-func (e *updaterError) Error() string {
+func (e *actorRefusal) Error() string {
 	if e.Message == "" {
 		return e.Reason
 	}
 	return e.Reason + ": " + e.Message
 }
 
-func (c *UpdaterClient) Apply(ctx context.Context, req updater.ApplyRequest) (updater.Accepted, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return updater.Accepted{}, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://updater/v1/apply", bytes.NewReader(body))
-	if err != nil {
-		return updater.Accepted{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return updater.Accepted{}, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, updater.MaxRequestBytes))
-	if resp.StatusCode != http.StatusAccepted {
-		var e updaterError
-		if json.Unmarshal(raw, &e) == nil && e.Reason != "" {
-			return updater.Accepted{}, &e
-		}
-		return updater.Accepted{}, fmt.Errorf("updater answered %d: %s", resp.StatusCode, string(raw))
-	}
-	var out updater.Accepted
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return updater.Accepted{}, fmt.Errorf("decode updater 202: %w", err)
-	}
-	return out, nil
-}
-
-func (c *UpdaterClient) Self(ctx context.Context) (UpdaterSelf, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://updater/v1/self", nil)
-	if err != nil {
-		return UpdaterSelf{}, err
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return UpdaterSelf{}, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return UpdaterSelf{}, fmt.Errorf("updater answered %d: %s", resp.StatusCode, string(raw))
-	}
-	var out UpdaterSelf
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return UpdaterSelf{}, fmt.Errorf("decode updater self: %w", err)
-	}
-	return out, nil
-}
-
-// ErrNoResult is a request id the updater has written no result file for yet —
-// normal for the first seconds of an apply, and on boot before the executor
-// has re-stamped it.
+// ErrNoResult is a request id the actor has no result for yet: normal for the
+// first seconds of an apply, and on boot before the actor has answered.
 var ErrNoResult = errors.New("no result for this request id")
-
-func (c *UpdaterClient) Result(ctx context.Context, requestID string) (updater.Result, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://updater/v1/results/"+requestID, nil)
-	if err != nil {
-		return updater.Result{}, err
-	}
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return updater.Result{}, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode == http.StatusNotFound {
-		return updater.Result{}, ErrNoResult
-	}
-	if resp.StatusCode != http.StatusOK {
-		return updater.Result{}, fmt.Errorf("updater answered %d: %s", resp.StatusCode, string(raw))
-	}
-	var out updater.Result
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return updater.Result{}, fmt.Errorf("decode updater result: %w", err)
-	}
-	return out, nil
-}
 
 // selfStore is the persistence the self-apply needs.
 type selfStore interface {
@@ -262,20 +119,32 @@ type SelfApplier struct {
 	Identity     func() buildinfo.Identity
 	Deadline     time.Duration
 	PollInterval time.Duration
-	// How long a read of the updater's self-report is reused. Short rather
-	// than cached at boot: the stack can be re-composed under a running control
-	// plane, and a report read once at start would then be a lie for its whole
-	// life.
-	InstallModeTTL time.Duration
+	// DeveloperCommit reads the commit a developer apply's images carry: its
+	// release_apply provenance and its success evidence, since the row names no
+	// release. Nil fails such an attempt before the send.
+	DeveloperCommit func(ctx context.Context, components []ComponentDigest) (string, error)
+	// VerdictSilence is how long, from the apply deadline on, the actor may give
+	// no answer for a request before the attempt times out.
+	VerdictSilence time.Duration
 
-	mu      sync.Mutex
-	self    UpdaterSelf
-	selfErr error
-	selfAt  time.Time
-	selfSet bool
+	// DeveloperSchema reads the schema a developer apply's control-plane image
+	// declares, which decides whether it migrates. Nil sends it as not
+	// migrating, and the recovery actor still reads the image's own label.
+	DeveloperSchema func(ctx context.Context, components []ComponentDigest) (int, error)
+
+	// confirmed holds the attempts whose operator confirmed a current backup of
+	// an external database. In memory only: control-api.md stores it on no row,
+	// so a control plane restarted before the send fails the step
+	// backup_unconfirmed and the operator applies again.
+	confirmed sync.Map
+	// schemas holds a developer apply's control-plane schema as its admission
+	// read it (NoteDeveloperSchema), so the send reads no registry after the
+	// drain. In memory only: a restarted control plane reads the image again.
+	schemas sync.Map
 }
 
 // NewSelfApplier builds the control-plane applier with the contract's timings.
+// A nil executor is a control plane with no recovery actor.
 func NewSelfApplier(store selfStore, up UpdaterAPI, log logger) *SelfApplier {
 	return &SelfApplier{
 		store:          store,
@@ -284,109 +153,27 @@ func NewSelfApplier(store selfStore, up UpdaterAPI, log logger) *SelfApplier {
 		Identity:       buildinfo.Get,
 		Deadline:       DefaultApplyDeadline,
 		PollInterval:   DefaultApplyPoll,
-		InstallModeTTL: DefaultInstallModeTTL,
+		VerdictSilence: DefaultVerdictSilence,
 	}
 }
+
+// DefaultVerdictSilence outlasts a hand-over's control-socket gap (the successor
+// re-binds it) with room to spare.
+const DefaultVerdictSilence = 2 * time.Minute
 
 // UpdaterPresent reports whether this control plane could apply itself at all.
 func (s *SelfApplier) UpdaterPresent() bool {
 	return s.updater != nil && s.updater.Present()
 }
 
-// InstallMode is how THIS control plane got its image, learned from the updater
-// beside it: it reads the compose config, so a default like
-// `quasar-control-plane:latest` is seen as the source install it is. nil is
-// "nobody could say", which is never treated as registry.
-//
-// A source-built control plane must never be offered a registry image: the two
-// images are different builds with different uids, and replacing one with the
-// other leaves a container that starts and then cannot write its own TLS volume
-// — a crash-loop with no console left to fix it from.
-func (s *SelfApplier) InstallMode() *string {
-	self, _, err := s.selfReport(context.Background())
-	if err != nil {
-		return nil
-	}
-	mode := ClassifyImageRef(self.Images[ComponentControlPlane])
-	if mode == "" {
-		return nil
-	}
-	return &mode
-}
-
-// selfReport is `GET /v1/self` over the socket, reused for InstallModeTTL. The
-// error is cached too: a failing updater is asked once per TTL, not once per
-// view read.
-func (s *SelfApplier) selfReport(ctx context.Context) (UpdaterSelf, time.Time, error) {
-	s.mu.Lock()
-	if s.selfSet && time.Since(s.selfAt) < s.InstallModeTTL {
-		defer s.mu.Unlock()
-		return s.self, s.selfAt, s.selfErr
-	}
-	s.mu.Unlock()
-
-	var self UpdaterSelf
-	var err error
-	if s.updater == nil || !s.updater.Present() {
-		err = errors.New("no updater socket")
-	} else {
-		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		self, err = s.updater.Self(cctx)
-		cancel()
-		if err != nil {
-			s.log.Warn("could not read this control plane's updater self-report", "err", err)
-		}
-	}
-	now := time.Now()
-	s.mu.Lock()
-	s.self, s.selfErr, s.selfAt, s.selfSet = self, err, now, true
-	s.mu.Unlock()
-	return self, now, err
-}
-
-// InvalidateSelf drops the cached self-report so the next read asks the
-// updater again: the apply endpoints call it before deciding.
-func (s *SelfApplier) InvalidateSelf() {
-	s.mu.Lock()
-	s.selfSet = false
-	s.mu.Unlock()
-}
-
-// PreflightFacts is what preflight can learn about this control plane's own
-// stack: the socket three-way, and the updater's self-report when it answers.
-func (s *SelfApplier) PreflightFacts(ctx context.Context) PreflightFacts {
-	f := PreflightFacts{}
-	if s.updater == nil {
-		return f
-	}
-	st := s.updater.SocketState()
-	f.Socket = &st
-	if !st.SocketExists {
-		return f
-	}
-	self, at, err := s.selfReport(ctx)
-	f.CheckedAt = &at
-	facts := &UpdaterSelfFacts{}
-	if err != nil {
-		facts.Err = err.Error()
-	} else {
-		facts.Version = self.Version
-		facts.StackDir = self.WorkingDir
-		facts.ConfigFiles = self.ConfigFiles
-		facts.ServiceConfigFiles = self.ServiceConfigFiles
-	}
-	f.Self = facts
-	return f
-}
-
-// Apply drives one control-plane attempt to terminal — or, in the normal case,
-// until the updater recreates this container and the process dies mid-poll.
-// The next boot's Adopt is what resolves the row then.
+// Apply drives one control-plane attempt to terminal or, in the normal case,
+// until the actor replaces this container and the process dies mid-poll. The
+// next boot's Adopt resolves the row then.
 func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 	if !s.UpdaterPresent() {
 		// Refused rather than attempted: an apply with nothing to carry it out
 		// is a failure with a name, not a timeout fifteen minutes later.
-		s.fail(a.ID, ReasonUpdaterAbsentFailure, "no updater socket at "+ConfiguredUpdaterSocket())
+		s.fail(a.ID, ReasonUpdaterAbsentFailure, s.absentOutput())
 		return
 	}
 
@@ -404,6 +191,9 @@ func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 		if errors.Is(err, ErrAttemptNotFound) {
 			return // resolved underneath us: a cancel, or a boot-adopted terminal state
 		}
+		if err != nil && ctx.Err() != nil {
+			return // shutting down, not a failure of the apply
+		}
 		if err != nil {
 			s.log.Error("self-apply: could not persist the request id", "attempt_id", a.ID, "err", err)
 			s.fail(a.ID, ReasonUpdaterUnreachable, "")
@@ -412,20 +202,25 @@ func (s *SelfApplier) Apply(ctx context.Context, a Attempt) {
 		if !s.send(dctx, a, requestID) {
 			return
 		}
-		s.poll(dctx, a.ID, requestID)
+		s.poll(ctx, a, requestID)
 		return
 	}
 	requestID, err := s.store.AttemptRequestID(ctx, a.ID)
+	if ctx.Err() != nil {
+		return // shutting down: the next boot's Adopt resolves the row
+	}
 	if err != nil || requestID == "" {
 		s.log.Error("self-apply: a sent attempt carries no request id", "attempt_id", a.ID, "err", err)
 		s.fail(a.ID, ReasonUpdaterUnreachable, "")
 		return
 	}
-	s.poll(dctx, a.ID, requestID)
+	s.poll(ctx, a, requestID)
 }
 
 func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) bool {
-	var ref updater.Release
+	id := s.Identity()
+	req := SelfRequest{RequestID: requestID, Components: a.RequestedDigests, FromVersion: id.Version}
+	_, req.ExternalBackupConfirmed = s.confirmed.Load(a.ID)
 	if a.ReleaseID != nil {
 		rel, err := s.store.Release(ctx, *a.ReleaseID)
 		if err != nil {
@@ -433,84 +228,156 @@ func (s *SelfApplier) send(ctx context.Context, a Attempt, requestID string) boo
 			s.fail(a.ID, ReasonInvalid, "")
 			return false
 		}
-		ref = updater.Release{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
+		req.Release = ReleaseRef{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
+		req.SchemaVersion = rel.SchemaVersion
+		req.Migrates = rel.SchemaVersion > id.SchemaVersion
+	} else {
+		// A developer apply: its provenance is the commit its images carry
+		// (control-api.md §"Developer apply").
+		commit, err := s.developerCommit(ctx, a)
+		if err != nil {
+			s.log.Error("self-apply: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
+			s.fail(a.ID, ReasonInvalid, "the images' build identity could not be read: "+err.Error())
+			return false
+		}
+		req.Release = ReleaseRef{SourceCommit: commit}
+		if noted, ok := s.schemas.Load(a.ID); ok {
+			req.SchemaVersion = noted.(int)
+			req.Migrates = req.SchemaVersion > id.SchemaVersion
+		} else if s.DeveloperSchema != nil {
+			schema, err := s.DeveloperSchema(ctx, a.RequestedDigests)
+			if err != nil {
+				s.log.Error("self-apply: could not read the developer apply's schema", "attempt_id", a.ID, "err", err)
+				s.fail(a.ID, ReasonInvalid, "the control-plane image's schema could not be read: "+err.Error())
+				return false
+			}
+			req.SchemaVersion = schema
+			req.Migrates = schema > id.SchemaVersion
+		}
 	}
-	components := make([]updater.Component, 0, len(a.RequestedDigests))
-	for _, c := range a.RequestedDigests {
-		components = append(components, updater.Component{Name: c.Name, Image: c.Image, Digest: c.Digest})
-	}
-	accepted, err := s.updater.Apply(ctx, updater.ApplyRequest{
-		RequestID: requestID, Components: components, Release: ref,
-	})
+	accepted, err := s.updater.Apply(ctx, req)
 	if err != nil {
-		var rej *updaterError
+		var rej *actorRefusal
 		if errors.As(err, &rej) {
 			// The socket's identifiers are already the closed reason
 			// vocabulary; an unrecognised one is stored verbatim.
-			s.log.Warn("self-apply: the updater refused", "attempt_id", a.ID, "reason", rej.Reason)
+			s.log.Warn("self-apply: the recovery actor refused", "attempt_id", a.ID, "reason", rej.Reason)
 			s.fail(a.ID, rej.Reason, rej.Message)
 			return false
 		}
-		s.log.Error("self-apply: could not reach the updater", "attempt_id", a.ID, "err", err)
+		s.log.Error("self-apply: could not reach the recovery actor", "attempt_id", a.ID, "err", err)
 		s.fail(a.ID, ReasonUpdaterUnreachable, err.Error())
 		return false
 	}
 	// The 202 already knows what this control plane was on; recording it now
 	// means a failure's manual restore is copy-paste even if nothing else is
 	// ever reported.
-	if prev := previousFromUpdater(accepted.Previous); len(prev) > 0 {
-		if err := s.store.SetPreviousDigests(ctx, a.ID, prev); err != nil {
+	if len(accepted.Previous) > 0 {
+		if err := s.store.SetPreviousDigests(ctx, a.ID, accepted.Previous); err != nil {
 			s.log.Warn("self-apply: could not record previous digests", "attempt_id", a.ID, "err", err)
 		}
 	}
-	s.log.Info("self-apply: accepted by the updater", "attempt_id", a.ID, "request_id", requestID)
+	s.log.Info("self-apply: accepted by the recovery actor", "attempt_id", a.ID, "request_id", requestID)
 	return true
 }
 
-// poll relays the result file onto the attempt until it is terminal. It
-// normally does not return: the recreate kills this process partway through,
-// and Adopt finishes the row on the next boot.
-func (s *SelfApplier) poll(ctx context.Context, attemptID, requestID string) {
+// poll relays the actor's result onto the attempt until it is terminal. It
+// normally does not return: the replacement stops this process partway through,
+// and Adopt finishes the row on the next boot. A cancelled ctx is this process
+// shutting down, which leaves the row open for the next boot.
+func (s *SelfApplier) poll(ctx context.Context, a Attempt, requestID string) {
+	if s.updater == nil {
+		s.fail(a.ID, ReasonUpdaterAbsentFailure, s.absentOutput())
+		return
+	}
+	if s.followVerdict(ctx, a, requestID) == verdictTimeout {
+		s.fail(a.ID, ReasonTimeout, "the recovery actor did not answer for this request within the apply deadline")
+	}
+}
+
+// verdict is how following the actor's result ended.
+type verdict int
+
+const (
+	// verdictResolved: the attempt is terminal.
+	verdictResolved verdict = iota
+	// verdictShutdown: this process is stopping (the actor stops the control
+	// plane it replaces or restores). Nothing was written, so the row stays
+	// open and the next boot's Adopt records the actor's real verdict.
+	verdictShutdown
+	// verdictTimeout: from the apply deadline on, the actor gave no answer for
+	// this request for VerdictSilence. Fail closed, never success.
+	verdictTimeout
+)
+
+func attemptStart(a Attempt) time.Time {
+	if a.StartedAt != nil {
+		return *a.StartedAt
+	}
+	return a.CreatedAt
+}
+
+// followVerdict relays the recovery actor's result for requestID until it is
+// terminal. While the actor answers a non-terminal state it is waited for past
+// the apply deadline: its own verify and restore timeouts bound the attempt, and
+// a control plane on a slow link may boot after the deadline and still be put
+// back. Only an actor that has not answered for this request, from the deadline
+// on, for VerdictSilence times the attempt out.
+func (s *SelfApplier) followVerdict(ctx context.Context, a Attempt, requestID string) verdict {
+	deadline := attemptStart(a).Add(s.Deadline)
+	var answered time.Time
 	for {
+		if cur, err := s.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+			return verdictResolved
+		}
+		if res, err := s.updater.Result(ctx, requestID); err == nil {
+			if s.record(ctx, a.ID, res) {
+				return verdictResolved
+			}
+			if res.State != AttemptSucceeded && res.State != AttemptFailed {
+				answered = time.Now()
+			}
+		}
+		if ctx.Err() != nil {
+			return verdictShutdown
+		}
+		if now := time.Now(); !now.Before(deadline) && now.Sub(answered) >= s.VerdictSilence {
+			s.log.Warn("self-apply: the recovery actor gave no verdict by the apply deadline",
+				"attempt_id", a.ID, "request_id", requestID)
+			return verdictTimeout
+		}
 		select {
 		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				s.log.Warn("self-apply: deadline expired with no terminal state", "attempt_id", attemptID)
-				s.fail(attemptID, ReasonTimeout, "")
-			}
-			return
+			return verdictShutdown
 		case <-time.After(s.PollInterval):
-		}
-		if a, err := s.store.Attempt(ctx, attemptID); err == nil && TerminalAttemptState(a.State) {
-			return
-		}
-		res, err := s.updater.Result(ctx, requestID)
-		if err != nil {
-			continue // no result file yet, or a socket that went away with us
-		}
-		if s.record(ctx, attemptID, res) {
-			return
 		}
 	}
 }
 
 // record writes one result onto the attempt and reports whether it resolved it.
-func (s *SelfApplier) record(ctx context.Context, attemptID string, res updater.Result) bool {
-	prev := previousFromUpdater(res.Previous)
+func (s *SelfApplier) record(ctx context.Context, attemptID string, res SelfResult) bool {
+	// Before the terminal write: a restore command in the output names this dump.
+	if res.PreUpdateDump != nil {
+		if d, ok := s.store.(dumpRecorder); ok {
+			if err := d.SetPreUpdateDump(ctx, attemptID, *res.PreUpdateDump); err != nil {
+				s.log.Warn("self-apply: could not record the pre-update dump", "attempt_id", attemptID, "err", err)
+			}
+		}
+	}
 	switch res.State {
-	case updater.StateSucceeded:
+	case AttemptSucceeded:
 		if _, err := s.store.SucceedAttempt(ctx, attemptID); err != nil {
 			s.log.Warn("self-apply: could not record success", "attempt_id", attemptID, "err", err)
 			return false
 		}
 		return true
-	case updater.StateFailed:
+	case AttemptFailed:
 		reason := ReasonInvalid
 		if res.Reason != nil && *res.Reason != "" {
 			reason = *res.Reason
 		}
-		if len(prev) > 0 {
-			_ = s.store.SetPreviousDigests(ctx, attemptID, prev)
+		if len(res.Previous) > 0 {
+			_ = s.store.SetPreviousDigests(ctx, attemptID, res.Previous)
 		}
 		if err := s.store.FailAttempt(ctx, attemptID, reason, res.Output); err != nil {
 			s.log.Warn("self-apply: could not record failure", "attempt_id", attemptID, "err", err)
@@ -522,6 +389,10 @@ func (s *SelfApplier) record(ctx context.Context, attemptID string, res updater.
 		if !wireAttemptStates[res.State] {
 			return false
 		}
+		var prev []PreviousDigest
+		if len(res.Previous) > 0 {
+			prev = res.Previous
+		}
 		if err := s.store.RecordReleaseState(ctx, attemptID, res.State, prev, res.Output); err != nil {
 			s.log.Warn("self-apply: could not record progress", "attempt_id", attemptID, "err", err)
 		}
@@ -530,49 +401,81 @@ func (s *SelfApplier) record(ctx context.Context, attemptID string, res updater.
 }
 
 // Adopt resolves a control-plane attempt left non-terminal by the restart it
-// caused. Order matters and is the contract's:
-//
-//  1. This binary is serving on the release's commit — the attempt succeeded,
-//     whatever a late result file says. Reading the result once at boot is
-//     wrong: the new container is up while the executor is still recreating
-//     (#113 finding 2).
-//  2. Otherwise poll the result id until it is terminal. A never-started apply
-//     is auto-restored by the updater, which brings the OLD build back — so
-//     this is exactly the branch a restore lands in, and it is recorded failed
-//     with its reason (#113 finding 5).
+// caused. The recovery actor's terminal result decides it, even when this
+// binary is serving on the release's commit: the actor may still put the old
+// control plane back, stopping this one first.
 //
 // Returns false when the attempt is still open: it was never sent, and the
-// caller re-drives it.
+// caller re-drives it. A cancelled ctx (this process shutting down) returns
+// true with nothing written; the caller must not re-drive then either.
+//
+// A restart caused by an operator's `quasar-recovery reconfigure` has no row to
+// adopt, and the control socket never answers with that attempt, so no row
+// takes it for its verdict (guarded by reconfigure_boot_test.go).
 func (s *SelfApplier) Adopt(ctx context.Context, a Attempt, wantCommit string) bool {
-	id := s.Identity()
-	if wantCommit != "" && id.SourceCommit != nil && commitsMatch(*id.SourceCommit, wantCommit) {
-		if done, err := s.store.SucceedAttempt(ctx, a.ID); err != nil {
-			s.log.Warn("self-apply: could not resolve the adopted attempt", "attempt_id", a.ID, "err", err)
-			return false
-		} else if done {
-			s.log.Info("control-plane apply succeeded: this build is serving on the release's commit",
-				"attempt_id", a.ID, "source_commit", *id.SourceCommit)
-		}
-		return true
-	}
 	requestID, err := s.store.AttemptRequestID(ctx, a.ID)
+	if ctx.Err() != nil {
+		return true // shutting down: nothing is decided, the next boot adopts
+	}
 	if err != nil {
-		s.log.Warn("self-apply: could not read the attempt's request id", "attempt_id", a.ID, "err", err)
+		// Fail closed: without a request id there is no verdict to wait for, so
+		// nothing is recorded; the caller re-drives, which fails the row with a
+		// name rather than calling an unverified build a success.
+		s.log.Warn("self-apply: an attempt's request id is unreadable; not deciding it", "attempt_id", a.ID, "err", err)
 		return false
 	}
 	if requestID == "" {
 		return false // never sent; the run re-drives it
 	}
+	if s.updater == nil {
+		s.fail(a.ID, ReasonUpdaterAbsentFailure, s.absentOutput())
+		return true
+	}
+	id := s.Identity()
+	if wantCommit != "" && id.SourceCommit != nil && commitsMatch(*id.SourceCommit, wantCommit) {
+		if s.followVerdict(ctx, a, requestID) == verdictTimeout {
+			s.fail(a.ID, ReasonTimeout, "the recovery actor gave no verdict within the apply deadline; this build is serving but was never verified")
+		}
+		return true
+	}
 	s.log.Warn("re-adopting a control-plane apply left in flight by a restart",
 		"attempt_id", a.ID, "state", a.State)
-	started := a.CreatedAt
-	if a.StartedAt != nil {
-		started = *a.StartedAt
-	}
-	dctx, cancel := context.WithDeadline(ctx, started.Add(s.Deadline))
-	defer cancel()
-	s.poll(dctx, a.ID, requestID)
+	s.poll(ctx, a, requestID)
 	return true
+}
+
+// dumpRecorder is a selfStore that keeps an attempt's pre_update_dump (*Store).
+type dumpRecorder interface {
+	SetPreUpdateDump(ctx context.Context, attemptID, dump string) error
+}
+
+// ConfirmExternalBackup carries the operator's confirmation of a current backup
+// of an external database to this attempt's request (control-api.md
+// external_backup_confirmed). Call it before Apply.
+func (s *SelfApplier) ConfirmExternalBackup(attemptID string) {
+	s.confirmed.Store(attemptID, true)
+}
+
+// NoteDeveloperSchema keeps the schema a developer apply's admission read from
+// its control-plane image, for the send. Call it before Apply.
+func (s *SelfApplier) NoteDeveloperSchema(attemptID string, schema int) {
+	s.schemas.Store(attemptID, schema)
+}
+
+// developerCommit is the commit a developer apply's images carry.
+func (s *SelfApplier) developerCommit(ctx context.Context, a Attempt) (string, error) {
+	if s.DeveloperCommit == nil {
+		return "", errors.New("no registry reader is wired to read the images' commit")
+	}
+	return s.DeveloperCommit(ctx, a.RequestedDigests)
+}
+
+// absentOutput names what is missing: no actor at all, or its socket.
+func (s *SelfApplier) absentOutput() string {
+	if s.updater == nil {
+		return "this control plane has no recovery actor to replace it: it was not installed with the seed"
+	}
+	return "no recovery actor socket to apply the control plane over at " + s.updater.SocketPath()
 }
 
 func (s *SelfApplier) fail(attemptID, reason, output string) {
@@ -581,15 +484,4 @@ func (s *SelfApplier) fail(attemptID, reason, output string) {
 	if err := s.store.FailAttempt(ctx, attemptID, reason, output); err != nil {
 		s.log.Error("self-apply: could not record the failure", "attempt_id", attemptID, "reason", reason, "err", err)
 	}
-}
-
-func previousFromUpdater(in []updater.PreviousComponent) []PreviousDigest {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]PreviousDigest, 0, len(in))
-	for _, p := range in {
-		out = append(out, PreviousDigest{Name: p.Name, Digest: p.Digest})
-	}
-	return out
 }

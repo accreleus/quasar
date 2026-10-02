@@ -1,0 +1,10 @@
+DROP TABLE host_idle_inventory;
+DROP TABLE host_hardware_evidence;
+DROP TABLE host_journal_active_snapshots;
+DROP TABLE host_journal_reconciliation;
+DROP TABLE host_config_attempts;
+DROP TABLE host_approval_review_tokens;
+DROP FUNCTION rh05_guard_review_token();
+DROP TABLE host_approval_review_issued;
+DROP TABLE host_config_approvals;
+DROP TABLE rh05_control_boot;

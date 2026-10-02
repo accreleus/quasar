@@ -55,7 +55,7 @@
   backdrop-filter: blur(26px) saturate(112%);
   -webkit-backdrop-filter: blur(26px) saturate(112%);
   border-bottom: 1px solid var(--glass-border);
-  box-shadow: 0 1px 0 oklch(0.02 0.01 267/.55);
+  box-shadow: 0 1px 0 var(--topbar-shadow);
   position: relative;
   z-index: 40;
 }
@@ -94,7 +94,7 @@
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--s2);
   min-width: 0;
   color: var(--text);
   text-decoration: none;
@@ -140,8 +140,8 @@
   height: var(--control-h);
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 0 14px;
+  gap: var(--s2);
+  padding: 0 var(--s4);
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
   background: color-mix(in oklch, var(--surf-inset) 76%, transparent);
@@ -170,7 +170,7 @@
   font-size: 10px;
   border: 1px solid var(--line-3);
   border-radius: var(--r-control);
-  padding: 1px 5px;
+  padding: 1px var(--s1);
   color: var(--text-3);
 }
 
@@ -184,9 +184,9 @@
 .user-btn {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
   height: var(--control-h);
-  padding: 0 8px 0 6px;
+  padding: 0 var(--s2) 0 var(--s2);
   border: 1px solid transparent;
   background: none;
   border-radius: var(--r-control);
@@ -207,7 +207,7 @@
   height: 26px;
   border-radius: 50%;
   background: var(--action);
-  color: oklch(1 0 0);
+  color: var(--on-accent);
   display: grid;
   place-content: center;
   font-family: var(--font-mono);
@@ -248,13 +248,13 @@
   right: 0;
   z-index: 80;
   width: 248px;
-  padding: 6px;
+  padding: var(--s2);
   background: color-mix(in oklch, var(--surf-raised) 90%, transparent);
   backdrop-filter: blur(28px);
   -webkit-backdrop-filter: blur(28px);
   border: 1px solid var(--glass-border);
   border-radius: var(--r-panel);
-  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem var(--pop-shadow);
   opacity: 0;
   visibility: hidden;
   transform: translateY(-4px);
@@ -273,10 +273,10 @@
 .up-head {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 10px 10px 12px;
+  gap: var(--s3);
+  padding: var(--s3) var(--s3) var(--s3);
   border-bottom: 1px solid var(--line);
-  margin-bottom: 6px;
+  margin-bottom: var(--s2);
 }
 
 .up-head .u-ava {
@@ -300,9 +300,9 @@
 .up-item {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--s3);
   width: 100%;
-  padding: 9px 10px;
+  padding: var(--s2) var(--s3);
   border: 0;
   border-radius: var(--r-control);
   background: none;
@@ -350,7 +350,7 @@
 .up-div {
   height: 1px;
   background: var(--line);
-  margin: 6px 4px;
+  margin: var(--s2) var(--s1);
 }
 
 .up-val {
@@ -372,13 +372,13 @@
   background: color-mix(in oklch, var(--surf-chrome) 84%, transparent);
   /* The inner light edge that separates the rail's glass from the page's
      without a second hairline — the same trick the topbar's bottom uses. */
-  box-shadow: inset -1px 0 0 oklch(0.9618 0.0086 247.91/.07);
+  box-shadow: inset -1px 0 0 var(--line-faint);
   backdrop-filter: blur(26px) saturate(112%);
   -webkit-backdrop-filter: blur(26px) saturate(112%);
   display: flex;
   flex-direction: column;
-  padding: var(--s3) 10px;
-  gap: 2px;
+  padding: var(--s3) var(--s2);
+  gap: var(--s1);
   overflow: hidden auto;
 }
 
@@ -386,9 +386,9 @@
   position: relative;
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--s3);
   height: 36px;
-  padding: 0 10px;
+  padding: 0 var(--s2);
   border: 0;
   border-radius: var(--r-control);
   background: none;
@@ -457,7 +457,7 @@
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 500;
-  padding: 1px 6px;
+  padding: 1px var(--s1);
   border-radius: var(--r-pill);
   flex: none;
 }
@@ -473,7 +473,7 @@
   text-transform: uppercase;
   color: var(--text-4);
   font-weight: 700;
-  padding: var(--s4) 10px var(--s2);
+  padding: var(--s4) var(--s2) var(--s2);
 }
 
 .rail-foot {
@@ -516,7 +516,7 @@
 .nav {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--s1);
   flex-wrap: nowrap;
   min-width: 0;
 }
@@ -528,7 +528,7 @@
   color: var(--text-3);
   font-size: var(--t-sm);
   font-weight: 600;
-  padding: 8px 13px;
+  padding: var(--s2) var(--s3);
   border-radius: var(--r-control);
   text-decoration: none;
   transition: background 0.15s ease, color 0.15s ease;
@@ -536,7 +536,7 @@
 
 .nav a:hover {
   color: var(--text);
-  background: oklch(0.9618 0.0086 247.91/.05);
+  background: var(--nav-hover);
   text-decoration: none;
 }
 
@@ -616,7 +616,7 @@
     position: fixed;
     inset: 0;
     z-index: 55;
-    background: oklch(0.02 0.01 267/.55);
+    background: var(--rail-scrim);
     backdrop-filter: blur(3px);
     -webkit-backdrop-filter: blur(3px);
   }
@@ -653,7 +653,7 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 3px;
+    gap: var(--s1);
     position: relative;
     color: var(--text-3);
     font-size: var(--t-xs);
@@ -721,8 +721,8 @@
   }
 
   .user-btn {
-    gap: 7px;
-    padding-inline: 6px;
+    gap: var(--s2);
+    padding-inline: var(--s2);
   }
 
   .user-btn .u-nm {
@@ -749,22 +749,22 @@
    overrides primitives.css carries for the classes it kept. */
 [data-theme="light"] .user-btn:hover,
 [data-theme="light"] .user-btn[aria-expanded="true"] {
-  background: oklch(0.24 0.022 268/.06);
+  background: var(--light-hover-fill);
   color: var(--text);
 }
 
 [data-theme="light"] .cmdk {
-  background-color: oklch(1 0 0/.86);
+  background-color: var(--light-field-bg);
   border-color: var(--line-2);
 }
 
 [data-theme="light"] .user-pop {
-  background: oklch(0.998 0.002 268/.92);
+  background: var(--light-pop-bg);
   box-shadow: var(--shadow-lg);
 }
 
 [data-theme="light"] .up-item:hover {
-  background: oklch(0.24 0.022 268/.05);
+  background: var(--light-hover-wash);
 }
 
 [data-theme="light"] .u-ava {
@@ -772,20 +772,20 @@
 }
 
 [data-theme="light"] .rail-item:hover {
-  background: oklch(0.24 0.022 268/.05);
+  background: var(--light-hover-wash);
 }
 
 [data-theme="light"] .nav a.active {
-  background: oklch(1 0 0);
+  background: var(--light-lift);
   border: 1px solid var(--line-2);
   box-shadow: var(--shadow-sm);
 }
 
 [data-theme="light"] .topbar,
 [data-theme="light"] .tabbar {
-  box-shadow: 0 1px 0 oklch(1 0 0/.6);
+  box-shadow: 0 1px 0 var(--light-chrome-highlight);
 }
 
 [data-theme="light"] .rail-scrim {
-  background: oklch(0.24 0.022 268/.28);
+  background: var(--light-scrim);
 }

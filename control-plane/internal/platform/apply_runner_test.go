@@ -33,7 +33,8 @@ type fakeStore struct {
 	release  Release
 	requests map[string]string // request id → attempt id
 	nextReq  int
-	counts   int // how many times the session count was read
+	counts   int     // how many times the session count was read
+	actor    *string // hosts.recovery_actor_source_commit
 }
 
 func newFakeStore(a Attempt) *fakeStore {
@@ -202,6 +203,12 @@ func (f *fakeStore) autoReverts() []Attempt {
 	return out
 }
 
+func (f *fakeStore) HostActorCommit(context.Context, string) (*string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.actor, nil
+}
+
 func (f *fakeStore) OpenHostAttempt(_ context.Context, hostID string) (Attempt, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -223,6 +230,10 @@ func (f *fakeStore) OpenAttempts(context.Context) ([]Attempt, error) {
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeStore) TerminalStandaloneAttemptsWithOwnedHolds(context.Context) ([]Attempt, error) {
+	return nil, nil // the fake has no durable admission table
 }
 
 func (f *fakeStore) Release(context.Context, string) (Release, error) {

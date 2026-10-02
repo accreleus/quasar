@@ -47,6 +47,9 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vulkanav1enc.patch`
 - `vulkan-enc-output-state-on-resize.patch`
 - `vkenc-bitstream-buffer-pool.patch`
+- `vulkanh265enc-radv-coded-height.patch`
+- `vulkanav1enc-exact-frame-size.patch`
+- `vulkanav1enc-min-qindex.patch`
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
 They are applied — **in this order** — to a from-source GStreamer `1.28.4`
@@ -68,13 +71,19 @@ its rationale references the AV1 element the eighth patch introduces.
 `vkenc-bitstream-buffer-pool.patch` applies **tenth (last)**: it was diffed against
 `gst-libs/gst/vulkan/gstvkencoder-private.c` with all nine predecessors applied, and that file is
 shaped by the rc-fix, intra-refresh, rc-retarget and output-state-on-resize patches before it.
-None of the ten are upstreamed into GStreamer itself yet.
+`vulkanh265enc-radv-coded-height.patch` applies **eleventh**: it edits the coded-size
+block of `new_sequence()` in `vkh265enc.c` that `vulkanh265enc.patch` and
+`vulkan-enc-output-state-on-resize.patch` shape first.
+`vulkanav1enc-exact-frame-size.patch` (twelfth) and `vulkanav1enc-min-qindex.patch` (thirteenth,
+last) both edit `vkav1enc.c`, which `vulkanav1enc.patch` creates; the second was diffed on top of
+the first.
+None of the thirteen are upstreamed into GStreamer itself yet.
 
-`vkh265enc-profile-template.patch` is an **eleventh candidate that is NOT wired into
+`vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
 correctness fix for an upstream defect the Quasar encode path already sidesteps by pinning
 `profile=main` in its capsfilter, so it buys nothing for a Quasar image and everything for
-anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **eleventh (last)**: it
+anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **fourteenth (last)**: it
 edits `gst_vulkan_h265_encoder_register()` in `vkh265enc.c`, a region no earlier patch
 touches, so its position is a convention rather than a constraint. See its section below.
 
@@ -171,7 +180,7 @@ landed in two stages:
    like the other encoders (verified live: encoder src caps carry
    `colorimetry=bt709, chroma-site=mpeg2`).
 
-Verified on Tower (RTX 5090): all-intra and 60-frame-GOP captures decode 120/120
+Verified on the lab host (RTX 5090): all-intra and 60-frame-GOP captures decode 120/120
 frames with 0 errors under jellyfin-ffmpeg strict decode (`-err_detect +explode`,
 versus 60/120 and 2/120 pre-fix), `sps_extension_present_flag=0`, all SPS NALs
 byte-identical, host-decode luma timeline flat, and the live node-agent HEVC path
@@ -182,7 +191,7 @@ browser (VideoToolbox) re-test remain outstanding.
 defect set that `vkh264enc-rc-fix.patch` fixes for H.264, and none of the fixes; the
 one node-agent diagnostic that should have caught it could not fire, because
 `rearm_vulkan_rc` warns when `bitrate` is not `GST_PARAM_MUTABLE_PLAYING` and this
-patch *does* set that flag, so everything host-side looked correct. Measured on Tower
+patch *does* set that flag, so everything host-side looked correct. Measured on the lab host
 with `vulkan_rc_retarget_probe.c` before the fix: an 8000 kbps CBR request
 produced **~550 Mbps** at 1080p60 snow (i.e. constant-QP), a retarget to 2000 changed
 nothing that tracked (ratio 0.67), and it emitted an extra key frame one frame after
@@ -247,7 +256,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   `gst_h264_encoder_reset()`, which zeroes `gop.cur_frame_index` — so the very
   next frame is an IDR that restarts the GOP. **This, not the Vulkan session
   reset below, is where the IDR-per-retarget actually came from**; measured on
-  Tower with `vulkan_rc_retarget_probe.c`, `idr-period=60` and a
+  the lab host with `vulkan_rc_retarget_probe.c`, `idr-period=60` and a
   retarget at frame 245 gave key frames at `0 60 120 180 240 246 306 366 426` —
   an extra key one frame after the retarget, with the GOP realigned to it, so
   under sustained ABR the keyframe interval collapses to the retarget interval.
@@ -256,7 +265,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   `_configure_rate_control()`'s rate half) and requests a reset-free re-apply,
   skipping the reconfigure entirely. A pre-`start()` write is unchanged. After:
   `0 60 120 180 240 300 360 420 480`, `RETARGET_VERDICT=PASS`. Confirmed live on
-  Tower under `qnetem` (H.264 1440p60, ABR `smooth`, `idr-period=60`), counting
+  the lab host under `qnetem` (H.264 1440p60, ABR `smooth`, `idr-period=60`), counting
   `gst_h264_encoder_print_gop_structure` — one per `configure()` — in the agent
   log: **11 GOP regenerations for 10 ABR retargets before, 1 for 17 after**.
 
@@ -280,7 +289,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   gave an identical `unexpected_keyframes_after_retarget=1`), and B1 alone would
   update `rc.bitrate` with nothing to deliver it to the driver.
 
-  Measured on Tower (RTX 5090, driver 595.80) with
+  Measured on the lab host (RTX 5090, driver 595.80) with
   `vkvideoencodeav1cbr.c`'s `rcupd-*-midgop`
   cases — the reset-free control path is codec-agnostic, so the AV1 harness
   exercises exactly the library code H.264/H.265 use. **The driver accepts it and
@@ -305,7 +314,7 @@ the shared encoder library (`gst-libs/gst/vulkan/gstvkencoder-private.{c,h}`).
   limitation.
 
 Evidence: see the **G2 entry in `docs/reports/VULKAN-WORKLOG.md`** (probe:
-`g2_bitrate_probe.c`, run on hermes Renoir in
+`g2_bitrate_probe.c`, run on aux-host Renoir in
 `quasar-vulkan:latest`).
 
 **Upstream status:** unreported as of 2026-07-05 — issue to be filed against
@@ -319,7 +328,7 @@ can be the AMD default (issue #367). Stock `1.28.4` `vulkanh264enc` emits **one
 slice per frame** (the element hardcodes `naluSliceEntryCount = 1`; its own source
 carries a `TODO: + support multi-slices`). Over a bursty-loss WiFi path a single
 lost packet destroys the whole frame, and with `idr-period=60` that costs up to a
-full second of received frames — a real-client A/B on hermes Renoir measured the
+full second of received frames — a real-client A/B on aux-host Renoir measured the
 single-slice `vulkanh264enc` stream collapsing to **8-13 received fps** while the
 agent delivered 54-60, whereas `vah264enc` (which emits `num-slices=8`) rode at
 **~50 fps** on the identical path (see the `2026-07-05T14:00Z` SOAK FINDING entry
@@ -338,7 +347,7 @@ driver's `VkVideoEncodeH264CapabilitiesKHR.maxSliceCount` (a `GST_WARNING` is
 logged when clamping). It touches only `ext/vulkan/vkh264enc.c` (no encoder-library
 change — the slice split lives entirely in the element).
 
-Evidence (hermes Renoir, `quasar-vulkan:latest`, `--device /dev/dri`, mounted
+Evidence (aux-host Renoir, `quasar-vulkan:latest`, `--device /dev/dri`, mounted
 rebuilt `libgstvulkan.so`; probe `slice_count_probe.c` counts VCL NALs
 per encoder-src buffer): **Renoir `maxSliceCount = 128`**; `num-slices=1` → 1
 slice/frame (default preserved), `num-slices=8` → exactly 8 slices/frame across
@@ -356,8 +365,8 @@ upstreamable.
 **Diagnostic A/B arm; not an accepted production fix.** Stock GStreamer `1.28.4` stores the
 submission mutex in each `GstVulkanQueue` wrapper. Distinct wrappers can refer to the same raw
 `VkQueue`, so their mutexes would not satisfy Vulkan's external-synchronization rule for that
-handle. Tower normally selects distinct graphics/compute and VIDEO_ENCODE queue families, however,
-so the converter and encoder are expected to use different raw queues. Tower has produced
+handle. The lab host normally selects distinct graphics/compute and VIDEO_ENCODE queue families, however,
+so the converter and encoder are expected to use different raw queues. The lab host has produced
 stochastic Xid 32 failures during session pipeline bring-up, where both queues begin submitting.
 
 This patch changes `gst_vulkan_queue_submit_lock()` / `_unlock()` to use one process-global GLib
@@ -399,7 +408,7 @@ capability probe `intra_refresh_caps_probe.c`):** the two target GPUs expose *di
 mode families, so the shared encoder negotiates in `gst_vulkan_encoder_start()` against
 `VkVideoEncodeIntraRefreshCapabilitiesKHR`:
 
-- **Tower RTX 5090 (NVIDIA 595.80):** only `PER_PICTURE_PARTITION` (maxCycle 64). Chosen as the
+- **Lab-host RTX 5090 (NVIDIA 595.80):** only `PER_PICTURE_PARTITION` (maxCycle 64). Chosen as the
   primary mode; cycle duration = the coded slice count — i.e. the requested `num-slices` clamped to
   the macroblock-row count and `maxIntraRefreshCycleDuration` (the H.264 VU requires cycle ==
   slice count, so the element clamps the requested region hint to mb-rows before start and additionally
@@ -408,7 +417,7 @@ mode families, so the shared encoder negotiates in `gst_vulkan_encoder_start()` 
   among seven P-slices whose index rotates `0..7` with period 8; with `num-slices=50` at 720p the cycle
   clamps to 45 (mb-rows) and the I-slice sweeps `0..44` with period 45 — no extra IDRs, no driver
   rejection.
-- **hermes Renoir (RADV Mesa 25.3.6):** `BLOCK_BASED|BLOCK_ROW_BASED|BLOCK_COLUMN_BASED` (no
+- **Aux-host Renoir (RADV Mesa 25.3.6):** `BLOCK_BASED|BLOCK_ROW_BASED|BLOCK_COLUMN_BASED` (no
   per-picture-partition), `partitionIndependentIntraRefreshRegions=true`, maxCycle 256. Falls back to
   `BLOCK_ROW_BASED` (legal alongside multi-slice because regions are partition-independent); cycle =
   slice count clamped to mb-rows and `maxIntraRefreshCycleDuration` (or 8 when `num-slices=1`). Verified:
@@ -426,7 +435,7 @@ per frame and skips marking a frame as intra-refresh (logging a warning) if the 
 references, so a mis-set reference count degrades to plain P frames rather than a driver error.
 **Consumers that enable intra refresh must therefore run `num-ref-frames=1`** (the node-agent's
 low-latency default) — otherwise the driver's default multi-reference GOP disables intra refresh
-every frame (observed on Tower with the stock 3-reference default).
+every frame (observed on the lab host with the stock 3-reference default).
 
 **Known limitation:** on the per-picture-partition path, `intra-refresh` with `num-slices=1` yields a
 cycle duration of 1 — i.e. every frame is fully intra (all-I), which is not useful. Pair intra
@@ -808,7 +817,7 @@ path, not in GStreamer.
 > (`node-agent/src/session/pipeline/source_branch.rs::pin_vulkan_encode_ring`; resolution
 > spec §7 item 4). `RING=2`, not the single stable slot `RING=1`, is pinned — the single slot starves
 > under the G1 `ParentBufferMeta` buffer-reuse gate below (multi-session spec §2c; rung-2 validated
-> on Tower, 2026-07-25). Uniform encode-src tiling in the compositor would restore full RING
+> on the lab host, 2026-07-25). Uniform encode-src tiling in the compositor would restore full RING
 > parallelism and is worth including in the PR #37 upstream report.
 
 ### `gst-wayland-display-app-cadence.patch`
@@ -828,8 +837,8 @@ The patch applies to the pinned `43d4c25` checkout after the Vulkan PTS patch an
 
 ### `gst-wayland-display-vulkan-nvidia-sync.patch`
 
-**Tower stabilization candidate, pending live A/B validation.** The VulkanImage producer and
-`vulkanh264enc` share GStreamer Vulkan objects and queues. Two plausible causes of Tower's Xid
+**Lab-host stabilization candidate, pending live A/B validation.** The VulkanImage producer and
+`vulkanh264enc` share GStreamer Vulkan objects and queues. Two plausible causes of the lab host's Xid
 13/32 and `VK_ERROR_DEVICE_LOST` are an externally-unsynchronized producer `vkQueueSubmit` and a
 replacement compositor creating a different logical Vulkan device during launcher-to-app swaps.
 The node agent now enforces device continuity; this patch makes the producer participate in
@@ -857,7 +866,7 @@ The patch moves the existing render-fence wait immediately after `render_output(
 readback or `to_gs_buffer()` conversion. This gives the external-memory consumer a completed GLES
 producer without relying on undocumented driver serialization. It removes the now-redundant late
 wait from the caller. This is independent of gst-interpipe and the encoder: an idle compositor's
-first conversion can otherwise race its own GLES render. Tower exposed that race on an RTX 5090
+first conversion can otherwise race its own GLES render. The lab host exposed that race on an RTX 5090
 with NVIDIA 595.80 as Xid 13/32 followed by `VK_ERROR_DEVICE_LOST`; upstream's cited RTX 5080 tests
 used driver 610.43.02 and only about 170 frames, so they do not cover this environment or sustained
 operation.
@@ -878,7 +887,7 @@ Upstream's own `tests/fixture.rs` documents the same failure ("spent hours … w
 at (0,0)") and works around it by calling `on_commit()` manually; this patch applies that fix
 at the production map site. One added call: `window.on_commit()` after `space.map_element()`.
 Applies after the other gst-wayland-display patches (context-adjacent to app-cadence).
-Found 2026-07-19 (Tower Steam kb/mouse regression investigation).
+Found 2026-07-19 (lab-host Steam kb/mouse regression investigation).
 
 ### `gst-wayland-display-fail-closed-renderer.patch`
 
@@ -936,7 +945,7 @@ investigation (see `docs/design/plans/2026-07-19-378-multisession-fail-closed-sp
 
    **Condition, not a one-shot event.** A first design that bumped the counter once per
    failed import (rate-limited to ≤1/5s) turned out to be insufficient: live T6 testing on
-   Tower found that gamescope submits exactly **one** dmabuf, its rejected import makes it
+   the lab host found that gamescope submits exactly **one** dmabuf, its rejected import makes it
    back off permanently (no retry, ever), so exactly one marker was ever emitted — and the
    node-agent's 2-in-30s debounce then never fired, leaving a pure-black session `running`
    forever. `comp::State` now tracks `renderer_degraded_active: Option<Instant>` as a
@@ -985,39 +994,73 @@ the pinned `smithay` / `gstreamer` versions.
 
 ### `gst-wayland-display-linear-encsrc-fallback.patch`
 
-**Latent-bug fix for the `WOLF_VULKAN_LINEAR_ENCSRC=1` opt-in knob** (the RX 9070 / GFX12
-swizzle-copy workaround). Patches gst-wayland-display
-(`wayland-display-core/src/utils/vulkan_share.rs::alloc_encode_src_buffer`), not GStreamer.
-Applied **last**, after `fail-closed-renderer`.
+**The encode-src allocator now tries LINEAR first, by default, with an automatic OPTIMAL
+fallback** (#281; supersedes the original `WOLF_VULKAN_LINEAR_ENCSRC=1` opt-in described
+below — the knob survives but its polarity is inverted, see below). Patches
+gst-wayland-display (`wayland-display-core/src/utils/vulkan_share.rs::alloc_encode_src_buffer`
+and its caller), not GStreamer. Applied after `fail-closed-renderer`; as of the 8th patch
+below it is no longer the *last* gst-wayland-display patch — `per-element-vulkan-device`
+applies after it (it touches the same function).
 
-Upstream's comment promises the knob is safe: "falls back to tiled if the linear alloc
-fails". The code did not deliver that — when
+**Why LINEAR-first is the default now, not just a knob for one card.** The compositor's
+RGBA→NV12 compute pass writes a LINEAR scratch image and then `vkCmdCopyImage`s that scratch
+into the encode-src image (this copy happens unconditionally — the compute shader never writes
+the encode-src image directly, there is no code path here with "no copy"). When the encode-src
+image is tiled (`OPTIMAL`), that copy crosses a swizzle-mode boundary that several radv
+generations mishandle: content displaced in vertical columns, bright green along the right and
+bottom edges. First hit on GFX12/RDNA4 (the RX 9070, #272's original report — hence the knob's
+name), and confirmed to recur on GFX10.3/RDNA2 (the AMD test host's Raphael/Granite Ridge iGPU,
+VCN 3.1.2). Allocating the encode-src image LINEAR makes the copy LINEAR→LINEAR, so the
+mishandled swizzle-boundary copy never runs. This is a destination-tiling change to a copy that
+was always going to happen, not a bandwidth win — expect no measured saving from it; a bandwidth
+number, if one is ever wanted, belongs in the live-exercise record, not here.
+
+**Automatic fallback, no configuration needed on any vendor.** If
 `gst_vulkan_image_memory_alloc_with_image_info` returns null for the LINEAR image, the
-function just returned `None`, which fails `VulkanNv12::new_on_shared` → "encode-src image
-allocation failed" → the session's whole Vulkan output fails to create. Verified live on
-the RTX 5090 (2026-07-24): NVIDIA's Vulkan-Video encoder rejects a LINEAR encode-src image,
-so setting the knob on an NVIDIA vulkan h265 host hard-failed every session instead of
-degrading gracefully.
+function logs a `tracing::warn!` and retries the identical allocation with
+`vk::ImageTiling::OPTIMAL`. Verified live on the RTX 5090 (2026-07-24): NVIDIA's Vulkan-Video
+encoder rejects a LINEAR encode-src image outright, so it always takes this fallback and lands
+on exactly the OPTIMAL image it always used — the retry is what makes LINEAR-first safe to
+default on for every vendor at once, not just the one it was fixed for.
 
-The patch implements the promised fallback: if the LINEAR alloc returns null while
-`WOLF_VULKAN_LINEAR_ENCSRC` is set, log a `tracing::warn!` and retry the identical
-allocation with `vk::ImageTiling::OPTIMAL` (the tiled default). The non-knob path is
-byte-identical (the retry branch is gated on `linear_encsrc`), and a genuine allocation
-failure still returns `None` after the retry. This makes the knob safe to leave on in
-mixed-GPU fleets: hosts whose encoder accepts LINEAR use it, hosts that reject it get the
-tiled default plus a warning, none hard-fail. Found while integrating the ring-slot tiling
-fix (`docs/design/plans/2026-07-24-vulkanh265enc-conformance-resolution-spec.md` §7 item 4).
+**Tiling-outer, flags-inner allocation ladder.** The allocation attempts are ordered by tiling
+first (LINEAR, then OPTIMAL), and within each tiling by usage-flag set, narrowest last. This
+ordering is load-bearing for NVIDIA: a naive flip to "flags-outer" would have let the first
+successful attempt on the fallback tiling settle for a narrower flag set than before, silently
+costing NVIDIA the `SAMPLED | TRANSFER_SRC | MUTABLE_FORMAT` "readable superset" image that
+`vulkanscale` (#501, the ABR external-resolution lever) depends on. Tiling-outer keeps the
+first OPTIMAL attempt on the same flag set NVIDIA always got.
+
+**Per-device tiling latch.** The allocator that picks LINEAR vs. OPTIMAL runs once per ring
+slot, at first allocation for that slot, and the chosen tiling is cached for the session — a
+ring must never end up split across two tilings for the same device, because the scratch→
+encode-src copy and any downstream code that reads the image's tiling assume one answer per
+slot for the session's life. A driver that rejects LINEAR on slot 0 and is then asked to
+allocate slot 1 takes the OPTIMAL path from the same latch, not a fresh LINEAR attempt per slot.
+
+**The knob: `WOLF_VULKAN_LINEAR_ENCSRC`, kept, inverted, diagnostic-only.** No operator needs
+to set it — the default (unset) already does the right thing on every vendor tested. Three
+cases:
+- unset → LINEAR-first with the automatic OPTIMAL fallback described above (the default).
+- `0` / `false` / `off` → OPTIMAL only, no LINEAR attempt. This reproduces the pre-#281
+  behaviour exactly and is how the corruption is deliberately reproduced for a regression
+  check.
+- any other value, **including `1` / `true`** → treated the same as unset. This is deliberate
+  backward compatibility: operators who were told to set `=1` as the interim #272 workaround
+  keep the same (now-default) behaviour rather than hitting a changed or rejected value.
+
+Found while integrating the ring-slot tiling fix
+(`docs/design/plans/2026-07-24-vulkanh265enc-conformance-resolution-spec.md` §7 item 4).
 
 | Field | Value |
 |---|---|
 | Origin | Quasar (this repo) — not vendored |
 | Patches | `games-on-whales/gst-wayland-display` (compositor), file `wayland-display-core/src/utils/vulkan_share.rs` |
-| Authored against | `43d4c25` (the `GST_WAYLAND_DISPLAY_REF` this image builds), on top of the other six `gst-wayland-display-*` patches (the `nvidia-sync` patch touches the same function, so this applies **after** the full stack) |
-| Upstream status | to be reported on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) (comment/behavior mismatch is upstream's) |
+| Authored against | `631cebb` (the `GST_WAYLAND_DISPLAY_REF` when it was authored; unchanged by the #284 bump to `0b691b4`, which does not touch `vulkan_share.rs`), on top of the other six `gst-wayland-display-*` patches (the `nvidia-sync` patch touches the same function, so this applies **after** the full stack) |
+| Upstream status | to be reported on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) |
 
-If `GST_WAYLAND_DISPLAY_REF` moves, first check whether upstream implemented its promised
-fallback (then drop this patch); otherwise re-diff against the new commit with the other
-six gst-wayland-display patches applied first, and update `docs/third-party-pins.md`.
+If `GST_WAYLAND_DISPLAY_REF` moves, re-diff against the new commit with the other six
+gst-wayland-display patches applied first, and update `docs/third-party-pins.md`.
 (Note: as of the 8th patch below, `linear-encsrc-fallback` is no longer the *last*
 gst-wayland-display patch — `per-element-vulkan-device` applies after it.)
 
@@ -1086,7 +1129,7 @@ three call sites + `start()` clone hand-off + `stop()` `clear()`).
 **Unit test (spec §4 rung 1, GPU-free half):** `vulkan_share::tests::
 shares_are_independent_per_element` asserts two `VulkanShare`s are distinct allocations, each
 starts with no device, and clearing one never touches the other. The full "two elements mint
-**distinct** `GstVulkanDevice` pointers" assertion needs a real GPU and is a Tower soak item
+**distinct** `GstVulkanDevice` pointers" assertion needs a real GPU and is a lab-host soak item
 (spec §4 rung 1 / §7 cross-session distinctness log) — `ensure_owned_device` opens a real
 `VkDevice`, so it cannot run headless.
 
@@ -1095,7 +1138,7 @@ starts with no device, and clearing one never touches the other. The full "two e
 | Origin | Quasar (this repo) — not vendored |
 | Patches | `games-on-whales/gst-wayland-display` (compositor core + gst element): `wayland-display-core/src/{utils/vulkan_share.rs,lib.rs,comp/mod.rs}`, `gst-plugin-wayland-display/src/waylandsrc/imp.rs` |
 | Authored against | `43d4c25`, on top of the other seven `gst-wayland-display-*` patches (applies **8th/last**; `nvidia-sync` + `linear-encsrc-fallback` also touch `vulkan_share.rs`) |
-| Verified | `cargo check --workspace` clean + unit test green in `quasar-dev:latest` on hermes (2026-07-25); Tower N-session soak is the spec §4 rung 2-4 gate |
+| Verified | `cargo check --workspace` clean + unit test green in `quasar-dev:latest` on the aux host (2026-07-25); the lab-host N-session soak is the spec §4 rung 2-4 gate |
 | Upstream status | offer as **contribution #6** on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) (spec §6) — the process-global slot blocks any multi-tenant Vulkan use of the element; vendor-neutral |
 
 If `GST_WAYLAND_DISPLAY_REF` moves, re-diff this against the new commit **with the other seven
@@ -1123,7 +1166,7 @@ header then reads as writable even though the memory is in use, so the slot gets
 the encoder — a GPU data hazard in the green-bars / device-loss family. (Michael's intermittent
 green bars on h264+h265 Vulkan sessions, which do **not** correlate with any GPU Xid/reset, are a
 candidate artifact this gate addresses — spec §2c green-bars hook; validated separately by a
-Tower strict-decode before/after capture, not gated on here.)
+lab-host strict-decode before/after capture, not gated on here.)
 
 **What it changes** (`encode_src` path only; VA / RGBx / DMABuf paths byte-identical):
 
@@ -1157,17 +1200,17 @@ and the encoder **sink** pad carries a warn-once probe (`attach_vulkan_parent_me
 flags if the meta was stripped anywhere on `interpipesink → interpipesrc → queue → encoder`
 (a silent gate regression otherwise).
 
-**Smoothness (mandatory Tower A/B, spec §4 rung 2):** the per-frame `parent.copy()` child + the
+**Smoothness (mandatory lab-host A/B, spec §4 rung 2):** the per-frame `parent.copy()` child + the
 drop-and-re-emit path may cost frame pacing; the gate is accepted only if `present_interval_sd_ms`
 and `present_fps` are **not worse** than develop's baseline on identical sessions (#108 present-σ
-rule). Runs on Tower.
+rule). Runs on the lab host.
 
 | Field | Value |
 |---|---|
 | Origin | Quasar (this repo) — not vendored; re-authored from `origin/fix/vulkan-ring-gate` G1 |
 | Patches | `games-on-whales/gst-wayland-display` (compositor core), file `wayland-display-core/src/utils/vulkan_nv12.rs` |
 | Authored against | `43d4c25`, on top of the other eight `gst-wayland-display-*` patches (applies **9th/last**; the `vulkan-pts` patch also touches `to_gst_buffer`) |
-| Verified | `cargo check -p wayland-display-core` clean + GPU-free unit test `parent_meta_tracks_shallow_header_copies_until_last_release` green in `quasar-dev` on hermes (2026-07-25); Tower smoothness A/B + green-bars before/after are the spec §4 rung 2/5 gates |
+| Verified | `cargo check -p wayland-display-core` clean + GPU-free unit test `parent_meta_tracks_shallow_header_copies_until_last_release` green in `quasar-dev` on the aux host (2026-07-25); the lab-host smoothness A/B + green-bars before/after are the spec §4 rung 2/5 gates |
 | Upstream status | offer alongside the vulkan-pts fix on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) — the bare-clone reuse hazard is in PR #37's vulkan output path |
 
 If `GST_WAYLAND_DISPLAY_REF` or the `vulkan-pts` patch moves, re-diff this against the new commit
@@ -1210,7 +1253,7 @@ pointer, so `from_glib_full` consumes a reference the element never owned, leavi
 negotiated caps one short for the rest of the session. Nothing visibly breaks while bug 1 is
 present, because the leaked config copy happens to hold a ref on that same caps. Fix bug 1
 alone and the caps drops below its true count: sessions still connect and decode, but buffers
-are never released and **every** session's pipelines are retained (Tower: VRAM 843 MiB, ~3000
+are never released and **every** session's pipelines are retained (the lab host: VRAM 843 MiB, ~3000
 `GstMemory` and 6 `GstPipeline`s alive after two sessions, plus
 `free_priv_data: object finalizing but still has 1 parents`). The two fixes are therefore a
 single unit; do not split them.
@@ -1218,7 +1261,7 @@ single unit; do not split them.
 **Why the leak resisted the earlier hunt.** With an application-injected per-session context
 (Quasar's ZC-02 zero-copy NVENC path, `node-agent/src/session/cuda_share.rs`) the leaked
 reference meant the session's `GstCudaContext` was never finalized: ~500 MiB VRAM plus one
-`cuda-EvtHandlr` driver thread per session, perfectly linear (Tower, measured 34 -> 542 -> 1000
+`cuda-EvtHandlr` driver thread per session, perfectly linear (the lab host, measured 34 -> 542 -> 1000
 MiB). Two properties hid it:
 
 - **The retaining chain is invisible to the leaks tracer as normally configured.** The repo's
@@ -1252,7 +1295,7 @@ context process-wide.
 | Origin | Quasar (this repo) — not vendored |
 | Patches | `games-on-whales/gst-wayland-display`: `wayland-display-core/src/utils/allocator/cuda/mod.rs`, `gst-plugin-wayland-display/src/waylandsrc/imp.rs` |
 | Authored against | `43d4c25`, on top of the other nine `gst-wayland-display-*` patches (applies **10th/last**; three of them also touch `imp.rs`) |
-| Verified | Tower RTX 5090, `quasar-nv` + `QUASAR_ENCODER=nvenc`, unfiltered `leaks` tracer. Before: +1 alive `GstCudaStream` and +1 `GstCudaContext` ref per session (1 session -> ref-count 2, 2 sessions -> 3). After, 3 sequential sessions: **0** alive `GstCudaStream`, `GstCudaContext` ref-count flat at **1** (the agent's own cached `GstContext`), VRAM flat at 544 MiB, zero GStreamer criticals, every session `DECODE OK` at 59-60 fps |
+| Verified | lab-host RTX 5090, `quasar-nv` + `QUASAR_ENCODER=nvenc`, unfiltered `leaks` tracer. Before: +1 alive `GstCudaStream` and +1 `GstCudaContext` ref per session (1 session -> ref-count 2, 2 sessions -> 3). After, 3 sequential sessions: **0** alive `GstCudaStream`, `GstCudaContext` ref-count flat at **1** (the agent's own cached `GstContext`), VRAM flat at 544 MiB, zero GStreamer criticals, every session `DECODE OK` at 59-60 fps |
 | Upstream status | offer as **finding #8** on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) — matters for any multi-tenant / multi-session CUDA use of `waylanddisplaysrc`, vendor-neutral within the CUDA path |
 
 **Known residual (not addressed here, not caused by this patch):** roughly one `GstCaps` per
@@ -1368,3 +1411,61 @@ The pointer-enter-refocus patch (Quasar-authored, patches gst-wayland-display �
 Like the other `gst-wayland-display-*` patches this is NOT applied at build time —
 the build compiles the fork branch; this file is the authored record and upstream
 submission source.
+
+### `vulkanh265enc-radv-coded-height.patch`
+
+Quasar-authored (#297). On RADV the HEVC SPS declared a picture VCN never coded.
+`vulkanh265enc.patch` aligns the SPS picture (`self->coded_width/height`) to the largest CTB the
+driver reports (64 on RADV) and crops back with a conformance window. RADV, however, programs VCN
+from the encode's `codedExtent` (the display size) aligned to **64x16** (`radv_video_enc.c`;
+radeonsi's VA path declares the same picture). RADV does rewrite the uploaded SPS to 64x16, but a
+64-aligned height is a fixed point of that rewrite, so the driver could not repair it.
+
+At 2560x1440 the SPS said 1472 rows while VCN coded 1440, so the last CTB row was coded as a partial
+row and declared as a full one. Against the source picture, rows 0-1311 decoded at 46 dB and rows
+1408-1439 at 8 dB. Apple's HEVC decoder refused the stream outright (Chrome on macOS: "This stream
+isn't supported on your device"). 720, 1200 and 2160 were broken the same way. 1080 escaped only
+because VCN's align(1080,16) = 1088 happens to equal the SPS's align(1080,64).
+
+On RADV (`VK_DRIVER_ID_MESA_RADV`, read through `vkGetPhysicalDeviceProperties2`) the coded height
+is now aligned to 16, which holds for every VCN generation in Mesa 25.3. The SPS then matches what
+VCN codes: 720, 1200, 1440 and 2160 carry no crop, and the bottom rows decode at 43-49 dB. 1080 is
+byte-identical to before. Width keeps the 64 CTB alignment, which is what VCN uses. Every other
+driver, NVIDIA included, is unchanged. The chosen alignment is logged at INFO (`coded size ...
+height alignment`). The patch also corrects the `vulkanh265enc.patch` comment that says RADV reports
+no SPS override: Mesa 25.3 always flags one, and returns the SPS it was given.
+
+### `vulkanav1enc-exact-frame-size.patch`
+
+Quasar-authored (#294). `vulkanav1enc.patch` rounded the AV1 frame size up to the driver's
+`codedPictureAlignment` (8x8 on NVIDIA) and signalled the display size only through the frame
+header's `render_width/height`. AV1 has no crop: `render_size` is advisory and Chrome displays the
+decoded frame, so a 1600x900 stream showed as 1600x904 with a padding strip at the bottom. The
+frame is now coded at the display size, rounded only to `encodeInputPictureGranularity` (2x2 on
+NVIDIA, floored at 2 so NV12 stays even).
+
+`codedPictureAlignment` is not a valid-usage constraint. Under the spec's "AV1 Encode Parameter
+Overrides", an 8x8 alignment means the driver never changes the size, and NVIDIA then emits the
+exact frame size with no `render_size`. A coarser alignment (RADV VCN4 reports 64x16, equal to its
+input granularity) is applied by the driver in its own sequence header, so RADV output is
+byte-for-byte what it was. The sequence header's `max_frame_*` must stay equal to the encode's
+`codedExtent` (VUID-vkCmdEncodeVideoKHR-flags-10323/10324). A padded size, which is only reachable
+on a driver with coarser granularity, logs a warning because the padding will be visible.
+
+Measured on the NVIDIA role: 1600x900 and 1366x768 decode at their exact size and are clean in the
+bottom rows (51 and 50 dB PSNR). 1080 and 720 are byte-identical to before.
+
+### `vulkanav1enc-min-qindex.patch`
+
+Quasar-authored (#294). Under CBR or VBR the NVIDIA driver (610, RTX 5090) drives flat or static
+content down to `base_q_idx` 1. A key frame coded at index 1 has corrupt tile data: dav1d rejects it
+with EINVAL and libaom reports "Failed to decode tile data". Inter frames at index 1 decode, so a
+live session plays until its next periodic key frame, then Chrome stalls with packets still
+arriving, and its keyframe requests only produce more corrupt key frames until the next resize.
+
+Offline, CBR 7000 kbps on a flat source corrupted every periodic key frame at 640x360, 854x480,
+1024x576, 1280x720 and 1366x768. 1080 and 2160 never reach index 1 on the same content. The patch
+floors the rate controller's minimum Q index at 2 whenever rate control is active (applied through
+`useMinQIndex`, which needs the driver's per-group Q index capability). Index 2 is visually identical
+to 1, and every key frame at index 2 or above decoded. A constant-QP request is left alone.
+

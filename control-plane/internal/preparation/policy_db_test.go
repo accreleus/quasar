@@ -38,6 +38,7 @@ func dbTest(t *testing.T) (*Store, string, Policy) {
 	exec(`INSERT INTO image_catalog(id,manifest_version,display_name,kind,version,registry_ref,runtime,library_provider,raw) VALUES('steam',1,'Steam','prebuilt','v1','unused','{"managed_home":true}','steam','{}')`)
 	ref := "ghcr.io/accreleus/quasar-steam@sha256:" + strings.Repeat("a", 64)
 	exec(`INSERT INTO installed_images(image_id,version,registry_ref) VALUES('steam','v1',$1)`, ref)
+	exec(`INSERT INTO apps(name,runtime_spec) VALUES('selected Steam',jsonb_build_object('image',$1::text))`, ref)
 	host := "14500000-0000-0000-0000-000000000001"
 	exec(`INSERT INTO hosts(id,node_name,node_secret_hash,status) VALUES($1,'prep-host','hash','online')`, host)
 	exec(`INSERT INTO host_images(host_id,image_id,version,state) VALUES($1,'steam','v1','ready')`, host)
@@ -47,6 +48,38 @@ func dbTest(t *testing.T) (*Store, string, Policy) {
 		t.Fatal(err)
 	}
 	return store, host, p
+}
+
+func TestWarmupRequiresCurrentSelectedSteamImage(t *testing.T) {
+	s, host, p := dbTest(t)
+	ctx := ConnectionContext(context.Background())
+	if err := s.Register(ctx, host, map[string]int{"steam_preparation": 1}); err != nil {
+		t.Fatal(err)
+	}
+	r := &Reports{Steam: Report{PolicyRevision: p.Revision, Images: []ImageReport{{Image: p.Images[0], PreparationEnabled: true, ConsumptionEnabled: true, State: "waiting_image", Reason: "image_not_ready"}}}}
+	if err := s.Report(ctx, host, r); err != nil {
+		t.Fatal(err)
+	}
+	params, err := s.Params(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(params)
+	if _, err := s.pool.Exec(ctx, `UPDATE app_placement SET mode='fixed' WHERE app_id=(SELECT id FROM apps WHERE name='selected Steam')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Params(ctx, host); err == nil {
+		t.Fatal("unselected host admitted template production")
+	}
+	if err := s.AllowJob(ctx, host, raw); err == nil {
+		t.Fatal("queued warmup survived removal of its last selected requirement")
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO app_placement_hosts(app_id,host_id) SELECT id,$1::uuid FROM apps WHERE name='selected Steam'`, host); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AllowJob(ctx, host, raw); err != nil {
+		t.Fatalf("reselected host should retain authorized warmup: %v", err)
+	}
 }
 func TestAdoptionRevisionIsFrozenUntilActualSteamChange(t *testing.T) {
 	s, _, p := dbTest(t)

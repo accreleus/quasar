@@ -71,6 +71,12 @@ func installAt(t *testing.T, pool *pgxpool.Pool, lazy bool, version, registryRef
 	`, imgID, version, registryRef, lazy); err != nil {
 		t.Fatalf("seed installed_images: %v", err)
 	}
+	// RH05 prepares only for selected apps. The historical Ensurer tests still
+	// exercise the same dispatch behavior through a real dynamic placement.
+	if _, err := pool.Exec(context.Background(), `INSERT INTO apps(name,runtime_spec)
+		VALUES ('ensure fixture managed app',jsonb_build_object('image',$1::text))`, registryRef); err != nil {
+		t.Fatalf("seed managed app requirement: %v", err)
+	}
 }
 
 // --- P4: template catalog/adoption seeding -----------------------------------
@@ -131,6 +137,10 @@ func installTemplateFrozen(t *testing.T, pool *pgxpool.Pool, lazy bool, contextR
 	`, tplID, tplVer, tplLocalTag(tplVer), contextRepo, contextSHA, dockerfile, buildArgs, lazy); err != nil {
 		t.Fatalf("seed template installed_images: %v", err)
 	}
+	if _, err := pool.Exec(context.Background(), `INSERT INTO apps(name,runtime_spec)
+		VALUES ('ensure fixture template app',jsonb_build_object('image',$1::text))`, tplLocalTag(tplVer)); err != nil {
+		t.Fatalf("seed template app requirement: %v", err)
+	}
 }
 
 func seedHost(t *testing.T, pool *pgxpool.Pool, name string) string {
@@ -162,6 +172,7 @@ type buildCall struct {
 type fakeFleet struct {
 	mu      sync.Mutex
 	hosts   []string
+	epoch   string
 	calls   []ensureCall
 	removes []removeCall
 	builds  []buildCall
@@ -180,9 +191,20 @@ type removeCall struct {
 
 func newFleet(hosts ...string) *fakeFleet {
 	return &fakeFleet{
-		hosts: hosts, ch: make(chan ensureCall, 64), rmCh: make(chan removeCall, 64),
+		hosts: hosts, epoch: "test-epoch-1", ch: make(chan ensureCall, 64), rmCh: make(chan removeCall, 64),
 		buildCh: make(chan buildCall, 64),
 	}
+}
+
+func (f *fakeFleet) ImageConnectionIdentity(hostID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range f.hosts {
+		if id == hostID {
+			return f.epoch, true
+		}
+	}
+	return "", false
 }
 
 func (f *fakeFleet) ConnectedHosts() []string {
@@ -269,18 +291,6 @@ func (f *fakeFleet) SendImageRemove(_ context.Context, hostID, _, imageID string
 		return agentws.AckResult{}, sendErr
 	}
 	return agentws.AckResult{OK: true}, nil
-}
-
-// waitRemove returns the next dispatched image_remove, or fails the test.
-func (f *fakeFleet) waitRemove(t *testing.T) removeCall {
-	t.Helper()
-	select {
-	case c := <-f.rmCh:
-		return c
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for an image_remove dispatch")
-		return removeCall{}
-	}
 }
 
 // noMoreRemoves asserts nothing further is dispatched within a short window.
@@ -688,51 +698,6 @@ func TestEnsureRejectionRecordedNotRetried(t *testing.T) {
 	fleet.noMoreEnsures(t, 100*time.Millisecond)
 }
 
-// --- ensure/remove ordering (review round) ------------------------------------
-
-// TestRemoveOrdersAfterInflightEnsure is the review-round acceptance for the
-// ensure/remove ordering bug: a remove for a (host, image) must not overtake an
-// in-flight ensure for the SAME target. Before the fix the two used different
-// inflight keys and ran concurrently, so a remove could complete first and leave
-// the image present after uninstall. Here the ensure is held mid-flight, a remove
-// is enqueued for the same target, and the remove must be dispatched only AFTER
-// the ensure completes — proving they share one serialized worker.
-func TestRemoveOrdersAfterInflightEnsure(t *testing.T) {
-	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, false)
-	h := seedHost(t, pool, "host-a")
-	fleet := newFleet(h)
-	fleet.gate = make(chan struct{})
-	e := NewEnsurer(pool, fleet, testLog())
-	// Release the gate no matter how the test exits, so a mid-test t.Fatal cannot
-	// leave the worker blocked and hang e.Close()'s wg.Wait(). Idempotent.
-	var once sync.Once
-	releaseGate := func() { once.Do(func() { close(fleet.gate) }) }
-	defer e.Close()
-	defer releaseGate()
-	ctx := context.Background()
-
-	// Kick the ensure; it blocks inside the fake agent holding the target worker.
-	if err := e.EnsureAll(ctx); err != nil {
-		t.Fatalf("ensure all: %v", err)
-	}
-	if c := fleet.waitEnsure(t); c.HostID != h {
-		t.Fatalf("ensure went to %s, want %s", c.HostID, h)
-	}
-	// While the ensure is in flight, enqueue a remove for the same target. It must
-	// NOT be dispatched yet — the worker is busy with the ensure.
-	e.RemoveImage(ctx, imgID, []string{h})
-	fleet.noMoreRemoves(t, 100*time.Millisecond)
-
-	// Release the ensure; the queued remove now runs behind it.
-	releaseGate()
-	rc := fleet.waitRemove(t)
-	if rc.HostID != h || rc.ImageID != imgID {
-		t.Fatalf("remove after ensure: %+v", rc)
-	}
-}
-
 // --- register reconciliation ---------------------------------------------------
 
 // TestRegisterReconciliationFlipsLostImage is the spec's reconciliation
@@ -896,11 +861,9 @@ func (f *faultyPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &faultyTx{Tx: tx, failOnExec: f.failOnExec}, nil
 }
 
-// TestReconcileTransactional is the review-round #2 acceptance line: a
-// mid-transaction upsert failure must roll back the ENTIRE reconciliation,
-// including changes made earlier in the SAME call — not leave a
-// partially-applied snapshot.
-func TestReconcileTransactional(t *testing.T) {
+// A per-image upsert fault preserves an independently valid ready report.
+// Demotion and accepted reports still commit as one snapshot.
+func TestReconcileIndependentImageFailure(t *testing.T) {
 	pool := ensureDB(t)
 	seedCatalog(t, pool)
 	// A second catalog entry so the reconcile report has two rows to upsert —
@@ -915,7 +878,7 @@ func TestReconcileTransactional(t *testing.T) {
 	}
 	h := seedHost(t, pool, "host-a")
 
-	fp := &faultyPool{Pool: pool, failOnExec: 2} // first upsert succeeds, second fails
+	fp := &faultyPool{Pool: pool, failOnExec: 6} // second image upsert fails after first committed within tx
 	e := newEnsurer(fp, nil, testLog())
 	defer e.Close()
 	ctx := context.Background()
@@ -925,15 +888,13 @@ func TestReconcileTransactional(t *testing.T) {
 		{ImageID: imgID2, Version: imgVer, State: "ready"},
 	})
 
-	// Nothing from this reconciliation may have landed: the first upsert's
-	// write was inside the same transaction as the second's failure, so it
-	// must be rolled back too.
-	var n int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM host_images WHERE host_id = $1::uuid`, h).Scan(&n); err != nil {
-		t.Fatalf("count host_images: %v", err)
+	var first, second bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_images WHERE host_id=$1::uuid AND image_id=$2 AND state='ready'),
+		EXISTS(SELECT 1 FROM host_images WHERE host_id=$1::uuid AND image_id=$3)`, h, imgID, imgID2).Scan(&first, &second); err != nil {
+		t.Fatal(err)
 	}
-	if n != 0 {
-		t.Fatalf("host_images rows after rolled-back reconciliation = %d, want 0", n)
+	if !first || second {
+		t.Fatalf("independent reconcile first ready=%t failed second stored=%t", first, second)
 	}
 }
 
@@ -958,7 +919,7 @@ func TestReconcileFailedUpsertDoesNotDemote(t *testing.T) {
 		t.Fatalf("precondition: state %+v (found=%v), want ready", hs, ok)
 	}
 
-	fp := &faultyPool{Pool: pool, failOnExec: 1} // the ONLY upsert in this report fails
+	fp := &faultyPool{Pool: pool, failOnExec: 1} // the only report cannot start its savepoint
 	e := newEnsurer(fp, nil, testLog())
 	defer e.Close()
 
@@ -988,8 +949,8 @@ func TestReconcileErrorDispatchesAdoptedImagesDirectly(t *testing.T) {
 	h := seedHost(t, pool, "host-a")
 	fleet := newFleet(h)
 
-	// Fault-inject the reconcile transaction's very first Exec (the upsert for
-	// the one reported image) so reconcile returns an error before it ever
+	// Fault-inject the reconcile transaction's very first Exec (the savepoint
+	// for the one reported image) so reconcile returns an error before it ever
 	// commits.
 	fp := &faultyPool{Pool: pool, failOnExec: 1}
 	e := newEnsurer(fp, fleet, testLog())

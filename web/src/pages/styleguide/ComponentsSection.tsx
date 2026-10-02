@@ -56,7 +56,7 @@ const SESSION_COLS: TableColumn<DemoSession>[] = [
   {
     key: "telemetry",
     header: "Telemetry",
-    render: (r) => <span className="mono sub" style={{ fontSize: "var(--t-xs)" }}>{r.telemetry}</span>,
+    render: (r) => <span className="mono sub t-xs">{r.telemetry}</span>,
   },
   {
     key: "actions",
@@ -138,9 +138,9 @@ export function ComponentsSection() {
 
         <CompLabel>Tabs (SectionHeadProvider)</CompLabel>
         <CompBlock>
-          <div className="sg-specimen" style={{ padding: 0, overflow: "hidden" }}>
+          <div className="sg-specimen sg-flush sg-clip">
             <SectionHeadProvider title="Preview section" tabs={DEMO_TABS}>
-              <div style={{ padding: "var(--s5)", color: "var(--text-3)", fontSize: "var(--t-sm)" }}>
+              <div className="sg-tab-body muted t-sm">
                 Tab content renders here.
               </div>
             </SectionHeadProvider>
@@ -168,7 +168,7 @@ export function ComponentsSection() {
         <h2>Inputs and switches</h2>
         <p className="sg-desc">Text, select, search, switch and checkbox, all on the input surface token.</p>
         <div className="sg-specimen">
-          <div className="sg-grid" style={{ gridTemplateColumns: "repeat(3,1fr)", maxWidth: 760, marginBottom: "var(--s4)" }}>
+          <div className="sg-grid mb4" style={{ gridTemplateColumns: "repeat(3,1fr)", maxWidth: 760 }}>
             <TextField label="Display name" defaultValue="quasar-node-1" />
             <SelectField label="GPU tier">
               <option>1080p · 60 fps</option>
@@ -188,7 +188,7 @@ export function ComponentsSection() {
       <section className="sg-block" id="sg-table">
         <h2>Table</h2>
         <p className="sg-desc">Row height and header follow the density token; the last column is action buttons.</p>
-        <div className="sg-specimen" style={{ padding: 0 }}>
+        <div className="sg-specimen sg-flush">
           <Table columns={SESSION_COLS} rows={DEMO_SESSIONS} rowKey={(r) => r.id} />
         </div>
       </section>
@@ -198,7 +198,7 @@ export function ComponentsSection() {
         <h2>Note</h2>
         <p className="sg-desc">An inset callout for context that is not an error, and its warning variant.</p>
         <div className="sg-specimen">
-          <div className="note" style={{ marginBottom: "var(--s3)" }}>
+          <div className="note mb3">
             Publishing happens on the next scan, not immediately.
           </div>
           <div className="note warn">Scheduling is paused for this host while it drains.</div>
@@ -211,7 +211,7 @@ export function ComponentsSection() {
         <p className="sg-desc">Capacity reads as a bar or a gauge; a trend reads as a sparkline.</p>
         <div className="sg-specimen">
           <SpecRow>
-            <div style={{ width: 320, display: "flex", flexDirection: "column", gap: "var(--s3)" }}>
+            <div className="col gap3" style={{ width: 320 }}>
               <Bar percent={62} label="VRAM" value="318/512" variant="grad" />
               <Bar percent={50} label="Slots" value="1/2" variant="success" />
               <Bar percent={83} label="Encode" value="83%" variant="warning" />
@@ -219,7 +219,7 @@ export function ComponentsSection() {
             <Gauge percent={72} label="GPU" color="var(--accent)" />
             <Gauge percent={41} label="VRAM" color="var(--success)" />
             <div style={{ width: 200 }}>
-              <div className="eyebrow" style={{ marginBottom: "var(--s2)" }}>Fps, last 60s</div>
+              <div className="eyebrow sg-eyebrow-gap">Fps, last 60s</div>
               <Sparkline points={SPARK_POINTS} color="var(--info)" height={34} />
             </div>
           </SpecRow>
@@ -246,7 +246,7 @@ export function ComponentsSection() {
           </SpecRow>
         </div>
         <Drawer open={drawerOpen} onClose={() => setDrawerOpen(false)} title="Session detail">
-          <p style={{ color: "var(--text-3)", fontSize: "var(--t-sm)" }}>
+          <p className="muted t-sm">
             Drawer body content goes here. Use it for contextual detail panels, filters or a
             secondary workflow without leaving the current page.
           </p>

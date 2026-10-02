@@ -50,8 +50,8 @@ export function RestartNote({
 }) {
   if (confirmRestart) {
     return (
-      <div className="note warn row gap3 center" style={{ marginBottom: "var(--s4)" }}>
-        <span style={{ flex: 1 }}>
+      <div className="note warn row gap3 center mb4">
+        <span className="grow">
           This will restart the agent and drop {liveSessionsWording(liveSessionsCount)} on this host.
         </span>
         <Button variant="ghost" onClick={onCancelConfirm}>Cancel</Button>
@@ -64,8 +64,8 @@ export function RestartNote({
 
   if (restartConfirmPending) {
     return (
-      <div className="note warn row gap3 center" style={{ marginBottom: "var(--s4)" }}>
-        <span style={{ flex: 1 }}>
+      <div className="note warn row gap3 center mb4">
+        <span className="grow">
           Restarting will drop {liveSessionsWording(liveSessionsCount)} on this host.
         </span>
         <Button variant="ghost" onClick={onCancelRestartPending}>Cancel</Button>
@@ -78,8 +78,8 @@ export function RestartNote({
 
   if (showRestartButton) {
     return (
-      <div className="note warn row gap3 center" style={{ marginBottom: "var(--s4)" }}>
-        <span style={{ flex: 1 }}>
+      <div className="note warn row gap3 center mb4">
+        <span className="grow">
           {pendingRestart
             ? "Encoder or GPU changes are pending an agent restart."
             : "A saved change hasn't reached the agent yet."}
@@ -93,7 +93,7 @@ export function RestartNote({
 
   if (hasDirtyRestart) {
     return (
-      <div className="note warn" style={{ marginBottom: "var(--s4)" }}>
+      <div className="note warn mb4">
         {pluralChanges(dirtyRestartCount)} pending. Saving {itOrThem(dirtyRestartCount)} restarts the node
         agent and ends {liveSessionsWording(liveSessionsCount)} on this host.
       </div>

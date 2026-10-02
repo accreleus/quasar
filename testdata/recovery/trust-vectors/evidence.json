@@ -1,0 +1,1145 @@
+{
+  "kind": "evidence",
+  "about": "signature_source.go ReleaseAssetSource.Evidence: how HTTP outcomes map onto signed / absent / fetch_error. Only a 404 on the signature asset is an absence; anything that could not be completed is a fetch_error, never an absence.",
+  "vectors": [
+    {
+      "name": "both assets present",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceFetchesBothAssets",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": "{\"format_version\":1,\"signatures\":[]}"
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "no signature asset is a definitive absence",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceNoSignatureAssetIsDefinitiveAbsence",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "release 0.3.0 publishes no platform-release-manifest.json.sig asset"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "a 503 is not an absence",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceServerErrorIsNotAbsence",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 503
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig answered HTTP 503"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "a signature with no manifest is a failure",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceSignatureWithoutManifestIsAFailure",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release 0.3.0 publishes a signature but https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json answered HTTP 404"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "an unreachable source is a failure",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceUnreachableSourceIsAFailure (a dropped connection here)",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "transport_error": true
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error_prefix": "fetching https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig: "
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "no version is an absence",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceNoVersionIsAbsence (nil)",
+      "version": null,
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "the request names no release version, so there is no published release manifest to verify against"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "an empty version is an absence",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceNoVersionIsAbsence (\"\")",
+      "version": "",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "the request names no release version, so there is no published release manifest to verify against"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "a blank version is an absence",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceNoVersionIsAbsence (\"  \")",
+      "version": "  ",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "the request names no release version, so there is no published release manifest to verify against"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "a prerelease version is fetchable",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL (prerelease)",
+      "version": "0.3.0-rc.1",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0-rc.1/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0-rc.1/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": "{\"format_version\":1,\"signatures\":[]}"
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0-rc.1/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0-rc.1/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "a padded version is trimmed before the URL",
+      "source": "added: signature_source.go trims the version",
+      "version": " 0.3.0\n",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": "{\"format_version\":1,\"signatures\":[]}"
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "a non-breaking space is trimmed too",
+      "source": "added: strings.TrimSpace is Unicode-aware",
+      "version": "0.3.0 ",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": "{\"format_version\":1,\"signatures\":[]}"
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "only a 404 is an absence: 410",
+      "source": "added: signature_source.go",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 410
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig answered HTTP 410"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "only a 404 is an absence: a redirect with nowhere to go",
+      "source": "added: net/http returns a 3xx with no Location",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 302
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig answered HTTP 302"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "a manifest 404 after a signature is a failure",
+      "source": "added: signature_source.go",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 404
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release 0.3.0 publishes a signature but https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json answered HTTP 404"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "an absent signature is decided before the manifest is fetched",
+      "source": "added: signature_source.go fetches the signature first",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 503
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 404
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "release 0.3.0 publishes no platform-release-manifest.json.sig asset"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "a manifest outage is a failure",
+      "source": "added: signature_source.go",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 503
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release 0.3.0 publishes a signature but https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json answered HTTP 503"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "a dropped manifest connection is a failure",
+      "source": "added: signature_source.go",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "transport_error": true
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error_prefix": "fetching https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json: "
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "an oversized signature is a failure",
+      "source": "added: signature_source.go MaxAssetBytes",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "segments": [
+                {
+                  "text": "a",
+                  "count": 1048577
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "fetching https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig: asset is larger than 1048576 bytes"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "an oversized manifest is a failure",
+      "source": "added: signature_source.go MaxAssetBytes",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "segments": [
+                {
+                  "text": "a",
+                  "count": 1048577
+                }
+              ]
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "fetching https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json: asset is larger than 1048576 bytes"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "an asset of exactly the limit is read",
+      "source": "added: signature_source.go MaxAssetBytes",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "segments": [
+                {
+                  "text": "a",
+                  "count": 1048576
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "segments": [
+              {
+                "text": "a",
+                "count": 1048576
+              }
+            ]
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "an empty signature asset is evidence",
+      "source": "added: signature_source.go (the gate, not the fetch, grades it)",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": ""
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": ""
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "a build suffix is not a release version",
+      "source": "added: signature_source.go versionRe",
+      "version": "1.2.3+build",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"1.2.3+build\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "an empty prerelease is not a release version",
+      "source": "added: signature_source.go versionRe",
+      "version": "1.2.3-",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"1.2.3-\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "two components is not a release version",
+      "source": "added: signature_source.go versionRe",
+      "version": "1.2",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"1.2\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "0.0.0 is a release version",
+      "source": "added: signature_source.go versionRe",
+      "version": "0.0.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.0.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.0.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": "{\"format_version\":1,\"signatures\":[]}"
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.0.0/platform-release-manifest.json.sig",
+          "https://releases.example.invalid/quasar/v0.0.0/platform-release-manifest.json"
+        ]
+      }
+    },
+    {
+      "name": "format 2: both assets present",
+      "source": "added: the recovery actor fetches the v2 pair (control-api.md amendment 14)",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        },
+        "asset_format": 2
+      },
+      "expect": {
+        "evidence": {
+          "state": "signed",
+          "manifest": {
+            "text": "{\"version\":\"0.3.0\"}"
+          },
+          "signature": {
+            "text": "{\"format_version\":1,\"signatures\":[]}"
+          }
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json"
+        ]
+      }
+    },
+    {
+      "name": "format 2: no v2 signature is an absence even beside a format-1 pair",
+      "source": "added: the recovery actor fetches the v2 pair",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          }
+        },
+        "asset_format": 2
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "release 0.3.0 publishes no platform-release-manifest.v2.json.sig asset"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "format 2: a v2 signature with no v2 manifest is a failure",
+      "source": "added: the recovery actor fetches the v2 pair",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        },
+        "asset_format": 2
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release 0.3.0 publishes a signature but https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json answered HTTP 404"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig",
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json"
+        ]
+      }
+    },
+    {
+      "name": "format 1: a v2-only release reads as unsigned to the updater",
+      "source": "added: the updater keeps the format-1 pair until it retires (#367)",
+      "version": "0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.v2.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "absent",
+          "why": "release 0.3.0 publishes no platform-release-manifest.json.sig asset"
+        },
+        "fetched": [
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
+        ]
+      }
+    },
+    {
+      "name": "refused version ../../etc/passwd",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "../../etc/passwd",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"../../etc/passwd\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "refused version 0.3.0/../..",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "0.3.0/../..",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"0.3.0/../..\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "refused version 0.3.0?x=1",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "0.3.0?x=1",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"0.3.0?x=1\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "refused version latest",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "latest",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"latest\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "refused version v0.3.0",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "v0.3.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"v0.3.0\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "refused version 0.3.0 0.4.0",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "0.3.0 0.4.0",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"0.3.0 0.4.0\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "refused version 0.3.0%2f",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "0.3.0%2f",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"0.3.0%2f\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    },
+    {
+      "name": "refused version 01.2.3",
+      "source": "go:control-plane/internal/updater/signature_source_test.go:TestEvidenceRefusesAVersionItWillNotPutInAURL",
+      "version": "01.2.3",
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "evidence": {
+          "state": "fetch_error",
+          "error": "release version \"01.2.3\" is not a semver release version; refusing to compose an asset URL from it"
+        },
+        "fetched": []
+      }
+    }
+  ]
+}

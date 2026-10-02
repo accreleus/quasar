@@ -1,0 +1,20 @@
+[
+  {
+    "name": "quasar-recovery",
+    "labels": {},
+    "status": "running",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "actor"
+    ]
+  },
+  {
+    "name": "quasar-seed",
+    "labels": {},
+    "status": "running",
+    "command": [
+      "/usr/local/bin/quasar-recovery",
+      "seed"
+    ]
+  }
+]

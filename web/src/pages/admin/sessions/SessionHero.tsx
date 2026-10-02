@@ -29,6 +29,19 @@ function fact(label: string, value: string) {
   return { label, value };
 }
 
+export function homeSeedLabel(seed: AdminSession["home_seed"]): string {
+  if (!seed) return "No verified initial home outcome";
+  switch (seed.mode) {
+    case "reflink": return seed.reason === "seeded" ? "Reflink clone completed" : "Unknown home outcome";
+    case "copy": return seed.reason === "seeded" ? "Full copy completed · no reflink storage saving" : "Unknown home outcome";
+    case "existing": return seed.reason === "existing_home" ? "Existing home preserved" : "Unknown home outcome";
+    case "cold": return ["template_unavailable", "source_disabled", "host_templates_disabled", "host_setting_invalid", "policy_unavailable", "storage_unavailable", "clone_failed", "policy_changed"].includes(seed.reason)
+      ? `Cold start · ${seed.reason.replaceAll("_", " ")} · no reflink storage saving`
+      : "Unknown home outcome";
+    default: return "Unknown home outcome";
+  }
+}
+
 export function SessionHero({
   session,
   now,
@@ -66,20 +79,17 @@ export function SessionHero({
 
   return (
     <div className="card">
-      <div
-        className="page-head"
-        style={{ margin: 0, padding: "var(--card-pad) var(--card-pad) var(--s4)" }}
-      >
+      <div className="page-head shdr-head">
         <div>
           <div className="rowflex shdr-title">
             <i className={`sdot ${sessionDotClass(session)}`} title={session.state} />
             <h1>{session.app_name ?? "Unnamed app"}</h1>
           </div>
-          <div className="sub" style={{ marginTop: 5 }}>
+          <div className="sub">
             {subject}
           </div>
         </div>
-        <div className="toolbar" style={{ marginBottom: 0 }}>
+        <div className="toolbar">
           <Button variant="ghost" onClick={onExportTrace} disabled={exporting}>
             <IconDownload />
             {exporting ? "Exporting…" : "Export trace"}
@@ -91,24 +101,18 @@ export function SessionHero({
           )}
         </div>
       </div>
-      <div
-        className="six"
-        style={{
-          padding: "var(--s4) var(--card-pad) var(--card-pad)",
-          borderTop: "1px solid var(--line)",
-        }}
-      >
+      <div className="six shdr-facts">
         {facts.map((f) => (
           <div key={f.label}>
             <div className="eyebrow">{f.label}</div>
-            <div
-              className="num"
-              style={{ fontSize: "var(--t-lg)", color: "var(--text)", marginTop: 5 }}
-            >
+            <div className="num t-lg text-1 mt1">
               {f.value}
             </div>
           </div>
         ))}
+      </div>
+      <div className="sub shdr-home">
+        Initial managed home · {homeSeedLabel(session.home_seed)}
       </div>
     </div>
   );
