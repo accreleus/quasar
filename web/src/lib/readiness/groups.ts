@@ -19,8 +19,25 @@ export interface ReadinessGroupDef {
 
 export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   // #254: the runtime is the most basic fault, so it comes first; startup_cleanup is
-  // the agent's own safety state (#256).
-  { key: "runtime", label: "Container runtime", ids: ["startup_cleanup", "policy_journal", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"] },
+  // the agent's own safety state (#256). #437: RH07's engine checks sit with the runtime
+  // they describe, as the approved RH07 readiness mock draws them.
+  {
+    key: "runtime",
+    label: "Container runtime",
+    ids: [
+      "startup_cleanup",
+      "policy_journal",
+      "readiness_probe",
+      "runtime_endpoint",
+      "runtime_engine",
+      "runtime_api_version",
+      "runtime_capabilities",
+      "runtime_cdi",
+      "engine_restart_on_boot",
+      "engine_healthchecks",
+      "host_container_mounts",
+    ],
+  },
   {
     key: "gpu",
     label: "GPU & display",
@@ -31,9 +48,11 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
     label: "NVIDIA driver",
     ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility", "nvidia_driver_mount"],
   },
-  { key: "input", label: "Input & sandbox", ids: ["input_probe", "uinput", "user_namespaces", "app_apparmor_profile"] },
+  { key: "input", label: "Input & sandbox", ids: ["input_probe", "uinput", "input_device_access", "user_namespaces", "app_apparmor_profile"] },
   // #259: the audio sidecar host probe.
   { key: "audio", label: "Audio", ids: ["audio_probe"] },
+  // #437: console mode's local display, audio and monitor control (amendment 17).
+  { key: "console", label: "Console mode", ids: ["console_display", "console_audio", "console_ddc"] },
   // #253: storage; homes first — the two that can block a launch later.
   { key: "storage", label: "Storage", ids: ["homes_root_writable", "homes_free_space", "template_free_space", "image_free_space"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },
@@ -41,7 +60,7 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   {
     key: "platform_update",
     label: "Updates",
-    ids: ["updater_socket", "health_addr_bindable"],
+    ids: ["owner_conflict", "updater_socket", "health_addr_bindable"],
   },
 ];
 
