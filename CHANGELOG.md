@@ -25,6 +25,9 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **Podman no longer starts a session with a missing bind source (#426).** Podman makes a
+  missing bind source on the host instead of refusing the container. Quasar now checks the
+  source first and refuses the launch, as Docker does, and nothing is created.
 - **Missing cover art is fetched again (#441).** If the artwork cache is lost, for example
   when a database is restored into a fresh install, the artwork job now fetches the missing
   images again from the reference it already has. An admin's chosen art stays locked. An

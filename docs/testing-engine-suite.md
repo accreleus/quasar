@@ -102,15 +102,13 @@ runner; `scripts/verify/ci-engine-target.sh` brings each engine up):
 | `podman-rootful` | yes: Ubuntu's Podman 4.9, suite run as root | every GPU case; Fedora's Podman 5 |
 | `podman-rootless` | yes: Ubuntu's Podman 4.9 through the user's `podman.socket` | every GPU case; the must-pass Fedora Atomic VM (SELinux enforcing, read-only `/usr`) |
 
-CI's Podman jobs record three failures in `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known`
+CI's Podman jobs record two failures in `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known`
 matrix value) instead of hiding them:
 
 - `restart`: Podman 4.9's compatible container update refuses a restart policy
   (`Engine`). Podman 5 accepts it.
 - `stop-crash-loop`: a product finding on Podman 4.9 and 5 alike. A crash-looping
   `unless-stopped` service keeps being restarted after a successful stop.
-- `missing-bind-source`: a product finding on Podman 4.9 and 5 alike. Podman creates the
-  missing source on the host and starts the container.
 
 What only the lab can run, in every mode, and why:
 

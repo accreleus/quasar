@@ -611,7 +611,8 @@ fn errors(ctx: &Ctx) -> String {
 
 /// A typed bind whose source is missing is refused, never created: a catalog bind of an
 /// unmounted share must not become an empty directory (`runtime/docker/application.rs`
-/// asks the engine for `CreateMountpoint=false`).
+/// asks the engine for `CreateMountpoint=false`; Podman ignores that, so on Podman the
+/// runtime checks the source first, #426).
 fn missing_bind_source(ctx: &Ctx) -> String {
     let source = ctx.fixture_path("never-created");
     let request = ApplicationRequest {
