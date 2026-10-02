@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **Relaunching an app straight after stopping it no longer asks for an operator (#434).**
+  While the previous session is still shutting down, the launch now says so and names that
+  session, so trying again in a moment works. If it has only just stopped, the launch waits
+  briefly for its cleanup instead of reporting that the home needs operator review.
 - **Missing cover art is fetched again (#441).** If the artwork cache is lost, for example
   when a database is restored into a fresh install, the artwork job now fetches the missing
   images again from the reference it already has. An admin's chosen art stays locked. An

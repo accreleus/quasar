@@ -154,18 +154,40 @@ var attemptObserver func(attempt int)
 // The GPU lock is taken after an unlocked pick, so the GPU can fill in between
 // and the under-lock re-check retries. The user lock is always acquired first —
 // a consistent class order, so the two cannot deadlock.
+//
+// A refusal by a settling home hold (homeHoldRefusal, #434) is waited out for
+// up to homeHoldSettleWait, holding no lock, then the launch is retried whole.
 func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session, error) {
+	var settleUntil time.Time
+	for {
+		sess, err := s.schedulePlacement(ctx, p)
+		var settling *homeHoldSettlingError
+		if errors.As(err, &settling) {
+			if settleUntil.IsZero() {
+				settleUntil = time.Now().Add(homeHoldSettleWait)
+			}
+			if s.awaitHomeHoldRelease(ctx, p, settling.holder, settleUntil) {
+				continue
+			}
+			err = ErrHomeConflict
+		}
+		if p.ManagedHome && errors.Is(err, ErrHomeConflict) {
+			if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
+				return Session{}, diagnosisErr
+			}
+		}
+		return sess, err
+	}
+}
+
+// schedulePlacement retries scheduleAttempt under same-GPU contention.
+func (s *Store) schedulePlacement(ctx context.Context, p CreateParams) (Session, error) {
 	for attempt := 0; attempt < maxPlacementAttempts; attempt++ {
 		if attemptObserver != nil {
 			attemptObserver(attempt)
 		}
 		sess, retry, err := s.scheduleAttempt(ctx, p)
 		if !retry {
-			if p.ManagedHome && errors.Is(err, ErrHomeConflict) {
-				if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
-					return Session{}, diagnosisErr
-				}
-			}
 			return sess, err
 		}
 	}
@@ -303,8 +325,13 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		switch {
 		case err == nil:
 			// The 409 body must carry the live session's id so the client can link
-			// to it (§2.1).
-			return Session{}, false, &HomeInUseError{SessionID: conflictID}
+			// to it (§2.1). A holder already stopping only needs a moment (#434).
+			var stopping bool
+			if err := tx.QueryRow(ctx, `SELECT state='stopping' FROM sessions WHERE id=$1::uuid`,
+				conflictID).Scan(&stopping); err != nil {
+				return Session{}, false, fmt.Errorf("read same-home session state: %w", err)
+			}
+			return Session{}, false, &HomeInUseError{SessionID: conflictID, Stopping: stopping}
 		case errors.Is(err, pgx.ErrNoRows):
 		default:
 			return Session{}, false, fmt.Errorf("count same-home sessions: %w", err)
