@@ -408,7 +408,7 @@ fn log_count(ctx: &Ctx, id: &str, marker: &str) -> usize {
 }
 
 /// An `unless-stopped` service comes back after it exits; a running one stopped stays
-/// down, as the recovery actor's stop-then-disable sequences assume.
+/// down.
 fn restart(ctx: &Ctx) -> String {
     let spec = ctx.service("restart", "echo suite-run; exit 3");
     assert_eq!(spec.restart, RestartPolicy::No);
@@ -469,8 +469,9 @@ fn stays_down(ctx: &Ctx, id: &str, marker: &str) {
     );
 }
 
-/// A crash-looping `unless-stopped` service stopped stays down: the recovery actor stops a
-/// failed control plane this way before disabling its restart (`migrate.rs` `stop_failed`).
+/// A crash-looping `unless-stopped` service stopped stays down. Podman does not record a
+/// stop that finds it between two runs, so `stop_container` reads the stop back and makes
+/// it hold (#425).
 fn stop_crash_loop(ctx: &Ctx) -> String {
     let spec = ContainerSpec {
         restart: RestartPolicy::UnlessStopped,

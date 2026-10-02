@@ -469,14 +469,16 @@ impl Actor {
         self.finish(j, State::Failed, Some(failure.reason), output, false)
     }
 
-    /// Stops a failed control plane that ran and disables its restart, so neither a daemon
-    /// restart nor its policy starts it again; removes one that never ran.
+    /// Disables a failed control plane's restart and stops it, so neither a daemon restart
+    /// nor its policy starts it again; removes one that never ran. The policy goes first
+    /// (ADR 0007): a failed control plane is usually crash-looping, and an engine that finds
+    /// it between two runs may not record the stop (Podman, #425).
     fn stop_failed(&self, id: &str, started: bool) -> Result<(), EngineError> {
         if !started {
             return self.retrying(|| self.engine.remove_container(id));
         }
         let grace = self.config.timing.stop_grace;
-        self.retrying(|| self.engine.stop_container(id, grace))?;
-        self.retrying(|| self.engine.set_restart_policy(id, RestartPolicy::No))
+        self.retrying(|| self.engine.set_restart_policy(id, RestartPolicy::No))?;
+        self.retrying(|| self.engine.stop_container(id, grace))
     }
 }

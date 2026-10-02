@@ -25,7 +25,7 @@ reported as a skip with its reason, never counted as a pass). The mode table is
 | `device-uinput` | `/dev/uinput`, given as the recovery actor's recipe gives it to the node agent (a device of an agent-shaped service with `label=disable`), opens for the container's root (D9). Sessions never get `/dev/uinput`, only the event nodes the agent creates. | `uinput` |
 | `cdi` | The engine injects NVIDIA through CDI (D10), and the app user opens what encode and render use: `/dev/nvidiactl`, `/dev/nvidia-uvm` and each `/dev/nvidiaN`. Other nodes a CDI specification lists may be withheld by host policy. | `cdi` |
 | `restart` | An `unless-stopped` service comes back after it exits, and a running one that is stopped stays down. | |
-| `stop-crash-loop` | A crash-looping `unless-stopped` service that is stopped stays down, as the recovery actor's stop-then-disable sequences assume (`migrate.rs` `stop_failed`, `replace.rs` `keep_old`). | |
+| `stop-crash-loop` | A crash-looping `unless-stopped` service that is stopped stays down. Podman does not record a stop that finds it between two runs, so the runtime reads every stop back and makes it hold (#425). | |
 | `health` | The engine runs a service's own healthcheck, to `healthy` and to `unhealthy`. | `health` |
 | `removal` | A running service is removed; a volume in use refuses removal (`Busy`), outlives its container and is then removed; removing what is gone is not an error. | |
 | `errors` | A missing image is refused with a named error on both lifecycles and leaves nothing behind. | |
@@ -103,16 +103,14 @@ runner; `scripts/verify/ci-engine-target.sh` brings each engine up):
 | `podman-rootful` | yes: Ubuntu's Podman 4.9, suite run as root | every GPU case; Fedora's Podman 5 |
 | `podman-rootless` | yes: Ubuntu's Podman 4.9 through the user's `podman.socket` | every GPU case; the must-pass Fedora Atomic VM (SELinux enforcing, read-only `/usr`) |
 
-CI's Podman jobs record two failures in `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known`
-matrix value) instead of hiding them:
+CI's Podman jobs record one failure in `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known`
+matrix value) instead of hiding it:
 
 - `restart`: Podman 4.9 cannot change a restart policy (`Engine`): its compatible API has
   no container update, and its native update has no restart policy. Podman 5.1 is the
   first that can, so it is Quasar's minimum (`engines.podman.minimumVersion` in the
   engine-profile table; #424). The case stays KNOWN here because the runner's Podman is
   below that minimum.
-- `stop-crash-loop`: a product finding on Podman 4.9 and 5 alike. A crash-looping
-  `unless-stopped` service keeps being restarted after a successful stop.
 
 What only the lab can run, in every mode, and why:
 

@@ -359,20 +359,149 @@ pub(crate) async fn start(
     }
 }
 
-pub(crate) async fn stop(
-    config: &RuntimeConfig,
-    id: &str,
-    grace: Duration,
-) -> Result<(), RuntimeError> {
-    let (docker, _) = discover(config).await?;
+/// How long a stop keeps working, once the engine's own stop has answered, to make the
+/// container stay stopped (#425).
+pub(crate) const STOP_SETTLE: Duration = Duration::from_secs(15);
+/// How long to wait before looking again at a container the engine is still moving.
+const SETTLE_POLL: Duration = Duration::from_millis(50);
+
+/// What a read-back after a stop says about the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterStop {
+    /// Not running, and nothing the engine does on its own starts it again.
+    Down,
+    /// Running or paused: it needs a stop.
+    Up,
+    /// Podman: it exited by itself, and its restart policy starts it again. A stop now is
+    /// a no-op the engine does not record.
+    RestartPending,
+    /// Being stopped or removed by someone: look again shortly.
+    Moving,
+}
+
+/// A Podman libpod inspect read as [`AfterStop`]. From libpod's `container_internal.go`
+/// (`shouldRestart`, `fullCleanup`), alike in 4.9 and 5.x: a container whose program
+/// exited is `stopped` until its cleanup runs, and that cleanup restarts it unless the stop
+/// was recorded (`StoppedByUser`) or the policy is `no`. A cleanup that did not restart it
+/// leaves it `exited`, and only an explicit start runs it again. A container whose program
+/// never ran is `created` (never started; also 4.9's word for one created in the OCI
+/// runtime) or `initialized` (5.x's), and nothing restarts it either.
+pub(crate) fn podman_after_stop(inspect: &serde_json::Value) -> AfterStop {
+    let state = &inspect["State"];
+    let status = state["Status"].as_str().unwrap_or_default();
+    if state["Running"].as_bool() == Some(true) || matches!(status, "running" | "paused") {
+        return AfterStop::Up;
+    }
+    if matches!(status, "stopping" | "removing") {
+        return AfterStop::Moving;
+    }
+    let recorded = state["StoppedByUser"].as_bool() == Some(true);
+    let restarts = !matches!(
+        inspect["HostConfig"]["RestartPolicy"]["Name"]
+            .as_str()
+            .unwrap_or_default(),
+        "" | "no"
+    );
+    if recorded || !restarts {
+        return AfterStop::Down;
+    }
+    match status {
+        "exited" | "created" | "initialized" | "configured" => AfterStop::Down,
+        "stopped" => AfterStop::RestartPending,
+        _ => AfterStop::Moving,
+    }
+}
+
+/// The engine's stop, its "already stopped" (304) being success.
+async fn stop_once(docker: &bollard::Docker, id: &str, grace: Duration) -> Result<(), Error> {
     let options = StopContainerOptions {
         t: Some(grace.as_secs().min(i32::MAX as u64) as i32),
         signal: None,
     };
     match docker.stop_container(id, Some(options)).await {
-        Ok(()) => Ok(()),
         Err(e) if status_code(&e) == Some(304) => Ok(()),
-        Err(e) => Err(mutation_error(e)),
+        other => other,
+    }
+}
+
+/// Stop the container and make sure it stays stopped, on every engine (#425).
+///
+/// Docker records an explicit stop whatever state the container is in: a container
+/// between two runs of a restart loop is `restarting`, which Docker stops and never
+/// restarts. Podman does not. Its API answers a stop of a container that is not running
+/// with 304 before reaching libpod's own stop, which is what records the stop
+/// (`StoppedByUser`), so a crash-looping `unless-stopped` container found between two runs
+/// is restarted by its own cleanup a moment later (4.9 and 5.x; the engine-mode suite's
+/// `stop-crash-loop` case). Stopping again does not help: measured on both versions, no
+/// stop in over a thousand found a container that exits at once running.
+///
+/// So every stop is read back until it holds. On Docker the read-back is one inspect.
+/// On Podman it is the native inspect, read by [`podman_after_stop`], and a container
+/// whose restart is pending is first `init`ed: created in the OCI runtime without its
+/// program, which is the half of the restart its cleanup was about to do anyway. That
+/// takes it out of the pending state (`init` resets the restart match, so the cleanup
+/// does not start it), and a stop of a `created` container is libpod's own stop, which
+/// records it. Nothing runs, so that stop needs no grace. Measured on Podman 4.9.3 and
+/// 5.8.4: one round, the stop recorded, no further run.
+///
+/// The alternatives were rejected. Disabling the restart policy around the stop needs a
+/// policy update Podman before 5.1 does not have (CI's 4.9 among them), and a crash
+/// between the two updates would leave `no`, which the recovery actor and the seed read as
+/// "Quasar's own stop" (ADR 0007). A plain stop-and-retry loop never wins against a fast
+/// crash loop.
+///
+/// A container that is not down by [`STOP_SETTLE`] fails the stop (`Engine`); a read-back
+/// that cannot be made leaves the outcome unknown.
+pub(crate) async fn stop(
+    config: &RuntimeConfig,
+    id: &str,
+    grace: Duration,
+) -> Result<(), RuntimeError> {
+    let (docker, info) = discover(config).await?;
+    stop_once(&docker, id, grace)
+        .await
+        .map_err(mutation_error)?;
+    let unknown = |_| RuntimeError::from(ErrorKind::UnknownOutcome);
+    // A container removed meanwhile is stopped for good.
+    let again = |grace: Duration| {
+        let docker = &docker;
+        async move {
+            match stop_once(docker, id, grace).await {
+                Err(e) if status_code(&e) == Some(404) => Ok(()),
+                other => other.map_err(mutation_error),
+            }
+        }
+    };
+    let deadline = tokio::time::Instant::now() + STOP_SETTLE;
+    loop {
+        let seen = if info.kind == crate::EngineKind::Podman {
+            super::libpod::inspect(config, id)
+                .await
+                .map_err(unknown)?
+                .map_or(AfterStop::Down, |v| podman_after_stop(&v))
+        } else {
+            match inspect_with(&docker, id).await.map_err(unknown)? {
+                Some(c) if c.running => AfterStop::Up,
+                _ => AfterStop::Down,
+            }
+        };
+        if seen == AfterStop::Down {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // The engine keeps running it: the stop did not hold.
+            return Err(ErrorKind::Engine.into());
+        }
+        match seen {
+            AfterStop::Down => unreachable!("returned above"),
+            AfterStop::Up => again(grace).await?,
+            AfterStop::RestartPending => {
+                // Refused: it was started meanwhile, and the next look stops it.
+                let created = super::libpod::init(config, id).await.map_err(unknown)?;
+                again(if created { Duration::ZERO } else { grace }).await?;
+            }
+            AfterStop::Moving => tokio::time::sleep(SETTLE_POLL).await,
+        }
     }
 }
 

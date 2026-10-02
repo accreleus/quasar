@@ -51,6 +51,27 @@ pub struct Behaviour {
     pub refuse_start: Option<String>,
     /// What the container has printed, for `logs_tail`.
     pub logs: String,
+    /// The container exits as soon as it starts, and its policy starts it again: a
+    /// [`CrashLoop`] from its start, exiting this many more times (`u32::MAX`: for good).
+    pub crash_loop: Option<u32>,
+}
+
+/// A container that exits by itself and that its restart policy starts again (#425). The
+/// engine acts between calls: after each call, a crash-looping container that runs exits,
+/// and one between two runs is started again while its policy is `unless-stopped`. As on
+/// Podman, a stop that finds it between runs is not recorded, so only a policy of `no`
+/// keeps it down.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrashLoop {
+    /// The first engine call (counted as [`Fault::call`]) after which it exits if it runs.
+    pub from_call: usize,
+    /// How many more times it exits as soon as it is started again before a run stays up;
+    /// `u32::MAX` never stays up.
+    pub again: u32,
+    /// Exited, and started again after the next call unless its policy is `no`.
+    pub between_runs: bool,
+    /// A stop found it between runs.
+    pub stop_missed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -109,6 +130,11 @@ pub struct FakeState {
     /// Host ports something outside the engine holds: a start publishing one is refused,
     /// as Docker refuses it, and the container stays `created`.
     pub ports_in_use: BTreeSet<u16>,
+    /// Containers that crash under their restart policy, by id.
+    pub crash_loops: BTreeMap<String, CrashLoop>,
+    /// Containers the engine started again after a stop of them had returned: a stop that
+    /// did not hold (#425). What the recovery actor must never cause.
+    pub restarted_after_stop: Vec<String>,
 }
 
 /// A database: its `schema_migrations` row and a token standing for its rows.
@@ -404,12 +430,49 @@ impl FakeEngine {
         }
         let inner = &mut *inner;
         let result = op(&mut inner.state, &mut inner.events);
+        crash_loops_act(&mut inner.state, index, &mut inner.events);
         let events = std::mem::take(&mut inner.events);
         match after {
             Some(error) => (Err(error), events),
             None => (result, events),
         }
     }
+}
+
+/// What the engine does between calls to the containers that crash-loop ([`CrashLoop`]).
+fn crash_loops_act(s: &mut FakeState, call: usize, ev: &mut Vec<Lifecycle>) {
+    let (containers, loops) = (&mut s.containers, &mut s.crash_loops);
+    loops.retain(|id, cl| {
+        let Some(c) = containers.get_mut(id) else {
+            return false;
+        };
+        if !cl.between_runs {
+            if c.status == "running" && call >= cl.from_call {
+                c.status = "exited".into();
+                c.exit_code = Some(3);
+                cl.between_runs = true;
+            }
+            return true;
+        }
+        if c.restart != RestartPolicy::UnlessStopped {
+            return false; // down for good
+        }
+        c.starts += 1;
+        if std::mem::take(&mut cl.stop_missed) && !s.restarted_after_stop.contains(id) {
+            s.restarted_after_stop.push(id.clone());
+        }
+        if cl.again > 0 {
+            // It ran and exited again at once.
+            if cl.again != u32::MAX {
+                cl.again -= 1;
+            }
+            return true;
+        }
+        c.status = "running".into();
+        c.exit_code = None;
+        ev.push(Lifecycle::Started(id.clone()));
+        false // this run stays up
+    });
 }
 
 /// Where the `local` driver keeps a volume's data on the engine host.
@@ -650,6 +713,15 @@ impl PlatformEngine for FakeEngine {
                 if let Some(b) = behaviour {
                     c.health = b.health;
                     c.logs = b.logs;
+                    if let Some(again) = b.crash_loop {
+                        s.crash_loops.insert(
+                            id.clone(),
+                            CrashLoop {
+                                again,
+                                ..Default::default()
+                            },
+                        );
+                    }
                 }
                 let spec = c.spec.clone();
                 control_plane_boot(s, &spec);
@@ -667,6 +739,10 @@ impl PlatformEngine for FakeEngine {
                 c.status = "exited".into();
                 c.exit_code = Some(0);
                 ev.push(Lifecycle::Stopped(id.clone()));
+                // A recorded stop: its policy never starts it again.
+                s.crash_loops.remove(&id);
+            } else if let Some(cl) = s.crash_loops.get_mut(&id) {
+                cl.stop_missed |= cl.between_runs;
             }
             Ok(())
         })
