@@ -1893,13 +1893,19 @@ func (h *Handler) attemptConsoleLaunch(ctx context.Context, hostID string, cfg c
 	if !h.consoleAuto.claimLaunch(hostID) {
 		return
 	}
-	var width, height, fps int32
-	if cfg.Mode != nil {
-		width = int32(cfg.Mode.Width)
-		height = int32(cfg.Mode.Height)
-		fps = int32((cfg.Mode.RefreshMillihz + 500) / 1000)
+	// #422: the session's initial size and rate follow the configured mode, else
+	// (local-only) the physical display; see console.ResolveSessionMode for the
+	// rule and the streaming exception. A capabilities read failure only costs
+	// the physical follow: the launch proceeds at the app defaults.
+	caps, err := h.consoleStore.GetCapabilities(ctx, hostID)
+	if err != nil {
+		h.log.Warn("console auto-start: load console capabilities failed, using app defaults", "host_id", hostID, "err", err)
+		caps = console.EmptyCapabilities()
 	}
-	sessionID, err := h.events.LaunchConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp, cfg.VideoTopology(), width, height, fps)
+	mode := console.ResolveSessionMode(cfg, caps)
+	h.log.Info("console auto-start: session mode", "host_id", hostID,
+		"width", mode.Width, "height", mode.Height, "fps", mode.FPS, "source", string(mode.Source))
+	sessionID, err := h.events.LaunchConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp, cfg.VideoTopology(), mode.Width, mode.Height, mode.FPS)
 	if err != nil {
 		h.consoleAuto.finishLaunch(hostID, "", false)
 		h.log.Warn("console auto-start: launch failed", "host_id", hostID, "connector", cfg.PinnedConnector(), "err", err)

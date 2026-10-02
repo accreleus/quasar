@@ -49,6 +49,10 @@ own; the two do not move together, and that is deliberate.
 - **The image-reference test runs again, in `make verify` (#415).** It checked the whole image
   contract against a stand-in Docker that knew only the older checks, so it had been failing
   unnoticed; it now checks only which image reference is pulled and inspected.
+- **A local console starts at the monitor's own resolution and refresh rate (#422).** With no
+  mode configured and streaming off, the console app now opens at the mode the display runs (for
+  example 3840×2160 at 60 Hz) instead of 1920×1080 at 60. A streamed console keeps the app's
+  defaults unless you pick a mode, and "Preferred" can be chosen again after picking another mode.
 - **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
   A reboot empties `/run`, and Podman would not start the agent without its runtime
   directory. The recovery actor now has the engine make it at every start, then starts the

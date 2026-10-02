@@ -301,8 +301,12 @@ export function HostConsole() {
                 disabled={locked || !selectedOutput}
                 value={selectedModeValue}
                 onChange={(e) => {
-                  const mode = selectedOutput?.modes.find((item) =>
-                    `${item.width}x${item.height}@${item.refresh_millihz}` === e.target.value);
+                  // "Preferred" stores the output's preferred mode: the API pins
+                  // output_id and mode together, so it cannot store a null mode (#422).
+                  const mode = e.target.value === NONE
+                    ? selectedOutput?.modes.find((item) => item.preferred) ?? selectedOutput?.modes[0]
+                    : selectedOutput?.modes.find((item) =>
+                      `${item.width}x${item.height}@${item.refresh_millihz}` === e.target.value);
                   if (mode) setField("mode", {
                     width: mode.width, height: mode.height, refresh_millihz: mode.refresh_millihz,
                   });
