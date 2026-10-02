@@ -581,7 +581,6 @@ jobs:
             BUILT_AT=${{ needs.inputs.outputs.built_at }}
             SCHEMA_VERSION=${{ steps.schema.outputs.version }}
             QUASAR_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-            QUASAR_SOURCE_REF=${{ github.ref_name }}
           cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane-cache:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane-cache:buildcache,mode=max
 

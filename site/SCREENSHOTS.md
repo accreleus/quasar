@@ -8,9 +8,7 @@ from, how to retake them, and what is still worth adding.
 | Page | Asset | What it shows |
 | --- | --- | --- |
 | `index.mdx` (landing) | `library-home.png` | The library home: the rail of recent and newly added apps, then the tiles. |
-| `start/quickstart.mdx` | `quickstart-engine.png` | The quick start's engine step for Fedora: rootful Docker and Podman with their profile badges, and the pointer to rootless. Retaken 2026-10-01. |
 | `install/first-run.mdx` | `setup-claim.png` | Step 1 of the wizard on an unclaimed instance. |
-| `install/first-run.mdx` | `setup-hosts.png` | Step 3, the host check, cropped to a host whose input checks fail and block launches. |
 | `playing/library.mdx` | `library.png` | The full library, grouped by source. |
 | `playing/in-session.mdx` | `session-drawer.png` | A live session, menu open on Controller and input, microphone on with its indicator. |
 | `playing/in-session.mdx` | `session-stats.png` | The Performance stats pane of a live session. |
@@ -34,9 +32,8 @@ and follows the theme toggle.
 ## Capture settings
 
 - Chrome, 1440x900 viewport, 2x device pixel ratio, dark theme, reduced motion.
-- Cropped to the browser content area. No OS chrome, no browser chrome.
-- Viewport-cropped, except `setup-hosts.png`, cropped from the full wizard page
-  to the failing host, and `quickstart-engine.png`, the quick start element alone.
+- Cropped to the browser content area and the viewport. No OS chrome, no
+  browser chrome.
 - Quantized with `pngquant` (quality 80 to 95; 55 to 90 for the three shots full
   of game art) to keep the repository small. Astro converts them at build time.
 - Dummy data throughout: fictional hosts (`gpu-host-01`, `gpu-host-02`,
@@ -45,8 +42,34 @@ and follows the theme toggle.
   or person appears. Invite codes are the 8-character prefixes the UI itself
   shows; the full code is never retrievable after minting.
 - Library art is SteamGridDB community art for real games, credited per image in
-  `src/assets/shots/demo-art/CREDITS.md`, where the files themselves are kept.
-  Nothing from Nintendo. The Desktop app keeps the default gradient tile.
+  "Game art in the screenshots" below. Nothing from Nintendo. The Desktop app
+  keeps the default gradient tile.
+
+## Game art in the screenshots
+
+The library tiles and heroes in the screenshots are resized (heroes also
+centre-cropped) copies of community uploads on [SteamGridDB](https://www.steamgriddb.com/),
+used only as illustrative demo art. Credit to SteamGridDB and to each uploader
+below. The game names, logos and artwork belong to their owners, the games'
+developers and publishers; their appearance implies no affiliation with or
+endorsement of Quasar. No image is covered by an open licence, so the source
+files are not kept in this repository. The picture in the in-session shots is a
+slow pan across the Forza Horizon 5 hero, streamed as video.
+
+- Forza Horizon 5: grid [162633](https://www.steamgriddb.com/grid/162633) by berry, hero [42805](https://www.steamgriddb.com/hero/42805) by Yaestro
+- Hades: grid [63955](https://www.steamgriddb.com/grid/63955) by thomwatson, hero [35720](https://www.steamgriddb.com/hero/35720) by ABH20
+- Celeste: grid [40963](https://www.steamgriddb.com/grid/40963) by Gums, hero [25973](https://www.steamgriddb.com/hero/25973) by Greez
+- Portal 2: grid [87946](https://www.steamgriddb.com/grid/87946) by MustafaMert, hero [552](https://www.steamgriddb.com/hero/552) by edco0328
+- Sid Meier's Civilization VI: grid [69705](https://www.steamgriddb.com/grid/69705) by qkzn, hero [6351](https://www.steamgriddb.com/hero/6351) by klepp0906
+- Stardew Valley: grid [89067](https://www.steamgriddb.com/grid/89067) by Jinx, hero [16046](https://www.steamgriddb.com/hero/16046) by Bun
+- Cyberpunk 2077: grid [121395](https://www.steamgriddb.com/grid/121395) by CluckenDip, hero [97318](https://www.steamgriddb.com/hero/97318) by CluckenDip
+- DOOM Eternal: grid [102232](https://www.steamgriddb.com/grid/102232) by HarrinorX, hero [9237](https://www.steamgriddb.com/hero/9237) by NightSkye
+- Hollow Knight: grid [81639](https://www.steamgriddb.com/grid/81639) by anidais, hero [24916](https://www.steamgriddb.com/hero/24916) by mdante_ar
+- Cities: Skylines: grid [36070](https://www.steamgriddb.com/grid/36070) by CaptainCero, hero [42020](https://www.steamgriddb.com/hero/42020) by CluckenDip
+- Elden Ring: grid [744598](https://www.steamgriddb.com/grid/744598) by IamGlitch, hero [39097](https://www.steamgriddb.com/hero/39097) by CluckenDip
+- Rocket League: grid [87950](https://www.steamgriddb.com/grid/87950) by Olympian, hero [12763](https://www.steamgriddb.com/hero/12763) by Olympian
+- Subnautica: grid [77101](https://www.steamgriddb.com/grid/77101) by DBK, hero [5723](https://www.steamgriddb.com/hero/5723) by klepp0906
+- Baldur's Gate 3: grid [120739](https://www.steamgriddb.com/grid/120739) by Soop, hero [129727](https://www.steamgriddb.com/hero/129727) by Elendil
 
 ## How they were taken (2026-09-30)
 
@@ -73,7 +96,6 @@ throwaway and are not committed; the shape of the run was:
    that art, not a game running.
 6. The first-run shots came from a second, unclaimed control plane on its own
    compose project and database, with two scripted agents against it.
-7. The quick start shot is the built documentation site itself.
 
 ## Still worth doing
 
