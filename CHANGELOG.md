@@ -53,6 +53,10 @@ own; the two do not move together, and that is deliberate.
   mode configured and streaming off, the console app now opens at the mode the display runs (for
   example 3840×2160 at 60 Hz) instead of 1920×1080 at 60. A streamed console keeps the app's
   defaults unless you pick a mode, and "Preferred" can be chosen again after picking another mode.
+- **Console mode grabs a keyboard, mouse or controller plugged in during a session (#421).**
+  With **Input devices** on auto, a device that arrives mid-session is now taken within
+  about a second, and one that is unplugged is released. Before, only the devices present
+  when the session started were grabbed. A device listed by path is taken when it appears.
 - **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
   A reboot empties `/run`, and Podman would not start the agent without its runtime
   directory. The recovery actor now has the engine make it at every start, then starts the
