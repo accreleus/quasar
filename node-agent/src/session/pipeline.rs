@@ -42,6 +42,7 @@ use rtp_ext::{
     attach_abs_capture_time_verification_probe,
 };
 mod audio_branch;
+mod audio_health;
 use audio_branch::add_audio_chain;
 mod mic_branch;
 use mic_branch::add_mic_branch;
@@ -457,7 +458,7 @@ pub fn build_session_pipeline(
     // and returns the tail capsfilter. Skipped under QUASAR_AUDIO_DISABLED.
     let audio_disabled = audio_disabled();
     let audio_rtp_capsfilter = if !audio_disabled {
-        Some(add_audio_chain(&pipeline, cfg)?)
+        Some(add_audio_chain(&pipeline, cfg, "standalone")?)
     } else {
         tracing::info!(
             "audio disabled (QUASAR_AUDIO_DISABLED=1) — video-only offer for #304 validation"
@@ -955,7 +956,8 @@ pub fn build_encode_pipeline(
         || cfg.console_config.as_ref().is_none_or(|c| c.stream_audio);
     let (audio_webrtc, audio_pipeline) = if !audio_disabled() && stream_audio_enabled {
         let audio_pipe = gst::Pipeline::new();
-        let audio_tail = add_audio_chain(&audio_pipe, cfg)?;
+        audio_health::watch_bus(&audio_pipe, &session_id);
+        let audio_tail = add_audio_chain(&audio_pipe, cfg, &session_id)?;
         let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
             .context("failed to create audio webrtcbin (encode pipeline)")?;
         // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video
