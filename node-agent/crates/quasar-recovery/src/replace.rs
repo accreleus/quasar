@@ -115,6 +115,7 @@ impl Actor {
             }
             Settlement::Continue => {
                 info!(request = %id, ?party, "continuing an attempt a restart interrupted");
+                self.restart_verifying(&mut journal)?;
                 self.run(journal)
             }
             Settlement::Restore => {
@@ -125,6 +126,49 @@ impl Actor {
             Settlement::Yield => {
                 info!(request = %id, ?party, "another recovery actor finishes this attempt; handing the machine to it");
                 self.yield_attempt(journal, party)
+            }
+        }
+    }
+
+    /// #438: an attempt a restart interrupted at `verifying` finds its new container
+    /// stopped when the machine rebooted, and nothing may bring it back: Podman restarts
+    /// no container at boot on its own. Verifying a container nobody starts can only end
+    /// in a restore, so the new container is started here, as `started` did, and then
+    /// verified within the attempt's full wait. A start the engine refuses goes straight to
+    /// restoring the kept container.
+    fn restart_verifying(&self, j: &mut Journal) -> Result<(), ()> {
+        let Some(i) = j.current() else {
+            return Ok(());
+        };
+        if j.steps[i].phase != Phase::Verifying || j.steps[i].name == RECOVERY_ACTOR {
+            return Ok(());
+        }
+        match self.new_container(j, i) {
+            Ok(Some(c)) if c.running => return Ok(()),
+            Ok(_) => {}
+            Err(Halt::Died) => return Err(()),
+            // Verification says what is wrong with a container it cannot find.
+            Err(Halt::Fail(_)) => return Ok(()),
+        }
+        info!(
+            token = "actor-verifying-restarted",
+            request = %j.request.request_id,
+            component = %j.steps[i].name,
+            "the new container is not running after the restart; starting it before verifying"
+        );
+        match self.start_new(j, i) {
+            Ok(()) => Ok(()),
+            Err(Halt::Died) => Err(()),
+            Err(Halt::Fail(failure)) if j.steps[i].migrating => self.fail_migrating(j, i, failure),
+            Err(Halt::Fail(failure)) => {
+                warn!(
+                    token = "actor-verification-failed",
+                    request = %j.request.request_id,
+                    reason = %failure.reason,
+                    "{}; restoring the kept container", failure.detail
+                );
+                j.steps[i].failure = Some(failure);
+                self.advance(j, i, Phase::Restoring)
             }
         }
     }

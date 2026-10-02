@@ -979,3 +979,94 @@ fn an_update_that_would_lose_the_gpu_fails_before_anything_stops() {
     assert_unchanged(&engine.state(), &before, "after the refused update");
     assert_eq!(before.spec.gpus.len(), 1);
 }
+
+/// #438: the machine reboots while a replacement is `verifying`, and at the boot nothing
+/// brings either agent container back: Podman restarts no container at boot on its own,
+/// and the kept one is stopped. The next start settles the attempt as an uninterrupted
+/// one would: it starts the new agent itself and verifies it, or restores the kept one
+/// when the new one cannot start, or says neither can.
+fn reboot_mid_verification(
+    new_starts: bool,
+    old_starts: bool,
+) -> (Arc<FakeEngine>, tempfile::TempDir) {
+    let (engine, dir) = installed(Behaviour {
+        // Never healthy before the reboot, so the attempt is still verifying.
+        health: Some("starting".into()),
+        ..Default::default()
+    });
+    let mut c = config(dir.path(), fast());
+    c.crash_after = Some(Box::new(|name, phase| {
+        name == "node-agent" && phase == quasar_recovery::journal::Phase::Verifying
+    }));
+    let actor = Arc::new(Actor::new(engine.clone(), c));
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    assert_eq!(result_of(&actor.status_for(Some(ID))).state, State::Verifying);
+    drop(actor);
+
+    // The reboot: every agent container stopped, and nothing restarts them.
+    engine.with_state(|s| {
+        for c in s.containers.values_mut() {
+            if c.status == "running"
+                && c.spec.labels.get("io.quasar.platform-service").map(String::as_str)
+                    == Some("node-agent")
+            {
+                c.status = "exited".into();
+                c.exit_code = Some(143);
+            }
+        }
+        let refuse = Behaviour {
+            refuse_start: Some("crun: cannot stat `/run/quasar-agent`: No such file or directory".into()),
+            ..Default::default()
+        };
+        s.behaviour.insert(
+            NEW_AGENT.into(),
+            if new_starts { healthy() } else { refuse.clone() },
+        );
+        if !old_starts {
+            s.behaviour.insert(AGENT_IMAGE.into(), refuse);
+        }
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (e, d) = (engine.clone(), dir.path().to_owned());
+    std::thread::spawn(move || {
+        let r = actor_with(&e, &d, fast()).resume().map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the start after the reboot never settled the attempt (#438)")
+        .expect("the start after the reboot failed");
+    (engine, dir)
+}
+
+#[test]
+fn a_reboot_mid_verification_starts_the_new_agent_and_verifies_it() {
+    let (engine, dir) = reboot_mid_verification(true, true);
+    let result = result_of(&actor_with(&engine, dir.path(), fast()).status_for(Some(ID)));
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    assert_replaced(&engine.state(), "after the reboot");
+}
+
+#[test]
+fn a_reboot_mid_verification_restores_the_kept_agent_when_the_new_one_cannot_start() {
+    let (engine, dir) = reboot_mid_verification(false, true);
+    let result = result_of(&actor_with(&engine, dir.path(), fast()).status_for(Some(ID)));
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert!(result.restored, "{result:?}");
+    let now = agents(&engine.state());
+    assert_eq!(now.len(), 1, "{now:#?}");
+    assert_eq!(now[0].spec.name, names::NODE_AGENT);
+    assert_eq!(now[0].spec.image, AGENT_IMAGE);
+    assert_eq!(now[0].status, "running");
+}
+
+#[test]
+fn a_reboot_mid_verification_with_neither_agent_startable_still_ends_the_attempt() {
+    let (engine, dir) = reboot_mid_verification(false, false);
+    let actor = actor_with(&engine, dir.path(), fast());
+    let result = result_of(&actor.status_for(Some(ID)));
+    assert!(result.state.is_terminal(), "{result:?}");
+    assert_eq!(result.state, State::Failed, "{result:?}");
+    assert_eq!(actor.status().in_flight, None);
+}
