@@ -220,6 +220,10 @@ pub(crate) struct ApplicationIntent {
     /// How the NVIDIA GPU was requested at create; the read-back judges against this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_injection: Option<crate::runtime::GpuInjection>,
+    /// #413: the `NVIDIA_DRIVER_CAPABILITIES` a `--gpus` container was created with, so
+    /// the read-back judges against it. `None` for CDI and for a journal from before #413.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvidia_driver_capabilities: Option<String>,
     /// RH-07 D14 (#404): on rootless Podman the app's `(uid, gid)` is mapped onto the Quasar
     /// user (`keep-id`), so home files on the host belong to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
