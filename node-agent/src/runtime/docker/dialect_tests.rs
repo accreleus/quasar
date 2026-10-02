@@ -413,20 +413,29 @@ fn keep_id_is_proven_by_the_one_range_mapped_onto_the_engine_user() {
 #[test]
 fn podman_read_only_binds_must_be_non_recursive() {
     let body = r#"{"Mounts":[
-        {"Destination":"/x","Options":["bind","nosuid","nodev"],"RW":false},
-        {"Destination":"/y","Options":["nosuid","nodev","rbind"],"RW":false},
-        {"Destination":"/z"}]}"#;
+        {"Destination":"/x","Options":["bind","nosuid","nodev"],"Propagation":"private","RW":false},
+        {"Destination":"/y","Options":["nosuid","nodev","rbind"],"Propagation":"private","RW":false},
+        {"Destination":"/z"},
+        {"Destination":"/w","Options":["bind"],"Propagation":"rprivate","RW":false}]}"#;
     let facts = PodmanFacts::from_inspect(body).unwrap();
     assert_eq!(
         facts.mount_options[0],
-        ("/x".to_string(), Some(caps(&["bind", "nosuid", "nodev"])))
+        RealizedMount {
+            destination: "/x".into(),
+            options: Some(caps(&["bind", "nosuid", "nodev"])),
+            propagation: Some("private".into()),
+        }
     );
-    assert_eq!(facts.mount_options[2], ("/z".to_string(), None));
+    assert_eq!(facts.mount_options[2].options, None);
     let ok = |targets: &[&str]| Dialect::Podman.read_only_binds_ok(Some(&facts), &caps(targets));
     assert!(ok(&["/x"]));
     assert!(ok(&["/x/"]), "a target compares as a path");
     assert!(!ok(&["/y"]), "rbind leaves submounts writable");
     assert!(!ok(&["/z"]), "unreported options prove nothing");
+    assert!(
+        !ok(&["/w"]),
+        "crun makes an rprivate bind recursive (Podman 4.9's default)"
+    );
     assert!(
         !ok(&["/absent"]),
         "a read-only bind that is not there is refused"

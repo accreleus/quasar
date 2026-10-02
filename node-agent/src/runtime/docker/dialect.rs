@@ -76,6 +76,14 @@ pub(crate) async fn open(config: &RuntimeConfig) -> Result<Engine, RuntimeError>
     })
 }
 
+/// One mount as Podman's native inspect reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RealizedMount {
+    pub destination: String,
+    pub options: Option<Vec<String>>,
+    pub propagation: Option<String>,
+}
+
 /// What Podman's native inspect states exactly, where its compatible inspect does not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PodmanFacts {
@@ -88,9 +96,9 @@ pub(crate) struct PodmanFacts {
     pub oci_runtime: Option<String>,
     /// Each realized mount's propagation, which the compatible inspect does not report.
     pub mount_propagations: Vec<String>,
-    /// Each realized mount's destination and mount options (`bind` or `rbind`, `ro`, ...);
-    /// `None` when the inspect does not carry them, which proves nothing.
-    pub mount_options: Vec<(String, Option<Vec<String>>)>,
+    /// Each realized mount's destination, mount options (`bind` or `rbind`, `ro`, ...) and
+    /// propagation; `None` where the inspect does not carry them, which proves nothing.
+    pub mount_options: Vec<RealizedMount>,
     /// The user namespace's maps as `container:parent:length`; Podman reports a keep-id
     /// container's `UsernsMode` only as `private`, so these are the proof of the mapping.
     pub uid_map: Vec<String>,
@@ -142,7 +150,15 @@ impl PodmanFacts {
                         let options = m
                             .get("Options")
                             .and_then(|o| serde_json::from_value::<Vec<String>>(o.clone()).ok());
-                        (destination, options)
+                        let propagation = m
+                            .get("Propagation")
+                            .and_then(|p| p.as_str())
+                            .map(str::to_string);
+                        RealizedMount {
+                            destination,
+                            options,
+                            propagation,
+                        }
                     })
                     .collect()
             })
@@ -449,19 +465,22 @@ impl Dialect {
         }
     }
 
-    /// Whether a read-only bind is asked for as a non-recursive bind (#410). Podman applies
-    /// `ro` to a bind's top mount only, so a submount of its source would stay writable,
-    /// and it has no recursive read-only option (`rro` is refused, `ro=recursive` changes
-    /// nothing; measured on Podman 5.8.4 with crun 1.28). A non-recursive bind carries no
-    /// submount at all: read-only all the way down, and a submount's files are not shown.
-    /// Docker (25+) makes a read-only bind recursive itself.
+    /// Whether a read-only bind is asked for as a non-recursive bind with `private`
+    /// propagation (#410). Podman applies `ro` to a bind's top mount only, so a submount of
+    /// its source would stay writable, and it has no recursive read-only option (`rro` is
+    /// refused, `ro=recursive` changes nothing; Podman 5.8.4 with crun 1.28). A
+    /// non-recursive bind carries no submount at all: read-only all the way down, and a
+    /// submount's files are not shown. The propagation must be `private`: crun reads
+    /// `rprivate`, Podman 4.9's default, as a recursive bind whatever the options say
+    /// (crun 1.14 to 1.27). Docker (25+) makes a read-only bind recursive itself.
     pub(crate) fn read_only_binds_non_recursive(self) -> bool {
         self == Dialect::Podman
     }
 
     /// Was every read-only bind at `targets` realized as a non-recursive bind, where the
     /// engine is asked for one? Podman's native inspect names `bind` (never `rbind`) in
-    /// the mount's options; options it does not report prove nothing.
+    /// the mount's options, and `private` as its propagation; what it does not report
+    /// proves nothing.
     pub(crate) fn read_only_binds_ok(
         self,
         podman: Option<&PodmanFacts>,
@@ -472,9 +491,10 @@ impl Dialect {
         }
         podman.is_some_and(|f| {
             targets.iter().all(|target| {
-                f.mount_options.iter().any(|(destination, options)| {
-                    Path::new(destination) == Path::new(target)
-                        && options.as_ref().is_some_and(|o| {
+                f.mount_options.iter().any(|m| {
+                    Path::new(&m.destination) == Path::new(target)
+                        && m.propagation.as_deref() == Some("private")
+                        && m.options.as_ref().is_some_and(|o| {
                             o.iter().any(|x| x == "bind") && !o.iter().any(|x| x == "rbind")
                         })
                 })

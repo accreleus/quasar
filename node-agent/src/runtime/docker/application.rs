@@ -462,8 +462,9 @@ fn environment(intent: &ApplicationIntent) -> Vec<String> {
 }
 
 /// A legacy `-v` bind as created on this engine: on an engine that makes read-only binds
-/// non-recursive (#410), a read-only bind of a host path that names neither `bind` nor
-/// `rbind` gets `bind`. A volume, a writable bind and an explicit choice are left as asked.
+/// non-recursive (#410), a read-only bind of a host path gets `bind` unless it names
+/// `bind` or `rbind`, and `private` unless it names a propagation. A volume, a writable
+/// bind and an explicit choice are left as asked (the read-back refuses a wrong one).
 fn created_legacy_mount(value: &str, dialect: super::dialect::Dialect) -> String {
     if !dialect.read_only_binds_non_recursive() {
         return value.to_owned();
@@ -475,12 +476,20 @@ fn created_legacy_mount(value: &str, dialect: super::dialect::Dialect) -> String
     };
     let options: Vec<&str> = options.split(',').collect();
     let read_only = options.iter().any(|o| matches!(*o, "ro" | "readonly"));
-    let chosen = options.iter().any(|o| matches!(*o, "bind" | "rbind"));
-    if source.starts_with('/') && read_only && !chosen {
-        format!("{value},bind")
-    } else {
-        value.to_owned()
+    if !source.starts_with('/') || !read_only {
+        return value.to_owned();
     }
+    let mut created = value.to_owned();
+    if !options.iter().any(|o| matches!(*o, "bind" | "rbind")) {
+        created.push_str(",bind");
+    }
+    const PROPAGATIONS: [&str; 6] = [
+        "private", "rprivate", "shared", "rshared", "slave", "rslave",
+    ];
+    if !options.iter().any(|o| PROPAGATIONS.contains(o)) {
+        created.push_str(",private");
+    }
+    created
 }
 
 /// The container targets of every read-only bind of a host path the request makes, typed
@@ -594,6 +603,11 @@ fn body(
                                 non_recursive: (*read_only
                                     && dialect.read_only_binds_non_recursive())
                                 .then_some(true),
+                                propagation: (*read_only
+                                    && dialect.read_only_binds_non_recursive())
+                                .then_some(
+                                    bollard::models::MountBindOptionsPropagationEnum::PRIVATE,
+                                ),
                                 ..Default::default()
                             }),
                             ..Default::default()
@@ -2565,11 +2579,21 @@ mod read_only_bind_tests {
     #[test]
     fn podman_read_only_legacy_binds_are_created_non_recursive() {
         let podman = |v| created_legacy_mount(v, Dialect::Podman);
-        assert_eq!(podman("/games:/library:ro"), "/games:/library:ro,bind");
-        assert_eq!(podman("/games:/library:z,ro"), "/games:/library:z,ro,bind");
+        assert_eq!(
+            podman("/games:/library:ro"),
+            "/games:/library:ro,bind,private"
+        );
+        assert_eq!(
+            podman("/games:/library:z,ro"),
+            "/games:/library:z,ro,bind,private"
+        );
         assert_eq!(
             podman("/games:/library:ro,rbind"),
-            "/games:/library:ro,rbind"
+            "/games:/library:ro,rbind,private"
+        );
+        assert_eq!(
+            podman("/games:/library:ro,rprivate"),
+            "/games:/library:ro,rprivate,bind"
         );
         assert_eq!(podman("/games:/library"), "/games:/library");
         assert_eq!(podman("/games:/library:rw"), "/games:/library:rw");
@@ -2648,6 +2672,7 @@ mod read_only_bind_tests {
             image_volume_identities: None,
             nvidia_params_repair: None,
             gpu_injection: None,
+            nvidia_driver_capabilities: None,
             keep_id: None,
             engine_groups: Vec::new(),
             group_add: None,
@@ -2660,7 +2685,7 @@ mod read_only_bind_tests {
         let docker = spec(Dialect::Docker);
         assert_eq!(
             podman["HostConfig"]["Mounts"][0]["BindOptions"],
-            serde_json::json!({"CreateMountpoint": false, "NonRecursive": true})
+            serde_json::json!({"CreateMountpoint": false, "NonRecursive": true, "Propagation": "private"})
         );
         assert_eq!(
             podman["HostConfig"]["Mounts"][1]["BindOptions"],
@@ -2668,7 +2693,7 @@ mod read_only_bind_tests {
         );
         assert_eq!(
             podman["HostConfig"]["Binds"],
-            serde_json::json!(["/games:/library:ro,bind"])
+            serde_json::json!(["/games:/library:ro,bind,private"])
         );
         for i in 0..2 {
             assert_eq!(
