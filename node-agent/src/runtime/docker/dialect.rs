@@ -88,6 +88,9 @@ pub(crate) struct PodmanFacts {
     pub oci_runtime: Option<String>,
     /// Each realized mount's propagation, which the compatible inspect does not report.
     pub mount_propagations: Vec<String>,
+    /// Each realized mount's destination and mount options (`bind` or `rbind`, `ro`, ...);
+    /// `None` when the inspect does not carry them, which proves nothing.
+    pub mount_options: Vec<(String, Option<Vec<String>>)>,
     /// The user namespace's maps as `container:parent:length`; Podman reports a keep-id
     /// container's `UsernsMode` only as `private`, so these are the proof of the mapping.
     pub uid_map: Vec<String>,
@@ -124,6 +127,26 @@ impl PodmanFacts {
                     .collect()
             })
             .unwrap_or_default();
+        let mount_options = value
+            .get("Mounts")
+            .and_then(|m| m.as_array())
+            .map(|mounts| {
+                mounts
+                    .iter()
+                    .map(|m| {
+                        let destination = m
+                            .get("Destination")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let options = m
+                            .get("Options")
+                            .and_then(|o| serde_json::from_value::<Vec<String>>(o.clone()).ok());
+                        (destination, options)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let oci_runtime = value
             .get("OCIRuntime")
             .and_then(|v| v.as_str())
@@ -144,6 +167,7 @@ impl PodmanFacts {
             bounding_caps,
             oci_runtime,
             mount_propagations,
+            mount_options,
             uid_map: map("UidMap"),
             gid_map: map("GidMap"),
         })
@@ -423,6 +447,39 @@ impl Dialect {
                     .all(|p| matches!(p.as_str(), "" | "private" | "rprivate"))
             }),
         }
+    }
+
+    /// Whether a read-only bind is asked for as a non-recursive bind (#410). Podman applies
+    /// `ro` to a bind's top mount only, so a submount of its source would stay writable,
+    /// and it has no recursive read-only option (`rro` is refused, `ro=recursive` changes
+    /// nothing; measured on Podman 5.8.4 with crun 1.28). A non-recursive bind carries no
+    /// submount at all: read-only all the way down, and a submount's files are not shown.
+    /// Docker (25+) makes a read-only bind recursive itself.
+    pub(crate) fn read_only_binds_non_recursive(self) -> bool {
+        self == Dialect::Podman
+    }
+
+    /// Was every read-only bind at `targets` realized as a non-recursive bind, where the
+    /// engine is asked for one? Podman's native inspect names `bind` (never `rbind`) in
+    /// the mount's options; options it does not report prove nothing.
+    pub(crate) fn read_only_binds_ok(
+        self,
+        podman: Option<&PodmanFacts>,
+        targets: &[String],
+    ) -> bool {
+        if !self.read_only_binds_non_recursive() {
+            return true;
+        }
+        podman.is_some_and(|f| {
+            targets.iter().all(|target| {
+                f.mount_options.iter().any(|(destination, options)| {
+                    Path::new(destination) == Path::new(target)
+                        && options.as_ref().is_some_and(|o| {
+                            o.iter().any(|x| x == "bind") && !o.iter().any(|x| x == "rbind")
+                        })
+                })
+            })
+        })
     }
 
     /// Whether `HostConfig.Binds` / `HostConfig.Mounts` echo the request. When they do

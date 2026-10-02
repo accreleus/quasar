@@ -30,6 +30,7 @@ reported as a skip with its reason, never counted as a pass). The mode table is
 | `removal` | A running service is removed; a volume in use refuses removal (`Busy`), outlives its container and is then removed; removing what is gone is not an error. | |
 | `errors` | A missing image is refused with a named error on both lifecycles and leaves nothing behind. | |
 | `missing-bind-source` | A typed bind whose source is missing is refused, the source is not created on the host, and nothing is left. | |
+| `read-only-submount` | A read-only bind, typed or `-v`, refuses writes to its top and to a submount of its source (Podman: asked for as a non-recursive bind, #410). | `submount` |
 
 The app user is uid/gid 4321, chosen to be nobody's account, so a file's owner says which
 mapping applied. The fixture image is a digest-pinned busybox (`sh`, `su`, `df`).
@@ -65,7 +66,7 @@ binary links only libc.
 | Variable | Meaning |
 |---|---|
 | `QUASAR_ENGINE_SUITE_TARGETS` | `<mode>=<socket path>`, space- or comma-separated. Unset, `make test-engines` targets every standard socket this user can reach: `/var/run/docker.sock` (docker-rootful), `$XDG_RUNTIME_DIR/docker.sock` (docker-rootless), `/run/podman/podman.sock` (podman-rootful), `$XDG_RUNTIME_DIR/podman/podman.sock` (podman-rootless). The `identity` case fails a socket that is not the mode it was named as. |
-| `QUASAR_ENGINE_SUITE_LACKS` | What this host cannot give: `;`-separated `[<mode>:]<capability>=<reason>`, capabilities `cdi`, `dri`, `uinput`, `health`. A declared gap turns the cases that need it into `SKIP` with the reason. An undeclared one fails them. |
+| `QUASAR_ENGINE_SUITE_LACKS` | What this host cannot give: `;`-separated `[<mode>:]<capability>=<reason>`, capabilities `cdi`, `dri`, `uinput`, `health`, `submount` (mounting a tmpfs inside a fixture: as root, or through `sudo -n`). A declared gap turns the cases that need it into `SKIP` with the reason. An undeclared one fails them. |
 | `QUASAR_ENGINE_SUITE_KNOWN` | Findings a mode is recorded as failing: `;`-separated `<mode>:<case>=<finding>` (a finding cannot contain `;`). The case still runs; a failure reports `KNOWN` with the finding and does not fail the run, and a pass does, so the entry is dropped once the finding is fixed. |
 | `QUASAR_ENGINE_SUITE_IMAGE` | The fixture image, when the engine cannot pull the default from Docker Hub. Any image with `sh`, `su`, `df` and `grep`, by digest. |
 | `QUASAR_ENGINE_SUITE_STATE_DIR` | Where the run's fixtures and runtime journals live (default: the system temp directory). It must be a path on the engine's host. |
@@ -146,6 +147,9 @@ map (#409). Hosts are named here by role only.
    nothing. The NVIDIA host's GPU can be held by another workload: if it is, record the
    NVIDIA row as pending. Never declare a gap to get a green run, and never infer an NVIDIA
    result from AMD.
+   A rootless run as the Quasar user, who has no `sudo`, cannot mount the submount:
+   declare `submount=the Quasar user cannot mount` there. The rootful run of the same
+   engine covers it.
 5. **Run it as the engine's owner**, one mode at a time:
 
    | Mode | As | Target |

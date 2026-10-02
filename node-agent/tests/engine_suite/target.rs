@@ -36,14 +36,17 @@ pub enum Capability {
     Uinput,
     /// Container healthchecks that the engine runs (Podman needs a systemd session).
     Health,
+    /// Mounting a tmpfs inside a fixture, as root or through `sudo -n` (#410's submount).
+    Submount,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 4] = [
+    pub const ALL: [Capability; 5] = [
         Capability::Cdi,
         Capability::Dri,
         Capability::Uinput,
         Capability::Health,
+        Capability::Submount,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -51,6 +54,7 @@ impl Capability {
             Capability::Dri => "dri",
             Capability::Uinput => "uinput",
             Capability::Health => "health",
+            Capability::Submount => "submount",
         }
     }
     fn parse(name: &str) -> Result<Self, String> {
