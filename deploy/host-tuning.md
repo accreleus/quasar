@@ -22,10 +22,10 @@ sysctl -w net.core.wmem_default=2097152
 
 Persist it:
 
-- **Standard Linux** (e.g. the hermes dev box): drop a file in
+- **Standard Linux** (e.g. the aux host): drop a file in
   `/etc/sysctl.d/99-quasar.conf` containing
   `net.core.wmem_default = 2097152`.
-- **unraid** (e.g. Tower): the rootfs is a ramdisk — append the `sysctl -w`
+- **unraid** (e.g. the lab host): the rootfs is a ramdisk — append the `sysctl -w`
   line to `/boot/config/go` instead (it runs at boot).
 
 Both dev hosts were set + persisted on 2026-06-12. Phase 5+ deployment

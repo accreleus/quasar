@@ -4,5 +4,5 @@ cd node-agent
 run "Rust formatting" cargo fmt --all --check
 run "Rust clippy" cargo clippy --workspace --all-targets -- -D warnings
 run "Rust Linux unit tests" cargo test --workspace --all-targets
-skip "GPU/media live tests require Tower or hermes; run the applicable scripts/harness/run-*-acceptance script on that host"
+skip "GPU/media live tests require the lab host or the aux host; run the applicable scripts/harness/run-*-acceptance script on that host"
 skip "gst-interpipe is not in Debian's gst packages, so it is absent from this image; the interpipe-backed leak-regression tests self-skip here (look for their own SKIP lines above) and run for real in the quasar-agent-dev container"

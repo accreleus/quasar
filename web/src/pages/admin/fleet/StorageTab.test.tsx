@@ -44,10 +44,10 @@ function makeHome(overrides: Partial<AdminHome>): AdminHome {
     id: "home-id",
     user_id: "u-alice",
     app_id: "a-steam",
-    host_id: "h-tower",
+    host_id: "h-lab",
     username: "alice",
     app_name: "Steam",
-    host_name: "tower",
+    host_name: "lab-host",
     provider: "local",
     ref: "/data/quasar/homes/alice/steam",
     bytes_used: 500,
@@ -60,8 +60,8 @@ function makeHome(overrides: Partial<AdminHome>): AdminHome {
 
 function makeHost(overrides: Partial<Host> = {}): Host {
   return {
-    id: "h-tower",
-    node_name: "tower",
+    id: "h-lab",
+    node_name: "lab-host",
     status: "online",
     agent_version: "0.1.0",
     cpu_cores: 16,
@@ -341,8 +341,8 @@ describe("StorageTab", () => {
   it("reclaim pending runs the home.gc job once per host with a pending home", async () => {
     vi.mocked(adminApi.listAdminHomes).mockResolvedValue({
       items: [
-        makeHome({ id: "h1", user_id: "u-alice", username: "alice", host_id: "h-tower", gc_after: "2026-02-01T00:00:00Z", bytes_used: 100 }),
-        makeHome({ id: "h2", user_id: "u-bob", username: "bob", host_id: "h-tower", gc_after: "2026-02-01T00:00:00Z", bytes_used: 200 }),
+        makeHome({ id: "h1", user_id: "u-alice", username: "alice", host_id: "h-lab", gc_after: "2026-02-01T00:00:00Z", bytes_used: 100 }),
+        makeHome({ id: "h2", user_id: "u-bob", username: "bob", host_id: "h-lab", gc_after: "2026-02-01T00:00:00Z", bytes_used: 200 }),
         makeHome({ id: "h3", user_id: "u-carl", username: "carl", host_id: "h-node2", gc_after: "2026-02-01T00:00:00Z", bytes_used: 50 }),
         makeHome({ id: "h4", user_id: "u-dana", username: "dana", bytes_used: 300 }),
       ],
@@ -358,13 +358,13 @@ describe("StorageTab", () => {
     await waitFor(() => expect(screen.getByText("Reclaim pending")).toBeTruthy());
     fireEvent.click(screen.getByText("Reclaim pending"));
 
-    // Two distinct hosts have a pending home (h-tower, h-node2).
+    // Two distinct hosts have a pending home (h-lab, h-node2).
     const dialog = await screen.findByRole("dialog", { name: "Reclaim pending homes" });
     expect(within(dialog).getByText(/Runs the cleanup job now on 2 hosts/)).toBeTruthy();
     fireEvent.click(within(dialog).getByRole("button", { name: "Reclaim" }));
 
     await waitFor(() => expect(adminApi.runJobNow).toHaveBeenCalledTimes(2));
-    expect(adminApi.runJobNow).toHaveBeenCalledWith("token", "home.gc", { host_id: "h-tower" });
+    expect(adminApi.runJobNow).toHaveBeenCalledWith("token", "home.gc", { host_id: "h-lab" });
     expect(adminApi.runJobNow).toHaveBeenCalledWith("token", "home.gc", { host_id: "h-node2" });
     expect(adminApi.tombstoneHome).not.toHaveBeenCalled();
   });
@@ -385,7 +385,7 @@ describe("StorageTab", () => {
   it("reports a partial failure when queuing the cleanup job on some hosts fails", async () => {
     vi.mocked(adminApi.listAdminHomes).mockResolvedValue({
       items: [
-        makeHome({ id: "h1", host_id: "h-tower", gc_after: "2026-02-01T00:00:00Z" }),
+        makeHome({ id: "h1", host_id: "h-lab", gc_after: "2026-02-01T00:00:00Z" }),
         makeHome({ id: "h2", host_id: "h-node2", gc_after: "2026-02-01T00:00:00Z" }),
       ],
       next_cursor: null,

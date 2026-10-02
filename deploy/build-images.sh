@@ -35,12 +35,12 @@
 #
 # WHY THIS EXISTS
 #   Three overlapping build paths existed (dev.sh image, build-image.sh,
-#   build-agent-tower.sh) with different target/arg defaults, plus hand-typed
+#   a per-host build-agent script) with different target/arg defaults, plus hand-typed
 #   `docker build` lines in docs. Dockerfile.vulkan is multi-target and Docker's
 #   no---target default is "last stage wins", so a bare build silently produced the
 #   fat CUDA image under whatever -t was passed (hit live 2026-07-12). Meanwhile the
 #   shipped nv image drifted 6.15GB of build toolchain and lost the pulseaudio daemon
-#   without anything noticing (2026-07-26: every Tower session had silent audio).
+#   without anything noticing (2026-07-26: every lab-host session had silent audio).
 #
 #   This script is the single entrypoint: it always passes an explicit --target, it
 #   validates every artifact against deploy/image-contract.json BEFORE promoting
@@ -93,7 +93,7 @@
 #                           checkout is never touched, so you can keep editing while it
 #                           builds. Removed on exit, including on failure.
 #   --worktree-dir DIR      where to put it. Default is <repo>/.build-tmp/worktree-*,
-#                           deliberately NOT /tmp: on the unraid box (Tower) /tmp is a
+#                           deliberately NOT /tmp: on the unraid box (the lab host) /tmp is a
 #                           ramdisk and the operator rule is that everything lives under
 #                           the repo at /mnt/user/appdata/quasar.
 #
@@ -623,7 +623,7 @@ check_args_declared() { # check_args_declared <role> <dockerfile-abs> <KEY=VALUE
 # (1) catches a re-pin that adds a second declaration and reintroduces drift; (2)
 # catches a re-pin that edits one file and forgets the other. Neither is relaxable:
 # a mismatch means the image's provenance LABELs would describe something other than
-# what was built, which is the exact opacity that let Tower and hermes drift under
+# what was built, which is the exact opacity that let the lab host and the aux host drift under
 # one tag in July.
 check_pins_agree() { # check_pins_agree <dockerfile-abs> <pins-env-abs>
   python3 - "$1" "$2" <<'PYEOF'
@@ -827,7 +827,6 @@ for role in "${ROLES[@]}"; do
   if [ "$DF_REL" = "deploy/Dockerfile.control.prod" ]; then
     ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
     ROLE_ARGS+=("SCHEMA_VERSION=$(highest_migration)")
-    [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
   fi
   # Both platform components use the same exact tag. Never stamp the shared
   # toolchain: its content and tag are independent of platform release versions.

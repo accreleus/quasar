@@ -150,7 +150,7 @@ func TestVetoFailsOpen(t *testing.T) {
 		},
 		{
 			name: "floor exceeds the card's whole pool (AMD APU carve-out)",
-			// hermes is a Renoir APU: mem_info_vram_total is the BIOS UMA
+			// the aux host is a Renoir APU: mem_info_vram_total is the BIOS UMA
 			// carve-out, not a real pool — most of a session's memory is
 			// GTT-backed. Acting on it would permanently veto the host
 			// (review finding #1). Abstaining structurally beats APU detection.
@@ -295,7 +295,7 @@ func TestVetoDebitCountsStopping(t *testing.T) {
 
 // --- rejection classification ----------------------------------------------
 
-// TestFloorAboveTotalStillClassifiesAsCapacityExhausted — the hermes case,
+// TestFloorAboveTotalStillClassifiesAsCapacityExhausted — the aux-host case,
 // live-reproduced 2026-07-26. A Renoir APU reports a 512 MB UMA carve-out
 // against the 1024 MB default floor.
 //

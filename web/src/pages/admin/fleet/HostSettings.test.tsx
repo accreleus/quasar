@@ -59,7 +59,7 @@ const KNOBS: ConfigKnob[] = [
 
 const HOST: Host = {
   id: "host-1",
-  node_name: "Tower",
+  node_name: "lab-host",
   status: "online",
   agent_version: "1.4.0",
   cpu_cores: 16,
@@ -121,7 +121,7 @@ describe("HostSettings", () => {
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "Host settings" })).toBeTruthy());
     expect(screen.getByText("Fleet")).toBeTruthy();
-    expect(screen.getByText(/Runtime configuration for Tower/)).toBeTruthy();
+    expect(screen.getByText(/Runtime configuration for lab-host/)).toBeTruthy();
     expect(screen.getByText("Runtime defaults")).toBeTruthy();
     expect(screen.getByText("Encoder and GPU")).toBeTruthy();
     expect(await screen.findByText("Idle timeout")).toBeTruthy();

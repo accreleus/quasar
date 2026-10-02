@@ -2,7 +2,7 @@
 #
 # validate-local-audio.sh — one-command PASS/FAIL/SKIP validator for the Quasar
 # local-audio (console-mode) PulseAudio sidecar. Replaces the ~15 manual probes
-# used during the 2026-07-14 local-audio debugging session. Run ON the Tower host
+# used during the 2026-07-14 local-audio debugging session. Run ON the lab host
 # (or via qnv sh), e.g.:
 #   qnv sh 'scripts/dev/validate-local-audio.sh'
 #   qnv sh 'scripts/dev/validate-local-audio.sh --capture 5'

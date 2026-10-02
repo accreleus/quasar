@@ -10,7 +10,7 @@
 # script runs the SAME CFT + playwright mechanism `qses` uses (the peer always
 # lives on this host; the API may be local or a remote stack).
 #
-# Run this ON THE HOST WHERE CFT LIVES (the hermes dev/CI box). CFT is bootstrapped
+# Run this ON THE HOST WHERE CFT LIVES (the aux host dev/CI box). CFT is bootstrapped
 # by `qses provision` at /tmp/cft + /tmp/t8-driver; this script reuses them.
 #
 # Usage:

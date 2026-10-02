@@ -178,28 +178,6 @@ if [ "${QUASAR_CONSOLE:-0}" = "1" ]; then
   ENV="$ENV+console"
 fi
 
-# Volume adoption (#448). The QUASAR_*_VOLUME name overrides moved out of the
-# base compose file into the opt-in deploy/overlays/docker-compose.adopt-volumes.yml
-# overlay (Compose v5 rejects an empty `name:` default). A host that was
-# already using these vars — a stack migrated off a forked compose file —
-# must keep working on this script without edits, so the overlay is added
-# automatically whenever the vars are configured. Partial configuration is
-# refused rather than silently adopting only some volumes: the un-adopted
-# ones would come up empty, which reads as data loss.
-ADOPT_PG_VOL="${QUASAR_POSTGRES_VOLUME:-$(env_val QUASAR_POSTGRES_VOLUME)}"
-ADOPT_AGENT_VOL="${QUASAR_AGENT_VOLUME:-$(env_val QUASAR_AGENT_VOLUME)}"
-ADOPT_CTRL_VOL="${QUASAR_CONTROL_VOLUME:-$(env_val QUASAR_CONTROL_VOLUME)}"
-if [ -n "$ADOPT_PG_VOL$ADOPT_AGENT_VOL$ADOPT_CTRL_VOL" ]; then
-  if [ -z "$ADOPT_PG_VOL" ] || [ -z "$ADOPT_AGENT_VOL" ] || [ -z "$ADOPT_CTRL_VOL" ]; then
-    echo "!! Volume adoption needs all three of QUASAR_POSTGRES_VOLUME," >&2
-    echo "!! QUASAR_AGENT_VOLUME and QUASAR_CONTROL_VOLUME set together" >&2
-    echo "!! (scripts/dev/migrate-compose-volumes.sh prints the values)." >&2
-    exit 1
-  fi
-  COMPOSE_FILES+=(-f deploy/overlays/docker-compose.adopt-volumes.yml)
-  echo "volume adoption: using docker-compose.adopt-volumes.yml ($ADOPT_PG_VOL, $ADOPT_AGENT_VOL, $ADOPT_CTRL_VOL)"
-fi
-
 DC="docker compose ${COMPOSE_FILES[*]}"
 
 # Verification probes must hit the ports compose actually published, which are
@@ -353,7 +331,7 @@ env_file_has_value() { [ -n "$(env_file_value "$1")" ]; }
 # so Compose derives the project name "deploy" unless overridden.
 COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-$(env_val COMPOSE_PROJECT_NAME)}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-deploy}"
-PG_VOLUME_NAME="${ADOPT_PG_VOL:-${COMPOSE_PROJECT}_quasar-postgres-data}"
+PG_VOLUME_NAME="${COMPOSE_PROJECT}_quasar-postgres-data"
 
 # --- QUASAR_SECRET_KEY -------------------------------------------------------
 # The encrypted secret store (migration 0040) needs a 32-byte master key. Without
@@ -401,7 +379,7 @@ else
   # that was meant to hide the message also hides the cause. That is exactly the
   # bootstrap case this branch exists to handle, so a missing file must read as
   # "no POSTGRES_USER override" and fall through to the default below.
-  # (Never reproduced on Tower/hermes: both have always had a .env.)
+  # (Never reproduced on the lab host or the aux host: both have always had a .env.)
   PG_USER="$( { sed -nE 's/^[[:space:]]*POSTGRES_USER[[:space:]]*=[[:space:]]*([^[:space:]#]+).*/\1/p' "$ENV_FILE" 2>/dev/null || true; } | tail -1)"
   PG_USER="${PG_USER:-quasar}"
   # NOT `$DC ps`: loading the compose file needs the very `:?`-required vars
@@ -509,9 +487,6 @@ else
     --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
     --filter label=com.docker.compose.service=quasar-postgres | head -1 || true)"
   existing_pg_volume=""
-  # PG_VOLUME_NAME already resolves to the adopted name when adoption is
-  # configured, so one exact-name inspect covers both cases (a label filter
-  # could not see an adopted volume created by other tooling anyway).
   if docker volume inspect "$PG_VOLUME_NAME" >/dev/null 2>&1; then
     existing_pg_volume="$PG_VOLUME_NAME"
   fi
@@ -694,11 +669,7 @@ if [ "$SCOPE" = control ]; then
 else
   step "[$ENV] 4/7 build web SPA ($WEB_IMAGE)"
   # web/dist is a bind mount into the control-plane container (see CLAUDE.md #131).
-  # QUASAR_SOURCE_REF: the container cannot see .git (a worktree's .git is a
-  # file), so the ref the bundle bakes in for the enroll-host one-liner (#100)
-  # is resolved here: the exact tag when on one, else the commit.
   docker run --rm -v "$PWD":/w -w /w/web \
-    -e QUASAR_SOURCE_REF="$(git describe --tags --exact-match 2>/dev/null || git rev-parse HEAD)" \
     "$WEB_IMAGE" sh -c "npm install --no-audit && npm run build"
   BUNDLE="$(bundle_on_disk)"
   echo "built web bundle: $BUNDLE"
@@ -766,7 +737,7 @@ fi
 # postgres seconds after the control-plane up created it — under the control
 # plane's FIRST-BOOT migration run on a virgin database, killing the
 # connection mid-migration and leaving schema_migrations dirty (crash-loop:
-# "Dirty database version N. Fix and force version."). Tower/hermes never hit
+# "Dirty database version N. Fix and force version."). The lab host and the aux host never hit
 # it because an already-migrated database's boot migration run is a
 # milliseconds no-op; only a virgin database has a window wide enough.
 #
@@ -780,7 +751,7 @@ fi
 # "connection refused", and the CP --wait below aborts the whole deploy —
 # seconds before it would have succeeded (#467, caught by the first-run
 # acceptance loop). An already-initialized postgres passes this in
-# milliseconds, which is why Tower/hermes never saw it.
+# milliseconds, which is why the lab host and the aux host never saw it.
 # One-time volume ownership repair, for stacks that predate the two control
 # images agreeing on a uid. A named volume takes its ownership from whichever
 # image created it: a stack built from source used to run as ROOT, so
@@ -797,7 +768,7 @@ fi
 # The name is derived from the compose project — never hardcoded `deploy_`,
 # which is only right when nothing set COMPOSE_PROJECT_NAME.
 if [ "$SCOPE" != web ]; then
-  CTRL_VOLUME_NAME="${ADOPT_CTRL_VOL:-${COMPOSE_PROJECT}_quasar-control-tls}"
+  CTRL_VOLUME_NAME="${COMPOSE_PROJECT}_quasar-control-tls"
   if docker volume inspect "$CTRL_VOLUME_NAME" >/dev/null 2>&1; then
     if docker run --rm -v "$CTRL_VOLUME_NAME":/t alpine \
          chown -R 1000:1000 /t >/dev/null 2>&1; then
@@ -818,7 +789,7 @@ $DC up -d --force-recreate --no-deps --wait --wait-timeout 300 quasar-control-pl
 if [ "$SCOPE" = all ]; then
   # Recreate the node-agent from the freshly-built, self-contained Vulkan image.
   # `up -d` can return while a dependency-health wait has left the recreated
-  # agent in Docker's Created state (observed repeatedly on Tower). `--wait`
+  # agent in Docker's Created state (observed repeatedly on the lab host). `--wait`
   # makes the deployment contract require the new agent to be running/healthy.
   $DC up -d --force-recreate --no-deps --wait --wait-timeout 60 quasar-node-agent
 fi
@@ -937,7 +908,7 @@ fi
 # Agent must re-register after the recreate. Registration lands a few seconds
 # after the control-plane container comes up (agent reconnect backoff), so poll
 # up to 30s instead of a single grep — a one-shot check raced and false-FAILed
-# redeploy-all's hermes leg, aborting the Tower leg.
+# redeploy-all's aux-host leg, aborting the lab-host leg.
 agent=MISSING
 agent_cid="$($DC ps -q quasar-node-agent 2>/dev/null || true)"
 if [ -z "$agent_cid" ] || [ "$(docker inspect -f '{{.State.Running}}' "$agent_cid" 2>/dev/null || true)" != true ]; then

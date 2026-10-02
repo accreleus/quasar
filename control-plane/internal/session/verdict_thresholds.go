@@ -11,7 +11,7 @@ const (
 	// hitchSdThresholdMs: present_interval_sd above this is a "hitch" (#108;
 	// ≥18 ms is the degraded band from AS-04/AS-05).
 	hitchSdThresholdMs = 18.0
-	// encoderCeilingMs: 60 fps budget is 16.7 ms; hermes Renoir VCN sits at
+	// encoderCeilingMs: 60 fps budget is 16.7 ms; aux-host Renoir VCN sits at
 	// p50 ~19 ms → a 45 fps ceiling (CLAUDE.md).
 	encoderCeilingMs = 16.0
 	// congestionLossDelta: packets_lost rise over the window past this is the
@@ -23,7 +23,7 @@ const (
 
 const (
 	// classifierMinHostFps: "host fps steady" guard; 50 fps tolerates the
-	// hermes ~45 fps VCN ceiling.
+	// the aux host's ~45 fps VCN ceiling.
 	classifierMinHostFps = 50.0
 )
 

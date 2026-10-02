@@ -45,7 +45,7 @@ index 3ba30e3..26bcb4c 100644
 +            // adopted with `from_glib_full`, leaving the negotiated caps one reference
 +            // short. This config copy holds a ref on the SAME caps, so freeing it here
 +            // while that over-unref is still in place takes the caps below its true count
-+            // and destabilises the running pipeline (verified on Tower: buffers are never
++            // and destabilises the running pipeline (verified on the lab host: buffers are never
 +            // released and every session's pipelines are retained).
 +            gst::ffi::gst_structure_free(config);
          }

@@ -22,7 +22,6 @@ docker compose -f deploy/docker-compose.yml \
 | `docker-compose.multiagent.yml` | two extra node-agents with their own identities | Multi-agent scheduling tests |
 | `docker-compose.profiling.yml` | the profiling image, `PERFMON`, a seccomp exception | Taking a CPU capture. Never a deployment |
 | `docker-compose.cores.yml` | `ulimit core` plus a core-dump bind mount | A crash hunt (#429) |
-| `docker-compose.adopt-volumes.yml` | `QUASAR_*_VOLUME` name overrides | Adopting pre-existing named volumes (#448); `redeploy.sh` layers it automatically when those vars are set |
 
 The contributor tooling these belong to is catalogued in
 [`docs/developer-tooling.md`](../../docs/developer-tooling.md).

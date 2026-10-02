@@ -115,7 +115,7 @@ func TestCertFailCodec(t *testing.T) {
 	cases := []struct {
 		class, sessionCodec, want string
 	}{
-		{ClientHealthUnsupported, "h265", "h265"}, // the Tower 2026-07-24 case
+		{ClientHealthUnsupported, "h265", "h265"}, // the gpu-test 2026-07-24 case
 		{ClientHealthUnsupported, "h264", "h264"}, // floor fail — profile-blocks via ProfileFailures
 		{ClientHealthDecode, "av1", "av1"},        // slow software AV1 decode is codec-specific
 		{ClientHealthPresentation, "h265", ""},    // display-side: genuinely profile-level

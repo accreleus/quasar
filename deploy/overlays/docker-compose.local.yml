@@ -8,7 +8,7 @@
 #
 # What this is NOT: a streaming stack. There is deliberately NO node-agent here.
 # The agent needs network_mode: host for WebRTC ICE, which Docker Desktop on
-# macOS/Windows cannot provide, plus a GPU. Sessions are exercised on Tower.
+# macOS/Windows cannot provide, plus a GPU. Sessions are exercised on the lab host.
 # For the real single-host stack use deploy/docker-compose.yml; for the fleet
 # use docker-compose.yml + docker-compose.nvidia.yml.
 #

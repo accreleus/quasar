@@ -146,7 +146,7 @@ API='$1'
 QDIR='$2'
 TOK=''
 # Preflight: a stack that is DOWN must be reported as down, not as "no
-# credential" — on 2026-08-23 a stopped tower stack read as a rotated password.
+# credential" — on 2026-08-23 a stopped lab-host stack read as a rotated password.
 HC=\$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 8 "\$API/health" 2>/dev/null); [ -n "\$HC" ] || HC=000
 if [ "\$HC" != 200 ]; then echo "stack=down http=\$HC" >&2; printf '\n'; exit 0; fi
 CPC=\$(docker ps --filter name=control-plane --format '{{.Names}}' 2>/dev/null | head -n 1)

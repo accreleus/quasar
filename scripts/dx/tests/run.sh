@@ -2247,7 +2247,7 @@ fixture = {
     "browser.stage_receive_to_present_p50_ms": {"p50": rows(43.4, 43.9, 43.4, 15)},
     "browser.stage_present_to_display_p50_ms": {"p50": rows(-0.2, -0.2, -0.2, 15)},
     # the one stage that regresses in the "bad" run: 2.3ms baseline, bad run
-    # measured 6.1ms — a real number lifted from the hermes-peer contrast in
+    # measured 6.1ms — a real number lifted from the aux-host-peer contrast in
     # docs/reports/2026-08-19-latency-budget/REPORT.md section 7, not invented.
     "browser.stage_decode_p50_ms": {"p50": rows(2.3, 6.1, 2.3, 15),
                                     "p95": rows(2.9, 6.4, 2.9, 15)},
@@ -3224,7 +3224,7 @@ else
 fi
 
 # A stack that is DOWN is reported as down — never as a rotated password. On
-# 2026-08-23 a stopped tower stack read as "no credential" until this preflight.
+# 2026-08-23 a stopped lab-host stack read as "no credential" until this preflight.
 sess_server_down
 rm -rf "$SESS_DIR/cache"
 down_out="$(sess_env bash "$DX/admin_token.sh" --host fakebox 2>&1)"; down_rc=$?

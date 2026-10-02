@@ -136,7 +136,6 @@ const MOVED: [string, string, string[]][] = [
   ["--line-edge", "oklch(0.9618 0.0086 247.91/.13)", ["styles/primitives.css"]],
   ["--card-shadow-near", "oklch(0.02 0.01 267/.45)", ["styles/primitives.css"]],
   ["--card-shadow-far", "oklch(0.02 0.01 267/.85)", ["styles/primitives.css"]],
-  ["--mono-tile-ink", "oklch(1 0 0/.85)", ["styles/primitives.css"]],
   ["--line-faint", "oklch(0.9618 0.0086 247.91/.07)", ["styles/primitives.css", "styles/shell.css"]],
   ["--row-hover", "oklch(0.9618 0.0086 247.91/.045)", ["styles/primitives.css"]],
   ["--table-expand-seam", "oklch(0.02 0.01 267/.5)", ["styles/primitives.css"]],

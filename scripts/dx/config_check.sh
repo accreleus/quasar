@@ -29,13 +29,6 @@ fi
 # values for the `${VAR:?}` required ones so validation reports STRUCTURE
 # problems rather than "you have no .env yet".
 export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-config-check-placeholder}"
-# The adopt-volumes overlay declares all three volume names `${VAR:?}`. Supplying
-# throwaway names here validates its STRUCTURE on every machine; the base file
-# deliberately ignores these vars (asserted by scripts/dev/test-compose-overlays.sh),
-# so exporting them cannot change what any other set renders.
-export QUASAR_POSTGRES_VOLUME="${QUASAR_POSTGRES_VOLUME:-config-check-postgres-vol}"
-export QUASAR_AGENT_VOLUME="${QUASAR_AGENT_VOLUME:-config-check-agent-vol}"
-export QUASAR_CONTROL_VOLUME="${QUASAR_CONTROL_VOLUME:-config-check-control-vol}"
 
 # Each entry is a file set validated as one unit (an overlay is only valid on
 # top of its base).
@@ -56,10 +49,6 @@ CONFIG_SETS=(
   "dev:docker-compose.yml overlays/docker-compose.dev.yml"
   "nvidia-dev:docker-compose.yml docker-compose.nvidia.yml overlays/docker-compose.dev.yml"
   "multiagent:docker-compose.yml overlays/docker-compose.multiagent.yml"
-  # Opt-in but live: redeploy.sh layers this whenever the QUASAR_*_VOLUME
-  # adoption path is taken, so it is a real deployment shape and must be
-  # validated like the rest.
-  "adopt-volumes:docker-compose.yml overlays/docker-compose.adopt-volumes.yml"
 )
 
 for entry in "${CONFIG_SETS[@]}"; do

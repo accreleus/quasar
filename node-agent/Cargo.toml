@@ -117,7 +117,7 @@ alsa = "0.12"
 [features]
 # ZC-02 N-A (full zero-copy NVENC): FFI-links libgstcuda-1.0 to create one GstCudaContext
 # and share it across the source + encode pipelines so the compositor's memory:CUDAMemory
-# surfaces are valid across the interpipe. OFF by default — the AMD/hermes image has no
+# surfaces are valid across the interpipe. OFF by default — the AMD (aux-host) image has no
 # libgstcuda, so its build is unaffected; the quasar-nv image builds `--features cuda`
 # (mirroring how gst-wayland-display itself is built `--features cuda` only there).
 cuda = []

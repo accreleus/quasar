@@ -748,7 +748,7 @@ func TestCoordinatorH264ProfileOverride(t *testing.T) {
 	}
 }
 
-// sctpAssociationError is the verbatim error text three Tower sessions reported on
+// sctpAssociationError is the verbatim error text three gpu-test sessions reported on
 // 2026-07-25 (48756bd4, 86e7d95d, f5a51f36) when the browser's DataChannel/SCTP
 // association died — twice during the first real remote-user WAN test over VPN.
 const sctpAssociationError = "encode pipeline error: Could not write to resource. " +

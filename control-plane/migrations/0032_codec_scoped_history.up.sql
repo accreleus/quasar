@@ -1,6 +1,6 @@
 -- 0032_codec_scoped_history.up.sql — codec-aware decode-failure verdicts.
 --
--- Live multi-codec validation (Tower, 2026-07-24) surfaced a design gap in the
+-- Live multi-codec validation (gpu-test, 2026-07-24) surfaced a design gap in the
 -- AS10-11 certification history: a client_unsupported verdict from an h265
 -- session (experimental vulkanh265enc bitstream) wrote a per-(user, device,
 -- profile) fail row, which made the whole profile ineligible — even though the

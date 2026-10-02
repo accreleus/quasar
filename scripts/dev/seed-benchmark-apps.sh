@@ -13,8 +13,8 @@
 #                            test): dense rippling high-frequency field that pushes
 #                            encode bitrate and the client decode/display path hard.
 #
-# Image: defaults to quasar-agent-dev:latest (hermes/AMD); set QUASAR_APP_IMAGE=quasar-node-agent:latest
-# on the NVENC box (Tower).
+# Image: defaults to quasar-agent-dev:latest (the aux host/AMD); set QUASAR_APP_IMAGE=quasar-node-agent:latest
+# on the NVENC box (the lab host).
 #
 # Each pins framerate=60/1 in the caps per the CLAUDE.md gotcha (videotestsrc
 # defaults to 30 fps; the cap here ensures the compositor capture matches intent).
@@ -47,7 +47,7 @@ if [ "${QUASAR_TLS:-auto}" = "off" ]; then
 else
   API="${API:-https://localhost:${QUASAR_TLS_PORT:-8443}}"
 fi
-# App container image. Defaults to the AMD dev image (hermes); override for the
+# App container image. Defaults to the AMD dev image (the aux host); override for the
 # NVENC box, e.g. QUASAR_APP_IMAGE=quasar-node-agent:latest on an NVIDIA host.
 IMAGE="${QUASAR_APP_IMAGE:-quasar-agent-dev:latest}"
 

@@ -98,7 +98,7 @@ else moved out on 2026-08-27:
 
 | Directory | Holds |
 |---|---|
-| `deploy/overlays/` | Situational compose overlays, none of them part of a normal install: `dev` (the build-from-source shape — `redeploy.sh` applies it), `local`, `multiagent`, `cores`, `profiling`, `adopt-volumes`, and `console` (the one operator-facing member — local display). [`deploy/overlays/README.md`](../deploy/overlays/README.md) has the table |
+| `deploy/overlays/` | Situational compose overlays, none of them part of a normal install: `dev` (the build-from-source shape — `redeploy.sh` applies it), `local`, `multiagent`, `cores`, `profiling`, and `console` (the one operator-facing member — local display). [`deploy/overlays/README.md`](../deploy/overlays/README.md) has the table |
 | `scripts/dev/` | `dev.sh`, the compose-overlay test, the volume migrator, the local-audio validator, the dev seeders and the diagnostics-app image |
 | `scripts/verify/` | The verify stage scripts plus the devtools image they run on |
 | `scripts/harness/` | Acceptance harnesses (`run-*.sh`), `lib/`, `checks/`, `fixtures/`, the `apitest` Go module, and `peer-driver.mjs` (the headless WebRTC peer driver, formerly `p4-troubleshoot.mjs`) |

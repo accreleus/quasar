@@ -27,7 +27,7 @@ index 10359bb..fe882cf 100644
 + * synchronized, but separate GstVulkanQueue wrappers can refer to the same
 + * VkQueue.  A per-wrapper mutex cannot serialize those callers.  Use one
 + * process-wide lock so every GStreamer Vulkan submit wrapper participates in
-+ * the same domain while Tower's stochastic session-start Xid 32 is isolated.
++ * the same domain while the lab host's stochastic session-start Xid 32 is isolated.
 + * Keep the private mutex and object layout unchanged for ABI stability. */
 +G_LOCK_DEFINE_STATIC (vulkan_queue_submit);
 +

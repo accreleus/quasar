@@ -28,7 +28,7 @@
 #
 # Other overlays: hardened.yml (Caddy TLS ingress, an optional managed-cert
 # path), plus everything situational in overlays/ (console, local, multiagent,
-# profiling, cores, adopt-volumes). deploy/README.md Part 2 has the rule; every
+# profiling, cores). deploy/README.md Part 2 has the rule; every
 # knob below is documented in docs/configuration.md.
 #
 # Prerequisites (Linux host with a GPU + Docker):
@@ -661,13 +661,10 @@ volumes:
   # No `name:` override here (#448). Compose v5 rejects an empty `name:` value
   # outright at `up` — "invalid volume name or ID: value is empty" — for EVERY
   # service, because the volume is a project-level definition; older Compose
-  # (Tower/hermes at the time) treated it as a no-op, which is why this never
+  # (the lab host and the aux host at the time) treated it as a no-op, which is why this never
   # showed up before v5. Worse, `docker compose config` silently DROPS the
   # empty key instead of erroring, so config-based validation cannot catch it.
-  # Volume-name overrides (to adopt a pre-existing volume under a different
-  # name — e.g. a stack migrating off a forked compose file) now live in the
-  # opt-in overlay deploy/overlays/docker-compose.adopt-volumes.yml. Normal deploys
-  # never apply it, so Compose falls back to its usual <project>_<key> naming.
+  # Compose names every volume <project>_<key>.
   quasar-postgres-data:
   quasar-agent-data:
   quasar-control-tls: # #376 TLS pair + UI-P7 artwork cache (/var/lib/quasar-control)

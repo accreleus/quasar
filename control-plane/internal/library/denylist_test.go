@@ -1,6 +1,6 @@
 package library
 
-// denylist_test.go — Gate 4 item 3 (spec §13): the ladder over the REAL Tower
+// denylist_test.go — Gate 4 item 3 (spec §13): the ladder over the REAL gpu-test
 // manifest set, and the precedence of all four rungs.
 //
 // The manifest set below is not illustrative. It is the nine `appmanifest_*.acf`

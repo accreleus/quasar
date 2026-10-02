@@ -26,7 +26,7 @@ import * as adminApi from "../../api/admin";
 function makeHost(overrides: Partial<Record<string, unknown>> = {}): Host {
   return {
     id: "h1",
-    node_name: "tower",
+    node_name: "lab-host",
     status: "online",
     last_registered_at: "2026-08-07T00:00:00Z",
     capacity_detection: "ok",
@@ -102,7 +102,7 @@ describe("StepHosts", () => {
     renderStep();
 
     await waitFor(() => {
-      expect(screen.getByText("tower")).toBeInTheDocument();
+      expect(screen.getByText("lab-host")).toBeInTheDocument();
     });
     expect(screen.getByText(/rtx 5090/i)).toBeInTheDocument();
     expect(screen.getByText(/3 encode slots/i)).toBeInTheDocument();
