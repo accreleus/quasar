@@ -562,14 +562,14 @@ replacement remains with the updater.**"
   - No RH-05 table stores agent or control-plane versions. Those live in `hosts.source_commit` etc.
     (migration 0074) and `platform_apply_*` (0075+).
 - **Explicit deferrals to RH-06:**
-  - `docs/rh05/operator-handoff.md:41-43`: "RH06 owns first-host and additional-host enrollment
+  - The RH-05 operator hand-off (since retired from the tree; see #346): "RH06 owns first-host and additional-host enrollment
     automation, deployment identity, credentials, mount/device provisioning and Quasar platform-image
     replacement. RH05 does not reconfigure those bootstrap inputs. Session adoption across agent
     replacement belongs to RH03/RH04; private registry support is #9 …"
-  - `docs/rh05/operator-handoff.md:7`: "RH05 begins **after** the agent has enrolled; it does not mint
+  - The same hand-off: "RH05 begins **after** the agent has enrolled; it does not mint
     bootstrap credentials, install GPU drivers, change device passthrough, add bind mounts or replace
     Quasar's platform containers. Keep the agent identity and owner state on its persistent volume."
-  - `docs/rh05/acceptance-map.md:49`: "41. Enrollment/mount boundary | … RH06 remains separate."
+  - The RH-05 acceptance map (also retired): "41. Enrollment/mount boundary | … RH06 remains separate."
     `:58` "Q2 enrolled-host boundary | Story 41; D2; Out of Scope".
   - `docs/design/rh05-contract-proposal.md:93`: "No configuration recovery replaces a platform image,
     repairs a broken binary/runtime/mount, or overrides the updater's authority (ADRs 0002 and 0004)."

@@ -193,8 +193,8 @@ Postgres); the agent only relays a `release_apply` to its recovery actor and rep
 well-formed digest (ADR 0001). Order is fixed by ADR 0002: control plane first, hosts
 after, never below the database's applied migration, so the console can never offer a
 downgrade; revert exists only for agents. A source-built host is told about releases but
-never given one. The design record is #104 (spec), the ADRs, and
-`docs/reports/2026-09-05-self-update-live-gate/`.
+never given one. The design record is #104 (spec) and the ADRs; the live-gate evidence
+was retired from the tree (see #119).
 
 ## Open decisions to confirm
 
