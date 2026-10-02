@@ -29,7 +29,7 @@ time, sequentially.
 - **The harness user must already exist AND be entitled to the target app.**
   Registration is closed by default (`registration_mode` defaults closed),
   and `/v1/apps` is entitlement-filtered - the old "auto-registered on first
-  run" claim here was false and has been removed. On the Tower dev stack the
+  run" claim here was false and has been removed. On the gpu-test dev stack the
   `qses` harness user already satisfies both. On a fresh stack, either have
   an admin create the user and grant entitlement first, or pass admin
   credentials via `--email`/`--pass` so the harness's own registration call
@@ -48,7 +48,7 @@ bash scripts/harness/run-soak-profile.sh --app 'Steam' [options...]
 | `--cycles N` | unlimited | Max cycles; whichever of duration/cycles hits first stops the run. |
 | `--hold SECS` | `90` | How long to hold each session running before teardown. |
 | `--settle SECS` | `10` | Pause after teardown, before sampling (lets teardown-triggered cleanup finish). |
-| `--app NAME` | *(required)* | App to launch each cycle. No default - launching the wrong app silently produces misleading data. `Steam` is Tower's known-good app. |
+| `--app NAME` | *(required)* | App to launch each cycle. No default - launching the wrong app silently produces misleading data. `Steam` is gpu-test's known-good app. |
 | `--profile ID` | none | Launch profile id (e.g. `1080p60`) to pin the launch to. |
 | `--api URL` | `https://localhost:18443` | Control-plane API base (curl always uses `-k`, self-signed cert). |
 | `--cp CONTAINER` | `deploy-quasar-control-plane-1` | Control-plane container name. |
@@ -94,7 +94,7 @@ CSV's header, same as any other missing-sample cell. Both are metadata, not
 leak series - neither is ever itself classified. Their only job is restart
 detection: a DECREASE between consecutive rows on EITHER column means that
 container restarted mid-run (see "Restart detection" below). This closes a
-real gap (#420): the D-5 chain hit a Tower 04:01 backup restart of the whole
+real gap (#420): the D-5 chain hit a gpu-test 04:01 backup restart of the whole
 stack, and because only `cp_uptime_s` was ever sampled, an agent-only
 restart was invisible - agent fd/RSS baselines silently reset with no
 segmentation banner, even though the control plane never restarted.
@@ -276,7 +276,7 @@ armed," so it reports missing rather than guessing).
 ## AMD VRAM sampling: implemented, untested
 
 `sample_vram_mb()` in `scripts/harness/run-soak-profile.sh` tries `nvidia-smi` first
-(Tower, NVENC) and falls back to summing
+(gpu-test, NVENC) and falls back to summing
 `/sys/class/drm/card*/device/mem_info_vram_used` (AMD sysfs, bytes -> MiB)
 when `nvidia-smi` is unavailable. The AMD fallback path is implemented but
 **has not been exercised against a real AMD host** - hermes (the AMD/VA box)

@@ -13,9 +13,9 @@
 --     and keeps FRAME RATE (spec §2).
 --   * The 720p30 debug profile and every non-catalog object are untouched.
 --
--- IDEMPOTENT BY DESIGN, AND WHY. Tower was converged to this exact catalog via
+-- IDEMPOTENT BY DESIGN, AND WHY. gpu-test was converged to this exact catalog via
 -- the admin API before this migration ships (the live-apply half of the same
--- approval). When Tower's control plane is next rebuilt from this branch, boot
+-- approval). When gpu-test's control plane is next rebuilt from this branch, boot
 -- runs m.Up() and this file executes against the already-converged database —
 -- so every statement is an UPSERT or a guarded delete, and running it there is
 -- a no-op. A FRESH database reaches this point with 0015's old catalog fanned

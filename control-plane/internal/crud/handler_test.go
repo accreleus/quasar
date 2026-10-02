@@ -529,7 +529,7 @@ func TestHostsCRUD(t *testing.T) {
 }
 
 // An app created without resource fields must inherit the SCHEMA defaults, not Go zero
-// values. Regression for the live Tower data bug (2026-07-26): the create request struct
+// values. Regression for the live gpu-test data bug (2026-07-26): the create request struct
 // took plain int32s, so an omitted `default_encode_slots` decoded to 0 and the app was
 // admitted onto a GPU with no free encode slots — admission control silently bypassed.
 func TestCreateAppResourceDefaults(t *testing.T) {

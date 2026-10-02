@@ -91,7 +91,7 @@ type ReportEntry struct {
 	// §16.1, was dropped). Stay in the allow-list anyway: narrowing buys nothing.
 	InstallDir string `json:"install_dir"`
 	SizeOnDisk int64  `json:"size_on_disk"`
-	// StateFlags is likewise unread: it was 4 for all five Valve tools on Tower and three of
+	// StateFlags is likewise unread: it was 4 for all five Valve tools on gpu-test and three of
 	// four real games, so it distinguishes nothing (denylist.go).
 	StateFlags int64 `json:"state_flags"`
 }

@@ -13,7 +13,7 @@ package session
 //
 // Conflating them is how a "green up/down test" ships a quality regression.
 //
-// Both run against a TOWER-SHAPED dataset in a SCRATCH database, never the
+// Both run against a GPU-TEST-SHAPED dataset in a SCRATCH database, never the
 // shared test database — the round trip migrates DOWN, and doing that to a
 // database other tests share would be destructive. An EMPTY database
 // round-trips trivially and has no apps, so the neutrality diff would be
@@ -182,7 +182,7 @@ func dumpTables(t *testing.T, pool *pgxpool.Pool, tables []string) string {
 	return b.String()
 }
 
-// --- the Tower-shaped dataset ------------------------------------------------
+// --- the gpu-test-shaped dataset ------------------------------------------------
 
 type prodFixture struct {
 	userNoPref  string
@@ -205,7 +205,7 @@ type prodApp struct {
 //   - ONE MATERIALISED list with several launchable entries (1440p60), with h264
 //     FIRST — today's stored order, and the case where reordering during the
 //     migration would silently flip an AV1-enabled host's behaviour.
-//   - SEVERAL NULLs (every other profile) — the Tower/ship-dark state, which
+//   - SEVERAL NULLs (every other profile) — the gpu-test/ship-dark state, which
 //     resolves to the in-code default and yields exactly one h264 rung.
 //   - ONE list with ZERO launchable entries (720p60) — which must still
 //     synthesise an h264 floor rung, because that profile streams h264 today via
@@ -242,7 +242,7 @@ func seedProdShaped(t *testing.T, pool *pgxpool.Pool) prodFixture {
 	must(t, pool.QueryRow(ctx, `INSERT INTO users (email, username, password_hash)
 		VALUES ('withpref@test.local','withpref','x') RETURNING id::text`).Scan(&f.userWithPre))
 
-	// One user pins a preference; the global default stays NULL (Tower's state).
+	// One user pins a preference; the global default stays NULL (gpu-test's state).
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO user_profile_preferences (user_id, default_profile_id)
 		VALUES ($1::uuid, '1080p60')`, f.userWithPre); err != nil {
@@ -289,7 +289,7 @@ func seedProdShaped(t *testing.T, pool *pgxpool.Pool) prodFixture {
 
 // --- the round trip ----------------------------------------------------------
 
-// TestMigration0036RoundTrip proves 0036 is reversible against a Tower-shaped
+// TestMigration0036RoundTrip proves 0036 is reversible against a gpu-test-shaped
 // dataset: the dump before `up` and after `down` must be byte-identical.
 //
 // An EMPTY database round-trips trivially and proves nothing, which is why the
