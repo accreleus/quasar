@@ -25,6 +25,9 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The console mode page says more about a black picture in a virtual machine (#414).**
+  With an NVIDIA GPU passed through, the virtual machine's own boot screen is black too, so
+  the cause is the card's hand-off rather than Quasar; the page says so and what to use instead.
 - **The Podman page explains a console unreachable from the network (#416).** When Docker
   runs on the same host, it can drop rootful Podman's forwarded traffic, so Quasar answers
   only on the host itself. The page and the troubleshooting guide give Docker's one-line
