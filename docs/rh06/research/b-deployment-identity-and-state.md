@@ -4,6 +4,10 @@ Snapshot: branch `develop` at `32aee45` (2026-09-24). Read-only research; no dep
 All paths are repo-relative. `path:line` citations were checked against the file. Anything under
 **Inferences / open questions** is a reading of the code rather than something it states.
 
+The volume-adoption path cited below (`deploy/overlays/docker-compose.adopt-volumes.yml`,
+`scripts/dev/migrate-compose-volumes.sh`, `docs/operations/compose-consolidation-migration.md`)
+was removed before 0.4.0; read those citations at the snapshot commit.
+
 Milestone framing (GitHub milestone 6, read with `gh`): "Remove manager-owned Compose file coupling
 only after recoverable replacement paths are proven." Issues: #218 "Define service ownership and
 recoverable API-based update execution" and #219 "Ship minimal enrollment and explicit migration
