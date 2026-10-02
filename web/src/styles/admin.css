@@ -422,6 +422,23 @@
 }
 
 /* ── Host console ──────────────────────────────────────────── */
+/* The settings beside a 300px rail. The RH07 mock keeps both columns at 900px, so this
+   does not take `.split`'s 1240px collapse; it stacks at the admin's phone breakpoint,
+   where the rail would leave the settings no room (#436). */
+.console-split {
+  grid-template-columns: minmax(0, 1fr) 300px;
+}
+
+.console-split > * {
+  min-width: 0;
+}
+
+@media (max-width: 760px) {
+  .console-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .console-group {
   padding: var(--s5) var(--card-pad) var(--s1);
 }
@@ -436,8 +453,17 @@
   align-self: flex-start;
 }
 
+/* One column that may shrink below the table's widest row (#436): a plain `1fr` is
+   `minmax(auto, 1fr)`, so a long device path widened the row past its card. */
 .cset.idev-row {
+  grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
+}
+
+/* The primitive's control slot sits at the row's end at its content's width; this row's
+   control is the table, which fills the row instead. */
+.cset.idev-row > div:last-child {
+  justify-self: stretch;
 }
 
 .idev-class {
@@ -451,6 +477,24 @@
 .table-wrap.idev-table {
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
+}
+
+/* Table cells never wrap (DESIGN.md "Density"): the path column takes the room the
+   other columns leave and truncates, and the cell's title carries the whole path (#436).
+   Its floor keeps a readable prefix where the table scrolls in a narrow card. */
+.idev-table td.idev-path-cell {
+  width: 100%;
+  min-width: 24ch;
+  max-width: 0;
+}
+
+.idev-path {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 
 /* `.cset p` sets the margin; two classes outrank it. */
