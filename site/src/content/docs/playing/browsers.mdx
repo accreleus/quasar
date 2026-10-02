@@ -3,22 +3,11 @@ title: Browser support
 description: Which browsers work and why HTTPS is required.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+Use a recent Chrome or Chromium-based browser, such as Edge or Brave. Chrome
+is the tested client; Firefox and Safari remain untested.
 
-## The short answer
-
-Use Chrome, or a Chromium-based browser such as Edge or Brave, on a desktop OS,
-over HTTPS.
-
-## Why Chrome
-
-Quasar is developed and tested against Chrome:
-
-- **Keyboard Lock** (Escape reaches the game) is Chromium-only.
-- **Codec rules** are based on Chrome's decoders.
-- **Gamepad** support is tested against Chrome's Gamepad API.
-
-Firefox and Safari are untested. Parts may work; nothing is promised.
+Keyboard Lock and controller support are tested with Chrome. Use HTTPS to enable
+these features and microphone capture.
 
 ## HTTPS is not optional
 
@@ -31,27 +20,14 @@ Firefox and Safari are untested. Parts may work; nothing is promised.
 The default install serves HTTPS on port 8443 with a self-signed certificate.
 Accept the browser warning once. See [HTTPS and certificates](/quasar/network/https/).
 
-## Codecs, and what your browser can decode
+## Codec compatibility
 
-Quasar measures what your browser can decode when you log in, and never sends
-something it can't play.
+Quasar checks the codecs your browser reports at login. The available codecs
+depend on the browser, operating system and hardware; AV1 is not guaranteed on
+every Chromium device. HEVC requires compatible OS hardware decoding.
 
-- **H.264** works everywhere. Every quality tier falls back to it.
-- **AV1** works everywhere Chrome runs, with a software fallback if there is no
-  hardware decoder.
-- **HEVC** needs hardware decode from the OS; Chrome has no software fallback.
-
-| Client OS | HEVC |
-| --- | --- |
-| macOS | Almost always works. |
-| Windows | Usually works, depending on the GPU. |
-| Linux | Effectively never. |
-
-If HEVC is unavailable, Quasar uses the next codec down.
-
-<Aside type="note" title="H.264 High profile does not decode in any browser">
-Browser sessions use constrained-baseline H.264. This is handled automatically.
-</Aside>
+See [Codecs](/quasar/tuning/codecs/) for the selection rules and compatibility
+limits. Browser sessions use constrained-baseline H.264 automatically.
 
 ## Mobile and tablets
 
@@ -60,5 +36,5 @@ games need a paired controller to be playable.
 
 ## Nothing to install
 
-No launcher, extension or client binary. A native client is planned; the browser
-is the only client today.
+No launcher, extension or client binary is needed. The browser is the supported
+client.

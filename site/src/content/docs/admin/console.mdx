@@ -108,8 +108,7 @@ Plug devices in before the session starts; a device plugged in later isn't grabb
 ## Starting on its own
 
 With **Auto-start on display** on and a **Default app** and **Default user** set,
-a display coming on launches that app as that user. The default user must be
-entitled to the app.
+a display coming on launches that app as that user. The default user must have access to the app.
 
 Monitor power is read over DDC/CI. This needs the i2c buses (granted by
 the console device rules on rootless) and a monitor that answers DDC. Without them, every

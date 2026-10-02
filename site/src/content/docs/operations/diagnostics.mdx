@@ -3,14 +3,18 @@ title: Diagnostics
 description: Taking a diagnostic bundle, what is in one, and how to read the verdict.
 ---
 
-When a session was bad, take a diagnostic bundle. It lines up what the encoder,
-the network and the client were doing over the same window and says which one
-was likely responsible.
+Take a diagnostic bundle while a problem is happening or soon afterwards. It
+compares the encoder, network and client over the same period to identify the
+likely cause.
 
 ## Taking one
 
-In **Admin ▸ Sessions**, open the session and take a bundle. Or, with an admin
-token:
+1. Open the session in **Admin ▸ Sessions**.
+2. Download its diagnostic bundle.
+3. Read the verdict below, then use [Stream quality](/quasar/troubleshooting/quality/)
+   for the next checks.
+
+With an admin token, you can also download it directly:
 
 ```bash
 curl -s "https://<host>:8443/v1/admin/sessions/<session-id>/diagnostic-bundle" \

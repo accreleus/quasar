@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- Simplify documentation around an all-in-one quick start, early GPU preparation, persistent storage, direct networking and first play; retain honest engine status and identify the #440 bootstrap dependency for generated tag-based configuration.
+
 ### Added
 - **CI tests the virtual keyboard, mouse and gamepad against a real kernel.** The node-agent
   job now loads `uinput` on the runner, creates the session's devices for real and reads them
@@ -657,6 +660,12 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The quick-start stack names `:latest` tags; the seed pins them (#440).** The generated
+  Dockge/Arcane stack no longer needs a pinning command and `<digest>` substitution: the seed
+  resolves `QUASAR_AGENT_IMAGE`, `QUASAR_CONTROL_PLANE_IMAGE`, `QUASAR_POSTGRES_IMAGE` and the
+  Add host overrides to registry digests on a first install, before it creates anything, and
+  records only digests. A failed pull creates nothing and is retried; a moved tag or a seed
+  redeploy never changes an installed machine. Explicit digests still work.
 - **Installing never asks you to download and run a script as root.** The quick start
   covers rootful Docker, rootful Podman and Unraid, and shows the few host commands it
   needs as commands you run yourself (the engine at boot; on Podman its socket,

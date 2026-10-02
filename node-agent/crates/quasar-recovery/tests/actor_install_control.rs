@@ -847,7 +847,7 @@ fn a_malformed_add_host_override_is_refused_before_anything_is_installed() {
     let mut env = combined_env();
     env.insert(
         "QUASAR_ENROLL_SEED_IMAGE".into(),
-        "registry.example.invalid/quasar/quasar-recovery:latest".into(),
+        "registry.example.invalid/quasar/quasar recovery".into(),
     );
     let engine = Arc::new(FakeEngine::new(seeded_host(env)));
     let dir = tempfile::tempdir().unwrap();

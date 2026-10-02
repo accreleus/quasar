@@ -56,11 +56,35 @@ site/
   SCREENSHOTS.md            checklist of screenshots still to capture
 ```
 
-The quick start writes the seed for one machine (combined, control-only or GPU
-host): a `docker run` script and the same seed as a one-service stack for Dockge
-or Arcane. It holds the seed's input names and the image tag it resolves, so a change
-to the seed's inputs (`docs/configuration.md` "Seed") or to the published image
-names needs the matching change in `stack-template.js` and its tests.
+The quick start configures an all-in-one GPU server with a managed database.
+It shows Docker Compose YAML or a Podman Quadlet with Copy and Download, early
+GPU preparation and storage ownership. The generator also supports advanced
+roles used by the installation reference pages. The instance-generated enrollment
+command remains the primary way to add a GPU host.
+
+This local preview uses the generator from #440 commit
+`5c5f2d94e9fa3c858bf33db25ffbc7516c451589` on `fix/440-latest-bootstrap`.
+The preview's backend base remains `develop` at `4b3e9c7d`: no backend code was
+merged. Configuration uses channel tags; the fix resolves them internally to
+digests on first install and preserves installed state on reruns. The preview
+carries a visible dependency notice until compatible published images are verified.
+
+## Local review scope (2026-10-01)
+
+The documentation pass preserves developer documentation and runtime contracts.
+In addition to the reviewed quick start, Requirements, NVIDIA/Unraid and Getting
+started pages, user docs now use shorter task steps and shared references:
+admin overview, Steam, images and jobs; browser/codec compatibility; encoder,
+bitrate and audio settings; diagnostics and bounded logs; direct networking,
+proxy examples and troubleshooting. Advanced tuning and backup/recovery detail
+remain available. Container engines now lives in Requirements with an old-URL
+redirect. Archify v3.0 authoring guidance informed the embedded diagram; its CLI
+and JSON validation workflow were not used.
+
+Local site tests, builds and link checks are the applicable validation. Full
+`make verify` also ran but failed in existing DX tests (Bash parse error,
+host-contract fixtures, missing local session tooling and sandbox TCP fixtures).
+No streaming/hardware tests or deployment were performed.
 
 ## Before publishing
 

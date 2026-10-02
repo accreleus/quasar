@@ -2,7 +2,7 @@
 /**
  * The quick start wizard.
  *
- * Seven steps, one output: the seed for one machine (src/data/stack-template.js).
+ * Six steps, one output: the seed for one machine (src/data/stack-template.js).
  * Everything happens in the browser. No fetch, no analytics, no secret: the
  * recovery actor generates every secret on the machine, and the operator's own
  * database password never passes through this page.
@@ -39,11 +39,10 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 	<ol class="qs-progress" aria-label="Progress">
 		<li data-dot="1" class="on">Host</li>
 		<li data-dot="2">Engine</li>
-		<li data-dot="3">Role</li>
+		<li data-dot="3">GPU</li>
 		<li data-dot="4">Storage</li>
-		<li data-dot="5">Owner</li>
-		<li data-dot="6">Access</li>
-		<li data-dot="7">Result</li>
+		<li data-dot="5">Access</li>
+		<li data-dot="6">Result</li>
 	</ol>
 
 	<!-- 1. Platform -->
@@ -93,39 +92,26 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 		</p>
 	</section>
 
-	<!-- 3. Role -->
 	<section data-step="3" class="qs-step">
-		<h2>What does this machine run?</h2>
-		<p class="qs-hint">
-			Every machine runs one container you declare, the seed. It creates
-			Quasar's recovery actor, which installs and updates the rest.
-		</p>
-		<div class="qs-choices">
-			<label><input type="radio" name="role" value="combined" checked /><span><strong>Everything on one machine</strong><em>Control plane, database and a GPU host</em></span></label>
-			<label><input type="radio" name="role" value="control-only" /><span><strong>The control plane only</strong><em>No GPU needed; GPU hosts join it later</em></span></label>
-			<label><input type="radio" name="role" value="gpu" /><span><strong>A GPU host for an existing control plane</strong><em>Joins with a string from Add host</em></span></label>
-		</div>
-		<p class="qs-note" data-when-agent>
-			The recovery actor detects the GPU itself. On NVIDIA, install the driver
-			and the NVIDIA Container Toolkit first; without them the host still
-			installs, and its readiness card names what is missing.
-		</p>
-		<p class="qs-note" data-when-role="gpu">
-			The simplest way to add a GPU host is the one-line command your control
-			plane prints under Admin, Fleet, Add host: it checks the host too, and names
-			anything missing. This wizard gives you the same host as a stack for
-			Dockge or Arcane instead.
-		</p>
-	</section>
+  <h2>Which GPU will run your games?</h2>
+  <div class="qs-choices">
+   <label><input type="radio" name="gpu" value="other" checked /><span><strong>AMD or Intel</strong><em>Use the Linux graphics driver. Intel remains untested.</em></span></label>
+   <label><input type="radio" name="gpu" value="nvidia" /><span><strong>NVIDIA</strong><em>Full graphics driver and NVIDIA Container Toolkit required.</em></span></label>
+  </div>
+  <div data-nvidia-prep hidden>
+   <p class="qs-note">Complete <a href={`${base}/install/nvidia/`}>NVIDIA setup</a> for your engine and platform before deploying. It covers the full graphics driver, Container Toolkit and compatibility checks. The engine-specific commands below follow that setup.</p>
+   <pre><code data-out="gpu-prep"></code></pre>
+  </div>
+  <p class="qs-note">This quick start installs everything on one server. Add more machines later with the instance's <a href={`${base}/install/second-host/`}>Add GPU host command</a>.</p>
+ </section>
 
 	<!-- 4. Storage -->
 	<section data-step="4" class="qs-step">
 		<h2>Where should Quasar keep things?</h2>
 		<div data-when-agent>
 			<p class="qs-hint">
-				User homes hold game saves, settings and launcher downloads. Templates
-				live beside the homes. The database, certificates and the machine's
-				own state use Docker-managed volumes.
+				Homes hold installed games, saves, settings and user files. Leave room for
+				the games you plan to install, in addition to about 20 GB for container images.
 			</p>
 			<label class="qs-field">
 				<span>Base path</span>
@@ -145,22 +131,19 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			Its database, certificate and machine state are Docker-managed volumes.
 		</p>
 
-		<figure class="qs-tree">
+		<details class="qs-adv"><summary>Directory and volume reference</summary><figure class="qs-tree">
 			<figcaption>What you end up with</figcaption>
 			<pre data-tree></pre>
-		</figure>
-	</section>
-
-	<!-- 5. Owner -->
-	<section data-step="5" class="qs-step">
-		<h2>Who should own your save data?</h2>
+		</figure></details>
+		<details class="qs-adv"><summary>Advanced permissions</summary>
+		<h3>Game-file ownership</h3>
 		<div data-when-agent>
 			<p class="qs-hint">
 				Game containers drop to this user, so it decides who can read the saves
 				from outside Quasar. It does not change what Quasar's own services run as.
 			</p>
 			<div class="qs-choices">
-				<label><input type="radio" name="owner" value="dedicated" checked /><span><strong>The default for this host</strong><em data-owner-default>uid 1000</em></span></label>
+				<label><input type="radio" name="owner" value="dedicated" checked /><span><strong>Quasar defaults (not detected from your host)</strong><em data-owner-default>uid 1000</em></span></label>
 				<label><input type="radio" name="owner" value="custom" /><span><strong>A specific uid and gid</strong><em>If your files need to belong to an existing account</em></span></label>
 			</div>
 			<div class="qs-row" data-when-owner="custom">
@@ -169,10 +152,11 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			</div>
 		</div>
 		<p class="qs-note" data-when-role="control-only">Nothing to choose: a control-only machine runs no games.</p>
+		</details>
 	</section>
 
-	<!-- 6. Access -->
-	<section data-step="6" class="qs-step">
+	<!-- 5. Access -->
+	<section data-step="5" class="qs-step">
 		<h2>How will you reach Quasar?</h2>
 		<div data-when-control>
 			<p class="qs-hint">
@@ -183,71 +167,8 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 				<span>The name or LAN address you will type into the browser</span>
 				<input type="text" name="publicHost" placeholder="192.168.1.50" spellcheck="false" />
 			</label>
-			<label class="qs-field">
-				<span>Other names for the certificate, if any</span>
-				<input type="text" name="tlsHosts" placeholder="quasar.lan" spellcheck="false" />
-			</label>
-			<p class="qs-note">
-				The certificate names exactly these. An address it does not name gives
-				you <code>ERR_CERT_COMMON_NAME_INVALID</code>, which cannot be clicked
-				through. An owned install takes no certificate of your own in this
-				release.
-			</p>
-
-			<div class="qs-choices">
-				<label><input type="radio" name="access" value="self-signed" checked /><span><strong>Straight to Quasar</strong><em>The default. Right for a LAN</em></span></label>
-				<label><input type="radio" name="access" value="proxy" /><span><strong>Through my reverse proxy</strong><em>Caddy, Traefik, nginx already running</em></span></label>
-			</div>
-			<div data-when-access="proxy">
-				<label class="qs-field qs-required">
-					<span>Public URL your proxy serves</span>
-					<input type="text" name="publicUrl" placeholder="https://quasar.example.com" spellcheck="false" />
-				</label>
-				<label class="qs-field">
-					<span>Your proxy's address, as Quasar sees it</span>
-					<input type="text" name="trustedProxies" placeholder="192.168.1.2" spellcheck="false" />
-				</label>
-				<p class="qs-note qs-warn">
-					Your proxy carries login and signaling. It does not carry the stream.
-					Video is WebRTC straight from the GPU host to the browser, so the two
-					still need a direct route: a LAN or a VPN.
-				</p>
-				<label class="qs-field">
-					<span>Which proxy?</span>
-					<select name="proxy">
-						<option value="caddy">Caddy</option>
-						<option value="traefik">Traefik</option>
-						<option value="nginx">nginx</option>
-						<option value="npm">NGINX Proxy Manager</option>
-					</select>
-				</label>
-			</div>
-
-			<div class="qs-choices">
-				<label><input type="radio" name="database" value="owned" checked /><span><strong>Quasar's own database</strong><em>Created and dumped before every update that changes it</em></span></label>
-				<label><input type="radio" name="database" value="external" /><span><strong>My own Postgres</strong><em>Quasar only uses it; backups are yours</em></span></label>
-			</div>
-			<div data-when-database="external">
-				<label class="qs-field qs-required"><span>Database host</span><input type="text" name="dbHost" placeholder="db.example.internal" spellcheck="false" /></label>
-				<div class="qs-row">
-					<label class="qs-field"><span>Port</span><input type="number" name="dbPort" value="5432" min="1" max="65535" /></label>
-					<label class="qs-field"><span>User</span><input type="text" name="dbUser" value="quasar" spellcheck="false" /></label>
-					<label class="qs-field"><span>Database</span><input type="text" name="dbName" value="quasar" spellcheck="false" /></label>
-				</div>
-				<label class="qs-field">
-					<span>TLS to the database</span>
-					<select name="dbSslmode">
-						<option value="require">require: encrypted</option>
-						<option value="verify-full">verify-full: encrypted, certificate checked</option>
-						<option value="disable">disable: only on the same host or a network you trust</option>
-					</select>
-				</label>
-				<p class="qs-note">
-					The password goes in the stack's <code>.env</code> (or this shell's
-					environment for the script), never on this page. It is the one secret
-					that lives in your configuration, by your choice of database.
-				</p>
-			</div>
+   <p class="qs-note">For example, open <code>https://192.168.1.50:8443</code>. Quasar makes a certificate for this address; follow <a href={`${base}/network/https/`}>HTTPS setup</a> to trust it. Your client also needs a direct LAN or VPN route to the GPU host.</p>
+   <p class="qs-note">The default is direct access with Quasar's managed database. For a reverse proxy, extra certificate names or external Postgres, follow <a href={`${base}/install/docker/`}>advanced installation</a>.</p>
 		</div>
 		<p class="qs-note" data-when-role="gpu">
 			Nothing to choose: a GPU host reaches its control plane through the
@@ -256,7 +177,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 	</section>
 
 	<!-- 7. Result -->
-	<section data-step="7" class="qs-step">
+	<section data-step="6" class="qs-step">
 		<h2>Your install</h2>
 		<dl class="qs-summary">
 			<div class="qs-sum-row"><dt>Host</dt><dd data-sum="platform"></dd></div>
@@ -287,7 +208,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 				<button type="button" data-copy="host">Copy</button>
 			</div>
 			<p class="qs-hint" data-host-hint></p>
-			<label class="qs-check" data-when-agent><input type="checkbox" name="nvidia" /><span>This machine has an NVIDIA GPU.</span></label>
+
 			<pre><code data-out="host"></code></pre>
 			<p class="qs-note">
 				Console mode (games on this machine's own screen) needs more device
@@ -297,27 +218,15 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			</p>
 		</div>
 
-		<!-- 2./3. Install: the seed, per engine -->
-		<div class="qs-out" data-out-block="script">
-			<div class="qs-out-head">
-				<h3 data-script-title></h3>
-				<button type="button" data-copy="script">Copy</button>
-			</div>
-			<p class="qs-hint" data-script-hint></p>
-			<pre class="qs-pre-full"><code data-out="script"></code></pre>
-		</div>
-
 		<!-- Podman: the Quadlet unit the script above writes, for reference (owner decision 3) -->
 		<div class="qs-out" data-out-block="quadlet">
 			<div class="qs-out-head">
-				<h4>The Quadlet unit it writes, for reference</h4>
-				<button type="button" data-copy="quadlet">Copy</button>
+				<h4>Podman Quadlet configuration</h4>
+				<button type="button" data-copy="quadlet">Copy</button><button type="button" data-download="quadlet">Download</button>
 			</div>
-			<pre class="qs-pre-full"><code data-out="quadlet"></code></pre>
-			<details class="qs-adv">
-				<summary>Only trying it out? Run the seed with podman run instead</summary>
-				<pre class="qs-pre-full"><code data-out="podman-run"></code></pre>
-			</details>
+			<p class="qs-note">The seed resolves image tags to immutable digests on first install. No manual substitution is needed.</p>
+            <pre class="qs-pre-full"><code data-out="quadlet"></code></pre>
+
 			<p class="qs-note">
 				The seed creates Quasar's recovery actor, which generates every secret
 				and creates the rest. Nothing here writes a Compose file or an .env.
@@ -327,16 +236,11 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 		<!-- Docker (and Unraid): the Dockge/Arcane stack. Not Podman (D15): the Quadlet unit is its equivalent. -->
 		<div class="qs-out" data-out-block="stack">
 			<div class="qs-out-head">
-				<h3 data-stack-title>Using Dockge or Arcane? Paste this stack instead</h3>
-				<button type="button" data-copy="stack">Copy</button>
+				<h3 data-stack-title>Docker Compose configuration</h3>
+				<button type="button" data-copy="stack">Copy</button><button type="button" data-download="stack">Download</button>
 			</div>
-			<p class="qs-hint">
-				One service, stored in your manager's own storage. Preparing the host
-				is then your job, and the readiness card lists anything missing.
-				Replace each <code>&lt;digest&gt;</code> with the pins this prints on
-				the machine:
-			</p>
-			<pre><code data-out="pins"></code></pre>
+
+   <p class="qs-hint">Save this as <code>compose.yaml</code>, or paste it into Docker Compose, Dockge or Arcane. The seed resolves the tags to immutable digests internally on first install. No manual substitution is needed.</p>
 			<pre><code data-out="stack"></code></pre>
 			<div data-out-block="env" hidden>
 				<div class="qs-out-head"><h4>The stack's .env</h4><button type="button" data-copy="env">Copy</button></div>
@@ -356,29 +260,37 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			<pre><code data-out="proxy"></code></pre>
 		</div>
 
+  <div class="qs-out">
+   <h3>Before starting</h3>
+   <p>Create the homes and templates directories with the chosen ownership. Do not change ownership of existing user data recursively.</p>
+   <pre><code data-out="directories"></code></pre>
+   <p>Docker users can save <code>compose.yaml</code> and run <code>docker compose up -d</code>, or use their stack manager. Podman users should save <code>quasar-seed.container</code> in <code>/etc/containers/systemd/</code>, then follow the <a href={`${base}/install/podman/`}>Quadlet start steps</a>.</p>
+   <p>Existing installation? Keep its homes, database and machine state. Follow <a href={`${base}/operations/upgrading/`}>Upgrading</a> before redeploying.</p>
+  </div>
 		<p class="qs-hint">
 			Then open Quasar and continue with{' '}
-			<a href={`${base}/install/first-run/`}>first run and checks</a>. Prefer to read
+			<a href={`${base}/install/first-run/`}>Create your account</a>. Prefer to read
 			the whole thing instead? <a href={`${base}/install/docker/`}>Docker</a>,{' '}
 			<a href={`${base}/install/podman/`}>Podman</a> and{' '}
 			<a href={`${base}/install/unraid/`}>Unraid</a> cover the same ground as prose.
 		</p>
 	</section>
 
+	<p class="qs-note qs-warn" data-validation hidden role="status"></p>
 	<nav class="qs-nav">
 		<button type="button" data-back disabled>Back</button>
-		<span class="qs-count"><span data-current>1</span> of 7</span>
+		<span class="qs-count"><span data-current>1</span> of 6</span>
 		<button type="button" data-next>Next</button>
 	</nav>
 </div>
 
 <script>
-	import { DEFAULTS, generate, homePath, templatePath, role } from '../data/stack-template.js';
+	import { DEFAULTS, generate, homePath, templatePath, role, appUser } from '../data/stack-template.js';
 	import { platform } from '../data/platforms.js';
 	import { profileFor } from '../data/engine-profiles.js';
 
 	// The build's base (the edge docs live under /quasar/edge/).
-	const profilesHref = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/start/engine-profiles/`;
+	const profilesHref = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/start/requirements/#container-engines`;
 
 	// Kept in step with the frontmatter's own copy above (no default engine, D3).
 	const ENGINE_OPTIONS = [
@@ -391,10 +303,10 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 	const engineLabel = (engine, mode) => ENGINE_OPTIONS.find((o) => o.engine === engine && o.mode === mode)?.label ?? `${engine}, ${mode}`;
 
 	for (const root of document.querySelectorAll('[data-quickstart]')) {
-		const answers = { ...DEFAULTS, engine: '', mode: '' }; // no default engine yet (D3)
+		const answers = { ...DEFAULTS, engine: 'docker', mode: 'rootful' }; // no default engine yet (D3)
 		let step = 1;
-		const LAST = 7;
-		const ACCESS_STEP = 6;
+		const LAST = 6;
+		const ACCESS_STEP = 5;
 		// Only overwrite a path or uid the reader has not typed into themselves.
 		const touched = new Set();
 
@@ -407,6 +319,10 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 		function collect() {
 			const val = (n) => field(n)?.value?.trim() ?? '';
 			answers.platform = checked('platform', 'fedora');
+            if (!touched.has('engine')) {
+                const preferred = answers.platform === 'fedora' ? 'podman:rootful' : 'docker:rootful';
+                root.querySelector(`[name="engine"][value="${preferred}"]`).checked = true;
+            }
 			const engineMode = checked('engine', '');
 			[answers.engine, answers.mode] = engineMode ? engineMode.split(':') : ['', ''];
 			answers.role = checked('role', 'combined');
@@ -418,7 +334,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			answers.savesPath = val('savesPath');
 			answers.uid = Number(val('uid') || platform(answers.platform).defaultUid);
 			answers.gid = Number(val('gid') || platform(answers.platform).defaultGid);
-			answers.nvidia = field('nvidia')?.checked ?? false;
+			answers.nvidia = checked('gpu', 'other') === 'nvidia';
 			answers.publicHost = val('publicHost');
 			answers.tlsHosts = val('tlsHosts');
 			answers.proxy = val('proxy') || 'caddy';
@@ -465,26 +381,12 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			note.classList.remove('qs-warn');
 			if (!answers.engine || !answers.mode) {
 				note.innerHTML =
-					'On a rootful engine, whoever controls the engine’s socket controls the machine, and Quasar holds that socket. <a href="' + profilesHref + '">Engine profiles</a> lists what each choice is tested on.';
+					'On a rootful engine, whoever controls the engine’s socket controls the machine, and Quasar holds that socket. <a href="' + profilesHref + '">Container engines</a> lists what each choice is tested on.';
 				return;
 			}
-			const p = profileFor(answers.platform, answers.engine, answers.mode);
-			const name = `${platform(answers.platform).label} with ${engineLabel(answers.engine, answers.mode)}`;
-			const badge = badgeHtml(p.status);
-			if (p.status === 'supported') {
-				const rootEquiv = ' The engine runs as root, so its socket is equivalent to root on this machine; a rootless engine avoids that.';
-				note.innerHTML = `${badge} <strong>${name}</strong>: ${p.reason}${rootEquiv} <a href="${profilesHref}">Engine profiles</a>`;
-			} else if (p.status === 'experimental') {
-				note.classList.add('qs-warn');
-				note.innerHTML = `${badge} <strong>${name}</strong> is experimental. ${p.reason} You can install it; if something does not work, the host’s readiness card names it, and a report helps make this profile supported. <a href="${profilesHref}">Engine profiles</a>`;
-			} else {
-				note.classList.add('qs-warn');
-				const alts = p.alternatives
-					.filter((alt) => alt.status !== 'unsupported')
-					.map((alt) => `<strong>${platform(alt.platform).label} with ${engineLabel(alt.engine, alt.mode)}</strong>`)
-					.join(' or ');
-				note.innerHTML = `${badge} <strong>${name}</strong> is not supported. ${p.reason}${alts ? ` Choose ${alts} instead.` : ''}`;
-			}
+            const p = profileFor(answers.platform, answers.engine, answers.mode);
+            note.classList.toggle('qs-warn', p.status !== 'supported');
+            note.innerHTML = `${badgeHtml(p.status)} ${p.status === 'experimental' ? 'Tested on Fedora uCore and Workstation; full release validation is incomplete.' : p.status === 'unsupported' ? 'Choose a supported engine for this platform.' : 'Validated engine mode.'} <a href="${profilesHref}">Container engines and test evidence</a>`;
 		}
 
 		/** A picture of what lands where. */
@@ -536,6 +438,8 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 		/** The access step needs the console's name before Next; the engine step needs a non-blocked choice. */
 		function stepComplete(n) {
 			if (n === 2) return engineChosenAndAllowed();
+            if (n === 4) return answers.basePath.startsWith('/') && (!answers.separateSaves || answers.savesPath.startsWith('/')) && [answers.uid, answers.gid].every(x => Number.isInteger(x) && x >= 0);
+            if (n === ACCESS_STEP && /[\s/]/.test(answers.publicHost)) return false;
 			if (n !== ACCESS_STEP || !role(answers.role).control) return true;
 			if (!answers.publicHost) return false;
 			if (answers.access === 'proxy' && !answers.publicUrl) return false;
@@ -549,7 +453,8 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			set('platform', platform(answers.platform).label);
 			set('role', r.label);
 			set('homes', homePath(answers));
-			set('owner', `uid ${answers.uid}, gid ${answers.gid}`);
+			const owner = appUser(answers);
+            set('owner', `uid ${owner.uid}, gid ${owner.gid}`);
 			const port = Number(answers.tlsPort);
 			set(
 				'public',
@@ -564,26 +469,6 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			const chosen = Boolean(answers.engine && answers.mode);
 			$('[data-sum-row="engine"]').hidden = !chosen;
 			if (chosen) $(`[data-sum="engine"]`).innerHTML = `${engineLabel(answers.engine, answers.mode)} &nbsp;${badgeHtml(profileFor(answers.platform, answers.engine, answers.mode).status)}`;
-		}
-
-		/** The Result step's titles. Unraid keeps its original, unnumbered heading (D-h). */
-		function resultTitles(showInstall) {
-			if (answers.platform === 'unraid') {
-				$('[data-script-title]').textContent = 'Run this on the machine';
-				return;
-			}
-			if (!showInstall) return;
-			$('[data-script-title]').textContent = answers.engine === 'podman' ? '2. Install Quasar as root' : '2. Run this on the machine';
-		}
-
-		function scriptHint() {
-			if (answers.platform === 'unraid') {
-				return 'It checks the host, pins the images to their digests, and starts one container, the seed. Quasar generates its own secrets on the machine.';
-			}
-			if (answers.engine === 'podman') {
-				return 'Resolves the image digests, writes the Quadlet unit below with them, then starts it through systemd. Quasar generates its own secrets on the machine.';
-			}
-			return 'Read it before you run it. It checks the engine and the host, pins the images to their digests, and starts one container, the seed. Quasar generates its own secrets on the machine.';
 		}
 
 		function hostHint() {
@@ -602,32 +487,29 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			$('[data-out-block="unavailable"]').hidden = !r.control || showInstall || unraid;
 
 			const hostBlock = $('[data-out-block="host"]');
-			hostBlock.hidden = !out.hostSteps;
+			hostBlock.hidden = !out.hostSteps || answers.engine === 'docker';
+            const prep = (out.hostSteps ?? '').replace(/^# Docker[^\n]*\n.*systemctl enable --now docker\n?/, '').trim();
+            $('[data-nvidia-prep]').hidden = !answers.nvidia;
+            $('[data-out="gpu-prep"]').textContent = prep || (unraid ? 'Use the Unraid NVIDIA driver plugin; check nvidia-smi lists your GPU.' : 'Follow the engine-specific NVIDIA preparation guide.');
 			if (out.hostSteps) {
 				$('[data-out="host"]').textContent = out.hostSteps;
 				$('[data-host-hint]').textContent = hostHint();
-			}
-
-			const scriptBlock = $('[data-out-block="script"]');
-			scriptBlock.hidden = !out.script;
-			if (out.script) {
-				$('[data-out="script"]').textContent = out.script;
-				$('[data-script-hint]').textContent = scriptHint();
 			}
 
 			const quadletBlock = $('[data-out-block="quadlet"]');
 			quadletBlock.hidden = !out.quadlet;
 			if (out.quadlet) {
 				$('[data-out="quadlet"]').textContent = out.quadlet;
-				$('[data-out="podman-run"]').textContent = out.podmanRun ?? '';
 			}
 
 			// The Dockge/Arcane stack is a Docker (and Unraid) thing; Podman's
 			// equivalent is the Quadlet unit above (D15).
 			const stackBlock = $('[data-out-block="stack"]');
-			stackBlock.hidden = podman;
-			$('[data-stack-title]').textContent = out.script && !unraid ? 'Using Dockge or Arcane? Paste this stack instead' : 'The stack for Dockge or Arcane';
-			$('[data-out="pins"]').textContent = out.pins;
+			stackBlock.hidden = podman || !showInstall;
+			$('[data-stack-title]').textContent = out.script && !unraid ? 'Docker Compose configuration' : 'Docker Compose configuration';
+            const owner = appUser(answers);
+            const quotePath = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+            $('[data-out="directories"]').textContent = `${unraid ? '' : 'sudo '}install -d -m 0755 -o ${owner.uid} -g ${owner.gid} ${quotePath(homePath(answers))} ${quotePath(templatePath(answers))}`;
 			$('[data-out="stack"]').textContent = out.stack;
 
 			const envBlock = $('[data-out-block="env"]');
@@ -642,7 +524,6 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 				$('[data-out="proxyFile"]').textContent = out.proxyConfig.filename;
 			}
 
-			resultTitles(showInstall);
 		}
 
 		function render() {
@@ -654,7 +535,11 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			tree();
 			output();
 			summary();
-			$('[data-next]').disabled = step === LAST || !stepComplete(step);
+			const complete = stepComplete(step);
+            $('[data-next]').disabled = step === LAST || !complete;
+            const validation = $('[data-validation]');
+            validation.hidden = complete;
+            validation.textContent = step === 4 ? 'Use absolute storage paths and non-negative whole UID/GID values.' : step === ACCESS_STEP ? 'Enter a hostname or LAN IP address, without https:// or a path.' : 'Choose a supported or experimental container engine.';
 			$('[data-back]').disabled = step === 1;
 			$('[data-current]').textContent = String(step);
 		}
@@ -664,7 +549,9 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			$$('[data-step]').forEach((el) => el.classList.toggle('on', Number(el.dataset.step) === step));
 			$$('[data-dot]').forEach((el) => el.classList.toggle('on', Number(el.dataset.dot) <= step));
 			render();
-			root.scrollIntoView({ behavior: 'smooth', block: 'start' });
+			root.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'start' });
+            $(`[data-step="${step}"] h2`)?.setAttribute('tabindex', '-1');
+            $(`[data-step="${step}"] h2`)?.focus({ preventScroll: true });
 		}
 
 		root.addEventListener('input', (e) => {
@@ -689,11 +576,23 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 			});
 		});
 
+        $$('[data-download]').forEach(btn => btn.addEventListener('click', () => {
+            const kind = btn.dataset.download;
+            const blob = new Blob([$(`[data-out="${kind}"]`).textContent], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href = url;
+            a.download = kind === 'stack' ? 'compose.yaml' : 'quasar-seed.container';
+            a.click(); URL.revokeObjectURL(url);
+        }));
+
+        field('engine').checked = true;
 		show(1);
 	}
 </script>
 
 <style>
+    .qs [hidden] { display: none !important; }
+    .qs button:focus-visible, .qs summary:focus-visible { outline: 2px solid var(--q-accent); outline-offset: 3px; }
 	.qs {
 		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
 		border-radius: var(--q-r-lg, 12px);

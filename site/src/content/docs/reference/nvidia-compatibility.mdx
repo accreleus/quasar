@@ -1,0 +1,42 @@
+---
+title: NVIDIA compatibility reference
+description: Measured Vulkan AV1 regression and the scope of existing codec guards.
+---
+
+Quasar's supported NVIDIA driver baseline is **610 or newer**. This maintainer-set
+requirement is broader than the measured regression below; it does not mean every
+card or driver version has been tested, or that all 595 versions have the same defect.
+
+## Measured AV1 regression
+
+RTX 5090 (PCI ID `10de:2b85`) with NVIDIA **595.99.02** produces corrupted Vulkan
+AV1 video. **610.57.04** produces clean output, including on Unraid with the open
+kernel modules. This is host encoding, not browser decoding. The 610.57.04 comparison produced clean output; the Unraid confirmation was
+operator-reported rather than a separate automated run.
+
+What Quasar does:
+
+- If any render device on the host matches the affected combination, AV1 is
+  removed from the host's codecs (with Vulkan or NVENC), and host readiness says
+  why. Sessions use HEVC or H.264 where the profile and client allow.
+- An AV1-only profile has no eligible codec on that host: allow another codec or
+  use another host.
+- Choosing `nvenc` or setting `QUASAR_VULKAN_AV1=0` does not bypass this.
+- Unlisted GPU and driver combinations stay eligible. That isn't a claim they were
+  all validated.
+
+After a driver update, recreate the agent container and check its reported driver
+and codecs; compatibility is reassessed at startup. On Unraid, confirm the package
+supplies the open kernel modules your GPU needs.
+
+On an older release without this protection, choose HEVC or H.264 explicitly on
+the affected driver. Check your release notes.
+
+Driver-volume provisioning can supply missing container libraries, including the
+Vulkan ICD, but not the host kernel driver. It is not a reason to switch to NVENC.
+If the Vulkan loader can't initialize, check the host's readiness findings.
+
+
+Evidence: [Vulkan AV1 driver comparison](https://github.com/accreleus/quasar/blob/4b3e9c7db301833616a3ad89dfb77e64357749f0/docs/reports/2026-09-06-av1-vulkan-driver-comparison.md).
+The current runtime guard remains scoped to the measured combination; the documented
+610+ supported baseline adds no new runtime check.

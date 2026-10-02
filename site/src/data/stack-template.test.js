@@ -70,14 +70,17 @@ test('every role is one service, the seed, with the two mounts and the named vol
   }
 });
 
-test('every image is a digest placeholder, never a tag', () => {
+test('every image is the channel tag, with nothing for the reader to substitute', () => {
   for (const role of ROLE_IDS) {
     const { stack } = generate(full({ role }));
     const doc = load(stack);
     const refs = [doc.services['quasar-seed'].image, ...Object.entries(env(stack)).filter(([k]) => k.endsWith('_IMAGE')).map(([, v]) => v)];
-    for (const ref of refs) assert.match(ref, new RegExp(`^${REGISTRY_NS}/quasar-[a-z-]+@sha256:<digest>$`), `${role}: ${ref}`);
-    assert.ok(!stack.includes(`:${CHANNEL_TAG}`), `${role}: the stack must not carry the channel tag`);
+    for (const ref of refs) assert.match(ref, new RegExp(`^${REGISTRY_NS}/quasar-[a-z-]+:${CHANNEL_TAG}$`), `${role}: ${ref}`);
+    assert.ok(!/@sha256|<digest>/.test(stack), `${role}: no digest or placeholder in the stack`);
   }
+  // A GPU host needs no control-plane image; a control-only machine still names the agent Add host installs.
+  assert.equal(env(generate(full({ role: 'gpu' })).stack).QUASAR_CONTROL_PLANE_IMAGE, undefined);
+  assert.ok(env(generate(full({ role: 'control-only' })).stack).QUASAR_AGENT_IMAGE);
 });
 
 test('each role takes the inputs its seed needs and no others', () => {
@@ -120,7 +123,7 @@ test('no secret is ever generated or written', () => {
   for (const role of ROLE_IDS) {
     for (const database of ['owned', 'external']) {
       const out = generate(full({ role, database, dbHost: 'db.example.internal' }));
-      const all = [out.stack, out.env ?? '', out.script ?? '', out.pins].join('\n');
+      const all = [out.stack, out.env ?? '', out.script ?? ''].join('\n');
       assert.ok(!/openssl|rand -hex|QUASAR_SECRET_KEY|POSTGRES_PASSWORD|ENROLLMENT_TOKEN/.test(all), `${role}/${database}`);
     }
   }
@@ -171,15 +174,8 @@ test('the stack carries the seed inputs in the same order as the script', () => 
   }
 });
 
-// --- the pins -------------------------------------------------------------
-
-test('the pins command names each image the role installs, by the channel tag', () => {
-  const combined = generate(full()).pins;
-  for (const name of ['quasar-recovery', 'quasar-control-plane', 'quasar-node-agent']) assert.ok(combined.includes(name), name);
-  assert.ok(combined.includes(`:${CHANNEL_TAG}`));
-  assert.ok(!generate(full({ role: 'gpu' })).pins.includes('quasar-control-plane'));
-  assert.equal(spawnSync('bash', ['-n'], { input: combined }).status, 0);
-});
+// The stack carries tags and the seed pins them (node-agent bootstrap `pin_images`):
+// there is no separate pinning command to generate.
 
 // --- the script -----------------------------------------------------------
 
@@ -219,7 +215,7 @@ test('an unsupported profile generates no install artifacts: the UI blocks it', 
   assert.equal(out.script, null);
   assert.equal(out.hostSteps, null);
   assert.equal(out.quadlet, null);
-  // The seed's own stack (Dockge/Arcane) and pins are not engine/mode specific and stay available.
+  // The seed's own stack (Dockge/Arcane) is not engine/mode specific and stays available.
   assert.ok(out.stack);
 });
 

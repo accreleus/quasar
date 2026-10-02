@@ -51,7 +51,7 @@ docker exec quasar-recovery quasar-recovery status   # services, blockers, last 
 | `actor-engine-config` | The engine endpoint is unusable. The actor exits. |
 | `actor-no-gpu`, `actor-gpu-probe-unreadable` | No usable GPU found. The agent is installed anyway; readiness reports the gap. |
 | `actor-gpus-served` | The agent gets the NVIDIA device setup. Normal. |
-| `actor-gpu-injection-unavailable` | An NVIDIA GPU was found but this engine can't pass it through. Do the NVIDIA part of preparing the host ([Docker](/quasar/install/docker/#prepare-the-host), [Podman](/quasar/install/podman/#prepare-the-host)), restart the engine, then remove the agent container. |
+| `actor-gpu-injection-unavailable` | An NVIDIA GPU was found but this engine can't pass it through. Follow [NVIDIA setup](/quasar/install/nvidia/) for your engine, restart it, then remove the agent container. |
 | `actor-gpus-refused` | The engine refused the GPU. Fix the NVIDIA Container Toolkit (or the CDI spec on Podman and rootless Docker), then remove the agent container. |
 | `actor-gpus-probe-retry` | The engine didn't answer the GPU probe. Asked up to three times. |
 | `actor-helper-name-taken` | A foreign container holds `quasar-gpu-probe` or `quasar-secrets-writer`. Remove it. |
@@ -82,8 +82,9 @@ A refused or failed update shows one of these reasons on the Releases tab:
 | `interrupted` | The actor restarted before changing anything. Apply again. |
 
 **A failed install:** fix the inputs, then start the seed again. If the recovery
-actor already exists, run `docker restart quasar-recovery` instead; it reinstalls
-from the seed's current inputs.
+actor already exists, run `docker restart quasar-recovery` instead. It retries using
+the machine's saved state; changing the seed's inputs does not reconfigure an
+installed machine. See [changing an input](/quasar/reference/environment/#the-recovery-actors-trust-settings).
 
 ## The control plane will not start
 
@@ -130,12 +131,8 @@ ls -l /dev/dri
 
 No `renderD128`: the host driver isn't loaded. If the nodes exist but the agent
 can't open them, check group and mode, and that the device is passed to the
-container. On NVIDIA:
-
-```bash
-nvidia-smi
-sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-```
+container. For NVIDIA, check `nvidia-smi` on the host, then follow the engine-specific
+checks in [NVIDIA setup](/quasar/install/nvidia/).
 
 ## The GPU is detected but there is no encoder
 
@@ -145,21 +142,13 @@ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 - `MESA_LOADER_DRIVER_OVERRIDE` or `LIBGL_ALWAYS_SOFTWARE` is set. They must be
   **unset**, not empty. Don't copy both the software and hardware blocks from `.env.example`.
 
-## NVIDIA host with a CUDA-only driver install
+## NVIDIA graphics libraries are missing
 
-CUDA-only installs lack EGL and 32-bit GL. Quasar fills the gap by default with a
-driver volume built from the running kernel module; readiness in **Fleet ▸ Hosts**
-shows progress and anything still missing. It can't fix the kernel module itself.
-After a host driver update, recreate the agent container.
-
-To install the full stack instead (Fedora):
-
-```bash
-sudo dnf install nvidia-driver-libs nvidia-driver-libs.i686 egl-wayland
-sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-```
-
-For the RTX 5090 AV1 restriction, see [AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
+Use the full graphics driver, not a CUDA-only installation. Follow
+[NVIDIA setup](/quasar/install/nvidia/) for prerequisites, container access and
+driver compatibility. Quasar can provision missing graphics libraries in a driver
+volume; the host's readiness card shows progress and gaps. It cannot repair the
+kernel module. After a host driver update, recreate the agent container.
 
 ## Input devices are not working
 

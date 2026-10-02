@@ -4,15 +4,11 @@ description: What listens where, what needs to be reachable from where, and the 
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import PortsTable from '../../../components/PortsTable.astro';
 
 ## Ports
 
-| Port | Protocol | Who connects | Purpose |
-| --- | --- | --- | --- |
-| 8443 | TCP, HTTPS | Browsers | The web app and API. |
-| 8080 | TCP, HTTP | Node agents, healthchecks | Agent enrollment, `/health`. Browser routes redirect to HTTPS. |
-| 9091 | TCP, HTTP | Localhost only | The node agent's health endpoint. |
-| ephemeral | UDP | Browsers, direct to the GPU host | WebRTC media and input. Not proxied. |
+<PortsTable />
 
 Change the published ports with `CONTROL_PORT` and `QUASAR_TLS_PORT`. The hardened
 Compose overlay puts Caddy on 443 and publishes no control-plane ports.

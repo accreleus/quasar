@@ -1,114 +1,46 @@
 ---
 title: Install on Unraid
-description: Install Quasar on Unraid with one docker run seed. No host preparation; storage off the FUSE layer; NVIDIA driver notes.
+description: Prepare persistent storage and your GPU, then use the shared quick start.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-Unraid uses its own Docker, which runs as root: **rootful Docker is the supported
-mode**. Unraid has no rootless Docker and no Podman. Plain `docker run` and Dockge
-both work.
+## Prepare your server
 
-## What you need
+- Check your GPU driver is loaded: `ls /dev/dri` should show a `renderD*` device.
+- Allow about 20 GB for container images, plus space for games and saves.
+- Use the Unraid host shell for commands; it runs as root, so omit `sudo`.
 
-- A GPU whose driver is loaded: `ls /dev/dri` shows a `renderD*` node.
-- About 20 GB free where Docker stores images, plus room for games and saves.
-- A root shell on the Unraid host. Commands run without `sudo`.
-
-### NVIDIA
-
-- Install the **NVIDIA driver plugin**, then check `nvidia-smi` lists the GPU.
-- RTX 50-series cards need the **open** kernel modules.
-- Unraid 7's plugin provides the **595** driver branch. On the RTX 5090,
-  **595.99.02 corrupts AV1**. Update to the **610** branch (**610.57.04** is clean),
-  or use HEVC or H.264. See [AV1 driver
-  compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
+For NVIDIA, complete [NVIDIA setup on Unraid](/quasar/install/nvidia/#unraid)
+before deploying, including the driver compatibility check.
 
 ## Storage paths
 
-`/mnt/user` is Unraid's FUSE user-share layer (shfs). Point the homes root, the
-templates root and any other Quasar data at a path that **bypasses** it:
-
-| Use | Example |
-| --- | --- |
-| A pool path | `/mnt/cache/appdata/quasar` |
-| A single disk | `/mnt/disk1/appdata/quasar` |
-| An exclusive-access share | the share's path |
-
-- The quick start fills in `/mnt/cache/appdata/quasar` as the **Base path**. If your
-  pool has another name, use that pool's path instead.
-- `/root` is a ramdisk. Never keep homes, templates or a Dockge stacks directory
-  there. Keep Dockge's stacks directory under `/mnt/user/appdata` so it survives a
-  reboot.
-- Game and save data is owned by uid 99 and gid 100, the Unraid convention. The
-  quick start sets `QUASAR_APP_PUID=99` and `QUASAR_APP_PGID=100` for you.
-
-## Host preparation
-
-None. Unraid's Docker is already running, and `/dev/uinput` appears on demand.
-For smoother streams, set the [UDP send buffer](/quasar/tuning/latency/#the-udp-send-buffer)
-(it has an Unraid recipe).
-
-## Install
-
-1. In the [quick start](/quasar/start/quickstart/), pick **Unraid**, your role and
-   access, and change the **Base path** (see [Storage paths](#storage-paths)).
-2. **Read the script** it shows, then run it in the Unraid shell.
-
-The script:
-
-- checks for `docker`, `curl` and `/dev/dri`;
-- stops if a Compose-made Quasar stack or an existing seed is on the machine;
-- pins the current stable release's images by digest;
-- creates the homes and templates roots, owned by 99:100;
-- starts **one container, the seed**, and waits up to ten minutes for Quasar.
-
-The seed it starts, with your values in place of the examples:
-
-```bash
-docker run -d --name quasar-seed --restart unless-stopped \
-  --security-opt label=disable \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v quasar-machine:/var/lib/quasar-machine:ro \
-  -e QUASAR_ROLE=combined \
-  -e QUASAR_PUBLIC_HOST=192.168.1.50 \
-  -e QUASAR_HOME_ROOT=/mnt/cache/appdata/quasar/homes \
-  -e QUASAR_TEMPLATE_ROOT=/mnt/cache/appdata/quasar/templates \
-  -e QUASAR_APP_PUID=99 \
-  -e QUASAR_APP_PGID=100 \
-  -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest> \
-  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
-  ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
-```
-
-Every input, the Dockge stack form, your own Postgres and the image-digest loop are
-the same as on Docker: see [Install the first
-machine](/quasar/install/docker/#install-the-first-machine).
-
-## How to know it worked
-
-The script ends with:
-
-> `Quasar is running. Open https://<host>:8443 and accept the certificate once.`
-
-Check it again any time:
-
-```bash
-docker exec quasar-recovery quasar-recovery status
-curl http://localhost:8080/health
-```
-
-You want `{"status":"ok","db":"ok"}`. Then continue with [First run and
-checks](/quasar/install/first-run/).
-
-<Aside type="caution" title="A Compose stack under /root">
-An older Compose install kept in `/root` is lost at the next reboot. See [Moving an
-existing stack](/quasar/install/legacy-compose/#moving-an-existing-stack).
+<Aside type="caution" title="Warning: keep game and home data off the FUSE layer">
+Use a direct pool path such as `/mnt/<pool>/appdata/quasar` for homes and templates.
+Replace `<pool>` with your actual pool name. Ordinary `/mnt/user` shares go through
+Unraid's FUSE user-share layer; exclusive-access shares can bypass it. Confirm how
+your share is configured before using it for game data.
 </Aside>
 
-## Removing it
+The quick start defaults to `/mnt/cache/appdata/quasar`. Change `cache` if your
+pool has another name. Saves, installed content and user files need persistent
+storage with enough space; do not put them under `/root`.
 
-Uninstall as on any host ([Uninstalling](/quasar/operations/uninstall/)). If you
-set the UDP send buffer, or installed with an older quick start, also remove any
-`sysctl -w net.core.wmem_default=2097152` and `modprobe uinput` lines from
-`/boot/config/go`.
+A stack manager's configuration directory is separate from game data. Keep it
+on persistent storage too; it does not need the same direct pool path merely
+because it holds a Compose file.
+
+Quasar defaults game-file ownership to **UID 99 / GID 100** on Unraid.
+
+## Install Quasar
+
+Use the [quick start](/quasar/start/quickstart/) and select **Unraid**. It supplies
+the platform's paths and ownership defaults, then follows the normal Docker
+seed deployment. Review the generated configuration before starting it. Docker Compose, Dockge or Arcane can keep that configuration.
+
+Open `https://<your-host>:8443`, follow the
+[certificate steps](/quasar/network/https/) and [create your account](/quasar/install/first-run/).
+
+For maintenance, see [Backup and restore](/quasar/operations/backup/),
+[Upgrading](/quasar/operations/upgrading/) and [Uninstalling](/quasar/operations/uninstall/).

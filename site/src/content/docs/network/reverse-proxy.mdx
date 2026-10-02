@@ -3,19 +3,21 @@ title: Behind a reverse proxy
 description: Running the control plane behind Caddy or your own proxy, and the two settings that make signaling work.
 ---
 
+import { Code, Tabs, TabItem } from '@astrojs/starlight/components';
+import { proxyConfig } from '../../../data/proxy-configs.js';
+
 The control plane can sit behind a proxy. The stream never goes through it, so
 see [Reaching Quasar remotely](/quasar/network/remote-access/) before expecting
 internet play.
 
 ## On an owned install
 
-Bring your own proxy. The [quick start](/quasar/start/quickstart/) writes a Caddy,
-Traefik, nginx or NGINX Proxy Manager snippet. Point it at the control plane's
-**HTTP** port (8080 by default), not 8443.
+Point your existing proxy at the control plane's **HTTP** port (8080 by default),
+not 8443. The examples below use `quasar.example.com` and a control plane at
+`quasar.lan:8080`; replace both with your addresses.
 
 - **Pass the original `Host` and send `X-Forwarded-Proto`.** The signaling address
-  is built from them; owned installs have no `PUBLIC_BASE_URL`. The quick-start
-  snippets do this.
+  is built from them; owned installs have no `PUBLIC_BASE_URL`. The examples below do this.
 - **Add the public URL to allowed origins** in **Admin ▸ Settings**. Opening
   first-run setup through the public address saves it for you. There is no
   environment override on an owned install.
@@ -27,6 +29,26 @@ Traefik, nginx or NGINX Proxy Manager snippet. Point it at the control plane's
   ```
 
 Keep `QUASAR_PUBLIC_HOST` for direct LAN access on the HTTPS port.
+
+## Proxy examples
+
+These add Quasar to an existing proxy; they do not install the proxy or configure
+its certificate. Keep your current certificate settings.
+
+<Tabs>
+<TabItem label="Caddy">
+<Code code={proxyConfig('caddy', {publicUrl: 'https://quasar.example.com', host: 'quasar.lan', port: 8080}).body} lang="plaintext" />
+</TabItem>
+<TabItem label="Traefik">
+<Code code={proxyConfig('traefik', {publicUrl: 'https://quasar.example.com', host: 'quasar.lan', port: 8080}).body} lang="yaml" />
+</TabItem>
+<TabItem label="nginx">
+<Code code={proxyConfig('nginx', {publicUrl: 'https://quasar.example.com', host: 'quasar.lan', port: 8080}).body} lang="nginx" />
+</TabItem>
+<TabItem label="NGINX Proxy Manager">
+<Code code={proxyConfig('npm', {publicUrl: 'https://quasar.example.com', host: 'quasar.lan', port: 8080}).body} lang="nginx" />
+</TabItem>
+</Tabs>
 
 ## On a legacy Compose install
 
@@ -80,6 +102,7 @@ directly (`/agent/ws` over HTTP), not through the proxy.
 
 ## Checking it worked
 
-Run Admin's access check from the public address, then log in from outside and
-launch something. If the session never starts, check allowed origins, then whether
-the client can reach the GPU host directly.
+1. Open the console at the proxy address and run Admin's access check.
+2. Connect through your LAN or VPN and launch a session.
+3. Confirm video, sound and input work. If the session never starts, check
+   allowed origins and the client's direct route to the host.

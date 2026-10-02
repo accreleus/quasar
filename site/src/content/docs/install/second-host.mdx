@@ -5,22 +5,20 @@ description: Enroll another GPU machine with one command from the admin console.
 
 {/* Keep this page's slug: the console's Add host dialog links to /install/second-host/ (web/src/pages/admin/fleet/AddHostModal.tsx). */}
 
-Each GPU host runs one node agent. Adding a host enrolls one more agent with the
-control plane.
+Each GPU host runs one node agent. Adding a host connects another computer with a GPU to the same instance.
 
 ## 1. Prepare the host
 
 - Linux with a working GPU driver (`ls /dev/dri` shows a `renderD*` node).
-- Docker or Podman, in a [supported engine profile](/quasar/start/engine-profiles/).
+- Docker or Podman, in a [supported engine mode](/quasar/start/requirements/#container-engines).
   The command detects which.
 - The host steps for its engine: [Docker](/quasar/install/docker/#prepare-the-host),
   [Podman](/quasar/install/podman/#prepare-the-host), or
-  [rootless](/quasar/install/rootless/). On NVIDIA, that includes the NVIDIA
-  Container Toolkit.
+  [rootless](/quasar/install/rootless/). For NVIDIA, complete [NVIDIA setup](/quasar/install/nvidia/).
 - A shell as the account that runs the engine: root for rootful Podman, root (or
   passwordless `sudo`) for rootful Docker, the `quasar` account for a rootless
   engine.
-- Network access to the control plane's `https://` address.
+- Network access to the control plane's `https://` address, plus a direct LAN or VPN route from each player's browser to this computer.
 
 ## 2. Generate the command
 
@@ -32,6 +30,9 @@ stays valid, and press **Create command**. You get:
 curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
   | QUASAR_ENROLLMENT='qenr1.…' sh
 ```
+
+The enrollment string contains the instance address, certificate pin and single-use
+token. It is private; the token is not embedded in the URL.
 
 ## 3. Inspect the script
 

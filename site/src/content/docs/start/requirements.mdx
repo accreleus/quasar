@@ -1,70 +1,82 @@
 ---
 title: Requirements
-description: What the host machine needs before you install Quasar, and what your client device needs to play.
+description: Choose a Linux GPU host and check the direct network path before installing.
 ---
 
-## The host machine
+import { Aside } from '@astrojs/starlight/components';
 
-| | Requirement |
+import PortsTable from '../../../components/PortsTable.astro';
+import EngineProfiles from '../../../components/EngineProfiles.astro';
+
+## Your server
+
+| Component | Requirement |
 | --- | --- |
-| OS | Linux with systemd. Docker Desktop on macOS and Windows can't carry the stream. |
-| Container engine | Docker Engine 20.10+ or Podman. See [Engine profiles](/quasar/start/engine-profiles/). |
-| Disk | About 20 GB free where the container engine stores images, plus room for games and saves. A control-only machine needs much less. |
-| CPU and RAM | Modest: the GPU does the encoding. Tested on 8 vCPU and 32 GB. |
-| GPU | See [GPU](#gpu). |
+| OS | Linux. |
+| Container engine | Docker Engine 20.10+ or Podman. See [Container engines](/quasar/start/requirements/#container-engines) for current support status. |
+| Disk | Allow about 20 GB for container images, then additional space for installed games, saves and user files. Check where your engine stores images as well as your homes disk. |
+| CPU and RAM | Quasar's services have modest overhead. Size the host for the games and number of simultaneous sessions you intend to run; the GPU handles video encoding. The 8 vCPU / 32 GB test host is a test configuration, not a minimum. |
 
-Compose isn't needed. Quasar starts its own containers.
+Docker Desktop on macOS or Windows, and WSL, are unsupported.
 
-| Stack manager | Status |
-| --- | --- |
-| Plain Docker or Podman | Supported |
-| Dockge, Arcane | Supported |
-| Unraid (`docker run`) | Supported |
-| Portainer, Kubernetes | Not supported |
+## Container engines
 
-One Quasar installation per container engine.
+Quasar runs on Docker and Podman in rootful or rootless mode. Rootless modes and
+rootful Podman remain experimental.
 
-### GPU
+<EngineProfiles />
 
-| Vendor | Encoder | Status |
+**Supported:** tested end to end. **Experimental:** tested, with release validation
+still incomplete. Tests cover rootful Docker with AMD/NVIDIA, and Podman/rootless
+on Fedora uCore and Workstation; this does not validate every distribution.
+
+### What’s the difference between rootful and rootless?
+
+<Aside type="note" title="Rootful and rootless">
+**Rootful** runs the engine as root; access to its socket gives control of the machine.
+**Rootless** runs under an ordinary account with reduced privileges and needs extra
+account and device setup. See [Rootless installation](/quasar/install/rootless/).
+</Aside>
+
+The documented [Podman](/quasar/install/podman/) and rootless installation paths
+require systemd; Quasar on rootful Docker does not. Run one Quasar installation per
+engine. Compose, Dockge and Arcane can manage its seed; Portainer and Kubernetes
+are unsupported.
+
+## GPU
+
+| Vendor | Encoder | Current validation |
 | --- | --- | --- |
-| AMD | Vulkan Video | Verified |
 | NVIDIA | Vulkan Video | Verified |
+| AMD | Vulkan Video | Verified |
 | Intel | VA-API | Untested |
-| None | openh264 (software) | Works, too slow to play on |
+| No GPU | Software H.264 | Too slow for practical play |
 
-**NVIDIA** needs the full driver (not CUDA-only) and the NVIDIA Container Toolkit.
-The install pages show the one or two commands that wire it to your engine:
-[Docker](/quasar/install/docker/#prepare-the-host),
-[Podman](/quasar/install/podman/#prepare-the-host),
-[rootless](/quasar/install/rootless/).
-
-### NVIDIA on Unraid
-
-See [Install on Unraid](/quasar/install/unraid/#nvidia).
-
-### Kernel
-
-Nothing to set for the install. `/dev/uinput` (Quasar's virtual keyboard, mouse and
-gamepads) loads on demand. For smoother streams, raise the [UDP send
-buffer](/quasar/tuning/latency/#the-udp-send-buffer): recommended, not required.
-
-### Firewall
-
-The node agent uses the host network, so a default-deny firewall must allow its
-WebRTC UDP. See [Ports and endpoints](/quasar/reference/ports/#firewall).
-SELinux can stay enforcing.
-
-## The client device
-
-A recent Chrome or Chromium. Firefox and Safari are untested
-([Browser support](/quasar/playing/browsers/)).
-
-The page must be served over HTTPS for gamepads, keyboard lock and the microphone.
-Quasar makes its own certificate, so this is handled
-([HTTPS and certificates](/quasar/network/https/)).
+<Aside type="note" title="NVIDIA prerequisites">
+NVIDIA requires the **full graphics driver, version 610 or newer, and NVIDIA Container Toolkit**.
+Follow [NVIDIA setup](/quasar/install/nvidia/) before installing.
+</Aside>
 
 ## Network
 
-The client must reach the GPU host directly: same LAN or a VPN. The stream doesn't
-go through a reverse proxy. See [Reaching Quasar remotely](/quasar/network/remote-access/).
+**Your browser must reach each GPU host directly over your LAN or VPN.** A reverse
+proxy can carry the web app and API; it cannot carry the game stream.
+
+For a default install, allow these connections from the relevant LAN or VPN peers:
+
+<PortsTable />
+
+The UDP range is chosen by Linux: check `cat /proc/sys/net/ipv4/ip_local_port_range`
+on the GPU host. A default-deny firewall must allow it even when login works.
+See [Firewall rules and custom ports](/quasar/reference/ports/#firewall) and
+[Remote access](/quasar/network/remote-access/). Optional UDP buffer tuning is in
+[Latency](/quasar/tuning/latency/#the-udp-send-buffer).
+
+## Your client
+
+Use recent **Chrome or Chromium**. Firefox and Safari are untested; see
+[Browser support](/quasar/playing/browsers/).
+
+HTTPS is required for gamepads, keyboard lock and the microphone. The install
+steps configure Quasar's certificate; see [HTTPS and certificates](/quasar/network/https/)
+for trusting it or using a reverse proxy.

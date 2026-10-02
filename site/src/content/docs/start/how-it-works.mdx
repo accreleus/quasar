@@ -1,54 +1,31 @@
 ---
 title: How it works
-description: The two services Quasar runs, what happens when you press play, and the terms you will meet in the admin area.
+description: From pressing Play to a direct stream from your GPU server.
 ---
 
 import ArchDiagram from '../../../components/ArchDiagram.astro';
 
-You don't need this to play. You do need it to run Quasar: these terms appear in
-the admin area.
+Quasar runs games on your GPU server and brings them to your browser. A first
+install puts everything on one host; you can add another computer as your library grows.
 
-## Two services
+<ArchDiagram caption="Management goes through the control plane. The game stream connects your browser directly to the GPU host." />
 
-- **Control plane** (Go, Postgres): accounts, the API, signaling, scheduling, and
-  the web app. It picks the host for each session. It holds no GPU state.
-- **Node agent** (Rust, one per GPU machine): owns the GPUs, reports capacity,
-  launches game containers, and runs the compositor, encoder and WebRTC for each
-  session.
+## Press Play
 
-A second GPU machine is just another node agent pointed at the same control plane.
-The web app only talks to the control plane, never to a node agent.
+1. Your browser asks the **control plane** to start an app.
+2. The control plane selects an available **GPU host** and compatible stream settings.
+3. The host's **node agent** starts the game.
+4. Your browser connects directly to that host for video, audio and input over WebRTC.
 
-### And one container that installs them
+The web app uses the control plane's API for accounts, the library and session
+management. The direct host connection carries the stream, so every GPU host
+must be reachable from your browser over your LAN or VPN.
 
-Each machine also runs a **recovery actor**. It creates and updates that machine's
-control plane, Postgres and node agent, and itself. You start only the **seed**,
-whose one job is to make sure the recovery actor exists. See
-[Install with Docker](/quasar/install/docker/).
+## What runs on your server
 
-## What happens when you press play
+- **Control plane:** serves the web app and manages accounts, the library and sessions. Its data lives in Postgres.
+- **Node agent:** runs apps and streams them from a GPU host. Each additional GPU server has its own agent.
+- **Installation and recovery:** you declare one seed container. It keeps a recovery service running to install, update and recover that machine's Quasar services. Persistent machine state and user homes must be kept.
 
-1. The browser asks the control plane for a session.
-2. The control plane picks a host with a free encode slot and enough GPU memory,
-   and settles one codec, resolution, frame rate and bitrate.
-3. The node agent starts the game container, its compositor, and the
-   compositor → encoder → WebRTC pipeline.
-4. Browser and node agent negotiate through the control plane.
-5. Video, audio and input then flow directly between browser and GPU host. The
-   control plane is out of the media path, which is why remote access is limited
-   ([Reaching Quasar remotely](/quasar/network/remote-access/)).
-
-<ArchDiagram caption="The control plane places the session and then steps out of the media path. Video, audio and input travel directly between the browser and the host." />
-
-## The terms you will meet
-
-| Term | Meaning |
-| --- | --- |
-| **Host** | A machine running the node agent. Admin ▸ Fleet ▸ Hosts. |
-| **Session** | One user, one app, one host. Assigned → starting → running → stopped or failed. |
-| **App** | A catalog entry: content, a container image and a launch command. A game, desktop or launcher. |
-| **Runtime preset** | A reusable container spec (image, environment, GPU flag, mounts) shared by apps. |
-| **Stream profile** | One encode rung: codec, resolution, frame rate, bitrate, and who can use it. Users never see these. |
-| **Launch profile** | An ordered list of stream profiles, best first. What users pick ("1080p60"). The server takes the first rung the host can encode and the client can decode. Each must include an H.264 rung. |
-| **Entitlement** | Whether an app appears in a user's library. Everyone or named users. |
-| **Device** | A browser you've logged in from. Quasar stores what it can decode. Rename, trust or revoke it from your account. |
+See the [glossary](/quasar/reference/glossary/) for app, host, session and quality
+profile terminology, or go straight to the [quick start](/quasar/start/quickstart/).

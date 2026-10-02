@@ -1,11 +1,21 @@
 ---
-title: Your library
+title: Set up your game library
 description: Finding apps, favourites, and choosing a quality tier.
 ---
 
 import Shot from '../../../components/Shot.astro';
 import library from '../../../assets/shots/library.png';
 import { Aside } from '@astrojs/starlight/components';
+
+## Start with Steam
+
+1. During first-run setup, enable **Steam** and choose who can use it. You can change this later under [Library sources](/quasar/admin/steam/).
+2. Open the **Steam launcher** in your library, sign in to Steam and install a game on the GPU host.
+3. After the next library scan, installed games appear as their own tiles. Select one and press **Play**.
+
+Allow disk space for the games you install. Saves and user files stay in
+[persistent homes](/quasar/playing/storage/). A Steam library scan discovers
+installed games; it does not install them for you.
 
 Your library is at `/app`. It shows only the apps you have been granted.
 
@@ -58,7 +68,7 @@ have set or locked an instance default.
 | Capacity exhausted | Hosts are full. Try again later. |
 | Session limit reached | You are at your account's session limit. |
 | Already running | You already have this app running. One at a time, to protect your saves. |
-| Not entitled | You do not have access. Ask your administrator. |
+| No app access | You do not have access. Ask your administrator. |
 
 ## Steam
 

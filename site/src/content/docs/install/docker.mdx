@@ -12,11 +12,11 @@ Unraid, follow [Unraid](/quasar/install/unraid/) instead.
 
 This page is **rootful** Docker (supported): Docker runs as root. To run Quasar
 as an ordinary account instead, follow [Install rootless](/quasar/install/rootless/)
-(experimental). Status per platform: [Engine profiles](/quasar/start/engine-profiles/).
+(experimental). Status per platform: [Container engines](/quasar/start/requirements/#container-engines).
 
 <Aside type="note" title="Stable releases">
-A new install starts on the **stable** channel, with images pinned by digest, so it
-never moves on its own. An install made before the first stable release is on
+A new install starts on the **stable** channel. The seed pins the images to digests
+when it installs, so the install never moves on its own. An install made before the first stable release is on
 `edge`: see [Moving an edge install to
 stable](/quasar/admin/releases/#moving-an-edge-install-to-stable).
 </Aside>
@@ -42,7 +42,7 @@ seed. Run one installation per container engine.
 
 It holds the Docker socket. Its limits:
 
-- It pulls images **only by digest**, and only from the allowed registry namespaces
+- It runs images **only by digest**, and pulls only from the allowed registry namespaces
   (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, the project's own by default). See [Release
   signatures](/quasar/operations/upgrading/#release-signatures).
 - It acts only on containers it created. A look-alike it did not create, such as a
@@ -61,26 +61,10 @@ Once, from an account with `sudo`. The quick start shows the same commands.
 sudo systemctl enable --now docker
 ```
 
-**NVIDIA:** install the [NVIDIA Container
-Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
-then give Docker its runtime:
+**NVIDIA:** complete [NVIDIA setup for rootful Docker](/quasar/install/nvidia/#docker-rootful)
+before deploying. It includes runtime configuration and any required SELinux policy.
 
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-If Docker runs with SELinux on (uCore and Fedora CoreOS do; `docker info` lists
-`selinux` under Security Options), also let containers open the NVIDIA devices:
-
-```bash
-sudo setsebool -P container_use_xserver_devices on
-echo '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' > quasar-nested-gpu.cil
-sudo semodule -i quasar-nested-gpu.cil
-```
-
-**Check it worked:** `systemctl is-enabled docker` says `enabled`; on NVIDIA,
-`docker info` lists `nvidia` under Runtimes.
+**Check it worked:** `systemctl is-enabled docker` says `enabled` on systemd hosts.
 
 Optional: [console mode](/quasar/admin/console/) needs the console rules from
 [Device rules](/quasar/install/device-rules/), and the [UDP send
@@ -97,19 +81,6 @@ sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes /var/lib/quasar/te
 
 Use the owner that suits your host.
 
-**Pin the images by digest.** The seed refuses tags. This prints all three digests
-for the current stable release:
-
-```bash
-for i in quasar-recovery quasar-control-plane quasar-node-agent; do
-  docker pull -q ghcr.io/accreleus/quasar/$i:latest >/dev/null &&
-  docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-    ghcr.io/accreleus/quasar/$i:latest | grep -m1 "^ghcr.io/accreleus/quasar/$i@"
-done
-```
-
-Use its output where the examples say `@sha256:<digest>`.
-
 ## Install the first machine
 
 The first machine runs the control plane. A combined host also runs a node agent,
@@ -119,7 +90,7 @@ so one machine with a GPU is a complete install.
 <TabItem label="docker run">
 
 ```bash
-docker run -d --name quasar-seed --restart unless-stopped \
+docker run -d --name quasar-seed --restart unless-stopped --pull always \
   --security-opt label=disable \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v quasar-machine:/var/lib/quasar-machine:ro \
@@ -127,9 +98,9 @@ docker run -d --name quasar-seed --restart unless-stopped \
   -e QUASAR_PUBLIC_HOST=192.168.1.50 \
   -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
   -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
-  -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest> \
-  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
-  ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
+  -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane:latest \
+  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent:latest \
+  ghcr.io/accreleus/quasar/quasar-recoveryseed
 ```
 
 </TabItem>
@@ -139,7 +110,8 @@ docker run -d --name quasar-seed --restart unless-stopped \
 services:
   quasar-seed:
     container_name: quasar-seed
-    image: "ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest>"
+    image: "ghcr.io/accreleus/quasar/quasar-recovery:latest"
+    pull_policy: always
     command: seed
     restart: unless-stopped
     security_opt: [label=disable]
@@ -148,8 +120,8 @@ services:
       QUASAR_PUBLIC_HOST: "192.168.1.50"
       QUASAR_HOME_ROOT: "/var/lib/quasar/homes"
       QUASAR_TEMPLATE_ROOT: "/var/lib/quasar/templates"
-      QUASAR_CONTROL_PLANE_IMAGE: "ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<digest>"
-      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>"
+      QUASAR_CONTROL_PLANE_IMAGE: "ghcr.io/accreleus/quasar/quasar-control-plane:latest"
+      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent:latest"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - quasar-machine:/var/lib/quasar-machine:ro
@@ -169,7 +141,7 @@ volumes:
 - **Behind a reverse proxy:** add `QUASAR_TRUSTED_PROXIES`. See [Behind a reverse
   proxy](/quasar/network/reverse-proxy/).
 - **Postgres:** `postgres:16-alpine`, pinned by the recovery actor.
-  `QUASAR_POSTGRES_IMAGE` pins another, by digest. Quasar never updates it.
+  `QUASAR_POSTGRES_IMAGE` names another (a tag is pinned at install). Quasar never updates it.
 
 You don't set a database password, secret key, enrollment string or admin account.
 The recovery actor generates the secrets, and you claim the instance in the browser:
@@ -220,7 +192,7 @@ once and expires after an hour by default (up to 30 days).
 <TabItem label="docker run">
 
 ```bash
-docker run -d --name quasar-seed --restart unless-stopped \
+docker run -d --name quasar-seed --restart unless-stopped --pull always \
   --security-opt label=disable \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v quasar-machine:/var/lib/quasar-machine:ro \
@@ -228,8 +200,8 @@ docker run -d --name quasar-seed --restart unless-stopped \
   -e QUASAR_ENROLLMENT='qenr1.…' \
   -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
   -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
-  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest> \
-  ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest> seed
+  -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent:latest \
+  ghcr.io/accreleus/quasar/quasar-recoveryseed
 ```
 
 </TabItem>
@@ -239,7 +211,8 @@ docker run -d --name quasar-seed --restart unless-stopped \
 services:
   quasar-seed:
     container_name: quasar-seed
-    image: "ghcr.io/accreleus/quasar/quasar-recovery@sha256:<digest>"
+    image: "ghcr.io/accreleus/quasar/quasar-recovery:latest"
+    pull_policy: always
     command: seed
     restart: unless-stopped
     security_opt: [label=disable]
@@ -248,7 +221,7 @@ services:
       QUASAR_ENROLLMENT: "qenr1.…"        # single use; may be deleted once enrolled
       QUASAR_HOME_ROOT: "/var/lib/quasar/homes"
       QUASAR_TEMPLATE_ROOT: "/var/lib/quasar/templates"
-      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<digest>"
+      QUASAR_AGENT_IMAGE: "ghcr.io/accreleus/quasar/quasar-node-agent:latest"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - quasar-machine:/var/lib/quasar-machine:ro
@@ -262,7 +235,11 @@ volumes:
 
 On every machine:
 
-- **Images by digest.** A tag is refused before anything is created.
+- **Images.** Name the `:latest` tags as shown. The seed pulls them once, pins each to its
+  digest, and records only the digests; if a pull fails it creates nothing and tries again.
+  A moved tag never changes an installed machine, and redeploying the seed does not
+  update it: updates are the console's **Releases** page. You may also give
+  `repository@sha256:<digest>` to install an exact build.
 - **Both mounts.** The engine socket, and the `quasar-machine` volume read-only. In a
   stack, keep the `name: quasar-machine` line, or the seed refuses to install
   (`seed-self-invalid`).

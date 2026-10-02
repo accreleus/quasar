@@ -1,236 +1,59 @@
 ---
-title: First run and checks
-description: Claim the first admin account, finish the five-step setup wizard, then check the install end to end.
+title: Create your account
+description: Open Quasar, read your one-time claim token and create the administrator account.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 import Shot from '../../../components/Shot.astro';
 import setup_claim from '../../../assets/shots/setup-claim.png';
-import setup_hosts from '../../../assets/shots/setup-hosts.png';
 
-The first time you open Quasar, it sends you to `/setup`. The wizard is resumable:
-close the tab and you come back where you left off. Then [check your
-install](#check-your-install). On Podman, use `podman` where a command says `docker`.
+## Claim your instance
 
-<Shot
-	label="Setup wizard"
-	sublabel="Step 1 of the five-step first-run wizard, on an instance nobody has claimed yet."
-	src={setup_claim}
-	alt="The Quasar first-run setup wizard, on the claim step"
-/>
-
-## Step 1: Claim
-
-Create the first admin account. It needs a one-time setup token, which only
-someone with shell access to the host can read:
+1. Open Quasar at the HTTPS address chosen during installation, for example `https://192.168.1.50:8443`. An unclaimed instance opens `/setup`.
+2. Read the one-time claim token on your server:
 
 ```bash
 docker exec quasar-control-plane cat /run/quasar/setup-token
 ```
 
-On a [legacy Compose install](/quasar/install/legacy-compose/), from the stack directory:
+Use `podman` instead of `docker` for Podman installations, as the account that
+runs the engine (root for a rootful Podman install).
 
-```bash
-docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
-  cat /run/quasar/setup-token
-```
+3. Enter the token, email, username and password in the Claim step. This creates your administrator account.
 
-Paste the token with the email, username and password you want.
-
-<Aside type="note" title="Restarting rotates the token">
+<Aside type="caution" title="Warning: restarting rotates the token">
 If the control plane restarts before you claim, read the token again.
 </Aside>
 
-### Or skip the wizard entirely
+<Shot label="Claim your instance" sublabel="Create the administrator account with the token from your server." src={setup_claim} alt="The Quasar setup wizard on the claim step" />
 
-Legacy Compose and source installs only (an owned install always uses the token).
-Set all three in `deploy/.env` before the first boot, with a strong password:
+## Finish setup
 
-```bash
-BOOTSTRAP_ADMIN_EMAIL=you@example.com
-BOOTSTRAP_ADMIN_USERNAME=you
-BOOTSTRAP_ADMIN_PASSWORD=
-```
+The wizard saves your progress, so you can return later.
 
-The control plane creates that admin at startup (and does nothing once an admin
-exists), and the Claim step is skipped. Registration never creates an admin.
-
-## Step 2: Basics
-
-Choose how new accounts are created (change later under Admin ▸ People ▸ Invites):
-
-| Mode | Behaviour |
+| Step | Choose or check |
 | --- | --- |
-| `closed` | Default. Only you create accounts. |
-| `invite_only` | Registration needs an invite code. |
-| `open` | Anyone who can reach the page can register. |
+| Basics | Keep registration closed, require an invite, or allow open registration. You can change this under People ▸ Invites. |
+| Hosts | Check that your GPU host is online and follow any failing [readiness checks](/quasar/troubleshooting/readiness/). Keep the storage path chosen at install unless you intend to reconfigure it. |
+| Libraries | Enable Steam and choose who can use it. Quasar prepares the launcher on your hosts. |
+| Finishing touches | Optionally add a SteamGridDB key for artwork, enable microphone support and start a library scan. |
 
-**Open setup through the address users will use**, including your reverse proxy's
-public hostname. From 0.2.4, **Continue** saves that origin for streaming, keeping
-any already allowed. It doesn't configure DNS or proxy routing.
+Use the address your players will use during setup. **Continue** saves that
+origin for streaming; it does not configure DNS or a proxy. An explicitly set
+`QUASAR_ALLOWED_ORIGINS` overrides setup's choice; see
+[Allowed origins](/quasar/network/reverse-proxy/#allowed-origins).
 
-If `QUASAR_ALLOWED_ORIGINS` is set (even empty), it wins; setup tells you if it
-rejects this address. On older releases, set the
-[allowed origins by hand](/quasar/network/reverse-proxy/#allowed-origins) before
-testing a stream.
-
-## Step 3: Hosts
-
-Shows what each node agent actually reported: registered, GPUs found, encoder
-detected, and named problems like a missing `/dev/uinput` or input rules. See
-[Readiness checks](/quasar/troubleshooting/readiness/). Nothing here blocks you.
-
-It also sets each host's home root. You can keep the reported root or pick a
-subdirectory. For a different root, reconfigure the host through its recovery
-actor (it reverts if the agent doesn't verify):
-
-```bash
-docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HOME_ROOT=/mnt/homes
-```
-
-Existing homes are not moved; see [Storage](/quasar/admin/hosts/#storage).
-
-<Shot
-	label="Setup wizard, hosts step"
-	sublabel="The host and GPU check for a host whose virtual input is not set up: its input checks fail, block launches, and name host preparation as the fix."
-	src={setup_hosts}
-	alt="The host and GPU check step of the setup wizard, showing a host with passing checks and two failing input checks"
-/>
-
-## Step 4: Libraries
-
-Turn on a library provider (Steam today) and choose who sees it: everyone, only
-you, or later. Quasar installs the image on your hosts and adds the launcher app.
-
-From 0.2.4, Steam images also prepare files for new users in the background; see
-[Steam preparation](/quasar/install/steam-preparation/). The Steam image is
-public. If it fails to install, check Admin ▸ Fleet ▸ Jobs and
-[Images](/quasar/admin/images/).
-
-## Step 5: Finishing touches
-
-All optional, all changeable later:
-
-- A SteamGridDB API key for cover art (later: Admin ▸ Library ▸ Sources). On an
-  owned install, a fresh install needs it again.
-- Browser microphone on or off.
-- Start the first Steam library scan. A failed scan doesn't block you.
-
-<Aside type="caution" title="Back up the secret key">
-`QUASAR_SECRET_KEY` cannot be recovered. On an owned install it lives in the
-`quasar-machine` volume: never delete it. On legacy Compose, back up `deploy/.env`.
+<Aside type="caution" title="Keep your persistent data">
+The `quasar-machine` volume contains the secret key and recovery state. Never
+delete it. Back up your [database and homes](/quasar/operations/backup/) to preserve
+accounts, games and saves.
 </Aside>
 
-## After the wizard
-
-1. Check Admin ▸ Fleet ▸ Releases reads `stable` ([Channels](/quasar/admin/releases/#channels)).
-2. [Check your install](#check-your-install) end to end.
-3. [Add apps](/quasar/admin/apps/).
-4. [Invite people](/quasar/admin/users/).
+Continue with [Set up your game library](/quasar/playing/library/), then
+[Play your first session](/quasar/playing/in-session/). You can
+[invite other people](/quasar/admin/users/) from the admin area.
 
 ## Check your install
 
-Work down the list. Each step assumes the ones above passed.
-
-### 1. The control plane answers
-
-```bash
-curl http://localhost:8080/health
-```
-
-Expected: `{"status":"ok","db":"ok"}`. This works before HTTPS is set up.
-
-### 2. The containers are up
-
-```bash
-docker ps --filter label=io.quasar.installation
-```
-
-| Machine | You want |
-| --- | --- |
-| Combined host | `quasar-recovery`, `quasar-postgres`, `quasar-control-plane`, `quasar-node-agent` |
-| Control-only host | `quasar-recovery`, `quasar-postgres`, `quasar-control-plane` |
-| GPU host | `quasar-recovery`, `quasar-node-agent` |
-
-All should be healthy. The seed (`quasar-seed`) is not listed. With your own
-database there is no `quasar-postgres`.
-
-The recovery actor lists the same services and anything in the way:
-
-```bash
-docker exec quasar-recovery quasar-recovery status
-```
-
-On a [legacy Compose install](/quasar/install/legacy-compose/), use
-`docker compose -f deploy/docker-compose.yml ps`.
-
-### 3. The node agent registered
-
-Your machine should be in **Admin ▸ Fleet ▸ Hosts** with a recent heartbeat. From
-the shell:
-
-```bash
-curl http://127.0.0.1:9091/health
-```
-
-```json
-{"status":"ok","sessions":0,"connected":true}
-```
-
-`connected: false` means the agent can't reach the control plane. On a GPU host, the
-enrollment string may be spent or expired: create a fresh command. See [When it says
-no](/quasar/install/second-host/#when-it-says-no).
-
-### 4. The GPU was found, and an encoder with it
-
-Open the host in **Admin ▸ Fleet ▸ Hosts**. The GPU should be listed with a render
-node and an encoder. A GPU with no encoder is the common failure: see [Install and
-startup problems](/quasar/troubleshooting/install/).
-
-```bash
-ls -l /dev/dri
-```
-
-No `renderD128` means no GPU is available to containers.
-
-### 5. Virtual input works
-
-```bash
-ls -l /dev/uinput
-```
-
-It must exist and be **writable** by the agent. The host detail page's readiness
-check tests this.
-
-### 6. A session actually streams
-
-Launch something from the library in Chrome. You should see moving video and hear
-audio.
-
-<Aside type="caution" title="A session in the `running` state is not proof">
-A session can report running while the browser decodes nothing. Look at the picture.
-</Aside>
-
-Press **Ctrl+Alt+Shift+Q**, turn on performance stats, and check the frame rate is
-close to the tier you launched.
-
-### 7. Certificates cover the address you use
-
-The certificate must name the address you browse to. The names come from
-`QUASAR_PUBLIC_HOST` and `QUASAR_TLS_HOSTS` (on legacy Compose, `QUASAR_TLS_HOSTS` in
-`deploy/.env`). To fix a missing one, see [HTTPS and
-certificates](/quasar/network/https/).
-
-```bash
-docker exec quasar-control-plane \
-  sh -c 'openssl x509 -in /var/lib/quasar-control/tls/cert.pem -noout -text' \
-  | grep -A1 'Subject Alternative Name'
-```
-
-On legacy Compose, use `docker compose -f deploy/docker-compose.yml exec
-quasar-control-plane` instead of `docker exec quasar-control-plane`.
-
-### If something failed
-
-See [Install and startup problems](/quasar/troubleshooting/install/) and [Health and
-logs](/quasar/operations/health/).
+If anything is missing, follow the [installation checks](/quasar/install/verify/)
+before changing your setup.

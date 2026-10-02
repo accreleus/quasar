@@ -15,14 +15,11 @@ The admin area is at `/admin`, for accounts with the admin role.
 	alt="The Quasar admin overview page"
 />
 
-## How admin access is enforced
+## Admin access
 
-The server checks the admin role on every admin API call. Hiding `/admin` from
-non-admins is only for tidiness; typing the URL gets a page that loads no data.
-
-The first admin is created through the first-run wizard's setup token. A legacy
-Compose install or source checkout can instead set the `BOOTSTRAP_ADMIN_*`
-environment variables. Registration only creates ordinary users.
+[Create your account](/quasar/install/first-run/) creates the first admin using
+the setup token. Other registrations create ordinary users. The server checks
+the admin role on every admin API request.
 
 ## The map
 
@@ -37,14 +34,13 @@ environment variables. Registration only creates ordinary users.
 | **Streaming** | **Launch profiles** (tiers users pick), **Stream profiles** (encode rungs). |
 | **People** | **Users** (roles, session limits), **Invites** (registration mode, codes). |
 
-## A sensible order for a new instance
+## Start here
 
-1. Check hosts and GPUs under **Fleet ▸ Hosts**.
-2. Install images under **Library ▸ Images**.
-3. Create apps under **Library ▸ Apps**.
-4. Check the tiers under **Streaming ▸ Launch profiles**.
-5. Set the registration mode and invite people under **People ▸ Invites**.
-6. Play something, then check it under **Sessions**.
+1. Check the host and GPU under **Fleet ▸ Hosts**.
+2. [Set up your game library](/quasar/playing/library/), or install an image and
+   [create an app](/quasar/admin/apps/) for another launcher or desktop.
+3. [Play your first session](/quasar/playing/in-session/).
+4. Set registration and invite people under **People ▸ Invites**.
 
 ## What the admin area does not do
 

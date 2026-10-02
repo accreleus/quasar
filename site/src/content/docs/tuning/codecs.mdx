@@ -23,9 +23,9 @@ A host's codecs depend on its encoder. See [Encoders](/quasar/tuning/encoders/).
 
 | Codec | Catalog bitrate target | Decodes in Chrome |
 | --- | --- | --- |
-| H.264 | Baseline | Everywhere |
+| H.264 | Baseline | Browser-session fallback |
 | HEVC | 30 to 40% lower | Only with OS hardware decode |
-| AV1 | 40 to 50% lower | Everywhere, with a software fallback |
+| AV1 | 40 to 50% lower | When the browser reports support; software decode may be used |
 
 These are the shipped catalog's targets, not a guarantee of equal quality. A
 better codec buys bandwidth headroom, not latency: it matters on a constrained
@@ -44,8 +44,9 @@ that passes four checks:
 3. **It hasn't failed for this client before.**
 4. **Hardware encode is available**, where the rung requires it.
 
-Every tier ends in an H.264 rung, so something always works. The default order is
-AV1, then HEVC, then H.264.
+Every shipped tier ends in an H.264 rung as a compatibility fallback. A launch
+still needs an eligible host and a working client. The default order is AV1, then
+HEVC, then H.264.
 
 ## HEVC in Chrome
 
@@ -62,8 +63,9 @@ so testing HEVC needs a real browser on macOS or Windows.
 
 ## AV1
 
-Chrome decodes AV1 everywhere (software decode costs a few ms per frame on a
-desktop CPU). AV1 is more often limited by the host's encoder than by the client.
+AV1 availability is checked per device. A browser may use software decoding when
+hardware decoding is unavailable, which increases client CPU use. Select H.264
+if AV1 playback is not smooth on your device.
 
 ## H.264 profile
 

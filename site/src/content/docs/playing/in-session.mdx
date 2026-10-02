@@ -1,5 +1,5 @@
 ---
-title: In a session
+title: Play your first session
 description: Input capture, the session drawer, gamepads, Escape, microphone, quick switch and health banners.
 ---
 
@@ -32,6 +32,16 @@ Escape reaches the game only with all three: a Chromium-based browser,
 fullscreen, and HTTPS. Otherwise Escape leaves fullscreen, and the drawer says
 what's missing. If Escape isn't working, check HTTPS first.
 
+## Fullscreen
+
+Use **Fullscreen** in the session menu. Fullscreen, HTTPS and a Chromium browser
+let Escape reach the game rather than leave fullscreen.
+
+## Ending the session
+
+Press **Exit session** in the drawer, or close the tab. Your saves are kept in
+your home directory. You then get a short summary of the session.
+
 ## Gamepads
 
 Press a button after connecting a controller: browsers hide it until it sends
@@ -53,17 +63,17 @@ A live microphone always shows a **MIC** indicator that can't be hidden.
 Swap to another app without ending the session. The stream stays up while the
 new app starts.
 
-## Scaling and fullscreen
+## Stream settings
 
-Scaling sets how the stream fits your window. Fullscreen is a toggle, and is
-required for Escape to reach the game.
+| Setting | Use it to |
+| --- | --- |
+| Scaling | Fit the stream to your browser window. |
+| Stream resolution | Change the video size, up to your launch size. Return to launch size to resume automatic resolution changes when enabled. |
+| Render resolution | Change the game's rendering size, up to the launch size. |
+| Interface scale | Adjust the hint used for app interface sizing. |
 
-The launch tier sets the maximum resolution and frame rate. In a session you can
-change stream resolution, render resolution and the interface-scale hint, each
-up to the launch size. Setting stream resolution back to the launch size lets
-automatic resolution changes resume, if enabled.
-
-There is no manual frame-rate control.
+The launch quality sets the maximum resolution and frame rate. There is no
+manual frame-rate control during a session.
 
 ## Performance stats
 
@@ -100,8 +110,3 @@ sessions on its own.
 ## Not available yet
 
 **Screenshot** and **Save last 30 seconds** are shown but disabled.
-
-## Ending the session
-
-Press **Exit session** in the drawer, or close the tab. Your saves are kept in
-your home directory. You then get a short summary of the session.

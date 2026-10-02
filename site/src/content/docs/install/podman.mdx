@@ -3,19 +3,19 @@ title: Install with Podman
 description: "Run Quasar's seed under rootful Podman as a Quadlet systemd unit (experimental), and check on it afterwards. Rootless has its own page."
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 
 On Podman, Quasar's seed runs as a **Quadlet** unit: a small file that systemd
 runs like any other service. The [quick start](/quasar/start/quickstart/) writes
-and starts it for you. This page covers doing it by hand and working with it
-afterwards. Inputs, roles and the recovery actor are the same as on
+for you to save and start. This page covers host preparation, starting the unit
+and checking the installation. Inputs, roles and the recovery actor are the same as on
 [Docker](/quasar/install/docker/#what-gets-installed).
 
 ## Rootful first
 
 This page is **rootful** Podman (experimental): Podman runs as root. To run Quasar
 as an ordinary account instead, follow [Install rootless](/quasar/install/rootless/).
-Status per platform: [Engine profiles](/quasar/start/engine-profiles/).
+Status per platform: [Container engines](/quasar/start/requirements/#container-engines).
 
 | | Rootful | Rootless |
 | --- | --- | --- |
@@ -46,26 +46,11 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
 | `podman-restart.service` | Brings Quasar's containers back after a reboot: Podman has no daemon to do it. |
 | `/etc/tmpfiles.d/quasar.conf` | Makes the agent's runtime directory at every boot. `/run` is emptied on reboot and Podman, unlike Docker, never creates a missing mount source, so without it the agent can't start after a reboot. |
 
-**NVIDIA:** install the [NVIDIA Container
-Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
-then describe the GPU to Podman. Run it again after a driver upgrade.
-
-```bash
-sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-```
-
-On SELinux (Fedora and its relatives), also let containers open the NVIDIA
-devices. SELinux stays enforcing:
-
-```bash
-sudo setsebool -P container_use_xserver_devices on
-echo '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' > quasar-nested-gpu.cil
-sudo semodule -i quasar-nested-gpu.cil
-```
+**NVIDIA:** complete [NVIDIA setup for Podman](/quasar/install/nvidia/#podman-rootful)
+before deploying. It includes CDI device generation, verification and SELinux policy.
 
 **Check it worked:** `systemctl is-enabled podman.socket podman-restart.service`
-says `enabled` twice, `ls -ld /run/quasar-agent` shows the directory, and on
-NVIDIA `nvidia-ctk cdi list` lists the GPU.
+says `enabled` twice, and `ls -ld /run/quasar-agent` shows the directory.
 
 Optional: [console mode](/quasar/admin/console/) needs the console rules from
 [Device rules](/quasar/install/device-rules/), and the [UDP send
@@ -73,23 +58,17 @@ buffer](/quasar/tuning/latency/#the-udp-send-buffer) makes streams smoother.
 
 ## Installing
 
-<Steps>
-
-1. **Quick start (recommended).** Pick Podman and go to **Result**. Run the
-   script it shows from an account with `sudo`. It resolves the image digests and
-   installs the unit.
-
-2. **Or by hand.** The Result step also shows the unit with placeholder digests.
-   Resolve them with `podman pull` and `podman image inspect`, fill in the
-   `Image=` and `Environment=QUASAR_*_IMAGE=` lines, write the file to the path
-   above, then:
+1. In the [quick start](/quasar/start/quickstart/), choose **Podman** and download the Quadlet configuration from **Result**.
+2. Save it as `/etc/containers/systemd/quasar-seed.container`, then load and start it:
 
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl start quasar-seed
    ```
 
-</Steps>
+The compatible seed resolves image tags to immutable digests on first install.
+Keep the machine-state volume and user homes when changing the unit.
+
 
 ## Adding a GPU host
 
@@ -107,24 +86,8 @@ sudo podman exec quasar-recovery quasar-recovery status
 ```
 
 The recovery actor's `status` is the most useful: it reports the install itself.
-Then continue with [First run and checks](/quasar/install/first-run/), using
+Then continue with [Create your account](/quasar/install/first-run/), using
 `sudo podman` where it says `docker`.
-
-## Only trying it out
-
-For a quick look without Quadlet, the Result step's "only trying it out" section
-has a bare `podman run`:
-
-```bash
-sudo podman run -d --name quasar-seed --restart unless-stopped \
-  --security-opt label=disable \
-  -v "/run/podman/podman.sock:/var/run/docker.sock" \
-  -v quasar-machine:/var/lib/quasar-machine:ro \
-  ... \
-  <seed image> seed
-```
-
-It is less reliable across reboots. Use the Quadlet unit for anything you keep.
 
 ## Boot behaviour
 

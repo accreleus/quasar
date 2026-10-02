@@ -17,16 +17,12 @@ the choice as `encoder resolved`:
 | Intel | VA-API |
 | None | openh264 |
 
-To override, set it in your `.env`. Values: `vulkan`, `va`, `nvenc`, `openh264`.
-
-```bash
-QUASAR_ENCODER=vulkan
-```
-
-Or override one machine from **Admin ▸ Fleet ▸ Hosts**, on that host's Settings
-page. It's a restart setting: it applies once approved and the host is idle, and
-never ends a running session. See
+To change it, open **Admin ▸ Fleet ▸ Hosts ▸ Settings**. It applies once approved
+and the host is idle, without ending a running session. See
 [Per-host settings](/quasar/admin/hosts/#per-host-settings).
+
+For an environment-managed agent, set `QUASAR_ENCODER` to `vulkan`, `va`, `nvenc`
+or `openh264` in its environment.
 
 An explicit value does not bypass a known codec compatibility restriction.
 
@@ -50,32 +46,16 @@ avoid a tiling defect on affected NVIDIA hardware.
 
 ### AV1 driver compatibility
 
-RTX 5090 (PCI ID `10de:2b85`) with NVIDIA **595.99.02** produces corrupted Vulkan
-AV1 video. **610.57.04** produces clean output, including on Unraid with the open
-kernel modules. This is host encoding, not browser decoding. 610.57.04 is
-validated working; it is not a universal minimum for every GPU.
+**NVIDIA GPUs require driver version 610 or newer.** This is Quasar's supported
+driver baseline. After updating the driver, recreate the agent container and check
+its reported driver and codecs in **Fleet ▸ Hosts**.
 
-What Quasar does:
+On Unraid, also confirm the package supplies the open kernel modules your GPU
+needs; see [NVIDIA setup on Unraid](/quasar/install/nvidia/#unraid).
 
-- If any render device on the host matches the affected combination, AV1 is
-  removed from the host's codecs (with Vulkan or NVENC), and host readiness says
-  why. Sessions use HEVC or H.264 where the profile and client allow.
-- An AV1-only profile has no eligible codec on that host: allow another codec or
-  use another host.
-- Choosing `nvenc` or setting `QUASAR_VULKAN_AV1=0` does not bypass this.
-- Unlisted GPU and driver combinations stay eligible. That isn't a claim they were
-  all validated.
-
-After a driver update, recreate the agent container and check its reported driver
-and codecs; compatibility is reassessed at startup. On Unraid, confirm the package
-supplies the open kernel modules your GPU needs.
-
-On an older release without this protection, choose HEVC or H.264 explicitly on
-the affected driver. Check your release notes.
-
-Driver-volume provisioning can supply missing container libraries, including the
-Vulkan ICD, but not the host kernel driver. It is not a reason to switch to NVENC.
-If the Vulkan loader can't initialize, check the host's readiness findings.
+Known AV1 restrictions can remove that codec from a host. Use HEVC or H.264 where
+the profile and client support it. Precise regression evidence and existing codec
+guards are in [NVIDIA compatibility reference](/quasar/reference/nvidia-compatibility/).
 
 ## VA-API
 

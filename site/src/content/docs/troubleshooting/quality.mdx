@@ -17,7 +17,7 @@ Keep the browser tab visible; a hidden tab gives `indeterminate_client_hidden`.
 Loss and round trip time rose together with a bitrate drop.
 
 - Use wired ethernet on both ends. This is usually the biggest win.
-- Apply the socket buffer sysctl from [Requirements](/quasar/start/requirements/).
+- Check the [UDP send buffer](/quasar/tuning/latency/#the-udp-send-buffer) on the host.
 - Drop to a lower quality tier.
 - Check adaptive bitrate is on, in `smooth` mode.
 - Look for other traffic on the link.

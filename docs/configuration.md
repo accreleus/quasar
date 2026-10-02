@@ -1293,8 +1293,9 @@ writes machine state and never talks to the control plane, so restarting, redepl
 updating or removing it never restarts or removes Quasar. It installs any of the three
 machine shapes (`CONTEXT.md` "Combined host"): a **GPU host** (below), a **combined host** or
 a **control-only host** ("Combined and control-only machines" below). It is the
-`quasar-recovery` image run with the `seed` command; start it **by digest** (a tag is
-resolved to its registry digest, and an image with none is refused). A GPU host:
+`quasar-recovery` image run with the `seed` command, by tag or digest (the seed resolves its own
+tag to its registry digest; an image with none is refused). The images it installs may be tags too:
+**image tags are pinned at first install** (below). A GPU host:
 
 ```
 docker run -d --name quasar-seed --restart unless-stopped \
@@ -1470,7 +1471,7 @@ is never logged): `docker exec quasar-control-plane cat /run/quasar/setup-token`
 `BOOTSTRAP_ADMIN_*` is not an input of an owned install.
 
 **Which images.** `QUASAR_CONTROL_PLANE_IMAGE` and `QUASAR_AGENT_IMAGE` are seed inputs,
-by digest, like the GPU host's agent image (a control-only machine names the agent image only
+by tag or digest, like the GPU host's agent image (a control-only machine names the agent image only
 for Add host, which installs it on new GPU hosts, with this machine's recovery image as their
 seed); a combined host's agent image must declare recipe
 revision 2 or later (it reads `ENROLLMENT_TOKEN_FILE`). Postgres defaults to the
@@ -1478,6 +1479,16 @@ revision 2 or later (it reads `ENROLLMENT_TOKEN_FILE`). Postgres defaults to the
 (`recipe::control::DEFAULT_POSTGRES_IMAGE`); `QUASAR_POSTGRES_IMAGE` pins another. It is
 created once and never updated by Quasar (#352 R1); later releases change only their default
 for new installs.
+
+**Image tags are pinned at first install (#440).** A seed image input may be a tag such as
+`…/quasar-node-agent:latest`. On a first install, before anything is created or written, the
+seed and then the actor pull each tag and replace it with the registry digest the engine reports
+for it; machine state, desired state and the containers carry only digests (ADR 0001). A pull
+that fails, or an image with no registry digest, creates nothing (`seed-agent-image-unavailable`
+is retried at the next look; an unusable reference is `seed-inputs-invalid`), so no partial
+install is left. Inputs are read only on a first install: a moved tag, a redeployed seed or a
+restart never changes an installed machine, and updates stay the platform release flow's.
+Giving `repository@sha256:<digest>` installs exactly that build.
 
 **Images from a test registry.** Release trust is a seed input too, recorded at first install
 (the "Recovery actor" table): to install, and later developer-apply, images from a test
@@ -1695,11 +1706,11 @@ registers as `seed_version`.
 | `QUASAR_HOME_ROOT` | — (**required** on first install of a machine with an agent) | Host path of the homes root; bound into the agent at the same path, and the control plane's `QUASAR_HOME_ROOT` on a combined host. Optional on a control-only host. |
 | `QUASAR_TEMPLATE_ROOT` | `templates` beside the home root | Host path of the templates root; bound at the same path. The default is the agent's own (`{QUASAR_HOME_ROOT}/../templates`, normalised: `/srv/quasar/homes` → `/srv/quasar/templates`); `/var/lib/quasar/templates` on a machine with no home root. A machine installed before this default keeps the root its machine state recorded. |
 | `QUASAR_NODE_NAME` | the engine host's name | The agent's `NODE_NAME`; on a combined host also the node name its local enrollment token is bound to. |
-| `QUASAR_AGENT_IMAGE` | — (**required** on first install of a machine with an agent) | The node-agent image as `repository@sha256:<digest>`; a tag is refused. The image must carry an `org.quasar.recipe` revision this actor carries (on a combined host, 2 or later), else the install stops with `recipe_unsupported` before anything is created. On a combined or control-only machine it is also the agent image the control plane's Add host installs on new GPU hosts (`QUASAR_ENROLL_AGENT_IMAGE`, #359), beside this machine's own recovery image as their seed (`QUASAR_ENROLL_SEED_IMAGE`); a control-only machine creates no agent from it, and without it Add host has no agent to offer. Both are recorded at install and reach a revision-2 control plane as `QUASAR_ENROLL_FALLBACK_*`, below the installed release's images (#365). |
-| `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | unset | A combined or control-only machine: overrides of the seed and node-agent images its control plane's Add host installs, as `repository@sha256:<digest>` (a tag refuses the install). Recorded at install and passed to the control plane under the same names; unset, Add host offers the installed release's images, then this machine's install-time ones. |
+| `QUASAR_AGENT_IMAGE` | — (**required** on first install of a machine with an agent) | The node-agent image, as `repository@sha256:<digest>` or a tag (**pinned at first install**, below). The image must carry an `org.quasar.recipe` revision this actor carries (on a combined host, 2 or later), else the install stops with `recipe_unsupported` before anything is created. On a combined or control-only machine it is also the agent image the control plane's Add host installs on new GPU hosts (`QUASAR_ENROLL_AGENT_IMAGE`, #359), beside this machine's own recovery image as their seed (`QUASAR_ENROLL_SEED_IMAGE`); a control-only machine creates no agent from it, and without it Add host has no agent to offer. Both are recorded at install and reach a revision-2 control plane as `QUASAR_ENROLL_FALLBACK_*`, below the installed release's images (#365). |
+| `QUASAR_ENROLL_SEED_IMAGE`, `QUASAR_ENROLL_AGENT_IMAGE` | unset | A combined or control-only machine: overrides of the seed and node-agent images its control plane's Add host installs, as `repository@sha256:<digest>` or a tag (pinned at first install). Recorded at install and passed to the control plane under the same names; unset, Add host offers the installed release's images, then this machine's install-time ones. |
 | `QUASAR_APP_PUID`, `QUASAR_APP_PGID`, `QUASAR_CONTAINER_NETWORK` | unset (the agent's defaults: image user, `none`) | Host defaults for the agent's app containers, with the agent's own meanings ("Node agent — app container & runtime"): numeric ids (Unraid: `99`/`100`), and `none`, `bridge` or `host`. Seed inputs recorded at first install and set on the agent (a GPU host's or a combined host's); an invalid value refuses the install (`token="seed-inputs-invalid"`). Unset renders exactly the agent container it always did. |
-| `QUASAR_CONTROL_PLANE_IMAGE` | — (**required** on a combined or control-only first install) | The control-plane image as `repository@sha256:<digest>`, of a recipe revision this actor carries (`org.quasar.recipe`, stamped by `deploy/build-images.sh control`). |
-| `QUASAR_POSTGRES_IMAGE` | the `postgres:16-alpine` digest this release carries | A Quasar-owned database's image, by digest. Created once, never updated (#352 R1). Refused together with `QUASAR_DATABASE_HOST`. |
+| `QUASAR_CONTROL_PLANE_IMAGE` | — (**required** on a combined or control-only first install) | The control-plane image, as `repository@sha256:<digest>` or a tag (pinned at first install), of a recipe revision this actor carries (`org.quasar.recipe`, stamped by `deploy/build-images.sh control`). |
+| `QUASAR_POSTGRES_IMAGE` | the `postgres:16-alpine` digest this release carries | A Quasar-owned database's image, by digest or tag (pinned at first install). Created once, never updated (#352 R1). Refused together with `QUASAR_DATABASE_HOST`. |
 | `QUASAR_PUBLIC_HOST` | unset | The name or address the console is reached by: a SAN on the control plane's self-signed certificate (the control plane's own `QUASAR_PUBLIC_HOST`). Set it: the control plane's container cannot see the machine's LAN address by itself. |
 | `QUASAR_TLS_HOSTS` | unset | More certificate SANs, comma-separated (the control plane's own `QUASAR_TLS_HOSTS`). |
 | `QUASAR_TRUSTED_PROXIES` | unset (empty) | The reverse proxies in front of the console, with the control plane's own meaning and rules (a `/0` or a malformed entry refuses the install). Recorded at first install and passed to the control plane. |

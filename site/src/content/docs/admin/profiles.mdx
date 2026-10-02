@@ -40,21 +40,17 @@ Twelve launch profiles: 720p, 1080p, 1440p and 4K at 60, 90 and 120 fps.
 
 Each tier's rungs go AV1, then HEVC, then H.264:
 
-| Codec | Bitrate saving vs H.264 | Browser support |
-| --- | --- | --- |
-| AV1 | about 40 to 50% | Chrome everywhere |
-| HEVC | about 30 to 40% | Chrome with OS hardware support (usually macOS and Windows, never Linux) |
-| H.264 | none | everywhere |
-
-The saving matters on a constrained link, not on a fast LAN.
+Browser decode support is measured per device. See [Codecs](/quasar/tuning/codecs/)
+for compatibility and bitrate targets; an AV1 or HEVC rung is used only when the
+host and client support it.
 
 <Aside type="caution" title="4K120 does not work in a browser">
 Browser decode can't keep up. Treat it as waiting on the native client.
 </Aside>
 
-## When to change any of this
+## When to change profiles
 
-Usually don't. Reasons you might:
+Keep the defaults unless you need to:
 
 - **Cap quality**: remove high tiers, or restrict apps to specific tiers, so one
   user can't take a whole GPU at 4K120.

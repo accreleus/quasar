@@ -1,140 +1,67 @@
 ---
-/**
- * The architecture diagram for start/how-it-works.
- *
- * An enlarged version of the inline diagram on the landing page
- * (Landing.astro), drawn against the same product tokens rather than exported
- * as an image, so it stays crisp at any size and follows the theme toggle.
- *
- * Kept in step with Landing.astro by hand. If the shapes there change, change
- * them here too.
- */
-interface Props {
-	/** Caption below the frame. */
-	caption?: string;
-}
-
+interface Props { caption?: string; }
 const { caption } = Astro.props;
+const icons = {
+ browser: 'M3 4h18v13H3z M8 21h8 M12 17v4 M3 8h18',
+ server: 'M4 3h16v7H4z M4 14h16v7H4z M7 6h.01 M7 17h.01 M11 6h6 M11 17h6',
+ game: 'M7 7h10c3 0 5 10 3 12-2 2-5-3-6-3h-4c-1 0-4 5-6 3C2 17 4 7 7 7z M6 11h4 M8 9v4 M16 11h.01 M18 13h.01',
+};
 ---
-
-<figure class="q-arch">
-	<div class="q-arch-frame">
-		<svg
-			class="q-arch-svg"
-			viewBox="0 0 880 400"
-			role="img"
-			aria-label="The browser talks to the control plane over HTTPS, and the control plane directs a node agent over a WebSocket. The node agent starts a game container on a GPU and then sends media and input directly to the browser over WebRTC, with the control plane out of the path."
-		>
-			<defs>
-				<!-- v3 reserves violet for action and retired the violet-to-cyan
-				     spectrum, so this is the accent to its pressed shade. -->
-				<linearGradient id="arch-media" x1="0" y1="0" x2="1" y2="0">
-					<stop offset="0" stop-color="oklch(0.5998 0.2179 273.21)"></stop>
-					<stop offset="1" stop-color="oklch(0.5 0.19 273.21)"></stop>
-				</linearGradient>
-			</defs>
-
-			<!-- Your device -->
-			<rect x="24" y="40" width="216" height="96" rx="16" class="q-anode"></rect>
-			<text x="132" y="82" class="q-alabel">Browser</text>
-			<text x="132" y="108" class="q-asub">YOUR DEVICE</text>
-
-			<!-- Control plane -->
-			<rect x="332" y="40" width="216" height="96" rx="16" class="q-anode"></rect>
-			<text x="440" y="82" class="q-alabel">Control plane</text>
-			<text x="440" y="108" class="q-asub">GO · POSTGRES</text>
-
-			<!-- Node agent -->
-			<rect x="640" y="40" width="216" height="96" rx="16" class="q-anode"></rect>
-			<text x="748" y="82" class="q-alabel">Node agent</text>
-			<text x="748" y="108" class="q-asub">RUST · ONE PER HOST</text>
-
-			<!-- Game container -->
-			<rect x="640" y="216" width="216" height="88" rx="16" class="q-anode"></rect>
-			<text x="748" y="254" class="q-alabel">Game container</text>
-			<text x="748" y="280" class="q-asub">COMPOSITOR · GPU ENCODE</text>
-
-			<!-- Control edges -->
-			<line x1="240" y1="88" x2="332" y2="88" class="q-aedge"></line>
-			<line x1="548" y1="88" x2="640" y2="88" class="q-aedge"></line>
-			<line x1="748" y1="136" x2="748" y2="216" class="q-aedge"></line>
-
-			<text x="286" y="74" class="q-aelabel">HTTPS API</text>
-			<text x="594" y="74" class="q-aelabel">WEBSOCKET</text>
-			<text x="748" y="182" class="q-aelabel">STARTS</text>
-
-			<!-- The media path, which does not go through the control plane -->
-			<path d="M 712 304 L 712 356 L 132 356 L 132 136" class="q-amedia"></path>
-			<text x="422" y="344" class="q-amlabel">WEBRTC · VIDEO, AUDIO AND INPUT</text>
-		</svg>
-	</div>
-	{caption && <figcaption>{caption}</figcaption>}
+<figure class="q-arch" data-architecture>
+ <div class="q-arch-frame">
+  <div class="q-map-heading"><small>QUASAR / CONNECTIONS</small><strong>One host. Two paths.</strong></div>
+  <svg class="q-map" viewBox="0 0 740 475" role="img" aria-labelledby="q-map-title q-map-desc">
+   <title id="q-map-title">Quasar all-in-one architecture</title><desc id="q-map-desc">The browser uses HTTPS to communicate with the control plane, which manages sessions on the GPU host. WebRTC video, audio and input connect the browser directly to the GPU host over LAN or VPN.</desc>
+   <defs><marker id="q-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M1 1 9 5 1 9" fill="context-stroke"/></marker></defs>
+   <rect class="q-boundary" x="412" y="38" width="306" height="408" rx="20"/>
+   <text class="q-group" x="438" y="66">YOUR SERVER</text><text class="q-note" x="438" y="85">All-in-one install</text>
+   <g class="q-route"><path d="M280 158 H440" marker-start="url(#q-arrow)" marker-end="url(#q-arrow)"/><text x="360" y="125">HTTPS</text><text class="q-note" x="360" y="144">Web app &amp; API</text></g>
+   <g class="q-route"><path d="M560 216 V300" marker-end="url(#q-arrow)"/><text x="633" y="256">Session</text><text x="633" y="274">management</text></g>
+   <g class="q-route q-media" data-part="stream"><path d="M160 216 V358 H440" marker-start="url(#q-arrow)" marker-end="url(#q-arrow)"/><text x="288" y="320">Direct WebRTC</text><text class="q-note" x="288" y="341">Video · audio · input</text><text class="q-note" x="288" y="385">Over your LAN or VPN</text></g>
+   {[
+    {id:'browser',x:40,y:100,icon:icons.browser,title:'Your browser',note:'Browse your library · press Play'},
+    {id:'control',x:440,y:100,icon:icons.server,title:'Control plane',note:'Accounts, library & host selection'},
+    {id:'host',x:440,y:300,icon:icons.game,title:'GPU host',note:'Node agent · game & stream'},
+   ].map(n => <g class="q-node" data-part={n.id} transform={`translate(${n.x} ${n.y})`}>
+    <rect width="240" height="116" rx="14"/><rect class="q-icon-tile" x="18" y="18" width="38" height="38" rx="10"/>
+    <svg x="25" y="25" width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d={n.icon}/></svg>
+    <text class="q-node-title" x="18" y="79">{n.title}</text><text class="q-note" x="18" y="99">{n.note}</text>
+   </g>)}
+  </svg>
+  <div class="q-mobile-map"><strong data-part="browser">Your browser</strong><span>↕ HTTPS · web app &amp; API</span><div><small>YOUR SERVER / ALL-IN-ONE</small><strong data-part="control">Control plane</strong><span>↓ Session management</span><strong data-part="host">GPU host</strong></div><p data-part="stream">Browser ↔ GPU host<br/><b>Direct WebRTC</b> · video, audio &amp; input<br/>Over your LAN or VPN</p></div>
+  <div class="q-arch-demo">
+   <button type="button" data-play-sequence>Explore pressing Play →</button>
+   <p aria-live="polite" data-sequence-text>Follow the request, then the direct stream.</p>
+  </div>
+ </div>
+ {caption && <figcaption>{caption}</figcaption>}
 </figure>
-
+<script>
+ for (const figure of document.querySelectorAll('[data-architecture]')) {
+  const sequence = [
+   ['browser', '1. You press Play in your browser.'],
+   ['control', '2. The control plane selects an available GPU host.'],
+   ['host', '3. The node agent starts your game on that host.'],
+   ['stream', '4. Video, audio and input connect directly between browser and GPU host.'],
+  ];
+  let index = 0;
+  const button = figure.querySelector('[data-play-sequence]');
+  button?.addEventListener('click', () => {
+   figure.querySelectorAll('[data-part]').forEach(part => part.classList.remove('selected'));
+   const [part, text] = sequence[index];
+   figure.querySelectorAll(`[data-part="${part}"]`).forEach(el => el.classList.add('selected'));
+   figure.querySelector('[data-sequence-text]').textContent = text;
+   index = (index + 1) % sequence.length;
+   button.textContent = index === 0 ? 'Play again' : 'Next step';
+  });
+ }
+</script>
 <style>
-	.q-arch {
-		margin: 1.75rem 0;
-	}
-
-	.q-arch-frame {
-		border-radius: var(--q-r-lg, 12px);
-		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
-		background: var(--q-ink-2, oklch(0.163 0.018 268));
-		box-shadow: var(--q-shadow-md, 0 6px 20px -6px rgba(0, 0, 0, 0.55));
-		padding: 1.5rem 1.25rem;
-	}
-
-	.q-arch-svg {
-		width: 100%;
-		height: auto;
-		display: block;
-	}
-
-	.q-anode {
-		fill: var(--q-ink-3, oklch(0.208 0.02 268));
-		stroke: var(--q-line-2, rgba(255, 255, 255, 0.12));
-		stroke-width: 1;
-	}
-
-	.q-alabel {
-		fill: var(--q-text, oklch(0.9618 0.0086 247.91));
-		font-family: var(--q-font-ui, sans-serif);
-		font-weight: 600;
-		font-size: 19px;
-		text-anchor: middle;
-	}
-
-	.q-asub {
-		fill: var(--q-text-3, oklch(0.6605 0.0265 259.81));
-		font-family: var(--q-font-mono, ui-monospace, monospace);
-		font-size: 11px;
-		letter-spacing: 0.14em;
-		text-anchor: middle;
-	}
-
-	.q-aedge {
-		stroke: var(--q-text-4, oklch(0.56 0.024 259));
-		stroke-width: 1.25;
-	}
-
-	.q-aelabel,
-	.q-amlabel {
-		fill: var(--q-text-3, oklch(0.6605 0.0265 259.81));
-		font-family: var(--q-font-mono, ui-monospace, monospace);
-		font-size: 11px;
-		letter-spacing: 0.14em;
-		text-anchor: middle;
-	}
-
-	.q-amedia {
-		fill: none;
-		stroke: url(#arch-media);
-		stroke-width: 2;
-	}
-
-	figcaption {
-		margin-top: 0.6rem;
-		font-size: 0.8125rem;
-		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
-	}
+.q-arch {margin:1.5rem 0}.q-arch-frame {border:1px solid var(--q-line-2);border-radius:20px;overflow:hidden;background:var(--q-ink-2)}.q-map-heading {padding:1.4rem 1.6rem 0;display:flex;flex-direction:column;gap:.3rem}.q-map-heading strong {font-size:1.35rem;color:var(--q-text);font-weight:600}.q-map-heading small {font-size:.65rem;letter-spacing:.14em;color:var(--q-text-3)}
+.q-map {display:block;width:100%;height:auto;font-family:inherit}.q-boundary {fill:var(--q-accent-soft);stroke:var(--q-line-2);stroke-dasharray:5 5}.q-group {fill:var(--q-text-2);font-size:11px;font-weight:600;letter-spacing:1.5px}.q-note {fill:var(--q-text-2);font-size:12px;font-weight:400}
+.q-node>rect:first-child {fill:var(--q-ink-3);stroke:var(--q-line-3)}.q-icon-tile {fill:var(--q-accent-soft)}.q-node svg {fill:none;stroke:var(--q-accent-text);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}.q-node-title {fill:var(--q-text);font-size:18px;font-weight:600}
+.q-route {color:var(--q-text-3);fill:var(--q-text-2)}.q-route path {fill:none;stroke:currentColor;stroke-width:1.6;stroke-linejoin:round}.q-route text {text-anchor:middle;font-size:13px;font-weight:600}.q-route .q-note {font-size:11px;font-weight:400}.q-media {color:var(--q-accent-text);fill:var(--q-accent-text)}.q-media path {stroke-width:2.5}.q-node.selected>rect:first-child {stroke:var(--q-accent-text);stroke-width:3}.q-media.selected path {stroke-width:5}
+.q-arch-demo {display:flex;align-items:center;gap:1rem;border-top:1px solid var(--q-line-2);padding:1rem 1.5rem;background:var(--q-ink-3)}.q-arch-demo button {flex-shrink:0;min-height:44px;padding:.5rem .8rem;font:inherit;font-size:.85rem;color:var(--q-text);background:var(--q-accent-soft);border:1px solid var(--q-line-2);border-radius:8px;cursor:pointer}.q-arch-demo button:focus-visible {outline:2px solid var(--q-accent-text);outline-offset:3px}.q-arch-demo p,figcaption {font-size:.85rem;color:var(--q-text-2)}.q-arch-demo p {margin:0;line-height:1.5}.q-mobile-map {display:none}
+@media(max-width:600px){.q-map{display:none}.q-mobile-map{display:flex;flex-direction:column;text-align:center;padding:1.5rem;gap:1rem;color:var(--q-text-2);font-size:.85rem}.q-mobile-map strong{display:block;padding:1rem;border:1px solid var(--q-line-3);border-radius:10px;background:var(--q-ink-3);color:var(--q-text)}.q-mobile-map div{display:flex;flex-direction:column;gap:1rem;padding:1rem;background:var(--q-accent-soft);border:1px dashed var(--q-line-3);border-radius:14px}.q-mobile-map .selected{outline:2px solid var(--q-accent-text);outline-offset:2px}.q-mobile-map small{font-size:.65rem;letter-spacing:.1em}.q-mobile-map p{padding:1rem;border-left:3px solid var(--q-accent-text);background:var(--q-accent-soft);line-height:1.8;margin:0}.q-arch-demo{flex-direction:column;align-items:flex-start}}
+@media(prefers-reduced-motion:reduce){.q-arch *{animation:none!important;transition:none!important}}
 </style>

@@ -138,7 +138,7 @@ and `docker compose --project-directory /opt/quasar-agent up -d` on each GPU hos
 An install can't be switched from rootful to rootless in place.
 
 - **Homes are copied** into a new root owned by the `quasar` account, never
-  re-owned in place ([why](/quasar/start/engine-profiles/#rootless-docker-and-home-ownership)).
+  re-owned in place ([why](/quasar/install/rootless/)).
 - **Same machine or a different one.** Either way, fully uninstall the old
   install before starting the new one.
 - These steps show rootless Podman. For rootless Docker, use `docker` in place of
