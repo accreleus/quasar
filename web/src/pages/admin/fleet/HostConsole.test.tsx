@@ -149,6 +149,40 @@ describe("HostConsole truthful topology", () => {
     ));
   });
 
+  it("#422: Preferred can be re-selected after picking another mode", async () => {
+    const current = await adminApi.getConsoleConfig("token", "host-1");
+    const output = current.capabilities.outputs![0];
+    vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
+      ...current,
+      capabilities: {
+        ...current.capabilities,
+        outputs: [{
+          ...output,
+          modes: [...output.modes, { name: "1920x1080", width: 1920, height: 1080, refresh_millihz: 60000,
+            preferred: false, interlaced: false, clock_khz: 148500, htotal: 2200, vtotal: 1125 }],
+        }],
+      },
+    } as never);
+    vi.mocked(adminApi.updateConsoleConfig).mockResolvedValue(current as never);
+
+    renderPage();
+
+    fireEvent.change(await screen.findByRole("combobox", { name: "Physical output" }), {
+      target: { value: "card1:DP-4" },
+    });
+    const mode = screen.getByRole("combobox", { name: "Physical mode" });
+    fireEvent.change(mode, { target: { value: "1920x1080@60000" } });
+    expect((mode as HTMLSelectElement).value).toBe("1920x1080@60000");
+    fireEvent.change(mode, { target: { value: "__none__" } });
+    expect((mode as HTMLSelectElement).value).toBe("2560x1440@119880");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(adminApi.updateConsoleConfig).toHaveBeenCalledWith(
+      "token", "host-1",
+      { output_id: "card1:DP-4", mode: { width: 2560, height: 1440, refresh_millihz: 119880 } },
+    ));
+  });
+
   it("#521: shows the ApiError message alone, never the machine code prefix", async () => {
     vi.mocked(adminApi.getHost).mockRejectedValue(
       new ApiError(400, "validation_failed", "host id is malformed"),

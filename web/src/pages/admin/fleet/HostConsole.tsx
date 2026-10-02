@@ -271,6 +271,7 @@ export function HostConsole() {
             <ConsoleRow title="Physical output" help="Card-scoped DRM connector. Automatic uses Weston's preferred connected output.">
               <select
                 className="select"
+                aria-label="Physical output"
                 disabled={locked}
                 value={effective.output_id ?? NONE}
                 onChange={(e) => {
@@ -297,12 +298,17 @@ export function HostConsole() {
             <ConsoleRow title="Physical mode" help="Exact DRM timing identity; fractional refresh rates are preserved.">
               <select
                 className="select"
+                aria-label="Physical mode"
                 style={{ width: 260 }}
                 disabled={locked || !selectedOutput}
                 value={selectedModeValue}
                 onChange={(e) => {
-                  const mode = selectedOutput?.modes.find((item) =>
-                    `${item.width}x${item.height}@${item.refresh_millihz}` === e.target.value);
+                  // "Preferred" stores the output's preferred mode: the API pins
+                  // output_id and mode together, so it cannot store a null mode (#422).
+                  const mode = e.target.value === NONE
+                    ? selectedOutput?.modes.find((item) => item.preferred) ?? selectedOutput?.modes[0]
+                    : selectedOutput?.modes.find((item) =>
+                      `${item.width}x${item.height}@${item.refresh_millihz}` === e.target.value);
                   if (mode) setField("mode", {
                     width: mode.width, height: mode.height, refresh_millihz: mode.refresh_millihz,
                   });
