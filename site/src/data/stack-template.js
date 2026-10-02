@@ -36,7 +36,7 @@
  */
 import { proxyConfig } from './proxy-configs.js';
 import { platform } from './platforms.js';
-import { profileFor } from './engine-profiles.js';
+import { ENGINES as ENGINE_TABLE, profileFor } from './engine-profiles.js';
 
 // `process` itself is a Node global, undefined in the browser this module is
 // also bundled for (the quick start's client <script>) — `typeof` is the one
@@ -559,9 +559,10 @@ ${doneBlock(a, r, host, 'docker exec quasar-control-plane')}
  * three image digests with `podman`, writes the Quadlet unit with them
  * substituted in, then starts it through systemd — the same unit `quadlet`
  * returns for on-screen reference, with real digests instead of placeholders.
- * It refuses to start while a host step is missing: podman-restart.service off, or
- * nothing making /run/quasar-agent at boot. Either way Quasar would not come back
- * after a reboot.
+ * It refuses a Podman older than the engine-profile table's minimum (#424: it cannot
+ * change a restart policy), and refuses to start while a host step is missing:
+ * podman-restart.service off, or nothing making /run/quasar-agent at boot. Either way
+ * Quasar would not come back after a reboot.
  */
 function podmanScript(a, r, p) {
   const { uid, gid } = appUser(a);
@@ -585,6 +586,15 @@ ${preflightBlock({
   r,
   external,
 })}
+podman_version="$(sudo podman info --format '{{.Version.Version}}' 2>/dev/null || true)"
+if printf '%s\\n' "$podman_version" | awk -v need='${ENGINE_TABLE.podman.minimumVersion}' '{
+     split($1, h, /[.+-]/); split(need, n, /[.]/)
+     if (h[1] !~ /^[0-9]+$/ || h[2] !~ /^[0-9]+$/) exit 1
+     exit !((h[1] + 0 < n[1] + 0) || (h[1] + 0 == n[1] + 0 && h[2] + 0 < n[2] + 0)) }'; then
+  echo "Podman $podman_version is older than ${ENGINE_TABLE.podman.minimumVersion}. ${ENGINE_TABLE.podman.minimumVersionReason}" >&2
+  echo "Upgrade Podman to ${ENGINE_TABLE.podman.minimumVersion} or later first, or install with Docker." >&2
+  exit 1
+fi
 if ! systemctl is-enabled --quiet podman-restart.service 2>/dev/null; then
   echo "podman-restart.service is off, so Quasar would not come back after a reboot. Run step 1 first:" >&2
   echo "  sudo systemctl enable podman-restart.service" >&2

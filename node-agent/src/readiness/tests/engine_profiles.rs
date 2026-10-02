@@ -50,6 +50,21 @@ fn mode(mode: &str) -> EngineMode {
 }
 
 fn facts(kind: EngineKind, mode: EngineMode, report: Option<&Value>) -> EngineFacts {
+    // A current release of each engine: a row's status is for an engine at least as new as
+    // the table's minimum for it.
+    let version = match kind {
+        EngineKind::Podman => "5.8.4",
+        _ => "29.0.0",
+    };
+    versioned(kind, mode, report, version)
+}
+
+fn versioned(
+    kind: EngineKind,
+    mode: EngineMode,
+    report: Option<&Value>,
+    version: &str,
+) -> EngineFacts {
     let api = ApiVersion {
         major: 1,
         minor: 41,
@@ -64,7 +79,7 @@ fn facts(kind: EngineKind, mode: EngineMode, report: Option<&Value>) -> EngineFa
         info: EngineInfo {
             kind,
             name: "engine".into(),
-            version: "1.0".into(),
+            version: version.into(),
             api_version: api,
             server_min_api: api,
             server_max_api: api,
@@ -271,5 +286,73 @@ fn every_unsupported_row_names_alternatives_that_are_not_unsupported() {
             let target = row(&t, to, text(alt, "engine"), text(alt, "mode"));
             assert_ne!(text(target, "status"), "unsupported", "{r} -> {alt}");
         }
+    }
+}
+
+/// #424: Podman older than the table's minimum cannot change a restart policy, so it is
+/// unsupported on every platform and mode, whatever the row says; the minimum itself is not.
+#[test]
+fn podman_older_than_the_tables_minimum_is_unsupported_everywhere() {
+    let t = table();
+    let minimum = text(&t["engines"]["podman"], "minimumVersion");
+    assert_eq!(
+        minimum, PODMAN_MINIMUM_VERSION,
+        "the agent holds the table's minimum"
+    );
+    assert!(t["engines"]["podman"]["minimumVersionReason"].is_string());
+    assert!(t["engines"]["docker"].get("minimumVersion").is_none());
+    for platform in t["platforms"].as_object().unwrap().keys() {
+        for sample in samples(&t, platform) {
+            let body = os_release(sample);
+            for m in [Rootful, Rootless] {
+                let row_status = text(row(&t, platform, "podman", mode_word(m)), "status");
+                for old in ["4.9.3", "5.0.3"] {
+                    let f = versioned(EngineKind::Podman, m, None, old);
+                    assert_eq!(
+                        reported_status(Some(&body), f),
+                        "unsupported",
+                        "Podman {old} on {}",
+                        text(sample, "name")
+                    );
+                }
+                for current in ["5.1.0", "5.8.4", "6.0"] {
+                    let f = versioned(EngineKind::Podman, m, None, current);
+                    assert_eq!(
+                        reported_status(Some(&body), f),
+                        row_status,
+                        "Podman {current} on {}",
+                        text(sample, "name")
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_old_podman_is_told_why_and_what_to_do() {
+    let root = FakeRoot::new("engine-profiles-old-podman");
+    let env = ProbeEnv {
+        runtime: RuntimeView::Observed {
+            endpoint: "unix:///run/podman/podman.sock".into(),
+            outcome: Ok(versioned(EngineKind::Podman, Rootful, None, "4.9.3")),
+        },
+        ..root.env(false, "")
+    };
+    let checks = probe(&env);
+    let c = get(&checks, ENGINE_ID);
+    assert_eq!(c.status, WARN, "{c:?}");
+    assert!(c.blocks.is_none(), "{c:?}");
+    assert!(
+        c.summary.contains("Podman 4.9.3") && c.summary.contains("older than Podman 5.1"),
+        "{c:?}"
+    );
+    assert!(c.remediation.contains("5.1"), "{c:?}");
+}
+
+fn mode_word(m: EngineMode) -> &'static str {
+    match m {
+        Rootful => "rootful",
+        Rootless => "rootless",
     }
 }

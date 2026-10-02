@@ -36,7 +36,7 @@ safe to repeat.
 | Check | Meaning and fix |
 | --- | --- |
 | `runtime_endpoint` | The Docker or Podman socket answers. Failing blocks the host. If `DOCKER_HOST` and `CONTAINER_HOST` name different engines, unset one. |
-| `runtime_engine` | The engine and its [engine profile](/quasar/start/requirements/#container-engines). Experimental or unsupported profiles warn only. |
+| `runtime_engine` | The engine and its [engine profile](/quasar/start/requirements/#container-engines). Experimental or unsupported profiles warn only. Podman older than 5.1 reads as unsupported: upgrade it, or updates will fail. |
 | `runtime_cdi` | How NVIDIA GPUs reach containers (CDI or `--gpus`). If neither works, the host is blocked: follow [NVIDIA setup](/quasar/install/nvidia/) for your engine, then restart it. |
 | `runtime_cdi_gpu<N>` | The same, per NVIDIA GPU on a mixed-vendor host. Blocks only that GPU. |
 | `engine_healthchecks` | Podman only. Health checks need a systemd session, or installs time out. Rootless: enable lingering for the `quasar` account and restart the Podman service. Rootful: use the systemd cgroup manager. |
