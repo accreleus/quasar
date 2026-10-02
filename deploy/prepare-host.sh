@@ -450,7 +450,8 @@ fi
 # ── console audio (PipeWire) ───────────────────────────────────────────────
 if [ -n "$CONSOLE_AUDIO_USER" ]; then
   STEP="console audio"
-  {
+  dropin_changed=0
+  if {
     cat <<EOF
 # Written by Quasar host preparation (deploy/prepare-host.sh). A second PipeWire
 # Pulse listen socket for console mode, reachable only through
@@ -480,13 +481,42 @@ pulse.properties = {
 }
 EOF
   } | put /etc/pipewire/pipewire-pulse.conf.d/90-quasar-console.conf 0644 \
-      "a Quasar-only PipeWire socket on $CONSOLE_AUDIO_USER's session, so console mode can play audio through a real desktop login without full access to it — restart $CONSOLE_AUDIO_USER's pipewire-pulse (or have $CONSOLE_AUDIO_USER log in again) to pick it up" \
-    || unchanged
+      "a Quasar-only PipeWire socket on $CONSOLE_AUDIO_USER's session, so console mode can play audio through a real desktop login without full access to it"; then
+    dropin_changed=1
+  else
+    unchanged
+  fi
 
   printf '# Written by Quasar host preparation. The console-audio socket %s'"'"'s pipewire-pulse listens on, reachable by the %s group only.\nd /run/quasar-console-audio 0750 %s %s -\n' "$CONSOLE_AUDIO_USER" "$QUSER" "$CONSOLE_AUDIO_USER" "$QUSER" \
     | put /etc/tmpfiles.d/quasar-console-audio.conf 0644 "/run/quasar-console-audio, owned by $CONSOLE_AUDIO_USER and readable by the $QUSER group, recreated at every boot" || unchanged
   run systemd-tmpfiles --create /etc/tmpfiles.d/quasar-console-audio.conf
   stand_in && mkdir -p "$R/run/quasar-console-audio"
+
+  # A running pipewire-pulse reads the drop-in only when it starts (#433). Restart it
+  # only when the drop-in just changed, only for $CONSOLE_AUDIO_USER, and only while that
+  # user's manager runs; otherwise it starts with the drop-in at their next login.
+  restart_cmd="systemctl --user -M $CONSOLE_AUDIO_USER@ restart pipewire-pulse.service"
+  if live; then
+    audio_uid="$(getent passwd "$CONSOLE_AUDIO_USER" | awk -F: '{print $3}')"
+    audio_manager() { systemctl is-active --quiet "user@$audio_uid.service"; }
+  else
+    audio_uid="$(awk -F: -v u="$CONSOLE_AUDIO_USER" '$1==u {print $3}' "$R/etc/passwd")"
+    audio_manager() { [ -e "$R/run/user/$audio_uid/systemd/private" ]; }
+  fi
+  if [ "$dropin_changed" = 1 ] && audio_manager; then
+    if [ "$DRY_RUN" = 1 ]; then
+      say would "restart $CONSOLE_AUDIO_USER's pipewire-pulse, so it opens the console-audio socket now"
+    elif run systemctl --user -M "$CONSOLE_AUDIO_USER@" restart pipewire-pulse.service; then
+      stand_in && : > "$R/run/quasar-console-audio/native"
+      say changed "$CONSOLE_AUDIO_USER's pipewire-pulse restarted — it now also listens on /run/quasar-console-audio/native"
+    else
+      say warn "$CONSOLE_AUDIO_USER's pipewire-pulse did not restart; run: $restart_cmd"
+    fi
+  elif [ "$dropin_changed" = 1 ]; then
+    say note "$CONSOLE_AUDIO_USER has no running user session: their pipewire-pulse opens the console-audio socket when they next log in (if it already runs, run: $restart_cmd)"
+  elif [ ! -e "$R/run/quasar-console-audio/native" ]; then
+    say note "the console-audio socket is not there yet: log $CONSOLE_AUDIO_USER in, or run: $restart_cmd"
+  fi
 fi
 
 # ── kernel modules ─────────────────────────────────────────────────────────
