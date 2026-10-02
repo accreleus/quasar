@@ -24,6 +24,16 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+Quasar 0.4.0 makes a first deployment much simpler. You paste the quick start's stack
+into Docker, Dockge, Arcane or Unraid, or run its command, and one seed container
+installs Quasar and keeps it running. From then on, updates are applied from the
+console, and one that fails its checks is rolled back automatically.
+
+Underneath, this is a major rearchitecture of how Quasar runs. Quasar no longer drives
+the Docker CLI or Compose: the control plane and node agent talk to the container engine
+through its API, and each machine's recovery actor owns its services. That is what lets
+one release run on Docker or Podman, rootful or rootless, with a least-privilege agent.
+
 ### Upgrading
 - **v0.3.0 and earlier are not updated in place.** Install fresh with the quick start, then restore your old database dump into it (see Upgrading in the docs). From 0.4.0 on, updates are applied from the console.
 
