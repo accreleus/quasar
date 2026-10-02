@@ -103,7 +103,10 @@ func (s *Store) previewHomeOwner(ctx context.Context, p CreateParams) (string, e
 		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	return homeClaimOwner(ctx, tx, p)
+	// The menu is advisory: a pending-home hold does not move the home, so the
+	// owner's codecs still apply. The launch decides the hold.
+	owner, _, err := homeClaimLocation(ctx, tx, p)
+	return owner, err
 }
 
 // nil means no candidate GPU rows at all (every GPU blocked, or the fleet down)

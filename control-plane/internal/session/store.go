@@ -74,6 +74,9 @@ type HomeInUseError struct {
 	// SessionID is never empty when this type is returned; a guard that cannot
 	// name the conflict returns plain ErrHomeInUse.
 	SessionID string
+	// Stopping: the session is already tearing down, so the caller only has to
+	// retry in a moment (#434). It changes the message, never the code.
+	Stopping bool
 }
 
 func (e *HomeInUseError) Error() string {
@@ -1094,7 +1097,9 @@ func (s *Store) HasLiveUserAppSession(ctx context.Context, userID, homeAppID, ex
 
 // HomeHostForApp returns the canonical owner for the pre-schedule tile pin, or
 // "" when no home was ever recorded. The reservation transaction repeats this
-// read; this first answer is only an early refusal/UX aid.
+// read; this first answer is only an early refusal/UX aid. It ignores a
+// pending-home hold: whether a hold is in use, settling or stuck is decided,
+// and waited for, only inside ScheduleAndCreate (#434).
 //
 // It is the pre-schedule half of §5: a derived tile provisions nothing, so a host
 // with no home for (user, parent) has literally nothing to mount, and placing it
@@ -1108,7 +1113,7 @@ func (s *Store) HomeHostForApp(ctx context.Context, userID, homeAppID string) (s
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	p := CreateParams{UserID: userID, AppID: homeAppID, ManagedHome: true}
-	owner, err := homeClaimOwner(ctx, tx, p)
+	owner, _, err := homeClaimLocation(ctx, tx, p)
 	if errors.Is(err, ErrHomeConflict) {
 		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
 			return "", fmt.Errorf("rollback home owner read: %w", rollbackErr)

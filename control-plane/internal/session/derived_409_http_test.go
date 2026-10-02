@@ -180,6 +180,49 @@ func TestLaunchHomeInUse409CarriesTheSessionID(t *testing.T) {
 	}
 }
 
+// TestLaunchHomeInUse409DuringTeardownCarriesTheSessionID is #434 at the wire.
+// A cleanup-capable agent's claim hold outlives the stop request, so a relaunch
+// while the previous session is still tearing down used to read "needs operator
+// review". It is the retryable home_in_use, naming the session and saying it is
+// shutting down rather than asking the user to stop it.
+func TestLaunchHomeInUse409DuringTeardownCarriesTheSessionID(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newDerived409Server(t, pool)
+	ctx := context.Background()
+
+	s := seed(t, pool, 8)
+	token, userID := registerUser(t, ctx, authSvc, "teardown@test.local", "teardownuser")
+	parent := seedSteamApp(t, pool, `{"image":"steam:1"}`)
+	provisionHome(t, pool, userID, parent, s.hostID)
+
+	// The first session is created straight through the store, so no dispatch
+	// goroutine races the hold this test records in its place.
+	store := NewStore(pool)
+	p := launchParams(s)
+	p.UserID, p.AppID, p.ManagedHome, p.PinHostID = userID, parent, true, s.hostID
+	first, err := store.ScheduleAndCreate(ctx, p)
+	if err != nil {
+		t.Fatalf("first launch: %v", err)
+	}
+	firstID := first.ID
+	holdHomeFor(t, pool, userID, parent, firstID)
+	if _, err := store.Transition(ctx, firstID, StateStopping, strptr("stop requested"), nil); err != nil {
+		t.Fatalf("stop the first session: %v", err)
+	}
+
+	resp, body := launchHTTP(t, srv.URL, token, parent)
+	if resp.StatusCode != http.StatusConflict || body.Error.Code != "home_in_use" {
+		t.Fatalf("relaunch during teardown: status=%d code=%q message=%q, want 409 home_in_use",
+			resp.StatusCode, body.Error.Code, body.Error.Message)
+	}
+	if body.Error.SessionID != firstID {
+		t.Errorf("error.session_id = %q, want the stopping session %q", body.Error.SessionID, firstID)
+	}
+	if !strings.Contains(body.Error.Message, "shutting down") {
+		t.Errorf("message = %q, want it to say the previous session is shutting down", body.Error.Message)
+	}
+}
+
 // TestLaunchHomeInUse409OmitsAnUnknownSessionID pins the "omitted, never empty"
 // rule: a client branches on the field's PRESENCE, and an empty string would make
 // it render a link to nowhere. The unrelated-quota-style path that returns a bare

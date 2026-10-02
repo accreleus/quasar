@@ -474,7 +474,7 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// running session instead of showing a generic failure for an app the user did
 	// not click. Absent rather than empty when the guard named none.
 	case errors.Is(err, ErrHomeInUse):
-		writeHomeInUse(w, err, "you already have a live session backed by this app's storage; go to it or stop it before launching another")
+		writeHomeInUse(w, err, homeInUseMessage(err, "you already have a live session backed by this app's storage; go to it or stop it before launching another"))
 		return
 	case errors.Is(err, ErrHomeConflict):
 		h.writeHomeConflict(w, r.Context(), req.AppID)
@@ -706,7 +706,7 @@ func (h *Handler) handleSwap(w http.ResponseWriter, r *http.Request) {
 			"the new app needs more VRAM or encode slots than the session reserved")
 		return
 	case errors.Is(err, ErrHomeInUse):
-		writeHomeInUse(w, err, "you already have a live session backed by that app's storage; stop it before swapping")
+		writeHomeInUse(w, err, homeInUseMessage(err, "you already have a live session backed by that app's storage; stop it before swapping"))
 		return
 	case errors.Is(err, ErrHomeConflict):
 		h.writeHomeConflict(w, r.Context(), req.AppID)
@@ -824,6 +824,17 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 		body["session_id"] = id
 	}
 	httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": body})
+}
+
+// homeInUseMessage keeps the live-session wording unless the session in the
+// way is already stopping (#434), when there is nothing to stop or go to: the
+// user only has to retry in a moment. The code and session_id are unchanged.
+func homeInUseMessage(err error, live string) string {
+	var hiu *HomeInUseError
+	if errors.As(err, &hiu) && hiu.Stopping {
+		return "your previous session backed by this app's storage is still shutting down; try again in a moment"
+	}
+	return live
 }
 
 func (h *Handler) writeHomeConflict(w http.ResponseWriter, ctx context.Context, appID string) {
