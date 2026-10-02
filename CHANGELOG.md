@@ -43,6 +43,9 @@ own; the two do not move together, and that is deliberate.
   two columns now stack instead of squeezing the settings to a sliver.
 - **A web test of the trace viewer no longer fails at random (#427).** It hovered the chart
   before the chart had loaded; it now waits for it.
+- **The image-reference test runs again, in `make verify` (#415).** It checked the whole image
+  contract against a stand-in Docker that knew only the older checks, so it had been failing
+  unnoticed; it now checks only which image reference is pulled and inspected.
 - **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
   A reboot empties `/run`, and Podman would not start the agent without its runtime
   directory. The recovery actor now has the engine make it at every start, then starts the

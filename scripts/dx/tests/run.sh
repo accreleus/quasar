@@ -166,6 +166,15 @@ else
   fail "enroll-host:contract" "$(printf '%s' "$eh_out" | grep '^FAIL' | head -n 5)"
 fi
 
+printf '\n== validate-image reference handling (#415) ==\n'
+# Offline: a mock docker records which reference is pulled and inspected.
+# deploy/test-validate-image-refs.sh is the spec; this only records its verdict.
+if vi_out="$(bash "$ROOT/deploy/test-validate-image-refs.sh" 2>&1)"; then
+  pass "validate-image:refs" "$(printf '%s' "$vi_out" | tail -n 1)"
+else
+  fail "validate-image:refs" "$(printf '%s' "$vi_out" | grep '^FAIL' | head -n 5)"
+fi
+
 printf '\n== guards ==\n'
 
 # Guard tests point resolution at the fixture, never the real operator config
