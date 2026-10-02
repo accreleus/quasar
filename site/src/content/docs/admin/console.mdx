@@ -97,6 +97,18 @@ terminal you want.
 
 PipeWire output is newer and less tested than ALSA.
 
+Host preparation with `--console-audio-user USER` makes USER's pipewire-pulse open
+the socket:
+
+| USER is | What happens |
+| --- | --- |
+| Logged in | Host preparation restarts their pipewire-pulse. |
+| Not logged in | The socket opens when they next log in. |
+
+It worked when `/run/quasar-console-audio/native` exists on the host and the
+`console_audio` check names PipeWire. If the check says the socket is missing, run
+as root: `systemctl --user -M USER@ restart pipewire-pulse.service`.
+
 ## Local input
 
 **Grab local input** takes the host's keyboards and mice exclusively for the

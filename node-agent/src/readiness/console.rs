@@ -39,6 +39,9 @@ pub struct AudioView {
     pub route: Result<crate::session::console_audio::Route, crate::session::console_audio::Refusal>,
     /// A console ALSA leg of this agent is playing: an open PCM is then ours.
     pub playing: bool,
+    /// Host preparation made the console-audio socket's directory, but the desktop user's
+    /// pipewire-pulse has not opened the socket in it yet (#433).
+    pub socket_missing: bool,
 }
 
 impl Default for AudioView {
@@ -47,6 +50,7 @@ impl Default for AudioView {
             sinks: Vec::new(),
             route: Ok(crate::session::console_audio::Route::Alsa { device: None }),
             playing: false,
+            socket_missing: false,
         }
     }
 }
@@ -59,6 +63,7 @@ impl AudioView {
             sinks: crate::session::console_audio::sinks(host),
             route: crate::session::console_audio::choose_route(output, host),
             playing,
+            socket_missing: host.socket_missing(),
         }
     }
 }
@@ -109,6 +114,9 @@ pub fn check_audio(v: &ConsoleView) -> ReadinessCheck {
             "console audio is playing on the host's sound device".into(),
         );
     }
+    if a.socket_missing {
+        return socket_missing(&a.route);
+    }
     match &a.route {
         Ok(route @ Route::PipeWire { .. }) => super::pass(
             CHECK_AUDIO,
@@ -154,6 +162,34 @@ pub fn check_audio(v: &ConsoleView) -> ReadinessCheck {
             refusal.to_string(),
             refusal.remediation().into(),
         ),
+    }
+}
+
+/// The host was prepared with `--console-audio-user`, but its socket is not there (#433):
+/// say so and why, whatever console audio does meanwhile.
+fn socket_missing(
+    route: &Result<crate::session::console_audio::Route, crate::session::console_audio::Refusal>,
+) -> ReadinessCheck {
+    use crate::session::console_audio::{PIPEWIRE_SOCKET, RESTART_PIPEWIRE_PULSE};
+    let missing = format!(
+        "the console-audio socket ({PIPEWIRE_SOCKET}) is missing: the desktop user's \
+         pipewire-pulse has not picked up host preparation's drop-in"
+    );
+    let remediation = format!(
+        "Restart the desktop user's pipewire-pulse, as root on the host: \
+         {RESTART_PIPEWIRE_PULSE} (USER is the account given to --console-audio-user), or \
+         have that user log in again. The next console session plays through it."
+    );
+    match route {
+        Ok(route) => super::warn_check(
+            CHECK_AUDIO,
+            format!(
+                "{missing}; console audio plays through {} meanwhile",
+                route.describe()
+            ),
+            remediation,
+        ),
+        Err(refusal) => super::fail(CHECK_AUDIO, format!("{refusal}; {missing}"), remediation),
     }
 }
 
@@ -385,6 +421,56 @@ mod tests {
         assert_eq!(pw.status, super::super::PASS, "{pw:?}");
         assert!(pw.summary.contains("PipeWire"), "{pw:?}");
         assert_eq!(v.audio.sinks[0].id, "pipewire:default");
+    }
+
+    /// #433: the socket directory is there but the socket is not: the check says so,
+    /// says why, and gives the restart command, whether ALSA still works or not.
+    #[test]
+    fn audio_says_the_socket_is_missing_and_how_to_restart_pipewire_pulse() {
+        use crate::session::console_audio::{Refusal, Route};
+        let mut v = view(true);
+        v.audio.socket_missing = true;
+        v.audio.sinks.push(crate::messages::AudioSink {
+            id: "hw:CARD=Generic,DEV=0".into(),
+            label: "ALC1220 Analog".into(),
+        });
+        v.audio.route = Ok(Route::Alsa { device: None });
+        let fallback = check_audio(&v);
+        assert_eq!(fallback.status, super::super::WARN, "{fallback:?}");
+        for want in [
+            "console-audio socket (/run/quasar-console-audio/native) is missing",
+            "pipewire-pulse has not picked up host preparation's drop-in",
+            "the host's default ALSA device",
+        ] {
+            assert!(fallback.summary.contains(want), "{want}: {fallback:?}");
+        }
+        assert!(
+            fallback
+                .remediation
+                .contains("systemctl --user -M USER@ restart pipewire-pulse.service"),
+            "{fallback:?}"
+        );
+        assert!(fallback.blocks.is_none());
+
+        v.audio.route = Err(Refusal::DeviceHeld {
+            device: "hw:CARD=Generic,DEV=0".into(),
+            owner_pid: None,
+        });
+        let held = check_audio(&v);
+        assert_eq!(held.status, super::super::FAIL, "{held:?}");
+        assert!(held.summary.contains("held by another program"), "{held:?}");
+        assert!(held.summary.contains("socket"), "{held:?}");
+        assert!(
+            held.remediation
+                .contains("systemctl --user -M USER@ restart pipewire-pulse.service"),
+            "{held:?}"
+        );
+
+        // An unprepared host keeps the old wording, with no restart advice.
+        v.audio.socket_missing = false;
+        assert!(!check_audio(&v)
+            .remediation
+            .contains("pipewire-pulse.service"));
     }
 
     #[test]

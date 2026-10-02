@@ -42,6 +42,10 @@ own; the two do not move together, and that is deliberate.
   briefly for its cleanup instead of reporting that the home needs operator review.
 - **Steam starts on an NVIDIA host without CDI (#413).** On a rootful Docker that passes the
   GPU with `--gpus`, Steam no longer exits at its GPU check with "Vulkan loader failed".
+- **Console audio through Host PipeWire works straight after host preparation (#433).**
+  `prepare-host.sh --console-audio-user USER` now restarts USER's pipewire-pulse when it
+  writes the drop-in and USER is logged in, and otherwise prints the restart command. The
+  `console_audio` check now says when the console-audio socket is missing, and why.
 - **Missing cover art is fetched again (#441).** If the artwork cache is lost, for example
   when a database is restored into a fresh install, the artwork job now fetches the missing
   images again from the reference it already has. An admin's chosen art stays locked. An

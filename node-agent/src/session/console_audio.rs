@@ -76,7 +76,16 @@ pub trait HostAudio {
     /// The current index of the card whose id is `id`, if the host has it.
     fn card_index(&self, id: &str) -> Option<u32>;
     fn pcm_status(&self, card: u32, device: u32) -> PcmStatus;
+    /// Host preparation made the socket's directory, but no socket is in it: the desktop
+    /// user's `pipewire-pulse` has not restarted since its drop-in was written (#433).
+    fn socket_missing(&self) -> bool {
+        false
+    }
 }
+
+/// What host preparation's console-audio user runs, as root on the host, so a running
+/// `pipewire-pulse` reads the drop-in and opens [`PIPEWIRE_SOCKET`] (#433).
+pub const RESTART_PIPEWIRE_PULSE: &str = "systemctl --user -M USER@ restart pipewire-pulse.service";
 
 /// Where the console audio leg plays.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +403,11 @@ impl HostAudio for LiveHostAudio {
 
     fn pipewire_sinks(&self) -> Vec<PipeWireSink> {
         cached_pipewire_sinks(&self.socket)
+    }
+
+    fn socket_missing(&self) -> bool {
+        self.socket.parent().is_some_and(Path::is_dir)
+            && std::fs::symlink_metadata(&self.socket).is_err()
     }
 
     fn alsa_sinks(&self) -> Vec<AudioSink> {
@@ -902,6 +916,31 @@ mod tests {
         );
         assert_eq!(sinks(&host)[0].id, "pipewire:default");
         assert!(sinks(&host).iter().all(|s| !s.id.starts_with("hw:")));
+    }
+
+    /// #433: host preparation made the socket directory, but the desktop user's
+    /// pipewire-pulse has not been restarted since, so nothing listens in it yet.
+    #[test]
+    fn live_host_audio_says_the_socket_is_missing_only_in_a_prepared_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let unprepared = LiveHostAudio {
+            socket: dir.path().join("absent/native"),
+            asound: dir.path().join("asound"),
+            dev_snd: dir.path().join("snd"),
+        };
+        assert!(!unprepared.socket_missing(), "no directory: not prepared");
+
+        let prepared = LiveHostAudio {
+            socket: dir.path().join("native"),
+            ..unprepared
+        };
+        assert!(prepared.socket_missing());
+
+        // A socket file, listening or stale, is not missing (stale is PipeWireSilent).
+        let listener = std::os::unix::net::UnixListener::bind(&prepared.socket).unwrap();
+        assert!(!prepared.socket_missing());
+        drop(listener);
+        assert!(!prepared.socket_missing());
     }
 
     #[test]
