@@ -61,6 +61,8 @@ fn container(r: &Recorded, index: usize) -> Container {
         mounts: Vec::new(),
         command: r.command.clone(),
         env: r.env.clone(),
+        created: None,
+        started_at: None,
     }
 }
 

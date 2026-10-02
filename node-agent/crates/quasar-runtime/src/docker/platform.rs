@@ -222,6 +222,8 @@ async fn inspect_with(
         mounts,
         command,
         env: config.env.unwrap_or_default(),
+        created: info.created.filter(|v| !v.is_empty()),
+        started_at: state.started_at.filter(|v| !v.is_empty()),
     }))
 }
 

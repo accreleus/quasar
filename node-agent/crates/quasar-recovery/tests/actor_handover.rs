@@ -338,6 +338,8 @@ fn view(c: &FakeContainer) -> Container {
             .cloned()
             .collect(),
         env: c.spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        created: None,
+        started_at: None,
     }
 }
 

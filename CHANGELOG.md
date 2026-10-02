@@ -24,6 +24,12 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **A readiness check says whether Quasar came back after a reboot (#412).** On Podman and
+  rootless Docker, `engine_restart_on_boot` passes once a reboot shows the engine started
+  Quasar again, fails if the node agent only came back much later, and names the host
+  preparation that fixes it. Before the first reboot it reads `unknown`.
+
 ### Fixed
 - **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
   A reboot empties `/run`, and Podman would not start the agent without its runtime
