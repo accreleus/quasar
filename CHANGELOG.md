@@ -41,6 +41,8 @@ own; the two do not move together, and that is deliberate.
 - **The Console page's input-device table stays inside its card (#436).** A long device path
   is shortened with an ellipsis, and hovering it shows the whole path. On a phone the page's
   two columns now stack instead of squeezing the settings to a sliver.
+- **A web test of the trace viewer no longer fails at random (#427).** It hovered the chart
+  before the chart had loaded; it now waits for it.
 - **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
   A reboot empties `/run`, and Podman would not start the agent without its runtime
   directory. The recovery actor now has the engine make it at every start, then starts the
