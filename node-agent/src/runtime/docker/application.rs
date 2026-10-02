@@ -773,6 +773,59 @@ fn explicit_mount_targets(request: &ApplicationRequest) -> Result<Vec<String>, R
     Ok(targets)
 }
 
+/// The typed bind sources this process cannot prove exist on the engine's host.
+///
+/// Podman's compatible create makes every missing absolute bind source on the host before
+/// it creates the container, whatever `CreateMountpoint` says (#426: Podman 4.9 to 5.8,
+/// `compat/containers_create.go`), so a bind of an unmounted share would start as an empty
+/// directory the engine made. Docker refuses that create itself. On Podman the runtime
+/// therefore checks each source first. `own_mounts` is how this process reaches the
+/// engine's host: `None` when it shares the engine's filesystem (a native agent, the engine
+/// suite), else the agent container's own mounts, through which a daemon path is read only
+/// by a bind that round-trips. A source no bind reaches cannot be proven and is returned.
+fn unproven_bind_sources(
+    request: &ApplicationRequest,
+    own_mounts: Option<&[quasar_runtime::Mount]>,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<String> {
+    request
+        .typed_mounts
+        .iter()
+        .filter_map(|mount| match mount {
+            ApplicationMount::Bind { source, .. } => Some(source),
+            ApplicationMount::Volume { .. } => None,
+        })
+        .filter(|source| {
+            let daemon = Path::new(source.as_str());
+            let seen = match own_mounts {
+                None => Some(daemon.to_path_buf()),
+                Some(mounts) => quasar_runtime::agent_path_for_daemon_path(mounts, daemon),
+            };
+            !seen.is_some_and(|path| exists(&path))
+        })
+        .cloned()
+        .collect()
+}
+
+/// How this process sees the engine's host, for [`unproven_bind_sources`]: `None` when it
+/// is not in a container; its own container's mounts when it is. A container the engine
+/// cannot name gives no mounts, so nothing in it counts as seen.
+async fn own_host_view(
+    docker: &bollard::Docker,
+) -> Result<Option<Vec<quasar_runtime::Mount>>, RuntimeError> {
+    let Some(id) = quasar_runtime::self_inspection::self_container_id() else {
+        let contained =
+            Path::new("/run/.containerenv").exists() || Path::new("/.dockerenv").exists();
+        return Ok(contained.then(Vec::new));
+    };
+    Ok(Some(
+        quasar_runtime::docker::inspect_container_with(docker, &id)
+            .await?
+            .map(|own| own.mounts)
+            .unwrap_or_default(),
+    ))
+}
+
 fn image_volume_targets(intent: &ApplicationIntent) -> Result<Vec<String>, RuntimeError> {
     let mut targets = intent
         .image_volumes
@@ -1259,6 +1312,21 @@ pub(crate) async fn start(
             } else {
                 None
             };
+            if docker.dialect == super::dialect::Dialect::Podman {
+                let view = own_host_view(&docker).await?;
+                let unproven = unproven_bind_sources(&request, view.as_deref(), Path::exists);
+                if !unproven.is_empty() {
+                    // Refused before anything is journalled or created, as Docker refuses it.
+                    tracing::warn!(
+                        token = "application-bind-source-missing",
+                        application = %request.name,
+                        sources = ?unproven,
+                        "refusing the launch: a bind source is missing on the host (or not \
+                         visible to the agent to prove it), and Podman would create it"
+                    );
+                    return Err(ErrorKind::Engine.into());
+                }
+            }
             // Docker confines with SELinux too when its daemon runs --selinux-enabled.
             let (rootless, selinux) = docker.confinement().await?;
             let app = app_identity(docker.dialect, rootless, &request, overflow_gid());
@@ -2249,5 +2317,87 @@ mod app_identity_tests {
         let read: ApplicationIntent = serde_json::from_value(value).unwrap();
         assert!(read.engine_groups.is_empty());
         assert_eq!(group_add(&read), &request().group_add);
+    }
+}
+
+#[cfg(test)]
+mod bind_source_tests {
+    use super::*;
+    use quasar_runtime::{DaemonHostPath, Mount as OwnMount, MountKind};
+
+    fn request(sources: &[&str]) -> ApplicationRequest {
+        ApplicationRequest {
+            typed_mounts: sources
+                .iter()
+                .map(|source| ApplicationMount::Bind {
+                    source: (*source).into(),
+                    target: "/in".into(),
+                    read_only: false,
+                    consistency: None,
+                })
+                .chain([ApplicationMount::Volume {
+                    source: "a-volume".into(),
+                    target: "/volume".into(),
+                    read_only: false,
+                    no_copy: false,
+                }])
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn bind(source: &str, destination: &str) -> OwnMount {
+        OwnMount {
+            kind: MountKind::Bind,
+            source: Some(DaemonHostPath(source.into())),
+            name: None,
+            destination: destination.into(),
+            read_only: Some(false),
+        }
+    }
+
+    #[test]
+    fn a_native_process_checks_each_bind_source_where_it_is() {
+        let present = |path: &Path| path == Path::new("/run/quasar-agent/wayland-1");
+        assert_eq!(
+            unproven_bind_sources(
+                &request(&["/run/quasar-agent/wayland-1", "/mnt/share/games"]),
+                None,
+                present
+            ),
+            ["/mnt/share/games"]
+        );
+    }
+
+    #[test]
+    fn a_contained_agent_checks_through_its_own_binds() {
+        let mounts = [bind("/srv/quasar/homes", "/homes")];
+        let seen = |path: &Path| path == Path::new("/homes/player");
+        assert!(unproven_bind_sources(
+            &request(&["/srv/quasar/homes/player"]),
+            Some(&mounts),
+            seen
+        )
+        .is_empty());
+        assert_eq!(
+            unproven_bind_sources(&request(&["/srv/quasar/homes/gone"]), Some(&mounts), seen),
+            ["/srv/quasar/homes/gone"]
+        );
+    }
+
+    /// The agent's own filesystem is not the host's: a path no bind reaches is never taken
+    /// as present just because the agent image happens to hold it.
+    #[test]
+    fn a_source_no_bind_reaches_is_unproven() {
+        let everything = |_: &Path| true;
+        assert_eq!(
+            unproven_bind_sources(&request(&["/opt/elsewhere"]), Some(&[]), everything),
+            ["/opt/elsewhere"]
+        );
+    }
+
+    #[test]
+    fn volumes_are_not_bind_sources() {
+        assert!(unproven_bind_sources(&request(&[]), None, |_| false).is_empty());
     }
 }

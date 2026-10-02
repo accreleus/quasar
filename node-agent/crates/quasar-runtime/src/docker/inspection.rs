@@ -106,7 +106,8 @@ pub(crate) async fn inspect_container(
     inspect_container_with(&docker, id).await
 }
 
-async fn inspect_container_with(
+/// One container's read-only facts on an open connection; `None` when it does not exist.
+pub async fn inspect_container_with(
     docker: &Docker,
     id: &str,
 ) -> Result<Option<crate::ContainerInspection>, RuntimeError> {
