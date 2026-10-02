@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The Podman page explains a console unreachable from the network (#416).** When Docker
+  runs on the same host, it can drop rootful Podman's forwarded traffic, so Quasar answers
+  only on the host itself. The page and the troubleshooting guide give Docker's one-line
+  fix and how to check it.
 - **A readiness check says whether Quasar came back after a reboot (#412).** On Podman and
   rootless Docker, `engine_restart_on_boot` passes once a reboot shows the engine started
   Quasar again, fails if the node agent only came back much later, and names the host

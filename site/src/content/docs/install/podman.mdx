@@ -47,7 +47,19 @@ sudo systemctl enable podman-restart.service
 before deploying. It includes CDI device generation, verification and SELinux policy.
 
 **Check it worked:** `systemctl is-enabled podman.socket podman-restart.service`
-says `enabled` twice, and `ls -ld /run/quasar-agent` shows the directory.
+says `enabled` twice.
+
+### Docker on the same machine
+
+If Docker also runs here, Docker can block Podman's published ports. Docker drops
+forwarded traffic when it had to turn IP forwarding on itself. Quasar then answers on
+`127.0.0.1` but not from the network.
+
+| What to do | How to know it worked |
+| --- | --- |
+| Add `"ip-forward-no-drop": true` to `/etc/docker/daemon.json`, then `sudo systemctl restart docker` | `sudo iptables -S FORWARD` starts with `-P FORWARD ACCEPT` |
+
+A firewall rule that opens Quasar's ports is still needed as usual. Removing Docker works too.
 
 Optional: [console mode](/quasar/admin/console/) needs the console rules from
 [Device rules](/quasar/install/device-rules/), and the [UDP send
