@@ -227,7 +227,7 @@ export function HostConsole() {
       )}
 
       {!loading && (
-        <div className="split" style={{ gridTemplateColumns: "minmax(0,1fr) 300px" }}>
+        <div className="split console-split">
           <div className="card">
             <div className="panel-head">
               <div>

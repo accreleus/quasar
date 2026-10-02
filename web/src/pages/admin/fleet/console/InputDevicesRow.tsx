@@ -61,7 +61,7 @@ export function InputDevicesRow({
   };
 
   return (
-    <div className="cset idev-row" style={{ gridTemplateColumns: "1fr" }}>
+    <div className="cset idev-row">
       <div>
         <h3>Input devices</h3>
         <p className="hint">
@@ -136,7 +136,9 @@ export function InputDevicesRow({
                     </td>
                     <td className="primary">{d.label}</td>
                     <td>{classifyDevice(d.label)}</td>
-                    <td><span className="cell-id">{d.path}</span></td>
+                    <td className="idev-path-cell">
+                      <span className="cell-id idev-path" title={d.path}>{d.path}</span>
+                    </td>
                     <td className="right">
                       {on
                         ? <Chip variant="success">passed through</Chip>

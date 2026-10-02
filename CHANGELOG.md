@@ -38,6 +38,9 @@ own; the two do not move together, and that is deliberate.
 - **The host readiness card files the engine and console mode checks in their own groups (#437).**
   The engine checks now sit under Container runtime, and console mode's display, audio and
   monitor control under a new Console mode group, instead of under Other.
+- **The Console page's input-device table stays inside its card (#436).** A long device path
+  is shortened with an ellipsis, and hovering it shows the whole path. On a phone the page's
+  two columns now stack instead of squeezing the settings to a sliver.
 - **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
   A reboot empties `/run`, and Podman would not start the agent without its runtime
   directory. The recovery actor now has the engine make it at every start, then starts the
