@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -57,6 +58,11 @@ type Service struct {
 
 	sweepInterval time.Duration
 	sweepBatch    int
+
+	// unrepairable remembers the apps already reported as having a missing
+	// image nothing can fetch again (#441), so the sweep says it once per
+	// process rather than every interval.
+	unrepairable sync.Map
 }
 
 // Options configures the service.
@@ -645,6 +651,9 @@ type SweepResult struct {
 	AppsConsidered     int
 	ArtworkResolved    int
 	NoMatch            int
+	// ArtworkRepaired counts rows whose missing cached image was fetched again
+	// (#441). Only SweepOnce repairs; ResolveApps leaves it zero.
+	ArtworkRepaired int
 }
 
 // SweepOnce resolves up to sweepBatch apps that have no artwork row. Exported
@@ -659,7 +668,8 @@ func (s *Service) SweepOnce(ctx context.Context) SweepResult {
 	// Deliberately not short-circuited on secrets.Store.Available(): that would
 	// throw away the "a key is stored but this control plane holds no master
 	// key" diagnostic, worth far more than one indexed lookup per interval.
-	if _, err := s.providerNow(ctx); err != nil {
+	provider, err := s.providerNow(ctx)
+	if err != nil {
 		return res
 	}
 	res.ProviderConfigured = true
@@ -669,7 +679,93 @@ func (s *Service) SweepOnce(ctx context.Context) SweepResult {
 		return res
 	}
 	s.resolveEach(ctx, apps, &res)
+	s.repairMissing(ctx, provider, &res)
 	return res
+}
+
+// repairMissing fetches again the cached images a row names but the cache no
+// longer holds (#441): a database restored into a fresh install, a lost volume,
+// a hand-cleaned cache. "Has a row" is PendingApps' whole predicate, so without
+// this such an app keeps a broken cover forever.
+//
+// A repair is not a re-match. The row's own provider reference is used (the
+// appid for an appid match, the provider ref otherwise), no title is searched,
+// and source, lock and attribution are kept, so an admin's correction stays
+// theirs. Only the missing crops are fetched. A row with no provider reference
+// (an upload or a pasted URL) cannot be fetched again and is reported once.
+// A provider error changes nothing and the next sweep tries again. Repairs
+// share the sweep's batch, so one pass makes at most sweepBatch provider calls
+// for them.
+func (s *Service) repairMissing(ctx context.Context, provider Provider, res *SweepResult) {
+	recs, err := s.store.RecordsWithAssets(ctx)
+	if err != nil {
+		s.log.Warn("artwork: could not list cached artwork to check", "err", err)
+		return
+	}
+	attempts := 0
+	for _, rec := range recs {
+		if ctx.Err() != nil || attempts >= s.sweepBatch {
+			return
+		}
+		tileMissing := rec.TileAsset != "" && !s.blobs.Has(rec.TileAsset)
+		heroMissing := rec.HeroAsset != "" && !s.blobs.Has(rec.HeroAsset)
+		if !tileMissing && !heroMissing {
+			continue
+		}
+		if rec.ProviderRef == "" || rec.Provider != provider.Name() {
+			if _, seen := s.unrepairable.LoadOrStore(rec.AppID, struct{}{}); !seen {
+				s.log.Warn("artwork: a cached image is missing and has no provider reference to fetch it again from; upload or set it again",
+					"token", "artwork-image-unrecoverable", "app_id", rec.AppID, "source", rec.Source)
+			}
+			continue
+		}
+		attempts++
+		if err := s.repairOne(ctx, provider, rec, tileMissing, heroMissing); err != nil {
+			s.log.Info("artwork: could not fetch a missing cached image again; the next sweep retries",
+				"app_id", rec.AppID, "err", err)
+			continue
+		}
+		res.ArtworkRepaired++
+	}
+}
+
+func (s *Service) repairOne(ctx context.Context, provider Provider, rec Record, tileMissing, heroMissing bool) error {
+	app, err := s.store.App(ctx, rec.AppID)
+	if err != nil {
+		return err
+	}
+	var art Candidate
+	if app.ExternalSource != "" && app.ExternalID == rec.ProviderRef {
+		art, err = provider.ArtByExternalRef(ctx, app.ExternalSource, app.ExternalID)
+	} else {
+		art, err = provider.Art(ctx, rec.ProviderRef)
+	}
+	if err != nil {
+		return err
+	}
+	var tileURL, heroURL string
+	if tileMissing {
+		if tileURL = art.TileURL; tileURL == "" {
+			return errors.New("the provider no longer offers a tile image")
+		}
+	}
+	if heroMissing {
+		if heroURL = art.HeroURL; heroURL == "" {
+			return errors.New("the provider no longer offers a hero image")
+		}
+	}
+	tile, hero, err := s.cacheCrops(ctx, tileURL, heroURL)
+	if err != nil {
+		return err
+	}
+	rec.TileAsset = firstNonEmpty(tile, rec.TileAsset)
+	rec.HeroAsset = firstNonEmpty(hero, rec.HeroAsset)
+	if err := s.store.Save(ctx, rec); err != nil {
+		return err
+	}
+	s.unrepairable.Delete(rec.AppID)
+	s.log.Info("artwork: fetched a missing cached image again", "app_id", rec.AppID, "source", rec.Source)
+	return nil
 }
 
 // ResolveApps resolves exactly the named apps now, under the sweep's rules —
