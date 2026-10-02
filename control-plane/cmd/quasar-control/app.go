@@ -677,7 +677,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		jobRegistry.MustRegister(jobs.Definition{
 			ID:          "artwork.sweep",
 			Name:        "Artwork grabber",
-			Description: "Resolves cover and hero art for apps that have no artwork record.",
+			Description: "Resolves cover and hero art for apps that have no artwork record, and fetches again any cached image that has gone missing.",
 			Plane:       jobs.PlaneControl,
 			Scope:       jobs.ScopeInstance,
 			Managed:     true,
@@ -695,6 +695,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 					"apps_considered":  res.AppsConsidered,
 					"artwork_resolved": res.ArtworkResolved,
 					"no_match":         res.NoMatch,
+					"artwork_repaired": res.ArtworkRepaired,
 				}), nil
 			},
 		})
