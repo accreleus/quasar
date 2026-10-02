@@ -144,4 +144,7 @@ See [Readiness checks](/quasar/troubleshooting/readiness/) for fixes.
 
 - Not every monitor mode and refresh rate is offered yet.
 - With an NVIDIA GPU passed through to a virtual machine, the console picture can
-  stay black.
+  stay black. The virtual machine's own boot screen is black too, so the cause is in
+  the hand-off of the card, not in Quasar. It has happened after the hypervisor used
+  the card without driving a display before starting the virtual machine. Run console
+  mode on a host that is not a virtual machine, or use another GPU.
