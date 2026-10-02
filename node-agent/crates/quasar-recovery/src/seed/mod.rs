@@ -657,8 +657,22 @@ impl Seed {
                     Ok(host) => host,
                     Err(e) => return unreachable(e),
                 };
-                let checked =
-                    Bootstrap::from_env(&me.env).and_then(|boot| boot.check(host.name.as_deref()));
+                let mut boot = match Bootstrap::from_env(&me.env) {
+                    Ok(boot) => boot,
+                    Err(why) => return inputs_invalid(why),
+                };
+                if let Err(e) = boot.pin_images(self.engine.as_ref()) {
+                    return match e {
+                        bootstrap::ResolveError::Engine { .. } => Outcome::Retry {
+                            token: "seed-agent-image-unavailable",
+                            why: format!(
+                                "{e}; nothing was installed, and it is tried again at the next look"
+                            ),
+                        },
+                        bootstrap::ResolveError::Invalid(why) => inputs_invalid(why),
+                    };
+                }
+                let checked = boot.check(host.name.as_deref());
                 let checked = match checked {
                     Ok(checked) => checked,
                     Err(why) => return inputs_invalid(why),

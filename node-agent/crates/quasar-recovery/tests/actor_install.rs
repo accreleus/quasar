@@ -539,8 +539,7 @@ fn a_first_install_without_its_required_inputs_says_which_and_creates_nothing() 
         }),
         ("QUASAR_AGENT_IMAGE", {
             let mut op = operator();
-            op.agent_image =
-                Some("registry.example.invalid/quasar/quasar-node-agent:latest".into());
+            op.agent_image = Some("registry.example.invalid/quasar/not an image".into());
             op
         }),
     ] {

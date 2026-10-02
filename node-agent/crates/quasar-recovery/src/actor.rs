@@ -998,7 +998,11 @@ impl Actor {
     }
 
     fn first_install(&self) -> Result<Machine, ResumeError> {
-        let boot = self.install_inputs()?;
+        let mut boot = self.install_inputs()?;
+        boot.pin_images(self.engine.as_ref()).map_err(|e| match e {
+            crate::bootstrap::ResolveError::Engine { error, .. } => ResumeError::Engine(error),
+            crate::bootstrap::ResolveError::Invalid(why) => ResumeError::Inputs(why),
+        })?;
         let host = self.engine.host()?;
         let checked = boot
             .check(host.name.as_deref())
