@@ -21,7 +21,7 @@ Check the session detail in **Admin ▸ Sessions**:
 | Cause | Fix |
 | --- | --- |
 | Packet loss (rising loss series in session detail) | A network problem, not the encoder. |
-| RTX 5090, Vulkan AV1, driver 595.99.02 | Upgrade to 610.57.04, or use HEVC or H.264. Current releases exclude AV1 on this combination. Don't switch to NVENC AV1. See [the compatibility policy](/quasar/tuning/encoders/#av1-driver-compatibility). |
+| NVIDIA Vulkan AV1 corruption | Use driver 610 or newer. Where a known codec restriction applies, use HEVC or H.264 if the profile and client support them. See [NVIDIA compatibility](/quasar/reference/nvidia-compatibility/). |
 | Vulkan host with HEVC, one frame in four black or torn | Undo any hand-set encode ring depth. `QUASAR_VULKAN_HEVC=1` sets it correctly. |
 
 ## No sound

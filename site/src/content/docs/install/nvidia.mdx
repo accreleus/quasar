@@ -7,17 +7,16 @@ import { Aside } from '@astrojs/starlight/components';
 
 ## Driver and toolkit
 
-Install the **full NVIDIA graphics driver** for your Linux distribution and check
+Install the **full NVIDIA graphics driver, version 610 or newer**, for your Linux distribution and check
 `nvidia-smi` lists your GPU. Then install the **NVIDIA Container Toolkit** using
 [NVIDIA's package instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 Choose the instructions for your distribution; Ubuntu/Debian and Fedora use different packages.
 On Unraid, use the [Unraid steps below](#unraid) instead.
 
 <Aside type="caution" title="Check driver compatibility">
-RTX 50-series cards need the open kernel modules. Before choosing AV1, read the
-[driver compatibility notes](/quasar/tuning/encoders/#av1-driver-compatibility):
-the measured RTX 5090 / 595.99.02 combination corrupts AV1. Use a compatible
-driver or HEVC/H.264.
+RTX 50-series cards need the open kernel modules as well as driver 610 or newer.
+Follow the [Unraid availability warning](#unraid) on that platform. Known codec
+restrictions and measured evidence are in the [NVIDIA compatibility reference](/quasar/reference/nvidia-compatibility/).
 </Aside>
 
 ## Docker rootful
@@ -100,12 +99,12 @@ The [6.18.52-Unraid plugin packages](https://github.com/unraid/unraid-nvidia-dri
 include open modules at 595.99.02, while newer packaged versions use proprietary modules.
 A higher version number alone does not make a package compatible with these cards.
 
-Quasar's RTX 5090 comparison found corrupt AV1 on 595.99.02 and clean output on
-610.57.04; the Unraid result with 610.57.04 is operator-reported. Using that combination
-on Unraid can require a compatible driver build outside the plugin's packaged choices.
-Quasar does not provide that build. Use HEVC or H.264 where your profile and client
-support it, or a host with a compatible packaged driver. This is not a universal
-610+ minimum. See [driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
+Meeting Quasar's **610+ supported baseline** with open modules on Unraid can
+require a compatible driver build outside the plugin's packaged choices. Quasar
+does not provide that build. HEVC or H.264 can avoid the known AV1 defect where
+the profile and client support them, but do not change the supported driver baseline.
+Alternatively, use a host with a compatible packaged driver. See the
+[NVIDIA compatibility reference](/quasar/reference/nvidia-compatibility/).
 </Aside>
 
 4. Continue with [Unraid installation](/quasar/install/unraid/) for persistent storage and deployment.

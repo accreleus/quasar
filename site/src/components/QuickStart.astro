@@ -224,7 +224,8 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 				<h4>Podman Quadlet configuration</h4>
 				<button type="button" data-copy="quadlet">Copy</button><button type="button" data-download="quadlet">Download</button>
 			</div>
-			<p class="qs-note qs-warn">Local preview for #440 at <code>5c5f2d94</code>: these <code>:latest</code> inputs require images containing that fix. Publication of compatible images is not verified here. The seed resolves tags internally; no manual substitution is needed. Podman uses Quadlet.</p><pre class="qs-pre-full"><code data-out="quadlet"></code></pre>
+			<p class="qs-note">The seed resolves image tags to immutable digests on first install. No manual substitution is needed.</p>
+            <pre class="qs-pre-full"><code data-out="quadlet"></code></pre>
 
 			<p class="qs-note">
 				The seed creates Quasar's recovery actor, which generates every secret
@@ -238,8 +239,8 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 				<h3 data-stack-title>Docker Compose configuration</h3>
 				<button type="button" data-copy="stack">Copy</button><button type="button" data-download="stack">Download</button>
 			</div>
-   <p class="qs-note qs-warn" role="status">Local preview for <a href="https://github.com/accreleus/quasar/commit/5c5f2d94e9fa3c858bf33db25ffbc7516c451589">#440's bootstrap fix</a>. These <code>:latest</code> inputs require images containing that fix. Publication of compatible images is not verified here; do not deploy against older images.</p>
-   <p class="qs-hint">Save this as <code>compose.yaml</code>, or paste it into Docker Compose, Dockge or Arcane. A compatible seed resolves the tags to immutable digests internally on first install. No manual substitution is needed.</p>
+
+   <p class="qs-hint">Save this as <code>compose.yaml</code>, or paste it into Docker Compose, Dockge or Arcane. The seed resolves the tags to immutable digests internally on first install. No manual substitution is needed.</p>
 			<pre><code data-out="stack"></code></pre>
 			<div data-out-block="env" hidden>
 				<div class="qs-out-head"><h4>The stack's .env</h4><button type="button" data-copy="env">Copy</button></div>
@@ -263,7 +264,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
    <h3>Before starting</h3>
    <p>Create the homes and templates directories with the chosen ownership. Do not change ownership of existing user data recursively.</p>
    <pre><code data-out="directories"></code></pre>
-   <p>With images containing the bootstrap fix, Docker users can save <code>compose.yaml</code> and run <code>docker compose up -d</code>, or use their stack manager. Podman users should save <code>quasar-seed.container</code> in <code>/etc/containers/systemd/</code>, then follow the <a href={`${base}/install/podman/`}>Quadlet start steps</a>.</p>
+   <p>Docker users can save <code>compose.yaml</code> and run <code>docker compose up -d</code>, or use their stack manager. Podman users should save <code>quasar-seed.container</code> in <code>/etc/containers/systemd/</code>, then follow the <a href={`${base}/install/podman/`}>Quadlet start steps</a>.</p>
    <p>Existing installation? Keep its homes, database and machine state. Follow <a href={`${base}/operations/upgrading/`}>Upgrading</a> before redeploying.</p>
   </div>
 		<p class="qs-hint">

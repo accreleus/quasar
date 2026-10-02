@@ -239,6 +239,7 @@ export default defineConfig({
 						{ label: 'Environment variables', slug: 'reference/environment' },
 						{ label: 'Ports and endpoints', slug: 'reference/ports' },
 						{ label: 'Glossary', slug: 'reference/glossary' },
+						{ label: 'NVIDIA compatibility', slug: 'reference/nvidia-compatibility' },
 					],
 				},
 				{
