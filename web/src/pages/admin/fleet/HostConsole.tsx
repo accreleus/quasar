@@ -271,6 +271,7 @@ export function HostConsole() {
             <ConsoleRow title="Physical output" help="Card-scoped DRM connector. Automatic uses Weston's preferred connected output.">
               <select
                 className="select"
+                aria-label="Physical output"
                 disabled={locked}
                 value={effective.output_id ?? NONE}
                 onChange={(e) => {
@@ -297,6 +298,7 @@ export function HostConsole() {
             <ConsoleRow title="Physical mode" help="Exact DRM timing identity; fractional refresh rates are preserved.">
               <select
                 className="select"
+                aria-label="Physical mode"
                 style={{ width: 260 }}
                 disabled={locked || !selectedOutput}
                 value={selectedModeValue}

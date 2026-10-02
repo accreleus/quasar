@@ -372,6 +372,7 @@ pub fn spawn_weston_console(
             // mode; without a config weston would light every connected output.
             let Some(mode) = mode.or_else(|| pinned_output_mode(output_id, &outputs)) else {
                 tracing::warn!(
+                    token = "console-pinned-output-mode-unknown",
                     "console: pinned output {output_id} has no configured mode and no \
                      detectable one; starting weston without an output config"
                 );
