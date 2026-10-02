@@ -511,6 +511,22 @@ impl PhysicalInput {
         auto_connect_controller: bool,
         virtual_devices: &Arc<VirtualDevices>,
     ) -> Self {
+        Self::start_with(
+            input_devices,
+            auto_connect_controller,
+            virtual_devices,
+            scan_input_nodes,
+        )
+    }
+
+    /// [`Self::start`] with the node scan supplied: a real-kernel test scans
+    /// only its own devices, so it never grabs the input of the host it runs on.
+    fn start_with(
+        input_devices: &serde_json::Value,
+        auto_connect_controller: bool,
+        virtual_devices: &Arc<VirtualDevices>,
+        mut scan: impl FnMut() -> Vec<InputNode> + Send + 'static,
+    ) -> Self {
         let virtual_paths = vec![
             virtual_devices.keyboard_path.clone(),
             virtual_devices.mouse_path.clone(),
@@ -530,7 +546,7 @@ impl PhysicalInput {
                     std::collections::BTreeMap::new();
                 let mut tracker = Tracker::default();
                 while !stop2.load(Ordering::Acquire) {
-                    let nodes = scan_input_nodes();
+                    let nodes = scan();
                     let candidates = resolve_candidates(
                         &selector,
                         auto_connect_controller,
@@ -870,5 +886,146 @@ mod tests {
             t.known.get(&p(3)),
             Some(Known::Failed { attempts: 1, .. })
         ));
+    }
+
+    /// #421 against the real kernel: a keyboard created while the session's
+    /// manager runs is grabbed and forwarded into the session's virtual
+    /// keyboard, released when it leaves the scan, and grabbed again when it
+    /// comes back. The scan sees only this test's devices (its tag), so a run
+    /// never grabs the input of the host it runs on. Needs `/dev/uinput`, root,
+    /// and the host's `/dev/input` (the agent's own bind).
+    #[test]
+    #[ignore = "needs /dev/uinput, the host's /dev/input and root: make test-uinput"]
+    fn uinput_physical_input_grabs_a_device_plugged_in_mid_session() {
+        use input_linux::{InputId, UInputHandle};
+        use std::time::Instant;
+
+        let test = "uinput_physical_input_grabs_a_device_plugged_in_mid_session";
+        if let Err(e) = OpenOptions::new().write(true).open("/dev/uinput") {
+            assert!(
+                std::env::var_os("QUASAR_REQUIRE_UINPUT").is_none(),
+                "{test}: /dev/uinput not usable ({e}), and QUASAR_REQUIRE_UINPUT is set"
+            );
+            eprintln!("SKIP {test}: /dev/uinput not usable ({e})");
+            return;
+        }
+        let tag = format!("hotplug-{:08x}", std::process::id());
+        let devs = Arc::new(VirtualDevices::create(&tag).expect("virtual devices"));
+
+        // The scan the manager sees: this test's nodes, while `present`.
+        let present = Arc::new(AtomicBool::new(true));
+        let (scan_tag, scan_present) = (tag.clone(), present.clone());
+        let scan = move || {
+            scan_input_nodes()
+                .into_iter()
+                .filter(|n| n.label.contains(&scan_tag) && scan_present.load(Ordering::Acquire))
+                .collect()
+        };
+        let physical = PhysicalInput::start_with(&json!("auto"), false, &devs, scan);
+        std::thread::sleep(HOTPLUG_INTERVAL * 2);
+
+        // Plug a keyboard in mid-session.
+        let uinput = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/uinput")
+            .unwrap();
+        let plugged = UInputHandle::new(uinput);
+        plugged.set_evbit(EventKind::Key).unwrap();
+        plugged.set_evbit(EventKind::Synchronize).unwrap();
+        for key in [Key::A, Key::B, Key::Enter] {
+            plugged.set_keybit(key).unwrap();
+        }
+        let id = InputId {
+            bustype: 0x03,
+            vendor: 0x1234,
+            product: 0x0421,
+            version: 1,
+        };
+        let name = format!("Hotplug Test Keyboard [{tag}]");
+        plugged.create(&id, name.as_bytes(), 0, &[]).unwrap();
+        let node = plugged.evdev_path().unwrap();
+
+        // Grabbed: another opener's EVIOCGRAB is refused while the session holds it.
+        let held_elsewhere = |want: bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let probe = EvdevHandle::new(open_physical(&node).unwrap());
+                let grabbed_by_us = probe.grab(true).is_ok();
+                if grabbed_by_us {
+                    probe.grab(false).unwrap();
+                }
+                if grabbed_by_us != want {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{node:?}: session grab {} within 3 s",
+                    if want { "not taken" } else { "not released" }
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        held_elsewhere(true);
+
+        // Forwarded: a key on the plugged keyboard arrives on the virtual one.
+        let virtual_kb = EvdevHandle::new(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&devs.keyboard_path)
+                .unwrap(),
+        );
+        let frame = |code: Key, value: i32| {
+            let ev = |type_: i32, code: u16, value: i32| isys::input_event {
+                time: isys::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                type_: type_ as u16,
+                code,
+                value,
+            };
+            [
+                ev(isys::EV_KEY, code as u16, value),
+                ev(isys::EV_SYN, isys::SYN_REPORT as u16, 0),
+            ]
+        };
+        plugged.write(&frame(Key::A, 1)).unwrap();
+        plugged.write(&frame(Key::A, 0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let zero = frame(Key::A, 0)[1];
+        let mut seen = Vec::new();
+        while !seen.contains(&(Key::A as u16, 1)) {
+            assert!(
+                Instant::now() < deadline,
+                "KEY_A never reached the virtual keyboard: {seen:?}"
+            );
+            let mut buf = [zero; 16];
+            match virtual_kb.read(&mut buf) {
+                Ok(n) => seen.extend(
+                    buf[..n]
+                        .iter()
+                        .filter(|e| e.type_ == isys::EV_KEY as u16)
+                        .map(|e| (e.code, e.value)),
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => panic!("read virtual keyboard: {e}"),
+            }
+        }
+
+        // Leaves the scan (unplugged, as the manager sees it): released.
+        present.store(false, Ordering::Release);
+        held_elsewhere(false);
+        // Comes back: grabbed again.
+        present.store(true, Ordering::Release);
+        held_elsewhere(true);
+
+        // Session end releases it too.
+        drop(physical);
+        held_elsewhere(false);
+        drop(plugged);
     }
 }
