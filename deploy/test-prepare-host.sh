@@ -201,7 +201,12 @@ grep -q '"unix:native"' "$pw" && grep -q 'address = "unix:/run/quasar-console-au
 tf="$r3b/etc/tmpfiles.d/quasar-console-audio.conf"
 grep -q '^d /run/quasar-console-audio 0750 alice quasar -$' "$tf" \
   && pass "tmpfiles.d creates /run/quasar-console-audio owned alice:quasar 0750" || fail "console audio tmpfiles" "$(cat "$tf" 2>&1)"
-restart_cmd="systemctl --user -M alice@ restart pipewire-pulse.service"
+restart_cmd="runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1500 systemctl --user restart pipewire-pulse.service"
+unit="$r3b/etc/systemd/user/quasar-console-audio.service"
+grep -qx 'ConditionUser=alice' "$unit" && grep -qx 'Wants=pipewire-pulse.service' "$unit" && grep -qx 'WantedBy=default.target' "$unit" \
+  && [ "$(readlink "$r3b/etc/systemd/user/default.target.wants/quasar-console-audio.service")" = /etc/systemd/user/quasar-console-audio.service ] \
+  && grep -qxF 'systemctl --global enable quasar-console-audio.service' "$r3b/.prepare-host-commands" \
+  && pass "a user unit, enabled globally but only for alice, starts her pipewire-pulse with her manager (the socket survives a reboot)" || fail "console audio boot unit" "$(cat "$unit" 2>&1)"
 # #433: alice is not logged in here, so nothing is restarted and the exact command is the next step.
 ! grep -q 'pipewire-pulse' "$r3b/.prepare-host-commands" 2>/dev/null && printf '%s' "$out3b" | grep -qF "$restart_cmd" \
   && pass "with no user manager running for alice, nothing is restarted and the restart command is printed" || fail "console audio restart note" "$out3b"
@@ -229,6 +234,13 @@ out3c="$(prep "$r3c" "$tmp/podman-only" --mode rootless --engine podman --consol
 out3c2="$(prep "$r3c" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)"
 [ "$(grep -c 'pipewire-pulse' "$r3c/.prepare-host-commands")" = 1 ] && ! printf '%s' "$out3c2" | grep -qE 'pipewire-pulse (restarted|did not)|restart .*pipewire-pulse|not there yet' \
   && pass "a re-run with the drop-in unchanged and the socket present restarts nothing" || fail "console audio restart idempotent" "$(cat "$r3c/.prepare-host-commands") $out3c2"
+# After a reboot the socket is gone (Fedora socket-activates pipewire-pulse): a re-run starts
+# it, never restarts it, so a running session is not disturbed.
+rm -f "$r3c/run/quasar-console-audio/native"
+out3c3="$(prep "$r3c" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)"
+grep -qxF "runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1500 systemctl --user start pipewire-pulse.service" "$r3c/.prepare-host-commands" \
+  && [ "$(grep -c 'restart pipewire-pulse' "$r3c/.prepare-host-commands")" = 1 ] && printf '%s' "$out3c3" | grep -q "changed  alice's pipewire-pulse started" \
+  && pass "with the drop-in unchanged and the socket missing, alice's pipewire-pulse is started, not restarted" || fail "console audio start" "$(cat "$r3c/.prepare-host-commands") $out3c3"
 
 # ── 4. optional settings only when asked ────────────────────────────────────
 if grep -qE 'dmesg_restrict|unprivileged_port_start' "$r/etc/sysctl.d/99-quasar.conf"; then fail "no optional sysctl by default" ""; else pass "optional kernel settings absent unless asked"; fi

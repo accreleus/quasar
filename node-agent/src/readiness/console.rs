@@ -176,9 +176,10 @@ fn socket_missing(
          pipewire-pulse has not picked up host preparation's drop-in"
     );
     let remediation = format!(
-        "Restart the desktop user's pipewire-pulse, as root on the host: \
-         {RESTART_PIPEWIRE_PULSE} (USER is the account given to --console-audio-user), or \
-         have that user log in again. The next console session plays through it."
+        "Run host preparation again (it starts the desktop user's pipewire-pulse), or \
+         restart it as root on the host: {RESTART_PIPEWIRE_PULSE} (USER is the account \
+         given to --console-audio-user), or have that user log in again. The next console \
+         session plays through it."
     );
     match route {
         Ok(route) => super::warn_check(
@@ -447,7 +448,7 @@ mod tests {
         assert!(
             fallback
                 .remediation
-                .contains("systemctl --user -M USER@ restart pipewire-pulse.service"),
+                .contains("runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service"),
             "{fallback:?}"
         );
         assert!(fallback.blocks.is_none());
@@ -462,7 +463,7 @@ mod tests {
         assert!(held.summary.contains("socket"), "{held:?}");
         assert!(
             held.remediation
-                .contains("systemctl --user -M USER@ restart pipewire-pulse.service"),
+                .contains("runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service"),
             "{held:?}"
         );
 
