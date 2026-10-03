@@ -421,24 +421,26 @@
   border-top: 1px solid var(--line);
 }
 
-/* ── Host console ──────────────────────────────────────────── */
-/* The settings beside a 300px rail. The RH07 mock keeps both columns at 900px, so this
-   does not take `.split`'s 1240px collapse; it stacks at the admin's phone breakpoint,
-   where the rail would leave the settings no room (#436). */
-.console-split {
+/* ── Settings beside a rail ────────────────────────────────── */
+/* A host's Settings and Console pages: the settings beside a 300px rail. The mocks keep
+   both columns at 900px, so this does not take `.split`'s 1240px collapse; it stacks at
+   the admin's phone breakpoint, where the rail would leave the settings no room
+   (#436, #444). Never set the columns inline: an inline style beats the breakpoint. */
+.rail-split {
   grid-template-columns: minmax(0, 1fr) 300px;
 }
 
-.console-split > * {
+.rail-split > * {
   min-width: 0;
 }
 
 @media (max-width: 760px) {
-  .console-split {
+  .rail-split {
     grid-template-columns: minmax(0, 1fr);
   }
 }
 
+/* ── Host console ──────────────────────────────────────────── */
 .console-group {
   padding: var(--s5) var(--card-pad) var(--s1);
 }

@@ -120,7 +120,7 @@ export function HostSettings() {
             onRestartNow={() => void s.handleRestart(false)}
           />
 
-          <div className="split mt4" style={{ gridTemplateColumns: "minmax(0,1fr) 300px" }}>
+          <div className="split rail-split mt4">
             <div>
               <SafeSettingsPolicy hostId={id} knobs={s.knobs} renderNodeOptions={s.renderNodeOptions} onOwnedKeys={onOwnedKeys} />
               <IdleApplyPolicy hostId={id} />
