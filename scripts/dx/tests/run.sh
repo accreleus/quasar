@@ -1766,6 +1766,19 @@ else
   fail "bench:run-force-policy-preflight-logged" "$(printf '%s' "$override_out" | grep -i profile_policy | tr '\n' ' ')"
 fi
 
+# #442: an output directory it cannot write is refused up front, by name.
+ro_parent="$WORK/ro-out"; mkdir -p "$ro_parent"; chmod 0555 "$ro_parent"
+ro_out="$(fp_run --profile forced --out "$ro_parent/run")"
+chmod 0755 "$ro_parent"
+if [ "$(id -u)" = 0 ]; then
+  pass "bench:run-unwritable-out-refused" "skipped meaning: root can write anywhere"
+elif printf '%s' "$ro_out" | grep -q "cannot write the output directory $ro_parent/run" \
+   && printf '%s' "$ro_out" | grep -q 'RESULT status=failed'; then
+  pass "bench:run-unwritable-out-refused" "named, with the fix, before anything runs"
+else
+  fail "bench:run-unwritable-out-refused" "$(printf '%s' "$ro_out" | tail -n 3 | tr '\n' ' ')"
+fi
+
 # `--profile forced` sends NO profile_id at all, so there is nothing to
 # override — the preflight must not touch the app.
 : > "$FP_STATE.app-patches.jsonl"
