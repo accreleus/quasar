@@ -102,12 +102,16 @@ the socket:
 
 | USER is | What happens |
 | --- | --- |
-| Logged in | Host preparation restarts their pipewire-pulse. |
+| Logged in, or lingering | Host preparation restarts their pipewire-pulse. |
 | Not logged in | The socket opens when they next log in. |
+
+After a reboot their pipewire-pulse starts with their session, so the socket is back
+without a step.
 
 It worked when `/run/quasar-console-audio/native` exists on the host and the
 `console_audio` check names PipeWire. If the check says the socket is missing, run
-as root: `systemctl --user -M USER@ restart pipewire-pulse.service`.
+host preparation again, or as root:
+`runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`.
 
 ## Local input
 
