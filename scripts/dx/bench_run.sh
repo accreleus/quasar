@@ -364,7 +364,11 @@ if [ "$DRY" = 1 ]; then
   dx_result "$TARGET" "suite=$SUITE" "scenario=$SCENARIO" "dry_run=1"
 fi
 
-mkdir -p "$OUT"
+# Said now, not as a later failure with no reason: a .diagnostics left root-owned by a
+# container run is the usual cause (#442).
+if ! mkdir -p "$OUT" 2>/dev/null || [ ! -w "$OUT" ]; then
+  dx_guard "$TARGET" "cannot write the output directory $OUT. If .diagnostics is root-owned from an earlier container run: sudo chown \"\$(id -u):\$(id -g)\" $DX_DIAG_DIR $DX_DIAG_DIR/bench, or pass --out DIR"
+fi
 
 # ── host API helpers ─────────────────────────────────────────────────────────
 # Everything admin-credentialed runs ON the stack host, against its host-local
