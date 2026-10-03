@@ -8,7 +8,10 @@
 //! Presence is read by listing `/host/dev` (a glob, which is a directory read), never by
 //! `stat`ing a node: under SELinux a confined container may list the host's `/dev` but
 //! not `stat` most of its nodes, and a `[ -e ]` there reads "absent" (found on the first
-//! rootless Podman install, RH-07).
+//! rootless Podman install, RH-07). The one exception is `/dev/i2c-*` (#443): an entry the
+//! probe *can* `stat` and finds not to be a character device (a stale placeholder file) is
+//! reported apart and never passed on, since an engine refuses a container given one. One it
+//! cannot `stat` is reported as a bus, as before.
 //!
 //! Which evidence wins: **device nodes**. `/sys/class/drm` is not namespaced, so inside a
 //! system container (an LXC guest) it lists every GPU of the physical host, including
@@ -37,7 +40,7 @@ pub const GPUS_PROBE_ATTEMPTS: u32 = 3;
 /// POSIX sh, so it runs in any image with coreutils or busybox.
 pub const SCRIPT: &str = r#"echo "quasar-probe 1"
 for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd|tty8) echo "dev ${f##*/}";; esac; done
-for f in /host/dev/i2c-*; do n=${f##*/i2c-}; case "$n" in ''|*[!0-9]*) ;; *) echo "i2c $n";; esac; done
+for f in /host/dev/i2c-*; do n=${f##*/i2c-}; case "$n" in ''|*[!0-9]*) ;; *) if [ -e "$f" ] && [ ! -c "$f" ]; then echo "i2c_not_device $n"; else echo "i2c $n"; fi;; esac; done
 for f in /host/run/systemd/*; do case "${f##*/}" in seats|sessions) echo "logind ${f##*/}";; esac; done
 for f in /host/run/quasar-console-audi[o]; do [ "$f" = /host/run/quasar-console-audio ] && echo "console_audio dir"; done
 [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
@@ -63,6 +66,10 @@ pub struct ProbeReport {
     pub sound: bool,
     /// The host's `/dev/i2c-<n>` bus numbers, sorted (console mode's DDC, RH-07 #407).
     pub i2c: Vec<u32>,
+    /// `/dev/i2c-<n>` entries the probe could `stat` and found not to be character devices
+    /// (a stale placeholder file, #443), sorted. Never passed to the agent: an engine
+    /// refuses to start a container given one.
+    pub i2c_not_device: Vec<u32>,
     /// Which of logind's `seats` and `sessions` directories the host's `/run/systemd` has.
     pub logind: Vec<String>,
     /// The host's `/run` has `quasar-console-audio`, the desktop user's Quasar-only
@@ -117,6 +124,14 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
                     report.i2c.push(bus);
                 }
             }
+            (Some("i2c_not_device"), Some(n)) => {
+                let bus = n
+                    .parse::<u32>()
+                    .map_err(|_| ProbeError::Unreadable(format!("unexpected line {line:?}")))?;
+                if !report.i2c_not_device.contains(&bus) {
+                    report.i2c_not_device.push(bus);
+                }
+            }
             (Some("logind"), Some(dir @ ("seats" | "sessions"))) => {
                 report.logind.push(dir.to_owned())
             }
@@ -136,6 +151,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
         return Err(ProbeError::Unreadable("no `end` line".into()));
     }
     report.i2c.sort_unstable();
+    report.i2c_not_device.sort_unstable();
     Ok(report)
 }
 
@@ -394,7 +410,23 @@ pub fn run(engine: &dyn PlatformEngine, image: &ImageRef) -> Result<ProbeReport,
         if code != 0 {
             return Err(ProbeError::Unreadable(format!("the probe exited {code}")));
         }
-        parse(&logs)
+        let report = parse(&logs)?;
+        if !report.i2c_not_device.is_empty() {
+            let skipped: Vec<String> = report
+                .i2c_not_device
+                .iter()
+                .map(|n| format!("/dev/i2c-{n}"))
+                .collect();
+            warn!(
+                token = "probe-i2c-not-a-device",
+                skipped = ?skipped,
+                "skipping {} on the host: not a character device (a stale placeholder file?); \
+                 console mode's monitor control will not use it. Remove it, load i2c-dev if \
+                 the bus should exist, then turn console mode off and on again",
+                skipped.join(", ")
+            );
+        }
+        Ok(report)
     })();
     let removed = engine.remove_container(&id);
     match (outcome, removed) {
@@ -492,6 +524,13 @@ mod tests {
         assert!(!select(&half).1.logind);
         assert!(select(&half).1.i2c.is_empty());
         assert!(parse("quasar-probe 1\ni2c x\nend").is_err());
+        // #443: a bus that is not a character device is reported apart, never as a bus.
+        let placeholders =
+            parse("quasar-probe 1\ni2c 3\ni2c_not_device 9\ni2c_not_device 8\nend").unwrap();
+        assert_eq!(placeholders.i2c, vec![3]);
+        assert_eq!(placeholders.i2c_not_device, vec![8, 9]);
+        assert_eq!(select(&placeholders).1.i2c, vec![3]);
+        assert!(parse("quasar-probe 1\ni2c_not_device x\nend").is_err());
         assert!(parse("quasar-probe 1\nlogind other\nend").is_err());
     }
 
@@ -522,7 +561,10 @@ mod tests {
     }
 
     /// The script lists i2c nodes and logind's directories by glob: a real shell against a
-    /// fake `/host` tree (regular files stand in for nodes; nothing is `stat`ed).
+    /// fake `/host` tree (regular files stand in for the other nodes). #443: an i2c entry is
+    /// a bus unless it can be `stat`ed and is not a character device: a symlink to
+    /// `/dev/null` is a character device without root, and a dangling symlink stands for a
+    /// node a confined probe may list but not `stat`, which stays a bus.
     #[test]
     fn the_script_reports_i2c_and_logind_from_a_listing() {
         let root = tempfile::tempdir().unwrap();
@@ -530,9 +572,11 @@ mod tests {
         std::fs::create_dir_all(host.join("dev")).unwrap();
         std::fs::create_dir_all(host.join("run/systemd/seats")).unwrap();
         std::fs::create_dir_all(host.join("run/systemd/sessions")).unwrap();
-        for n in ["i2c-4", "i2c-12", "i2c-dev", "i2c-", "tty8", "tty80"] {
+        for n in ["i2c-7", "i2c-dev", "i2c-", "tty8", "tty80"] {
             std::fs::write(host.join("dev").join(n), "").unwrap();
         }
+        std::os::unix::fs::symlink("/dev/null", host.join("dev/i2c-4")).unwrap();
+        std::os::unix::fs::symlink(host.join("absent"), host.join("dev/i2c-12")).unwrap();
         let script = SCRIPT.replace("/host/", &format!("{}/", host.display()));
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -541,6 +585,12 @@ mod tests {
             .expect("sh");
         let report = parse(&String::from_utf8_lossy(&out.stdout)).unwrap();
         assert_eq!(report.i2c, vec![4, 12]);
+        assert_eq!(
+            report.i2c_not_device,
+            vec![7],
+            "#443: a placeholder file is no bus"
+        );
+        assert_eq!(select(&report).1.i2c, vec![4, 12]);
         assert!(report.logind());
         assert!(report.console_vt, "RH-07 #407: the console VT is listed");
         assert!(select(&report).1.console_vt);
