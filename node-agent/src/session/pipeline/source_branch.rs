@@ -111,7 +111,9 @@ pub(crate) fn build_video_source(
     // The caps that cross the interpipe boundary. The framerate field is load-bearing:
     // without it waylanddisplaysrc produces 1 fps.
     let tail_caps = raw_video_caps(cfg);
+    // Named so a console mode switch (#445) can re-pin it to the new WxH@fps in place.
     let tail = gst::ElementFactory::make("capsfilter")
+        .name("source-caps")
         .property("caps", &tail_caps)
         .build()
         .context("capsfilter not found")?;

@@ -14,6 +14,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/accreleus/quasar/control-plane/internal/console"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ice"
 	"github.com/accreleus/quasar/control-plane/internal/profile"
@@ -201,6 +202,12 @@ type streamResp struct {
 	// launch size first. Always serialized so a client never duplicates the family
 	// table; an aspect ratio with no family gets one entry.
 	Rungs [][2]int32 `json:"rungs"`
+	// #445: the physical display mode a local console session runs at, as the
+	// agent last reported it (agent-api.md session_metrics.console_mode). Present
+	// once known; absent on a streamed session and before the first console
+	// sample. Moves when the app picks another mode; width/height/fps above stay
+	// the launch mode.
+	ConsoleMode *console.ModeSelection `json:"console_mode,omitempty"`
 }
 
 type sessionResp struct {
@@ -308,6 +315,7 @@ func toSessionRespExt(s Session, ext externalState, haveExt bool) sessionResp {
 		stream.ExternalWidth, stream.ExternalHeight = &w, &h
 		stream.ExternalResizeSupported = ext.Supported
 		stream.ExternalOwner = ext.Owner
+		stream.ConsoleMode = ext.ConsoleMode
 	}
 	return sessionRespWithStream(s, stream)
 }

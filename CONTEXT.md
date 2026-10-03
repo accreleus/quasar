@@ -75,6 +75,21 @@ tile discovered inside a parent app's library. It inherits the parent's
 runtime, image, and resource demand; a handful of fields (default profile,
 profile policy) stay on the tile.
 
+**Mode set** — the display modes a console session's compositor advertises to the
+app: the connected monitor's real DRM modes, each with its own refresh rate, not
+filtered by what the session renders at now. Distinct from the *mode ladder*
+(smaller same-aspect sizes at one refresh, for an in-game resolution menu on a
+streamed session). _Avoid_: "resolutions" (a mode carries a refresh too).
+
+**Mode request** — a client's pick of one mode from the mode set, made inside the
+session through `wlr-output-management` and surfaced by the compositor as a
+`quasar-mode-request` bus message. The compositor changes nothing itself: the
+node agent decides (`plan_mode_switch`), moves the monitor and re-pins the
+compositor's caps, and the app follows its display's new configure without a
+restart. The physical mode that results is reported as
+`session_metrics.console_mode`. _Avoid_: "resize" (that is the stream's external
+size), "modeset" unqualified (weston's DRM modeset is one step of it).
+
 **Generation** — one app container launched into one session: the gen-0
 container the session boots with, and each replacement a swap launches after
 it. Its container name carries the number (`quasar-sess-<sid>-g<n>`), and its

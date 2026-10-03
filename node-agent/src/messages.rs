@@ -351,6 +351,11 @@ pub enum AgentMsg {
         /// admin PATCH). Present only alongside `stream_width`/`stream_height`.
         #[serde(skip_serializing_if = "Option::is_none")]
         external_owner: Option<&'static str>,
+        /// #445: the physical display mode a console session's local display runs at,
+        /// present once the agent knows it (a local-only console; moved by a mode the app
+        /// picked). Absent on a streamed session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        console_mode: Option<ConsoleModeSelection>,
     },
     /// Image-management P2: pull/remove progress for a managed catalog image on
     /// this host (agent-api.md `image_state`). Fire-and-forget like
@@ -466,6 +471,13 @@ impl AgentMsg {
             ladder_res_rung: w.ladder_res_rung,
             ladder_fps: w.ladder_fps,
             external_owner: w.external_owner,
+            console_mode: w.console_mode.map(|(width, height, refresh_millihz)| {
+                ConsoleModeSelection {
+                    width,
+                    height,
+                    refresh_millihz,
+                }
+            }),
         }
     }
 }
@@ -840,7 +852,7 @@ pub struct ConsoleConfig {
     pub fullscreen: bool,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleModeSelection {
     pub width: u16,
     pub height: u16,
@@ -1455,6 +1467,7 @@ mod tests {
             ladder_res_rung: None,
             ladder_fps: None,
             external_owner: None,
+            console_mode: None,
         }
     }
 
