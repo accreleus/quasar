@@ -43,6 +43,10 @@ own; the two do not move together, and that is deliberate.
   passes. `bench_run.sh` now says when it cannot write its output directory, and how to fix it.
 - **A host's Settings page fits a phone screen (#444).** Its two columns now stack instead of
   squeezing the settings to a sliver beside the host card.
+- **A stale file at `/dev/i2c-N` no longer stops console mode turning on (#443).** On a
+  rootless engine the recovery actor now skips, and logs, an i2c entry that is not a device,
+  so console mode turns on and only monitor control goes without that bus. The `console_ddc`
+  check says how to clear it.
 - **Console audio survives a reboot, and host preparation can restart PipeWire on Fedora
   CoreOS (#433).** The desktop user's PipeWire now starts with their session, so the
   console-audio socket is back after a reboot. Host preparation restarts it through

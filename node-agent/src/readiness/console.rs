@@ -215,7 +215,10 @@ pub fn check_ddc(v: &ConsoleView) -> ReadinessCheck {
             CHECK_DDC,
             "no I2C bus is mapped to a display connector yet".into(),
             "Check /dev/i2c-* is present (host preparation grants it on a rootless engine) \
-             and that a monitor is connected."
+             and that a monitor is connected. On a rootless engine the recovery actor passes \
+             only the /dev/i2c-N that are character devices: one that is a plain file (a \
+             stale placeholder) is skipped and named in its log. Remove that file, load \
+             i2c-dev, then turn console mode off and on again."
                 .into(),
         );
     }
