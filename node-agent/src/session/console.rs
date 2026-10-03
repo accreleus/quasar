@@ -427,6 +427,18 @@ pub fn spawn_weston_console(
     session_id: &str,
     config: Option<&crate::messages::ConsoleConfig>,
 ) -> Result<WestonConsole> {
+    // The connector inventory for a pinned output, gathered BEFORE any lock below:
+    // `detect_drm_outputs` takes `drm_open_lock` itself per card, and that mutex is
+    // not re-entrant, so calling it under this function's own `_drm_open_guard`
+    // deadlocks the runner thread (hit live on the first #445 mode switch, 2026-10-03:
+    // weston killed, no replacement, black screen until the agent was restarted). The
+    // pinned path never ran on a live console before that, so #422 shipped it unseen.
+    // Uses the narrow `detect_drm_outputs`, not `detect_console_capabilities` — the
+    // latter's DDC/CI + audio + input enumeration would eat this fn's 15s budget.
+    let pinned_outputs = config
+        .filter(|c| c.output_id.is_some())
+        .map(|_| crate::capacity::detect_drm_outputs());
+
     // Acquire the process-wide console lock BEFORE ensure_seatd()/spawn: only one
     // physical console exists, so this blocks a new launch until the previous
     // WestonConsole's Drop has fully drained its process group (see Drop and
@@ -469,11 +481,10 @@ pub fn spawn_weston_console(
     let config_path = config
         .and_then(|c| c.output_id.as_deref().map(|id| (id, c.mode.clone())))
         .map(|(output_id, mode)| -> Result<Option<std::path::PathBuf>> {
-            // Gather every other connected connector so weston_output_config can
-            // emit `mode=off` stanzas for them (see its doc). Uses the narrow
-            // `detect_drm_outputs`, not `detect_console_capabilities` — the latter's
-            // DDC/CI + audio + input enumeration would eat this fn's 15s budget.
-            let outputs = crate::capacity::detect_drm_outputs();
+            // Every other connected connector, so weston_output_config can emit
+            // `mode=off` stanzas for them (see its doc). Probed above, before the
+            // locks — never call `detect_drm_outputs` from here.
+            let outputs = pinned_outputs.clone().unwrap_or_default();
             // #422: a pinned output with no configured mode runs at its physical
             // mode; without a config weston would light every connected output.
             let Some(mode) = mode.or_else(|| pinned_output_mode(output_id, &outputs)) else {
