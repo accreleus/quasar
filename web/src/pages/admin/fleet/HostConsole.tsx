@@ -227,7 +227,7 @@ export function HostConsole() {
       )}
 
       {!loading && (
-        <div className="split console-split">
+        <div className="split rail-split">
           <div className="card">
             <div className="panel-head">
               <div>
