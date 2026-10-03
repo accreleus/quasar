@@ -8360,6 +8360,8 @@ export interface components {
              * @enum {string}
              */
             external_owner?: "auto" | "pinned";
+            /** @description console-mode-switch (approved 2026-10-03, #445). The physical display mode a local console session runs at, as the agent last reported it (agent-api.md session_metrics.console_mode; refresh_millihz is the exact DRM timing). Present once a console sample has been seen; absent on every streamed session and before the first sample — absence means "not a known local console", never "at the launch mode". Moves when the app in the session picks another mode in its own display settings; width/height/fps stay the launch mode. In-memory cache, dropped on a control-plane restart like external_width. Read-only. */
+            console_mode?: components["schemas"]["ConsoleModeSelection"];
             /** @description session-display-stream (approved 2026-08-16). The fixed, aspect-ratio-filtered table of [width,height] pairs this session's stream_width/stream_height may be set to via PATCH /v1/sessions/{id}/display (always <= the launch size, launch size always included). Always present on session.stream for a running session; absent on an app's display_stream. Not the admin-configured stream-profile "rungs" (AS10-01) — a separate, fixed table unrelated to the admin encode-rung catalog. 21:9 family membership is by a set of reduced ratios {43:18, 64:27, 7:3} — 3440x1440 reduces to 43:18, 2560x1080 to 64:27 — control-api.md's table is the reference, not a computed tolerance. */
             rungs?: number[][];
         };

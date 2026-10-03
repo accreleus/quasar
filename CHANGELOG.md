@@ -38,6 +38,12 @@ own; the two do not move together, and that is deliberate.
   preparation that fixes it. Before the first reboot it reads `unknown`.
 
 ### Fixed
+- **In console mode, the desktop's display settings list the monitor's real modes, and
+  picking one changes the monitor (#445).** The compositor now advertises every resolution
+  and refresh rate the connected display supports and takes a choice through the standard
+  output-management protocol; the node agent moves the monitor and the picture to that mode
+  with the app still running, and the session reports the mode it runs at. Needs the matching
+  desktop image, which carries the choice from the X11 desktop to the compositor.
 - **`make test-engines-build` no longer leaves `.diagnostics` owned by root (#442).** The
   suite binary and its directories now belong to whoever ran it, so a later `make verify`
   passes. `bench_run.sh` now says when it cannot write its output directory, and how to fix it.
