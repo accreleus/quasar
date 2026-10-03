@@ -372,6 +372,10 @@ type SessionMetricsMsg struct {
 	// rate — absent means "at the launch rate", never "unknown".
 	LadderFps     *int32 `json:"ladder_fps,omitempty"`
 	ExternalOwner string `json:"external_owner,omitempty"` // "auto" | "pinned"
+	// #445: the physical display mode a local console session runs at, present
+	// once the agent knows it and moved when the app picks another. Absent on a
+	// streamed session.
+	ConsoleMode *console.ModeSelection `json:"console_mode,omitempty"`
 }
 
 // SessionTraceEventMsg is an agent-emitted trace event (agent-api.md

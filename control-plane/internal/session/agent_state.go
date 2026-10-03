@@ -182,6 +182,7 @@ func (c *Coordinator) AgentMetrics(ctx context.Context, hostID string, m agentws
 	// insert: the cache validates the next display request and is what the Session
 	// resource serializes, so it must not be hostage to a metrics write.
 	c.display.observe(m.SessionID, m.StreamWidth, m.StreamHeight, m.ExternalResizeSupported, m.ExternalOwner)
+	c.display.observeConsoleMode(m.SessionID, m.ConsoleMode)
 
 	metrics := buildAgentMetrics(m)
 	// Append only; retention is the telemetry janitor's job. An ingest that also
@@ -354,6 +355,11 @@ func buildAgentMetrics(m agentws.SessionMetricsMsg) json.RawMessage {
 	}
 	if m.ExternalOwner != "" {
 		obj["external_owner"] = m.ExternalOwner
+	}
+	// #445: the console session's physical display mode, verbatim, so the
+	// diagnostic bundle can tell which mode a window was rendered at.
+	if m.ConsoleMode != nil {
+		obj["console_mode"] = *m.ConsoleMode
 	}
 	b, err := json.Marshal(obj)
 	if err != nil {

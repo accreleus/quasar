@@ -101,7 +101,7 @@ pub(crate) fn h264_caps_profile(requested: &str, encoder: EncoderChoice) -> Resu
 /// display-ratio assertion so negotiation never completes.
 ///
 /// ZC-01: encoder-aware per path; see [`raw_video_caps_for`].
-pub(super) fn raw_video_caps(cfg: &SessionConfig) -> gst::Caps {
+pub(crate) fn raw_video_caps(cfg: &SessionConfig) -> gst::Caps {
     if local_dmabuf_transport(cfg) {
         return gst::Caps::builder("video/x-raw")
             .features(["memory:DMABuf"])

@@ -13,6 +13,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/accreleus/quasar/control-plane/internal/console"
 )
 
 // Adaptive external resolution (spec D4/D5): stream_width/stream_height on
@@ -167,6 +168,46 @@ func TestDisplayStateCache(t *testing.T) {
 	}
 	if st, _ := d.get("s1"); st.Owner != "" {
 		t.Fatalf("owner not cleared at launch size: got %q", st.Owner)
+	}
+
+	d.forget("s1")
+	if _, ok := d.get("s1"); ok {
+		t.Fatal("forget left an entry behind")
+	}
+}
+
+// TestDisplayStateConsoleMode pins #445: a console sample's display mode is cached
+// independently of the external size, a sample without one leaves it alone, a later
+// one replaces it, and forget clears it with the rest.
+func TestDisplayStateConsoleMode(t *testing.T) {
+	d := newDisplayState()
+
+	d.observeConsoleMode("s1", nil)
+	if _, ok := d.get("s1"); ok {
+		t.Fatal("a nil console mode created an entry")
+	}
+
+	first := console.ModeSelection{Width: 1920, Height: 1080, RefreshMillihz: 60000}
+	d.observeConsoleMode("s1", &first)
+	st, ok := d.get("s1")
+	if !ok || st.ConsoleMode == nil || *st.ConsoleMode != first {
+		t.Fatalf("console mode not recorded: %+v ok=%v", st, ok)
+	}
+	if st.HasSize {
+		t.Fatal("a console mode must not invent an external size")
+	}
+
+	// A streamed-style sample (no console mode) leaves it in place...
+	d.observeConsoleMode("s1", nil)
+	d.observe("s1", nil, nil, bp(false), "")
+	if st, _ := d.get("s1"); st.ConsoleMode == nil || *st.ConsoleMode != first {
+		t.Fatalf("console mode clobbered by a sample without one: %+v", st)
+	}
+	// ...and the app picking another mode replaces it.
+	second := console.ModeSelection{Width: 2560, Height: 1440, RefreshMillihz: 143981}
+	d.observeConsoleMode("s1", &second)
+	if st, _ := d.get("s1"); st.ConsoleMode == nil || *st.ConsoleMode != second {
+		t.Fatalf("console mode not moved: %+v", st)
 	}
 
 	d.forget("s1")
@@ -483,6 +524,31 @@ func TestSessionRespRungsAndExternal(t *testing.T) {
 	}
 	if st.ExternalOwner != "" {
 		t.Fatalf("external_owner not cleared at launch size: got %q", st.ExternalOwner)
+	}
+	if st.ConsoleMode != nil {
+		t.Fatalf("console_mode present on a streamed session: %+v", st.ConsoleMode)
+	}
+
+	// #445: a console sample carries the physical display mode; the resource reports
+	// it beside the launch size, and a later sample (the app picked a mode) moves it.
+	coord.AgentMetrics(ctx, host, agentws.SessionMetricsMsg{
+		Type: "session_metrics", SessionID: sid, TsUnixMs: time.Now().UnixMilli(),
+		ConsoleMode: &console.ModeSelection{Width: 1920, Height: 1080, RefreshMillihz: 60000},
+	})
+	st = get()
+	if st.ConsoleMode == nil || *st.ConsoleMode != (console.ModeSelection{Width: 1920, Height: 1080, RefreshMillihz: 60000}) {
+		t.Fatalf("console_mode after a console sample: %+v", st.ConsoleMode)
+	}
+	coord.AgentMetrics(ctx, host, agentws.SessionMetricsMsg{
+		Type: "session_metrics", SessionID: sid, TsUnixMs: time.Now().UnixMilli(),
+		ConsoleMode: &console.ModeSelection{Width: 2560, Height: 1440, RefreshMillihz: 143981},
+	})
+	st = get()
+	if st.ConsoleMode == nil || st.ConsoleMode.Width != 2560 || st.ConsoleMode.RefreshMillihz != 143981 {
+		t.Fatalf("console_mode did not move with the app's choice: %+v", st.ConsoleMode)
+	}
+	if st.Width != 1920 || st.Height != 1080 {
+		t.Fatalf("launch width/height moved with the console mode: %dx%d", st.Width, st.Height)
 	}
 }
 
