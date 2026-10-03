@@ -114,8 +114,10 @@ it is authoritative: a mismatch is refused and neither operator hatch overrides 
 1. `git clone git@github.com:salty2011/gst-wayland-display.git` (or use the existing clone; `origin`
    is the fork, `upstream` is games-on-whales).
 2. Branch off `develop`, make the change as a real commit, merge back into `develop`, push.
-3. Bump `GST_WAYLAND_DISPLAY_REF` in `deploy/Dockerfile.vulkan` to the new `develop` SHA and update
-   the row above. Nothing is rebuilt until that bump, which is the gate.
+3. Bump `GST_WAYLAND_DISPLAY_REF` in `deploy/pins.env`, `deploy/Dockerfile.vulkan` **and
+   `scripts/release/release-manifest.json`** (the Images workflow's release preflight refuses a
+   manifest that disagrees with `pins.env`; `scripts/release/release-preflight.sh` checks it
+   locally), then update the row above. Nothing is rebuilt until that bump, which is the gate.
 4. Re-diff the corresponding file in `deploy/patches/vulkan/` so the authored record and the branch
    stay in step, and update that README section.
 
