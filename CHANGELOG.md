@@ -38,6 +38,10 @@ own; the two do not move together, and that is deliberate.
   preparation that fixes it. Before the first reboot it reads `unknown`.
 
 ### Fixed
+- **Console audio survives a reboot, and host preparation can restart PipeWire on Fedora
+  CoreOS (#433).** The desktop user's PipeWire now starts with their session, so the
+  console-audio socket is back after a reboot. Host preparation restarts it through
+  `runuser`, which also works on uCore.
 - **The host readiness card files the engine and console mode checks in their own groups (#437).**
   The engine checks now sit under Container runtime, and console mode's display, audio and
   monitor control under a new Console mode group, instead of under Other.

@@ -83,9 +83,11 @@ pub trait HostAudio {
     }
 }
 
-/// What host preparation's console-audio user runs, as root on the host, so a running
-/// `pipewire-pulse` reads the drop-in and opens [`PIPEWIRE_SOCKET`] (#433).
-pub const RESTART_PIPEWIRE_PULSE: &str = "systemctl --user -M USER@ restart pipewire-pulse.service";
+/// What to run, as root on the host, so the console-audio user's `pipewire-pulse` reads
+/// the drop-in and opens [`PIPEWIRE_SOCKET`] (#433). Through `runuser`: the `-M USER@`
+/// form needs machined's transient units, which fail on Fedora CoreOS (uCore).
+pub const RESTART_PIPEWIRE_PULSE: &str =
+    "runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service";
 
 /// Where the console audio leg plays.
 #[derive(Debug, Clone, PartialEq, Eq)]

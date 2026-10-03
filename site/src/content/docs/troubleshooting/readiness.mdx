@@ -82,7 +82,7 @@ is off, and never block streaming. See [Console mode](/quasar/admin/console/#rea
 | Agent not created with console access | Turn console mode on from the host's Local console page. |
 | Another process holds the display | Stop the desktop or login screen on that output, or pick another. Rootless: install the console [device rules](/quasar/install/device-rules/). Then toggle console mode off and on. |
 | No local audio sink | Check the host has a sound device, or set up [Host PipeWire](/quasar/admin/console/#local-audio). |
-| Console-audio socket missing | The desktop user's pipewire-pulse hasn't read host preparation's drop-in yet. As root on the host: `systemctl --user -M USER@ restart pipewire-pulse.service`, or have USER log in again. |
+| Console-audio socket missing | The desktop user's pipewire-pulse hasn't read host preparation's drop-in yet. Run host preparation again, or as root on the host: `runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`. Or have USER log in again. |
 | `ddcutil` missing, or no i2c bus for a connector | Every connected display counts as on. Check `/dev/i2c-*` exists (the console device rules grant it on rootless) and a monitor is connected. |
 
 ## Owner conflict
