@@ -38,6 +38,10 @@ own; the two do not move together, and that is deliberate.
   preparation that fixes it. Before the first reboot it reads `unknown`.
 
 ### Fixed
+- **In console mode, a desktop that only resizes its own window when you pick a resolution
+  still moves the monitor to match (#447).** Some desktops don't speak the standard
+  output-management protocol but do resize their fullscreen window on a resolution change;
+  the compositor now treats that resize as the same request and moves the console monitor.
 - **In console mode, the desktop's display settings list the monitor's real modes, and
   picking one changes the monitor (#445).** The compositor now advertises every resolution
   and refresh rate the connected display supports and takes a choice through the standard
