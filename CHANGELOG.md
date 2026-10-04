@@ -42,6 +42,9 @@ own; the two do not move together, and that is deliberate.
   preparation that fixes it. Before the first reboot it reads `unknown`.
 
 ### Fixed
+- **A KDE console session's resolution pick no longer snaps back (#447).** The compositor's
+  follow-the-window fallback stays quiet while the desktop speaks wlr-output-management, so a
+  stale frame at the old size during the switch is not read as a request to go back.
 - **Docker install commands separate the recovery image from `seed`.** Both the
   first-machine and GPU-host examples now include the missing space so Docker runs
   the seed command instead of trying to pull a `quasar-recoveryseed` image.
