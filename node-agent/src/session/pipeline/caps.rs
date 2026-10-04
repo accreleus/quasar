@@ -41,18 +41,33 @@ pub(crate) fn vulkan_image_transport(cfg: &SessionConfig) -> bool {
     uses_vulkan_images(cfg.encoder, cfg.video_topology)
 }
 
-/// Encoder-free local display uses ordinary DRM PRIME buffers: unlike the Vulkan
-/// encode ring, DMABuf sync is designed for cross-pipeline display import, and
-/// waylandsink advertises DMA_DRM directly. Knob: `QUASAR_EXPERIMENTAL_LOCAL_DMABUF`.
+/// Encoder-free local display on RGB DRM PRIME buffers (#450): the compositor renders
+/// into a recycled ring of GBM buffers (`display-dmabuf`, see `source_branch`) and the
+/// display imports them as-is — no readback, no CPU copy, no `videoconvert`. The DMA_DRM
+/// caps leave `drm-format` open: the display leg's interpipesrc allows renegotiation, so
+/// the source negotiates against the sink's real format list (weston's linux-dmabuf
+/// formats, or the KMS plane's) and takes the first one the compositor renders.
+/// Knob: `QUASAR_EXPERIMENTAL_LOCAL_DMABUF`, default off until a live console check.
 pub(crate) fn local_dmabuf_transport(cfg: &SessionConfig) -> bool {
-    cfg.video_topology == VideoTopology::LocalOnly
-        && !cfg.use_test_src
-        && matches!(
-            std::env::var("QUASAR_EXPERIMENTAL_LOCAL_DMABUF")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("TRUE")
-        )
+    local_dmabuf_transport_for(
+        cfg.video_topology,
+        cfg.use_test_src,
+        std::env::var("QUASAR_EXPERIMENTAL_LOCAL_DMABUF")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`local_dmabuf_transport`] over its inputs: local-only, a real compositor (not the
+/// synthetic test source, which has no dmabufs), and the knob on.
+fn local_dmabuf_transport_for(
+    topology: VideoTopology,
+    use_test_src: bool,
+    knob: Option<&str>,
+) -> bool {
+    topology == VideoTopology::LocalOnly
+        && !use_test_src
+        && matches!(knob, Some("1") | Some("true") | Some("TRUE"))
 }
 
 fn uses_vulkan_images(encoder: EncoderChoice, topology: VideoTopology) -> bool {
@@ -342,13 +357,30 @@ pub(super) fn encoder_input_caps_for(
 mod tests {
     use super::{
         caps_profile, cuda_encoder_input_caps, encoder_input_caps_for, h264_caps_profile,
-        raw_video_caps, raw_video_caps_for, uses_vulkan_images, va_encoder_input_caps,
+        local_dmabuf_transport_for, raw_video_caps, raw_video_caps_for, uses_vulkan_images,
+        va_encoder_input_caps,
     };
     use crate::messages::VideoTopology;
     use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
     use gstreamer as gst;
 
     // ---- caps_profile: the all-codec generalization of h264_caps_profile ----
+
+    /// #450: the local DMABuf transport is local-only, needs the real compositor, and is
+    /// off unless the knob says otherwise.
+    #[test]
+    fn local_dmabuf_transport_only_for_local_only_with_the_knob() {
+        use VideoTopology::*;
+        for knob in [Some("1"), Some("true"), Some("TRUE")] {
+            assert!(local_dmabuf_transport_for(LocalOnly, false, knob));
+            assert!(!local_dmabuf_transport_for(LocalOnly, true, knob));
+            assert!(!local_dmabuf_transport_for(StreamOnly, false, knob));
+            assert!(!local_dmabuf_transport_for(DualOutput, false, knob));
+        }
+        for knob in [None, Some(""), Some("0"), Some("True"), Some("yes")] {
+            assert!(!local_dmabuf_transport_for(LocalOnly, false, knob));
+        }
+    }
 
     #[test]
     fn caps_profile_h264_matches_h264_caps_profile() {

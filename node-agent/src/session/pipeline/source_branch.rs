@@ -89,10 +89,22 @@ pub(crate) fn build_video_source(
             );
             pin_vulkan_encode_ring();
         } else if local_dmabuf_transport(cfg) {
-            el.set_property("nv12", true);
-            tracing::info!(
-                "local display: waylanddisplaysrc nv12=true (prefer display-importable NV12 DMABuf)"
-            );
+            // #450: RGB dmabufs straight to the display, from the compositor's recycled
+            // output ring. `display-dmabuf` orders the RGB formats for a display (XRGB first,
+            // LINEAR where the GPU renders it, compressed last); never `nv12`, which selects
+            // the standalone Vulkan NV12 converter (an encoder format, broken on NVIDIA).
+            if el.find_property("display-dmabuf").is_some() {
+                el.set_property("display-dmabuf", true);
+                tracing::info!(
+                    "local display: waylanddisplaysrc display-dmabuf=true (RGB DMABuf ring to the display)"
+                );
+            } else {
+                tracing::warn!(
+                    token = "local-dmabuf-old-compositor",
+                    "local display: compositor lacks display-dmabuf (older gst-wayland-display); \
+                     the DMABuf format is whatever the renderer lists first"
+                );
+            }
         }
         // libinput's path backend opens these directly (no udev/seat). The gamepad
         // reaches the app through the container's mounted device node instead.
@@ -117,6 +129,19 @@ pub(crate) fn build_video_source(
         .property("caps", &tail_caps)
         .build()
         .context("capsfilter not found")?;
+
+    // Local-only DMABuf (#450), whatever the host's encoder: the compositor's RGB dmabuf
+    // ring goes straight to the display leg. No videoscale/videoconvert — neither can
+    // negotiate the DMABuf memory feature; the compositor renders at WxH itself.
+    if local_dmabuf_transport(cfg) {
+        pipeline.add_many([&src, &tail])?;
+        gst::Element::link_many([&src, &tail])
+            .context("failed to link local-only DMABuf source (compositor → DMA_DRM)")?;
+        tracing::info!(
+            "local-only topology: source emits DMABuf DMA_DRM for direct display import"
+        );
+        return Ok(tail);
+    }
 
     match cfg.encoder {
         // NVENC N-A: the compositor emits memory:CUDAMemory BGRA at the session WxH (it
@@ -168,13 +193,6 @@ pub(crate) fn build_video_source(
                 gst::Element::link_many([&src, &tail]).context(
                     "failed to link Vulkan video source (compositor → VulkanImage NV12)",
                 )?;
-            } else if local_dmabuf_transport(cfg) {
-                pipeline.add_many([&src, &tail])?;
-                gst::Element::link_many([&src, &tail])
-                    .context("failed to link local-only DMABuf source (compositor → DMA_DRM)")?;
-                tracing::info!(
-                    "local-only topology: source emits DMABuf DMA_DRM for direct display import"
-                );
             } else {
                 let scale = gst::ElementFactory::make("videoscale")
                     .build()

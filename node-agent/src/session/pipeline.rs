@@ -1103,8 +1103,8 @@ impl Drop for LocalDisplay {
 /// Build the [`LocalDisplay`] fan-out for `cfg`, listening to `initial_sink_name`.
 ///
 /// The interpipesrc config must mirror the encode pipeline's exactly
-/// (`do-timestamp=false`, `allow-renegotiation=false`, `caps=raw_video_caps`, `is-live`,
-/// `format=time`): the runner shares one clock + base time across all pipelines, so the
+/// (`do-timestamp=false`, `allow-renegotiation=false` — except under the local DMABuf
+/// transport, see below — `caps=raw_video_caps`, `is-live`, `format=time`): the runner shares one clock + base time across all pipelines, so the
 /// source's PTS are already valid here and re-stamping breaks pacing (#68).
 ///
 /// The download bridge is encoder-aware: the interpipe carries CUDAMemory / VulkanImage /
@@ -1123,13 +1123,20 @@ pub fn build_local_display_pipeline(
     let pipeline = gst::Pipeline::new();
 
     let raw_caps = raw_video_caps(cfg);
+    // The local DMABuf transport's caps leave `drm-format` open (only the source and sink
+    // between them know which modifier works), so this interpipesrc must take the caps the
+    // source actually negotiated: with renegotiation off it would push the unfixed caps
+    // property downstream and waylandsink fails `not-negotiated`. It also routes the
+    // source's caps query to the sink, so the compositor picks a format the display takes.
+    // waylandsink/kmssink accept new caps at any time; no encoder sits behind this leg.
+    let allow_renegotiation = caps::local_dmabuf_transport(cfg);
     let interpipesrc = gst::ElementFactory::make("interpipesrc")
         .name(format!("{initial_sink_name}-dispsrc"))
         .property("listen-to", initial_sink_name)
         .property("is-live", true)
         .property("do-timestamp", false)
         .property_from_str("format", "time")
-        .property("allow-renegotiation", false)
+        .property("allow-renegotiation", allow_renegotiation)
         .property("caps", &raw_caps)
         .build()
         .context("interpipesrc not found — is gst-interpipe installed in the image?")?;
@@ -1151,34 +1158,42 @@ pub fn build_local_display_pipeline(
             .with_context(|| format!("{name} not found — is the plugin in the image?"))
     };
     let mut bridge: Vec<gst::Element> = Vec::new();
-    match cfg.encoder {
-        // memory:CUDAMemory BGRA → download to system, then convert.
-        #[cfg(feature = "cuda")]
-        EncoderChoice::Nvenc => {
-            bridge.push(make_el("cudadownload")?);
-            bridge.push(make_el("videoconvert")?);
-        }
-        // No cuda feature: the interpipe carries system RGBx, so just convert.
-        #[cfg(not(feature = "cuda"))]
-        EncoderChoice::Nvenc => bridge.push(make_el("videoconvert")?),
-        // memory:VulkanImage NV12 → download to system, then convert.
-        EncoderChoice::Vulkan => {
-            if caps::vulkan_image_transport(cfg) {
-                bridge.push(make_el("vulkandownload")?);
-            }
-            if !caps::local_dmabuf_transport(cfg) {
+    // Local DMABuf (#450): the display imports the compositor's dmabufs as-is, for any
+    // encoder choice; a bridge element would only bring the CPU copy back.
+    let encoder_bridge = if caps::local_dmabuf_transport(cfg) {
+        None
+    } else {
+        Some(cfg.encoder)
+    };
+    match encoder_bridge {
+        None => {}
+        Some(encoder) => match encoder {
+            // memory:CUDAMemory BGRA → download to system, then convert.
+            #[cfg(feature = "cuda")]
+            EncoderChoice::Nvenc => {
+                bridge.push(make_el("cudadownload")?);
                 bridge.push(make_el("videoconvert")?);
             }
-        }
-        // VA: under ZC-03 dmabuf RGB, kmssink imports the dmabuf directly — videoconvert
-        // cannot negotiate the DMABuf memory feature. Otherwise system RGBx → convert.
-        EncoderChoice::Va => {
-            if caps::dmabuf_zerocopy_format(cfg).is_none() {
+            // No cuda feature: the interpipe carries system RGBx, so just convert.
+            #[cfg(not(feature = "cuda"))]
+            EncoderChoice::Nvenc => bridge.push(make_el("videoconvert")?),
+            // memory:VulkanImage NV12 → download to system, then convert.
+            EncoderChoice::Vulkan => {
+                if caps::vulkan_image_transport(cfg) {
+                    bridge.push(make_el("vulkandownload")?);
+                }
                 bridge.push(make_el("videoconvert")?);
             }
-        }
-        // openh264: system I420 → convert.
-        EncoderChoice::Openh264 => bridge.push(make_el("videoconvert")?),
+            // VA: under ZC-03 dmabuf RGB, kmssink imports the dmabuf directly — videoconvert
+            // cannot negotiate the DMABuf memory feature. Otherwise system RGBx → convert.
+            EncoderChoice::Va => {
+                if caps::dmabuf_zerocopy_format(cfg).is_none() {
+                    bridge.push(make_el("videoconvert")?);
+                }
+            }
+            // openh264: system I420 → convert.
+            EncoderChoice::Openh264 => bridge.push(make_el("videoconvert")?),
+        },
     }
 
     let terminal = if let Some(sock) = wayland_socket {
