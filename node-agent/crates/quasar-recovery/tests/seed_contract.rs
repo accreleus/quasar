@@ -186,6 +186,7 @@ fn every_actor_container_a_recovery_actor_renders_carries_more_than_the_seed_lab
         app: Default::default(),
         console: false,
         console_vt_kept: false,
+        agent_variables: Default::default(),
     };
     let image = quasar_recovery::recipe::ImageRef::parse(ACTOR_IMAGE).unwrap();
     for revision in Book::window(Role::RecoveryActor).unwrap() {

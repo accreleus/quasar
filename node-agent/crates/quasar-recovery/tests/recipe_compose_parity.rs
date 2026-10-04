@@ -302,6 +302,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         app: Default::default(),
         console: false,
         console_vt_kept: false,
+        agent_variables: Default::default(),
     }
 }
 

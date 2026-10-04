@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Seed-managed installs can set the node agent's own settings (#448).** Set them on the seed,
+  such as `QUASAR_APP_MOUNT_ALLOW` for host folders apps may bind, or change them later with
+  `quasar-recovery reconfigure`, which re-creates only the node agent. Settings the install
+  manages are refused. See "Agent variables" in `docs/configuration.md`.
 - **The console mode page says more about a black picture in a virtual machine (#414).**
   With an NVIDIA GPU passed through, the virtual machine's own boot screen is black too, so
   the cause is the card's hand-off rather than Quasar; the page says so and what to use instead.

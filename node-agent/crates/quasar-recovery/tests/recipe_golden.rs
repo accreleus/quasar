@@ -62,6 +62,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
         app: Default::default(),
         console: false,
         console_vt_kept: false,
+        agent_variables: Default::default(),
     }
 }
 
@@ -1189,4 +1190,71 @@ fn a_rootless_agent_gets_each_drm_node_rather_than_the_directory() {
     let got = devices(&rootful);
     assert!(got.contains(&"/dev/dri".to_string()), "{got:?}");
     assert!(!got.contains(&"/dev/dri/card0".to_string()), "{got:?}");
+}
+
+#[test]
+fn agent_variables_render_over_the_agent_defaults_and_none_render_nothing() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    for vendor in [Some(GpuVendor::Nvidia), Some(GpuVendor::Amd), None] {
+        let plain = inputs(vendor);
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("agent_variables")
+            .is_none());
+        let before = render(Role::NodeAgent, 3, &plain, &image, &agent_secrets()).unwrap();
+
+        let mut with = plain.clone();
+        with.agent_variables.extend([
+            (
+                "QUASAR_APP_MOUNT_ALLOW".to_string(),
+                "/mnt/games:rw".to_string(),
+            ),
+            ("QUASAR_CUDA_DEVICE".to_string(), "1".to_string()),
+            ("QUASAR_ABR_MODE".to_string(), "protective".to_string()),
+        ]);
+        let after = render(Role::NodeAgent, 3, &with, &image, &agent_secrets()).unwrap();
+        assert_eq!(after.env["QUASAR_APP_MOUNT_ALLOW"], "/mnt/games:rw");
+        assert_eq!(
+            after.env["QUASAR_CUDA_DEVICE"], "1",
+            "over the NVIDIA default"
+        );
+        assert_eq!(after.env["QUASAR_ABR_MODE"], "protective");
+        let mut rest = after.env.clone();
+        let mut expected = before.env.clone();
+        for k in with.agent_variables.keys() {
+            rest.remove(k);
+            expected.remove(k);
+        }
+        assert_eq!(rest, expected, "nothing else moves");
+        assert_eq!(after.binds, before.binds);
+        assert_ne!(after.labels, before.labels, "a new specification");
+    }
+
+    let mut owned = inputs(None);
+    owned
+        .agent_variables
+        .insert("QUASAR_RENDER_NODE".into(), "/dev/dri/renderD129".into());
+    assert!(matches!(
+        render(Role::NodeAgent, 3, &owned, &image, &agent_secrets()),
+        Err(RenderError::Invalid(_))
+    ));
+    let mut broken = inputs(None);
+    broken
+        .agent_variables
+        .insert("QUASAR_APP_MOUNT_ALLOW".into(), "/a\n/b".into());
+    assert!(render(Role::NodeAgent, 3, &broken, &image, &agent_secrets()).is_err());
+}
+
+#[test]
+fn agent_variables_are_documented() {
+    let docs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/configuration.md"),
+    )
+    .unwrap();
+    for name in quasar_recovery::recipe::AGENT_VARIABLES {
+        assert!(
+            docs.contains(&format!("| `{name}`")) || docs.contains(&format!("`{name}` /")),
+            "{name} has no row in docs/configuration.md"
+        );
+    }
 }

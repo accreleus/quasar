@@ -220,6 +220,10 @@ impl Bootstrap {
                     manifest_timeout_s: get(MANIFEST_TIMEOUT_S),
                     insecure_registries: get(INSECURE_REGISTRIES),
                 },
+                agent_variables: recipe::AGENT_VARIABLES
+                    .iter()
+                    .filter_map(|name| get(name).map(|v| (name.to_string(), v.trim().to_owned())))
+                    .collect(),
             },
         })
     }
@@ -308,6 +312,13 @@ impl Bootstrap {
             None
         };
         let app = self.check_app()?;
+        if !agent_here {
+            if let Some(name) = op.agent_variables.keys().next() {
+                return Err(format!(
+                    "{name} configures the node agent, and a control-only machine runs none. Unset it here"
+                ));
+            }
+        }
         let override_of = |name: &str, raw: &Option<String>| -> Result<Option<ImageRef>, String> {
             raw.as_deref()
                 .map(|v| ImageRef::parse(v.trim()).map_err(|e| format!("{name}: {e}")))
@@ -333,6 +344,7 @@ impl Bootstrap {
             app: app.clone(),
             console: false,
             console_vt_kept: false,
+            agent_variables: op.agent_variables.clone(),
         };
         recipe::validate(&probe).map_err(|e| e.to_string())?;
         trust_config(&op.trust)?;
@@ -348,6 +360,7 @@ impl Bootstrap {
             enroll_agent_image: named_agent,
             enroll_overrides,
             app,
+            agent_variables: op.agent_variables.clone(),
         })
     }
 
@@ -475,6 +488,7 @@ pub struct Checked {
     /// The operator's `QUASAR_ENROLL_SEED_IMAGE` / `QUASAR_ENROLL_AGENT_IMAGE`, if given.
     pub enroll_overrides: (Option<ImageRef>, Option<ImageRef>),
     pub app: AppInputs,
+    pub agent_variables: std::collections::BTreeMap<String, String>,
 }
 
 /// The release trust a machine's recorded settings give, parsed as the updater parses its
