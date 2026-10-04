@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.4.1 — 2026-10-04
+
 ### Added
 - **Seed-managed installs can set the node agent's own settings (#448).** Set them on the seed,
   such as `QUASAR_APP_MOUNT_ALLOW` for host folders apps may bind, or change them later with
