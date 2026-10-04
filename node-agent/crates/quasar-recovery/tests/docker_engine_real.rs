@@ -481,6 +481,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
         app: Default::default(),
         console: false,
         console_vt_kept: false,
+        agent_variables: Default::default(),
     };
     let mounts = SecretMounts {
         volume: Some(secrets_vol.clone()),

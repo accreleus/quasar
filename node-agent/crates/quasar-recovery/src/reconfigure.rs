@@ -168,7 +168,7 @@ fn not_reconfigurable(key: &str) -> &'static str {
         var::ENROLLMENT => "an installed machine keeps its identity",
         crate::bootstrap::AWAIT_RESTORE => "it holds a fresh install's first control plane until a restore, so it means something only at install. To load a pre-RH-06 install's dump, reinstall with it: `quasar-recovery uninstall --purge`, then install again with the seed and QUASAR_AWAIT_RESTORE=1",
         k if k.starts_with("QUASAR_DATABASE_") => "the database is fixed at install. Changing the database mode (Quasar's own Postgres or your own database) or the database itself moves data, which a reconfigure never does. To change it, reinstall: back the database up, run `quasar-recovery uninstall`, install again with the seed and the new QUASAR_DATABASE_* inputs, and load your data into the new database",
-        _ => "unknown variable",
+        _ => "it is neither a machine input nor an agent variable",
     }
 }
 
@@ -191,10 +191,27 @@ fn apply_fields(
 ) -> Result<Inputs, String> {
     let mut after = before.clone();
     for (key, value) in changes {
+        if recipe::is_agent_variable(key) {
+            if role == MachineRole::ControlOnly {
+                return Err(format!(
+                    "{key} configures the node agent, and a control-only machine runs none"
+                ));
+            }
+            match opt(value) {
+                Some(v) => after.agent_variables.insert(key.clone(), v),
+                None => after.agent_variables.remove(key),
+            };
+            continue;
+        }
         let control_key = CONTROL_ONLY.contains(&key.as_str());
         if !EVERYWHERE.contains(&key.as_str()) && !control_key {
+            let agent = if role == MachineRole::ControlOnly {
+                ""
+            } else {
+                ", and the agent variables (docs/configuration.md \"Agent variables\")"
+            };
             return Err(format!(
-                "{key} is not changed by a reconfigure: {}. Reconfigurable here: {}",
+                "{key} is not changed by a reconfigure: {}. Reconfigurable here: {}{agent}",
                 not_reconfigurable(key),
                 variables(Some(role)).join(", ")
             ));

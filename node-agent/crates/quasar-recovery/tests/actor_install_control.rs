@@ -1028,3 +1028,32 @@ fn app_container_defaults_come_from_the_seed_and_reach_the_agent() {
         );
     }
 }
+
+#[test]
+fn bootstrap_takes_agent_variables_only_where_an_agent_runs() {
+    use quasar_recovery::bootstrap::Bootstrap;
+    let check = |env: BTreeMap<String, String>| {
+        let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        Bootstrap::from_env(&pairs).unwrap().check(Some("host"))
+    };
+    let mut combined = combined_env();
+    combined.insert("QUASAR_APP_MOUNT_ALLOW".into(), " /mnt/games ".into());
+    combined.insert("QUASAR_RENDER_NODE".into(), "/dev/dri/renderD129".into());
+    let checked = check(combined).unwrap();
+    assert_eq!(
+        checked.agent_variables,
+        BTreeMap::from([(
+            "QUASAR_APP_MOUNT_ALLOW".to_string(),
+            "/mnt/games".to_string()
+        )]),
+        "only agent variables are taken; the install owns the render node"
+    );
+
+    let mut control_only = control_only_external_env();
+    control_only.insert("QUASAR_APP_MOUNT_ALLOW".into(), "/mnt/games".into());
+    let refused = check(control_only).unwrap_err();
+    assert!(
+        refused.contains("QUASAR_APP_MOUNT_ALLOW") && refused.contains("control-only"),
+        "{refused}"
+    );
+}

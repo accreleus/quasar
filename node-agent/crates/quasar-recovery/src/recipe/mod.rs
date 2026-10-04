@@ -393,6 +393,10 @@ pub struct Inputs {
     /// true.
     #[serde(default, skip_serializing_if = "is_false")]
     pub console_vt_kept: bool,
+    /// The operator's agent variables (#448): names from [`AGENT_VARIABLES`], rendered over
+    /// the agent's defaults. Empty renders exactly what a machine without them rendered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_variables: BTreeMap<String, String>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -832,6 +836,9 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
             )));
         }
     }
+    for (name, value) in &inputs.agent_variables {
+        check_agent_variable(name, value)?;
+    }
     if let Some(control) = &inputs.control {
         control::validate(control)?;
         if inputs.socket_dir.is_none() {
@@ -940,6 +947,137 @@ const NODE_AGENT_ENV: &[(&str, &str)] = &[
     ("QUASAR_APP_PUID", ""),
     ("QUASAR_APP_PGID", ""),
 ];
+
+/// The node agent's own settings an operator may give it on an owned install (#448): its
+/// documented `QUASAR_*` knobs, minus what the recipe or a machine input owns and the
+/// dev/test-only ones. Every name is a row of `docs/configuration.md` (guarded by
+/// `agent_variables_are_documented`).
+pub const AGENT_VARIABLES: &[&str] = &[
+    "QUASAR_ABR",
+    "QUASAR_ABR_CLIFF_GUARD_FRAC",
+    "QUASAR_ABR_DEADBAND",
+    "QUASAR_ABR_DISABLED",
+    "QUASAR_ABR_DOWN_DWELL_MS",
+    "QUASAR_ABR_EWMA_ALPHA",
+    "QUASAR_ABR_FLOOR_KBPS",
+    "QUASAR_ABR_FLOOR_RATIO",
+    "QUASAR_ABR_LADDER",
+    "QUASAR_ABR_LADDER_ENGAGE_DWELL",
+    "QUASAR_ABR_LADDER_FLOOR_FOLLOWS_RUNG",
+    "QUASAR_ABR_LADDER_FPS",
+    "QUASAR_ABR_LADDER_MAX_BIAS",
+    "QUASAR_ABR_LADDER_ORDER",
+    "QUASAR_ABR_LADDER_RECOVER_DWELL",
+    "QUASAR_ABR_LADDER_RESOLUTION",
+    "QUASAR_ABR_LADDER_RES_ENGAGE_DWELL",
+    "QUASAR_ABR_LADDER_RES_ENGAGE_FRAC",
+    "QUASAR_ABR_LADDER_RES_EXPONENT",
+    "QUASAR_ABR_LADDER_RES_MIN_HEIGHT",
+    "QUASAR_ABR_LADDER_RES_MIN_STEP_S",
+    "QUASAR_ABR_LADDER_RES_RECOVER_DWELL",
+    "QUASAR_ABR_LADDER_RES_RECOVER_FRAC",
+    "QUASAR_ABR_MAX_DOWN_STEP",
+    "QUASAR_ABR_MAX_UP_STEP",
+    "QUASAR_ABR_MIN_INTERVAL_MS",
+    "QUASAR_ABR_MODE",
+    "QUASAR_ADAPT_ENCODE_BUDGET_FRAC",
+    "QUASAR_ADAPT_FPS_STEADY_FRAC",
+    "QUASAR_ADAPT_GCC_BELOW_FRAC",
+    "QUASAR_ADAPT_SEND_AT_CAP_FRAC",
+    "QUASAR_APP_APPARMOR_PROFILE",
+    "QUASAR_APP_BOOT_TIMEOUT_SECS",
+    "QUASAR_APP_DISPLAY_ENV",
+    "QUASAR_APP_GAMESCOPE_ENV",
+    "QUASAR_APP_MOUNT_ALLOW",
+    "QUASAR_APP_PIDS_LIMIT",
+    "QUASAR_APP_PRIVILEGE_OPTOUT",
+    "QUASAR_APP_READ_ONLY",
+    "QUASAR_APP_SECCOMP",
+    "QUASAR_APP_SHM_SIZE",
+    "QUASAR_APP_STOP_TIMEOUT_SECS",
+    "QUASAR_AUDIO_DISABLED",
+    "QUASAR_AUDIO_NO_CLOCK",
+    "QUASAR_AUDIO_REQUIRED",
+    "QUASAR_CAPTURE_BITSTREAM",
+    "QUASAR_CAPTURE_H264",
+    "QUASAR_CONSOLE_DDC",
+    "QUASAR_CUDA_CONTEXT_SHARED",
+    "QUASAR_CUDA_DEVICE",
+    "QUASAR_CUDA_RUNTIME",
+    "QUASAR_CUDA_RUNTIME_DIR",
+    "QUASAR_ENCODER",
+    "QUASAR_FEC_ARM_LOSS_PCT",
+    "QUASAR_FEC_ARM_WINDOWS",
+    "QUASAR_FEC_DISARM_WINDOWS",
+    "QUASAR_FEC_MAX_FLAPS",
+    "QUASAR_FEC_MODE",
+    "QUASAR_FEC_PERCENTAGE",
+    "QUASAR_FEC_WINDOW_S",
+    "QUASAR_GOP",
+    "QUASAR_HOMES_FREE_SPACE_FLOOR_GIB",
+    "QUASAR_HOMES_GC",
+    "QUASAR_HOMES_GC_DRY_RUN",
+    "QUASAR_HOMES_GC_RETENTION_HOURS",
+    "QUASAR_HOME_TEMPLATES",
+    "QUASAR_IDLE_TIMEOUT_SECS",
+    "QUASAR_IMAGE_SOURCE_HOSTS",
+    "QUASAR_INPUT_BATCH_MS",
+    "QUASAR_INPUT_CHANNEL_MODE",
+    "QUASAR_INPUT_CONTROLLER_NUDGE",
+    "QUASAR_INPUT_TRACE",
+    "QUASAR_INTEL_VULKAN_VIDEO",
+    "QUASAR_INTRA_REFRESH",
+    "QUASAR_INTRA_REFRESH_PERIOD",
+    "QUASAR_JOB_POLL_SECS",
+    "QUASAR_LATENCY_PROBE",
+    "QUASAR_LOG_FORMAT",
+    "QUASAR_MALLOC_TRIM",
+    "QUASAR_MIC",
+    "QUASAR_MIC_DISABLED",
+    "QUASAR_MIC_JITTER_MS",
+    "QUASAR_NVENC_DEFER_TEARDOWN",
+    "QUASAR_NVENC_MAX_SESSIONS",
+    "QUASAR_NVIDIA_DRIVER_RUN",
+    "QUASAR_NVIDIA_DRIVER_TRUST_ON_FIRST_USE",
+    "QUASAR_NV_LIB32_PATH",
+    "QUASAR_QUEUE_BUFFERS",
+    "QUASAR_REQUIRE_HW_RENDER",
+    "QUASAR_SLICES",
+    "QUASAR_SWAP_APP_READY_TIMEOUT_MS",
+    "QUASAR_TARGET_USAGE",
+    "QUASAR_TEMPLATE_ALLOW_CROSSFS",
+    "QUASAR_TEMPLATE_CLONE_MODE",
+    "QUASAR_TEMPLATE_MIN_FREE_BYTES",
+    "QUASAR_TEMPLATE_SETTLE_SECS",
+    "QUASAR_TEMPLATE_WARMUP",
+    "QUASAR_TEMPLATE_WARMUP_TIMEOUT_SECS",
+    "QUASAR_TRACE_ENC_PTS",
+    "QUASAR_TRACE_RTP_MARKER",
+    "QUASAR_TRACE_RTP_TS",
+    "QUASAR_VULKAN_AV1",
+    "QUASAR_VULKAN_H264",
+    "QUASAR_VULKAN_HEVC",
+    "QUASAR_VULKAN_MAX_SESSIONS",
+    "QUASAR_ZEROCOPY",
+];
+
+pub fn is_agent_variable(name: &str) -> bool {
+    AGENT_VARIABLES.contains(&name)
+}
+
+fn check_agent_variable(name: &str, value: &str) -> Result<(), RenderError> {
+    if !is_agent_variable(name) {
+        return Err(RenderError::Invalid(format!(
+            "{name} is not an agent variable"
+        )));
+    }
+    if value.contains(['\n', '\r', '\0']) || value.len() > 4096 {
+        return Err(RenderError::Invalid(format!(
+            "{name} holds a line break or is longer than 4096 bytes"
+        )));
+    }
+    Ok(())
+}
 
 /// `deploy/docker-compose.nvidia.yml`'s environment, beyond the render node.
 const NVIDIA_ENV: &[(&str, &str)] = &[
@@ -1061,6 +1199,8 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
         ));
         gpus.push(GpuRequest::nvidia_all(GpuInjection::DeviceRequest));
     }
+    // Last, so an operator's value wins over every default above.
+    env.extend(inputs.agent_variables.clone());
     binds.sort_by(|a, b| a.target.cmp(&b.target));
 
     ContainerSpec {
