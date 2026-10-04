@@ -1570,10 +1570,6 @@ pub fn run_blocking(
                     .map(|m| (m.width as i32, m.height as i32, m.refresh_millihz as i32))
                     .collect();
                 current_source.set_output_modes(&triples);
-                // #447: a nested display server with no wlr-output-management support
-                // still resizes its own fullscreen window on a resolution change — treat
-                // that resize as an implicit mode request so the console monitor follows.
-                current_source.set_follow_client_size(true);
             }
             modes
         } else {

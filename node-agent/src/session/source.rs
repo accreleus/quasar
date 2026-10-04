@@ -48,11 +48,6 @@ const OUTPUT_MODES: &str = "output-modes";
 /// #445: the application message `waylanddisplaysrc` posts when a client applied an output
 /// configuration (fields `width`, `height`, `refresh-millihz`).
 const MODE_REQUEST: &str = "quasar-mode-request";
-/// #447: when true, a nested display server with no `wlr-output-management` support that
-/// resizes its own fullscreen window is treated by the compositor as an implicit request to
-/// change the advertised output mode to match — the console/desktop fallback for guests that
-/// can't speak the protocol but do resize on a resolution change.
-const FOLLOW_CLIENT_SIZE: &str = "follow-client-size";
 /// The source tail capsfilter (`pipeline::build_video_source`), re-pinned on a mode switch.
 const SOURCE_CAPS: &str = "source-caps";
 
@@ -907,34 +902,6 @@ impl AppSource {
         source.set_property(OUTPUT_MODES, value.as_str());
         tracing::info!(
             "session {}: compositor output modes set to [{value}]",
-            self.session_id,
-        );
-        true
-    }
-
-    /// #447: tell the compositor to treat a client-driven resize of its own fullscreen
-    /// window, on a nested display server with no `wlr-output-management` support, as an
-    /// implicit request to change the advertised output mode to match. Console/local-only
-    /// sessions only. Guarded on `find_property`; an older image debug-logs and no-ops.
-    /// Returns whether it was taken.
-    pub fn set_follow_client_size(&self, on: bool) -> bool {
-        let Some(source) = self.pipeline.by_name("video-source") else {
-            tracing::warn!(
-                token = "follow-client-size-no-video-source",
-                "follow client size: source pipeline has no video-source element"
-            );
-            return false;
-        };
-        if source.find_property(FOLLOW_CLIENT_SIZE).is_none() {
-            tracing::debug!(
-                "compositor lacks the {FOLLOW_CLIENT_SIZE} property (older gst-wayland-display); \
-                 a client resize will not move the advertised output mode"
-            );
-            return false;
-        }
-        source.set_property(FOLLOW_CLIENT_SIZE, on);
-        tracing::info!(
-            "session {}: compositor follow-client-size set to {on}",
             self.session_id,
         );
         true

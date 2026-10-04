@@ -48,16 +48,12 @@ own; the two do not move together, and that is deliberate.
 - **Docker install commands separate the recovery image from `seed`.** Both the
   first-machine and GPU-host examples now include the missing space so Docker runs
   the seed command instead of trying to pull a `quasar-recoveryseed` image.
-- **In console mode, a desktop that only resizes its own window when you pick a resolution
-  still moves the monitor to match (#447).** Some desktops don't speak the standard
-  output-management protocol but do resize their fullscreen window on a resolution change;
-  the compositor now treats that resize as the same request and moves the console monitor.
 - **In console mode, the desktop's display settings list the monitor's real modes, and
   picking one changes the monitor (#445).** The compositor now advertises every resolution
   and refresh rate the connected display supports and takes a choice through the standard
   output-management protocol; the node agent moves the monitor and the picture to that mode
-  with the app still running, and the session reports the mode it runs at. Needs the matching
-  desktop image, which carries the choice from the X11 desktop to the compositor.
+  with the app still running, and the session reports the mode it runs at. Works with the
+  XFCE desktop image; KDE and Steam follow in a later release.
 - **`make test-engines-build` no longer leaves `.diagnostics` owned by root (#442).** The
   suite binary and its directories now belong to whoever ran it, so a later `make verify`
   passes. `bench_run.sh` now says when it cannot write its output directory, and how to fix it.
