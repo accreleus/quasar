@@ -25,6 +25,13 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Console mode can show the desktop without CPU copies (#450), behind
+  `QUASAR_EXPERIMENTAL_LOCAL_DMABUF=1`.** The compositor renders into a recycled ring of RGB
+  dmabufs that the display imports as they are. Before, every frame went through system memory
+  and was copied three times, which drops frames at 3840x2160@120. On an RTX 5090 lab host, a
+  headless 4K120 run delivered 120 of 120 fps, and the compositor thread fell from a full core
+  to about 2 %. Still off by default until it has passed on a real console. It needs the
+  compositor pin that ships the ring.
 - **Seed-managed installs can set the node agent's own settings (#448).** Set them on the seed,
   such as `QUASAR_APP_MOUNT_ALLOW` for host folders apps may bind, or change them later with
   `quasar-recovery reconfigure`, which re-creates only the node agent. Settings the install
