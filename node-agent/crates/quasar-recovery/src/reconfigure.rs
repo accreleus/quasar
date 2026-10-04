@@ -1,5 +1,6 @@
 //! `quasar-recovery reconfigure` (#352 decision A2): changing a machine's inputs (its home
-//! root, public host, ports, release trust, app-container defaults) after install.
+//! root, public host, ports, release trust, app-container defaults, agent variables) after
+//! install.
 //!
 //! A reconfigure is a **Replacement with the same digests and new machine inputs**: each
 //! service whose rendered specification the change moves is replaced through the attempt
