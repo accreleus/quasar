@@ -42,6 +42,9 @@ own; the two do not move together, and that is deliberate.
   preparation that fixes it. Before the first reboot it reads `unknown`.
 
 ### Fixed
+- **Docker install commands separate the recovery image from `seed`.** Both the
+  first-machine and GPU-host examples now include the missing space so Docker runs
+  the seed command instead of trying to pull a `quasar-recoveryseed` image.
 - **In console mode, a desktop that only resizes its own window when you pick a resolution
   still moves the monitor to match (#447).** Some desktops don't speak the standard
   output-management protocol but do resize their fullscreen window on a resolution change;
