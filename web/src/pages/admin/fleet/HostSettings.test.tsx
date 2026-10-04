@@ -130,6 +130,17 @@ describe("HostSettings", () => {
     expect(encoderRow.textContent).toMatch(/restart/);
   });
 
+  // #444: an inline grid template outranks every stylesheet rule, so it beat the stacking
+  // breakpoint and squeezed the settings to a sliver at phone width. The layout is a class.
+  it("lays the settings and the rail out with the rail-split class, not an inline grid", async () => {
+    renderPage();
+
+    await screen.findByText("Idle timeout");
+    const split = screen.getByText("Runtime defaults").closest(".split") as HTMLElement;
+    expect(split.classList.contains("rail-split")).toBe(true);
+    expect(split.style.gridTemplateColumns).toBe("");
+  });
+
   it("Discard and Save changes are disabled while the draft is clean", async () => {
     renderPage();
 

@@ -421,24 +421,105 @@ fn group_add(intent: &ApplicationIntent) -> &Vec<String> {
         .unwrap_or(&intent.request.group_add)
 }
 
-/// The request's environment with the agent-owned engine-groups entry: a caller's value
-/// never reaches the image.
+/// What the legacy NVIDIA hook behind Docker's `--gpus` is asked to inject (#413): its
+/// default (`compute,utility`, what it grants a container whose environment names none)
+/// plus `display`, the one capability that adds `/dev/nvidia-modeset`. The NVIDIA Vulkan
+/// driver in the driver volume cannot start without that node; CDI injects it anyway. On
+/// a full-driver host `display` also mounts the host's own graphics libraries, the same
+/// driver version as the volume, which stays first on `LD_LIBRARY_PATH`.
+const GPUS_DRIVER_CAPABILITIES: &str = "compute,utility,display";
+const DRIVER_CAPABILITIES_ENV: &str = "NVIDIA_DRIVER_CAPABILITIES";
+
+/// The capabilities an app container created with `injection` asks the hook for. CDI runs
+/// no hook, so it asks for none.
+fn hook_driver_capabilities(injection: Option<GpuInjection>) -> Option<&'static str> {
+    (injection == Some(GpuInjection::DeviceRequest)).then_some(GPUS_DRIVER_CAPABILITIES)
+}
+
+/// The request's environment with the agent-owned entries (engine groups, and the
+/// `--gpus` driver capabilities): a caller's value for either never reaches the image.
 fn environment(intent: &ApplicationIntent) -> Vec<String> {
+    let capabilities = intent.nvidia_driver_capabilities.as_deref();
     let mut entries: Vec<String> = intent
         .request
         .environment
         .iter()
-        .filter(|e| e.split_once('=').map(|(k, _)| k) != Some(ENGINE_GROUPS_ENV))
+        .filter(|e| {
+            let key = e.split_once('=').map(|(k, _)| k);
+            key != Some(ENGINE_GROUPS_ENV)
+                && (capabilities.is_none() || key != Some(DRIVER_CAPABILITIES_ENV))
+        })
         .cloned()
         .collect();
     if !intent.engine_groups.is_empty() {
         let gids: Vec<String> = intent.engine_groups.iter().map(u32::to_string).collect();
         entries.push(format!("{ENGINE_GROUPS_ENV}={}", gids.join(",")));
     }
+    if let Some(capabilities) = capabilities {
+        entries.push(format!("{DRIVER_CAPABILITIES_ENV}={capabilities}"));
+    }
     canonical_env(&entries)
 }
 
-fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> ContainerCreateBody {
+/// A legacy `-v` bind as created on this engine: on an engine that makes read-only binds
+/// non-recursive (#410), a read-only bind of a host path gets `bind` unless it names
+/// `bind` or `rbind`, and `private` unless it names a propagation. A volume, a writable
+/// bind and an explicit choice are left as asked (the read-back refuses a wrong one).
+fn created_legacy_mount(value: &str, dialect: super::dialect::Dialect) -> String {
+    if !dialect.read_only_binds_non_recursive() {
+        return value.to_owned();
+    }
+    let mut parts = value.splitn(3, ':');
+    let (Some(source), Some(_target), Some(options)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return value.to_owned();
+    };
+    let options: Vec<&str> = options.split(',').collect();
+    let read_only = options.iter().any(|o| matches!(*o, "ro" | "readonly"));
+    if !source.starts_with('/') || !read_only {
+        return value.to_owned();
+    }
+    let mut created = value.to_owned();
+    if !options.iter().any(|o| matches!(*o, "bind" | "rbind")) {
+        created.push_str(",bind");
+    }
+    const PROPAGATIONS: [&str; 6] = [
+        "private", "rprivate", "shared", "rshared", "slave", "rslave",
+    ];
+    if !options.iter().any(|o| PROPAGATIONS.contains(o)) {
+        created.push_str(",private");
+    }
+    created
+}
+
+/// The container targets of every read-only bind of a host path the request makes, typed
+/// or legacy: the binds [`super::dialect::Dialect::read_only_binds_ok`] must prove.
+fn read_only_bind_targets(request: &ApplicationRequest) -> Result<Vec<String>, RuntimeError> {
+    let mut targets = Vec::new();
+    for mount in &request.mounts {
+        let mount = parse_legacy_mount(mount)?;
+        if mount.read_only && mount.source.starts_with('/') {
+            targets.push(lexical_path(mount.target)?);
+        }
+    }
+    for mount in &request.typed_mounts {
+        if let ApplicationMount::Bind {
+            target,
+            read_only: true,
+            ..
+        } = mount
+        {
+            targets.push(lexical_path(target)?);
+        }
+    }
+    Ok(targets)
+}
+
+fn body(
+    intent: &ApplicationIntent,
+    injection: Option<GpuInjection>,
+    dialect: super::dialect::Dialect,
+) -> ContainerCreateBody {
     let r = &intent.request;
     let environment = environment(intent);
     let mut labels = HashMap::new();
@@ -494,7 +575,12 @@ fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> Containe
                 (true, Some(injection)) => Some(vec![nvidia_device_request(injection)]),
                 _ => None,
             },
-            binds: Some(r.mounts.clone()),
+            binds: Some(
+                r.mounts
+                    .iter()
+                    .map(|mount| created_legacy_mount(mount, dialect))
+                    .collect(),
+            ),
             mounts: Some(
                 r.typed_mounts
                     .iter()
@@ -514,6 +600,14 @@ fn body(intent: &ApplicationIntent, injection: Option<GpuInjection>) -> Containe
                             // the legacy `-v` compatibility behavior is different.
                             bind_options: Some(MountBindOptions {
                                 create_mountpoint: Some(false),
+                                non_recursive: (*read_only
+                                    && dialect.read_only_binds_non_recursive())
+                                .then_some(true),
+                                propagation: (*read_only
+                                    && dialect.read_only_binds_non_recursive())
+                                .then_some(
+                                    bollard::models::MountBindOptionsPropagationEnum::PRIVATE,
+                                ),
                                 ..Default::default()
                             }),
                             ..Default::default()
@@ -773,6 +867,59 @@ fn explicit_mount_targets(request: &ApplicationRequest) -> Result<Vec<String>, R
     Ok(targets)
 }
 
+/// The typed bind sources this process cannot prove exist on the engine's host.
+///
+/// Podman's compatible create makes every missing absolute bind source on the host before
+/// it creates the container, whatever `CreateMountpoint` says (#426: Podman 4.9 to 5.8,
+/// `compat/containers_create.go`), so a bind of an unmounted share would start as an empty
+/// directory the engine made. Docker refuses that create itself. On Podman the runtime
+/// therefore checks each source first. `own_mounts` is how this process reaches the
+/// engine's host: `None` when it shares the engine's filesystem (a native agent, the engine
+/// suite), else the agent container's own mounts, through which a daemon path is read only
+/// by a bind that round-trips. A source no bind reaches cannot be proven and is returned.
+fn unproven_bind_sources(
+    request: &ApplicationRequest,
+    own_mounts: Option<&[quasar_runtime::Mount]>,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<String> {
+    request
+        .typed_mounts
+        .iter()
+        .filter_map(|mount| match mount {
+            ApplicationMount::Bind { source, .. } => Some(source),
+            ApplicationMount::Volume { .. } => None,
+        })
+        .filter(|source| {
+            let daemon = Path::new(source.as_str());
+            let seen = match own_mounts {
+                None => Some(daemon.to_path_buf()),
+                Some(mounts) => quasar_runtime::agent_path_for_daemon_path(mounts, daemon),
+            };
+            !seen.is_some_and(|path| exists(&path))
+        })
+        .cloned()
+        .collect()
+}
+
+/// How this process sees the engine's host, for [`unproven_bind_sources`]: `None` when it
+/// is not in a container; its own container's mounts when it is. A container the engine
+/// cannot name gives no mounts, so nothing in it counts as seen.
+async fn own_host_view(
+    docker: &bollard::Docker,
+) -> Result<Option<Vec<quasar_runtime::Mount>>, RuntimeError> {
+    let Some(id) = quasar_runtime::self_inspection::self_container_id() else {
+        let contained =
+            Path::new("/run/.containerenv").exists() || Path::new("/.dockerenv").exists();
+        return Ok(contained.then(Vec::new));
+    };
+    Ok(Some(
+        quasar_runtime::docker::inspect_container_with(docker, &id)
+            .await?
+            .map(|own| own.mounts)
+            .unwrap_or_default(),
+    ))
+}
+
 fn image_volume_targets(intent: &ApplicationIntent) -> Result<Vec<String>, RuntimeError> {
     let mut targets = intent
         .image_volumes
@@ -959,7 +1106,8 @@ async fn inspect_owned(
     }
     // Each check names what it guards, so a refusal says why (#397). Any one failing
     // refuses the container; nothing here ever retries with more privilege.
-    let refusals: [(bool, &str); 19] = [
+    let read_only_targets = read_only_bind_targets(&intent.request)?;
+    let refusals: [(bool, &str); 20] = [
         (
             host.network_mode.as_deref() != Some(&intent.request.network),
             "network mode",
@@ -1060,6 +1208,10 @@ async fn inspect_owned(
         (
             !dialect.mount_propagation_ok(podman.as_ref()),
             "mount propagation",
+        ),
+        (
+            !dialect.read_only_binds_ok(podman.as_ref(), &read_only_targets),
+            "read-only binds",
         ),
     ];
     if let Some((_, what)) = refusals.iter().find(|(refused, _)| *refused) {
@@ -1259,6 +1411,21 @@ pub(crate) async fn start(
             } else {
                 None
             };
+            if docker.dialect == super::dialect::Dialect::Podman {
+                let view = own_host_view(&docker).await?;
+                let unproven = unproven_bind_sources(&request, view.as_deref(), Path::exists);
+                if !unproven.is_empty() {
+                    // Refused before anything is journalled or created, as Docker refuses it.
+                    tracing::warn!(
+                        token = "application-bind-source-missing",
+                        application = %request.name,
+                        sources = ?unproven,
+                        "refusing the launch: a bind source is missing on the host (or not \
+                         visible to the agent to prove it), and Podman would create it"
+                    );
+                    return Err(ErrorKind::Engine.into());
+                }
+            }
             // Docker confines with SELinux too when its daemon runs --selinux-enabled.
             let (rootless, selinux) = docker.confinement().await?;
             let app = app_identity(docker.dialect, rootless, &request, overflow_gid());
@@ -1302,6 +1469,8 @@ pub(crate) async fn start(
                 image_volumes: image_config.volumes,
                 image_volume_identities: None,
                 nvidia_params_repair: None,
+                nvidia_driver_capabilities: hook_driver_capabilities(gpu_injection)
+                    .map(str::to_owned),
                 gpu_injection,
                 keep_id,
                 engine_groups: app.engine_groups,
@@ -1356,7 +1525,7 @@ pub(crate) async fn start(
                         name: Some(intent.request.name.clone()),
                         ..Default::default()
                     }),
-                    body(&intent, injection),
+                    body(&intent, injection, docker.dialect),
                 )
                 .await;
             match created {
@@ -2137,6 +2306,7 @@ mod app_identity_tests {
             image_volume_identities: None,
             nvidia_params_repair: None,
             gpu_injection: None,
+            nvidia_driver_capabilities: None,
             keep_id,
             engine_groups: Vec::new(),
             group_add: None,
@@ -2156,7 +2326,7 @@ mod app_identity_tests {
     }
 
     fn spec(intent: &ApplicationIntent) -> serde_json::Value {
-        serde_json::to_value(body(intent, None)).unwrap()
+        serde_json::to_value(body(intent, None, Dialect::Docker)).unwrap()
     }
 
     #[test]
@@ -2249,5 +2419,291 @@ mod app_identity_tests {
         let read: ApplicationIntent = serde_json::from_value(value).unwrap();
         assert!(read.engine_groups.is_empty());
         assert_eq!(group_add(&read), &request().group_add);
+    }
+
+    /// #413: Docker's `--gpus` runs the legacy NVIDIA hook, which grants only the
+    /// capabilities the container's environment names (`compute,utility` when it names
+    /// none, as app images do). Without `display` it leaves out `/dev/nvidia-modeset`, and
+    /// the NVIDIA Vulkan driver in the driver volume cannot start. CDI injects every node.
+    #[test]
+    fn a_gpus_launch_asks_the_legacy_hook_for_the_display_capability() {
+        assert_eq!(
+            hook_driver_capabilities(Some(GpuInjection::DeviceRequest)),
+            Some(GPUS_DRIVER_CAPABILITIES)
+        );
+        assert_eq!(GPUS_DRIVER_CAPABILITIES, "compute,utility,display");
+        assert_eq!(hook_driver_capabilities(Some(GpuInjection::Cdi)), None);
+        assert_eq!(hook_driver_capabilities(None), None);
+
+        let gpus = ApplicationIntent {
+            nvidia_driver_capabilities: Some(GPUS_DRIVER_CAPABILITIES.into()),
+            ..intent(request(), None)
+        };
+        let env = spec(&gpus)["Env"].clone();
+        assert_eq!(
+            env,
+            serde_json::json!([
+                "PUID=1000",
+                "PGID=1000",
+                "NVIDIA_DRIVER_CAPABILITIES=compute,utility,display"
+            ])
+        );
+    }
+
+    #[test]
+    fn the_capabilities_are_agent_owned() {
+        let mut request = request();
+        request
+            .environment
+            .push("NVIDIA_DRIVER_CAPABILITIES=compute".into());
+        let gpus = ApplicationIntent {
+            nvidia_driver_capabilities: Some(GPUS_DRIVER_CAPABILITIES.into()),
+            ..intent(request.clone(), None)
+        };
+        assert_eq!(
+            environment(&gpus)
+                .iter()
+                .filter(|e| e.starts_with("NVIDIA_DRIVER_CAPABILITIES="))
+                .collect::<Vec<_>>(),
+            ["NVIDIA_DRIVER_CAPABILITIES=compute,utility,display"]
+        );
+        // Not decided by the agent: the request's environment passes through untouched.
+        assert!(environment(&intent(request, None))
+            .contains(&"NVIDIA_DRIVER_CAPABILITIES=compute".to_string()));
+    }
+
+    /// A container created before #413 is read back against the environment it was
+    /// created with, so a running session survives the agent that made it.
+    #[test]
+    fn a_journal_from_before_413_asks_for_no_capabilities() {
+        let mut value = serde_json::to_value(ApplicationIntent {
+            gpu_injection: Some(GpuInjection::DeviceRequest),
+            ..intent(request(), None)
+        })
+        .unwrap();
+        assert!(value.get("nvidia_driver_capabilities").is_none());
+        value["phase"] = serde_json::json!("Running");
+        let read: ApplicationIntent = serde_json::from_value(value).unwrap();
+        assert_eq!(read.nvidia_driver_capabilities, None);
+        assert_eq!(environment(&read), ["PUID=1000", "PGID=1000"]);
+    }
+}
+
+#[cfg(test)]
+mod bind_source_tests {
+    use super::*;
+    use quasar_runtime::{DaemonHostPath, Mount as OwnMount, MountKind};
+
+    fn request(sources: &[&str]) -> ApplicationRequest {
+        ApplicationRequest {
+            typed_mounts: sources
+                .iter()
+                .map(|source| ApplicationMount::Bind {
+                    source: (*source).into(),
+                    target: "/in".into(),
+                    read_only: false,
+                    consistency: None,
+                })
+                .chain([ApplicationMount::Volume {
+                    source: "a-volume".into(),
+                    target: "/volume".into(),
+                    read_only: false,
+                    no_copy: false,
+                }])
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn bind(source: &str, destination: &str) -> OwnMount {
+        OwnMount {
+            kind: MountKind::Bind,
+            source: Some(DaemonHostPath(source.into())),
+            name: None,
+            destination: destination.into(),
+            read_only: Some(false),
+        }
+    }
+
+    #[test]
+    fn a_native_process_checks_each_bind_source_where_it_is() {
+        let present = |path: &Path| path == Path::new("/run/quasar-agent/wayland-1");
+        assert_eq!(
+            unproven_bind_sources(
+                &request(&["/run/quasar-agent/wayland-1", "/mnt/share/games"]),
+                None,
+                present
+            ),
+            ["/mnt/share/games"]
+        );
+    }
+
+    #[test]
+    fn a_contained_agent_checks_through_its_own_binds() {
+        let mounts = [bind("/srv/quasar/homes", "/homes")];
+        let seen = |path: &Path| path == Path::new("/homes/player");
+        assert!(unproven_bind_sources(
+            &request(&["/srv/quasar/homes/player"]),
+            Some(&mounts),
+            seen
+        )
+        .is_empty());
+        assert_eq!(
+            unproven_bind_sources(&request(&["/srv/quasar/homes/gone"]), Some(&mounts), seen),
+            ["/srv/quasar/homes/gone"]
+        );
+    }
+
+    /// The agent's own filesystem is not the host's: a path no bind reaches is never taken
+    /// as present just because the agent image happens to hold it.
+    #[test]
+    fn a_source_no_bind_reaches_is_unproven() {
+        let everything = |_: &Path| true;
+        assert_eq!(
+            unproven_bind_sources(&request(&["/opt/elsewhere"]), Some(&[]), everything),
+            ["/opt/elsewhere"]
+        );
+    }
+
+    #[test]
+    fn volumes_are_not_bind_sources() {
+        assert!(unproven_bind_sources(&request(&[]), None, |_| false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod read_only_bind_tests {
+    use super::super::dialect::Dialect;
+    use super::*;
+
+    #[test]
+    fn podman_read_only_legacy_binds_are_created_non_recursive() {
+        let podman = |v| created_legacy_mount(v, Dialect::Podman);
+        assert_eq!(
+            podman("/games:/library:ro"),
+            "/games:/library:ro,bind,private"
+        );
+        assert_eq!(
+            podman("/games:/library:z,ro"),
+            "/games:/library:z,ro,bind,private"
+        );
+        assert_eq!(
+            podman("/games:/library:ro,rbind"),
+            "/games:/library:ro,rbind,private"
+        );
+        assert_eq!(
+            podman("/games:/library:ro,rprivate"),
+            "/games:/library:ro,rprivate,bind"
+        );
+        assert_eq!(podman("/games:/library"), "/games:/library");
+        assert_eq!(podman("/games:/library:rw"), "/games:/library:rw");
+        assert_eq!(podman("cache:/cache:ro"), "cache:/cache:ro");
+        assert_eq!(
+            created_legacy_mount("/games:/library:ro", Dialect::Docker),
+            "/games:/library:ro"
+        );
+    }
+
+    #[test]
+    fn read_only_bind_targets_are_every_read_only_host_bind() {
+        let request = ApplicationRequest {
+            mounts: vec![
+                "/games:/library:ro".into(),
+                "/saves:/saves".into(),
+                "cache:/cache:ro".into(),
+            ],
+            typed_mounts: vec![
+                ApplicationMount::Bind {
+                    source: "/run/udev-export".into(),
+                    target: "/run/udev/data/".into(),
+                    read_only: true,
+                    consistency: None,
+                },
+                ApplicationMount::Bind {
+                    source: "/run/quasar-agent/wayland-1".into(),
+                    target: "/run/quasar-wayland/wayland-1".into(),
+                    read_only: false,
+                    consistency: None,
+                },
+                ApplicationMount::Volume {
+                    source: "driver".into(),
+                    target: "/opt/driver".into(),
+                    read_only: true,
+                    no_copy: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            read_only_bind_targets(&request).unwrap(),
+            ["/library", "/run/udev/data"]
+        );
+    }
+
+    #[test]
+    fn podman_asks_for_a_non_recursive_read_only_typed_bind() {
+        let intent = ApplicationIntent {
+            request: ApplicationRequest {
+                typed_mounts: vec![
+                    ApplicationMount::Bind {
+                        source: "/a".into(),
+                        target: "/ro".into(),
+                        read_only: true,
+                        consistency: None,
+                    },
+                    ApplicationMount::Bind {
+                        source: "/b".into(),
+                        target: "/rw".into(),
+                        read_only: false,
+                        consistency: None,
+                    },
+                ],
+                mounts: vec!["/games:/library:ro".into()],
+                ..Default::default()
+            },
+            owner: "owner".into(),
+            socket: "/run/docker.sock".into(),
+            id: None,
+            image_id: Some("sha256:abc".into()),
+            image_entrypoint: None,
+            image_cmd: None,
+            image_user: None,
+            image_volumes: None,
+            image_volume_identities: None,
+            nvidia_params_repair: None,
+            gpu_injection: None,
+            nvidia_driver_capabilities: None,
+            keep_id: None,
+            engine_groups: Vec::new(),
+            group_add: None,
+            nested_sandbox_label: false,
+            phase: ApplicationPhase::Creating,
+            result: None,
+        };
+        let spec = |dialect| serde_json::to_value(body(&intent, None, dialect)).unwrap();
+        let podman = spec(Dialect::Podman);
+        let docker = spec(Dialect::Docker);
+        assert_eq!(
+            podman["HostConfig"]["Mounts"][0]["BindOptions"],
+            serde_json::json!({"CreateMountpoint": false, "NonRecursive": true, "Propagation": "private"})
+        );
+        assert_eq!(
+            podman["HostConfig"]["Mounts"][1]["BindOptions"],
+            serde_json::json!({"CreateMountpoint": false})
+        );
+        assert_eq!(
+            podman["HostConfig"]["Binds"],
+            serde_json::json!(["/games:/library:ro,bind,private"])
+        );
+        for i in 0..2 {
+            assert_eq!(
+                docker["HostConfig"]["Mounts"][i]["BindOptions"],
+                serde_json::json!({"CreateMountpoint": false})
+            );
+        }
+        assert_eq!(
+            docker["HostConfig"]["Binds"],
+            serde_json::json!(["/games:/library:ro"])
+        );
     }
 }

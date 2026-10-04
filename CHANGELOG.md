@@ -24,6 +24,105 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **Seed-managed installs can set the node agent's own settings (#448).** Set them on the seed,
+  such as `QUASAR_APP_MOUNT_ALLOW` for host folders apps may bind, or change them later with
+  `quasar-recovery reconfigure`, which re-creates only the node agent. Settings the install
+  manages are refused. See "Agent variables" in `docs/configuration.md`.
+- **The console mode page says more about a black picture in a virtual machine (#414).**
+  With an NVIDIA GPU passed through, the virtual machine's own boot screen is black too, so
+  the cause is the card's hand-off rather than Quasar; the page says so and what to use instead.
+- **The Podman page explains a console unreachable from the network (#416).** When Docker
+  runs on the same host, it can drop rootful Podman's forwarded traffic, so Quasar answers
+  only on the host itself. The page and the troubleshooting guide give Docker's one-line
+  fix and how to check it.
+- **A readiness check says whether Quasar came back after a reboot (#412).** On Podman and
+  rootless Docker, `engine_restart_on_boot` passes once a reboot shows the engine started
+  Quasar again, fails if the node agent only came back much later, and names the host
+  preparation that fixes it. Before the first reboot it reads `unknown`.
+
+### Fixed
+- **A KDE console session's resolution pick no longer snaps back (#447).** The compositor's
+  follow-the-window fallback stays quiet while the desktop speaks wlr-output-management, so a
+  stale frame at the old size during the switch is not read as a request to go back.
+- **Docker install commands separate the recovery image from `seed`.** Both the
+  first-machine and GPU-host examples now include the missing space so Docker runs
+  the seed command instead of trying to pull a `quasar-recoveryseed` image.
+- **In console mode, the desktop's display settings list the monitor's real modes, and
+  picking one changes the monitor (#445).** The compositor now advertises every resolution
+  and refresh rate the connected display supports and takes a choice through the standard
+  output-management protocol; the node agent moves the monitor and the picture to that mode
+  with the app still running, and the session reports the mode it runs at. Works with the
+  XFCE desktop image; KDE and Steam follow in a later release.
+- **`make test-engines-build` no longer leaves `.diagnostics` owned by root (#442).** The
+  suite binary and its directories now belong to whoever ran it, so a later `make verify`
+  passes. `bench_run.sh` now says when it cannot write its output directory, and how to fix it.
+- **A host's Settings page fits a phone screen (#444).** Its two columns now stack instead of
+  squeezing the settings to a sliver beside the host card.
+- **A stale file at `/dev/i2c-N` no longer stops console mode turning on (#443).** On a
+  rootless engine the recovery actor now skips, and logs, an i2c entry that is not a device,
+  so console mode turns on and only monitor control goes without that bus. The `console_ddc`
+  check says how to clear it.
+- **Console audio survives a reboot, and host preparation can restart PipeWire on Fedora
+  CoreOS (#433).** The desktop user's PipeWire now starts with their session, so the
+  console-audio socket is back after a reboot. Host preparation restarts it through
+  `runuser`, which also works on uCore.
+- **The host readiness card files the engine and console mode checks in their own groups (#437).**
+  The engine checks now sit under Container runtime, and console mode's display, audio and
+  monitor control under a new Console mode group, instead of under Other.
+- **The Console page's input-device table stays inside its card (#436).** A long device path
+  is shortened with an ellipsis, and hovering it shows the whole path. On a phone the page's
+  two columns now stack instead of squeezing the settings to a sliver.
+- **A web test of the trace viewer no longer fails at random (#427).** It hovered the chart
+  before the chart had loaded; it now waits for it.
+- **The image-reference test runs again, in `make verify` (#415).** It checked the whole image
+  contract against a stand-in Docker that knew only the older checks, so it had been failing
+  unnoticed; it now checks only which image reference is pulled and inspected.
+- **A local console starts at the monitor's own resolution and refresh rate (#422).** With no
+  mode configured and streaming off, the console app now opens at the mode the display runs (for
+  example 3840×2160 at 60 Hz) instead of 1920×1080 at 60. A streamed console keeps the app's
+  defaults unless you pick a mode, and "Preferred" can be chosen again after picking another mode.
+- **Console mode grabs a keyboard, mouse or controller plugged in during a session (#421).**
+  With **Input devices** on auto, a device that arrives mid-session is now taken within
+  about a second, and one that is unplugged is released. Before, only the devices present
+  when the session started were grabbed. A device listed by path is taken when it appears.
+- **Rootful Podman brings the node agent back after a reboot with no extra host step (#439).**
+  A reboot empties `/run`, and Podman would not start the agent without its runtime
+  directory. The recovery actor now has the engine make it at every start, then starts the
+  agent. The quick start and **Add host** no longer ask for a `tmpfiles.d` line.
+- **Read-only mounts stay read-only on Podman, all the way down (#410).** Podman made only
+  the top of a read-only mount read-only, so a disk mounted inside it stayed writable. Quasar
+  now asks Podman for a mount without the submounts and checks it. On Podman, a disk mounted
+  inside a read-only catalog mount is therefore not shown in the app.
+- **Podman older than 5.1 is refused up front (#424).** Podman before 5.1 can't change a
+  container's restart policy, so updates failed on it. The quick start and **Add host** now
+  stop before pulling anything and name the version, and the host's `runtime_engine` check
+  reads it as unsupported. Ubuntu 24.04 ships Podman 4.9.
+- **Podman no longer starts a session with a missing bind source (#426).** Podman makes a
+  missing bind source on the host instead of refusing the container. Quasar now checks the
+  source first and refuses the launch, as Docker does, and nothing is created.
+- **Relaunching an app straight after stopping it no longer asks for an operator (#434).**
+  While the previous session is still shutting down, the launch now says so and names that
+  session, so trying again in a moment works. If it has only just stopped, the launch waits
+  briefly for its cleanup instead of reporting that the home needs operator review.
+- **Steam starts on an NVIDIA host without CDI (#413).** On a rootful Docker that passes the
+  GPU with `--gpus`, Steam no longer exits at its GPU check with "Vulkan loader failed".
+- **Console audio through Host PipeWire works straight after host preparation (#433).**
+  `prepare-host.sh --console-audio-user USER` now restarts USER's pipewire-pulse when it
+  writes the drop-in and USER is logged in, and otherwise prints the restart command. The
+  `console_audio` check now says when the console-audio socket is missing, and why.
+- **Missing cover art is fetched again (#441).** If the artwork cache is lost, for example
+  when a database is restored into a fresh install, the artwork job now fetches the missing
+  images again from the reference it already has. An admin's chosen art stays locked. An
+  uploaded image can't be fetched again, so the log asks for it to be uploaded once more.
+- **A changed homes root takes effect (#418).** After `quasar-recovery reconfigure
+  QUASAR_HOME_ROOT=...`, the host switches to the new root and sessions start again. Existing
+  homes follow to the same path under the new root, so move their files there first or players
+  start with fresh homes.
+- **A stopped Quasar service stays stopped on Podman (#425).** Podman restarted a
+  crash-looping service, such as a failed control plane, after Quasar had stopped it. Quasar
+  now disables a service's restart before stopping it and checks that every stop holds.
+
 ## 0.4.0 — 2026-10-02
 
 Quasar 0.4.0 makes a first deployment much simpler. You paste the quick start's stack

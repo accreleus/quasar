@@ -424,6 +424,10 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 		}
 	}
 	ref := drv.ref(key)
+	moved, err := repointOutsideRoot(ctx, tx, userID, appID, hostID, drv.name(), drv.root)
+	if err != nil {
+		return "", err
+	}
 	// Sticky ref: an existing row keeps its stored ref, so renames never
 	// re-point the mount away from the data. Only a provider change replaces
 	// it — the row must describe the home actually mounted, or GC/admin views
@@ -454,7 +458,95 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 	if err := tx.Commit(ctx); err != nil {
 		return "", fmt.Errorf("commit user_home: %w", err)
 	}
+	moved.log(hostID)
 	return mount, nil
+}
+
+// repointedHome records one re-pointed home for logging after commit.
+type repointedHome struct{ id, from, to string }
+
+func (h *repointedHome) log(hostID string) {
+	if h != nil {
+		slog.Info("managed home re-pointed under the host's current home root; Quasar does not move home data",
+			"home_id", h.id, "host_id", hostID, "from", h.from, "to", h.to)
+	}
+}
+
+// repointOutsideRoot handles a live local home whose stored ref lies outside
+// the host's current root — the root was reconfigured (#418). Quasar does not
+// move user data: the row is re-pointed to the same <user>/<app> path under the
+// current root, so an operator who moved the tree finds it again and one who
+// did not starts a fresh home there. A ref whose relative path cannot be
+// derived, or whose new path another home on this host already holds, is a
+// home conflict: the row is left alone and never silently reused. Runs on the
+// launch's host-locked transaction; the caller logs the result after commit.
+func repointOutsideRoot(ctx context.Context, tx pgx.Tx, userID, appID, hostID, provider, root string) (*repointedHome, error) {
+	if root == "" {
+		return nil, nil
+	}
+	var id, storedProvider, ref string
+	err := tx.QueryRow(ctx, `SELECT id::text, provider, ref FROM user_homes
+		WHERE user_id=$1::uuid AND app_id=$2::uuid AND host_id=$3::uuid AND gc_after IS NULL
+		FOR UPDATE`, userID, appID, hostID).Scan(&id, &storedProvider, &ref)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read user_home location: %w", err)
+	}
+	if storedProvider != provider || pathWithin(path.Clean(ref), root) {
+		return nil, nil
+	}
+	refuse := func(why string) error {
+		slog.Warn("managed home left outside the host's home root; refusing to reuse it",
+			"home_id", id, "host_id", hostID, "ref", ref, "home_root", root, "reason", why)
+		return fmt.Errorf("%w: home %s is stored at %s, outside this host's home root %s, and %s",
+			ErrHomeConflict, id, ref, root, why)
+	}
+	relative, ok := homeRelativePath(ref)
+	if !ok {
+		return nil, refuse("its <user>/<app> path cannot be derived")
+	}
+	target := path.Join(root, relative)
+	var taken bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_homes
+		WHERE host_id=$1::uuid AND provider=$2 AND ref=$3 AND id<>$4::uuid)`,
+		hostID, provider, target, id).Scan(&taken); err != nil {
+		return nil, fmt.Errorf("check re-pointed home path: %w", err)
+	}
+	if taken {
+		return nil, refuse("another home on this host already uses " + target)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_homes SET ref=$2 WHERE id=$1::uuid`, id, target); err != nil {
+		return nil, fmt.Errorf("re-point user_home: %w", err)
+	}
+	return &repointedHome{id: id, from: ref, to: target}, nil
+}
+
+// homeRelativePath is the <user>/<app> tail of a local ref ({root}/{user}/{app},
+// localDriver.ref): two slug segments under an absolute, traversal-free path.
+func homeRelativePath(ref string) (string, bool) {
+	if !path.IsAbs(ref) || strings.Contains(ref, "..") {
+		return "", false
+	}
+	parts := strings.Split(strings.Trim(path.Clean(ref), "/"), "/")
+	if len(parts) < 3 {
+		return "", false
+	}
+	user, app := parts[len(parts)-2], parts[len(parts)-1]
+	if !homeSegment.MatchString(user) || !homeSegment.MatchString(app) {
+		return "", false
+	}
+	return user + "/" + app, true
+}
+
+// homeSegment is one slugify output segment.
+var homeSegment = regexp.MustCompile(`^[a-z0-9_-]+$`)
+
+// pathWithin reports whether clean is root or beneath it, segment-aware.
+func pathWithin(clean, root string) bool {
+	root = path.Clean(root)
+	return clean == root || root == "/" || strings.HasPrefix(clean, root+"/")
 }
 
 // ErrHomeNotProvisioned is returned by RequireHome when the (user, app, host)
@@ -476,13 +568,35 @@ func (m *Manager) RequireHome(ctx context.Context, userID, appID, hostID, contai
 	if !path.IsAbs(containerPath) {
 		return "", fmt.Errorf("home_container_path %q is not absolute", containerPath)
 	}
-	// One statement for the existence check, gc_after guard and touch: split
+	// One transaction for the existence check, gc_after guard and touch: split
 	// up, a concurrent tombstone could land between them and the caller would
-	// mount a home already scheduled for deletion. No resolveDriver / ref
-	// synthesis on purpose — the stored ref is authoritative; re-deriving could
-	// hand back a path for a provider the data is not stored under.
+	// mount a home already scheduled for deletion. No ref synthesis on purpose
+	// — the stored ref is authoritative; re-deriving could hand back a path for
+	// a provider the data is not stored under. The one exception is EnsureHome's
+	// re-point of a home left outside a reconfigured root (#418), under the
+	// same host lock a root edit takes.
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	var moved *repointedHome
+	if locked, ok := m.roots.(LockedHomeRootResolver); ok {
+		if _, err := tx.Exec(ctx, `SELECT id FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID); err != nil {
+			return "", fmt.Errorf("lock home host: %w", err)
+		}
+		root, err := locked.HomeRootTx(ctx, tx, hostID)
+		if err != nil {
+			return "", fmt.Errorf("resolve home root for host %s: %w", hostID, err)
+		}
+		if root = strings.TrimSpace(root); path.IsAbs(root) {
+			if moved, err = repointOutsideRoot(ctx, tx, userID, appID, hostID, localDriver{}.name(), path.Clean(root)); err != nil {
+				return "", err
+			}
+		}
+	}
 	var storedRef string
-	err := m.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE user_homes SET last_used_at = now()
 		WHERE user_id = $1::uuid AND app_id = $2::uuid AND host_id = $3::uuid
 		  AND gc_after IS NULL
@@ -498,6 +612,10 @@ func (m *Manager) RequireHome(ctx context.Context, userID, appID, hostID, contai
 	if err := validateMount(mount); err != nil {
 		return "", err
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit require user_home: %w", err)
+	}
+	moved.log(hostID)
 	return mount, nil
 }
 

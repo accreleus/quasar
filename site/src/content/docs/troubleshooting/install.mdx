@@ -166,16 +166,20 @@ If it exists, the agent must be able to open it for writing. The `uinput` and
 
 ## The agent does not start after a reboot (Podman)
 
-`cannot stat /run/quasar-agent: No such file or directory`: nothing recreates the
-agent's runtime directory at boot. Rootful:
+`cannot stat /run/quasar-agent: No such file or directory`: a reboot emptied `/run`.
 
-```bash
-echo 'd /run/quasar-agent 0755 root root -' | sudo tee /etc/tmpfiles.d/quasar.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf
-```
+| Mode | What to do |
+| --- | --- |
+| Rootful | Nothing. The recovery actor makes the directory and starts the agent when it starts. If it did not, check `sudo podman logs quasar-recovery` for `actor-runtime-dir-failed`, and that `podman-restart.service` is enabled. |
+| Rootless | Step 4 of [Install rootless](/quasar/install/rootless/#prepare-the-host-once-as-root), then `podman start quasar-node-agent` as `quasar`. |
 
-Then start the agent again (`sudo podman start quasar-node-agent`). Rootless: step 4
-of [Install rootless](/quasar/install/rootless/#prepare-the-host-once-as-root).
+## The console is unreachable from the network (rootful Podman)
+
+The control plane answers on `127.0.0.1:8443` on the host, but connections from another
+machine hang. Check `sudo iptables -S FORWARD`. If it says `-P FORWARD DROP`, Docker
+also runs on this host and is dropping Podman's forwarded traffic. Fix it as
+[Docker on the same machine](/quasar/install/podman/#docker-on-the-same-machine) says.
+If the policy is `ACCEPT`, check that your firewall opens the port.
 
 ## A GPU-less host will not start
 

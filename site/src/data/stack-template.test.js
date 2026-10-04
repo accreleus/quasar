@@ -31,7 +31,6 @@ import {
   podmanRunSeed,
   ROOTLESS_DOCS_URL,
   NESTED_GPU_CIL,
-  RUNTIME_DIR_TMPFILES,
 } from './stack-template.js';
 import { PROXIES, proxyConfig } from './proxy-configs.js';
 import { PLATFORMS } from './platforms.js';
@@ -286,16 +285,11 @@ test('host steps: Docker starts at boot; Podman gets its socket and podman-resta
   const podman = hostSteps(full({ engine: 'podman' }));
   assert.match(podman, /^sudo systemctl enable --now podman\.socket$/m);
   assert.match(podman, /^sudo systemctl enable podman-restart\.service$/m);
-  assert.ok(podman.includes(`echo '${RUNTIME_DIR_TMPFILES}' | sudo tee /etc/tmpfiles.d/quasar.conf`));
-  assert.match(podman, /^sudo systemd-tmpfiles --create \/etc\/tmpfiles\.d\/quasar\.conf$/m);
   assert.ok(!podman.includes('nvidia'));
-  // Docker recreates a missing bind source itself.
+  // The recovery actor makes the agent's runtime directory at every boot (#439): no host
+  // step for it on either engine.
+  assert.ok(!podman.includes('tmpfiles'));
   assert.ok(!docker.includes('tmpfiles'));
-});
-
-test('the runtime directory line is the one deploy/prepare-host.sh writes for rootful', () => {
-  const prep = readFileSync(fileURLToPath(new URL('../../../deploy/prepare-host.sh', import.meta.url)), 'utf8');
-  assert.ok(prep.includes(RUNTIME_DIR_TMPFILES));
 });
 
 test('host steps on NVIDIA: Docker gets the toolkit runtime, Podman a CDI specification', () => {
@@ -360,11 +354,19 @@ test('rootful Podman with podman-restart.service off stops before anything is pu
   assert.ok(!/podman pull/.test(r.calls), 'nothing pulled');
 });
 
-test('rootful Podman with nothing making /run/quasar-agent at boot stops before anything is pulled', () => {
-  const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir({ runDirOff: true }) });
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /\/etc\/tmpfiles\.d\/quasar\.conf/);
-  assert.ok(!/podman pull/.test(r.calls), 'nothing pulled');
+test('a Podman older than 5.1 stops before anything is pulled, naming the version (#424)', () => {
+  for (const version of ['4.9.3', '5.0.3']) {
+    const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir({ podmanVersion: version }) });
+    assert.notEqual(r.status, 0, version);
+    assert.match(r.stderr, new RegExp(`Podman ${version.replaceAll('.', '\\.')} is older than 5\\.1`));
+    assert.match(r.stderr, /restart policy/);
+    assert.ok(!/podman pull/.test(r.calls), 'nothing pulled');
+  }
+});
+
+test('Podman 5.1 itself, the minimum, installs', () => {
+  const r = runScript(generate(full({ engine: 'podman', role: 'control-only' })).script, { engine: fakeEngineDir({ podmanVersion: '5.1.0' }) });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
 });
 
 test('rootful Podman installs end to end against the fake engine', () => {

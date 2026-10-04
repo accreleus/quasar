@@ -31,7 +31,8 @@ commands:
             keeps the database, machine state and homes unless --purge
   reconfigure [--dry-run] [--yes] VARIABLE=value...
             change this machine's inputs (home root, public host, ports, release trust, app
-            defaults, ...) through a verified replacement on the same images; run it inside
+            defaults, agent variables, ...) through a verified replacement on the same images;
+            an empty value unsets an optional one; run it inside
             the recovery actor (docker exec). The database and the node name are changed by
             reinstalling, never by a reconfigure
   restore   on a control-plane machine, inside the running actor
@@ -485,6 +486,8 @@ fn actor() -> ExitCode {
     unbound(actor.serve());
     serve_operator(&actor);
 
+    // Before `resume`, which may start the node agent (#438): its runtime directory (#439).
+    actor.make_agent_runtime_dir();
     let resumed = actor.resume();
     if let Err(e) = &resumed {
         error!(

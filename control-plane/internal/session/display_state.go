@@ -1,6 +1,10 @@
 package session
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/accreleus/quasar/control-plane/internal/console"
+)
 
 // externalState is the in-memory view of one running session's EXTERNAL
 // (encoded) frame size and whether its encoder can change that size live.
@@ -25,6 +29,12 @@ type externalState struct {
 	// reports stream_width/height (node-agent/src/session/metrics.rs), so it is
 	// cleared in lockstep with the size and never left stale.
 	Owner string
+	// ConsoleMode is the physical display mode a local console session runs at
+	// (#445), as the agent last reported it; nil until a console sample arrives
+	// and on every streamed session. Independent of the external size: a console
+	// session has no encoder, and a mode the app picked moves the monitor, not
+	// the wire.
+	ConsoleMode *console.ModeSelection
 }
 
 // displayState holds the per-session external-resolution cache. Like swapper and
@@ -89,6 +99,21 @@ func (d *displayState) observe(sessionID string, w, h *int32, supported *bool, o
 	if supported != nil {
 		st.Supported = supported
 	}
+	d.m[sessionID] = st
+}
+
+// observeConsoleMode folds a console sample's display mode into the cache (#445).
+// A sample without one changes nothing: a streamed session never carries it, and a
+// console session reports it in every window once known.
+func (d *displayState) observeConsoleMode(sessionID string, mode *console.ModeSelection) {
+	if mode == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.m[sessionID]
+	m := *mode
+	st.ConsoleMode = &m
 	d.m[sessionID] = st
 }
 

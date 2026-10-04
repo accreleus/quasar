@@ -75,6 +75,8 @@ pub struct OperatorInputs {
     pub enroll_seed_override: Option<String>,
     pub enroll_agent_override: Option<String>,
     pub trust: TrustInputs,
+    /// The seed's agent variables (`recipe::AGENT_VARIABLES`), by name.
+    pub agent_variables: std::collections::BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for OperatorInputs {
@@ -1034,6 +1036,7 @@ impl Actor {
             app: checked.app.clone(),
             console: false,
             console_vt_kept: false,
+            agent_variables: checked.agent_variables.clone(),
         };
         if checked.control.is_some() {
             // The seed a new GPU host runs is this machine's recovery image.

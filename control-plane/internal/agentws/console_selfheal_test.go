@@ -22,15 +22,18 @@ type selfHealEvents struct {
 	mu          sync.Mutex
 	launchCount int
 	launchErr   error
+	// lastMode is the width/height/fps of the latest launch (#422).
+	lastMode [3]int32
 }
 
-func (e *selfHealEvents) LaunchConsoleSession(context.Context, string, string, string, string, int32, int32, int32) (string, error) {
+func (e *selfHealEvents) LaunchConsoleSession(_ context.Context, _, _, _, _ string, width, height, fps int32) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.launchErr != nil {
 		return "", e.launchErr
 	}
 	e.launchCount++
+	e.lastMode = [3]int32{width, height, fps}
 	return fmt.Sprintf("sess-%d", e.launchCount), nil
 }
 

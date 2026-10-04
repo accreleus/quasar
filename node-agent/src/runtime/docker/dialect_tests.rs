@@ -27,6 +27,7 @@ fn podman(effective: &[&str], runtime: &str) -> PodmanFacts {
         bounding_caps: Some(set),
         oci_runtime: Some(runtime.into()),
         mount_propagations: vec!["rprivate".into()],
+        mount_options: Vec::new(),
         uid_map: Vec::new(),
         gid_map: Vec::new(),
     }
@@ -404,4 +405,44 @@ fn keep_id_is_proven_by_the_one_range_mapped_onto_the_engine_user() {
     .unwrap();
     assert!(!keep_id_ok(Some(&default), 1000, 1000));
     assert!(!keep_id_ok(None, 1000, 1000));
+}
+
+/// #410, from Podman 5.8.4's native inspect: a read-only bind asked for non-recursively
+/// reads `bind`; a `-v src:dst:ro` left as it was reads `rbind`, and its submounts stay
+/// writable inside the container.
+#[test]
+fn podman_read_only_binds_must_be_non_recursive() {
+    let body = r#"{"Mounts":[
+        {"Destination":"/x","Options":["bind","nosuid","nodev"],"Propagation":"private","RW":false},
+        {"Destination":"/y","Options":["nosuid","nodev","rbind"],"Propagation":"private","RW":false},
+        {"Destination":"/z"},
+        {"Destination":"/w","Options":["bind"],"Propagation":"rprivate","RW":false}]}"#;
+    let facts = PodmanFacts::from_inspect(body).unwrap();
+    assert_eq!(
+        facts.mount_options[0],
+        RealizedMount {
+            destination: "/x".into(),
+            options: Some(caps(&["bind", "nosuid", "nodev"])),
+            propagation: Some("private".into()),
+        }
+    );
+    assert_eq!(facts.mount_options[2].options, None);
+    let ok = |targets: &[&str]| Dialect::Podman.read_only_binds_ok(Some(&facts), &caps(targets));
+    assert!(ok(&["/x"]));
+    assert!(ok(&["/x/"]), "a target compares as a path");
+    assert!(!ok(&["/y"]), "rbind leaves submounts writable");
+    assert!(!ok(&["/z"]), "unreported options prove nothing");
+    assert!(
+        !ok(&["/w"]),
+        "crun makes an rprivate bind recursive (Podman 4.9's default)"
+    );
+    assert!(
+        !ok(&["/absent"]),
+        "a read-only bind that is not there is refused"
+    );
+    assert!(ok(&[]));
+    assert!(!Dialect::Podman.read_only_binds_ok(None, &caps(&["/x"])));
+    assert!(Dialect::Docker.read_only_binds_ok(None, &caps(&["/x"])));
+    assert!(Dialect::Podman.read_only_binds_non_recursive());
+    assert!(!Dialect::Docker.read_only_binds_non_recursive());
 }

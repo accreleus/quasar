@@ -184,6 +184,10 @@ pub struct PlatformContainer {
     pub command: Vec<String>,
     /// `Config.Env` as `KEY=value`. May hold secrets: never log it.
     pub env: Vec<String>,
+    /// When the container was created and last started, as the engine writes them
+    /// (RFC 3339); `None` when it does not say.
+    pub created: Option<String>,
+    pub started_at: Option<String>,
 }
 
 impl std::fmt::Debug for PlatformContainer {
@@ -227,6 +231,8 @@ mod debug_tests {
             mounts: Vec::new(),
             command: Vec::new(),
             env: vec!["QUASAR_ENROLLMENT=qenr1.secret-token".into()],
+            created: None,
+            started_at: None,
         };
         let shown = format!("{c:?}");
         assert!(shown.contains("QUASAR_ENROLLMENT"), "{shown}");
@@ -346,11 +352,17 @@ impl RuntimeClient {
         )
     }
 
-    /// Stop with a grace period; an already stopped container is not an error.
+    /// Stop with a grace period; an already stopped container is not an error. `Ok` means
+    /// stopped and staying stopped, read back on every engine: a crash-looping container
+    /// under `unless-stopped` included, which a plain Podman stop leaves to be restarted
+    /// (#425). One the engine keeps running is `Engine` after
+    /// [`docker::platform::STOP_SETTLE`].
     pub fn stop_container(&self, id: impl Into<String>, grace: Duration) -> Operation<()> {
         let config = self.config().clone();
         let id = id.into();
-        let budget = self.deadline() + grace;
+        // The first stop, then the settle: its last round can start just before the settle
+        // ends and make a read-back, an `init` and a stop, then read back once more.
+        let budget = self.deadline() * 5 + grace * 2 + docker::platform::STOP_SETTLE;
         self.submit_owned(
             async move { docker::platform::stop(&config, &id, grace).await },
             budget,

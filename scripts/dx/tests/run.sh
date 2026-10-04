@@ -166,6 +166,15 @@ else
   fail "enroll-host:contract" "$(printf '%s' "$eh_out" | grep '^FAIL' | head -n 5)"
 fi
 
+printf '\n== validate-image reference handling (#415) ==\n'
+# Offline: a mock docker records which reference is pulled and inspected.
+# deploy/test-validate-image-refs.sh is the spec; this only records its verdict.
+if vi_out="$(bash "$ROOT/deploy/test-validate-image-refs.sh" 2>&1)"; then
+  pass "validate-image:refs" "$(printf '%s' "$vi_out" | tail -n 1)"
+else
+  fail "validate-image:refs" "$(printf '%s' "$vi_out" | grep '^FAIL' | head -n 5)"
+fi
+
 printf '\n== guards ==\n'
 
 # Guard tests point resolution at the fixture, never the real operator config
@@ -1755,6 +1764,19 @@ if printf '%s' "$override_out" | grep -q "PATCHing profile_policy to 'prefer'"; 
   pass "bench:run-force-policy-preflight-logged"
 else
   fail "bench:run-force-policy-preflight-logged" "$(printf '%s' "$override_out" | grep -i profile_policy | tr '\n' ' ')"
+fi
+
+# #442: an output directory it cannot write is refused up front, by name.
+ro_parent="$WORK/ro-out"; mkdir -p "$ro_parent"; chmod 0555 "$ro_parent"
+ro_out="$(fp_run --profile forced --out "$ro_parent/run")"
+chmod 0755 "$ro_parent"
+if [ "$(id -u)" = 0 ]; then
+  pass "bench:run-unwritable-out-refused" "skipped meaning: root can write anywhere"
+elif printf '%s' "$ro_out" | grep -q "cannot write the output directory $ro_parent/run" \
+   && printf '%s' "$ro_out" | grep -q 'RESULT status=failed'; then
+  pass "bench:run-unwritable-out-refused" "named, with the fix, before anything runs"
+else
+  fail "bench:run-unwritable-out-refused" "$(printf '%s' "$ro_out" | tail -n 3 | tr '\n' ' ')"
 fi
 
 # `--profile forced` sends NO profile_id at all, so there is nothing to

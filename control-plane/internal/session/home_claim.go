@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -12,9 +13,22 @@ import (
 // lock. The actual row lock/insert comes after host, placement and image-fence
 // locks. Any known null or divergent location is an operator conflict,
 // including tombstoned rows whose backing data has not been proved absent.
+// A pending-home hold by another session refuses as homeHoldRefusal decides.
 func homeClaimOwner(ctx context.Context, tx pgx.Tx, p CreateParams, sameSession ...string) (string, error) {
+	owner, holder, err := homeClaimLocation(ctx, tx, p)
+	if err != nil || holder == "" || (len(sameSession) > 0 && holder == sameSession[0]) {
+		return owner, err
+	}
+	return "", homeHoldRefusal(ctx, tx, holder, owner)
+}
+
+// homeClaimLocation is homeClaimOwner without the pending-home hold: the
+// owner host plus the holding session ID, or "" for none. Only advisory
+// pre-schedule reads use it directly; the reservation transaction always
+// rechecks the hold.
+func homeClaimLocation(ctx context.Context, tx pgx.Tx, p CreateParams) (owner, holder string, _ error) {
 	if !p.ManagedHome {
-		return "", nil
+		return "", "", nil
 	}
 	var hostCount int
 	var unknown bool
@@ -28,10 +42,10 @@ func homeClaimOwner(ctx context.Context, tx pgx.Tx, p CreateParams, sameSession 
 		WHERE uh.user_id=$1::uuid AND COALESCE(a.parent_app_id,a.id)=$2::uuid
 	`, p.UserID, p.homeAppID()).Scan(&hostCount, &unknown, &tombstoned, &soleHost)
 	if err != nil {
-		return "", fmt.Errorf("read legacy home locations: %w", err)
+		return "", "", fmt.Errorf("read legacy home locations: %w", err)
 	}
 	if hostCount > 1 || unknown || tombstoned {
-		return "", ErrHomeConflict
+		return "", "", ErrHomeConflict
 	}
 	var hostID *string
 	var state string
@@ -42,21 +56,112 @@ func homeClaimOwner(ctx context.Context, tx pgx.Tx, p CreateParams, sameSession 
 	`, p.UserID, p.homeAppID()).Scan(&hostID, &state, &pendingSession)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if hostCount == 1 && soleHost != nil {
-			return *soleHost, nil
+			return *soleHost, "", nil
 		}
-		return "", nil
+		return "", "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read canonical home claim: %w", err)
+		return "", "", fmt.Errorf("read canonical home claim: %w", err)
 	}
-	if state == "conflict" || hostID == nil ||
-		(pendingSession != nil && (len(sameSession) == 0 || *pendingSession != sameSession[0])) {
-		return "", ErrHomeConflict
+	if state == "conflict" || hostID == nil {
+		return "", "", ErrHomeConflict
 	}
 	if hostCount == 1 && soleHost != nil && *soleHost != *hostID {
-		return "", ErrHomeConflict
+		return "", "", ErrHomeConflict
 	}
-	return *hostID, nil
+	if pendingSession != nil {
+		holder = *pendingSession
+	}
+	return *hostID, holder, nil
+}
+
+// The pending-home hold outlives its session row: only the agent's qualified
+// terminal clears it (home_hold.go), and that proof can trail the session's
+// own terminal state by a moment (#434). A relaunch in that gap is not a case
+// for operator review, so a hold by another session is refused by what its
+// holder is doing:
+//
+//   - holder still live (pending … stopping): the single-writer rule's
+//     retryable home_in_use, naming the holder. It is the caller's own session
+//     (claims are per user), the same answer gate 2b gives without a hold.
+//   - holder terminal on the claim's host, that host connected, and ended
+//     within homeHoldSettleWindow: the hold is settling. ScheduleAndCreate waits
+//     up to homeHoldSettleWait for the proof, then falls back to home_conflict,
+//     which the contract fixes for a hold (control-api.md, the 0090 hold).
+//   - anything else — no holder row, holder on another host, host offline, or
+//     proof overdue: the hold will not clear by itself, so home_conflict.
+//
+// None of these is persisted: persistHomeConflict records location evidence
+// only, never a hold.
+const homeHoldSettleWindow = 2 * time.Minute
+
+// homeHoldSettleWait bounds one launch's wait for a settling hold. A variable
+// so tests can shorten it.
+var homeHoldSettleWait = 10 * time.Second
+
+const homeHoldPollInterval = 200 * time.Millisecond
+
+// homeHoldSettlingError is a home_conflict that waiting may resolve. It
+// unwraps to ErrHomeConflict, so every caller that does not wait answers as
+// before.
+type homeHoldSettlingError struct{ holder string }
+
+func (e *homeHoldSettlingError) Error() string { return ErrHomeConflict.Error() }
+func (e *homeHoldSettlingError) Unwrap() error { return ErrHomeConflict }
+
+func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) error {
+	var state State
+	var host *string
+	var connected, recent bool
+	err := tx.QueryRow(ctx, `SELECT s.state, s.host_id::text,
+		COALESCE(h.status IN ('online','draining'), false),
+		COALESCE(s.ended_at, s.updated_at) > now() - ($2::int * interval '1 second')
+		FROM sessions s LEFT JOIN hosts h ON h.id=s.host_id
+		WHERE s.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second)).
+		Scan(&state, &host, &connected, &recent)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrHomeConflict
+	}
+	if err != nil {
+		return fmt.Errorf("read home hold session: %w", err)
+	}
+	switch {
+	case !state.IsTerminal():
+		return &HomeInUseError{SessionID: holder, Stopping: state == StateStopping}
+	case host != nil && *host == claimHost && connected && recent:
+		return &homeHoldSettlingError{holder: holder}
+	default:
+		return ErrHomeConflict
+	}
+}
+
+// awaitHomeHoldRelease polls, outside any transaction, until holder no longer
+// holds the claim (true) or until passes (false).
+func (s *Store) awaitHomeHoldRelease(ctx context.Context, p CreateParams, holder string, until time.Time) bool {
+	for {
+		var held bool
+		err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM managed_home_claims
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_session_id=$3::uuid)`,
+			p.UserID, p.homeAppID(), holder).Scan(&held)
+		if err != nil {
+			return false
+		}
+		if !held {
+			return true
+		}
+		wait := time.Until(until)
+		if wait <= 0 {
+			return false
+		}
+		if wait > homeHoldPollInterval {
+			wait = homeHoldPollInterval
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(wait):
+		}
+	}
 }
 
 // claimSelectedHome runs after the GPU and host have been rechecked and before
@@ -90,9 +195,11 @@ func claimSelectedHome(ctx context.Context, tx pgx.Tx, p CreateParams, hostID st
 	if err != nil {
 		return fmt.Errorf("verify canonical home claim: %w", err)
 	}
-	if state == "conflict" || owner == nil || *owner != hostID ||
-		(pendingSession != nil && (len(sameSession) == 0 || *pendingSession != sameSession[0])) {
+	if state == "conflict" || owner == nil || *owner != hostID {
 		return ErrHomeConflict
+	}
+	if pendingSession != nil && (len(sameSession) == 0 || *pendingSession != sameSession[0]) {
+		return homeHoldRefusal(ctx, tx, *pendingSession, hostID)
 	}
 	// Lock every recorded location after the candidate was selected. Tombstone
 	// and GC writers then serialize with this decision; a stale unlocked hint

@@ -78,6 +78,11 @@ pub const CASES: &[Case] = &[
         needs: &[],
         run: missing_bind_source,
     },
+    Case {
+        name: "read-only-submount",
+        needs: &[Capability::Submount],
+        run: read_only_submount,
+    },
 ];
 
 /// The ids an app drops to. Distinct from any account a runner or lab user has, so the
@@ -403,7 +408,7 @@ fn log_count(ctx: &Ctx, id: &str, marker: &str) -> usize {
 }
 
 /// An `unless-stopped` service comes back after it exits; a running one stopped stays
-/// down, as the recovery actor's stop-then-disable sequences assume.
+/// down.
 fn restart(ctx: &Ctx) -> String {
     let spec = ctx.service("restart", "echo suite-run; exit 3");
     assert_eq!(spec.restart, RestartPolicy::No);
@@ -464,8 +469,9 @@ fn stays_down(ctx: &Ctx, id: &str, marker: &str) {
     );
 }
 
-/// A crash-looping `unless-stopped` service stopped stays down: the recovery actor stops a
-/// failed control plane this way before disabling its restart (`migrate.rs` `stop_failed`).
+/// A crash-looping `unless-stopped` service stopped stays down. Podman does not record a
+/// stop that finds it between two runs, so `stop_container` reads the stop back and makes
+/// it hold (#425).
 fn stop_crash_loop(ctx: &Ctx) -> String {
     let spec = ContainerSpec {
         restart: RestartPolicy::UnlessStopped,
@@ -611,7 +617,8 @@ fn errors(ctx: &Ctx) -> String {
 
 /// A typed bind whose source is missing is refused, never created: a catalog bind of an
 /// unmounted share must not become an empty directory (`runtime/docker/application.rs`
-/// asks the engine for `CreateMountpoint=false`).
+/// asks the engine for `CreateMountpoint=false`; Podman ignores that, so on Podman the
+/// runtime checks the source first, #426).
 fn missing_bind_source(ctx: &Ctx) -> String {
     let source = ctx.fixture_path("never-created");
     let request = ApplicationRequest {
@@ -642,4 +649,92 @@ fn missing_bind_source(ctx: &Ctx) -> String {
         "refused ({:?}); the source was not created; nothing left",
         error.kind
     )
+}
+
+/// A tmpfs mounted on a fixture subdirectory for one case, unmounted when dropped. The
+/// suite runs as the engine's owner: as root it mounts directly, otherwise through
+/// `sudo -n`. A host that can do neither declares `submount` lacking.
+struct Submount(std::path::PathBuf);
+
+impl Submount {
+    fn command(program: &str) -> std::process::Command {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc_geteuid() } == 0 {
+            std::process::Command::new(program)
+        } else {
+            let mut sudo = std::process::Command::new("sudo");
+            sudo.args(["-n", program]);
+            sudo
+        }
+    }
+
+    fn mount(path: &std::path::Path) -> Self {
+        let out = Self::command("mount")
+            .args(["-t", "tmpfs", "-o", "size=1m,mode=0777", "suite-submount"])
+            .arg(path)
+            .output()
+            .expect("run mount");
+        assert!(
+            out.status.success(),
+            "cannot mount a tmpfs at {} ({}); a host that cannot declares submount lacking",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Submount(path.to_path_buf())
+    }
+}
+
+impl Drop for Submount {
+    fn drop(&mut self) {
+        let _ = Self::command("umount").arg(&self.0).status();
+    }
+}
+
+extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+}
+
+/// #410: a read-only bind is read-only all the way down. Podman applies `ro` to a bind's
+/// top mount only, so a submount of the source would stay writable; the runtime asks
+/// Podman for a non-recursive bind instead, and Docker makes `ro` recursive itself. Typed
+/// and legacy `-v` binds alike, and nothing the container tries reaches the submount.
+fn read_only_submount(ctx: &Ctx) -> String {
+    let source = ctx.fixture_dir("ro-source");
+    let sub = source.join("sub");
+    std::fs::create_dir(&sub).expect("create the submount point");
+    let _mounted = Submount::mount(&sub);
+    let result = ctx.run_application(ApplicationRequest {
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "for d in /suite/ro-typed /suite/ro-legacy; do \
+               touch $d/top 2>/dev/null && echo $d/top=written || echo $d/top=refused; \
+               touch $d/sub/suite-write 2>/dev/null && echo $d/sub=written || echo $d/sub=refused; \
+             done"
+                .into(),
+        ],
+        typed_mounts: vec![ApplicationMount::Bind {
+            source: source.to_string_lossy().into_owned(),
+            target: "/suite/ro-typed".into(),
+            read_only: true,
+            consistency: None,
+        }],
+        mounts: vec![format!("{}:/suite/ro-legacy:ro", source.display())],
+        ..ctx.application("ro-submount")
+    });
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    for line in [
+        "/suite/ro-typed/top=refused",
+        "/suite/ro-typed/sub=refused",
+        "/suite/ro-legacy/top=refused",
+        "/suite/ro-legacy/sub=refused",
+    ] {
+        assert!(result.stdout.contains(line), "{line}: {}", result.stdout);
+    }
+    assert!(
+        !sub.join("suite-write").exists() && !source.join("top").exists(),
+        "a write reached the host"
+    );
+    "a read-only bind (typed and -v) refused writes to its top and to a submount".into()
 }

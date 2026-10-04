@@ -467,7 +467,7 @@ fi
 
 # ── engine profiles ──────────────────────────────────────────────────────────
 # testdata/engine-profiles/profiles.json as records, one per line, split on '|':
-#   platform|<id>|<label>        engine|<id>|<label>
+#   platform|<id>|<label>        engine|<id>|<label>|<minimum version>|<why>
 #   profile|<platform>|<engine>|<mode>|<status>|<alternatives>|<reason>
 #   unknown|<status>|<alternatives>|<reason>
 # An alternative is engine/mode on this machine, or engine/mode@platform. The block
@@ -482,8 +482,8 @@ platform|debian|Debian
 platform|arch|Arch
 platform|unraid|Unraid
 platform|other|Another Linux
-engine|docker|Docker
-engine|podman|Podman
+engine|docker|Docker||
+engine|podman|Podman|5.1|Podman 5.1 is the first Podman that can change a container's restart policy, which installing and updating Quasar need.
 profile|fedora|docker|rootful|supported||Rootful Docker is the engine profile Quasar is validated on, with AMD and NVIDIA GPUs.
 profile|fedora|docker|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
 profile|fedora|podman|rootless|experimental||Tested on Fedora (uCore and Workstation); expected to work on any Linux distribution.
@@ -727,6 +727,25 @@ if [ "$reported" != "$MODE" ]; then
 fi
 ok "engine: $ENGINE_LABEL, $MODE ($ENGINE_SOCKET)"
 
+# The engine's own version against the table's minimum for it (#424): an older one is
+# refused by name, before anything is pulled. A version that does not read as
+# major.minor is not taken as old.
+engine_minimum="$(engine_profiles | awk -F'|' -v id="$ENGINE" '$1 == "engine" && $2 == id { print $4; exit }')"
+if [ -n "$engine_minimum" ]; then
+  if [ "$ENGINE" = podman ]; then
+    engine_version="$(dk info --format '{{.Version.Version}}' 2>/dev/null || true)"
+  else
+    engine_version="$(dk version --format '{{.Server.Version}}' 2>/dev/null || true)"
+  fi
+  if printf '%s %s\n' "$engine_version" "$engine_minimum" | awk '{
+       split($1, h, /[.+-]/); split($2, n, /[.+-]/)
+       if (h[1] !~ /^[0-9]+$/ || h[2] !~ /^[0-9]+$/) exit 1
+       exit !((h[1] + 0 < n[1] + 0) || (h[1] + 0 == n[1] + 0 && h[2] + 0 < n[2] + 0)) }'; then
+    engine_why="$(engine_profiles | awk -F'|' -v id="$ENGINE" '$1 == "engine" && $2 == id { print $5; exit }')"
+    host_error "$ENGINE_LABEL $engine_version is older than $engine_minimum, so this script does not install Quasar on it. $engine_why Upgrade $ENGINE_LABEL to $engine_minimum or later, or use Docker rootful. Nothing was pulled or started."
+  fi
+fi
+
 # The engine profile, before anything is pulled: unsupported is refused by name.
 row="$(profile_row "$platform" "$ENGINE" "$MODE")"
 profile_status="${row%%|*}"; row="${row#*|}"
@@ -763,9 +782,8 @@ if [ "$MODE" = rootless ]; then
 elif [ "$ENGINE" = podman ]; then
   link=/etc/systemd/system/default.target.wants/podman-restart.service
   [ -e "$ROOT$link" ] || [ -L "$ROOT$link" ] || prep_need "Podman's restart at boot (podman-restart.service)"
-  # /run is a tmpfs, and Podman (unlike Docker) never creates a missing bind source:
-  # without this the agent cannot start after a reboot.
-  [ -e "$ROOT/etc/tmpfiles.d/quasar.conf" ] || prep_need "the agent's runtime directory at boot (/etc/tmpfiles.d/quasar.conf)"
+  # The agent's runtime directory needs no step: /run is emptied at every boot, and the
+  # recovery actor has the engine make it again before the agent starts (#439).
 fi
 if [ -n "$prep_missing" ]; then
   if [ "$MODE" = rootless ]; then
@@ -775,9 +793,7 @@ if [ -n "$prep_missing" ]; then
   else
     prep_text="this machine is not prepared for $ENGINE_LABEL rootful yet. Missing: $prep_missing.
   Run once, as root:
-    systemctl enable podman-restart.service
-    echo 'd /run/quasar-agent 0755 root root -' > /etc/tmpfiles.d/quasar.conf
-    systemd-tmpfiles --create /etc/tmpfiles.d/quasar.conf"
+    systemctl enable podman-restart.service"
   fi
   if [ "$DRY" = 1 ]; then
     warn "$prep_text"

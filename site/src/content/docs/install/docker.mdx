@@ -100,7 +100,7 @@ docker run -d --name quasar-seed --restart unless-stopped --pull always \
   -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
   -e QUASAR_CONTROL_PLANE_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane:latest \
   -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent:latest \
-  ghcr.io/accreleus/quasar/quasar-recoveryseed
+  ghcr.io/accreleus/quasar/quasar-recovery seed
 ```
 
 </TabItem>
@@ -201,7 +201,7 @@ docker run -d --name quasar-seed --restart unless-stopped --pull always \
   -e QUASAR_HOME_ROOT=/var/lib/quasar/homes \
   -e QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates \
   -e QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent:latest \
-  ghcr.io/accreleus/quasar/quasar-recoveryseed
+  ghcr.io/accreleus/quasar/quasar-recovery seed
 ```
 
 </TabItem>

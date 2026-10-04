@@ -480,6 +480,7 @@ fn a_control_only_machine_takes_every_control_plane_input_and_no_home_root() {
         ("QUASAR_APP_PUID", "99"),
         ("QUASAR_APP_PGID", "100"),
         ("QUASAR_CONTAINER_NETWORK", "bridge"),
+        ("QUASAR_APP_MOUNT_ALLOW", "/mnt/games"),
     ] {
         let refused = actor
             .reconfigure(changes(&[(key, value)]))
@@ -493,6 +494,88 @@ fn a_control_only_machine_takes_every_control_plane_input_and_no_home_root() {
     }
     assert_eq!(m.inputs(), before, "nothing was recorded");
     m.never_a_migration("control-only");
+}
+
+#[test]
+fn agent_variables_from_the_seed_reach_the_agent_and_a_reconfigure_moves_only_the_agent() {
+    let mut seed = combined_env();
+    seed.insert("QUASAR_APP_MOUNT_ALLOW".into(), "/mnt/games".into());
+    let m = Machine::install(seed);
+    assert_eq!(env(&m.agent(), "QUASAR_APP_MOUNT_ALLOW"), "/mnt/games");
+    assert_eq!(
+        m.inputs()["agent_variables"]["QUASAR_APP_MOUNT_ALLOW"],
+        "/mnt/games"
+    );
+    assert!(
+        env(&m.control_plane(), "QUASAR_APP_MOUNT_ALLOW").is_empty(),
+        "the control plane is not given agent variables"
+    );
+
+    let actor = m.actor();
+    let control_plane = m.control_plane().id;
+    let plan = actor
+        .reconfigure(dry(&[
+            ("QUASAR_APP_MOUNT_ALLOW", "/mnt/games,/srv/media:rw"),
+            ("QUASAR_ENCODER", "va"),
+        ]))
+        .unwrap();
+    assert_eq!(plan.replaced, vec!["node-agent"]);
+    assert_eq!(
+        plan.changed,
+        vec!["QUASAR_APP_MOUNT_ALLOW", "QUASAR_ENCODER"]
+    );
+    let (_, result) = run(
+        &actor,
+        changes(&[
+            ("QUASAR_APP_MOUNT_ALLOW", "/mnt/games,/srv/media:rw"),
+            ("QUASAR_ENCODER", "va"),
+        ]),
+    );
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    let agent = m.agent();
+    assert_eq!(
+        env(&agent, "QUASAR_APP_MOUNT_ALLOW"),
+        "/mnt/games,/srv/media:rw"
+    );
+    assert_eq!(
+        env(&agent, "QUASAR_ENCODER"),
+        "va",
+        "over the recipe default"
+    );
+    assert_eq!(m.control_plane().id, control_plane);
+    assert_eq!(m.settled(), "applied");
+
+    let (_, result) = run(&actor, changes(&[("QUASAR_APP_MOUNT_ALLOW", "")]));
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    assert!(!m.agent().spec.env.contains_key("QUASAR_APP_MOUNT_ALLOW"));
+    assert!(m.inputs()["agent_variables"]
+        .get("QUASAR_APP_MOUNT_ALLOW")
+        .is_none());
+    m.never_a_migration("agent variables");
+}
+
+#[test]
+fn a_setting_the_install_owns_or_a_misspelt_one_is_not_an_agent_variable() {
+    let m = Machine::install(combined_env());
+    let actor = m.actor();
+    let before = m.inputs();
+    for key in [
+        "QUASAR_RENDER_NODE",
+        "QUASAR_ENROLLMENT_FILE",
+        "QUASAR_RECOVERY_SOCKET",
+        "QUASAR_HEALTH_ADDR",
+        "QUASAR_APP_MOUNT_ALOW",
+    ] {
+        let refused = actor.reconfigure(changes(&[(key, "x")])).expect_err(key);
+        assert_eq!(refused.reason, Reason::Invalid, "{key}");
+        assert!(
+            refused.message.contains("Agent variables"),
+            "{key}: {}",
+            refused.message
+        );
+    }
+    assert_eq!(m.inputs(), before);
+    assert!(m.record().is_none());
 }
 
 // ----- what a reconfigure never does -----

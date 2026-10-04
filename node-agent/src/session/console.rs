@@ -123,6 +123,134 @@ fn weston_output_config(
     Ok(cfg)
 }
 
+/// The mode to write for a pinned `output_id` whose config carries no `mode` (#422):
+/// the output's active mode (what its CRTC runs now), else its DRM-preferred mode,
+/// else its first mode. `None` when the output is absent, disconnected or reports no
+/// modes; the caller then writes no config and weston behaves as before. The control
+/// plane sizes the session with the same rule (`console.ResolveSessionMode`).
+fn pinned_output_mode(
+    output_id: &str,
+    outputs: &[crate::messages::DrmOutputCapability],
+) -> Option<crate::messages::ConsoleModeSelection> {
+    let output = outputs.iter().find(|o| o.id == output_id && o.connected)?;
+    let mode = output
+        .active_mode
+        .as_ref()
+        .or_else(|| output.modes.iter().find(|m| m.preferred))
+        .or_else(|| output.modes.first())?;
+    Some(crate::messages::ConsoleModeSelection {
+        width: mode.width,
+        height: mode.height,
+        refresh_millihz: mode.refresh_millihz,
+    })
+}
+
+/// The connector a console session's local display runs on: the pinned `output_id`'s, else
+/// the first connected output's (the same rule `console.ResolveSessionMode` uses for an
+/// Automatic console). `None` when nothing is connected.
+pub fn console_output<'a>(
+    config: Option<&crate::messages::ConsoleConfig>,
+    outputs: &'a [crate::messages::DrmOutputCapability],
+) -> Option<&'a crate::messages::DrmOutputCapability> {
+    match config.and_then(|c| c.output_id.as_deref()) {
+        Some(id) => outputs.iter().find(|o| o.id == id && o.connected),
+        None => outputs.iter().find(|o| o.connected),
+    }
+}
+
+/// The modes a console session's display genuinely supports, for the compositor to
+/// advertise (#445): every non-interlaced DRM mode of [`console_output`], deduplicated on
+/// `WxH@mHz`, in the order the kernel lists them (preferred first). Empty when no output is
+/// connected, in which case the compositor advertises its one mode as before.
+pub fn console_output_modes(
+    config: Option<&crate::messages::ConsoleConfig>,
+    outputs: &[crate::messages::DrmOutputCapability],
+) -> Vec<crate::messages::ConsoleModeSelection> {
+    let Some(output) = console_output(config, outputs) else {
+        return Vec::new();
+    };
+    let mut modes: Vec<crate::messages::ConsoleModeSelection> = Vec::new();
+    for mode in output.modes.iter().filter(|m| !m.interlaced) {
+        let sel = crate::messages::ConsoleModeSelection {
+            width: mode.width,
+            height: mode.height,
+            refresh_millihz: mode.refresh_millihz,
+        };
+        if !modes.contains(&sel) {
+            modes.push(sel);
+        }
+    }
+    modes
+}
+
+/// The console config to start weston with when the session moves to `mode` (#445): the
+/// same config, pinned to the connector [`console_output`] resolves (an Automatic console
+/// becomes pinned to the connector it is actually on, so weston lights that one at the
+/// chosen mode and no other) with `mode` as its static mode.
+pub fn console_config_at_mode(
+    config: &crate::messages::ConsoleConfig,
+    mode: crate::messages::ConsoleModeSelection,
+    outputs: &[crate::messages::DrmOutputCapability],
+) -> crate::messages::ConsoleConfig {
+    let mut at = config.clone();
+    if at.output_id.is_none() {
+        at.output_id = console_output(Some(config), outputs).map(|o| o.id.clone());
+    }
+    at.mode = Some(mode);
+    at
+}
+
+/// The refresh rate as the whole hertz the pipeline runs at (`143981` mHz -> `144`).
+pub fn mode_fps(mode: &crate::messages::ConsoleModeSelection) -> i32 {
+    ((mode.refresh_millihz + 500) / 1000) as i32
+}
+
+/// Why a client's mode request was not acted on. Logged, never fatal: the session keeps
+/// running at its current mode.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModeSwitchRefusal {
+    /// The requested mode is not one of the display's modes.
+    NotAvailable,
+    /// The session is already at that mode.
+    AlreadyCurrent,
+    /// A streamed console: a mode change is an encoder restart on the latency path, which
+    /// the stream rule does not allow yet (#445 item 4).
+    Streaming,
+    /// The request is not a mode (non-positive dimension or refresh).
+    Malformed,
+}
+
+/// Decide what a client's `(width, height, refresh_mHz)` mode request means for a console
+/// session (#445). Pure, so the rule is unit-tested: the request must name one of
+/// `available` (same size, nearest refresh within half a hertz -- the compositor already
+/// snaps, this re-checks against the DRM list the agent trusts), must differ from
+/// `current`, and the session must not be streamed.
+pub fn plan_mode_switch(
+    request: (i32, i32, i32),
+    current: &crate::messages::ConsoleModeSelection,
+    available: &[crate::messages::ConsoleModeSelection],
+    streaming: bool,
+) -> Result<crate::messages::ConsoleModeSelection, ModeSwitchRefusal> {
+    let (w, h, refresh) = request;
+    if w <= 0 || h <= 0 || refresh <= 0 || w > u16::MAX as i32 || h > u16::MAX as i32 {
+        return Err(ModeSwitchRefusal::Malformed);
+    }
+    let target = available
+        .iter()
+        .filter(|m| m.width as i32 == w && m.height as i32 == h)
+        .min_by_key(|m| (m.refresh_millihz as i64 - refresh as i64).abs())
+        .filter(|m| (m.refresh_millihz as i64 - refresh as i64).abs() <= 500)
+        .cloned()
+        .ok_or(ModeSwitchRefusal::NotAvailable)?;
+    if streaming {
+        return Err(ModeSwitchRefusal::Streaming);
+    }
+    if target == *current {
+        return Err(ModeSwitchRefusal::AlreadyCurrent);
+    }
+    Ok(target)
+}
+
 /// A running headless weston process + the Wayland socket name it created. Killed
 /// on Drop (every session exit path drops the owning [`super::pipeline::LocalDisplay`]
 /// first — see the runner's reverse-declaration-order teardown).
@@ -299,6 +427,18 @@ pub fn spawn_weston_console(
     session_id: &str,
     config: Option<&crate::messages::ConsoleConfig>,
 ) -> Result<WestonConsole> {
+    // The connector inventory for a pinned output, gathered BEFORE any lock below:
+    // `detect_drm_outputs` takes `drm_open_lock` itself per card, and that mutex is
+    // not re-entrant, so calling it under this function's own `_drm_open_guard`
+    // deadlocks the runner thread (hit live on the first #445 mode switch, 2026-10-03:
+    // weston killed, no replacement, black screen until the agent was restarted). The
+    // pinned path never ran on a live console before that, so #422 shipped it unseen.
+    // Uses the narrow `detect_drm_outputs`, not `detect_console_capabilities` — the
+    // latter's DDC/CI + audio + input enumeration would eat this fn's 15s budget.
+    let pinned_outputs = config
+        .filter(|c| c.output_id.is_some())
+        .map(|_| crate::capacity::detect_drm_outputs());
+
     // Acquire the process-wide console lock BEFORE ensure_seatd()/spawn: only one
     // physical console exists, so this blocks a new launch until the previous
     // WestonConsole's Drop has fully drained its process group (see Drop and
@@ -339,24 +479,35 @@ pub fn spawn_weston_console(
     // `fullscreen` (see `pipeline::build_local_display_pipeline`). Ships with stock
     // weston (9.0+).
     let config_path = config
-        .and_then(|c| c.output_id.as_deref().zip(c.mode.as_ref()))
-        .map(|(output_id, mode)| -> Result<std::path::PathBuf> {
-            // Gather every other connected connector so weston_output_config can
-            // emit `mode=off` stanzas for them (see its doc). Uses the narrow
-            // `detect_drm_outputs`, not `detect_console_capabilities` — the latter's
-            // DDC/CI + audio + input enumeration would eat this fn's 15s budget.
+        .and_then(|c| c.output_id.as_deref().map(|id| (id, c.mode.clone())))
+        .map(|(output_id, mode)| -> Result<Option<std::path::PathBuf>> {
+            // Every other connected connector, so weston_output_config can emit
+            // `mode=off` stanzas for them (see its doc). Probed above, before the
+            // locks — never call `detect_drm_outputs` from here.
+            let outputs = pinned_outputs.clone().unwrap_or_default();
+            // #422: a pinned output with no configured mode runs at its physical
+            // mode; without a config weston would light every connected output.
+            let Some(mode) = mode.or_else(|| pinned_output_mode(output_id, &outputs)) else {
+                tracing::warn!(
+                    token = "console-pinned-output-mode-unknown",
+                    "console: pinned output {output_id} has no configured mode and no \
+                     detectable one; starting weston without an output config"
+                );
+                return Ok(None);
+            };
             let pinned_connector = output_id.split_once(':').map(|(_, c)| c);
-            let other_connected: Vec<String> = crate::capacity::detect_drm_outputs()
+            let other_connected: Vec<String> = outputs
                 .into_iter()
                 .filter(|o| o.connected && Some(o.connector.as_str()) != pinned_connector)
                 .map(|o| o.connector)
                 .collect();
             let path = Path::new(&xdg).join(format!("weston-console-{session_id}.ini"));
-            let body = weston_output_config(output_id, mode, &other_connected)?;
+            let body = weston_output_config(output_id, &mode, &other_connected)?;
             std::fs::write(&path, body).context("write session-owned Weston config")?;
-            Ok(path)
+            Ok(Some(path))
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
 
     let mut command = std::process::Command::new("weston");
     command.args([
@@ -566,6 +717,186 @@ mod tests {
         assert!(cfg.contains("name=DP-5\nmode=off"));
     }
 
+    fn drm_mode(
+        width: u16,
+        height: u16,
+        refresh_millihz: u32,
+        preferred: bool,
+    ) -> crate::messages::DrmModeCapability {
+        crate::messages::DrmModeCapability {
+            name: format!("{width}x{height}"),
+            width,
+            height,
+            refresh_millihz,
+            preferred,
+            interlaced: false,
+            clock_khz: 0,
+            htotal: 0,
+            vtotal: 0,
+        }
+    }
+
+    /// 42 modes as a 4K 240 Hz DisplayPort monitor reports them over DRM:
+    /// native 3840x2160 first (preferred at 60 Hz), then scaled and legacy modes.
+    fn four_k_240_modes() -> Vec<crate::messages::DrmModeCapability> {
+        let table: [(u16, u16, u32); 42] = [
+            (3840, 2160, 60_000),
+            (3840, 2160, 239_990),
+            (3840, 2160, 200_000),
+            (3840, 2160, 165_000),
+            (3840, 2160, 144_000),
+            (3840, 2160, 120_000),
+            (3840, 2160, 119_880),
+            (3840, 2160, 100_000),
+            (3840, 2160, 59_940),
+            (3840, 2160, 50_000),
+            (3840, 2160, 30_000),
+            (3840, 2160, 29_970),
+            (3840, 2160, 25_000),
+            (3840, 2160, 24_000),
+            (3840, 2160, 23_976),
+            (2560, 1440, 239_970),
+            (2560, 1440, 165_000),
+            (2560, 1440, 144_000),
+            (2560, 1440, 119_998),
+            (2560, 1440, 59_951),
+            (1920, 1080, 240_000),
+            (1920, 1080, 144_001),
+            (1920, 1080, 120_000),
+            (1920, 1080, 119_880),
+            (1920, 1080, 100_000),
+            (1920, 1080, 60_000),
+            (1920, 1080, 59_940),
+            (1920, 1080, 50_000),
+            (1920, 1080, 30_000),
+            (1920, 1080, 24_000),
+            (1680, 1050, 59_954),
+            (1600, 900, 60_000),
+            (1440, 900, 59_887),
+            (1280, 1024, 75_025),
+            (1280, 1024, 60_020),
+            (1280, 800, 59_810),
+            (1280, 720, 60_000),
+            (1280, 720, 59_940),
+            (1024, 768, 75_029),
+            (1024, 768, 60_004),
+            (800, 600, 60_317),
+            (640, 480, 59_940),
+        ];
+        table
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, h, r))| drm_mode(w, h, r, i == 0))
+            .collect()
+    }
+
+    fn drm_output(
+        id: &str,
+        connected: bool,
+        active_mode: Option<crate::messages::DrmModeCapability>,
+        modes: Vec<crate::messages::DrmModeCapability>,
+    ) -> crate::messages::DrmOutputCapability {
+        let (card, connector) = id.split_once(':').unwrap();
+        crate::messages::DrmOutputCapability {
+            id: id.to_string(),
+            card: card.to_string(),
+            render_node: None,
+            connector: connector.to_string(),
+            connected,
+            active_mode,
+            modes,
+        }
+    }
+
+    // #422: a pinned output with no configured mode resolves to its active mode,
+    // else its preferred one, else its first; absent/disconnected/mode-less -> None.
+    #[test]
+    fn pinned_output_mode_follows_the_physical_display() {
+        assert_eq!(four_k_240_modes().len(), 42);
+        let four_k_240 = drm_output(
+            "card0:DP-4",
+            true,
+            Some(drm_mode(3840, 2160, 239_990, false)),
+            four_k_240_modes(),
+        );
+        let four_k_idle = drm_output("card0:DP-4", true, None, four_k_240_modes());
+        let qhd_119879 = drm_output(
+            "card0:DP-5",
+            true,
+            Some(drm_mode(2560, 1440, 119_879, false)),
+            vec![drm_mode(2560, 1440, 119_879, false)],
+        );
+        let no_flags = drm_output(
+            "card0:DP-5",
+            true,
+            None,
+            vec![
+                drm_mode(2560, 1440, 119_879, false),
+                drm_mode(1920, 1080, 60_000, false),
+            ],
+        );
+        let unplugged = drm_output("card0:DP-4", false, None, four_k_240_modes());
+        let empty = drm_output("card0:DP-4", true, None, vec![]);
+
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            Vec<crate::messages::DrmOutputCapability>,
+            Option<(u16, u16, u32)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "active 4K@240 wins",
+                "card0:DP-4",
+                vec![qhd_119879.clone(), four_k_240.clone()],
+                Some((3840, 2160, 239_990)),
+            ),
+            (
+                "exact millihertz kept",
+                "card0:DP-5",
+                vec![four_k_240.clone(), qhd_119879.clone()],
+                Some((2560, 1440, 119_879)),
+            ),
+            (
+                "idle output -> preferred",
+                "card0:DP-4",
+                vec![four_k_idle],
+                Some((3840, 2160, 60_000)),
+            ),
+            (
+                "no active, no preferred -> first",
+                "card0:DP-5",
+                vec![no_flags],
+                Some((2560, 1440, 119_879)),
+            ),
+            ("absent output", "card1:DP-4", vec![four_k_240], None),
+            ("disconnected output", "card0:DP-4", vec![unplugged], None),
+            ("no modes", "card0:DP-4", vec![empty], None),
+        ];
+        for (name, id, outputs, want) in cases {
+            let got =
+                pinned_output_mode(id, &outputs).map(|m| (m.width, m.height, m.refresh_millihz));
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    // The resolved mode feeds the same weston ini as a configured one, rounded
+    // only at that boundary (119879 mHz -> @120).
+    #[test]
+    fn pinned_output_mode_writes_a_weston_ini() {
+        let outputs = vec![drm_output(
+            "card0:DP-5",
+            true,
+            Some(drm_mode(2560, 1440, 119_879, false)),
+            vec![drm_mode(2560, 1440, 119_879, false)],
+        )];
+        let mode = pinned_output_mode("card0:DP-5", &outputs).unwrap();
+        assert_eq!(
+            weston_output_config("card0:DP-5", &mode, &["DP-4".to_string()]).unwrap(),
+            "[output]\nname=DP-5\nmode=2560x1440@120\n\n[output]\nname=DP-4\nmode=off\n"
+        );
+    }
+
     #[test]
     fn backend_selects_direct_kms_only_for_amdgpu() {
         let root =
@@ -594,5 +925,133 @@ mod tests {
             local_backend_at(Some(&cfg), Path::new("/definitely/missing")),
             LocalBackend::Weston
         );
+    }
+
+    fn console_config(output_id: Option<&str>) -> crate::messages::ConsoleConfig {
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "output_id": output_id,
+        }))
+        .unwrap()
+    }
+
+    fn mode(w: u16, h: u16, mhz: u32) -> crate::messages::ConsoleModeSelection {
+        crate::messages::ConsoleModeSelection {
+            width: w,
+            height: h,
+            refresh_millihz: mhz,
+        }
+    }
+
+    /// #445: the compositor is told the connected display's modes, non-interlaced, each
+    /// with its own refresh, deduplicated.
+    #[test]
+    fn console_output_modes_lists_the_pinned_displays_modes() {
+        let mut modes = four_k_240_modes();
+        // A duplicate timing (two DRM modes with the same WxH@mHz) collapses to one.
+        modes.push(modes[0].clone());
+        // An interlaced mode is left out: the compositor cannot render a field.
+        let mut interlaced = drm_mode(1920, 1080, 60_000, false);
+        interlaced.interlaced = true;
+        modes.push(interlaced);
+        let outputs = vec![
+            drm_output("card1:DP-1", true, None, modes.clone()),
+            drm_output(
+                "card1:HDMI-A-1",
+                true,
+                None,
+                vec![drm_mode(1280, 720, 60_000, true)],
+            ),
+        ];
+
+        let got = console_output_modes(Some(&console_config(Some("card1:DP-1"))), &outputs);
+        let expected: Vec<_> = four_k_240_modes()
+            .iter()
+            .map(|m| mode(m.width, m.height, m.refresh_millihz))
+            .collect();
+        assert_eq!(got, expected);
+
+        // Automatic: the first connected output.
+        let got = console_output_modes(Some(&console_config(None)), &outputs);
+        assert_eq!(got, expected);
+
+        // A pinned output that is not connected, or no output at all: nothing to advertise.
+        assert!(
+            console_output_modes(Some(&console_config(Some("card1:DP-9"))), &outputs).is_empty()
+        );
+        assert!(console_output_modes(None, &[]).is_empty());
+    }
+
+    /// #445: the config weston is restarted with pins the connector the session is on and
+    /// carries the chosen mode, whether the admin pinned an output or left it Automatic.
+    #[test]
+    fn console_config_at_mode_pins_the_connector_and_the_mode() {
+        let outputs = vec![
+            drm_output("card1:DP-1", false, None, vec![]),
+            drm_output("card1:HDMI-A-1", true, None, four_k_240_modes()),
+        ];
+        let chosen = mode(2560, 1440, 143_981);
+
+        let at = console_config_at_mode(&console_config(None), chosen.clone(), &outputs);
+        assert_eq!(at.output_id.as_deref(), Some("card1:HDMI-A-1"));
+        assert_eq!(at.mode, Some(chosen.clone()));
+        assert!(at.enabled, "everything else is carried over");
+
+        let at = console_config_at_mode(
+            &console_config(Some("card1:DP-1")),
+            chosen.clone(),
+            &outputs,
+        );
+        assert_eq!(
+            at.output_id.as_deref(),
+            Some("card1:DP-1"),
+            "an admin pin is kept"
+        );
+        assert_eq!(at.mode, Some(chosen));
+    }
+
+    /// #445: the switch rule.
+    #[test]
+    fn plan_mode_switch_accepts_only_a_different_available_mode_on_a_local_console() {
+        let available = vec![
+            mode(3840, 2160, 239_990),
+            mode(2560, 1440, 143_981),
+            mode(1920, 1080, 119_880),
+            mode(1920, 1080, 60_000),
+        ];
+        let current = mode(1920, 1080, 60_000);
+
+        // The compositor rounds to whole hertz on the caps; the DRM entry is the truth.
+        assert_eq!(
+            plan_mode_switch((2560, 1440, 144_000), &current, &available, false),
+            Ok(mode(2560, 1440, 143_981))
+        );
+        assert_eq!(
+            plan_mode_switch((1920, 1080, 120_000), &current, &available, false),
+            Ok(mode(1920, 1080, 119_880))
+        );
+        assert_eq!(
+            plan_mode_switch((1920, 1080, 60_000), &current, &available, false),
+            Err(ModeSwitchRefusal::AlreadyCurrent)
+        );
+        assert_eq!(
+            plan_mode_switch((1920, 1080, 75_000), &current, &available, false),
+            Err(ModeSwitchRefusal::NotAvailable),
+            "a refresh more than half a hertz off every entry is not that entry"
+        );
+        assert_eq!(
+            plan_mode_switch((800, 600, 60_000), &current, &available, false),
+            Err(ModeSwitchRefusal::NotAvailable)
+        );
+        assert_eq!(
+            plan_mode_switch((2560, 1440, 144_000), &current, &available, true),
+            Err(ModeSwitchRefusal::Streaming)
+        );
+        assert_eq!(
+            plan_mode_switch((0, 1440, 144_000), &current, &available, false),
+            Err(ModeSwitchRefusal::Malformed)
+        );
+        assert_eq!(mode_fps(&mode(2560, 1440, 143_981)), 144);
+        assert_eq!(mode_fps(&mode(1920, 1080, 59_940)), 60);
     }
 }

@@ -1,0 +1,93 @@
+{
+ "configured": {
+  "State": {
+   "Status": "created",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "ExitCode": 0
+  },
+  "HostConfig": {
+   "RestartPolicy": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+   }
+  }
+ },
+ "restart-pending": {
+  "State": {
+   "Status": "stopped",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "ExitCode": 3
+  },
+  "HostConfig": {
+   "RestartPolicy": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+   }
+  }
+ },
+ "initialised": {
+  "State": {
+   "Status": "initialized",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "ExitCode": 0
+  },
+  "HostConfig": {
+   "RestartPolicy": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+   }
+  }
+ },
+ "stopped-by-user": {
+  "State": {
+   "Status": "exited",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "StoppedByUser": true,
+   "ExitCode": 137
+  },
+  "HostConfig": {
+   "RestartPolicy": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+   }
+  }
+ },
+ "running": {
+  "State": {
+   "Status": "running",
+   "Running": true,
+   "Paused": false,
+   "Restarting": false,
+   "ExitCode": 0
+  },
+  "HostConfig": {
+   "RestartPolicy": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+   }
+  }
+ },
+ "exited-policy-no": {
+  "State": {
+   "Status": "exited",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "ExitCode": 3
+  },
+  "HostConfig": {
+   "RestartPolicy": {
+    "Name": "no",
+    "MaximumRetryCount": 0
+   }
+  }
+ }
+}

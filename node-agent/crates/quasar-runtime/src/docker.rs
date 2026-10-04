@@ -14,8 +14,9 @@ use crate::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 pub mod credentials;
 mod inspection;
+mod libpod;
 pub(crate) mod platform;
-pub use inspection::{all_container_image_ids, daemon_images};
+pub use inspection::{all_container_image_ids, daemon_images, inspect_container_with};
 
 /// Inspect one container, tolerating what Podman reports outside Docker's API schema, which
 /// bollard cannot parse: the health status `stopped` (an exited container whose image has a

@@ -23,6 +23,10 @@ services:
         hard: 0
     environment:
       HOME: /tmp/quasar-home
+      # Who invoked it (scripts/verify.sh): a target that writes into the bind-mounted
+      # tree gives what it writes to this user, not root (#442).
+      DEVTOOLS_UID: ${DEVTOOLS_UID:-0}
+      DEVTOOLS_GID: ${DEVTOOLS_GID:-0}
       TEST_DATABASE_URL: postgres://quasar_test:quasar_test@postgres:5432/quasar_test?sslmode=disable
       # Per-worktree subdirectory of the shared quasar-cargo-target volume
       # (#417): every worktree used to build into the SAME path in-container,

@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use quasar_recovery::actor::{Actor, ActorConfig, ReplaceTiming, TrustConfig};
 use quasar_recovery::engine::{
-    Behaviour, EngineError, ErrorKind, FakeContainer, FakeEngine, FakeState, Fault, Image,
-    RestartPolicy, When,
+    Behaviour, CrashLoop, EngineError, ErrorKind, FakeContainer, FakeEngine, FakeState, Fault,
+    Image, RestartPolicy, When,
 };
 use quasar_recovery::recipe::names;
 use quasar_recovery::socket::{Component, Reason, Release, Request, RequestKind, State, Status};
@@ -453,6 +453,48 @@ fn every_crash_point_of_an_unhealthy_replacement_settles_to_the_table() {
 #[test]
 fn a_daemon_restart_at_any_point_of_a_replacement_ends_in_a_stated_outcome() {
     sweep(healthy(), |state, _, at| assert_replaced(state, at), true);
+}
+
+/// #425: the old agent exits by itself at every engine call of a replacement in turn, and
+/// its `unless-stopped` policy starts it again; a stop that finds it between two runs is
+/// not recorded, as on Podman. Keeping it disables the restart before the stop, so no stop
+/// is undone and the old agent never runs beside its replacement.
+#[test]
+fn an_old_agent_that_exits_at_any_call_stays_down_once_it_is_kept() {
+    let (reference, reference_dir) = installed(healthy());
+    let start = reference.calls();
+    let actor = actor_with(&reference, reference_dir.path(), fast());
+    actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+    actor.wait_attempt();
+    let total = reference.calls() - start;
+    assert!(total > 10, "the sweep must not be vacuous ({total} calls)");
+
+    for call in start..start + total {
+        let at = format!("exits after call {}", call - start);
+        let (engine, dir) = installed(healthy());
+        let old = old_agent(&engine);
+        engine.with_state(|s| {
+            s.crash_loops.insert(
+                old.id.clone(),
+                CrashLoop {
+                    from_call: call,
+                    ..Default::default()
+                },
+            );
+        });
+        let actor = actor_with(&engine, dir.path(), fast());
+        actor.submit(Caller::Agent, agent_request(ID)).unwrap();
+        actor.wait_attempt();
+        let state = engine.state();
+        assert_eq!(
+            state.restarted_after_stop,
+            Vec::<String>::new(),
+            "{at}: the engine started the old agent again after it was stopped"
+        );
+        let result = result_of(&actor.status_for(Some(ID)));
+        assert_eq!(result.state, State::Succeeded, "{at}: {result:?}");
+        assert_replaced(&state, &at);
+    }
 }
 
 #[test]

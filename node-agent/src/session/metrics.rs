@@ -191,6 +191,10 @@ pub struct MetricsWindow {
     /// Who owns the external size, `"auto"` (the ladder) or `"pinned"` (a user/admin
     /// PATCH). Rides the size echo: at the launch size there is nothing to own.
     pub external_owner: Option<&'static str>,
+    /// #445: the physical display mode a console session runs at, `(width, height,
+    /// refresh_mHz)`. Not an echo: present in every window once set (a console session
+    /// always has one), absent on a streamed session, which has none.
+    pub console_mode: Option<(u16, u16, u32)>,
     /// SPT-01: the raw rtpgccbwe estimate (kbit/s) BEFORE the governor's EWMA / deadband
     /// / step logic; its delta against `abr_setpoint_kbps` is the governor's smoothing
     /// contribution. `None` when ABR is disarmed or no estimate has arrived.
@@ -269,6 +273,8 @@ pub struct SessionMetrics {
     /// no counter, ring or classifier here, and owns its own lock (one mutex over the
     /// whole echo, so a drain can never mix a new width with an old height).
     display: LiveEcho,
+    /// #445: the console session's physical display mode; see `MetricsWindow::console_mode`.
+    console_mode: Mutex<Option<(u16, u16, u32)>>,
     /// SPT-03: the frame rate the classifier should expect, seeded from the launch fps.
     /// Drives the per-frame encode budget (`1000 / target_fps`) so the saturation trip
     /// scales with the tier instead of assuming 60.
@@ -426,6 +432,7 @@ impl SessionMetrics {
             gcc_estimate_kbps_bits: AtomicU64::new(0),
             abr_mode,
             display: LiveEcho::default(),
+            console_mode: Mutex::new(None),
             target_fps: AtomicU64::new(target_fps as u64),
             last_setpoint_kbps: Mutex::new(0),
             last_encode_in_ms: AtomicU64::new(0),
@@ -832,6 +839,12 @@ impl SessionMetrics {
         self.display.set_external_resize_supported(supported);
     }
 
+    /// #445: record the physical display mode a console session runs at, reported in every
+    /// window from now on. Written at launch and after every applied mode switch.
+    pub fn set_console_mode(&self, mode: Option<(u16, u16, u32)>) {
+        *self.console_mode.lock().unwrap() = mode;
+    }
+
     /// SPT-08 (D6): publish the ladder's speed-bias rung. Written by the ladder's
     /// `on_window` closure per actuated step; a snapshot, not a counter.
     pub fn set_ladder_bias(&self, bias: u8) {
@@ -1137,6 +1150,7 @@ impl SessionMetrics {
             ladder_res_rung: echo.ladder_res_rung.reported(),
             ladder_fps: echo.ladder_fps.reported(),
             external_owner: echo.external_owner.reported(),
+            console_mode: *self.console_mode.lock().unwrap(),
             gcc_estimate_kbps,
             abr_mode: self.abr_mode,
             adaptation_state,

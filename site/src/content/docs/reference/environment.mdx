@@ -64,6 +64,20 @@ Also seed inputs.
 | `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | Timeout for that fetch. |
 | `QUASAR_PLATFORM_INSECURE_REGISTRIES` | unset | First machine: plain-HTTP registries allowed for a developer apply. |
 
+### Agent variables
+
+Also seed inputs, on a GPU or combined host. These are the node agent's own
+settings. The most common one:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_APP_MOUNT_ALLOW` | unset | Host folders apps may bind besides the home root, comma-separated. Read-only unless an entry ends `:rw`, e.g. `/mnt/games,/mnt/saves:rw`. |
+
+Most `QUASAR_*` node-agent settings in the sections below work here too, such
+as `QUASAR_ENCODER` and the ABR knobs. The full list is "Agent variables" in
+`docs/configuration.md`. A setting the install manages, like the render node or
+the enrollment file, is refused.
+
 To change an input later:
 
 ```bash
@@ -72,10 +86,15 @@ docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER
 
 `reconfigure` accepts the trust settings, `QUASAR_HOME_ROOT`,
 `QUASAR_TEMPLATE_ROOT`, `QUASAR_APP_PUID`, `QUASAR_APP_PGID`,
-`QUASAR_CONTAINER_NETWORK`, and on the first machine `QUASAR_PUBLIC_HOST`,
-`QUASAR_TLS_HOSTS`, `QUASAR_TRUSTED_PROXIES`, the ports and the Add host images.
+`QUASAR_CONTAINER_NETWORK`, the agent variables, and on the first machine
+`QUASAR_PUBLIC_HOST`, `QUASAR_TLS_HOSTS`, `QUASAR_TRUSTED_PROXIES`, the ports and
+the Add host images. An empty value (`QUASAR_APP_MOUNT_ALLOW=`) removes a setting.
 It replaces the affected services and rolls back if they don't verify. Database
 inputs and the node name need a reinstall.
+
+Changing `QUASAR_HOME_ROOT` doesn't move saves. Move the old root's contents
+into the new root first, or players start with fresh homes. It worked when the
+host's Settings show the new root as verified and an existing save loads.
 
 ## Required on a legacy Compose install
 

@@ -1557,6 +1557,24 @@ pub fn run_blocking(
         cfg.stream.width,
         cfg.stream.height,
     ));
+    // #445: a local console also advertises the monitor's REAL modes, each with its own
+    // refresh, so the app's display settings list them and a choice comes back as a mode
+    // request the local-only loop acts on. Same bind-time rule as the ladder.
+    let console_modes: Vec<crate::messages::ConsoleModeSelection> =
+        if cfg.video_topology == VideoTopology::LocalOnly {
+            let outputs = crate::capacity::detect_drm_outputs();
+            let modes = console::console_output_modes(cfg.console_config.as_ref(), &outputs);
+            if !modes.is_empty() {
+                let triples: Vec<(i32, i32, i32)> = modes
+                    .iter()
+                    .map(|m| (m.width as i32, m.height as i32, m.refresh_millihz as i32))
+                    .collect();
+                current_source.set_output_modes(&triples);
+            }
+            modes
+        } else {
+            Vec::new()
+        };
     if let Err(e) = current_source.start() {
         tracing::error!(
             token = "runner-source-start-failed",
@@ -1623,6 +1641,7 @@ pub fn run_blocking(
             local_backend,
             prestarted_weston,
             console_vt.as_mut(),
+            console_modes,
         );
         return;
     }
@@ -2917,7 +2936,7 @@ pub fn run_blocking(
 #[allow(clippy::too_many_arguments)]
 fn run_local_only<F: Fn(SessionEvent)>(
     session_id: &str,
-    cfg: &SessionConfig,
+    launch_cfg: &SessionConfig,
     emit: &F,
     diagnostic_tx: DiagnosticEventTx,
     stop: Arc<AtomicBool>,
@@ -2936,8 +2955,15 @@ fn run_local_only<F: Fn(SessionEvent)>(
     local_backend: console::LocalBackend,
     prestarted_weston: Option<console::WestonConsole>,
     mut console_vt: Option<&mut super::console_vt::ConsoleVt>,
+    // #445: the monitor's modes the compositor advertises; empty when no display is
+    // connected (then no mode request can be honoured).
+    console_modes: Vec<crate::messages::ConsoleModeSelection>,
 ) {
-    let Some(cc) = cfg.console_config.as_ref().filter(|c| c.enabled) else {
+    // #445: the session's mode can move (a mode the app picked), so the config the
+    // display pipeline, a swap and the cadence log read is this live copy, not the
+    // launch config.
+    let mut live_cfg: SessionConfig = launch_cfg.clone();
+    let Some(cc) = live_cfg.console_config.clone().filter(|c| c.enabled) else {
         tracing::error!(
             token = "runner-local-only-console-required",
             "local_only assignment requires enabled console_config"
@@ -2952,7 +2978,7 @@ fn run_local_only<F: Fn(SessionEvent)>(
     let mut weston = match (local_backend, prestarted_weston) {
         (console::LocalBackend::Weston, Some(weston)) => Some(weston),
         (console::LocalBackend::Weston, None) => {
-            match console::spawn_weston_console(session_id, cfg.console_config.as_ref()) {
+            match console::spawn_weston_console(session_id, live_cfg.console_config.as_ref()) {
                 Ok(weston) => Some(weston),
                 Err(e) => {
                     tracing::error!(
@@ -2968,64 +2994,31 @@ fn run_local_only<F: Fn(SessionEvent)>(
         }
         (console::LocalBackend::DirectKms, _) => None,
     };
-    let socket = weston.as_ref().map(|weston| weston.socket.as_str());
-    let local_display = match pipeline::build_local_display_pipeline(cfg, sink0, socket) {
+    let mut local_display = match bring_up_local_display(
+        &live_cfg,
+        sink0,
+        weston.as_ref().map(|weston| weston.socket.as_str()),
+        current_source,
+        shared_clock,
+        shared_base,
+        cuda_ctx,
+        va_ctx,
+    ) {
         Ok(ld) => ld,
         Err(e) => {
             tracing::error!(
                 token = "runner-local-display-build-failed",
-                error = %format_args!("{e:#}"),
-                "build local-display pipeline failed"
+                error = %e,
+                "local-display pipeline failed"
             );
-            emit(SessionEvent::Failed(format!(
-                "build local-display pipeline: {e:#}"
-            )));
+            emit(SessionEvent::Failed(e));
             current_source.teardown();
             return;
         }
     };
-    local_display
-        .pipeline
-        .set_start_time(None::<gst::ClockTime>);
-    local_display.pipeline.use_clock(Some(shared_clock));
-    local_display.pipeline.set_base_time(shared_base);
-    if pipeline::vulkan_image_transport(cfg) {
-        let mut shared = 0;
-        for context_type in ["gst.vulkan.instance", "gst.vulkan.device"] {
-            if let Some(context) = current_source.source_context(context_type) {
-                local_display.pipeline.set_context(&context);
-                shared += 1;
-            } else {
-                tracing::warn!(
-                    token = "vulkan-context-query-unanswered",
-                    "local-only Vulkan producer did not answer {context_type} context query"
-                );
-            }
-        }
-        tracing::info!("local-only Vulkan context bridge installed ({shared}/2 producer contexts)");
-    }
-    if let Some(ctx) = va_ctx {
-        local_display.pipeline.set_context(ctx);
-        super::va_share::install_need_context_handler(&local_display.pipeline, ctx);
-    }
-    if let Some(ctx) = cuda_ctx {
-        local_display.pipeline.set_context(ctx);
-    }
-    if let Err(e) = local_display.pipeline.set_state(gst::State::Playing) {
-        tracing::error!(
-            token = "runner-local-display-playing-failed",
-            error = %format_args!("{e:#}"),
-            "local-display pipeline PLAYING transition failed"
-        );
-        emit(SessionEvent::Failed(format!(
-            "local-display set PLAYING: {e:#}"
-        )));
-        current_source.teardown();
-        return;
-    }
 
     let local_audio = cc.audio_output.as_deref().and_then(|output| {
-        match pipeline::build_local_audio_pipeline(cfg, output) {
+        match pipeline::build_local_audio_pipeline(&live_cfg, output) {
             Ok(la) => {
                 la.pipeline.set_start_time(None::<gst::ClockTime>);
                 la.pipeline.use_clock(Some(shared_clock));
@@ -3070,9 +3063,25 @@ fn run_local_only<F: Fn(SessionEvent)>(
     emit(SessionEvent::Progress("local display pipeline ready"));
     emit(SessionEvent::Running);
 
-    let display_bus = local_display.pipeline.bus();
+    // #445: the mode the local display runs at, as the monitor names it (the DRM entry
+    // whose size is the session's and whose refresh is nearest the session fps), reported
+    // on every metrics window. `None` when no display is connected.
+    let mut console_current: Option<crate::messages::ConsoleModeSelection> = console_modes
+        .iter()
+        .filter(|m| {
+            m.width as i32 == live_cfg.stream.width && m.height as i32 == live_cfg.stream.height
+        })
+        .min_by_key(|m| (m.refresh_millihz as i64 - live_cfg.stream.fps as i64 * 1000).abs())
+        .cloned();
+    session_metrics.set_console_mode(
+        console_current
+            .as_ref()
+            .map(|m| (m.width, m.height, m.refresh_millihz)),
+    );
+
+    let mut display_bus = local_display.pipeline.bus();
     // session-display-update state — see the matching declarations in run_blocking.
-    let encode_size = (cfg.stream.width, cfg.stream.height);
+    let encode_size = (live_cfg.stream.width, live_cfg.stream.height);
     let mut current_render: Option<(i32, i32)> = None;
     let mut current_ui_scale: f64 = 1.0;
     // A local-only console session has no encode pipeline (the source feeds
@@ -3138,7 +3147,7 @@ fn run_local_only<F: Fn(SessionEvent)>(
             }
             current_source.teardown();
             emit(SessionEvent::Stopped {
-                bytes_used: compute_bytes_used(cfg),
+                bytes_used: compute_bytes_used(&live_cfg),
                 detail: None,
             });
             return;
@@ -3158,11 +3167,100 @@ fn run_local_only<F: Fn(SessionEvent)>(
             );
         }
 
+        // #445: a mode the app picked (through the compositor's wlr-output-management).
+        if let Some(request) = current_source.take_mode_request() {
+            let current =
+                console_current
+                    .clone()
+                    .unwrap_or(crate::messages::ConsoleModeSelection {
+                        width: live_cfg.stream.width as u16,
+                        height: live_cfg.stream.height as u16,
+                        refresh_millihz: live_cfg.stream.fps as u32 * 1000,
+                    });
+            match console::plan_mode_switch(request, &current, &console_modes, cc.stream) {
+                Ok(target) => {
+                    let outputs = crate::capacity::detect_drm_outputs();
+                    match switch_console_mode(
+                        session_id,
+                        &mut live_cfg,
+                        &cc,
+                        &target,
+                        &outputs,
+                        &mut weston,
+                        local_backend,
+                        &mut local_display,
+                        current_source,
+                        &ipsink_name(session_id, *gen),
+                        shared_clock,
+                        shared_base,
+                        cuda_ctx,
+                        va_ctx,
+                    ) {
+                        Ok(()) => {
+                            console_current = Some(target.clone());
+                            session_metrics.set_console_mode(Some((
+                                target.width,
+                                target.height,
+                                target.refresh_millihz,
+                            )));
+                            diagnostic_tx.try_emit(
+                                session_id.to_string(),
+                                TraceEvent {
+                                    ts_unix_ms: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as i64)
+                                        .unwrap_or(0),
+                                    event: "console.mode_switched",
+                                    payload: serde_json::json!({
+                                        "width": target.width,
+                                        "height": target.height,
+                                        "refresh_millihz": target.refresh_millihz,
+                                        "source": "app_request",
+                                    }),
+                                },
+                            );
+                        }
+                        Err(failure) if failure.fatal => {
+                            tracing::error!(
+                                token = "runner-console-mode-switch-failed",
+                                reason = %failure.reason,
+                                "console mode switch failed; ending session"
+                            );
+                            emit(SessionEvent::Failed(failure.reason));
+                            let _ = local_display.pipeline.set_state(gst::State::Null);
+                            if let Some(audio) = &local_audio {
+                                let _ = audio.pipeline.set_state(gst::State::Null);
+                            }
+                            current_source.teardown();
+                            return;
+                        }
+                        Err(failure) => {
+                            tracing::warn!(
+                                token = "runner-console-mode-switch-rolled-back",
+                                reason = %failure.reason,
+                                "console mode switch rolled back; session stays at its mode"
+                            );
+                        }
+                    }
+                    // Either way the local-display pipeline is a new object now.
+                    display_bus = local_display.pipeline.bus();
+                }
+                Err(refusal) => {
+                    tracing::info!(
+                        token = "console-mode-request-refused",
+                        ?request,
+                        ?refusal,
+                        "console mode request not applied"
+                    );
+                }
+            }
+        }
+
         while let Ok(req) = swap_rx.try_recv() {
             *gen += 1;
             emit(SessionEvent::Swapping);
             match perform_swap(
-                cfg,
+                &live_cfg,
                 session_id,
                 *gen,
                 res,
@@ -3302,10 +3400,10 @@ fn run_local_only<F: Fn(SessionEvent)>(
             let frames = local_display.drain_sink_frames();
             let seconds = cadence_elapsed.as_secs_f64();
             let delivered_fps = frames as f64 / seconds;
-            let expected = (cfg.stream.fps as f64 * seconds).round() as u64;
+            let expected = (live_cfg.stream.fps as f64 * seconds).round() as u64;
             let missing = expected.saturating_sub(frames);
             tracing::info!(
-                target_fps = cfg.stream.fps,
+                target_fps = live_cfg.stream.fps,
                 frames,
                 window_ms = cadence_elapsed.as_millis() as u64,
                 delivered_fps = format_args!("{delivered_fps:.2}"),
@@ -3379,6 +3477,233 @@ fn run_local_only<F: Fn(SessionEvent)>(
             cadence_at = Instant::now();
         }
     }
+}
+
+/// Build the local-display pipeline (`interpipesrc(listen-to=sink) → … → waylandsink|kmssink`)
+/// against the live config, share the session clock and the producer's Vulkan/VA/CUDA
+/// contexts with it, and bring it to PLAYING. The one bring-up path for a console session's
+/// local display: the launch uses it, and so does a mode switch (#445) after re-pinning
+/// the source. Returns the `SessionEvent::Failed` reason on error.
+#[allow(clippy::too_many_arguments)]
+fn bring_up_local_display(
+    cfg: &SessionConfig,
+    sink_name: &str,
+    wayland_socket: Option<&str>,
+    current_source: &AppSource,
+    shared_clock: &gst::Clock,
+    shared_base: gst::ClockTime,
+    cuda_ctx: Option<&gst::Context>,
+    va_ctx: Option<&gst::Context>,
+) -> Result<pipeline::LocalDisplay, String> {
+    let local_display = pipeline::build_local_display_pipeline(cfg, sink_name, wayland_socket)
+        .map_err(|e| format!("build local-display pipeline: {e:#}"))?;
+    local_display
+        .pipeline
+        .set_start_time(None::<gst::ClockTime>);
+    local_display.pipeline.use_clock(Some(shared_clock));
+    local_display.pipeline.set_base_time(shared_base);
+    if pipeline::vulkan_image_transport(cfg) {
+        let mut shared = 0;
+        for context_type in ["gst.vulkan.instance", "gst.vulkan.device"] {
+            if let Some(context) = current_source.source_context(context_type) {
+                local_display.pipeline.set_context(&context);
+                shared += 1;
+            } else {
+                tracing::warn!(
+                    token = "vulkan-context-query-unanswered",
+                    "local-only Vulkan producer did not answer {context_type} context query"
+                );
+            }
+        }
+        tracing::info!("local-only Vulkan context bridge installed ({shared}/2 producer contexts)");
+    }
+    if let Some(ctx) = va_ctx {
+        local_display.pipeline.set_context(ctx);
+        super::va_share::install_need_context_handler(&local_display.pipeline, ctx);
+    }
+    if let Some(ctx) = cuda_ctx {
+        local_display.pipeline.set_context(ctx);
+    }
+    local_display
+        .pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| format!("local-display set PLAYING: {e:#}"))?;
+    Ok(local_display)
+}
+
+/// Why a console mode switch did not complete. `fatal` means the session cannot go on
+/// (the display could not be brought back at any mode); otherwise it was rolled back to
+/// the mode it had.
+struct ModeSwitchFailure {
+    fatal: bool,
+    reason: String,
+}
+
+/// #445: move a local console session to `target`, the mode the app picked, without
+/// restarting the app: the local display pipeline is stopped, the source is HELD (PAUSED,
+/// so the compositor keeps serving its clients and nothing renders on the GPU during the
+/// modeset -- a modeset under a PLAYING Vulkan source has faulted NVIDIA, Xid 13/32),
+/// weston is restarted at the target mode (the DirectKms path has no weston: kmssink
+/// modesets from the new caps), the source tail is re-pinned to the new WxH@fps, the local
+/// display is rebuilt at the new caps, and the source resumes. The compositor sees the new
+/// caps, moves its `wl_output` to the target mode and configures every toplevel; a rootful
+/// Xwayland follows the configure, so the desktop's screen resizes in place.
+///
+/// If weston cannot start at the target mode, the previous mode is restored the same way;
+/// only a failure to come back at all is fatal.
+#[allow(clippy::too_many_arguments)]
+fn switch_console_mode(
+    session_id: &str,
+    live_cfg: &mut SessionConfig,
+    console_config: &crate::messages::ConsoleConfig,
+    target: &crate::messages::ConsoleModeSelection,
+    outputs: &[crate::messages::DrmOutputCapability],
+    weston: &mut Option<console::WestonConsole>,
+    local_backend: console::LocalBackend,
+    local_display: &mut pipeline::LocalDisplay,
+    current_source: &mut AppSource,
+    sink_name: &str,
+    shared_clock: &gst::Clock,
+    shared_base: gst::ClockTime,
+    cuda_ctx: Option<&gst::Context>,
+    va_ctx: Option<&gst::Context>,
+) -> Result<(), ModeSwitchFailure> {
+    let previous = (
+        live_cfg.stream.width,
+        live_cfg.stream.height,
+        live_cfg.stream.fps,
+    );
+    let fps = console::mode_fps(target);
+    tracing::info!(
+        token = "console-mode-switch",
+        from = %format_args!("{}x{}@{}", previous.0, previous.1, previous.2),
+        to = %format_args!("{}x{}@{} ({} mHz)", target.width, target.height, fps, target.refresh_millihz),
+        "console mode switch requested by the app"
+    );
+
+    // 1. Consumers before the producer (the same order as session stop).
+    let _ = local_display.pipeline.set_state(gst::State::Null);
+    current_source.pause().map_err(|e| ModeSwitchFailure {
+        fatal: true,
+        reason: format!("console mode switch: hold source: {e:#}"),
+    })?;
+
+    // 2. The physical display, at the target mode.
+    let mut at_mode = |mode: &crate::messages::ConsoleModeSelection| -> anyhow::Result<()> {
+        if local_backend == console::LocalBackend::Weston {
+            // Drop first: only one console weston may exist, and Drop drains the old one.
+            *weston = None;
+            let cfg_at = console::console_config_at_mode(console_config, mode.clone(), outputs);
+            *weston = Some(console::spawn_weston_console(session_id, Some(&cfg_at))?);
+        }
+        Ok(())
+    };
+    let mut restore = |live_cfg: &mut SessionConfig,
+                       weston: &Option<console::WestonConsole>,
+                       current_source: &mut AppSource,
+                       reason: String|
+     -> ModeSwitchFailure {
+        live_cfg.stream.width = previous.0;
+        live_cfg.stream.height = previous.1;
+        live_cfg.stream.fps = previous.2;
+        let caps = pipeline::raw_video_caps(live_cfg);
+        current_source.set_stream_mode(previous.0, previous.1, previous.2, &caps);
+        match bring_up_local_display(
+            live_cfg,
+            sink_name,
+            weston.as_ref().map(|w| w.socket.as_str()),
+            current_source,
+            shared_clock,
+            shared_base,
+            cuda_ctx,
+            va_ctx,
+        ) {
+            Ok(ld) => {
+                *local_display = ld;
+                match current_source.start() {
+                    Ok(()) => ModeSwitchFailure {
+                        fatal: false,
+                        reason,
+                    },
+                    Err(e) => ModeSwitchFailure {
+                        fatal: true,
+                        reason: format!("{reason}; and the source did not resume: {e:#}"),
+                    },
+                }
+            }
+            Err(e) => ModeSwitchFailure {
+                fatal: true,
+                reason: format!("{reason}; and the previous mode did not come back: {e}"),
+            },
+        }
+    };
+
+    if let Err(e) = at_mode(target) {
+        let reason = format!(
+            "console mode switch: weston did not start at {}x{}@{}: {e:#}",
+            target.width, target.height, fps
+        );
+        tracing::warn!(token = "console-mode-switch-weston-failed", "{reason}");
+        let previous_mode = crate::messages::ConsoleModeSelection {
+            width: previous.0 as u16,
+            height: previous.1 as u16,
+            refresh_millihz: previous.2 as u32 * 1000,
+        };
+        if let Err(e) = at_mode(&previous_mode) {
+            return Err(ModeSwitchFailure {
+                fatal: true,
+                reason: format!("{reason}; and it did not come back at the previous mode: {e:#}"),
+            });
+        }
+        return Err(restore(live_cfg, weston, current_source, reason));
+    }
+
+    // 3. The source, re-pinned to the new mode; the compositor applies it on the new caps.
+    live_cfg.stream.width = target.width as i32;
+    live_cfg.stream.height = target.height as i32;
+    live_cfg.stream.fps = fps;
+    let caps = pipeline::raw_video_caps(live_cfg);
+    if !current_source.set_stream_mode(target.width as i32, target.height as i32, fps, &caps) {
+        return Err(restore(
+            live_cfg,
+            weston,
+            current_source,
+            "console mode switch: the source has no re-pinnable caps".to_string(),
+        ));
+    }
+
+    // 4. The local display at the new caps, then the source resumes.
+    match bring_up_local_display(
+        live_cfg,
+        sink_name,
+        weston.as_ref().map(|w| w.socket.as_str()),
+        current_source,
+        shared_clock,
+        shared_base,
+        cuda_ctx,
+        va_ctx,
+    ) {
+        Ok(ld) => *local_display = ld,
+        Err(e) => {
+            return Err(ModeSwitchFailure {
+                fatal: true,
+                reason: format!("console mode switch: {e}"),
+            })
+        }
+    }
+    current_source.start().map_err(|e| ModeSwitchFailure {
+        fatal: true,
+        reason: format!("console mode switch: resume source: {e:#}"),
+    })?;
+
+    tracing::info!(
+        "app display mode: {}x{}@{} (source=app_request, refresh_millihz={})",
+        target.width,
+        target.height,
+        fps,
+        target.refresh_millihz
+    );
+    Ok(())
 }
 
 /// Bytes used by the session's local-driver home dirs after the container is torn down,

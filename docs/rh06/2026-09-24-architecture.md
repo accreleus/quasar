@@ -308,7 +308,7 @@ impl Actor {
 
 Phases for one component, each journalled (fsync) **before** it is acted on:
 
-`admitted → [dumped] → pulled → checked (recipe supported) → old_kept (stop, disable restart,
+`admitted → [dumped] → pulled → checked (recipe supported) → old_kept (disable restart, stop,
 rename .kept) → created → started → verifying → verified → old_discarded → succeeded`
 
 and on failure `restoring → restored` (old container renamed back, restart re-enabled, started).

@@ -36,9 +36,10 @@ safe to repeat.
 | Check | Meaning and fix |
 | --- | --- |
 | `runtime_endpoint` | The Docker or Podman socket answers. Failing blocks the host. If `DOCKER_HOST` and `CONTAINER_HOST` name different engines, unset one. |
-| `runtime_engine` | The engine and its [engine profile](/quasar/start/requirements/#container-engines). Experimental or unsupported profiles warn only. |
+| `runtime_engine` | The engine and its [engine profile](/quasar/start/requirements/#container-engines). Experimental or unsupported profiles warn only. Podman older than 5.1 reads as unsupported: upgrade it, or updates will fail. |
 | `runtime_cdi` | How NVIDIA GPUs reach containers (CDI or `--gpus`). If neither works, the host is blocked: follow [NVIDIA setup](/quasar/install/nvidia/) for your engine, then restart it. |
 | `runtime_cdi_gpu<N>` | The same, per NVIDIA GPU on a mixed-vendor host. Blocks only that GPU. |
+| `engine_restart_on_boot` | Whether the engine brought Quasar back at the last reboot. Passes once a reboot proves it; `unknown` until the host first reboots after install. Fails if the node agent came back much later. Rootful Docker skips it. The fix is host preparation: `podman-restart.service` (Podman), and lingering plus the user's engine service (rootless). |
 | `engine_healthchecks` | Podman only. Health checks need a systemd session, or installs time out. Rootless: enable lingering for the `quasar` account and restart the Podman service. Rootful: use the systemd cgroup manager. |
 
 ## Input
@@ -81,7 +82,8 @@ is off, and never block streaming. See [Console mode](/quasar/admin/console/#rea
 | Agent not created with console access | Turn console mode on from the host's Local console page. |
 | Another process holds the display | Stop the desktop or login screen on that output, or pick another. Rootless: install the console [device rules](/quasar/install/device-rules/). Then toggle console mode off and on. |
 | No local audio sink | Check the host has a sound device, or set up [Host PipeWire](/quasar/admin/console/#local-audio). |
-| `ddcutil` missing, or no i2c bus for a connector | Every connected display counts as on. Check `/dev/i2c-*` exists (the console device rules grant it on rootless) and a monitor is connected. |
+| Console-audio socket missing | The desktop user's pipewire-pulse hasn't read host preparation's drop-in yet. Run host preparation again, or as root on the host: `runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`. Or have USER log in again. |
+| `ddcutil` missing, or no i2c bus for a connector | Every connected display counts as on. Check `/dev/i2c-*` exists (the console device rules grant it on rootless) and a monitor is connected. On rootless, a `/dev/i2c-N` that is a plain file rather than a device is skipped and named in the recovery actor's log: remove it, then toggle console mode off and on. |
 
 ## Owner conflict
 

@@ -44,8 +44,9 @@ fn fixture(
                 } else {
                     format!("GET {expected_path}")
                 };
+            // HTTP/1.0 is the runtime's own requests to Podman's native API.
             assert!(
-                String::from_utf8_lossy(&request).starts_with(&format!("{expected} HTTP/1.1")),
+                String::from_utf8_lossy(&request).starts_with(&format!("{expected} HTTP/1.")),
                 "{}",
                 String::from_utf8_lossy(&request)
             );
@@ -408,4 +409,168 @@ fn gpu_injection_is_decided_from_engine_facts() {
             "{kind:?} {mode:?} {cdi:?}"
         );
     }
+}
+
+const STOP_ID: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+/// `stop_container` against a scripted engine; the result, and whether every scripted
+/// request was made (a stop that returns early leaves the engine waiting).
+fn scripted_stop(script: Vec<(String, u16, String)>) -> (Result<(), RuntimeError>, bool) {
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let script = script
+        .into_iter()
+        .map(|(path, status, body)| (leak(path), status, leak(body)))
+        .collect();
+    let (_dir, runtime, server) = fixture(script);
+    let result = runtime
+        .stop_container(STOP_ID, Duration::from_secs(2))
+        .wait();
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while !server.is_finished() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let served = server.is_finished();
+    if served {
+        server.join().unwrap();
+    }
+    (result, served)
+}
+
+fn podman_after_stop_fixtures() -> [(&'static str, serde_json::Value); 2] {
+    [
+        (
+            "4.9.3",
+            serde_json::from_str(include_str!(
+                "../testdata/engines/podman-4.9.3-after-stop.json"
+            ))
+            .unwrap(),
+        ),
+        (
+            "5.8.4",
+            serde_json::from_str(include_str!(
+                "../testdata/engines/podman-5.8.4-after-stop.json"
+            ))
+            .unwrap(),
+        ),
+    ]
+}
+
+/// #425: Podman's native inspect, captured from Podman 4.9.3 and 5.8.4, says whether a
+/// stop holds. A crash-looping `unless-stopped` container that exited by itself is
+/// `stopped` with no stop recorded, and its cleanup restarts it.
+#[test]
+fn a_podman_read_back_says_whether_a_stop_holds() {
+    use crate::docker::platform::{podman_after_stop, AfterStop};
+    for (version, states) in podman_after_stop_fixtures() {
+        for (state, want) in [
+            ("configured", AfterStop::Down),
+            ("restart-pending", AfterStop::RestartPending),
+            ("initialised", AfterStop::Down),
+            ("stopped-by-user", AfterStop::Down),
+            ("running", AfterStop::Up),
+            ("exited-policy-no", AfterStop::Down),
+        ] {
+            assert_eq!(
+                podman_after_stop(&states[state]),
+                want,
+                "Podman {version}, {state}"
+            );
+        }
+    }
+    let stopping = serde_json::json!({
+        "State": {"Status": "stopping", "Running": false},
+        "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}}
+    });
+    assert_eq!(podman_after_stop(&stopping), AfterStop::Moving);
+}
+
+/// #425: Podman answers a stop of a crash-looping container found between two runs with
+/// 304 and does not record it, so its cleanup restarts it. The runtime reads the stop back,
+/// creates the container without its program, and stops it again, which Podman records.
+#[test]
+fn a_podman_stop_of_a_crash_loop_between_runs_is_made_to_hold() {
+    let version = include_str!("../testdata/engines/podman-rootful-version.json");
+    for (podman, states) in podman_after_stop_fixtures() {
+        let json = format!("/v4.0.0/libpod/containers/{STOP_ID}/json");
+        let (result, served) = scripted_stop(vec![
+            ("/version".into(), 200, version.into()),
+            (
+                format!("POST /v1.44/containers/{STOP_ID}/stop?t=2"),
+                304,
+                String::new(),
+            ),
+            (json.clone(), 200, states["restart-pending"].to_string()),
+            (
+                format!("POST /v4.0.0/libpod/containers/{STOP_ID}/init"),
+                204,
+                String::new(),
+            ),
+            // Created, nothing runs: no grace.
+            (
+                format!("POST /v1.44/containers/{STOP_ID}/stop?t=0"),
+                204,
+                String::new(),
+            ),
+            (json, 200, states["stopped-by-user"].to_string()),
+        ]);
+        assert!(
+            served,
+            "Podman {podman}: the stop was not read back until it held"
+        );
+        assert!(result.is_ok(), "Podman {podman}: {result:?}");
+    }
+}
+
+/// A Podman stop that was recorded the first time is read back once and nothing more.
+#[test]
+fn a_podman_stop_that_holds_is_read_back_once() {
+    let version = include_str!("../testdata/engines/podman-rootful-version.json");
+    let [_, (_, states)] = podman_after_stop_fixtures();
+    let (result, served) = scripted_stop(vec![
+        ("/version".into(), 200, version.into()),
+        (
+            format!("POST /v1.44/containers/{STOP_ID}/stop?t=2"),
+            204,
+            String::new(),
+        ),
+        (
+            format!("/v4.0.0/libpod/containers/{STOP_ID}/json"),
+            200,
+            states["stopped-by-user"].to_string(),
+        ),
+    ]);
+    assert!(served);
+    assert!(result.is_ok(), "{result:?}");
+}
+
+fn docker_inspect(running: bool) -> String {
+    let status = if running { "running" } else { "exited" };
+    format!(
+        r#"{{"Id":"{STOP_ID}","Name":"/quasar-control-plane","Config":{{"Image":"x"}},"HostConfig":{{"RestartPolicy":{{"Name":"unless-stopped","MaximumRetryCount":0}}}},"State":{{"Status":"{status}","Running":{running}}}}}"#
+    )
+}
+
+/// On Docker the stop is what it was, then one compatible inspect proves it; a container
+/// still running is stopped again. Nothing Podman-native is asked.
+#[test]
+fn a_docker_stop_is_read_back_and_repeated_only_while_it_runs() {
+    let stop = format!("POST /v1.48/containers/{STOP_ID}/stop?t=2");
+    let get = format!("/v1.48/containers/{STOP_ID}/json");
+    let (result, served) = scripted_stop(vec![
+        ("/version".into(), 200, VERSION.into()),
+        (stop.clone(), 204, String::new()),
+        (get.clone(), 200, docker_inspect(false)),
+    ]);
+    assert!(served);
+    assert!(result.is_ok(), "{result:?}");
+
+    let (result, served) = scripted_stop(vec![
+        ("/version".into(), 200, VERSION.into()),
+        (stop.clone(), 304, String::new()),
+        (get.clone(), 200, docker_inspect(true)),
+        (stop, 204, String::new()),
+        (get, 200, docker_inspect(false)),
+    ]);
+    assert!(served);
+    assert!(result.is_ok(), "{result:?}");
 }

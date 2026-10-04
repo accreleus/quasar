@@ -27,7 +27,7 @@ time. Each host has its own page: **Admin ▸ Fleet ▸** the host **▸ Local c
 | **Local audio output** | **Auto**, a sink the host reported, or **Quiet**. See [Local audio](#local-audio). |
 | **Grab local input**, **Input devices** | Takes the host's keyboards, mice and controllers for the session. See [Local input](#local-input). |
 | **Default app**, **Default user**, **Auto-start on display** | Launches that app as that user when a display comes on. See [Starting on its own](#starting-on-its-own). |
-| **Auto-connect controller** | Attaches a connected controller to the console session. |
+| **Auto-connect controller** | With a list of input devices, also attaches any controller plugged in. Auto already takes every controller. |
 
 The right-hand column lists the host's connectors and modes, audio sinks and
 input devices.
@@ -97,13 +97,31 @@ terminal you want.
 
 PipeWire output is newer and less tested than ALSA.
 
+Host preparation with `--console-audio-user USER` makes USER's pipewire-pulse open
+the socket:
+
+| USER is | What happens |
+| --- | --- |
+| Logged in, or lingering | Host preparation restarts their pipewire-pulse. |
+| Not logged in | The socket opens when they next log in. |
+
+After a reboot their pipewire-pulse starts with their session, so the socket is back
+without a step.
+
+It worked when `/run/quasar-console-audio/native` exists on the host and the
+`console_audio` check names PipeWire. If the check says the socket is missing, run
+host preparation again, or as root:
+`runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`.
+
 ## Local input
 
 **Grab local input** takes the host's keyboards and mice exclusively for the
 console session. **Input devices** picks what is passed in: by class, by device
 path, or none.
 
-Plug devices in before the session starts; a device plugged in later isn't grabbed.
+A device plugged in during a session is grabbed within about a second, and released
+when it is unplugged. With a list of device paths, a listed device is grabbed when it
+appears, and **Auto-connect controller** also grabs any controller that is plugged in.
 
 ## Starting on its own
 
@@ -132,4 +150,7 @@ See [Readiness checks](/quasar/troubleshooting/readiness/) for fixes.
 
 - Not every monitor mode and refresh rate is offered yet.
 - With an NVIDIA GPU passed through to a virtual machine, the console picture can
-  stay black.
+  stay black. The virtual machine's own boot screen is black too, so the cause is in
+  the hand-off of the card, not in Quasar. It has happened after the hypervisor used
+  the card without driving a display before starting the virtual machine. Run console
+  mode on a host that is not a virtual machine, or use another GPU.

@@ -1032,7 +1032,7 @@ app's catalog `runtime_spec` (image/args/env/mounts/gpu) is used instead.
 | `QUASAR_APP_SHM_SIZE` | `1g` | `--shm-size` for app containers. Docker's 64 MB default breaks Chromium-embedding apps (Steam's UI renders black/flashing on failed GPU command buffers). shm is tmpfs — allocated on use, so the roomy default is free for small apps. |
 | `QUASAR_APP_STOP_TIMEOUT_SECS` | `10` | Graceful-stop window for app containers: session teardown asks the runtime API to stop with SIGTERM, then SIGKILL after N seconds before the force-remove backstop, so apps can exit cleanly (Steam otherwise marks its install unclean and re-verifies every executable checksum on the next launch, ~9 s). `0` restores kill-only teardown. Well-behaved apps exit on TERM immediately, so the window costs nothing for them. |
 | `QUASAR_SWAP_APP_READY_TIMEOUT_MS` | `45000` | How long a quick-switch (session app swap) waits for the **replacement app** to actually present a frame before rolling back. The swap is serialised (2026-08-05): the outgoing app container is stopped and reaped first — both generations bind-mount the same managed home, and a second instance of a home-locking app (Steam) hands off to the first and exits 0 — so this budget covers container start + app startup, not just a first frame. Generous by default because a Steam-derived image needs 4.5–10.6 s just to reach its ready gate (#384) and a cold image pull is on top. A separate, fixed 20 s budget covers the earlier compositor-startup phase. Non-numeric or `0` ⇒ the default (a typo must not make every swap fail instantly). Raise it for very slow titles; lowering it only makes rollback happen sooner. |
-| `QUASAR_APP_MOUNT_ALLOW` | unset (managed-home root only) | Comma-separated list of host directories an app's `runtime_spec.mounts` / preset `mounts` may bind on **this** host, each optionally suffixed `:rw` (default read-only, and an entry's `:ro` is honoured verbatim). The managed-home root (`QUASAR_HOME_ROOT`, or the per-host root pushed from Admin → Hosts) is always allowed read-write and needs no entry, so the shipped catalog — whose images mount nothing else — works with this unset. Enforced by the node agent at assign and at app swap, because it is the agent that spawns the container and a mount string originates in a manifest authored on another machine; a mount naming anything else fails the assign with `session-assign-rejected` and nothing is spawned. A **deny list beats this allowlist**: `/`, `/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/run`, `/var/run`, `/var/lib/docker` (and the other container-runtime state dirs), `/lib/modules`, any directory containing a container-runtime socket, and any source containing `..` are refused whatever is listed here — binding any of them hands the session the host daemon and therefore host root. Sources are matched component-wise, so `/opt/games` does not allow `/opt/gamesecret`. The control plane applies the same deny list at image install and at admin preset writes (400), but that is a second line only: the host decides which of its own paths a session sees. |
+| `QUASAR_APP_MOUNT_ALLOW` | unset (managed-home root only) | Comma-separated list of host directories an app's `runtime_spec.mounts` / preset `mounts` may bind on **this** host, each optionally suffixed `:rw` (default read-only, and an entry's `:ro` is honoured verbatim). The managed-home root (`QUASAR_HOME_ROOT`, or the per-host root pushed from Admin → Hosts) is always allowed read-write and needs no entry, so the shipped catalog — whose images mount nothing else — works with this unset. Enforced by the node agent at assign and at app swap, because it is the agent that spawns the container and a mount string originates in a manifest authored on another machine; a mount naming anything else fails the assign with `session-assign-rejected` and nothing is spawned. A **deny list beats this allowlist**: `/`, `/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/run`, `/var/run`, `/var/lib/docker` (and the other container-runtime state dirs), `/lib/modules`, any directory containing a container-runtime socket, and any source containing `..` are refused whatever is listed here — binding any of them hands the session the host daemon and therefore host root. Sources are matched component-wise, so `/opt/games` does not allow `/opt/gamesecret`. The control plane applies the same deny list at image install and at admin preset writes (400), but that is a second line only: the host decides which of its own paths a session sees. On an owned install, set it on the seed or with `reconfigure` ("Agent variables" below). |
 | `QUASAR_APP_PRIVILEGE_OPTOUT` | `allow` | Whether this host honours an app's `runtime_spec.no_new_privileges: false` and `runtime_spec.systempaths_unconfined: true` (both rows below). `deny` ignores both, keeping `no-new-privileges` on and `/proc`/`/sys` masked, and logs `token="app-privilege-optout-denied"` — for an operator running a catalog they do not author. It is not the default because the shipped catalog needs both (Steam re-escalates via `sudo`, KDE needs an unmasked `/proc` for `bwrap`), so denying by default would break the default library out of the box; an unrecognised value warns and stays permissive rather than silently hardening a working host. |
 | `QUASAR_APP_SECCOMP` | `unconfined` | Seccomp profile for app containers. Docker's builtin profile denies unprivileged user-namespace creation, which Steam's pressure-vessel (bwrap) requires — hence the GOW/Wolf-style `unconfined` default. `default` restores Docker's builtin profile; any other value is passed as a profile path. |
 | `QUASAR_APP_APPARMOR_PROFILE` | unset (auto) | AppArmor profile for app containers, on hosts that enforce AppArmor (#76; an SELinux host gets no `apparmor=` flag whatever this says). Unset ⇒ the agent uses the scoped **`quasar-app`** profile (`deploy/apparmor/quasar-app`) when the host has it loaded, and `unconfined` when it does not — Docker's `docker-default` denies the mounts Steam's pressure-vessel and Flatpak's `bwrap` perform inside their user namespace, so plain `docker-default` is not an option. Loading the profile needs root **on the host** and the agent never does it: `sudo apparmor_parser -r -W <compose dir>/apparmor/quasar-app`, which `deploy/enroll-host.sh` runs at enrollment. The agent reads the loaded-profile list through the `/sys/kernel/security` bind in `deploy/docker-compose.yml`; without that mount it cannot tell and stays unconfined. Set to `unconfined` to force the pre-profile behaviour for a title the profile breaks, or to another profile name your host loads itself (asserted, not verified — a name that is not loaded makes the container runtime refuse every launch). Reported on the host's readiness card as `app_apparmor_profile`. |
@@ -1672,6 +1672,44 @@ dry run it is refused as contradictory.
 With the stack, preparing the host is the operator's job; the host's readiness card lists
 what is missing once it enrolls.
 
+### Agent variables (#448)
+
+On a GPU or combined host, the seed also takes the node agent's own settings, by their
+usual names. The first install records them in machine state (`machine.json`
+`inputs.agent_variables`), and the recovery actor sets them in the agent's environment
+over its defaults. Like every seed input they are read once, on a clean machine. To change
+one on an installed machine, use `reconfigure` (below), which re-creates only the node
+agent:
+
+```sh
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_APP_MOUNT_ALLOW=/mnt/games,/mnt/saves:rw
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_APP_MOUNT_ALLOW=   # removes it
+```
+
+The agent variables are the documented node-agent `QUASAR_*` settings in the "Node agent"
+sections above, except the ones the install owns and the dev/test-only ones. The list is
+`AGENT_VARIABLES` in `node-agent/crates/quasar-recovery/src/recipe/mod.rs`. The seed
+ignores any other name; `reconfigure` refuses one, and refuses every agent variable on a
+control-only machine. Not agent variables:
+
+- **Owned by the install:** `QUASAR_ENROLLMENT`, `QUASAR_ENROLLMENT_FILE`,
+  `QUASAR_RECOVERY_SOCKET`, `QUASAR_CONSOLE_ACCESS`, `QUASAR_PULSE_IMAGE`,
+  `QUASAR_RENDER_NODE`, `QUASAR_HEALTH_ADDR`, `QUASAR_GPU_NVIDIA`,
+  `QUASAR_NVIDIA_DRIVER_VOLUME`, `QUASAR_NVIDIA_DRIVER_HOST_PATH`,
+  `QUASAR_APP_ENGINE_GROUPS`, `QUASAR_ALLOW_PLAINTEXT_AGENT`. `QUASAR_TEMPLATE_ROOT`,
+  `QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK` are seed inputs in
+  their own right.
+- **Dev and test only:** `QUASAR_APP_IMAGE`, `QUASAR_APP_ARGS`, `QUASAR_APP_GPU`,
+  `QUASAR_APP_EXIT_POLICY`, `QUASAR_FPS`, `QUASAR_WIDTH`, `QUASAR_HEIGHT`,
+  `QUASAR_BITRATE_KBPS`, `QUASAR_CODEC`, `QUASAR_H264_PROFILE`, `QUASAR_USE_TEST_SRC`,
+  `QUASAR_USE_TEST_AUDIO`, `QUASAR_SYNTHETIC_GPU_CAPACITY`, `QUASAR_LOCAL_DISPLAY`,
+  `QUASAR_EXPERIMENTAL_LOCAL_DMABUF`, `QUASAR_DIAG_NO_OBS`, `QUASAR_MEDIA_PROBE_DUMP`.
+
+A setting Admin → Hosts also manages (the encoder and ABR knobs, for example) is the
+host's deployment baseline: a per-host override in the console still wins.
+`QUASAR_APP_MOUNT_ALLOW` is set only here. It decides which host paths a session can see,
+and that decision belongs to the host, not the control plane.
+
 ## Recovery actor (`quasar-recovery`, RH-06)
 
 The Quasar-owned container that creates this machine's platform services through the
@@ -1734,7 +1772,10 @@ second disposable probe that requests the GPU the way the agent's recipe revisio
 before it, always `--gpus all`:
 - **by CDI** (`nvidia.com/gpu=all`) on Podman, and on a Docker that reports an NVIDIA CDI
   device;
-- **by `--gpus all`** on a rootful Docker that reports none;
+- **by `--gpus all`** on a rootful Docker that reports none. An app container asked this
+  way is also given `NVIDIA_DRIVER_CAPABILITIES=compute,utility,display` (#413): the
+  legacy hook behind `--gpus` adds `/dev/nvidia-modeset` only for `display`, and the
+  driver volume's Vulkan driver cannot start without it (CDI always injects it);
 - **not at all** on a rootless Docker that reports none: the agent is installed without the
   NVIDIA shape (`token="actor-gpu-injection-unavailable"`) and readiness `runtime_cdi`
   fails, naming host preparation (`deploy/prepare-host.sh` writes the CDI specification).
@@ -2022,8 +2063,9 @@ It takes the seed's variable names. On every machine, the release trust
 `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`,
 `QUASAR_UPDATER_MANIFEST_TIMEOUT_S`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`). On a machine with
 a node agent (a GPU host or a combined host), the agent's inputs: `QUASAR_HOME_ROOT`,
-`QUASAR_TEMPLATE_ROOT`, `QUASAR_APP_PUID`, `QUASAR_APP_PGID` and `QUASAR_CONTAINER_NETWORK`;
-a control-only machine runs no agent, so it refuses them. On a combined or
+`QUASAR_TEMPLATE_ROOT`, `QUASAR_APP_PUID`, `QUASAR_APP_PGID`, `QUASAR_CONTAINER_NETWORK`
+and the agent variables ("Agent variables" above); a control-only machine runs no agent, so
+it refuses them. On a combined or
 control-only machine also the control plane's inputs: `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_HOSTS`,
 `QUASAR_TRUSTED_PROXIES`, `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT`, `QUASAR_ENROLL_SEED_IMAGE`
 and `QUASAR_ENROLL_AGENT_IMAGE`. An empty value unsets an optional one.

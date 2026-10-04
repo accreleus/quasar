@@ -32,8 +32,10 @@ use super::{Codec, EncoderChoice, SessionConfig};
 use crate::messages::VideoTopology;
 
 mod caps;
+use caps::caps_profile;
 pub(crate) use caps::vulkan_image_transport;
-use caps::{caps_profile, raw_video_caps};
+// #445: the console mode switch re-pins the source tail to these caps at the new mode.
+pub(crate) use caps::raw_video_caps;
 mod codec_chain;
 use codec_chain::{build_bitstream_chain, BitstreamChain};
 mod rtp_ext;

@@ -749,6 +749,56 @@ fn a_rootless_host_without_sound_logind_or_i2c_gets_none_of_them() {
     );
 }
 
+/// #443: the real probe script run against a host `/dev` where `i2c-3` is a character
+/// device and `i2c-8` / `i2c-9` are empty regular files (stale placeholders). Before the
+/// fix the probe listed all three, the engine refused the agent the placeholders, and
+/// console mode was put back to off.
+fn probe_of_a_host_with_i2c_placeholders() -> String {
+    let root = tempfile::tempdir().unwrap();
+    let dev = root.path().join("host/dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::create_dir_all(root.path().join("host/run")).unwrap();
+    // A genuine character device without root: a symlink to /dev/null.
+    std::os::unix::fs::symlink("/dev/null", dev.join("i2c-3")).unwrap();
+    for placeholder in ["i2c-8", "i2c-9"] {
+        std::fs::write(dev.join(placeholder), "").unwrap();
+    }
+    let script = quasar_recovery::probe::SCRIPT.replace(
+        "/host/",
+        &format!("{}/", root.path().join("host").display()),
+    );
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("sh");
+    let printed = String::from_utf8_lossy(&out.stdout);
+    // The script reads no GPU from a fake tree; give the machine the rootless AMD node.
+    printed.replace("\nend", "\nnode /dev/dri/renderD129 226:129 0x1002\nend")
+}
+
+/// #443: an `/dev/i2c-N` that is not a character device is skipped, so console mode turns
+/// on with the real buses only instead of being put back.
+#[test]
+fn a_regular_file_at_dev_i2c_is_skipped_and_console_mode_still_turns_on() {
+    let mut state = rootless();
+    state.probe_output = probe_of_a_host_with_i2c_placeholders();
+    state.host_devices.retain(|d| !d.starts_with("/dev/i2c-"));
+    // The engine has only the real node; the placeholders are no devices to it.
+    state.host_devices.insert("/dev/i2c-3".to_string());
+    let m = Machine::install(state);
+    let actor = m.actor();
+    let id = run(&actor, enable());
+    let result = actor.status_operator(Some(&id)).result.expect("journalled");
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    let last = actor.console_status().last.expect("settled");
+    assert_eq!(last.settled, Settled::Applied, "{last:?}");
+    let agent = m.one_running_agent("console on past the placeholders");
+    assert!(console_on(&agent));
+    assert_eq!(i2c_devices(&agent), vec!["/dev/i2c-3"]);
+    assert_eq!(m.inputs()["devices"]["i2c"], serde_json::json!([3]));
+}
+
 /// D13: a host prepared with `--console-audio-user` has the PipeWire socket directory;
 /// turning console mode on reads it and binds it read-write into the agent.
 #[test]

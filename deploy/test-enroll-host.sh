@@ -45,7 +45,7 @@ def alts(a):
     return ' '.join(x['engine'] + '/' + x['mode'] + ('@' + x['platform'] if 'platform' in x else '') for x in a)
 out = ["engine_profiles() {", "cat <<'PROFILES'"]
 out += ['platform|%s|%s' % (k, v['label']) for k, v in t['platforms'].items()]
-out += ['engine|%s|%s' % (k, v['label']) for k, v in t['engines'].items()]
+out += ['engine|%s|%s|%s|%s' % (k, v['label'], v.get('minimumVersion', ''), v.get('minimumVersionReason', '')) for k, v in t['engines'].items()]
 for r in t['profiles']:
     out.append('profile|%s|%s|%s|%s|%s|%s' % (r['platform'], r['engine'], r['mode'], r['status'], alts(r['alternatives']), r['reason']))
 u = t['unknownEngine']
@@ -167,6 +167,7 @@ case "$cmd" in
     case "${2:-}" in
       *SecurityOptions*) if [ "${MOCK_ROOTLESS:-0}" = 1 ]; then echo '["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]'; else echo '["name=seccomp,profile=builtin","name=cgroupns"]'; fi ;;
       *Rootless*) if [ "${MOCK_ROOTLESS:-0}" = 1 ]; then echo true; else echo false; fi ;;
+      *Version.Version*) echo "${MOCK_ENGINE_VERSION:-5.8.4}" ;;
       *) echo "${MOCK_HOSTNAME:-gpu-b}" ;;
     esac
     exit 0 ;;
@@ -1082,6 +1083,27 @@ else
   fail "rootful podman" "rc=$RC sudo=[$(head -2 <<<"$SUDO_LOG")] run=[$(seed_run)] out=$(tail -5 <<<"$OUT")"
 fi
 
+# #424: a Podman older than the table's minimum cannot change a restart policy, which
+# installs and updates need: refused by name before anything is pulled.
+for old_podman in 4.9.3 5.0.3; do
+  mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; reset_engine
+  run_installer "podman-$old_podman" "${OK_ENV[@]}" MOCK_ROOTLESS=0 MOCK_ENGINE_VERSION="$old_podman"
+  if [ "$RC" -ne 0 ] && grep -q "Podman $old_podman is older than 5.1" <<<"$OUT" \
+     && grep -q "restart policy" <<<"$OUT" && grep -q 'Nothing was pulled or started' <<<"$OUT" \
+     && [ -z "$(seed_run)" ] && ! grep -q '^pull\|^-n podman pull' <<<"$DOCKER_LOG"; then
+    pass "Podman $old_podman: older than the table's minimum 5.1, refused by name before anything is pulled"
+  else
+    fail "podman $old_podman" "rc=$RC run=[$(seed_run)] out=$(tail -4 <<<"$OUT")"
+  fi
+done
+mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; reset_engine
+run_installer podman-5.1 "${OK_ENV[@]}" MOCK_ROOTLESS=0 MOCK_ENGINE_VERSION=5.1.0
+if [ "$RC" -eq 0 ] && grep -q 'engine: Podman, rootful' <<<"$OUT"; then
+  pass "Podman 5.1.0: the table's minimum itself installs"
+else
+  fail "podman 5.1.0" "rc=$RC out=$(tail -4 <<<"$OUT")"
+fi
+
 # Rootful Docker is the path every earlier section ran; said explicitly here.
 mk_root "$tmp/root"; reset_engine
 run_installer docker-rootful "${OK_ENV[@]}"
@@ -1198,13 +1220,14 @@ if [ "$RC" -eq 1 ] && grep -qxF '    systemctl enable podman-restart.service' <<
 else
   fail "unprepared rootful podman" "rc=$RC out=$(tail -4 <<<"$OUT")"
 fi
+# #439: the recovery actor makes the agent's runtime directory at every boot, so rootful
+# Podman needs no tmpfiles line.
 mk_root "$tmp/root"; os_release "${FEDORA[@]}"; rootful_podman_root; rm "$tmp/root/etc/tmpfiles.d/quasar.conf"; reset_engine
-run_installer unprepared-rootful-podman-rundir "${OK_ENV[@]}"
-if [ "$RC" -eq 1 ] && grep -q 'tmpfiles.d/quasar.conf' <<<"$OUT" \
-   && grep -qxF "    echo 'd /run/quasar-agent 0755 root root -' > /etc/tmpfiles.d/quasar.conf" <<<"$OUT" && nothing_started; then
-  pass "rootful Podman without the boot-time runtime directory: named with its tmpfiles line (Podman never creates a missing bind source), nothing started"
+run_installer rootful-podman-no-tmpfiles "${OK_ENV[@]}" MOCK_ROOTLESS=0
+if [ "$RC" -eq 0 ] && ! grep -q 'tmpfiles' <<<"$OUT" && grep -q 'engine: Podman, rootful' <<<"$OUT"; then
+  pass "rootful Podman without a tmpfiles line: installs, and no step asks for one (#439)"
 else
-  fail "unprepared rootful podman rundir" "rc=$RC out=$(tail -6 <<<"$OUT")"
+  fail "rootful podman no tmpfiles" "rc=$RC out=$(tail -6 <<<"$OUT")"
 fi
 
 # Rootless: a failing check's fix is printed as root's, never applied; AppArmor warns.

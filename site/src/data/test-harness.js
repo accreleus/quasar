@@ -21,9 +21,8 @@
  *   - intercepts `systemctl` (Quadlet's `daemon-reload`/`start`, and the
  *     podman-restart.service check) so nothing here ever asks a real init
  *     system anything; `restartOff` makes `is-enabled` answer "disabled";
- *   - intercepts `systemd-tmpfiles`, whose `--cat-config` lists the agent's
- *     runtime directory unless `runDirOff`;
- *   - intercepts `curl`, which never contacts the network.
+ *   - intercepts `curl`, which never contacts the network;
+ *   - answers `podman info --format '{{.Version.Version}}'` with `podmanVersion`.
  *
  * Nothing here ever calls a real `docker`, `podman` or `sudo` binary, by name
  * or by absolute path. The suite's last test, "no generated script ever
@@ -54,7 +53,7 @@ function shim(dir, name, body) {
  * for a Compose-labelled control plane, matching the flags the generated
  * script checks for before it will start the seed.
  */
-export function fakeEngineDir({ legacy = false, existing = false, portTaken = false, restartOff = false, runDirOff = false } = {}) {
+export function fakeEngineDir({ legacy = false, existing = false, portTaken = false, restartOff = false, podmanVersion = '5.8.4' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'quasar-qs-'));
   const log = join(dir, 'calls');
   writeFileSync(log, '');
@@ -73,7 +72,7 @@ esac`);
 
   shim(dir, 'podman', `echo "podman $*" >> ${JSON.stringify(log)}
 case "$1" in
-  info) exit 0 ;;
+  info) case "$*" in *Version.Version*) echo ${JSON.stringify(podmanVersion)} ;; esac; exit 0 ;;
   container) ${existing ? 'exit 0' : 'exit 1'} ;;
   pull) exit 0 ;;
   image) ref="\${@: -1}"; echo "\${ref%:*}@sha256:0123abcd" ;;
@@ -91,10 +90,6 @@ exec "$@"`);
 case "$*" in
   *is-enabled*podman-restart*) exit ${restartOff ? 1 : 0} ;;
 esac
-exit 0`);
-
-  shim(dir, 'systemd-tmpfiles', `echo "systemd-tmpfiles $*" >> ${JSON.stringify(log)}
-${runDirOff ? '' : "echo 'd /run/quasar-agent 0755 root root -'"}
 exit 0`);
 
   shim(dir, 'curl', `echo "curl $*" >> ${JSON.stringify(log)}

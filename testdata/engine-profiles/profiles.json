@@ -10,7 +10,9 @@
       "label": "Docker"
     },
     "podman": {
-      "label": "Podman"
+      "label": "Podman",
+      "minimumVersion": "5.1",
+      "minimumVersionReason": "Podman 5.1 is the first Podman that can change a container's restart policy, which installing and updating Quasar need."
     }
   },
   "modes": [
