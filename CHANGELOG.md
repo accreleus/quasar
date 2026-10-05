@@ -31,7 +31,8 @@ own; the two do not move together, and that is deliberate.
   and was copied three times, which drops frames at 3840x2160@120. On an RTX 5090 lab host, a
   headless 4K120 run delivered 120 of 120 fps, and the compositor thread fell from a full core
   to about 2 %. Still off by default until it has passed on a real console. It needs the
-  compositor pin that ships the ring.
+  compositor pin that ships the ring. A released ring slot now sits out two frames before it
+  is drawn into again, after a live console showed tile garbage under load on NVIDIA.
 
 ### Fixed
 - **In console mode, a desktop that only resizes its own window when you pick a resolution
