@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Console mode is being rebuilt as direct display (#453).** Decision and spec recorded: a console session's desktop drives the monitor itself (KWin or gamescope on their DRM backends), nothing of Quasar's sits between it and the screen, and it is never streamed; ADR 0009 and the glossary carry the terms (console session, direct display, displaying). No behaviour changes yet.
 - **Console mode can show the desktop without CPU copies (#450), behind
   `QUASAR_EXPERIMENTAL_LOCAL_DMABUF=1`.** The compositor renders into a recycled ring of RGB
   dmabufs that the display imports as they are. Before, every frame went through system memory

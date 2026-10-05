@@ -75,6 +75,22 @@ tile discovered inside a parent app's library. It inherits the parent's
 runtime, image, and resource demand; a handful of fields (default profile,
 profile policy) stay on the tile.
 
+**Console session** — a session whose desktop owns the host's own screen: it
+holds the display directly, reads the real input devices and plays audio to the
+host's sound device. It is never streamed. Other, streamed sessions keep running
+beside it on the same GPU. _Avoid_: "local session" (ambiguous with a dev
+standalone launch), "dual output" (a retired topology that streamed the console
+session too).
+
+**Direct display** — how a console session reaches the screen: the desktop
+itself drives the display device, with no compositor, pipeline or display server
+of Quasar's between it and the monitor. _Avoid_: "local display" (the retired
+path, which rendered the session into a Quasar-owned display server).
+
+**Displaying** — a console session's health verdict: its container is alive, its
+desktop holds the display, and a frame is on screen. A still desktop is
+displaying; no frame cadence is required.
+
 **Mode set** — the display modes a console session's compositor advertises to the
 app: the connected monitor's real DRM modes, each with its own refresh rate, not
 filtered by what the session renders at now. Distinct from the *mode ladder*
