@@ -7,7 +7,7 @@
 //!
 //! Polling, not a `udev` netlink monitor: `udev` isn't a crate dependency and a
 //! hotplug event isn't latency-sensitive, so a dedicated thread re-reads the same
-//! sysfs/procfs sources `capacity::detect_console_capabilities` uses every
+//! sysfs and `/dev` sources `capacity::detect_console_capabilities` uses every
 //! [`POLL_INTERVAL`] and diffs the snapshot.
 //!
 //! Debounce: a change must repeat on two consecutive polls before it fires — since

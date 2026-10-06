@@ -17,4 +17,8 @@
 /// `/dev/kmsg` only when the host allows kernel-log reads, and `label=disable`. This agent
 /// reads GPU faults only through that optional grant; without NET_ADMIN its firewall-reading
 /// media reachability check reports that it cannot read the firewall (#403 replaces it).
-pub const RECIPE_REVISION: u32 = 3;
+/// 4 (#461): console mode no longer gives this agent `SYS_ADMIN`, the sound device or the
+/// console PipeWire socket; the console session's container holds the screen, the input
+/// and the sound device (ADR 0009). The agent is told whether the host has a sound device
+/// (`QUASAR_HOST_SOUND`) instead of reading its own `/dev/snd`.
+pub const RECIPE_REVISION: u32 = 4;

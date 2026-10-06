@@ -23,6 +23,13 @@ pub struct ScanoutMode {
     pub refresh_millihz: u32,
 }
 
+impl ScanoutMode {
+    /// The refresh rate in whole hertz (`143981` mHz -> `144`).
+    pub fn refresh_hz(&self) -> u32 {
+        (self.refresh_millihz + 500) / 1000
+    }
+}
+
 /// A fact the verdict needed and did not see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Missing {
@@ -78,6 +85,18 @@ pub fn read_drm_facts(card_node: &std::path::Path, connector: &str) -> DisplayFa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_rounds_to_whole_hertz() {
+        let mode = |refresh_millihz| ScanoutMode {
+            width: 3840,
+            height: 2160,
+            refresh_millihz,
+        };
+        assert_eq!(mode(143_981).refresh_hz(), 144);
+        assert_eq!(mode(59_940).refresh_hz(), 60);
+        assert_eq!(mode(239_990).refresh_hz(), 240);
+    }
 
     const MODE: ScanoutMode = ScanoutMode {
         width: 3840,

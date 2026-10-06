@@ -33,9 +33,9 @@ The right-hand column lists the host's connectors and modes, and its input devic
 
 ## Turning it on
 
-Turning console mode on (or off) replaces the host's node agent with one that can
-reach the display, sound and monitor control. The page asks you to confirm,
-because this **ends the host's live sessions**.
+Turning console mode on (or off) replaces the host's node agent with one that holds
+the console terminal and can read the display and monitor control. The page asks you
+to confirm, because this **ends the host's live sessions**.
 
 - While it runs, the page reads **Applying** and new sessions on the host wait.
 - If the new agent is unhealthy, the old one is put back and the page shows the
@@ -58,7 +58,9 @@ DDC), this machine's input devices and `tty8`.
 <Aside type="caution" title="What console mode grants">
 The console session holds the screen and the raw input of the host. Its desktop is
 given the display card, every input device you allow (**the `quasar` group can read
-what is typed on this machine's keyboard**) and the sound device.
+what is typed on this machine's keyboard**) and the sound device. The node agent holds
+none of these: it gets only `tty8`, read access to the display cards and the i2c
+buses, and no capability.
 </Aside>
 
 - **The display must be free.** If a desktop or login screen holds it, `console_card`
@@ -88,39 +90,14 @@ back when the session ends.
 To get the screen back by hand, put `tty8` back in text mode, then `chvt` to the
 terminal you want.
 
-## Local audio
+## Sound
 
-> The console page no longer picks an audio output (protocol amendment 19): with
-> direct display the desktop plays through the sound device it is given and you pick
-> the output in its own settings. Until the direct-display engine ships (#458), the
-> agent's older audio routing below still applies, quiet unless an output was set.
+The desktop plays through the host's sound device, which it is given; pick the output
+in its own settings. `console_sound` checks the host has one.
 
-The agent's older routing used what the host reported:
-
-- **Host PipeWire**: when the host has a Quasar-only PipeWire socket on a desktop
-  user's session ([`deploy/prepare-host.sh`](https://github.com/accreleus/quasar/blob/main/deploy/prepare-host.sh)
-  `--console-audio-user USER` sets one up; read it first), sound
-  plays through that user's PipeWire, beside the desktop's own sound. Raw devices are hidden while PipeWire answers.
-- **Sound device (ALSA)**: used when no PipeWire answers and the device is free.
-  Listed as `hw:CARD=<id>,DEV=<n>`; an older `hw:N,M` setting still works.
-- Otherwise the console is quiet.
-
-PipeWire output is newer and less tested than ALSA.
-
-Host preparation with `--console-audio-user USER` makes USER's pipewire-pulse open
-the socket:
-
-| USER is | What happens |
-| --- | --- |
-| Logged in, or lingering | Host preparation restarts their pipewire-pulse. |
-| Not logged in | The socket opens when they next log in. |
-
-After a reboot their pipewire-pulse starts with their session, so the socket is back
-without a step.
-
-It worked when `/run/quasar-console-audio/native` exists on the host. If it is
-missing, run host preparation again, or as root:
-`runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`.
+Host preparation's `--console-audio-user` is retired: it is accepted and does nothing.
+Files an earlier run wrote for it are named when host preparation runs; nothing uses
+them.
 
 ## Local input
 
@@ -163,7 +140,6 @@ See [Readiness checks](/quasar/troubleshooting/readiness/) for fixes.
 
 ## Known limits
 
-- Not every monitor mode and refresh rate is offered yet.
 - With an NVIDIA GPU passed through to a virtual machine, the console picture can
   stay black. The virtual machine's own boot screen is black too, so the cause is in
   the hand-off of the card, not in Quasar. It has happened after the hypervisor used

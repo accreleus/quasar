@@ -51,6 +51,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             console_audio: false,
             console_vt: false,
             udev_data: None,
+            host_sound: None,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -315,6 +316,192 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
             Some("1"),
             "{file}"
         );
+    }
+}
+
+#[test]
+fn node_agent_revision_4_renders_its_golden_specification_per_vendor() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    for (vendor, file) in [
+        (Some(GpuVendor::Nvidia), "node-agent-r4-nvidia.json"),
+        (Some(GpuVendor::Amd), "node-agent-r4-amd.json"),
+        (Some(GpuVendor::Intel), "node-agent-r4-intel.json"),
+        (None, "node-agent-r4-none.json"),
+    ] {
+        let r4 = render(
+            Role::NodeAgent,
+            4,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        check(file, &r4);
+        // Without console mode revision 4 is revision 3: only the console grants moved.
+        let mut r3 = render(
+            Role::NodeAgent,
+            3,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        r3.labels = r4.labels.clone();
+        assert_eq!(r3, r4, "{file}");
+    }
+}
+
+/// ADR 0009: from revision 4 the console session's container, not the agent, holds
+/// the screen, the input and the sound device. Console mode gives the agent only what it
+/// launches and watches a console desktop with: logind's state to name a display holder,
+/// the i2c nodes for DDC (a rootful `c 89` rule, or each node on a rootless engine), the
+/// console VT, and the host facts it cannot read (udev data, sound). No capability, no
+/// sound device, no ALSA rule, no PipeWire socket, whatever the host has.
+#[test]
+fn node_agent_revision_4_with_console_mode_gives_the_agent_only_its_own_console_grants() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let rootless = |vendor, host_sysfs: bool, cdi: bool| {
+        let mut i = inputs(Some(vendor));
+        i.devices.engine_rootless = true;
+        i.devices.host_sysfs = host_sysfs;
+        i.gpu.cdi = cdi;
+        i
+    };
+    let owned = combined(DatabaseInputs::Owned);
+    for (plain, secrets, file) in [
+        (
+            inputs(Some(GpuVendor::Nvidia)),
+            agent_secrets(),
+            "node-agent-r4-nvidia-console.json",
+        ),
+        (
+            inputs(Some(GpuVendor::Amd)),
+            agent_secrets(),
+            "node-agent-r4-amd-console.json",
+        ),
+        (
+            owned,
+            local_agent_secrets(),
+            "node-agent-r4-combined-amd-console.json",
+        ),
+        (
+            rootless(GpuVendor::Nvidia, false, true),
+            agent_secrets(),
+            "node-agent-r4-nvidia-rootless-console.json",
+        ),
+        (
+            rootless(GpuVendor::Nvidia, true, true),
+            agent_secrets(),
+            "node-agent-r4-nvidia-docker-rootless-console.json",
+        ),
+        (
+            rootless(GpuVendor::Amd, false, false),
+            agent_secrets(),
+            "node-agent-r4-amd-rootless-console.json",
+        ),
+    ] {
+        let rootless = plain.devices.engine_rootless;
+        let mut console = plain.clone();
+        console.console = true;
+        // Everything a host can have; revision 3 would grant the agent all of it.
+        console.devices.sound = true;
+        console.devices.console_audio = true;
+        console.devices.logind = true;
+        console.devices.console_vt = true;
+        console.devices.udev_data = Some(true);
+        console.devices.host_sound = Some(true);
+        console.devices.i2c = vec![3, 12];
+        let without = render(Role::NodeAgent, 4, &plain, &image, &secrets).unwrap();
+        let with = render(Role::NodeAgent, 4, &console, &image, &secrets).unwrap();
+        check(file, &with);
+
+        assert_eq!(with.cap_add, without.cap_add, "{file}: no capability");
+        let binds = |s: &quasar_recovery::recipe::ContainerSpec| -> Vec<String> {
+            s.binds.iter().map(|b| b.to_engine()).collect()
+        };
+        let added: Vec<String> = binds(&with)
+            .into_iter()
+            .filter(|b| !binds(&without).contains(b))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                "/run/systemd/seats:/host/run/systemd/seats:ro".to_string(),
+                "/run/systemd/sessions:/host/run/systemd/sessions:ro".to_string(),
+            ],
+            "{file}"
+        );
+        assert!(
+            binds(&without).iter().all(|b| binds(&with).contains(b)),
+            "{file}: a bind was dropped"
+        );
+        let new_devices: Vec<String> = with
+            .devices
+            .iter()
+            .filter(|d| !without.devices.contains(d))
+            .map(|d| format!("{}:{}:{}", d.host, d.container, d.permissions))
+            .collect();
+        let new_rules: Vec<String> = with
+            .device_cgroup_rules
+            .iter()
+            .filter(|r| !without.device_cgroup_rules.contains(r))
+            .cloned()
+            .collect();
+        if rootless {
+            assert_eq!(
+                new_devices,
+                vec![
+                    "/dev/i2c-3:/dev/i2c-3:rw".to_string(),
+                    "/dev/i2c-12:/dev/i2c-12:rw".to_string(),
+                    "/dev/tty8:/dev/tty8:rw".to_string(),
+                ],
+                "{file}"
+            );
+            assert!(with.device_cgroup_rules.is_empty(), "{file}");
+        } else {
+            assert_eq!(
+                new_devices,
+                vec!["/dev/tty8:/dev/tty8:rw".to_string()],
+                "{file}"
+            );
+            assert_eq!(new_rules, vec!["c 89:* rmw".to_string()], "{file}");
+        }
+        let mut env = with.env.clone();
+        for (key, value) in [
+            ("QUASAR_CONSOLE_ACCESS", "1"),
+            ("QUASAR_HOST_SOUND", "1"),
+            ("QUASAR_HOST_UDEV_DATA", "1"),
+        ] {
+            assert_eq!(env.remove(key).as_deref(), Some(value), "{file}: {key}");
+        }
+        assert_eq!(env, without.env, "{file}");
+        assert_eq!(with.security_opt, without.security_opt, "{file}");
+        assert_eq!(with.gpus, without.gpus, "{file}");
+
+        // A host with none of them, read: told there is no sound device, and nothing the
+        // engine would have to find on the host.
+        let mut bare = console.clone();
+        bare.devices.sound = false;
+        bare.devices.host_sound = Some(false);
+        bare.devices.console_audio = false;
+        bare.devices.logind = false;
+        bare.devices.console_vt = false;
+        bare.devices.udev_data = None;
+        bare.devices.i2c.clear();
+        let quiet = render(Role::NodeAgent, 4, &bare, &image, &secrets).unwrap();
+        assert_eq!(binds(&quiet), binds(&without), "{file}");
+        assert_eq!(quiet.devices, without.devices, "{file}");
+        assert_eq!(quiet.cap_add, without.cap_add, "{file}");
+        assert_eq!(
+            quiet.env.get("QUASAR_HOST_SOUND").map(String::as_str),
+            Some("0"),
+            "{file}"
+        );
+        assert!(!quiet.env.contains_key("QUASAR_HOST_UDEV_DATA"), "{file}");
+        // Not read yet (machine state from before revision 4): no answer rendered at all.
+        bare.devices.host_sound = None;
+        let unread = render(Role::NodeAgent, 4, &bare, &image, &secrets).unwrap();
+        assert!(!unread.env.contains_key("QUASAR_HOST_SOUND"), "{file}");
     }
 }
 
@@ -700,7 +887,7 @@ fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
     let image = ImageRef::parse(AGENT_IMAGE).unwrap();
     for (role, revision) in [
         (Role::NodeAgent, 0),
-        (Role::NodeAgent, 4),
+        (Role::NodeAgent, 5),
         (Role::RecoveryActor, 2),
         (Role::ControlPlane, 0),
         (Role::ControlPlane, 3),

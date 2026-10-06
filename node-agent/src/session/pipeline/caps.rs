@@ -6,7 +6,6 @@
 use anyhow::{anyhow, Result};
 use gstreamer as gst;
 
-use crate::messages::VideoTopology;
 use crate::session::{Codec, EncoderChoice, SessionConfig};
 
 /// The `profile` caps-field the encoder-output capsfilter advertises, or `None` when
@@ -32,46 +31,12 @@ pub(crate) fn caps_profile(
     }
 }
 
-/// VulkanImage is an encoder transport contract, not a local-display format: the
-/// producer's images are VIDEO_ENCODE_SRC layout and its ring sync is designed for
-/// the Vulkan encoder. Local-only has no encoder, and forcing those images through
-/// vulkandownload races consumer reads against slot reuse on NVIDIA, eventually
-/// losing the device.
+/// The compositor emits memory:VulkanImage NV12 straight into the Vulkan encoder (VK-05):
+/// the images are VIDEO_ENCODE_SRC layout and the ring's sync is the encoder's. Every
+/// session that builds a pipeline is streamed (a console session has none), so this is
+/// the encoder choice alone.
 pub(crate) fn vulkan_image_transport(cfg: &SessionConfig) -> bool {
-    uses_vulkan_images(cfg.encoder, cfg.video_topology)
-}
-
-/// Encoder-free local display on RGB DRM PRIME buffers (#450): the compositor renders
-/// into a recycled ring of GBM buffers (`display-dmabuf`, see `source_branch`) and the
-/// display imports them as-is — no readback, no CPU copy, no `videoconvert`. The DMA_DRM
-/// caps leave `drm-format` open: the display leg's interpipesrc allows renegotiation, so
-/// the source negotiates against the sink's real format list (weston's linux-dmabuf
-/// formats, or the KMS plane's) and takes the first one the compositor renders.
-/// Knob: `QUASAR_EXPERIMENTAL_LOCAL_DMABUF`, default off until a live console check.
-pub(crate) fn local_dmabuf_transport(cfg: &SessionConfig) -> bool {
-    local_dmabuf_transport_for(
-        cfg.video_topology,
-        cfg.use_test_src,
-        std::env::var("QUASAR_EXPERIMENTAL_LOCAL_DMABUF")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// [`local_dmabuf_transport`] over its inputs: local-only, a real compositor (not the
-/// synthetic test source, which has no dmabufs), and the knob on.
-fn local_dmabuf_transport_for(
-    topology: VideoTopology,
-    use_test_src: bool,
-    knob: Option<&str>,
-) -> bool {
-    topology == VideoTopology::LocalOnly
-        && !use_test_src
-        && matches!(knob, Some("1") | Some("true") | Some("TRUE"))
-}
-
-fn uses_vulkan_images(encoder: EncoderChoice, topology: VideoTopology) -> bool {
-    encoder == EncoderChoice::Vulkan && topology != VideoTopology::LocalOnly
+    cfg.encoder == EncoderChoice::Vulkan
 }
 
 /// The H.264 `profile` caps-field for `requested` on `encoder` — the EFFECTIVE
@@ -117,23 +82,6 @@ pub(crate) fn h264_caps_profile(requested: &str, encoder: EncoderChoice) -> Resu
 ///
 /// ZC-01: encoder-aware per path; see [`raw_video_caps_for`].
 pub(crate) fn raw_video_caps(cfg: &SessionConfig) -> gst::Caps {
-    if local_dmabuf_transport(cfg) {
-        return gst::Caps::builder("video/x-raw")
-            .features(["memory:DMABuf"])
-            .field("format", "DMA_DRM")
-            .field("width", cfg.stream.width)
-            .field("height", cfg.stream.height)
-            .field("framerate", gst::Fraction::new(cfg.stream.fps, 1))
-            .build();
-    }
-    if cfg.encoder == EncoderChoice::Vulkan && !vulkan_image_transport(cfg) {
-        return gst::Caps::builder("video/x-raw")
-            .field("format", "RGBx")
-            .field("width", cfg.stream.width)
-            .field("height", cfg.stream.height)
-            .field("framerate", gst::Fraction::new(cfg.stream.fps, 1))
-            .build();
-    }
     let dmabuf_drm_format = dmabuf_zerocopy_format(cfg);
     raw_video_caps_for(
         cfg.encoder,
@@ -357,30 +305,12 @@ pub(super) fn encoder_input_caps_for(
 mod tests {
     use super::{
         caps_profile, cuda_encoder_input_caps, encoder_input_caps_for, h264_caps_profile,
-        local_dmabuf_transport_for, raw_video_caps, raw_video_caps_for, uses_vulkan_images,
-        va_encoder_input_caps,
+        raw_video_caps_for, va_encoder_input_caps,
     };
-    use crate::messages::VideoTopology;
-    use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
+    use crate::session::{Codec, EncoderChoice};
     use gstreamer as gst;
 
     // ---- caps_profile: the all-codec generalization of h264_caps_profile ----
-
-    /// #450: the local DMABuf transport is local-only, needs the real compositor, and is
-    /// off unless the knob says otherwise.
-    #[test]
-    fn local_dmabuf_transport_only_for_local_only_with_the_knob() {
-        use VideoTopology::*;
-        for knob in [Some("1"), Some("true"), Some("TRUE")] {
-            assert!(local_dmabuf_transport_for(LocalOnly, false, knob));
-            assert!(!local_dmabuf_transport_for(LocalOnly, true, knob));
-            assert!(!local_dmabuf_transport_for(StreamOnly, false, knob));
-            assert!(!local_dmabuf_transport_for(DualOutput, false, knob));
-        }
-        for knob in [None, Some(""), Some("0"), Some("True"), Some("yes")] {
-            assert!(!local_dmabuf_transport_for(LocalOnly, false, knob));
-        }
-    }
 
     #[test]
     fn caps_profile_h264_matches_h264_caps_profile() {
@@ -426,26 +356,6 @@ mod tests {
             assert_eq!(caps_profile(Codec::Av1, "main", enc).unwrap(), None);
             assert_eq!(caps_profile(Codec::Av1, "whatever", enc).unwrap(), None);
         }
-    }
-
-    #[test]
-    fn vulkan_images_are_encoder_transport_not_local_only_transport() {
-        assert!(uses_vulkan_images(
-            EncoderChoice::Vulkan,
-            VideoTopology::StreamOnly
-        ));
-        assert!(uses_vulkan_images(
-            EncoderChoice::Vulkan,
-            VideoTopology::DualOutput
-        ));
-        assert!(!uses_vulkan_images(
-            EncoderChoice::Vulkan,
-            VideoTopology::LocalOnly
-        ));
-        assert!(!uses_vulkan_images(
-            EncoderChoice::Va,
-            VideoTopology::StreamOnly
-        ));
     }
 
     // ZC-02 N-B: the interpipe stays SYSTEM memory (cudaupload+cudaconvert are
@@ -510,59 +420,6 @@ mod tests {
             feats.contains("memory:VulkanImage"),
             "Vulkan interpipe must carry memory:VulkanImage, got {caps}"
         );
-    }
-
-    // CM-08: `raw_video_caps` must carry memory:VulkanImage NV12 for a DualOutput vulkan
-    // session (so the console leg's bridge picks `vulkandownload`) and must DEMOTE a
-    // LocalOnly one to system RGBx (no encoder ring). Driven through the wrapper, not
-    // `raw_video_caps_for`, so it pins the demotion decision a regression would flip.
-    #[test]
-    fn cm08_vulkan_dualoutput_is_vulkanimage_localonly_is_system_rgbx() {
-        gstreamer::init().unwrap();
-
-        let dual = raw_video_caps(&vulkan_cfg(VideoTopology::DualOutput));
-        assert!(
-            dual.features(0)
-                .is_some_and(|f| f.contains("memory:VulkanImage")),
-            "DualOutput vulkan must carry memory:VulkanImage (drives vulkandownload), got {dual}"
-        );
-        assert_eq!(
-            dual.structure(0).unwrap().get::<String>("format").unwrap(),
-            "NV12"
-        );
-
-        let local = raw_video_caps(&vulkan_cfg(VideoTopology::LocalOnly));
-        assert_eq!(
-            local.structure(0).unwrap().get::<String>("format").unwrap(),
-            "RGBx",
-            "LocalOnly vulkan must demote to system RGBx, got {local}"
-        );
-        assert!(
-            local
-                .features(0)
-                .is_none_or(|f| !f.contains("memory:VulkanImage")),
-            "LocalOnly vulkan must be system memory, not a VulkanImage, got {local}"
-        );
-    }
-
-    /// A real `SessionConfig` for the Vulkan encoder at `topology`.
-    /// `use_test_src`/experimental-dmabuf envs stay unset, so the plain paths run.
-    fn vulkan_cfg(topology: VideoTopology) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
-        settings.encoder = EncoderChoice::Vulkan;
-        let stream = StreamParams {
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            bitrate_kbps: 8000,
-            h264_profile: "constrained-baseline".to_string(),
-            codec: crate::session::Codec::H264,
-            abr_floor_kbps: 0,
-            mic: false,
-        };
-        let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
-        cfg.video_topology = topology;
-        cfg
     }
 
     // `vulkanh264enc`'s src pad template advertises all three profiles.

@@ -106,13 +106,22 @@ pub struct InputNode {
     pub openable: bool,
 }
 
-/// The sound device a console session would be given.
+/// The sound device a console session would be given. The agent holds no sound device of
+/// its own: on an owned install the recovery actor tells it whether the host has one
+/// (`console_plan::HOST_SOUND_ENV`). Where the host's `/dev/snd` is visible to the agent
+/// (a Compose install's `/host/dev`, which is how a Compose agent knows, with no variable)
+/// its nodes are judged for openability too.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SoundView {
     #[default]
     Missing,
-    /// `/dev/snd` is there; the nodes in it the Quasar account cannot open read-write.
+    /// `/dev/snd` is visible; the nodes in it the Quasar account cannot open read-write.
     Present { denied: Vec<String> },
+    /// The host has `/dev/snd`, by the recovery actor's word alone: the agent cannot see
+    /// the nodes, so it cannot judge whether the console desktop can open them.
+    Told,
+    /// Neither visible nor told: an agent created before the actor read it.
+    Unknown,
 }
 
 /// The console terminal.
@@ -272,9 +281,15 @@ impl InputView {
 }
 
 impl SoundView {
-    fn observe(snd: &Path) -> Self {
+    /// `snd`: the host's `/dev/snd` as the agent sees it, if at all. `told`: the
+    /// recovery actor's answer.
+    fn observe(snd: &Path, told: Option<&str>) -> Self {
         if !snd.is_dir() {
-            return SoundView::Missing;
+            return match told.map(str::trim) {
+                Some("1") => SoundView::Told,
+                Some("0") => SoundView::Missing,
+                _ => SoundView::Unknown,
+            };
         }
         let mut denied: Vec<String> = std::fs::read_dir(snd)
             .into_iter()
@@ -341,7 +356,12 @@ impl ConsoleView {
                 == Some("rootless"),
             card: CardView::observe(config.output_id.as_deref()),
             input: InputView::observe(&config.input_devices),
-            sound: SoundView::observe(&host_dev().join("snd")),
+            sound: SoundView::observe(
+                &host_dev().join("snd"),
+                std::env::var(crate::session::console_plan::HOST_SOUND_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
             terminal: TerminalView::observe(),
             udev: UdevView::from_env(std::env::var(HOST_UDEV_DATA_ENV).ok().as_deref()),
             i2c_nodes: has_i2c_nodes(Path::new("/dev")),
@@ -508,8 +528,8 @@ pub fn check_sound(v: &ConsoleView) -> ReadinessCheck {
     match &v.sound {
         SoundView::Missing => super::fail(
             CHECK_SOUND,
-            "no sound device (/dev/snd) is visible to this agent, so the console desktop \
-             would have no sound"
+            "the host has no sound device (/dev/snd), so the console desktop would have \
+             no sound"
                 .into(),
             format!(
                 "If the host has a sound card, check its driver is loaded, {RECREATE} (the \
@@ -531,6 +551,25 @@ pub fn check_sound(v: &ConsoleView) -> ReadinessCheck {
         SoundView::Present { .. } => super::pass(
             CHECK_SOUND,
             "the host's sound device (/dev/snd) can be passed in".into(),
+        ),
+        SoundView::Told => super::pass(
+            CHECK_SOUND,
+            format!(
+                "the recovery actor reports the host has a sound device (/dev/snd), which is \
+                 passed in; this agent holds none, so whether the console desktop can open it \
+                 is that container's own grant ({}), not checked here",
+                if v.rootless {
+                    "on this rootless engine, the host's ACL from host preparation with \
+                     --console"
+                } else {
+                    "its device grant"
+                }
+            ),
+        ),
+        SoundView::Unknown => super::unknown(
+            CHECK_SOUND,
+            "this agent was not told whether the host has a sound device (/dev/snd): turn \
+             console mode off and on again so the recovery actor reads it",
         ),
     }
 }
@@ -915,6 +954,17 @@ mod tests {
             "cannot open 1 of the host's sound devices (first: /dev/snd/controlC0)",
             "prepare-host.sh --mode rootless --console",
         );
+        let mut told = on();
+        told.sound = SoundView::Told;
+        let pass = check_sound(&told);
+        assert_eq!(pass.status, PASS);
+        assert!(
+            pass.summary.contains("recovery actor reports") && pass.summary.contains("not checked"),
+            "{pass:?}"
+        );
+        let mut unread = on();
+        unread.sound = SoundView::Unknown;
+        assert_eq!(check_sound(&unread).status, UNKNOWN);
     }
 
     #[test]
@@ -1030,7 +1080,16 @@ mod tests {
     fn the_sound_reader_sees_what_is_there() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            SoundView::observe(&dir.path().join("snd")),
+            SoundView::observe(&dir.path().join("snd"), None),
+            SoundView::Unknown
+        );
+        // The agent holds no sound device; the recovery actor's answer decides.
+        assert_eq!(
+            SoundView::observe(&dir.path().join("snd"), Some("1")),
+            SoundView::Told
+        );
+        assert_eq!(
+            SoundView::observe(&dir.path().join("snd"), Some("0")),
             SoundView::Missing
         );
         let snd = dir.path().join("snd");
@@ -1038,7 +1097,7 @@ mod tests {
         std::fs::write(snd.join("controlC0"), "").unwrap();
         std::fs::write(snd.join("timer"), "").unwrap();
         assert_eq!(
-            SoundView::observe(&snd),
+            SoundView::observe(&snd, Some("1")),
             SoundView::Present { denied: Vec::new() },
             "a node this test may open read-write, and a non-PCM node ignored"
         );

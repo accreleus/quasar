@@ -363,7 +363,6 @@ RUN cd /opt/gstreamer-src && \
 #   gst-plugins-base:typefind     -> (core decodebin-adjacent, upstream default-on)
 #   gst-plugins-base:videotestsrc -> videotestsrc                    (pipeline.rs test/fallback source)
 #   gst-plugins-base:audiotestsrc -> audiotestsrc                    (audio_branch.rs silent Pulse fallback)
-#   gst-plugins-base:alsa         -> alsasink                        (console local-audio output)
 #   gst-plugins-base:videoconvertscale -> videoconvert, videoscale   (pipeline.rs, source_branch.rs)
 #   gst-plugins-base:playback     -> upstream default (decodebin family; kept for parity)
 #   gst-plugins-base:drm          -> DRM buffer/caps negotiation (va/vulkan dmabuf paths)
@@ -386,7 +385,6 @@ RUN cd /opt/gstreamer-src && \
 #   gst-plugins-bad:vulkan-video  -> the Vulkan video-encode/decode extension vulkanh264enc needs
 #   gst-plugins-bad:videoparsers  -> h264parse                       (pipeline.rs / encoders.rs)
 #   gst-plugins-bad:wayland       -> upstream default (Wayland sink/buffer-pool support)
-#   gst-plugins-bad:kms           -> kmssink (AMD direct-KMS console backend)
 #   libnice (monorepo subproject) -> nicesrc/nicesink (webrtcbin's ICE backend)
 #   libnice:gstreamer             -> the gst plugin INSIDE the libnice subproject; the global
 #                                     -Dauto_features=disabled propagates into subprojects and
@@ -450,7 +448,6 @@ RUN cd /opt/gstreamer-src && meson setup build --prefix=/opt/gst --libdir=lib64 
     -Dgst-plugins-base:typefind=enabled \
     -Dgst-plugins-base:videotestsrc=enabled \
     -Dgst-plugins-base:audiotestsrc=enabled \
-    -Dgst-plugins-base:alsa=enabled \
     -Dgst-plugins-base:videoconvertscale=enabled \
     -Dgst-plugins-base:playback=enabled \
     -Dgst-plugins-base:drm=enabled \
@@ -466,7 +463,6 @@ RUN cd /opt/gstreamer-src && meson setup build --prefix=/opt/gst --libdir=lib64 
     -Dgst-plugins-bad:vulkan-video=enabled \
     -Dgst-plugins-bad:videoparsers=enabled \
     -Dgst-plugins-bad:wayland=enabled \
-    -Dgst-plugins-bad:kms=enabled \
     -Dorc=disabled \
     -Ddoc=disabled \
     -Dgtk_doc=disabled \
@@ -784,9 +780,10 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # install the daemon explicitly (weak deps remain disabled above).
     alsa-lib pulseaudio-libs pulseaudio \
     pciutils-libs libsrtp \
-    # Console local-output runtime: weston drives atomic KMS and seatd provides
-    # VT-unbound device access inside the agent container.
-    weston seatd ddcutil pulseaudio-utils procps-ng iproute \
+    # ddcutil: console mode's monitor power over DDC (readiness console_ddc). A console
+    # session's desktop drives the display from its own container (ADR 0009), so the
+    # agent carries no display server of its own.
+    ddcutil pulseaudio-utils procps-ng iproute \
     # host-observability: hwdata ships /usr/share/hwdata/pci.ids, the vendor/device
     # id -> model-name database the node-agent's GPU model detection falls back to
     # (pciutils-libs above is the lspci shared libs — no ids database on Fedora).
@@ -849,13 +846,14 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # "no encoder found" report, so they are checked here, at the point of install,
     # in addition to deploy/image-contract.json checking the finished image.
     rpm -q pulseaudio mesa-vulkan-drivers-freeworld mesa-va-drivers-freeworld intel-media-driver avahi || exit 1 ; \
-    # -- Runtime image trim (2026-08-20): ~250 MB, IN THIS LAYER --------------------
-    # Three groups of packages that are pulled in as transitive dependencies, are
-    # never used by any Quasar code path, and together weigh ~210 MB. Each is removed
-    # with `rpm -e --nodeps` because the thing that requires them (weston-libs,
-    # pulseaudio) IS wanted — only its optional backend is not. The removals and the
-    # proof that the survivors still link are in the SAME layer as the install, so a
-    # broken removal fails the build here rather than shipping.
+    # -- Runtime image trim (2026-08-20), IN THIS LAYER ------------------------------
+    # Two groups of packages that are pulled in as transitive dependencies and are
+    # never used by any Quasar code path. Each is removed with `rpm -e --nodeps`
+    # because the thing that requires them (pulseaudio) IS wanted — only its optional
+    # backend is not. The removals and the proof that the survivors still link are in
+    # the SAME layer as the install, so a broken removal fails the build here rather
+    # than shipping. (A third group, ~120 MB of a console display server's remote
+    # backends, left with that display server.)
     #
     # SAME RUN AS THE INSTALL, not a tidier one of its own. The first version of this
     # was a separate RUN and `docker history` showed exactly what that costs: the dnf
@@ -863,25 +861,16 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # overlay delete hides bytes; it never reclaims them. Same lesson as the
     # `--allowerasing` merge above, learned twice in one file.
     #
-    # GROUP 1 — weston's VNC and RDP backends (~120 MB measured: libicu 38.2,
-    # flite 22.5, samba-client-libs 20.6, lpcnetfreedv 15.5, libavcodec-free 10.3,
-    # libavfilter-free 4.2, freerdp-libs 3.9, libavformat-free 2.7, codec2 1.4,
-    # libwinpr 1.3, neatvnc 0.16). Console local-output mode drives atomic KMS
-    # through drm-backend.so only (CM-08). Weston's backends are dlopen'd plugins, so
-    # the vnc/rdp .so files are deleted alongside their libraries — leaving the
-    # plugins in place with their deps gone would turn a config typo into a confusing
-    # dlopen error instead of a clean "no such backend".
-    #
-    # GROUP 2 — Fedora's OWN GStreamer 1.26 and the python3 it drags in (~81 MB:
+    # GROUP 1 — Fedora's OWN GStreamer 1.26 and the python3 it drags in (~81 MB:
     # python3-libs 45.5, iso-codes 22.5, gstreamer1-plugins-base 7.7, gstreamer1 5.6).
-    # Required by `pulseaudio` (for its RTP modules, which Quasar does not load) and
-    # by `weston-libs` (for remoting-plugin, removed in group 1). This is also a
-    # CORRECTNESS fix, not only a size one: 36 distro plugins for a DIFFERENT
+    # Required by `pulseaudio` (for its RTP modules, which Quasar does not load). This
+    # is also a CORRECTNESS fix, not only a size one: 36 distro plugins for a DIFFERENT
     # GStreamer major-minor were sitting in /usr/lib64/gstreamer-1.0 next to the
     # vendored 1.28 tree, one GST_PLUGIN_PATH mistake away from being loaded.
-    # Pulse's own gst-linked modules go with them for the same reason as group 1.
+    # Pulse's own gst-linked modules go with them: dlopen'd plugins left in place with
+    # their deps gone would turn a config typo into a confusing dlopen error.
     #
-    # GROUP 3 — locales, but only the ones THIS layer installed. glibc-langpack-en
+    # GROUP 2 — locales, but only the ones THIS layer installed. glibc-langpack-en
     # from quasar-base provides en_US.UTF-8, which is what LANG/LC_ALL are set to;
     # every other language's catalogues are dead weight on a headless streaming host.
     #
@@ -889,16 +878,9 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # that arrives in quasar-base's upstream Fedora KIWI layer, which no child layer
     # can reclaim -- pruning it there was tried, measured, and reverted (see the
     # comment in quasar-images images/quasar-base/Dockerfile). What this prune does
-    # reclaim is the catalogues weston, mesa, pulseaudio and friends add in the RUN
-    # above, which is worth single-digit MB, not 53. It stays because it is free and
-    # in the right layer; do not quote 53 MB for it. \
-    # Weston's VNC and RDP backends, and the two plugins that pull the distro
-    # GStreamer in. Named explicitly because which backend console mode uses is a
-    # DESIGN decision (drm-backend, CM-08), not something to infer from linkage.
-    rm -f /usr/lib64/libweston-*/vnc-backend.so \
-          /usr/lib64/libweston-*/rdp-backend.so \
-          /usr/lib64/libweston-*/remoting-plugin.so \
-          /usr/lib64/libweston-*/pipewire-plugin.so ; \
+    # reclaim is the catalogues mesa, pulseaudio and friends add in the RUN above,
+    # which is worth single-digit MB, not 53. It stays because it is free and in the
+    # right layer; do not quote 53 MB for it. \
     # Every dlopen-able pulse plugin that reaches the distro GStreamer, found by
     # asking the linker rather than by listing names -- a hand-written list is only
     # as good as whoever last read the package contents, and the build gate below
@@ -929,25 +911,20 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       [ "$removed" = 0 ] && break ; \
     done ; \
     rpm -e --nodeps \
-        neatvnc freerdp-libs libwinpr samba-client-libs libicu \
-        libavfilter-free libavformat-free libavcodec-free codec2 lpcnetfreedv flite \
         gstreamer1-plugins-base gstreamer1 iso-codes python3 python3-libs \
       2>/dev/null || true ; \
     find /usr/share/locale -mindepth 1 -maxdepth 1 -type d ! -name 'en*' -exec rm -rf {} + ; \
     ldconfig ; \
     # PROOF, in the same layer as the removal: every survivor that matters still
-    # resolves every soname it needs. `weston --version` and `pulseaudio --version`
-    # both exec the real binary, so a missing library is an immediate non-zero exit
-    # rather than a surprise at first console session or first audio capture.
-    missing=$(for f in /usr/bin/weston /usr/bin/pulseaudio /usr/bin/pactl /usr/bin/seatd \
-                       /usr/lib64/libweston-*/drm-backend.so \
-                       /usr/lib64/libweston-*/gl-renderer.so \
-                       /usr/lib64/libweston-*/headless-backend.so \
+    # resolves every soname it needs. `pulseaudio --version` execs the real binary, so
+    # a missing library is an immediate non-zero exit rather than a surprise at the
+    # first audio capture.
+    missing=$(for f in /usr/bin/pulseaudio /usr/bin/pactl \
                        /usr/lib64/pulseaudio/modules/*.so /usr/lib64/pulse-*/modules/*.so ; do \
                 { [ -e "$f" ] && ldd "$f" 2>/dev/null | grep 'not found' ; } || true ; \
               done) ; \
     if [ -n "$missing" ]; then echo "TRIM BROKE A SURVIVOR:"; echo "$missing"; exit 1; fi ; \
-    weston --version && pulseaudio --version && echo "runtime trim OK: $(du -sh /usr/share/locale | cut -f1) locale, no distro GStreamer" ; \
+    pulseaudio --version && echo "runtime trim OK: $(du -sh /usr/share/locale | cut -f1) locale, no distro GStreamer" ; \
     ! test -e /usr/lib64/gstreamer-1.0/libgstapp.so
 
 # ── Agent-INDEPENDENT half of this stage ──────────────────────────────────────
@@ -1042,7 +1019,6 @@ COPY --from=build /opt/agent/quasar-node-agent /usr/local/bin/quasar-node-agent
 # has no GPU attached, so neither can be checked here; they are validated at first runtime launch
 # against real hardware instead. Everything checked below has no such dependency.
 RUN gst-inspect-1.0 waylanddisplaysrc \
-    && gst-inspect-1.0 kmssink \
     && gst-inspect-1.0 interpipesrc \
     && gst-inspect-1.0 rtpgccbwe \
     && gst-inspect-1.0 webrtcbin \
@@ -1057,12 +1033,9 @@ RUN gst-inspect-1.0 waylanddisplaysrc \
     && gst-inspect-1.0 opusenc \
     && gst-inspect-1.0 pulsesrc \
     && gst-inspect-1.0 audiotestsrc \
-    && gst-inspect-1.0 alsasink \
     && gst-inspect-1.0 coloreffects \
     && command -v pulseaudio \
     && pulseaudio --version \
-    && command -v weston \
-    && command -v seatd \
     && ldd /usr/local/bin/quasar-node-agent | (! grep "not found")
 
 # The registry above was scanned with NO GPU present — drop it so the first runtime invocation
@@ -1141,9 +1114,10 @@ ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
 #   1. Container build/test env — `docker run -v repo:/workspace -w /workspace/node-agent
 #      quasar-dev128 cargo build` (scripts/dev/dev.sh, qtest). FROM `toolchain` so the full toolchain +
 #      gst 1.28 -devel headers + /opt/gst are already present; the repo is MOUNTED, not baked.
-#   2. Session app-container image — bench apps' runtime_spec image is quasar-agent-dev: needs weston +
-#      weston-terminal demo clients, gst-launch tools (-Dtools=enabled, already in /opt/gst),
-#      videotestsrc/waylandsink (in /opt/gst), wayland + pulse client libs.
+#   2. Session app-container image — bench apps' runtime_spec image is quasar-agent-dev: needs the
+#      weston-terminal Wayland demo client, gst-launch tools (-Dtools=enabled, already in /opt/gst),
+#      videotestsrc/waylandsink (in /opt/gst), wayland + pulse client libs. These are Wayland CLIENTS
+#      of a streamed session's compositor, not a display server of the agent's.
 #   3. Base-compose agent-service image — runs the repo-built target/release binary with the repo
 #      mounted; needs the GPU runtime driver stacks + /dev/dri (freeworld VA/Vulkan, same as the
 #      runtime target). Its Docker CLI is developer tooling for compose and harness workflows,
@@ -1157,7 +1131,7 @@ ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
 # option A). `build` is `COPY node-agent` + `cargo build --release`, so while `dev` was its child
 # EVERY one-character edit under node-agent/ invalidated the COPY, which invalidated the cargo
 # build, which invalidated every layer below — the rustup components, three dnf transactions
-# (RPM Fusion freeworld drivers, weston/seatd/ddcutil/vulkan-tools, avahi), and the dev-only
+# (RPM Fusion freeworld drivers, the demo client/ddcutil/vulkan-tools, avahi), and the dev-only
 # Docker CLI download. Not one of those reads node-agent source; the dependency was stage ordering, not
 # content. `runtime` never had the defect because it is FROM the base and pulls the binary in with
 # a single trailing `COPY --from=build`. This stage now has that same shape: the environment is
@@ -1178,7 +1152,7 @@ FROM ${TOOLCHAIN_IMAGE} AS dev
 RUN rustup component add rustfmt clippy
 
 # RPM Fusion freeworld VA + Vulkan driver stacks (same rationale as the runtime target: stock
-# Fedora Mesa strips the patent-encumbered encode entrypoints). Needed so a weston app-container
+# Fedora Mesa strips the patent-encumbered encode entrypoints). Needed so a bench app container
 # and the compose agent can drive the GPU. The `.x86_64` pin + --allowerasing are mandatory (see
 # the runtime stage's note) to avoid dnf silently resolving only the 32-bit driver.
 # intel-media-driver rides along for the same reason it is in the runtime stage: Mesa's VA
@@ -1192,13 +1166,13 @@ RUN dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-rel
         intel-media-driver.x86_64 \
     && dnf clean all
 
-# Weston + a visibly-rendering demo client (weston-terminal; the SHM flower/smoke clients render
-# near-black on the black compositor bg — CLAUDE.md gst-interpipe note), plus the Wayland/pulse
-# client libs + diagnostics an app container or interactive debugging wants. The build stage
-# already carries wayland-devel/pulseaudio-libs-devel/vulkan-tools etc.; these are the extras.
+# A visibly-rendering Wayland demo client for bench apps (weston-terminal, which Fedora ships only
+# in the `weston` package; the SHM flower/smoke clients render near-black on the black compositor
+# bg — CLAUDE.md gst-interpipe note), plus the Wayland/pulse client libs + diagnostics an app
+# container or interactive debugging wants. The build stage already carries
+# wayland-devel/pulseaudio-libs-devel/vulkan-tools etc.; these are the extras.
 RUN dnf install -y --setopt=install_weak_deps=False \
         weston \
-        seatd \
         ddcutil \
         pulseaudio-utils \
         mesa-va-drivers libva-utils \
@@ -1244,9 +1218,8 @@ ENV VK_LOADER_DRIVERS_DISABLE="*lvp_icd*"
 ENV ANV_DEBUG="video-encode"
 
 # Build-time verification: the dev image exposes the same device-free elements the runtime target
-# checks, PLUS the weston demo client and the toolchain (this image doubles as the cargo build env).
+# checks, PLUS the Wayland demo client and the toolchain (this image doubles as the cargo build env).
 RUN gst-inspect-1.0 waylanddisplaysrc \
-    && gst-inspect-1.0 kmssink \
     && gst-inspect-1.0 interpipesrc \
     && gst-inspect-1.0 rtpgccbwe \
     && gst-inspect-1.0 webrtcbin \
@@ -1294,7 +1267,7 @@ CMD ["bash"]
 # it. That is not the contract being weakened; it is this image never claiming to be a
 # shipped artifact.
 #
-# FROM `dev`, so it inherits the toolchain, both freeworld driver stacks, weston,
+# FROM `dev`, so it inherits the toolchain, both freeworld driver stacks, the demo client,
 # dev-only Docker tooling and mDNS — everything needed to run a real session and profile it.
 #
 # Build:  deploy/build-images.sh profiling

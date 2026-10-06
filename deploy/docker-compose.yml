@@ -316,9 +316,9 @@ services:
     # occurred" (#83). Read-only, off the media path: the tailer reports NVRM Xid
     # and amdgpu fault lines and nothing else.
     cap_add: [NET_ADMIN, SYSLOG]
-    # tini as pid 1: weston's orphaned helper processes (reparented when a
-    # console session's process group is SIGKILL'd, see session/console.rs) are
-    # reaped instead of accumulating as zombies under the node-agent.
+    # tini as pid 1: helper processes the agent starts (probes, ddcutil) that are
+    # orphaned when their parent is killed are reaped instead of accumulating as
+    # zombies under the node-agent.
     init: true
     environment:
       # The agent connects to the CP via localhost because both share host network.

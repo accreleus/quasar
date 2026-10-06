@@ -840,7 +840,7 @@ impl SessionMetrics {
     }
 
     /// #445: record the physical display mode a console session runs at, reported in every
-    /// window from now on. Written at launch and after every applied mode switch.
+    /// window from now on. Written whenever the desktop is displaying at a new mode.
     pub fn set_console_mode(&self, mode: Option<(u16, u16, u32)>) {
         *self.console_mode.lock().unwrap() = mode;
     }

@@ -351,7 +351,8 @@ Read in `node-agent/src/config.rs`. `CONTROL_PLANE_URL` is **required**.
 | `QUASAR_ENROLLMENT` | unset | **The one-paste way to join a second host (#12).** Admin → Fleet → Add host also prints a one-line installer (`deploy/enroll-host.sh`, served by the control plane itself at `/enroll-host.sh`; a self-signed control plane is fetched with `curl --pinnedpubkey`) that hands this string to the seed on the new machine, whose recovery actor gives it to the agent as `QUASAR_ENROLLMENT_FILE` — see "Add host" below. The enrollment string itself: `qenr1.<FINGERPRINT>.<base64url(wss-url)>.<token>`. It supplies the control-plane URL, the certificate fingerprint to pin, and a minted single-use enrollment token in one value — the fingerprint is first and verbatim (uppercase colon-separated SHA-256, exactly as the control plane logs it) so you can compare it by eye before pasting. The agent refuses a string carrying a `ws://` URL. Precedence when other variables are also set: `CONTROL_PLANE_URL` overrides the URL inside it (logged at WARN — split-horizon deployments) **but only with another `wss://` address — a `ws://` override is fatal even with `QUASAR_ALLOW_PLAINTEXT_AGENT=1`**, because it would send the string's own token in cleartext (unset `QUASAR_ENROLLMENT` and use `ENROLLMENT_TOKEN` if cleartext is really intended); `CONTROL_PLANE_FINGERPRINT` overrides the fingerprint inside it (WARN — the certificate-rotation path); an `ENROLLMENT_TOKEN` that *differs* from the token inside it is fatal; a saved pin that differs from the configured one is superseded with a WARN. An empty fingerprint segment (`qenr1..`) means the control plane is behind a real-CA certificate and is logged as such at connect, so a mispasted string is visible. Once enrolled, the pin is saved beside the node secret (`NODE_SECRET_PATH` + `.tls`) and this variable can be removed. |
 | `QUASAR_ENROLLMENT_FILE` | unset | The file twin of `QUASAR_ENROLLMENT` (#357): a path whose contents (trimmed) are the enrollment string, with exactly the same meaning. On an owned install the recovery actor sets it to `/run/quasar-secrets/enrollment`, a read-only file in the agent's secrets volume, so the string never enters the container environment. Setting both variables is a startup error; an unreadable file is a startup error naming the path, never the contents; an empty file is the same as no enrollment string. Unset, `QUASAR_ENROLLMENT` behaves exactly as before. |
 | `QUASAR_RECOVERY_SOCKET` | unset | Set only by the recovery actor's recipe (#357): the agent socket, `/run/quasar-recovery/agent.sock`. Its presence makes this an **owned** install: before every `register` the agent reads the actor's `GET /v1/status` there and registers `install_mode: "owned"`, `updater_present` = whether the actor answered, and the actor's `recovery_actor_version`, `recovery_actor_source_commit` and `seed_version` (agent-api.md amendment 14). No answer logs `token="install-actor-unreachable"` and registers `updater_present: false`. Unset (a Compose or source install), the host has no recovery actor: the agent registers `updater_present: false` and its `install_mode` from its own image reference (a registry host or a bare local tag), and its `updater_socket` readiness check reads not applicable. Do not set it by hand. |
-| `QUASAR_CONSOLE_ACCESS` | unset | Set only by the recovery actor's recipe (RH-07 #395), to `1`, on an owned agent created with console mode's additions: `SYS_ADMIN`, `/dev/snd`, `/proc/asound` at `/host-proc/asound` (read-only), device rules for ALSA (major 116) and i2c-dev (major 89), and `/dev/tty8` (console mode's own virtual terminal) when the host has it; on a rootless engine no capability or device rule, and each host `/dev/i2c-N` passed as a device. The agent asks for them on its agent socket (`POST /v1/console`); the actor replaces the agent with verify-and-restore, on a host whose `/dev/dri` its device probe found, in either engine mode. Unset, the container has none of them. Do not set it by hand. |
+| `QUASAR_CONSOLE_ACCESS` | unset | Set only by the recovery actor's recipe (RH-07 #395), to `1`, on an owned agent created with console mode's additions. From recipe revision 4 they are only what the agent launches and watches a console session with: a device rule for i2c-dev (major 89; on a rootless engine each host `/dev/i2c-N` passed as a device instead), logind's seat and session state read-only, `/dev/tty8` (console mode's own virtual terminal) when the host has it, and `QUASAR_HOST_UDEV_DATA`/`QUASAR_HOST_SOUND`; no capability and no sound device, which the console session's container is given instead. A revision-3 agent (one an actor puts back) also gets `SYS_ADMIN`, `/dev/snd`, `/proc/asound` and the ALSA rule. The agent asks for them on its agent socket (`POST /v1/console`); the actor replaces the agent with verify-and-restore, on a host whose `/dev/dri` its device probe found, in either engine mode. Unset, the container has none of them. Do not set it by hand. |
+| `QUASAR_HOST_SOUND` | unset | Set by the recovery actor on a recipe-revision-4 console agent (#461): `1` when the host has a sound device, `/dev/snd`, which a console session's container is given, `0` when it has none. Read only when console mode is turned on, never at the actor's own start, so a sound card that appears during a live console session re-creates no agent; turn console mode off and on to pass it. Until a console host's console mode is turned off and on after the upgrade to revision 4 the variable is unset and `console_sound` reads `unknown`. The agent holds no sound device itself; unset, it looks for the host's `/dev/snd` at `/host/dev` (a Compose install binds the host's `/dev` there, and the console overlay sets no sound fact), then in its own `/dev`. Do not set it by hand. |
 | `QUASAR_HOST_UDEV_DATA` | unset | Set by the recovery actor on a console agent (#460): `1` when the host has udev's device database, `/run/udev/data`, which a console session's container is given read-only, `0` when it has none. The actor reads it only when console mode is turned on, never at its own start, so an upgrade alone re-creates no agent: until a console host's console mode is turned off and on after the upgrade the variable is unset and `console_udev` reads `unknown`. On Podman it is also what proves the console container's `/run/udev/data` bind source (the runtime refuses a bind source the agent cannot see, `token=application-bind-source-missing`), so there a console launch is refused until it reads `1`. The Compose console overlay sets `1`; set `0` there on a host without systemd-udevd. |
 | `CONTROL_PLANE_URL` | — (**required** unless `QUASAR_ENROLLMENT` supplies it) | Control-plane WebSocket, e.g. `ws://localhost:8080` or `wss://cp.example:8443` (HTTP base for the agent pull channels is derived from it: `ws→http`, `wss→https`, strips `/agent/ws`). **`wss://` works (#12)** and both agent clients — the websocket and the node-secret HTTP polls — verify the same way: **pinned** to the control plane's leaf certificate when a fingerprint is known (from `QUASAR_ENROLLMENT`, `CONTROL_PLANE_FINGERPRINT`, or the saved pin), else against the bundled WebPKI roots (a real certificate, e.g. the Caddy overlay). Under a pin, SAN and expiry are not checked — the pin is the identity, and the self-signed default routinely lacks the LAN name or IP you dial. **`ws://` is cleartext**: the enrollment token and the node secret cross it as plain JSON. It is allowed without ceremony only to loopback (`localhost` / `127.0.0.0/8` / `::1`, the single-host compose default); to any other host the agent refuses to start unless `QUASAR_ALLOW_PLAINTEXT_AGENT=1`. |
 | `CONTROL_PLANE_FINGERPRINT` | unset | Manual certificate pin: the SHA-256 the control plane logs at startup (`fingerprint=…`, also on the admin Access panel and `GET /v1/admin/access-check`). Accepts `AB:CD:…`, lowercase, bare hex, or a `sha256:` prefix. Use it to **rotate**: after a control-plane certificate is re-issued every pinned agent stops connecting (it logs `token="cp-tls-pin-mismatch"` with the expected and observed values) until this is updated — one value per host, no re-enrollment, the node secret and host row survive. Overrides the fingerprint inside `QUASAR_ENROLLMENT` and the saved pin. Does nothing on a `ws://` URL (logged at WARN). |
@@ -1088,18 +1089,29 @@ the app's catalog `runtime_spec.env` does not already set one.
 
 ---
 
-## Node agent — console / local display
+## Node agent — console
+
+A console session's desktop drives the monitor from its own container (ADR 0009). That
+container, not the agent, holds the screen, the host's raw input and the sound device: grant
+console mode only on a host whose monitor, keyboard, mouse and speakers you mean to hand to the
+console desktop. The agent itself keeps only what it launches and watches a console session
+with: the console terminal (`tty8`), read access to the display cards, the i2c nodes for monitor
+power over DDC, logind's state (to name what holds a display) and two host facts it cannot read
+itself, `QUASAR_HOST_UDEV_DATA` and `QUASAR_HOST_SOUND`, which the recovery actor sets each time
+console mode is turned on. It has no capability for any of it. A Compose install grants the
+same with `deploy/overlays/docker-compose.console.yml`, and its agent reads `/dev/snd` through the
+base file's `/host/dev`.
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_LOCAL_DISPLAY` | unset (off) | **Dev-only fallback.** Any non-empty value enables the local-display leg (weston + `waylandsink`, CM-01) when the session has **no** `console_config` pushed from the control plane — a real operator console session is driven by `console_config.enabled` instead (admin UI → host → Console; see below), which this env never overrides. The env path is also best-effort/soft-skip on failure, unlike a real console session's fail-loud requirement. Dev/standalone launch path only. |
 | `QUASAR_CONSOLE_DDC` | on (any value other than `0`, including unset) | CM-09 monitor **power** detection via DDC/CI (VCP `0xd6`) — distinguishes a monitor actually powered off from one merely idle, which DRM connector status alone cannot (an off panel still reports `status=connected`). `QUASAR_CONSOLE_DDC=0` disables the DDC/CI probe entirely; any other value (or unset) leaves it enabled **if** the `ddcutil` binary is present on the host — a missing binary silently degrades the whole module to the always-powered/physical-connected behaviour, byte-identical to disabling it. |
-| `QUASAR_EXPERIMENTAL_LOCAL_DMABUF` | off | **Experimental, console (local-display) only.** `1`, `true` or `TRUE` turns it on. Any other value, including `True`, leaves it off. When on, the console display shows the compositor's frames as RGB DMABuf, with no CPU copies. The compositor renders into a ring of 4–8 GPU buffers (`display-dmabuf`). Each buffer is reused only after the display has released it. `waylandsink` or `kmssink` imports the buffers as they are. When off, every frame is read back into system memory and copied: that path drops frames at 3840x2160@120 (#450). The format is picked between the compositor and the display: `XRGB8888` first, LINEAR where the GPU can render it, compressed modifiers last. On NVIDIA that is a block-linear modifier, because NVIDIA cannot render to LINEAR. Applies only when the session's `video_topology` is `LocalOnly` and it is not using the synthetic test source (`QUASAR_USE_TEST_SRC`). Otherwise it does nothing. Needs a gst-wayland-display build with `display-dmabuf`. On an older one the agent logs `token=local-dmabuf-old-compositor`. On an owned install, set it on the seed or with `reconfigure` ("Agent variables" below), so a console host can turn it on for a live check. |
+| `QUASAR_EXPERIMENTAL_LOCAL_DMABUF` | — | **Retired (#461), ignored.** It tuned the console display path the agent used to draw, which a console desktop's own display replaced. Still accepted as an agent variable so an install that set it keeps applying; remove it with `reconfigure` when convenient. |
 
-**Direct display (#453).** Not a knob. A console session (`local_only`) whose app sets
-`runtime_spec.direct_display: true` runs with no compositor, pipeline or encoder: its desktop drives
-the monitor itself. The agent sets `QUASAR_DIRECT_DISPLAY=1` on the app container, and the image's
-launcher starts its desktop on the DRM backend. What the container is given:
+**Direct display (#453).** Not a knob. A console session (`local_only`) runs with no compositor,
+pipeline or encoder: its desktop drives the monitor itself, so its app must set
+`runtime_spec.direct_display: true`. The agent sets `QUASAR_DIRECT_DISPLAY=1` on the app
+container, and the image's launcher starts its desktop on the DRM backend. What the container is
+given:
 
 | Grant | Why |
 |---|---|
@@ -1133,7 +1145,7 @@ it closes the card after its reads, so it never opens a card a console session h
 |---|---|
 | `console_card` | the console output's card node (every card for `auto` with no monitor) is read-write for the Quasar account (`access(2)`) and no other process holds DRM master on it (read on a read-only open), or this agent's console session does |
 | `console_input` | `input_devices` is valid, `/dev/input` lists, every listed node exists, and the Quasar account can open each node the desktop would get read-write (`access(2)`, so the host ACL counts) |
-| `console_sound` | `/dev/snd` is visible to the agent and its `controlC*`/`pcmC*` nodes open read-write |
+| `console_sound` | the host has a sound device. Where the agent can see the host's `/dev/snd` (a Compose install's `/host/dev`) its `controlC*`/`pcmC*` nodes must also open read-write. On an owned install the agent cannot: `QUASAR_HOST_SOUND=1` is the recovery actor's word for the device's presence, and whether the console desktop can open it is that container's own grant (rootless: the host ACL from `prepare-host.sh --console`), not checked here. `unknown` while the variable is unset: turn console mode off and on |
 | `console_terminal` | a console session holds `tty8`, the host has no VTs, or `/dev/tty8` is in the agent's container, opens read-write, and startup could take it |
 | `console_udev` | `QUASAR_HOST_UDEV_DATA=1`: the host has udev's data, which the console container is given read-only (the udev control socket is never passed). `unknown` while the variable is unset: turn console mode off and on |
 | `console_ddc` | `ddcutil`, a mapped i2c bus, a power reading. `skip` when the image has no `ddcutil` or the host was not prepared (no `/dev/i2c-*` in the agent) |
@@ -1146,7 +1158,7 @@ once it is **displaying**: the container is alive, a client holds DRM master on 
 framebuffer is on the connector. The connector's mode is reported as the session's console mode.
 A desktop that does not display within the session's app boot timeout (120 s without one) fails
 the session, naming what was missing. The agent refuses a `local_only` assignment whose app lacks
-`direct_display`, and every `dual_output` assignment.
+`direct_display`, and any topology other than `stream_only` and `local_only`.
 
 A hidraw node that is granted at launch stays usable even when it is unplugged and replugged
 (the cgroup rule matches the major, not one node), but a controller plugged in for the **first**
@@ -1157,8 +1169,8 @@ evdev path still works meanwhile (hotplugged `/dev/input` nodes do appear, via t
 the `c 13:* rwm` rule), so a controller plugged in mid-session keeps working, just named from
 its evdev GUID rather than as itself, until the session is restarted.
 
-**The console terminal (#407).** Not a knob. For the life of every local console session
-(`local_only`; `dual_output` was retired by amendment 19) the agent makes `tty8` the active virtual
+**The console terminal (#407).** Not a knob. For the life of every console session
+(`local_only`) the agent makes `tty8` the active virtual
 terminal with its kernel keyboard off (`K_OFF`, `KD_GRAPHICS`), and switches back to the previous
 terminal when the session ends; otherwise every key typed in the session would also reach the
 host's text console. A helper child (`quasar-node-agent console-vt`) holds `tty8` as its
@@ -1186,7 +1198,7 @@ terminal.
 | `QUASAR_APP_BOOT_TIMEOUT_SECS` | `300` | How long a launched app container may take to present its first frame before the session fails with `app_never_presented`. `0` disables the watchdog. Only applies to sessions that launch an app container. |
 | `QUASAR_USE_TEST_SRC` | off | `1`/`true` → synthetic `videotestsrc` instead of the compositor (smoke tests). |
 | `QUASAR_USE_TEST_AUDIO` | off | `1`/`true` → synthetic audio (also implied by `QUASAR_USE_TEST_SRC`). |
-| `QUASAR_AUDIO_REQUIRED` | off | `1`/`true` → an unavailable PulseAudio sidecar **fails** the session instead of silently degrading to silent audio. Off by default so hosts with no audio stack (headless CI, smoke tests) still run; **release deployments should set it**. Regardless of this knob, a degraded session now reports `effective_media.audio.{path,degraded,reason}` and emits an `audio.degraded` trace event — before 2026-07-26 the fallback was a single WARN line and the session still reported `running`, so a sidecar image with no `pulseaudio` binary muted every lab-host session (streamed *and* console-local, since local audio also captures from the sidecar via `pulsesrc`) for days with nothing surfacing it. |
+| `QUASAR_AUDIO_REQUIRED` | off | `1`/`true` → an unavailable PulseAudio sidecar **fails** the session instead of silently degrading to silent audio. Off by default so hosts with no audio stack (headless CI, smoke tests) still run; **release deployments should set it**. Regardless of this knob, a degraded session now reports `effective_media.audio.{path,degraded,reason}` and emits an `audio.degraded` trace event — before 2026-07-26 the fallback was a single WARN line and the session still reported `running`, so a sidecar image with no `pulseaudio` binary muted every lab-host session for days with nothing surfacing it. |
 | `QUASAR_WIDTH` / `QUASAR_HEIGHT` | `1280` / `720` | Dev-path stream size (overridden per-assignment). |
 | `QUASAR_FPS` | `60` | Dev-path frame rate (overridden per-assignment). |
 | `QUASAR_BITRATE_KBPS` | `8000` | Dev-path target bitrate, kbit/s (overridden per-assignment). |
@@ -1771,8 +1783,8 @@ control-only machine. Not agent variables:
 - **Dev and test only:** `QUASAR_APP_IMAGE`, `QUASAR_APP_ARGS`, `QUASAR_APP_GPU`,
   `QUASAR_APP_EXIT_POLICY`, `QUASAR_FPS`, `QUASAR_WIDTH`, `QUASAR_HEIGHT`,
   `QUASAR_BITRATE_KBPS`, `QUASAR_CODEC`, `QUASAR_H264_PROFILE`, `QUASAR_USE_TEST_SRC`,
-  `QUASAR_USE_TEST_AUDIO`, `QUASAR_SYNTHETIC_GPU_CAPACITY`, `QUASAR_LOCAL_DISPLAY`,
-  `QUASAR_DIAG_NO_OBS`, `QUASAR_MEDIA_PROBE_DUMP`.
+  `QUASAR_USE_TEST_AUDIO`, `QUASAR_SYNTHETIC_GPU_CAPACITY`, `QUASAR_DIAG_NO_OBS`,
+  `QUASAR_MEDIA_PROBE_DUMP`.
 
 A setting Admin → Hosts also manages (the encoder and ABR knobs, for example) is the
 host's deployment baseline: a per-host override in the console still wins.

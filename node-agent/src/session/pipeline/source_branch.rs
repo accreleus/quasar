@@ -9,9 +9,7 @@ use gstreamer::prelude::*;
 use crate::session::virtual_input::VirtualDevices;
 use crate::session::{EncoderChoice, SessionConfig};
 
-use super::caps::{
-    dmabuf_zerocopy_format, local_dmabuf_transport, raw_video_caps, vulkan_image_transport,
-};
+use super::caps::{dmabuf_zerocopy_format, raw_video_caps, vulkan_image_transport};
 use super::encoders::va_device_element_prefix;
 
 /// Self-heal the compositor's Vulkan encode-src ring-slot tiling defect by pinning the
@@ -88,23 +86,6 @@ pub(crate) fn build_video_source(
                 "VK-05: waylanddisplaysrc vulkan=true (emit memory:VulkanImage NV12 for vulkanh264enc)"
             );
             pin_vulkan_encode_ring();
-        } else if local_dmabuf_transport(cfg) {
-            // #450: RGB dmabufs straight to the display, from the compositor's recycled
-            // output ring. `display-dmabuf` orders the RGB formats for a display (XRGB first,
-            // LINEAR where the GPU renders it, compressed last); never `nv12`, which selects
-            // the standalone Vulkan NV12 converter (an encoder format, broken on NVIDIA).
-            if el.find_property("display-dmabuf").is_some() {
-                el.set_property("display-dmabuf", true);
-                tracing::info!(
-                    "local display: waylanddisplaysrc display-dmabuf=true (RGB DMABuf ring to the display)"
-                );
-            } else {
-                tracing::warn!(
-                    token = "local-dmabuf-old-compositor",
-                    "local display: compositor lacks display-dmabuf (older gst-wayland-display); \
-                     the DMABuf format is whatever the renderer lists first"
-                );
-            }
         }
         // libinput's path backend opens these directly (no udev/seat). The gamepad
         // reaches the app through the container's mounted device node instead.
@@ -123,25 +104,11 @@ pub(crate) fn build_video_source(
     // The caps that cross the interpipe boundary. The framerate field is load-bearing:
     // without it waylanddisplaysrc produces 1 fps.
     let tail_caps = raw_video_caps(cfg);
-    // Named so a console mode switch (#445) can re-pin it to the new WxH@fps in place.
     let tail = gst::ElementFactory::make("capsfilter")
         .name("source-caps")
         .property("caps", &tail_caps)
         .build()
         .context("capsfilter not found")?;
-
-    // Local-only DMABuf (#450), whatever the host's encoder: the compositor's RGB dmabuf
-    // ring goes straight to the display leg. No videoscale/videoconvert — neither can
-    // negotiate the DMABuf memory feature; the compositor renders at WxH itself.
-    if local_dmabuf_transport(cfg) {
-        pipeline.add_many([&src, &tail])?;
-        gst::Element::link_many([&src, &tail])
-            .context("failed to link local-only DMABuf source (compositor → DMA_DRM)")?;
-        tracing::info!(
-            "local-only topology: source emits DMABuf DMA_DRM for direct display import"
-        );
-        return Ok(tail);
-    }
 
     match cfg.encoder {
         // NVENC N-A: the compositor emits memory:CUDAMemory BGRA at the session WxH (it
@@ -188,22 +155,9 @@ pub(crate) fn build_video_source(
         // arms. No videoconvert/videoscale — neither can negotiate the VulkanImage memory
         // feature, so either would fail negotiation at runtime.
         EncoderChoice::Vulkan => {
-            if vulkan_image_transport(cfg) {
-                pipeline.add_many([&src, &tail])?;
-                gst::Element::link_many([&src, &tail]).context(
-                    "failed to link Vulkan video source (compositor → VulkanImage NV12)",
-                )?;
-            } else {
-                let scale = gst::ElementFactory::make("videoscale")
-                    .build()
-                    .context("videoscale not found")?;
-                pipeline.add_many([&src, &scale, &tail])?;
-                gst::Element::link_many([&src, &scale, &tail])
-                    .context("failed to link local-only Vulkan-host source (compositor → RGBx)")?;
-                tracing::info!(
-                    "local-only topology: Vulkan encode transport bypassed; source emits system RGBx"
-                );
-            }
+            pipeline.add_many([&src, &tail])?;
+            gst::Element::link_many([&src, &tail])
+                .context("failed to link Vulkan video source (compositor → VulkanImage NV12)")?;
         }
         EncoderChoice::Openh264 => {
             let scale = gst::ElementFactory::make("videoscale")

@@ -8,22 +8,34 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::console_plan::{self, ConsoleHost, DirectDisplay};
+use super::super::console_vt::ConsoleVt;
 use super::super::container::{AppDisplayMode, ContainerRuntime, LaunchParams, RunningContainer};
 use super::super::displaying::{self, Missing, ScanoutMode, Verdict};
 use super::super::metrics::SessionMetrics;
 use super::super::source::{spawn_observer, GenerationObservation};
 use super::super::{teardown, SessionConfig};
 use super::{
-    app_container_name, app_exit_event, compute_bytes_used, console_leg, now_unix_ms,
-    DiagnosticEventTx, SessionEvent, TraceEvent,
+    app_container_name, app_exit_event, compute_bytes_used, now_unix_ms, DiagnosticEventTx,
+    SessionEvent, TraceEvent,
 };
-use crate::messages::VideoTopology;
 
-/// A console session whose app declares it can run direct. Everything else on the
-/// local-only topology still takes the nested path until it is retired (#461).
-pub(super) fn wants_direct(cfg: &SessionConfig) -> bool {
-    cfg.video_topology == VideoTopology::LocalOnly
-        && cfg.container.as_ref().is_some_and(|c| c.direct_display)
+/// #407: a console session holds the console VT, keyboard off, for its whole life, so
+/// nothing typed at the desktop reaches a host login prompt. Declared before the container
+/// and the card claim so it drops after them. Fail-closed: `Err` is the `Failed` reason.
+fn take_terminal(stop: &Arc<AtomicBool>) -> Result<ConsoleVt, String> {
+    ConsoleVt::take(stop.clone()).map_err(|e| {
+        tracing::error!(
+            token = "runner-console-vt-failed",
+            error = %format_args!("{e:#}"),
+            "console session refused: the console terminal could not be taken"
+        );
+        format!("console terminal: {e:#}")
+    })
+}
+
+/// Why the console terminal was lost mid-session, if it was.
+fn terminal_lost(vt: &mut Option<ConsoleVt>) -> Option<String> {
+    vt.as_mut().and_then(|vt| vt.lost())
 }
 
 /// How long the desktop gets to open the card before the agent looks: the agent's own
@@ -133,6 +145,7 @@ pub(super) fn run_direct<F: Fn(SessionEvent)>(
 enum Failure {
     ConsoleOff,
     NoApp,
+    NotDirect,
     NoOutput,
     InputRefused,
     LaunchFailed,
@@ -148,6 +161,9 @@ fn failed(failure: Failure, reason: String) -> SessionEvent {
         }
         Failure::NoApp => {
             tracing::error!(token = "direct-display-no-app", reason = %reason, "{message}")
+        }
+        Failure::NotDirect => {
+            tracing::error!(token = "direct-display-not-direct", reason = %reason, "{message}")
         }
         Failure::NoOutput => {
             tracing::error!(token = "direct-display-no-output", reason = %reason, "{message}")
@@ -187,10 +203,18 @@ fn run_until_end<F: Fn(SessionEvent)>(
     let Some(spec) = cfg.container.clone() else {
         return failed(Failure::NoApp, "a console session needs an app".into());
     };
+    // The assignment refused this already (`console_plan::topology_refusal`); a desktop
+    // launched without its direct entry would wait for a parent display that never comes.
+    if let Some(refusal) = console_plan::topology_refusal(
+        crate::messages::VideoTopology::LocalOnly,
+        spec.direct_display,
+    ) {
+        return failed(Failure::NotDirect, refusal);
+    }
     // Declared first so it drops last: the terminal is restored after the container and
     // the card claim are gone.
-    let mut console_vt = match console_leg::take_terminal(cfg, stop) {
-        Ok(vt) => vt,
+    let mut console_vt = match take_terminal(stop) {
+        Ok(vt) => Some(vt),
         Err(reason) => return SessionEvent::Failed(reason),
     };
     let outputs = crate::capacity::detect_drm_outputs();
@@ -206,7 +230,7 @@ fn run_until_end<F: Fn(SessionEvent)>(
     let (hidraw_nodes, hidraw_major) = match &input {
         // Every existing hidraw node, plus the major so a controller plugged in later
         // still opens once its node appears (#462).
-        console_plan::InputGrant::All => (host_hidraw_nodes(), host_hidraw_major()),
+        console_plan::InputGrant::All => (console_plan::host_hidraw_nodes(), host_hidraw_major()),
         // Only the allowlisted events' resolved siblings; no hotplug rule.
         console_plan::InputGrant::Nodes(nodes) => {
             let mut resolved: Vec<String> = Vec::new();
@@ -290,7 +314,7 @@ fn run_until_end<F: Fn(SessionEvent)>(
     let mut watch = DisplayWatch::new(cfg.app_boot_timeout.unwrap_or(DEFAULT_DISPLAY_BUDGET));
     let mut looked_at: Option<Instant> = None;
     loop {
-        if let Some(reason) = console_leg::terminal_lost(&mut console_vt) {
+        if let Some(reason) = terminal_lost(&mut console_vt) {
             stop_container(&mut container);
             return failed(
                 Failure::TerminalLost,
@@ -405,9 +429,11 @@ fn stop_container(container: &mut RunningContainer) {
     }
 }
 
-/// Does the host have a sound device to hand the desktop? The agent sees the host's `/dev`
-/// at `/host/dev` when the recipe mounts it, else its own `/dev`, which carries `/dev/snd`
-/// only while the agent's own console grants do (until #461 moves them to the host probe).
+/// Does the host have a sound device to hand the desktop? The agent holds no sound device
+/// of its own. On an owned install the recovery actor tells it
+/// (`console_plan::HOST_SOUND_ENV`); a Compose agent sees the host's `/dev/snd` through the
+/// base file's `/dev:/host/dev` bind instead (the console overlay sets no sound fact).
+/// Without either, its own `/dev`.
 fn host_has_sound() -> bool {
     let host_dev = std::path::Path::new("/host/dev");
     let dev = if host_dev.is_dir() {
@@ -415,31 +441,10 @@ fn host_has_sound() -> bool {
     } else {
         std::path::Path::new("/dev")
     };
-    dev.join("snd").is_dir()
-}
-
-/// Every `/dev/hidrawN` node the host has right now, for an `InputGrant::All` console.
-/// Same dev-root choice as [`host_has_sound`]: `/host/dev` when the recipe mounts it,
-/// else the agent's own `/dev`.
-fn host_hidraw_nodes() -> Vec<String> {
-    let host_dev = std::path::Path::new("/host/dev");
-    let dev = if host_dev.is_dir() {
-        host_dev
-    } else {
-        std::path::Path::new("/dev")
-    };
-    let Ok(entries) = std::fs::read_dir(dev) else {
-        return Vec::new();
-    };
-    let mut nodes: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_str()?.to_string();
-            name.starts_with("hidraw").then(|| format!("/dev/{name}"))
-        })
-        .collect();
-    nodes.sort();
-    nodes
+    console_plan::host_sound(
+        std::env::var(console_plan::HOST_SOUND_ENV).ok().as_deref(),
+        dev.join("snd").is_dir(),
+    )
 }
 
 /// hidraw's character major, read fresh at launch (it is dynamic, not a fixed constant

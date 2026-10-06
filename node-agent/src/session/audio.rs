@@ -36,7 +36,7 @@ pub const PULSE_NAME_PREFIX: &str = "quasar-pulse-";
 pub const QUASAR_SINK_NAME: &str = "quasar_output";
 
 /// The monitor source of [`QUASAR_SINK_NAME`], recorded by the host-audio capture
-/// `pulsesrc` (WebRTC encode branch and console local-audio leg). Pinned explicitly as
+/// `pulsesrc` (the WebRTC encode branch). Pinned explicitly as
 /// `pulsesrc device=…`, never relying on it being the daemon DEFAULT source: the sidecar
 /// also loads a microphone feed sink and a remap-source, and a moved default would
 /// silently point host capture at the client's own microphone. Kept in lockstep with
@@ -396,145 +396,6 @@ pub(crate) fn wait_for_socket(path: &Path) -> bool {
     socket_accepts_connection(path)
 }
 
-/// The ALSA mixer control gating the HDA codec's digital converter (`AC_DIG1_ENABLE`). On
-/// some HDA HDMI/DP outputs it defaults to OFF on every boot/module reload, and with no
-/// `alsactl` restore a session opening `alsasink device=hw:0,3` plays audio that never
-/// reaches the wire (hw_ptr advances, codec `Digital:` node stays blank).
-const IEC958_SWITCH_NAME: &str = "IEC958 Playback Switch";
-
-/// Best-effort: enable every `{IEC958_SWITCH_NAME}` boolean mixer control on the ALSA card
-/// `alsa_device` (an `alsasink`-style string like `"hw:0,3"`) resolves to. Returns how
-/// many were flipped on; 0 when the card has none, as most non-HDMI cards do.
-///
-/// Enables EVERY matching control rather than mapping the device's PCM index to a control
-/// index: there is no stable index↔pcm-device mapping, and enabling an unconnected pin's
-/// switch is harmless.
-///
-/// Never fails the caller — a pre-flight nicety for the local-audio pipeline, not a hard
-/// dependency. Log any error and start the pipeline anyway.
-pub fn enable_iec958_playback_switches(alsa_device: &str) -> Result<usize> {
-    if alsa_device == "auto" {
-        return enable_iec958_playback_switches_auto();
-    }
-
-    let card = card_spec_from_device(alsa_device)
-        .ok_or_else(|| anyhow!("could not parse an ALSA card from device '{alsa_device}'"))?;
-
-    enable_iec958_playback_switches_on_card(&card)
-}
-
-/// The ALSA `default` PCM does not expose its backing card through the device string, so
-/// enumerate every card visible inside the agent container and enable the matching
-/// switches on each. Console deployments expose only the intended `/dev/snd/controlC*`
-/// devices; inaccessible cards are tolerated as long as one opened successfully.
-fn enable_iec958_playback_switches_auto() -> Result<usize> {
-    let mut enabled = 0usize;
-    let mut opened = 0usize;
-    let mut first_error = None;
-
-    for card in alsa::card::Iter::new() {
-        let card = match card {
-            Ok(card) => card,
-            Err(e) => {
-                first_error.get_or_insert_with(|| anyhow!("enumerate ALSA cards: {e}"));
-                continue;
-            }
-        };
-        let spec = format!("hw:{}", card.get_index());
-        match enable_iec958_playback_switches_on_card(&spec) {
-            Ok(n) => {
-                opened += 1;
-                enabled += n;
-            }
-            Err(e) => {
-                tracing::debug!(card = %spec, error = %format!("{e:#}"), "cannot inspect IEC958 controls on automatic ALSA card");
-                first_error.get_or_insert(e);
-            }
-        }
-    }
-
-    match (opened, first_error) {
-        (0, Some(error)) => Err(error),
-        _ => Ok(enabled),
-    }
-}
-
-fn enable_iec958_playback_switches_on_card(card: &str) -> Result<usize> {
-    let hctl =
-        alsa::hctl::HCtl::new(card, false).with_context(|| format!("open HCtl for '{card}'"))?;
-    hctl.load()
-        .with_context(|| format!("load HCtl for '{card}'"))?;
-
-    let mut enabled = 0usize;
-    for elem in hctl.elem_iter() {
-        let id = match elem.get_id() {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        if id.get_interface() != alsa::ctl::ElemIface::Mixer {
-            continue;
-        }
-        let Ok(name) = id.get_name() else {
-            continue;
-        };
-        if name != IEC958_SWITCH_NAME {
-            continue;
-        }
-
-        let info = match elem.info() {
-            Ok(info) => info,
-            Err(e) => {
-                tracing::debug!(
-                    token = "audio-iec958-inspect-failed",card, control = IEC958_SWITCH_NAME, error = %e, "cannot inspect IEC958 playback switch");
-                continue;
-            }
-        };
-        if info.get_type() != alsa::ctl::ElemType::Boolean {
-            continue;
-        }
-        let count = info.get_count();
-
-        let mut value = match elem.read() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    token = "audio-iec958-read-failed",card, control = IEC958_SWITCH_NAME, error = %e, "cannot read IEC958 playback switch");
-                continue;
-            }
-        };
-        for idx in 0..count {
-            value.set_boolean(idx, true);
-        }
-        match elem.write(&value) {
-            Ok(_) => enabled += 1,
-            Err(e) => {
-                tracing::warn!(
-                    token = "audio-iec958-enable-failed",card, control = IEC958_SWITCH_NAME, error = %e, "cannot enable IEC958 playback switch");
-            }
-        }
-    }
-
-    Ok(enabled)
-}
-
-/// Reduce `"hw:0,3"` / `"hw:CARD=NAME,DEV=X"` / `"plughw:1,0"` to the bare card spec
-/// ALSA's `Ctl`/`HCtl` open calls expect (`"hw:0"` / `"hw:NAME"`). `None` for anything
-/// that is not an ALSA hw device (`"auto"`), so the caller skips rather than misparses.
-fn card_spec_from_device(device: &str) -> Option<String> {
-    let rest = device
-        .strip_prefix("plughw:")
-        .or_else(|| device.strip_prefix("hw:"))?;
-    let card_part = rest.split(',').next()?.trim();
-    if card_part.is_empty() {
-        return None;
-    }
-    let card = card_part.strip_prefix("CARD=").unwrap_or(card_part).trim();
-    if card.is_empty() {
-        return None;
-    }
-    Some(format!("hw:{card}"))
-}
-
 /// The last lines a daemon wrote, bounded for one log line.
 fn output_tail(stdout: &str, stderr: &str) -> String {
     const MAX: usize = 600;
@@ -582,20 +443,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn card_spec_parses_common_forms() {
-        assert_eq!(card_spec_from_device("hw:0,3").as_deref(), Some("hw:0"));
-        assert_eq!(card_spec_from_device("hw:1").as_deref(), Some("hw:1"));
-        assert_eq!(card_spec_from_device("plughw:0,3").as_deref(), Some("hw:0"));
-        assert_eq!(
-            card_spec_from_device("hw:CARD=NVidia,DEV=3").as_deref(),
-            Some("hw:NVidia")
-        );
-        assert_eq!(card_spec_from_device("auto"), None);
-        assert_eq!(card_spec_from_device(""), None);
-        assert_eq!(card_spec_from_device("hw:"), None);
-    }
 
     /// The device-name constants must stay in lockstep with the baked daemon argv: the
     /// capture pulsesrc pins `quasar_output.monitor` by literal, and the mic

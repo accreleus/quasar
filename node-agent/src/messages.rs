@@ -351,9 +351,9 @@ pub enum AgentMsg {
         /// admin PATCH). Present only alongside `stream_width`/`stream_height`.
         #[serde(skip_serializing_if = "Option::is_none")]
         external_owner: Option<&'static str>,
-        /// #445: the physical display mode a console session's local display runs at,
-        /// present once the agent knows it (a local-only console; moved by a mode the app
-        /// picked). Absent on a streamed session.
+        /// #445: the mode the console connector runs at while a console session's desktop
+        /// is displaying, present once the agent has read it (it moves when the desktop
+        /// changes mode). Absent on a streamed session.
         #[serde(skip_serializing_if = "Option::is_none")]
         console_mode: Option<ConsoleModeSelection>,
     },
@@ -817,48 +817,31 @@ pub enum AppExitPolicy {
     Unknown,
 }
 
-/// CM-01 console-mode config, delivered in `config_update.console_config`. Every
-/// field is `#[serde(default)]` and unknown keys are ignored. The wire carries
-/// `enabled`, `output_id`, `input_devices`, `auto_start_on_display`, `default_app`
-/// and `default_user` (agent-api.md amendment 19). The other fields are read only
-/// by the old local-display path and go with it in #461; their defaults (`grab` and
-/// `fullscreen` true) are the values that path ran with.
+/// CM-01 console-mode config, delivered in `config_update.console_config`: the six fields
+/// of agent-api.md amendment 19. Every field is `#[serde(default)]` and unknown keys are
+/// ignored, so a control plane that still sends a retired key (`connector`, `mode`,
+/// `compositor`, `audio_output`, `stream`, `stream_audio`, `grab`,
+/// `auto_connect_controller`, `fullscreen`) is read as if it had not.
 #[derive(Deserialize, Debug, Clone)]
 pub struct ConsoleConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "console_auto")]
-    pub connector: String,
     #[serde(default)]
     pub output_id: Option<String>,
     #[serde(default)]
-    pub mode: Option<ConsoleModeSelection>,
-    #[serde(default = "console_weston")]
-    pub compositor: String,
-    #[serde(default)]
-    pub audio_output: Option<String>,
-    #[serde(default)]
-    pub stream: bool,
-    #[serde(default)]
-    pub stream_audio: bool,
-    #[serde(default)]
     pub input_devices: serde_json::Value,
-    #[serde(default = "spec_true")]
-    pub grab: bool,
     #[serde(default)]
     pub auto_start_on_display: bool,
-    #[serde(default)]
-    pub auto_connect_controller: bool,
     #[serde(default)]
     pub default_app: Option<String>,
     /// The control plane's designated console session owner. The agent never
     /// acts on this — carried only for lossless deserialization.
     #[serde(default)]
     pub default_user: Option<String>,
-    #[serde(default = "spec_true")]
-    pub fullscreen: bool,
 }
 
+/// A display mode as `session_metrics.console_mode` reports it: the console connector's
+/// current mode while a console session is displaying.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleModeSelection {
     pub width: u16,
@@ -866,17 +849,19 @@ pub struct ConsoleModeSelection {
     pub refresh_millihz: u32,
 }
 
-/// Explicit per-session video output plan. This is assignment-scoped so a host
-/// with console capability does not accidentally mirror every browser session.
+/// Explicit per-session video output plan (agent-api.md amendment 19): a streamed
+/// session, or a console session whose desktop drives the host's display.
 #[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoTopology {
     #[default]
     StreamOnly,
     LocalOnly,
-    /// Not sent by the control plane (agent-api.md amendment 19); goes with the
-    /// old local-display path in #461.
-    DualOutput,
+    /// Any other wire value, `dual_output` included (retired by amendment 19): the
+    /// assignment is acked `ok:false` (`console_plan::topology_refusal`) rather than
+    /// failing the whole `session_assign` deserialize.
+    #[serde(other)]
+    Unsupported,
 }
 
 // ── session_capture ──────────────────────────────────────────────────────────
@@ -983,13 +968,6 @@ pub struct CaptureParams {
     pub window_ms: Option<u64>,
 }
 
-fn console_auto() -> String {
-    "auto".to_string()
-}
-fn console_weston() -> String {
-    "weston".to_string()
-}
-
 /// CM-01 host console capabilities, reported in `capacity.console_capabilities`
 /// (agent-api.md) so the admin console-config UI can populate selectors.
 /// `PartialEq` (CM-06/07): the console-hotplug watcher (`session::console_hotplug`)
@@ -1060,12 +1038,6 @@ pub struct DrmModeCapability {
     pub clock_khz: u32,
     pub htotal: u16,
     pub vtotal: u16,
-}
-
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct AudioSink {
-    pub id: String,
-    pub label: String,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -1196,8 +1168,8 @@ pub enum ControlMsg {
         settings: serde_json::Value,
         #[serde(default)]
         settings_delivery_id: Option<String>,
-        /// Host's resolved console-mode config. Absent ⇒ console mode disabled
-        /// (falls back to `QUASAR_LOCAL_DISPLAY` for dev).
+        /// Host's resolved console-mode config. Absent ⇒ keep the last one (none yet ⇒
+        /// console mode off).
         #[serde(default)]
         console_config: Option<ConsoleConfig>,
         #[serde(default)]
@@ -1567,7 +1539,7 @@ mod tests {
             }
         ));
 
-        let mut local = base;
+        let mut local = base.clone();
         local["video_topology"] = serde_json::json!("local_only");
         let parsed: ControlMsg = serde_json::from_value(local).unwrap();
         assert!(matches!(
@@ -1577,6 +1549,24 @@ mod tests {
                 ..
             }
         ));
+
+        // The retired `dual_output` (and any value this agent does not run) still
+        // parses, so the assignment can be refused with an ack instead of dropped.
+        for retired in ["dual_output", "something_newer"] {
+            let mut msg = base.clone();
+            msg["video_topology"] = serde_json::json!(retired);
+            let parsed: ControlMsg = serde_json::from_value(msg).unwrap();
+            assert!(
+                matches!(
+                    parsed,
+                    ControlMsg::SessionAssign {
+                        video_topology: VideoTopology::Unsupported,
+                        ..
+                    }
+                ),
+                "{retired}"
+            );
+        }
     }
 
     #[test]
@@ -2478,12 +2468,11 @@ mod tests {
         assert_eq!(v["external_owner"], "auto");
     }
 
-    /// Amendment 19 (#455): the control plane sends the six-field console_config.
-    /// It deserializes, the retired fields take the values the old path ran with,
-    /// and a key this agent does not know is ignored rather than failing the
-    /// `config_update`.
+    /// Amendment 19 (#455): the control plane sends the six-field console_config. It
+    /// deserializes, and a retired key or one this agent does not know is ignored rather
+    /// than failing the `config_update`.
     #[test]
-    fn trimmed_console_config_deserializes_with_retired_defaults() {
+    fn trimmed_console_config_deserializes_and_ignores_retired_keys() {
         let cfg: ConsoleConfig = serde_json::from_value(serde_json::json!({
             "enabled": true,
             "output_id": "card0:DP-4",
@@ -2491,6 +2480,9 @@ mod tests {
             "auto_start_on_display": true,
             "default_app": "6f1c0000-0000-0000-0000-000000000001",
             "default_user": "0b2e0000-0000-0000-0000-000000000002",
+            "audio_output": "hw:1,3",
+            "stream": true,
+            "grab": true,
             "some_future_key": {"nested": true}
         }))
         .unwrap();
@@ -2499,13 +2491,6 @@ mod tests {
         assert_eq!(cfg.input_devices, serde_json::json!(["/dev/input/event4"]));
         assert!(cfg.auto_start_on_display);
         assert!(cfg.default_app.is_some() && cfg.default_user.is_some());
-        // Retired fields: the old control plane's defaults.
-        assert_eq!(cfg.connector, "auto");
-        assert_eq!(cfg.compositor, "weston");
-        assert!(cfg.mode.is_none());
-        assert!(cfg.audio_output.is_none());
-        assert!(!cfg.stream && !cfg.stream_audio && !cfg.auto_connect_controller);
-        assert!(cfg.grab && cfg.fullscreen);
     }
 
     /// Amendment 19: `direct_display` rides the `app` object, absent ⇒ false.

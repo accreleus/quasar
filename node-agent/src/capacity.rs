@@ -1,5 +1,5 @@
 //! Host and GPU capacity detection from sysfs/procfs, plus the console-mode inventory
-//! (DRM outputs, audio sinks, physical input) the admin UI populates selectors from.
+//! (DRM outputs and input devices) the admin UI populates selectors from.
 //!
 //! `encode_slots_total` is what admission RESERVES against; live free VRAM is a separate,
 //! advisory signal sampled by [`crate::vram`]. Detection failure fails CLOSED — an empty GPU
@@ -10,8 +10,8 @@
 
 use crate::gpu_identity::DriverIdentities;
 use crate::messages::{
-    AudioSink, ConsoleCapabilities, DrmModeCapability, DrmOutputCapability, GpuCapacity,
-    HostCapacity, InputDeviceInfo, StorageVolume,
+    ConsoleCapabilities, DrmModeCapability, DrmOutputCapability, GpuCapacity, HostCapacity,
+    InputDeviceInfo, StorageVolume,
 };
 use crate::session::EncoderChoice;
 use crate::vram::VramTarget;
@@ -170,9 +170,18 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
     }
 }
 
-/// Output/connector inventory only, without the DDC power probe and audio/input enumeration
-/// `detect_console_capabilities` also does. `session::console::spawn_weston_console` calls
-/// this per launch; the full probe would eat its 15s socket-wait budget for discarded data.
+/// Process-wide lock around the *moment* of opening a DRM primary node (#407). Opening a
+/// card node, in any mode, makes the opener DRM master when nobody holds it
+/// (`drm_auth.c`), so two of the agent's own reads racing each other could leave one of
+/// them master for an instant. Callers hold it only around an open, never across a
+/// session.
+pub(crate) fn drm_open_lock() -> &'static std::sync::Mutex<()> {
+    static DRM_OPEN_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    DRM_OPEN_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Output/connector inventory only, without the DDC power probe and input enumeration
+/// `detect_console_capabilities` also does: what a console launch and readiness read.
 pub(crate) fn detect_drm_outputs() -> Vec<DrmOutputCapability> {
     detect_drm_outputs_at(
         std::path::Path::new("/dev/dri"),
@@ -327,9 +336,9 @@ fn detect_drm_outputs_at(
             continue;
         }
         // #407: opening a primary node can make the opener DRM master automatically when
-        // the display is free (whatever the open mode), racing spawn_weston_console's own
-        // open for it — see session::console::drm_open_lock. Held for this card only.
-        let _drm_open_guard = crate::session::console::drm_open_lock()
+        // the display is free (whatever the open mode) — see `drm_open_lock`. Held for this
+        // card only.
+        let _drm_open_guard = drm_open_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Ok(file) = open_card_read_only(&entry.path()) else {
@@ -400,7 +409,7 @@ pub(crate) fn connector_scanout(card_node: &std::path::Path, connector: &str) ->
     use drm::control::Device as _;
     use drm::Device as _;
 
-    let _drm_open_guard = crate::session::console::drm_open_lock()
+    let _drm_open_guard = drm_open_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Ok(file) = open_card_read_only(card_node) else {
@@ -468,7 +477,7 @@ fn console_card_access_at(dri_root: &std::path::Path, card: &str) -> CardAccess 
     if let Err(e) = access_read_write(&node) {
         return CardAccess::Unopenable(format!("not read-write for this account: {e}"));
     }
-    let _drm_open_guard = crate::session::console::drm_open_lock()
+    let _drm_open_guard = drm_open_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Under the lock: a claim taken while this waited must keep the agent off the card.
@@ -568,111 +577,7 @@ fn detect_drm_connectors() -> Vec<String> {
     crate::ddc::powered_connectors(out)
 }
 
-/// ALSA playback sinks from an asound root (`/proc/asound` or the host bind at
-/// `/host-proc/asound`). A card name alone is insufficient for HDMI/DP: the active output
-/// is often device 3 or 7, not the non-existent device zero. Ids name the card by its id
-/// (`hw:CARD=<id>,DEV=<device>`), which a driver reload does not move (#407 live).
-pub(crate) fn alsa_sinks_at(asound: &std::path::Path, dev_snd: &std::path::Path) -> Vec<AudioSink> {
-    let cards = std::fs::read_to_string(asound.join("cards")).unwrap_or_default();
-    let pcm = std::fs::read_to_string(asound.join("pcm")).unwrap_or_default();
-    let ids = crate::session::console_audio::read_card_ids(asound);
-    parse_audio_sinks(&cards, &pcm, &ids)
-        .into_iter()
-        // Compose may expose only one sound device; advertising the rest of the host's
-        // inventory hands an operator a sink whose ALSA node the pipeline cannot open.
-        // Card-level fallbacks name a controller, not a playback PCM; still useful on a
-        // host that exposes no pcm data.
-        .filter(|(pcm, _)| {
-            pcm.is_none_or(|(card, device)| pcm_device_path(dev_snd, card, device).exists())
-        })
-        .map(|(_, sink)| sink)
-        .collect()
-}
-
-fn pcm_device_path(dev_snd: &std::path::Path, card: u32, device: u32) -> std::path::PathBuf {
-    dev_snd.join(format!("pcmC{card}D{device}p"))
-}
-
-/// Each playback sink with the `(card index, device)` it is at now (`None` for a
-/// card-level fallback). `ids` maps a card index to its id; a card with none keeps the
-/// index form.
-fn parse_audio_sinks(
-    cards: &str,
-    pcm: &str,
-    ids: &std::collections::BTreeMap<u32, String>,
-) -> Vec<(Option<(u32, u32)>, AudioSink)> {
-    use crate::session::console_audio::{alsa_card_sink_id, alsa_sink_id};
-    let mut labels = std::collections::BTreeMap::new();
-    for line in cards.lines() {
-        let trimmed = line.trim_start();
-        let Some((idx_str, rest)) = trimmed.split_once(' ') else {
-            continue;
-        };
-        let Ok(idx) = idx_str.trim().parse::<u32>() else {
-            continue;
-        };
-        let label = rest
-            .rsplit_once(" - ")
-            .map(|(_, l)| l.trim())
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| rest.trim())
-            .to_string();
-        labels.insert(idx, label);
-    }
-
-    let mut out = Vec::new();
-    for line in pcm.lines() {
-        // Kernel format: "00-03: HDMI 0 : HDMI 0 : playback 1".
-        let Some((address, detail)) = line.split_once(':') else {
-            continue;
-        };
-        if !detail.contains("playback") {
-            continue;
-        }
-        let Some((card, device)) = address.trim().split_once('-') else {
-            continue;
-        };
-        let (Ok(card), Ok(device)) = (card.parse::<u32>(), device.parse::<u32>()) else {
-            continue;
-        };
-        let endpoint = detail
-            .split(':')
-            .next()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("playback");
-        let card_label = labels
-            .get(&card)
-            .cloned()
-            .unwrap_or_else(|| format!("card {card}"));
-        let id = match ids.get(&card) {
-            Some(card_id) => alsa_sink_id(card_id, device),
-            None => format!("hw:{card},{device}"),
-        };
-        out.push((
-            Some((card, device)),
-            AudioSink {
-                id,
-                label: format!("{card_label} — {endpoint}"),
-            },
-        ));
-    }
-
-    // A card with no PCM detail yet (a USB DAC still initializing) keeps a card-level option.
-    if out.is_empty() {
-        out.extend(labels.into_iter().map(|(idx, label)| {
-            let id = match ids.get(&idx) {
-                Some(card_id) => alsa_card_sink_id(card_id),
-                None => format!("hw:{idx}"),
-            };
-            (None, AudioSink { id, label })
-        }));
-    }
-    out
-}
-
-/// `/dev/input/event*` with the name from `/sys/class/input/<event>/device/name`. Also
-/// resolves `console_config.input_devices: "auto"` in `session::physical_input`.
+/// `/dev/input/event*` with the name from `/sys/class/input/<event>/device/name`.
 pub(crate) fn detect_input_devices() -> Vec<InputDeviceInfo> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
@@ -1740,106 +1645,6 @@ mod tests {
     #[test]
     fn pci_ids_parser_unknown_returns_none() {
         assert_eq!(parse_pci_ids(PCI_IDS_FIXTURE, "ffff", "ffff"), None);
-    }
-
-    #[test]
-    fn audio_sinks_report_exact_playback_pcm_devices() {
-        let cards = "\
- 0 [NVidia         ]: HDA-Intel - HDA NVidia
- 1 [Generic        ]: HDA-Intel - HD-Audio Generic
-";
-        let pcm = "\
-00-03: HDMI 0 : HDMI 0 : playback 1
-00-07: HDMI 1 : HDMI 1 : playback 1
-01-00: ALC1220 Analog : ALC1220 Analog : playback 1 : capture 1
-";
-        let ids = std::collections::BTreeMap::from([
-            (0, "NVidia".to_string()),
-            (1, "Generic".to_string()),
-        ]);
-        assert_eq!(
-            parse_audio_sinks(cards, pcm, &ids),
-            vec![
-                (
-                    Some((0, 3)),
-                    AudioSink {
-                        id: "hw:CARD=NVidia,DEV=3".to_string(),
-                        label: "HDA NVidia — HDMI 0".to_string(),
-                    }
-                ),
-                (
-                    Some((0, 7)),
-                    AudioSink {
-                        id: "hw:CARD=NVidia,DEV=7".to_string(),
-                        label: "HDA NVidia — HDMI 1".to_string(),
-                    }
-                ),
-                (
-                    Some((1, 0)),
-                    AudioSink {
-                        id: "hw:CARD=Generic,DEV=0".to_string(),
-                        label: "HD-Audio Generic — ALC1220 Analog".to_string(),
-                    }
-                ),
-            ]
-        );
-        // A card whose id cannot be read keeps the index form.
-        assert_eq!(
-            parse_audio_sinks(cards, pcm, &Default::default())[2].1.id,
-            "hw:1,0"
-        );
-    }
-
-    /// Through a temporary asound root: the id is the card's, wherever its index moved.
-    #[test]
-    fn alsa_sinks_name_the_card_id_and_keep_only_openable_pcms() {
-        let dir = tempfile::tempdir().unwrap();
-        let (asound, dev_snd) = (dir.path().join("asound"), dir.path().join("snd"));
-        std::fs::create_dir_all(asound.join("card1")).unwrap();
-        std::fs::create_dir_all(&dev_snd).unwrap();
-        std::fs::write(
-            asound.join("cards"),
-            " 0 [Generic        ]: HDA-Intel - HD-Audio Generic\n 1 [NVidia         ]: HDA-Intel - HDA NVidia\n",
-        )
-        .unwrap();
-        std::fs::write(asound.join("card1/id"), "NVidia\n").unwrap();
-        std::fs::write(
-            asound.join("pcm"),
-            "00-00: ALC1220 Analog : ALC1220 Analog : playback 1\n01-03: HDMI 0 : HDMI 0 : playback 1\n",
-        )
-        .unwrap();
-        std::fs::write(dev_snd.join("pcmC1D3p"), "").unwrap();
-        assert_eq!(
-            alsa_sinks_at(&asound, &dev_snd),
-            vec![AudioSink {
-                id: "hw:CARD=NVidia,DEV=3".to_string(),
-                label: "HDA NVidia — HDMI 0".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn audio_sinks_fall_back_to_card_when_pcm_is_unavailable() {
-        let cards = " 0 [NVidia ]: HDA-Intel - HDA NVidia\n";
-        let ids = std::collections::BTreeMap::from([(0, "NVidia".to_string())]);
-        assert_eq!(
-            parse_audio_sinks(cards, "", &ids),
-            vec![(
-                None,
-                AudioSink {
-                    id: "hw:CARD=NVidia".to_string(),
-                    label: "HDA NVidia".to_string(),
-                }
-            )]
-        );
-    }
-
-    #[test]
-    fn audio_sink_pcm_path_matches_alsa_endpoint() {
-        assert_eq!(
-            pcm_device_path(std::path::Path::new("/dev/snd"), 0, 3),
-            std::path::Path::new("/dev/snd/pcmC0D3p")
-        );
     }
 
     #[test]
