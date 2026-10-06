@@ -107,18 +107,21 @@ pub struct InputNode {
 }
 
 /// The sound device a console session would be given. The agent holds no sound device of
-/// its own (#461): the recovery actor tells it whether the host has one
-/// (`console_plan::HOST_SOUND_ENV`), as the Compose console overlay does. Where the host's
-/// `/dev/snd` is in the agent's container anyway (a Compose install's `/host/dev`), its
-/// nodes are judged too.
+/// its own: on an owned install the recovery actor tells it whether the host has one
+/// (`console_plan::HOST_SOUND_ENV`). Where the host's `/dev/snd` is visible to the agent
+/// (a Compose install's `/host/dev`, which is how a Compose agent knows, with no variable)
+/// its nodes are judged for openability too.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SoundView {
     #[default]
     Missing,
-    /// `/dev/snd` is there; the nodes in it the Quasar account cannot open read-write.
+    /// `/dev/snd` is visible; the nodes in it the Quasar account cannot open read-write.
     Present { denied: Vec<String> },
-    /// The host has `/dev/snd`, by the recovery actor's (or the overlay's) word.
+    /// The host has `/dev/snd`, by the recovery actor's word alone: the agent cannot see
+    /// the nodes, so it cannot judge whether the console desktop can open them.
     Told,
+    /// Neither visible nor told: an agent created before the actor read it.
+    Unknown,
 }
 
 /// The console terminal.
@@ -284,7 +287,8 @@ impl SoundView {
         if !snd.is_dir() {
             return match told.map(str::trim) {
                 Some("1") => SoundView::Told,
-                _ => SoundView::Missing,
+                Some("0") => SoundView::Missing,
+                _ => SoundView::Unknown,
             };
         }
         let mut denied: Vec<String> = std::fs::read_dir(snd)
@@ -550,7 +554,22 @@ pub fn check_sound(v: &ConsoleView) -> ReadinessCheck {
         ),
         SoundView::Told => super::pass(
             CHECK_SOUND,
-            "the host has a sound device (/dev/snd) to pass in".into(),
+            format!(
+                "the recovery actor reports the host has a sound device (/dev/snd), which is \
+                 passed in; this agent holds none, so whether the console desktop can open it \
+                 is that container's own grant ({}), not checked here",
+                if v.rootless {
+                    "on this rootless engine, the host's ACL from host preparation with \
+                     --console"
+                } else {
+                    "its device grant"
+                }
+            ),
+        ),
+        SoundView::Unknown => super::unknown(
+            CHECK_SOUND,
+            "this agent was not told whether the host has a sound device (/dev/snd): turn \
+             console mode off and on again so the recovery actor reads it",
         ),
     }
 }
@@ -937,7 +956,15 @@ mod tests {
         );
         let mut told = on();
         told.sound = SoundView::Told;
-        assert_eq!(check_sound(&told).status, PASS);
+        let pass = check_sound(&told);
+        assert_eq!(pass.status, PASS);
+        assert!(
+            pass.summary.contains("recovery actor reports") && pass.summary.contains("not checked"),
+            "{pass:?}"
+        );
+        let mut unread = on();
+        unread.sound = SoundView::Unknown;
+        assert_eq!(check_sound(&unread).status, UNKNOWN);
     }
 
     #[test]
@@ -1054,9 +1081,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             SoundView::observe(&dir.path().join("snd"), None),
-            SoundView::Missing
+            SoundView::Unknown
         );
-        // #461: the agent holds no sound device; the recovery actor's answer decides.
+        // The agent holds no sound device; the recovery actor's answer decides.
         assert_eq!(
             SoundView::observe(&dir.path().join("snd"), Some("1")),
             SoundView::Told

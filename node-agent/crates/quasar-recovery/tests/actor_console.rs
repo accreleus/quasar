@@ -55,7 +55,7 @@ fn binds_sound(agent: &FakeContainer) -> bool {
             .any(|r| r.starts_with("c 116:"))
 }
 
-/// What the agent was told about the host's sound device (revision 4, #461).
+/// What the agent was told about the host's sound device (revision 4).
 fn told_sound(agent: &FakeContainer) -> Option<&str> {
     agent.spec.env.get("QUASAR_HOST_SOUND").map(String::as_str)
 }
@@ -243,7 +243,7 @@ fn enabling_replaces_only_the_agent_with_the_console_additions_and_disabling_tak
     assert_ne!(agent.id, old.id);
     assert_eq!(agent.spec.image, old.spec.image, "the same digest");
     assert!(console_on(&agent));
-    // #461: the console desktop's container holds the screen and the sound device, not the
+    // The console desktop's container holds the screen and the sound device, not the
     // agent: no capability, no sound device, only the host's answer about it.
     assert!(agent.spec.cap_add.is_empty(), "{:?}", agent.spec.cap_add);
     assert!(!binds_sound(&agent), "{:?}", agent.spec);
@@ -280,7 +280,7 @@ fn enabling_replaces_only_the_agent_with_the_console_additions_and_disabling_tak
 
 /// Sound is read when console mode is turned on, not only at the install: the agent is told
 /// the host has none, and once a sound card appeared, that it has one. The agent itself is
-/// never given the device (#461).
+/// never given the device.
 #[test]
 fn console_mode_tells_the_agent_about_the_host_sound_device_as_it_is_now() {
     let mut state = rootful();
@@ -832,7 +832,7 @@ fn a_regular_file_at_dev_i2c_is_skipped_and_console_mode_still_turns_on() {
 
 /// D13: a host prepared with `--console-audio-user` has the PipeWire socket directory.
 /// Turning console mode on still reads it (machine state a revision-3 agent renders with),
-/// but from revision 4 (#461) the console desktop plays its own audio and the agent is not
+/// but from revision 4 the console desktop plays its own audio and the agent is not
 /// given it; a revision-3 agent still is.
 #[test]
 fn the_console_audio_directory_is_read_but_bound_only_into_a_revision_3_agent() {
@@ -1211,6 +1211,44 @@ fn the_console_vt_is_kept_after_console_mode_is_turned_off() {
     devices.retain(|d| d.host != "/dev/tty8");
     assert_eq!(devices, before.spec.devices);
     assert_eq!(m.inputs()["console_vt_kept"], true);
+}
+
+/// Whether the host has a sound device is read when console mode is turned on and
+/// told to a revision-4 agent; an actor start never reads it, so a sound card that appears
+/// during a live console session re-creates no agent until console mode is turned on again.
+#[test]
+fn host_sound_is_read_when_console_mode_is_turned_on_and_never_at_a_start() {
+    let mut state = rootful();
+    state.probe_output = PROBE_AMD.into();
+    let m = Machine::install(state);
+    let actor = m.actor();
+    run(&actor, enable());
+    let agent = m.one_running_agent("console on without sound");
+    assert_eq!(told_sound(&agent), Some("0"));
+    assert_eq!(m.inputs()["devices"]["host_sound"], false);
+
+    m.engine
+        .with_state(|s| s.probe_output = PROBE_AMD_SOUND.into());
+    drop(actor);
+    let actor = m.actor();
+    actor.resume().unwrap();
+    assert_eq!(actor.recheck_on_start(), None);
+    assert_eq!(
+        m.agent().id,
+        agent.id,
+        "a start re-created the console agent"
+    );
+    assert_eq!(told_sound(&m.agent()), Some("0"));
+    assert_eq!(m.inputs()["devices"]["host_sound"], false);
+
+    // Turned off and on again, it is read.
+    run(&actor, disable());
+    run(&actor, enable());
+    assert_eq!(
+        told_sound(&m.one_running_agent("console on again")),
+        Some("1")
+    );
+    assert_eq!(m.inputs()["devices"]["host_sound"], true);
 }
 
 /// #460: turning console mode on reads whether the host has udev's database and tells the

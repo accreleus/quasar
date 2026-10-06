@@ -291,6 +291,7 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             console_audio: false,
             console_vt: false,
             udev_data: None,
+            host_sound: None,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -594,8 +595,8 @@ const ALLOWED_CONSOLE: &[(&str, &str, &str)] = &[
     (
         "+env",
         "QUASAR_HOST_SOUND=1",
-        "an owned agent has no host /dev (revision 3), so the actor tells it whether the host \
-         has a sound device; a Compose agent sees /dev/snd through the base file's /host/dev",
+        "the overlay sets no sound fact: a Compose agent sees the host's /dev/snd through the \
+         base file's /dev:/host/dev bind; an owned agent has no host /dev, so the actor tells it",
     ),
 ];
 
@@ -627,7 +628,7 @@ fn delta(without: &Shape, with: &Shape) -> BTreeSet<(String, String)> {
 }
 
 /// The console additions compared as additions: the overlay's to the Compose service, the
-/// recipe's to the current revision (4, #461) without console mode. Revision 3's own
+/// recipe's to the current revision (4) without console mode. Revision 3's own
 /// differences from Compose (RH-07 #402) are not the console's, so the base shapes are not
 /// compared here.
 #[test]
@@ -651,6 +652,8 @@ fn the_console_additions_match_the_console_overlay_except_the_listed_differences
         // The overlay grants the console VT and says the host has udev's database
         // unconditionally; the recipe only on a host that has them.
         on.devices.sound = true;
+        // What the actor writes when console mode is turned on (revision 4).
+        on.devices.host_sound = Some(true);
         on.devices.console_vt = true;
         on.devices.udev_data = Some(true);
         let mut files = vec![base.clone()];

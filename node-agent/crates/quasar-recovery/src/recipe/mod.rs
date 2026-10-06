@@ -271,12 +271,11 @@ pub struct HostDevices {
     /// other container sees. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_sysfs: bool,
-    /// The host has `/dev/snd` (RH-07 #395). From revision 4 (#461) console mode tells the
-    /// agent so (`QUASAR_HOST_SOUND`), and the agent hands the device to the console
-    /// session's container; revision 3 bound it into the agent, only when present (a bind of
-    /// a missing source is refused by Podman and silently created as an empty directory by
-    /// Docker). Read again whenever console mode is turned on, since sound may appear after
-    /// the install. Written only when true.
+    /// The host has `/dev/snd` (RH-07 #395). Revision 3's console mode binds it into the
+    /// agent, only when present (a bind of a missing source is refused by Podman and
+    /// silently created as an empty directory by Docker). Read again whenever console mode is
+    /// turned on and at every actor start while it is on, since sound may appear after the
+    /// install. Revision 4 renders [`Self::host_sound`] instead. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sound: bool,
     /// The host's `/dev/i2c-<n>` bus numbers (RH-07 #407), for console mode's DDC on a
@@ -297,7 +296,7 @@ pub struct HostDevices {
     /// `--console-audio-user` made the desktop user's PipeWire listen there, in a directory
     /// only that user and the Quasar group can enter. Revision 3's console mode binds it
     /// read-write so the agent plays console audio through that PipeWire; from revision 4
-    /// (#461) the console desktop plays its own audio and nothing reads it. Read with `i2c`;
+    /// the console desktop plays its own audio and nothing reads it. Read with `i2c`;
     /// written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub console_audio: bool,
@@ -320,6 +319,13 @@ pub struct HostDevices {
     /// until then. The agent learns it as `QUASAR_HOST_UDEV_DATA`. Written only when read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udev_data: Option<bool>,
+    /// Whether the host has `/dev/snd`, as a revision-4 console agent is told it
+    /// (`QUASAR_HOST_SOUND`, #461): the agent hands the device to the console session's
+    /// container and holds none itself. Read only when console mode is turned on, never at
+    /// an actor start, so a sound card that appears during a live console session re-creates
+    /// no agent; `None` until then. Written only when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_sound: Option<bool>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -341,6 +347,7 @@ impl Default for HostDevices {
             dri_nodes: Vec::new(),
             console_vt: false,
             udev_data: None,
+            host_sound: None,
             unknown: Unknown::new(),
         }
     }
@@ -1276,11 +1283,11 @@ fn least_privilege(spec: &mut ContainerSpec, inputs: &Inputs) {
     );
 }
 
-/// Console mode (RH-07 #395, #407; #461): what `deploy/overlays/docker-compose.console.yml`
+/// Console mode (RH-07 #395, #407): what `deploy/overlays/docker-compose.console.yml`
 /// grants, shaped for the engine mode. Each rootful difference from the overlay is listed in
 /// `tests/recipe_compose_parity.rs`.
 ///
-/// From revision 4 (#461, ADR 0009) the console session's container, not the agent, holds
+/// From revision 4 (ADR 0009) the console session's container, not the agent, holds
 /// the screen, the raw input and the sound device: the agent keeps only what it uses to
 /// launch and watch one. That is the console terminal ([`console_vt`]), read access to the
 /// display cards it already has, the i2c nodes for monitor power over DDC, logind's state
@@ -1297,12 +1304,10 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs, revision: u32) {
     let rootless = inputs.devices.engine_rootless;
     if revision < 4 {
         agent_drawn_console(spec, inputs);
-    } else {
+    } else if let Some(sound) = inputs.devices.host_sound {
         // The agent hands the console desktop the host's sound device; it opens none.
-        spec.env.insert(
-            HOST_SOUND_ENV.into(),
-            if inputs.devices.sound { "1" } else { "0" }.into(),
-        );
+        spec.env
+            .insert(HOST_SOUND_ENV.into(), if sound { "1" } else { "0" }.into());
     }
     // logind's seat and session files, read-only: how the agent names what holds the
     // display when it cannot take it.
@@ -1339,7 +1344,7 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs, revision: u32) {
 }
 
 /// Revision 3's console grants, for the console the agent itself drew on the monitor and
-/// played the session's audio for (retired by #461): rendered unchanged so an actor can put
+/// played the session's audio for (retired): rendered unchanged so an actor can put
 /// a revision-3 agent back.
 fn agent_drawn_console(spec: &mut ContainerSpec, inputs: &Inputs) {
     let rootless = inputs.devices.engine_rootless;
@@ -1401,9 +1406,9 @@ pub const CONSOLE_HOST_PREFIX: &str = "/host";
 /// console agent created since that was read.
 pub const HOST_UDEV_DATA_ENV: &str = "QUASAR_HOST_UDEV_DATA";
 
-/// `1` or `0`: whether the host has a sound device, `/dev/snd` ([`HostDevices::sound`]), on
-/// a console agent from revision 4. The agent hands it to the console desktop and opens
-/// none itself.
+/// `1` or `0`: whether the host has a sound device, `/dev/snd` ([`HostDevices::host_sound`]),
+/// on a console agent from revision 4 created since that was read. The agent hands it to the
+/// console desktop and opens none itself.
 pub const HOST_SOUND_ENV: &str = "QUASAR_HOST_SOUND";
 
 /// `1` on an agent container created with the console additions, and absent otherwise.

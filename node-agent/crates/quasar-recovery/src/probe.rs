@@ -247,6 +247,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         console_vt: report.console_vt,
         // Read only when console mode is turned on (`console::ConsoleDevices`).
         udev_data: None,
+        host_sound: None,
         engine_rootless: false,
         host_sysfs: false,
     };

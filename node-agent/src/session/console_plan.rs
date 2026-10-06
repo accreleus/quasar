@@ -10,13 +10,13 @@ pub const DIRECT_DISPLAY_ENV: &str = "QUASAR_DIRECT_DISPLAY";
 pub const UDEV_DATA: &str = "/run/udev/data";
 
 /// `1` or `0`: whether the host has a sound device (`/dev/snd`) to hand a console desktop.
-/// The agent holds none itself (#461), so the recovery actor reads it each time console
-/// mode is turned on and sets it on the agent, and the Compose console overlay sets it too.
+/// The agent holds none itself, so the recovery actor reads it each time console
+/// mode is turned on and sets it on the agent. The Compose console overlay does not set it:
+/// a Compose agent sees the host's `/dev/snd` through the base file's `/dev:/host/dev` bind.
 pub const HOST_SOUND_ENV: &str = "QUASAR_HOST_SOUND";
 
-/// The host's sound answer: the recovery actor's when it gave one, else whether `/dev/snd`
-/// is in the agent's own container (an agent created before the answer existed still had
-/// the host's sound device bound).
+/// The host's sound answer: the recovery actor's when it gave one, else whether the host's
+/// `/dev/snd` is visible to the agent (`/host/dev/snd` on a Compose install).
 pub fn host_sound(told: Option<&str>, own_dev_snd: bool) -> bool {
     match told.map(str::trim) {
         Some("1") => true,
@@ -243,6 +243,38 @@ fn sysfs_root() -> &'static std::path::Path {
 /// exposes one, read from the real sysfs root.
 pub fn hidraw_sibling(event_node: &str) -> Option<String> {
     hidraw_sibling_at(sysfs_root(), event_node)
+}
+
+/// Every hidraw device the host has right now, as the host path of its node
+/// (`/dev/hidrawN`), for an `InputGrant::All` console. Listed from sysfs, which is not
+/// namespaced: an owned agent has neither the host's `/dev/hidraw*` nor `/host/dev`, and
+/// needs neither, since the engine resolves a `--device` path on the host.
+pub fn host_hidraw_nodes() -> Vec<String> {
+    host_hidraw_nodes_at(sysfs_root())
+}
+
+/// Injectable-root version of [`host_hidraw_nodes`]: the `class/hidraw/hidrawN` entries
+/// under `sysfs_root`, in device-number order.
+pub fn host_hidraw_nodes_at(sysfs_root: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(sysfs_root.join("class/hidraw")) else {
+        return Vec::new();
+    };
+    let mut numbers: Vec<u32> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let digits = name.to_str()?.strip_prefix("hidraw")?;
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| digits.parse().ok())
+                .flatten()
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
+        .into_iter()
+        .map(|n| format!("/dev/hidraw{n}"))
+        .collect()
 }
 
 /// Injectable-root version of [`hidraw_sibling`], so a test can point at a tempdir built
@@ -544,6 +576,26 @@ mod tests {
         assert_eq!(
             hidraw_sibling_at(root, "/dev/input/event11"),
             Some("/dev/hidraw5".to_string())
+        );
+    }
+
+    #[test]
+    fn host_hidraw_nodes_are_listed_from_sysfs_as_host_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            host_hidraw_nodes_at(root).is_empty(),
+            "no class/hidraw at all"
+        );
+        let class = root.join("class/hidraw");
+        for name in [
+            "hidraw10", "hidraw2", "hidraw0", "hidrawx", "hidraw", "other",
+        ] {
+            std::fs::create_dir_all(class.join(name)).unwrap();
+        }
+        assert_eq!(
+            host_hidraw_nodes_at(root),
+            vec!["/dev/hidraw0", "/dev/hidraw2", "/dev/hidraw10"]
         );
     }
 

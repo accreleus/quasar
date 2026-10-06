@@ -51,6 +51,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             console_audio: false,
             console_vt: false,
             udev_data: None,
+            host_sound: None,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -350,7 +351,7 @@ fn node_agent_revision_4_renders_its_golden_specification_per_vendor() {
     }
 }
 
-/// #461 (ADR 0009): from revision 4 the console session's container, not the agent, holds
+/// ADR 0009: from revision 4 the console session's container, not the agent, holds
 /// the screen, the input and the sound device. Console mode gives the agent only what it
 /// launches and watches a console desktop with: logind's state to name a display holder,
 /// the i2c nodes for DDC (a rootful `c 89` rule, or each node on a rootless engine), the
@@ -408,6 +409,7 @@ fn node_agent_revision_4_with_console_mode_gives_the_agent_only_its_own_console_
         console.devices.logind = true;
         console.devices.console_vt = true;
         console.devices.udev_data = Some(true);
+        console.devices.host_sound = Some(true);
         console.devices.i2c = vec![3, 12];
         let without = render(Role::NodeAgent, 4, &plain, &image, &secrets).unwrap();
         let with = render(Role::NodeAgent, 4, &console, &image, &secrets).unwrap();
@@ -476,25 +478,30 @@ fn node_agent_revision_4_with_console_mode_gives_the_agent_only_its_own_console_
         assert_eq!(with.security_opt, without.security_opt, "{file}");
         assert_eq!(with.gpus, without.gpus, "{file}");
 
-        // A host with none of them: told there is no sound device, and nothing the engine
-        // would have to find on the host.
+        // A host with none of them, read: told there is no sound device, and nothing the
+        // engine would have to find on the host.
         let mut bare = console.clone();
         bare.devices.sound = false;
+        bare.devices.host_sound = Some(false);
         bare.devices.console_audio = false;
         bare.devices.logind = false;
         bare.devices.console_vt = false;
         bare.devices.udev_data = None;
         bare.devices.i2c.clear();
-        let bare = render(Role::NodeAgent, 4, &bare, &image, &secrets).unwrap();
-        assert_eq!(binds(&bare), binds(&without), "{file}");
-        assert_eq!(bare.devices, without.devices, "{file}");
-        assert_eq!(bare.cap_add, without.cap_add, "{file}");
+        let quiet = render(Role::NodeAgent, 4, &bare, &image, &secrets).unwrap();
+        assert_eq!(binds(&quiet), binds(&without), "{file}");
+        assert_eq!(quiet.devices, without.devices, "{file}");
+        assert_eq!(quiet.cap_add, without.cap_add, "{file}");
         assert_eq!(
-            bare.env.get("QUASAR_HOST_SOUND").map(String::as_str),
+            quiet.env.get("QUASAR_HOST_SOUND").map(String::as_str),
             Some("0"),
             "{file}"
         );
-        assert!(!bare.env.contains_key("QUASAR_HOST_UDEV_DATA"), "{file}");
+        assert!(!quiet.env.contains_key("QUASAR_HOST_UDEV_DATA"), "{file}");
+        // Not read yet (machine state from before revision 4): no answer rendered at all.
+        bare.devices.host_sound = None;
+        let unread = render(Role::NodeAgent, 4, &bare, &image, &secrets).unwrap();
+        assert!(!unread.env.contains_key("QUASAR_HOST_SOUND"), "{file}");
     }
 }
 

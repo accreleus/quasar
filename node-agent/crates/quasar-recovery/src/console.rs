@@ -395,9 +395,14 @@ impl ConsoleDevices {
     }
 
     /// [`Self::apply`], plus the facts read only when console mode is turned on: the agent
-    /// is re-created then anyway, so a new one never re-creates it at an actor start.
+    /// is re-created then anyway, so a new one never re-creates it at an actor start. Sound
+    /// is both: revision 3 binds the device when present and follows it at every start;
+    /// revision 4 only tells the agent ([`HostDevices::host_sound`]), and only from here.
+    ///
+    /// [`HostDevices::host_sound`]: crate::recipe::HostDevices::host_sound
     pub(crate) fn apply_for_console(self, devices: &mut crate::recipe::HostDevices) {
         devices.udev_data = Some(self.udev_data);
+        devices.host_sound = Some(self.sound);
         self.apply(devices);
     }
 }

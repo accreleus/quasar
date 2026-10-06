@@ -7845,7 +7845,7 @@ mod tests {
             false,
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(4);
-        // `dual_output` is retired (#461): refused as a topology, whatever the access.
+        // `dual_output` is retired: refused as a topology, whatever the access.
         for (topology, refusal) in [
             ("local_only", "without console access"),
             ("dual_output", "dual_output is retired"),

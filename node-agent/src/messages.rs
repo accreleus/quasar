@@ -1550,7 +1550,7 @@ mod tests {
             }
         ));
 
-        // #461: the retired `dual_output` (and any value this agent does not run) still
+        // The retired `dual_output` (and any value this agent does not run) still
         // parses, so the assignment can be refused with an ack instead of dropped.
         for retired in ["dual_output", "something_newer"] {
             let mut msg = base.clone();
