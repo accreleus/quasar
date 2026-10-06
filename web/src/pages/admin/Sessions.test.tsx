@@ -9,6 +9,7 @@ import * as adminApi from "../../api/admin";
 import type { AdminSession, Host } from "../../api/types";
 import { ToastProvider } from "../../components/Toast";
 import { Sessions } from "./Sessions";
+import { detailHeadline } from "./sessions/SessionRow";
 
 vi.mock("../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../api/admin");
@@ -304,6 +305,45 @@ describe("Sessions — rows", () => {
     await mount([RUNNING, FAILED]);
     expect(screen.getByText(/bbbbbbbb · failed/)).toBeInTheDocument();
     expect(screen.getByText("aaaaaaaa")).toBeInTheDocument();
+  });
+
+  it("follows the id with a running session's detail, and says nothing when there is none", async () => {
+    const CONSOLE = makeSession({
+      id: "eeeeeeee-0000-0000-0000-000000000005",
+      app_name: "KDE Plasma",
+      state_detail: "displaying 3840×2160 @ 240 Hz",
+    });
+    await mount([CONSOLE, RUNNING]);
+    const row = screen.getByText("KDE Plasma").closest("tr")!;
+    expect(within(row).getByText("eeeeeeee")).toBeInTheDocument();
+    expect(within(row).getByText("· displaying 3840×2160 @ 240 Hz")).toHaveAttribute(
+      "title",
+      "displaying 3840×2160 @ 240 Hz",
+    );
+    // RUNNING carries state_detail: null — the sub-label is the bare id, alone.
+    const plain = screen.getByText("aaaaaaaa");
+    expect(plain.children).toHaveLength(0);
+    expect(plain.textContent).toBe("aaaaaaaa");
+  });
+
+  it("cuts a detail's reason from the row, keeping it whole in the title", async () => {
+    const why = "not displaying: nothing is scanned out on the console connector";
+    await mount([makeSession({ id: "ffffffff-0000-0000-0000-000000000006", app_name: "Steam", state_detail: why })]);
+    expect(screen.getByText("· not displaying")).toHaveAttribute("title", why);
+    expect(screen.queryByText(/scanned out/)).not.toBeInTheDocument();
+  });
+
+  it("ellipsises a headline too long for the session column", () => {
+    expect(detailHeadline("swap failed; rolled back: image missing")).toBe("swap failed; rolled back");
+    const long = detailHeadline("x".repeat(80));
+    expect(long).toHaveLength(40);
+    expect(long.endsWith("…")).toBe(true);
+  });
+
+  it("leaves a terminal session's detail to the session page", async () => {
+    await mount([{ ...FAILED, state_detail: "app exited" }]);
+    expect(screen.getByText("bbbbbbbb · failed")).toBeInTheDocument();
+    expect(screen.queryByText(/app exited/)).not.toBeInTheDocument();
   });
 
   it("carries the full ids as titles, for log correlation", async () => {

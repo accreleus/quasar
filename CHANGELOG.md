@@ -49,7 +49,7 @@ own; the two do not move together, and that is deliberate.
   Contract: protocol amendment 19.
 
 ### Fixed
-- **A console session survives the monitor being switched off (#458).** A monitor that drops its DisplayPort link on power-off looked like an unplug and the desktop was restarted, closing its apps. A disconnected connector no longer stops the session; the desktop handles the display's return. A host that wants an unplug to end the session sets `QUASAR_CONSOLE_DISCONNECT_GRACE` on the control plane. A console session reports "displaying 3840×2160 @ 240 Hz" instead of a streaming label.
+- **A console session survives the monitor being switched off (#458).** A monitor that drops its DisplayPort link on power-off looked like an unplug and the desktop was restarted, closing its apps. A disconnected connector no longer stops the session; the desktop handles the display's return. A host that wants an unplug to end the session sets `QUASAR_CONSOLE_DISCONNECT_GRACE` on the control plane. The admin session list and the session page show what a running session is doing: "displaying 3840×2160 @ 240 Hz" (or "not displaying: …") for a console session, "app presented" for a stream.
 - **In console mode, a desktop that only resizes its own window when you pick a resolution
   still moves the monitor to match (#447).** Some desktops don't speak the standard
   output-management protocol but do resize their fullscreen window on a resolution change;
