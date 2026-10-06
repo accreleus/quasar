@@ -1105,6 +1105,7 @@ launcher starts its desktop on the DRM backend. What the container is given:
 | the console GPU's card and render nodes | the desktop opens the card itself and becomes DRM master by being its first opener |
 | `/dev/snd` (when the host has it) | the desktop's own audio stack plays through the monitor or the sound card |
 | `/dev/input`, bind-mounted read-only, with device-cgroup rule `c 13:* rwm` | input devices, including ones plugged in later. Nodes still open read-write; the container cannot change the host's nodes. An allowlist in `input_devices` (`/dev/input/eventN` only) passes just those nodes, and no rule. |
+| every `/dev/hidrawN` node present at launch, passed individually with `--device`, plus device-cgroup rule `c <major>:* rwm` (the major read fresh from `/proc/devices`, since it is dynamic) | Steam Input reads a controller's identity over hidraw; with none, Steam falls back to an evdev GUID match that can misname the pad (#462). An `input_devices` allowlist passes only the allowlisted events' hidraw siblings (resolved through sysfs), and no cgroup rule. `/dev/hidrawN`'s parent is `/dev` itself, so unlike `/dev/input` it is never bind-mounted — that would hand over the whole device directory. |
 | `/run/udev/data`, read-only | so libudev knows the devices. The host's udev control socket is not passed; the image makes the placeholder libudev checks for. |
 | the host network namespace | udev hotplug events arrive over netlink, which is per namespace |
 
@@ -1117,6 +1118,15 @@ framebuffer is on the connector. The connector's mode is reported as the session
 A desktop that does not display within the session's app boot timeout (120 s without one) fails
 the session, naming what was missing. The agent refuses a `local_only` assignment whose app lacks
 `direct_display`, and every `dual_output` assignment.
+
+A hidraw node that is granted at launch stays usable even when it is unplugged and replugged
+(the cgroup rule matches the major, not one node), but a controller plugged in for the **first**
+time after the container started is not identified correctly until the next session: with no
+bind of `/dev` itself, nothing inside the container creates the new `/dev/hidrawN` node — only
+the host's udev does that, and the image's udev client never runs inside the container. The
+evdev path still works meanwhile (hotplugged `/dev/input` nodes do appear, via the bind plus
+the `c 13:* rwm` rule), so a controller plugged in mid-session keeps working, just named from
+its evdev GUID rather than as itself, until the session is restarted.
 
 **The console terminal (#407).** Not a knob. For the life of every local console session
 (`local_only`; `dual_output` was retired by amendment 19) the agent makes `tty8` the active virtual

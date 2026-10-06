@@ -203,10 +203,29 @@ fn run_until_end<F: Fn(SessionEvent)>(
         Err(reason) => return failed(Failure::InputRefused, reason),
     };
     let card_node = format!("/dev/dri/{}", output.card);
+    let (hidraw_nodes, hidraw_major) = match &input {
+        // Every existing hidraw node, plus the major so a controller plugged in later
+        // still opens once its node appears (#462).
+        console_plan::InputGrant::All => (host_hidraw_nodes(), host_hidraw_major()),
+        // Only the allowlisted events' resolved siblings; no hotplug rule.
+        console_plan::InputGrant::Nodes(nodes) => {
+            let mut resolved: Vec<String> = Vec::new();
+            for node in nodes {
+                if let Some(sibling) = console_plan::hidraw_sibling(node) {
+                    if !resolved.contains(&sibling) {
+                        resolved.push(sibling);
+                    }
+                }
+            }
+            (resolved, None)
+        }
+    };
     let host = ConsoleHost {
         card_node: card_node.clone(),
         render_node: output.render_node.clone(),
         sound: host_has_sound(),
+        hidraw_nodes,
+        hidraw_major,
     };
     let _claim = crate::capacity::claim_display(&output.card);
 
@@ -397,6 +416,39 @@ fn host_has_sound() -> bool {
         std::path::Path::new("/dev")
     };
     dev.join("snd").is_dir()
+}
+
+/// Every `/dev/hidrawN` node the host has right now, for an `InputGrant::All` console.
+/// Same dev-root choice as [`host_has_sound`]: `/host/dev` when the recipe mounts it,
+/// else the agent's own `/dev`.
+fn host_hidraw_nodes() -> Vec<String> {
+    let host_dev = std::path::Path::new("/host/dev");
+    let dev = if host_dev.is_dir() {
+        host_dev
+    } else {
+        std::path::Path::new("/dev")
+    };
+    let Ok(entries) = std::fs::read_dir(dev) else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            name.starts_with("hidraw").then(|| format!("/dev/{name}"))
+        })
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// hidraw's character major, read fresh at launch (it is dynamic, not a fixed constant
+/// like evdev's). sysfs-adjacent `/proc/devices` is not namespaced any more than
+/// `/sys/class/drm` is (see [`crate::capacity::detect_drm_outputs`]), so the agent's own
+/// read already answers for the host, with no `/host` mount needed.
+fn host_hidraw_major() -> Option<u32> {
+    let contents = std::fs::read_to_string("/proc/devices").ok()?;
+    console_plan::hidraw_major_from(&contents)
 }
 
 #[cfg(test)]
