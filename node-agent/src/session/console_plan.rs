@@ -49,9 +49,9 @@ pub fn input_grant(input_devices: &serde_json::Value) -> Result<InputGrant, Stri
             for item in items {
                 let node = item
                     .as_str()
-                    .filter(|path| path.starts_with("/dev/input/") && !path.contains(".."))
+                    .filter(|path| is_event_node(path))
                     .ok_or_else(|| {
-                        format!("input_devices entry {item} is not a /dev/input node")
+                        format!("input_devices entry {item} is not a /dev/input/event node")
                     })?;
                 if !nodes.iter().any(|n| n == node) {
                     nodes.push(node.to_string());
@@ -60,9 +60,38 @@ pub fn input_grant(input_devices: &serde_json::Value) -> Result<InputGrant, Stri
             Ok(InputGrant::Nodes(nodes))
         }
         other => Err(format!(
-            "input_devices must be \"auto\" or a list of /dev/input nodes, not {other}"
+            "input_devices must be \"auto\" or a list of /dev/input/event nodes, not {other}"
         )),
     }
+}
+
+/// Why an assignment's topology cannot run here (agent-api.md amendment 19): `dual_output`
+/// is retired, and a console session's app must declare `runtime_spec.direct_display`.
+pub fn topology_refusal(
+    topology: crate::messages::VideoTopology,
+    app_direct: bool,
+) -> Option<String> {
+    use crate::messages::VideoTopology;
+    match topology {
+        VideoTopology::StreamOnly => None,
+        VideoTopology::LocalOnly if app_direct => None,
+        VideoTopology::LocalOnly => Some(
+            "a console session's app must declare runtime_spec.direct_display: this one \
+             cannot drive the display directly"
+                .into(),
+        ),
+        VideoTopology::DualOutput => Some(
+            "dual_output is retired: a console session is never \
+             streamed"
+                .into(),
+        ),
+    }
+}
+
+/// `/dev/input/eventN` exactly: a directory handed to `--device` expands to every node in it.
+fn is_event_node(path: &str) -> bool {
+    path.strip_prefix("/dev/input/event")
+        .is_some_and(|n| !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The output a console desktop drives: `cardN:CONNECTOR` names one, absent or `auto`
@@ -104,22 +133,20 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
     if host.sound {
         device("/dev/snd");
     }
-    let mut bind = |src: &str, read_only: bool| {
+    let mut bind = |src: &str| {
         args.push("--mount".to_string());
-        args.push(format!(
-            "type=bind,src={src},dst={src}{}",
-            if read_only { ",readonly" } else { "" }
-        ));
+        args.push(format!("type=bind,src={src},dst={src},readonly"));
     };
-    match input {
-        InputGrant::All => bind("/dev/input", false),
-        InputGrant::Nodes(_) => {}
+    // Read-only: device nodes still open read-write, but container root cannot chmod,
+    // chown or unlink the host's own nodes.
+    if input == &InputGrant::All {
+        bind("/dev/input");
     }
-    // libudev reads device properties from the data dir and takes the control socket's
-    // presence to mean udev is running; the hotplug events themselves arrive over netlink,
-    // which is why the container shares the host's network namespace.
-    bind("/run/udev/data", true);
-    bind("/run/udev/control", true);
+    // libudev reads device properties here. Hotplug events arrive over netlink, which is
+    // why the container shares the host's network namespace. The host's udev control
+    // socket is never handed in (root inside could steer the host's udevd through it);
+    // the image makes the placeholder libudev looks for.
+    bind("/run/udev/data");
     match input {
         InputGrant::All => args.extend(["--device-cgroup-rule".into(), INPUT_CGROUP_RULE.into()]),
         InputGrant::Nodes(nodes) => {
@@ -170,6 +197,20 @@ mod tests {
     }
 
     #[test]
+    fn only_direct_console_apps_and_no_dual_output_are_accepted() {
+        use crate::messages::VideoTopology::*;
+        assert_eq!(topology_refusal(StreamOnly, false), None);
+        assert_eq!(topology_refusal(StreamOnly, true), None);
+        assert_eq!(topology_refusal(LocalOnly, true), None);
+        assert!(topology_refusal(LocalOnly, false)
+            .unwrap()
+            .contains("direct_display"));
+        assert!(topology_refusal(DualOutput, true)
+            .unwrap()
+            .contains("dual_output"));
+    }
+
+    #[test]
     fn input_devices_auto_absent_or_a_list() {
         use serde_json::json;
         assert_eq!(input_grant(&json!(null)), Ok(InputGrant::All));
@@ -185,7 +226,18 @@ mod tests {
                 "/dev/input/event5".into()
             ]))
         );
-        for bad in [json!("all"), json!(3), json!(["/dev/sda"]), json!([7])] {
+        for bad in [
+            json!("all"),
+            json!(3),
+            json!(["/dev/sda"]),
+            json!([7]),
+            json!(["/dev/input/"]),
+            json!(["/dev/input/."]),
+            json!(["/dev/input/by-id"]),
+            json!(["/dev/input/event"]),
+            json!(["/dev/input/event3/../../sda"]),
+            json!(["/dev/input/mouse0"]),
+        ] {
             assert!(input_grant(&bad).is_err(), "{bad}");
         }
     }
@@ -231,9 +283,8 @@ mod tests {
         assert_eq!(
             pairs(&args, "--mount"),
             [
-                "type=bind,src=/dev/input,dst=/dev/input",
+                "type=bind,src=/dev/input,dst=/dev/input,readonly",
                 "type=bind,src=/run/udev/data,dst=/run/udev/data,readonly",
-                "type=bind,src=/run/udev/control,dst=/run/udev/control,readonly",
             ]
         );
         assert_eq!(pairs(&args, "--network"), ["host"]);

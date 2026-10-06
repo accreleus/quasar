@@ -1002,9 +1002,9 @@ impl ContainerRuntime {
             .unwrap_or_else(|| Self::container_name(params.session_id));
 
         // Validate the network BEFORE anything is spawned: an out-of-set value must
-        // fail the launch, never reach the engine.
-        // A direct-display console shares the host's network namespace (udev hotplug
-        // arrives over netlink); `console_plan::console_args` carries that grant.
+        // fail the launch, never reach the engine. A direct-display console ignores the
+        // app's network and shares the host's namespace (udev hotplug arrives over
+        // netlink); `console_plan::console_args` carries that grant.
         let direct = params.direct_display.as_ref();
         let network = match direct {
             Some(_) => None,
@@ -1584,7 +1584,7 @@ pub struct LaunchParams<'a> {
     /// #384: the session's streamed display mode, injected as env so an app that cannot
     /// read the Wayland output (nested gamescope) runs at the selected profile.
     pub display: AppDisplayMode,
-    /// A console session's direct-display grants (#453); `None` for every streamed or
+    /// A console session's direct-display grants; `None` for every streamed or
     /// nested launch. With it, no Wayland socket, virtual devices or stream mode are
     /// handed in.
     pub direct_display: Option<super::console_plan::DirectDisplay>,

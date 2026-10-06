@@ -1,4 +1,4 @@
-//! The direct-display console engine (#453, ADR 0009): the console session's app container
+//! The direct-display console engine (ADR 0009): the console session's app container
 //! drives the monitor itself. The agent takes the terminal, claims the card, launches the
 //! container with the console plan's grants, watches that it is displaying, and stops it.
 //! No compositor, pipeline or encoder exists for this session.
@@ -105,7 +105,9 @@ impl DisplayWatch {
     }
 }
 
-/// Run one direct-display console session to its end on the calling thread.
+/// Run one direct-display console session to its end on the calling thread. The terminal
+/// event goes out only once the container is stopped, the card claim released and the
+/// console terminal restored, so a relaunch on it never meets this session's leftovers.
 pub(super) fn run_direct<F: Fn(SessionEvent)>(
     session_id: &str,
     cfg: &SessionConfig,
@@ -114,42 +116,91 @@ pub(super) fn run_direct<F: Fn(SessionEvent)>(
     stop: Arc<AtomicBool>,
     session_metrics: Arc<SessionMetrics>,
 ) {
-    let fail = |reason: String| {
-        tracing::error!(
-            token = "direct-display-failed",
-            reason = %reason,
-            "console session failed"
-        );
-        emit(SessionEvent::Failed(reason));
-    };
     emit(SessionEvent::Starting);
+    let end = run_until_end(
+        session_id,
+        cfg,
+        emit,
+        &diagnostic_tx,
+        &stop,
+        &session_metrics,
+    );
+    emit(end);
+}
+
+/// Why a console session ended in failure; each is logged under its own token.
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    ConsoleOff,
+    NoApp,
+    NoOutput,
+    InputRefused,
+    LaunchFailed,
+    TerminalLost,
+    NeverDisplayed,
+}
+
+fn failed(failure: Failure, reason: String) -> SessionEvent {
+    let message = "console session failed";
+    match failure {
+        Failure::ConsoleOff => {
+            tracing::error!(token = "direct-display-console-off", reason = %reason, "{message}")
+        }
+        Failure::NoApp => {
+            tracing::error!(token = "direct-display-no-app", reason = %reason, "{message}")
+        }
+        Failure::NoOutput => {
+            tracing::error!(token = "direct-display-no-output", reason = %reason, "{message}")
+        }
+        Failure::InputRefused => {
+            tracing::error!(token = "direct-display-input-refused", reason = %reason, "{message}")
+        }
+        Failure::LaunchFailed => {
+            tracing::error!(token = "direct-display-launch-failed", reason = %reason, "{message}")
+        }
+        Failure::TerminalLost => {
+            tracing::error!(token = "direct-display-terminal-lost", reason = %reason, "{message}")
+        }
+        Failure::NeverDisplayed => {
+            tracing::error!(token = "direct-display-never-displayed", reason = %reason, "{message}")
+        }
+    }
+    SessionEvent::Failed(reason)
+}
+
+/// Everything the session holds is a local here, released on return.
+fn run_until_end<F: Fn(SessionEvent)>(
+    session_id: &str,
+    cfg: &SessionConfig,
+    emit: &F,
+    diagnostic_tx: &DiagnosticEventTx,
+    stop: &Arc<AtomicBool>,
+    session_metrics: &SessionMetrics,
+) -> SessionEvent {
     emit(SessionEvent::Progress("taking the console"));
     let Some(console) = cfg.console_config.as_ref().filter(|c| c.enabled) else {
-        fail("local_only assignment requires enabled console_config".into());
-        return;
+        return failed(
+            Failure::ConsoleOff,
+            "local_only assignment requires enabled console_config".into(),
+        );
     };
     let Some(spec) = cfg.container.clone() else {
-        fail("a console session needs an app".into());
-        return;
+        return failed(Failure::NoApp, "a console session needs an app".into());
     };
-
     // Declared first so it drops last: the terminal is restored after the container and
     // the card claim are gone.
-    let mut console_vt = match console_leg::take_terminal(cfg, &stop) {
+    let mut console_vt = match console_leg::take_terminal(cfg, stop) {
         Ok(vt) => vt,
-        Err(reason) => {
-            emit(SessionEvent::Failed(reason));
-            return;
-        }
+        Err(reason) => return SessionEvent::Failed(reason),
     };
     let outputs = crate::capacity::detect_drm_outputs();
     let output = match console_plan::console_output(console.output_id.as_deref(), &outputs) {
         Ok(output) => output.clone(),
-        Err(reason) => return fail(reason),
+        Err(reason) => return failed(Failure::NoOutput, reason),
     };
     let input = match console_plan::input_grant(&console.input_devices) {
         Ok(input) => input,
-        Err(reason) => return fail(reason),
+        Err(reason) => return failed(Failure::InputRefused, reason),
     };
     let card_node = format!("/dev/dri/{}", output.card);
     let host = ConsoleHost {
@@ -178,7 +229,12 @@ pub(super) fn run_direct<F: Fn(SessionEvent)>(
     let mut observation = GenerationObservation::new();
     let mut container = match ContainerRuntime::from_env().run(&spec, &params) {
         Ok(container) => container,
-        Err(e) => return fail(format!("console desktop launch failed: {e:#}")),
+        Err(e) => {
+            return failed(
+                Failure::LaunchFailed,
+                format!("console desktop launch failed: {e:#}"),
+            )
+        }
     };
     tracing::info!(
         output = %output.id,
@@ -202,22 +258,32 @@ pub(super) fn run_direct<F: Fn(SessionEvent)>(
             },
         );
     };
+    let displaying = |mode: Option<ScanoutMode>| {
+        session_metrics.set_console_mode(mode.map(|m| (m.width, m.height, m.refresh_millihz)));
+        tracing::info!(?mode, "console desktop is displaying");
+        trace(
+            "console.displaying",
+            serde_json::json!({ "mode": mode_json(mode) }),
+        );
+    };
     let started = Instant::now();
     let mut watch = DisplayWatch::new(cfg.app_boot_timeout.unwrap_or(DEFAULT_DISPLAY_BUDGET));
     let mut looked_at: Option<Instant> = None;
     loop {
         if let Some(reason) = console_leg::terminal_lost(&mut console_vt) {
             stop_container(&mut container);
-            return fail(format!("console terminal lost: {reason}"));
+            return failed(
+                Failure::TerminalLost,
+                format!("console terminal lost: {reason}"),
+            );
         }
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
             stop_container(&mut container);
-            emit(SessionEvent::Stopped {
+            return SessionEvent::Stopped {
                 bytes_used: compute_bytes_used(cfg),
                 detail: None,
-            });
-            return;
+            };
         }
         if let Some(status) = observation.take_exit() {
             tracing::error!(
@@ -232,42 +298,23 @@ pub(super) fn run_direct<F: Fn(SessionEvent)>(
                     "video_topology": "local_only",
                 }),
             );
-            emit(app_exit_event(
-                status,
-                watch.running,
-                observation.log_tail(),
-            ));
+            let end = app_exit_event(status, watch.running, observation.log_tail());
             stop_container(&mut container);
-            return;
+            return end;
         }
         let due = looked_at.map_or(started.elapsed() >= FIRST_LOOK, |at| {
             at.elapsed() >= LOOK_EVERY
         });
         if due {
             looked_at = Some(Instant::now());
-            let mut facts =
+            let facts =
                 displaying::read_drm_facts(std::path::Path::new(&card_node), &output.connector);
-            facts.container_alive = true;
-            let mode_tuple =
-                |mode: Option<ScanoutMode>| mode.map(|m| (m.width, m.height, m.refresh_millihz));
             match watch.observe(displaying::verdict(&facts), started.elapsed()) {
                 WatchStep::Running(mode) => {
-                    session_metrics.set_console_mode(mode_tuple(mode));
-                    tracing::info!(?mode, "console desktop is displaying");
-                    trace(
-                        "console.displaying",
-                        serde_json::json!({ "mode": mode_json(mode) }),
-                    );
+                    displaying(mode);
                     emit(SessionEvent::Running);
                 }
-                WatchStep::ModeChanged(mode) | WatchStep::Regained(mode) => {
-                    session_metrics.set_console_mode(mode_tuple(mode));
-                    tracing::info!(?mode, "console desktop is displaying");
-                    trace(
-                        "console.displaying",
-                        serde_json::json!({ "mode": mode_json(mode) }),
-                    );
-                }
+                WatchStep::ModeChanged(mode) | WatchStep::Regained(mode) => displaying(mode),
                 WatchStep::Lost(missing) => {
                     let why = describe(&missing);
                     tracing::warn!(
@@ -280,12 +327,14 @@ pub(super) fn run_direct<F: Fn(SessionEvent)>(
                     );
                 }
                 WatchStep::NeverDisplayed(missing) => {
-                    let reason = format!(
-                        "the console desktop never displayed: {}",
-                        describe(&missing)
-                    );
                     stop_container(&mut container);
-                    return fail(reason);
+                    return failed(
+                        Failure::NeverDisplayed,
+                        format!(
+                            "the console desktop never displayed: {}",
+                            describe(&missing)
+                        ),
+                    );
                 }
                 WatchStep::Wait | WatchStep::Same => {}
             }
@@ -312,27 +361,34 @@ fn mode_json(mode: Option<ScanoutMode>) -> serde_json::Value {
     })
 }
 
-/// Stops the console container within the teardown budget; an unconfirmed stop stays with
-/// the runtime's durable cleanup.
+/// Stops the console container within the session's teardown budget; an unconfirmed stop
+/// stays with the runtime's durable cleanup.
 fn stop_container(container: &mut RunningContainer) {
-    let budget = teardown::RetryBudget::new(Duration::from_secs(30));
+    let budget = teardown::RetryBudget::new(teardown::STOP_RETRY_BUDGET);
+    let mut last_error = None;
     let report = teardown::retry_with_budget(
         || match container.stop() {
             Ok(()) => teardown::StopAttempt::Confirmed,
-            Err(error) => teardown::classify_stop(teardown::error_kind(&error)),
+            Err(error) => {
+                let attempt = teardown::classify_stop(teardown::error_kind(&error));
+                last_error = Some(format!("{error:#}"));
+                attempt
+            }
         },
         &budget,
     );
     if !matches!(report, teardown::StopAttempt::Confirmed) {
         tracing::warn!(
             token = "direct-display-stop-unconfirmed",
-            "console desktop stop not confirmed ({report:?}); runtime cleanup holds it"
+            "console desktop stop not confirmed ({report:?}): {}; runtime cleanup holds it",
+            last_error.as_deref().unwrap_or("no error reported")
         );
     }
 }
 
 /// Does the host have a sound device to hand the desktop? The agent sees the host's `/dev`
-/// at `/host/dev` when the recipe mounts it, else its own `/dev`.
+/// at `/host/dev` when the recipe mounts it, else its own `/dev`, which carries `/dev/snd`
+/// only while the agent's own console grants do (until #461 moves them to the host probe).
 fn host_has_sound() -> bool {
     let host_dev = std::path::Path::new("/host/dev");
     let dev = if host_dev.is_dir() {

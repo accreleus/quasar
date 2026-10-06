@@ -3688,6 +3688,17 @@ impl SessionManager {
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
+                if let Some(refusal) = crate::session::console_plan::topology_refusal(
+                    video_topology,
+                    container.as_ref().is_some_and(|c| c.direct_display),
+                ) {
+                    warn!(
+                        token = "session-assign-rejected",
+                        "session {session_id} assignment rejected: {refusal}"
+                    );
+                    self.note_session_count();
+                    return Some(ack(id, false, Some(refusal)));
+                }
                 let params = match stream_to_params(stream) {
                     Ok(p) => p,
                     Err(error) => {
