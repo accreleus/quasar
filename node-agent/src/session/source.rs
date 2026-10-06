@@ -1244,6 +1244,7 @@ impl AppSource {
             container_name: Some(self.container_name.clone()),
             nvidia_lib32_path: &self.nvidia_lib32_path,
             display: self.display,
+            direct_display: None,
         };
         // Snapshot the commit counter BEFORE the container exists, so anything counted
         // from here on can only have been drawn by the container about to start. Read
@@ -1289,46 +1290,13 @@ impl AppSource {
         }
     }
 
-    /// Spawn the dedicated RuntimeClient observer for a just-launched container. One thread
-    /// per generation owns only observation: each request is bounded, the intentional-stop
-    /// marker ends the loop, and cancellation never asks the engine to stop the workload.
-    /// A verified terminal result supplies final logs before this thread publishes status.
+    /// [`spawn_observer`] for this source's generation.
     fn spawn_exit_waiter(
         &self,
         application: crate::runtime::ApplicationId,
         observer: GenerationObserver,
     ) {
-        let sink_name = self.sink_name.clone();
-        let thread_sink_name = sink_name.clone();
-        let builder = std::thread::Builder::new().name("quasar-app-wait".to_string());
-        let log_span = tracing::Span::current();
-        if let Err(e) = builder.spawn(move || {
-            // Re-enter the session span so this thread's lines carry session=<id>.
-            let _log_span = log_span.enter();
-            let sink_name = thread_sink_name;
-            let observed = application.clone();
-            let tailed = application;
-            observe_until_exit(
-                &observer,
-                &sink_name,
-                || {
-                    crate::runtime::configured()
-                        .and_then(|api| api.observe_application(observed.clone()).wait())
-                },
-                || {
-                    crate::runtime::configured()
-                        .and_then(|api| api.application_log_tail(tailed.clone()).wait())
-                        .ok()
-                },
-                || std::thread::sleep(OBSERVATION_RETRY_DELAY),
-            );
-        }) {
-            tracing::warn!(
-                token = "app-liveness-waiter-spawn-failed",
-                "source '{sink_name}': failed to spawn app-liveness waiter thread: {e} — \
-                 an app exit for this generation will go undetected"
-            );
-        }
+        spawn_observer(self.sink_name.clone(), application, observer);
     }
 
     /// Tear down (idempotent): stop the app container, release the pulse sidecar
@@ -1395,6 +1363,47 @@ impl AppSource {
                 report
             }
         }
+    }
+}
+
+/// Spawn the dedicated RuntimeClient observer for a just-launched container. One thread
+/// per generation owns only observation: each request is bounded, the intentional-stop
+/// marker ends the loop, and cancellation never asks the engine to stop the workload.
+/// A verified terminal result supplies final logs before this thread publishes status.
+/// `label` names the generation in logs.
+pub(crate) fn spawn_observer(
+    label: String,
+    application: crate::runtime::ApplicationId,
+    observer: GenerationObserver,
+) {
+    let thread_label = label.clone();
+    let builder = std::thread::Builder::new().name("quasar-app-wait".to_string());
+    let log_span = tracing::Span::current();
+    if let Err(e) = builder.spawn(move || {
+        // Re-enter the session span so this thread's lines carry session=<id>.
+        let _log_span = log_span.enter();
+        let observed = application.clone();
+        let tailed = application;
+        observe_until_exit(
+            &observer,
+            &thread_label,
+            || {
+                crate::runtime::configured()
+                    .and_then(|api| api.observe_application(observed.clone()).wait())
+            },
+            || {
+                crate::runtime::configured()
+                    .and_then(|api| api.application_log_tail(tailed.clone()).wait())
+                    .ok()
+            },
+            || std::thread::sleep(OBSERVATION_RETRY_DELAY),
+        );
+    }) {
+        tracing::warn!(
+            token = "app-liveness-waiter-spawn-failed",
+            "source '{label}': failed to spawn app-liveness waiter thread: {e} — \
+             an app exit for this generation will go undetected"
+        );
     }
 }
 

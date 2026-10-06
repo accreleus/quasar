@@ -27,6 +27,7 @@ use super::vulkan_fault;
 use super::{pipeline, SessionConfig};
 
 mod console_leg;
+mod direct_display;
 use crate::messages::{AppExitPolicy, VideoTopology};
 
 const SCTP_STOP_RACE_GRACE: Duration = Duration::from_secs(1);
@@ -1375,6 +1376,20 @@ pub fn run_blocking(
         }
     }
     let _metrics_hook_guard = MetricsHookGuard(session_metrics.clone());
+
+    // A direct-display console session has no media pipeline at all.
+    if direct_display::wants_direct(&cfg) {
+        drop(capture_rx);
+        direct_display::run_direct(
+            &session_id,
+            &cfg,
+            &emit,
+            diagnostic_tx,
+            stop,
+            session_metrics,
+        );
+        return;
+    }
 
     if let Err(e) = super::ensure_gst_init(&cfg) {
         tracing::error!(

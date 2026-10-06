@@ -4883,6 +4883,7 @@ fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option
         network: app.network,
         systempaths_unconfined: app.systempaths_unconfined,
         require_local_image: false,
+        direct_display: app.direct_display,
     }))
 }
 

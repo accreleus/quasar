@@ -173,6 +173,7 @@ impl WarmupHost for AgentWarmupHost {
             // path, so it never needs an unmasked /proc.
             systempaths_unconfined: false,
             require_local_image: false,
+            direct_display: false,
         };
 
         let mut cfg = SessionConfig::for_assignment_with(

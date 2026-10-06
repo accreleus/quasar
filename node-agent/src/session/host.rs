@@ -224,6 +224,7 @@ impl SessionHost {
             container_name: None,
             nvidia_lib32_path: &self.nvidia_lib32_path,
             display: self.display,
+            direct_display: None,
         };
         match self.runtime.run(&effective_spec, &params) {
             Ok(c) => {

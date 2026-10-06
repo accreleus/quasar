@@ -19,6 +19,14 @@ pub enum InputGrant {
     Nodes(Vec<String>),
 }
 
+/// What `ContainerRuntime::run` grants a console container in place of the nested
+/// display: the host facts plus the input grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectDisplay {
+    pub host: ConsoleHost,
+    pub input: InputGrant,
+}
+
 /// The host facts a console plan is built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleHost {
@@ -28,6 +36,58 @@ pub struct ConsoleHost {
     pub render_node: Option<String>,
     /// The host has `/dev/snd`.
     pub sound: bool,
+}
+
+/// `console_config.input_devices`: absent or `"auto"` is every device, an array of node
+/// paths is exactly those. Anything else refuses the launch rather than guess.
+pub fn input_grant(input_devices: &serde_json::Value) -> Result<InputGrant, String> {
+    match input_devices {
+        serde_json::Value::Null => Ok(InputGrant::All),
+        serde_json::Value::String(s) if s == "auto" => Ok(InputGrant::All),
+        serde_json::Value::Array(items) => {
+            let mut nodes: Vec<String> = Vec::new();
+            for item in items {
+                let node = item
+                    .as_str()
+                    .filter(|path| path.starts_with("/dev/input/") && !path.contains(".."))
+                    .ok_or_else(|| {
+                        format!("input_devices entry {item} is not a /dev/input node")
+                    })?;
+                if !nodes.iter().any(|n| n == node) {
+                    nodes.push(node.to_string());
+                }
+            }
+            Ok(InputGrant::Nodes(nodes))
+        }
+        other => Err(format!(
+            "input_devices must be \"auto\" or a list of /dev/input nodes, not {other}"
+        )),
+    }
+}
+
+/// The output a console desktop drives: `cardN:CONNECTOR` names one, absent or `auto`
+/// takes the first connected output. The connector must have a monitor.
+pub fn console_output<'a>(
+    output_id: Option<&str>,
+    outputs: &'a [crate::messages::DrmOutputCapability],
+) -> Result<&'a crate::messages::DrmOutputCapability, String> {
+    let output = match output_id.filter(|id| *id != "auto") {
+        Some(id) => outputs
+            .iter()
+            .find(|o| o.id == id)
+            .ok_or_else(|| format!("console output {id} not found on this host"))?,
+        None => outputs
+            .iter()
+            .find(|o| o.connected)
+            .ok_or_else(|| "no console output has a monitor (no monitor connected)".to_string())?,
+    };
+    if !output.connected {
+        return Err(format!(
+            "console output {} has no monitor connected",
+            output.id
+        ));
+    }
+    Ok(output)
 }
 
 /// The grants, as `docker run` arguments `application_request_from_args` understands.
@@ -94,6 +154,70 @@ mod tests {
             .filter(|w| w[0] == flag)
             .map(|w| w[1].clone())
             .collect()
+    }
+
+    fn output(id: &str, connected: bool) -> crate::messages::DrmOutputCapability {
+        let (card, connector) = id.split_once(':').unwrap();
+        crate::messages::DrmOutputCapability {
+            id: id.into(),
+            card: card.into(),
+            render_node: None,
+            connector: connector.into(),
+            connected,
+            active_mode: None,
+            modes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn input_devices_auto_absent_or_a_list() {
+        use serde_json::json;
+        assert_eq!(input_grant(&json!(null)), Ok(InputGrant::All));
+        assert_eq!(input_grant(&json!("auto")), Ok(InputGrant::All));
+        assert_eq!(
+            input_grant(&json!([
+                "/dev/input/event3",
+                "/dev/input/event3",
+                "/dev/input/event5"
+            ])),
+            Ok(InputGrant::Nodes(vec![
+                "/dev/input/event3".into(),
+                "/dev/input/event5".into()
+            ]))
+        );
+        for bad in [json!("all"), json!(3), json!(["/dev/sda"]), json!([7])] {
+            assert!(input_grant(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn auto_takes_the_first_connected_output() {
+        let outputs = [
+            output("card0:DP-1", false),
+            output("card0:DP-2", true),
+            output("card1:HDMI-A-1", true),
+        ];
+        for id in [None, Some("auto")] {
+            assert_eq!(console_output(id, &outputs).unwrap().id, "card0:DP-2");
+        }
+    }
+
+    #[test]
+    fn a_named_output_must_exist_and_have_a_monitor() {
+        let outputs = [output("card0:DP-1", false), output("card1:HDMI-A-1", true)];
+        assert_eq!(
+            console_output(Some("card1:HDMI-A-1"), &outputs).unwrap().id,
+            "card1:HDMI-A-1"
+        );
+        assert!(console_output(Some("card0:DP-1"), &outputs)
+            .unwrap_err()
+            .contains("no monitor"));
+        assert!(console_output(Some("card2:DP-1"), &outputs)
+            .unwrap_err()
+            .contains("not found"));
+        assert!(console_output(None, &[output("card0:DP-1", false)])
+            .unwrap_err()
+            .contains("no monitor"));
     }
 
     #[test]
