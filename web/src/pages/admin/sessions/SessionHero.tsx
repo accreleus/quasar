@@ -11,7 +11,7 @@ import { codecDisplayName, normaliseCodec } from "../../../lib/codecDisplay";
 import { agentMetrics, browserMetrics } from "../../../lib/fleet/sessionMetrics";
 import { bitrate } from "../../../lib/format/bitrate";
 import { durationBetween } from "../../../lib/format/duration";
-import { sessionDotClass } from "./SessionRow";
+import { runningDetail, sessionDotClass } from "./SessionRow";
 
 export interface SessionHeroProps {
   session: AdminSession;
@@ -70,12 +70,16 @@ export function SessionHero({
   ];
 
   // Full host name here, unlike the list rows: nothing is competing for the
-  // width, so there is no reason to strip the `quasar-` prefix.
+  // width, so there is no reason to strip the `quasar-` prefix. The detail
+  // follows the state, as it does in the People drawer's session history.
   const subject = [
     session.username ?? session.user_id.slice(0, 8),
     session.host_name ?? "unassigned",
     session.state,
-  ].join(" · ");
+    runningDetail(session),
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <div className="card">

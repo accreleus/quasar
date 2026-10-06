@@ -299,6 +299,12 @@ pub enum SessionEvent {
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
     Running,
+    /// A console session's desktop is displaying at the connector's mode (`None` when the
+    /// card reports no mode). The first one is the session's `running`; later ones carry a
+    /// mode change or the display coming back.
+    Displaying(Option<super::displaying::ScanoutMode>),
+    /// A running console session's desktop stopped displaying; the session goes on.
+    NotDisplaying(String),
     Stopping,
     /// Session stopped cleanly. `bytes_used` is the post-session du measurement when
     /// `QUASAR_HOME_ROOT` is set, else `None`. `detail` is the terminal `stopped` row's

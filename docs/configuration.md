@@ -116,6 +116,12 @@ then arrive as files.
 | `QUASAR_PLATFORM_WEBHOOK_HOSTS` | unset | Optional comma-separated host allowlist **narrowing** where a release notification may be POSTed (#123). Unset means "whatever host the admin configured", which is already contained: delivery is **https only**, refuses a URL carrying credentials, **follows no redirect**, **refuses at dial any host resolving to a loopback, private, link-local, multicast or unspecified address**, and bounds the response body — the same `internal/outbound` containment `QUASAR_IMAGE_REGISTRY_HOSTS` uses. Set it when the destination should be pinned independently of whoever holds an admin token; a URL whose host is not on the list is refused by name, and the refusal names this variable. **It cannot re-open the private-address guard:** a LAN or loopback receiver is unreachable by design, so a script on the same box needs a public https endpoint (a tunnel, a reverse proxy) in front of it. |
 | `QUASAR_TELEMETRY_RETAIN_INTERVAL` | unset; job default `5m` | How often the `telemetry.retain` job applies the two rules above. A standard job `EnvOverride`: a Go duration that is **authoritative over the admin Jobs page** while it is set (and shown as env-locked there), `0` is the kill switch that stops the job being scheduled at all, and a malformed value falls back to the job row rather than failing startup. One pass deletes in bounded batches, logs one `INFO` line with the counts, and `WARN`s if it took over 30s or could not drain its backlog. **This job is the only thing that deletes session telemetry** — no ingest path prunes, and reaching a terminal state prunes nothing, so with it disabled telemetry grows without bound. |
 
+### Console disconnect grace (`QUASAR_CONSOLE_DISCONNECT_GRACE`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `QUASAR_CONSOLE_DISCONNECT_GRACE` | unset (never) | Unset, a console host's auto-started session is never stopped because its connector reads disconnected: some monitors drop their DisplayPort link when powered off, which the connector cannot tell from an unplug, and the desktop handles the display's return itself. Set to a Go duration to stop the session once the connector has been absent that long (`0` stops at once), with stop reason `console_display_disconnected`; a malformed value refuses startup. |
+
 ### Launch admission right after an agent (re)connects (#288)
 
 Right after a host's node agent (re)connects — a recreate, an update, a control-plane
@@ -1103,7 +1109,9 @@ launcher starts its desktop on the DRM backend. What the container is given:
 | the host network namespace | udev hotplug events arrive over netlink, which is per namespace |
 
 While the session lives, the agent never opens that card node for its inventory (the console
-output list is the last reading, with `connected` refreshed from sysfs). The session is `running`
+output list is the last reading, with `connected` refreshed from sysfs) and never reads the
+monitor's power state over DDC: that read is over a second of i2c traffic on the display link,
+felt as a hitch by a running game. The session is `running`
 once it is **displaying**: the container is alive, a client holds DRM master on the card and a
 framebuffer is on the connector. The connector's mode is reported as the session's console mode.
 A desktop that does not display within the session's app boot timeout (120 s without one) fails

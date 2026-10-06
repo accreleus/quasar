@@ -4793,6 +4793,29 @@ impl SessionManager {
                     None,
                 )
             }
+            SessionEvent::Displaying(mode) => {
+                if let Some(handle) = self.running.get_mut(session_id) {
+                    handle.reached_running = true;
+                }
+                self.note_session_count();
+                let detail = match mode {
+                    Some(m) => format!(
+                        "displaying {}×{} @ {} Hz",
+                        m.width,
+                        m.height,
+                        crate::session::console::mode_fps(&crate::messages::ConsoleModeSelection {
+                            width: m.width,
+                            height: m.height,
+                            refresh_millihz: m.refresh_millihz,
+                        })
+                    ),
+                    None => "displaying".to_string(),
+                };
+                ("running", Some(detail), None)
+            }
+            SessionEvent::NotDisplaying(why) => {
+                ("running", Some(format!("not displaying: {why}")), None)
+            }
             SessionEvent::Stopping => ("stopping", Some("tearing down".to_string()), None),
             // A clean stop never carries an `error_message`. `detail` carries a reason
             // on a peer disconnect, recorded as `state_detail`, so operators see why it
