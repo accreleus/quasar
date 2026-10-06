@@ -60,18 +60,20 @@ pub(super) fn holds_physical_display(cfg: &SessionConfig) -> bool {
 /// Whether the session streams audio to the browser. Must stay the condition
 /// `pipeline::build_encode_pipeline` builds the audio pipeline on.
 pub(super) fn streams_audio(cfg: &SessionConfig) -> bool {
-    cfg.video_topology != VideoTopology::DualOutput
-        || cfg.console_config.as_ref().is_none_or(|c| c.stream_audio)
+    cfg.video_topology != VideoTopology::DualOutput || stream_audio_setting(cfg)
 }
 
-/// The console's `stream_audio` and `connector` settings as the effective-media snapshot
-/// reports them.
-pub(super) fn snapshot_settings(cfg: &SessionConfig) -> (bool, &str) {
-    let console = cfg.console_config.as_ref();
-    (
-        console.is_none_or(|c| c.stream_audio),
-        console.map(|c| c.connector.as_str()).unwrap_or("auto"),
-    )
+/// The console's `stream_audio` setting as the effective-media snapshot reports it.
+pub(super) fn stream_audio_setting(cfg: &SessionConfig) -> bool {
+    cfg.console_config.as_ref().is_none_or(|c| c.stream_audio)
+}
+
+/// The console's connector setting, `auto` without a console config.
+pub(super) fn connector(cfg: &SessionConfig) -> &str {
+    cfg.console_config
+        .as_ref()
+        .map(|c| c.connector.as_str())
+        .unwrap_or("auto")
 }
 
 /// Fail the whole DualOutput session when a required console local-display leg cannot
@@ -110,10 +112,17 @@ pub(super) struct DualOutputLeg {
     backend: console::LocalBackend,
 }
 
+/// A required console display that did not come up. Carries the weston that did start, so
+/// the caller tears the session down before weston is killed, as on every other path.
+pub(super) struct DualOutputFailure {
+    pub(super) reason: String,
+    _weston: Option<console::WestonConsole>,
+}
+
 impl DualOutputLeg {
-    /// Brings up whatever the console config asks of a streamed session. `Err` is the
-    /// `Failed` reason of a real console session whose local display could not come up
-    /// (fail-closed); the dev-only `QUASAR_LOCAL_DISPLAY` fallback stays best-effort.
+    /// Brings up whatever the console config asks of a streamed session. `Err` is a real
+    /// console session whose local display could not come up (fail-closed); the dev-only
+    /// `QUASAR_LOCAL_DISPLAY` fallback stays best-effort.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start(
         cfg: &SessionConfig,
@@ -125,7 +134,7 @@ impl DualOutputLeg {
         vulkan_contexts: Option<&VulkanContextBridge>,
         cuda_ctx: Option<&gst::Context>,
         va_ctx: Option<&gst::Context>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DualOutputFailure> {
         let console_enabled = match cfg.console_config.as_ref() {
             Some(cc) => cc.enabled && cfg.video_topology == VideoTopology::DualOutput,
             None => std::env::var("QUASAR_LOCAL_DISPLAY")
@@ -170,9 +179,11 @@ impl DualOutputLeg {
             // If Weston was selected but failed to come up, don't build the fan-out.
             if local_backend == console::LocalBackend::Weston && weston.is_none() {
                 if console_required {
-                    return Err(
-                        "console: weston compositor failed to start for local display".into(),
-                    );
+                    return Err(DualOutputFailure {
+                        reason: "console: weston compositor failed to start for local display"
+                            .into(),
+                        _weston: weston,
+                    });
                 }
                 break 'local_display None;
             }
@@ -181,9 +192,10 @@ impl DualOutputLeg {
                 Ok(ld) => ld,
                 Err(e) => {
                     if console_required {
-                        return Err(format!(
-                            "console: build local-display pipeline failed: {e:#}"
-                        ));
+                        return Err(DualOutputFailure {
+                            reason: format!("console: build local-display pipeline failed: {e:#}"),
+                            _weston: weston,
+                        });
                     }
                     tracing::warn!(
                         token = "console-display-pipeline-build-failed",
@@ -221,9 +233,12 @@ impl DualOutputLeg {
                     // Consumer-before-source teardown: NULL the local-display pipeline
                     // before the caller tears down the producing source.
                     let _ = ld.pipeline.set_state(gst::State::Null);
-                    return Err(format!(
-                        "console: local-display pipeline failed to reach PLAYING: {e:#}"
-                    ));
+                    return Err(DualOutputFailure {
+                        reason: format!(
+                            "console: local-display pipeline failed to reach PLAYING: {e:#}"
+                        ),
+                        _weston: weston,
+                    });
                 }
                 tracing::warn!(
                     token = "console-display-pipeline-play-failed",
@@ -234,7 +249,7 @@ impl DualOutputLeg {
             }
             tracing::info!(
                 "console mode: local-display fan-out PLAYING (connector={}, backend={})",
-                snapshot_settings(cfg).1,
+                connector(cfg),
                 local_backend.name()
             );
             Some(ld)
@@ -400,7 +415,7 @@ pub(super) fn run_local_only<F: Fn(SessionEvent)>(
     let mut gen_owned: u64 = 0;
     let gen = &mut gen_owned;
     let sink0 = ipsink_name(session_id, *gen);
-    // #445: the monitor's REAL modes, each with its own refresh, advertised before the
+    // #445: the monitor's real modes, each with its own refresh, advertised before the
     // compositor starts so the app's display settings list them and a choice comes back as
     // a mode request. Empty when no display is connected (then no request can be honoured).
     let mut console_modes: Vec<crate::messages::ConsoleModeSelection> = Vec::new();
@@ -457,25 +472,7 @@ pub(super) fn run_local_only<F: Fn(SessionEvent)>(
         return;
     };
 
-    let mut weston = match (local_backend, prestarted_weston) {
-        (console::LocalBackend::Weston, Some(weston)) => Some(weston),
-        (console::LocalBackend::Weston, None) => {
-            match console::spawn_weston_console(session_id, live_cfg.console_config.as_ref()) {
-                Ok(weston) => Some(weston),
-                Err(e) => {
-                    tracing::error!(
-                        token = "runner-weston-launch-failed",
-                        error = %format_args!("{e:#}"),
-                        "spawn weston console failed"
-                    );
-                    emit(SessionEvent::Failed(format!("spawn weston console: {e:#}")));
-                    current_source.teardown();
-                    return;
-                }
-            }
-        }
-        (console::LocalBackend::DirectKms, _) => None,
-    };
+    let mut weston = prestarted_weston;
     let mut local_display = match bring_up_local_display(
         &live_cfg,
         sink0,

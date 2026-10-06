@@ -491,7 +491,6 @@ fn effective_media_snapshot(
                 .find(|feature| caps.contains(feature))
         })
         .unwrap_or("system");
-    let (console_stream_audio, console_connector) = console_leg::snapshot_settings(cfg);
     // #384: what the app container was told its display is, which the stream mode alone
     // cannot answer (rendered at 1440p, or rendered at 1080p and upscaled?). Computed by
     // the same function the launch uses over the same catalog env, so it cannot drift
@@ -542,10 +541,10 @@ fn effective_media_snapshot(
             "render_node": cfg.render_node,
             "cuda_device_id": cfg.cuda_device_id,
             "stream": true,
-            "stream_audio": console_stream_audio,
+            "stream_audio": console_leg::stream_audio_setting(cfg),
             "local_output": local_backend.is_some(),
             "local_backend": local_backend,
-            "connector": console_connector
+            "connector": console_leg::connector(cfg)
         },
         "actual": {
             "game_gpu_access": app_gpu_requested,
@@ -1235,18 +1234,10 @@ fn swap_source_ready(
     }
 }
 
-/// Run one session to completion on the calling (dedicated) thread, over the split
-/// pipeline so the source app can be swapped while encode + `webrtcbin` stay live.
-///
-/// `sig_in_rx` carries inbound answer/ICE from the control-plane relay; outbound offer/ICE
-/// goes out via `evt_tx`. `swap_rx` carries `session_swap_app` requests.
-/// Builds and starts generation 0: the compositor source plus the first app container,
-/// behind the interpipe boundary `sink0` names. `before_start` runs after every
-/// bind-time property is set and before the compositor starts. On failure the reason is
-/// logged and emitted as `Failed`, and `None` returned. The Vulkan producer contexts are
-/// retained for the runner's lifetime: every replacement compositor MUST receive them
-/// before start or it may create a second logical VkDevice while the persistent encoder
-/// stays bound to generation 0.
+/// Starts generation 0 (compositor plus first app container) behind `sink0`; on failure
+/// emits `Failed` and returns `None`. Keep the returned Vulkan contexts for the runner's
+/// life: every replacement compositor must receive them before start, or it may create a
+/// second VkDevice while the encoder stays bound to generation 0.
 #[allow(clippy::too_many_arguments)]
 fn start_first_source<F: Fn(SessionEvent)>(
     cfg: &SessionConfig,
@@ -1338,6 +1329,11 @@ fn start_first_source<F: Fn(SessionEvent)>(
     Some((source, vulkan_contexts))
 }
 
+/// Run one session to completion on the calling (dedicated) thread, over the split
+/// pipeline so the source app can be swapped while encode + `webrtcbin` stay live.
+///
+/// `sig_in_rx` carries inbound answer/ICE from the control-plane relay; outbound offer/ICE
+/// goes out via `evt_tx`. `swap_rx` carries `session_swap_app` requests.
 #[allow(clippy::too_many_arguments)]
 pub fn run_blocking(
     session_id: String,
@@ -1416,8 +1412,6 @@ pub fn run_blocking(
     emit(SessionEvent::Starting);
     emit(SessionEvent::Progress("preparing resources and image"));
 
-    // Declared before `res`, weston and the physical input forwarder so it drops after
-    // them (`console_leg::take_terminal`).
     let mut console_vt = match console_leg::take_terminal(&cfg, &stop) {
         Ok(vt) => vt,
         Err(reason) => {
@@ -1769,10 +1763,10 @@ pub fn run_blocking(
         va_ctx.as_ref(),
     ) {
         Ok(leg) => leg,
-        Err(reason) => {
+        Err(failure) => {
             console_leg::fail_dualoutput_console(
                 &emit,
-                reason,
+                failure.reason,
                 &mut current_source,
                 &encode_pipe,
                 audio_pipeline.as_ref(),
