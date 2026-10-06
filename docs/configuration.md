@@ -120,7 +120,7 @@ then arrive as files.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `QUASAR_CONSOLE_DISCONNECT_GRACE` | `5m` | How long a console host's connector may read disconnected before its auto-started console session is stopped (Go duration; `0` stops at once). Many monitors drop their DisplayPort link when powered off, which the connector cannot tell from an unplug; within the grace the desktop keeps running and the display comes back on its own. The stop reason past the grace is `console_display_disconnected`. |
+| `QUASAR_CONSOLE_DISCONNECT_GRACE` | unset (never) | Unset, a console host's auto-started session is never stopped because its connector reads disconnected: some monitors drop their DisplayPort link when powered off, which the connector cannot tell from an unplug, and the desktop handles the display's return itself. Set to a Go duration to stop the session once the connector has been absent that long (`0` stops at once), with stop reason `console_display_disconnected`; a malformed value refuses startup. |
 
 ### Launch admission right after an agent (re)connects (#288)
 

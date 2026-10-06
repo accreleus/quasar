@@ -65,7 +65,7 @@ func TestConsoleAutoStartSkipsWhenPinnedConnectorAbsent(t *testing.T) {
 // remain present — the auto-stop keys off the same pin as auto-start.
 func TestConsoleAutoStopWhenPinnedConnectorGoesAbsent(t *testing.T) {
 	h, pool, ev := selfHealHandler(t)
-	h.consoleAuto.disconnectGrace = 0
+	h.WithConsoleDisconnectGrace(0)
 	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
 
 	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
@@ -143,41 +143,91 @@ func TestResolvedConfigPinnedConnectorFromOutputID(t *testing.T) {
 	}
 }
 
-// A connector that drops and comes back within the disconnect grace keeps the
-// session: a monitor that loses its link on power-off is not an unplug. One that
-// stays absent past the grace stops it, from the timer the first absence armed.
-func TestConsoleAutoStopWaitsOutTheDisconnectGrace(t *testing.T) {
+// Without a configured grace an absent connector never stops the session: a monitor
+// that drops its link on power-off reads as unplugged, and the desktop handles its
+// return.
+func TestConsoleAbsentConnectorKeepsTheSessionByDefault(t *testing.T) {
 	h, pool, ev := selfHealHandler(t)
-	h.consoleAuto.disconnectGrace = 150 * time.Millisecond
 	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
 	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
 	if got := ev.count(); got != 1 {
 		t.Fatalf("launch count = %d, want 1", got)
 	}
-
 	stopEv := &teardownEvents{active: true}
 	h.events = stopEv
 	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
-	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
-	if n := len(stopEv.stopped); n != 0 {
-		t.Fatalf("stops = %d, want 0 (display back within the grace)", n)
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
+	if n := len(stopEv.reasons()); n != 0 {
+		t.Fatalf("stops = %d, want 0", n)
 	}
-	if _, tracked := h.consoleAuto.sessions[hostID]; !tracked {
-		t.Fatal("the session must still be tracked after a short absence")
+	h.consoleAuto.mu.Lock()
+	_, tracked := h.consoleAuto.sessions[hostID]
+	_, noted := h.consoleAuto.absent[hostID]
+	h.consoleAuto.mu.Unlock()
+	if !tracked || !noted {
+		t.Fatalf("tracked=%v noted=%v, want the session kept and the absence noted", tracked, noted)
+	}
+}
+
+// With a grace, a connector that drops and comes back within it keeps the session
+// and disarms the timer; one that stays absent past the grace stops it from the
+// timer the first absence armed. Disabling console mode mid-grace stops the session
+// for that reason alone.
+func TestConsoleAutoStopWaitsOutTheDisconnectGrace(t *testing.T) {
+	const grace = 1500 * time.Millisecond
+	h, pool, ev := selfHealHandler(t)
+	h.WithConsoleDisconnectGrace(grace)
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
+	h.consoleAuto.mu.Lock()
+	_, tracked := h.consoleAuto.sessions[hostID]
+	_, noted := h.consoleAuto.absent[hostID]
+	h.consoleAuto.mu.Unlock()
+	if n := len(stopEv.reasons()); n != 0 || !tracked || noted {
+		t.Fatalf("stops=%d tracked=%v absence=%v, want 0/true/false after the display came back", n, tracked, noted)
 	}
 
 	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		h.consoleAuto.mu.Lock()
-		_, tracked := h.consoleAuto.sessions[hostID]
-		h.consoleAuto.mu.Unlock()
-		if !tracked {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	deadline := time.Now().Add(grace + 3*time.Second)
+	for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
 	}
-	if n := len(stopEv.stopReasons); n != 1 || stopEv.stopReasons[0] != "console_display_disconnected" {
-		t.Fatalf("stops = %v, want one console_display_disconnected after the grace", stopEv.stopReasons)
+	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_display_disconnected" {
+		t.Fatalf("stops = %v, want one console_display_disconnected after the grace", got)
+	}
+	h.consoleAuto.mu.Lock()
+	_, noted = h.consoleAuto.absent[hostID]
+	h.consoleAuto.mu.Unlock()
+	if noted {
+		t.Fatal("the absence must be forgotten once the session is stopped")
+	}
+}
+
+func TestConsoleDisableMidGraceStopsOnceForDisable(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	h.WithConsoleDisconnectGrace(400 * time.Millisecond)
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
+	if err := h.consoleStore.Upsert(context.Background(), hostID, map[string]any{"enabled": false}, nil); err != nil {
+		t.Fatalf("disable console: %v", err)
+	}
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
+	time.Sleep(700 * time.Millisecond)
+	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_disabled" {
+		t.Fatalf("stops = %v, want exactly one console_disabled (the grace timer must be disarmed)", got)
 	}
 }

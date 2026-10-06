@@ -34,6 +34,11 @@ type Config struct {
 	DBStatementTimeout time.Duration // QUASAR_DB_STATEMENT_TIMEOUT (default 30s)
 	DBLockTimeout      time.Duration // QUASAR_DB_LOCK_TIMEOUT (default 10s)
 
+	// QUASAR_CONSOLE_DISCONNECT_GRACE: absent ⇒ a console session is never stopped
+	// for a disconnected connector; set ⇒ stopped once it has been absent that long.
+	ConsoleDisconnectGraceSet bool
+	ConsoleDisconnectGrace    time.Duration
+
 	LogLevel string // "debug"|"info"|"warn"|"error"
 
 	AuthTokenTTL time.Duration // bearer-token lifetime (AUTH_TOKEN_TTL, e.g. "24h")
@@ -297,6 +302,14 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("QUASAR_DB_LOCK_TIMEOUT %q: must be a positive Go duration", v)
 		}
 		c.DBLockTimeout = d
+	}
+	if v := os.Getenv("QUASAR_CONSOLE_DISCONNECT_GRACE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return nil, fmt.Errorf("QUASAR_CONSOLE_DISCONNECT_GRACE %q: must be a Go duration (0 stops at once)", v)
+		}
+		c.ConsoleDisconnectGraceSet = true
+		c.ConsoleDisconnectGrace = d
 	}
 
 	localFile := os.Getenv("QUASAR_LOCAL_ENROLLMENT_FILE")

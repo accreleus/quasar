@@ -4800,10 +4800,14 @@ impl SessionManager {
                 self.note_session_count();
                 let detail = match mode {
                     Some(m) => format!(
-                        "displaying at {}x{}@{}",
+                        "displaying {}×{} @ {} Hz",
                         m.width,
                         m.height,
-                        (m.refresh_millihz + 500) / 1000
+                        crate::session::console::mode_fps(&crate::messages::ConsoleModeSelection {
+                            width: m.width,
+                            height: m.height,
+                            refresh_millihz: m.refresh_millihz,
+                        })
                     ),
                     None => "displaying".to_string(),
                 };
