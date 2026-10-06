@@ -171,11 +171,77 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
 /// `detect_console_capabilities` also does. `session::console::spawn_weston_console` calls
 /// this per launch; the full probe would eat its 15s socket-wait budget for discarded data.
 pub(crate) fn detect_drm_outputs() -> Vec<DrmOutputCapability> {
-    detect_drm_outputs_at(std::path::Path::new("/dev/dri"))
+    detect_drm_outputs_at(
+        std::path::Path::new("/dev/dri"),
+        std::path::Path::new("/sys/class/drm"),
+    )
+}
+
+/// Cards whose display a console desktop owns, with the outputs read before the claim.
+/// The inventory never opens a claimed card's node: opening a primary node while nobody
+/// holds DRM master makes the opener master, and a poll landing while the desktop starts
+/// would leave it without the display.
+fn claimed_cards(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, Vec<DrmOutputCapability>>> {
+    static CLAIMED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<DrmOutputCapability>>>,
+    > = std::sync::OnceLock::new();
+    CLAIMED.get_or_init(Default::default)
+}
+
+/// Held for a console session's life: while it lives, `card`'s outputs are its last
+/// read with `connected` refreshed from sysfs.
+#[derive(Debug)]
+pub(crate) struct DisplayClaim {
+    card: String,
+}
+
+/// Claims `card` (e.g. `card0`) for a console desktop. Call before the desktop starts.
+pub(crate) fn claim_display(card: &str) -> DisplayClaim {
+    let outputs = detect_drm_outputs()
+        .into_iter()
+        .filter(|o| o.card == card)
+        .collect();
+    claim_display_with(card, outputs)
+}
+
+fn claim_display_with(card: &str, outputs: Vec<DrmOutputCapability>) -> DisplayClaim {
+    claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(card.to_string(), outputs);
+    DisplayClaim {
+        card: card.to_string(),
+    }
+}
+
+impl Drop for DisplayClaim {
+    fn drop(&mut self) {
+        claimed_cards()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.card);
+    }
+}
+
+fn claimed_outputs(card: &str, sysfs_root: &std::path::Path) -> Option<Vec<DrmOutputCapability>> {
+    let claimed = claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut outputs = claimed.get(card)?.clone();
+    for output in &mut outputs {
+        let status = sysfs_root
+            .join(format!("{card}-{}", output.connector))
+            .join("status");
+        output.connected = std::fs::read_to_string(status)
+            .map(|s| s.trim() == "connected")
+            .unwrap_or(output.connected);
+    }
+    Some(outputs)
 }
 
 #[derive(Debug)]
-struct DrmCard(std::fs::File);
+pub(crate) struct DrmCard(pub(crate) std::fs::File);
 
 impl std::os::fd::AsFd for DrmCard {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
@@ -185,7 +251,7 @@ impl std::os::fd::AsFd for DrmCard {
 impl drm::Device for DrmCard {}
 impl drm::control::Device for DrmCard {}
 
-fn drm_mode_capability(mode: &drm::control::Mode) -> DrmModeCapability {
+pub(crate) fn drm_mode_capability(mode: &drm::control::Mode) -> DrmModeCapability {
     use drm::control::{ModeFlags, ModeTypeFlags};
     let (width, height) = mode.size();
     let (_, _, htotal) = mode.hsync();
@@ -211,7 +277,10 @@ fn drm_mode_capability(mode: &drm::control::Mode) -> DrmModeCapability {
     }
 }
 
-fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability> {
+fn detect_drm_outputs_at(
+    dri_root: &std::path::Path,
+    sysfs_root: &std::path::Path,
+) -> Vec<DrmOutputCapability> {
     use drm::control::{connector, Device as _};
 
     let mut cards: Vec<_> = std::fs::read_dir(dri_root)
@@ -224,6 +293,10 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
     let mut outputs = Vec::new();
     for entry in cards {
         let card_name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(claimed) = claimed_outputs(&card_name, sysfs_root) {
+            outputs.extend(claimed);
+            continue;
+        }
         // #407: opening a primary node read-write can make the opener DRM master
         // automatically when the display is free, racing spawn_weston_console's own
         // open for it — see session::console::drm_open_lock. Held for this card only.
@@ -1277,6 +1350,44 @@ fn detection_failure(
 
 #[cfg(test)]
 mod tests {
+
+    fn claimed_output(card: &str, connector: &str) -> DrmOutputCapability {
+        DrmOutputCapability {
+            id: format!("{card}:{connector}"),
+            card: card.into(),
+            render_node: None,
+            connector: connector.into(),
+            connected: true,
+            active_mode: None,
+            modes: Vec::new(),
+        }
+    }
+
+    /// A claimed card is reported from its claim, never opened: the fake node here is a
+    /// plain file whose resource ioctl would fail and drop the card from the inventory.
+    #[test]
+    fn a_claimed_card_is_read_from_its_claim_and_sysfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let dri = dir.path().join("dri");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir_all(&dri).unwrap();
+        std::fs::create_dir_all(sys.join("card91-DP-1")).unwrap();
+        std::fs::write(dri.join("card91"), b"").unwrap();
+        std::fs::write(sys.join("card91-DP-1/status"), "disconnected\n").unwrap();
+
+        assert!(detect_drm_outputs_at(&dri, &sys).is_empty());
+        let claim = claim_display_with("card91", vec![claimed_output("card91", "DP-1")]);
+        let outputs = detect_drm_outputs_at(&dri, &sys);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].id, "card91:DP-1");
+        assert!(
+            !outputs[0].connected,
+            "connected follows sysfs while claimed"
+        );
+        drop(claim);
+        assert!(detect_drm_outputs_at(&dri, &sys).is_empty());
+    }
+
     use super::*;
 
     const PCI_IDS_FIXTURE: &str = "\
