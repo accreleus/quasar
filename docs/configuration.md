@@ -1098,8 +1098,8 @@ launcher starts its desktop on the DRM backend. What the container is given:
 |---|---|
 | the console GPU's card and render nodes | the desktop opens the card itself and becomes DRM master by being its first opener |
 | `/dev/snd` (when the host has it) | the desktop's own audio stack plays through the monitor or the sound card |
-| `/dev/input`, bind-mounted, with device-cgroup rule `c 13:* rwm` | input devices, including ones plugged in later. An allowlist in `input_devices` passes only those nodes, and no rule. |
-| `/run/udev/data` and `/run/udev/control`, read-only | so libudev knows the devices, and that udev is running |
+| `/dev/input`, bind-mounted read-only, with device-cgroup rule `c 13:* rwm` | input devices, including ones plugged in later. Nodes still open read-write; the container cannot change the host's nodes. An allowlist in `input_devices` (`/dev/input/eventN` only) passes just those nodes, and no rule. |
+| `/run/udev/data`, read-only | so libudev knows the devices. The host's udev control socket is not passed; the image makes the placeholder libudev checks for. |
 | the host network namespace | udev hotplug events arrive over netlink, which is per namespace |
 
 While the session lives, the agent never opens that card node for its inventory (the console
@@ -1107,7 +1107,8 @@ output list is the last reading, with `connected` refreshed from sysfs). The ses
 once it is **displaying**: the container is alive, a client holds DRM master on the card and a
 framebuffer is on the connector. The connector's mode is reported as the session's console mode.
 A desktop that does not display within the session's app boot timeout (120 s without one) fails
-the session, naming what was missing.
+the session, naming what was missing. The agent refuses a `local_only` assignment whose app lacks
+`direct_display`, and every `dual_output` assignment.
 
 **The console terminal (#407).** Not a knob. For the life of every local console session
 (`local_only`; `dual_output` was retired by amendment 19) the agent makes `tty8` the active virtual
