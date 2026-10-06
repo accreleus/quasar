@@ -55,6 +55,12 @@ own; the two do not move together, and that is deliberate.
   still moves the monitor to match (#447).** Some desktops don't speak the standard
   output-management protocol but do resize their fullscreen window on a resolution change;
   the compositor now treats that resize as the same request and moves the console monitor.
+- **The pull-deadline test flaked under a full parallel `cargo test --workspace` on a loaded
+  machine (#463).** It raced a fixed server-side sleep against the client's own deadline and
+  asserted a fixed wall-clock bound; the fixture now blocks on an explicit release signal
+  instead of a timed sleep, and the elapsed-time assertion is gone. A few sibling timing tests
+  in `images::tests` shared the same too-tight bound on a non-blocking call and got a generous
+  one.
 
 ## 0.4.1 — 2026-10-04
 
