@@ -2496,30 +2496,6 @@ mod app_identity_tests {
         }
     }
 
-    /// #460: a streamed session's plan holds no card node, so no engine creates one in it.
-    #[test]
-    fn a_streamed_plan_has_no_card_node_on_any_engine() {
-        let plan = vec![
-            "--device".to_string(),
-            "/dev/dri/renderD128".into(),
-            "--device".into(),
-            "/dev/dri/renderD129".into(),
-        ];
-        for (dialect, rootless, body) in bodies(&argv_request(plan)) {
-            let devices: Vec<&str> = body["HostConfig"]["Devices"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|d| d["PathOnHost"].as_str().unwrap())
-                .collect();
-            assert_eq!(
-                devices,
-                ["/dev/dri/renderD128", "/dev/dri/renderD129"],
-                "{dialect:?} rootless={rootless}"
-            );
-        }
-    }
-
     /// #460: the console plan is the same request on every engine, and the same container
     /// on the rootful ones. A rootless engine cannot apply a device-cgroup rule (rootless
     /// Podman refuses the create), so it gets none: a later input device opens through the

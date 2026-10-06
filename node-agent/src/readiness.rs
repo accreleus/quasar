@@ -1606,8 +1606,7 @@ fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck 
         );
     }
     let dri = env.root.join("dev/dri");
-    // The render nodes: all of the DRM nodes a streamed app is given (#460).
-    let nodes = dir_entries_matching(&dri, |n| n.starts_with("renderD"));
+    let nodes = dir_entries_matching(&dri, |n| n.starts_with("renderD") || n.starts_with("card"));
     if nodes.is_empty() {
         // Already covered loudly by `render_node`; saying it twice hides the real fault.
         return skip(

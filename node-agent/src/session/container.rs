@@ -46,9 +46,9 @@
 //!     remapped mic (`quasar_mic_src`), and catalog env wins for the device names. The
 //!     sidecar socket grants anonymous auth, so no cookie is shared
 //!     (`audio::pulse_run_args`).
-//!   - GPU: `--gpus all` (NVIDIA) and `--device /dev/dri/renderD*` for each render node,
-//!     never a card node (#460), plus one numeric `--group-add` per group owning a passed
-//!     DRM node. The image registers the runtime-injected driver itself, never baked.
+//!   - GPU: `--gpus all` (NVIDIA) or `--device /dev/dri` (VA/DRI), plus one numeric
+//!     `--group-add` per group owning a passed DRM node. The image registers the
+//!     runtime-injected driver itself, never baked.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -721,7 +721,7 @@ fn env_disabled(var: &str) -> bool {
 /// of per-host state it carries is the GPU vendor decision.
 #[derive(Debug, Clone)]
 pub struct ContainerRuntime {
-    /// Request an NVIDIA GPU via `--gpus all` (every vendor also gets the render nodes).
+    /// Request an NVIDIA GPU via `--gpus all` (AMD/Intel use `--device /dev/dri`).
     /// Knob: `QUASAR_GPU_NVIDIA`.
     nvidia: bool,
 }
@@ -761,16 +761,7 @@ impl ContainerRuntime {
     /// completing in between would mount a volume no check had seen.
     fn app_gpu_access_with(&self, volume: Option<VolumeInfo>) -> AppGpuAccess {
         let nodes = dri_node_owners(Path::new(DRI_DIR));
-        let card_nodes =
-            streamed_card_nodes_from(std::env::var(STREAMED_CARD_NODES_ENV).ok().as_deref());
-        if card_nodes {
-            tracing::warn!(
-                token = "app-card-nodes",
-                "{STREAMED_CARD_NODES_ENV} is on: streamed sessions are given the DRM card nodes \
-                 and can take a console desktop's display"
-            );
-        }
-        let access = app_gpu_access_for(self.nvidia, volume, &nodes, card_nodes);
+        let access = app_gpu_access(self.nvidia, volume, &nodes);
         // The nodes arrive 0660 root:render, and the app user (PUID, no supplementary
         // groups) is neither — so RADV fails `Could not open device
         // /dev/dri/renderD128: Permission denied`, Vulkan enumerates llvmpipe only, and
@@ -778,7 +769,7 @@ impl ContainerRuntime {
         // VK_EXT_physical_device_drm" (desktop images degrade silently to software
         // rendering instead). NVIDIA never hit it: its ICD opens the 0666 /dev/nvidia*
         // nodes. Grants nothing the passed device did not already imply.
-        let group_add = AppGpuAccess::group_add_args(&access.dri_groups);
+        let group_add = access.group_add_args();
         if !group_add.is_empty() {
             tracing::info!(
                 token = "app-dri-group-add",
@@ -1232,7 +1223,7 @@ impl ContainerRuntime {
             let lib32 = nvidia_lib32_mount_args(&lib32);
             args.extend(match direct {
                 // The console GPU's own nodes come from the console plan.
-                Some(_) => access.console_args(&image_ld, &lib32),
+                Some(_) => access.args(&image_ld, &lib32, false),
                 None => access.session_args(&image_ld, &lib32),
             });
         }
@@ -1657,140 +1648,49 @@ pub struct AppGpuAccess {
     nvidia: bool,
     /// Never set on a non-NVIDIA host, whatever the provisioner published.
     driver_volume: Option<VolumeInfo>,
-    /// The DRM nodes a streamed session (and the host probe standing for one) gets: the
-    /// render nodes (`/dev/dri/renderD*`), ascending, and no card node (#460). A card node
-    /// would let a streamed app become DRM master by opening it first, and take the display
-    /// from a console desktop on the same GPU. [`STREAMED_CARD_NODES_ENV`] adds the card
-    /// nodes back.
-    streamed_nodes: Vec<String>,
-    /// The groups owning those nodes. Non-zero, ascending and distinct, as the GPU probe
-    /// profile requires.
-    streamed_groups: Vec<u32>,
-    /// The groups owning every DRM node, card nodes included: a console container is
-    /// given its GPU's card node by the console plan, so it needs that node's group too.
+    /// Non-zero, ascending and distinct, as the GPU probe profile requires.
     dri_groups: Vec<u32>,
 }
 
 /// Decide from observed facts; the live gathering is [`ContainerRuntime::app_gpu_access_live`].
-#[cfg(test)]
 fn app_gpu_access(
     nvidia: bool,
     volume: Option<VolumeInfo>,
     nodes: &[DrmNodeOwner],
 ) -> AppGpuAccess {
-    app_gpu_access_for(nvidia, volume, nodes, false)
-}
-
-/// [`app_gpu_access`], with `card_nodes` saying whether streamed sessions also get the
-/// card nodes ([`STREAMED_CARD_NODES_ENV`]).
-fn app_gpu_access_for(
-    nvidia: bool,
-    volume: Option<VolumeInfo>,
-    nodes: &[DrmNodeOwner],
-    card_nodes: bool,
-) -> AppGpuAccess {
-    let streamed: Vec<DrmNodeOwner> = nodes
-        .iter()
-        .filter(|n| drm_node_number(&n.name, "renderD").is_some() || card_nodes)
-        .map(|n| DrmNodeOwner {
-            name: n.name.clone(),
-            mode: n.mode,
-            gid: n.gid,
-        })
-        .collect();
-    let mut streamed_nodes: Vec<String> = streamed
-        .iter()
-        .map(|n| format!("{DRI_DIR}/{}", n.name))
-        .collect();
-    streamed_nodes.sort_by_key(|path| drm_node_order(path));
     AppGpuAccess {
         nvidia,
         driver_volume: volume.filter(|_| nvidia),
-        streamed_nodes,
-        streamed_groups: granted_dri_gids(&streamed),
         dri_groups: granted_dri_gids(nodes),
-    }
-}
-
-/// Gives streamed sessions and the host probe the card nodes again, as before #460, when
-/// `1`/`true`. Off by default. An escape hatch, not a setting: a streamed app given a card
-/// node can take a console desktop's display. Nested gamescope refuses a GPU whose Vulkan
-/// driver reports no primary node ("physical device has no primary node"), and Mesa reports
-/// one only when the card node is in the container's `/dev/dri`; this restores streamed
-/// gamescope on such a host while that is settled.
-pub const STREAMED_CARD_NODES_ENV: &str = "QUASAR_APP_CARD_NODES";
-
-fn streamed_card_nodes_from(value: Option<&str>) -> bool {
-    matches!(value, Some("1" | "true" | "TRUE" | "yes"))
-}
-
-/// `<prefix><N>` exactly, as its number.
-fn drm_node_number(name: &str, prefix: &str) -> Option<u32> {
-    name.strip_prefix(prefix)
-        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|n| n.parse().ok())
-}
-
-/// Card nodes first, then render nodes, each numerically (`renderD129` before
-/// `renderD1000`), so one set of nodes has one argv.
-fn drm_node_order(path: &str) -> (u8, u32) {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    match drm_node_number(name, "card") {
-        Some(n) => (0, n),
-        None => (1, drm_node_number(name, "renderD").unwrap_or(u32::MAX)),
     }
 }
 
 impl AppGpuAccess {
     /// Numeric only: `render`/`video` do not exist in the app images, and a name that
     /// does not resolve fails the whole `docker run`.
-    fn group_add_args(gids: &[u32]) -> Vec<String> {
-        gids.iter()
+    fn group_add_args(&self) -> Vec<String> {
+        self.dri_groups
+            .iter()
             .flat_map(|gid| ["--group-add".to_string(), gid.to_string()])
             .collect()
     }
 
-    /// A streamed session's `docker run` arguments: the render nodes only, never a card
-    /// node (#460). Order is load-bearing: `nvidia_lib32_mount` must precede the driver
-    /// volume or the two swap places in the realized `Mounts`.
-    ///
-    /// On NVIDIA the device request is the toolkit's to fill. Docker's `--gpus` hook
-    /// (libnvidia-container) injects no DRM node, so the streamed container holds none.
-    /// A CDI request (`nvidia.com/gpu=all`) does: `nvidia-ctk cdi generate` lists every
-    /// DRM node of the GPU, card included, in each GPU device and offers no device
-    /// without it. That card node is the known gap: `console_card` names a streamed app
-    /// that took the display, and a console launch then fails rather than fight for it.
+    /// `docker run` arguments. Order is load-bearing: `nvidia_lib32_mount` must precede
+    /// the driver volume or the two swap places in the realized `Mounts`.
     pub fn session_args(
         &self,
         image_ld_library_path: &str,
         nvidia_lib32_mount: &[String],
     ) -> Vec<String> {
-        let mut args = self.nvidia_args(image_ld_library_path, nvidia_lib32_mount);
-        for node in &self.streamed_nodes {
-            args.push("--device".into());
-            args.push(node.clone());
-        }
-        args.extend(Self::group_add_args(&self.streamed_groups));
-        args
+        self.args(image_ld_library_path, nvidia_lib32_mount, true)
     }
 
-    /// A console container's GPU arguments: the console plan passes its GPU's card and
-    /// render nodes itself, so this adds no DRM node, and the groups of every DRM node so
-    /// the desktop can open the card it is given.
-    pub fn console_args(
+    /// [`Self::session_args`], with `whole_dri` choosing whether every DRM node is passed.
+    fn args(
         &self,
         image_ld_library_path: &str,
         nvidia_lib32_mount: &[String],
-    ) -> Vec<String> {
-        let mut args = self.nvidia_args(image_ld_library_path, nvidia_lib32_mount);
-        args.extend(Self::group_add_args(&self.dri_groups));
-        args
-    }
-
-    fn nvidia_args(
-        &self,
-        image_ld_library_path: &str,
-        nvidia_lib32_mount: &[String],
+        whole_dri: bool,
     ) -> Vec<String> {
         let mut args = Vec::new();
         if self.nvidia {
@@ -1803,6 +1703,12 @@ impl AppGpuAccess {
                 image_ld_library_path,
             ));
         }
+        // AMD/Intel, and NVIDIA's render node for Vulkan/EGL, all want the DRM nodes.
+        if whole_dri {
+            args.push("--device".into());
+            args.push(DRI_DIR.into());
+        }
+        args.extend(self.group_add_args());
         args
     }
 
@@ -1831,8 +1737,8 @@ impl AppGpuAccess {
         crate::runtime::GpuProbeRun {
             entrypoint,
             command,
-            devices: self.streamed_nodes.clone(),
-            groups: self.streamed_groups.clone(),
+            devices: vec![DRI_DIR.into()],
+            groups: self.dri_groups.clone(),
             nvidia_device_request: self.nvidia,
             nvidia: self.driver_volume.as_ref().and_then(nvidia_driver_access),
         }
@@ -2652,139 +2558,41 @@ mod tests {
 
     /// The AMD/Intel launch defect: 0660 root:render nodes with no group-add make RADV
     /// fail to open renderD128, so Vulkan enumerates llvmpipe and gamescope exits 1.
-    /// A streamed session is given the render nodes only (#460), so only their groups; a
-    /// console container is given its card node too, so the card's group as well.
     #[test]
-    fn dri_group_add_covers_every_node_the_app_is_given_and_cannot_open_otherwise() {
-        let streamed = |nodes: &[DrmNodeOwner]| {
+    fn dri_group_add_covers_every_node_the_app_cannot_open_otherwise() {
+        let group_add = |nodes: &[DrmNodeOwner]| {
             flag_values(
                 &app_gpu_access(false, None, nodes).session_args("", &[]),
                 "--group-add",
             )
         };
-        let console = |nodes: &[DrmNodeOwner]| {
-            flag_values(
-                &app_gpu_access(false, None, nodes).console_args("", &[]),
-                "--group-add",
-            )
-        };
         // the aux host: renderD128 root:render(991), card0 root:video(44).
-        let aux = [node("renderD128", 0o660, 991), node("card0", 0o660, 44)];
-        assert_eq!(streamed(&aux), vec!["991"], "the render node's group only");
         assert_eq!(
-            console(&aux),
+            group_add(&[node("renderD128", 0o660, 991), node("card0", 0o660, 44)]),
             vec!["44", "991"],
             "both owning gids, ascending"
         );
 
         // Deduped across nodes sharing a group, and ordered independently of readdir.
-        let two = [
-            node("renderD129", 0o660, 991),
-            node("renderD128", 0o660, 991),
-            node("card1", 0o660, 44),
-        ];
-        assert_eq!(streamed(&two), vec!["991"]);
-        assert_eq!(console(&two), vec!["44", "991"]);
+        assert_eq!(
+            group_add(&[
+                node("renderD129", 0o660, 991),
+                node("renderD128", 0o660, 991),
+                node("card1", 0o660, 44),
+            ]),
+            vec!["44", "991"]
+        );
 
         // Nothing to grant: world-rw needs no group, a groupless mode has none to give,
         // and gid 0 is never handed out.
-        let none = [
+        assert!(group_add(&[
             node("renderD128", 0o666, 991),
             node("card0", 0o600, 44),
             node("renderD129", 0o660, 0),
-        ];
-        assert!(streamed(&none).is_empty());
-        assert!(console(&none).is_empty());
+        ])
+        .is_empty());
 
-        assert!(streamed(&[]).is_empty());
-    }
-
-    /// #460: a streamed session never holds a card node, whatever the vendor, so it cannot
-    /// become DRM master and take the display from a console desktop on the same GPU. The
-    /// argv is engine-independent; `runtime::docker` realizes it the same on every engine.
-    #[test]
-    fn a_streamed_session_is_given_the_render_nodes_and_never_a_card_node() {
-        let dir = tempfile::tempdir().unwrap();
-        let nodes = [
-            node("card1", 0o660, 44),
-            node("renderD129", 0o660, 991),
-            node("card0", 0o660, 44),
-            node("renderD128", 0o660, 991),
-            node("renderD1000", 0o660, 991),
-        ];
-        for (label, nvidia, volume) in [
-            ("amd/intel", false, None),
-            ("nvidia (toolkit userspace)", true, None),
-            (
-                "nvidia (driver volume)",
-                true,
-                Some(volume(dir.path(), Some("quasar-nvidia-driver"), None)),
-            ),
-        ] {
-            let access = app_gpu_access(nvidia, volume, &nodes);
-            let session = access.session_args("/image/lib", &[]);
-            assert_eq!(
-                flag_values(&session, "--device"),
-                [
-                    "/dev/dri/renderD128",
-                    "/dev/dri/renderD129",
-                    "/dev/dri/renderD1000"
-                ],
-                "{label}: every render node, numerically, and nothing else"
-            );
-            let mut argv: Vec<String> = ["run", "--name", "quasar-sess-x"]
-                .map(String::from)
-                .to_vec();
-            argv.extend(session);
-            argv.push("image".into());
-            let request = application_request_for_test(&argv);
-            assert!(
-                request
-                    .devices
-                    .iter()
-                    .all(|d| !d.contains("/card") && d != DRI_DIR),
-                "{label}: {:?}",
-                request.devices
-            );
-            assert_eq!(request.nvidia_gpu, nvidia, "{label}");
-
-            // The console container gets no DRM node from here: the console plan passes
-            // its own GPU's card and render nodes.
-            assert!(
-                flag_values(&access.console_args("/image/lib", &[]), "--device").is_empty(),
-                "{label}"
-            );
-        }
-    }
-
-    /// The escape hatch gives the card nodes back to streamed sessions and the probe alike,
-    /// and only an explicit yes turns it on.
-    #[test]
-    fn the_card_node_escape_hatch_restores_the_card_nodes_for_session_and_probe() {
-        let nodes = [
-            node("renderD128", 0o660, 991),
-            node("card1", 0o660, 44),
-            node("card0", 0o660, 44),
-        ];
-        let access = app_gpu_access_for(false, None, &nodes, true);
-        let session = access.session_args("", &[]);
-        assert_eq!(
-            flag_values(&session, "--device"),
-            ["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/renderD128"]
-        );
-        assert_eq!(flag_values(&session, "--group-add"), ["44", "991"]);
-        let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
-        assert_eq!(flag_values(&session, "--device"), probe.devices);
-        for (value, on) in [
-            (None, false),
-            (Some(""), false),
-            (Some("0"), false),
-            (Some("no"), false),
-            (Some("1"), true),
-            (Some("true"), true),
-        ] {
-            assert_eq!(streamed_card_nodes_from(value), on, "{value:?}");
-        }
+        assert!(group_add(&[]).is_empty());
     }
 
     /// Readiness predicts app access with this same predicate; a divergence is how the
@@ -2894,13 +2702,9 @@ mod tests {
                 "{label}: the probe profile requires non-zero, ascending, distinct gids"
             );
             assert_eq!(
-                flag_values(&session, "--device"),
-                probe.devices,
+                flag_values(&session, "--device").contains(&DRI_DIR.to_string()),
+                probe.devices == vec![DRI_DIR.to_string()],
                 "{label}: DRM nodes"
-            );
-            assert!(
-                probe.devices.iter().all(|d| !d.contains("/card")),
-                "{label}: the probe, like a streamed session, holds no card node"
             );
 
             let gpus_all = flag_values(&session, "--gpus") == ["all"];
@@ -3009,17 +2813,13 @@ mod tests {
         let AppGpuAccess {
             nvidia,
             driver_volume,
-            streamed_nodes,
-            streamed_groups,
-            // A console container's groups; the probe stands for a streamed session.
-            dri_groups: _,
+            dri_groups,
         } = &access;
         let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
         assert_eq!(*nvidia, probe.nvidia_device_request);
         assert_eq!(driver_volume.is_some(), probe.nvidia.is_some());
-        assert_eq!(*streamed_groups, probe.groups);
-        assert_eq!(*streamed_nodes, probe.devices);
-        assert_eq!(probe.devices, vec!["/dev/dri/renderD128".to_string()]);
+        assert_eq!(*dri_groups, probe.groups);
+        assert_eq!(probe.devices, vec![DRI_DIR.to_string()]);
     }
 
     /// The realized create body depends on argv order: the 32-bit bind must precede the
@@ -3053,7 +2853,7 @@ mod tests {
                 "-e".into(),
                 "VK_LOADER_DRIVERS_DISABLE=*lvp_icd*".into(),
                 "--device".into(),
-                "/dev/dri/renderD128".into(),
+                DRI_DIR.into(),
                 "--group-add".into(),
                 "991".into(),
             ]
