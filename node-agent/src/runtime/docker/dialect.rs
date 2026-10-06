@@ -12,6 +12,7 @@
 //! - `no-new-privileges` has no `:true`;
 //! - requested devices and device requests are not reported (rootless never lists a plain
 //!   device; CDI-expanded devices appear only once started, with empty permissions);
+//! - device-cgroup rules are never reported (libpod's inspect has no field for them);
 //! - named volumes sit in `Binds` with extra options, and `HostConfig.Mounts` is empty;
 //! - `Config.Image` names the image even when it was created by ID.
 //!
@@ -502,11 +503,18 @@ impl Dialect {
         })
     }
 
-    /// Whether the read-back is checked for `HostConfig.DeviceCgroupRules`. Podman's read-back
-    /// is not checked yet (#460); rootless Podman cannot apply device rules at all, its
-    /// access being the node's own permissions.
-    pub(crate) fn echoes_device_cgroup_rules(self) -> bool {
-        self == Dialect::Docker
+    /// Are the reported device-cgroup rules exactly what Quasar asked for (#460)? Docker
+    /// echoes `HostConfig.DeviceCgroupRules` exactly. Podman does not report them: its
+    /// inspect (compatible and native alike) is built from libpod's host-config view, which
+    /// has no such field, so a rule it applied reads as none. On Podman an empty report is
+    /// "not reported", never taken as granted, and any rule it does report must be exactly
+    /// the request's. A rootless engine is asked for none
+    /// (`application::rootless_device_cgroup_rules`), so there the request is empty too.
+    pub(crate) fn device_cgroup_rules_ok(self, reported: &[String], requested: &[String]) -> bool {
+        match self {
+            Dialect::Docker => reported == requested,
+            Dialect::Podman => reported.is_empty() || reported == requested,
+        }
     }
 
     /// Whether `HostConfig.Binds` / `HostConfig.Mounts` echo the request. When they do

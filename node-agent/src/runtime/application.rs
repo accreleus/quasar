@@ -264,6 +264,10 @@ pub(crate) struct ApplicationIntent {
     /// named; `None` is the request's own list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_add: Option<Vec<String>>,
+    /// #460: the container's device-cgroup rules when the engine cannot apply the
+    /// request's (a rootless engine: none); `None` is the request's own list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_cgroup_rules: Option<Vec<String>>,
     /// On an engine that confines with SELinux the app runs as the nested-sandbox type
     /// (`dialect::NESTED_SANDBOX_LABEL`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

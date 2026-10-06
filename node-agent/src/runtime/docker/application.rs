@@ -362,7 +362,24 @@ pub(super) struct AppIdentity {
     pub keep_id: Option<(u32, u32)>,
     pub engine_groups: Vec<u32>,
     pub group_add: Option<Vec<String>>,
+    /// `Some` when the engine cannot apply the request's device-cgroup rules: what the
+    /// container is created with instead.
+    pub device_cgroup_rules: Option<Vec<String>>,
     pub reason: &'static str,
+}
+
+/// A rootless engine applies no device-cgroup rule (#460): rootless Podman refuses to
+/// create a container that names one ("device cgroup rules are not supported in rootless
+/// mode or in a user namespace"), and no rootless runtime can install a device program.
+/// Access to a device node there is the node's own permissions, which host preparation
+/// grants the Quasar account: an input node plugged in after the container started opens
+/// through that host ACL alone. So the rules are left out rather than refused, and the
+/// read-back expects none.
+fn rootless_device_cgroup_rules(
+    rootless: bool,
+    request: &ApplicationRequest,
+) -> Option<Vec<String>> {
+    (rootless && !request.device_cgroup_rules.is_empty()).then(Vec::new)
 }
 
 pub(super) fn app_identity(
@@ -372,11 +389,13 @@ pub(super) fn app_identity(
     overflow_gid: u32,
 ) -> AppIdentity {
     use super::dialect::Dialect;
+    let device_cgroup_rules = rootless_device_cgroup_rules(rootless, request);
     match (dialect, rootless) {
         (Dialect::Podman, true) => AppIdentity {
             keep_id: Some(app_ids(&request.environment)),
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules,
             reason: "rootless Podman maps the app user onto the Quasar account (keep-id)",
         },
         // Inside a rootless Docker container gid 0 is the Quasar account's group: the only
@@ -394,6 +413,7 @@ pub(super) fn app_identity(
                     .cloned()
                     .collect(),
             ),
+            device_cgroup_rules,
             reason: "rootless Docker has no per-container mapping; the app joins the Quasar \
                      account's group (gid 0 inside)",
         },
@@ -401,6 +421,7 @@ pub(super) fn app_identity(
             keep_id: None,
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules,
             reason: "rootful engine: device nodes carry their host groups",
         },
     }
@@ -419,6 +440,14 @@ fn group_add(intent: &ApplicationIntent) -> &Vec<String> {
         .group_add
         .as_ref()
         .unwrap_or(&intent.request.group_add)
+}
+
+/// The device-cgroup rules the container is created with and read back against.
+fn device_cgroup_rules(intent: &ApplicationIntent) -> &Vec<String> {
+    intent
+        .device_cgroup_rules
+        .as_ref()
+        .unwrap_or(&intent.request.device_cgroup_rules)
 }
 
 /// What the legacy NVIDIA hook behind Docker's `--gpus` is asked to inject (#413): its
@@ -571,8 +600,9 @@ fn body(
                     })
                     .collect(),
             ),
-            device_cgroup_rules: (!r.device_cgroup_rules.is_empty())
-                .then(|| r.device_cgroup_rules.clone()),
+            device_cgroup_rules: Some(device_cgroup_rules(intent))
+                .filter(|rules| !rules.is_empty())
+                .cloned(),
             device_requests: match (r.nvidia_gpu, injection) {
                 (true, Some(injection)) => Some(vec![nvidia_device_request(injection)]),
                 _ => None,
@@ -1208,9 +1238,10 @@ async fn inspect_owned(
             "devices",
         ),
         (
-            dialect.echoes_device_cgroup_rules()
-                && normalized(host.device_cgroup_rules.as_ref())
-                    != intent.request.device_cgroup_rules,
+            !dialect.device_cgroup_rules_ok(
+                &normalized(host.device_cgroup_rules.as_ref()),
+                device_cgroup_rules(intent),
+            ),
             "device cgroup rules",
         ),
         (
@@ -1450,6 +1481,15 @@ pub(crate) async fn start(
                 "app container groups decided by the engine mode: {}",
                 app.reason
             );
+            if app.device_cgroup_rules.is_some() {
+                tracing::info!(
+                    token = "app-device-cgroup-rules-omitted",
+                    application = %request.name,
+                    rules = ?request.device_cgroup_rules,
+                    "rootless engine: the device-cgroup rules are left out; device access is \
+                     the host's permissions (host preparation's ACLs)"
+                );
+            }
             let keep_id = app.keep_id;
             // The catalog already runs these apps unconfined by seccomp for their own
             // sandboxes (bwrap); under SELinux the same need is the nested-sandbox type.
@@ -1483,6 +1523,7 @@ pub(crate) async fn start(
                 keep_id,
                 engine_groups: app.engine_groups,
                 group_add: app.group_add,
+                device_cgroup_rules: app.device_cgroup_rules,
                 nested_sandbox_label,
                 phase: ApplicationPhase::Creating,
                 result: None,
@@ -2318,6 +2359,7 @@ mod app_identity_tests {
             keep_id,
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules: None,
             nested_sandbox_label: false,
             phase: ApplicationPhase::Creating,
             result: None,
@@ -2329,6 +2371,7 @@ mod app_identity_tests {
         ApplicationIntent {
             engine_groups: app.engine_groups,
             group_add: app.group_add,
+            device_cgroup_rules: app.device_cgroup_rules,
             ..intent(request(), app.keep_id)
         }
     }
@@ -2416,6 +2459,140 @@ mod app_identity_tests {
                 .collect::<Vec<_>>(),
             [&format!("{ENGINE_GROUPS_ENV}=0")]
         );
+    }
+
+    /// The four engine modes, each as the create body it produces for `request`.
+    fn bodies(request: &ApplicationRequest) -> Vec<(Dialect, bool, serde_json::Value)> {
+        [
+            (Dialect::Docker, false),
+            (Dialect::Docker, true),
+            (Dialect::Podman, false),
+            (Dialect::Podman, true),
+        ]
+        .into_iter()
+        .map(|(dialect, rootless)| {
+            let app = app_identity(dialect, rootless, request, OVERFLOW);
+            let intent = ApplicationIntent {
+                engine_groups: app.engine_groups,
+                group_add: app.group_add,
+                device_cgroup_rules: app.device_cgroup_rules,
+                ..intent(request.clone(), app.keep_id)
+            };
+            let body = serde_json::to_value(body(&intent, None, dialect)).unwrap();
+            (dialect, rootless, body)
+        })
+        .collect()
+    }
+
+    fn argv_request(plan: Vec<String>) -> ApplicationRequest {
+        let mut argv: Vec<String> = ["run", "--name", "quasar-sess-op"]
+            .map(String::from)
+            .to_vec();
+        argv.extend(plan);
+        argv.push("quasar-app:test".into());
+        ApplicationRequest {
+            operation: "op".into(),
+            ..crate::session::container::application_request_for_test(&argv)
+        }
+    }
+
+    /// #460: a streamed session's plan holds no card node, so no engine creates one in it.
+    #[test]
+    fn a_streamed_plan_has_no_card_node_on_any_engine() {
+        let plan = vec![
+            "--device".to_string(),
+            "/dev/dri/renderD128".into(),
+            "--device".into(),
+            "/dev/dri/renderD129".into(),
+        ];
+        for (dialect, rootless, body) in bodies(&argv_request(plan)) {
+            let devices: Vec<&str> = body["HostConfig"]["Devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["PathOnHost"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                devices,
+                ["/dev/dri/renderD128", "/dev/dri/renderD129"],
+                "{dialect:?} rootless={rootless}"
+            );
+        }
+    }
+
+    /// #460: the console plan is the same request on every engine, and the same container
+    /// on the rootful ones. A rootless engine cannot apply a device-cgroup rule (rootless
+    /// Podman refuses the create), so it gets none: a later input device opens through the
+    /// host's ACL.
+    #[test]
+    fn the_console_plan_is_one_container_on_every_engine_less_the_rule_rootless() {
+        use crate::session::console_plan::{console_args, ConsoleHost, InputGrant};
+        let host = ConsoleHost {
+            card_node: "/dev/dri/card1".into(),
+            render_node: Some("/dev/dri/renderD129".into()),
+            sound: true,
+        };
+        for input in [
+            InputGrant::All,
+            InputGrant::Nodes(vec!["/dev/input/event3".into()]),
+        ] {
+            let request = argv_request(console_args(&host, &input));
+            let bodies = bodies(&request);
+            let field = |body: &serde_json::Value, key: &str| body["HostConfig"][key].clone();
+            let (_, _, reference) = &bodies[0];
+            for (dialect, rootless, body) in &bodies {
+                for key in ["Devices", "NetworkMode"] {
+                    assert_eq!(
+                        field(body, key),
+                        field(reference, key),
+                        "{input:?} {dialect:?} rootless={rootless}: {key}"
+                    );
+                }
+                let rules = field(body, "DeviceCgroupRules");
+                match (&input, rootless) {
+                    (InputGrant::All, false) => {
+                        assert_eq!(rules, serde_json::json!(["c 13:* rwm"]), "{dialect:?}")
+                    }
+                    _ => assert!(
+                        rules.is_null(),
+                        "{input:?} {dialect:?} rootless={rootless}: {rules}"
+                    ),
+                }
+                assert!(
+                    body["Env"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!("QUASAR_DIRECT_DISPLAY=1")),
+                    "{dialect:?} rootless={rootless}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_rootless_engine_leaves_the_device_cgroup_rules_out() {
+        let with_rule = ApplicationRequest {
+            device_cgroup_rules: vec!["c 13:* rwm".into()],
+            ..request()
+        };
+        for dialect in [Dialect::Docker, Dialect::Podman] {
+            assert_eq!(
+                app_identity(dialect, true, &with_rule, OVERFLOW).device_cgroup_rules,
+                Some(Vec::new()),
+                "{dialect:?} rootless"
+            );
+            assert_eq!(
+                app_identity(dialect, false, &with_rule, OVERFLOW).device_cgroup_rules,
+                None,
+                "{dialect:?} rootful keeps the request's"
+            );
+            // No rule asked for: nothing recorded, so a streamed session's journal is
+            // unchanged.
+            assert_eq!(
+                app_identity(dialect, true, &request(), OVERFLOW).device_cgroup_rules,
+                None
+            );
+        }
     }
 
     #[test]
@@ -2684,6 +2861,7 @@ mod read_only_bind_tests {
             keep_id: None,
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules: None,
             nested_sandbox_label: false,
             phase: ApplicationPhase::Creating,
             result: None,
