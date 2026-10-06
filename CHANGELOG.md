@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **A console session's desktop now drives the monitor itself (#458).** For an app that declares `runtime_spec.direct_display`, the node agent launches the app container with the console GPU's card node, the sound device, the input devices (plugged in later too) and the host's udev, and the desktop takes the display on its own DRM backend: no compositor, pipeline or second display server in between. The session is running once it is displaying, and reports the monitor's mode.
 - **Console mode is being rebuilt as direct display (#453).** Decision and spec recorded: a console session's desktop drives the monitor itself (KWin or gamescope on their DRM backends), nothing of Quasar's sits between it and the screen, and it is never streamed; ADR 0009 and the glossary carry the terms (console session, direct display, displaying). No behaviour changes yet.
 - **Console mode can show the desktop without CPU copies (#450), behind
   `QUASAR_EXPERIMENTAL_LOCAL_DMABUF=1`.** The compositor renders into a recycled ring of RGB
