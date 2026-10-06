@@ -11,8 +11,7 @@ func noApp(string) (bool, error) { return false, nil }
 func okUser(string) (bool, error) { return true, nil }
 func noUser(string) (bool, error) { return false, nil }
 
-// retiredKeyNames is amendment 19's list (#455): the console settings that
-// meant something only to the retired local-display path.
+// retiredKeyNames are former settings the console desktop now owns
 var retiredKeyNames = []string{
 	"connector", "mode", "compositor", "audio_output", "stream",
 	"stream_audio", "grab", "auto_connect_controller", "fullscreen",
@@ -71,7 +70,7 @@ func TestValidatePatch(t *testing.T) {
 			app     func(string) (bool, error)
 			user    func(string) (bool, error)
 			wantErr string
-		}{"retired " + key + " rejected", map[string]any{key: true}, empty, okApp, okUser, "retired"})
+		}{"retired " + key + " rejected", map[string]any{key: true}, empty, okApp, okUser, "no longer a setting"})
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

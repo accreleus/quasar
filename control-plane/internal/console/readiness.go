@@ -5,11 +5,8 @@ import (
 	"fmt"
 )
 
-// DefaultAppCheckID is the console readiness check the control plane
-// evaluates (control-api.md §Console mode, amendment 19): whether the
-// console's default app can run direct. The agent's own console checks (the
-// grants direct display needs) ride the host's readiness report instead; only
-// the control plane knows an app's runtime_spec.
+// DefaultAppCheckID is the console readiness check the control plane evaluates
+// (control-api.md §Console mode), because only it knows an app's runtime_spec.
 const DefaultAppCheckID = "console_default_app"
 
 // ReadinessCheck mirrors protocol/openapi.yaml ReadinessCheck for the checks

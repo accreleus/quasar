@@ -91,9 +91,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeEnvelope writes the GET/PATCH 200 body (openapi.yaml
-// ConsoleConfigEnvelope): the resolved config, the capabilities, and since
-// amendment 19 the default-app list (apps that can run direct) and the
-// control plane's console readiness checks.
+// ConsoleConfigEnvelope): config, capabilities, default_apps and readiness.
 func (h *Handler) writeEnvelope(w http.ResponseWriter, r *http.Request, resolved ConsoleConfig, caps Capabilities) {
 	ctx := r.Context()
 	apps, err := h.store.DirectApps(ctx)

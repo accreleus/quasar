@@ -43,9 +43,8 @@ type providerRuntimeExtras struct {
 	GPU                   *bool `json:"gpu"`
 	NoNewPrivileges       *bool `json:"no_new_privileges"`
 	SystempathsUnconfined *bool `json:"systempaths_unconfined"`
-	// DirectDisplay (amendment 19, #455): the image can run as a console
-	// session, driving the host's display itself. Gates the console's
-	// default-app list; written only when the manifest states it.
+	// DirectDisplay: the image can run as a console session (agent-api.md
+	// app.direct_display); gates the console's default-app list.
 	DirectDisplay *bool `json:"direct_display"`
 	ManagedHome   bool  `json:"managed_home"`
 }

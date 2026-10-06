@@ -160,8 +160,8 @@ func TestPatchRetiredKeysRefusedAndDroppedFromStoredRow(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handlePatch(rec, patchRequest(t, hostID, map[string]any{"stream": false}))
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "retired") {
-		t.Fatalf("PATCH of a retired key: status = %d, body = %s, want 400 saying retired", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "no longer a setting") {
+		t.Fatalf("PATCH of a retired key: status = %d, body = %s, want 400 saying it is no longer a setting", rec.Code, rec.Body.String())
 	}
 
 	rec = httptest.NewRecorder()

@@ -1840,9 +1840,8 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 
 	switch {
 	case nowPresent && !alreadyLaunched:
-		// Amendment 19: a default app that cannot run direct is a failed
-		// console_default_app readiness check (served on the console page),
-		// not a launch, and not a launch failure for the backoff to count.
+		// A default app that cannot run direct fails console_default_app: no
+		// launch, and no failure for the backoff to count.
 		check, err := h.consoleStore.DefaultAppReadiness(ctx, cfg)
 		if err != nil {
 			h.log.Warn("console auto-start: evaluate console readiness failed", "host_id", hostID, "err", err)

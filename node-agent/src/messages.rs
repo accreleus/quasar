@@ -782,10 +782,8 @@ pub struct AppSpec {
     /// `flatpak run` fails without this flag). Absent ⇒ `false`.
     #[serde(default)]
     pub systempaths_unconfined: bool,
-    /// Amendment 19 (#455) `runtime_spec` key: the image can run as a console
-    /// session, driving the host's display itself (agent-api.md `session_assign`
-    /// `app.direct_display`). Absent ⇒ `false`: the image only knows the nested,
-    /// streamed entry.
+    /// The image can run as a console session, driving the host's display itself
+    /// (agent-api.md `session_assign` `app.direct_display`). Absent ⇒ `false`.
     #[serde(default)]
     pub direct_display: bool,
 }
@@ -819,49 +817,36 @@ pub enum AppExitPolicy {
     Unknown,
 }
 
-/// CM-01 console-mode config, delivered in `config_update.console_config`. The
-/// full resolved object; all fields `#[serde(default)]` so a partial/older
-/// payload deserializes cleanly, and unknown keys are ignored (no
-/// `deny_unknown_fields`). `input_devices` stays opaque JSON (CM-03 consumes it).
-///
-/// Amendment 19 (#455) trimmed the wire to six fields: `enabled`, `output_id`,
-/// `input_devices`, `auto_start_on_display`, `default_app`, `default_user`. The
-/// retired fields below stay only because the old local-display path in
-/// `session::runner` still reads them; a current control plane never sends them,
-/// so each takes the value the control plane used to send by default.
+/// CM-01 console-mode config, delivered in `config_update.console_config`. Every
+/// field is `#[serde(default)]` and unknown keys are ignored. The wire carries
+/// `enabled`, `output_id`, `input_devices`, `auto_start_on_display`, `default_app`
+/// and `default_user` (agent-api.md amendment 19). The other fields are read only
+/// by the old local-display path and go with it in #461; their defaults (`grab` and
+/// `fullscreen` true) are the values that path ran with.
 #[derive(Deserialize, Debug, Clone)]
 pub struct ConsoleConfig {
     #[serde(default)]
     pub enabled: bool,
-    // retired by #455; removed with the old path in #461
     #[serde(default = "console_auto")]
     pub connector: String,
     #[serde(default)]
     pub output_id: Option<String>,
-    // retired by #455; removed with the old path in #461
     #[serde(default)]
     pub mode: Option<ConsoleModeSelection>,
-    // retired by #455; removed with the old path in #461
     #[serde(default = "console_weston")]
     pub compositor: String,
-    // retired by #455; removed with the old path in #461
     #[serde(default)]
     pub audio_output: Option<String>,
-    // retired by #455; removed with the old path in #461
     #[serde(default)]
     pub stream: bool,
-    // retired by #455; removed with the old path in #461
     #[serde(default)]
     pub stream_audio: bool,
     #[serde(default)]
     pub input_devices: serde_json::Value,
-    // retired by #455; removed with the old path in #461. Defaults to `true`, the
-    // control plane's old default, so the old path keeps grabbing until it goes.
     #[serde(default = "spec_true")]
     pub grab: bool,
     #[serde(default)]
     pub auto_start_on_display: bool,
-    // retired by #455; removed with the old path in #461
     #[serde(default)]
     pub auto_connect_controller: bool,
     #[serde(default)]
@@ -870,7 +855,6 @@ pub struct ConsoleConfig {
     /// acts on this — carried only for lossless deserialization.
     #[serde(default)]
     pub default_user: Option<String>,
-    // retired by #455; removed with the old path in #461
     #[serde(default = "spec_true")]
     pub fullscreen: bool,
 }
@@ -890,9 +874,8 @@ pub enum VideoTopology {
     #[default]
     StreamOnly,
     LocalOnly,
-    /// Retired by amendment 19 (#455): a control plane never sends it. Kept
-    /// while the old local-display path in `session::runner` still matches on
-    /// it; removed with that path in #461.
+    /// Not sent by the control plane (agent-api.md amendment 19); goes with the
+    /// old local-display path in #461.
     DualOutput,
 }
 
@@ -1011,8 +994,7 @@ fn console_weston() -> String {
 /// (agent-api.md) so the admin console-config UI can populate selectors.
 /// `PartialEq` (CM-06/07): the console-hotplug watcher (`session::console_hotplug`)
 /// diffs successive snapshots to detect a display/input hardware change.
-/// Amendment 19 (#455) dropped `audio_sinks`: a console desktop picks its own
-/// audio output from the sound device it is given.
+/// No audio sinks: a console desktop picks its own output (agent-api.md amendment 19).
 #[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConsoleCapabilities {
     pub connectors: Vec<String>,

@@ -114,7 +114,7 @@ describe("HostConsole direct display (amendment 19)", () => {
     ));
   });
 
-  it("a saved default app that cannot run direct shows the readiness failure as the row's help", async () => {
+  it("a saved default app that cannot run direct shows the readiness failure as an error", async () => {
     const current = await adminApi.getConsoleConfig("token", "host-1");
     const summary = "The console's default app Old Desktop cannot run direct: its runtime spec does " +
       "not declare direct_display, so console mode will not launch it.";
@@ -128,12 +128,14 @@ describe("HostConsole direct display (amendment 19)", () => {
     } as never);
     renderPage();
 
-    expect(await screen.findByText(summary)).toBeTruthy();
+    const failure = await screen.findByText(summary);
+    expect(failure).toHaveClass("form-error");
+    expect(screen.getByText(/Only apps that can drive the display directly are offered/)).toBeTruthy();
     const select = screen.getByRole("combobox", { name: "Default app" }) as HTMLSelectElement;
     expect(select.value).toBe(NESTED_ID);
     expect(screen.getByRole("option", { name: "Current app (cannot run direct)" })).toBeTruthy();
 
-    // Picking a direct app replaces the failure with the ordinary help.
+    // A new pick has not been checked yet, so the saved app's failure goes.
     fireEvent.change(select, { target: { value: KDE_ID } });
     expect(screen.queryByText(summary)).toBeNull();
   });

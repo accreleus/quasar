@@ -2,14 +2,10 @@
 // §A.6). Reads/writes the CM-01 console-config API (GET/PATCH
 // /v1/admin/hosts/{id}/console-config).
 //
-// Amendment 19 (#455): a console session's desktop drives the host's display
-// directly, so the page edits only the six settings that still mean
-// something: enabled, the output pick, input devices, auto-start on display,
-// default app and default user. The desktop owns its mode, audio output and
-// input handling; nothing is streamed. The default-app list is the server's
-// `default_apps` (apps that declare runtime_spec.direct_display), and the
-// server's `console_default_app` readiness check explains a default app that
-// cannot run direct.
+// The console desktop owns its mode, audio output and input, so the page edits
+// only what control-api.md §Console mode defines. The default-app list is the
+// server's `default_apps`; its `console_default_app` check explains a saved app
+// that cannot run direct.
 //
 // Input devices is the one place this page goes beyond a straight restyle
 // (InputDevicesRow, in ./console/): `ConsoleConfig.input_devices` is
@@ -73,13 +69,24 @@ function Switch({
   );
 }
 
-/** One `.cset` row: title + help on the left, one control on the right. */
-function ConsoleRow({ title, help, children }: { title: string; help: ReactNode; children: ReactNode }) {
+/** One `.cset` row: title + help (and an optional error) on the left, one control on the right. */
+function ConsoleRow({
+  title,
+  help,
+  error,
+  children,
+}: {
+  title: string;
+  help: ReactNode;
+  error?: string | null;
+  children: ReactNode;
+}) {
   return (
     <div className="cset">
       <div>
         <h3>{title}</h3>
         <p className="hint">{help}</p>
+        {error && <p className="form-error mt1">{error}</p>}
       </div>
       <div>{children}</div>
     </div>
@@ -103,7 +110,7 @@ export function HostConsole() {
   const capabilities = data?.capabilities ?? null;
   const directApps = data?.defaultApps ?? [];
   const users = data?.users ?? [];
-  const defaultAppCheck = data?.readiness.find((check) => check.id === "console_default_app");
+  const defaultAppCheck = (data?.readiness ?? []).find((check) => check.id === "console_default_app");
 
   const [pending, setPending] = useState<ConsoleConfig>({});
   const [saving, setSaving] = useState(false);
@@ -172,10 +179,9 @@ export function HostConsole() {
   // launch.
   const savedApp = config?.default_app ?? null;
   const savedAppOffered = savedApp == null || directApps.some((a) => a.id === savedApp);
-  const defaultAppHelp =
-    defaultAppCheck && defaultAppCheck.status === "fail" && !("default_app" in pending)
-      ? defaultAppCheck.summary
-      : "The app the console session runs. Only apps that can drive the display directly are offered.";
+  // The saved app's failure; a pending pick has not been checked yet.
+  const defaultAppError =
+    defaultAppCheck?.status === "fail" && !("default_app" in pending) ? defaultAppCheck.summary : null;
 
   const discard = () => setPending({});
 
@@ -188,8 +194,9 @@ export function HostConsole() {
         ...prev,
         config: saved.config,
         capabilities: saved.capabilities,
-        defaultApps: saved.default_apps,
-        readiness: saved.readiness,
+        // `?? []`: an older control plane predates this envelope.
+        defaultApps: saved.default_apps ?? [],
+        readiness: saved.readiness ?? [],
       }));
       setPending({});
       addToast({ variant: "success", title: "Console config saved" });
@@ -302,7 +309,11 @@ export function HostConsole() {
 
             <Group title="Startup" />
 
-            <ConsoleRow title="Default app" help={defaultAppHelp}>
+            <ConsoleRow
+              title="Default app"
+              help="The app the console session runs. Only apps that can drive the display directly are offered."
+              error={defaultAppError}
+            >
               <select
                 className="select"
                 aria-label="Default app"

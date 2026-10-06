@@ -1,6 +1,6 @@
 // Package console implements the CM-01 admin per-host console-config surface:
 // whether a host runs a console session, a session whose desktop drives the
-// host's own display directly (amendment 19, #453/#455; ADR 0009).
+// host's own display directly (ADR 0009).
 // Storage: schema.md `console_config` / `console_capabilities`. Delivery to the
 // agent: agent-api.md `config_update.console_config` + capability enumeration
 // in `capacity.console_capabilities`. Mirrors the internal/hostcfg package's
@@ -18,7 +18,7 @@ import (
 
 // ConsoleConfig is the resolved (every field has a value) console-mode
 // configuration, with the exact json tags of protocol/openapi.yaml
-// ConsoleConfig: the six settings amendment 19 kept. OutputID / DefaultApp /
+// ConsoleConfig. OutputID / DefaultApp /
 // DefaultUser are nullable — nil is a meaningful value ("automatic output" /
 // "no app" / "no auto-launch owner"), not "unset".
 type ConsoleConfig struct {
@@ -39,18 +39,16 @@ type ConsoleConfig struct {
 	DefaultUser *string `json:"default_user"`
 }
 
-// ModeSelection is a physical display mode as the DRM mode names it. Since
-// amendment 19 it is no longer a console setting; it survives as the shape of
-// a console session's reported mode (agent-api.md session_metrics.console_mode).
+// ModeSelection is a physical display mode as the DRM mode names it: the shape
+// of a console session's reported mode (agent-api.md session_metrics.console_mode).
 type ModeSelection struct {
 	Width          uint16 `json:"width"`
 	Height         uint16 `json:"height"`
 	RefreshMillihz uint32 `json:"refresh_millihz"`
 }
 
-// ConsoleVideoTopology is the only per-session output plan a console session
-// has since amendment 19 retired `dual_output`: its desktop drives the display
-// directly and is never streamed.
+// ConsoleVideoTopology is a console session's only output plan: its desktop
+// drives the display and is never streamed (agent-api.md session_assign).
 const ConsoleVideoTopology = "local_only"
 
 // PinnedConnector returns the connector the level-trigger presence check
@@ -108,8 +106,7 @@ func (d *InputDevices) UnmarshalJSON(b []byte) error {
 
 // Capabilities is what the host can do in console mode (agent-api.md
 // `capacity.console_capabilities`). Empty arrays if the agent has not reported.
-// An `audio_sinks` array from an agent older than amendment 19 is ignored: a
-// console desktop picks its own audio output.
+// An older agent's `audio_sinks` is dropped here, never stored or served.
 type Capabilities struct {
 	Connectors   []string          `json:"connectors"`
 	Outputs      []DRMOutput       `json:"outputs,omitempty"`

@@ -4,16 +4,14 @@
 // LaunchByProfile, but with no profile/tier resolution and no probe envelope:
 // the app's plain defaults, pinned to the host whose display connected.
 //
-// Since amendment 19 (#455) a console session's desktop drives the display
-// directly: it is always `local_only`, and its app must declare
-// runtime_spec.direct_display.
+// A console session is always `local_only` and its app must declare
+// runtime_spec.direct_display (agent-api.md session_assign).
 package session
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
 )
@@ -41,18 +39,8 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		return "", fmt.Errorf("console auto-start: %w", ErrConsoleAppNotDirect)
 	}
 
-	encodeSlots, needsSignaling, err := consoleTransportPlan(videoTopology, app.DefaultEncodeSlots)
-	if err != nil {
+	if err := checkConsoleTopology(videoTopology); err != nil {
 		return "", fmt.Errorf("console auto-start: %w", err)
-	}
-	var tokenHash string
-	var tokenExpires time.Time
-	if needsSignaling {
-		tok, err := newSignalingToken(time.Now())
-		if err != nil {
-			return "", fmt.Errorf("console auto-start: signaling token: %w", err)
-		}
-		tokenHash, tokenExpires = tok.Hash, tok.ExpiresAt
 	}
 	if width <= 0 {
 		width = app.DefaultWidth
@@ -72,15 +60,14 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		FPS:             fps,
 		BitrateKbps:     app.DefaultBitrateKbps,
 		H264Profile:     "constrained-baseline", // T8; irrelevant to a local-only leg
-		NeedEncodeSlots: encodeSlots,
+		NeedEncodeSlots: 0,                      // local_only: nothing is encoded
 		// The console drives a physical display and a launch failure feeds the
 		// handler's crash-loop backoff, so after consoleBackoffMaxRetries a
 		// transient VRAM veto would kill it semi-permanently with only an error
 		// log. Encode slots still gate this launch; only the advisory veto is off.
 		SkipVramVeto: true,
-		TokenHash:    tokenHash,
-		TokenExpires: tokenExpires,
-		ManagedHome:  app.ManagedHome,
+		// No signaling token: nothing is streamed.
+		ManagedHome: app.ManagedHome,
 		// Inert for a non-catalog image. It cannot re-place the console (already
 		// pinned), but it does refuse to auto-start an app whose managed image is
 		// not on that host yet.
@@ -141,15 +128,13 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	return sess.ID, nil
 }
 
-// consoleTransportPlan is a console session's reservation plan. `local_only`
-// is the only console topology: the desktop drives the display and nothing is
-// encoded or signalled. `dual_output` was retired by amendment 19 and fails
-// closed like any other value.
-func consoleTransportPlan(videoTopology string, _ int32) (encodeSlots int32, needsSignaling bool, err error) {
+// checkConsoleTopology fails closed on anything but `local_only`, the only
+// console topology: no encode slot, no signaling token.
+func checkConsoleTopology(videoTopology string) error {
 	if videoTopology == console.ConsoleVideoTopology {
-		return 0, false, nil
+		return nil
 	}
-	return 0, false, fmt.Errorf("invalid console video topology %q: a console session is %q", videoTopology, console.ConsoleVideoTopology)
+	return fmt.Errorf("invalid console video topology %q: a console session is %q", videoTopology, console.ConsoleVideoTopology)
 }
 
 // StopConsoleSession is a thin wrapper over the normal Stop teardown, so console

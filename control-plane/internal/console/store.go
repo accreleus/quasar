@@ -51,6 +51,10 @@ func (s *Store) UserExists(ctx context.Context, userID string) (bool, error) {
 	return exists, nil
 }
 
+// DefaultAppFacts and DirectApps resolve the effective runtime_spec like
+// session.GetLaunchApp and test direct_display in SQL like RuntimeSpecDirect;
+// guarded by TestConsoleDirectAppsMatchLaunchSpec.
+//
 // DefaultAppFacts reads what the console_default_app check needs about appID:
 // whether it exists, its name, whether it and (for a derived tile) its parent
 // are enabled, and whether its EFFECTIVE runtime_spec — a derived tile's

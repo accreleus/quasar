@@ -7,8 +7,7 @@ import (
 
 // Defaults returns the default for every console-config field (mirrors
 // hostcfg.Defaults()): off, automatic output, every input device, no app and
-// no owner. The nil defaults are meaningful values, not omissions. These are
-// the six settings amendment 19 (#455) kept.
+// no owner. The nil defaults are meaningful values, not omissions.
 func Defaults() map[string]any {
 	return map[string]any{
 		"enabled":               false,
@@ -31,11 +30,9 @@ var knownKeys = map[string]bool{
 	"default_user":          true,
 }
 
-// retiredKeys are the settings amendment 19 retired with the local-display
-// path: the desktop owns its mode, audio output and input, and a console
-// session is never streamed. Migration 0099 removed them from stored rows. A
-// PATCH naming one is refused with a message that says it was retired rather
-// than that it was never a setting.
+// retiredKeys are former settings the desktop now owns (agent-api.md amendment
+// 19; migration 0099 removed them from stored rows). A PATCH naming one gets a
+// message saying so rather than "unknown key".
 var retiredKeys = map[string]bool{
 	"connector":               true,
 	"mode":                    true,
@@ -95,7 +92,7 @@ func Resolve(sparse map[string]any) (ConsoleConfig, error) {
 func ValidatePatch(patch map[string]any, caps Capabilities, appExists func(appID string) (bool, error), userExists func(userID string) (bool, error)) error {
 	for k, v := range patch {
 		if retiredKeys[k] {
-			return fmt.Errorf("console-config key %q was retired with direct display (amendment 19): the desktop owns that setting now", k)
+			return fmt.Errorf("console-config key %q is no longer a setting: the console desktop owns it", k)
 		}
 		if !knownKeys[k] {
 			return fmt.Errorf("unknown console-config key %q", k)

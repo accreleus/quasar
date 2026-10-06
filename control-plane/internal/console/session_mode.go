@@ -23,11 +23,9 @@ type SessionMode struct {
 	Source             ModeSource
 }
 
-// ResolveSessionMode picks the console session's initial mode (#422) from the
-// resolved console config and the host's last capability report. Pure; caps may
-// be empty. Since amendment 19 the desktop drives the display and picks its own
-// mode, so this is only the launch size and rate recorded on the session row;
-// there is no configured mode and no streamed console to protect.
+// ResolveSessionMode picks the console session's launch size and rate (#422),
+// recorded on the session row, from the resolved config and the host's last
+// capability report. Pure; caps may be empty. The desktop sets the real mode.
 //
 //   - A pinned output_id runs at that output's active mode, else its preferred
 //     mode, else its first mode.
