@@ -35,6 +35,9 @@ own; the two do not move together, and that is deliberate.
   compositor pin that ships the ring. A released ring slot now sits out two frames before it
   is drawn into again, after a live console showed tile garbage under load on NVIDIA.
 
+### Changed
+- **The node agent reaches every console concern through one place (#454).** The terminal hold, the local-only session and a streamed session's console fan-out moved out of the session runner's streaming path into one module, so the direct-display engine can replace it and the retirement can delete it in one place. No behaviour change.
+
 ### Fixed
 - **In console mode, a desktop that only resizes its own window when you pick a resolution
   still moves the monitor to match (#447).** Some desktops don't speak the standard
