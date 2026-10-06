@@ -73,18 +73,36 @@ func selfHealHandler(t *testing.T) (*Handler, *pgxpool.Pool, *selfHealEvents) {
 	return h, pool, ev
 }
 
+// seedConsoleApp inserts an app for a console's default_app. direct sets
+// runtime_spec.direct_display, which amendment 19 requires before the
+// control plane auto-starts a console session with it.
+func seedConsoleApp(t *testing.T, pool *pgxpool.Pool, direct bool) string {
+	t.Helper()
+	spec := `{"image":"desktop:1"}`
+	if direct {
+		spec = `{"image":"desktop:1","direct_display":true}`
+	}
+	var id string
+	if err := pool.QueryRow(context.Background(),
+		`INSERT INTO apps(name, runtime_spec) VALUES ($1, $2::jsonb) RETURNING id::text`,
+		"console-app-"+t.Name(), spec).Scan(&id); err != nil {
+		t.Fatalf("seed console app: %v", err)
+	}
+	return id
+}
+
 // seedEligibleConsoleHost seeds a host row and a console_config eligible for
 // auto-start (enabled + auto_start_on_display + default_app + default_user
-// all set); default_app/default_user are opaque strings inside the JSONB
-// config, not FK-checked by console.Store.Upsert, so any UUID-shaped string
-// works.
+// all set). default_app is a real app that can run direct (the auto-start
+// gate reads it); default_user is an opaque string inside the JSONB config,
+// not FK-checked by console.Store.Upsert, so any UUID-shaped string works.
 func seedEligibleConsoleHost(t *testing.T, h *Handler, pool *pgxpool.Pool) string {
 	t.Helper()
 	hostID := seedHost(t, pool)
 	cfg := map[string]any{
 		"enabled":               true,
 		"auto_start_on_display": true,
-		"default_app":           "00000000-0000-0000-0000-0000000000aa",
+		"default_app":           seedConsoleApp(t, pool, true),
 		"default_user":          "00000000-0000-0000-0000-0000000000bb",
 	}
 	if err := h.consoleStore.Upsert(context.Background(), hostID, cfg, nil); err != nil {

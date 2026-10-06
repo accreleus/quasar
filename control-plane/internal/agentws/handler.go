@@ -1840,6 +1840,19 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 
 	switch {
 	case nowPresent && !alreadyLaunched:
+		// Amendment 19: a default app that cannot run direct is a failed
+		// console_default_app readiness check (served on the console page),
+		// not a launch, and not a launch failure for the backoff to count.
+		check, err := h.consoleStore.DefaultAppReadiness(ctx, cfg)
+		if err != nil {
+			h.log.Warn("console auto-start: evaluate console readiness failed", "host_id", hostID, "err", err)
+			return
+		}
+		if check.Status != "pass" {
+			h.log.Info("console auto-start: not launching", "host_id", hostID,
+				"check", check.ID, "status", check.Status, "summary", check.Summary)
+			return
+		}
 		h.attemptConsoleLaunch(ctx, hostID, cfg, isCapacityPath)
 	case !nowPresent && alreadyLaunched:
 		h.consoleAuto.mu.Lock()
@@ -1893,9 +1906,8 @@ func (h *Handler) attemptConsoleLaunch(ctx context.Context, hostID string, cfg c
 	if !h.consoleAuto.claimLaunch(hostID) {
 		return
 	}
-	// #422: the session's initial size and rate follow the configured mode, else
-	// (local-only) the physical display; see console.ResolveSessionMode for the
-	// rule and the streaming exception. A capabilities read failure only costs
+	// #422: the session's initial size and rate follow the physical display;
+	// see console.ResolveSessionMode. A capabilities read failure only costs
 	// the physical follow: the launch proceeds at the app defaults.
 	caps, err := h.consoleStore.GetCapabilities(ctx, hostID)
 	if err != nil {
@@ -1905,7 +1917,7 @@ func (h *Handler) attemptConsoleLaunch(ctx context.Context, hostID string, cfg c
 	mode := console.ResolveSessionMode(cfg, caps)
 	h.log.Info("console auto-start: session mode", "host_id", hostID,
 		"width", mode.Width, "height", mode.Height, "fps", mode.FPS, "source", string(mode.Source))
-	sessionID, err := h.events.LaunchConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp, cfg.VideoTopology(), mode.Width, mode.Height, mode.FPS)
+	sessionID, err := h.events.LaunchConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp, console.ConsoleVideoTopology, mode.Width, mode.Height, mode.FPS)
 	if err != nil {
 		h.consoleAuto.finishLaunch(hostID, "", false)
 		h.log.Warn("console auto-start: launch failed", "host_id", hostID, "connector", cfg.PinnedConnector(), "err", err)

@@ -51,6 +51,85 @@ func (s *Store) UserExists(ctx context.Context, userID string) (bool, error) {
 	return exists, nil
 }
 
+// DefaultAppFacts reads what the console_default_app check needs about appID:
+// whether it exists, its name, whether it and (for a derived tile) its parent
+// are enabled, and whether its EFFECTIVE runtime_spec — a derived tile's
+// parent's, exactly as GetLaunchApp resolves it — declares direct_display.
+func (s *Store) DefaultAppFacts(ctx context.Context, appID string) (DefaultAppFacts, error) {
+	var (
+		facts DefaultAppFacts
+		spec  []byte
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT a.name, a.enabled AND COALESCE(p.enabled, true),
+		       COALESCE(p.runtime_spec, a.runtime_spec)
+		  FROM apps a
+		  LEFT JOIN apps p ON p.id = a.parent_app_id
+		 WHERE a.id::text = $1`, appID).Scan(&facts.Name, &facts.Enabled, &spec)
+	if err == pgx.ErrNoRows {
+		return DefaultAppFacts{}, nil
+	}
+	if err != nil {
+		return DefaultAppFacts{}, fmt.Errorf("query default app: %w", err)
+	}
+	facts.Found = true
+	facts.Direct = RuntimeSpecDirect(spec)
+	return facts, nil
+}
+
+// DirectApps lists the apps a console's default-app pick may name (amendment
+// 19): enabled apps (with an enabled parent, for a derived tile) whose
+// effective runtime_spec declares `direct_display: true`, ordered by name.
+// Never nil, so it serializes as `[]`.
+func (s *Store) DirectApps(ctx context.Context) ([]DefaultApp, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.id::text, a.name
+		  FROM apps a
+		  LEFT JOIN apps p ON p.id = a.parent_app_id
+		 WHERE a.enabled AND COALESCE(p.enabled, true)
+		   AND COALESCE(p.runtime_spec, a.runtime_spec) -> 'direct_display' = 'true'::jsonb
+		 ORDER BY a.name, a.id`)
+	if err != nil {
+		return nil, fmt.Errorf("query direct apps: %w", err)
+	}
+	defer rows.Close()
+	out := []DefaultApp{}
+	for rows.Next() {
+		var app DefaultApp
+		if err := rows.Scan(&app.ID, &app.Name); err != nil {
+			return nil, fmt.Errorf("scan direct app: %w", err)
+		}
+		out = append(out, app)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read direct apps: %w", err)
+	}
+	return out, nil
+}
+
+// DefaultAppReadiness evaluates console_default_app for a resolved config.
+// Anything but `pass` means no console session is auto-started.
+func (s *Store) DefaultAppReadiness(ctx context.Context, cfg ConsoleConfig) (ReadinessCheck, error) {
+	var facts DefaultAppFacts
+	if cfg.DefaultApp != nil {
+		var err error
+		if facts, err = s.DefaultAppFacts(ctx, *cfg.DefaultApp); err != nil {
+			return ReadinessCheck{}, err
+		}
+	}
+	return DefaultAppCheck(cfg.DefaultApp, facts), nil
+}
+
+// Readiness evaluates the console readiness checks the control plane owns for
+// a resolved config (today only console_default_app). Never nil.
+func (s *Store) Readiness(ctx context.Context, cfg ConsoleConfig) ([]ReadinessCheck, error) {
+	check, err := s.DefaultAppReadiness(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return []ReadinessCheck{check}, nil
+}
+
 // Get returns the host's sparse console-config override map (empty if no row
 // exists). Absent keys resolve to Defaults() at read time — see Resolve.
 func (s *Store) Get(ctx context.Context, hostID string) (map[string]any, error) {
@@ -72,9 +151,11 @@ func (s *Store) Get(ctx context.Context, hostID string) (map[string]any, error) 
 	return out, nil
 }
 
-// Upsert writes the full sparse config map for a host. updatedBy may be nil.
+// Upsert writes the full sparse config map for a host, keeping only console
+// settings (KnownOnly), so a retired key a row still carried does not survive
+// the write. updatedBy may be nil.
 func (s *Store) Upsert(ctx context.Context, hostID string, config map[string]any, updatedBy *string) error {
-	raw, err := json.Marshal(config)
+	raw, err := json.Marshal(KnownOnly(config))
 	if err != nil {
 		return fmt.Errorf("encode console_config: %w", err)
 	}
@@ -278,6 +359,7 @@ func (s *Store) ResetEnabledOnRestoredAccess(ctx context.Context, hostID string,
 	}
 
 	newEnabled := !*access.Target
+	sparse = KnownOnly(sparse)
 	sparse["enabled"] = newEnabled
 	rawCfg, err := json.Marshal(sparse)
 	if err != nil {

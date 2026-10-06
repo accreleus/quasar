@@ -8412,6 +8412,8 @@ export interface components {
             };
             mounts?: string[];
             gpu?: boolean;
+            /** @description Amendment 19, optional (absent = false): the app's image can run as a console session, driving the host's display itself. Gates the console's default-app list and its console_default_app readiness check. */
+            direct_display?: boolean;
         };
         /** @description Admin create/edit shape. runtime_spec + resource defaults are admin/scheduler-internal. */
         AppWrite: {
@@ -10542,50 +10544,35 @@ export interface components {
         ConfigCatalogResponse: {
             knobs: components["schemas"]["ConfigKnob"][];
         };
-        /** @description Per-host console-mode config. On PATCH the body is partial (any subset); on GET it is the resolved object. Off + local-only by default; audio_output has no default (null = quiet). */
+        /** @description Per-host console-mode config. On PATCH the body is partial (any subset); on GET it is the resolved object. Off by default. AMENDMENT 19 (#453/#455): trimmed to these six fields for direct display; connector, mode, compositor, audio_output, stream, stream_audio, grab, auto_connect_controller and fullscreen are retired. A PATCH naming any other key is 400 validation_failed; a stored key the server does not know is ignored on read. */
         ConsoleConfig: {
             enabled?: boolean;
-            /** @description 'auto' or a DRM connector name (DP-4, HDMI-A-1, …). */
-            connector?: string;
-            /** @description Card-scoped DRM output id from capabilities.outputs; null selects automatic output. */
+            /** @description The output pick: a card-scoped DRM output id from capabilities.outputs (card0:DP-4), meaning this card, launch when this connector has a monitor. null = automatic (any connected output). Need not be connected at write time. */
             output_id?: string | null;
-            /** @description Exact static physical mode for output_id; null selects the compositor preferred mode. */
-            mode?: null | components["schemas"]["ConsoleModeSelection"];
-            /** @enum {string} */
-            compositor?: "weston" | "cage";
-            /** @description Local host sink id ('auto' | alsa hw id | hdmi | motherboard | usb:*), or null = no local audio. */
-            audio_output?: string | null;
-            /** @description Also stream over WebRTC (dual-output). Default false = local-only. */
-            stream?: boolean;
-            stream_audio?: boolean;
-            /** @description 'auto' or an explicit list of /dev/input/event* paths. */
+            /** @description 'auto' (every input device) or an explicit list of /dev/input/event* paths: the allowlist passed into the console container. */
             input_devices?: "auto" | string[];
-            grab?: boolean;
             auto_start_on_display?: boolean;
-            auto_connect_controller?: boolean;
-            /** Format: uuid */
+            /**
+             * Format: uuid
+             * @description The app the console session runs. Offered from ConsoleConfigEnvelope.default_apps (runtime_spec.direct_display true); one without the key is accepted and reported by the console_default_app readiness check.
+             */
             default_app?: string | null;
             /**
              * Format: uuid
              * @description CM-06: owner of auto-started console sessions (users.id). Required when auto_start_on_display=true.
              */
             default_user?: string | null;
-            fullscreen?: boolean;
         };
         ConsoleModeSelection: {
             width: number;
             height: number;
             refresh_millihz: number;
         };
-        /** @description What the host can do in console mode (from agent-api capacity.console_capabilities). Empty arrays if unreported. */
+        /** @description What the host can do in console mode (from agent-api capacity.console_capabilities). Empty arrays if unreported. Amendment 19: audio_sinks is no longer served. */
         ConsoleCapabilities: {
             connectors: string[];
             /** @description Typed per-card DRM connector and mode inventory. Additive; absent from older agents. */
             outputs?: components["schemas"]["DrmOutputCapability"][];
-            audio_sinks: {
-                id: string;
-                label: string;
-            }[];
             input_devices: {
                 path: string;
                 label: string;
@@ -10633,6 +10620,15 @@ export interface components {
         ConsoleConfigEnvelope: {
             config: components["schemas"]["ConsoleConfig"];
             capabilities: components["schemas"]["ConsoleCapabilities"];
+            /** @description Amendment 19: the enabled apps whose effective runtime_spec (a derived tile's parent's) declares direct_display true, ordered by name. The only apps the console page offers as default_app. */
+            default_apps: components["schemas"]["ConsoleDefaultApp"][];
+            /** @description Amendment 19: console readiness checks the control plane evaluates (source operator, never blocks). Today exactly one, console_default_app: skip with no default app, pass when it declares direct_display, fail when it is gone, disabled or does not declare it. While not pass, no console session is auto-started. */
+            readiness: components["schemas"]["ReadinessCheck"][];
+        };
+        ConsoleDefaultApp: {
+            /** Format: uuid */
+            id: string;
+            name: string;
         };
         TraceSeriesPoint: {
             ts_unix_ms?: number;

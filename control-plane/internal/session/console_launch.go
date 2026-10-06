@@ -3,13 +3,26 @@
 // console_config.default_app. Same schedule -> assign -> start primitives as
 // LaunchByProfile, but with no profile/tier resolution and no probe envelope:
 // the app's plain defaults, pinned to the host whose display connected.
+//
+// Since amendment 19 (#455) a console session's desktop drives the display
+// directly: it is always `local_only`, and its app must declare
+// runtime_spec.direct_display.
 package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/console"
 )
+
+// ErrConsoleAppNotDirect: the console's default app does not declare
+// runtime_spec.direct_display, so it cannot run as a console session. No
+// session is created; the console page's console_default_app readiness check
+// is where the operator reads why (control-api.md §Console mode).
+var ErrConsoleAppNotDirect = errors.New("console app cannot run direct: its runtime spec does not declare direct_display")
 
 // LaunchConsoleSession launches one pinned console session on hostID, owned by
 // userID, running appID at the app's defaults. Called by the agentws capacity
@@ -20,6 +33,12 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	app, err := c.store.GetLaunchApp(ctx, appID)
 	if err != nil {
 		return "", fmt.Errorf("console auto-start: load app: %w", err)
+	}
+	// Backstop for the agentws auto-start gate: an app that cannot run direct
+	// is a readiness failure, never a launch. RuntimeSpec is the effective one
+	// (a derived tile's parent's).
+	if !console.RuntimeSpecDirect(app.RuntimeSpec) {
+		return "", fmt.Errorf("console auto-start: %w", ErrConsoleAppNotDirect)
 	}
 
 	encodeSlots, needsSignaling, err := consoleTransportPlan(videoTopology, app.DefaultEncodeSlots)
@@ -122,15 +141,15 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	return sess.ID, nil
 }
 
-func consoleTransportPlan(videoTopology string, defaultEncodeSlots int32) (encodeSlots int32, needsSignaling bool, err error) {
-	switch videoTopology {
-	case "local_only":
+// consoleTransportPlan is a console session's reservation plan. `local_only`
+// is the only console topology: the desktop drives the display and nothing is
+// encoded or signalled. `dual_output` was retired by amendment 19 and fails
+// closed like any other value.
+func consoleTransportPlan(videoTopology string, _ int32) (encodeSlots int32, needsSignaling bool, err error) {
+	if videoTopology == console.ConsoleVideoTopology {
 		return 0, false, nil
-	case "dual_output":
-		return defaultEncodeSlots, true, nil
-	default:
-		return 0, false, fmt.Errorf("invalid console video topology %q", videoTopology)
 	}
+	return 0, false, fmt.Errorf("invalid console video topology %q: a console session is %q", videoTopology, console.ConsoleVideoTopology)
 }
 
 // StopConsoleSession is a thin wrapper over the normal Stop teardown, so console

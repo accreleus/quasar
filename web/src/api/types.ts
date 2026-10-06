@@ -680,6 +680,9 @@ export type ConsoleCapabilities = Schemas["ConsoleCapabilities"];
 
 export type ConsoleConfigEnvelope = Schemas["ConsoleConfigEnvelope"];
 
+/** Amendment 19: one entry of the console's default-app list (an app that can run direct). */
+export type ConsoleDefaultApp = Schemas["ConsoleDefaultApp"];
+
 /** Amendment 18. "Has access" (`control-api.md` §Console mode, `agent-api.md`
  *  `capacity.console_capabilities.access`): `state` is `on`, or `restored` with
  *  `target` false. An unrecognised `state` reads as `off`. */

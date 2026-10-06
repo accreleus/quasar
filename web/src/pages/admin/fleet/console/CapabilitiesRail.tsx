@@ -1,5 +1,5 @@
 // The console page's "Reported capabilities" rail card (handoff-v3-spec §A.6):
-// connectors, per-output facts, audio sinks, and the input-device count.
+// connectors, per-output facts, and the input-device count.
 
 import type { ConsoleCapabilities } from "../../../../api/types";
 import { passedThroughPaths, type InputDevicesValue } from "./inputDevices";
@@ -42,9 +42,6 @@ export function CapabilitiesRail({
               )}
             </div>
           ))}
-          <div>
-            Audio sinks: {capabilities!.audio_sinks.map((s) => s.label).join(", ") || "—"}
-          </div>
           <div>
             Input devices: {devices.length} reported · {passedCount} passed through
           </div>

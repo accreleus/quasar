@@ -11,7 +11,7 @@ func TestConsoleTransportPlan(t *testing.T) {
 		wantErr   bool
 	}{
 		{"local-only has no encoder or signaling", "local_only", 0, false, false},
-		{"dual output keeps encoder and signaling", "dual_output", 2, true, false},
+		{"retired dual output is rejected", "dual_output", 0, false, true},
 		{"invalid topology fails closed", "stream_only", 0, false, true},
 	}
 	for _, tt := range tests {

@@ -43,7 +43,11 @@ type providerRuntimeExtras struct {
 	GPU                   *bool `json:"gpu"`
 	NoNewPrivileges       *bool `json:"no_new_privileges"`
 	SystempathsUnconfined *bool `json:"systempaths_unconfined"`
-	ManagedHome           bool  `json:"managed_home"`
+	// DirectDisplay (amendment 19, #455): the image can run as a console
+	// session, driving the host's display itself. Gates the console's
+	// default-app list; written only when the manifest states it.
+	DirectDisplay *bool `json:"direct_display"`
+	ManagedHome   bool  `json:"managed_home"`
 }
 
 // catalogArtwork: only `tile` maps to an app column (cover_url, migration 0039).

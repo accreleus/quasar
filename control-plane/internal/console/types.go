@@ -1,11 +1,12 @@
 // Package console implements the CM-01 admin per-host console-config surface:
-// local display + local audio + local input ("use the host like a console").
+// whether a host runs a console session, a session whose desktop drives the
+// host's own display directly (amendment 19, #453/#455; ADR 0009).
 // Storage: schema.md `console_config` / `console_capabilities`. Delivery to the
-// agent: agent-api.md `config_update.console_config` (additive) + capability
-// enumeration in `capacity.console_capabilities` (additive). Mirrors the
-// internal/hostcfg package's store/resolve/handler shape, but is a distinct
-// structured surface (lists, nested selectors) rather than a flat scalar knob
-// catalog, so it carries a typed ConsoleConfig for the resolved API response.
+// agent: agent-api.md `config_update.console_config` + capability enumeration
+// in `capacity.console_capabilities`. Mirrors the internal/hostcfg package's
+// store/resolve/handler shape, but is a distinct structured surface (lists,
+// nested selectors) rather than a flat scalar knob catalog, so it carries a
+// typed ConsoleConfig for the resolved API response.
 package console
 
 import (
@@ -17,43 +18,45 @@ import (
 
 // ConsoleConfig is the resolved (every field has a value) console-mode
 // configuration, with the exact json tags of protocol/openapi.yaml
-// ConsoleConfig. AudioOutput / DefaultApp / DefaultUser are nullable — nil is
-// a meaningful value ("no local audio yet" / "no auto-launch app" / "no
-// auto-launch owner"), not "unset".
+// ConsoleConfig: the six settings amendment 19 kept. OutputID / DefaultApp /
+// DefaultUser are nullable — nil is a meaningful value ("automatic output" /
+// "no app" / "no auto-launch owner"), not "unset".
 type ConsoleConfig struct {
-	Enabled               bool           `json:"enabled"`
-	Connector             string         `json:"connector"`
-	OutputID              *string        `json:"output_id"`
-	Mode                  *ModeSelection `json:"mode"`
-	Compositor            string         `json:"compositor"`
-	AudioOutput           *string        `json:"audio_output"`
-	Stream                bool           `json:"stream"`
-	StreamAudio           bool           `json:"stream_audio"`
-	InputDevices          InputDevices   `json:"input_devices"`
-	Grab                  bool           `json:"grab"`
-	AutoStartOnDisplay    bool           `json:"auto_start_on_display"`
-	AutoConnectController bool           `json:"auto_connect_controller"`
-	DefaultApp            *string        `json:"default_app"`
+	Enabled bool `json:"enabled"`
+	// OutputID is the output pick: a card-scoped DRM output id
+	// (`cardN:CONNECTOR`) meaning "this card, launch when this connector has
+	// a monitor"; nil is automatic (any connected output).
+	OutputID *string `json:"output_id"`
+	// InputDevices is the allowlist of input nodes passed into the console
+	// container; "auto" passes every one.
+	InputDevices       InputDevices `json:"input_devices"`
+	AutoStartOnDisplay bool         `json:"auto_start_on_display"`
+	DefaultApp         *string      `json:"default_app"`
 	// DefaultUser is the admin-set owner (users.id) for auto-started console
 	// sessions (CM-06 Decision 2, 2026-07-11). auto_start_on_display requires
 	// this set — the node-agent does not consume it; control-plane uses it
 	// for session ownership only.
 	DefaultUser *string `json:"default_user"`
-	Fullscreen  bool    `json:"fullscreen"`
 }
 
+// ModeSelection is a physical display mode as the DRM mode names it. Since
+// amendment 19 it is no longer a console setting; it survives as the shape of
+// a console session's reported mode (agent-api.md session_metrics.console_mode).
 type ModeSelection struct {
 	Width          uint16 `json:"width"`
 	Height         uint16 `json:"height"`
 	RefreshMillihz uint32 `json:"refresh_millihz"`
 }
 
+// ConsoleVideoTopology is the only per-session output plan a console session
+// has since amendment 19 retired `dual_output`: its desktop drives the display
+// directly and is never streamed.
+const ConsoleVideoTopology = "local_only"
+
 // PinnedConnector returns the connector the level-trigger presence check
-// (agentws connectorPresent) should key on (CM-09 item 3). `connector` itself
-// stays validation-locked to "auto" (resolve.go), so the pin — when one
-// exists — is derived from the already-validated `output_id`
-// (`cardN:CONNECTOR`, resolve.go ValidatePatch/ValidateOutputSelection). No
-// `output_id` means "auto" (today's any-connector-present behavior).
+// (agentws connectorPresent) keys on (CM-09 item 3), derived from the
+// already-validated `output_id` (`cardN:CONNECTOR`, resolve.go
+// ValidatePatch). No `output_id` means "auto" (any connector present).
 func (c ConsoleConfig) PinnedConnector() string {
 	if c.OutputID == nil {
 		return "auto"
@@ -67,16 +70,6 @@ func (c ConsoleConfig) PinnedConnector() string {
 		return "auto"
 	}
 	return connector
-}
-
-// VideoTopology returns the per-session output plan represented by the
-// backwards-compatible stream flag. Console mode always has local output;
-// stream=true adds WebRTC as a second output.
-func (c ConsoleConfig) VideoTopology() string {
-	if c.Stream {
-		return "dual_output"
-	}
-	return "local_only"
 }
 
 // InputDevices is "auto" (enumerate connected) or an explicit list of
@@ -115,10 +108,11 @@ func (d *InputDevices) UnmarshalJSON(b []byte) error {
 
 // Capabilities is what the host can do in console mode (agent-api.md
 // `capacity.console_capabilities`). Empty arrays if the agent has not reported.
+// An `audio_sinks` array from an agent older than amendment 19 is ignored: a
+// console desktop picks its own audio output.
 type Capabilities struct {
 	Connectors   []string          `json:"connectors"`
 	Outputs      []DRMOutput       `json:"outputs,omitempty"`
-	AudioSinks   []AudioSink       `json:"audio_sinks"`
 	InputDevices []InputDevicePath `json:"input_devices"`
 	// Access (amendment 18, agent-api.md `capacity.console_capabilities.access`)
 	// is the agent's latest console-access report on an owned host. Nil when
@@ -176,12 +170,6 @@ type DRMMode struct {
 	VTotal         uint16 `json:"vtotal"`
 }
 
-// AudioSink is one reported local host audio sink.
-type AudioSink struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
 // InputDevicePath is one reported physical input device.
 type InputDevicePath struct {
 	Path  string `json:"path"`
@@ -195,7 +183,6 @@ func EmptyCapabilities() Capabilities {
 	return Capabilities{
 		Connectors:   []string{},
 		Outputs:      []DRMOutput{},
-		AudioSinks:   []AudioSink{},
 		InputDevices: []InputDevicePath{},
 	}
 }
