@@ -505,6 +505,12 @@ impl Dialect {
     /// Whether `HostConfig.Binds` / `HostConfig.Mounts` echo the request. When they do
     /// not (Podman), the realized mount points, which every engine reports, are what is
     /// compared.
+    /// Whether the read-back carries `HostConfig.DeviceCgroupRules` as requested. Rootless
+    /// Podman cannot apply device rules at all; its access is the node's own permissions.
+    pub(crate) fn echoes_device_cgroup_rules(self) -> bool {
+        self == Dialect::Docker
+    }
+
     pub(crate) fn echoes_mount_requests(self) -> bool {
         self == Dialect::Docker
     }

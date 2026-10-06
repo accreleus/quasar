@@ -417,6 +417,10 @@ fn application_request_from_args(args: &[String], operation: String) -> Result<A
                 request.devices.push(next()?.clone());
                 i += 1;
             }
+            "--device-cgroup-rule" => {
+                request.device_cgroup_rules.push(next()?.clone());
+                i += 1;
+            }
             "--group-add" => {
                 request.group_add.push(next()?.clone());
                 i += 1;
@@ -502,6 +506,11 @@ fn application_request_from_args(args: &[String], operation: String) -> Result<A
         anyhow::bail!("invalid application runtime request");
     }
     Ok(request)
+}
+
+#[cfg(test)]
+pub(crate) fn application_request_for_test(args: &[String]) -> ApplicationRequest {
+    application_request_from_args(args, "test-operation".into()).expect("valid request")
 }
 
 fn parse_size(value: &str) -> Result<i64> {

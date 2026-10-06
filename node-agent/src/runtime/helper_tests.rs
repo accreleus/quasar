@@ -1442,6 +1442,33 @@ fn application_rejects_mismatched_realized_mount_device_and_security_requirement
 }
 
 #[test]
+fn application_device_cgroup_rules_are_created_and_verified() {
+    let request = |operation: &str| ApplicationRequest {
+        device_cgroup_rules: vec!["c 13:* rwm".into()],
+        ..realized_requirements_request(operation)
+    };
+    let engine = Engine::new();
+    assert!(engine
+        .client()
+        .start_application(request("fixture-cgroup-rules"))
+        .wait()
+        .is_ok());
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().host_config_patch = Some(json!({"DeviceCgroupRules": null}));
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request("fixture-cgroup-rules-dropped"))
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol,
+        "an engine that did not apply the rule must be refused"
+    );
+}
+
+#[test]
 fn application_accepts_normalized_typed_mount_defaults() {
     let engine = Engine::new();
     engine.state.lock().unwrap().host_mount_override = Some(json!([{

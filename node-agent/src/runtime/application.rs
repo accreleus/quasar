@@ -86,6 +86,9 @@ pub struct ApplicationRequest {
     /// syntax whose SELinux and consistency suffixes must remain byte exact.
     pub typed_mounts: Vec<ApplicationMount>,
     pub devices: Vec<String>,
+    /// `c <major>:<minor|*> <rwm>` only; lets a node created after start be opened.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_cgroup_rules: Vec<String>,
     pub group_add: Vec<String>,
     pub network: String,
     pub gpu: bool,
@@ -108,6 +111,7 @@ impl Default for ApplicationRequest {
             mounts: Vec::new(),
             typed_mounts: Vec::new(),
             devices: Vec::new(),
+            device_cgroup_rules: Vec::new(),
             group_add: Vec::new(),
             network: "none".into(),
             gpu: false,
@@ -136,6 +140,10 @@ impl ApplicationRequest {
                 .mounts
                 .iter()
                 .all(|mount| !mount.is_empty() && !mount.contains('\0'))
+            && self
+                .device_cgroup_rules
+                .iter()
+                .all(|rule| valid_device_cgroup_rule(rule))
             && self.typed_mounts.iter().all(|mount| match mount {
                 ApplicationMount::Bind { source, target, .. }
                 | ApplicationMount::Volume { source, target, .. } => {
@@ -146,6 +154,26 @@ impl ApplicationRequest {
                 }
             })
     }
+}
+
+/// A character-device rule with numeric major, numeric-or-`*` minor and a non-empty
+/// subset of `rwm`. Block devices and the `a` wildcard are refused.
+fn valid_device_cgroup_rule(rule: &str) -> bool {
+    let mut parts = rule.split(' ');
+    let (Some("c"), Some(numbers), Some(access), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some((major, minor)) = numbers.split_once(':') else {
+        return false;
+    };
+    let number = |s: &str| !s.is_empty() && s.len() <= 10 && s.bytes().all(|b| b.is_ascii_digit());
+    number(major)
+        && (minor == "*" || number(minor))
+        && !access.is_empty()
+        && access.len() <= 3
+        && access.bytes().all(|b| matches!(b, b'r' | b'w' | b'm'))
 }
 
 /// Terminal evidence retained before a container is removed.
@@ -346,5 +374,30 @@ impl ApplicationJournal {
         std::fs::File::open(self.path.parent().ok_or(super::ErrorKind::Protocol)?)
             .and_then(|f| f.sync_all())
             .map_err(|_| super::ErrorKind::Unavailable.into())
+    }
+}
+
+#[cfg(test)]
+mod device_cgroup_rule_tests {
+    use super::valid_device_cgroup_rule;
+
+    #[test]
+    fn only_character_device_rules_are_valid() {
+        for ok in ["c 13:* rwm", "c 116:3 rw", "c 226:0 r"] {
+            assert!(valid_device_cgroup_rule(ok), "{ok}");
+        }
+        for bad in [
+            "a *:* rwm",
+            "b 8:* rwm",
+            "c *:* rwm",
+            "c 13:* rwx",
+            "c 13 rwm",
+            "c 13:* ",
+            "c 13:*  rwm",
+            "c 13:* rwm extra",
+            "",
+        ] {
+            assert!(!valid_device_cgroup_rule(bad), "{bad:?}");
+        }
     }
 }

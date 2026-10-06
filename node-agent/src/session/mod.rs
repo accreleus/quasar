@@ -22,6 +22,8 @@ pub(crate) mod console;
 // and the device is free (#407 RH07-15, D13).
 pub(crate) mod console_audio;
 pub mod console_hotplug;
+// The grants a direct-display console container gets (#453).
+pub mod console_plan;
 // Startup check that this agent can actually take the console display before it
 // reports healthy (#407 RH07-15).
 pub(crate) mod console_preflight;
