@@ -578,25 +578,24 @@ fn the_rendered_node_agent_matches_the_compose_definitions_except_the_listed_dif
     );
 }
 
+/// The node-agent recipe revision the console overlay is compared with: the one this tree's
+/// agent image declares.
+const CONSOLE_REVISION: u32 = 4;
+
 /// `(kind, item, reason)`: how the console additions (RH-07 #395) differ from what
 /// `deploy/overlays/docker-compose.console.yml` adds to the Compose service. `-`: the
 /// overlay adds it and the recipe does not; `+`: the reverse.
 const ALLOWED_CONSOLE: &[(&str, &str, &str)] = &[
     (
-        "-rule",
-        "c 116:* rmw",
-        "ALSA nodes arrive with the /dev/snd bind and nothing creates one, so no `m`",
-    ),
-    ("+rule", "c 116:* rw", "the same ALSA access without `m`"),
-    (
-        "-rule",
-        "c 226:* rmw",
-        "revision 3 maps /dev/dri as a device, which already grants its DRM nodes",
-    ),
-    (
         "+env",
         "QUASAR_CONSOLE_ACCESS=1",
         "how the agent tells that its container carries the console additions",
+    ),
+    (
+        "+env",
+        "QUASAR_HOST_SOUND=1",
+        "an owned agent has no host /dev (revision 3), so the actor tells it whether the host \
+         has a sound device; a Compose agent sees /dev/snd through the base file's /host/dev",
     ),
 ];
 
@@ -628,8 +627,9 @@ fn delta(without: &Shape, with: &Shape) -> BTreeSet<(String, String)> {
 }
 
 /// The console additions compared as additions: the overlay's to the Compose service, the
-/// recipe's to revision 3 without console mode. Revision 3's own differences from Compose
-/// (RH-07 #402) are not the console's, so the base shapes are not compared here.
+/// recipe's to the current revision (4, #461) without console mode. Revision 3's own
+/// differences from Compose (RH-07 #402) are not the console's, so the base shapes are not
+/// compared here.
 #[test]
 fn the_console_additions_match_the_console_overlay_except_the_listed_differences() {
     let base = deploy("docker-compose.yml");
@@ -648,8 +648,8 @@ fn the_console_additions_match_the_console_overlay_except_the_listed_differences
         let plain = inputs(vendor);
         let mut on = plain.clone();
         on.console = true;
-        // The overlay grants sound and the console VT, and says the host has udev's
-        // database, unconditionally; the recipe only on a host that has them.
+        // The overlay grants the console VT and says the host has udev's database
+        // unconditionally; the recipe only on a host that has them.
         on.devices.sound = true;
         on.devices.console_vt = true;
         on.devices.udev_data = Some(true);
@@ -662,8 +662,10 @@ fn the_console_additions_match_the_console_overlay_except_the_listed_differences
         let compose_console = compose_shape(&files, &dotenv(&on));
         let overlay = delta(&compose_plain, &compose_console);
         let recipe = delta(
-            &spec_shape(&render(Role::NodeAgent, 3, &plain, &image, &secrets).unwrap()),
-            &spec_shape(&render(Role::NodeAgent, 3, &on, &image, &secrets).unwrap()),
+            &spec_shape(
+                &render(Role::NodeAgent, CONSOLE_REVISION, &plain, &image, &secrets).unwrap(),
+            ),
+            &spec_shape(&render(Role::NodeAgent, CONSOLE_REVISION, &on, &image, &secrets).unwrap()),
         );
         let mut found = BTreeSet::new();
         for (kind, item) in overlay.difference(&recipe) {

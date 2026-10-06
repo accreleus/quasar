@@ -32,16 +32,20 @@ const RELEASE_ID: &str = "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22";
 const PROBE_AMD_SOUND: &str =
     "quasar-probe 1\ndev uinput\ndev kmsg\ndev snd\nnode /dev/dri/renderD129 226:129 0x1002\nend\n";
 
-/// A rootful AMD GPU host with sound whose agent image carries recipe revision 3.
+/// The recipe revision this tree's agent image declares (`node-agent/src/recipe.rs`).
+const AGENT_RECIPE: &str = "4";
+
+/// A rootful AMD GPU host with sound whose agent image carries the current recipe revision.
 fn rootful() -> FakeState {
     let mut state = amd_host();
     state.probe_output = PROBE_AMD_SOUND.into();
     state
         .registry
-        .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
+        .insert(AGENT_IMAGE.into(), agent_image(Some(AGENT_RECIPE)));
     state
 }
 
+/// Whether the agent itself was given the host's sound device (revision 3 only).
 fn binds_sound(agent: &FakeContainer) -> bool {
     agent.spec.binds.iter().any(|b| b.source == "/dev/snd")
         || agent
@@ -49,6 +53,11 @@ fn binds_sound(agent: &FakeContainer) -> bool {
             .device_cgroup_rules
             .iter()
             .any(|r| r.starts_with("c 116:"))
+}
+
+/// What the agent was told about the host's sound device (revision 4, #461).
+fn told_sound(agent: &FakeContainer) -> Option<&str> {
+    agent.spec.env.get("QUASAR_HOST_SOUND").map(String::as_str)
 }
 
 struct Machine {
@@ -190,7 +199,7 @@ fn release_request() -> Request {
 }
 
 fn with_release(mut state: FakeState) -> FakeState {
-    let mut image = agent_image(Some("3"));
+    let mut image = agent_image(Some(AGENT_RECIPE));
     image.id = "sha256:d0d0000000000000000000000000000000000000000000000000000000000000".into();
     image.repo_digests = vec![NEW_AGENT.into()];
     state.registry.insert(NEW_AGENT.into(), image);
@@ -234,12 +243,11 @@ fn enabling_replaces_only_the_agent_with_the_console_additions_and_disabling_tak
     assert_ne!(agent.id, old.id);
     assert_eq!(agent.spec.image, old.spec.image, "the same digest");
     assert!(console_on(&agent));
-    assert_eq!(agent.spec.cap_add, vec!["SYS_ADMIN".to_string()]);
-    assert!(agent
-        .spec
-        .binds
-        .iter()
-        .any(|b| b.source == "/dev/snd" && b.target == "/dev/snd"));
+    // #461: the console desktop's container holds the screen and the sound device, not the
+    // agent: no capability, no sound device, only the host's answer about it.
+    assert!(agent.spec.cap_add.is_empty(), "{:?}", agent.spec.cap_add);
+    assert!(!binds_sound(&agent), "{:?}", agent.spec);
+    assert_eq!(told_sound(&agent), Some("1"));
     assert!(m.console_input());
     let status = actor.console_status();
     assert!(status.enabled && status.in_flight.is_none(), "{status:?}");
@@ -270,11 +278,11 @@ fn enabling_replaces_only_the_agent_with_the_console_additions_and_disabling_tak
     assert_eq!(actor.console(disable()).expect("answered"), None);
 }
 
-/// Sound is read when console mode is turned on, not only at the install: a host without
-/// it gets console mode without sound devices (nothing for the engine to create), and one
-/// whose sound appeared after the install gets them.
+/// Sound is read when console mode is turned on, not only at the install: the agent is told
+/// the host has none, and once a sound card appeared, that it has one. The agent itself is
+/// never given the device (#461).
 #[test]
-fn console_mode_gives_sound_devices_only_on_a_host_that_has_them_now() {
+fn console_mode_tells_the_agent_about_the_host_sound_device_as_it_is_now() {
     let mut state = rootful();
     state.probe_output = PROBE_AMD.into();
     let m = Machine::install(state);
@@ -284,6 +292,7 @@ fn console_mode_gives_sound_devices_only_on_a_host_that_has_them_now() {
     let quiet = m.one_running_agent("enabled without sound");
     assert!(console_on(&quiet));
     assert!(!binds_sound(&quiet), "{:?}", quiet.spec);
+    assert_eq!(told_sound(&quiet), Some("0"));
     assert!(quiet
         .spec
         .device_cgroup_rules
@@ -295,7 +304,26 @@ fn console_mode_gives_sound_devices_only_on_a_host_that_has_them_now() {
         .with_state(|s| s.probe_output = PROBE_AMD_SOUND.into());
     run(&actor, enable());
     let loud = m.one_running_agent("enabled with sound");
-    assert!(console_on(&loud) && binds_sound(&loud), "{:?}", loud.spec);
+    assert!(console_on(&loud) && !binds_sound(&loud), "{:?}", loud.spec);
+    assert_eq!(told_sound(&loud), Some("1"));
+}
+
+/// A revision-3 agent (one an actor may put back) is still given the grants its own
+/// console drew with: `SYS_ADMIN` and the host's sound device (ADR 0008 Rule B).
+#[test]
+fn a_revision_3_agent_still_gets_the_grants_its_console_used() {
+    let mut state = rootful();
+    state
+        .registry
+        .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
+    let m = Machine::install(state);
+    let actor = m.actor();
+    run(&actor, enable());
+    let agent = m.one_running_agent("revision 3 console");
+    assert!(console_on(&agent));
+    assert_eq!(agent.spec.cap_add, vec!["SYS_ADMIN".to_string()]);
+    assert!(binds_sound(&agent), "{:?}", agent.spec);
+    assert_eq!(told_sound(&agent), None);
 }
 
 /// An operator reconfigure keeps console mode as it is, and cannot set it.
@@ -563,7 +591,7 @@ fn a_host_without_dri_is_refused() {
     let mut state = host(PROBE_NONE, &["runc"], false, &["/dev/uinput", "/dev/kmsg"]);
     state
         .registry
-        .insert(AGENT_IMAGE.into(), agent_image(Some("3")));
+        .insert(AGENT_IMAGE.into(), agent_image(Some(AGENT_RECIPE)));
     let m = Machine::install(state);
     let actor = m.actor();
     assert!(!actor.console_status().supported);
@@ -713,7 +741,8 @@ fn a_rootless_engine_takes_console_mode_without_a_capability_or_device_rules() {
         agent.spec.device_cgroup_rules
     );
     assert_eq!(i2c_devices(&agent), vec!["/dev/i2c-3", "/dev/i2c-5"]);
-    assert!(agent.spec.binds.iter().any(|b| b.source == "/dev/snd"));
+    assert!(!binds_sound(&agent), "{:?}", agent.spec);
+    assert_eq!(told_sound(&agent), Some("1"));
     assert!(binds_logind(&agent));
     assert_eq!(m.inputs()["devices"]["i2c"], serde_json::json!([3, 5]));
     assert_eq!(m.inputs()["devices"]["logind"], true);
@@ -728,7 +757,8 @@ fn a_rootless_engine_takes_console_mode_without_a_capability_or_device_rules() {
     assert_eq!(off.spec.devices, old.spec.devices);
 }
 
-/// Sound, logind and i2c are each given only where the host has them now.
+/// logind and i2c are each given only where the host has them now, and the agent is told
+/// the host has no sound device.
 #[test]
 fn a_rootless_host_without_sound_logind_or_i2c_gets_none_of_them() {
     let mut state = rootless();
@@ -739,6 +769,7 @@ fn a_rootless_host_without_sound_logind_or_i2c_gets_none_of_them() {
     let agent = m.one_running_agent("bare rootless console");
     assert!(console_on(&agent));
     assert!(!binds_sound(&agent), "{:?}", agent.spec);
+    assert_eq!(told_sound(&agent), Some("0"));
     assert!(!binds_logind(&agent), "{:?}", agent.spec);
     assert!(i2c_devices(&agent).is_empty(), "{:?}", agent.spec);
     assert!(agent.spec.cap_add.is_empty() && agent.spec.device_cgroup_rules.is_empty());
@@ -799,36 +830,41 @@ fn a_regular_file_at_dev_i2c_is_skipped_and_console_mode_still_turns_on() {
     assert_eq!(m.inputs()["devices"]["i2c"], serde_json::json!([3]));
 }
 
-/// D13: a host prepared with `--console-audio-user` has the PipeWire socket directory;
-/// turning console mode on reads it and binds it read-write into the agent.
+/// D13: a host prepared with `--console-audio-user` has the PipeWire socket directory.
+/// Turning console mode on still reads it (machine state a revision-3 agent renders with),
+/// but from revision 4 (#461) the console desktop plays its own audio and the agent is not
+/// given it; a revision-3 agent still is.
 #[test]
-fn a_host_with_the_console_audio_directory_gets_it_bound() {
-    let mut state = rootless();
-    state.probe_output = PROBE_ROOTLESS.replace("\nend\n", "\nconsole_audio dir\nend\n");
-    let m = Machine::install(state);
-    let actor = m.actor();
-    run(&actor, enable());
-    let agent = m.one_running_agent("rootless console with PipeWire");
-    assert!(
-        agent
-            .spec
-            .binds
-            .iter()
-            .any(|b| b.source == "/run/quasar-console-audio"
+fn the_console_audio_directory_is_read_but_bound_only_into_a_revision_3_agent() {
+    let binds_pipewire = |agent: &FakeContainer| {
+        agent.spec.binds.iter().any(|b| {
+            b.source == "/run/quasar-console-audio"
                 && b.target == "/run/quasar-console-audio"
-                && !b.read_only),
-        "{:?}",
-        agent.spec.binds
-    );
-    assert_eq!(m.inputs()["devices"]["console_audio"], true);
+                && !b.read_only
+        })
+    };
+    for (revision, bound) in [(AGENT_RECIPE, false), ("3", true)] {
+        let mut state = rootless();
+        state.probe_output = PROBE_ROOTLESS.replace("\nend\n", "\nconsole_audio dir\nend\n");
+        state
+            .registry
+            .insert(AGENT_IMAGE.into(), agent_image(Some(revision)));
+        let m = Machine::install(state);
+        let actor = m.actor();
+        run(&actor, enable());
+        let agent = m.one_running_agent("rootless console with PipeWire");
+        assert_eq!(
+            binds_pipewire(&agent),
+            bound,
+            "revision {revision}: {:?}",
+            agent.spec.binds
+        );
+        assert_eq!(m.inputs()["devices"]["console_audio"], true);
 
-    run(&actor, disable());
-    let off = m.one_running_agent("console off");
-    assert!(!off
-        .spec
-        .binds
-        .iter()
-        .any(|b| b.source == "/run/quasar-console-audio"));
+        run(&actor, disable());
+        let off = m.one_running_agent("console off");
+        assert!(!binds_pipewire(&off), "revision {revision}");
+    }
 }
 
 // ----- the console agent's preflight (#407) -----
