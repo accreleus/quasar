@@ -10,6 +10,13 @@ pub const DIRECT_DISPLAY_ENV: &str = "QUASAR_DIRECT_DISPLAY";
 /// plugged in after start is a new node the device cgroup has never allowed.
 const INPUT_CGROUP_RULE: &str = "c 13:* rwm";
 
+/// Where a hidraw device's sysfs sibling lives relative to its evdev `device` symlink:
+/// `event<N>/device` resolves to the HID device's `input/input<M>` directory, so its
+/// parent's parent is the HID device directory that also owns `hidraw/hidraw<K>`.
+fn hidraw_dir_for_input_device(input_device_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    Some(input_device_dir.parent()?.parent()?.join("hidraw"))
+}
+
 /// Which input devices the desktop gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputGrant {
@@ -36,6 +43,17 @@ pub struct ConsoleHost {
     pub render_node: Option<String>,
     /// The host has `/dev/snd`.
     pub sound: bool,
+    /// The `/dev/hidrawN` nodes to grant: the caller resolves these for the chosen
+    /// [`InputGrant`] before building the plan — every existing node for `All`, or just
+    /// the allowlisted events' resolved siblings for `Nodes` (#462). Steam Input reads
+    /// controllers over hidraw; with no hidraw node it falls back to an evdev GUID match
+    /// that misnames the pad.
+    pub hidraw_nodes: Vec<String>,
+    /// hidraw's character major, so a controller plugged in later (an `All` grant only —
+    /// `Nodes` grants no hotplug rule) can still open its node once it exists. Dynamic,
+    /// read from `/proc/devices` at launch; `None` when the host has no hidraw major
+    /// registered at all.
+    pub hidraw_major: Option<u32>,
 }
 
 /// `console_config.input_devices`: absent or `"auto"` is every device, an array of node
@@ -133,6 +151,12 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
     if host.sound {
         device("/dev/snd");
     }
+    // `/dev/hidrawN`'s parent is `/dev` itself, so it is never bind-mounted (that would
+    // hand over the whole device directory); each node the caller resolved is passed
+    // individually instead, same as an input allowlist's nodes below.
+    for node in &host.hidraw_nodes {
+        device(node);
+    }
     let mut bind = |src: &str| {
         args.push("--mount".to_string());
         args.push(format!("type=bind,src={src},dst={src},readonly"));
@@ -148,7 +172,16 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
     // the image makes the placeholder libudev looks for.
     bind("/run/udev/data");
     match input {
-        InputGrant::All => args.extend(["--device-cgroup-rule".into(), INPUT_CGROUP_RULE.into()]),
+        InputGrant::All => {
+            args.extend(["--device-cgroup-rule".into(), INPUT_CGROUP_RULE.into()]);
+            // A controller plugged in after launch is a hidraw node the device cgroup
+            // has never allowed, same reasoning as the evdev rule above. An allowlisted
+            // (`Nodes`) grant gets no such rule: the nodes it was given are exactly what
+            // was resolved at launch, nothing more.
+            if let Some(major) = host.hidraw_major {
+                args.extend(["--device-cgroup-rule".into(), format!("c {major}:* rwm")]);
+            }
+        }
         InputGrant::Nodes(nodes) => {
             for node in nodes {
                 args.extend(["--device".into(), node.clone()]);
@@ -164,6 +197,52 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
     args
 }
 
+/// hidraw's character major from a `/proc/devices` listing (its own format: a `Character
+/// devices:` section, then `<major> <name>` lines, blank line, `Block devices:`). Dynamic
+/// on most kernels (allocated from the misc range), so this cannot be a constant like
+/// [`INPUT_CGROUP_RULE`]'s evdev major.
+pub fn hidraw_major_from(proc_devices: &str) -> Option<u32> {
+    proc_devices.lines().find_map(|line| {
+        let (major, name) = line.trim().split_once(char::is_whitespace)?;
+        if name.trim() != "hidraw" {
+            return None;
+        }
+        major.trim().parse::<u32>().ok()
+    })
+}
+
+/// The production root: sysfs is not namespaced (same as `/sys/class/drm`, read without a
+/// `/host` mount elsewhere in this agent), so the bare path already answers for the host.
+fn sysfs_root() -> &'static std::path::Path {
+    std::path::Path::new("/sys")
+}
+
+/// An allowlisted `/dev/input/eventN`'s hidraw sibling, if the same HID device also
+/// exposes one, read from the real sysfs root.
+pub fn hidraw_sibling(event_node: &str) -> Option<String> {
+    hidraw_sibling_at(sysfs_root(), event_node)
+}
+
+/// Injectable-root version of [`hidraw_sibling`], so a test can point at a tempdir built
+/// to mimic `/sys/class/input/event<N>/device/../../hidraw/hidraw<M>` instead of the real
+/// sysfs tree.
+pub fn hidraw_sibling_at(sysfs_root: &std::path::Path, event_node: &str) -> Option<String> {
+    let event_name = std::path::Path::new(event_node).file_name()?.to_str()?;
+    let device_link = sysfs_root
+        .join("class/input")
+        .join(event_name)
+        .join("device");
+    let input_device_dir = std::fs::canonicalize(device_link).ok()?;
+    let hidraw_dir = hidraw_dir_for_input_device(&input_device_dir)?;
+    std::fs::read_dir(hidraw_dir)
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            name.starts_with("hidraw").then(|| format!("/dev/{name}"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +252,8 @@ mod tests {
             card_node: "/dev/dri/card1".into(),
             render_node: Some("/dev/dri/renderD129".into()),
             sound: true,
+            hidraw_nodes: Vec::new(),
+            hidraw_major: None,
         }
     }
 
@@ -327,16 +408,159 @@ mod tests {
     }
 
     #[test]
+    fn all_input_also_grants_every_hidraw_node_with_the_major_rule() {
+        let with_hidraw = ConsoleHost {
+            hidraw_nodes: vec!["/dev/hidraw0".into(), "/dev/hidraw3".into()],
+            hidraw_major: Some(242),
+            ..host()
+        };
+        let args = console_args(&with_hidraw, &InputGrant::All);
+        assert_eq!(
+            pairs(&args, "--device"),
+            [
+                "/dev/dri/card1",
+                "/dev/dri/renderD129",
+                "/dev/snd",
+                "/dev/hidraw0",
+                "/dev/hidraw3",
+            ]
+        );
+        assert_eq!(
+            pairs(&args, "--device-cgroup-rule"),
+            ["c 13:* rwm", "c 242:* rwm"]
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_hidraw_major_grants_no_hidraw_rule() {
+        // Absent hidraw entirely: no nodes, no major (the `host()` fixture default).
+        // Behaves exactly as it did before #462.
+        let args = console_args(&host(), &InputGrant::All);
+        assert!(!pairs(&args, "--device")
+            .iter()
+            .any(|d| d.contains("hidraw")));
+        assert_eq!(pairs(&args, "--device-cgroup-rule"), ["c 13:* rwm"]);
+    }
+
+    #[test]
+    fn an_allowlisted_events_resolved_hidraw_sibling_is_granted_with_no_rule() {
+        // The caller already resolved event11's sibling through sysfs before building the
+        // plan; `console_args` itself does no I/O.
+        let resolved = ConsoleHost {
+            hidraw_nodes: vec!["/dev/hidraw5".into()],
+            ..host()
+        };
+        let input = InputGrant::Nodes(vec!["/dev/input/event11".into()]);
+        let args = console_args(&resolved, &input);
+        assert_eq!(
+            pairs(&args, "--device"),
+            [
+                "/dev/dri/card1",
+                "/dev/dri/renderD129",
+                "/dev/snd",
+                "/dev/hidraw5",
+                "/dev/input/event11",
+            ]
+        );
+        assert!(pairs(&args, "--device-cgroup-rule").is_empty());
+    }
+
+    #[test]
+    fn an_event_with_no_hidraw_sibling_grants_nothing_extra() {
+        // The caller found no sibling for this event (e.g. a sound card's jack-sense input,
+        // or the power button: real evdev devices with no HID backing at all), so
+        // hidraw_nodes stays empty and only the allowlisted event itself is passed.
+        let input = InputGrant::Nodes(vec!["/dev/input/event0".into()]);
+        let args = console_args(&host(), &input);
+        assert_eq!(
+            pairs(&args, "--device"),
+            [
+                "/dev/dri/card1",
+                "/dev/dri/renderD129",
+                "/dev/snd",
+                "/dev/input/event0",
+            ]
+        );
+    }
+
+    /// `<root>/class/input/event<N>/device` symlinked to `<root>/devices/<hid>/input/input<M>`,
+    /// mimicking the real sysfs layout (verified by reading a live console host's
+    /// `/sys/class/input/event*/device` structure for #462): an evdev device's `device`
+    /// symlink resolves to the HID device's own `input/inputM` subdirectory, so `hidraw`
+    /// is a sibling of the HID device two levels up from there, not one.
+    fn fake_sysfs_hid_event(
+        root: &std::path::Path,
+        event_name: &str,
+        hid_name: &str,
+        input_name: &str,
+    ) -> std::path::PathBuf {
+        let hid_dir = root.join("devices").join(hid_name);
+        let input_dir = hid_dir.join("input").join(input_name);
+        std::fs::create_dir_all(&input_dir).unwrap();
+        let event_dir = root.join("class/input").join(event_name);
+        std::fs::create_dir_all(&event_dir).unwrap();
+        std::os::unix::fs::symlink(&input_dir, event_dir.join("device")).unwrap();
+        hid_dir
+    }
+
+    #[test]
+    fn hidraw_sibling_at_resolves_through_the_hid_devices_sysfs_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hid_dir = fake_sysfs_hid_event(root, "event11", "0003:342D:E3E7.0023", "input485");
+        std::fs::create_dir_all(hid_dir.join("hidraw/hidraw5")).unwrap();
+
+        assert_eq!(
+            hidraw_sibling_at(root, "/dev/input/event11"),
+            Some("/dev/hidraw5".to_string())
+        );
+    }
+
+    #[test]
+    fn hidraw_sibling_at_is_none_with_no_hidraw_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A real evdev device with no HID backing at all (e.g. the power button): its HID
+        // device directory exists but never grows a `hidraw/` subdirectory.
+        fake_sysfs_hid_event(root, "event1", "LNXPWRBN:00", "input19");
+
+        assert_eq!(hidraw_sibling_at(root, "/dev/input/event1"), None);
+    }
+
+    #[test]
+    fn hidraw_sibling_at_is_none_for_an_unresolvable_event() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(hidraw_sibling_at(dir.path(), "/dev/input/event99"), None);
+    }
+
+    #[test]
+    fn hidraw_major_from_proc_devices_listing() {
+        let listing = "Character devices:\n  1 mem\n  4 /dev/vc/0\n 13 input\n242 hidraw\n\n\
+                        Block devices:\n  8 sd\n";
+        assert_eq!(hidraw_major_from(listing), Some(242));
+        assert_eq!(
+            hidraw_major_from("Character devices:\n  1 mem\n\nBlock devices:\n  8 sd\n"),
+            None
+        );
+    }
+
+    #[test]
     fn the_plan_round_trips_through_the_runtime_request() {
+        let with_hidraw = ConsoleHost {
+            hidraw_nodes: vec!["/dev/hidraw0".into()],
+            hidraw_major: Some(242),
+            ..host()
+        };
         let mut args: Vec<String> = ["run", "--name", "quasar-sess-x"]
             .map(String::from)
             .to_vec();
-        args.extend(console_args(&host(), &InputGrant::All));
+        args.extend(console_args(&with_hidraw, &InputGrant::All));
         args.push("image".into());
         let request = super::super::container::application_request_for_test(&args);
         assert_eq!(request.network, "host");
-        assert_eq!(request.device_cgroup_rules, ["c 13:* rwm"]);
+        assert_eq!(request.device_cgroup_rules, ["c 13:* rwm", "c 242:* rwm"]);
         assert!(request.devices.contains(&"/dev/dri/card1".to_string()));
+        assert!(request.devices.contains(&"/dev/hidraw0".to_string()));
         assert!(request
             .environment
             .contains(&"QUASAR_DIRECT_DISPLAY=1".to_string()));
