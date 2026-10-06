@@ -417,6 +417,10 @@ fn application_request_from_args(args: &[String], operation: String) -> Result<A
                 request.devices.push(next()?.clone());
                 i += 1;
             }
+            "--device-cgroup-rule" => {
+                request.device_cgroup_rules.push(next()?.clone());
+                i += 1;
+            }
             "--group-add" => {
                 request.group_add.push(next()?.clone());
                 i += 1;
@@ -502,6 +506,11 @@ fn application_request_from_args(args: &[String], operation: String) -> Result<A
         anyhow::bail!("invalid application runtime request");
     }
     Ok(request)
+}
+
+#[cfg(test)]
+pub(crate) fn application_request_for_test(args: &[String]) -> ApplicationRequest {
+    application_request_from_args(args, "test-operation".into()).expect("valid request")
 }
 
 fn parse_size(value: &str) -> Result<i64> {
@@ -993,8 +1002,14 @@ impl ContainerRuntime {
             .unwrap_or_else(|| Self::container_name(params.session_id));
 
         // Validate the network BEFORE anything is spawned: an out-of-set value must
-        // fail the launch, never reach the engine.
-        let network = resolve_network(spec.network.as_deref())?;
+        // fail the launch, never reach the engine. A direct-display console ignores the
+        // app's network and shares the host's namespace (udev hotplug arrives over
+        // netlink); `console_plan::console_args` carries that grant.
+        let direct = params.direct_display.as_ref();
+        let network = match direct {
+            Some(_) => None,
+            None => Some(resolve_network(spec.network.as_deref())?),
+        };
 
         anyhow::ensure!(
             name.starts_with(SESSION_NAME_PREFIX),
@@ -1012,11 +1027,6 @@ impl ContainerRuntime {
             name.clone(),
             "--label".into(),
             format!("{}={owner}", crate::container_ownership::LABEL),
-            // Isolated by default: `none` unless the app declares a requirement
-            // (§S2: Steam's first boot must download steamui.so) or the operator sets
-            // a host-wide default.
-            "--network".into(),
-            network,
             // Tenant apps need no capabilities to connect to the session-owned Wayland
             // socket or use explicitly mapped devices. Privilege reduction stays on
             // even when an operator enables app networking; this bounds the launched
@@ -1024,6 +1034,12 @@ impl ContainerRuntime {
             "--cap-drop".into(),
             "ALL".into(),
         ];
+        // Isolated by default: `none` unless the app declares a requirement (§S2:
+        // Steam's first boot must download steamui.so) or the operator sets a host-wide
+        // default.
+        if let Some(network) = network {
+            args.extend(["--network".into(), network]);
+        }
         // The quasar-images entrypoint is root-init-then-drop (useradd for PUID/PGID,
         // then `setpriv --reuid`), which a bare cap-drop ALL kills at init: useradd
         // exits 10 (mode-000 Fedora shadow files need CAP_DAC_OVERRIDE) and setpriv
@@ -1158,7 +1174,7 @@ impl ContainerRuntime {
         // fake-udev records to a host-shared dir, mounted read-only where libudev reads.
         // Skipped when absent (test-src sessions).
         let udev_dir = super::virtual_input::udev_export_dir(params.runtime_dir, params.session_id);
-        if udev_dir.is_dir() {
+        if direct.is_none() && udev_dir.is_dir() {
             args.push("--mount".into());
             args.push(format!(
                 "type=bind,src={},dst=/run/udev/data,readonly",
@@ -1171,7 +1187,9 @@ impl ContainerRuntime {
         // uid-0 app containers unable to traverse it after `--cap-drop ALL`, and
         // granting DAC caps would expose every other session's sockets and Pulse state.
         // A file bind gives a traversable, container-private parent holding one socket.
-        args.extend(wayland_mount_args(params));
+        if direct.is_none() {
+            args.extend(wayland_mount_args(params));
+        }
 
         // ── GPU passthrough ───────────────────────────────────────────────────
         if spec.gpu {
@@ -1201,10 +1219,13 @@ impl ContainerRuntime {
                     image_ld = ld;
                 }
             }
-            args.extend(
-                self.app_gpu_access_with(gated_volume)
-                    .session_args(&image_ld, &nvidia_lib32_mount_args(&lib32)),
-            );
+            let access = self.app_gpu_access_with(gated_volume);
+            let lib32 = nvidia_lib32_mount_args(&lib32);
+            args.extend(match direct {
+                // The console GPU's own nodes come from the console plan.
+                Some(_) => access.args(&image_ld, &lib32, false),
+                None => access.session_args(&image_ld, &lib32),
+            });
         }
 
         // ── Virtual input device nodes (mouse/keyboard for evdev-native apps,
@@ -1231,19 +1252,27 @@ impl ContainerRuntime {
         // `app_display_env` skips anything the spec-env loop already emitted. Named
         // `app_display`, not `display`: a bare `display` ident inside `tracing::info!`
         // resolves to `tracing::field::display`.
-        let app_display = app_display_env(params.display, &spec.env);
-        for (k, v) in &app_display.vars {
-            args.push("-e".into());
-            args.push(format!("{k}={v}"));
+        if let Some(direct) = direct {
+            // The desktop takes the monitor's own mode; no stream mode is injected.
+            args.extend(super::console_plan::console_args(
+                &direct.host,
+                &direct.input,
+            ));
+        } else {
+            let app_display = app_display_env(params.display, &spec.env);
+            for (k, v) in &app_display.vars {
+                args.push("-e".into());
+                args.push(format!("{k}={v}"));
+            }
+            tracing::info!(
+                "app display mode: {}x{}@{} (source={}, gamescope_env={})",
+                params.display.width,
+                params.display.height,
+                params.display.fps,
+                app_display.source.as_str(),
+                app_display.gamescope_env
+            );
         }
-        tracing::info!(
-            "app display mode: {}x{}@{} (source={}, gamescope_env={})",
-            params.display.width,
-            params.display.height,
-            params.display.fps,
-            app_display.source.as_str(),
-            app_display.gamescope_env
-        );
 
         // Forward PUID/PGID as ENV, never docker `--user`: `--user` bypasses the
         // quasar-images root-init-then-drop entrypoint and breaks images that need it.
@@ -1397,6 +1426,8 @@ pub struct ContainerSpec {
     /// `--security-opt systempaths=unconfined` (default off), the desktop-session launch
     /// profile knob for apps needing an unmasked `/proc`.
     pub systempaths_unconfined: bool,
+    /// The image can run its desktop directly on the display (`runtime_spec.direct_display`).
+    pub direct_display: bool,
 }
 
 /// The docker network modes an APP may ask for over the wire (`AppSpec.network`, which
@@ -1528,6 +1559,7 @@ impl ContainerSpec {
             network: None,
             systempaths_unconfined: false,
             require_local_image: false,
+            direct_display: false,
         })
     }
 }
@@ -1552,6 +1584,10 @@ pub struct LaunchParams<'a> {
     /// #384: the session's streamed display mode, injected as env so an app that cannot
     /// read the Wayland output (nested gamescope) runs at the selected profile.
     pub display: AppDisplayMode,
+    /// A console session's direct-display grants; `None` for every streamed or
+    /// nested launch. With it, no Wayland socket, virtual devices or stream mode are
+    /// handed in.
+    pub direct_display: Option<super::console_plan::DirectDisplay>,
 }
 
 const APP_WAYLAND_RUNTIME_DIR: &str = "/run/quasar-wayland";
@@ -1646,6 +1682,16 @@ impl AppGpuAccess {
         image_ld_library_path: &str,
         nvidia_lib32_mount: &[String],
     ) -> Vec<String> {
+        self.args(image_ld_library_path, nvidia_lib32_mount, true)
+    }
+
+    /// [`Self::session_args`], with `whole_dri` choosing whether every DRM node is passed.
+    fn args(
+        &self,
+        image_ld_library_path: &str,
+        nvidia_lib32_mount: &[String],
+        whole_dri: bool,
+    ) -> Vec<String> {
         let mut args = Vec::new();
         if self.nvidia {
             args.push("--gpus".into());
@@ -1658,8 +1704,10 @@ impl AppGpuAccess {
             ));
         }
         // AMD/Intel, and NVIDIA's render node for Vulkan/EGL, all want the DRM nodes.
-        args.push("--device".into());
-        args.push(DRI_DIR.into());
+        if whole_dri {
+            args.push("--device".into());
+            args.push(DRI_DIR.into());
+        }
         args.extend(self.group_add_args());
         args
     }
@@ -3484,6 +3532,7 @@ mod tests {
                 height: 1080,
                 fps: 60,
             },
+            direct_display: None,
         };
 
         let args = wayland_mount_args(&params);

@@ -171,7 +171,83 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
 /// `detect_console_capabilities` also does. `session::console::spawn_weston_console` calls
 /// this per launch; the full probe would eat its 15s socket-wait budget for discarded data.
 pub(crate) fn detect_drm_outputs() -> Vec<DrmOutputCapability> {
-    detect_drm_outputs_at(std::path::Path::new("/dev/dri"))
+    detect_drm_outputs_at(
+        std::path::Path::new("/dev/dri"),
+        std::path::Path::new("/sys/class/drm"),
+    )
+}
+
+/// Cards whose display a console desktop owns, with the outputs read before the claim.
+/// The inventory never opens a claimed card's node: opening a primary node while nobody
+/// holds DRM master makes the opener master, and a poll landing while the desktop starts
+/// would leave it without the display.
+type ClaimedCards = std::collections::BTreeMap<String, (u64, Vec<DrmOutputCapability>)>;
+
+fn claimed_cards() -> &'static std::sync::Mutex<ClaimedCards> {
+    static CLAIMED: std::sync::OnceLock<std::sync::Mutex<ClaimedCards>> =
+        std::sync::OnceLock::new();
+    CLAIMED.get_or_init(Default::default)
+}
+
+/// Held for a console session's life: while it lives, `card`'s outputs are its last
+/// read with `connected` refreshed from sysfs. A later claim of the same card replaces
+/// this one, and this one's drop then leaves the later claim in place.
+#[derive(Debug)]
+pub(crate) struct DisplayClaim {
+    card: String,
+    generation: u64,
+}
+
+/// Claims `card` (e.g. `card0`) for a console desktop. Call before the desktop starts.
+pub(crate) fn claim_display(card: &str) -> DisplayClaim {
+    let outputs = detect_drm_outputs()
+        .into_iter()
+        .filter(|o| o.card == card)
+        .collect();
+    claim_display_with(card, outputs)
+}
+
+fn claim_display_with(card: &str, outputs: Vec<DrmOutputCapability>) -> DisplayClaim {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(card.to_string(), (generation, outputs));
+    DisplayClaim {
+        card: card.to_string(),
+        generation,
+    }
+}
+
+impl Drop for DisplayClaim {
+    fn drop(&mut self) {
+        let mut claimed = claimed_cards()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if claimed
+            .get(&self.card)
+            .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            claimed.remove(&self.card);
+        }
+    }
+}
+
+fn claimed_outputs(card: &str, sysfs_root: &std::path::Path) -> Option<Vec<DrmOutputCapability>> {
+    let claimed = claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut outputs = claimed.get(card)?.1.clone();
+    for output in &mut outputs {
+        let status = sysfs_root
+            .join(format!("{card}-{}", output.connector))
+            .join("status");
+        output.connected = std::fs::read_to_string(status)
+            .map(|s| s.trim() == "connected")
+            .unwrap_or(output.connected);
+    }
+    Some(outputs)
 }
 
 #[derive(Debug)]
@@ -211,7 +287,10 @@ fn drm_mode_capability(mode: &drm::control::Mode) -> DrmModeCapability {
     }
 }
 
-fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability> {
+fn detect_drm_outputs_at(
+    dri_root: &std::path::Path,
+    sysfs_root: &std::path::Path,
+) -> Vec<DrmOutputCapability> {
     use drm::control::{connector, Device as _};
 
     let mut cards: Vec<_> = std::fs::read_dir(dri_root)
@@ -224,6 +303,10 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
     let mut outputs = Vec::new();
     for entry in cards {
         let card_name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(claimed) = claimed_outputs(&card_name, sysfs_root) {
+            outputs.extend(claimed);
+            continue;
+        }
         // #407: opening a primary node read-write can make the opener DRM master
         // automatically when the display is free, racing spawn_weston_console's own
         // open for it — see session::console::drm_open_lock. Held for this card only.
@@ -246,13 +329,9 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
             let Ok(info) = card.get_connector(*handle, false) else {
                 continue;
             };
-            let connector_name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+            let connector_name = connector_name(&info);
             let modes = info.modes().iter().map(drm_mode_capability).collect();
-            let active_mode = info
-                .current_encoder()
-                .and_then(|encoder| card.get_encoder(encoder).ok())
-                .and_then(|encoder| encoder.crtc())
-                .and_then(|crtc| card.get_crtc(crtc).ok())
+            let active_mode = connector_crtc(&card, &info)
                 .and_then(|crtc| crtc.mode().map(|mode| drm_mode_capability(&mode)));
             outputs.push(DrmOutputCapability {
                 id: format!("{card_name}:{connector_name}"),
@@ -267,6 +346,72 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
     }
     outputs.sort_by(|a, b| a.id.cmp(&b.id));
     outputs
+}
+
+/// `DP-1`-style name of a connector, as sysfs and console config spell it.
+fn connector_name(info: &drm::control::connector::Info) -> String {
+    format!("{}-{}", info.interface().as_str(), info.interface_id())
+}
+
+/// The CRTC a connector is currently driven by, if any.
+fn connector_crtc(
+    card: &DrmCard,
+    info: &drm::control::connector::Info,
+) -> Option<drm::control::crtc::Info> {
+    use drm::control::Device as _;
+    let encoder = card.get_encoder(info.current_encoder()?).ok()?;
+    card.get_crtc(encoder.crtc()?).ok()
+}
+
+/// What a card says about one connector's display.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConnectorScanout {
+    /// A client other than the agent holds DRM master on the card.
+    pub master_held: bool,
+    /// The connector's CRTC scans out a framebuffer.
+    pub framebuffer: bool,
+    pub mode: Option<DrmModeCapability>,
+}
+
+/// Reads `connector` (e.g. `DP-1`) on `card_node`. An unreadable card reports nothing
+/// held and nothing scanned out.
+///
+/// Opening a primary node while nobody holds master makes the opener master. DROP_MASTER
+/// succeeds only for the current master, so it both tells whether another client held the
+/// card and hands the display straight back if this open took it. A desktop opening the
+/// card inside that window (microseconds) would come up without master, so callers read
+/// only once the desktop has had time to open the card itself.
+pub(crate) fn connector_scanout(card_node: &std::path::Path, connector: &str) -> ConnectorScanout {
+    use drm::control::Device as _;
+    use drm::Device as _;
+
+    let _drm_open_guard = crate::session::console::drm_open_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(card_node)
+    else {
+        return ConnectorScanout::default();
+    };
+    let card = DrmCard(file);
+    let master_held = card.release_master_lock().is_err();
+    let crtc = card.resource_handles().ok().and_then(|resources| {
+        resources.connectors().iter().find_map(|handle| {
+            let info = card.get_connector(*handle, false).ok()?;
+            (connector_name(&info) == connector).then(|| connector_crtc(&card, &info))?
+        })
+    });
+    ConnectorScanout {
+        master_held,
+        framebuffer: crtc
+            .as_ref()
+            .is_some_and(|crtc| crtc.framebuffer().is_some()),
+        mode: crtc
+            .and_then(|crtc| crtc.mode())
+            .map(|mode| drm_mode_capability(&mode)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1278,6 +1423,61 @@ fn detection_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claimed_output(card: &str, connector: &str) -> DrmOutputCapability {
+        DrmOutputCapability {
+            id: format!("{card}:{connector}"),
+            card: card.into(),
+            render_node: None,
+            connector: connector.into(),
+            connected: true,
+            active_mode: None,
+            modes: Vec::new(),
+        }
+    }
+
+    /// An old session's claim dropping after a new session claimed the same card must
+    /// leave the new claim in place.
+    #[test]
+    fn a_stale_claim_never_releases_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let dri = dir.path().join("dri");
+        std::fs::create_dir_all(&dri).unwrap();
+        std::fs::write(dri.join("card92"), b"").unwrap();
+        let old = claim_display_with("card92", vec![claimed_output("card92", "DP-1")]);
+        let new = claim_display_with("card92", vec![claimed_output("card92", "DP-2")]);
+        drop(old);
+        let outputs = detect_drm_outputs_at(&dri, dir.path());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].id, "card92:DP-2");
+        drop(new);
+        assert!(detect_drm_outputs_at(&dri, dir.path()).is_empty());
+    }
+
+    /// A claimed card is reported from its claim, never opened: the fake node here is a
+    /// plain file whose resource ioctl would fail and drop the card from the inventory.
+    #[test]
+    fn a_claimed_card_is_read_from_its_claim_and_sysfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let dri = dir.path().join("dri");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir_all(&dri).unwrap();
+        std::fs::create_dir_all(sys.join("card91-DP-1")).unwrap();
+        std::fs::write(dri.join("card91"), b"").unwrap();
+        std::fs::write(sys.join("card91-DP-1/status"), "disconnected\n").unwrap();
+
+        assert!(detect_drm_outputs_at(&dri, &sys).is_empty());
+        let claim = claim_display_with("card91", vec![claimed_output("card91", "DP-1")]);
+        let outputs = detect_drm_outputs_at(&dri, &sys);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].id, "card91:DP-1");
+        assert!(
+            !outputs[0].connected,
+            "connected follows sysfs while claimed"
+        );
+        drop(claim);
+        assert!(detect_drm_outputs_at(&dri, &sys).is_empty());
+    }
 
     const PCI_IDS_FIXTURE: &str = "\
 # comment line, ignored

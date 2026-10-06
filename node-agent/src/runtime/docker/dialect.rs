@@ -502,6 +502,13 @@ impl Dialect {
         })
     }
 
+    /// Whether the read-back is checked for `HostConfig.DeviceCgroupRules`. Podman's read-back
+    /// is not checked yet (#460); rootless Podman cannot apply device rules at all, its
+    /// access being the node's own permissions.
+    pub(crate) fn echoes_device_cgroup_rules(self) -> bool {
+        self == Dialect::Docker
+    }
+
     /// Whether `HostConfig.Binds` / `HostConfig.Mounts` echo the request. When they do
     /// not (Podman), the realized mount points, which every engine reports, are what is
     /// compared.

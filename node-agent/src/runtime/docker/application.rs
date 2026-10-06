@@ -571,6 +571,8 @@ fn body(
                     })
                     .collect(),
             ),
+            device_cgroup_rules: (!r.device_cgroup_rules.is_empty())
+                .then(|| r.device_cgroup_rules.clone()),
             device_requests: match (r.nvidia_gpu, injection) {
                 (true, Some(injection)) => Some(vec![nvidia_device_request(injection)]),
                 _ => None,
@@ -1107,7 +1109,7 @@ async fn inspect_owned(
     // Each check names what it guards, so a refusal says why (#397). Any one failing
     // refuses the container; nothing here ever retries with more privilege.
     let read_only_targets = read_only_bind_targets(&intent.request)?;
-    let refusals: [(bool, &str); 20] = [
+    let refusals: [(bool, &str); 21] = [
         (
             host.network_mode.as_deref() != Some(&intent.request.network),
             "network mode",
@@ -1204,6 +1206,12 @@ async fn inspect_owned(
                 intent.request.nvidia_gpu,
             ),
             "devices",
+        ),
+        (
+            dialect.echoes_device_cgroup_rules()
+                && normalized(host.device_cgroup_rules.as_ref())
+                    != intent.request.device_cgroup_rules,
+            "device cgroup rules",
         ),
         (
             !dialect.mount_propagation_ok(podman.as_ref()),
