@@ -2651,10 +2651,8 @@ mod tests {
             emit_manager.emit_version_snapshot(); // coalesced while full
             done_tx.send(()).unwrap();
         });
-        // A generous bound, not a race: dispatch is non-blocking, so this only
-        // needs enough headroom that CPU contention elsewhere can't make a
-        // genuinely non-blocking call look like it hung (a real block would
-        // still be caught, just reported slower).
+        // 2 s is a hang detector, not a timing claim: a non-blocking call under CPU
+        // contention must not read as a hang (#463). Same for the bounds below.
         let returned = done_rx.recv_timeout(Duration::from_secs(2));
         let identity = ImageIdentity {
             image_id: "steam".into(),
@@ -2744,10 +2742,8 @@ mod tests {
                 entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             }
         }
-        // A generous bound, not a race: `scans_while_stalled` below is the real,
-        // non-timing proof that the 20 later calls coalesced instead of blocking.
-        // This just catches an actual hang promptly instead of waiting out the
-        // full join; it must not itself be mistaken for CPU contention.
+        // `scans_while_stalled` below is the real proof that the later calls coalesced;
+        // this only catches a hang.
         let responsive = started.elapsed() < Duration::from_secs(2);
         let scans_while_stalled = calls.load(Ordering::SeqCst);
         release_tx.send(()).unwrap();
@@ -3116,9 +3112,6 @@ mod tests {
             emit_manager.emit_version_snapshot();
             emit_done_tx.send(()).unwrap();
         });
-        // A generous bound, not a race: emitting is non-blocking, so this only
-        // needs enough headroom that CPU contention can't make a genuinely
-        // non-blocking call look like it hung.
         let emit_returned = emit_done_rx.recv_timeout(Duration::from_secs(2));
         let mut premature = Vec::new();
         let probe_deadline = Instant::now() + Duration::from_millis(100);
@@ -3923,9 +3916,6 @@ mod tests {
             finish_op(&worker_mgr, "steam");
             let _ = done_tx.send(());
         });
-        // A generous bound, not a race: emitting must not block on backpressure,
-        // so this only needs enough headroom that CPU contention can't make a
-        // genuinely non-blocking call look like a retained worker.
         let completed = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         drop(rx); // also releases a regressed blocking worker before asserting
         worker.join().unwrap();
