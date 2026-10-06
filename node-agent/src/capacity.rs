@@ -155,11 +155,14 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
         .filter(|o| o.connected)
         .map(|o| o.connector.clone())
         .collect();
+    let claimed = outputs.iter().any(|o| display_claimed(&o.card));
     ConsoleCapabilities {
         connectors: if typed_connectors.is_empty() {
             detect_drm_connectors()
-        } else {
+        } else if ddc_probe_allowed(claimed) {
             crate::ddc::powered_connectors(typed_connectors)
+        } else {
+            typed_connectors
         },
         outputs,
         input_devices: detect_input_devices(),
@@ -232,6 +235,22 @@ impl Drop for DisplayClaim {
             claimed.remove(&self.card);
         }
     }
+}
+
+/// Whether a console desktop currently owns `card`'s display.
+pub(crate) fn display_claimed(card: &str) -> bool {
+    claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(card)
+}
+
+/// The DDC power read tells a powered-off monitor from an unplugged one so auto-start
+/// does not launch into a sleeping panel. It is over a second of i2c traffic on the
+/// display link, which a running desktop feels as a hitch every poll, and while a
+/// desktop owns the display the panel's power is the desktop's business.
+fn ddc_probe_allowed(display_claimed: bool) -> bool {
+    !display_claimed
 }
 
 fn claimed_outputs(card: &str, sysfs_root: &std::path::Path) -> Option<Vec<DrmOutputCapability>> {
@@ -1434,6 +1453,18 @@ mod tests {
             active_mode: None,
             modes: Vec::new(),
         }
+    }
+
+    /// The monitor-power read is the agent talking to the panel over the display link; it
+    /// never happens while a desktop owns that display.
+    #[test]
+    fn ddc_is_not_read_while_a_display_is_claimed() {
+        assert!(ddc_probe_allowed(false));
+        assert!(!ddc_probe_allowed(true));
+        let claim = claim_display_with("card93", Vec::new());
+        assert!(display_claimed("card93"));
+        drop(claim);
+        assert!(!display_claimed("card93"));
     }
 
     /// An old session's claim dropping after a new session claimed the same card must

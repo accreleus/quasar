@@ -49,6 +49,7 @@ own; the two do not move together, and that is deliberate.
   Contract: protocol amendment 19.
 
 ### Fixed
+- **A game on the console no longer hitches every 10 seconds (#458).** The agent read the monitor's power state over DDC every 10 s while a console session ran, and each read is over a second of i2c traffic on the display link. While a desktop owns the display the read is skipped; it still gates auto-start when nothing is on the screen.
 - **A console session survives the monitor being switched off (#458).** A monitor that drops its DisplayPort link on power-off looked like an unplug and the desktop was restarted, closing its apps. A disconnected connector no longer stops the session; the desktop handles the display's return. A host that wants an unplug to end the session sets `QUASAR_CONSOLE_DISCONNECT_GRACE` on the control plane. A console session reports "displaying 3840×2160 @ 240 Hz" instead of a streaming label.
 - **In console mode, a desktop that only resizes its own window when you pick a resolution
   still moves the monitor to match (#447).** Some desktops don't speak the standard

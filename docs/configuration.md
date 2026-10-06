@@ -1109,7 +1109,9 @@ launcher starts its desktop on the DRM backend. What the container is given:
 | the host network namespace | udev hotplug events arrive over netlink, which is per namespace |
 
 While the session lives, the agent never opens that card node for its inventory (the console
-output list is the last reading, with `connected` refreshed from sysfs). The session is `running`
+output list is the last reading, with `connected` refreshed from sysfs) and never reads the
+monitor's power state over DDC: that read is over a second of i2c traffic on the display link,
+felt as a hitch by a running game. The session is `running`
 once it is **displaying**: the container is alive, a client holds DRM master on the card and a
 framebuffer is on the connector. The connector's mode is reported as the session's console mode.
 A desktop that does not display within the session's app boot timeout (120 s without one) fails
