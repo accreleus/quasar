@@ -245,7 +245,8 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         console_audio: report.console_audio,
         dri_nodes: report.dri_nodes(),
         console_vt: report.console_vt,
-        udev_data: report.udev_data,
+        // Read only when console mode is turned on (`console::ConsoleDevices`).
+        udev_data: None,
         engine_rootless: false,
         host_sysfs: false,
     };
@@ -566,8 +567,7 @@ mod tests {
         assert!(parse("quasar-probe 1\nconsole_audio other\nend").is_err());
     }
 
-    /// #460: udev's device database is read by listing `/host/run/udev`, and becomes the
-    /// recipe input console mode binds it by.
+    /// #460: udev's device database is read by listing `/host/run/udev`.
     #[test]
     fn the_udev_database_is_reported_from_a_listing() {
         let root = tempfile::tempdir().unwrap();
@@ -584,11 +584,11 @@ mod tests {
             parse(&String::from_utf8_lossy(&out.stdout)).unwrap()
         };
         assert!(!run(&host).udev_data);
-        assert!(!select(&run(&host)).1.udev_data);
         std::fs::create_dir_all(host.join("run/udev/data")).unwrap();
         let report = run(&host);
         assert!(report.udev_data);
-        assert!(select(&report).1.udev_data);
+        // Not a recipe input at install or at an actor start: only console mode reads it.
+        assert_eq!(select(&report).1.udev_data, None);
         assert!(parse("quasar-probe 1\nudev other\nend").is_err());
     }
 

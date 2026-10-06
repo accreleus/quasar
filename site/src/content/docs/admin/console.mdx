@@ -64,10 +64,8 @@ what is typed on this machine's keyboard**) and the sound device.
 - **The display must be free.** If a desktop or login screen holds it, `console_card`
   fails and names what holds it. Stop the login screen on that output, or choose
   another output.
-- **Streamed sessions get the render node only**, never the display card, so they
-  can't take the screen from the console desktop. On an NVIDIA host whose GPU
-  reaches containers through CDI the card comes with the GPU anyway; if a streamed
-  game takes the display, `console_card` says so.
+- **Streamed sessions are still given the display card.** If a streamed game takes
+  the display first, `console_card` says so.
 - **Rootless:** a device plugged in later works through the device rules alone. If
   one doesn't, replug it after installing the rules.
 - **Devices are re-read** each time console mode is turned on and at every start.

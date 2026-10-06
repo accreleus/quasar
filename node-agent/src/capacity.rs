@@ -425,13 +425,12 @@ pub(crate) fn connector_scanout(card_node: &std::path::Path, connector: &str) ->
     }
 }
 
-/// Every read of a card node the agent makes is read-only (#460). The mode-setting reads
-/// (resources, connectors, encoders, CRTCs) and DROP_MASTER are ioctls the kernel allows on
-/// any open file, so the agent needs only read access to the card, which is all a rootless
-/// host grants it for its inventory, and it never holds a writable handle on the display.
-/// The open mode does not decide mastership: whoever opens a free card first becomes
-/// master, which is why every opener here drops it again at once and the inventory never
-/// opens a card a console desktop has claimed.
+/// Every card node the agent opens, it opens read-only: the mode-setting reads (resources,
+/// connectors, encoders, CRTCs) and DROP_MASTER are ioctls the kernel allows on a read-only
+/// file. The open mode does not decide mastership: the first opener of a card nobody holds
+/// becomes DRM master and stays master until it drops it or closes the card.
+/// [`connector_scanout`] and [`console_card_access`] drop it at once; the inventory keeps it
+/// until it closes the card after its reads, which is why it never opens a claimed card.
 fn open_card_read_only(card_node: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().read(true).open(card_node)
 }
@@ -453,23 +452,29 @@ pub enum CardAccess {
 }
 
 /// `card` (e.g. `card0`) as `connector_scanout` reads it: never opened while claimed, and
-/// opened read-only otherwise, giving back at once any mastership the open took.
+/// opened read-only otherwise, giving back at once any mastership the open took. A card
+/// this account cannot open read-write, as the desktop will, is unopenable.
 pub(crate) fn console_card_access(card: &str) -> CardAccess {
     console_card_access_at(std::path::Path::new("/dev/dri"), card)
 }
 
 fn console_card_access_at(dri_root: &std::path::Path, card: &str) -> CardAccess {
     use drm::Device as _;
-    if display_claimed(card) {
-        return CardAccess::Claimed;
-    }
     let node = dri_root.join(card);
     if !node.exists() {
         return CardAccess::Missing;
     }
+    // The desktop opens the card read-write; the agent proves that without doing it.
+    if let Err(e) = access_read_write(&node) {
+        return CardAccess::Unopenable(format!("not read-write for this account: {e}"));
+    }
     let _drm_open_guard = crate::session::console::drm_open_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Under the lock: a claim taken while this waited must keep the agent off the card.
+    if display_claimed(card) {
+        return CardAccess::Claimed;
+    }
     match open_card_read_only(&node) {
         Err(e) => CardAccess::Unopenable(e.to_string()),
         Ok(file) => {
@@ -479,6 +484,18 @@ fn console_card_access_at(dri_root: &std::path::Path, card: &str) -> CardAccess 
                 CardAccess::Free
             }
         }
+    }
+}
+
+/// `access(2)` for read and write: the caller's real ids against the node's mode and ACL.
+pub(crate) fn access_read_write(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: a valid NUL-terminated path, no other pointers.
+    match unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
     }
 }
 
@@ -1518,6 +1535,29 @@ mod tests {
 
     /// An old session's claim dropping after a new session claimed the same card must
     /// leave the new claim in place.
+    /// #460: `console_card` never opens a card a console session has claimed, and a node
+    /// that is not there is named as missing.
+    #[test]
+    fn console_card_access_respects_a_claim_and_names_a_missing_node() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            console_card_access_at(dir.path(), "card90"),
+            CardAccess::Missing
+        );
+        std::fs::write(dir.path().join("card90"), "").unwrap();
+        let claim = claim_display_with("card90", Vec::new());
+        assert_eq!(
+            console_card_access_at(dir.path(), "card90"),
+            CardAccess::Claimed
+        );
+        drop(claim);
+        // A plain file is no DRM device: DROP_MASTER fails, which reads as held.
+        assert_eq!(
+            console_card_access_at(dir.path(), "card90"),
+            CardAccess::Held
+        );
+    }
+
     #[test]
     fn a_stale_claim_never_releases_a_newer_one() {
         let dir = tempfile::tempdir().unwrap();

@@ -309,7 +309,6 @@ impl Actor {
                 logind = after.devices.logind,
                 console_audio = after.devices.console_audio,
                 console_vt = after.devices.console_vt,
-                udev_data = after.devices.udev_data,
                 re_created,
                 "the host's console devices changed since the agent was created"
             );

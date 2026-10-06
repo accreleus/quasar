@@ -316,7 +316,7 @@ impl Actor {
             ..machine.inputs.clone()
         };
         if let Some(devices) = devices {
-            devices.apply(&mut after.devices);
+            devices.apply_for_console(&mut after.devices);
         }
         after.keep_console_vt();
         recipe::validate(&after).map_err(|e| {
@@ -389,9 +389,15 @@ impl ConsoleDevices {
         devices.console_audio = self.console_audio;
         devices.i2c = self.i2c;
         devices.console_vt = self.console_vt;
-        devices.udev_data = self.udev_data;
         if !self.dri_nodes.is_empty() {
             devices.dri_nodes = self.dri_nodes;
         }
+    }
+
+    /// [`Self::apply`], plus the facts read only when console mode is turned on: the agent
+    /// is re-created then anyway, so a new one never re-creates it at an actor start.
+    pub(crate) fn apply_for_console(self, devices: &mut crate::recipe::HostDevices) {
+        devices.udev_data = Some(self.udev_data);
+        self.apply(devices);
     }
 }

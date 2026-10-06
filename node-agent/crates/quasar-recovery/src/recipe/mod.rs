@@ -311,12 +311,12 @@ pub struct HostDevices {
     /// off. Read with `i2c`; written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub console_vt: bool,
-    /// The host has udev's device database, [`UDEV_DATA_DIR`] (#460). A console session's
-    /// container is given it read-only so its desktop knows its devices; console mode binds
-    /// it into the agent too, read-only, so the agent can check it and, on Podman, prove
-    /// the console container's bind source exists. Read with `i2c`; written only when true.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub udev_data: bool,
+    /// Whether the host has udev's device database, `/run/udev/data` (#460), which a
+    /// console session's container is given read-only. Read only when console mode is
+    /// turned on, never at an actor start, so an upgrade alone re-creates no agent; `None`
+    /// until then. The agent learns it as `QUASAR_HOST_UDEV_DATA`. Written only when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udev_data: Option<bool>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -337,7 +337,7 @@ impl Default for HostDevices {
             console_audio: false,
             dri_nodes: Vec::new(),
             console_vt: false,
-            udev_data: false,
+            udev_data: None,
             unknown: Unknown::new(),
         }
     }
@@ -1314,15 +1314,6 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
         spec.binds
             .push(bind(CONSOLE_AUDIO_DIR, CONSOLE_AUDIO_DIR, false));
     }
-    // udev's device database, read-only (#460): the console container is given it, and
-    // the agent reads it for `console_udev` and, on Podman, to prove that bind's source.
-    if inputs.devices.udev_data {
-        spec.binds.push(bind(
-            UDEV_DATA_DIR,
-            &format!("{CONSOLE_HOST_PREFIX}{UDEV_DATA_DIR}"),
-            true,
-        ));
-    }
     spec.binds.sort_by(|a, b| a.target.cmp(&b.target));
     if rootless {
         // No mknod inside a user namespace: each i2c node the host has is passed in.
@@ -1338,6 +1329,13 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
         // The agent mknods /dev/i2c-N for DDC (ddc.rs). DRM is already a mapped device
         // (`/dev/dri`), so no major-226 rule.
         spec.device_cgroup_rules.push("c 89:* rmw".to_string());
+    }
+    // The host's answer the agent cannot read itself, as `QUASAR_HOST_FUSE` is.
+    if let Some(udev_data) = inputs.devices.udev_data {
+        spec.env.insert(
+            HOST_UDEV_DATA_ENV.into(),
+            if udev_data { "1" } else { "0" }.into(),
+        );
     }
     spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
 }
@@ -1368,11 +1366,12 @@ pub const LOGIND_DIRS: [&str; 2] = ["/run/systemd/seats", "/run/systemd/sessions
 /// on the host and inside the agent (`HostDevices::console_audio`).
 pub const CONSOLE_AUDIO_DIR: &str = "/run/quasar-console-audio";
 
-/// udev's device database on the host (`HostDevices::udev_data`).
-pub const UDEV_DATA_DIR: &str = "/run/udev/data";
-
 /// Where console mode's host views live inside the agent: `/host/run/systemd/seats`, ...
 pub const CONSOLE_HOST_PREFIX: &str = "/host";
+
+/// `1` or `0`: whether the host has `/run/udev/data` ([`HostDevices::udev_data`]), on a
+/// console agent created since that was read.
+pub const HOST_UDEV_DATA_ENV: &str = "QUASAR_HOST_UDEV_DATA";
 
 /// `1` on an agent container created with the console additions, and absent otherwise.
 pub const CONSOLE_ACCESS_ENV: &str = "QUASAR_CONSOLE_ACCESS";

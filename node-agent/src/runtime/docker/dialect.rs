@@ -503,13 +503,13 @@ impl Dialect {
         })
     }
 
-    /// Are the reported device-cgroup rules exactly what Quasar asked for (#460)? Docker
-    /// echoes `HostConfig.DeviceCgroupRules` exactly. Podman does not report them: its
-    /// inspect (compatible and native alike) is built from libpod's host-config view, which
-    /// has no such field, so a rule it applied reads as none. On Podman an empty report is
-    /// "not reported", never taken as granted, and any rule it does report must be exactly
-    /// the request's. A rootless engine is asked for none
-    /// (`application::rootless_device_cgroup_rules`), so there the request is empty too.
+    /// Are the reported device-cgroup rules what Quasar asked for (#460)? Docker echoes
+    /// `HostConfig.DeviceCgroupRules` exactly and is checked exactly. Rootful Podman gives no
+    /// positive proof that a rule was applied: its inspect, compatible and native alike, has
+    /// no such field, so an empty report is accepted and a rule it does report must be the
+    /// request's. A rootless engine is never asked for a rule: it is left out at create and
+    /// the journal records that ([`super::application`]'s `rootless_device_cgroup_rules`),
+    /// so there the expected set is empty on every engine.
     pub(crate) fn device_cgroup_rules_ok(self, reported: &[String], requested: &[String]) -> bool {
         match self {
             Dialect::Docker => reported == requested,

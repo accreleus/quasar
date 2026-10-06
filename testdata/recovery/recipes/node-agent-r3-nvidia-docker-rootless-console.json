@@ -95,7 +95,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "node-agent",
     "io.quasar.recipe": "3",
-    "io.quasar.spec": "sha256:d85a77fb5d048405472894fdaced397dd41279f5929720d4ce623310fac9196e"
+    "io.quasar.spec": "sha256:84420891c6f464241fe1b403d509c9f513a743737204eaa470f8648e56627333"
   },
   "network_mode": "host",
   "binds": [
@@ -127,11 +127,6 @@
     {
       "source": "/run/systemd/sessions",
       "target": "/host/run/systemd/sessions",
-      "read_only": true
-    },
-    {
-      "source": "/run/udev/data",
-      "target": "/host/run/udev/data",
       "read_only": true
     },
     {

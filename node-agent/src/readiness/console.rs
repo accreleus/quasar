@@ -72,6 +72,8 @@ pub struct ConsoleView {
     pub terminal: TerminalView,
     pub udev: UdevView,
     pub ddc: crate::ddc::DdcSummary,
+    /// Any `/dev/i2c-N` is in the agent's container.
+    pub i2c_nodes: bool,
 }
 
 /// The console card(s) judged and what reading each found.
@@ -134,14 +136,20 @@ pub enum TerminalView {
     },
 }
 
-/// The host's udev data, as the agent sees it.
+/// Whether the host has udev's device database, `/run/udev/data`. The agent never sees
+/// the host's `/run`: the recovery actor tells it (`QUASAR_HOST_UDEV_DATA`), reading it
+/// each time console mode is turned on, and the Compose console overlay sets it too.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum UdevView {
+    /// Not told: an agent created before the actor read it.
     #[default]
+    Unknown,
     Missing,
-    Unreadable(String),
-    Readable,
+    Present,
 }
+
+/// The actor's answer, as the agent reads it.
+pub const HOST_UDEV_DATA_ENV: &str = "QUASAR_HOST_UDEV_DATA";
 
 /// The cards a console session would use: the one the output pick names, or for `auto`
 /// the card of the first connected output. With `auto` and no monitor, every card the
@@ -175,14 +183,23 @@ fn host_dev() -> PathBuf {
     }
 }
 
-/// `access(2)` for read and write, which judges the caller's real ids and the node's ACL.
 fn openable_rw(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: a valid NUL-terminated path, no other pointers.
-    unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) == 0 }
+    crate::capacity::access_read_write(path).is_ok()
+}
+
+/// Whether any `/dev/i2c-N` is in the agent's container: what host preparation (and, on a
+/// rootless engine, the recovery actor) gives console mode for DDC.
+fn has_i2c_nodes(dev: &Path) -> bool {
+    std::fs::read_dir(dev)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("i2c-"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 fn card_names(dri: &Path) -> Vec<String> {
@@ -294,21 +311,11 @@ impl TerminalView {
 }
 
 impl UdevView {
-    /// The recovery actor binds the host's `/run/udev/data` at `/host/run/udev/data`; an
-    /// agent on the host itself (or a Compose bind at the same path) reads its own.
-    fn observe() -> Self {
-        let path = [
-            Path::new("/host/run/udev/data"),
-            Path::new(crate::session::console_plan::UDEV_DATA),
-        ]
-        .into_iter()
-        .find(|p| p.is_dir());
-        match path {
-            None => UdevView::Missing,
-            Some(p) => match std::fs::read_dir(p) {
-                Ok(_) => UdevView::Readable,
-                Err(e) => UdevView::Unreadable(e.to_string()),
-            },
+    fn from_env(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("1") => UdevView::Present,
+            Some("0") => UdevView::Missing,
+            _ => UdevView::Unknown,
         }
     }
 }
@@ -327,12 +334,17 @@ impl ConsoleView {
         let config = config();
         ConsoleView {
             enabled,
-            rootless: crate::ddc::is_rootless(),
+            rootless: crate::buildinfo::install_facts()
+                .engine
+                .engine_mode
+                .as_deref()
+                == Some("rootless"),
             card: CardView::observe(config.output_id.as_deref()),
             input: InputView::observe(&config.input_devices),
             sound: SoundView::observe(&host_dev().join("snd")),
             terminal: TerminalView::observe(),
-            udev: UdevView::observe(),
+            udev: UdevView::from_env(std::env::var(HOST_UDEV_DATA_ENV).ok().as_deref()),
+            i2c_nodes: has_i2c_nodes(Path::new("/dev")),
             ddc,
         }
     }
@@ -387,9 +399,9 @@ pub fn check_card(v: &ConsoleView) -> ReadinessCheck {
                     CHECK_CARD,
                     format!("{who} holds DRM master on {node}, so a console desktop cannot take the display"),
                     "Stop the desktop or login screen driving that card (for example its \
-                     display manager), or pick an output on another card. On an NVIDIA host \
-                     whose GPU reaches containers through CDI, a streamed session's app is \
-                     given the card node too and may hold it: end that session."
+                     display manager), or pick an output on another card. Streamed sessions \
+                     are given the card node too, so a streamed app may hold it: end that \
+                     session."
                         .into(),
                 );
             }
@@ -578,7 +590,7 @@ pub fn check_udev(v: &ConsoleView) -> ReadinessCheck {
         return super::skip(CHECK_UDEV, OFF_SUMMARY);
     }
     match &v.udev {
-        UdevView::Readable => super::pass(
+        UdevView::Present => super::pass(
             CHECK_UDEV,
             "the host's udev data (/run/udev/data) can be passed in, so devices plugged in \
              later reach the desktop"
@@ -586,15 +598,15 @@ pub fn check_udev(v: &ConsoleView) -> ReadinessCheck {
         ),
         UdevView::Missing => super::fail(
             CHECK_UDEV,
-            "the host's udev data (/run/udev/data) is not visible to this agent, so the \
-             console desktop would not know its input devices"
+            "the host has no udev data (/run/udev/data), so the console desktop would not \
+             know its input devices"
                 .into(),
             format!("Check the host runs systemd-udevd, {RECREATE}."),
         ),
-        UdevView::Unreadable(err) => super::fail(
+        UdevView::Unknown => super::unknown(
             CHECK_UDEV,
-            format!("the host's udev data (/run/udev/data) cannot be read ({err})"),
-            format!("Check /run/udev/data on the host is readable by everyone, as udev makes it, {RECREATE}."),
+            "this agent was not told whether the host has udev data (/run/udev/data): turn \
+             console mode off and on again so the recovery actor reads it",
         ),
     }
 }
@@ -604,15 +616,19 @@ pub fn check_ddc(v: &ConsoleView) -> ReadinessCheck {
         return super::skip(CHECK_DDC, OFF_SUMMARY);
     }
     let d = &v.ddc;
+    // Optional (amendment 19): a host not prepared for it reads skip, not a fault.
     if !d.available {
-        return super::warn_check(
+        return super::skip(
             CHECK_DDC,
-            "ddcutil is not present in this agent image; monitor-power detection is off \
-             (every connected display is treated as powered on)"
-                .into(),
-            "Rebuild the node agent image with ddcutil, or ignore it: display detection \
-             and hotplug still work without it."
-                .into(),
+            "ddcutil is not in this agent image, so monitor power is not read (every \
+             connected display counts as on)",
+        );
+    }
+    if !v.i2c_nodes {
+        return super::skip(
+            CHECK_DDC,
+            "the host was not prepared for monitor control (no /dev/i2c-* in this agent), so \
+             monitor power is not read; host preparation with --console grants it",
         );
     }
     if !d.bus_mapped {
@@ -681,13 +697,14 @@ mod tests {
                 openable: true,
                 startup: Some(Ok(())),
             },
-            udev: UdevView::Readable,
+            udev: UdevView::Present,
             ddc: crate::ddc::DdcSummary {
                 available: true,
                 bus_mapped: true,
                 any_read: true,
                 all_off: false,
             },
+            i2c_nodes: true,
         }
     }
 
@@ -793,7 +810,7 @@ mod tests {
         assert_fail(
             &check_card(&held),
             "gdm, the login screen holds DRM master on /dev/dri/card1",
-            "CDI",
+            "a streamed app may hold it",
         );
         let mut none = on();
         none.card.cards.clear();
@@ -948,30 +965,52 @@ mod tests {
     }
 
     #[test]
-    fn udev_fails_when_missing_or_unreadable() {
+    fn udev_fails_when_the_host_has_none_and_is_unknown_until_the_actor_says() {
         let mut missing = on();
         missing.udev = UdevView::Missing;
         assert_fail(
             &check_udev(&missing),
-            "/run/udev/data) is not visible",
+            "the host has no udev data (/run/udev/data)",
             "systemd-udevd",
         );
-        let mut unreadable = on();
-        unreadable.udev = UdevView::Unreadable("Permission denied".into());
-        assert_fail(
-            &check_udev(&unreadable),
-            "cannot be read (Permission denied)",
-            "readable",
+        let mut untold = on();
+        untold.udev = UdevView::Unknown;
+        let unknown = check_udev(&untold);
+        assert_eq!(unknown.status, UNKNOWN, "{unknown:?}");
+        assert!(
+            unknown
+                .summary
+                .contains("turn console mode off and on again"),
+            "{unknown:?}"
         );
+        assert!(unknown.blocks.is_none());
+        for (value, view) in [
+            (Some("1"), UdevView::Present),
+            (Some(" 0 "), UdevView::Missing),
+            (Some("yes"), UdevView::Unknown),
+            (None, UdevView::Unknown),
+        ] {
+            assert_eq!(UdevView::from_env(value), view, "{value:?}");
+        }
     }
 
     #[test]
     fn ddc_walks_available_bus_mapped_any_read_all_off_in_order() {
         let mut v = on();
         v.ddc = Default::default();
-        assert_eq!(check_ddc(&v).status, WARN, "no ddcutil");
+        assert_eq!(
+            check_ddc(&v).status,
+            SKIP,
+            "no ddcutil: optional, not a fault"
+        );
 
         v.ddc.available = true;
+        v.i2c_nodes = false;
+        let unprepared = check_ddc(&v);
+        assert_eq!(unprepared.status, SKIP, "host not prepared: {unprepared:?}");
+        assert!(unprepared.summary.contains("--console"), "{unprepared:?}");
+
+        v.i2c_nodes = true;
         assert_eq!(check_ddc(&v).status, WARN, "no bus mapped");
 
         v.ddc.bus_mapped = true;
@@ -1003,5 +1042,17 @@ mod tests {
             SoundView::Present { denied: Vec::new() },
             "a node this test may open read-write, and a non-PCM node ignored"
         );
+    }
+
+    #[test]
+    fn i2c_nodes_are_found_by_name_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_i2c_nodes(dir.path()));
+        for name in ["i2c-", "i2c-dev", "tty8"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        assert!(!has_i2c_nodes(dir.path()));
+        std::fs::write(dir.path().join("i2c-4"), "").unwrap();
+        assert!(has_i2c_nodes(dir.path()));
     }
 }

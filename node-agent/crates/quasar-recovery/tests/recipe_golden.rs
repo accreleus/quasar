@@ -50,7 +50,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             logind: false,
             console_audio: false,
             console_vt: false,
-            udev_data: false,
+            udev_data: None,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -248,7 +248,6 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
         let mut console = plain.clone();
         console.console = true;
         console.devices.sound = true;
-        console.devices.udev_data = true;
         let without = render(Role::NodeAgent, 3, &plain, &image, &secrets).unwrap();
         let with = render(Role::NodeAgent, 3, &console, &image, &secrets).unwrap();
         check(file, &with);
@@ -264,8 +263,7 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
             added(binds(&without), binds(&with)),
             vec![
                 "/dev/snd:/dev/snd".to_string(),
-                "/proc/asound:/host-proc/asound:ro".to_string(),
-                "/run/udev/data:/host/run/udev/data:ro".to_string(),
+                "/proc/asound:/host-proc/asound:ro".to_string()
             ],
             "{file}"
         );
@@ -301,7 +299,6 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
         // engine would have to create.
         let mut quiet = console.clone();
         quiet.devices.sound = false;
-        quiet.devices.udev_data = false;
         let quiet = render(Role::NodeAgent, 3, &quiet, &image, &secrets).unwrap();
         assert_eq!(quiet.cap_add, vec!["SYS_ADMIN".to_string()], "{file}");
         assert_eq!(binds(&quiet), binds(&without), "{file}");
@@ -369,7 +366,6 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
         console.devices.sound = true;
         console.devices.logind = true;
         console.devices.i2c = vec![3, 12];
-        console.devices.udev_data = true;
         let without = render(Role::NodeAgent, 3, &plain, &image, &agent_secrets()).unwrap();
         let with = render(Role::NodeAgent, 3, &console, &image, &agent_secrets()).unwrap();
         check(file, &with);
@@ -394,7 +390,6 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
                 "/proc/asound:/host-proc/asound:ro".to_string(),
                 "/run/systemd/seats:/host/run/systemd/seats:ro".to_string(),
                 "/run/systemd/sessions:/host/run/systemd/sessions:ro".to_string(),
-                "/run/udev/data:/host/run/udev/data:ro".to_string(),
             ],
             "{file}"
         );
@@ -431,7 +426,6 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
         bare.devices.sound = false;
         bare.devices.logind = false;
         bare.devices.i2c.clear();
-        bare.devices.udev_data = false;
         let bare = render(Role::NodeAgent, 3, &bare, &image, &agent_secrets()).unwrap();
         assert_eq!(binds(&bare), binds(&without), "{file}");
         assert_eq!(bare.devices, without.devices, "{file}");
@@ -1263,5 +1257,30 @@ fn agent_variables_are_documented() {
             docs.contains(&format!("| `{name}`")) || docs.contains(&format!("`{name}` /")),
             "{name} has no row in docs/configuration.md"
         );
+    }
+}
+
+/// #460: whether the host has udev's database reaches a console agent as an environment
+/// input, only once console mode has read it; a machine that never read it renders as before.
+#[test]
+fn a_console_agent_is_told_whether_the_host_has_udev_data_once_it_was_read() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let mut console = inputs(Some(GpuVendor::Amd));
+    console.console = true;
+    let unread = render(Role::NodeAgent, 3, &console, &image, &agent_secrets()).unwrap();
+    assert!(!unread.env.contains_key("QUASAR_HOST_UDEV_DATA"));
+    for (fact, value) in [(true, "1"), (false, "0")] {
+        let mut read = console.clone();
+        read.devices.udev_data = Some(fact);
+        let spec = render(Role::NodeAgent, 3, &read, &image, &agent_secrets()).unwrap();
+        assert_eq!(
+            spec.env.get("QUASAR_HOST_UDEV_DATA").map(String::as_str),
+            Some(value)
+        );
+        assert_eq!(spec.binds, unread.binds, "an input, never a mount");
+        // Console mode off: no console additions, so no such input either.
+        read.console = false;
+        let off = render(Role::NodeAgent, 3, &read, &image, &agent_secrets()).unwrap();
+        assert!(!off.env.contains_key("QUASAR_HOST_UDEV_DATA"));
     }
 }
