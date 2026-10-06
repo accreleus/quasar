@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
-- **A direct-display console session now passes hidraw nodes, not just evdev, so Steam Input identifies a controller correctly (#462).** The agent grants every `/dev/hidrawN` node present at launch (or, with an `input_devices` allowlist, just the allowlisted events' hidraw siblings, resolved through sysfs) plus a device-cgroup rule for hidraw's major, so a plugged controller shows up in Steam Big Picture as itself instead of falling back to an evdev GUID match. A controller plugged in for the first time mid-session still isn't identified correctly until the next session start — the container gets no new `/dev/hidrawN` node without a udev client of its own — but keeps working over evdev in the meantime.
+- **A direct-display console session now passes hidraw nodes, not just evdev, so Steam Input identifies a controller correctly (#462).** The agent grants every `/dev/hidrawN` node present at launch (or, with an `input_devices` allowlist, just the allowlisted events' hidraw siblings, resolved through sysfs) plus a device-cgroup rule for hidraw's major, so a plugged controller shows up in Steam Big Picture as itself instead of falling back to an evdev GUID match. The hidraw devices are listed from sysfs and passed by their host paths, so an owned install, whose agent sees neither the host's `/dev/hidraw*` nor `/host/dev`, is covered too. A controller plugged in for the first time mid-session still isn't identified correctly until the next session start — the container gets no new `/dev/hidrawN` node without a udev client of its own — but keeps working over evdev in the meantime.
 - **A console session's desktop now drives the monitor itself (#458).** For an app that declares `runtime_spec.direct_display`, the node agent launches the app container with the console GPU's card node, the sound device, the input devices (plugged in later too) and the host's udev, and the desktop takes the display on its own DRM backend: no compositor, pipeline or second display server in between. The session is running once it is displaying, and reports the monitor's mode.
 - **Console mode is being rebuilt as direct display (#453).** Decision and spec recorded: a console session's desktop drives the monitor itself (KWin or gamescope on their DRM backends), nothing of Quasar's sits between it and the screen, and it is never streamed; ADR 0009 and the glossary carry the terms (console session, direct display, displaying). No behaviour changes yet.
 
@@ -49,14 +49,21 @@ own; the two do not move together, and that is deliberate.
   `QUASAR_EXPERIMENTAL_LOCAL_DMABUF` display ring (still accepted as an agent variable, and
   ignored), dual output (a `dual_output` assignment is refused), the agent's console audio
   routing (the desktop plays its own audio; `prepare-host.sh --console-audio-user` is accepted
-  and does nothing) and forwarding the desktop's monitor-mode picks (it sets its own modes).
-  The node agent's own console grants are now the console terminal, read access to the display
-  cards and the i2c nodes for DDC: no `SYS_ADMIN` and no sound device (node-agent recipe
-  revision 4, and the Compose console overlay likewise); the console desktop's container holds
-  the screen, the input and the sound device. The agent image drops weston, seatd and the
-  `kmssink`/`alsasink` elements.
+  and does nothing), and in-app monitor-mode picking (#445, shipped in 0.4.1: the agent no
+  longer forwards a mode the app picks; a direct desktop sets its own modes). At node-agent
+  recipe revision 4 the agent's own console grants are exactly the console terminal, read
+  access to the display cards, the i2c nodes (DDC), logind's seat and session state files, and
+  two host facts (udev data and sound): no `SYS_ADMIN` and no sound device, and the Compose
+  console overlay likewise. The console desktop's container holds the screen, the input and
+  the sound device. After upgrading, turn a console host's console mode off and on once so the
+  agent learns whether the host has a sound device (`console_sound` reads `unknown` until
+  then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **A streamed session on a host with console mode on is reaped for a lost transport again
+  (#461).** Every session on such a host was exempt from the idle reaper, an exemption meant
+  for the retired dual output; a streamed session whose browser is gone now ends like any
+  other.
 - **A game on the console no longer hitches every 10 seconds (#458).** The agent read the monitor's power state over DDC every 10 s while a console session ran, and each read is over a second of i2c traffic on the display link. While a desktop owns the display the read is skipped; it still gates auto-start when nothing is on the screen.
 - **A console session survives the monitor being switched off (#458).** A monitor that drops its DisplayPort link on power-off looked like an unplug and the desktop was restarted, closing its apps. A disconnected connector no longer stops the session; the desktop handles the display's return. A host that wants an unplug to end the session sets `QUASAR_CONSOLE_DISCONNECT_GRACE` on the control plane. The admin session list and the session page show what a running session is doing: "displaying 3840×2160 @ 240 Hz" (or "not displaying: …") for a console session, "app presented" for a stream.
 - **The pull-deadline test flaked under a full parallel `cargo test --workspace` on a loaded

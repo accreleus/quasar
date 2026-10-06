@@ -853,7 +853,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # backend is not. The removals and the proof that the survivors still link are in
     # the SAME layer as the install, so a broken removal fails the build here rather
     # than shipping. (A third group, ~120 MB of a console display server's remote
-    # backends, left with that display server in #461.)
+    # backends, left with that display server.)
     #
     # SAME RUN AS THE INSTALL, not a tidier one of its own. The first version of this
     # was a separate RUN and `docker history` showed exactly what that costs: the dnf

@@ -191,7 +191,7 @@ out3d="$(prep "$r3d" "$tmp/podman-only" --mode rootless --engine podman --consol
 [ ! -e "$r3d/etc/systemd/system" ] && printf '%s' "$out3d" | grep -q 'would    getty@tty8.service masked' \
   && pass "--console dry run masks nothing and says it would" || fail "tty8 dry run" "$out3d"
 
-# ── 3b. console audio is retired (#461) ─────────────────────────────────────
+# ── 3b. console audio is retired ────────────────────────────────────────────
 r3b="$tmp/r3b"; mk_root "$r3b"; printf 'alice:x:1500:1500::/home/alice:/bin/bash\n' >> "$r3b/etc/passwd"
 out3b="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)" || fail "retired console audio run" "$out3b"
 [ ! -e "$r3b/etc/pipewire" ] && [ ! -e "$r3b/etc/tmpfiles.d/quasar-console-audio.conf" ] && [ ! -e "$r3b/etc/systemd/user" ] \

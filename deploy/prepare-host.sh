@@ -434,7 +434,7 @@ if [ "$CONSOLE" = 1 ]; then
   done
 fi
 
-# ── console audio (retired, #461) ──────────────────────────────────────────
+# ── console audio (retired) ────────────────────────────────────────────────
 # A console session's desktop plays its own audio through the sound device it is given.
 # Earlier runs could give the agent a PipeWire socket on a desktop user's session; nothing
 # uses it now, and what they wrote is named here rather than removed from under that user.

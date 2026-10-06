@@ -66,7 +66,7 @@
           "docker": "#239: the agent talks to the engine only through its Unix-socket API; a CLI in the image would be an un-owned mutation path.",
           "podman": "#239: the agent talks to the engine only through its Unix-socket API; a CLI in the image would be an un-owned mutation path.",
           "weston": "#461: the agent runs no display server. A console session's desktop drives the display from its own container (ADR 0009); a display server back in the agent image would be the retired console path returning.",
-          "seatd": "#461: as weston. No seat daemon crosses a container boundary (ADR 0009)."
+          "seatd": "As weston. No seat daemon crosses a container boundary (ADR 0009)."
         }
       },
 
