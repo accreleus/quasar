@@ -3,6 +3,7 @@ title: Console mode
 description: Run a desktop on a screen plugged into the host, with its own sound and input.
 ---
 
+import { Aside } from '@astrojs/starlight/components';
 import Shot from '../../../components/Shot.astro';
 import admin_console from '../../../assets/shots/admin-console.png';
 
@@ -49,17 +50,26 @@ instead.
 
 ## Rootful and rootless hosts
 
-Console mode works in every engine mode. Install the console rules from [Device
-rules](/quasar/install/device-rules/) first; on a rootless host this is required.
-They grant the display cards, sound devices, i2c buses (monitor power over DDC),
-this machine's keyboards, mice and controllers (so console mode can grab them;
-**the `quasar` group can then read what is typed on this keyboard**), and `tty8`.
+Console mode works the same in every engine mode. Install the console rules from
+[Device rules](/quasar/install/device-rules/) first; on a rootless host this is
+required. They grant the display cards, sound devices, i2c buses (monitor power over
+DDC), this machine's input devices and `tty8`.
 
-On a rootless host:
+<Aside type="caution" title="What console mode grants">
+The console session holds the screen and the raw input of the host. Its desktop is
+given the display card, every input device you allow (**the `quasar` group can read
+what is typed on this machine's keyboard**) and the sound device.
+</Aside>
 
-- **The display must be free.** If a desktop or login screen holds it, the attempt
+- **The display must be free.** If a desktop or login screen holds it, `console_card`
   fails and names what holds it. Stop the login screen on that output, or choose
   another output.
+- **Streamed sessions get the render node only**, never the display card, so they
+  can't take the screen from the console desktop. On an NVIDIA host whose GPU
+  reaches containers through CDI the card comes with the GPU anyway; if a streamed
+  game takes the display, `console_card` says so.
+- **Rootless:** a device plugged in later works through the device rules alone. If
+  one doesn't, replug it after installing the rules.
 - **Devices are re-read** each time console mode is turned on and at every start.
   If a reboot renumbers the i2c buses, the agent is replaced to pick them up.
 
@@ -95,8 +105,7 @@ The agent's older routing used what the host reported:
   plays through that user's PipeWire, beside the desktop's own sound. Raw devices are hidden while PipeWire answers.
 - **Sound device (ALSA)**: used when no PipeWire answers and the device is free.
   Listed as `hw:CARD=<id>,DEV=<n>`; an older `hw:N,M` setting still works.
-- Otherwise the console is quiet, and the `console_audio` readiness check names
-  what holds the device.
+- Otherwise the console is quiet.
 
 PipeWire output is newer and less tested than ALSA.
 
@@ -111,9 +120,8 @@ the socket:
 After a reboot their pipewire-pulse starts with their session, so the socket is back
 without a step.
 
-It worked when `/run/quasar-console-audio/native` exists on the host and the
-`console_audio` check names PipeWire. If the check says the socket is missing, run
-host preparation again, or as root:
+It worked when `/run/quasar-console-audio/native` exists on the host. If it is
+missing, run host preparation again, or as root:
 `runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`.
 
 ## Local input
@@ -145,8 +153,11 @@ session.
 
 | Check | What it reports |
 | --- | --- |
-| `console_display` | Whether the agent has console access and the display is free. Names what holds it. |
-| `console_audio` | The audio route (PipeWire or a named device), or why none is usable. |
+| `console_card` | The console card can be passed in and nothing else holds the display. Names what holds it. |
+| `console_input` | The allowed input devices exist and the `quasar` account can open them. |
+| `console_sound` | The sound device can be passed in. |
+| `console_terminal` | `tty8` can be held for the session. |
+| `console_udev` | The host's device database (`/run/udev/data`) can be passed in, so devices plugged in later reach the desktop. |
 | `console_ddc` | Whether monitor power can be read (`ddcutil`, a mapped i2c bus, a reading). |
 | `console_default_app` | Shown on the console page, not the host's list: whether the default app can run direct. A fail names the app and nothing is launched. |
 

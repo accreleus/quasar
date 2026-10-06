@@ -106,10 +106,7 @@ Run each step from an account with `sudo`. Every step is safe to repeat.
 
 </Steps>
 
-For a machine that shows games on its own screen, add the console rules from
-[Device rules](/quasar/install/device-rules/) and see [Console
-mode](/quasar/admin/console/). For smoother streams, set the [UDP send
-buffer](/quasar/tuning/latency/#the-udp-send-buffer).
+For smoother streams, set the [UDP send buffer](/quasar/tuning/latency/#the-udp-send-buffer).
 
 ### Check it worked
 
@@ -135,6 +132,38 @@ it.** `--dry-run` prints what it would change and changes nothing:
 sudo sh prepare-host.sh --mode rootless --engine podman \
   --homes /var/lib/quasar/homes --templates /var/lib/quasar/templates --dry-run
 ```
+
+### Console mode on a rootless host
+
+A machine that shows a desktop on its own screen needs more access, because a rootless
+engine passes no device rules: the `quasar` account must be able to open every device
+the console desktop is given.
+
+<Aside type="caution" title="What you grant">
+The console session holds the screen and the raw input of the host. The `quasar` group
+can then read what is typed on this machine's keyboard.
+</Aside>
+
+<Steps>
+
+1. **Install the console rules** from [Device rules](/quasar/install/device-rules/):
+   the display cards, sound devices, i2c buses, this machine's input devices and
+   `tty8`, each by ACL. Or run `prepare-host.sh` with `--console`.
+
+2. **Keep login prompts off `tty8`:**
+
+   ```bash
+   sudo systemctl mask getty@tty8.service autovt@tty8.service
+   ```
+
+3. **Free the display:** no desktop or login screen may run on the output the
+   console uses.
+
+</Steps>
+
+It worked when every console check on the host's page passes once console mode is on
+(see [Console mode](/quasar/admin/console/#readiness)). A device plugged in later
+works through the rules alone.
 
 ## Install, as `quasar`
 

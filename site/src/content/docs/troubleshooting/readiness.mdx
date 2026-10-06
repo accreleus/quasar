@@ -74,15 +74,20 @@ or read `dmesg` yourself.
 
 ## Console mode
 
-`console_display`, `console_audio` and `console_ddc` are skipped while console mode
-is off, and never block streaming. See [Console mode](/quasar/admin/console/#readiness).
+The console checks (`console_card`, `console_input`, `console_sound`,
+`console_terminal`, `console_udev`, `console_ddc`) are skipped while console mode is
+off, and never block streaming. See [Console mode](/quasar/admin/console/#readiness).
+Most fixes end the same way: run host preparation with `--console`, then turn console
+mode off and on so the agent is re-created with the devices.
 
 | Failure | Fix |
 | --- | --- |
-| Agent not created with console access | Turn console mode on from the host's Local console page. |
-| Another process holds the display | Stop the desktop or login screen on that output, or pick another. Rootless: install the console [device rules](/quasar/install/device-rules/). Then toggle console mode off and on. |
-| No local audio sink | Check the host has a sound device, or set up [Host PipeWire](/quasar/admin/console/#local-audio). |
-| Console-audio socket missing | The desktop user's pipewire-pulse hasn't read host preparation's drop-in yet. Run host preparation again, or as root on the host: `runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`. Or have USER log in again. |
+| A card, input, sound or terminal node can't be opened | Install the console [device rules](/quasar/install/device-rules/) (`prepare-host.sh --console`). Replug an input device it missed. |
+| Another program holds the display | Stop the desktop or login screen on that output, or pick another. On NVIDIA with CDI, end the streamed session that holds it. |
+| A listed input device is not on this host | Plug it in, or edit **Input devices**. Numbers can change when devices are replugged. |
+| No sound device | Check the host's sound driver is loaded. Without one the console desktop has no sound. |
+| `tty8` is another session's terminal | Stop the login prompt on `tty8` (host preparation masks `getty@tty8`). |
+| `/run/udev/data` not visible | The host must run systemd-udevd. |
 | `ddcutil` missing, or no i2c bus for a connector | Every connected display counts as on. Check `/dev/i2c-*` exists (the console device rules grant it on rootless) and a monitor is connected. On rootless, a `/dev/i2c-N` that is a plain file rather than a device is skipped and named in the recovery actor's log: remove it, then toggle console mode off and on. |
 
 ## Owner conflict
