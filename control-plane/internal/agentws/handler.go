@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"slices"
 	"sort"
@@ -128,14 +129,37 @@ type consoleAutoState struct {
 	launching      map[string]bool            // hostID → launch currently being scheduled
 	lastConnectors map[string][]string        // hostID → last-reported connector list
 	backoff        map[string]*consoleBackoff // hostID → crash-loop backoff state
+	// hostID → when its console connector was first reported absent while a session
+	// ran; cleared when it is back. The disconnect grace runs from here.
+	absentSince map[string]time.Time
+	// How long a connector may stay absent before the session is stopped. A monitor
+	// that drops its link on power-off is otherwise an unplug. Zero stops at once.
+	disconnectGrace time.Duration
+}
+
+// consoleDisconnectGraceDefault is the default for QUASAR_CONSOLE_DISCONNECT_GRACE.
+const consoleDisconnectGraceDefault = 5 * time.Minute
+
+func consoleDisconnectGraceFromEnv() time.Duration {
+	raw := os.Getenv("QUASAR_CONSOLE_DISCONNECT_GRACE")
+	if raw == "" {
+		return consoleDisconnectGraceDefault
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return consoleDisconnectGraceDefault
+	}
+	return d
 }
 
 func newConsoleAutoState() *consoleAutoState {
 	return &consoleAutoState{
-		sessions:       make(map[string]string),
-		launching:      make(map[string]bool),
-		lastConnectors: make(map[string][]string),
-		backoff:        make(map[string]*consoleBackoff),
+		sessions:        make(map[string]string),
+		launching:       make(map[string]bool),
+		lastConnectors:  make(map[string][]string),
+		backoff:         make(map[string]*consoleBackoff),
+		absentSince:     make(map[string]time.Time),
+		disconnectGrace: consoleDisconnectGraceFromEnv(),
 	}
 }
 
@@ -1837,6 +1861,16 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	// A pinned connector missing from the report is simply not-present — never a
 	// silent fallback to a different monitor.
 	nowPresent := connectorPresent(connectors, cfg.PinnedConnector())
+	if nowPresent {
+		h.consoleAuto.mu.Lock()
+		_, wasAbsent := h.consoleAuto.absentSince[hostID]
+		delete(h.consoleAuto.absentSince, hostID)
+		h.consoleAuto.mu.Unlock()
+		if wasAbsent && alreadyLaunched {
+			h.log.Info("console auto-stop: display back within the disconnect grace, session kept",
+				"host_id", hostID, "session_id", recordedID)
+		}
+	}
 
 	switch {
 	case nowPresent && !alreadyLaunched:
@@ -1854,9 +1888,13 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 		}
 		h.attemptConsoleLaunch(ctx, hostID, cfg, isCapacityPath)
 	case !nowPresent && alreadyLaunched:
+		if !h.consoleDisconnectGraceElapsed(hostID) {
+			return
+		}
 		h.consoleAuto.mu.Lock()
 		sessionID, ok := h.consoleAuto.sessions[hostID]
 		delete(h.consoleAuto.sessions, hostID)
+		delete(h.consoleAuto.absentSince, hostID)
 		h.consoleAuto.mu.Unlock()
 		if !ok {
 			h.log.Debug("console auto-stop: no session recorded for host, nothing to stop", "host_id", hostID)
@@ -1876,6 +1914,37 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 				"host_id", hostID, "pinned_connector", pinned, "reported_connectors", connectors)
 		}
 	}
+}
+
+// consoleDisconnectGraceElapsed answers whether a running console session whose
+// connector is absent should be stopped now. The first absence starts the grace
+// and schedules a re-evaluation when it ends; until then the session is kept, so
+// a monitor that drops its link on power-off (indistinguishable from an unplug by
+// the connector state) does not end the desktop.
+func (h *Handler) consoleDisconnectGraceElapsed(hostID string) bool {
+	h.consoleAuto.mu.Lock()
+	defer h.consoleAuto.mu.Unlock()
+	grace := h.consoleAuto.disconnectGrace
+	if grace <= 0 {
+		return true
+	}
+	since, waiting := h.consoleAuto.absentSince[hostID]
+	if waiting {
+		return time.Since(since) >= grace
+	}
+	h.consoleAuto.absentSince[hostID] = time.Now()
+	h.log.Info("console auto-stop: connector absent, waiting out the disconnect grace",
+		"host_id", hostID, "grace", grace.String())
+	time.AfterFunc(grace, func() {
+		h.consoleAuto.mu.Lock()
+		connectors := h.consoleAuto.lastConnectors[hostID]
+		_, stillAbsent := h.consoleAuto.absentSince[hostID]
+		h.consoleAuto.mu.Unlock()
+		if stillAbsent {
+			h.reevalConsole(context.Background(), hostID, connectors, false)
+		}
+	})
+	return false
 }
 
 // attemptConsoleLaunch launches the auto-start console session, gated by the

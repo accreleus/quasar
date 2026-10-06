@@ -265,6 +265,7 @@ fn run_until_end<F: Fn(SessionEvent)>(
             "console.displaying",
             serde_json::json!({ "mode": mode_json(mode) }),
         );
+        emit(SessionEvent::Displaying(mode));
     };
     let started = Instant::now();
     let mut watch = DisplayWatch::new(cfg.app_boot_timeout.unwrap_or(DEFAULT_DISPLAY_BUDGET));
@@ -310,11 +311,9 @@ fn run_until_end<F: Fn(SessionEvent)>(
             let facts =
                 displaying::read_drm_facts(std::path::Path::new(&card_node), &output.connector);
             match watch.observe(displaying::verdict(&facts), started.elapsed()) {
-                WatchStep::Running(mode) => {
-                    displaying(mode);
-                    emit(SessionEvent::Running);
-                }
-                WatchStep::ModeChanged(mode) | WatchStep::Regained(mode) => displaying(mode),
+                WatchStep::Running(mode)
+                | WatchStep::ModeChanged(mode)
+                | WatchStep::Regained(mode) => displaying(mode),
                 WatchStep::Lost(missing) => {
                     let why = describe(&missing);
                     tracing::warn!(
@@ -323,8 +322,9 @@ fn run_until_end<F: Fn(SessionEvent)>(
                     );
                     trace(
                         "console.not_displaying",
-                        serde_json::json!({ "reason": why }),
+                        serde_json::json!({ "reason": &why }),
                     );
+                    emit(SessionEvent::NotDisplaying(why));
                 }
                 WatchStep::NeverDisplayed(missing) => {
                     stop_container(&mut container);

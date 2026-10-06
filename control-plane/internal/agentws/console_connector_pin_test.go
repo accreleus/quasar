@@ -3,6 +3,7 @@ package agentws
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -64,6 +65,7 @@ func TestConsoleAutoStartSkipsWhenPinnedConnectorAbsent(t *testing.T) {
 // remain present — the auto-stop keys off the same pin as auto-start.
 func TestConsoleAutoStopWhenPinnedConnectorGoesAbsent(t *testing.T) {
 	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.disconnectGrace = 0
 	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
 
 	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
@@ -138,5 +140,44 @@ func TestResolvedConfigPinnedConnectorFromOutputID(t *testing.T) {
 	}
 	if got := unpinned.PinnedConnector(); got != "auto" {
 		t.Fatalf("PinnedConnector() with no output_id = %q, want auto", got)
+	}
+}
+
+// A connector that drops and comes back within the disconnect grace keeps the
+// session: a monitor that loses its link on power-off is not an unplug. One that
+// stays absent past the grace stops it, from the timer the first absence armed.
+func TestConsoleAutoStopWaitsOutTheDisconnectGrace(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.disconnectGrace = 150 * time.Millisecond
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
+	if n := len(stopEv.stopped); n != 0 {
+		t.Fatalf("stops = %d, want 0 (display back within the grace)", n)
+	}
+	if _, tracked := h.consoleAuto.sessions[hostID]; !tracked {
+		t.Fatal("the session must still be tracked after a short absence")
+	}
+
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.consoleAuto.mu.Lock()
+		_, tracked := h.consoleAuto.sessions[hostID]
+		h.consoleAuto.mu.Unlock()
+		if !tracked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := len(stopEv.stopReasons); n != 1 || stopEv.stopReasons[0] != "console_display_disconnected" {
+		t.Fatalf("stops = %v, want one console_display_disconnected after the grace", stopEv.stopReasons)
 	}
 }
