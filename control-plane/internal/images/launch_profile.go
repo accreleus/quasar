@@ -36,8 +36,10 @@ import (
 //
 //   - gpu: the manifest's value; TRUE when the manifest is silent. An app on a
 //     managed preset is a streamed, GPU-composited session by construction.
-//   - no_new_privileges, systempaths_unconfined: written only when the manifest
-//     states them; absent stays absent (the agent's hardened default applies).
+//   - no_new_privileges, systempaths_unconfined, direct_display: written only
+//     when the manifest states them; absent stays absent (the agent's hardened
+//     default applies; an app without direct_display cannot be a console's
+//     default app, amendment 19).
 //   - every other key in spec is preserved.
 //
 // An empty spec is `{}`. The result is re-encoded (key order is not
@@ -63,7 +65,7 @@ func ApplyLaunchProfile(spec json.RawMessage, runtimeRaw []byte) (json.RawMessag
 	return b, nil
 }
 
-// applyLaunchProfile writes the three profile keys into spec.
+// applyLaunchProfile writes the profile keys into spec.
 func applyLaunchProfile(spec map[string]any, rt providerRuntimeExtras) {
 	gpu := true
 	if rt.GPU != nil {
@@ -75,5 +77,8 @@ func applyLaunchProfile(spec map[string]any, rt providerRuntimeExtras) {
 	}
 	if rt.SystempathsUnconfined != nil {
 		spec["systempaths_unconfined"] = *rt.SystempathsUnconfined
+	}
+	if rt.DirectDisplay != nil {
+		spec["direct_display"] = *rt.DirectDisplay
 	}
 }

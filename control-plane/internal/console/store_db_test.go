@@ -33,7 +33,8 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM console_capabilities; DELETE FROM console_config;
 		DELETE FROM hosts WHERE node_name LIKE 'console-test-%';
-		DELETE FROM users WHERE email LIKE 'console-test-%'`); err != nil {
+		DELETE FROM users WHERE email LIKE 'console-test-%';
+		DELETE FROM apps WHERE name LIKE 'console-test-%'`); err != nil {
 		pool.Close()
 		t.Fatalf("truncate: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestUpsertCapabilitiesPreservesBookkeeping(t *testing.T) {
 	ctx := context.Background()
 
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{"DP-1"}, AudioSinks: []AudioSink{}, InputDevices: []InputDevicePath{},
+		Connectors: []string{"DP-1"}, InputDevices: []InputDevicePath{},
 		Access: &Access{State: "on", Target: boolPtr(true), RequestID: strPtr("req-1"), Summary: "on"},
 	}); err != nil {
 		t.Fatalf("upsert 1: %v", err)
@@ -151,7 +152,7 @@ func TestUpsertCapabilitiesPreservesBookkeeping(t *testing.T) {
 	// An unrelated resend (different connectors, access repeated) must not
 	// drop either bookkeeping key.
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{"DP-1", "HDMI-A-1"}, AudioSinks: []AudioSink{}, InputDevices: []InputDevicePath{},
+		Connectors: []string{"DP-1", "HDMI-A-1"}, InputDevices: []InputDevicePath{},
 		Access: &Access{State: "on", Target: boolPtr(true), RequestID: strPtr("req-1"), Summary: "on"},
 	}); err != nil {
 		t.Fatalf("upsert 2: %v", err)
@@ -173,7 +174,7 @@ func TestUpsertCapabilitiesPreservesBookkeeping(t *testing.T) {
 	// A report with no access at all clears access AND the hold, keeping the
 	// handled-request-id record.
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{"DP-1", "HDMI-A-1"}, AudioSinks: []AudioSink{}, InputDevices: []InputDevicePath{},
+		Connectors: []string{"DP-1", "HDMI-A-1"}, InputDevices: []InputDevicePath{},
 	}); err != nil {
 		t.Fatalf("upsert 3: %v", err)
 	}
@@ -202,7 +203,7 @@ func TestClearAccessLeavesOtherFieldsAlone(t *testing.T) {
 	ctx := context.Background()
 
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{"DP-1"}, AudioSinks: []AudioSink{{ID: "a1", Label: "Speakers"}}, InputDevices: []InputDevicePath{},
+		Connectors: []string{"DP-1"}, InputDevices: []InputDevicePath{{Path: "/dev/input/event1", Label: "Keyboard"}},
 		Access: &Access{State: "on", Target: boolPtr(true), RequestID: strPtr("req-9"), Summary: "on"},
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -226,8 +227,8 @@ func TestClearAccessLeavesOtherFieldsAlone(t *testing.T) {
 	if len(got.Connectors) != 1 || got.Connectors[0] != "DP-1" {
 		t.Fatalf("connectors = %v, want [DP-1] untouched", got.Connectors)
 	}
-	if len(got.AudioSinks) != 1 {
-		t.Fatalf("audio sinks = %v, want untouched", got.AudioSinks)
+	if len(got.InputDevices) != 1 {
+		t.Fatalf("input devices = %v, want untouched", got.InputDevices)
 	}
 	if placementHoldPending(t, pool, hostID) {
 		t.Fatal("placement hold survived ClearAccess")

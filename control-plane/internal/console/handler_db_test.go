@@ -51,7 +51,7 @@ func TestGetReturnsStoredAccess(t *testing.T) {
 	ctx := context.Background()
 
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{"DP-1"}, AudioSinks: []AudioSink{}, InputDevices: []InputDevicePath{},
+		Connectors: []string{"DP-1"}, InputDevices: []InputDevicePath{},
 		Access: &Access{State: "restored", Target: boolPtr(true), RequestID: strPtr("req-get-1"),
 			Reason: strPtr("unhealthy"), Summary: "the node agent did not become healthy"},
 	}); err != nil {
@@ -81,7 +81,7 @@ func TestPatchRefusedWhileApplying(t *testing.T) {
 	store := NewStore(pool)
 	ctx := context.Background()
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{}, AudioSinks: []AudioSink{}, InputDevices: []InputDevicePath{},
+		Connectors: []string{}, InputDevices: []InputDevicePath{},
 		Access: &Access{State: "applying", Target: boolPtr(true), RequestID: strPtr("req-applying"), Summary: "replacing the agent"},
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -108,7 +108,7 @@ func TestPatchUnsupportedRefusesOnlyFalseToTrue(t *testing.T) {
 	store := NewStore(pool)
 	ctx := context.Background()
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{}, AudioSinks: []AudioSink{}, InputDevices: []InputDevicePath{},
+		Connectors: []string{}, InputDevices: []InputDevicePath{},
 		Access: &Access{State: "unsupported", Summary: "rootless engine: console access needs RH07-15"},
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -125,7 +125,7 @@ func TestPatchUnsupportedRefusesOnlyFalseToTrue(t *testing.T) {
 
 	// Every other key still goes through while unsupported.
 	rec = httptest.NewRecorder()
-	h.handlePatch(rec, patchRequest(t, hostID, map[string]any{"grab": false}))
+	h.handlePatch(rec, patchRequest(t, hostID, map[string]any{"auto_start_on_display": true}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unrelated key status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
@@ -150,7 +150,7 @@ func TestPatchSetsPlacementHoldOnlyWhenEnabledChanges(t *testing.T) {
 	store := NewStore(pool)
 	ctx := context.Background()
 	if err := store.UpsertCapabilities(ctx, hostID, Capabilities{
-		Connectors: []string{}, AudioSinks: []AudioSink{}, InputDevices: []InputDevicePath{},
+		Connectors: []string{}, InputDevices: []InputDevicePath{},
 		Access: &Access{State: "on", Target: boolPtr(true), RequestID: strPtr("req-hold"), Summary: "on"},
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -160,7 +160,7 @@ func TestPatchSetsPlacementHoldOnlyWhenEnabledChanges(t *testing.T) {
 
 	// A PATCH that changes nothing about `enabled` sets no hold.
 	rec := httptest.NewRecorder()
-	h.handlePatch(rec, patchRequest(t, hostID, map[string]any{"grab": false}))
+	h.handlePatch(rec, patchRequest(t, hostID, map[string]any{"auto_start_on_display": true}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}

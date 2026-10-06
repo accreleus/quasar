@@ -782,6 +782,10 @@ pub struct AppSpec {
     /// `flatpak run` fails without this flag). Absent ⇒ `false`.
     #[serde(default)]
     pub systempaths_unconfined: bool,
+    /// The image can run as a console session, driving the host's display itself
+    /// (agent-api.md `session_assign` `app.direct_display`). Absent ⇒ `false`.
+    #[serde(default)]
+    pub direct_display: bool,
 }
 
 fn spec_true() -> bool {
@@ -813,9 +817,12 @@ pub enum AppExitPolicy {
     Unknown,
 }
 
-/// CM-01 console-mode config, delivered in `config_update.console_config`. The
-/// full resolved object; all fields `#[serde(default)]` so a partial/older
-/// payload deserializes cleanly. `input_devices` stays opaque JSON (CM-03 consumes it).
+/// CM-01 console-mode config, delivered in `config_update.console_config`. Every
+/// field is `#[serde(default)]` and unknown keys are ignored. The wire carries
+/// `enabled`, `output_id`, `input_devices`, `auto_start_on_display`, `default_app`
+/// and `default_user` (agent-api.md amendment 19). The other fields are read only
+/// by the old local-display path and go with it in #461; their defaults (`grab` and
+/// `fullscreen` true) are the values that path ran with.
 #[derive(Deserialize, Debug, Clone)]
 pub struct ConsoleConfig {
     #[serde(default)]
@@ -836,7 +843,7 @@ pub struct ConsoleConfig {
     pub stream_audio: bool,
     #[serde(default)]
     pub input_devices: serde_json::Value,
-    #[serde(default)]
+    #[serde(default = "spec_true")]
     pub grab: bool,
     #[serde(default)]
     pub auto_start_on_display: bool,
@@ -848,7 +855,7 @@ pub struct ConsoleConfig {
     /// acts on this — carried only for lossless deserialization.
     #[serde(default)]
     pub default_user: Option<String>,
-    #[serde(default)]
+    #[serde(default = "spec_true")]
     pub fullscreen: bool,
 }
 
@@ -867,6 +874,8 @@ pub enum VideoTopology {
     #[default]
     StreamOnly,
     LocalOnly,
+    /// Not sent by the control plane (agent-api.md amendment 19); goes with the
+    /// old local-display path in #461.
     DualOutput,
 }
 
@@ -985,6 +994,7 @@ fn console_weston() -> String {
 /// (agent-api.md) so the admin console-config UI can populate selectors.
 /// `PartialEq` (CM-06/07): the console-hotplug watcher (`session::console_hotplug`)
 /// diffs successive snapshots to detect a display/input hardware change.
+/// No audio sinks: a console desktop picks its own output (agent-api.md amendment 19).
 #[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConsoleCapabilities {
     pub connectors: Vec<String>,
@@ -992,7 +1002,6 @@ pub struct ConsoleCapabilities {
     /// for compatibility with older control planes and hotplug logic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<DrmOutputCapability>,
-    pub audio_sinks: Vec<AudioSink>,
     pub input_devices: Vec<InputDeviceInfo>,
     /// Amendment 18 (RH-07 #395): whether this agent can run console mode, on an owned
     /// host whose recovery actor replaces the agent to grant it. Absent on a host with no
@@ -2467,5 +2476,65 @@ mod tests {
         assert_eq!(v["ladder_res_rung"], 1);
         assert_eq!(v["ladder_fps"], 60);
         assert_eq!(v["external_owner"], "auto");
+    }
+
+    /// Amendment 19 (#455): the control plane sends the six-field console_config.
+    /// It deserializes, the retired fields take the values the old path ran with,
+    /// and a key this agent does not know is ignored rather than failing the
+    /// `config_update`.
+    #[test]
+    fn trimmed_console_config_deserializes_with_retired_defaults() {
+        let cfg: ConsoleConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "output_id": "card0:DP-4",
+            "input_devices": ["/dev/input/event4"],
+            "auto_start_on_display": true,
+            "default_app": "6f1c0000-0000-0000-0000-000000000001",
+            "default_user": "0b2e0000-0000-0000-0000-000000000002",
+            "some_future_key": {"nested": true}
+        }))
+        .unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.output_id.as_deref(), Some("card0:DP-4"));
+        assert_eq!(cfg.input_devices, serde_json::json!(["/dev/input/event4"]));
+        assert!(cfg.auto_start_on_display);
+        assert!(cfg.default_app.is_some() && cfg.default_user.is_some());
+        // Retired fields: the old control plane's defaults.
+        assert_eq!(cfg.connector, "auto");
+        assert_eq!(cfg.compositor, "weston");
+        assert!(cfg.mode.is_none());
+        assert!(cfg.audio_output.is_none());
+        assert!(!cfg.stream && !cfg.stream_audio && !cfg.auto_connect_controller);
+        assert!(cfg.grab && cfg.fullscreen);
+    }
+
+    /// Amendment 19: `direct_display` rides the `app` object, absent ⇒ false.
+    #[test]
+    fn app_spec_direct_display_defaults_false() {
+        let plain: AppSpec = serde_json::from_value(serde_json::json!({"image": "x:1"})).unwrap();
+        assert!(!plain.direct_display);
+        let direct: AppSpec =
+            serde_json::from_value(serde_json::json!({"image": "kde:1", "direct_display": true}))
+                .unwrap();
+        assert!(direct.direct_display);
+    }
+
+    /// Amendment 19: the capability inventory keeps typed outputs and input devices
+    /// and no longer reports audio sinks.
+    #[test]
+    fn console_capabilities_report_no_audio_sinks() {
+        let caps = ConsoleCapabilities {
+            connectors: vec!["DP-4".to_string()],
+            input_devices: vec![InputDeviceInfo {
+                path: "/dev/input/event4".to_string(),
+                label: "Keyboard".to_string(),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&caps).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("audio_sinks"));
+        assert_eq!(json["connectors"], serde_json::json!(["DP-4"]));
+        assert_eq!(json["input_devices"][0]["path"], "/dev/input/event4");
     }
 }

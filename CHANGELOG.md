@@ -37,6 +37,15 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 - **The node agent reaches every console concern through one place (#454).** The terminal hold, the local-only session and a streamed session's console fan-out moved out of the session runner's streaming path into one module, so the direct-display engine can replace it and the retirement can delete it in one place. No behaviour change.
+- **The console page keeps only the settings direct display still uses (#455).** Console
+  config is now `enabled`, the output pick, input devices, auto-start on display, default app
+  and default user. Physical mode, the streaming switches (dual output), local audio output,
+  grab local input, auto-connect controller, compositor and fullscreen are gone: the desktop
+  owns its mode, sound and input, and a console session is never streamed. An upgrade drops
+  the retired keys from stored configs (migration 0099) and never blocks on them. The
+  default-app list offers only apps whose `runtime_spec` declares `direct_display: true`; a
+  default app without it shows a readiness failure on the console page and is not launched.
+  Contract: protocol amendment 19.
 
 ### Fixed
 - **In console mode, a desktop that only resizes its own window when you pick a resolution

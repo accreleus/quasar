@@ -10,20 +10,18 @@ import (
 )
 
 // CM-09 item 3: the level-trigger presence check must key on the connector
-// pinned via output_id (not the validation-locked `connector` field, which
-// stays "auto"). seedEligibleConsolePinnedHost mirrors
-// seedEligibleConsoleHost (console_selfheal_test.go) with an output_id/mode
-// pin added.
+// pinned via output_id. seedEligibleConsolePinnedHost mirrors
+// seedEligibleConsoleHost (console_selfheal_test.go) with an output_id pin
+// added.
 func seedEligibleConsolePinnedHost(t *testing.T, h *Handler, pool *pgxpool.Pool, outputID string) string {
 	t.Helper()
 	hostID := seedHost(t, pool)
 	cfg := map[string]any{
 		"enabled":               true,
 		"auto_start_on_display": true,
-		"default_app":           "00000000-0000-0000-0000-0000000000aa",
+		"default_app":           seedConsoleApp(t, pool, true),
 		"default_user":          "00000000-0000-0000-0000-0000000000bb",
 		"output_id":             outputID,
-		"mode":                  map[string]any{"width": 1920, "height": 1080, "refresh_millihz": 60000},
 	}
 	if err := h.consoleStore.Upsert(context.Background(), hostID, cfg, nil); err != nil {
 		t.Fatalf("seed pinned console config: %v", err)
@@ -122,16 +120,13 @@ func TestConnectorPresentPinned(t *testing.T) {
 	}
 }
 
-// console.ConsoleConfig.PinnedConnector plumbing sanity: Resolve() locks
-// `connector` to "auto" but preserves output_id, and PinnedConnector derives
-// the connector from it.
+// console.ConsoleConfig.PinnedConnector plumbing sanity: Resolve() preserves
+// output_id (and ignores the retired `connector` key a stale row may still
+// carry), and PinnedConnector derives the connector from it.
 func TestResolvedConfigPinnedConnectorFromOutputID(t *testing.T) {
-	cfg, err := console.Resolve(map[string]any{"output_id": "card0:DP-4"})
+	cfg, err := console.Resolve(map[string]any{"output_id": "card0:DP-4", "connector": "HDMI-A-1"})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if cfg.Connector != "auto" {
-		t.Fatalf("Connector = %q, want auto (validation-locked)", cfg.Connector)
 	}
 	if got := cfg.PinnedConnector(); got != "DP-4" {
 		t.Fatalf("PinnedConnector() = %q, want DP-4", got)

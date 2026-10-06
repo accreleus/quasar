@@ -3,13 +3,24 @@
 // console_config.default_app. Same schedule -> assign -> start primitives as
 // LaunchByProfile, but with no profile/tier resolution and no probe envelope:
 // the app's plain defaults, pinned to the host whose display connected.
+//
+// A console session is always `local_only` and its app must declare
+// runtime_spec.direct_display (agent-api.md session_assign).
 package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/console"
 )
+
+// ErrConsoleAppNotDirect: the console's default app does not declare
+// runtime_spec.direct_display, so it cannot run as a console session. No
+// session is created; the console page's console_default_app readiness check
+// is where the operator reads why (control-api.md §Console mode).
+var ErrConsoleAppNotDirect = errors.New("console app cannot run direct: its runtime spec does not declare direct_display")
 
 // LaunchConsoleSession launches one pinned console session on hostID, owned by
 // userID, running appID at the app's defaults. Called by the agentws capacity
@@ -21,19 +32,15 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	if err != nil {
 		return "", fmt.Errorf("console auto-start: load app: %w", err)
 	}
-
-	encodeSlots, needsSignaling, err := consoleTransportPlan(videoTopology, app.DefaultEncodeSlots)
-	if err != nil {
-		return "", fmt.Errorf("console auto-start: %w", err)
+	// Backstop for the agentws auto-start gate: an app that cannot run direct
+	// is a readiness failure, never a launch. RuntimeSpec is the effective one
+	// (a derived tile's parent's).
+	if !console.RuntimeSpecDirect(app.RuntimeSpec) {
+		return "", fmt.Errorf("console auto-start: %w", ErrConsoleAppNotDirect)
 	}
-	var tokenHash string
-	var tokenExpires time.Time
-	if needsSignaling {
-		tok, err := newSignalingToken(time.Now())
-		if err != nil {
-			return "", fmt.Errorf("console auto-start: signaling token: %w", err)
-		}
-		tokenHash, tokenExpires = tok.Hash, tok.ExpiresAt
+
+	if err := checkConsoleTopology(videoTopology); err != nil {
+		return "", fmt.Errorf("console auto-start: %w", err)
 	}
 	if width <= 0 {
 		width = app.DefaultWidth
@@ -53,15 +60,14 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		FPS:             fps,
 		BitrateKbps:     app.DefaultBitrateKbps,
 		H264Profile:     "constrained-baseline", // T8; irrelevant to a local-only leg
-		NeedEncodeSlots: encodeSlots,
+		NeedEncodeSlots: 0,                      // local_only: nothing is encoded
 		// The console drives a physical display and a launch failure feeds the
 		// handler's crash-loop backoff, so after consoleBackoffMaxRetries a
 		// transient VRAM veto would kill it semi-permanently with only an error
 		// log. Encode slots still gate this launch; only the advisory veto is off.
 		SkipVramVeto: true,
-		TokenHash:    tokenHash,
-		TokenExpires: tokenExpires,
-		ManagedHome:  app.ManagedHome,
+		// No signaling token: nothing is streamed.
+		ManagedHome: app.ManagedHome,
 		// Inert for a non-catalog image. It cannot re-place the console (already
 		// pinned), but it does refuse to auto-start an app whose managed image is
 		// not on that host yet.
@@ -122,15 +128,13 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	return sess.ID, nil
 }
 
-func consoleTransportPlan(videoTopology string, defaultEncodeSlots int32) (encodeSlots int32, needsSignaling bool, err error) {
-	switch videoTopology {
-	case "local_only":
-		return 0, false, nil
-	case "dual_output":
-		return defaultEncodeSlots, true, nil
-	default:
-		return 0, false, fmt.Errorf("invalid console video topology %q", videoTopology)
+// checkConsoleTopology fails closed on anything but `local_only`, the only
+// console topology: no encode slot, no signaling token.
+func checkConsoleTopology(videoTopology string) error {
+	if videoTopology == console.ConsoleVideoTopology {
+		return nil
 	}
+	return fmt.Errorf("invalid console video topology %q: a console session is %q", videoTopology, console.ConsoleVideoTopology)
 }
 
 // StopConsoleSession is a thin wrapper over the normal Stop teardown, so console

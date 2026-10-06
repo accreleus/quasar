@@ -2110,9 +2110,8 @@ async fn connect_and_run(
         }
     }
     info!(
-        "console capabilities: {} connector(s), {} audio sink(s), {} input device(s)",
+        "console capabilities: {} connector(s), {} input device(s)",
         cap.console.connectors.len(),
-        cap.console.audio_sinks.len(),
         cap.console.input_devices.len()
     );
     let gpu_inventory = cap.gpus.clone();
@@ -2611,9 +2610,8 @@ async fn connect_and_run(
                     // A hotplug can change the GPU set a probe result depended on.
                     mgr.notify_probe_inputs();
                     info!(
-                        "console hotplug: {reason}; re-sending capacity ({} connector(s), {} audio sink(s), {} input device(s))",
+                        "console hotplug: {reason}; re-sending capacity ({} connector(s), {} input device(s))",
                         cap.console.connectors.len(),
-                        cap.console.audio_sinks.len(),
                         cap.console.input_devices.len()
                     );
                     // Reported-copy only — see `send_fresh_capacity`.
@@ -4337,8 +4335,12 @@ impl SessionManager {
                 // Latch for the next session build. Absent ⇒ keep the current value.
                 if let Some(cc) = console_config {
                     info!(
-                        "console config updated: enabled={} connector={} compositor={} stream={} audio_output={:?}",
-                        cc.enabled, cc.connector, cc.compositor, cc.stream, cc.audio_output
+                        "console config updated: enabled={} output_id={:?} input_devices={} auto_start_on_display={} default_app={:?}",
+                        cc.enabled,
+                        cc.output_id,
+                        cc.input_devices,
+                        cc.auto_start_on_display,
+                        cc.default_app
                     );
                     // #411: the DDC power probe forks `ddcutil` per connected connector
                     // on the 2 s hotplug poll, and nothing consumes a reading unless

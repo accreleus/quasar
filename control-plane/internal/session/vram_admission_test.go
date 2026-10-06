@@ -362,21 +362,17 @@ func TestConsoleLaunchBypassesVetoAndCertDoesNot(t *testing.T) {
 		t.Fatalf("cert-bench launch on a full GPU: got %v want ErrCapacityExhausted (the bench must NOT bypass)", err)
 	}
 
-	// The console path bypasses it and comes up.
-	sessID, err := coord.LaunchConsoleSession(ctx, s.hostID, s.userID, s.appID, "dual_output", 1280, 720, 60)
+	// The console path bypasses it and comes up. (Amendment 19: a console app
+	// must declare direct_display, and a console session is local_only, so it
+	// reserves no encode slot; the dual-output encode-slot leg is gone.)
+	must(t, exec(t, pool, `UPDATE apps SET runtime_spec = runtime_spec || '{"direct_display":true}'::jsonb
+		WHERE id::text = $1`, s.appID))
+	sessID, err := coord.LaunchConsoleSession(ctx, s.hostID, s.userID, s.appID, "local_only", 1280, 720, 60)
 	if err != nil {
 		t.Fatalf("console auto-start must bypass the veto: %v", err)
 	}
 	if sessID == "" {
 		t.Fatal("console auto-start returned no session id")
-	}
-
-	// Encode slots still gate the console: only the advisory VRAM veto is skipped.
-	// host-2 has a GPU with ZERO encode slots, and the console launch is pinned
-	// to it, so the reservation has nowhere to go.
-	noSlots, _ := seedSecondHost(t, pool, 16384, 0)
-	if _, err := coord.LaunchConsoleSession(ctx, noSlots, s.userID, s.appID, "dual_output", 1280, 720, 60); err == nil {
-		t.Fatal("console auto-start bypassed the ENCODE SLOT reservation too")
 	}
 }
 

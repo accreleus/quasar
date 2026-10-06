@@ -1089,7 +1089,7 @@ the app's catalog `runtime_spec.env` does not already set one.
 | `QUASAR_EXPERIMENTAL_LOCAL_DMABUF` | off | **Experimental, console (local-display) only.** `1`, `true` or `TRUE` turns it on. Any other value, including `True`, leaves it off. When on, the console display shows the compositor's frames as RGB DMABuf, with no CPU copies. The compositor renders into a ring of 4–8 GPU buffers (`display-dmabuf`). Each buffer is reused only after the display has released it. `waylandsink` or `kmssink` imports the buffers as they are. When off, every frame is read back into system memory and copied: that path drops frames at 3840x2160@120 (#450). The format is picked between the compositor and the display: `XRGB8888` first, LINEAR where the GPU can render it, compressed modifiers last. On NVIDIA that is a block-linear modifier, because NVIDIA cannot render to LINEAR. Applies only when the session's `video_topology` is `LocalOnly` and it is not using the synthetic test source (`QUASAR_USE_TEST_SRC`). Otherwise it does nothing. Needs a gst-wayland-display build with `display-dmabuf`. On an older one the agent logs `token=local-dmabuf-old-compositor`. On an owned install, set it on the seed or with `reconfigure` ("Agent variables" below), so a console host can turn it on for a live check. |
 
 **The console terminal (#407).** Not a knob. For the life of every local console session
-(`local_only`, or `dual_output` with console mode on) the agent makes `tty8` the active virtual
+(`local_only`; `dual_output` was retired by amendment 19) the agent makes `tty8` the active virtual
 terminal with its kernel keyboard off (`K_OFF`, `KD_GRAPHICS`), and switches back to the previous
 terminal when the session ends; otherwise every key typed in the session would also reach the
 host's text console. A helper child (`quasar-node-agent console-vt`) holds `tty8` as its
@@ -2411,9 +2411,22 @@ The authoritative knob catalog (keys, types, defaults, classes) lives in
 ### Console auto-start (`default_app` / `default_user`) — needs an entitlement
 
 Per-host console-mode settings live in `console_config` (`GET`/`PATCH
-/v1/admin/hosts/{id}/console-config`, admin UI → host → Console). When
-`auto_start_on_display` is on and both `default_app` and `default_user` are set,
-a display connecting to that host auto-launches that app as that user.
+/v1/admin/hosts/{id}/console-config`, admin UI → host → Console). Since protocol
+amendment 19 (#455) there are six: `enabled`, `output_id` (the output pick; `null`
+is automatic), `input_devices` (`"auto"` or the list of devices passed into the
+console container), `auto_start_on_display`, `default_app` and `default_user`.
+`connector`, `mode`, `compositor`, `audio_output`, `stream`, `stream_audio`, `grab`,
+`auto_connect_controller` and `fullscreen` are retired: a PATCH naming one is
+refused, migration 0099 removed them from stored rows, and a stored key the control
+plane does not know is ignored on read. When `auto_start_on_display` is on and both
+`default_app` and `default_user` are set, a display connecting to that host
+auto-launches that app as that user.
+
+**The default app must be able to run direct.** Its `runtime_spec` (a derived
+tile's parent's) must declare `"direct_display": true`; a catalog image declares it
+in its manifest `runtime` block. The console page offers only such apps. A default
+app without the key fails the `console_default_app` readiness check on the console
+page and is not launched.
 
 **The console auto-start goes through the same entitlement gate as any other
 launch** (steam-library-discovery Phase 2, migration 0043): the launch runs

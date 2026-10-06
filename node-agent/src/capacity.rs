@@ -162,7 +162,6 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
             crate::ddc::powered_connectors(typed_connectors)
         },
         outputs,
-        audio_sinks: detect_audio_sinks(),
         input_devices: detect_input_devices(),
         access: None,
     }
@@ -337,13 +336,6 @@ fn detect_drm_connectors() -> Vec<String> {
     // On DP/nvidia-drm a monitor in standby keeps `status=connected`, so gate on DDC/CI VCP
     // 0xd6 power state; console auto-start/stop rides on this. No-op without ddcutil.
     crate::ddc::powered_connectors(out)
-}
-
-/// Console audio sinks: the host PipeWire's while its console-audio socket answers (the
-/// `hw:*` ones hidden then, never fought for), otherwise the host's ALSA playback PCMs
-/// (`session::console_audio`, RH-07 #407 D13).
-pub(crate) fn detect_audio_sinks() -> Vec<AudioSink> {
-    crate::session::console_audio::sinks(&crate::session::console_audio::LiveHostAudio::live())
 }
 
 /// ALSA playback sinks from an asound root (`/proc/asound` or the host bind at

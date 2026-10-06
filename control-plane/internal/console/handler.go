@@ -87,9 +87,28 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.writeEnvelope(w, r, resolved, caps)
+}
+
+// writeEnvelope writes the GET/PATCH 200 body (openapi.yaml
+// ConsoleConfigEnvelope): config, capabilities, default_apps and readiness.
+func (h *Handler) writeEnvelope(w http.ResponseWriter, r *http.Request, resolved ConsoleConfig, caps Capabilities) {
+	ctx := r.Context()
+	apps, err := h.store.DirectApps(ctx)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load console default apps")
+		return
+	}
+	checks, err := h.store.Readiness(ctx, resolved)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not evaluate console readiness")
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"config":       resolved,
 		"capabilities": caps,
+		"default_apps": apps,
+		"readiness":    checks,
 	})
 }
 
@@ -136,22 +155,15 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 
 	// Merge the partial patch onto the stored sparse config: a null value
 	// clears the key (reverts to Defaults() on the next Resolve); any other
-	// value sets it (control-api.md — `enabled:true` with `audio_output:null`
-	// is valid, since audio_output's default is already null).
-	merged := map[string]any{}
-	for k, v := range old {
-		merged[k] = v
-	}
+	// value sets it. Only console settings are carried over, so a retired key
+	// a pre-amendment-19 row still holds is dropped by this write.
+	merged := KnownOnly(old)
 	for k, v := range patch {
 		if v == nil {
 			delete(merged, k)
 		} else {
 			merged[k] = v
 		}
-	}
-	if err := ValidateOutputSelection(merged, caps); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
-		return
 	}
 
 	oldResolved, err := Resolve(old)
@@ -218,10 +230,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"config":       resolved,
-		"capabilities": caps,
-	})
+	h.writeEnvelope(w, r, resolved, caps)
 }
 
 // adminUserID returns the authenticated admin's user id for the updated_by

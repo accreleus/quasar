@@ -169,13 +169,6 @@ fn describe_change(before: &ConsoleCapabilities, after: &ConsoleCapabilities) ->
             after.input_devices.len()
         ));
     }
-    if before.audio_sinks.len() != after.audio_sinks.len() {
-        parts.push(format!(
-            "audio sinks changed {} -> {}",
-            before.audio_sinks.len(),
-            after.audio_sinks.len()
-        ));
-    }
     if parts.is_empty() {
         "console capabilities changed".to_string()
     } else {
