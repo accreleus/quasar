@@ -933,6 +933,52 @@ fn unproven_bind_sources(
         .collect()
 }
 
+/// The bind-source check before a create (#426), as one decision. Only Podman needs it.
+/// One source is proven by a host fact instead of a bind the agent has: a console
+/// container's read-only `/run/udev/data`, which the recovery actor probes and reports as
+/// `QUASAR_HOST_UDEV_DATA` (`host_udev_data`). `Err` is the refusal's text.
+fn bind_source_check(
+    dialect: super::dialect::Dialect,
+    request: &ApplicationRequest,
+    own_mounts: Option<&[quasar_runtime::Mount]>,
+    exists: impl Fn(&Path) -> bool,
+    host_udev_data: Option<&str>,
+) -> Result<(), String> {
+    if dialect != super::dialect::Dialect::Podman {
+        return Ok(());
+    }
+    let udev_proven = host_udev_data.map(str::trim) == Some("1");
+    let unproven: Vec<String> = unproven_bind_sources(request, own_mounts, exists)
+        .into_iter()
+        .filter(|source| !(udev_proven && is_console_udev_bind(request, source)))
+        .collect();
+    if unproven.is_empty() {
+        return Ok(());
+    }
+    let mut why = format!(
+        "a bind source is missing on the host (or not visible to the agent to prove it), and \
+         Podman would create it: {}",
+        unproven.join(", ")
+    );
+    if unproven.iter().any(|s| is_console_udev_bind(request, s)) {
+        why.push_str(
+            "; the host's udev data (/run/udev/data) is not known to this agent: turn console \
+             mode off and on again so the recovery actor reads it",
+        );
+    }
+    Err(why)
+}
+
+/// `source` is the console plan's udev bind: `/run/udev/data` read-only at the same path.
+fn is_console_udev_bind(request: &ApplicationRequest, source: &str) -> bool {
+    use crate::session::console_plan::UDEV_DATA;
+    source == UDEV_DATA
+        && request.typed_mounts.iter().any(|m| {
+            matches!(m, ApplicationMount::Bind { source, target, read_only: true, .. }
+                if source == UDEV_DATA && target == UDEV_DATA)
+        })
+}
+
 /// How this process sees the engine's host, for [`unproven_bind_sources`]: `None` when it
 /// is not in a container; its own container's mounts when it is. A container the engine
 /// cannot name gives no mounts, so nothing in it counts as seen.
@@ -1452,15 +1498,20 @@ pub(crate) async fn start(
             };
             if docker.dialect == super::dialect::Dialect::Podman {
                 let view = own_host_view(&docker).await?;
-                let unproven = unproven_bind_sources(&request, view.as_deref(), Path::exists);
-                if !unproven.is_empty() {
+                let host_udev_data =
+                    std::env::var(crate::readiness::console::HOST_UDEV_DATA_ENV).ok();
+                if let Err(why) = bind_source_check(
+                    docker.dialect,
+                    &request,
+                    view.as_deref(),
+                    Path::exists,
+                    host_udev_data.as_deref(),
+                ) {
                     // Refused before anything is journalled or created, as Docker refuses it.
                     tracing::warn!(
                         token = "application-bind-source-missing",
                         application = %request.name,
-                        sources = ?unproven,
-                        "refusing the launch: a bind source is missing on the host (or not \
-                         visible to the agent to prove it), and Podman would create it"
+                        "refusing the launch: {why}"
                     );
                     return Err(ErrorKind::Engine.into());
                 }
@@ -2729,6 +2780,61 @@ mod bind_source_tests {
     #[test]
     fn volumes_are_not_bind_sources() {
         assert!(unproven_bind_sources(&request(&[]), None, |_| false).is_empty());
+    }
+
+    /// A console container's udev bind, beside the input bind the agent can see.
+    fn console_request() -> ApplicationRequest {
+        let bind = |path: &str| ApplicationMount::Bind {
+            source: path.into(),
+            target: path.into(),
+            read_only: true,
+            consistency: None,
+        };
+        ApplicationRequest {
+            typed_mounts: vec![bind("/dev/input"), bind("/run/udev/data")],
+            ..Default::default()
+        }
+    }
+
+    /// #460: the agent never sees the host's /run, so the console udev bind is proven by the
+    /// recovery actor's host fact on Podman; Docker checks nothing; every other bind is
+    /// still checked as before.
+    #[test]
+    fn the_console_udev_bind_is_proven_by_the_host_fact_on_podman_only() {
+        use super::super::dialect::Dialect;
+        let mounts = [bind("/dev/input", "/dev/input")];
+        let seen = |path: &Path| path == Path::new("/dev/input");
+        let check = |dialect, request: &ApplicationRequest, fact: Option<&str>| {
+            bind_source_check(dialect, request, Some(&mounts), seen, fact)
+        };
+        let console = console_request();
+        assert_eq!(check(Dialect::Podman, &console, Some("1")), Ok(()));
+        for fact in [None, Some("0"), Some("yes")] {
+            let refused = check(Dialect::Podman, &console, fact).unwrap_err();
+            assert!(refused.contains("/run/udev/data"), "{refused}");
+            assert!(
+                refused.contains("turn console mode off and on again"),
+                "{fact:?}: {refused}"
+            );
+        }
+        assert_eq!(check(Dialect::Docker, &console, None), Ok(()));
+
+        // The fact proves udev data only: another missing source is still refused, with no
+        // console advice.
+        let mut other = console_request();
+        other.typed_mounts.push(ApplicationMount::Bind {
+            source: "/mnt/share/games".into(),
+            target: "/games".into(),
+            read_only: true,
+            consistency: None,
+        });
+        let refused = check(Dialect::Podman, &other, Some("1")).unwrap_err();
+        assert!(refused.contains("/mnt/share/games"), "{refused}");
+        assert!(!refused.contains("/run/udev/data"), "{refused}");
+        // A writable bind of the same path is not the console plan's.
+        let writable = request(&["/run/udev/data"]);
+        let refused = check(Dialect::Podman, &writable, Some("1")).unwrap_err();
+        assert!(refused.contains("/run/udev/data"), "{refused}");
     }
 }
 
