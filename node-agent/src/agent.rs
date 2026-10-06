@@ -4357,6 +4357,10 @@ impl SessionManager {
                     // on the 2 s hotplug poll, and nothing consumes a reading unless
                     // console mode is on — latch it so `ddc` can short-circuit.
                     crate::ddc::set_console_enabled(cc.enabled);
+                    crate::readiness::console::set_config(
+                        cc.output_id.clone(),
+                        cc.input_devices.clone(),
+                    );
                     crate::session::console_audio::set_configured_output(
                         cc.audio_output.as_deref(),
                     );

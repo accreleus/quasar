@@ -326,17 +326,13 @@ fn detect_drm_outputs_at(
             outputs.extend(claimed);
             continue;
         }
-        // #407: opening a primary node read-write can make the opener DRM master
-        // automatically when the display is free, racing spawn_weston_console's own
+        // #407: opening a primary node can make the opener DRM master automatically when
+        // the display is free (whatever the open mode), racing spawn_weston_console's own
         // open for it — see session::console::drm_open_lock. Held for this card only.
         let _drm_open_guard = crate::session::console::drm_open_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(entry.path())
-        else {
+        let Ok(file) = open_card_read_only(&entry.path()) else {
             continue;
         };
         let card = DrmCard(file);
@@ -407,11 +403,7 @@ pub(crate) fn connector_scanout(card_node: &std::path::Path, connector: &str) ->
     let _drm_open_guard = crate::session::console::drm_open_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(card_node)
-    else {
+    let Ok(file) = open_card_read_only(card_node) else {
         return ConnectorScanout::default();
     };
     let card = DrmCard(file);
@@ -430,6 +422,63 @@ pub(crate) fn connector_scanout(card_node: &std::path::Path, connector: &str) ->
         mode: crtc
             .and_then(|crtc| crtc.mode())
             .map(|mode| drm_mode_capability(&mode)),
+    }
+}
+
+/// Every read of a card node the agent makes is read-only (#460). The mode-setting reads
+/// (resources, connectors, encoders, CRTCs) and DROP_MASTER are ioctls the kernel allows on
+/// any open file, so the agent needs only read access to the card, which is all a rootless
+/// host grants it for its inventory, and it never holds a writable handle on the display.
+/// The open mode does not decide mastership: whoever opens a free card first becomes
+/// master, which is why every opener here drops it again at once and the inventory never
+/// opens a card a console desktop has claimed.
+fn open_card_read_only(card_node: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(card_node)
+}
+
+/// What the agent can tell about a console card without taking it (#460,
+/// `readiness::console`'s `console_card`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardAccess {
+    /// The node is not in this agent's container.
+    Missing,
+    /// The node is there but will not open read-only.
+    Unopenable(String),
+    /// Opened read-only; nobody else holds DRM master.
+    Free,
+    /// Another process holds DRM master.
+    Held,
+    /// This agent's console session claimed it: its desktop holds the display.
+    Claimed,
+}
+
+/// `card` (e.g. `card0`) as `connector_scanout` reads it: never opened while claimed, and
+/// opened read-only otherwise, giving back at once any mastership the open took.
+pub(crate) fn console_card_access(card: &str) -> CardAccess {
+    console_card_access_at(std::path::Path::new("/dev/dri"), card)
+}
+
+fn console_card_access_at(dri_root: &std::path::Path, card: &str) -> CardAccess {
+    use drm::Device as _;
+    if display_claimed(card) {
+        return CardAccess::Claimed;
+    }
+    let node = dri_root.join(card);
+    if !node.exists() {
+        return CardAccess::Missing;
+    }
+    let _drm_open_guard = crate::session::console::drm_open_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match open_card_read_only(&node) {
+        Err(e) => CardAccess::Unopenable(e.to_string()),
+        Ok(file) => {
+            if DrmCard(file).release_master_lock().is_err() {
+                CardAccess::Held
+            } else {
+                CardAccess::Free
+            }
+        }
     }
 }
 

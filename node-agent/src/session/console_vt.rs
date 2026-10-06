@@ -325,6 +325,16 @@ pub(crate) fn presence(sys_class_tty: &Path, node: &Path) -> Presence {
     }
 }
 
+/// Whether a console session holds the console VT now (`readiness::console`, #460).
+pub(crate) fn held() -> bool {
+    active_slot().is_some()
+}
+
+/// The console VT's device node, as the agent sees it.
+pub(crate) fn console_node() -> PathBuf {
+    node_path(CONSOLE_VT)
+}
+
 fn node_path(n: u32) -> PathBuf {
     PathBuf::from(format!("/dev/tty{n}"))
 }

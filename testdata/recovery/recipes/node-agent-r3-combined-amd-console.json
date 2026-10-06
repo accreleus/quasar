@@ -89,7 +89,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "node-agent",
     "io.quasar.recipe": "3",
-    "io.quasar.spec": "sha256:4d85cac4aa9f205ffd9385c966121801d09309d70227a7d206a37e3c204aa6f7"
+    "io.quasar.spec": "sha256:910603d158c236fe322fb5311914b8af8e99e512fdaa36c8366e8e26a832588c"
   },
   "network_mode": "host",
   "binds": [
@@ -111,6 +111,11 @@
     {
       "source": "/etc/os-release",
       "target": "/host/etc/os-release",
+      "read_only": true
+    },
+    {
+      "source": "/run/udev/data",
+      "target": "/host/run/udev/data",
       "read_only": true
     },
     {

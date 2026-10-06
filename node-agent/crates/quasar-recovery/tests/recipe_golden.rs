@@ -50,6 +50,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             logind: false,
             console_audio: false,
             console_vt: false,
+            udev_data: false,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -247,6 +248,7 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
         let mut console = plain.clone();
         console.console = true;
         console.devices.sound = true;
+        console.devices.udev_data = true;
         let without = render(Role::NodeAgent, 3, &plain, &image, &secrets).unwrap();
         let with = render(Role::NodeAgent, 3, &console, &image, &secrets).unwrap();
         check(file, &with);
@@ -262,7 +264,8 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
             added(binds(&without), binds(&with)),
             vec![
                 "/dev/snd:/dev/snd".to_string(),
-                "/proc/asound:/host-proc/asound:ro".to_string()
+                "/proc/asound:/host-proc/asound:ro".to_string(),
+                "/run/udev/data:/host/run/udev/data:ro".to_string(),
             ],
             "{file}"
         );
@@ -298,6 +301,7 @@ fn node_agent_revision_3_with_console_mode_adds_only_the_console_additions() {
         // engine would have to create.
         let mut quiet = console.clone();
         quiet.devices.sound = false;
+        quiet.devices.udev_data = false;
         let quiet = render(Role::NodeAgent, 3, &quiet, &image, &secrets).unwrap();
         assert_eq!(quiet.cap_add, vec!["SYS_ADMIN".to_string()], "{file}");
         assert_eq!(binds(&quiet), binds(&without), "{file}");
@@ -365,6 +369,7 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
         console.devices.sound = true;
         console.devices.logind = true;
         console.devices.i2c = vec![3, 12];
+        console.devices.udev_data = true;
         let without = render(Role::NodeAgent, 3, &plain, &image, &agent_secrets()).unwrap();
         let with = render(Role::NodeAgent, 3, &console, &image, &agent_secrets()).unwrap();
         check(file, &with);
@@ -389,6 +394,7 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
                 "/proc/asound:/host-proc/asound:ro".to_string(),
                 "/run/systemd/seats:/host/run/systemd/seats:ro".to_string(),
                 "/run/systemd/sessions:/host/run/systemd/sessions:ro".to_string(),
+                "/run/udev/data:/host/run/udev/data:ro".to_string(),
             ],
             "{file}"
         );
@@ -425,6 +431,7 @@ fn node_agent_revision_3_with_console_mode_on_a_rootless_engine() {
         bare.devices.sound = false;
         bare.devices.logind = false;
         bare.devices.i2c.clear();
+        bare.devices.udev_data = false;
         let bare = render(Role::NodeAgent, 3, &bare, &image, &agent_secrets()).unwrap();
         assert_eq!(binds(&bare), binds(&without), "{file}");
         assert_eq!(bare.devices, without.devices, "{file}");

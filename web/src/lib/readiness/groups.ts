@@ -51,8 +51,12 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   { key: "input", label: "Input & sandbox", ids: ["input_probe", "uinput", "input_device_access", "user_namespaces", "app_apparmor_profile"] },
   // #259: the audio sidecar host probe.
   { key: "audio", label: "Audio", ids: ["audio_probe"] },
-  // #437: console mode's local display, audio and monitor control (amendment 17).
-  { key: "console", label: "Console mode", ids: ["console_display", "console_audio", "console_ddc"] },
+  // Console mode's grants for direct display (amendment 19, #460).
+  {
+    key: "console",
+    label: "Console mode",
+    ids: ["console_card", "console_input", "console_sound", "console_terminal", "console_udev", "console_ddc"],
+  },
   // #253: storage; homes first — the two that can block a launch later.
   { key: "storage", label: "Storage", ids: ["homes_root_writable", "homes_free_space", "template_free_space", "image_free_space"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },

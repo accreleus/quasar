@@ -10,7 +10,8 @@
 //! host-side read is `/etc/os-release` (via `/host`), used purely to pick remediation wording;
 //! its absence degrades to generic wording, never a failed check.
 
-/// `console_display` / `console_audio` / `console_ddc` (RH-07 #407).
+/// Console mode's grants: `console_card`, `console_input`, `console_sound`,
+/// `console_terminal`, `console_udev`, `console_ddc` (amendment 19, #460).
 pub mod console;
 /// `owner_conflict` on an owned install.
 pub mod owner_conflict;
@@ -151,7 +152,7 @@ pub struct ProbeEnv {
     /// The agent runs NVIDIA sessions (`ContainerRuntime::is_nvidia`), even when capacity
     /// detection dropped the GPU, as it does when the engine injected none.
     pub nvidia_runtime: bool,
-    /// `console_display` / `console_audio` / `console_ddc` inputs (RH-07 #407).
+    /// The console checks' inputs (amendment 19, #460).
     pub console: console::ConsoleView,
 }
 
@@ -282,17 +283,7 @@ impl ProbeEnv {
             runtime,
             gpus: Vec::new(),
             nvidia_runtime: crate::session::container::ContainerRuntime::from_env().is_nvidia(),
-            console: console::ConsoleView {
-                enabled: crate::ddc::is_console_enabled(),
-                has_access: std::env::var(crate::release::console::MARKER_ENV)
-                    .is_ok_and(|v| v.trim() == "1"),
-                preflight: crate::session::console_preflight::last(),
-                audio: console::AudioView::observe(
-                    &crate::session::console_audio::LiveHostAudio::live(),
-                    &crate::session::console_audio::configured_output(),
-                ),
-                ddc: crate::ddc::summary(),
-            },
+            console: console::ConsoleView::live(),
         }
     }
 
@@ -580,10 +571,10 @@ fn probe_all(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         // The update path: what preflight reads about this host.
         platform_update::check_updater_socket(env.recovery_actor.as_ref()),
         platform_update::check_health_addr_bindable(&env.health, &env.self_identity),
-        console::check_display(&env.console),
-        console::check_audio(&env.console),
-        console::check_ddc(&env.console),
     ]
+    .into_iter()
+    .chain(console::checks(&env.console))
+    .collect()
 }
 
 fn check_vulkan_av1_compatibility(env: &ProbeEnv) -> ReadinessCheck {
@@ -1615,7 +1606,8 @@ fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck 
         );
     }
     let dri = env.root.join("dev/dri");
-    let nodes = dir_entries_matching(&dri, |n| n.starts_with("renderD") || n.starts_with("card"));
+    // The render nodes: all of the DRM nodes a streamed app is given (#460).
+    let nodes = dir_entries_matching(&dri, |n| n.starts_with("renderD"));
     if nodes.is_empty() {
         // Already covered loudly by `render_node`; saying it twice hides the real fault.
         return skip(

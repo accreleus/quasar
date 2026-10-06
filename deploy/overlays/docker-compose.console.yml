@@ -41,6 +41,9 @@ services:
       # Docker forbids a bind into a container's own /proc, so the agent reads this
       # host procfs view to advertise the exact ALSA hw:C,D selector.
       - /proc/asound:/host-proc/asound:ro
+      # udev's device database (#460): a direct-display console container is given it
+      # read-only, and the agent's console_udev readiness check reads it here.
+      - /run/udev/data:/host/run/udev/data:ro
     devices:
       # Console mode's own virtual terminal (#407): the agent makes it the active VT with
       # the kernel keyboard off for a console session's life, so nothing typed in a

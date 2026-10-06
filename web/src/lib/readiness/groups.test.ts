@@ -57,8 +57,11 @@ const AGENT_CHECK_IDS = [
   "engine_restart_on_boot",
   "engine_healthchecks",
   "input_device_access",
-  "console_display",
-  "console_audio",
+  "console_card",
+  "console_input",
+  "console_sound",
+  "console_terminal",
+  "console_udev",
   "console_ddc",
 ];
 
@@ -129,12 +132,12 @@ describe("readiness groups (#102)", () => {
   });
 
   it("files the console mode checks under Console mode, never Other", () => {
-    const { groups } = groupChecks([c("console_ddc"), c("console_display", "fail"), c("console_audio"), c("audio_probe")]);
+    const { groups } = groupChecks([c("console_ddc"), c("console_card", "fail"), c("console_udev"), c("console_input"), c("audio_probe")]);
     expect(groups.map((g) => [g.key, g.label])).toEqual([
       ["audio", "Audio"],
       ["console", "Console mode"],
     ]);
-    expect(groups[1].checks.map((x) => x.id)).toEqual(["console_display", "console_audio", "console_ddc"]);
+    expect(groups[1].checks.map((x) => x.id)).toEqual(["console_card", "console_input", "console_udev", "console_ddc"]);
   });
 
   it("files input_device_access with uinput and the update preflight's owner_conflict under Updates", () => {

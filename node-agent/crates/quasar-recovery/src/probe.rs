@@ -3,7 +3,8 @@
 //! The actor cannot look for itself: a container sees only the devices it was given, and
 //! the actor is given none. So the actor runs a short-lived probe from the agent image
 //! with the host's `/dev` bound read-only at `/host/dev` (and `/run` at `/host/run`, for
-//! logind's state and the console-audio socket directory, RH-07 #407), reads what it printed, and removes it whatever happened.
+//! logind's state, the console-audio socket directory, RH-07 #407, and udev's device
+//! database, #460), reads what it printed, and removes it whatever happened.
 //!
 //! Presence is read by listing `/host/dev` (a glob, which is a directory read), never by
 //! `stat`ing a node: under SELinux a confined container may list the host's `/dev` but
@@ -43,6 +44,7 @@ for f in /host/dev/*; do case "${f##*/}" in uinput|kmsg|nvidiactl|fuse|snd|tty8)
 for f in /host/dev/i2c-*; do n=${f##*/i2c-}; case "$n" in ''|*[!0-9]*) ;; *) if [ -e "$f" ] && [ ! -c "$f" ]; then echo "i2c_not_device $n"; else echo "i2c $n"; fi;; esac; done
 for f in /host/run/systemd/*; do case "${f##*/}" in seats|sessions) echo "logind ${f##*/}";; esac; done
 for f in /host/run/quasar-console-audi[o]; do [ "$f" = /host/run/quasar-console-audio ] && echo "console_audio dir"; done
+for f in /host/run/udev/dat[a]; do [ "$f" = /host/run/udev/data ] && echo "udev data"; done
 [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 0 ] && echo "kernel_log open"
 for n in /host/dev/dri/renderD* /host/dev/dri/card*; do
   [ -c "$n" ] || continue
@@ -75,6 +77,8 @@ pub struct ProbeReport {
     /// The host's `/run` has `quasar-console-audio`, the desktop user's Quasar-only
     /// PipeWire socket directory (console audio, RH-07 #407).
     pub console_audio: bool,
+    /// The host's `/run` has udev's device database, `udev/data` (#460).
+    pub udev_data: bool,
     pub nvidia_nodes: bool,
     /// The host has `/dev/tty8`, console mode's virtual terminal (RH-07 #407).
     pub console_vt: bool,
@@ -116,6 +120,7 @@ pub fn parse(output: &str) -> Result<ProbeReport, ProbeError> {
             (Some("dev"), Some("tty8")) => report.console_vt = true,
             (Some("kernel_log"), Some("open")) => report.kernel_log = true,
             (Some("console_audio"), Some("dir")) => report.console_audio = true,
+            (Some("udev"), Some("data")) => report.udev_data = true,
             (Some("i2c"), Some(n)) => {
                 let bus = n
                     .parse::<u32>()
@@ -240,6 +245,7 @@ pub fn select(report: &ProbeReport) -> (GpuFacts, HostDevices) {
         console_audio: report.console_audio,
         dri_nodes: report.dri_nodes(),
         console_vt: report.console_vt,
+        udev_data: report.udev_data,
         engine_rootless: false,
         host_sysfs: false,
     };
@@ -558,6 +564,32 @@ mod tests {
         assert!(report.console_audio);
         assert!(select(&report).1.console_audio);
         assert!(parse("quasar-probe 1\nconsole_audio other\nend").is_err());
+    }
+
+    /// #460: udev's device database is read by listing `/host/run/udev`, and becomes the
+    /// recipe input console mode binds it by.
+    #[test]
+    fn the_udev_database_is_reported_from_a_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host");
+        std::fs::create_dir_all(host.join("dev")).unwrap();
+        std::fs::create_dir_all(host.join("run/udev")).unwrap();
+        let run = |host: &std::path::Path| {
+            let script = SCRIPT.replace("/host/", &format!("{}/", host.display()));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("sh");
+            parse(&String::from_utf8_lossy(&out.stdout)).unwrap()
+        };
+        assert!(!run(&host).udev_data);
+        assert!(!select(&run(&host)).1.udev_data);
+        std::fs::create_dir_all(host.join("run/udev/data")).unwrap();
+        let report = run(&host);
+        assert!(report.udev_data);
+        assert!(select(&report).1.udev_data);
+        assert!(parse("quasar-probe 1\nudev other\nend").is_err());
     }
 
     /// The script lists i2c nodes and logind's directories by glob: a real shell against a

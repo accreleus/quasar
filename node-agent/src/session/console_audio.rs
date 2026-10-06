@@ -21,8 +21,14 @@
 //! [`choose_route`] is the whole decision and does no I/O of its own: what it reads of the
 //! host comes through [`HostAudio`], whose live implementation ([`LiveHostAudio`]) takes
 //! its paths as fields so tests can point it at a temporary `/proc/asound` and a real
-//! socket. `capacity::detect_audio_sinks`, `pipeline::build_local_audio_pipeline` and the
-//! `console_audio` readiness check all go through it, so they cannot disagree.
+//! socket. `capacity::detect_audio_sinks` and `pipeline::build_local_audio_pipeline` go
+//! through it, so they cannot disagree.
+//!
+//! The local-display path this serves is retired with direct display (#453): a console
+//! desktop plays through the sound device it is given. The `console_audio` readiness check
+//! that read the sink listing went with amendment 19 (#460), and the module goes with the
+//! rest of the old path (#461); until then its unread helpers stay as they are.
+#![allow(dead_code)]
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;

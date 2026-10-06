@@ -103,6 +103,12 @@ fn rootless() -> bool {
     ROOTLESS.load(Ordering::Relaxed)
 }
 
+/// The engine mode latched by [`set_rootless`], for fix texts that name host preparation's
+/// `--mode` (`readiness::console`).
+pub(crate) fn is_rootless() -> bool {
+    rootless()
+}
+
 fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| {
         Mutex::new(Cache {

@@ -367,6 +367,7 @@ pub(crate) struct ConsoleDevices {
     i2c: Vec<u32>,
     dri_nodes: Vec<String>,
     console_vt: bool,
+    udev_data: bool,
 }
 
 impl ConsoleDevices {
@@ -378,6 +379,7 @@ impl ConsoleDevices {
             i2c: report.i2c.clone(),
             dri_nodes: report.dri_nodes(),
             console_vt: report.console_vt,
+            udev_data: report.udev_data,
         }
     }
 
@@ -387,6 +389,7 @@ impl ConsoleDevices {
         devices.console_audio = self.console_audio;
         devices.i2c = self.i2c;
         devices.console_vt = self.console_vt;
+        devices.udev_data = self.udev_data;
         if !self.dri_nodes.is_empty() {
             devices.dri_nodes = self.dri_nodes;
         }
